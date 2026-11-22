@@ -3099,6 +3099,306 @@ async fn kr_req_13_12_a_connection_of_another_owner_reaching_during_the_cancel_i
     adopted.stop().await;
 }
 
+/// KR-REQ-13.12 (S1): a reach that comes between a sender's result and its decision leaves no idle
+/// pause. The sender's connection fails; the sender is held just before its decision takes the gate;
+/// the phone reaches the host on a newer connection meanwhile; the decision reads the newest
+/// connection inside its gate section and starts the upload on it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_13_12_a_reach_between_the_senders_result_and_its_decision_leaves_no_idle_pause() {
+    use testing::Point;
+
+    let adopted = Adopted::start(1).await;
+    let (phone, control) = phone_for(&adopted).await;
+    let companion = &phone.companion;
+    let desk = desk_of(companion);
+    let bytes = pattern(5);
+    let (content, gate, _release) = gated(&bytes);
+    let key = kr_ipc::new_uuid();
+    let before = testing::hold_at(key, Point::SettleBeforeGate);
+    let settled = testing::hold_at(key, Point::SenderSettled);
+    let decided = testing::hold_at(key, Point::DecisionDone);
+    let paired = paired_of(companion).await;
+    let old = Arc::clone(&paired.session);
+    let sending = {
+        let sent = request(&adopted, &bytes, content, key);
+        let desk = Arc::clone(&desk);
+        tokio::spawn(async move { desk.send(paired, sent).await })
+    };
+    gate.reached().await;
+    control.hold();
+    old.transport().close();
+    gate.release();
+    before.until_passed(1).await;
+    // The phone makes another connection while the sender is held before its decision.
+    control.stop_holding();
+    control.release_all();
+    let newer = on_another_connection(companion, &old).await;
+    until("the desk is told of the new connection", || {
+        desk.holds_newest_for_test(&newer)
+    })
+    .await;
+    before.release();
+    settled.until_passed(1).await;
+    assert_eq!(
+        desk.resumed_on_for_test(key),
+        Some(newer.link),
+        "the decision started the upload on the connection that came during the hold"
+    );
+    // The mark a reach leaves would hand a late decision to a fresh one that ends in the same state,
+    // so the case also reads that no fresh decision was needed: the sender's own section started it.
+    tokio::time::timeout(WATCHDOG, desk.idle())
+        .await
+        .expect("the desk's own tasks end");
+    assert_eq!(
+        decided.passed(),
+        0,
+        "the decision section saw the reach itself: no fresh decision was handed over"
+    );
+    tokio::time::timeout(WATCHDOG, sending)
+        .await
+        .expect("the upload ends on the newer connection")
+        .expect("the task ran")
+        .expect("the upload is published");
+    adopted.stop().await;
+}
+
+/// KR-REQ-13.12 (T3): a reach that skipped a sending upload and a connection of another account that
+/// then replaced it as the newest give one fresh decision and no loop. The first decision hands the
+/// key over once; the fresh one finds no usable connection and leaves the upload paused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_13_12_a_reach_whose_connection_was_replaced_gives_one_fresh_decision_and_no_loop() {
+    use testing::Point;
+
+    let adopted = Adopted::start(1).await;
+    let (phone, _control) = phone_for(&adopted).await;
+    let companion = &phone.companion;
+    let desk = desk_of(companion);
+    let bytes = pattern(5);
+    let (content, gate, _release) = gated(&bytes);
+    let key = kr_ipc::new_uuid();
+    let waiting = testing::hold_at(key, Point::CancelWaiting);
+    let decided = testing::hold_at(key, Point::DecisionDone);
+    let paired = paired_of(companion).await;
+    let sending = {
+        let sent = request(&adopted, &bytes, content, key);
+        let (desk, paired) = (Arc::clone(&desk), paired.clone());
+        tokio::spawn(async move { desk.send(paired, sent).await })
+    };
+    gate.reached().await;
+    // A reach of the upload's account skips the sending upload and marks it; then a connection of
+    // another account becomes the newest.
+    desk.host_reached(Paired {
+        link: paired.link + 1_000,
+        ..paired.clone()
+    });
+    desk.host_reached(Paired {
+        account: Some(kr_client::services::AccountMark::from_bytes([7; 32])),
+        link: paired.link + 2_000,
+        ..paired.clone()
+    });
+    let finishing = {
+        let (desk, paired) = (Arc::clone(&desk), paired.clone());
+        tokio::spawn(async move { desk.finish_asked(&paired, key).await })
+    };
+    waiting.until_passed(1).await;
+    gate.release();
+    // Two decisions end the chain; a loop would end in no state, so the case waits for the second
+    // or the third and counts.
+    tokio::select! {
+        () = desk.idle() => {}
+        () = decided.until_passed(3) => {}
+    }
+    assert_eq!(
+        decided.passed(),
+        2,
+        "one decision, and one fresh decision that ends the chain"
+    );
+    assert!(
+        tokio::time::timeout(WATCHDOG, finishing).await.is_ok(),
+        "the finish is answered"
+    );
+    assert_eq!(desk.phase_for_test(key), Some("paused"));
+    assert_eq!(
+        desk.resumed_on_for_test(key),
+        None,
+        "no connection of the account was usable"
+    );
+    sending.abort();
+    adopted.stop().await;
+}
+
+/// KR-REQ-13.12: a fresh decision that finds its key sending leaves the sender alone.
+/// A decision hands a key over and a newer reach of the account starts the key before the fresh
+/// decision takes the turn: the fresh decision neither stops that sender nor starts another.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_13_12_a_fresh_decision_leaves_a_sender_that_a_later_reach_started() {
+    use testing::Point;
+
+    let adopted = Adopted::start(1).await;
+    let (phone, control) = phone_for(&adopted).await;
+    let companion = &phone.companion;
+    let desk = desk_of(companion);
+    let bytes = pattern(5);
+    let (content, gate, _release) = gated(&bytes);
+    let key = kr_ipc::new_uuid();
+    let settled = testing::hold_at(key, Point::SenderSettled);
+    let paired = paired_of(companion).await;
+    let session = Arc::clone(&paired.session);
+    let sending = {
+        let sent = request(&adopted, &bytes, content, key);
+        let (desk, paired) = (Arc::clone(&desk), paired.clone());
+        tokio::spawn(async move { desk.send(paired, sent).await })
+    };
+    gate.reached().await;
+    let started = testing::hold_at(key, Point::SenderStarting);
+    desk.host_reached(Paired {
+        link: paired.link + 1_000,
+        ..paired.clone()
+    });
+    desk.host_reached(Paired {
+        account: Some(kr_client::services::AccountMark::from_bytes([7; 32])),
+        link: paired.link + 2_000,
+        ..paired.clone()
+    });
+    control.hold();
+    session.transport().close();
+    // The key's turn is held, so that the fresh decision the sender's decision hands over waits.
+    let turn = desk.hold_turn_for_test(key).await;
+    gate.release();
+    settled.until_passed(1).await;
+    // A newer reach of the account starts the paused upload; its sender is held at its first line.
+    desk.host_reached(Paired {
+        link: paired.link + 4_000,
+        ..paired.clone()
+    });
+    started.until_passed(1).await;
+    let generation = desk.generation_for_test(key);
+    let waiting = testing::hold_at(key, Point::CancelWaiting);
+    drop(turn);
+    // The fresh decision takes the turn: it ends at once (left alone), or it begins to stop the sender.
+    tokio::select! {
+        () = desk.idle() => {}
+        () = waiting.until_passed(1) => {}
+    }
+    assert_eq!(
+        waiting.passed(),
+        0,
+        "the fresh decision did not stop the sender"
+    );
+    assert_eq!(desk.generation_for_test(key), generation);
+    assert_eq!(desk.phase_for_test(key), Some("sending"));
+    started.release();
+    sending.abort();
+    adopted.stop().await;
+}
+
+/// KR-REQ-13.12 (X1): `forgotten` stops a sender that a restart started after its first look, before
+/// its second loop removes the entry. The restart's `act_on` holds the key's turn and is held before
+/// it starts the upload; `forgotten` takes its snapshot and waits for the turn; then the sender starts,
+/// and the barrier stops and waits for it before the entry goes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_13_12_forgotten_stops_a_sender_that_a_restart_started_before_its_second_loop() {
+    use testing::Point;
+
+    let adopted = Adopted::start(1).await;
+    let (phone, control) = phone_for(&adopted).await;
+    let companion = &phone.companion;
+    let bytes = pattern(5);
+    let old = Arc::clone(&paired_of(companion).await.session);
+    let (key, _first, _who) = left_paused(&adopted, &phone, &control, &bytes).await;
+    let reading = testing::hold_at(key, Point::Reading);
+    let started = testing::hold_at(key, Point::SenderStarting);
+    let exited = testing::hold_at(key, Point::SenderExit);
+    // The phone reaches the host: the restart reads the entry's content and is held with the turn.
+    control.stop_holding();
+    control.release_all();
+    let newer = on_another_connection(companion, &old).await;
+    reading.until_passed(1).await;
+    let desk = desk_of(companion);
+    let wanted = testing::hold_at(key, Point::TurnWanted);
+    let waiting = testing::hold_at(key, Point::CancelWaiting);
+    desk.forgotten(newer.device_id);
+    wanted.until_passed(1).await;
+    reading.release();
+    // The restart starts the upload and lets the turn go; the barrier then stops the sender, or, with
+    // no barrier, `forgotten` has finished and removed the entry.
+    tokio::select! {
+        () = waiting.until_passed(1) => {}
+        () = desk.idle() => {}
+    }
+    assert_eq!(
+        entries_in(&folder(&phone)),
+        1,
+        "the entry is not removed while its sender runs"
+    );
+    assert_eq!(desk.held_count_for_test(), 1);
+    started.release();
+    exited.until_passed(1).await;
+    tokio::time::timeout(WATCHDOG, desk.idle())
+        .await
+        .expect("the desk's own tasks end");
+    assert_eq!(desk.held_count_for_test(), 0, "no upload is held");
+    assert_eq!(entries_in(&folder(&phone)), 0, "the entry is gone");
+    adopted.stop().await;
+}
+
+/// KR-REQ-13.12 (X2): a restart removes another principal's entry only in the entry's turn. A holder
+/// keeps the turn; the restart asks for it and the entry stays; it goes once the turn is let go.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_13_12_restarts_removal_of_another_principals_entry_waits_for_the_turn() {
+    use testing::Point;
+
+    let adopted = Adopted::start(1).await;
+    let (phone, _control) = phone_for(&adopted).await;
+    let companion = &phone.companion;
+    let paired = paired_of(companion).await;
+    let key = kr_ipc::new_uuid();
+    let bytes = vec![5_u8; 16];
+    testing::keep(
+        &folder(&phone),
+        key,
+        paired.environment_id,
+        kr_protocol::ids::DeviceId::new(kr_ipc::new_uuid()),
+        None,
+        net_support::on_the_host(&adopted.host),
+        None,
+        testing::Got::Beginning,
+        16,
+        Held::new(bytes.clone()).digest(),
+        testing::Where::Copy,
+    );
+    testing::keep_copy(&folder(&phone), key, &bytes);
+    let desk = desk_of(companion);
+    let turn = desk.hold_turn_for_test(key).await;
+    let wanted = testing::hold_at(key, Point::TurnWanted);
+    let restarting = {
+        let desk = Arc::clone(&desk);
+        tokio::spawn(async move { desk.restart(paired).await })
+    };
+    // The restart asks for the turn, or, with no turn asked for, it finishes.
+    tokio::select! {
+        () = wanted.until_passed(1) => {}
+        () = async {
+            while !restarting.is_finished() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        } => {}
+    }
+    assert_eq!(
+        entries_in(&folder(&phone)),
+        1,
+        "the entry stays while another operation holds its turn"
+    );
+    assert!(!restarting.is_finished());
+    drop(turn);
+    tokio::time::timeout(WATCHDOG, restarting)
+        .await
+        .expect("the restart ends once the turn is let go")
+        .expect("the task ran");
+    assert_eq!(entries_in(&folder(&phone)), 0, "the entry goes in its turn");
+    adopted.stop().await;
+}
+
 /// How many draft creations and discards the client's book still holds as unresolved on `session`.
 async fn draft_actions_in_the_book(session: &kr_client::Session) -> usize {
     use kr_protocol::method::Method;

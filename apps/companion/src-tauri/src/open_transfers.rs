@@ -897,6 +897,9 @@ enum Job {
     Cancel { who: Who, paired: Option<Paired> },
     /// The cancel of the key is finished on `paired`'s connection.
     Finish { paired: Paired },
+    /// The key's upload, if any, and its entry and copy are over for good: the host this device
+    /// knew was forgotten, or the pairing the entry was kept under is not the one in force.
+    Forget,
     /// Nothing but the attempt and the decision that every barrier ends with.
     Decide,
 }
@@ -964,7 +967,8 @@ impl Stopped<'_> {
             self.ended = true;
             return;
         }
-        self.desk.idle_or_next(&live, None, self.used, self.looked);
+        self.desk
+            .idle_or_next(&live, None, self.used, self.looked, None);
     }
 }
 
@@ -1102,6 +1106,8 @@ impl Desk {
 
     /// Takes the turn of `key`, waiting for whoever holds it. The wait is outside every lock.
     async fn turn(&self, key: Uuid) -> Turn {
+        #[cfg(feature = "testing")]
+        testing::note(key, testing::Point::TurnWanted);
         let turn = Arc::clone(locked(&self.registry).turns.entry(key).or_default());
         Turn {
             key,
@@ -1410,13 +1416,12 @@ impl Desk {
         // A sign-out gives the transport's reason, which the driver returns in place of the plain
         // end; what this device ended is never waited out.
         let by_this_device = session.transport().ended_by_this_device().is_some();
-        self.settle_as(live, Some(session), generation, by_this_device, result);
+        self.settle_as(live, generation, by_this_device, result);
     }
 
     fn settle_as(
         self: &Arc<Self>,
         live: &Arc<Live>,
-        session: Option<&Arc<Session>>,
         generation: u64,
         by_this_device: bool,
         result: kr_client::Result<AttachmentHandle>,
@@ -1450,10 +1455,11 @@ impl Desk {
             if transfer.is_some() {
                 // The host holds what this device could not write down: it stays here, paused, and
                 // the next send keeps the identifier before anything else.
-                if self.pause_as(live, generation) {
-                    live.outcome
-                        .send_replace(Some(Outcome::Failed(CommandError::from(error))));
-                }
+                self.settle_paused(
+                    live,
+                    generation,
+                    Some(Outcome::Failed(CommandError::from(error))),
+                );
             } else {
                 // Nothing was asked of the host.
                 if let Ok(store) = self.store() {
@@ -1472,23 +1478,7 @@ impl Desk {
                 _ => false,
             };
         if resumable {
-            let newest = locked(&self.sessions)
-                .get(&(file.environment_id, file.device_id))
-                .and_then(|known| known.newest.clone());
-            let registry = locked(&self.registry);
-            if live.generation.load(Ordering::Acquire) != generation {
-                return;
-            }
-            *locked(&live.phase) = Phase::Paused;
-            if let (Some(newest), Some(failed)) = (newest, session)
-                && !Arc::ptr_eq(&newest.session, failed)
-            {
-                // The connection that came up first is the one this upload goes on, at once, when it
-                // was made for the upload's own account.
-                self.start_under(&registry, live, newest, true);
-            }
-            #[cfg(feature = "testing")]
-            testing::note(live.key, testing::Point::SenderSettled);
+            self.settle_paused(live, generation, None);
             return;
         }
         let uncertain = matches!(error, ClientError::SubmissionUncertain { .. })
@@ -1532,15 +1522,19 @@ impl Desk {
         live.outcome.send_replace(Some(outcome));
     }
 
-    /// Pauses `live` for the sender of `generation`, and says whether it did: a sender that a stop
-    /// took over pauses nothing.
-    fn pause_as(&self, live: &Arc<Live>, generation: u64) -> bool {
-        let _registry = locked(&self.registry);
-        if live.generation.load(Ordering::Acquire) != generation {
-            return false;
-        }
-        *locked(&live.phase) = Phase::Paused;
-        true
+    /// The sender of `generation` leaves its upload for a later connection: the decision section
+    /// pauses it, or starts it on a newer connection of its account at once. A sender that a stop
+    /// took over decides nothing.
+    fn settle_paused(self: &Arc<Self>, live: &Arc<Live>, generation: u64, failed: Option<Outcome>) {
+        self.idle_or_next(
+            live,
+            Some(generation),
+            live.sent_link.load(Ordering::Acquire),
+            0,
+            failed,
+        );
+        #[cfg(feature = "testing")]
+        testing::note(live.key, testing::Point::SenderSettled);
     }
 
     /// The host was reached on `paired`'s connection: the paused uploads of its account resume on
@@ -1573,14 +1567,17 @@ impl Desk {
                 .into_iter()
                 .filter(|live| live.owner.device_id != device_id)
                 .collect();
-            let paused: Vec<(Arc<Live>, bool)> = mine
-                .into_iter()
-                .filter(|live| *locked(&live.phase) == Phase::Paused)
-                .map(|live| {
+            let mut paused: Vec<(Arc<Live>, bool)> = Vec::new();
+            for live in mine {
+                if *locked(&live.phase) == Phase::Paused {
                     let cancelled = registry.cancelled.contains(&live.key);
-                    (live, cancelled)
-                })
-                .collect();
+                    paused.push((live, cancelled));
+                } else {
+                    // This reach cannot start the upload: it is held, stopping or sending. It
+                    // records that it came, so that the decision that ends the hold reads it.
+                    live.reached.fetch_max(paired.link, Ordering::AcqRel);
+                }
+            }
             (paused, other)
         };
         // An upload of another principal on this host belongs to a pairing that is not in force: it
@@ -1588,12 +1585,7 @@ impl Desk {
         for live in other {
             let desk = Arc::clone(self);
             self.work.spawn(async move {
-                let turn = desk.turn(live.key).await;
-                desk.stopped(&turn).await;
-                if let Ok(store) = desk.store() {
-                    let _ = store.remove(live.key);
-                }
-                desk.end(&live, Outcome::Cancelled);
+                desk.barrier_task(live.key, false, Job::Forget, 0, 0).await;
             });
         }
         for (live, cancelled) in paused {
@@ -1647,8 +1639,10 @@ impl Desk {
                 continue;
             }
             if file.device_id != paired.device_id {
-                // Another principal's: the pairing it was kept under is not the one in force.
-                let _ = store.remove(file.key);
+                // Another principal's: the pairing it was kept under is not the one in force. It
+                // goes in its key's turn, read again there, after a sender that started since is
+                // stopped.
+                let _ = self.barrier(file.key, false, Job::Forget, 0, 0).await;
             } else if file.account != paired.account_id() {
                 // Another account's: hidden, left as it is, and found again when its account reaches
                 // the host. Its copy is named by its entry, so the orphan pass keeps it.
@@ -2049,6 +2043,10 @@ impl Desk {
         match job {
             Job::Cancel { who, paired } => self.cancel_work(stopped, &who, paired).await,
             Job::Finish { paired } => self.finish_work(stopped, &paired).await,
+            Job::Forget => {
+                stopped.forget(&self.store()?, key);
+                Ok(Self::said(key, "forgotten", None, None))
+            }
             Job::Decide => Ok(Self::asked(key, None)),
         }
     }
@@ -2283,6 +2281,9 @@ impl Desk {
     /// finds the upload paused and starts it. `generation` validates a sender's right to decide;
     /// without it the caller is a barrier that holds the turn of the key.
     ///
+    /// `failed` is the outcome a sender's command ends with when the upload stays for a later
+    /// connection; it is written in the same section.
+    ///
     /// An upload that nothing owes is started on the newest connection of its account when that is
     /// newer than every connection `used` names. An upload whose cancel is owed, or one that a reach
     /// went by after the decision `looked` read, is paused and handed to a fresh decision, which
@@ -2293,7 +2294,12 @@ impl Desk {
         generation: Option<u64>,
         used: u64,
         looked: u64,
+        failed: Option<Outcome>,
     ) {
+        #[cfg(feature = "testing")]
+        if generation.is_some() {
+            testing::pause(live.key, testing::Point::SettleBeforeGate);
+        }
         let registry = locked(&self.registry);
         let right = match generation {
             Some(generation) => live.generation.load(Ordering::Acquire) == generation,
@@ -2308,11 +2314,19 @@ impl Desk {
         let newest = locked(&self.sessions)
             .get(&(live.owner.environment_id, live.owner.device_id))
             .and_then(|known| known.newest.clone());
+        // A reach at or below the number of the connection the sender went on is not news.
+        let looked = looked.max(live.sent_link.load(Ordering::Acquire));
         let seen = live.reached.load(Ordering::Acquire);
         let owed =
             registry.cancelled.contains(&live.key) || live.cancel_asked.load(Ordering::Acquire);
         let usable =
             newest.filter(|newest| newest.account == live.owner.account && newest.link > used);
+        // The command's failure is written in the section that validated the sender's generation,
+        // before any new start, so that an old sender never overwrites the outcome of the one that
+        // replaced it.
+        if let Some(failed) = failed {
+            live.outcome.send_replace(Some(failed));
+        }
         *locked(&live.phase) = Phase::Paused;
         match usable {
             Some(newest) if !owed => {
@@ -2560,28 +2574,21 @@ impl Desk {
     pub fn forgotten(self: &Arc<Self>, device_id: DeviceId) {
         let desk = Arc::clone(self);
         self.work.spawn(async move {
-            let sending: Vec<Arc<Live>> = locked(&desk.registry)
+            let sending: Vec<Uuid> = locked(&desk.registry)
                 .held
                 .values()
                 .filter(|live| live.owner.device_id == device_id)
-                .cloned()
+                .map(|live| live.key)
                 .collect();
-            let store = desk.store().ok();
-            for live in sending {
-                let turn = desk.turn(live.key).await;
-                desk.stopped(&turn).await;
-                locked(&desk.verdicts).remove(&live.key);
-                if let Some(store) = &store {
-                    let _ = store.remove(live.key);
-                }
-                desk.end(&live, Outcome::Cancelled);
+            for key in sending {
+                desk.barrier_task(key, false, Job::Forget, 0, 0).await;
             }
-            let Some(store) = store else { return };
+            let Ok(store) = desk.store() else { return };
             for file in store.all().entries {
                 if file.device_id == device_id {
-                    let _turn = desk.turn(file.key).await;
-                    locked(&desk.verdicts).remove(&file.key);
-                    let _ = store.remove(file.key);
+                    // Read again under the turn: an upload that a reach started since is stopped
+                    // before its entry goes.
+                    desk.barrier_task(file.key, false, Job::Forget, 0, 0).await;
                 }
             }
         });
@@ -2669,6 +2676,12 @@ impl Desk {
             .map(|newest| (newest.link, newest.account.clone()))
     }
 
+    /// Takes the turn of `key` and keeps it until the answer is dropped, so that a suite can put an
+    /// operation behind it.
+    pub async fn hold_turn_for_test(&self, key: Uuid) -> impl Send + use<> {
+        self.turn(key).await
+    }
+
     /// How many uploads the desk holds.
     #[must_use]
     pub fn held_count_for_test(&self) -> usize {
@@ -2753,6 +2766,10 @@ pub mod testing {
         SenderSettled,
         /// A barrier ended: in its decision section, or in a final resolution. Noted, never held.
         DecisionDone,
+        /// An operation asks for the key's turn, whether or not it is free. Noted, never held.
+        TurnWanted,
+        /// A sender has its result and is about to take the gate for its decision. Held.
+        SettleBeforeGate,
         /// A sender task ended, however it ended: finished, stopped, or panicked. Noted, never held.
         SenderExit,
     }
@@ -3404,7 +3421,6 @@ mod tests {
 
         desk.settle_as(
             &live,
-            None,
             0,
             false,
             Err(not_kept(&std::io::Error::other("disk full"))),
@@ -3455,7 +3471,7 @@ mod tests {
     fn a_send_ends_as_what_the_host_and_the_connection_said() {
         // The connection ended before the reservation left: paused, to ask again.
         let (_dir, desk, live, _store) = held(None, Reached::Beginning);
-        desk.settle_as(&live, None, 0, false, Err(ClientError::ConnectionEnded));
+        desk.settle_as(&live, 0, false, Err(ClientError::ConnectionEnded));
         assert_eq!(*locked(&live.phase), Phase::Paused);
         assert!(locked(&desk.registry).held.contains_key(&live.file().key));
 
@@ -3464,14 +3480,14 @@ mod tests {
         let lost = ClientError::SubmissionUncertain {
             action_id: kr_protocol::ids::ActionId::new(kr_ipc::new_uuid()),
         };
-        desk.settle_as(&live, None, 0, false, Err(lost));
+        desk.settle_as(&live, 0, false, Err(lost));
         assert!(!locked(&desk.registry).held.contains_key(&live.file().key));
         assert!(store.path(live.file().key, UPLOAD_EXTENSION).exists());
 
         // The host refused for good while it holds the reservation: a failed upload, entry kept.
         let (_dir, desk, live, store) =
             held(Some(TransferId::new(kr_ipc::new_uuid())), Reached::Begun);
-        desk.settle_as(&live, None, 0, false, refused(ErrorCode::QuotaExceeded));
+        desk.settle_as(&live, 0, false, refused(ErrorCode::QuotaExceeded));
         assert_eq!(
             locked(&desk.verdicts).get(&live.file().key),
             Some(&Verdict::Failed("the host's words".to_owned()))
@@ -3480,14 +3496,14 @@ mod tests {
 
         // The host refused the reservation: nothing is left.
         let (_dir, desk, live, store) = held(None, Reached::Beginning);
-        desk.settle_as(&live, None, 0, false, refused(ErrorCode::QuotaExceeded));
+        desk.settle_as(&live, 0, false, refused(ErrorCode::QuotaExceeded));
         assert!(!store.path(live.file().key, UPLOAD_EXTENSION).exists());
         assert!(!store.path(live.file().key, COPY_EXTENSION).exists());
 
         // The sign-in it was sent under ended and it had no account: it stops for good, with its copy.
         let (_dir, desk, live, store) =
             held(Some(TransferId::new(kr_ipc::new_uuid())), Reached::Begun);
-        desk.settle_as(&live, None, 0, true, Err(ClientError::ConnectionEnded));
+        desk.settle_as(&live, 0, true, Err(ClientError::ConnectionEnded));
         assert!(!store.path(live.file().key, UPLOAD_EXTENSION).exists());
         assert!(!store.path(live.file().key, COPY_EXTENSION).exists());
     }
@@ -3531,12 +3547,41 @@ mod tests {
             Some(TransferId::new(kr_ipc::new_uuid())),
             Reached::Begun,
         );
-        desk.settle_as(&live, None, 0, true, Err(ClientError::ConnectionEnded));
+        desk.settle_as(&live, 0, true, Err(ClientError::ConnectionEnded));
         let key = live.file().key;
         assert_eq!(*locked(&live.phase), Phase::Paused);
         assert!(locked(&desk.registry).held.contains_key(&key));
         assert!(store.path(key, UPLOAD_EXTENSION).exists());
         assert!(store.path(key, COPY_EXTENSION).exists());
+    }
+
+    /// KR-REQ-13.12: the failure a sender ends its command with is written in the gate
+    /// section that validates the sender's generation. An old sender that is held between its check
+    /// and the gate while a stop moves the generation on and the sender that replaced it ends the
+    /// upload writes nothing over that outcome.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_old_sender_never_overwrites_the_outcome_of_the_one_that_replaced_it() {
+        let (_dir, desk, live, _store) =
+            held(Some(TransferId::new(kr_ipc::new_uuid())), Reached::Begun);
+        live.journal_failed.store(true, Ordering::Release);
+        let hold = testing::hold_at(live.key, testing::Point::SettleBeforeGate);
+        let old = {
+            let (desk, live) = (Arc::clone(&desk), Arc::clone(&live));
+            tokio::spawn(async move {
+                desk.settle_as(&live, 0, false, Err(ClientError::ConnectionEnded));
+            })
+        };
+        hold.until_passed(1).await;
+        // A stop moved the generation on, and the sender that replaced the old one ended the upload.
+        live.generation.fetch_add(2, Ordering::AcqRel);
+        desk.end(&live, Outcome::Cancelled);
+        hold.release();
+        old.await.expect("the old sender settled");
+        assert!(
+            matches!(*live.outcome.borrow(), Some(Outcome::Cancelled)),
+            "the newer outcome stands"
+        );
     }
 
     /// A thread held at a point of the sender's task is a worker of the runtime: the case that lets it
