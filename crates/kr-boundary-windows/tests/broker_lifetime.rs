@@ -202,7 +202,7 @@ impl Drop for BrokerLoop {
 #[ignore = "runs as the system in a disposable guest"]
 fn a_refusal_reaches_a_client_that_reads_its_length_and_its_body_apart() {
     if !runs_as_the_system() {
-        eprintln!("SKIPPED: needs the system's token");
+        eprintln!("skipped: needs the system's token");
         return;
     }
     broker::init();
@@ -679,7 +679,7 @@ fn absent_session(luid: u64) {
 #[ignore = "runs as the system in a disposable guest"]
 fn a_normal_ending_leaves_no_session_and_journals_the_whole_life() {
     if !runs_as_the_system() {
-        eprintln!("SKIPPED: needs the system's token");
+        eprintln!("skipped: needs the system's token");
         return;
     }
     let setting = Setting::new();
@@ -848,7 +848,7 @@ fn expect_uncertain_until_released(
 #[ignore = "runs as the system in a disposable guest"]
 fn a_held_token_handle_makes_the_end_uncertain_and_closing_it_clears_it_at_the_next_try() {
     if !runs_as_the_system() {
-        eprintln!("SKIPPED: needs the system's token");
+        eprintln!("skipped: needs the system's token");
         return;
     }
     let setting = Setting::new();
@@ -873,7 +873,7 @@ fn a_held_token_handle_makes_the_end_uncertain_and_closing_it_clears_it_at_the_n
 #[ignore = "runs as the system in a disposable guest"]
 fn a_held_process_object_makes_the_end_uncertain_and_closing_it_clears_it_at_the_next_try() {
     if !runs_as_the_system() {
-        eprintln!("SKIPPED: needs the system's token");
+        eprintln!("skipped: needs the system's token");
         return;
     }
     let setting = Setting::new();
@@ -967,7 +967,7 @@ impl Drop for Clock {
 #[ignore = "runs as the system in a disposable guest"]
 fn the_boot_marker_is_the_same_across_a_change_of_the_clock_and_a_journal_reads_the_same_boot() {
     if !runs_as_the_system() {
-        eprintln!("SKIPPED: needs the system's token");
+        eprintln!("skipped: needs the system's token");
         return;
     }
     let setting = Setting::new();
@@ -1052,7 +1052,7 @@ fn expect_clean_end(replies: &[InvocationReply], by: EndedBy) {
 #[ignore = "runs as the system in a disposable guest"]
 fn a_cancel_a_disconnect_and_a_deadline_each_end_through_the_one_ending_function() {
     if !runs_as_the_system() {
-        eprintln!("SKIPPED: needs the system's token");
+        eprintln!("skipped: needs the system's token");
         return;
     }
     let setting = Setting::new();
@@ -1097,7 +1097,7 @@ fn a_cancel_a_disconnect_and_a_deadline_each_end_through_the_one_ending_function
 #[ignore = "runs as the system in a disposable guest"]
 fn the_end_of_the_clients_process_and_the_stop_of_the_service_each_end_the_invocation() {
     if !runs_as_the_system() {
-        eprintln!("SKIPPED: needs the system's token");
+        eprintln!("skipped: needs the system's token");
         return;
     }
     let setting = Setting::new();
@@ -1136,7 +1136,7 @@ fn the_end_of_the_clients_process_and_the_stop_of_the_service_each_end_the_invoc
 fn a_program_that_cannot_start_is_a_refusal_when_nothing_is_left_and_not_started_when_something_is()
 {
     if !runs_as_the_system() {
-        eprintln!("SKIPPED: needs the system's token");
+        eprintln!("skipped: needs the system's token");
         return;
     }
     let setting = Setting::new();
@@ -1195,7 +1195,7 @@ fn a_program_that_cannot_start_is_a_refusal_when_nothing_is_left_and_not_started
 #[ignore = "runs as the system in a disposable guest"]
 fn a_client_that_never_connects_its_pipes_is_refused_after_the_bound_and_the_invocation_ends() {
     if !runs_as_the_system() {
-        eprintln!("SKIPPED: needs the system's token");
+        eprintln!("skipped: needs the system's token");
         return;
     }
     let setting = Setting::new();
@@ -1230,7 +1230,7 @@ fn a_client_that_never_connects_its_pipes_is_refused_after_the_bound_and_the_inv
 #[ignore = "runs as the system in a disposable guest"]
 fn a_child_that_hides_from_the_scan_changes_nothing_because_the_end_rests_on_the_session() {
     if !runs_as_the_system() {
-        eprintln!("SKIPPED: needs the system's token");
+        eprintln!("skipped: needs the system's token");
         return;
     }
     let setting = Setting::new();
@@ -1696,7 +1696,7 @@ const POINTS: [&str; 32] = [
 #[ignore = "runs as the system in a disposable guest"]
 fn a_broker_that_crashes_at_each_point_is_finished_by_the_restart_with_its_session_gone() {
     if !runs_as_the_system() {
-        eprintln!("SKIPPED: needs the system's token");
+        eprintln!("skipped: needs the system's token");
         return;
     }
     let setting = Setting::new();
@@ -1751,7 +1751,7 @@ fn a_broker_that_crashes_at_each_point_is_finished_by_the_restart_with_its_sessi
 fn a_crash_with_a_handle_held_on_purpose_keeps_the_grants_and_the_slot_until_the_handle_is_closed()
 {
     if !runs_as_the_system() {
-        eprintln!("SKIPPED: needs the system's token");
+        eprintln!("skipped: needs the system's token");
         return;
     }
     let setting = Setting::new();
@@ -1838,7 +1838,7 @@ fn write_journal(setting: &Setting, rows: &[Row]) -> PathBuf {
 fn a_torn_tail_a_root_intent_without_its_made_row_and_a_release_intent_without_its_result_are_finished()
  {
     if !runs_as_the_system() {
-        eprintln!("SKIPPED: needs the system's token");
+        eprintln!("skipped: needs the system's token");
         return;
     }
     let setting = Setting::new();
@@ -1908,7 +1908,7 @@ fn a_torn_tail_a_root_intent_without_its_made_row_and_a_release_intent_without_i
 #[ignore = "runs as the system in a disposable guest"]
 fn a_journal_with_a_damaged_middle_record_keeps_its_tree_blocked() {
     if !runs_as_the_system() {
-        eprintln!("SKIPPED: needs the system's token");
+        eprintln!("skipped: needs the system's token");
         return;
     }
     let setting = Setting::new();
@@ -2009,7 +2009,7 @@ fn still_running(pid: u32) -> bool {
 #[ignore = "runs as the system in a disposable guest"]
 fn a_reader_child_ends_before_the_grant_and_one_that_refuses_or_overruns_ends_the_invocation() {
     if !runs_as_the_system() {
-        eprintln!("SKIPPED: needs the system's token");
+        eprintln!("skipped: needs the system's token");
         return;
     }
     let setting = Setting::new();
@@ -2102,7 +2102,7 @@ fn a_reader_child_ends_before_the_grant_and_one_that_refuses_or_overruns_ends_th
 #[ignore = "runs as the system in a disposable guest"]
 fn a_crash_while_a_reader_child_runs_is_finished_by_the_restart_with_its_session_gone() {
     if !runs_as_the_system() {
-        eprintln!("SKIPPED: needs the system's token");
+        eprintln!("skipped: needs the system's token");
         return;
     }
     let setting = Setting::new();

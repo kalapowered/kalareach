@@ -1083,7 +1083,7 @@ fn the_journal_makes_no_permit_and_writes_nothing_for_a_child_of_another_invocat
 fn the_journal_makes_a_reader_permit_without_a_row_and_only_for_its_own_invocation_once_the_root_is_made()
  {
     if !runs_as_the_system() {
-        eprintln!("SKIPPED: the fixture of this case needs the system's token");
+        eprintln!("skipped: the fixture of this case needs the system's token");
         return;
     }
     use kr_boundary_windows::filekey::FileKey;
