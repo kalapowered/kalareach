@@ -37,6 +37,11 @@ use tauri::test::MockRuntime;
 pub const SOON: Duration = Duration::from_secs(10);
 
 /// Where the bundle's pages are served from.
+/// On Windows the bundle is served from `http://tauri.localhost`; a call from the address the other
+/// platforms use is a call from a remote origin, which the capabilities do not grant.
+#[cfg(windows)]
+pub const BUNDLE: &str = "http://tauri.localhost";
+#[cfg(not(windows))]
 pub const BUNDLE: &str = "tauri://localhost";
 
 /// The numbers the scripted reader reports, all different, so that a report that reads one for
