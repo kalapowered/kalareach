@@ -1972,7 +1972,7 @@ fn a_reader_that_ends_and_leaves_a_live_descendant_refuses_the_operation_before_
     assert!(
         matches!(
             replies.last(),
-            Some(InvocationReply::Refused { kind: RefusedKind::Operation, detail }) if detail.contains("live process")
+            Some(InvocationReply::Refused { kind: RefusedKind::Operation, detail }) if detail.contains("reader of the project ended and left")
         ),
         "{replies:?}"
     );
