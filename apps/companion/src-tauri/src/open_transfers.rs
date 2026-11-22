@@ -2043,7 +2043,7 @@ impl Desk {
     async fn work_of(self: &Arc<Self>, stopped: &mut Stopped<'_>, job: Job) -> Result<Cancelled> {
         let key = stopped.turn.key;
         #[cfg(feature = "testing")]
-        if testing::armed(key, testing::Fault::PanicInWork) {
+        if testing::take(key, testing::Fault::PanicInWork) {
             panic!("a fault injected into the work of a barrier");
         }
         match job {
@@ -2833,7 +2833,7 @@ pub mod testing {
     pub enum Fault {
         /// The owner check of a finish before the barrier is skipped.
         SkipPrecheck,
-        /// The work of a barrier panics.
+        /// The work of a barrier panics, once: a recovery that runs the work again meets no panic.
         PanicInWork,
     }
 
@@ -2859,6 +2859,14 @@ pub mod testing {
             .unwrap_or_else(PoisonError::into_inner)
             .insert((key, fault));
         Armed(key, fault)
+    }
+
+    /// Whether `fault` is armed for `key`, disarming it.
+    pub(super) fn take(key: Uuid, fault: Fault) -> bool {
+        ARMED
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&(key, fault))
     }
 
     pub(super) fn armed(key: Uuid, fault: Fault) -> bool {
