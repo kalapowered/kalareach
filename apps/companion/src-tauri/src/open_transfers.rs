@@ -2195,16 +2195,34 @@ pub mod testing {
         changed: Condvar,
     }
 
+    /// Runs `wait`, which blocks the calling thread. On a worker of a runtime with several workers the
+    /// runtime hands the worker's queue to another thread first: the tasks queued on it, and the one
+    /// that will let this thread go, must not wait for the thread to be released.
+    fn blocking<R>(wait: impl FnOnce() -> R) -> R {
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime)
+                if runtime.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread =>
+            {
+                tokio::task::block_in_place(wait)
+            }
+            _ => wait(),
+        }
+    }
+
     impl Hold {
         pub(crate) fn arrive(&self, wait: bool) {
             let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
             state.0 += 1;
             self.changed.notify_all();
-            while wait && !state.1 {
-                state = self
-                    .changed
-                    .wait(state)
-                    .unwrap_or_else(PoisonError::into_inner);
+            if wait {
+                blocking(|| {
+                    while !state.1 {
+                        state = self
+                            .changed
+                            .wait(state)
+                            .unwrap_or_else(PoisonError::into_inner);
+                    }
+                });
             }
         }
 
@@ -2778,5 +2796,35 @@ mod tests {
         assert!(locked(&desk.registry).held.contains_key(&key));
         assert!(store.path(key, UPLOAD_EXTENSION).exists());
         assert!(store.path(key, COPY_EXTENSION).exists());
+    }
+
+    /// A thread held at a point of the sender's task is a worker of the runtime: the case that lets it
+    /// go is a task of the same runtime, and it must still run. On a runtime of one worker a hold that
+    /// keeps its worker would wait for ever.
+    #[cfg(feature = "testing")]
+    #[test]
+    fn a_hold_at_a_point_leaves_the_runtime_free_to_run_the_task_that_lets_it_go() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("a runtime of one worker");
+        let hold = Arc::new(testing::Hold::default());
+        let (done, finished) = std::sync::mpsc::channel();
+        let (holding, releasing) = (Arc::clone(&hold), Arc::clone(&hold));
+        runtime.spawn(async move {
+            holding.arrive(true);
+            let _ = done.send(());
+        });
+        runtime.spawn(async move {
+            releasing.until_passed(1).await;
+            releasing.release();
+        });
+        let went_on = finished.recv_timeout(std::time::Duration::from_secs(10));
+        runtime.shutdown_background();
+        assert!(
+            went_on.is_ok(),
+            "the thread at the hold goes on once the hold is released"
+        );
     }
 }

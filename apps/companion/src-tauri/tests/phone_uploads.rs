@@ -240,17 +240,22 @@ impl Content for HeldAtTheSecondChunk {
             self.gate
                 .reached
                 .store(true, std::sync::atomic::Ordering::Release);
-            let released = self
-                .gate
-                .released
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let (_released, wait) = self
-                .gate
-                .letting_go
-                .wait_timeout_while(released, WATCHDOG, |released| !*released)
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            assert!(!wait.timed_out(), "the case never let the content go");
+            // The sender reads on a worker of the application's runtime. The worker's queue goes to
+            // another thread while this one waits, so the tasks that make the case's next step, and
+            // the one that lets the content go, are not held behind it.
+            tokio::task::block_in_place(|| {
+                let released = self
+                    .gate
+                    .released
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let (_released, wait) = self
+                    .gate
+                    .letting_go
+                    .wait_timeout_while(released, WATCHDOG, |released| !*released)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                assert!(!wait.timed_out(), "the case never let the content go");
+            });
         }
         self.held.read_at(offset, len)
     }
