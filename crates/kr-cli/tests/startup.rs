@@ -4825,27 +4825,60 @@ fn the_service_start_is_chosen_and_used_where_no_daemon_has_ever_run() {
     host.close(&created);
 }
 
-/// KR-REQ-07.12: a restart whose service start's daemon ended after writing why it could not
-/// listen says why, in this command's words, and does not say that the requested daemon may still
-/// start: the manager named the process that wrote the line, the process ended with it, and the
-/// definition kr wrote does not start it again.
-///
-/// No daemon runs, so the restart starts one through the user manager, from a definition that
-/// names a stub daemon: a script that records that it started, waits for the case to let it go,
-/// prints, as itself, the line a daemon prints for a file where its rendezvous endpoint belongs,
-/// and ends. The manager gives the process of a daemon that is running when it is asked, so the
-/// case lets the stub go only after the manager reports the stub's process, and the failure has to
-/// name that process.
+/// A directory with a `systemctl` that runs the real one and, once a `show` that follows a `start`
+/// has returned, makes `mark`: the moment the user manager has told the command which process it
+/// started. A case puts the directory first on the restart command's `PATH` and lets its stub
+/// daemon go only when the mark is there, so the command's own read of the process is never later
+/// than the stub's end, however loaded the machine is. It is written aside as text and placed by a
+/// process of its own, as the recording tools are.
 #[cfg(target_os = "linux")]
-#[test]
-fn a_service_start_whose_daemon_ended_with_a_listen_line_says_why_and_no_requested_daemon_may_still_start()
- {
-    let Some(host) = ServiceHost::create() else {
-        return;
-    };
+fn a_systemctl_that_marks_the_read_after_a_start(root: &Path, mark: &Path) -> PathBuf {
+    let directory = root.join("marking-systemctl");
+    std::fs::create_dir(&directory).expect("a folder for the marking systemctl");
+    let asked = directory.join("start-asked");
+    let text = directory.join("systemctl.text");
+    std::fs::write(
+        &text,
+        format!(
+            "#!/bin/sh\n\
+             PATH=/usr/bin:/bin\n\
+             for argument in \"$@\"; do\n\
+             \x20 [ \"$argument\" = start ] && : > {asked}\n\
+             done\n\
+             systemctl \"$@\"\n\
+             status=$?\n\
+             if [ -e {asked} ]; then\n\
+             \x20 for argument in \"$@\"; do\n\
+             \x20   [ \"$argument\" = show ] && : > {mark}\n\
+             \x20 done\n\
+             fi\n\
+             exit $status\n",
+            asked = kr_worker::testing::shell_quoted(&asked),
+            mark = kr_worker::testing::shell_quoted(mark),
+        ),
+    )
+    .expect("writes the marking systemctl");
+    kr_ipc::testing::place_program(&text, &directory.join("systemctl"));
+    directory
+}
+
+/// A restart where no daemon runs, in a service host whose unit names a stub daemon: the stub
+/// records that it started, waits to be let go, prints, as itself, the line a daemon prints for a
+/// file where its rendezvous endpoint belongs, and ends. `kr host startup --set service` is run from
+/// the stub's installation first, so the unit is the one that kr writes for it and any drop-in the
+/// case wrote before.
+///
+/// The stub is let go only after the command has read from the user manager which process it
+/// started (see [`a_systemctl_that_marks_the_read_after_a_start`]), and the process that the
+/// manager reports for it is the one the failure has to name. Returns the failure's message and
+/// the failure's words for the stub's end, as the command says them where it knows the process.
+#[cfg(target_os = "linux")]
+fn a_restart_into_a_stub_that_wrote_its_last_line(
+    host: &ServiceHost,
+    tail: &str,
+) -> (String, String) {
     let started = host.tree.root().join("stub-started");
     let go = host.tree.root().join("stub-go");
-    let tail = "a tail only the daemon's own log holds";
     let daemon = stub_daemon(
         &started,
         Some(&go),
@@ -4872,21 +4905,23 @@ fn a_service_start_whose_daemon_ended_with_a_listen_line_says_why_and_no_request
         "{chosen}"
     );
 
-    let running = start(host.kr_from(&installation, &["--json", "host", "restart"]));
+    let read = host.tree.root().join("stub-process-read");
+    let marking = a_systemctl_that_marks_the_read_after_a_start(host.tree.root(), &read);
+    let mut restart = host.kr_from(&installation, &["--json", "host", "restart"]);
+    restart.env("PATH", format!("{}:/usr/bin:/bin", marking.display()));
+    let running = start(restart);
     wait_for_mark(&started, "the stub daemon's start");
+    wait_for_mark(&read, "the command's read of the stub's process");
     let process = host
         .daemon()
         .expect("the user manager reports the stub it started");
-    // The restart asks the manager for the process as soon as the manager has started the stub;
-    // this is the margin for that.
-    std::thread::sleep(Duration::from_millis(2000));
     std::fs::write(&go, "").expect("lets the stub go");
 
     let output = running.finish("kr host restart");
     let failed = failure_of(&output, "kr host restart");
     assert_eq!(output.status.code(), Some(1), "{failed}");
     assert_eq!(failed["code"], "ENVIRONMENT_UNAVAILABLE", "{failed}");
-    let message = failed["message"].as_str().unwrap_or_default();
+    let message = failed["message"].as_str().unwrap_or_default().to_owned();
     let rendezvous = host
         .tree
         .environment()
@@ -4901,6 +4936,25 @@ fn a_service_start_whose_daemon_ended_with_a_listen_line_says_why_and_no_request
          is in ",
         host.tree.environment_id()
     );
+    (message, said)
+}
+
+/// KR-REQ-07.12: a restart whose service start's daemon ended after writing why it could not
+/// listen says why, in this command's words, and does not say that the requested daemon may still
+/// start: the manager named the process that wrote the line, the process ended with it, and the
+/// unit that kr wrote does not start it again.
+///
+/// No daemon runs, so the restart starts one through the user manager, as
+/// [`a_restart_into_a_stub_that_wrote_its_last_line`] sets out.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_service_start_whose_daemon_ended_with_a_listen_line_says_why_and_no_requested_daemon_may_still_start()
+ {
+    let Some(host) = ServiceHost::create() else {
+        return;
+    };
+    let tail = "a tail only the daemon's own log holds";
+    let (message, said) = a_restart_into_a_stub_that_wrote_its_last_line(&host, tail);
     assert!(
         message.contains(&said),
         "the failure names the stub's process and says why it ended, in this command's words: \
