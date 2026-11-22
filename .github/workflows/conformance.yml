@@ -39,11 +39,25 @@ concurrency:
 
 jobs:
   linux:
-    name: linux
+    name: linux part ${{ matrix.part }} of 2
     # A manual run can leave a job out; the nightly run has all three.
     if: github.event_name != 'workflow_dispatch' || inputs.linux
     runs-on: ubuntu-24.04
-    timeout-minutes: 340
+    # The platform's plan is run in two parts, one in each job of the matrix, as the macOS and Windows
+    # jobs run theirs: on 21 November the report's 240 minutes ended before its step 32, which had
+    # not started 239.9 minutes in, and the workspace's tests alone took 10,627 seconds (177
+    # minutes) of them. The plan's rule puts that step by itself in part 1, with the report's own
+    # build and fetch before it (about 4 minutes) and the build of the worker that follows it (127
+    # seconds), which is 183 minutes of the step's 240: 57 minutes, 31 percent, of room. Part 2 is
+    # every other step: steps 3 to 31 took 3,386 seconds (56 minutes) on that night, and steps 32
+    # to 34 did not run, so part 2's time is not measured; it also compiles what part 1's workspace
+    # run compiled for it before, which no step of that night shows, and the first run of the two
+    # parts says it. The report's 240 minutes and the job's 340 are the limits of the single job
+    # that they were, and the steps' limits still add up to 326 of the 340.
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [1, 2]
     env:
       # No debug information and no incremental artefacts: nothing here reads them, and the disk
       # has to hold a debug build of every test target and a release build for the measurements.
@@ -108,8 +122,9 @@ jobs:
             libsoup-3.0-dev libjavascriptcoregtk-4.1-dev libncurses-dev \
             desktop-file-utils python3-gi
 
+      # Part 1 alone saves them, so that the two parts do not save under one key.
       - name: Save the build packages' archives
-        if: github.ref == 'refs/heads/main' && steps.conformance-linux-install.outputs.save == 'true'
+        if: github.ref == 'refs/heads/main' && matrix.part == 1 && steps.conformance-linux-install.outputs.save == 'true'
         continue-on-error: true
         timeout-minutes: 2
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
@@ -165,33 +180,35 @@ jobs:
           key: conformance-applications-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('tests/conformance/applications.lock', 'scripts/run-conformance.sh') }}
           restore-keys: conformance-applications-${{ runner.os }}-${{ runner.arch }}-
 
-      # Every group this platform runs, the applications fetched and built from the pins in
-      # tests/conformance/applications.lock. The step fails when the run did. It took 152 to 207
-      # minutes on the eleven nights of 30 October to 9 November (207 on 8 November), and the job
-      # 155 to 210. The limits of the job's steps add up to 326 of its 340 minutes, the other steps'
-      # each at least twice the longest its step took in those nights (the disk step, at 2.7
-      # minutes, has 6), the package install's 35 minutes the retries of its script, and the two
-      # cache steps around it 2 minutes each. The
-      # report's 240 minutes are 33 over the slowest night, and 10 over it with the fetch's worst
-      # case (22 and a half minutes, in scripts/run-conformance.sh) added.
+      # The groups of this platform's part of the plan, the applications fetched and built from the
+      # pins in tests/conformance/applications.lock. The step fails when the run did. The whole plan
+      # in one step took 152 to 207 minutes on the eleven nights of 30 October to 9 November (207 on
+      # 8 November), and over 240 on 21 November; part 1 of the two now takes about 183 (see the
+      # job's note above), and the job's whole run 155 to 210 on those nights. The limits of the job's
+      # steps add up to 326 of its 340 minutes, the other steps' each at least twice the longest its
+      # step took in those nights (the disk step, at 2.7 minutes, has 6), the package install's 35
+      # minutes the retries of its script, and the two cache steps around it 2 minutes each. The
+      # report's 240 minutes are 57 over part 1 as measured, and the fetch's worst case (22 and a
+      # half minutes, in scripts/run-conformance.sh) is inside that.
       - name: The conformance report
         timeout-minutes: 240
         env:
           REPORT_GROUPS: ${{ inputs.groups }}
+          REPORT_PART: ${{ matrix.part }}
         run: |
           read -r -a names <<< "$REPORT_GROUPS"
           arguments=()
           for name in ${names[@]+"${names[@]}"}; do
             arguments+=(--group "$name")
           done
-          bash scripts/run-conformance.sh ${arguments[@]+"${arguments[@]}"}
+          bash scripts/run-conformance.sh --part "$REPORT_PART/2" ${arguments[@]+"${arguments[@]}"}
 
       # The archives are held when the index the fetch wrote reads, is for this lock, names every
       # program the lock pins, and names none of them as unavailable: an index that is empty, cut
       # short or missing a program is not one to save the archives under.
       - name: Check that every application's archive is held
         id: applications-held
-        if: ${{ !cancelled() && github.ref == 'refs/heads/main' && steps.applications.outputs.cache-hit != 'true' && (inputs.groups == '' || contains(inputs.groups, 'applications')) }}
+        if: ${{ !cancelled() && matrix.part == 1 && github.ref == 'refs/heads/main' && steps.applications.outputs.cache-hit != 'true' && (inputs.groups == '' || contains(inputs.groups, 'applications')) }}
         timeout-minutes: 1
         run: |
           index="$HOME/.cache/kalareach/conformance-applications/index.json"
@@ -236,7 +253,7 @@ jobs:
         timeout-minutes: 5
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: conformance-linux
+          name: conformance-linux-part-${{ matrix.part }}
           path: ${{ env.KR_TEST_ARTIFACTS_DIR }}
           if-no-files-found: error
 
@@ -254,7 +271,7 @@ jobs:
         timeout-minutes: 5
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: conformance-linux
+          name: conformance-linux-part-${{ matrix.part }}
           path: ${{ env.KR_TEST_ARTIFACTS_DIR }}
           if-no-files-found: error
 

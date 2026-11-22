@@ -1658,6 +1658,47 @@ fn no_job_of_the_conformance_workflow_runs_the_report_from_the_file_the_build_wr
     );
 }
 
+/// The Linux and macOS jobs of the conformance workflow each run their platform's plan in two
+/// parts, one in each leg of the job's matrix: the workspace's tests took 177 minutes of the Linux
+/// job's 240-minute report step in the run of 21 November, so that the step ended before its
+/// last three steps, and a hosted macOS volume that is held for more than three hours loses files.
+/// Each leg's report takes its own part, and each part keeps its evidence under a name of its own,
+/// so that the second part's upload does not meet the first's.
+#[test]
+fn the_linux_and_macos_jobs_of_the_conformance_workflow_run_their_plans_in_two_parts() {
+    let report = fs::read_to_string(repository().join(".github/workflows/conformance.yml"))
+        .expect("the conformance workflow");
+    for name in ["linux", "macos"] {
+        let text = job(&report, name);
+        assert!(
+            text.contains("part: [1, 2]"),
+            "the {name} job's matrix does not have the two parts"
+        );
+        let runs = steps_holding(&text, "bash scripts/run-conformance.sh");
+        assert_eq!(
+            runs.len(),
+            1,
+            "the {name} job starts the report in {} steps",
+            runs.len()
+        );
+        assert!(
+            runs[0].contains("REPORT_PART: ${{ matrix.part }}")
+                && runs[0].contains("--part \"$REPORT_PART/2\""),
+            "the {name} job's report does not take the part its leg names: {}",
+            runs[0]
+        );
+        let uploads = steps_holding(
+            &text,
+            &format!("name: conformance-{name}-part-${{{{ matrix.part }}}}"),
+        );
+        assert_eq!(
+            uploads.len(),
+            2,
+            "the {name} job's two tries to keep its evidence do not both name the part"
+        );
+    }
+}
+
 /// A person on Windows is shown the PowerShell commands that start the report twice: in the guide,
 /// and in what the script prints where it refuses to run there. They are the same lines.
 #[test]
