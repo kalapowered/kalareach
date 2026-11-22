@@ -325,7 +325,8 @@ fn a_host_said_why_it_could_not_start(jobs: &std::path::Path, socket_name: &str)
 /// `env -u XDG_RUNTIME_DIR -u DBUS_SESSION_BUS_ADDRESS cargo test --locked -p kr-cli --test
 /// upgrade --features upgrade-suite -- --nocapture --ignored --exact
 /// plugin_host_frames::a_host_that_cannot_bind_beside_the_daemon_of_the_release_before_leaves_it_serving`,
-/// after `cargo build --locked -p kr-controller -p kr-worker -p kr-hook -p kr-plugin-host`.
+/// after `cargo build --locked -p kr-controller -p kr-worker -p kr-hook -p kr-plugin-host` and
+/// `cargo build --locked -p kr-describe-model --bin kr-describe-inference`.
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "run by name on Linux with XDG_RUNTIME_DIR and DBUS_SESSION_BUS_ADDRESS removed from the environment"]

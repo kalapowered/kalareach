@@ -3656,6 +3656,15 @@ mod tests {
             1,
             "{after_the_first}"
         );
+        #[cfg(unix)]
+        assert_eq!(
+            after_the_first
+                .as_str()
+                .matches(&said_path(ListenRole::Rendezvous))
+                .count(),
+            1,
+            "{after_the_first}"
+        );
         let after_the_second = last_line_said(
             &written(ListenRole::Control, &unanswered, control.clone(), 4242),
             expect,

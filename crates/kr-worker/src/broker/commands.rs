@@ -3140,8 +3140,9 @@ fn gateway_failure_said(error: &BrokerError) -> String {
     let text = match error {
         // The folder this backend made goes when its session closes, with what stands at the
         // address, and a command line after this one gets a folder of its own (a second run of the
-        // same program in this line gets this backend again): so no instruction to move the thing
-        // away is given, and no claim that kr leaves it for good.
+        // same invocation in this line gets this backend again, and any other run in the line runs
+        // as typed): so no instruction to move the thing away is given, and no claim that kr
+        // leaves it for good.
         BrokerError::Listen {
             endpoint,
             refusal: kr_ipc::listen::ListenRefusal::NotASocket { object },
