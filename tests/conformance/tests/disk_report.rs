@@ -145,3 +145,96 @@ fn the_script_holds_no_command_that_signals_or_looks_up_a_process() {
         }
     }
 }
+
+/// A hosted macOS runner's closing report, with `reader` standing in for `/usr/bin/log`: it returns
+/// what the report printed and the text of the `disk-faults.txt` it kept.
+fn kernel_read_with(reader: &str) -> (String, String) {
+    let state = tempfile::tempdir().expect("a state directory");
+    let program = state.path().join("log");
+    std::fs::write(&program, reader).expect("a reader");
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))
+            .expect("the reader runs");
+    }
+    let evidence = state.path().join("evidence");
+    let body = format!(
+        "mkdir -p \"$state\" '{evidence}'\n\
+         echo \"S $(( $(date +%s) - 600 ))\" > \"$samples\"\n\
+         export RUNNER_ENVIRONMENT=github-hosted KR_TEST_ARTIFACTS_DIR='{evidence}' \
+         KR_DISK_REPORT_LOG='{program}'\n\
+         kernel_storage_errors\n\
+         echo \"== file\"\ncat '{evidence}/disk-faults.txt'\n",
+        evidence = evidence.display(),
+        program = program.display()
+    );
+    let (text, ok) = in_shell(state.path(), &body);
+    assert!(ok, "{text}");
+    let (printed, kept) = text.split_once("== file\n").expect("the file is shown");
+    (printed.to_owned(), kept.to_owned())
+}
+
+#[test]
+fn a_kernel_log_that_cannot_be_read_is_said_in_the_file_it_leaves_and_never_leaves_it_empty() {
+    if cfg!(not(target_os = "macos")) {
+        return;
+    }
+    let (printed, kept) =
+        kernel_read_with("#!/bin/sh\necho 'log: cannot open the log store' >&2\nexit 3\n");
+    assert!(
+        printed.contains("was not read at all (status 3)") && printed.contains("not ruled out"),
+        "{printed}"
+    );
+    assert!(
+        kept.contains("was not read at all (status 3)")
+            && kept.contains("the reader said: log: cannot open the log store"),
+        "{kept}"
+    );
+}
+
+#[test]
+fn a_kernel_log_read_with_no_fault_says_so_in_the_file_and_a_fault_is_counted() {
+    if cfg!(not(target_os = "macos")) {
+        return;
+    }
+    let (printed, kept) =
+        kernel_read_with("#!/bin/sh\necho 'Timestamp               Ty Process[PID:TID]'\n");
+    assert!(printed.contains("logged no storage fault"), "{printed}");
+    assert!(kept.contains("was read: 0 matching lines"), "{kept}");
+    let (printed, kept) = kernel_read_with(
+        "#!/bin/sh\n\
+         echo '2026-11-21 13:01:52.100 Df kernel[0:1a] (apfs) apfs_vnop_pagein: error 5'\n\
+         echo '2026-11-21 13:01:53.200 Df ReportCrash[77:2b] cc exited due to SIGBUS'\n",
+    );
+    assert!(
+        printed.contains("logged 2 storage fault lines")
+            && printed.contains("from 2026-11-21 13:01:52 to 2026-11-21 13:01:53"),
+        "{printed}"
+    );
+    assert!(kept.contains("was read: 2 matching lines"), "{kept}");
+}
+
+#[test]
+fn the_kernel_log_is_asked_for_failed_page_ins_and_a_sigbus_as_well_as_failed_writes() {
+    if cfg!(not(target_os = "macos")) {
+        return;
+    }
+    // The reader keeps the predicate it was given, in the evidence directory's file.
+    let (_, kept) = kernel_read_with(
+        "#!/bin/sh\nfor word in \"$@\"; do echo \"2026-11-21 13:01:52.100 asked: $word\"; done\n",
+    );
+    for term in [
+        "I/O error",
+        "cluster_pageout",
+        "cluster_push() failed",
+        "trim_list failed",
+        "pagein",
+        "page-in",
+        "SIGBUS",
+    ] {
+        assert!(
+            kept.contains(&format!("CONTAINS \"{term}\"")),
+            "{term}: {kept}"
+        );
+    }
+}

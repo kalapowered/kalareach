@@ -267,12 +267,17 @@ alarmed() {
         shift
     done
     shift
-    "${prefix[@]+"${prefix[@]}"}" /usr/bin/perl -e 'alarm shift; exec @ARGV or exit 127' "$limit" "$@" > "$out" 2> /dev/null
+    "${prefix[@]+"${prefix[@]}"}" /usr/bin/perl -e 'alarm shift; exec @ARGV or exit 127' "$limit" "$@" > "$out" 2> "${alarm_stderr:-/dev/null}"
 }
 
-# The kernel's lines about a write to storage that failed, from the first sample to now, on a
-# hosted macOS runner. The log is read as root where the runner allows it (`sudo -n`, which never
-# asks for a password) and the read ends by itself after 90 seconds.
+# The kernel's lines about a read or a write to storage that failed, from the first sample to now,
+# on a hosted macOS runner: an I/O error, a failed page-out or page-in, and any SIGBUS, which is
+# what a program gets when a page of a file it maps cannot be read. The log is read as root where
+# the runner allows it (`sudo -n`, which never asks for a password) and the read ends by itself
+# after 90 seconds. The file it keeps is never empty: it ends with a line that says the log was read
+# and how many lines matched, or it is the line that says the log was not read, and why, with what
+# the reader said. An empty file used to be the same for a log with no fault and a log that could
+# not be read, and a run that lost files read as a clean disk.
 kernel_storage_errors() {
     [ "$(uname -s)" = Darwin ] && [ "${RUNNER_ENVIRONMENT:-}" = github-hosted ] || return 0
     first="$(awk '$1 == "S" { print $2; exit }' "$samples" 2> /dev/null)"
@@ -285,34 +290,49 @@ kernel_storage_errors() {
     evidence="$(kr_artifacts_dir_if_set && printf '%s' "$kr_artifacts")" || evidence=""
     out="${evidence:-/tmp/kr-test-artifacts}/disk-faults.txt"
     mkdir -p "$(dirname "$out")" 2> /dev/null
-    predicate='process == "kernel" AND (eventMessage CONTAINS "I/O error" OR eventMessage CONTAINS "cluster_pageout" OR eventMessage CONTAINS "cluster_push() failed" OR eventMessage CONTAINS "trim_list failed")'
+    predicate='(process == "kernel" AND (eventMessage CONTAINS "I/O error" OR eventMessage CONTAINS "cluster_pageout" OR eventMessage CONTAINS "cluster_push() failed" OR eventMessage CONTAINS "trim_list failed" OR eventMessage CONTAINS "pagein" OR eventMessage CONTAINS "page-in")) OR eventMessage CONTAINS "SIGBUS"'
+    reader="${KR_DISK_REPORT_LOG:-/usr/bin/log}"
+    said="$state/kernel-log.stderr"
+    alarm_stderr="$said"
     read_ok=0
+    status=0
     for attempt in sudo plain; do
         if [ "$attempt" = sudo ]; then
             # the redirect is in alarmed, so the runner's own shell writes the file, in its directory
-            alarmed 90 "$out" sudo -n -- /usr/bin/log show --last "${minutes}m" --style compact --predicate "$predicate"
+            alarmed 90 "$out" sudo -n -- "$reader" show --last "${minutes}m" --style compact --predicate "$predicate"
         else
-            alarmed 90 "$out" -- /usr/bin/log show --last "${minutes}m" --style compact --predicate "$predicate"
+            alarmed 90 "$out" -- "$reader" show --last "${minutes}m" --style compact --predicate "$predicate"
         fi
         status=$?
         if [ "$status" -eq 142 ]; then
-            echo "  the kernel's log was not read in 90 seconds"
-            return 0
+            break
         fi
         if [ "$status" -eq 0 ]; then
             read_ok=1
             break
         fi
     done
+    alarm_stderr=/dev/null
     if [ "$read_ok" -ne 1 ]; then
-        echo "  the kernel's log could not be read"
+        if [ "$status" -eq 142 ]; then
+            reason="in 90 seconds"
+        else
+            reason="at all (status $status)"
+        fi
+        {
+            echo "# the kernel's log was not read $reason, so this file says nothing about storage faults"
+            head -c 2000 "$said" 2> /dev/null | sed 's/^/# the reader said: /'
+        } > "$out" 2> /dev/null
+        echo "  the kernel's log was not read $reason: a storage fault is not ruled out (the reason is in disk-faults.txt)"
         return 0
     fi
-    count="$(grep -c 'kernel\[' "$out" || true)"
+    stamped='^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] '
+    count="$(grep -c "$stamped" "$out" || true)"
+    echo "# the kernel's log was read: ${count:-0} matching lines" >> "$out"
     if [ "${count:-0}" -eq 0 ]; then
-        echo "  the kernel logged no storage error since the job began"
+        echo "  the kernel logged no storage fault since the job began"
     else
-        echo "  the kernel logged $count storage error lines since the job began, from $(grep 'kernel\[' "$out" | sed -n '1p' | cut -c1-19) to $(grep 'kernel\[' "$out" | sed -n '$p' | cut -c1-19) (kept in disk-faults.txt)"
+        echo "  the kernel logged $count storage fault lines (I/O errors, failed page-ins and page-outs, SIGBUS) since the job began, from $(grep "$stamped" "$out" | sed -n '1p' | cut -c1-19) to $(grep "$stamped" "$out" | sed -n '$p' | cut -c1-19) (kept in disk-faults.txt)"
     fi
 }
 

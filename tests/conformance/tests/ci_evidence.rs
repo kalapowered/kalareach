@@ -2115,6 +2115,15 @@ const LIST: &[Listed] = &[
             1,
         )],
     ),
+    // The case sets the variable for the closing disk report, under its own temporary folder, where
+    // a reader it writes stands in for the system's log.
+    lines(
+        "tests/conformance/tests/disk_report.rs",
+        &[(
+            r#"export RUNNER_ENVIRONMENT=github-hosted KR_TEST_ARTIFACTS_DIR='{evidence}' \"#,
+            1,
+        )],
+    ),
     // The case sets the variable for the program it starts, under its own temporary folder.
     lines(
         "tests/conformance/tests/fetch.rs",
