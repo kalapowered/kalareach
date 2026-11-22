@@ -184,6 +184,20 @@ fn a_crate_is_extracted_once_for_the_releases_that_have_it_as_it_is() {
         "{:?}",
         shared.calls.borrow()
     );
+
+    // Only the crates the rules are made of are members of a tree: the root manifest names them
+    // alone, and `kr-protocol` is no crate of the tree though its manifest is there.
+    let one = Counting::new(&[("c1", "kr-worker", "id1")]);
+    let work = tempfile::tempdir().expect("a folder");
+    let trees = read_releases(entries, &roots, &listed(&["c1"]), &one, work.path());
+    assert!(trees.is_ok(), "{:?}", trees.as_ref().err());
+    let trees = trees.unwrap_or_default();
+    assert!(
+        matches!(trees[0].1.krate("kr_worker"), Lookup::Found(_)),
+        "{:?}",
+        trees[0].1.krate("kr_worker")
+    );
+    assert_eq!(trees[0].1.krate("kr_protocol"), Lookup::Absent);
 }
 
 #[test]
