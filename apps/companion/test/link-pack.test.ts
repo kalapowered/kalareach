@@ -2,12 +2,12 @@
  * The packing of a line's links, held against an exhaustive search.
  *
  * `packRooms` gives each short link of a line the room it lacks of the least size. The search below tries
- * every assignment of boxes to a small random line (whole pixels, a least size of 10): a box holds its
- * link's words, stays in the column, and keeps off every other link's box and every control. The packing
- * must complete as many links as the best assignment does, and its boxes must not cross one another, a
- * control or the column. Where a group is not a row, each of its lines must complete no fewer links than a
- * search of that line alone against the middles of the gaps to the other lines' links does. The seeds are
- * fixed, so a failure names its line.
+ * every assignment of boxes to a small random line (the words on whole pixels, the boxes' edges on half
+ * pixels, a least size of 10): a box holds its link's words, stays in the column, and keeps off every other
+ * link's box and every control. The packing must complete as many links as the best assignment does, and
+ * its boxes must not cross one another, a control or the column. Where a group is not a row, each of its
+ * lines must complete no fewer links than a search of that line alone against the middles of the gaps to
+ * the other lines' links does. The seeds are fixed, so a failure names its line.
  */
 
 import { describe, expect, it } from 'vitest'
@@ -111,7 +111,8 @@ function layoutOf(seed: number, rows: number): Line {
 
 /**
  * The most links that any assignment of non-overlapping boxes completes, by trying all of them. `scope` is the items that take part (all
- * of them by default) and `walls` an extra bound on each link's box (none by default).
+ * of them by default) and `walls` an extra bound on each link's box (none by default). A box grows in half pixels, because the middle
+ * of a gap between words on whole pixels can lie on a half pixel.
  */
 function bestCount(line: Line, scope: readonly number[] = line.items.map((_, index) => index), walls?: (index: number) => { left: number; right: number }): number {
   const links = scope.filter((index) => line.items[index].link)
@@ -127,7 +128,7 @@ function bestCount(line: Line, scope: readonly number[] = line.items.map((_, ind
       const index = chosen[at]
       const own = (line.items[index]).box
       const wall = walls?.(index) ?? { left: -Infinity, right: Infinity }
-      for (let left = 0; left <= need(index); left += 1) {
+      for (let left = 0; left <= need(index); left += 0.5) {
         const box = { left: own.left - left, right: own.right + (need(index) - left) }
         if (box.left < Math.min(line.column.left, own.left) || box.right > Math.max(line.column.right, own.right)) continue
         if (box.left < wall.left || box.right > wall.right) continue
