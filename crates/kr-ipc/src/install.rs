@@ -694,7 +694,9 @@ fn hold_opened_within(
     within: Duration,
 ) -> Result<(File, ReleaseManifest)> {
     lock_opened_within(&file, &path, within)?;
-    let manifest = read_manifest(&file, &path, release)?;
+    let manifest = read_manifest(&file, &path, release).inspect_err(|_| {
+        let _ = filelock::release(&file);
+    })?;
     Ok((file, manifest))
 }
 
@@ -702,8 +704,6 @@ fn hold_opened_within(
 /// that `path` still names the file locked. The manifest is not read.
 #[cfg(unix)]
 fn lock_opened_within(file: &File, path: &Path, within: Duration) -> Result<()> {
-    use std::os::unix::fs::MetadataExt as _;
-
     if !lock_within(file, path, Locking::Shared, within)? {
         return Err(InstallError::Replaced {
             path: path.to_path_buf(),
@@ -711,6 +711,16 @@ fn lock_opened_within(file: &File, path: &Path, within: Duration) -> Result<()> 
                      does not start",
         });
     }
+    still_named_by(file, path).inspect_err(|_| {
+        let _ = filelock::release(file);
+    })
+}
+
+/// Checks that `path` still names `file`, which holds the shared lock.
+#[cfg(unix)]
+fn still_named_by(file: &File, path: &Path) -> Result<()> {
+    use std::os::unix::fs::MetadataExt as _;
+
     let held = file
         .metadata()
         .map_err(|error| InstallError::io("read", path, error))?;
@@ -3781,6 +3791,29 @@ mod tests {
         let (removed, free) = manifest_after_a_removal_with_a_copy(true);
         removed.expect_err("the trash cannot be made");
         assert!(free, "the lock is free once the removal ended");
+    }
+
+    /// A hold attempt that fails after it takes the shared lock leaves no lock on the manifest,
+    /// though a program keeps a copy of its file.
+    #[test]
+    fn a_hold_attempt_that_fails_after_it_takes_the_lock_leaves_none_though_a_program_keeps_a_copy()
+    {
+        let test = test_store();
+        let one = release("0.1.0+aaaaaaaaaaaa");
+        let two = release("0.2.0+bbbbbbbbbbbb");
+        install(&test.store, &one);
+        let path = test.store.manifest(&one);
+        let opened = File::open(&path).expect("a program opens its manifest");
+        let _program = program_with_a_copy_of(&opened);
+        std::fs::write(&path, manifest_of(&two)).expect("the manifest names another release");
+        assert!(matches!(
+            hold_opened_within(opened, path, &one, Duration::ZERO),
+            Err(InstallError::Replaced { .. })
+        ));
+        assert!(
+            !test.store.held(&one).expect("asks"),
+            "the failed attempt left no lock"
+        );
     }
 
     /// The roots a daemon records are read back whole, a path of any bytes included.
