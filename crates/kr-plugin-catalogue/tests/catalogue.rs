@@ -159,6 +159,105 @@ async fn kr_req_11_07_a_generation_verifies_through_the_qualified_client() {
     assert_eq!(index.entries[0].plugin_id, plugin());
 }
 
+/// A generation published under a folder whose name holds a caret, and its two locations as the
+/// text a person types for them. `url` 2.5.9 writes a caret in a path as `%5E`, where 2.5.8 kept
+/// it, so the text is the locations' own with the caret put back.
+async fn at_a_caret(home: &std::path::Path) -> (Generation, String, String) {
+    let folder = home.join("repo^name");
+    std::fs::create_dir(&folder).expect("a folder with a caret in its name");
+    let generation = Generation::build(&folder, GenerationSpec::default()).await;
+    let typed = |location: url::Url| location.as_str().replace("%5E", "^");
+    let metadata = typed(generation.metadata_url());
+    let targets = typed(generation.targets_url());
+    assert!(
+        metadata.contains("/repo^name/") && targets.contains("/repo^name/"),
+        "{metadata} and {targets} hold the caret the person typed"
+    );
+    (generation, metadata, targets)
+}
+
+/// The enrolment of the repository at the locations a person typed, parsed as the controller
+/// parses them.
+fn enrolment_at(generation: &Generation, metadata: &str, targets: &str) -> Enrolment {
+    Enrolment::new(
+        repository(),
+        RepositoryKind::Local,
+        url::Url::parse(metadata).expect("a location"),
+        url::Url::parse(targets).expect("a location"),
+        generation.root_bytes(),
+        RepositoryBudgets::defaults(),
+        CapabilityCeiling::default_ceiling(),
+    )
+    .expect("an enrollable repository")
+}
+
+/// What a sync of the repository came to: its generation and its entries, or why it failed.
+async fn synced(catalogue: &mut Catalogue) -> Result<(u64, usize), String> {
+    catalogue
+        .sync(&repository())
+        .await
+        .map(|outcome| (outcome.generation.get(), outcome.entries))
+        .map_err(|error| error.to_string())
+}
+
+/// A local repository in a folder whose name holds a caret syncs from the locations a person typed
+/// for it: the caret the person wrote is the one in the folder's name, whatever `url` writes it as.
+#[tokio::test]
+async fn a_repository_in_a_folder_with_a_caret_syncs_from_the_locations_a_person_typed() {
+    let home = tempfile::tempdir().expect("a temporary directory");
+    let (generation, metadata, targets) = at_a_caret(home.path()).await;
+    let mut catalogue = Catalogue::with_broker(
+        &home.path().join("catalogue"),
+        Arc::new(kr_plugin_catalogue::UnboundBroker),
+        local(),
+    )
+    .expect("an openable catalogue");
+    catalogue
+        .enrol(enrolment_at(&generation, &metadata, &targets), true)
+        .expect("the owner adopted the root");
+
+    assert_eq!(synced(&mut catalogue).await, Ok((1, 1)));
+}
+
+/// An enrolment saved with a caret in its folder, as a release that kept the caret wrote it, syncs
+/// once this host has read it again: the text is parsed again whenever the record is read.
+#[tokio::test]
+async fn an_enrolment_saved_with_a_caret_in_its_folder_syncs_after_it_is_read_again() {
+    let home = tempfile::tempdir().expect("a temporary directory");
+    let (generation, metadata, targets) = at_a_caret(home.path()).await;
+    let root = home.path().join("catalogue");
+    {
+        let mut catalogue =
+            Catalogue::with_broker(&root, Arc::new(kr_plugin_catalogue::UnboundBroker), local())
+                .expect("an openable catalogue");
+        catalogue
+            .enrol(enrolment_at(&generation, &metadata, &targets), true)
+            .expect("the owner adopted the root");
+    }
+    let connection = rusqlite::Connection::open(root.join("catalogue.sqlite3"))
+        .expect("the catalogue's database");
+    connection
+        .execute(
+            "UPDATE enrolments SET metadata_url = ?1, targets_url = ?2",
+            rusqlite::params![metadata, targets],
+        )
+        .expect("the record as it was saved");
+    let saved: (String, String) = connection
+        .query_row(
+            "SELECT metadata_url, targets_url FROM enrolments",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("one enrolment");
+    assert_eq!(saved, (metadata, targets), "the caret is saved as typed");
+    drop(connection);
+
+    let mut reopened =
+        Catalogue::with_broker(&root, Arc::new(kr_plugin_catalogue::UnboundBroker), local())
+            .expect("an openable catalogue");
+    assert_eq!(synced(&mut reopened).await, Ok((1, 1)));
+}
+
 /// KR-REQ-25.21: metadata signed by a root this host did not adopt is refused, and nothing is
 /// activated, so a catalogue record is trusted only when its signature verifies.
 ///

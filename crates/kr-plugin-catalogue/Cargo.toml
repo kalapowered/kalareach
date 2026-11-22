@@ -41,8 +41,9 @@ rusqlite = { workspace = true, features = ["bundled"] }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-# The wait between two tries of a fetch that failed before its answer began.
-tokio.workspace = true
+# The wait between two tries of a fetch that failed before its answer began, and the read of a
+# repository's file from a local folder.
+tokio = { workspace = true, features = ["fs", "io-util"] }
 tough.workspace = true
 url.workspace = true
 
