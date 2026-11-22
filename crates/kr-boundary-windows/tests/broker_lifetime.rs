@@ -768,15 +768,10 @@ fn copy_of_the_token() -> Handle {
     Handle::new(copy, "the held token").unwrap()
 }
 
-/// What an end that a held handle keeps from being proved leaves: the reply says uncertain, the
-/// rows say so, nothing is released, the slot is blocked and the tree held, a request is refused
-/// with the words of the uncertain end, and a restart finds the session still there. `release`
-/// lets the held handle go, and the next try proves the end and finishes it.
-fn expect_uncertain_until_released(
-    life: &Life,
-    replies: &[InvocationReply],
-    release: impl FnOnce(),
-) {
+/// What an end that is not proved leaves: the reply says uncertain, the rows say so, nothing is
+/// released, the slot is blocked and the tree held, and a request is refused with the words of the
+/// uncertain end.
+fn expect_an_uncertain_end(life: &Life, replies: &[InvocationReply]) {
     assert!(
         matches!(
             replies.last(),
@@ -816,6 +811,18 @@ fn expect_uncertain_until_released(
         ),
         "{again:?}"
     );
+}
+
+/// What an end that a held handle keeps from being proved leaves: the reply says uncertain, the
+/// rows say so, nothing is released, the slot is blocked and the tree held, a request is refused
+/// with the words of the uncertain end, and a restart finds the session still there. `release`
+/// lets the held handle go, and the next try proves the end and finishes it.
+fn expect_uncertain_until_released(
+    life: &Life,
+    replies: &[InvocationReply],
+    release: impl FnOnce(),
+) {
+    expect_an_uncertain_end(life, replies);
     // The same try again, with the handle still held, finds the session still there.
     let broker = life.restarted(1);
     let first_try = recover(&broker.env).unwrap();
@@ -1951,6 +1958,14 @@ fn a_journal_with_a_damaged_middle_record_keeps_its_tree_blocked() {
     assert!(matches!(broker.trees.blocked(), Some(Blocked::Leftover(_))));
 }
 
+/// A reader that ends with the code 0 and leaves a live process refuses the operation before the
+/// grant: no `Grant`, `GrantComplete` or `ProcessStarted` row stands. Two ends are right. Where the
+/// logon session leaves the system's list, the reply is the refusal, the tree is closed and the
+/// slot is free. On a guest, Defender's real-time protection holds a token of the account on some
+/// runs (its process gains a token handle while the reader's process is alive), so the session
+/// stays past the end's bound: the end is then not proved, the journal holds `EndUncertain` that
+/// names the logon session, the reply is `finished` with `NotStarted` and an uncertain cleanup, the
+/// slot stays closed, and the next request is refused with the words of the uncertain end.
 #[test]
 #[ignore = "runs as the system in a disposable guest"]
 fn a_reader_that_ends_and_leaves_a_live_descendant_refuses_the_operation_before_the_grant() {
@@ -1969,25 +1984,45 @@ fn a_reader_that_ends_and_leaves_a_live_descendant_refuses_the_operation_before_
         |_| {},
     );
     let replies = run_one(&life, How::Reads, client_of(None), None);
-    assert!(
-        matches!(
-            replies.last(),
-            Some(InvocationReply::Refused { kind: RefusedKind::Operation, detail }) if detail.contains("reader of the project ended and left")
-        ),
-        "{replies:?}"
-    );
-    let names = kinds(&life.rows());
+    let rows = life.rows();
+    let names = kinds(&rows);
+    // Whichever end follows, the operation never reached its grant or its primary.
     assert!(
         !names
             .iter()
             .any(|name| name == "Grant" || name == "GrantComplete" || name == "ProcessStarted"),
         "no grant is made while a process of the reader lives: {names:?}"
     );
-    assert!(
-        life.ended() && life.releases() == 1 && !life.trees.locked(),
-        "{names:?}"
-    );
-    absent_session(hooks::session());
+    match replies.last() {
+        // The end is proved: the refusal, the tree closed and the slot free.
+        Some(InvocationReply::Refused {
+            kind: RefusedKind::Operation,
+            detail,
+        }) if detail.contains("reader of the project ended and left") => {
+            assert!(
+                life.ended() && life.releases() == 1 && !life.trees.locked(),
+                "{names:?}"
+            );
+            absent_session(hooks::session());
+        }
+        // The end is not proved: the logon session stays in the system's list.
+        Some(InvocationReply::Finished {
+            exit: None,
+            ended_by: EndedBy::NotStarted,
+            cleanup: Cleanup::Uncertain,
+            ..
+        }) => {
+            assert!(
+                rows.iter().any(|row| matches!(
+                    row,
+                    Row::EndUncertain { reason } if reason.contains("logon session")
+                )),
+                "{rows:?}"
+            );
+            expect_an_uncertain_end(&life, &replies);
+        }
+        other => panic!("{other:?} {names:?}"),
+    }
 }
 
 /// Whether the process with this number is still running.
