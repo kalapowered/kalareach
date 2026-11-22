@@ -245,8 +245,8 @@ struct Interrupts {
     /// True while no command of a step with a limit runs: a signal has its default action then.
     outside: Arc<AtomicBool>,
     /// For each of the [`Group::FORWARDED`] signals, in that order, its number once it reached the
-    /// report while a command ran, or 0. A flag is not cleared: the report ends the run after the
-    /// command it ended.
+    /// report, or 0. A signal that reaches the report while no command runs is recorded too, and
+    /// then ends it. A flag is not cleared: the report ends the run after the command it ended.
     received: Vec<Arc<AtomicUsize>>,
     /// The number of the signal that stops the run, or 0: the first that a read found. A signal
     /// that comes later does not replace it, so the step that was stopped, the steps that were not
@@ -584,32 +584,42 @@ impl Group {
     const FORWARDED: &[rustix::process::Signal] =
         &[rustix::process::Signal::INT, rustix::process::Signal::TERM];
 
-    /// Sets the handlers for the [`Group::FORWARDED`] signals, once. For each, a signal that
-    /// reaches the report while no command runs has its default action, which ends the report as
-    /// it ends without the handlers; while a command runs, the signal's number is recorded.
+    /// Sets the handlers for the [`Group::FORWARDED`] signals, once. For each, the signal's number is
+    /// recorded, and then, while no command runs, the default action ends the report as it ends
+    /// without the handlers.
     fn arm() -> io::Result<&'static Interrupts> {
         INTERRUPTS
             .get_or_init(|| {
                 let interrupts = Interrupts::new();
                 for (&signal, received) in Self::FORWARDED.iter().zip(&interrupts.received) {
                     let number = signal.as_raw();
-                    // The default action goes first: the actions run in the order they are set.
-                    signal_hook::flag::register_conditional_default(
-                        number,
-                        interrupts.outside.clone(),
-                    )
-                    .map_err(|error| error.to_string())?;
-                    signal_hook::flag::register_usize(
-                        number,
-                        received.clone(),
-                        usize::try_from(number).map_err(|error| error.to_string())?,
-                    )
+                    let value = usize::try_from(number).map_err(|error| error.to_string())?;
+                    Self::handle(number, &interrupts.outside, |number| {
+                        signal_hook::flag::register_usize(number, received.clone(), value)
+                    })
                     .map_err(|error| error.to_string())?;
                 }
                 Ok(interrupts)
             })
             .as_ref()
             .map_err(|why| io::Error::other(format!("the signals could not be handled: {why}")))
+    }
+
+    /// Sets the two actions that run, in the order they are set, when the signal numbered `number`
+    /// reaches the report: `record`, which keeps the signal for the supervisor, and then the default
+    /// action, which runs only while `outside` is true. A handler that is on another thread than the
+    /// supervisor's therefore records the signal before it reads `outside`, and the supervisor closes
+    /// the phase before it reads what was recorded; with every access `SeqCst`, either the handler
+    /// finds the phase closed and ends the report by the signal, or the supervisor finds the record.
+    /// The two cannot be separated: a signal that is accepted is a signal that is recorded.
+    fn handle(
+        number: i32,
+        outside: &Arc<AtomicBool>,
+        record: impl FnOnce(i32) -> io::Result<signal_hook::SigId>,
+    ) -> io::Result<()> {
+        record(number)?;
+        signal_hook::flag::register_conditional_default(number, outside.clone())?;
+        Ok(())
     }
 
     /// Sends the signal numbered `number` to the group `child` leads, when the number is of a
@@ -904,6 +914,67 @@ mod tests {
         assert!(
             interrupts.outside.load(Ordering::SeqCst),
             "the phase was not closed"
+        );
+    }
+
+    /// The variable that makes the test program run the child's part of
+    /// `a_signal_that_finds_the_phase_closed_is_recorded_before_it_ends_the_process`.
+    const CHILD: &str = "KR_CONFORMANCE_UNIT_CHILD";
+
+    /// KR-REQ-29.01, the part about reproducible commands: a signal that reaches the report while no
+    /// command runs is recorded before the default action ends the report, so a handler that runs
+    /// on another thread than the supervisor cannot accept a signal and leave it unrecorded: it
+    /// either records it before the supervisor closes the phase and reads, or finds the phase closed
+    /// and ends the report by the signal. The case sets the two actions of `Group::handle` for a
+    /// signal with a record that writes a byte to its standard error, closes the phase, and raises
+    /// the signal in a child that is this test program. The byte is there, and the child ended by
+    /// the signal, only when the record ran first and the default action after it.
+    #[test]
+    fn a_signal_that_finds_the_phase_closed_is_recorded_before_it_ends_the_process() {
+        use std::io::Read;
+        use std::os::fd::AsFd;
+        use std::os::unix::process::ExitStatusExt;
+        let number = signal_hook::consts::SIGUSR1;
+        if std::env::var_os(CHILD).is_some() {
+            let outside = Arc::new(AtomicBool::new(true));
+            let witness = std::io::stderr()
+                .as_fd()
+                .try_clone_to_owned()
+                .expect("a descriptor");
+            Group::handle(number, &outside, |number| {
+                signal_hook::low_level::pipe::register(number, witness)
+            })
+            .expect("the actions");
+            signal_hook::low_level::raise(number).expect("a signal");
+            // Not reached when the default action ends the process.
+            std::process::exit(3);
+        }
+        let (mut reader, writer) = std::io::pipe().expect("a pipe");
+        let mut command = Command::new(std::env::current_exe().expect("the test program"));
+        command
+            .args([
+                "--exact",
+                "tree::tests::a_signal_that_finds_the_phase_closed_is_recorded_before_it_ends_the_process",
+                "--test-threads=1",
+            ])
+            .env(CHILD, "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(writer);
+        let mut child = command.spawn().expect("the child");
+        // The writer is held by the command until it is dropped, and the read below ends with it.
+        drop(command);
+        let status = child.wait().expect("a wait");
+        let mut written = Vec::new();
+        reader.read_to_end(&mut written).expect("a read");
+        assert!(
+            written.contains(&b'X'),
+            "the default action ended the child before the record ran: {status:?}, {written:?}"
+        );
+        assert_eq!(
+            status.signal(),
+            Some(number),
+            "the child was not ended by the signal: {status:?}"
         );
     }
 
