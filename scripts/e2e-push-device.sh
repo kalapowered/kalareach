@@ -912,11 +912,16 @@ run_android() {
     "$adb" -s "$serial" shell dumpsys dropbox --print data_app_native_crash data_app_crash data_app_anr >"$artefacts/dropbox.log" 2>&1
     touch "$harness/finish"
     cat "$harness/report.json" >"$artefacts/report.json"
-    local status=0 line
+    # The judge's own status counts beside its lines: a judge that ends in error after a passing line
+    # leaves no failed check to read.
+    local status=0 line judged judge_status
+    judged="$(judge)"
+    judge_status=$?
     while IFS= read -r line; do
         say "$line"
         case "$line" in *" ok=0"*) status=2 ;; esac
-    done < <(judge)
+    done <<<"$judged"
+    [ "$judge_status" = 0 ] || { say "the judge ended with status $judge_status"; status=2; }
     [ "$status" = 0 ] || return 2
 }
 
