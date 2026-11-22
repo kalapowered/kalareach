@@ -50,6 +50,7 @@
 #
 helper | blocking | crates/kr-controller/src/transfer.rs | hands the caller's closure to a blocking task and awaits its answer
 helper | on_a_thread | crates/kr-worker/src/desktop/probe.rs | runs the caller's filesystem question on a thread and waits for it with a clock
+helper | read_authorised_file_with | crates/kr-worker/src/desktop/probe.rs | runs the caller's read of the nominated file on a thread and waits for it no later than the check's declared bound
 helper | read_within | crates/kr-controller/src/catalogue/mod.rs | runs the caller's read on a blocking task and waits for it no later than a deadline
 helper | serve_each | crates/kr-controller/src/ | serves each connection that a listener accepts on a task of its own, running the caller's closure for it
 helper | submit_within | crates/kr-worker/src/service.rs | runs the caller's recheck and then the request's dispatch on a blocking task and waits for it no later than a deadline
@@ -392,8 +393,9 @@ crates/kr-worker/src/broker/server.rs | Server::start | Self::spawn | spec | 1 |
 crates/kr-worker/src/broker/websocket.rs | TextLines::drop | .spawn | async{tokio::time::timeout_at} | 1 | other_crate | - | worker program: linked; the worker runs it
 crates/kr-worker/src/daemon_link.rs | Drafts::ensure_reporter | .spawn | deliver | 1 | other_crate | - | worker program: linked; the worker runs it
 crates/kr-worker/src/description_facts.rs | DescriptionFacts::read_directory | .spawn | closure{.run_reads} | 1 | other_crate | - | worker program: linked; the worker runs it
-crates/kr-worker/src/desktop/probe.rs | bounded_read | on_a_thread | closure{read_first_block} | 1 | other_crate | - | worker program: linked; the thread waits for a read that a stalled filesystem may never end, by design: the check stops waiting and the thread stays
 crates/kr-worker/src/desktop/probe.rs | on_a_thread | std::thread::spawn | closure{.send} | 1 | other_crate | - | worker program: linked; the worker runs it
+crates/kr-worker/src/desktop/probe.rs | read_authorised_file | read_authorised_file_with | closure{read_first_block} | 1 | other_crate | - | worker program: linked; the thread waits for a read that a stalled filesystem may never end, by design: the check stops waiting and the thread stays
+crates/kr-worker/src/desktop/probe.rs | read_authorised_file_with | on_a_thread | read | 1 | other_crate | - | worker program: linked; the thread waits for a read that a stalled filesystem may never end, by design: the check stops waiting and the thread stays
 crates/kr-worker/src/diagnostics.rs | Writer::offer | .spawn | closure{write_lines} | 1 | other_crate | - | worker program: linked; the worker runs it
 crates/kr-worker/src/fence/bridge.rs | BridgeServer::serve | tokio::spawn | write_outbound | 1 | other_crate | - | worker program: linked; the worker runs it
 crates/kr-worker/src/local_gate.rs | LocalWrites::withdraw_soon | tokio::spawn | async{withdraw} | 1 | other_crate | - | worker program: linked; the worker runs it

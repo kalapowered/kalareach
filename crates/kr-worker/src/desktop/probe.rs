@@ -581,17 +581,23 @@ impl Facilities for Platform {
 /// Reading the whole of a file the check knows nothing about would be a diagnostic that copies a
 /// document into memory, so it reads enough to establish that the bytes come out and stops.
 fn read_authorised_file(plan: &Plan) -> Ran {
-    read_authorised_file_by(plan, bounded_read)
+    read_authorised_file_with(plan, |path| read_first_block(&path))
 }
 
-/// The authorised-file read, with the bounded read of the file given rather than chosen.
+/// The authorised-file read, with the read of the file given rather than chosen.
 ///
-/// The product gives [`bounded_read`]. A case can give a read that does not return, to see the
-/// check stop waiting for it at its declared bound; everything else the check does is this
-/// function's own.
-fn read_authorised_file_by(
+/// The product gives [`read_first_block`]. A case can give a read that does not return, to see the
+/// check stop waiting for it at its declared bound: the read is put on a thread here, and waited
+/// for here, whichever read it is.
+///
+/// A regular file on a filesystem that has stopped answering blocks in the kernel, and a read has
+/// no deadline of its own. The read is done on a thread and waited for with one, so the check
+/// answers whatever the filesystem does. A read that never returns leaves its thread waiting
+/// rather than the check, which is the trade this makes deliberately: a diagnostic that cannot
+/// answer is worse than a thread that is still asleep when the process ends.
+fn read_authorised_file_with(
     plan: &Plan,
-    read: impl FnOnce(&Path, Duration) -> Option<std::io::Result<FirstBlock>>,
+    read: impl FnOnce(PathBuf) -> std::io::Result<FirstBlock> + Send + 'static,
 ) -> Ran {
     let check = Check::AuthorisedFileRead;
     let Some(path) = plan.authorised_file.as_deref() else {
@@ -611,7 +617,7 @@ fn read_authorised_file_by(
     // a pipe or a device between a look and a read is not read at all. The open itself does not
     // wait for the other end of a pipe, and the whole check answers inside its own bound whatever
     // the filesystem does.
-    let outcome = match read(path, check.effects().bound) {
+    let outcome = match on_a_thread(path, check.effects().bound, read) {
         None => Outcome::NotAttempted {
             detail: Sentence::new()
                 .path(path)
@@ -668,17 +674,6 @@ enum FirstBlock {
     NotRegular,
     /// This many bytes came out.
     Read(usize),
-}
-
-/// Reads the first block of a file, or gives up on the clock.
-///
-/// A regular file on a filesystem that has stopped answering blocks in the kernel, and a read has
-/// no deadline of its own. The read is done on a thread and waited for with one, so the check
-/// answers whatever the filesystem does. A read that never returns leaves its thread waiting
-/// rather than the check, which is the trade this makes deliberately: a diagnostic that cannot
-/// answer is worse than a thread that is still asleep when the process ends.
-fn bounded_read(path: &Path, bound: Duration) -> Option<std::io::Result<FirstBlock>> {
-    on_a_thread(path, bound, |path| read_first_block(&path))
 }
 
 /// Runs one filesystem question on a thread and waits for it with a clock.
@@ -2019,17 +2014,15 @@ mod tests {
         let finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let stand_in_finished = std::sync::Arc::clone(&finished);
         let began = std::time::Instant::now();
-        let ran = read_authorised_file_by(&plan, move |path, bound| {
-            on_a_thread(path, bound, move |_| {
-                started_tell
-                    .send(())
-                    .expect("the case is waiting for the stand-in");
-                // Kept here until the case lets it go, or for the longest it stays.
-                let _ = released.recv_timeout(STAND_IN_STAYS);
-                stand_in_finished.store(true, std::sync::atomic::Ordering::SeqCst);
-                let _ = ended_tell.send(());
-                Ok(FirstBlock::Read(0))
-            })
+        let ran = read_authorised_file_with(&plan, move |_| {
+            started_tell
+                .send(())
+                .expect("the case is waiting for the stand-in");
+            // Kept here until the case lets it go, or for the longest it stays.
+            let _ = released.recv_timeout(STAND_IN_STAYS);
+            stand_in_finished.store(true, std::sync::atomic::Ordering::SeqCst);
+            let _ = ended_tell.send(());
+            Ok(FirstBlock::Read(0))
         });
         let elapsed = began.elapsed();
 
