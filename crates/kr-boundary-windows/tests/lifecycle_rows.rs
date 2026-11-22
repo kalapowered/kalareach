@@ -492,6 +492,20 @@ fn an_operation_that_did_not_start_is_a_refusal_when_nothing_is_left_and_says_so
             other => panic!("{other:?}"),
         }
     }
+    // A real stop of the service began the ending: the reply keeps it, whatever else failed.
+    match ending_reply(
+        Some(refusal),
+        EndedBy::Stop,
+        None,
+        Cleanup::Uncertain,
+        ConfigurationState::Same,
+    ) {
+        Ending::Finished(InvocationReply::Finished { ended_by, exit, .. }) => {
+            assert_eq!(ended_by, EndedBy::Stop);
+            assert_eq!(exit, None);
+        }
+        other => panic!("{other:?}"),
+    }
     // An ending that no failure began keeps the ending the caller names and its exit code.
     match ending_reply(
         None,

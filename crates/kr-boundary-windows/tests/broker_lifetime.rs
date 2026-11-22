@@ -740,24 +740,29 @@ fn hold_the_token(held: &Arc<Mutex<Option<Handle>>>) {
     let held = Arc::clone(held);
     hooks::set_hook(Some(Arc::new(move |name| {
         if name == "token made" {
-            let mut copy: HANDLE = null_mut();
-            // SAFETY: duplicates a handle of this process into this process; the source is the
-            // token the broker made, open at this point.
-            let done = unsafe {
-                DuplicateHandle(
-                    GetCurrentProcess(),
-                    hooks::token_handle() as HANDLE,
-                    GetCurrentProcess(),
-                    &raw mut copy,
-                    0,
-                    0,
-                    DUPLICATE_SAME_ACCESS,
-                )
-            };
-            assert_ne!(done, 0, "the token is copied");
-            *held.lock().unwrap() = Some(Handle::new(copy, "the held token").unwrap());
+            *held.lock().unwrap() = Some(copy_of_the_token());
         }
     })));
+}
+
+/// A copy of the token the broker made for the invocation in progress, in this process.
+fn copy_of_the_token() -> Handle {
+    let mut copy: HANDLE = null_mut();
+    // SAFETY: duplicates a handle of this process into this process; the source is the token the
+    // broker made, open while the hook that calls this runs.
+    let done = unsafe {
+        DuplicateHandle(
+            GetCurrentProcess(),
+            hooks::token_handle() as HANDLE,
+            GetCurrentProcess(),
+            &raw mut copy,
+            0,
+            0,
+            DUPLICATE_SAME_ACCESS,
+        )
+    };
+    assert_ne!(done, 0, "the token is copied");
+    Handle::new(copy, "the held token").unwrap()
 }
 
 /// What an end that a held handle keeps from being proved leaves: the reply says uncertain, the
@@ -1265,6 +1270,95 @@ fn a_child_that_hides_from_the_scan_changes_nothing_because_the_end_rests_on_the
     expect_clean_end(&replies, EndedBy::Cancel);
     absent_session(*seen.lock().unwrap());
     assert!(life.ended() && life.releases() == 1);
+}
+
+/// Runs an invocation in which the service is told to stop at `point`, with a copy of the token
+/// held so that the end cannot be proved, and returns the replies.
+fn stopped_at(
+    setting: &Setting,
+    point: &'static str,
+    reading: bool,
+    how: How,
+) -> Vec<InvocationReply> {
+    let edit = |env: &mut Environment| {
+        env.bounds.session = Duration::from_secs(2);
+    };
+    let life = if reading {
+        Life::open_reading(
+            &setting.scratch.dir,
+            &setting.account,
+            &["sleep", "120000"],
+            &["exit", "0"],
+            1,
+            edit,
+        )
+    } else {
+        Life::open(
+            &setting.scratch.dir,
+            &setting.account,
+            &["sleep", "120000"],
+            1,
+            edit,
+        )
+    };
+    let held = Arc::new(Mutex::new(None));
+    let stop = Arc::clone(&life.env.stop);
+    hooks::set_hook(Some(Arc::new({
+        let held = Arc::clone(&held);
+        move |name| {
+            if name == "token made" {
+                *held.lock().unwrap() = Some(copy_of_the_token());
+            }
+            if name == point {
+                stop.set();
+            }
+        }
+    })));
+    let replies = run_one(&life, how, client_of(None), None);
+    let luid = hooks::session();
+    hooks::set_hook(None);
+    drop(held.lock().unwrap().take());
+    absent_session(luid);
+    replies
+}
+
+#[test]
+#[ignore = "runs as the system in a disposable guest"]
+fn a_stop_of_the_service_during_the_reader_or_the_wait_for_the_pipes_ends_by_the_stop() {
+    if !runs_as_the_system() {
+        eprintln!("skipped: needs the system's token");
+        return;
+    }
+    let setting = Setting::new();
+    // The reader is running when the service is told to stop, and the end cannot be proved.
+    let replies = stopped_at(&setting, "reader resumed", true, How::Reads);
+    assert!(
+        matches!(
+            replies.last(),
+            Some(InvocationReply::Finished {
+                ended_by: EndedBy::Stop,
+                exit: None,
+                cleanup: Cleanup::Uncertain,
+                ..
+            })
+        ),
+        "{replies:?}"
+    );
+    // The service is told to stop while the client is to connect the data pipes.
+    forget_journals(&setting);
+    let replies = stopped_at(&setting, "accepted", false, How::NeverConnects);
+    assert!(
+        matches!(
+            replies.last(),
+            Some(InvocationReply::Finished {
+                ended_by: EndedBy::Stop,
+                exit: None,
+                cleanup: Cleanup::Uncertain,
+                ..
+            })
+        ),
+        "{replies:?}"
+    );
 }
 
 // ---- A broker that crashes with an invocation alive, and the restart that finishes it.
