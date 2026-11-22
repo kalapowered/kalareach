@@ -504,6 +504,30 @@ mod tests {
     }
 
     #[test]
+    fn the_macos_plan_states_every_steps_seconds_and_its_three_parts_take_two_hours_at_most() {
+        let steps = steps(Platform::MacOs, &every_group(), "/tmp/evidence", None);
+        let unweighed: Vec<&str> = steps
+            .iter()
+            .filter(|step| step.weight.is_none())
+            .map(|step| step.id.as_str())
+            .collect();
+        assert!(unweighed.is_empty(), "no weight: {unweighed:?}");
+        let mut every = Vec::new();
+        for number in 1..=3 {
+            let part = part_of(steps.clone(), (number, 3));
+            let seconds: u64 = part.iter().filter_map(|step| step.weight).sum();
+            assert!(
+                seconds <= 2 * 3600,
+                "macOS part {number} of 3 is estimated at {seconds} seconds"
+            );
+            every.extend(part.into_iter().skip(1).map(|step| step.id));
+        }
+        // The first step is the build that opens each part, and the others are in one part each.
+        let others: Vec<String> = steps.iter().skip(1).map(|step| step.id.clone()).collect();
+        assert_eq!(every, others);
+    }
+
+    #[test]
     fn the_parts_of_a_plan_each_hold_the_opening_builds_and_together_every_other_step_once() {
         let step = |what: &str, reading: Reading| Step {
             id: String::new(),
@@ -890,8 +914,7 @@ mod tests {
     }
 
     #[test]
-    fn the_macos_plan_opens_with_the_worker_build_and_keeps_the_workspace_tests_alone_in_part_one()
-    {
+    fn the_macos_plan_opens_with_the_worker_build_and_runs_the_workspace_tests_as_three_steps() {
         let applications = ApplicationsPlan {
             left_out: Vec::new(),
         };
@@ -903,7 +926,14 @@ mod tests {
         );
         assert_eq!(plan[0].reading, Reading::Build);
         assert!(plan[0].command.iter().any(|word| word == "kr-worker"));
-        assert!(runs_the_workspace(&plan[1]), "{}", plan[1].line());
+        // The workspace's tests: kr-controller, companion-tauri with kr-worker, and the rest.
+        assert!(plan[1].command.iter().any(|word| word == "kr-controller"));
+        assert!(plan[2].command.iter().any(|word| word == "companion-tauri"));
+        assert!(runs_the_workspace(&plan[3]), "{}", plan[3].line());
+        assert_eq!(
+            plan.iter().filter(|step| runs_the_workspace(step)).count(),
+            1
+        );
         assert_eq!(
             plan.iter()
                 .filter(|step| step.reading == Reading::Build)
@@ -913,22 +943,18 @@ mod tests {
         for parts in 1..=3 {
             holds_every_step_once(&plan, parts);
         }
-        assert_eq!(part_of(plan.clone(), (1, 2)), plan[..2]);
         assert_eq!(part_of(plan.clone(), (1, 1)), plan);
-        let second = part_of(plan.clone(), (2, 2));
-        assert_eq!(second[0], plan[0]);
-        assert_eq!(second[1..], plan[2..]);
     }
 
     #[test]
-    fn a_plan_without_the_workspace_tests_is_cut_by_count_and_empty_groups_leave_empty_parts() {
+    fn a_plan_without_weights_is_cut_by_count_and_empty_groups_leave_empty_parts() {
         for platform in [Platform::Linux, Platform::MacOs, Platform::Windows] {
             let plan = steps(platform, &every_group(), "/tmp/e", None);
             for parts in 1..=3 {
                 holds_every_step_once(&plan, parts);
             }
         }
-        let only_the_workspace = steps(Platform::MacOs, &["rust"], "/tmp/e", None);
+        let only_the_workspace = steps(Platform::Linux, &["rust"], "/tmp/e", None);
         assert_eq!(only_the_workspace.len(), 1);
         assert_eq!(
             part_of(only_the_workspace.clone(), (1, 2)),

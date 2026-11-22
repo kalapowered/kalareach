@@ -1658,21 +1658,23 @@ fn no_job_of_the_conformance_workflow_runs_the_report_from_the_file_the_build_wr
     );
 }
 
-/// The Linux and macOS jobs of the conformance workflow each run their platform's plan in two
-/// parts, one in each leg of the job's matrix: the workspace's tests took 177 minutes of the Linux
-/// job's 240-minute report step in the run of 21 November, so that the step ended before its
+/// The Linux job of the conformance workflow runs its platform's plan in two parts and the macOS job
+/// in three, one in each leg of the job's matrix: the workspace's tests took 177 minutes of the
+/// Linux job's 240-minute report step in the run of 21 November, so that the step ended before its
 /// last three steps, and a hosted macOS volume that is held for more than three hours loses files.
 /// Each leg's report takes its own part, and each part keeps its evidence under a name of its own,
-/// so that the second part's upload does not meet the first's.
+/// so that one part's upload does not meet another's.
 #[test]
-fn the_linux_and_macos_jobs_of_the_conformance_workflow_run_their_plans_in_two_parts() {
+fn the_linux_job_of_the_conformance_workflow_runs_its_plan_in_two_parts_and_the_macos_job_in_three()
+{
     let report = fs::read_to_string(repository().join(".github/workflows/conformance.yml"))
         .expect("the conformance workflow");
-    for name in ["linux", "macos"] {
+    for (name, parts) in [("linux", 2_u32), ("macos", 3)] {
         let text = job(&report, name);
+        let legs: Vec<String> = (1..=parts).map(|part| part.to_string()).collect();
         assert!(
-            text.contains("part: [1, 2]"),
-            "the {name} job's matrix does not have the two parts"
+            text.contains(&format!("part: [{}]", legs.join(", "))),
+            "the {name} job's matrix does not have its {parts} parts"
         );
         let runs = steps_holding(&text, "bash scripts/run-conformance.sh");
         assert_eq!(
@@ -1683,7 +1685,7 @@ fn the_linux_and_macos_jobs_of_the_conformance_workflow_run_their_plans_in_two_p
         );
         assert!(
             runs[0].contains("REPORT_PART: ${{ matrix.part }}")
-                && runs[0].contains("--part \"$REPORT_PART/2\""),
+                && runs[0].contains(&format!("--part \"$REPORT_PART/{parts}\"")),
             "the {name} job's report does not take the part its leg names: {}",
             runs[0]
         );

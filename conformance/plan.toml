@@ -132,14 +132,192 @@ id = 'end-to-end-the-worker-the-network-suite-launches'
 group = 'end-to-end'
 what = 'the worker the network suite launches'
 platforms = ['linux', 'macos']
+weight = { macos = 239 }
+weighed = '''the scheduled conformance run 44892776113 of 2026-11-21, macOS part 1 of 2'''
 reading = 'build'
 command = ['cargo', 'build', '--locked', '-p', 'kr-worker', '--bin', 'kr-worker']
 
 [[step]]
+id = 'rust-the-workspace-s-tests-kr-controller-on-macos'
+group = 'rust'
+what = '''the workspace's tests of kr-controller, less what the macOS runner cannot host'''
+platforms = ['macos']
+weight = { macos = 6170 }
+weighed = '''an estimate: the libtest times of kr-controller's programs in the scheduled conformance run 44892776113 of 2026-11-21, macOS part 1 of 2, are 4,349 of the 9,097 seconds that its one workspace step's programs took, and the 3,809 seconds of that step that were compiling and doc-tests are shared by those times; refresh it from the first run of the three parts'''
+reading = 'cargo'
+command = [
+    'cargo',
+    'test',
+    '--locked',
+    '-p',
+    'kr-controller',
+    '--no-fail-fast',
+]
+[[step.skips]]
+name = 'the_helper_inside_a_container_refuses_a_handshake_that_declares_a_network_actor'
+reason = 'needs podman, which the macOS runner does not have; the Linux run hosts it'
+[[step.skips]]
+name = 'a_running_container_is_observed_as_running_and_a_stopped_one_as_stopped'
+reason = 'needs podman, which the macOS runner does not have; the Linux run hosts it'
+[[step.skips]]
+name = 'a_reused_container_name_is_not_the_identity_that_was_enrolled'
+reason = 'needs podman, which the macOS runner does not have; the Linux run hosts it'
+[[step.skips]]
+name = 'the_argument_vector_reaches_the_container_exactly_as_it_was_built'
+reason = 'needs podman, which the macOS runner does not have; the Linux run hosts it'
+[[step.skips]]
+name = 'a_helper_path_with_a_space_in_it_is_one_argument_inside_the_container'
+reason = 'needs podman, which the macOS runner does not have; the Linux run hosts it'
+[[step.skips]]
+name = 'a_refresh_that_reached_a_running_environment_without_a_helper_scopes_no_channel'
+reason = 'needs podman, which the macOS runner does not have; the Linux run hosts it'
+[[step.skips]]
+name = 'a_repository_whose_own_data_is_on_another_filesystem_is_captured'
+reason = '''needs a second filesystem, which the landing workflow's macOS job attaches for it'''
+[[step.skips]]
+name = 'bind_mount_and_cross_device_grafts_are_refused'
+reason = '''needs a second filesystem, which the landing workflow's macOS job attaches for it'''
+[[step.skips]]
+name = 'recursive_removal_refuses_a_grafted_mount'
+reason = '''needs a second filesystem, which the landing workflow's macOS job attaches for it'''
+[[step.skips]]
+name = 'a_removal_stops_before_a_disk_image_attached_inside_the_tree'
+reason = '''needs a second filesystem, which the landing workflow's macOS job attaches for it'''
+[[step.skips]]
+name = 'a_staging_directory_on_another_filesystem_is_refused_whatever_its_numbers'
+reason = '''needs a second filesystem, which the landing workflow's macOS job attaches for it'''
+[[step.skips]]
+name = 'a_scope_on_another_filesystem_is_refused_whatever_its_numbers'
+reason = '''needs a second filesystem, which the landing workflow's macOS job attaches for it'''
+[[step.skips]]
+name = 'a_directory_on_another_filesystem_is_not_the_recorded_one_whatever_its_numbers'
+reason = '''needs a second filesystem, which the landing workflow's macOS job attaches for it'''
+[[step.skips]]
+name = 'a_registered_repository_on_another_filesystem_is_refused_whatever_its_numbers'
+reason = '''needs a second filesystem, which the landing workflow's macOS job attaches for it'''
+[[step.skips]]
+name = 'a_workspace_tree_on_another_filesystem_is_not_removed_whatever_its_numbers'
+reason = '''needs a second filesystem, which the landing workflow's macOS job attaches for it'''
+[[step.skips]]
+name = 'a_workspace_tree_on_another_filesystem_is_not_read_whatever_its_numbers'
+reason = '''needs a second filesystem, which the landing workflow's macOS job attaches for it'''
+[[step.skips]]
+name = 'a_filesystem_mounted_over_a_registered_subdirectory_is_not_read_as_it'
+reason = '''needs a second filesystem, which the landing workflow's macOS job attaches for it'''
+[[step.skips]]
+name = 'owner_cleanup_does_not_remove_a_staging_directory_on_another_filesystem'
+reason = '''needs a second filesystem, which the landing workflow's macOS job attaches for it'''
+[[step.skips]]
+name = 'a_directory_on_another_filesystem_is_not_taken_away_as_the_one_this_host_made'
+reason = '''needs a second filesystem, which the landing workflow's macOS job attaches for it'''
+[[step.skips]]
+name = 'a_workspace_on_another_filesystem_is_not_opened_whatever_its_numbers'
+reason = '''needs a second filesystem, which the landing workflow's macOS job attaches for it'''
+[[step.skips]]
+name = 'a_materialisation_on_another_filesystem_is_not_read_or_emptied_whatever_its_numbers'
+reason = '''needs a second filesystem, which the landing workflow's macOS job attaches for it'''
+[[step.skips]]
+name = 'a_staged_name_on_another_filesystem_is_left_where_it_is_whatever_its_numbers'
+reason = '''needs a second filesystem, which the landing workflow's macOS job attaches for it'''
+[[step.skips]]
+name = 'a_volume_whose_disk_is_held_is_detached_once_it_is_let_go'
+reason = '''needs a second filesystem, which the landing workflow's macOS job attaches for it'''
+
+[[step]]
+id = 'rust-the-workspace-s-tests-companion-and-worker-on-macos'
+group = 'rust'
+what = '''the workspace's tests of companion-tauri and kr-worker, less what the macOS runner cannot host'''
+platforms = ['macos']
+weight = { macos = 3337 }
+weighed = '''an estimate: the libtest times of the programs of companion-tauri and kr-worker in the scheduled conformance run 44892776113 of 2026-11-21, macOS part 1 of 2, are 2,352 of the 9,097 seconds that its one workspace step's programs took, and the 3,809 seconds of that step that were compiling and doc-tests are shared by those times; refresh it from the first run of the three parts'''
+reading = 'cargo'
+command = [
+    'cargo',
+    'test',
+    '--locked',
+    '-p',
+    'companion-tauri',
+    '-p',
+    'kr-worker',
+    '--no-fail-fast',
+]
+[[step.skips]]
+name = 'the_helper_inside_a_container_refuses_a_handshake_that_declares_a_network_actor'
+reason = 'needs podman, which the macOS runner does not have; the Linux run hosts it'
+[[step.skips]]
+name = 'a_running_container_is_observed_as_running_and_a_stopped_one_as_stopped'
+reason = 'needs podman, which the macOS runner does not have; the Linux run hosts it'
+[[step.skips]]
+name = 'a_reused_container_name_is_not_the_identity_that_was_enrolled'
+reason = 'needs podman, which the macOS runner does not have; the Linux run hosts it'
+[[step.skips]]
+name = 'the_argument_vector_reaches_the_container_exactly_as_it_was_built'
+reason = 'needs podman, which the macOS runner does not have; the Linux run hosts it'
+[[step.skips]]
+name = 'a_helper_path_with_a_space_in_it_is_one_argument_inside_the_container'
+reason = 'needs podman, which the macOS runner does not have; the Linux run hosts it'
+[[step.skips]]
+name = 'a_refresh_that_reached_a_running_environment_without_a_helper_scopes_no_channel'
+reason = 'needs podman, which the macOS runner does not have; the Linux run hosts it'
+[[step.skips]]
+name = 'a_repository_whose_own_data_is_on_another_filesystem_is_captured'
+reason = '''needs a second filesystem, which the landing workflow's macOS job attaches for it'''
+[[step.skips]]
+name = 'bind_mount_and_cross_device_grafts_are_refused'
+reason = '''needs a second filesystem, which the landing workflow's macOS job attaches for it'''
+[[step.skips]]
+name = 'recursive_removal_refuses_a_grafted_mount'
+reason = '''needs a second filesystem, which the landing workflow's macOS job attaches for it'''
+[[step.skips]]
+name = 'a_removal_stops_before_a_disk_image_attached_inside_the_tree'
+reason = '''needs a second filesystem, which the landing workflow's macOS job attaches for it'''
+[[step.skips]]
+name = 'a_staging_directory_on_another_filesystem_is_refused_whatever_its_numbers'
+reason = '''needs a second filesystem, which the landing workflow's macOS job attaches for it'''
+[[step.skips]]
+name = 'a_scope_on_another_filesystem_is_refused_whatever_its_numbers'
+reason = '''needs a second filesystem, which the landing workflow's macOS job attaches for it'''
+[[step.skips]]
+name = 'a_directory_on_another_filesystem_is_not_the_recorded_one_whatever_its_numbers'
+reason = '''needs a second filesystem, which the landing workflow's macOS job attaches for it'''
+[[step.skips]]
+name = 'a_registered_repository_on_another_filesystem_is_refused_whatever_its_numbers'
+reason = '''needs a second filesystem, which the landing workflow's macOS job attaches for it'''
+[[step.skips]]
+name = 'a_workspace_tree_on_another_filesystem_is_not_removed_whatever_its_numbers'
+reason = '''needs a second filesystem, which the landing workflow's macOS job attaches for it'''
+[[step.skips]]
+name = 'a_workspace_tree_on_another_filesystem_is_not_read_whatever_its_numbers'
+reason = '''needs a second filesystem, which the landing workflow's macOS job attaches for it'''
+[[step.skips]]
+name = 'a_filesystem_mounted_over_a_registered_subdirectory_is_not_read_as_it'
+reason = '''needs a second filesystem, which the landing workflow's macOS job attaches for it'''
+[[step.skips]]
+name = 'owner_cleanup_does_not_remove_a_staging_directory_on_another_filesystem'
+reason = '''needs a second filesystem, which the landing workflow's macOS job attaches for it'''
+[[step.skips]]
+name = 'a_directory_on_another_filesystem_is_not_taken_away_as_the_one_this_host_made'
+reason = '''needs a second filesystem, which the landing workflow's macOS job attaches for it'''
+[[step.skips]]
+name = 'a_workspace_on_another_filesystem_is_not_opened_whatever_its_numbers'
+reason = '''needs a second filesystem, which the landing workflow's macOS job attaches for it'''
+[[step.skips]]
+name = 'a_materialisation_on_another_filesystem_is_not_read_or_emptied_whatever_its_numbers'
+reason = '''needs a second filesystem, which the landing workflow's macOS job attaches for it'''
+[[step.skips]]
+name = 'a_staged_name_on_another_filesystem_is_left_where_it_is_whatever_its_numbers'
+reason = '''needs a second filesystem, which the landing workflow's macOS job attaches for it'''
+[[step.skips]]
+name = 'a_volume_whose_disk_is_held_is_detached_once_it_is_let_go'
+reason = '''needs a second filesystem, which the landing workflow's macOS job attaches for it'''
+
+[[step]]
 id = 'rust-the-workspace-s-tests-less-what-the-macos-runner-cannot'
 group = 'rust'
-what = '''the workspace's tests, less what the macOS runner cannot host'''
+what = '''the workspace's tests, less kr-controller, companion-tauri and kr-worker and what the macOS runner cannot host'''
 platforms = ['macos']
+weight = { macos = 3399 }
+weighed = '''an estimate: the libtest times of the other programs and the doc-tests in the scheduled conformance run 44892776113 of 2026-11-21, macOS part 1 of 2, are 2,396 of the 9,097 seconds that its one workspace step's programs took, and the 3,809 seconds of that step that were compiling and doc-tests are shared by those times; refresh it from the first run of the three parts'''
 reading = 'cargo'
 command = [
     'cargo',
@@ -148,6 +326,12 @@ command = [
     '--workspace',
     '--exclude',
     'kr-sync-integration',
+    '--exclude',
+    'kr-controller',
+    '--exclude',
+    'companion-tauri',
+    '--exclude',
+    'kr-worker',
     '--no-fail-fast',
 ]
 [[step.skips]]
@@ -1422,6 +1606,8 @@ id = 'end-to-end-kr-worker-host-one-test-at-a-time'
 group = 'end-to-end'
 what = 'kr-worker host, one test at a time'
 platforms = ['linux', 'macos']
+weight = { macos = 383 }
+weighed = '''the scheduled conformance run 44892776113 of 2026-11-21, macOS part 2 of 2'''
 reading = 'cargo'
 command = [
     'cargo',
@@ -1440,6 +1626,8 @@ id = 'end-to-end-kr-worker-terminal-one-test-at-a-time'
 group = 'end-to-end'
 what = 'kr-worker terminal, one test at a time'
 platforms = ['linux', 'macos']
+weight = { macos = 7 }
+weighed = '''the scheduled conformance run 44892776113 of 2026-11-21, macOS part 2 of 2'''
 reading = 'cargo'
 command = [
     'cargo',
@@ -1458,6 +1646,8 @@ id = 'end-to-end-kr-worker-authority-one-test-at-a-time'
 group = 'end-to-end'
 what = 'kr-worker authority, one test at a time'
 platforms = ['linux', 'macos']
+weight = { macos = 52 }
+weighed = '''the scheduled conformance run 44892776113 of 2026-11-21, macOS part 2 of 2'''
 reading = 'cargo'
 command = [
     'cargo',
@@ -1476,6 +1666,8 @@ id = 'end-to-end-kr-worker-receipts-one-test-at-a-time'
 group = 'end-to-end'
 what = 'kr-worker receipts, one test at a time'
 platforms = ['linux', 'macos']
+weight = { macos = 20 }
+weighed = '''the scheduled conformance run 44892776113 of 2026-11-21, macOS part 2 of 2'''
 reading = 'cargo'
 command = [
     'cargo',
@@ -1494,6 +1686,8 @@ id = 'end-to-end-kr-controller-barrier-one-test-at-a-time'
 group = 'end-to-end'
 what = 'kr-controller barrier, one test at a time'
 platforms = ['linux', 'macos']
+weight = { macos = 202 }
+weighed = '''the scheduled conformance run 44892776113 of 2026-11-21, macOS part 2 of 2'''
 reading = 'cargo'
 command = [
     'cargo',
@@ -1512,6 +1706,8 @@ id = 'end-to-end-kr-worker-backpressure-one-test-at-a-time'
 group = 'end-to-end'
 what = 'kr-worker backpressure, one test at a time'
 platforms = ['linux', 'macos']
+weight = { macos = 10 }
+weighed = '''the scheduled conformance run 44892776113 of 2026-11-21, macOS part 2 of 2'''
 reading = 'cargo'
 command = [
     'cargo',
@@ -1530,6 +1726,8 @@ id = 'end-to-end-kr-worker-session-one-test-at-a-time'
 group = 'end-to-end'
 what = 'kr-worker session, one test at a time'
 platforms = ['linux', 'macos']
+weight = { macos = 109 }
+weighed = '''the scheduled conformance run 44892776113 of 2026-11-21, macOS part 2 of 2'''
 reading = 'cargo'
 command = [
     'cargo',
@@ -1548,6 +1746,8 @@ id = 'end-to-end-kr-worker-fence-one-test-at-a-time'
 group = 'end-to-end'
 what = 'kr-worker fence, one test at a time'
 platforms = ['linux', 'macos']
+weight = { macos = 241 }
+weighed = '''the scheduled conformance run 44892776113 of 2026-11-21, macOS part 2 of 2'''
 reading = 'cargo'
 command = [
     'cargo',
@@ -1566,6 +1766,8 @@ id = 'end-to-end-kr-controller-shell-one-test-at-a-time'
 group = 'end-to-end'
 what = 'kr-controller shell, one test at a time'
 platforms = ['linux', 'macos']
+weight = { macos = 47 }
+weighed = '''the scheduled conformance run 44892776113 of 2026-11-21, macOS part 2 of 2'''
 reading = 'cargo'
 command = [
     'cargo',
@@ -1584,6 +1786,8 @@ id = 'end-to-end-kr-controller-contracts-one-test-at-a-time'
 group = 'end-to-end'
 what = 'kr-controller contracts, one test at a time'
 platforms = ['linux', 'macos']
+weight = { macos = 14 }
+weighed = '''the scheduled conformance run 44892776113 of 2026-11-21, macOS part 2 of 2'''
 reading = 'cargo'
 command = [
     'cargo',
@@ -1602,6 +1806,8 @@ id = 'end-to-end-kr-controller-envelope-one-test-at-a-time'
 group = 'end-to-end'
 what = 'kr-controller envelope, one test at a time'
 platforms = ['linux', 'macos']
+weight = { macos = 17 }
+weighed = '''the scheduled conformance run 44892776113 of 2026-11-21, macOS part 2 of 2'''
 reading = 'cargo'
 command = [
     'cargo',
@@ -1620,6 +1826,8 @@ id = 'end-to-end-kr-controller-project-one-test-at-a-time'
 group = 'end-to-end'
 what = 'kr-controller project, one test at a time'
 platforms = ['linux', 'macos']
+weight = { macos = 113 }
+weighed = '''the scheduled conformance run 44892776113 of 2026-11-21, macOS part 2 of 2'''
 reading = 'cargo'
 command = [
     'cargo',
@@ -1638,6 +1846,8 @@ id = 'end-to-end-kr-controller-voice-one-test-at-a-time'
 group = 'end-to-end'
 what = 'kr-controller voice, one test at a time'
 platforms = ['linux', 'macos']
+weight = { macos = 55 }
+weighed = '''the scheduled conformance run 44892776113 of 2026-11-21, macOS part 2 of 2'''
 reading = 'cargo'
 command = [
     'cargo',
@@ -1656,6 +1866,8 @@ id = 'end-to-end-kr-controller-changeset-one-test-at-a-time'
 group = 'end-to-end'
 what = 'kr-controller changeset, one test at a time'
 platforms = ['linux', 'macos']
+weight = { macos = 32 }
+weighed = '''the scheduled conformance run 44892776113 of 2026-11-21, macOS part 2 of 2'''
 reading = 'cargo'
 command = [
     'cargo',
@@ -1674,6 +1886,8 @@ id = 'end-to-end-kr-cli-attach-one-test-at-a-time'
 group = 'end-to-end'
 what = 'kr-cli attach, one test at a time'
 platforms = ['linux', 'macos']
+weight = { macos = 180 }
+weighed = '''the scheduled conformance run 44892776113 of 2026-11-21, macOS part 2 of 2'''
 reading = 'cargo'
 command = [
     'cargo',
@@ -1692,6 +1906,8 @@ id = 'end-to-end-kr-cli-lifecycle-one-test-at-a-time'
 group = 'end-to-end'
 what = 'kr-cli lifecycle, one test at a time'
 platforms = ['linux', 'macos']
+weight = { macos = 141 }
+weighed = '''the scheduled conformance run 44892776113 of 2026-11-21, macOS part 2 of 2'''
 reading = 'cargo'
 command = [
     'cargo',
@@ -1710,6 +1926,8 @@ id = 'end-to-end-kr-faults-kills-one-test-at-a-time'
 group = 'end-to-end'
 what = 'kr-faults kills, one test at a time'
 platforms = ['linux', 'macos']
+weight = { macos = 154 }
+weighed = '''the scheduled conformance run 44892776113 of 2026-11-21, macOS part 2 of 2'''
 reading = 'cargo'
 command = [
     'cargo',
@@ -1728,6 +1946,8 @@ id = 'end-to-end-kr-controller-network-one-test-at-a-time'
 group = 'end-to-end'
 what = 'kr-controller network, one test at a time'
 platforms = ['linux', 'macos']
+weight = { macos = 216 }
+weighed = '''the scheduled conformance run 44892776113 of 2026-11-21, macOS part 2 of 2'''
 reading = 'cargo'
 command = [
     'cargo',
@@ -1747,6 +1967,8 @@ id = 'performance-the-measurement-suite-s-own-regressions'
 group = 'performance'
 what = '''the measurement suite's own regressions'''
 platforms = ['linux', 'macos']
+weight = { macos = 880 }
+weighed = '''the scheduled conformance run 44892776113 of 2026-11-21, macOS part 2 of 2'''
 reading = 'cargo'
 command = ['cargo', 'test', '--locked', '--release', '-p', 'kr-worker', '--test', 'performance']
 
@@ -1755,6 +1977,8 @@ id = 'performance-the-input-measurements-own-regressions'
 group = 'performance'
 what = '''the input measurements' own regressions'''
 platforms = ['linux', 'macos']
+weight = { macos = 15 }
+weighed = '''the scheduled conformance run 44892776113 of 2026-11-21, macOS part 2 of 2'''
 reading = 'cargo'
 command = ['cargo', 'test', '--locked', '--release', '-p', 'kr-worker', '--bench', 'input_latency']
 
@@ -1763,6 +1987,8 @@ id = 'performance-the-attach-to-a-usable-screen-measurement'
 group = 'performance'
 what = 'the attach_to_a_usable_screen measurement'
 platforms = ['linux', 'macos']
+weight = { macos = 4 }
+weighed = '''the scheduled conformance run 44892776113 of 2026-11-21, macOS part 2 of 2'''
 reading = 'cargo'
 command = [
     'cargo',
@@ -1785,6 +2011,8 @@ id = 'performance-the-added-input-forwarding-latency-measurement'
 group = 'performance'
 what = 'the added_input_forwarding_latency measurement'
 platforms = ['linux', 'macos']
+weight = { macos = 44 }
+weighed = '''the scheduled conformance run 44892776113 of 2026-11-21, macOS part 2 of 2'''
 reading = 'cargo'
 command = [
     'cargo',
@@ -1807,6 +2035,8 @@ id = 'performance-the-paste-prefix-recogniser-deadline-measurement'
 group = 'performance'
 what = 'the paste_prefix_recogniser_deadline measurement'
 platforms = ['linux', 'macos']
+weight = { macos = 16 }
+weighed = '''the scheduled conformance run 44892776113 of 2026-11-21, macOS part 2 of 2'''
 reading = 'cargo'
 command = [
     'cargo',
@@ -1829,6 +2059,8 @@ id = 'performance-the-idle-resources-for-twenty-sessions-and-thirty-two'
 group = 'performance'
 what = 'the idle_resources_for_twenty_sessions_and_thirty_two_views measurement'
 platforms = ['linux', 'macos']
+weight = { macos = 306 }
+weighed = '''the scheduled conformance run 44892776113 of 2026-11-21, macOS part 2 of 2'''
 reading = 'cargo'
 command = [
     'cargo',
@@ -1851,6 +2083,8 @@ id = 'performance-terminal-output-handling-optimised'
 group = 'performance'
 what = 'terminal output handling, optimised'
 platforms = ['linux', 'macos']
+weight = { macos = 200 }
+weighed = '''the scheduled conformance run 44892776113 of 2026-11-21, macOS part 2 of 2'''
 reading = 'cargo'
 command = [
     'cargo',
@@ -1871,6 +2105,8 @@ id = 'performance-transport-scheduling-and-reconnect-optimised'
 group = 'performance'
 what = 'transport scheduling and reconnect, optimised'
 platforms = ['linux', 'macos']
+weight = { macos = 222 }
+weighed = '''the scheduled conformance run 44892776113 of 2026-11-21, macOS part 2 of 2'''
 reading = 'cargo'
 command = [
     'cargo',
@@ -1891,6 +2127,8 @@ id = 'typescript-the-report-s-own-reading-of-typescript'
 group = 'typescript'
 what = '''the report's own reading of TypeScript'''
 platforms = ['linux', 'macos']
+weight = { macos = 42 }
+weighed = '''the scheduled conformance run 44892776113 of 2026-11-21, macOS part 2 of 2'''
 reading = 'cargo'
 command = [
     'cargo',
@@ -1911,6 +2149,8 @@ id = 'typescript-the-report-s-discovery-of-typescript'
 group = 'typescript'
 what = '''the report's discovery of TypeScript from a plan'''
 platforms = ['linux', 'macos']
+weight = { macos = 60 }
+weighed = '''no measurement: this step is in neither part's result of the scheduled conformance run 44892776113 of 2026-11-21, and 60 seconds is assumed'''
 reading = 'cargo'
 command = [
     'cargo',
@@ -1936,6 +2176,8 @@ id = 'typescript-packages-protocol-s-tests'
 group = 'typescript'
 what = '''packages/protocol's tests'''
 platforms = ['linux', 'macos']
+weight = { macos = 6 }
+weighed = '''the scheduled conformance run 44892776113 of 2026-11-21, macOS part 2 of 2'''
 reading = 'vitest'
 package = 'packages/protocol'
 output = '{evidence}/conformance/vitest/packages-protocol.json'
@@ -1956,6 +2198,8 @@ id = 'typescript-packages-plugin-sdk-s-tests'
 group = 'typescript'
 what = '''packages/plugin-sdk's tests'''
 platforms = ['linux', 'macos']
+weight = { macos = 1 }
+weighed = '''the scheduled conformance run 44892776113 of 2026-11-21, macOS part 2 of 2'''
 reading = 'vitest'
 package = 'packages/plugin-sdk'
 output = '{evidence}/conformance/vitest/packages-plugin-sdk.json'
@@ -1976,6 +2220,8 @@ id = 'typescript-apps-companion-s-tests'
 group = 'typescript'
 what = '''apps/companion's tests'''
 platforms = ['linux', 'macos']
+weight = { macos = 302 }
+weighed = '''the scheduled conformance run 44892776113 of 2026-11-21, macOS part 2 of 2'''
 reading = 'vitest'
 package = 'apps/companion'
 output = '{evidence}/conformance/vitest/apps-companion.json'
@@ -1996,6 +2242,8 @@ id = 'applications-the-application-matrix-in-a-real-session'
 group = 'applications'
 what = 'the application matrix in a real session'
 platforms = ['linux', 'macos']
+weight = { macos = 18 }
+weighed = '''the scheduled conformance run 44892776113 of 2026-11-21, macOS part 2 of 2'''
 reading = 'cargo'
 needs = ['KR_CONFORMANCE_APPLICATIONS']
 skips_from = 'applications'
@@ -2027,6 +2275,8 @@ id = 'phones-the-ios-application-s-unit-tests'
 group = 'phones'
 what = '''the iOS application's unit tests'''
 platforms = ['macos']
+weight = { macos = 427 }
+weighed = '''the scheduled conformance run 44892776113 of 2026-11-21, macOS part 2 of 2'''
 reading = 'lane'
 lane = 'xcode'
 output = '{evidence}/conformance/ios.json'

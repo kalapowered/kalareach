@@ -276,22 +276,25 @@ jobs:
           if-no-files-found: error
 
   macos:
-    name: macos part ${{ matrix.part }} of 2
+    name: macos part ${{ matrix.part }} of 3
     if: github.event_name != 'workflow_dispatch' || inputs.macos
     runs-on: macos-15
-    # The platform's plan is run in two parts, one in each job of the matrix: the whole plan took 286
-    # minutes on 14 November, 5 minutes under its limit, and ran out of its limit of 287 minutes on 15
-    # November in its last step. Part 1 is the workspace's tests by themselves, which the report
-    # keeps apart for this: they took 186 and 192 minutes on those two nights, 190 and 196 minutes of
-    # the report's step with the fetch of the applications and the build of the report that open it.
-    # Part 2 is every other step of the plan, 92 and 91 minutes on those nights, with the build of
-    # the worker that opens the plan in both parts, and the compiling that the workspace's tests did
-    # for it before. The run of the two parts on 15 November took 190 minutes for part 1 and 99 for
-    # part 2, of which the report's step took 186 and 95. A part that fails does not stop the other.
+    # The platform's plan is run in three parts, one in each job of the matrix. The whole plan took
+    # 286 minutes on 14 November and ran out of its limit of 287 minutes on 15 November in its last
+    # step, so it was run in two parts, the workspace's tests by themselves in part 1; on 21
+    # November part 1 took 215 minutes of its step (12,906 seconds), and a runner's volume that was
+    # held that long lost files: a program that read as bytes from elsewhere in its file, three that
+    # were gone, and a linker that was ended by SIGBUS. The workspace's tests are now three steps
+    # (kr-controller; companion-tauri with kr-worker; the rest), and the plan states each step's
+    # seconds from that night as its `weight`, so that the report cuts the steps into parts of
+    # nearly equal time and not by count. The weights of the three are estimates, because that night
+    # ran them as one step; from them the parts take about 106, 116 and 79 minutes (each holds the
+    # worker's build, 239 seconds). The first run of the three parts measures them, and the weights
+    # are refreshed from it. A part that fails does not stop the others.
     strategy:
       fail-fast: false
       matrix:
-        part: [1, 2]
+        part: [1, 2, 3]
     # The limits of the steps add up to less than this one, so a step that hangs is ended and the
     # steps after it still report. The job's own limit is under GitHub's six hours.
     timeout-minutes: 355
@@ -454,10 +457,12 @@ jobs:
       # counts. Those steps' limits add up to 65 minutes, each at least twice the longest its step
       # took in the eleven nights (the disk step, at 3.8 minutes, has 8; the closing report, which
       # also reads the kernel's log for failed writes to the volume, has 4), so the limits of the
-      # job's steps add up to 352 of its 355 minutes, under GitHub's six hours. Part 1, the
-      # workspace's tests, took 186 minutes of the step and part 2 took 95 in the run of 15
-      # November, so a part keeps 101 minutes of the 287 at the least, more than a quarter of it: a
-      # runner a quarter slower takes 232 minutes for part 1.
+      # job's steps add up to 352 of its 355 minutes, under GitHub's six hours. The step's 287
+      # minutes and the job's 355 are unchanged by the three parts: the longest part is estimated at
+      # 116 minutes (see the job's note above), which leaves 171 minutes, 2.5 times the estimate, for
+      # a slower runner or an estimate that is short; they are lowered from the first run's measured
+      # times. Part 1 of the two parts took 215 minutes of the step on 21 November, which is what the
+      # three parts replace.
       - name: The conformance report
         timeout-minutes: 287
         env:
@@ -469,7 +474,7 @@ jobs:
           for name in ${names[@]+"${names[@]}"}; do
             arguments+=(--group "$name")
           done
-          bash scripts/run-conformance.sh --part "$REPORT_PART/2" ${arguments[@]+"${arguments[@]}"}
+          bash scripts/run-conformance.sh --part "$REPORT_PART/3" ${arguments[@]+"${arguments[@]}"}
 
       # The archives are held when the index the fetch wrote reads, is for this lock, names every
       # program the lock pins, and names none of them as unavailable: an index that is empty, cut
