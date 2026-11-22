@@ -128,6 +128,11 @@ pub struct Step {
     pub timeout: Option<u64>,
     /// The time budget it spends from, by `id`, and the budget's seconds.
     pub budget: Option<(String, u64)>,
+    /// What the step took on this platform, in seconds, when it was last measured, as the plan
+    /// states it with the run it comes from. A plan whose every step that is cut by count states one
+    /// is cut into parts of nearly equal time by these; a plan with a step that does not is cut by
+    /// the count of its steps.
+    pub weight: Option<u64>,
     /// The names in `env` whose value holds a placeholder. A command that reproduces one of the
     /// step's tests cannot repeat their values, because the run gives a placeholder its value.
     pub placeholder_env: Vec<String>,
@@ -159,6 +164,7 @@ impl Step {
             after: Vec::new(),
             timeout: None,
             budget: None,
+            weight: None,
             placeholder_env: Vec::new(),
             placeholder_words: Vec::new(),
         }
@@ -210,6 +216,9 @@ struct Cut {
     shares: usize,
     /// How many remaining steps there are.
     rest: usize,
+    /// The part of each remaining step, in their order, when every step that is cut by count states
+    /// a weight: the parts are then cut by time and no step stands alone. Otherwise none.
+    timed: Option<Vec<usize>>,
 }
 
 impl Cut {
@@ -226,7 +235,8 @@ impl Cut {
             .iter()
             .take_while(|index| steps[**index].reading == Reading::Build)
             .count();
-        let alone = if parts > 1 {
+        let weighed = parts > 1 && cut.iter().all(|index| steps[*index].weight.is_some());
+        let alone = if parts > 1 && !weighed {
             cut.iter()
                 .position(|index| runs_the_workspace(&steps[*index]))
                 .filter(|slot| *slot >= opening)
@@ -235,21 +245,70 @@ impl Cut {
         };
         let shares = if alone.is_some() { parts - 1 } else { parts };
         let rest = cut.len() - opening - usize::from(alone.is_some());
+        let timed = weighed.then(|| {
+            let seconds: Vec<u64> = cut[opening..]
+                .iter()
+                .map(|index| steps[*index].weight.unwrap_or(0))
+                .collect();
+            balanced(&seconds, parts)
+        });
         Self {
             steps: cut,
             opening,
             alone,
             shares,
             rest,
+            timed,
         }
     }
 
     /// The part, from 1, that holds the remaining step at `position` among the remaining steps: the
     /// first part whose share ends after it.
     fn part_at(&self, position: usize) -> usize {
+        if let Some(parts) = &self.timed {
+            return parts[position];
+        }
         let share = scaled((position + 1, self.shares, self.rest), true);
         share + usize::from(self.alone.is_some())
     }
+}
+
+/// The part, from 1, of each of `seconds` in turn, cutting them in order into `parts` parts of which
+/// the longest takes the least time: the least limit that the greedy fill of the parts, each as full
+/// as it can be without passing the limit, brings within `parts`. A step longer than the limit has a
+/// part to itself. A part has no step when the others are so long that fewer parts than `parts`
+/// make the cut.
+fn balanced(seconds: &[u64], parts: usize) -> Vec<usize> {
+    let fill = |limit: u64| -> Vec<usize> {
+        let (mut part, mut load) = (1_usize, 0_u64);
+        seconds
+            .iter()
+            .map(|step| {
+                if load > 0 && load.saturating_add(*step) > limit {
+                    part += 1;
+                    load = 0;
+                }
+                load = load.saturating_add(*step);
+                part
+            })
+            .collect()
+    };
+    let used = |limit: u64| fill(limit).last().copied().unwrap_or(1);
+    let (mut low, mut high) = (
+        seconds.iter().copied().max().unwrap_or(0),
+        seconds
+            .iter()
+            .fold(0_u64, |all, step| all.saturating_add(*step)),
+    );
+    while low < high {
+        let middle = low + (high - low) / 2;
+        if used(middle) <= parts {
+            high = middle;
+        } else {
+            low = middle + 1;
+        }
+    }
+    fill(low)
 }
 
 /// `a * b / c`, rounded up when `up` and down when not, with the product taken in 128 bits so that
@@ -338,13 +397,6 @@ pub fn budget_across_parts(steps: &[Step], parts: usize) -> Option<String> {
 pub fn part_of(steps: Vec<Step>, part: (usize, usize)) -> Vec<Step> {
     let (number, parts) = part;
     let cut = Cut::of(&steps, parts);
-    let share = if cut.alone.is_some() {
-        number.saturating_sub(1)
-    } else {
-        number
-    };
-    let from = scaled((cut.rest, share.saturating_sub(1), cut.shares), false);
-    let to = scaled((cut.rest, share, cut.shares), false);
     let mut kept = vec![false; steps.len()];
     let mut position = 0;
     for (slot, index) in cut.steps.iter().enumerate() {
@@ -355,7 +407,7 @@ pub fn part_of(steps: Vec<Step>, part: (usize, usize)) -> Vec<Step> {
         } else {
             let at = position;
             position += 1;
-            (from..to).contains(&at)
+            cut.part_at(at) == number
         };
     }
     // A set-up step comes before the steps that name it, so one pass from the end keeps each set-up
@@ -469,6 +521,7 @@ mod tests {
             after: Vec::new(),
             timeout: None,
             budget: None,
+            weight: None,
             placeholder_env: Vec::new(),
             placeholder_words: Vec::new(),
         };
@@ -492,6 +545,7 @@ mod tests {
             after: after.iter().map(|name| (*name).to_owned()).collect(),
             timeout: None,
             budget: None,
+            weight: None,
             placeholder_env: Vec::new(),
             placeholder_words: Vec::new(),
             ..step_of(id, &["cargo"], reading)
@@ -537,6 +591,80 @@ mod tests {
         };
         assert_eq!(ids((1, 2)), ["a"]);
         assert_eq!(ids((2, 2)), ["s1", "s2", "t"]);
+    }
+
+    /// `step` with `seconds` as the time it took when last measured.
+    fn weighed(mut step: Step, seconds: u64) -> Step {
+        step.weight = Some(seconds);
+        step
+    }
+
+    /// The ids of the steps of one part of `steps`.
+    fn part_ids(steps: &[Step], part: (usize, usize)) -> Vec<String> {
+        part_of(steps.to_vec(), part)
+            .into_iter()
+            .map(|step| step.id)
+            .collect()
+    }
+
+    #[test]
+    fn a_plan_whose_steps_all_state_a_weight_is_cut_into_parts_of_nearly_equal_time() {
+        let mut steps = vec![weighed(named("build", Reading::Build, false, &[]), 100)];
+        let rest = [4000, 3000, 2000, 1500, 1500, 1000, 500, 500];
+        for (n, seconds) in rest.into_iter().enumerate() {
+            let step = named(&format!("t{n}"), Reading::Cargo, false, &[]);
+            steps.push(weighed(step, seconds));
+        }
+        let mut every = Vec::new();
+        for number in 1..=3 {
+            let part = part_ids(&steps, (number, 3));
+            assert_eq!(part[0], "build", "the opening build is in part {number}");
+            every.extend(part.into_iter().skip(1));
+            let seconds: u64 = part_of(steps.clone(), (number, 3))
+                .iter()
+                .map(|step| step.weight.expect("a weight"))
+                .sum();
+            // The least time the largest part can take is 5,000 seconds of the steps, and the
+            // build is in each part: by count the first part would take 7,000.
+            assert!(seconds <= 5_100, "part {number} takes {seconds} seconds");
+        }
+        assert_eq!(every, ["t0", "t1", "t2", "t3", "t4", "t5", "t6", "t7"]);
+    }
+
+    #[test]
+    fn a_weighted_plan_does_not_hold_the_workspace_step_by_itself_in_part_1() {
+        let mut steps = vec![
+            weighed(named("build", Reading::Build, false, &[]), 100),
+            weighed(workspace("w"), 6000),
+        ];
+        for n in 0..4 {
+            let step = named(&format!("t{n}"), Reading::Cargo, false, &[]);
+            steps.push(weighed(step, 3000));
+        }
+        assert_eq!(part_ids(&steps, (1, 2)), ["build", "w", "t0"]);
+        assert_eq!(part_ids(&steps, (2, 2)), ["build", "t1", "t2", "t3"]);
+        // One step without a weight and the plan is cut by count again, with the workspace alone.
+        steps[2].weight = None;
+        assert_eq!(part_ids(&steps, (1, 2)), ["build", "w"]);
+        assert_eq!(part_ids(&steps, (2, 2)), ["build", "t0", "t1", "t2", "t3"]);
+    }
+
+    #[test]
+    fn the_budget_check_reads_the_weighted_cut_as_the_parts_are_cut() {
+        let mut steps = vec![
+            weighed(named("build", Reading::Build, false, &[]), 100),
+            weighed(budgeted(named("b1", Reading::Cargo, false, &[]), "a"), 1000),
+            weighed(budgeted(named("b2", Reading::Cargo, false, &[]), "a"), 1000),
+            weighed(named("x", Reading::Cargo, false, &[]), 5000),
+        ];
+        // By time the two steps of the budget share part 1 and the long step has part 2.
+        assert_eq!(part_ids(&steps, (1, 2)), ["build", "b1", "b2"]);
+        assert_eq!(budget_across_parts(&steps, 2), None);
+        // By count they would stand in different parts.
+        for step in &mut steps {
+            step.weight = None;
+        }
+        assert_eq!(budget_across_parts(&steps, 2).as_deref(), Some("a"));
     }
 
     /// `step` naming the budget `id`.
@@ -702,6 +830,7 @@ mod tests {
             after: Vec::new(),
             timeout: None,
             budget: None,
+            weight: None,
             placeholder_env: Vec::new(),
             placeholder_words: Vec::new(),
         }

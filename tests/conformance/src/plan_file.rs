@@ -147,6 +147,16 @@ pub struct StepDef {
     /// The `id` of the `[[budget]]` the step spends from, with the other steps that name it.
     #[serde(default)]
     pub budget: Option<String>,
+    /// What the step took, in seconds, on each platform it runs on, when it was last measured. The
+    /// report cuts a platform's plan into parts of nearly equal time by these when every step that
+    /// the cut places states one for that platform. A whole number of seconds from 1 to
+    /// [`MOST_SECONDS`], under the name of a platform the step runs on.
+    #[serde(default)]
+    pub weight: BTreeMap<String, i64>,
+    /// The run and the date the `weight` was measured at, which a later reader refreshes it from.
+    /// Required with a `weight`, and not given without one.
+    #[serde(default)]
+    pub weighed: Option<String>,
 }
 
 /// The most seconds a step's `timeout` or a budget's `seconds` may be: a day.
@@ -1161,6 +1171,38 @@ impl Plan {
                     ));
                 }
             }
+            for (name, seconds) in &step.weight {
+                if !step
+                    .platforms
+                    .iter()
+                    .any(|platform| platform.name() == name.as_str())
+                {
+                    return refuse(format!(
+                        "step `{id}` has a `weight` for `{name}`, which is not a platform it runs on"
+                    ));
+                }
+                if !(1..=MOST_SECONDS).contains(seconds) {
+                    return refuse(format!(
+                        "step `{id}` has a `weight` of {seconds} seconds for `{name}`: a time is a \
+                         whole number of seconds from 1 to {MOST_SECONDS}"
+                    ));
+                }
+            }
+            match (
+                step.weight.is_empty(),
+                step.weighed.as_deref().map(str::trim),
+            ) {
+                (false, None | Some("")) => {
+                    return refuse(format!(
+                        "step `{id}` has a `weight` and no `weighed`, which says the run and the date \
+                         it was measured at"
+                    ));
+                }
+                (true, Some(_)) => {
+                    return refuse(format!("step `{id}` has a `weighed` and no `weight`"));
+                }
+                _ => {}
+            }
             if let Some(seconds) = step.timeout
                 && !(1..=MOST_SECONDS).contains(&seconds)
             {
@@ -1424,6 +1466,13 @@ impl Plan {
                     skips_from: None,
                     timeout: step.timeout.and_then(|seconds| i64::try_from(seconds).ok()),
                     budget: step.budget.map(|(id, _)| id),
+                    weight: step.weight.map_or_else(BTreeMap::new, |seconds| {
+                        ["linux", "macos", "windows"]
+                            .into_iter()
+                            .map(|name| (name.to_owned(), i64::try_from(seconds).unwrap_or(1)))
+                            .collect()
+                    }),
+                    weighed: step.weight.map(|_| "a plan made from steps".to_owned()),
                 })
                 .collect(),
             budgets,
@@ -1516,6 +1565,10 @@ impl Plan {
                     timeout: definition
                         .timeout
                         .and_then(|seconds| u64::try_from(seconds).ok()),
+                    weight: definition
+                        .weight
+                        .get(platform.name())
+                        .and_then(|seconds| u64::try_from(*seconds).ok()),
                     budget: definition.budget.as_ref().and_then(|id| {
                         self.budgets
                             .iter()

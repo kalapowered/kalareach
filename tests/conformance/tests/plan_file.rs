@@ -2333,6 +2333,26 @@ fn time_faults() -> Vec<(&'static str, String, &'static str)> {
             "step `one` has a `timeout` of 86401 seconds",
         ),
         (
+            "a weight of zero seconds",
+            limited("weight = { linux = 0 }\nweighed = 'run 1'\n"),
+            "step `one` has a `weight` of 0 seconds for `linux`: a time is a whole number of seconds from 1 to 86400",
+        ),
+        (
+            "a weight for a platform the step does not run on",
+            limited("weight = { macos = 5 }\nweighed = 'run 1'\n"),
+            "step `one` has a `weight` for `macos`, which is not a platform it runs on",
+        ),
+        (
+            "a weight that says no run",
+            limited("weight = { linux = 5 }\n"),
+            "step `one` has a `weight` and no `weighed`",
+        ),
+        (
+            "a weighed with no weight",
+            limited("weighed = 'run 1'\n"),
+            "step `one` has a `weighed` and no `weight`",
+        ),
+        (
             "a budget of zero seconds",
             budgeted("[[budget]]\nid = 'b'\nseconds = 0\n", "budget = 'b'\n"),
             "budget `b` has 0 seconds: a time is a whole number of seconds from 1 to 86400",
