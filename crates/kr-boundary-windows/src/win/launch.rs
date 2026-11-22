@@ -222,10 +222,13 @@ pub struct InvocationId(pub [u8; 16]);
 /// its process identifier and its creation time. A permit for another invocation or another child
 /// is refused: each of the three is compared.
 ///
-/// The journal makes the permit of an invocation's child when its append of the child's process
-/// row has returned, so that a child cannot run before its row is durable. A program of the proof
-/// belongs to no invocation and no recovery has to find it: the proof module alone makes the
-/// permits of those.
+/// A permit is made by the journal (a row for the primary child, no row for a reader) or by the
+/// proof module alone. The journal makes the primary child's permit when its append of the child's
+/// process row has returned, so that the child cannot run before its row is durable. It makes a
+/// reader's permit without a row, once the private root is made and before the primary child
+/// starts: a reader changes nothing on the tree, and the end of every child is proved by the
+/// session. A program of the proof belongs to no invocation and no recovery has to find it: the
+/// proof module alone makes the permits of those.
 #[derive(Debug)]
 pub struct ResumePermit {
     invocation: Option<InvocationId>,
@@ -242,8 +245,8 @@ impl ResumePermit {
         }
     }
 
-    /// The permit of an invocation's child, for the journal to make once the child's process row
-    /// is durable.
+    /// The permit of an invocation's child, for the journal to make: once the primary child's
+    /// process row is durable, or, for a reader, once the root is made and the rows allow one.
     pub(crate) fn for_invocation(invocation: InvocationId, child: &SuspendedChild) -> ResumePermit {
         ResumePermit::bound_to(Some(invocation), child)
     }

@@ -291,12 +291,24 @@ impl Journal {
 }
 
 impl Journal {
-    /// Makes the leave to resume a reader child. Nothing is written.
+    /// Makes the leave to resume a reader child: one of the children that read the configuration
+    /// and the repository for the invocation before its primary child runs. **Nothing is written:**
+    /// a reader changes nothing on the tree, and the end of every child of the invocation is
+    /// proved by its logon session, which the first row records.
     ///
     /// # Errors
     ///
-    /// Returns why a reader may not start now.
+    /// Returns an error when the child belongs to another invocation, when an earlier write failed,
+    /// and when the rows say a reader may not start now: the private root is not made, or the
+    /// primary child, the end of the job or a release is recorded.
     pub fn permit_for_reader(&self, child: &SuspendedChild) -> Result<ResumePermit, JournalError> {
+        if child.invocation() != Some(self.invocation) {
+            return Err(JournalError::OtherChild);
+        }
+        if self.closed {
+            return Err(JournalError::Closed);
+        }
+        self.tracker.reader_may_start()?;
         Ok(ResumePermit::for_invocation(self.invocation, child))
     }
 }
