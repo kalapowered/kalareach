@@ -933,8 +933,9 @@ impl Job {
     /// A removal of a key's record is owed for the record the key holds now, which `desk` reads in
     /// this one gate section: the held upload's owner, or with none held the owner of the entry.
     /// `Supersede` is owed while its pairing is the one in force and the record is another
-    /// device's; `Forget` while the record is the forgotten device's. Every other job is owed
-    /// whenever it is asked for.
+    /// device's; `Forget` while the record is the forgotten device's; the finish of a cancel on a
+    /// pairing's connection while that pairing is the one in force. The person's own cancel and
+    /// the freeing are owed whenever they are asked for.
     fn owed(&self, desk: &Desk, key: Uuid, held: Option<&Arc<Live>>) -> bool {
         match self {
             Self::Decide { live, generation } => {
@@ -956,7 +957,10 @@ impl Job {
             Self::Forget { device_id } => desk
                 .owner_of(key, held)
                 .is_some_and(|(_, device)| device == *device_id),
-            Self::Cancel { .. } | Self::Finish { .. } | Self::Free { .. } => true,
+            Self::Finish { paired } => {
+                desk.in_force(paired.environment_id, paired.device_id, paired.link)
+            }
+            Self::Cancel { .. } | Self::Free { .. } => true,
         }
     }
 }
@@ -1328,14 +1332,14 @@ impl Desk {
         // was written has recorded the key, or has ended this upload, and the start refuses; one that
         // comes after finds the sender's handle stored.
         let started = {
-            let registry = locked(&self.registry);
+            let mut registry = locked(&self.registry);
             // A send on a connection the desk has moved past goes on its own connection and does
             // not make it the newest.
             let _ = locked(&self.sessions)
                 .entry((paired.environment_id, paired.device_id))
                 .or_default()
                 .observe(Connection::of(&paired));
-            self.start_under(&registry, &live, Connection::of(&paired), false)
+            self.start_under(&mut registry, &live, Connection::of(&paired), false)
         };
         if !started {
             let _ = store.remove_copy(key);
@@ -1364,13 +1368,14 @@ impl Desk {
     /// the one declared.
     ///
     /// It starts only an upload that this desk holds (by identity), whose key the person did not
-    /// cancel, that has no sender, and whose account is the connection's: a second caller that holds
-    /// a stale list finds the upload sending and is refused, so an upload has one task, and a
-    /// connection of another sign-in never carries the upload. The task and its handle are made
-    /// here, in one step under the gate, so a stop finds the handle.
+    /// cancel, that has no sender, whose account is the connection's and whose pairing is the one
+    /// in force: a second caller that holds a stale list finds the upload sending and is refused,
+    /// so an upload has one task, and a connection of another sign-in or of an older pairing never
+    /// carries the upload. The task and its handle are made here, in one step under the gate, so a
+    /// stop finds the handle. An upload just admitted that is refused for its pairing is ended.
     fn start_under(
         self: &Arc<Self>,
-        registry: &Registry,
+        registry: &mut Registry,
         live: &Arc<Live>,
         connection: Connection,
         verify: bool,
@@ -1384,6 +1389,20 @@ impl Desk {
             || live.cancel_asked.load(Ordering::Acquire)
             || live.owner.account != connection.account
         {
+            return false;
+        }
+        // A pairing that is no longer the one in force starts nothing: the pairing in force removes
+        // what the old one left. An upload that was admitted a moment ago and is refused here has
+        // no sender and no owner to end it, so it ends in this section; its entry, the old
+        // pairing's, stays for the pairing in force to remove.
+        if !self.in_force(
+            live.owner.environment_id,
+            live.owner.device_id,
+            connection.link,
+        ) {
+            if *locked(&live.phase) == Phase::Admitted {
+                Self::end_under(registry, live, Outcome::Cancelled);
+            }
             return false;
         }
         let session = connection.session;
@@ -1705,8 +1724,8 @@ impl Desk {
             } else {
                 #[cfg(feature = "testing")]
                 testing::pause(live.key, testing::Point::Claiming);
-                let registry = locked(&self.registry);
-                self.start_under(&registry, &live, connection.clone(), true);
+                let mut registry = locked(&self.registry);
+                self.start_under(&mut registry, &live, connection.clone(), true);
             }
         }
         if locked(&self.root).is_none() {
@@ -1804,6 +1823,11 @@ impl Desk {
     ) {
         let key = file.key;
         let turn = self.turn(key).await;
+        // A pairing that is no longer the one in force acts on none of its entries: it finishes no
+        // cancel, publishes nothing and removes nothing. The pairing in force removes them.
+        if !self.in_force(paired.environment_id, paired.device_id, paired.link) {
+            return;
+        }
         let Some(file) = store.entry(key) else {
             return;
         };
@@ -1849,7 +1873,12 @@ impl Desk {
                             let live = Live::new(file, content, true);
                             let mut registry = locked(&self.registry);
                             if registry.admit_restarted(&live) {
-                                self.start_under(&registry, &live, Connection::of(paired), false);
+                                self.start_under(
+                                    &mut registry,
+                                    &live,
+                                    Connection::of(paired),
+                                    false,
+                                );
                             }
                         }
                         // A publication in progress needs no content: the entry stays, and the host is
@@ -2479,7 +2508,7 @@ impl Desk {
         if generation.is_some() {
             testing::pause(live.key, testing::Point::SettleBeforeGate);
         }
-        let registry = locked(&self.registry);
+        let mut registry = locked(&self.registry);
         let right = match generation {
             Some(generation) => live.generation.load(Ordering::Acquire) == generation,
             None => registry
@@ -2509,7 +2538,7 @@ impl Desk {
         *locked(&live.phase) = Phase::Paused;
         match usable {
             Some(newest) if !owed => {
-                self.start_under(&registry, live, newest, true);
+                self.start_under(&mut registry, live, newest, true);
             }
             usable => {
                 if seen > looked || (owed && usable.is_some()) {
@@ -3512,6 +3541,19 @@ mod tests {
             !forget(held_device).owed(&desk, nothing, None),
             "a key with no upload and no entry"
         );
+        let finish = |device_id, link| Job::Finish {
+            paired: Paired {
+                device_id,
+                environment_id,
+                account: None,
+                session: silent_session(),
+                link,
+            },
+        };
+        assert!(
+            finish(acting, 5).owed(&desk, live.key, Some(&live)),
+            "the finish of a pairing in force"
+        );
         // A connection of another device of the host, numbered above the acting pairing's: the
         // acting pairing is not the one in force.
         let _ = locked(&desk.sessions)
@@ -3529,6 +3571,10 @@ mod tests {
         assert!(
             supersede(acting, 9).owed(&desk, live.key, Some(&live)),
             "an equal number is not newer"
+        );
+        assert!(
+            !finish(acting, 5).owed(&desk, live.key, Some(&live)),
+            "the finish of an obsolete pairing"
         );
     }
 
