@@ -13,13 +13,24 @@
 use kr_protocol::hello::{PACKAGE_VERSION, PackageVersion};
 use kr_protocol::hostinfo::export::{ContentClass, Sentence};
 use kr_protocol::identity::EnvironmentAccess;
+use kr_protocol::ids::EnvironmentId;
 
 use crate::bridge::invoke::{HelperEnd, Refusal};
 use crate::bridge::launch::{self, LaunchError};
 
-/// Returns the sentence that says why a bridge to an environment of `access` did not answer.
+/// How far a bridge got before it was refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Stage {
+    /// The destination had not acknowledged the opening.
+    Opening,
+    /// The destination had acknowledged the opening, and the read that follows it was refused.
+    Read,
+}
+
+/// Returns the sentence that says why a bridge to an environment of `access` did not answer, from
+/// the stage it was refused at.
 #[must_use]
-pub fn of(refusal: &Refusal, access: EnvironmentAccess) -> Sentence {
+pub fn of(refusal: &Refusal, access: EnvironmentAccess, stage: Stage) -> Sentence {
     let program =
         || Sentence::new().stated(launch::program_of(access).unwrap_or("the helper program"));
     // What most of the causes that follow an answer say first: the helper ran, and what answered
@@ -48,26 +59,39 @@ pub fn of(refusal: &Refusal, access: EnvironmentAccess) -> Sentence {
         Refusal::NotStarted { detail, .. } => program()
             .stated(" could not be started: ")
             .withheld(ContentClass::Message, detail),
-        Refusal::Stream { helper, .. } => match helper {
-            Some(HelperEnd::Exited(code)) => program()
-                .stated(" ended with exit code ")
-                .number(u64::from(u32::from_ne_bytes(code.to_ne_bytes())))
-                .stated(" before the environment answered"),
-            Some(HelperEnd::Signalled(signal)) => program()
-                .stated(" was ended by signal ")
-                .number(u64::from(u32::from_ne_bytes(signal.to_ne_bytes())))
-                .stated(" before the environment answered"),
-            Some(HelperEnd::Unaccounted) | None => {
-                program().stated(" ended the connection before the environment answered")
+        Refusal::Stream { helper, .. } => {
+            let before = match stage {
+                Stage::Opening => " before the environment answered",
+                Stage::Read => {
+                    " after the environment acknowledged the bridge, before it answered the read"
+                }
+            };
+            match helper {
+                Some(HelperEnd::Exited(code)) => program()
+                    .stated(" ended with exit code ")
+                    .number(u64::from(u32::from_ne_bytes(code.to_ne_bytes())))
+                    .stated(before),
+                Some(HelperEnd::Signalled(signal)) => program()
+                    .stated(" was ended by signal ")
+                    .number(u64::from(u32::from_ne_bytes(signal.to_ne_bytes())))
+                    .stated(before),
+                Some(HelperEnd::Unaccounted) | None => {
+                    program().stated(" ended the connection").stated(before)
+                }
             }
-        },
+        }
         Refusal::Unreadable { detail } => ran()
             .stated("wrote a frame this host cannot read (")
             .withheld(ContentClass::Message, detail)
             .stated(")"),
-        Refusal::NotAnAcknowledgement => {
-            ran().stated("answered the opening frame with something that is not an acknowledgement")
-        }
+        Refusal::NotAnAcknowledgement => match stage {
+            Stage::Opening => program().stated(
+                " ran, and the environment's first frame was not an acknowledgement of the opening",
+            ),
+            Stage::Read => program().stated(
+                " ran, and the environment answered the read with something that is not an answer",
+            ),
+        },
         Refusal::ProtocolMajor {
             destination,
             invoker,
@@ -77,7 +101,7 @@ pub fn of(refusal: &Refusal, access: EnvironmentAccess) -> Sentence {
             .stated(", and this host speaks ")
             .number(u64::from(*invoker)),
         Refusal::WrongRole { expected, answered } => ran()
-            .stated("answered as the ")
+            .stated("is the ")
             .stated(answered.as_str())
             .stated(", where the opening asked for the ")
             .stated(expected.as_str()),
@@ -90,7 +114,10 @@ pub fn of(refusal: &Refusal, access: EnvironmentAccess) -> Sentence {
                 "; enrol the environment that is installed there rather than reusing this record",
             ),
         Refusal::Destination(error) => program()
-            .stated(" ran, and the environment refused the bridge: ")
+            .stated(match stage {
+                Stage::Opening => " ran, and the environment refused the bridge: ",
+                Stage::Read => " ran, and the environment answered the read with an error: ",
+            })
             .stated(error.code.as_str())
             .stated(" (")
             .withheld(ContentClass::Message, &error.message)
@@ -100,8 +127,8 @@ pub fn of(refusal: &Refusal, access: EnvironmentAccess) -> Sentence {
             .stated(" said nothing for ")
             .number(waited.as_secs())
             .stated(" seconds, so it was ended"),
-        Refusal::UserMismatch { enrolled, answered } => ran()
-            .stated("ran as ")
+        Refusal::UserMismatch { enrolled, answered } => program()
+            .stated(" ran, and the helper that answered ran as ")
             .withheld(ContentClass::Name, answered)
             .stated(", not as the user ")
             .withheld(ContentClass::Name, enrolled)
@@ -150,6 +177,76 @@ pub fn of(refusal: &Refusal, access: EnvironmentAccess) -> Sentence {
                 .stated("; it may still be running, and this host no longer waits for it")
         }
     }
+}
+
+/// Returns the sentence for an access class that no process bridge reaches.
+#[must_use]
+pub fn not_a_process_bridge(access: EnvironmentAccess) -> Sentence {
+    Sentence::new()
+        .stated(access.as_str())
+        .stated(" is not reached by a process bridge, so none was opened")
+}
+
+/// Returns the sentence for an environment that is not running, which no bridge is opened to.
+#[must_use]
+pub fn not_running() -> Sentence {
+    Sentence::new().stated(
+        "no bridge was opened, because this environment is not running; refresh with --start to \
+         start it",
+    )
+}
+
+/// Returns the sentence for a bridge that was not opened for a reason the host's own error gives.
+#[must_use]
+pub fn not_opened(reason: &str) -> Sentence {
+    Sentence::new()
+        .stated("no bridge was opened, because ")
+        .withheld(ContentClass::Message, reason)
+}
+
+/// Returns the sentence for a destination that answered on its own local channel, `over_ssh` when
+/// the helper there was asked once and no request crossed ssh.
+#[must_use]
+pub fn answered(environment: &EnvironmentId, user: &str, over_ssh: bool) -> Sentence {
+    Sentence::new()
+        .stated("environment ")
+        .identifier(environment)
+        .stated(" answered as ")
+        .withheld(ContentClass::Name, user)
+        .stated(if over_ssh {
+            " on the helper installed there, over ssh; no request crosses ssh"
+        } else {
+            " over its own local channel"
+        })
+}
+
+/// Returns the sentence for an answer that is of no use because the record it was asked for
+/// changed while the bridge was open, `over_ssh` for a helper that was asked once over ssh.
+#[must_use]
+pub fn record_changed(over_ssh: bool) -> Sentence {
+    Sentence::new().stated(if over_ssh {
+        "this environment's record changed while its helper was asked, so what answered says \
+         nothing about what is recorded now"
+    } else {
+        "this environment's record changed while the bridge was open, so what answered says \
+         nothing about what is recorded now"
+    })
+}
+
+/// Returns the sentence for a bridge that answered and whose answer could not be recorded.
+#[must_use]
+pub fn answered_not_recorded(reason: &str) -> Sentence {
+    Sentence::new()
+        .stated("the bridge answered, and this host did not record that, because ")
+        .withheld(ContentClass::Message, reason)
+}
+
+/// Appends that a refusal could not be recorded either, for the reason the host's own error gives.
+#[must_use]
+pub fn and_not_recorded(sentence: Sentence, reason: &str) -> Sentence {
+    sentence
+        .stated("; and this host did not record that, because ")
+        .withheld(ContentClass::Message, reason)
 }
 
 /// Appends a protocol version as its three numbers.
@@ -269,8 +366,8 @@ mod tests {
             ),
             (
                 Refusal::NotAnAcknowledgement,
-                "podman ran, and the environment that answered answered the opening frame with \
-                 something that is not an acknowledgement"
+                "podman ran, and the environment's first frame was not an acknowledgement of the \
+                 opening"
                     .to_owned(),
             ),
             (
@@ -288,8 +385,8 @@ mod tests {
                     answered: LocalRole::Worker,
                 },
                 format!(
-                    "podman ran, and the environment that answered answered as the {}, where the \
-                     opening asked for the {}",
+                    "podman ran, and the environment that answered is the {}, where the opening \
+                     asked for the {}",
                     LocalRole::Worker.as_str(),
                     LocalRole::Controller.as_str()
                 ),
@@ -328,8 +425,8 @@ mod tests {
                     answered: "another".to_owned(),
                 },
                 format!(
-                    "podman ran, and the environment that answered ran as [name withheld, 7 \
-                     bytes], not as the user [name withheld, {} bytes] the enrolment names",
+                    "podman ran, and the helper that answered ran as [name withheld, 7 bytes], not \
+                     as the user [name withheld, {} bytes] the enrolment names",
                     ARRIVED.len()
                 ),
             ),
@@ -400,7 +497,7 @@ mod tests {
             ),
         ];
         for (refusal, expected) in table {
-            let said = of(&refusal, EnvironmentAccess::Container);
+            let said = of(&refusal, EnvironmentAccess::Container, Stage::Opening);
             assert_eq!(said.as_str(), expected, "{refusal:?}");
             assert!(!said.as_str().contains(ARRIVED), "{refusal:?}: {said}");
         }
@@ -420,9 +517,58 @@ mod tests {
             (EnvironmentAccess::WslDistribution, "wsl.exe"),
         ] {
             assert_eq!(
-                of(&ended, access).as_str(),
+                of(&ended, access, Stage::Opening).as_str(),
                 format!("{program} ended with exit code 255 before the environment answered")
             );
+        }
+    }
+
+    /// KR-REQ-18.11, the part about connection diagnostics: once the destination has acknowledged
+    /// the opening, a helper that ends, an error answer to the read and a frame that is not an
+    /// answer are told as what happened to the read, and not as a bridge that was not opened.
+    #[test]
+    fn a_refusal_of_the_read_is_told_as_one_after_the_acknowledgement() {
+        let after = " after the environment acknowledged the bridge, before it answered the read";
+        for (refusal, expected) in [
+            (
+                Refusal::Stream {
+                    detail: ARRIVED.to_owned(),
+                    helper: Some(HelperEnd::Exited(125)),
+                },
+                format!("podman ended with exit code 125{after}"),
+            ),
+            (
+                Refusal::Stream {
+                    detail: ARRIVED.to_owned(),
+                    helper: Some(HelperEnd::Signalled(9)),
+                },
+                format!("podman was ended by signal 9{after}"),
+            ),
+            (
+                Refusal::Stream {
+                    detail: ARRIVED.to_owned(),
+                    helper: Some(HelperEnd::Unaccounted),
+                },
+                format!("podman ended the connection{after}"),
+            ),
+            (
+                Refusal::Destination(ProtocolError::new(ErrorCode::PermissionDenied, ARRIVED)),
+                format!(
+                    "podman ran, and the environment answered the read with an error: \
+                     PERMISSION_DENIED ([message withheld, {} bytes])",
+                    ARRIVED.len()
+                ),
+            ),
+            (
+                Refusal::NotAnAcknowledgement,
+                "podman ran, and the environment answered the read with something that is not an \
+                 answer"
+                    .to_owned(),
+            ),
+        ] {
+            let said = of(&refusal, EnvironmentAccess::Container, Stage::Read);
+            assert_eq!(said.as_str(), expected, "{refusal:?}");
+            assert!(!said.as_str().contains(ARRIVED), "{refusal:?}: {said}");
         }
     }
 }

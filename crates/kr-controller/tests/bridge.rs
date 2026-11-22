@@ -1972,7 +1972,9 @@ async fn a_helper_that_ends_after_it_acknowledged_is_told_by_its_program() {
     let said = refreshed.connection.as_str();
     assert!(
         said.starts_with("wsl.exe ended with exit code ")
-            && said.ends_with(" before the environment answered"),
+            && said.ends_with(
+                " after the environment acknowledged the bridge, before it answered the read",
+            ),
         "{said}"
     );
 }

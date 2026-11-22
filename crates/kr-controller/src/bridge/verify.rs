@@ -24,7 +24,17 @@ use kr_protocol::identity::{BridgeTarget, BridgeVerification, EnvironmentEnrolme
 use kr_protocol::ids::{BuildId, EnvironmentId, RequestId};
 use kr_protocol::method::{Method, MethodVersion};
 
+use crate::bridge::diagnosis::Stage;
 use crate::bridge::invoke::{self, Refusal};
+
+/// A refusal of a bridge, and how far the bridge got before it.
+#[derive(Debug)]
+pub struct Refused {
+    /// What stopped the bridge.
+    pub refusal: Refusal,
+    /// Whether the destination had acknowledged the opening.
+    pub stage: Stage,
+}
 
 /// Opens a bridge to one enrolled environment and reports what answered.
 ///
@@ -33,17 +43,21 @@ use crate::bridge::invoke::{self, Refusal};
 ///
 /// # Errors
 ///
-/// Returns the [`Refusal`] naming what stopped it: a helper that would not start, a stream that
-/// failed, a destination that refused the opening frame, an environment that answered with an
-/// identity the enrolment does not name, the destination's own error for the read, or a helper
-/// that could not be ended once it had answered.
+/// Returns the [`Refused`] naming what stopped it and at which stage: a helper that would not
+/// start, a stream that failed, a destination that refused the opening frame, an environment that
+/// answered with an identity the enrolment does not name, the destination's own error for the
+/// read, or a helper that could not be ended once it had answered.
 pub async fn through_bridge(
     actor: &ActorEnvelope,
     already_bridged: bool,
     enrolment: &EnvironmentEnrolment,
     origin_environment_id: EnvironmentId,
     build_id: BuildId,
-) -> Result<BridgeVerification, Refusal> {
+) -> Result<BridgeVerification, Refused> {
+    let at_opening = |refusal| Refused {
+        refusal,
+        stage: Stage::Opening,
+    };
     let opening = invoke::open(
         actor,
         already_bridged,
@@ -54,8 +68,9 @@ pub async fn through_bridge(
         // A refresh looks at what is running. Starting a destination's daemon is for create and
         // attach, which say so themselves.
         false,
-    )?;
-    let mut invocation = opening.launch().await?;
+    )
+    .map_err(at_opening)?;
+    let mut invocation = opening.launch().await.map_err(at_opening)?;
     let answer = match invocation
         .request(Request {
             request_id: RequestId::new(1),
@@ -67,7 +82,12 @@ pub async fn through_bridge(
     {
         Ok(answer) => answer,
         // A helper that ended while the read was asked says how, rather than that a stream failed.
-        Err(refusal) => return Err(invocation.settled(refusal).await),
+        Err(refusal) => {
+            return Err(Refused {
+                refusal: invocation.settled(refusal).await,
+                stage: Stage::Read,
+            });
+        }
     };
     let verification = BridgeVerification {
         environment_id: invocation.acknowledgement().environment_id,
@@ -81,11 +101,17 @@ pub async fn through_bridge(
     // A helper that could not be ended is that process, so it is the answer: what the destination
     // said is not worth a process nobody accounts for, and nothing it established is kept.
     if let Err(unended @ Refusal::Unkillable { .. }) = invocation.close().await {
-        return Err(unended);
+        return Err(Refused {
+            refusal: unended,
+            stage: Stage::Read,
+        });
     }
     match answer.outcome {
         Outcome::Ok(_) => Ok(verification),
-        Outcome::Error(error) => Err(Refusal::Destination(error)),
+        Outcome::Error(error) => Err(Refused {
+            refusal: Refusal::Destination(error),
+            stage: Stage::Read,
+        }),
     }
 }
 
@@ -192,7 +218,7 @@ mod tests {
         .await
         .expect_err("a refusal");
         assert_eq!(
-            refusal,
+            refusal.refusal,
             Refusal::NetworkActor {
                 ingress: ActorIngress::PairedDevice
             }
@@ -210,7 +236,7 @@ mod tests {
         )
         .await
         .expect_err("a refusal");
-        assert!(matches!(refusal, Refusal::Launch(_)), "{refusal}");
+        assert!(matches!(refusal.refusal, Refusal::Launch(_)), "{refusal:?}");
     }
 
     /// Set in the program that runs the case below on a host with no container runtime.
@@ -260,8 +286,24 @@ mod tests {
         )
         .await;
         match refusal {
-            Err(Refusal::NotStarted { program, .. }) => {
+            Err(Refused {
+                refusal: refusal @ Refusal::NotStarted { .. },
+                stage,
+            }) => {
+                let Refusal::NotStarted { program, detail } = &refusal else {
+                    unreachable!("matched above");
+                };
                 assert_eq!(program, crate::bridge::launch::CONTAINER_RUNTIME);
+                // What a person reads names the program and gives the operating system's message
+                // as its class and length.
+                assert_eq!(
+                    crate::bridge::diagnosis::of(&refusal, EnvironmentAccess::Container, stage)
+                        .as_str(),
+                    format!(
+                        "podman could not be started: [message withheld, {} bytes]",
+                        detail.len()
+                    )
+                );
             }
             other => panic!("the runtime cannot be started here, yet {other:?} came back"),
         }
