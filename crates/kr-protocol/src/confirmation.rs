@@ -407,9 +407,9 @@ pub const COMMAND_INTEGRATION_NOTICE: &str = "This package changes how a command
      host's reading, which follows it.";
 
 /// What the host writes before its own exact reading of a command integration in an installation's
-/// statement. A bridge's own words never hold it (the package check refuses them, and the host
-/// refuses a manifest that has it), so the first place it stands is where the host's reading
-/// starts and the publisher's words end.
+/// statement. The publisher's own words, a bridge's and an integration's, never hold it, alone or
+/// read together (the package check refuses them, and the host refuses a manifest that has it), so
+/// the first place it stands is where the host's reading starts and the publisher's words end.
 pub const INTEGRATION_STATEMENT_LABEL: &str =
     "The host's exact reading of the command integration:";
 

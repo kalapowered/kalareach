@@ -9,10 +9,10 @@
  * and offers nothing to press.
  *
  * A request for a repository's root or an installation lists everything the confirmation covers
- * under its sentence. What this host says, what the publisher says of a native bridge and what the
- * host reads of a command integration are separate texts: the host's notice comes first, then the
- * publisher's words, quoted and named, then the host's reading, quoted and named as the host's, so
- * one is never read as another.
+ * under its sentence. What this host says, what the publisher says of a native bridge and of a
+ * command integration, and what the host reads of a command integration are separate texts: the
+ * host's notice comes first, then the publisher's words, quoted and named, then the host's
+ * reading, quoted and named as the host's, so one is never read as another.
  */
 
 import {

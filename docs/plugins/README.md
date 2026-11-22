@@ -339,7 +339,8 @@ applies. The host generates this reading from the signed manifest, and it is nev
 bridge's statement cannot hold the label the reading follows, and the package check refuses one that
 does. Packages whose reading is longer than 4,000 characters will not be accepted. The command
 integration's own `grant_statement` is shown with the bridge's words, as the publisher's, before the
-host's reading; the package check refuses one that holds a label the host writes. `plugin.grant` does
+host's reading; the package check refuses a package whose publisher's words, by themselves or read
+together, hold a label the host writes. `plugin.grant` does
 not add `command_integration.launch` to an installed release: it names `plugin.install`, where the
 owner is shown the reading.
 
@@ -981,7 +982,7 @@ report the same code for the same defect.
 | `control_parameters_widen` | A control's parameters do not narrow its action's |
 | `qualification_invalid` | A qualification result claims something the catalogue cannot know |
 | `integration_without_capability` | A command integration without `command_integration.launch` |
-| `integration_invalid` | A command integration (1) references another command, (2) adds a flag not permitted by the contract, (3) sets a variable not permitted by the contract, (4) has a statement of what it does that is longer than an owner is shown whole, or (5) includes a backend declaration that does not adhere to the contract (e.g. by omitting or repeating `{gateway}`, by including arguments or launching words that fall outside the acceptable bounds, or by failing to provide a table to read from) |
+| `integration_invalid` | A command integration (1) references another command, (2) adds a flag not permitted by the contract, (3) sets a variable not permitted by the contract, (4) has a statement of what it does that is longer than an owner is shown whole, (5) includes a backend declaration that does not adhere to the contract (e.g. by omitting or repeating `{gateway}`, by including arguments or launching words that fall outside the acceptable bounds, or by failing to provide a table to read from), or (6) has a statement of what it does that holds the words the host writes before its own reading of a command integration or of a placement, by itself or read together with a native bridge's statement |
 | `launch_probe_without_capability` | A launch probe without `launch.probe` |
 | `launch_probe_invalid` | A launch probe passes no argument or too many, carries an option that is not a name, or names a mode that is not a JSON Pointer |
 

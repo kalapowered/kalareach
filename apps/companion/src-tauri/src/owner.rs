@@ -1388,16 +1388,18 @@ mod tests {
 
     /// KR-REQ-12.07: an installation whose grant holds a command integration carries the host's own
     /// notice of it and the host's reading of the declaration as a part of its own, apart from the
-    /// publisher's words about a bridge that come before it, so the page can caption each by who
-    /// wrote it. A grant that holds a native bridge too carries both notices, and a grant with only
-    /// the integration claims no bridge and has no publisher's words.
+    /// publisher's words that come before it, so the page can caption each by who wrote it. The
+    /// publisher's words are a bridge's, and the integration's own where the host writes them; a
+    /// host that writes none (an older one) sends the reading alone. A grant that holds a native
+    /// bridge too carries both notices, and a grant with only the integration claims no bridge.
     #[test]
     fn an_installation_with_a_command_integration_shows_the_hosts_notice_for_it_alone() {
         use kr_protocol::confirmation::{
-            COMMAND_INTEGRATION_NOTICE, NATIVE_BRIDGE_NOTICE, install_statement,
+            COMMAND_INTEGRATION_NOTICE, NATIVE_BRIDGE_NOTICE, install_statement, publisher_words,
         };
         let reading = "Runs \"codex\" in KalaReach sessions with no arguments added. It sets no \
                        environment variables.";
+        let own_words = "Starts codex in KalaReach sessions with the flags its bridge needs.";
         let view_of = |grant: &[&str], statement: Option<String>| {
             let plan = PluginInstallPlan {
                 grant: grant.iter().map(|name| (*name).to_owned()).collect(),
@@ -1421,7 +1423,10 @@ mod tests {
         );
         assert!(only.checkable);
         assert_eq!(only.notice.as_deref(), Some(COMMAND_INTEGRATION_NOTICE));
-        assert_eq!(only.statement, None, "none of it is the publisher's words");
+        assert_eq!(
+            only.statement, None,
+            "a host that writes no integration words sends none"
+        );
         assert_eq!(only.reading.as_deref(), Some(reading));
         assert!(
             only.detail.as_deref().is_some_and(|line| {
@@ -1431,6 +1436,33 @@ mod tests {
             "{:?}",
             only.detail
         );
+
+        // The current host writes the integration's own words as the publisher's, before the
+        // host's reading.
+        let current = view_of(
+            &["command_integration.launch"],
+            install_statement(Some(own_words), None, Some(reading)),
+        );
+        assert!(current.checkable);
+        assert_eq!(current.notice.as_deref(), Some(COMMAND_INTEGRATION_NOTICE));
+        assert_eq!(
+            current.statement.as_deref(),
+            Some(own_words),
+            "the integration's own words are the publisher's"
+        );
+        assert_eq!(current.reading.as_deref(), Some(reading));
+        let words = publisher_words(Some(PUBLISHER), Some(own_words)).expect("words");
+        let current_both = view_of(
+            &["command_integration.launch", "native_bridge.install"],
+            install_statement(Some(&words), None, Some(reading)),
+        );
+        assert!(current_both.checkable);
+        assert_eq!(
+            current_both.statement.as_deref(),
+            Some(words.as_str()),
+            "the bridge's words and the integration's own are the publisher's, in one part"
+        );
+        assert_eq!(current_both.reading.as_deref(), Some(reading));
 
         let both = view_of(
             &["command_integration.launch", "native_bridge.install"],

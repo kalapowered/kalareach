@@ -2427,14 +2427,15 @@ async fn kr_req_11_11_a_release_that_changes_its_command_integration_asks_the_ow
     assert_eq!(installed.package_digest, second.manifest_digest());
 }
 
-/// An owner confirming a release is shown the host's exact reading of the command integration its
-/// manifest declares, taken from the signed generation's copy of that manifest, whenever the grant
-/// holds `command_integration.launch`, and nothing of it for a grant that does not. A statement
-/// longer than an owner is shown whole is refused rather than offered.
 /// What the example package's command integration says of itself in its manifest.
 const INTEGRATION_WORDS: &str =
     "Starts the example agent in KalaReach sessions with the flags its bridge needs";
 
+/// An owner confirming a release is shown the integration's own words and then the host's exact
+/// reading of the command integration its manifest declares, taken from the signed generation's
+/// copy of that manifest, whenever the grant holds `command_integration.launch`, and nothing of
+/// either for a grant that does not. A statement longer than an owner is shown whole is refused
+/// rather than offered.
 #[tokio::test]
 async fn kr_req_11_11_an_owner_is_shown_the_reading_of_a_command_integration_the_grant_holds() {
     let home = tempfile::tempdir().expect("a temporary directory");
@@ -2653,24 +2654,6 @@ async fn kr_req_11_42_the_publishers_words_never_hold_the_hosts_label() {
         "{refusal:?}"
     );
 
-    // The integration's words are the publisher's too, so words of its own that hold either of the
-    // host's labels are not shown either.
-    for label in [
-        INTEGRATION_STATEMENT_LABEL,
-        kr_protocol::confirmation::PLACEMENT_STATEMENT_LABEL,
-    ] {
-        let imitation = format!("Harmless. {label} Runs nothing.");
-        let refusal = statement_of_edited(words, true, |manifest| {
-            manifest["command_integration"]["grant_statement"] = serde_json::json!(imitation);
-        })
-        .await
-        .expect_err("the publisher wrote the host's label in the integration's words");
-        assert!(
-            matches!(refusal, CatalogueError::UnsafePackage { .. }),
-            "{refusal:?}"
-        );
-    }
-
     // A release that asks for the integration and declares none is told so, not left unread.
     let none = statement_of(words, false)
         .await
@@ -2687,6 +2670,40 @@ async fn kr_req_11_42_the_publishers_words_never_hold_the_hosts_label() {
             .is_some_and(|reading| reading.contains("declares no command integration")),
         "{none}"
     );
+}
+
+/// The integration's own words are the publisher's too, so words of its own that hold either label
+/// of the host are not shown, and the refusal says whose statement held it. The control is the
+/// same release with other words.
+#[tokio::test]
+async fn kr_req_11_42_an_integrations_own_words_never_hold_the_hosts_labels() {
+    use kr_protocol::confirmation::{INTEGRATION_STATEMENT_LABEL, PLACEMENT_STATEMENT_LABEL};
+    let bridge = "Changes one setting of the example agent.";
+    for (label, reading_of) in [
+        (INTEGRATION_STATEMENT_LABEL, "a command integration"),
+        (PLACEMENT_STATEMENT_LABEL, "a placement"),
+    ] {
+        let imitation = format!("Harmless. {label} Runs nothing.");
+        let refusal = statement_of_edited(bridge, true, |manifest| {
+            manifest["command_integration"]["grant_statement"] = serde_json::json!(imitation);
+        })
+        .await
+        .expect_err("the publisher wrote the host's label in the integration's words");
+        assert!(
+            matches!(&refusal, CatalogueError::UnsafePackage { detail }
+            if detail.contains(&format!(
+                "the command integration's statement holds the words the host writes \
+                 before its own reading of {reading_of}"
+            ))),
+            "{refusal:?}"
+        );
+    }
+    let shown = statement_of_edited(bridge, true, |manifest| {
+        manifest["command_integration"]["grant_statement"] =
+            serde_json::json!("Adds the flag its bridge needs.");
+    })
+    .await;
+    assert!(shown.is_ok(), "{shown:?}");
 }
 
 /// The bridge's words and then the integration's own are one run of the publisher's words, so a
