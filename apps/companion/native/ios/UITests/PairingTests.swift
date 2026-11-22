@@ -417,6 +417,37 @@ final class PairingTests: DeviceTestCase {
         screenshot("paired")
     }
 
+    /// The phone's side of a pairing whose issuing side is the real `kr pair` command
+    /// (`scripts/e2e-pairing-issuer-device.sh ios`, which sets `KR_PAIRING_ISSUER`; every other run of
+    /// this class skips the case): the phone scans the invitation the command drew, shows its value,
+    /// gives that value to the script as the person reads it off the screen, and is paired once the
+    /// command has approved it.
+    func testIssuerAnInvitationTheCommandDrewPairsAndShowsItsValue() throws {
+        try XCTSkipUnless(
+            ProcessInfo.processInfo.environment["KR_PAIRING_ISSUER"] == "1",
+            "only the issuing-side script drives this case"
+        )
+        openHosts()
+        waitFor("direct.png.added", timeout: 300)
+        chooseTheNewestPicture()
+        waitToShow("Invitation from a host")
+        screenshot("scanned-summary")
+        press("Pair")
+        // The page spells the value out for a screen reader, one character at a time, in two groups.
+        let spelled = app.staticTexts.matching(
+            NSPredicate(format: "label MATCHES %@", "([0-9a-fA-F] ){3}[0-9a-fA-F], ([0-9a-fA-F] ){3}[0-9a-fA-F]")
+        ).firstMatch
+        XCTAssertTrue(spelled.waitForExistence(timeout: 90), "the phone showed no value")
+        let value = spelled.label.replacingOccurrences(of: ",", with: "").replacingOccurrences(of: " ", with: "")
+        try? Data((value + "\n").utf8).write(to: URL(fileURLWithPath: path("phone-value.txt")))
+        say("PAIRING the phone shows the value \(value)")
+        screenshot("value")
+        waitFor("approve", timeout: 300)
+        waitToShow("Paired with", timeout: 120)
+        say("PAIRING the phone is paired")
+        screenshot("paired")
+    }
+
     /// A code QR that names another service raises the system's alert with that service's name before
     /// anything is contacted: Cancel contacts nothing, and accepting contacts that service once.
     func test3ACodeForAnotherServiceAsksBeforeAnythingIsContacted() {

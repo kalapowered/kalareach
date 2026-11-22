@@ -35,7 +35,7 @@ struct Script {
     env: &'static [(&'static str, &'static str)],
 }
 
-const SCRIPTS: [Script; 12] = [
+const SCRIPTS: [Script; 13] = [
     Script {
         path: "scripts/e2e-mobile.sh",
         args: &["android"],
@@ -83,6 +83,13 @@ const SCRIPTS: [Script; 12] = [
         args: &["android"],
         waits_for_boot: false,
         env: &[],
+    },
+    Script {
+        // The package it installs is named, so the script goes no further than the device for it.
+        path: "scripts/e2e-pairing-issuer-device.sh",
+        args: &["android"],
+        waits_for_boot: false,
+        env: &[("KR_ISSUER_ANDROID_APK", "application.apk")],
     },
     Script {
         // The package it installs is named, so the script goes no further than the device for it.
@@ -575,7 +582,7 @@ fn run_with(
         &record,
         &format!(
             "case \"$*\" in\n\
-             *--message-format=json*) for host in voice_device pairing_device release_tls_device push_device; do echo '{{\"reason\":\"compiler-artifact\",\"executable\":\"{path}\",\"target\":{{\"name\":\"'$host'\"}}}}'; done ;;\n\
+             *--message-format=json*) for host in voice_device pairing_device release_tls_device push_device kr-controller-held kr; do echo '{{\"reason\":\"compiler-artifact\",\"executable\":\"{path}\",\"target\":{{\"name\":\"'$host'\"}}}}'; done ;;\n\
              *) exit 1 ;;\n\
              esac",
             path = tools.join("voice_device").display()
@@ -870,8 +877,9 @@ fn a_device_on_the_pairing_scripts_serial_that_is_not_kalareachs_is_left_alone()
 
 /// The scripts that start an emulator on a serial of their own: every script here but the one that
 /// uses whatever emulator is listed.
-const OWN_SERIAL: [&str; 11] = [
+const OWN_SERIAL: [&str; 12] = [
     "scripts/e2e-pairing-device.sh",
+    "scripts/e2e-pairing-issuer-device.sh",
     "scripts/e2e-android-release.sh",
     "scripts/e2e-push-device.sh",
     "scripts/e2e-push-android-receiver.sh",
@@ -885,8 +893,9 @@ const OWN_SERIAL: [&str; 11] = [
 ];
 /// The ones among them that go on to install into the device, whose control run is ended by the
 /// device refusing the installation.
-const INSTALLS: [&str; 7] = [
+const INSTALLS: [&str; 8] = [
     "scripts/e2e-pairing-device.sh",
+    "scripts/e2e-pairing-issuer-device.sh",
     "scripts/e2e-android-release.sh",
     "scripts/e2e-push-device.sh",
     "scripts/e2e-push-android-receiver.sh",

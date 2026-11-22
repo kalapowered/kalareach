@@ -2,7 +2,7 @@
 """Drives the installed companion application on the Android emulator through its own screens, for
 `scripts/e2e-pairing-device.sh android`.
 
-Three commands:
+Four commands:
 
   aim <grpc port>
       Moves the emulator's virtual camera to its first view of the wall's picture. The emulator's
@@ -14,6 +14,12 @@ Three commands:
       through `uiautomator`, which names the page's own buttons and texts, and driven by taps at
       the centre of what it names. Every prompt of the system is answered by the button a person
       would press. A line `PAIRING <what held>` is printed for each thing the run showed.
+
+  issuer <adb> <serial> <issuer directory> <screenshot directory> <grpc port>
+      Pairs the phone with a host whose issuing side is the real `kr pair` command, for
+      `scripts/e2e-pairing-issuer-device.sh android`: scans the invitation the command drew, writes the
+      value the phone shows to `phone-value.txt` in the issuer directory, and waits for the command's
+      approval before it waits for the paired screen.
 
   release <adb> <serial> <harness directory> <screenshot directory> <port> <attempts file>
       Drives the minified release build through its pairing screen, for
@@ -1129,6 +1135,34 @@ def drive(adb: str, serial: str, directory: Path, shots: Path, port: str) -> Non
     a_host_that_refuses(phone, directory, port)
 
 
+# The value the phone shows, spelled for a screen reader one character at a time in two groups of four.
+SPELLED_VALUE = re.compile(r"(?:[0-9a-f] ){3}[0-9a-f], (?:[0-9a-f] ){3}[0-9a-f]", re.IGNORECASE)
+
+
+def issuer(adb: str, serial: str, directory: Path, shots: Path, port: str) -> None:
+    """The phone's side of a pairing whose issuing side is the real `kr pair` command: the command's
+    drawn invitation is the picture on the emulator's wall, the value the phone shows is read from its
+    screen and given to the script, and the phone is paired once the command has approved it."""
+    phone = Phone(adb, serial, shots)
+    shots.mkdir(parents=True, exist_ok=True)
+    phone.run("shell", "am", "start", "-n", f"{APP}/.MainActivity")
+    phone.wait(lambda each: each == "Hosts", "the shell's Hosts tab", 90)
+    phone.press("Hosts")
+    phone.wait(lambda each: each == "Pair with a host", "the pairing screen")
+    scan(phone, directory, "direct", port, owner_card, "the scanned invitation")
+    phone.shot("scanned-summary")
+    phone.press("Pair")
+    node = phone.wait(lambda each: SPELLED_VALUE.fullmatch(each) is not None, "the value", 90)
+    value = node["label"].replace(",", "").replace(" ", "")
+    (directory / "phone-value.txt").write_text(value + "\n")
+    say(f"the phone shows the value {value}")
+    phone.shot("value")
+    wait_for_file(directory, "approve", 300)
+    phone.wait(lambda each: each.startswith("Paired with"), "the paired screen", 120)
+    say("the phone is paired")
+    phone.shot("paired")
+
+
 # ---- The release build's verified TLS ----------------------------------------------------------
 
 
@@ -1310,6 +1344,8 @@ def main() -> None:
         aim(arguments[1])
     elif len(arguments) == 6 and arguments[0] == "drive":
         drive(arguments[1], arguments[2], Path(arguments[3]), Path(arguments[4]), arguments[5])
+    elif len(arguments) == 6 and arguments[0] == "issuer":
+        issuer(arguments[1], arguments[2], Path(arguments[3]), Path(arguments[4]), arguments[5])
     elif len(arguments) == 7 and arguments[0] == "release":
         release(arguments[1], arguments[2], Path(arguments[3]), Path(arguments[4]), arguments[5], Path(arguments[6]))
     else:
