@@ -2386,6 +2386,53 @@ async fn kr_req_13_12_a_reconnect_before_the_driver_fails_resumes_the_upload_on_
     adopted.stop().await;
 }
 
+/// KR-REQ-13.12: a send that carries the connection its caller read before the phone made another
+/// goes on that connection and does not make it the newest again. The desk was told the host was
+/// reached on the newer one, so the upload that fails on the ended connection goes on the newer one
+/// at once; it would otherwise pause and wait for a connection that is already up.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_13_12_a_send_on_a_connection_the_desk_has_moved_past_does_not_make_it_the_newest() {
+    let adopted = Adopted::start(1).await;
+    let (phone, _control) = phone_for(&adopted).await;
+    let companion = &phone.companion;
+    let desk = desk_of(companion);
+    let after_copy = desk.hold_after_copy_for_test();
+    let bytes = pattern(5);
+    let paired = paired_of(companion).await;
+    let old = Arc::clone(&paired.session);
+    // The send has read its connection and written its copy, and has not started.
+    let sending = {
+        let sent = request(
+            &adopted,
+            &bytes,
+            Arc::new(Held::new(bytes.clone())),
+            kr_ipc::new_uuid(),
+        );
+        let desk = Arc::clone(&desk);
+        tokio::spawn(async move { desk.send(paired, sent).await })
+    };
+    // The connection ends, the phone makes another, and the desk is told the host was reached on it.
+    old.transport().close();
+    let newer = on_another_connection(companion, &old).await;
+    until("the desk is told of the new connection", || {
+        desk.holds_newest_for_test(&newer)
+    })
+    .await;
+
+    after_copy.add_permits(1);
+    let handle = tokio::time::timeout(WATCHDOG, sending)
+        .await
+        .expect("the upload goes on the newer connection, where the send's own has ended")
+        .expect("the task ran")
+        .expect("the upload is published");
+    assert_eq!(handle.byte_len.get(), bytes.len() as u64);
+    assert!(
+        desk.holds_newest_for_test(&newer),
+        "the connection the send carried did not become the newest again"
+    );
+    adopted.stop().await;
+}
+
 /// How many draft creations and discards the client's book still holds as unresolved on `session`.
 async fn draft_actions_in_the_book(session: &kr_client::Session) -> usize {
     use kr_protocol::method::Method;

@@ -736,6 +736,49 @@ impl Connection {
     }
 }
 
+/// The connections to one host's device that the desk was told of, and the order they came in: the
+/// newest, and the sessions it has moved past.
+///
+/// An operation that carries the connection it read a moment before, a send, can arrive after the
+/// desk was told the host was reached on a newer one. It goes on its own connection, but it does not
+/// make that connection the newest again: an upload that then paused on it would wait for a
+/// connection that the desk already holds.
+#[derive(Default)]
+struct Connections {
+    newest: Option<Connection>,
+    /// The sessions the desk moved past. A weak handle keeps a session's address from being taken
+    /// by another while it is listed; one that has ended is dropped at the next change.
+    passed: Vec<std::sync::Weak<Session>>,
+}
+
+impl Connections {
+    /// The host was reached on `connection`: it is the newest from now on, whatever came before.
+    fn reached(&mut self, connection: Connection) {
+        let incoming = Arc::as_ptr(&connection.session);
+        self.passed
+            .retain(|old| old.strong_count() > 0 && !std::ptr::eq(old.as_ptr(), incoming));
+        if let Some(previous) = self.newest.replace(connection)
+            && !std::ptr::eq(Arc::as_ptr(&previous.session), incoming)
+        {
+            self.passed.push(Arc::downgrade(&previous.session));
+        }
+    }
+
+    /// An upload is sent on `connection`. It is the newest, as the host may not have been reached on
+    /// it yet, unless the desk has already moved past it.
+    fn used(&mut self, connection: Connection) {
+        let incoming = Arc::as_ptr(&connection.session);
+        if self
+            .passed
+            .iter()
+            .any(|old| std::ptr::eq(old.as_ptr(), incoming))
+        {
+            return;
+        }
+        self.reached(connection);
+    }
+}
+
 /// What the gate guards: the uploads this process holds, the keys the person cancelled, and the
 /// turns of the keys.
 #[derive(Default)]
@@ -839,7 +882,7 @@ pub struct Desk {
     places_freed: AtomicU64,
     /// The newest connection of each host's device, with its account, so that an upload whose
     /// connection ended while a newer one of the same account was coming up goes on at once.
-    sessions: Mutex<HashMap<(EnvironmentId, DeviceId), Connection>>,
+    sessions: Mutex<HashMap<(EnvironmentId, DeviceId), Connections>>,
     /// What a suite holds a send at, before it is admitted.
     #[cfg(feature = "testing")]
     before_admission: Mutex<Option<Arc<tokio::sync::Semaphore>>>,
@@ -1054,10 +1097,10 @@ impl Desk {
         // comes after finds the sender's handle stored.
         let started = {
             let registry = locked(&self.registry);
-            locked(&self.sessions).insert(
-                (paired.environment_id, paired.device_id),
-                Connection::of(&paired),
-            );
+            locked(&self.sessions)
+                .entry((paired.environment_id, paired.device_id))
+                .or_default()
+                .used(Connection::of(&paired));
             self.start_under(&registry, &live, Connection::of(&paired), false)
         };
         if !started {
@@ -1296,7 +1339,7 @@ impl Desk {
         if resumable {
             let newest = locked(&self.sessions)
                 .get(&(file.environment_id, file.device_id))
-                .cloned();
+                .and_then(|known| known.newest.clone());
             let registry = locked(&self.registry);
             if live.generation.load(Ordering::Acquire) != generation {
                 return;
@@ -1371,7 +1414,10 @@ impl Desk {
     pub fn host_reached(self: &Arc<Self>, paired: Paired) {
         let (device_id, environment_id) = (paired.device_id, paired.environment_id);
         let connection = Connection::of(&paired);
-        locked(&self.sessions).insert((environment_id, device_id), connection.clone());
+        locked(&self.sessions)
+            .entry((environment_id, device_id))
+            .or_default()
+            .reached(connection.clone());
         let who = paired.who();
         let (paused, other) = {
             let registry = locked(&self.registry);
@@ -2134,6 +2180,7 @@ impl Desk {
     pub fn holds_newest_for_test(&self, paired: &Paired) -> bool {
         locked(&self.sessions)
             .get(&(paired.environment_id, paired.device_id))
+            .and_then(|known| known.newest.as_ref())
             .is_some_and(|newest| Arc::ptr_eq(&newest.session, &paired.session))
     }
 }
