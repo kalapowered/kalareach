@@ -322,7 +322,7 @@ fn zz_the_child() {
 #[ignore = "runs as the system in a disposable guest"]
 fn broker_auth_a_person_is_identified_from_the_pipe_and_a_pid_in_a_message_changes_nothing() {
     if !runs_as_the_system() {
-        eprintln!("SKIPPED: needs the system's token");
+        eprintln!("skipped: needs the system's token");
         return;
     }
     prepare();
@@ -402,7 +402,7 @@ fn broker_auth_a_person_is_identified_from_the_pipe_and_a_pid_in_a_message_chang
 #[ignore = "runs as the system in a disposable guest"]
 fn broker_auth_an_elevated_client_and_an_unsplit_administrator_are_refused_with_the_text() {
     if !runs_as_the_system() {
-        eprintln!("SKIPPED: needs the system's token");
+        eprintln!("skipped: needs the system's token");
         return;
     }
     let server = serve_once(Vec::new(), |mut connection| {
@@ -439,7 +439,7 @@ fn broker_auth_an_elevated_client_and_an_unsplit_administrator_are_refused_with_
 #[ignore = "runs as the system in a disposable guest"]
 fn broker_auth_a_caller_that_opens_the_pipe_anonymously_cannot_be_identified() {
     if !runs_as_the_system() {
-        eprintln!("SKIPPED: needs the system's token");
+        eprintln!("skipped: needs the system's token");
         return;
     }
     let server = serve_once(Vec::new(), |mut connection| {
@@ -464,7 +464,7 @@ fn broker_auth_a_caller_that_opens_the_pipe_anonymously_cannot_be_identified() {
 #[ignore = "runs as the system in a disposable guest"]
 fn broker_auth_a_process_that_runs_as_another_account_than_the_connection_is_refused() {
     if !runs_as_the_system() {
-        eprintln!("SKIPPED: needs the system's token");
+        eprintln!("skipped: needs the system's token");
         return;
     }
     prepare();
@@ -545,7 +545,7 @@ fn copy_of(source: &Handle, primary: bool) -> Handle {
 #[ignore = "runs as the system in a disposable guest"]
 fn broker_auth_the_facts_of_real_tokens_are_read_and_refused_by_the_rule_that_names_them() {
     if !runs_as_the_system() {
-        eprintln!("SKIPPED: needs the system's token");
+        eprintln!("skipped: needs the system's token");
         return;
     }
     prepare();
@@ -620,7 +620,7 @@ fn broker_auth_the_facts_of_real_tokens_are_read_and_refused_by_the_rule_that_na
 #[ignore = "runs as the system in a disposable guest"]
 fn broker_auth_a_token_of_an_app_container_is_read_as_one() {
     if !runs_as_the_system() {
-        eprintln!("SKIPPED: needs the system's token");
+        eprintln!("skipped: needs the system's token");
         return;
     }
     let name = wide("krauthcontainer");
@@ -821,7 +821,7 @@ fn real_open(person: &Person, path: &std::path::Path) -> (bool, bool) {
 #[ignore = "runs as the system in a disposable guest"]
 fn broker_auth_the_rights_come_from_the_descriptor_and_agree_with_a_real_open() {
     if !runs_as_the_system() {
-        eprintln!("SKIPPED: needs the system's token");
+        eprintln!("skipped: needs the system's token");
         return;
     }
     prepare();
@@ -905,7 +905,7 @@ fn broker_auth_the_rights_come_from_the_descriptor_and_agree_with_a_real_open() 
 #[ignore = "runs as the system in a disposable guest"]
 fn broker_auth_a_probe_token_stands_for_a_sibling_whose_own_account_allows_nothing() {
     if !runs_as_the_system() {
-        eprintln!("SKIPPED: needs the system's token");
+        eprintln!("skipped: needs the system's token");
         return;
     }
     prepare();
@@ -1000,7 +1000,7 @@ fn dacl_of(pipe: HANDLE) -> Vec<(u8, u32, String)> {
 #[ignore = "runs as the system in a disposable guest"]
 fn broker_auth_the_data_pipes_open_to_the_person_alone_and_carry_bytes_one_way() {
     if !runs_as_the_system() {
-        eprintln!("SKIPPED: needs the system's token");
+        eprintln!("skipped: needs the system's token");
         return;
     }
     prepare();
@@ -1071,7 +1071,7 @@ fn broker_auth_the_data_pipes_open_to_the_person_alone_and_carry_bytes_one_way()
 #[ignore = "runs as the system in a disposable guest"]
 fn broker_auth_a_boundary_token_opens_neither_data_pipe_for_any_right() {
     if !runs_as_the_system() {
-        eprintln!("SKIPPED: needs the system's token");
+        eprintln!("skipped: needs the system's token");
         return;
     }
     prepare();
@@ -1121,7 +1121,7 @@ fn broker_auth_a_boundary_token_opens_neither_data_pipe_for_any_right() {
 #[ignore = "runs as the system in a disposable guest"]
 fn broker_auth_a_wrong_connecting_client_is_disconnected_and_the_instance_stays() {
     if !runs_as_the_system() {
-        eprintln!("SKIPPED: needs the system's token");
+        eprintln!("skipped: needs the system's token");
         return;
     }
     prepare();
@@ -1238,7 +1238,7 @@ fn broker_auth_a_waiter_that_outlives_its_wait_keeps_the_handles_it_uses() {
 #[ignore = "runs as the system in a disposable guest"]
 fn broker_auth_a_client_that_never_connects_ends_the_wait_by_its_bound_or_by_the_stop() {
     if !runs_as_the_system() {
-        eprintln!("SKIPPED: needs the system's token");
+        eprintln!("skipped: needs the system's token");
         return;
     }
     prepare();
@@ -1275,7 +1275,7 @@ fn handle_count() -> u32 {
 #[ignore = "runs as the system in a disposable guest"]
 fn broker_auth_a_handle_value_in_an_operate_frame_is_an_unknown_field_and_nothing_is_duplicated() {
     if !runs_as_the_system() {
-        eprintln!("SKIPPED: needs the system's token");
+        eprintln!("skipped: needs the system's token");
         return;
     }
     let valid = serde_json::json!({
@@ -1388,7 +1388,7 @@ impl Drop for BrokerLoop {
 #[ignore = "runs as the system in a disposable guest"]
 fn broker_auth_a_wrong_protocol_version_is_refused_by_the_running_broker() {
     if !runs_as_the_system() {
-        eprintln!("SKIPPED: needs the system's token");
+        eprintln!("skipped: needs the system's token");
         return;
     }
     let broker_loop = BrokerLoop::start();
@@ -1427,7 +1427,7 @@ fn broker_auth_a_wrong_protocol_version_is_refused_by_the_running_broker() {
 #[ignore = "runs as the system in a disposable guest"]
 fn broker_auth_an_impostor_that_took_the_pipes_name_first_is_refused_by_the_service_and_the_host() {
     if !runs_as_the_system() {
-        eprintln!("SKIPPED: needs the system's token");
+        eprintln!("skipped: needs the system's token");
         return;
     }
     assert!(
