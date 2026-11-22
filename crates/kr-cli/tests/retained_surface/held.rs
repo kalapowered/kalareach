@@ -101,13 +101,22 @@ fn crate_paths(folder: &Path) -> Result<BTreeMap<String, String>, String> {
     Ok(paths)
 }
 
-/// Copies the files under `from` to `to`, folders included.
+/// Copies the files under `from` to `to`, folders included. A link stays a link, so that the walker
+/// refuses a file reached through one, as it does in a full checkout.
 fn copy_files(from: &Path, to: &Path) -> Result<(), String> {
     std::fs::create_dir_all(to).map_err(|error| format!("{}: {error}", to.display()))?;
     for entry in std::fs::read_dir(from).map_err(|error| format!("{}: {error}", from.display()))? {
         let entry = entry.map_err(|error| error.to_string())?;
         let target = to.join(entry.file_name());
-        if entry.path().is_dir() {
+        let kind = entry
+            .file_type()
+            .map_err(|error| format!("{}: {error}", entry.path().display()))?;
+        if kind.is_symlink() {
+            let to_what = std::fs::read_link(entry.path())
+                .map_err(|error| format!("{}: {error}", entry.path().display()))?;
+            std::os::unix::fs::symlink(to_what, &target)
+                .map_err(|error| format!("{}: {error}", target.display()))?;
+        } else if kind.is_dir() {
             copy_files(&entry.path(), &target)?;
         } else {
             std::fs::copy(entry.path(), &target)

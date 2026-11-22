@@ -14,6 +14,8 @@ use super::walker::{Depth, Lookup};
 struct Counting {
     crates: BTreeMap<&'static str, (&'static str, &'static str)>,
     calls: RefCell<Vec<String>>,
+    /// Whether the worker's `src` holds a module that is a link to another file.
+    linked: bool,
 }
 
 impl Counting {
@@ -24,7 +26,14 @@ impl Counting {
                 .map(|(commit, directory, subtree)| (*commit, (*directory, *subtree)))
                 .collect(),
             calls: RefCell::new(Vec::new()),
+            linked: false,
         }
+    }
+
+    /// The same, with `src/linked.rs` a link to `src/real.rs` and `mod linked;` in the root.
+    fn with_a_source_link(mut self) -> Self {
+        self.linked = true;
+        self
     }
 
     fn called(&self, what: &str) -> usize {
@@ -74,14 +83,22 @@ impl Extract for Counting {
             .push(format!("files {commit} {path}"));
         let folder = into.join(path);
         std::fs::create_dir_all(&folder).map_err(|error| error.to_string())?;
+        let module = if self.linked { "mod linked;\n" } else { "" };
         std::fs::write(
             folder.join("lib.rs"),
             format!(
-                "pub fn check_envelope() {{ let _ = \"{}\"; }}\npub fn helper_fn() {{}}\n",
+                "{module}pub fn check_envelope() {{ let _ = \"{}\"; }}\npub fn helper_fn() {{}}\n",
                 self.crates[commit].1
             ),
         )
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+        if self.linked {
+            std::fs::write(folder.join("real.rs"), "pub fn real() {}\n")
+                .map_err(|error| error.to_string())?;
+            std::os::unix::fs::symlink("real.rs", folder.join("linked.rs"))
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(())
     }
 }
 
@@ -166,6 +183,24 @@ fn a_crate_is_extracted_once_for_the_releases_that_have_it_as_it_is() {
             .all(|call| !call.starts_with("files") || call.ends_with("crates/kr-worker/src")),
         "{:?}",
         shared.calls.borrow()
+    );
+}
+
+#[test]
+fn a_source_link_is_kept_for_the_walkers_refusal() {
+    let world = control();
+    let entries = std::slice::from_ref(&world.entry);
+    let roots = [the_root(ROOT, "kr_worker", Depth::Alone)];
+    let work = tempfile::tempdir().expect("a folder");
+    let extract = Counting::new(&[("c1", "kr-worker", "id1")]).with_a_source_link();
+    let trees = read_releases(entries, &roots, &listed(&["c1"]), &extract, work.path())
+        .expect("a link in a source is no reason to refuse the copy");
+    // The walker refuses a file reached through a link, as it does in a full checkout: the copy
+    // must not turn the link into a regular file that reads as any other.
+    let found = trees[0].1.item("kr_worker", "helper_fn");
+    assert!(
+        matches!(&found, Lookup::Failed(error) if error.contains("reached through a link")),
+        "{found:?}"
     );
 }
 
