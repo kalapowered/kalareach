@@ -6291,3 +6291,156 @@ async fn kr_req_23_41_a_sent_prompt_ends_the_entry_of_the_account_it_was_made_un
     );
     adopted.stop().await;
 }
+
+// ---- the transfers a record of the account holds ---------------------------------------------------
+
+/// A published upload that `paired`'s account made, kept as an entry, and its handle.
+async fn published_for(
+    adopted: &Adopted,
+    desk: &Arc<Desk>,
+    paired: &Paired,
+) -> kr_protocol::transfer::AttachmentHandle {
+    let bytes = vec![7_u8; 64];
+    let sent = request(
+        adopted,
+        &bytes,
+        Arc::new(Held::new(bytes.clone())),
+        kr_ipc::new_uuid(),
+    );
+    desk.send(paired.clone(), sent)
+        .await
+        .expect("the upload is published")
+}
+
+/// The draft's attachment for `handle`, written as the command writes it before it ends the
+/// upload's entry.
+async fn attached_as(
+    adopted: &Adopted,
+    drafts: &companion_tauri::paired_drafts::Drafts,
+    paired: &Paired,
+    session: kr_protocol::ids::SessionId,
+    handle: &kr_protocol::transfer::AttachmentHandle,
+) -> kr_protocol::ids::DraftId {
+    let bind: companion_tauri::paired_drafts::Bind = serde_json::from_value(json!({
+        "session_id": session.to_string(),
+        "text": "see the file",
+        "transfer_id": handle.transfer_id,
+        "contribution": contribution(),
+    }))
+    .expect("a bind");
+    drafts
+        .bind(
+            paired.clone(),
+            net_support::on_the_session(&adopted.host, session),
+            bind,
+        )
+        .await
+        .expect("the bind")
+        .draft_id
+}
+
+/// KR-REQ-13.12 (F1, F2): a transfer is the signed-in account's to read only while a record of that
+/// account holds it. The upload's entry holds it, then the draft's attachment, and between the bind
+/// (which writes the attachment) and the end of the entry both do, so no moment shows it as free;
+/// another account of the device finds no record of its own, although the host would answer it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_13_12_a_transfer_is_held_by_the_account_whose_record_names_it() {
+    use kr_client::services::AccountMark;
+
+    let adopted = Adopted::start(1).await;
+    let (phone, _control) = phone_for(&adopted).await;
+    let companion = &phone.companion;
+    let desk = desk_of(companion);
+    let state = companion.app.state::<companion_tauri::AppState>();
+    let drafts = state.paired_drafts();
+    let paired = paired_of(companion).await;
+    let one = Paired {
+        account: Some(AccountMark::from_bytes([1; 32])),
+        ..paired.clone()
+    };
+    let two = Paired {
+        account: Some(AccountMark::from_bytes([2; 32])),
+        ..paired.clone()
+    };
+    let session = adopted.workers[0].session_id;
+    let handle = published_for(&adopted, &desk, &one).await;
+    let id = handle.transfer_id;
+    assert!(
+        state.holds_transfer(&one.who(), id),
+        "the account's own entry holds it"
+    );
+    assert!(
+        !state.holds_transfer(&two.who(), id),
+        "another account's call finds no record of its own"
+    );
+    attached_as(&adopted, &drafts, &one, session, &handle).await;
+    assert!(
+        desk.holds(&one.who(), id) && drafts.holds(&one.who(), id),
+        "between the bind and the end of the entry both records hold it"
+    );
+    desk.bound(&one.who(), id).await;
+    assert!(!desk.holds(&one.who(), id), "the entry ended with the bind");
+    assert!(
+        state.holds_transfer(&one.who(), id),
+        "the draft's attachment holds it after the entry ended"
+    );
+    assert!(
+        !state.holds_transfer(&two.who(), id),
+        "the bound upload's id is not another account's to read"
+    );
+    let none = Paired {
+        account: None,
+        ..paired
+    };
+    assert!(
+        state.holds_transfer(
+            &none.who(),
+            kr_protocol::ids::TransferId::new(kr_ipc::new_uuid())
+        ),
+        "on a host with no organisation nothing is compared"
+    );
+    adopted.stop().await;
+}
+
+/// KR-REQ-13.12 (F3): once the last local record of a transfer has ended, whether the draft was sent,
+/// discarded or swept, the account's own call finds no record either.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_13_12_the_status_is_refused_after_the_last_local_record_ends() {
+    use kr_client::services::AccountMark;
+
+    let adopted = Adopted::start(1).await;
+    let (phone, _control) = phone_for(&adopted).await;
+    let companion = &phone.companion;
+    let desk = desk_of(companion);
+    let state = companion.app.state::<companion_tauri::AppState>();
+    let drafts = state.paired_drafts();
+    let one = Paired {
+        account: Some(AccountMark::from_bytes([1; 32])),
+        ..paired_of(companion).await
+    };
+    let session = adopted.workers[0].session_id;
+    for ending in ["sent", "discarded", "swept"] {
+        let handle = published_for(&adopted, &desk, &one).await;
+        let id = handle.transfer_id;
+        let draft = attached_as(&adopted, &drafts, &one, session, &handle).await;
+        desk.bound(&one.who(), id).await;
+        assert!(state.holds_transfer(&one.who(), id), "held ({ending})");
+        match ending {
+            "sent" => drafts.sent(&one.who(), session, draft).await,
+            "discarded" => drafts
+                .end(
+                    one.clone(),
+                    net_support::on_the_session(&adopted.host, session),
+                    session,
+                )
+                .await
+                .expect("the draft is discarded"),
+            _ => drafts.sweep(one.clone(), &[]).await,
+        }
+        assert!(
+            !state.holds_transfer(&one.who(), id),
+            "no record holds the transfer after the draft was {ending}"
+        );
+    }
+    adopted.stop().await;
+}

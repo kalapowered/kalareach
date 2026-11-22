@@ -1795,7 +1795,8 @@ pub async fn history_page(
 }
 /// Reads how much of an upload the host already holds. On a host this device is paired with the
 /// host knows the device and not the account, so the account is checked here: the mark is the
-/// account's, and the upload is not one that another account of this device holds.
+/// account's, and on a host that answers to an organisation the transfer is one that a record of
+/// the account holds.
 #[tauri::command]
 pub async fn attachment_upload_status(
     state: State<'_, AppState>,
@@ -1805,10 +1806,7 @@ pub async fn attachment_upload_status(
     let typed: kr_protocol::transfer::UploadStatusParams = decode(params)?;
     if state.paired_context().is_some() {
         let who = state.paired_who_for(mark.as_deref()).await?;
-        if state
-            .transfers()
-            .is_another_accounts(&who, typed.transfer_id)
-        {
+        if !state.holds_transfer(&who, typed.transfer_id) {
             return Err(CommandError::invalid(crate::open_transfers::NO_OPEN_UPLOAD));
         }
     }

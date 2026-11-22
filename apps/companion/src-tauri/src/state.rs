@@ -428,6 +428,22 @@ impl AppState {
         Ok(who)
     }
 
+    /// Whether the transfer `transfer_id` is `who`'s to read or to bind. On a host whose grant
+    /// answers to an organisation the host knows the device and not the account, so the transfer
+    /// must be named by a record of the signed-in account: an upload this device holds, an entry
+    /// kept for it, or an attachment of a draft it keeps. On a host with no organisation nothing is
+    /// compared.
+    #[must_use]
+    pub fn holds_transfer(
+        &self,
+        who: &crate::open_transfers::Who,
+        transfer_id: kr_protocol::ids::TransferId,
+    ) -> bool {
+        who.account.is_none()
+            || self.transfers().holds(who, transfer_id)
+            || self.paired_drafts().holds(who, transfer_id)
+    }
+
     /// The account the records of a paired host are kept for: the account signed in on a host whose
     /// grant answers to an organisation, none on another.
     ///
