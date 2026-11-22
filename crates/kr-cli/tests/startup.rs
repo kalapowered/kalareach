@@ -4975,6 +4975,45 @@ fn a_service_start_whose_daemon_ended_with_a_listen_line_says_why_and_no_request
     );
 }
 
+/// KR-REQ-07.12: a restart whose service start's daemon ended after writing why it could not
+/// listen still says that the requested daemon may still start where the unit's own policy starts
+/// a daemon that ends again.
+///
+/// A drop-in of the host sets `Restart=on-failure` with a delay of 30 seconds. The check of the
+/// unit lets it stand, since it sets neither the command nor how the unit is started, so the user
+/// manager starts the stub again, after the delay, once it has ended with its failure. The
+/// failure names the stub's process, so the command has read the process, and keeps the sentence
+/// all the same, because what the manager reports of the unit does not say that no restart
+/// follows.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_service_start_whose_unit_a_drop_in_restarts_keeps_the_sentence_that_the_requested_daemon_may_still_start()
+ {
+    let Some(host) = ServiceHost::create() else {
+        return;
+    };
+    let own = host
+        .definition()
+        .with_file_name(format!("{}.service.d", host.label()));
+    std::fs::create_dir_all(&own).expect("the unit's own drop-in directory");
+    std::fs::write(
+        own.join("10-restart.conf"),
+        "[Service]\nRestart=on-failure\nRestartSec=30s\n",
+    )
+    .expect("a drop-in");
+    let tail = "a tail only the daemon's own log holds";
+    let (message, said) = a_restart_into_a_stub_that_wrote_its_last_line(&host, tail);
+    assert!(
+        message.contains(&said),
+        "the failure names the stub's process and says why it ended, in this command's words: \
+         {message}"
+    );
+    assert!(
+        message.contains("The requested daemon may still start."),
+        "a daemon that the manager starts again after it ended may still start: {message}"
+    );
+}
+
 /// KR-REQ-07.12: a service manager holding anything but the definition kr wrote is not asked to
 /// start it, and kr does not change what it holds either.
 ///
