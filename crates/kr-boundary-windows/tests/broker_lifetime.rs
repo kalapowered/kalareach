@@ -1018,6 +1018,18 @@ impl Clock {
         Clock::adjust(seconds);
         seconds_between(was, std::time::SystemTime::now())
     }
+
+    /// Reads the clock back: it must stand `offset` seconds from the true time, which is the time
+    /// the case began at plus the time that has passed since. Whatever set the clock back after
+    /// the move of `last` seconds fails the case here, with the offset it left.
+    fn expect_offset(&self, offset: i64, last: i64, when: &str) {
+        let right = self.began + self.at.elapsed();
+        let stands = seconds_between(right, std::time::SystemTime::now());
+        assert!(
+            (stands - offset).abs() < 600,
+            "the clock was set back after the move of {last} s: it stood {stands} s from the true time {when}, not {offset} s"
+        );
+    }
 }
 
 impl Drop for Clock {
@@ -1099,12 +1111,17 @@ fn the_boot_marker_is_the_same_across_a_change_of_the_clock_and_a_journal_reads_
     assert!(same_boot(&first.id));
     // The clock goes a day forward, and then two days back, past the time of the first row.
     let clock = Clock::new();
+    let mut offset = 0;
     for seconds in [86_400, -172_800] {
         let moved = clock.move_by(seconds);
         assert!(
             (moved - seconds).abs() < 600,
             "the clock moved {moved} s, not {seconds} s"
         );
+        offset += seconds;
+        // The marker is read while the moved clock is in force: the clock is read back on both
+        // sides of the read.
+        clock.expect_offset(offset, seconds, "before the marker was read");
         let again = boot::marker().unwrap();
         assert_eq!(
             (again.id.as_str(), again.made, again.trusted),
@@ -1112,6 +1129,7 @@ fn the_boot_marker_is_the_same_across_a_change_of_the_clock_and_a_journal_reads_
             "the marker changed with the clock"
         );
         assert!(same_boot(&again.id), "the journal reads another boot");
+        clock.expect_offset(offset, seconds, "after the marker was read");
     }
     drop(clock);
     assert_eq!(boot::marker().unwrap().id, first.id);
