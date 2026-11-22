@@ -1204,17 +1204,30 @@ def session_row(number: int):
     return lambda each: f"Session {number}" in each and not each.startswith(("Sessions", "Attention"))
 
 
+def cards_listed(nodes: list[dict]) -> list[int]:
+    """The display numbers of the session cards on the screen, one for each card, from the top down. A
+    card shows its name twice, as its own label and as the title inside it, so the nodes that name a
+    session are counted by card: a node whose centre lies inside the box of a wider node that names a
+    session is part of that node's card."""
+    named = []
+    for node in nodes:
+        found = re.search(r"\bSession (\d+)\b", node["label"])
+        if found is not None and not node["label"].startswith(("Sessions", "Attention")):
+            named.append((int(found.group(1)), node["box"]))
+    named.sort(key=lambda each: -(each[1][2] - each[1][0]) * (each[1][3] - each[1][1]))
+    cards: list[tuple[int, list[int]]] = []
+    for number, box in named:
+        across, down = (box[0] + box[2]) / 2, (box[1] + box[3]) / 2
+        if not any(held[0] <= across <= held[2] and held[1] <= down <= held[3] for _, held in cards):
+            cards.append((number, box))
+    return [number for number, _ in sorted(cards, key=lambda each: each[1][1])]
+
+
 def rows_listed(phone: Phone, numbers: list[int], what: str) -> None:
-    """Waits until the list shows the rows of exactly these sessions. The first host holds sessions 1 and
-    2 and the second host holds session 1, so the list of one host is told from the other's by how many
-    sessions it shows, and by the host in use."""
-
-    def holds(nodes: list[dict]) -> bool:
-        labels = [each["label"] for each in nodes if each["label"]]
-        listed = {number for number in (1, 2) if any(session_row(number)(label) for label in labels)}
-        return listed == set(numbers)
-
-    phone.wait_screen(holds, what, 90, nudging=True)
+    """Waits until the list shows one card for each of these sessions and no other card. The first host
+    holds sessions 1 and 2 and the second host holds session 1, so the list of one host is told from the
+    other's by how many cards it shows, and by the host in use."""
+    phone.wait_screen(lambda nodes: sorted(cards_listed(nodes)) == sorted(numbers), what, 90, nudging=True)
 
 
 def host_in_use(phone: Phone) -> str | None:

@@ -833,16 +833,45 @@ final class PairingTests: DeviceTestCase {
         return nearest?.label.split(separator: " ").dropFirst().first.map(String.init)
     }
 
-    /// Waits until the list shows the rows of exactly these sessions. The first host holds sessions 1 and
-    /// 2 and the second host holds session 1, so the list of one host is told from the other's by how
-    /// many sessions it shows, and by the host in use.
-    private func rowsListed(_ numbers: Set<Int>, _ what: String) {
-        eventually(what, timeout: 90) {
-            let listed = Set([1, 2].filter { number in
-                app.buttons.matching(NSPredicate(format: "label CONTAINS %@", "Session \(number)")).firstMatch.exists
-            })
-            return listed == numbers
+    /// The buttons and texts of the page with their frames, all read from one snapshot of the tree.
+    private func labelledFrames() -> [(label: String, frame: CGRect)] {
+        guard let root = try? app.snapshot() else { return [] }
+        var found: [(label: String, frame: CGRect)] = []
+        func walk(_ element: XCUIElementSnapshot) {
+            for child in element.children {
+                if child.elementType == .button || child.elementType == .staticText { found.append((child.label, child.frame)) }
+                walk(child)
+            }
         }
+        walk(root)
+        return found
+    }
+
+    /// The display numbers of the session cards among `found`, one for each card, from the top down. A
+    /// card shows its name twice, as its own label and as the title inside it, so the elements that name
+    /// a session are counted by card: an element whose centre lies inside the frame of a larger one that
+    /// names a session is part of that one's card.
+    static func cardNumbers(_ found: [(label: String, frame: CGRect)]) -> [Int] {
+        let named = found.compactMap { each -> (number: Int, frame: CGRect)? in
+            guard !each.label.hasPrefix("Sessions"), !each.label.hasPrefix("Attention"),
+                let range = each.label.range(of: #"\bSession (\d+)\b"#, options: .regularExpression),
+                let number = Int(each.label[range].dropFirst("Session ".count))
+            else { return nil }
+            return (number, each.frame)
+        }
+        var cards: [(number: Int, frame: CGRect)] = []
+        for each in named.sorted(by: { $0.frame.width * $0.frame.height > $1.frame.width * $1.frame.height }) {
+            let centre = CGPoint(x: each.frame.midX, y: each.frame.midY)
+            if !cards.contains(where: { $0.frame.contains(centre) }) { cards.append(each) }
+        }
+        return cards.sorted { $0.frame.minY < $1.frame.minY }.map { $0.number }
+    }
+
+    /// Waits until the list shows one card for each of these sessions and no other card. The first host
+    /// holds sessions 1 and 2 and the second host holds session 1, so the list of one host is told from
+    /// the other's by how many cards it shows, and by the host in use.
+    private func rowsListed(_ numbers: [Int], _ what: String) {
+        eventually(what, timeout: 90) { PairingTests.cardNumbers(labelledFrames()).sorted() == numbers.sorted() }
     }
 
     /// Opens the session `number` from the list and waits for its composer.
