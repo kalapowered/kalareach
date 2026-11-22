@@ -1034,19 +1034,15 @@ while time.monotonic() < end:
     }
 
     /// KR-REQ-29.01, the part about reproducible commands: a signal that reached the report before a
-    /// command is due starts nothing: the call says which signal it was, and the command's script,
-    /// which writes a file, did not run.
+    /// command is due starts nothing: the call says which signal it was. The command is a program that
+    /// does not exist, so a start would be an error from the call. That makes the start of the command
+    /// visible whatever the test process does with `INT`, and however long a started shell takes to
+    /// reach its first command.
     #[test]
     fn a_signal_received_before_a_command_is_due_starts_nothing() {
         let place = tempfile::tempdir().expect("a directory");
-        let started = place.path().join("started.txt");
-        let mut command = Command::new("bash");
-        command
-            .arg("-c")
-            .arg("printf started >> \"$1\"")
-            .arg("bash")
-            .arg(&started)
-            .stdin(Stdio::null());
+        let mut command = Command::new(place.path().join("no-such-program"));
+        command.stdin(Stdio::null());
         let interrupts = Interrupts::new();
         interrupts.received[0].store(2, Ordering::SeqCst);
         let deadline = Deadline {
@@ -1054,10 +1050,11 @@ while time.monotonic() < end:
             seconds: 600,
             budget: false,
         };
-        let waited = supervise(&mut command, deadline, false, &interrupts, || {}).expect("a call");
-        assert!(matches!(waited, Waited::Interrupted(_, 2)), "{waited:?}");
-        std::thread::sleep(Duration::from_millis(500));
-        assert!(!started.exists(), "the command was started");
+        let waited = supervise(&mut command, deadline, false, &interrupts, || {});
+        assert!(
+            matches!(waited, Ok(Waited::Interrupted(_, 2))),
+            "the command was started, or the signal was not found: {waited:?}"
+        );
     }
 
     /// KR-REQ-29.01, the part about reproducible commands: the report finds a host that cannot wait
