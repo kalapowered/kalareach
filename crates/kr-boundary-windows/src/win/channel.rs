@@ -20,6 +20,8 @@
 use std::os::windows::io::AsRawHandle;
 use std::ptr::{null, null_mut};
 use std::sync::Arc;
+#[cfg(feature = "testing")]
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -52,6 +54,41 @@ use super::sd::{Principals, SdKind, descriptor};
 /// How long a cancelled connect is given to end before the wait stops asking for it.
 const CANCEL_GRACE: Duration = Duration::from_secs(2);
 
+/// Seams for the test build. They act on the calling thread only, so that cases that run side by
+/// side in one program do not meet each other's.
+#[cfg(feature = "testing")]
+pub mod testing {
+    use std::cell::Cell;
+
+    thread_local! {
+        static REFUSE_CANCEL: Cell<bool> = const { Cell::new(false) };
+        static FAIL_START_IN: Cell<u32> = const { Cell::new(0) };
+    }
+
+    /// Makes the waits that this thread runs skip the call that ends a blocked connect, as when the
+    /// system does not answer it: a waiter that does not end is then left behind after its grace.
+    pub fn refuse_cancel(on: bool) {
+        REFUSE_CANCEL.with(|cell| cell.set(on));
+    }
+
+    /// Makes the start of the `starts`-th next waiter on this thread fail (1 is the next).
+    pub fn fail_start_in(starts: u32) {
+        FAIL_START_IN.with(|cell| cell.set(starts));
+    }
+
+    pub(super) fn cancel_refused() -> bool {
+        REFUSE_CANCEL.with(Cell::get)
+    }
+
+    pub(super) fn start_fails() -> bool {
+        FAIL_START_IN.with(|cell| {
+            let left = cell.get();
+            cell.set(left.saturating_sub(1));
+            left == 1
+        })
+    }
+}
+
 /// The two server ends of an invocation's data pipes and their names.
 #[derive(Debug)]
 pub struct DataPipes {
@@ -60,6 +97,9 @@ pub struct DataPipes {
     /// The names the client opens.
     pub names: PipeNames,
     client_pid: u32,
+    /// How many threads that wait on these pipes have started and not yet ended.
+    #[cfg(feature = "testing")]
+    live: std::sync::Arc<AtomicUsize>,
 }
 
 /// How the wait for the client's connections ended.
@@ -140,6 +180,8 @@ pub fn make_data_pipes(client: &ClientIdentity) -> Result<DataPipes> {
         stderr_server,
         names,
         client_pid: client.pid,
+        #[cfg(feature = "testing")]
+        live: Arc::new(AtomicUsize::new(0)),
     })
 }
 
@@ -212,20 +254,46 @@ struct Waiter {
     cancelled: Arc<AtomicBool>,
 }
 
+/// Counts a waiting thread while it runs: the count of the pipes it waits on.
+#[cfg(feature = "testing")]
+struct Counted(std::sync::Arc<AtomicUsize>);
+
+#[cfg(feature = "testing")]
+impl Drop for Counted {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 impl Waiter {
-    fn start(pipe: &Handle, expected: u32) -> Result<Waiter> {
+    fn start(
+        pipe: &Handle,
+        expected: u32,
+        #[cfg(feature = "testing")] live: &std::sync::Arc<AtomicUsize>,
+    ) -> Result<Waiter> {
+        #[cfg(feature = "testing")]
+        if testing::start_fails() {
+            return Err(ffi::error(0, "a waiter's start failed, as a case asked"));
+        }
         // SAFETY: an event with no name, set by hand.
         let event = unsafe { CreateEventW(null(), 1, 0, null()) };
         // text: channel_waiter-1
         let done = Handle::new(event, "making an event for a data pipe's wait")?;
         let cancelled = Arc::new(AtomicBool::new(false));
         let (pipe, event, flag) = (pipe.raw() as usize, done.raw() as usize, cancelled.clone());
+        #[cfg(feature = "testing")]
+        let counted = {
+            live.fetch_add(1, Ordering::SeqCst);
+            Counted(live.clone())
+        };
         let thread = std::thread::spawn(move || {
             let result = connect_the_client(pipe, expected, &flag);
             // SAFETY: the event is open until the waiter has joined this thread.
             unsafe {
                 SetEvent(event as HANDLE);
             }
+            #[cfg(feature = "testing")]
+            drop(counted);
             result
         });
         Ok(Waiter {
@@ -244,10 +312,17 @@ impl Waiter {
         let until = Instant::now() + CANCEL_GRACE;
         let handle = thread.as_raw_handle();
         while !thread.is_finished() && Instant::now() < until {
-            // SAFETY: the handle is the thread's own, valid until the join below. A call that finds
-            // no blocking call to cancel (the thread is between two) fails, and the loop asks again.
-            unsafe {
-                CancelSynchronousIo(handle as HANDLE);
+            #[cfg(feature = "testing")]
+            let asked = !testing::cancel_refused();
+            #[cfg(not(feature = "testing"))]
+            let asked = true;
+            if asked {
+                // SAFETY: the handle is the thread's own, valid until the join below. A call that
+                // finds no blocking call to cancel (the thread is between two) fails, and the loop
+                // asks again.
+                unsafe {
+                    CancelSynchronousIo(handle as HANDLE);
+                }
             }
             // text: channel_cancel-1
             let _ = ffi::wait(
@@ -283,8 +358,18 @@ impl DataPipes {
     /// Returns the platform's error when a wait or a connect fails.
     pub fn wait_connected(&self, bound: Duration, stop: &Stop) -> Result<Outcome> {
         let mut waiters = [
-            Waiter::start(&self.stdout_server, self.client_pid)?,
-            Waiter::start(&self.stderr_server, self.client_pid)?,
+            Waiter::start(
+                &self.stdout_server,
+                self.client_pid,
+                #[cfg(feature = "testing")]
+                &self.live,
+            )?,
+            Waiter::start(
+                &self.stderr_server,
+                self.client_pid,
+                #[cfg(feature = "testing")]
+                &self.live,
+            )?,
         ];
         let until = Instant::now() + bound;
         let mut pending = vec![0_usize, 1];
@@ -314,6 +399,14 @@ impl DataPipes {
             waiter.cancel();
         }
         outcome
+    }
+
+    /// The count of threads that wait on these pipes and are still running, which outlives the
+    /// pipes themselves.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn live_waiters(&self) -> std::sync::Arc<AtomicUsize> {
+        self.live.clone()
     }
 
     /// Gives the two server ends to the launcher as the child's standard output and standard error.
