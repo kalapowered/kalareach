@@ -57,6 +57,8 @@ The five hook events are the ones whose exit codes refuse nothing: the action ha
 or the code is ignored. A hook here observes because the forwarder never answers anything but `{}`,
 and on these five events even a wrong exit code could not block anything.
 
+`Stop` is not one of them. Claude Code reads exit code 2 from a `Stop` hook as a request to go on with the turn instead of ending it, so a package that registers `Stop` keeps the forwarder's exit code 0 with `{}` for it, as for the five.
+
 ## The command line
 
 `kr-hook` accepts the invocations a registration names for each of the three applications it knows
@@ -283,6 +285,7 @@ still run; the report is then applied late, or, if the hook has already gone, no
 | `PostToolUse` | `tool_finished`, with the tool's name | Records it; for the contact skill's `ask_user`, also records which thread ran the request |
 | `PostToolUseFailure` | `tool_failed`, with the tool's name | Records it |
 | `Notification` | `notification`, with its kind and text | Records it |
+| `Stop` | `turn_ended`, with no detail | Counts as a turn's end only when the host can vouch for it, as the host guide says; no released package registers `Stop` yet |
 
 The thread is Claude Code's `session_id`. `/clear` and an interactive `/resume` end one session and
 start another; compaction starts the same one again, which changes nothing.

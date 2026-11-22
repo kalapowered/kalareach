@@ -44,6 +44,8 @@ only when the hook exits 0. The forwarder exits 0 with exactly `{}`, an object t
 A forwarder that refuses its command line exits 64, and one Qoder CLI cannot find never starts;
 Qoder CLI logs either and changes nothing else.
 
+`Stop` is not one of the five. Qoder CLI reads exit code 2 from a `Stop` hook as a request to go on with the turn instead of ending it, so a package that registers `Stop` keeps the forwarder's exit code 0 with `{}` for it.
+
 ## What each event reports
 
 | Event | Observation | What the worker does with it |
@@ -53,6 +55,7 @@ Qoder CLI logs either and changes nothing else.
 | `PostToolUse` | `tool_finished`, with the tool's name | Records it; for the contact skill's `ask_user`, also records which thread ran the request |
 | `PostToolUseFailure` | `tool_failed`, with the tool's name | Records it |
 | `Notification` | `notification`, with its kind and text | Records it |
+| `Stop` | `turn_ended`, with no detail | Counts as a turn's end only when the host can vouch for it, as the host guide says; no released package registers `Stop` yet |
 
 The thread is Qoder CLI's `session_id`. A session starting at startup, on a resume, after `/clear`
 or as a new session selects its thread. Qoder CLI names an MCP tool `mcp__<server>__<tool>`, as

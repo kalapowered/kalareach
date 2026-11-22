@@ -89,7 +89,8 @@ pub enum HookReport {
     Notification,
     /// The agent finished a turn it ran. It has no detail. A later hook of the person's own may
     /// still block the end and let the agent go on, so a thread's later end is a later turn end,
-    /// not a repeat.
+    /// not a repeat. An interrupted turn and a turn that ended in an error are not ends of this
+    /// kind: map no such event to it.
     TurnEnded,
 }
 
