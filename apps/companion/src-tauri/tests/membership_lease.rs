@@ -3691,3 +3691,60 @@ async fn the_status_of_a_transfer_is_read_only_for_a_record_of_the_signed_in_acc
         "the host was not asked for either refusal"
     );
 }
+
+/// KR-REQ-23.41: on a member host a file is added to a draft only from a transfer that a record of the
+/// signed-in account holds: a handle whose transfer no such record names is refused in the words for
+/// an upload the application no longer holds, before any call to the host.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_bind_of_a_transfer_no_record_of_the_account_holds_is_refused_and_the_host_sees_no_bind()
+{
+    let rig = Rig::start_with(SERVED, 1).await;
+    rig.connection(true).await;
+    let companion = rig.companion();
+    let state = companion.app.state::<companion_tauri::AppState>();
+    let ada = state
+        .account_of(true)
+        .await
+        .expect("an account is signed in")
+        .expect("a mark")
+        .to_hex();
+    let session = rig.session().to_string();
+    let subject: companion_tauri::target::Subject =
+        serde_json::from_value(json!({ "sessionId": session, "sessionEpoch": "1" }))
+            .expect("a subject");
+    let contribution = serde_json::to_value(kr_protocol::transfer::AttachmentContribution {
+        operation_id: "attach".to_owned(),
+        accepted_media_types: vec!["application/octet-stream".to_owned()],
+        max_byte_len: kr_protocol::scalars::U64::new(1 << 20),
+        max_count: kr_protocol::scalars::U64::new(4),
+        insertion_method: kr_protocol::transfer::InsertionMethod::ManualTerminalWorkflow,
+        external_destination: Nullable::null(),
+        model_media_capability: false,
+    })
+    .expect("encodes");
+    let refused = companion_tauri::commands::draft_add_attachment(
+        companion.app.state::<companion_tauri::AppState>(),
+        subject,
+        json!({
+            "session_id": session,
+            "text": "see the file",
+            "transfer_id": kr_ipc::new_uuid().to_string(),
+            "contribution": contribution,
+        }),
+        Some(ada),
+    )
+    .await;
+    assert!(
+        refused
+            .as_ref()
+            .err()
+            .is_some_and(|said| said.message == companion_tauri::open_transfers::NO_OPEN_UPLOAD),
+        "the bind is refused as an upload the application no longer holds: {:?}",
+        refused.map(|_| ())
+    );
+    assert_eq!(
+        rig.control.sent(Method::AgentDraftAddAttachment),
+        0,
+        "the host saw no bind"
+    );
+}
