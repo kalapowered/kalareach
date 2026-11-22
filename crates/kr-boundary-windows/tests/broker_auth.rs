@@ -15,9 +15,10 @@ mod common;
 use std::ffi::c_void;
 use std::ptr::{null, null_mut};
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_ACCESS_DENIED, GENERIC_READ, GENERIC_WRITE, GetLastError, HANDLE,
@@ -1141,6 +1142,79 @@ fn broker_auth_a_wrong_connecting_client_is_disconnected_and_the_instance_stays(
     let (outcome, _pipes) = waiter.join().unwrap();
     assert_eq!(outcome, Outcome::Connected);
     drop((out, err));
+}
+
+#[test]
+#[ignore = "runs as the system in a disposable guest"]
+fn broker_auth_a_wait_that_fails_to_start_its_second_waiter_cancels_the_first() {
+    if !runs_as_the_system() {
+        eprintln!("skipped: needs the system's token");
+        return;
+    }
+    prepare();
+    let person = Person::new();
+    let pipes = make_data_pipes(&stand_in_client(&person.sid)).unwrap();
+    let stop = Stop::new().unwrap();
+    kr_boundary_windows::win::channel::testing::fail_start_in(2);
+    let outcome = pipes.wait_connected(Duration::from_secs(60), &stop);
+    assert!(outcome.is_err(), "the second waiter did not start");
+    assert_eq!(
+        pipes.live_waiters().load(Ordering::SeqCst),
+        0,
+        "the first waiter is cancelled when the setup fails"
+    );
+}
+
+#[test]
+#[ignore = "runs as the system in a disposable guest"]
+fn broker_auth_a_waiter_that_outlives_its_wait_keeps_the_handles_it_uses() {
+    if !runs_as_the_system() {
+        eprintln!("skipped: needs the system's token");
+        return;
+    }
+    prepare();
+    let person = Person::new();
+    let pipes = make_data_pipes(&stand_in_client(&person.sid)).unwrap();
+    let (out_name, err_name) = (pipes.names.stdout.clone(), pipes.names.stderr.clone());
+    let stop = Stop::new().unwrap();
+    // The cancel of the blocked connects is refused, so both threads are left behind after their
+    // grace, as when the system does not answer a cancel.
+    kr_boundary_windows::win::channel::testing::refuse_cancel(true);
+    let outcome = pipes
+        .wait_connected(Duration::from_millis(300), &stop)
+        .unwrap();
+    kr_boundary_windows::win::channel::testing::refuse_cancel(false);
+    assert_eq!(outcome, Outcome::TimedOut);
+    let live = pipes.live_waiters();
+    assert_eq!(
+        live.load(Ordering::SeqCst),
+        2,
+        "both threads are still blocked"
+    );
+    // The owner closes its ends. The threads hold their own: the closing neither waits for them nor
+    // takes the pipes from them.
+    let (closed, closing) = mpsc::channel();
+    let closer = std::thread::spawn(move || {
+        drop(pipes);
+        closed.send(()).unwrap();
+    });
+    assert!(
+        closing.recv_timeout(Duration::from_secs(15)).is_ok(),
+        "the owner's close did not return while the threads waited"
+    );
+    closer.join().unwrap();
+    // The names are still the broker's, held by the threads: the right client connects, and the
+    // threads end by themselves.
+    let out = open_pipe(&out_name, GENERIC_READ, SECURITY_ANONYMOUS)
+        .expect("the pipe stays while a thread waits on it");
+    let err = open_pipe(&err_name, GENERIC_READ, SECURITY_ANONYMOUS)
+        .expect("the pipe stays while a thread waits on it");
+    drop((out, err));
+    let until = Instant::now() + Duration::from_secs(30);
+    while live.load(Ordering::SeqCst) != 0 {
+        assert!(Instant::now() < until, "the threads did not end");
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 #[test]
