@@ -3356,6 +3356,72 @@ async fn kr_req_13_12_a_fresh_decision_leaves_a_sender_that_a_later_reach_starte
     adopted.stop().await;
 }
 
+/// KR-REQ-13.12 (Z1): a queued decision leaves a sender that started and paused since. A sender
+/// fails and its decision hands the key over; the fresh decision waits for the key's turn. Meanwhile
+/// a reach starts the paused key on a newer connection and that sender fails and pauses too. The
+/// decision queued before is owed no more: it would start the key again on the connection that has
+/// just failed it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_13_12_a_queued_decision_leaves_a_sender_that_started_and_paused_since() {
+    use testing::Point;
+
+    let adopted = Adopted::start(1).await;
+    let (phone, control) = phone_for(&adopted).await;
+    let companion = &phone.companion;
+    let desk = desk_of(companion);
+    let bytes = pattern(5);
+    let (content, gate, _release) = gated(&bytes);
+    let key = kr_ipc::new_uuid();
+    let settled = testing::hold_at(key, Point::SenderSettled);
+    let paired = paired_of(companion).await;
+    let session = Arc::clone(&paired.session);
+    let sending = {
+        let sent = request(&adopted, &bytes, content, key);
+        let (desk, paired) = (Arc::clone(&desk), paired.clone());
+        tokio::spawn(async move { desk.send(paired, sent).await })
+    };
+    gate.reached().await;
+    // A reach of the upload's account skips the sending upload and marks it; then a connection of
+    // another account becomes the newest.
+    desk.host_reached(Paired {
+        link: paired.link + 1_000,
+        ..paired.clone()
+    });
+    desk.host_reached(Paired {
+        account: Some(kr_client::services::AccountMark::from_bytes([7; 32])),
+        link: paired.link + 2_000,
+        ..paired.clone()
+    });
+    control.hold();
+    session.transport().close();
+    // The key's turn is held, so that the fresh decision the sender's decision hands over waits.
+    let turn = desk.hold_turn_for_test(key).await;
+    gate.release();
+    settled.until_passed(1).await;
+    // A newer reach of the account starts the paused upload; its sender fails on the closed session
+    // and pauses it again. The sender's own note says it is over.
+    let started = testing::hold_at(key, Point::SenderStarting);
+    desk.host_reached(Paired {
+        link: paired.link + 4_000,
+        ..paired.clone()
+    });
+    started.until_passed(1).await;
+    started.release();
+    settled.until_passed(2).await;
+    let generation = desk.generation_for_test(key);
+    drop(turn);
+    // The queued decision takes the turn: it is a task of the desk's own, which `idle` waits for.
+    desk.idle().await;
+    assert_eq!(
+        desk.generation_for_test(key),
+        generation,
+        "the queued decision neither stopped nor started a sender"
+    );
+    assert_eq!(desk.phase_for_test(key), Some("paused"));
+    sending.abort();
+    adopted.stop().await;
+}
+
 /// KR-REQ-13.12 (X1): `forgotten` stops a sender that a restart started after its first look, before
 /// its second loop removes the entry. The restart's `act_on` holds the key's turn and is held before
 /// it starts the upload; `forgotten` takes its snapshot and waits for the turn; then the sender starts,

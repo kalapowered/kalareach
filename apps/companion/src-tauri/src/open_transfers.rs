@@ -907,8 +907,30 @@ enum Job {
         session: Arc<Session>,
         link: u64,
     },
-    /// Nothing but the attempt and the decision that every barrier ends with.
-    Decide,
+    /// Nothing but the attempt and the decision that every barrier ends with, queued for the
+    /// upload `live` when its generation was `generation`: it is owed only while that upload is
+    /// still the one held for the key and no stop or start has moved its generation since.
+    Decide { live: Arc<Live>, generation: u64 },
+}
+
+impl Job {
+    /// Whether the barrier's work is still owed. It is read under the gate, in the section that
+    /// stops the key, before the sender is touched: a barrier whose precondition has gone does
+    /// nothing, and answers `Skipped`.
+    ///
+    /// A queued decision is owed to the upload and the generation it was queued for. A generation
+    /// that moved means a stop or a start took place since, and the sender or barrier that did
+    /// ends in a decision of its own, on a fresh read of the connections and the marks. Every other
+    /// job is owed whenever it is asked for.
+    fn owed(&self, held: Option<&Arc<Live>>) -> bool {
+        match self {
+            Self::Decide { live, generation } => {
+                held.is_some_and(|held| Arc::ptr_eq(held, live))
+                    && live.generation.load(Ordering::Acquire) == *generation
+            }
+            Self::Cancel { .. } | Self::Finish { .. } | Self::Forget | Self::Free { .. } => true,
+        }
+    }
 }
 
 /// What a barrier answers.
@@ -1986,6 +2008,9 @@ impl Desk {
         let (held, handle) = {
             let registry = locked(&self.registry);
             let held = registry.held.get(&key).cloned();
+            if !job.owed(held.as_ref()) {
+                return Answered::Skipped;
+            }
             if skip
                 && held.as_ref().is_some_and(|live| {
                     matches!(*locked(&live.phase), Phase::Sending | Phase::Admitted)
@@ -2050,7 +2075,7 @@ impl Desk {
                 session,
                 link,
             } => self.free_work(stopped, &wanting, &session, link).await,
-            Job::Decide => Ok(Self::asked(key, None)),
+            Job::Decide { .. } => Ok(Self::asked(key, None)),
         }
     }
 
@@ -2387,20 +2412,30 @@ impl Desk {
             usable => {
                 if seen > looked || (owed && usable.is_some()) {
                     let link = usable.map_or(0, |newest| newest.link);
-                    self.hand_over(live.key, used, looked.max(seen).max(link));
+                    self.hand_over(
+                        live,
+                        live.generation.load(Ordering::Acquire),
+                        used,
+                        looked.max(seen).max(link),
+                    );
                 }
             }
         }
     }
 
-    /// Gives the key to a fresh decision: a task of the desk's own that takes the key's turn after
-    /// the holder lets it go, leaves a sending upload alone, and carries what the decision before it
-    /// read.
-    fn hand_over(self: &Arc<Self>, key: Uuid, used: u64, looked: u64) {
+    /// Gives the upload `live` to a fresh decision: a task of the desk's own that takes the key's
+    /// turn after the holder lets it go, does nothing once `live` is not the held upload or its
+    /// generation is no longer `generation`, leaves a sending upload alone, and carries what the
+    /// decision before it read.
+    fn hand_over(self: &Arc<Self>, live: &Arc<Live>, generation: u64, used: u64, looked: u64) {
         let desk = Arc::clone(self);
+        let key = live.key;
+        let job = Job::Decide {
+            live: Arc::clone(live),
+            generation,
+        };
         self.work.spawn(async move {
-            desk.barrier_task(key, true, Job::Decide, used, looked)
-                .await;
+            desk.barrier_task(key, true, job, used, looked).await;
         });
     }
 
@@ -3185,6 +3220,38 @@ mod tests {
             *locked(&live.phase),
             Phase::Stopping,
             "an upload the desk no longer holds is left as it is"
+        );
+    }
+
+    /// KR-REQ-13.12 (U1): a queued decision is owed only to the upload and the generation it was
+    /// queued for: the same upload at the same generation is owed, the same upload after a stop or a
+    /// start is not, and another upload held under the key is not, even with the same number.
+    #[test]
+    fn a_queued_decision_is_owed_only_to_the_upload_and_the_generation_it_was_queued_for() {
+        let (_dir, _desk, live, _store) = held(None, Reached::Beginning);
+        let queued = Job::Decide {
+            live: Arc::clone(&live),
+            generation: live.generation.load(Ordering::Acquire),
+        };
+        assert!(
+            queued.owed(Some(&live)),
+            "the upload it was queued for, at the generation it was queued at"
+        );
+        assert!(!queued.owed(None), "no upload is held");
+        // Another upload under the same key, made with the same generation number.
+        let other = Live::new(live.file(), Arc::new(Held::new(vec![1; 4])), true);
+        assert_eq!(
+            other.generation.load(Ordering::Acquire),
+            live.generation.load(Ordering::Acquire)
+        );
+        assert!(
+            !queued.owed(Some(&other)),
+            "another upload held under the key"
+        );
+        live.generation.fetch_add(1, Ordering::AcqRel);
+        assert!(
+            !queued.owed(Some(&live)),
+            "the same upload after the generation moved"
         );
     }
 
