@@ -40,10 +40,10 @@ use windows_sys::Win32::Storage::FileSystem::{
     ReadFile, SECURITY_ANONYMOUS, SECURITY_SQOS_PRESENT, SYNCHRONIZE, WriteFile,
 };
 use windows_sys::Win32::System::Threading::{
-    CREATE_SUSPENDED, CreateProcessAsUserW, CreateProcessW, DETACHED_PROCESS,
-    EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess, GetExitCodeProcess, GetProcessHandleCount,
-    GetProcessTimes, InitializeProcThreadAttributeList, OpenProcess, OpenProcessToken,
-    PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, PROCESS_INFORMATION,
+    CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessAsUserW, CreateProcessW,
+    DETACHED_PROCESS, EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess, GetExitCodeProcess,
+    GetProcessHandleCount, GetProcessTimes, InitializeProcThreadAttributeList, OpenProcess,
+    OpenProcessToken, PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, PROCESS_INFORMATION,
     PROCESS_QUERY_LIMITED_INFORMATION, STARTUPINFOEXW, STARTUPINFOW, TerminateProcess,
     UpdateProcThreadAttribute,
 };
@@ -216,10 +216,30 @@ fn path_of_this_program() -> Vec<u16> {
     ))
 }
 
+/// The environment a child of a case gets: this program's own, and the variable that names what the
+/// child does. The program itself keeps no variable of the case.
+fn environment_for(mode: &str) -> Vec<u16> {
+    use std::os::windows::ffi::OsStrExt as _;
+    let mut variables: Vec<(std::ffi::OsString, std::ffi::OsString)> =
+        std::env::vars_os().collect();
+    variables.retain(|(name, _)| name != "KR_AUTH_CHILD");
+    variables.push(("KR_AUTH_CHILD".into(), mode.into()));
+    // The block is sorted by the names as the system compares them, and ends with a second NUL.
+    variables.sort_by_key(|(name, _)| name.to_string_lossy().to_uppercase());
+    let mut block: Vec<u16> = Vec::new();
+    for (name, value) in variables {
+        block.extend(name.encode_wide());
+        block.push(u16::from(b'='));
+        block.extend(value.encode_wide());
+        block.push(0);
+    }
+    block.push(0);
+    block
+}
+
 /// A child of this program that runs as the token's account and acts for `mode`.
 fn spawn_as(primary: &Handle, mode: &str) -> PROCESS_INFORMATION {
-    // SAFETY: the variable is set before any thread of the case starts.
-    unsafe { std::env::set_var("KR_AUTH_CHILD", mode) };
+    let environment = environment_for(mode);
     let mut line = path_of_this_program();
     // SAFETY: a zeroed record is a valid start.
     let mut startup: STARTUPINFOW = unsafe { std::mem::zeroed() };
@@ -236,8 +256,8 @@ fn spawn_as(primary: &Handle, mode: &str) -> PROCESS_INFORMATION {
             null(),
             null(),
             0,
-            DETACHED_PROCESS,
-            null(),
+            DETACHED_PROCESS | CREATE_UNICODE_ENVIRONMENT,
+            environment.as_ptr().cast(),
             null(),
             &raw const startup,
             &raw mut info,
@@ -1118,13 +1138,10 @@ fn broker_auth_a_wrong_connecting_client_is_disconnected_and_the_instance_stays(
         (outcome, pipes)
     });
     // Another process opens the pipe; the broker disconnects it and the instance stays.
-    // SAFETY: the variables are set before the child starts and read by the child alone.
-    unsafe {
-        std::env::set_var("KR_AUTH_CHILD", "wrong_client");
-        std::env::set_var("KR_AUTH_PIPE", &out_name);
-    }
     let status = std::process::Command::new(std::env::current_exe().unwrap())
         .args(["--ignored", "--exact", "zz_the_child", "--nocapture"])
+        .env("KR_AUTH_CHILD", "wrong_client")
+        .env("KR_AUTH_PIPE", &out_name)
         .status()
         .unwrap();
     assert!(
