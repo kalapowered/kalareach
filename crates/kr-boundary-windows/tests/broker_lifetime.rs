@@ -9,6 +9,7 @@
 #![cfg(all(windows, feature = "testing"))]
 #![allow(unsafe_code)]
 
+use std::os::windows::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 use std::ptr::{null, null_mut};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -1275,7 +1276,9 @@ fn note(dir: &Path, file: &str, text: &str) {
 
 /// The broker the crash cases start: it runs one invocation on the fixture, and at the named point
 /// it ends its own process, as a crash does. With `KR_LIFE_HOLD` it first gives the invocation's
-/// token to the process that started it, so that a handle outlives the crash.
+/// token to the process that started it, so that a handle outlives the crash. With
+/// `KR_LIFE_HOLD_ROOT` it keeps a file of the private root open without sharing from the moment the
+/// root is made, so that the removal of the root cannot delete it.
 #[test]
 #[ignore = "started by the crash cases as the broker that they crash"]
 fn the_broker_that_the_crash_cases_crash() {
@@ -1287,6 +1290,7 @@ fn the_broker_that_the_crash_cases_crash() {
     let parent: u32 = std::env::var("KR_LIFE_PARENT").unwrap().parse().unwrap();
     let hold = std::env::var("KR_LIFE_HOLD").is_ok();
     let reading = std::env::var("KR_LIFE_READER").is_ok();
+    let hold_root = std::env::var("KR_LIFE_HOLD_ROOT").is_ok();
     prepare();
     let marker = dir.join("marks").join("child-running.txt");
     let running = marker.display().to_string();
@@ -1306,9 +1310,25 @@ fn the_broker_that_the_crash_cases_crash() {
     let reached = Arc::new(AtomicU32::new(0));
     let hook_dir = dir.clone();
     let hook_marker = marker.clone();
+    let held_file: Arc<Mutex<Option<std::fs::File>>> = Arc::new(Mutex::new(None));
     hooks::set_hook(Some(Arc::new(move |name| {
         if hooks::session() != 0 {
             note(&hook_dir, "session.txt", &hooks::session().to_string());
+        }
+        if hold_root && name == "after RootMade" {
+            let root = std::fs::read_dir(hook_dir.join("run"))
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap()
+                .path();
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .share_mode(0)
+                .open(root.join("held.lock"))
+                .unwrap();
+            *held_file.lock().unwrap() = Some(file);
         }
         if name != point {
             return;
@@ -1351,7 +1371,7 @@ fn the_broker_that_the_crash_cases_crash() {
 }
 
 /// Starts the broker child that crashes at `point` and returns its exit code.
-fn crash_child(setting: &Setting, point: &str, hold: bool, reading: bool) -> i32 {
+fn crash_child(setting: &Setting, point: &str, hold: bool, reading: bool, root_file: bool) -> i32 {
     let me = std::env::current_exe().unwrap();
     let mut command = std::process::Command::new(me);
     command
@@ -1372,6 +1392,9 @@ fn crash_child(setting: &Setting, point: &str, hold: bool, reading: bool) -> i32
     }
     if reading {
         command.env("KR_LIFE_READER", "1");
+    }
+    if root_file {
+        command.env("KR_LIFE_HOLD_ROOT", "1");
     }
     let mut child = command.spawn().unwrap();
     let until = Instant::now() + Duration::from_secs(180);
@@ -1445,7 +1468,7 @@ fn a_broker_that_crashes_at_each_point_is_finished_by_the_restart_with_its_sessi
     let mut failures = Vec::new();
     for point in POINTS {
         clear_run(&setting);
-        let code = crash_child(&setting, point, false, false);
+        let code = crash_child(&setting, point, false, false, false);
         if code != 99 {
             failures.push(format!(
                 "{point}: the broker ended with {code}, not by the crash"
@@ -1498,7 +1521,7 @@ fn a_crash_with_a_handle_held_on_purpose_keeps_the_grants_and_the_slot_until_the
     }
     let setting = Setting::new();
     clear_run(&setting);
-    assert_eq!(crash_child(&setting, "waiting", true, false), 99);
+    assert_eq!(crash_child(&setting, "waiting", true, false, false), 99);
     let luid: u64 = std::fs::read_to_string(setting.scratch.path("session.txt"))
         .unwrap()
         .trim()
@@ -1810,7 +1833,10 @@ fn a_crash_while_a_reader_child_runs_is_finished_by_the_restart_with_its_session
     }
     let setting = Setting::new();
     clear_run(&setting);
-    assert_eq!(crash_child(&setting, "reader resumed", false, true), 99);
+    assert_eq!(
+        crash_child(&setting, "reader resumed", false, true, false),
+        99
+    );
     let luid: u64 = std::fs::read_to_string(setting.scratch.path("session.txt"))
         .unwrap()
         .trim()
@@ -1853,4 +1879,75 @@ fn a_crash_while_a_reader_child_runs_is_finished_by_the_restart_with_its_session
         "{names:?}"
     );
     assert!(broker.releases() == 1 && !broker.trees.locked());
+}
+
+#[test]
+#[ignore = "runs as the system in a disposable guest"]
+fn a_crash_after_a_root_leftover_is_finished_by_the_restart_when_the_root_can_now_be_removed() {
+    if !runs_as_the_system() {
+        eprintln!("skipped: needs the system's token");
+        return;
+    }
+    let setting = Setting::new();
+    clear_run(&setting);
+    // The broker holds a file of the private root open, so the removal leaves it; the broker is cut
+    // off after the first leftover row of the root and before any row that ends the invocation.
+    assert_eq!(
+        crash_child(&setting, "after Leftover", false, false, true),
+        99
+    );
+    let luid: u64 = std::fs::read_to_string(setting.scratch.path("session.txt"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    absent_session(luid);
+    let broker = Life::open(
+        &setting.scratch.dir,
+        &setting.account,
+        &["sleep", "60000"],
+        1,
+        |_| {},
+    );
+    let before = broker.rows();
+    assert!(
+        matches!(
+            before.last(),
+            Some(Row::Leftover {
+                class: kr_boundary_windows::journal::rows::LeftoverClass::Root,
+                ..
+            })
+        ),
+        "{:?}",
+        kinds(&before)
+    );
+    // The process that held the file is gone: the removal now succeeds.
+    let recovery = recover(&broker.env).unwrap();
+    assert!(
+        matches!(recovery.invocations.as_slice(), [Recovered::Ended(_)]),
+        "{:?}",
+        recovery.invocations
+    );
+    let rows = broker.rows();
+    assert!(
+        matches!(rows.last(), Some(Row::End { root_leftovers: 0 })),
+        "{:?}",
+        kinds(&rows)
+    );
+    assert!(
+        rows.iter().any(|row| matches!(row, Row::RootRemoved))
+            && rows
+                .iter()
+                .any(|row| matches!(row, Row::LeftoverCleared { .. })),
+        "{:?}",
+        kinds(&rows)
+    );
+    assert!(broker.releases() == 1 && !broker.trees.locked());
+    assert_eq!(
+        std::fs::read_dir(setting.scratch.path("run"))
+            .unwrap()
+            .count(),
+        0,
+        "the private root is gone"
+    );
 }

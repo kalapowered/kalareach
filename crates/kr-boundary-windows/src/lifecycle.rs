@@ -212,6 +212,9 @@ pub struct Closing {
     pub repository: Option<(Row, Left)>,
     /// Objects of the private root that the removal could not delete.
     pub root: Vec<Left>,
+    /// The objects of the private root that the journal already holds as open leftovers, from an
+    /// earlier end that did not finish.
+    pub root_recorded: Vec<String>,
 }
 
 /// The rows that close an invocation after a proved end, in the one order: what is unresolved is

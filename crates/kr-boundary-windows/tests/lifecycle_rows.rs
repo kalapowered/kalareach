@@ -50,8 +50,14 @@ fn snapshot(id: u32, kind: SnapshotKind) -> Row {
 /// An invocation whose process ended and whose private root was removed, as the ending function
 /// leaves it just before it closes the journal.
 fn ended_invocation() -> Tracker {
+    ended_with_root_leftovers(&[])
+}
+
+/// The same, after an earlier end that left these objects of the private root open and did not
+/// finish: the removal of the root has since succeeded, and the closing rows are still to come.
+fn ended_with_root_leftovers(open: &[&str]) -> Tracker {
     let mut tracker = Tracker::new();
-    let rows = [
+    let mut rows = vec![
         Row::Begin {
             invocation: ID.to_owned(),
             boot_marker: BOOT.to_owned(),
@@ -77,8 +83,16 @@ fn ended_invocation() -> Tracker {
             creation_time: 34,
         },
         Row::JobEnded,
-        Row::RootRemoved,
     ];
+    for object in open {
+        rows.push(Row::Leftover {
+            object: (*object).to_owned(),
+            reason: "a case's reason".to_owned(),
+            class: LeftoverClass::Root,
+            snapshot: None,
+        });
+    }
+    rows.push(Row::RootRemoved);
     for row in rows {
         tracker
             .apply(&row)
@@ -93,6 +107,7 @@ fn closing() -> Closing {
         tree: Vec::new(),
         repository: None,
         root: Vec::new(),
+        root_recorded: Vec::new(),
     }
 }
 
@@ -230,6 +245,80 @@ fn a_leftover_of_the_private_root_comes_before_the_end_and_frees_the_slot() {
     assert!(!tracker.holds_the_slot());
     assert_eq!(tracker.leftovers().len(), 1);
     assert_eq!(cleanup_of(&closing), Cleanup::Clean);
+}
+
+#[test]
+fn a_root_leftover_that_an_earlier_end_left_open_is_cleared_when_the_removal_no_longer_finds_it() {
+    // The earlier end crashed after the first leftover row of the private root; the removal now
+    // finds nothing, so the end counts none and the tracker takes it.
+    let closing = Closing {
+        root_recorded: vec![r"run\x\file.lock".to_owned()],
+        ..closing()
+    };
+    let rows = closing_rows(&closing);
+    assert!(
+        rows.iter().any(|row| matches!(
+            row,
+            Row::LeftoverCleared { key } if key == r"run\x\file.lock"
+        )),
+        "{rows:?}"
+    );
+    assert!(
+        rows.iter()
+            .any(|row| matches!(row, Row::End { root_leftovers: 0 })),
+        "{rows:?}"
+    );
+    let mut tracker = ended_with_root_leftovers(&[r"run\x\file.lock"]);
+    apply_all(&mut tracker, &rows);
+    assert_eq!(tracker.standing(), Standing::Finished);
+    assert!(!tracker.holds_the_slot());
+    assert!(tracker.leftovers().is_empty());
+}
+
+#[test]
+fn a_root_leftover_that_the_removal_finds_again_is_not_journalled_twice_and_the_end_counts_it() {
+    let closing = Closing {
+        root: vec![left(r"run\x\file.lock")],
+        root_recorded: vec![r"run\x\file.lock".to_owned()],
+        ..closing()
+    };
+    let rows = closing_rows(&closing);
+    assert!(
+        rows.iter()
+            .all(|row| !matches!(row, Row::Leftover { .. } | Row::LeftoverCleared { .. })),
+        "{rows:?}"
+    );
+    let mut tracker = ended_with_root_leftovers(&[r"run\x\file.lock"]);
+    apply_all(&mut tracker, &rows);
+    assert_eq!(tracker.standing(), Standing::Finished);
+    assert!(!tracker.holds_the_slot());
+    assert_eq!(tracker.leftovers().len(), 1);
+}
+
+#[test]
+fn the_end_counts_the_open_root_leftovers_after_a_clearance_and_a_new_leftover() {
+    // Open from the earlier end: a and b. The removal finds b and c: a is cleared, c is new.
+    let closing = Closing {
+        root: vec![left("b"), left("c")],
+        root_recorded: vec!["a".to_owned(), "b".to_owned()],
+        ..closing()
+    };
+    let rows = closing_rows(&closing);
+    let mut tracker = ended_with_root_leftovers(&["a", "b"]);
+    apply_all(&mut tracker, &rows);
+    assert_eq!(tracker.standing(), Standing::Finished);
+    let mut open: Vec<&str> = tracker
+        .leftovers()
+        .iter()
+        .map(|leftover| leftover.object.as_str())
+        .collect();
+    open.sort_unstable();
+    assert_eq!(open, ["b", "c"]);
+    assert!(
+        rows.iter()
+            .any(|row| matches!(row, Row::End { root_leftovers: 2 })),
+        "{rows:?}"
+    );
 }
 
 #[test]

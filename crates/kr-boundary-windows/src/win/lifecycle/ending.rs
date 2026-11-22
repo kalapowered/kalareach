@@ -90,6 +90,7 @@ pub(super) fn close_out(
         tree: tree_left,
         repository,
         root: root_left,
+        root_recorded: Vec::new(),
     };
     let mut written = true;
     for row in closing_rows(&closing) {
