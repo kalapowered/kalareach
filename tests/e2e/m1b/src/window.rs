@@ -393,6 +393,18 @@ impl Window {
         terminal.rows()
     }
 
+    /// Whether the window's output has ended: its reader has taken every byte the program wrote
+    /// and nothing more will come. The reader ends with `kr`, not with a program that `kr` shows:
+    /// an agent's process that ends leaves the window's output going on, which [`Quiet`] is for.
+    #[must_use]
+    pub fn output_ended(&self) -> bool {
+        self.collected
+            .seen
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .ended
+    }
+
     /// Waits until the screen this window shows carries `needle`, and returns that screen.
     ///
     /// What `kr` writes to its terminal is a screen it paints, not the session's own bytes: a
@@ -480,6 +492,37 @@ impl Drop for Window {
             let _ = self.child.kill();
         }
         let _ = self.child.wait();
+    }
+}
+
+/// How long a window has taken no byte, counted from the moment it is made.
+///
+/// What a program writes reaches a window through the host and `kr`, and the window's reader ends
+/// only with `kr`. So when a program that `kr` shows ends, the window may not have taken all it
+/// wrote, and the program's end is no proof that the screen is final. What a window can show is
+/// that no byte has come for a period since the program's end was seen: a screen read then is the
+/// last the program drew, unless its bytes were held longer than that period on the way.
+#[derive(Clone, Copy, Debug)]
+pub struct Quiet {
+    mark: usize,
+    since: Instant,
+}
+
+impl Quiet {
+    /// Counts from `now`, with the window as far as `mark` bytes.
+    #[must_use]
+    pub const fn new(mark: usize, now: Instant) -> Self {
+        Self { mark, since: now }
+    }
+
+    /// Whether the window has taken no byte for `period` as of `now`, given that it is as far as
+    /// `mark` bytes. A byte taken since the last call starts the count again.
+    pub fn is_quiet(&mut self, mark: usize, now: Instant, period: Duration) -> bool {
+        if mark != self.mark {
+            self.mark = mark;
+            self.since = now;
+        }
+        now.saturating_duration_since(self.since) >= period
     }
 }
 

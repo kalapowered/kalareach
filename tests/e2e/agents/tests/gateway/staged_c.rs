@@ -25,6 +25,7 @@ use kr_e2e_agents::observe::{
 };
 use kr_e2e_agents::stage::{Keyboard, events_snapshot};
 use kr_e2e_m1b::run::running;
+use kr_e2e_m1b::window::Quiet;
 
 /// What the stand-in started by hand says on its first row.
 const BY_HAND: &str = "codex-stand-in: by hand";
@@ -1585,10 +1586,77 @@ fn agent_now(ctx: &Context, session_id: SessionId) -> Option<ProcessStartIdentit
         .unwrap_or_else(|why| panic!("the agent's process was not looked for: {why}"))
 }
 
+/// How long the window must have taken no byte, after the agent's process is seen to end, before the
+/// screen is read: what the agent wrote just before its end can still be on its way to the window.
+const QUIET: Duration = Duration::from_millis(500);
+
+/// Whether the screen can be read as the last the agent drew: while the agent's process runs, the
+/// screen is as far as it has drawn; once it has ended, only when the window has taken no byte for
+/// [`QUIET`] since the end was seen, or its output has ended (nothing more can come).
+const fn last_drawn(agent_ended: bool, window_quiet: bool) -> bool {
+    !agent_ended || window_quiet
+}
+
+/// A refusal printed just before the agent's process ends reaches the window after the end is
+/// seen: the screen is read only once the window has been quiet, and the one read then shows the
+/// refusal, not an end with none of the entry's texts on the screen.
+#[test]
+fn a_refusal_printed_just_before_the_agents_end_is_read_once_the_window_is_quiet() {
+    let screen = |rows: &[&str]| rows.iter().map(|row| (*row).to_owned()).collect::<Vec<_>>();
+    let typed = "codex resume 0123-4567";
+    let composer = "Ask Codex to do anything";
+    let refusals = ["This conversation is open in another app".to_owned()];
+    let before = screen(&["kr-session$ codex resume 0123-4567", "  Resuming session…"]);
+    let after = screen(&[
+        "kr-session$ codex resume 0123-4567",
+        "  This conversation is open in another app",
+    ]);
+    // The end is seen at 0 ms; the card's bytes reach the window at 300 ms, behind the end.
+    let start = Instant::now();
+    let mut quiet = Quiet::new(100, start);
+    let mut read = None;
+    for at in (0..=2000_u64).step_by(50) {
+        let now = start + Duration::from_millis(at);
+        let mark = if at < 300 { 100 } else { 160 };
+        let window_quiet = quiet.is_quiet(mark, now, QUIET);
+        if last_drawn(true, window_quiet) {
+            let rows = if at < 300 { &before } else { &after };
+            read = Some((
+                at,
+                second_screen(rows, typed, composer, &refusals, &[], true),
+            ));
+            break;
+        }
+    }
+    let (at, how) = read.expect("the window goes quiet");
+    assert_eq!(
+        how,
+        Some((
+            Started::Refused,
+            Some("This conversation is open in another app".to_owned())
+        )),
+        "the screen read at {at} ms, after the end, has the card the agent printed before it"
+    );
+    assert!(
+        at >= 300 + 500,
+        "{at} ms: the read waits for {QUIET:?} of no byte"
+    );
+    assert!(
+        last_drawn(false, false),
+        "a screen read while the agent runs is as far as it has drawn"
+    );
+    assert!(
+        !last_drawn(true, false),
+        "a screen read after the end, with bytes still arriving, is not the last"
+    );
+}
+
 /// Waits for the second start of the agent in `at` to end one way or the other, and says how, by
 /// [`second_screen`], with the agent's process where it was seen: the process below the session's
 /// worker that maps the agent's file is looked for until it is seen, and its end is read before
-/// each read of the screen, so that the screen it is judged with is the last the agent drew.
+/// each read of the screen. Once it has ended the screen is read only when the window has taken no
+/// byte for [`QUIET`] since the end was seen, so that the screen it is judged with is the last the
+/// agent drew, unless the agent's bytes are held on the way for longer than that.
 fn second_start(
     ctx: &Context,
     at: &Seated<'_>,
@@ -1598,14 +1666,27 @@ fn second_start(
     draft: &[String],
 ) -> (Started, Option<String>, Option<ProcessStartIdentity>) {
     let mut agent: Option<ProcessStartIdentity> = None;
+    let mut quiet: Option<Quiet> = None;
     let started = Instant::now();
     loop {
         if agent.is_none() {
             agent = agent_now(ctx, at.session_id);
         }
         let ended = agent.as_ref().is_some_and(|identity| !running(identity));
-        let rows = at.person.window.screen();
-        if let Some((how, shown)) = second_screen(&rows, typed, composer, refusals, draft, ended) {
+        let window = &at.person.window;
+        let window_quiet = ended && {
+            let now = Instant::now();
+            let mark = window.mark();
+            quiet
+                .get_or_insert_with(|| Quiet::new(mark, now))
+                .is_quiet(mark, now, QUIET)
+                || window.output_ended()
+        };
+        let rows = window.screen();
+        if last_drawn(ended, window_quiet)
+            && let Some((how, shown)) =
+                second_screen(&rows, typed, composer, refusals, draft, ended)
+        {
             return (how, shown, agent);
         }
         assert!(
