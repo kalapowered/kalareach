@@ -614,6 +614,21 @@ pub fn run(options: &Options, progress: &mut dyn FnMut(&str)) -> Result<Document
     let mut executed = Vec::new();
     let mut budgets = Budgets::default();
     for (index, step) in steps.iter().enumerate() {
+        // A signal that reached the report ends the run: the step it stopped is recorded, and no
+        // step after it starts.
+        if let Some(signal) = crate::tree::interrupted() {
+            let done = run::not_run_for_interrupt(step, signal);
+            progress(&format!(
+                "step {} of {}: {} ({}): {}",
+                index + 1,
+                steps.len(),
+                step.what,
+                step.line(),
+                done.error.as_deref().unwrap_or_default()
+            ));
+            executed.push(done);
+            continue;
+        }
         progress(&format!(
             "step {} of {}: {} ({})",
             index + 1,
@@ -738,6 +753,12 @@ fn failed_set_up(step: &plan::Step, executed: &[Executed]) -> Option<(usize, Str
             }
             (Some(Blocked::Budget(by)), _, _) => {
                 format!("was not run, because its budget was spent by step {by}")
+            }
+            (Some(Blocked::Interrupted(signal)), _, _) => {
+                format!(
+                    "was not run, because the run was interrupted by {}",
+                    run::signal_words(signal)
+                )
             }
             (None, Some(error), _) => format!("could not be run or read: {error}"),
             (None, None, Some(0)) => return None,

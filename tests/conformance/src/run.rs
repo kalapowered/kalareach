@@ -84,6 +84,9 @@ pub enum Blocked {
     SetUp(usize),
     /// The step of this number spent the budget the step names.
     Budget(usize),
+    /// The report was sent this signal (INT or TERM) while an earlier step ran, or after it, and
+    /// ends the run.
+    Interrupted(i32),
 }
 
 /// Why a step's command did not run to its end.
@@ -392,6 +395,20 @@ pub fn not_run_for_budget(step: &Step, by: usize) -> Executed {
         error: Some(format!("not run because its budget was spent by step {by}")),
         blocked: Some(Blocked::Budget(by)),
         ..not_run(step, by, "", "")
+    }
+}
+
+/// What a step that was not run is when the report was sent the signal numbered `signal`, which
+/// ends the run: no step after the one it stopped is started.
+#[must_use]
+pub fn not_run_for_interrupt(step: &Step, signal: i32) -> Executed {
+    Executed {
+        error: Some(format!(
+            "not run because the run was interrupted by {}",
+            signal_words(signal)
+        )),
+        blocked: Some(Blocked::Interrupted(signal)),
+        ..not_run(step, 0, "", "")
     }
 }
 

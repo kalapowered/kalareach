@@ -24,6 +24,15 @@ use kr_conformance::plan::Platform;
 use kr_conformance::plan_file::Plan;
 use kr_conformance::report::{self, Options, Stopped};
 
+/// Ends the run by the signal it was sent, as it would have ended without the handlers that sent
+/// the signal on to the step's processes: the signal's default action is run, and a shell reads 128
+/// and the signal's number when it is not.
+fn ended_by(signal: i32) -> ExitCode {
+    #[cfg(unix)]
+    let _ = signal_hook::low_level::emulate_default_handler(signal);
+    ExitCode::from(u8::try_from(128 + signal).unwrap_or(1))
+}
+
 fn usage(problem: &str) -> ExitCode {
     eprintln!("kr-conformance: {problem}");
     eprintln!(
@@ -382,6 +391,9 @@ fn run(root: PathBuf, plan: Plan, evidence_directory: &std::path::Path, asked: A
     println!("result: {}", path.display());
     if let Some(line) = summary.failure_line() {
         println!("{line}");
+    }
+    if let Some(signal) = kr_conformance::tree::interrupted() {
+        return ended_by(signal);
     }
     if document.passed() {
         ExitCode::SUCCESS
