@@ -264,6 +264,7 @@ pub struct Tracker {
     uncertain: bool,
     release_verified: bool,
     verified_once: bool,
+    release_begun: bool,
     ended: bool,
     leftovers: Vec<OpenLeftover>,
     /// How many of the open leftovers no object's room paid for: the clearance of each is paid from
@@ -326,6 +327,7 @@ impl Tracker {
             uncertain: false,
             release_verified: false,
             verified_once: false,
+            release_begun: false,
             ended: false,
             leftovers: Vec::new(),
             open_unowned: 0,
@@ -689,6 +691,7 @@ impl Tracker {
                 // A release that begins after the verification means the verification no longer
                 // holds.
                 self.release_verified = false;
+                self.release_begun = true;
                 self.pending_releases.insert(*key, ());
                 self.spent += framed;
                 self.set_account(*key, account);
@@ -976,14 +979,27 @@ impl Tracker {
         self.process
     }
 
-    /// Whether a reader child of the invocation may be resumed now.
+    /// Whether a reader child of the invocation may be resumed now: the private root is made, and
+    /// neither the primary child, the end of the job nor any release has been recorded. A reader
+    /// has no row of its own: the end of every child is proved by the session, and a reader runs
+    /// before the primary child and changes nothing on the tree.
     ///
     /// # Errors
     ///
-    /// Returns why not.
+    /// Returns why a reader may not start now.
     pub fn reader_may_start(&self) -> Result<(), OrderError> {
-        debug_assert!(self.began || !self.began);
-        Ok(())
+        let why = if !matches!(self.root, RootState::Made(..)) {
+            "a reader starts while the private root is not made"
+        } else if self.process.is_some() {
+            "a reader starts after the primary process"
+        } else if self.job_ended {
+            "a reader starts after the job ended"
+        } else if self.release_begun || self.verified_once {
+            "a reader starts after the release began"
+        } else {
+            return Ok(());
+        };
+        Err(OrderError::Order(why.to_owned()))
     }
 
     /// Whether the job's end was recorded.
