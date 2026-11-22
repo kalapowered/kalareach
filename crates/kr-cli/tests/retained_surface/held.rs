@@ -74,7 +74,8 @@ fn crates_of_the_rules<'a>(entries: &'a [Narrower], roots: &'a [Root]) -> BTreeS
 }
 
 /// The directory of each crate whose manifest `folder` holds, by the name its code uses: the
-/// package of `crates/<directory>/Cargo.toml`, as the walker names it.
+/// package of `crates/<directory>/Cargo.toml`. A rule crate that lies elsewhere is not found, and its
+/// lookups say so.
 fn crate_paths(folder: &Path) -> Result<BTreeMap<String, String>, String> {
     let mut paths = BTreeMap::new();
     let crates = folder.join("crates");
@@ -128,7 +129,8 @@ fn copy_files(from: &Path, to: &Path) -> Result<(), String> {
 
 /// Names `members` as the only members of the workspace that the root manifest in `folder`
 /// declares: the other crates stay as manifests with entry files, which is what a path dependency
-/// needs, and are no crates of the tree.
+/// needs. Cargo still makes each crate that a member depends on by path a member too, with the
+/// entry files of its manifest and nothing else.
 fn limit_members(folder: &Path, members: &[String]) -> Result<(), String> {
     let manifest = folder.join("Cargo.toml");
     let text = std::fs::read_to_string(&manifest)
