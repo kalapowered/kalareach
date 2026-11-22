@@ -21,6 +21,8 @@
 //! | `channel` | An invocation's data pipes: the two named pipes that carry Git's output to the client |
 //! | `client` | The client of an invocation: its process and token, known from the pipe and never from a message |
 //! | `rights` | What a token may do to an object, computed from the object's descriptor: the person's, the broker's own and a sibling's |
+//! | `session` | The system's logon sessions: the session of a token, the list, and the wait until one is gone |
+//! | `scan` | The detector scan of an invocation's end: every process, looked at once |
 //! | `walk` | The anchored walk: objects reached by identifier from a held directory |
 //! | `pipe` | The broker's local pipe |
 //! | `proof` | The proof that the boundary is in force, and that it was released |
@@ -48,8 +50,10 @@ pub mod proof;
 pub mod registry;
 pub mod rights;
 pub mod root;
+pub mod scan;
 pub mod sd;
 pub mod service;
+pub mod session;
 pub mod setup;
 mod stop;
 pub mod token;

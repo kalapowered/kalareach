@@ -26,6 +26,8 @@ uuid.workspace = true
 # The calls the installation and the broker make: accounts and their rights, the service manager,
 # the registry, logon tokens, job objects, pipes and the signature check on the programs.
 windows-sys = { workspace = true, features = [
+    "Wdk_System_SystemInformation",
+    "Wdk_System_Threading",
     "Win32_NetworkManagement_NetManagement",
     "Win32_Security_Authentication_Identity",
     "Win32_Security_Authorization",

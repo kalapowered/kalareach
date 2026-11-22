@@ -136,6 +136,40 @@ impl PrivateRoot {
         self.dir.key()
     }
 
+    /// Reopens the private root of an invocation that did not end, by its recorded name, relative
+    /// to the held `run` directory. The answer is none when no directory has the name.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the name cannot be opened as a directory beneath `run`, or when the
+    /// directory is not the one the journal recorded as made.
+    pub fn reopen(
+        run: &DirHandle,
+        run_path: &Path,
+        name: &RootName,
+        made: Option<&FileKey>,
+    ) -> Result<Option<PrivateRoot>, RootError> {
+        let units: Vec<u16> = name.as_str().encode_utf16().collect();
+        match run.open_directory_named(&units, LIST | DELETE | READ_CONTROL)? {
+            Ok(held) => {
+                if made.is_some_and(|key| *key != held.key()) {
+                    return Err(RootError::Refused(
+                        "the private root is not the directory that the journal recorded"
+                            .to_owned(),
+                    ));
+                }
+                Ok(Some(PrivateRoot {
+                    dir: held,
+                    path: run_path.join(name.as_str()),
+                }))
+            }
+            Err(super::walk::Lost::Gone) => Ok(None),
+            Err(lost) => Err(RootError::Refused(format!(
+                "the private root could not be reopened: {lost}"
+            ))),
+        }
+    }
+
     /// The held directory, which stays open without delete sharing until the root is removed.
     #[must_use]
     pub fn dir(&self) -> &DirHandle {

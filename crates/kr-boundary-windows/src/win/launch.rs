@@ -331,6 +331,9 @@ pub struct SuspendedChild {
     /// Whether the launcher asked the platform, before returning, whether the process is in the
     /// job and was told it is. A child that is not in the job is never returned.
     pub in_job_checked: bool,
+    /// The values of the three inherited handles, as the broker held them: the child's table
+    /// holds the same values.
+    pub inherited: [usize; 3],
     /// Whether the child was made suspended.
     suspended: bool,
     /// The invocation the child belongs to, or none for a program of the proof.
@@ -522,7 +525,55 @@ impl Drop for SuspendedChild {
     }
 }
 
+/// The process information class that lists a process's handles.
+const PROCESS_HANDLE_INFORMATION: i32 = 51;
+/// `STATUS_INFO_LENGTH_MISMATCH`.
+const STATUS_INFO_LENGTH_MISMATCH: i32 = 0xC000_0004_u32 as i32;
+
 impl SuspendedChild {
+    /// The values of every handle in the child's table, as the system lists them. Before the child
+    /// is resumed these are the handles it inherited and nothing else.
+    ///
+    /// # Errors
+    ///
+    /// Returns the platform's error when the list cannot be read.
+    pub fn handle_values(&self) -> Result<Vec<usize>, ffi::Error> {
+        use windows_sys::Wdk::System::Threading::NtQueryInformationProcess;
+        let mut buffer = vec![0_u64; 512];
+        loop {
+            let mut needed = 0_u32;
+            // SAFETY: the process is open with the right to query it, and the buffer is the length
+            // given, aligned for the records.
+            let status = unsafe {
+                NtQueryInformationProcess(
+                    self.process.raw(),
+                    PROCESS_HANDLE_INFORMATION,
+                    buffer.as_mut_ptr().cast(),
+                    (buffer.len() * 8) as u32,
+                    &raw mut needed,
+                )
+            };
+            if status == STATUS_INFO_LENGTH_MISMATCH {
+                let more = (needed as usize / 8 + 64).max(buffer.len() * 2);
+                buffer.resize(more, 0);
+                continue;
+            }
+            if status != 0 {
+                // text: launch_handle_values-1
+                return Err(ffi::error(
+                    status as u32,
+                    "listing the handles of a suspended child",
+                ));
+            }
+            // The record is a count, a reserved word and entries of five words: the handle's
+            // value, two counts, the access and the type with the attributes.
+            let count = buffer[0] as usize;
+            return Ok((0..count)
+                .map(|entry| buffer[2 + entry * 5] as usize)
+                .collect());
+        }
+    }
+
     /// The invocation the child belongs to, or none for a program of the proof.
     #[must_use]
     pub fn invocation(&self) -> Option<InvocationId> {
@@ -983,6 +1034,7 @@ pub fn launch(spec: ChildSpec<'_>) -> Result<SuspendedChild, LaunchError> {
         pid: created.dwProcessId,
         creation_time: 0,
         in_job_checked: false,
+        inherited: handles.map(|handle| handle as usize),
         suspended: true,
         invocation: spec.invocation,
         reports: spec.job.reports(),

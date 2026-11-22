@@ -40,7 +40,7 @@ use windows_sys::Win32::System::IO::{CancelIoEx, CancelSynchronousIo, OVERLAPPED
 use windows_sys::Win32::System::Pipes::{
     CreateNamedPipeW, DisconnectNamedPipe, GetNamedPipeClientProcessId,
     GetNamedPipeServerProcessId, ImpersonateNamedPipeClient, PIPE_READMODE_BYTE,
-    PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT, WaitNamedPipeW,
+    PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT, PeekNamedPipe, WaitNamedPipeW,
 };
 use windows_sys::Win32::System::Threading::{
     CreateEventW, GetCurrentThread, INFINITE, OpenProcess, OpenThreadToken,
@@ -506,6 +506,36 @@ impl Connection {
     /// holds one absolute deadline over a request and its answer.
     pub fn set_deadline(&mut self, deadline: Option<Instant>) {
         self.deadline = deadline;
+    }
+
+    /// How many bytes the client has sent that have not been read, without waiting. The wait of an
+    /// invocation looks at its connection with this, since a pipe has no handle to wait on for a
+    /// frame that has not come.
+    ///
+    /// # Errors
+    ///
+    /// Returns the platform's error, which says that the client has closed its end.
+    pub fn available(&self) -> io::Result<u32> {
+        let mut ready = 0_u32;
+        // SAFETY: the pipe is open and the out-parameter is local.
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the answer is read with the last error: a closed client end is told from bytes that are not there"
+        )]
+        let peeked = unsafe {
+            PeekNamedPipe(
+                self.pipe.raw(),
+                null_mut(),
+                0,
+                null_mut(),
+                &raw mut ready,
+                null_mut(),
+            )
+        };
+        if peeked == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(ready)
     }
 
     /// Waits until the client has read every byte this end wrote, for at most `bound`, and says
