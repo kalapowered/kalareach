@@ -1068,7 +1068,7 @@ pub fn start_pairing<R: tauri::Runtime>(
                 {
                     let app = emitter.clone();
                     tauri::async_runtime::spawn(async move {
-                        let _ = hosts::use_host(&app, host).await;
+                        let _ = hosts::use_first_host(&app, host).await;
                     });
                 }
             }
