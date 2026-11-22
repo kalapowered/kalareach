@@ -749,7 +749,8 @@ accounts hold, once, and tries the begin once more; a refusal for the file's siz
 (`QUOTA_EXCEEDED`) frees nothing. A draft the host refuses for its count of drafts is handled the
 same way, with other accounts' drafts discarded instead of cancelled. If the desk cannot learn
 whether the host cancelled an upload of another account that it stopped to free a place, that upload
-is shown as cancel asked until the host is reached under the account that owns the upload.
+is shown as cancel asked until the host is reached under the account that owns the upload, or a
+later freeing finishes the cancel.
 
 Every command of the page that reads or changes an upload or a draft carries the mark of the account
 the page made it under. On a host that answers to an organisation, a command whose mark is missing
