@@ -785,6 +785,7 @@ final class PairingTests: DeviceTestCase {
     /// own files say what each agent was sent and what each session's screen shows.
     private let commandFirst = "Summarise the open changes on the first host"
     private let commandSecond = "Summarise the open changes on the second host"
+    private let commandThird = "Summarise the open changes in the first session of the first host"
     private let terminalLine = "hello from the phone on the first host"
 
     /// Asks the sessions leg's host a question and waits for its answer. What it is asked for goes in
@@ -1003,6 +1004,7 @@ final class PairingTests: DeviceTestCase {
         openTab("Hosts")
         press("Use this host")
         eventually("the first host to be in use", timeout: 60) { hostInUse() == first }
+        screenshot("hosts-first-in-use-again")
         askAbout("chosen", "1")
         let chosenAgain = read("chosen-1.txt")
         XCTAssertNotNil(chosenAgain.range(of: "^host=1 h1=[1-9][0-9]* h2=[0-9]+$", options: .regularExpression), "the first host serves no connection of the phone: \(chosenAgain)")
@@ -1012,5 +1014,14 @@ final class PairingTests: DeviceTestCase {
         askAbout("received", "1:2")
         XCTAssertEqual(read("received-1-2.txt"), "h1s1=0 h1s2=1 h2s1=1 target=h1s2 text=\(commandFirst)", "choosing a host sent something")
         say("PAIRING the phone chose the first host again and lists its two sessions, and choosing a host sent no agent anything")
+
+        // A message written in the first host's first session reaches that host's agent: the choice back
+        // reached the host, which the host's connection count alone does not show (the phone keeps both).
+        openSession(1)
+        writeAndSend(commandThird)
+        screenshot("first-host-session-one-message-sent")
+        askAbout("received", "1:1")
+        XCTAssertEqual(read("received-1-1.txt"), "h1s1=1 h1s2=1 h2s1=1 target=h1s1 text=\(commandThird)", "the first host's first agent was not sent the message alone")
+        say("PAIRING a message written in the first host's first session, once that host was chosen again, reached the agent of that session once and no other agent")
     }
 }

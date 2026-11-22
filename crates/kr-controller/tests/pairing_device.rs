@@ -41,7 +41,7 @@
 //! | Phase | What the script asks | The suite writes |
 //! | --- | --- | --- |
 //! | `listed` | `want-listed.txt` names a host (`1` or `2`) | `listed-<host>.txt`: the display numbers of the sessions that host lists to its own owner |
-//! | `received` | `want-received.txt` names a host and a session (`1:2`, `2:1`), or those and `line` | `received-<host>-<session>.txt`: how many prompts each of the three agents was sent, and the text the named one was last sent; with `line`, `screen-<host>-<session>.txt`: how many lines of each session's screen hold the typed line |
+//! | `received` | `want-received.txt` names a host and a session (`1:1`, `1:2`, `2:1`), or those and `line` | `received-<host>-<session>.txt`: how many prompts each of the three agents was sent, and the text the named one was last sent; with `line`, `screen-<host>-<session>.txt`: how many lines of each session's screen hold the typed line |
 //! | `chosen` | `want-chosen.txt` names a host | `chosen-<host>.txt`: how many connections of the phone each host is serving |
 //!
 //! `KR_HARNESS_PEER` is the name the phone reaches this machine by: `127.0.0.1` for a simulator,
@@ -803,6 +803,7 @@ impl Run {
             ("h2s1", &leg.second_first),
         ];
         let target = match (host, session) {
+            ("1", "1") => "h1s1",
             ("1", "2") => "h1s2",
             ("2", "1") => "h2s1",
             _ => panic!("the script asked about {wanted}"),
@@ -868,7 +869,10 @@ impl Run {
     }
 
     /// How many connections of the phone each host is serving, once the host the script names is
-    /// serving one: the phone reached the host it chose.
+    /// serving one. The phone keeps a connection to each host it is paired with, so a host that was not
+    /// chosen can already be serving one: the record shows that the phone is in contact with the named
+    /// host, not that it chose it. What shows the choice is what `received` records for a message
+    /// written in that host's session.
     async fn chosen(&self) {
         let which = self.wanted("chosen");
         let phone_of_first = self
@@ -1356,7 +1360,8 @@ async fn a_phone_scans_pairs_and_confirms_against_a_real_host() {
     workers[0].register_agent(Arc::clone(&upstream));
     let sessions = sessions_leg.then(|| {
         // The phone offers a prompt only to an agent that a package recognised. The agents of the
-        // other sessions are numbered apart from the first's, so that no two instances share an identity.
+        // other sessions of one host are numbered apart from its first's, so that no two instances of a
+        // host share an identity; each host's first agent is number 2.
         workers[0].announce_agent_package_numbered(2);
         let first_second = Arc::new(Upstream::default());
         workers[1].register_agent_numbered(3, Arc::clone(&first_second) as _);

@@ -65,10 +65,12 @@
 # KR_PAIRING_LEG=sessions runs the sessions leg instead of the cases above (the default leg): the host holds
 # two sessions, a second host holds one, and the phone is paired with both as an owner device. The phone
 # lists the first host's sessions, opens the second of them and sends it a message and a typed line,
-# chooses the second host and sends a message in its session, and chooses the first again. Every step is
-# read against what the host it concerns recorded: the sessions it lists, what each agent was sent, what
-# each session's program wrote back, and how many connections of the phone each host is serving. No case
-# of the default leg runs in it.
+# chooses the second host and sends a message in its session, and chooses the first again and sends a message
+# in its first session. Every step is read against what the host it concerns recorded: the sessions it lists,
+# what each agent was sent, what each session's program wrote back, and how many connections of the phone each
+# host is serving. The phone keeps a connection to each host it is paired with, so that count shows contact
+# with a host, not the choice of it: a message sent in a host's session shows that. No case of the default leg
+# runs in it.
 # KR_PAIRING_SHOTS is where the screenshots go (default /tmp/kr-pair-phone); KR_PAIRING_GRPC_PORT is the
 # port of the Android emulator's controller (default 8754), which must be free: the camera is moved
 # through it, so a port that already answers would move another emulator's.
@@ -483,6 +485,7 @@ host_matches() { # <what the record shows> <file> <extended regular expression>
 judge_sessions() { # <driver output>
     local bad=0 check
     local first="Summarise the open changes on the first host" second="Summarise the open changes on the second host"
+    local third="Summarise the open changes in the first session of the first host"
     local line="hello from the phone on the first host"
     for check in \
         "the phone is paired with two hosts as an owner device of each, and the first stays in use" \
@@ -491,7 +494,8 @@ judge_sessions() { # <driver output>
         "a line typed into the first host's second session's terminal view reached that session's program and no other" \
         "the phone chose the second host and lists its one session in place of the first host's two, as that host lists it" \
         "a message written in the second host's session reached that host's agent once and none of the first host's" \
-        "the phone chose the first host again and lists its two sessions, and choosing a host sent no agent anything"; do
+        "the phone chose the first host again and lists its two sessions, and choosing a host sent no agent anything" \
+        "a message written in the first host's first session, once that host was chosen again, reached the agent of that session once and no other agent"; do
         if grep -q -F "PAIRING $check" "$1"; then
             say "check=$check ok=1"
         else
@@ -517,6 +521,8 @@ judge_sessions() { # <driver output>
     host_matches "the first host was serving a connection of the phone once it was chosen again" chosen-1.txt "^host=1 h1=[1-9][0-9]* h2=[0-9]+\$"
     host_equals "after the first host was chosen again no agent had been sent anything more" received-1-2.txt \
         "h1s1=0 h1s2=1 h2s1=1 target=h1s2 text=$first"
+    host_equals "the first host's agent in its first session was sent the message written there after the choice back, and the others nothing more" received-1-1.txt \
+        "h1s1=1 h1s2=1 h2s1=1 target=h1s1 text=$third"
     if [ "$logs_searched" -ge 1 ] && [ "$logs_found" = 0 ] && [ -z "$log_problem" ]; then
         say "check=no log holds an invitation's text or secret ok=1 detail=$logs_searched log read whole"
     else

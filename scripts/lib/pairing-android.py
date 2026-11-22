@@ -1185,6 +1185,7 @@ def issuer(adb: str, serial: str, directory: Path, shots: Path, port: str) -> No
 # say what each agent was sent and what each session's screen shows.
 COMMAND_FIRST = "Summarise the open changes on the first host"
 COMMAND_SECOND = "Summarise the open changes on the second host"
+COMMAND_THIRD = "Summarise the open changes in the first session of the first host"
 TERMINAL_LINE = "hello from the phone on the first host"
 
 
@@ -1462,6 +1463,17 @@ def sessions(adb: str, serial: str, directory: Path, shots: Path, port: str) -> 
     if read(directory, "received-1-2.txt") != f"h1s1=0 h1s2=1 h2s1=1 target=h1s2 text={COMMAND_FIRST}":
         raise SystemExit(f"choosing a host sent something: {read(directory, 'received-1-2.txt')}")
     say("the phone chose the first host again and lists its two sessions, and choosing a host sent no agent anything")
+
+    # A message written in the first host's first session reaches that host's agent: the choice back reached
+    # the host, which the host's connection count alone does not show (the phone keeps both).
+    open_a_session(phone, 1)
+    write_and_send(phone, COMMAND_THIRD)
+    phone.shot("first-host-session-one-message-sent")
+    ask_about(directory, "received", "1:1")
+    expected = f"h1s1=1 h1s2=1 h2s1=1 target=h1s1 text={COMMAND_THIRD}"
+    if read(directory, "received-1-1.txt") != expected:
+        raise SystemExit(f"the first host's first agent was not sent the message alone: {read(directory, 'received-1-1.txt')}")
+    say("a message written in the first host's first session, once that host was chosen again, reached the agent of that session once and no other agent")
 
 
 # ---- The release build's verified TLS ----------------------------------------------------------
