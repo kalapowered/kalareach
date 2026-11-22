@@ -686,7 +686,7 @@ fn diagnostic_listing(luid: u64) -> String {
 
 /// The handles to tokens of the logon session that any process of the machine holds, by process
 /// number and handle value.
-fn token_handles_of(luid: u64) -> String {
+fn token_handles_of(luid: u64, counts: &mut std::collections::HashMap<u64, u32>) -> String {
     use windows_sys::Wdk::System::SystemInformation::NtQuerySystemInformation;
     use windows_sys::Win32::Foundation::CloseHandle;
     use windows_sys::Win32::Security::{GetTokenInformation, TOKEN_STATISTICS, TokenStatistics};
@@ -753,6 +753,7 @@ fn token_handles_of(luid: u64) -> String {
             continue;
         }
         let pid = word(entry(index) + 8);
+        *counts.entry(pid).or_default() += 1;
         let value = word(entry(index) + 16) as usize;
         let mut mine = value as HANDLE;
         let mut duplicated = false;
@@ -2113,17 +2114,40 @@ fn a_reader_that_ends_and_leaves_a_live_descendant_refuses_the_operation_before_
         1,
         |_| {},
     );
+    let mut baseline = std::collections::HashMap::new();
+    let _ = token_handles_of(0, &mut baseline);
     let replies = run_one(&life, How::Reads, client_of(None), None);
     if !matches!(replies.last(), Some(InvocationReply::Refused { .. })) {
         let luid = hooks::session();
         let rows = life.rows();
         let listing = diagnostic_listing(luid);
-        let before = token_handles_of(luid);
-        drop(life);
-        let after = session::wait_absent(luid, Duration::from_secs(10));
-        let later = token_handles_of(luid);
+        let mut now = std::collections::HashMap::new();
+        let before = token_handles_of(luid, &mut now);
+        let grown: Vec<(u64, u32, u32)> = now
+            .iter()
+            .filter(|(pid, count)| **count > baseline.get(*pid).copied().unwrap_or(0))
+            .map(|(pid, count)| (*pid, baseline.get(pid).copied().unwrap_or(0), *count))
+            .collect();
+        let numbers: Vec<String> = grown.iter().map(|(pid, _, _)| pid.to_string()).collect();
+        let named = if numbers.is_empty() {
+            String::new()
+        } else {
+            std::process::Command::new("powershell.exe")
+                .args([
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    &format!(
+                        "Get-Process -Id {} -ErrorAction SilentlyContinue | ForEach-Object {{ '' + $_.Id + ' ' + $_.ProcessName }}",
+                        numbers.join(",")
+                    ),
+                ])
+                .output()
+                .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
+                .unwrap_or_default()
+        };
         panic!(
-            "{replies:?} {rows:?}\n{listing}\nbefore the drop: {before}\nafter the broker's side was dropped: {after:?}; {later}"
+            "{replies:?} {rows:?}\n{listing}\nat the end: {before}\ntoken handles per process that grew (pid, before, now): {grown:?}\n{named}"
         );
     }
     assert!(
