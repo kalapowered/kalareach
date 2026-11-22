@@ -146,27 +146,35 @@ fn the_script_holds_no_command_that_signals_or_looks_up_a_process() {
     }
 }
 
-/// A hosted macOS runner's closing report, with `reader` standing in for `/usr/bin/log`: it returns
-/// what the report printed and the text of the `disk-faults.txt` it kept.
+/// Writes a program that runs.
+fn write_program(path: &Path, text: &str) {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::write(path, text).expect("a program");
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+        .expect("the program runs");
+}
+
+/// A hosted macOS runner's closing report, with `reader` standing in for `/usr/bin/log` and a
+/// program that runs its command in the place of `sudo`, so that no `sudo` runs and none logs the
+/// command, which holds the whole predicate: it returns what the report printed and the text of the
+/// `disk-faults.txt` it kept.
 fn kernel_read_with(reader: &str) -> (String, String) {
     let state = tempfile::tempdir().expect("a state directory");
     let program = state.path().join("log");
-    std::fs::write(&program, reader).expect("a reader");
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))
-            .expect("the reader runs");
-    }
+    write_program(&program, reader);
+    let privilege = state.path().join("privilege");
+    write_program(&privilege, "#!/bin/sh\nshift\nexec \"$@\"\n");
     let evidence = state.path().join("evidence");
     let body = format!(
         "mkdir -p \"$state\" '{evidence}'\n\
          echo \"S $(( $(date +%s) - 600 ))\" > \"$samples\"\n\
          export RUNNER_ENVIRONMENT=github-hosted KR_TEST_ARTIFACTS_DIR='{evidence}' \
-         KR_DISK_REPORT_LOG='{program}'\n\
+         KR_DISK_REPORT_LOG='{program}' KR_DISK_REPORT_PRIVILEGE='{privilege}'\n\
          kernel_storage_errors\n\
          echo \"== file\"\ncat '{evidence}/disk-faults.txt'\n",
         evidence = evidence.display(),
-        program = program.display()
+        program = program.display(),
+        privilege = privilege.display()
     );
     let (text, ok) = in_shell(state.path(), &body);
     assert!(ok, "{text}");
@@ -199,7 +207,10 @@ fn a_kernel_log_read_with_no_fault_says_so_in_the_file_and_a_fault_is_counted() 
     }
     let (printed, kept) =
         kernel_read_with("#!/bin/sh\necho 'Timestamp               Ty Process[PID:TID]'\n");
-    assert!(printed.contains("logged no storage fault"), "{printed}");
+    assert!(
+        printed.contains("holds no line about a storage fault"),
+        "{printed}"
+    );
     assert!(kept.contains("was read: 0 matching lines"), "{kept}");
     let (printed, kept) = kernel_read_with(
         "#!/bin/sh\n\
@@ -207,7 +218,7 @@ fn a_kernel_log_read_with_no_fault_says_so_in_the_file_and_a_fault_is_counted() 
          echo '2026-11-21 13:01:53.200 Df ReportCrash[77:2b] cc exited due to SIGBUS'\n",
     );
     assert!(
-        printed.contains("logged 2 storage fault lines")
+        printed.contains("holds 2 lines that match a storage fault")
             && printed.contains("from 2026-11-21 13:01:52 to 2026-11-21 13:01:53"),
         "{printed}"
     );
@@ -237,4 +248,80 @@ fn the_kernel_log_is_asked_for_failed_page_ins_and_a_sigbus_as_well_as_failed_wr
             "{term}: {kept}"
         );
     }
+}
+
+/// Whether the system's log would return a line of `process` that says `message`, for `predicate`:
+/// macOS evaluates the predicate over the line's process and message as `log show` does.
+fn predicate_matches(predicate: &str, process: &str, message: &str) -> bool {
+    let directory = tempfile::tempdir().expect("a directory");
+    let script = directory.path().join("evaluate.js");
+    std::fs::write(
+        &script,
+        "ObjC.import('Foundation');\n\
+         function run(argv) {\n\
+         \x20 var p = $.NSPredicate.predicateWithFormat(argv[0]);\n\
+         \x20 var line = $({process: argv[1], eventMessage: argv[2]});\n\
+         \x20 return p.evaluateWithObject(line) ? 'match' : 'no';\n\
+         }\n",
+    )
+    .expect("a script");
+    let out = Command::new("/usr/bin/osascript")
+        .args(["-l", "JavaScript"])
+        .arg(&script)
+        .args([predicate, process, message])
+        .output()
+        .expect("osascript runs");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).trim() == "match"
+}
+
+#[test]
+fn the_line_sudo_logs_for_the_read_holds_the_predicate_and_is_not_counted_as_a_fault() {
+    if cfg!(not(target_os = "macos")) {
+        return;
+    }
+    // The reader keeps the predicate it was given, which is its last word.
+    let (_, kept) = kernel_read_with(
+        "#!/bin/sh\nfor word in \"$@\"; do last=\"$word\"; done\n\
+         echo \"2026-11-21 13:01:52.100 predicate: $last\"\n",
+    );
+    let predicate = kept
+        .lines()
+        .find_map(|line| line.split_once(" predicate: "))
+        .map(|(_, predicate)| predicate.to_owned())
+        .expect("the predicate");
+    // What sudo logs about a command it runs: the command, whole.
+    let sudo_line = format!(
+        "user : TTY=unknown ; PWD=/ ; USER=root ; COMMAND=/usr/bin/log show --last 12m --style compact --predicate {predicate}"
+    );
+    assert!(
+        sudo_line.contains("SIGBUS") && sudo_line.contains("page-in"),
+        "the line holds the terms: {sudo_line}"
+    );
+    assert!(
+        !predicate_matches(&predicate, "sudo", &sudo_line),
+        "sudo's line of the read counts as a storage fault: {predicate}"
+    );
+    // The lines that are faults still count.
+    for (process, message) in [
+        ("kernel", "disk0s2: I/O error"),
+        ("kernel", "apfs_vnop_pagein: error 5"),
+        ("kernel", "cluster_pageout: failed"),
+        ("ReportCrash", "cc exited due to SIGBUS"),
+        ("launchd", "a service exited due to SIGBUS"),
+    ] {
+        assert!(
+            predicate_matches(&predicate, process, message),
+            "{process}: {message}"
+        );
+    }
+    assert!(!predicate_matches(
+        &predicate,
+        "kernel",
+        "a line about nothing"
+    ));
 }

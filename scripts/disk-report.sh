@@ -270,11 +270,15 @@ alarmed() {
     "${prefix[@]+"${prefix[@]}"}" /usr/bin/perl -e 'alarm shift; exec @ARGV or exit 127' "$limit" "$@" > "$out" 2> "${alarm_stderr:-/dev/null}"
 }
 
-# The kernel's lines about a read or a write to storage that failed, from the first sample to now,
-# on a hosted macOS runner: an I/O error, a failed page-out or page-in, and any SIGBUS, which is
-# what a program gets when a page of a file it maps cannot be read. The log is read as root where
-# the runner allows it (`sudo -n`, which never asks for a password) and the read ends by itself
-# after 90 seconds. The file it keeps is never empty: it ends with a line that says the log was read
+# The log's lines about a read or a write to storage that failed, from the first sample to now,
+# on a hosted macOS runner: the kernel's lines about an I/O error and a failed page-out or page-in,
+# and any other process's line that says SIGBUS, which is what a program gets when a page of a file
+# it maps cannot be read (a sound disk can give it too, for a file that was cut short). Every
+# process but sudo counts for SIGBUS: sudo logs the command it runs for the read, and that command
+# holds the whole predicate, the word SIGBUS among it. The log is read as root where the runner
+# allows it (`sudo -n`, which never asks for a password; `KR_DISK_REPORT_PRIVILEGE` names another
+# program that runs its arguments after `-n`, for the cases) and the read ends by itself after 90
+# seconds. The file it keeps is never empty: it ends with a line that says the log was read
 # and how many lines matched, or it is the line that says the log was not read, and why, with what
 # the reader said. An empty file used to be the same for a log with no fault and a log that could
 # not be read, and a run that lost files read as a clean disk.
@@ -290,8 +294,9 @@ kernel_storage_errors() {
     evidence="$(kr_artifacts_dir_if_set && printf '%s' "$kr_artifacts")" || evidence=""
     out="${evidence:-/tmp/kr-test-artifacts}/disk-faults.txt"
     mkdir -p "$(dirname "$out")" 2> /dev/null
-    predicate='(process == "kernel" AND (eventMessage CONTAINS "I/O error" OR eventMessage CONTAINS "cluster_pageout" OR eventMessage CONTAINS "cluster_push() failed" OR eventMessage CONTAINS "trim_list failed" OR eventMessage CONTAINS "pagein" OR eventMessage CONTAINS "page-in")) OR eventMessage CONTAINS "SIGBUS"'
+    predicate='(process == "kernel" AND (eventMessage CONTAINS "I/O error" OR eventMessage CONTAINS "cluster_pageout" OR eventMessage CONTAINS "cluster_push() failed" OR eventMessage CONTAINS "trim_list failed" OR eventMessage CONTAINS "pagein" OR eventMessage CONTAINS "page-in")) OR (eventMessage CONTAINS "SIGBUS" AND NOT process == "sudo")'
     reader="${KR_DISK_REPORT_LOG:-/usr/bin/log}"
+    privilege="${KR_DISK_REPORT_PRIVILEGE:-sudo}"
     said="$state/kernel-log.stderr"
     alarm_stderr="$said"
     read_ok=0
@@ -299,7 +304,7 @@ kernel_storage_errors() {
     for attempt in sudo plain; do
         if [ "$attempt" = sudo ]; then
             # the redirect is in alarmed, so the runner's own shell writes the file, in its directory
-            alarmed 90 "$out" sudo -n -- "$reader" show --last "${minutes}m" --style compact --predicate "$predicate"
+            alarmed 90 "$out" "$privilege" -n -- "$reader" show --last "${minutes}m" --style compact --predicate "$predicate"
         else
             alarmed 90 "$out" -- "$reader" show --last "${minutes}m" --style compact --predicate "$predicate"
         fi
@@ -330,9 +335,9 @@ kernel_storage_errors() {
     count="$(grep -c "$stamped" "$out" || true)"
     echo "# the kernel's log was read: ${count:-0} matching lines" >> "$out"
     if [ "${count:-0}" -eq 0 ]; then
-        echo "  the kernel logged no storage fault since the job began"
+        echo "  the log holds no line about a storage fault since the job began"
     else
-        echo "  the kernel logged $count storage fault lines (I/O errors, failed page-ins and page-outs, SIGBUS) since the job began, from $(grep "$stamped" "$out" | sed -n '1p' | cut -c1-19) to $(grep "$stamped" "$out" | sed -n '$p' | cut -c1-19) (kept in disk-faults.txt)"
+        echo "  the log holds $count lines that match a storage fault (I/O errors, failed page-ins and page-outs, SIGBUS) since the job began, from $(grep "$stamped" "$out" | sed -n '1p' | cut -c1-19) to $(grep "$stamped" "$out" | sed -n '$p' | cut -c1-19) (kept in disk-faults.txt)"
     fi
 }
 
