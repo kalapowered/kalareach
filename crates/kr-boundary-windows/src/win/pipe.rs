@@ -19,7 +19,7 @@ use std::ffi::c_void;
 use std::io::{self, Read, Write};
 use std::ptr::{null, null_mut};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{
     ERROR_BROKEN_PIPE, ERROR_IO_PENDING, ERROR_NO_DATA, ERROR_PIPE_BUSY, ERROR_PIPE_NOT_CONNECTED,
@@ -32,10 +32,11 @@ use windows_sys::Win32::Security::{
     SetKernelObjectSecurity, TOKEN_QUERY, TokenUser,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED, OPEN_EXISTING,
-    PIPE_ACCESS_DUPLEX, SECURITY_IDENTIFICATION, SECURITY_SQOS_PRESENT, WRITE_DAC, WriteFile,
+    CreateFileW, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED, FILE_GENERIC_WRITE,
+    FlushFileBuffers, OPEN_EXISTING, PIPE_ACCESS_DUPLEX, SECURITY_IDENTIFICATION,
+    SECURITY_SQOS_PRESENT, WRITE_DAC, WriteFile,
 };
-use windows_sys::Win32::System::IO::{CancelIoEx, OVERLAPPED};
+use windows_sys::Win32::System::IO::{CancelIoEx, CancelSynchronousIo, OVERLAPPED};
 use windows_sys::Win32::System::Pipes::{
     CreateNamedPipeW, DisconnectNamedPipe, GetNamedPipeClientProcessId,
     GetNamedPipeServerProcessId, ImpersonateNamedPipeClient, PIPE_READMODE_BYTE,
@@ -163,6 +164,9 @@ pub struct Connection {
 /// deadline and reads no answer after it, and a run of a program of the proof keeps two seconds
 /// before its deadline for the job's end and the pipes' end.
 const CANCEL_GRACE_MS: u32 = 100;
+
+/// How long a thread that was asked to give up a blocking call has to do so before it is left.
+const CANCEL_GRACE: Duration = Duration::from_secs(2);
 
 /// Seams for the test build: a call the platform would answer is made not to be, so that a case
 /// shows what the connection does then.
@@ -502,6 +506,65 @@ impl Connection {
     /// holds one absolute deadline over a request and its answer.
     pub fn set_deadline(&mut self, deadline: Option<Instant>) {
         self.deadline = deadline;
+    }
+
+    /// Waits until the client has read every byte this end wrote, for at most `bound`, and says
+    /// whether it has. A connection that is closed with unread bytes in the pipe loses them, so a
+    /// client that reads the length of an answer and then its body gets a broken pipe for the body;
+    /// the server calls this after its last answer and before it closes. A wait that the stop or the
+    /// bound ends asks the call to give up and waits a short time for it, and says no.
+    ///
+    /// The call runs on a thread of its own, on its own copy of the handle, so that a client that
+    /// reads nothing holds no more than that thread, and only for the bound and the grace.
+    pub fn let_the_client_read(&self, bound: Duration) -> bool {
+        use std::os::windows::io::AsRawHandle as _;
+        let End::Server(server) = &self.pipe else {
+            return true;
+        };
+        let copy = match server.0.duplicate(FILE_GENERIC_WRITE) {
+            Ok(copy) => copy,
+            Err(uncopied) => {
+                drop(uncopied);
+                return false;
+            }
+        };
+        let thread = std::thread::spawn(move || {
+            // SAFETY: the handle is this thread's own copy of a connected server end, open until
+            // the thread returns. The call returns when the client has read everything that was
+            // written, or when another thread cancels it.
+            let flushed = unsafe { FlushFileBuffers(copy.raw()) };
+            flushed != 0
+        });
+        let handle = thread.as_raw_handle() as HANDLE;
+        let read = matches!(
+            self.stop.wait_for(
+                &[handle],
+                ffi::milliseconds(bound, INFINITE - 1),
+                "waiting for the client to read the last answer",
+            ),
+            Ok(ffi::Waited::Signalled(1))
+        );
+        if !read {
+            let until = Instant::now() + CANCEL_GRACE;
+            while !thread.is_finished() && Instant::now() < until {
+                // SAFETY: the handle is the thread's own, valid until the join below. A call that
+                // finds nothing to cancel (the thread is between two calls) fails and is asked again.
+                unsafe {
+                    CancelSynchronousIo(handle);
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        if !thread.is_finished() {
+            return false;
+        }
+        match thread.join() {
+            Ok(flushed) => read && flushed,
+            Err(panicked) => {
+                drop(panicked);
+                false
+            }
+        }
     }
 
     /// The process on the other end of a connection a client made to this server, and a copy of the
