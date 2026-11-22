@@ -60,6 +60,7 @@ pub mod events;
 pub mod filekey;
 pub mod frame;
 pub mod journal;
+pub mod limits;
 pub mod manifest;
 pub mod messages;
 pub mod names;
