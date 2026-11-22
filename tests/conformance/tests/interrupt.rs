@@ -40,6 +40,12 @@ const GROUP: &str = "trap 'printf \"%s\\n\" INT >> \"$1.signals\"' INT\ntrap 'pr
 /// [`GROUP`] with both signals ignored by the whole group, so that only the force ends it.
 const IGNORES: &str = "trap '' INT TERM\nprintf '%s\\n' \"$$\" >> \"$1\"\nsleep 61 &\nprintf '%s\\n' \"$!\" >> \"$1\"\nwait\n";
 
+/// [`GROUP`] with `INT` ignored by the whole group, and a leader that, when it is sent `TERM`, writes
+/// `TERM` to `<file>.signals` and sends `INT` to its parent, the report's program. The second signal
+/// is then sent by the group, after the report selected the first and sent it on, and so within the
+/// grace that began with it.
+const ANSWERS_TERM_WITH_INT: &str = "trap '' INT\ntrap 'printf \"%s\\n\" TERM >> \"$1.signals\"; kill -INT \"$PPID\"' TERM\nprintf '%s\\n' \"$$\" >> \"$1\"\nsleep 61 &\nprintf '%s\\n' \"$!\" >> \"$1\"\nwait\n";
+
 /// Records its pid and waits 20 s: a step without a limit.
 const WAITS: &str = "printf '%s\\n' \"$$\" >> \"$1\"\nsleep 20\n";
 
@@ -376,9 +382,11 @@ fn a_signal_that_reaches_the_report_as_the_last_step_ends_leaves_the_step_stoppe
 }
 
 /// KR-REQ-29.01, the part about reproducible commands: the signal that stops the run is the first
-/// the report records. The group ignores both signals, so the grace runs its two seconds; an `INT`
-/// that arrives in it does not replace the `TERM` that began it, though `INT` comes first in the
-/// report's list, and the stopped step, the step after it and the end of the report all name `TERM`.
+/// the report selects. The case sends `TERM` once. The group's leader answers `TERM`, which the
+/// report sends on only after it selected it, with an `INT` to the report, so that signal is
+/// recorded in the grace that began with the selection, with no sleep and no second send of the
+/// case's own to time. It does not replace the `TERM`, though `INT` comes first in the report's
+/// list, and the stopped step, the step after it and the end of the report all name `TERM`.
 #[test]
 fn a_second_signal_in_the_grace_does_not_change_the_signal_of_the_run() {
     let place = tempfile::tempdir().expect("a directory for the pids");
@@ -389,13 +397,15 @@ fn a_second_signal_in_the_grace_does_not_change_the_signal_of_the_run() {
             step("held", "timeout = 600", "held", &pids),
             step("later", "timeout = 600", "later", &later),
         ],
-        &[("held", IGNORES), ("later", WAITS)],
+        &[("held", ANSWERS_TERM_WITH_INT), ("later", WAITS)],
     );
     recorded_pids(&pids, 2);
     run.send(Signal::TERM);
-    std::thread::sleep(Duration::from_millis(500));
-    run.send(Signal::INT);
     let status = run.ended_within(BOUND);
+    // The leader wrote this when the report sent it `TERM`, and then sent `INT`: without this line
+    // the case would not have sent a second signal.
+    let sent = std::fs::read_to_string(place.path().join("pids.txt.signals")).unwrap_or_default();
+    assert_eq!(sent, "TERM\n", "the group was not sent TERM");
     assert_eq!(status.signal(), Some(Signal::TERM.as_raw()), "{status:?}");
     let result = run.result();
     assert_eq!(result["steps"][0]["error"], "stopped by signal TERM");
