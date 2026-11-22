@@ -733,8 +733,10 @@ fn u64_at(bytes: &[u8], at: usize) -> Option<u64> {
 }
 
 /// The damage a program's first bytes and length show, or none when none is seen: it is shorter
-/// than a page, its first page is all zeros, or its load commands run past its end. A script, a
-/// program of another system and a universal binary are not read for damage.
+/// than a page, its first page is all zeros, it begins with no executable header (a linked program
+/// whose first page held bytes from elsewhere in the file, which the kernel refuses), or its load
+/// commands run past its end. A script, a program of another system and a universal binary are not
+/// read for damage.
 #[must_use]
 pub fn damage_of(head: &[u8], length: u64) -> Option<String> {
     if head.starts_with(b"#!")
@@ -757,7 +759,15 @@ pub fn damage_of(head: &[u8], length: u64) -> Option<String> {
         return Some(format!("the first page ({PAGE} bytes) is all zeros"));
     }
     if u32_at(head, 0) != Some(MACH_O_64) {
-        return None;
+        let first: Vec<String> = head
+            .iter()
+            .take(8)
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        return Some(format!(
+            "it begins with no executable header (its first bytes are {})",
+            first.join(" ")
+        ));
     }
     let (Some(commands), Some(size)) = (u32_at(head, 16), u32_at(head, 20)) else {
         return None;
@@ -975,6 +985,29 @@ mod tests {
                 .unwrap()
                 .contains("load command at byte 32 ends past")
         );
+    }
+
+    #[test]
+    fn a_head_that_is_no_executable_header_is_damage_whatever_it_holds() {
+        // The first bytes of a linked program that a storage fault replaced with a symbol name from
+        // elsewhere in the file: it has its length and no zero page, and the kernel refuses it.
+        let text = b"receipt12ReceiptStateEE00ENtNtNt".repeat(200);
+        let found = damage_of(&text, 61_360_848).expect("a head that is no header is damage");
+        assert!(
+            found.contains("no executable header") && found.contains("72 65 63 65 69 70 74 31"),
+            "{found}"
+        );
+        // Every other form `damage_of` passes over still passes, and so does a whole Mach-O file.
+        for head in [
+            &b"#!/bin/sh\n"[..],
+            &b"\x7fELF\x02\x01"[..],
+            &b"MZ\x90\x00"[..],
+            &[0xca, 0xfe, 0xba, 0xbe, 0, 0][..],
+            &[0xca, 0xfe, 0xba, 0xbf, 0, 0][..],
+        ] {
+            assert_eq!(damage_of(head, 61_360_848), None, "{head:?}");
+        }
+        assert_eq!(damage_of(&mach_o(8192, 72, 4096), 8192), None);
     }
 
     #[test]
