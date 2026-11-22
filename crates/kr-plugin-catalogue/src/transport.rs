@@ -150,13 +150,16 @@ const READ_CHUNK: usize = 16 * 1024;
 /// The path on this machine that a `file` address names.
 ///
 /// The update client reads an address's path as it stands, with no decoding, so that a name it has
-/// percent-encoded, a slash or a dot among them, stays the name of one file in the repository's
-/// folder and never becomes a way out of it. `url` writes a caret in a path as `%5E`, so a folder
-/// that a person enrolled as `repo^name` reaches here as `repo%5Ename`, and the client's reading
-/// would look for a folder of that name. Every segment but the last is the person's, and its
-/// `%5E` is read as the caret it was written from; nothing else in it is decoded. The last segment
-/// is the name the client added to the enrolled address, encoded by its own rule, and stays as the
-/// client reads it.
+/// percent-encoded, a slash among the characters it encodes, stays the name of one file in the
+/// repository's folder and never becomes a way out of it. `url` writes a caret in a path as `%5E`,
+/// so a folder that a person enrolled as `repo^name` reaches here as `repo%5Ename`, and the
+/// client's reading would look for a folder of that name. In every segment but the last, `%5E` is
+/// read as the caret it was written from; nothing else in it is decoded, and the last segment
+/// stays as the client reads it. The client adds the rest of the path: for metadata, one role name
+/// encoded by `encode_filename`, which escapes a caret and keeps a dot; for a payload, the
+/// segments of the resolved target name. A target name holds neither `%` nor `^` (ids are slugs,
+/// versions are semver, package paths use `A-Z a-z 0-9 . - _`), so reading `%5E` as a caret
+/// changes none of its segments.
 fn local_path(url: &Url) -> PathBuf {
     let path = match url.path().rsplit_once('/') {
         Some((folders, name)) => format!("{}/{name}", folders.replace("%5E", "^")),
@@ -433,6 +436,22 @@ mod tests {
             .await
             .expect("a stream");
         assert_eq!(read_all(stream).await, Ok(b"inside".to_vec()));
+    }
+
+    /// A file that opens and then cannot be read (a folder opens on Unix and fails at its first
+    /// read) arrives as a failure of another kind, and never as an absence.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_read_that_fails_after_the_open_is_not_an_absence() {
+        let folder = tempfile::tempdir().expect("a temporary directory");
+        std::fs::create_dir(folder.path().join("a")).expect("a folder");
+        let base = Url::from_directory_path(folder.path()).expect("a folder address");
+        let transport = RepositoryTransport::local_only("a test reads files from disk");
+        let stream = transport
+            .fetch(base.join("a").expect("an address"))
+            .await
+            .expect("a stream");
+        assert_eq!(read_all(stream).await, Err(TransportErrorKind::Other));
     }
 
     /// A file longer than one read arrives whole, and a file that is not there arrives as its
