@@ -1045,6 +1045,12 @@ pub struct Asked {
     pub manager: Manager,
     /// The process it runs the daemon as, when it said.
     pub pid: Option<u32>,
+    /// Whether the manager's own policy for the job was read, when it was asked, and holds no
+    /// restart: the daemon it runs is not started again when it ends. False where the policy was
+    /// not read, or may start the daemon again: a unit's drop-in can set `Restart`, and launchd can
+    /// hold a job that was loaded with `KeepAlive`. A unit that another unit starts by name is not
+    /// read.
+    pub no_restart: bool,
 }
 
 /// A definition checked for a start request, with the environment's lock held until the request
@@ -1519,6 +1525,11 @@ mod platform {
         arguments: Vec<String>,
         working_directory: Option<String>,
         pid: Option<u32>,
+        /// What the description says of keeping the job alive: some true where it lists the
+        /// `keepalive` property or a field of that name, some false where it lists its properties
+        /// and `keepalive` is none of them, none where it lists no properties, so that nothing is
+        /// known.
+        keep_alive: Option<bool>,
     }
 
     kr_client::debug_fields!(Loaded { pid });
@@ -1564,10 +1575,26 @@ mod platform {
                     "working directory" => loaded.working_directory = Some(value.to_owned()),
                     "pid" => loaded.pid = value.trim().parse().ok(),
                     "arguments" if value == "{" => in_arguments = true,
+                    "properties" => {
+                        let kept = value
+                            .split('|')
+                            .any(|property| property.trim().eq_ignore_ascii_case("keepalive"));
+                        loaded.keep_alive = Some(kept || loaded.keep_alive == Some(true));
+                    }
+                    _ if name.to_ascii_lowercase().contains("keepalive") => {
+                        loaded.keep_alive = Some(true);
+                    }
                     _ => {}
                 }
             }
             loaded
+        }
+
+        /// Whether launchd said that it does not keep the job alive: its description lists its
+        /// properties, and `keepalive` is none of them. A description that lists none says nothing,
+        /// and launchd may start the job again.
+        pub(super) fn without_restart(&self) -> bool {
+            self.keep_alive == Some(false)
         }
 
         /// What launchd would run otherwise than `definition` says, in words of kr's own: another
@@ -1795,11 +1822,17 @@ mod platform {
         let domain = record.domain.as_deref().unwrap_or_default();
         let target = record.target();
         let said = record.target_said();
-        if next(&job(&target, &said).map_err(Refusal::Failed)?, expected)? == Next::Load {
+        let found = job(&target, &said).map_err(Refusal::Failed)?;
+        // The job as launchd holds it for this start: what it held, or what it holds once the
+        // definition is loaded. Its properties are read from this description.
+        let held = if next(&found, expected)? == Next::Load {
             load(domain, &record.path).map_err(Refusal::Failed)?;
-            loaded_as_written(&job(&target, &said).map_err(Refusal::Failed)?, expected)
-                .map_err(Refusal::Failed)?;
-        }
+            let loaded = job(&target, &said).map_err(Refusal::Failed)?;
+            loaded_as_written(&loaded, expected).map_err(Refusal::Failed)?;
+            loaded
+        } else {
+            found
+        };
         let asked = shown!("launchctl kickstart -p {}", said);
         let output = run(LAUNCHCTL, &["kickstart", "-p", &target], &[], &asked)
             .map_err(Unanswered::refusal)?;
@@ -1809,6 +1842,7 @@ mod platform {
         Ok(Asked {
             manager: Manager::Launchd,
             pid: String::from_utf8_lossy(&output.stdout).trim().parse().ok(),
+            no_restart: matches!(&held, Job::Loaded(loaded) if loaded.without_restart()),
         })
     }
 }
@@ -2103,6 +2137,12 @@ mod platform {
         /// it; a property that lists no command prints no line.
         pub(super) commands: Vec<(String, String)>,
         pub(super) pid: Option<u32>,
+        /// The `Restart` the manager holds for the unit, with every drop-in applied: none where it
+        /// printed no such line.
+        pub(super) restart: Option<String>,
+        /// The `RestartForceExitStatus` it holds, which restarts the unit whatever `Restart` says
+        /// where it lists a status: empty where it lists none, none where it printed no such line.
+        pub(super) restart_forced: Option<String>,
     }
 
     impl Unit {
@@ -2125,6 +2165,8 @@ mod platform {
                     "NeedDaemonReload" => unit.need_reload = value == "yes",
                     "Type" => value.clone_into(&mut unit.start_type),
                     "MainPID" => unit.pid = value.parse().ok().filter(|pid| *pid != 0),
+                    "Restart" => unit.restart = Some(value.to_owned()),
+                    "RestartForceExitStatus" => unit.restart_forced = Some(value.to_owned()),
                     _ if key.starts_with("Exec") && key.ends_with("Ex") => {
                         unit.commands.push((key.to_owned(), value.to_owned()));
                     }
@@ -2132,6 +2174,13 @@ mod platform {
                 }
             }
             unit
+        }
+
+        /// Whether the manager said that it does not start the unit again when its process ends:
+        /// `Restart=no` and no status that forces a restart. A manager that printed either line
+        /// otherwise, or did not print it, says nothing of the kind.
+        pub(super) fn restarts_no_more(&self) -> bool {
+            self.restart.as_deref() == Some("no") && self.restart_forced.as_deref() == Some("")
         }
 
         /// Why the user manager would not run the definition kr wrote as kr wrote it, when it
@@ -2504,6 +2553,24 @@ mod platform {
         Ok(Unit::read(&String::from_utf8_lossy(&output.stdout)))
     }
 
+    /// What the user manager holds of the process of the unit `name` and of what restarts it, as
+    /// `systemctl show` prints those properties. They are asked for by name: `systemctl show`
+    /// leaves out a property that is empty unless it is named, and a `RestartForceExitStatus` that
+    /// lists no status is the empty one.
+    fn started(name: &str, said: &Shown) -> std::result::Result<Unit, Shown> {
+        let output = succeeded(
+            &[
+                "show",
+                "--property=MainPID",
+                "--property=Restart",
+                "--property=RestartForceExitStatus",
+                name,
+            ],
+            &shown!("systemctl --user show {}", *said),
+        )?;
+        Ok(Unit::read(&String::from_utf8_lossy(&output.stdout)))
+    }
+
     /// Has the user manager read the definition just written, and checks that it would run it as
     /// kr wrote it. What it holds otherwise is named with where the drop-ins it reads are shown,
     /// and the definition stays written and recorded. Drop-ins it applies besides are named too.
@@ -2581,9 +2648,12 @@ mod platform {
         if !output.status.success() {
             return Err(Refusal::Failed(refused(&asked, &output)));
         }
+        // One read gives the process and the policy. A read that failed gives neither.
+        let found = started(&name, &said).ok();
         Ok(Asked {
             manager: Manager::Systemd,
-            pid: unit(&name, &said).ok().and_then(|found| found.pid),
+            pid: found.as_ref().and_then(|found| found.pid),
+            no_restart: found.as_ref().is_some_and(Unit::restarts_no_more),
         })
     }
 }
@@ -3313,6 +3383,57 @@ mod tests {
         );
     }
 
+    /// Launchd's description says whether it keeps a job alive, in its properties line or in a
+    /// field of its own, and the start takes the daemon's end for the last of it only where the
+    /// description lists its properties and `keepalive` is none of them. A description that lists
+    /// none says nothing, so launchd may start the job again.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_loaded_job_is_without_restart_only_where_launchd_lists_properties_and_no_keepalive() {
+        let described = |extra: &str| {
+            platform::Loaded::read(&format!(
+                "gui/501/{LABEL} = {{\n\tpath = /Users/someone/{LABEL}.plist\n\tstate = running\n\
+                 {extra}\tpid = 4242\n}}\n"
+            ))
+        };
+        assert!(
+            described("\tproperties = runatload | inferred program\n").without_restart(),
+            "properties are listed and keepalive is none of them"
+        );
+        assert!(
+            described("\tproperties = runatload\n").without_restart(),
+            "one property, not keepalive"
+        );
+        assert!(
+            !described("\tproperties = keepalive | runatload\n").without_restart(),
+            "keepalive is listed"
+        );
+        assert!(
+            !described("\tproperties = runatload | KeepAlive\n").without_restart(),
+            "keepalive is listed in another case"
+        );
+        assert!(
+            !described("\tkeepalive = {\n\t\tSuccessfulExit => false\n\t}\n").without_restart(),
+            "a field of its own is a job that is kept alive, and no properties are listed"
+        );
+        assert!(
+            !described("\tkeepalive = {\n\t}\n\tproperties = runatload\n").without_restart(),
+            "a field of its own wins over a properties line that follows it"
+        );
+        assert!(
+            !described("\tproperties = runatload\n\tkeepalive = {\n\t}\n").without_restart(),
+            "a field of its own wins over a properties line that came first"
+        );
+        assert!(
+            !described("").without_restart(),
+            "no properties are listed, so nothing is known"
+        );
+        assert!(
+            !described("\tendpoints = {\n\t\tkeepalive = 1\n\t}\n").without_restart(),
+            "a nested line is not a field of the job, and nothing is known"
+        );
+    }
+
     /// What launchd holds for a label, as `launchctl print` describes it: a job loaded from
     /// `path`, whose arguments after kr's own are `extra`.
     #[cfg(target_os = "macos")]
@@ -3527,6 +3648,54 @@ mod tests {
         assert_eq!(unit.target(), format!("{LABEL}.service"));
         assert_eq!(unit.program, "/opt/k r$HOME/kr-controller");
         assert_eq!(unit.arguments, arguments);
+    }
+
+    /// The user manager's word that it does not start the unit again is `Restart=no` with an empty
+    /// `RestartForceExitStatus=`, both printed. Any other `Restart`, a status that forces a
+    /// restart, and a line that is not printed say nothing of the kind.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_unit_restarts_no_more_only_where_the_manager_prints_no_restart_and_no_forced_status() {
+        let printed = |restart: &str, forced: &str| {
+            platform::Unit::read(&format!(
+                "Type=exec\nMainPID=4242\nLoadState=loaded\n{restart}{forced}"
+            ))
+        };
+        assert!(printed("Restart=no\n", "RestartForceExitStatus=\n").restarts_no_more());
+        for other in [
+            "on-failure",
+            "always",
+            "on-success",
+            "on-abnormal",
+            "on-abort",
+        ] {
+            assert!(
+                !printed(&format!("Restart={other}\n"), "RestartForceExitStatus=\n")
+                    .restarts_no_more(),
+                "Restart={other}"
+            );
+        }
+        assert!(
+            !printed("Restart=no\n", "RestartForceExitStatus=1\n").restarts_no_more(),
+            "a status that forces a restart"
+        );
+        assert!(
+            !printed("Restart=no\n", "").restarts_no_more(),
+            "no forced status line is printed"
+        );
+        assert!(
+            !printed("", "RestartForceExitStatus=\n").restarts_no_more(),
+            "no Restart line is printed"
+        );
+        assert!(
+            !platform::Unit::read("").restarts_no_more(),
+            "nothing is printed"
+        );
+        // The other keys that begin with the same word are not the policy.
+        assert!(
+            !printed("RestartUSec=100ms\n", "RestartForceExitStatus=\n").restarts_no_more(),
+            "RestartUSec is not Restart"
+        );
     }
 
     /// The unit kr writes, at `path`, as the user manager's comparisons below take it.

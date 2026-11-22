@@ -608,9 +608,11 @@ impl Launching {
         self.pending.store(true, Ordering::SeqCst);
     }
 
-    /// The daemon that was asked for has ended: a process this command started was seen to end, or
-    /// the process that a service manager named wrote the log's refusal of a bind and ended with it.
-    /// The start was made, and no daemon it asked for may still come up.
+    /// The daemon that was asked for has ended and the manager starts it no more: a process this
+    /// command started was seen to end, or the process that a service manager named wrote the
+    /// log's refusal of a bind and ended with it, under a policy that the manager reported when it
+    /// was asked, which holds no restart. The start was made, and no daemon it asked for may still
+    /// come up.
     #[cfg(unix)]
     pub(crate) fn process_ended(&self) {
         self.pending.store(false, Ordering::SeqCst);
@@ -1643,11 +1645,14 @@ async fn managed(
         Ok(client) => return Ok((client, Some(started))),
         Err(Waited::Deadline(last)) => last,
         Err(Waited::Stopped(line)) => {
-            // The manager named the process, and that process wrote the line and ended with it; the
-            // definition has no restart, so no requested daemon may still come up. With no process
-            // named, the line may be another start's daemon's, and the requested daemon may still
-            // come up.
-            if asked.pid.is_some() {
+            // The manager named the process, and that process wrote the line and ended with it. The
+            // manager's own policy for the job, as it reported it when it was asked, holds no
+            // restart, so no requested daemon may still come up. Where no process was named, the
+            // policy was not read, or it may restart the daemon (a systemd drop-in can set
+            // Restart, and launchd can hold a job loaded with KeepAlive), the line may be another
+            // start's daemon's or the manager's next start may follow it, and the requested daemon
+            // may still come up. A unit that another unit starts by name is not read.
+            if asked.pid.is_some() && asked.no_restart {
                 launched.process_ended();
             }
             if let Some(listed) = last_look(endpoint, majors, seen).await {
