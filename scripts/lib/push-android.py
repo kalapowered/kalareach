@@ -23,6 +23,17 @@ Commands, each given the adb program, the emulator's serial and a screenshot dir
       Waits until the page says that the question was answered by someone else, with what the person
       had chosen, and offers nothing to send. Prints `PUSH-ENDED <what the screen shows>`.
 
+  expired
+      Waits until the page says that the question expired, with what the person had chosen, and
+      offers nothing to send. Prints `PUSH-EXPIRED <what the screen shows>`.
+
+  shade <words>
+      Opens the notification shade, waits for the notification that shows those words, takes a picture
+      of it and closes the shade again. Prints `PUSH-SHADE <what the screen shows>`.
+
+The environment variable `KR_PUSH_SHOT_PREFIX`, when it is set, goes in front of every picture's name
+and a hyphen, so that two steps that take a picture of the same screen keep both.
+
 `blind` is for a sheet the application opens over the Attention screen, which the web view does not
 always hand over to `uiautomator`: when the choice or the button is not on the screen, it is pressed
 where the form draws it (`SHEET_CHOICES`, `SHEET_SEND`) and the run's own checks, the worker's
@@ -34,6 +45,7 @@ uses. It uses the Python standard library alone.
 """
 
 import importlib.util
+import os
 import sys
 import time
 from pathlib import Path
@@ -177,10 +189,45 @@ def observe(phone: Phone) -> None:
     print(f"PUSH-ENDED {texts(phone)}", flush=True)
 
 
+def expired(phone: Phone) -> None:
+    """Waits for the page to say that a question the person had chosen Yes to, and had not sent,
+    expired, and to offer nothing to send."""
+    def said(nodes: list[dict]) -> bool:
+        labels = [each["label"] for each in nodes]
+        return (
+            not any(label == "Send answer" for label in labels)
+            and any(label.lower() == "no longer waiting" for label in labels)
+            and any(label.startswith("This question expired") for label in labels)
+            and any(label.startswith("You had chosen Yes") for label in labels)
+        )
+
+    phone.wait_screen(said, "the page to say the question expired", 60, nudging=True)
+    phone.shot("expired")
+    print(f"PUSH-EXPIRED {texts(phone)}", flush=True)
+
+
+def shade(phone: Phone, words: str) -> None:
+    phone.run("shell", "cmd", "statusbar", "expand-notifications")
+    phone.wait(lambda each: words in each, f"the notification that shows {words!r}", 45)
+    phone.shot("shade")
+    print(f"PUSH-SHADE {texts(phone)}", flush=True)
+    phone.run("shell", "cmd", "statusbar", "collapse")
+
+
 def main() -> None:
     arguments = sys.argv[1:]
-    if len(arguments) >= 4 and arguments[0] in {"tap", "choose", "send", "observe"}:
+    if len(arguments) >= 4 and arguments[0] in {"tap", "choose", "send", "observe", "expired", "shade"}:
         phone = Phone(arguments[1], arguments[2], Path(arguments[3]))
+        prefix = os.environ.get("KR_PUSH_SHOT_PREFIX", "")
+        if prefix:
+            take = phone.shot
+            phone.shot = lambda name: take(f"{prefix}-{name}")
+        if arguments[0] == "expired" and len(arguments) == 4:
+            expired(phone)
+            return
+        if arguments[0] == "shade" and len(arguments) == 5:
+            shade(phone, arguments[4])
+            return
         if arguments[0] == "tap" and len(arguments) == 5:
             tap_notification(phone, arguments[4])
             return

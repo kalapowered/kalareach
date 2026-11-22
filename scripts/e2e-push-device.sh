@@ -17,6 +17,16 @@
 # Firebase receiver, from inside the application's own user; on the simulator as `xcrun simctl
 # push`. The host then asks a question, which is delivered through the gateway the same way.
 #
+# The Android run adds two states of the phone, after the host has answered a question first: a
+# question asked while the emulator is in deep Doze (`scripts/lib/android-doze.py`), and two
+# questions that run out of time, one of them after the person has chosen an answer to it and one
+# before the person has touched it. They are set with `KR_PUSH_ANDROID_STATES=1`, which this script
+# gives the host for the emulator and for nothing else. The Doze run shows our side of a delivery to a
+# phone in deep Doze: the gateway's request (high priority, a time to live) as the stand-in recorded
+# it, and the application's own receiver showing the alert with no network and no web view. It does
+# not show Google's handling of that request in Doze, which needs a live provider, or any maker's
+# battery rules: an adb broadcast stands in for the message, as it does for every delivery here.
+#
 # What the run shows, and what it does not:
 #   shows       the phone answers the gateway's challenge from its receiver and no other message,
 #               becomes a destination at the host under the authorisation the gateway issued, files
@@ -220,7 +230,9 @@ PY
 
 # Starts the host for a phone that reaches this machine as `peer`, and waits until it is up.
 start_harness() { # <peer>
-    KR_HARNESS_DIR="$harness" KR_HARNESS_PEER="$1" KR_HARNESS_SECONDS=1500 \
+    local states=0
+    [ "$platform" = android ] && states=1
+    KR_HARNESS_DIR="$harness" KR_HARNESS_PEER="$1" KR_HARNESS_SECONDS=1500 KR_PUSH_ANDROID_STATES="$states" \
         KR_PUSH_GATEWAY="$gateway_origin" KR_PUSH_FCM_PORT="$fcm_port" KR_PUSH_TOKEN="$token" \
         host_start "$harness_exe" --ignored --exact a_phone_registers_with_a_gateway_and_is_delivered_to_through_it --nocapture \
         >"$artefacts/harness.log" 2>&1 &
@@ -267,7 +279,7 @@ wait_for_report() {
 # Needs the files `$artefacts/phone-register.txt`, `phone-pending.json`, `phone-push.json` and
 # `phone-limited.txt` which the platform's run leaves.
 judge() {
-    python3 - "$harness/report.json" "$artefacts" "$platform" <<'PY'
+    python3 - "$harness/report.json" "$artefacts" "$platform" "$run" <<'PY'
 import json
 import os
 import re
@@ -424,6 +436,102 @@ say("a second question answered at the host while the person had chosen Yes and 
     late_seen[:300].replace("\n", " "))
 say("and the host's answer is the one the worker keeps (09.21)", report.get("host_answer_kept") is True)
 
+if platform == "android":
+    harness = os.path.dirname(sys.argv[1])
+
+    def doze_line(text, label):
+        """The key=value pairs of the first line the Doze driver printed with `label`."""
+        for each in text.splitlines():
+            if each.startswith(label + " "):
+                return dict(pair.split("=", 1) for pair in each[len(label) + 1:].split() if "=" in pair)
+        return {}
+
+    def delivery_state(number):
+        """What the pump wrote about a delivery of this run: its state before and after, its clock."""
+        text = read(f"delivery-state-{number}.txt")
+        values = {}
+        if f"run={sys.argv[4]}" not in text.splitlines():
+            return values
+        for each in text.splitlines():
+            if each.startswith("clock_before="):
+                values["clock_before"] = each.split("=", 1)[1]
+            elif each.startswith("before DOZE-READ "):
+                values["before"] = doze_line(each[len("before "):], "DOZE-READ")
+            elif each.startswith("after DOZE-READ "):
+                values["after"] = doze_line(each[len("after "):], "DOZE-READ")
+        return values
+
+    def when_of(number):
+        """The time the notification the phone listed for a delivery says it was posted at."""
+        dump = read(f"notifications-{number}.txt").split("Archived notifications", 1)[0]
+        found = re.search(r"pkg=to\.kala\.reach .*?when=(\d+)/", dump, re.DOTALL)
+        return int(found.group(1)) if found else None
+
+    if "doze_on_step" not in report:
+        say("the Doze and expiry phases ran", False, "the host did not reach them")
+    else:
+        say("the Doze and expiry phases began with the daemon at rest",
+            report.get("states_started_quiet") is True and report.get("expiry_started_quiet") is True
+            and report.get("untouched_started_quiet") is True)
+        entered = report.get("doze_on_step") or ""
+        held = doze_line(entered, "DOZE-ENTERED")
+        say("the phone was put in deep Doze: deep idle, the screen off, no power source, and the application not on the allowlist",
+            "DOZE-ENTERED" in entered and "exit=0" in entered and held.get("deep") == "IDLE"
+            and held.get("idle_mode") == "true" and held.get("wakefulness") == "Asleep"
+            and held.get("powered") == "false" and held.get("allowlisted") == "false", entered.strip().replace("\n", " | ")[:300])
+        request = report.get("doze_request") or {}
+        ttl = re.fullmatch(r"(\d+)s", str(request.get("ttl")))
+        say("the gateway's request to the provider's stand-in for the delivery asked for high priority, a data message, a collapse key and a time to live within the notification's four hours",
+            report.get("doze_delivered") is True and request.get("priority") == "high" and request.get("data_only") is True
+            and request.get("collapse_key") is True and ttl is not None and 0 < int(ttl.group(1)) <= 4 * 60 * 60, f"{request}")
+        number = report.get("doze_message_number")
+        state = delivery_state(number) if isinstance(number, int) else {}
+        before, after = state.get("before", {}), state.get("after", {})
+        say("the delivery was put on the phone while it was in deep Doze, with the screen off, and the application's receiver showed the generic alert with none of the question's text",
+            report.get("doze_put_on_the_phone") is True and report.get("doze_shown") is True
+            and before.get("deep") == "IDLE" and before.get("idle_mode") == "true" and before.get("wakefulness") == "Asleep"
+            and any(line.startswith(f"{number}|delivery: shown") for line in read("delivery-outcomes.txt").splitlines()),
+            f"before {before}")
+        posted, clock = when_of(number) if isinstance(number, int) else None, state.get("clock_before")
+        gap = posted - int(clock) if posted is not None and str(clock).isdigit() else None
+        say("the notification was posted within the receiver's budget of ten seconds of the message being handed over, by the phone's own clock",
+            gap is not None and 0 <= gap <= 10_000, f"{gap} ms")
+        say("the phone still reported deep Doze after the delivery was shown",
+            after.get("deep") == "IDLE" and after.get("idle_mode") == "true", f"after {after}")
+        read_step = report.get("doze_read_step") or ""
+        awake = doze_line(read_step, "DOZE-AWAKE")
+        say("with the screen on the phone was still in deep Doze, and the notification posted in Doze was in the shade",
+            "DOZE-READ" in read_step and awake.get("deep") == "IDLE" and awake.get("wakefulness") == "Awake" and "PUSH-SHADE" in read_step,
+            read_step.strip().replace("\n", " | ")[:300])
+        left = report.get("doze_off_step") or ""
+        say("the phone left Doze", "DOZE-LEFT" in left and "exit=0" in left and doze_line(left, "DOZE-LEFT").get("deep") == "ACTIVE",
+            left.strip().replace("\n", " | ")[:300])
+        tapped = report.get("doze_tap_step") or ""
+        say("the notification posted in Doze opened the Attention screen, and the person's Yes is the paired device's answer in the worker's ledger",
+            "PUSH-TAPPED" in tapped and "Attention" in tapped and report.get("doze_answered") is True
+            and report.get("doze_answer_is_yes_and_the_paired_devices") is True, tapped[:200].replace("\n", " "))
+
+        left_ms = report.get("expire_chosen_with_ms_left")
+        chosen = report.get("expire_step") or ""
+        say("a question that lives two minutes was chosen Yes on the phone before it ran out, and not sent",
+            report.get("expiring_lives_ms") == 120_000 and report.get("expiring_shown") is True and "PUSH-CHOSEN" in chosen
+            and isinstance(left_ms, int) and left_ms > 0 and report.get("expiring_still_waiting_when_chosen") is True,
+            f"{left_ms} ms left when chosen")
+        ended = report.get("expire_observe_step") or ""
+        say("five seconds after the deadline the host holds the question as expired with no answer, and the phone says that it expired and what the person had chosen, and offers nothing to send",
+            report.get("expiring_expired_without_an_answer") is True and "PUSH-EXPIRED" in ended and "No longer waiting" in ended
+            and "This question expired" in ended and re.search(r"You had chosen( \| | )Yes", ended) and "Send answer" not in ended,
+            ended[:300].replace("\n", " "))
+        print("note=the refusal sentence of a press after the deadline, 'so this attempt changed nothing', was "
+              + ("on the screen" if "so this attempt changed nothing" in ended else "not on the screen") + " in that read")
+        late = report.get("expire_tap_step") or ""
+        shown_ms = report.get("untouched_shown_with_ms_left")
+        say("a notification the person left alone until its question had run out of time opened the Attention screen with nothing to send, and the host holds the question as expired with no answer",
+            report.get("untouched_shown") is True and isinstance(shown_ms, int) and shown_ms > 0
+            and report.get("untouched_expired_without_an_answer") is True and "PUSH-TAPPED" in late and "Attention" in late
+            and "Send answer" not in late and report.get("untouched_still_expired_without_an_answer") is True,
+            late[:300].replace("\n", " "))
+
 if report.get("later_phases_ran") is not True:
     say("the phases after the registration ran", False, "the host had no destination to go on with")
 else:
@@ -524,6 +632,11 @@ pump_android() { # <adb> <serial>
             "$adb" -s "$serial" shell am force-stop "$app_id" >/dev/null 2>&1
             echo "pid before the message: '$("$adb" -s "$serial" shell pidof "$app_id" | tr -d '\r')'" >"$artefacts/cold-start.txt"
         fi
+        local clock_before="" state_before=""
+        if python3 "$here/scripts/lib/push-inject.py" kind "$file" | grep -q '^delivery$'; then
+            state_before="$(python3 "$here/scripts/lib/android-doze.py" read "$adb" "$serial")"
+            clock_before="$("$adb" -s "$serial" shell date +%s%3N | tr -d '\r')"
+        fi
         "$adb" -s "$serial" shell "run-as $app_id sh" <"$harness/inject-$n.sh" >"$harness/inject-$n.out" 2>&1
         while :; do
             after="$("$adb" -s "$serial" logcat -d -s KalaReachPush:I 2>/dev/null | grep -c 'KalaReachPush')"
@@ -539,6 +652,14 @@ pump_android() { # <adb> <serial>
         if python3 "$here/scripts/lib/push-inject.py" kind "$file" | grep -q '^delivery$'; then
             printf '%s|%s\n' "$n" "$outcome" >>"$artefacts/delivery-outcomes.txt"
             check_android_notification "$adb" "$serial" "$n"
+            # The phone's state around the delivery, and its clock when the message was handed over.
+            {
+                echo "run=$run"
+                echo "note=$(python3 "$here/scripts/lib/push-inject.py" note "$file")"
+                echo "clock_before=$clock_before"
+                echo "before $state_before"
+                echo "after $(python3 "$here/scripts/lib/android-doze.py" read "$adb" "$serial")"
+            } >"$artefacts/delivery-state-$n.txt"
         else
             printf '%s|%s\n' "$n" "$outcome" >>"$artefacts/challenge-outcomes.txt"
         fi
@@ -591,8 +712,10 @@ android_launch() { # <adb> <serial> <name> <json fields>
 # Taps the notification the host's generic alert is on, opens the question on the Attention screen
 # and chooses an answer; for `send` it then sends it. What the phone showed is written to the step's
 # done file.
-action_android() { # <adb> <serial> <step> <words of the question> <choice> <send|stop>
+action_android() { # <adb> <serial> <step> <words of the question> <choice> <send|stop> [<picture prefix>]
     local adb="$1" serial="$2" step="$3" words="$4" choice="$5" ending="$6" alert out="$harness/done-$3.tmp" blind=blind
+    local KR_PUSH_SHOT_PREFIX="${7:-}"
+    export KR_PUSH_SHOT_PREFIX
     alert="$(python3 "$here/scripts/lib/push-inject.py" alert "$(ls -t "$harness"/inject-*.json | head -1)")"
     # The sheet a notification's tap opens is not always in the tree the web view hands over, so the
     # person who answers from it presses where the form draws its choices. Every question's form is
@@ -632,6 +755,49 @@ steps_android() { # <adb> <serial>
             : >"$harness/started-late-observe"
             python3 "$here/scripts/lib/push-android.py" observe "$adb" "$serial" "$shots" >"$harness/done-late-observe.tmp" 2>&1
             mv "$harness/done-late-observe.tmp" "$harness/done-late-observe"
+        fi
+        if [ -e "$harness/step-doze-on.json" ] && [ ! -e "$harness/started-doze-on" ]; then
+            : >"$harness/started-doze-on"
+            { python3 "$here/scripts/lib/android-doze.py" enter "$adb" "$serial"; echo "exit=$?"; } >"$harness/done-doze-on.tmp" 2>&1
+            mv "$harness/done-doze-on.tmp" "$harness/done-doze-on"
+        fi
+        if [ -e "$harness/step-doze-read.json" ] && [ ! -e "$harness/started-doze-read" ]; then
+            : >"$harness/started-doze-read"
+            # The phone asleep, then awake with the screen on and still in Doze, with the shade's picture.
+            local alert
+            alert="$(python3 "$here/scripts/lib/push-inject.py" alert "$(ls -t "$harness"/inject-*.json | head -1)")"
+            {
+                python3 "$here/scripts/lib/android-doze.py" read "$adb" "$serial"
+                python3 "$here/scripts/lib/android-doze.py" wake "$adb" "$serial"
+                KR_PUSH_SHOT_PREFIX=doze python3 "$here/scripts/lib/push-android.py" shade "$adb" "$serial" "$shots" "$alert"
+                python3 "$here/scripts/lib/android-doze.py" read "$adb" "$serial"
+            } >"$harness/done-doze-read.tmp" 2>&1
+            mv "$harness/done-doze-read.tmp" "$harness/done-doze-read"
+        fi
+        if [ -e "$harness/step-doze-off.json" ] && [ ! -e "$harness/started-doze-off" ]; then
+            : >"$harness/started-doze-off"
+            { python3 "$here/scripts/lib/android-doze.py" leave "$adb" "$serial"; echo "exit=$?"; } >"$harness/done-doze-off.tmp" 2>&1
+            mv "$harness/done-doze-off.tmp" "$harness/done-doze-off"
+        fi
+        if [ -e "$harness/step-doze-tap.json" ] && [ ! -e "$harness/started-doze-tap" ]; then
+            : >"$harness/started-doze-tap"
+            action_android "$adb" "$serial" doze-tap "A question is waiting for an answer" "Yes" send doze
+        fi
+        if [ -e "$harness/step-expire.json" ] && [ ! -e "$harness/started-expire" ]; then
+            : >"$harness/started-expire"
+            action_android "$adb" "$serial" expire "A question is waiting for an answer" "Yes" stop expire
+        fi
+        if [ -e "$harness/step-expire-observe.json" ] && [ ! -e "$harness/started-expire-observe" ]; then
+            : >"$harness/started-expire-observe"
+            KR_PUSH_SHOT_PREFIX=expire python3 "$here/scripts/lib/push-android.py" expired "$adb" "$serial" "$shots" >"$harness/done-expire-observe.tmp" 2>&1
+            mv "$harness/done-expire-observe.tmp" "$harness/done-expire-observe"
+        fi
+        if [ -e "$harness/step-expire-tap.json" ] && [ ! -e "$harness/started-expire-tap" ]; then
+            : >"$harness/started-expire-tap"
+            local alert_late
+            alert_late="$(python3 "$here/scripts/lib/push-inject.py" alert "$(ls -t "$harness"/inject-*.json | head -1)")"
+            KR_PUSH_SHOT_PREFIX=expire-late python3 "$here/scripts/lib/push-android.py" tap "$adb" "$serial" "$shots" "$alert_late" >"$harness/done-expire-tap.tmp" 2>&1
+            mv "$harness/done-expire-tap.tmp" "$harness/done-expire-tap"
         fi
         if [ -e "$harness/step-newtoken.json" ] && [ ! -e "$harness/started-newtoken" ]; then
             : >"$harness/started-newtoken"
