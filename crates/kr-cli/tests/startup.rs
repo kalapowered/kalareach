@@ -761,10 +761,11 @@ impl Standalone {
         self.kr_at(&installation().join("kr"), arguments)
     }
 
-    /// [`Self::kr`] from another installation: the one a case with a stub daemon lays out. It runs
-    /// in the working directory of [`installation`], so the held daemon and the worker are built
-    /// first: `cargo build --locked -p kr-controller --features testing --bin kr-controller-held`
-    /// and `cargo build --locked -p kr-worker`; a build of this crate alone fails here and says why.
+    /// [`Self::kr`] from another installation: the one a case with a stub daemon lays out.
+    /// [`Self::kr_at`] calls [`installation`] for its working directory before this sets the stub
+    /// installation's, so the held daemon and the worker are built first: `cargo build --locked -p
+    /// kr-controller --features testing --bin kr-controller-held` and `cargo build --locked -p
+    /// kr-worker`; a build of this crate alone fails there and says why.
     fn kr_from(&self, installation: &Path, arguments: &[&str]) -> Command {
         let mut command = self.kr_at(&installation.join("kr"), arguments);
         command.current_dir(installation);
