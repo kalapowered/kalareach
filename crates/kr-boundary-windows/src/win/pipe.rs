@@ -29,7 +29,7 @@ use windows_sys::Win32::Security::Authorization::ConvertStringSecurityDescriptor
 use windows_sys::Win32::Security::{
     CheckTokenMembership, DACL_SECURITY_INFORMATION, GetTokenInformation,
     PROTECTED_DACL_SECURITY_INFORMATION, RevertToSelf, SECURITY_ATTRIBUTES, SID_AND_ATTRIBUTES,
-    SetKernelObjectSecurity, TOKEN_DUPLICATE, TOKEN_QUERY, TokenUser,
+    SetKernelObjectSecurity, TOKEN_QUERY, TokenUser,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED, OPEN_EXISTING,
@@ -506,8 +506,9 @@ impl Connection {
 
     /// The process on the other end of a connection a client made to this server, and a copy of the
     /// token that the caller's side of the connection carries, read while the caller is impersonated
-    /// and reverted at once. The copy is an impersonation token at the level the caller's open
-    /// allowed; it is the caller's own effective token, and the process's token is another thing.
+    /// and reverted at once. The handle is to an impersonation token at the level the caller's open
+    /// allowed, the system's own copy of the caller's effective token taken when it connected; the
+    /// process's token is another thing.
     ///
     /// # Errors
     ///
@@ -529,14 +530,7 @@ impl Connection {
         }
         let mut token: HANDLE = null_mut();
         // SAFETY: the thread's own impersonation token is opened as the service itself.
-        let opened = unsafe {
-            OpenThreadToken(
-                GetCurrentThread(),
-                TOKEN_QUERY | TOKEN_DUPLICATE,
-                1,
-                &raw mut token,
-            )
-        };
+        let opened = unsafe { OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, 1, &raw mut token) };
         let failure = if opened == 0 {
             // text: pipe_identity-3
             Some(last("reading the caller's token"))

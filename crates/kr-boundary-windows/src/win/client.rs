@@ -68,10 +68,10 @@ pub fn client_from_pipe(connection: &Connection) -> std::result::Result<ClientId
         Err(_) => return Err(standing::unidentified(standing::RULE_IDENTIFY)),
     };
     let unidentified = |_: ffi::Error| standing::unidentified(standing::RULE_IDENTIFY);
-    let token = ImpersonationToken::duplicate_of(&caller).map_err(unidentified)?;
+    let token = ImpersonationToken::of_caller(caller);
     let facts = facts_of(&token).map_err(unidentified)?;
     standing::refuse(&facts)?;
-    let caller_user = token::user_of(&caller).map_err(unidentified)?;
+    let caller_user = token.user().map_err(unidentified)?;
     // The process is held before its token is read, so the token is the held process's.
     let process = hold_process(pid).map_err(|_| process_refusal())?;
     let creation_time = created(&process).map_err(|_| process_refusal())?;
