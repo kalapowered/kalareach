@@ -127,7 +127,7 @@ impl Run<'_> {
             _ => None,
         };
         // Terminate and wait.
-        let retained: Vec<&Child> = self.primary.iter().collect();
+        let retained: Vec<&Child> = self.readers.iter().chain(self.primary.iter()).collect();
         let ended = match self.job.as_mut() {
             Some(job) => job.end(&retained, Instant::now() + bounds.end),
             None => Ended {
@@ -165,6 +165,7 @@ impl Run<'_> {
         // wait for the session: the token, and the process objects of the children, which refer to
         // their token for as long as they exist.
         self.primary = None;
+        self.readers.clear();
         self.token = None;
         #[cfg(feature = "testing")]
         super::testing::note(0, self.session);

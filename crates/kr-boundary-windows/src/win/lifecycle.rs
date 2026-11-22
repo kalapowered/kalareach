@@ -12,7 +12,9 @@
 //! 4. The group and the token are made, the token is read back, the logon session is read, and
 //!    the journal's first row is durable.
 //! 5. The job and the private root are made.
-//! 6. (The tree's readers run as children of the job: built with the operate path.)
+//! 6. The tree's reader child, when the tree has one, runs in the private root as a child of the
+//!    job: it is made suspended, the journal makes its permit without a row, and it has ended before
+//!    the grant. Its end is proved with every other child's, by the session.
 //! 7. The tree is granted.
 //! 8. The data pipes are made, the reply `accepted` is sent, and the client connects both.
 //! 9. The primary child is made suspended inside the job; the checks before its resume run; its
@@ -68,6 +70,9 @@ pub use recovery::{Recovered, Recovery, recover};
 /// How long the wait for the end of the job and of its processes may take.
 pub const END_BOUND: Duration = Duration::from_secs(30);
 
+/// How long a reader child has to end.
+pub const READER_BOUND: Duration = Duration::from_secs(30);
+
 /// How long the wait for the logon session to leave the system's list may take.
 pub const SESSION_BOUND: Duration = Duration::from_secs(30);
 
@@ -90,6 +95,8 @@ pub struct Bounds {
     pub deadline: Duration,
     /// How long the client has to connect both data pipes.
     pub connect: Duration,
+    /// How long a reader child has to end.
+    pub reader: Duration,
     /// How long the job and its processes have to end.
     pub end: Duration,
     /// How long the logon session has to leave the system's list.
@@ -101,6 +108,7 @@ impl Default for Bounds {
         Self {
             deadline: INVOCATION_DEADLINE,
             connect: CONNECT_BOUND,
+            reader: READER_BOUND,
             end: END_BOUND,
             session: SESSION_BOUND,
         }
@@ -227,6 +235,13 @@ pub trait TreeHold: Send {
         group: &Sid,
         rows: &mut dyn FnMut(Row) -> Result<(), String>,
     ) -> Result<(), Refusal>;
+    /// Phase 6: the program of the tree's reader child, when the tree has one. It runs in the
+    /// private root before the grant and ends with the code 0 when the tree is accepted.
+    ///
+    /// # Errors
+    ///
+    /// Returns why the child cannot be planned.
+    fn reader(&self, root: &PrivateRoot) -> Result<Option<ChildPlan>, String>;
     /// The program of the primary child.
     ///
     /// # Errors
@@ -405,6 +420,7 @@ pub(super) struct Run<'a> {
     pub(super) job: Option<Job>,
     pub(super) root: Option<PrivateRoot>,
     pub(super) primary: Option<Child>,
+    pub(super) readers: Vec<Child>,
     pub(super) pipes: Option<DataPipes>,
     pub(super) started: bool,
     pub(super) began: bool,
@@ -509,6 +525,71 @@ impl Run<'_> {
             },
         )
         .map_err(not_started)
+    }
+
+    /// Phase 6: the tree's reader child. A reader that ends with another code than 0, that does not
+    /// end within its bound or that cannot be started refuses the operation, and the ending
+    /// function ends what ran.
+    fn classify(&mut self) -> Result<(), Failure> {
+        let root = self
+            .root
+            .as_ref()
+            .ok_or_else(|| not_started("no private root"))?;
+        let Some(plan) = self
+            .tree
+            .as_ref()
+            .ok_or_else(|| not_started("no tree"))?
+            .reader(root)
+            .map_err(not_started)?
+        else {
+            return Ok(());
+        };
+        let descriptor = self.process_descriptor()?;
+        let token = self.token.as_ref().ok_or_else(|| not_started("no token"))?;
+        let job = self.job.as_ref().ok_or_else(|| not_started("no job"))?;
+        let suspended = launch(ChildSpec {
+            invocation: Some(self.id),
+            token: TokenSpec::Boundary(token),
+            job,
+            program: plan.program,
+            command_line: plan.command_line,
+            cwd: &plan.cwd,
+            env: &plan.env,
+            stdin: Std::Nul,
+            stdout: Std::Nul,
+            stderr: Std::Nul,
+            process_descriptor: &descriptor,
+            thread_descriptor: &descriptor,
+            deadline: Some(self.deadline),
+        })
+        .map_err(not_started)?;
+        self.started = true;
+        at("reader suspended");
+        let journal = self
+            .journal
+            .as_ref()
+            .ok_or_else(|| not_started("the journal is not open"))?;
+        let permit = journal.permit_for_reader(&suspended).map_err(not_started)?;
+        let child = suspended.resume(permit).map_err(not_started)?;
+        at("reader resumed");
+        // The end of the invocation waits for this child with the others, whatever came of it.
+        self.readers.push(child);
+        let reader = self
+            .readers
+            .last()
+            .ok_or_else(|| not_started("no reader"))?;
+        match reader.wait_or_stop(self.env.bounds.reader, &self.env.stop) {
+            Ok(Some(0)) => {
+                at("reader ended");
+                Ok(())
+            }
+            Ok(Some(code)) => Err(not_started(format!(
+                "the reader of the project ended with the code {code}"
+            ))),
+            Ok(None) if self.env.stop.is_set() => Err(not_started("the broker is stopping")),
+            Ok(None) => Err(not_started("the reader of the project did not end in time")),
+            Err(unread) => Err(not_started(unread)),
+        }
     }
 
     /// Phase 7: the grant.
@@ -680,6 +761,7 @@ impl Run<'_> {
     ) -> Result<EndedBy, Failure> {
         self.begin(request)?;
         self.make_root()?;
+        self.classify()?;
         self.grant()?;
         self.open_channel(connection)?;
         self.start_primary()?;
@@ -819,6 +901,7 @@ pub fn run_invocation(
         job: None,
         root: None,
         primary: None,
+        readers: Vec::new(),
         pipes: None,
         started: false,
         began: false,
