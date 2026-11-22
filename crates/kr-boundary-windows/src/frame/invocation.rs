@@ -400,6 +400,9 @@ pub enum EndedBy {
     Deadline,
     /// The broker was stopping.
     Stop,
+    /// The operation did not start: a phase failed after the journal's first row, before the primary
+    /// ran or ended by itself.
+    NotStarted,
 }
 
 /// What kind of object a leftover is on.

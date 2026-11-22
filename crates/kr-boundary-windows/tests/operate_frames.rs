@@ -694,6 +694,7 @@ fn replies() -> Vec<InvocationReply> {
         EndedBy::Cancel,
         EndedBy::Deadline,
         EndedBy::Stop,
+        EndedBy::NotStarted,
     ] {
         all.push(InvocationReply::Finished {
             exit: Some(128),
@@ -779,6 +780,28 @@ fn the_replies_are_encoded_as_these_bytes() {
             r#""cleanup":{"failed":{"object":"a","class":"repository"}},"#,
             r#""configuration":"same","notes":{"items":["n"],"cut":0},"replaced_protected":2}"#
         )
+    );
+}
+
+#[test]
+fn a_reply_that_says_the_operation_was_not_started_is_read_and_written_by_its_name() {
+    let body = concat!(
+        r#"{"answer":"finished","exit":null,"ended_by":"not-started","cleanup":"uncertain","#,
+        r#""configuration":"same","notes":{"items":[],"cut":0},"replaced_protected":0}"#
+    );
+    let read: InvocationReply =
+        serde_json::from_str(body).expect("the value is part of the protocol");
+    assert_eq!(serde_json::to_string(&read).unwrap(), body);
+    assert!(
+        matches!(
+            read,
+            InvocationReply::Finished {
+                ended_by: EndedBy::NotStarted,
+                exit: None,
+                ..
+            }
+        ),
+        "{read:?}"
     );
 }
 
