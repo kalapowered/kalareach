@@ -352,6 +352,7 @@ export function ApprovalRequests({
             ? approvalNoticeFor({
                 instance: request.instance,
                 capabilities: capabilityRecords(facts.capabilities.records),
+                binding: facts.binding,
                 connected: true,
                 rights: new Set(rights)
               })

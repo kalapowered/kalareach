@@ -347,10 +347,11 @@ export function Conversation({
         instance:
           agent.instances?.find((each) => each.application_instance_id === agent.instance) ?? null,
         capabilities: agent.capabilities,
+        binding: agent.binding,
         connected,
         rights: rights === null ? null : new Set(rights)
       }),
-    [agent.instances, agent.instance, agent.capabilities, connected, rights]
+    [agent.instances, agent.instance, agent.capabilities, agent.binding, connected, rights]
   )
 
   // The conversation the session's agent is in now: what a draft is written for, and what it is

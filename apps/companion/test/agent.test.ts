@@ -27,6 +27,7 @@ import {
   composerOffers,
   foldWithheld,
   drawnUnder,
+  hostSentence,
   invocationOf,
   liveInstance,
   targetOf,
@@ -626,5 +627,38 @@ describe('the instance the composer speaks to (KR-REQ-12.23)', () => {
     expect(composerInstance(listed, 'c')).toBeNull()
     expect(composerInstance(listed, null)).toBeNull()
     expect(composerInstance(null, 'a')).toBeNull()
+  })
+})
+
+describe('a reason the host gives, shown as a sentence', () => {
+  it('starts with a capital letter and ends with a full stop', () => {
+    expect(hostSentence('the terminal’s conversation is not read, so the thread is unknown')).toBe(
+      'The terminal’s conversation is not read, so the thread is unknown.'
+    )
+  })
+
+  it('leaves a sentence that is whole as it is, whatever mark ends it', () => {
+    expect(hostSentence('The conversation changed outside this host.')).toBe(
+      'The conversation changed outside this host.'
+    )
+    expect(hostSentence('Is the channel on?')).toBe('Is the channel on?')
+  })
+
+  it('says nothing for a reason that has no words', () => {
+    expect(hostSentence('  ')).toBe('')
+  })
+
+  it('is what an offer gives for a suspension the host worded as a clause', () => {
+    const offers = composerOffers({
+      known: true,
+      instance: null,
+      binding: binding({
+        rich_mutations_suspended: true,
+        suspension_reason: 'the stream does not say which conversation it is in'
+      }),
+      capabilities: capabilities(),
+      rights: EVERY_RIGHT
+    })
+    expect(offers.answer.reason).toBe('The stream does not say which conversation it is in.')
   })
 })

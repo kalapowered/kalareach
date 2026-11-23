@@ -221,3 +221,70 @@ describe('the inbox card of an approval that cannot be answered here', () => {
     expect(within(approval).queryByTestId('approval-offer')).toBeNull()
   })
 })
+
+describe('the notice while the host suspends rich mutations', () => {
+  const FENCE =
+    'approvals cannot be recorded while the record store has a fault, so they are answered in the terminal, which goes on working'
+  const SENTENCE =
+    'Approvals cannot be recorded while the record store has a fault, so they are answered in the terminal, which goes on working.'
+
+  it('gives_the_hosts_reason_as_a_sentence_and_offers_the_terminal', async () => {
+    open((controls) => {
+      controls.records.suspend(SESSION_MAIN, FENCE)
+    })
+    const region = await notice()
+    expect(region).toHaveTextContent('Claude Code asks for approvals in its terminal. Answer them there.')
+    expect(within(region).getByTestId('approval-offer-reason')).toHaveTextContent(SENTENCE)
+    await userEvent.click(within(region).getByRole('button', { name: 'Open the terminal' }))
+    await waitFor(() => {
+      expect(screen.getByRole('tab', { name: 'Terminal' })).toHaveAttribute('aria-selected', 'true')
+    })
+  })
+
+  it('draws_the_decisions_disabled_with_the_same_sentence_on_the_card_in_the_conversation', async () => {
+    open((controls) => {
+      controls.records.suspend(SESSION_MAIN, FENCE)
+    })
+    const approval = await screen.findByTestId('approval')
+    expect(within(approval).getByRole('button', { name: 'Allow once' })).toBeDisabled()
+    expect(within(approval).getByTestId('approval-unavailable')).toHaveTextContent(SENTENCE)
+  })
+
+  it('names_the_reason_on_the_inbox_card_once', async () => {
+    open(
+      (controls) => {
+        controls.records.suspend(SESSION_MAIN, FENCE)
+      },
+      true,
+      { view: 'attention' }
+    )
+    const approval = await screen.findByTestId('approval')
+    const offer = await within(approval).findByTestId('approval-offer')
+    expect(within(offer).getByTestId('approval-offer-reason')).toHaveTextContent(SENTENCE)
+    expect(within(approval).queryByTestId('approval-unavailable')).toBeNull()
+  })
+
+  it('an_agent_that_does_not_use_channels_gets_no_notice_for_a_suspension', async () => {
+    open((controls) => {
+      controls.records.suspend(SESSION_MAIN, FENCE)
+    }, false)
+    await screen.findByTestId('approval')
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0))
+    })
+    expect(screen.queryByRole('region', { name: 'Approvals' })).toBeNull()
+  })
+
+  it('lifting_the_suspension_takes_the_notice_away', async () => {
+    const controls = open((each) => {
+      each.records.suspend(SESSION_MAIN, FENCE)
+    })
+    await notice()
+    act(() => {
+      controls.records.suspend(SESSION_MAIN, null)
+    })
+    await waitFor(() => {
+      expect(screen.queryByRole('region', { name: 'Approvals' })).toBeNull()
+    })
+  })
+})

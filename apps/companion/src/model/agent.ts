@@ -115,6 +115,29 @@ export function unboundBecause(instance: AgentInstanceSummary): string {
 }
 
 /**
+ * A reason the host gave, shown as a sentence.
+ *
+ * The host words some of its reasons as clauses for its own log, in lower case and with no full
+ * stop. Every reason this page shows on its own line goes through here: a first letter that is
+ * lower case is raised, and a reason that does not end in a full stop, a question mark or an
+ * exclamation mark gets a full stop. A reason that is a sentence already is not changed.
+ */
+export function hostSentence(reason: string): string {
+  const text = reason.trim()
+  if (text === '') return ''
+  const raised = text.charAt(0).toUpperCase() + text.slice(1)
+  return /[.!?]$/.test(raised) ? raised : `${raised}.`
+}
+
+/** What a suspended binding says when the host gave no reason of its own. */
+function suspensionOf(binding: AgentBindingState): string {
+  return hostSentence(
+    binding.suspension_reason ??
+      'The host could not confirm which conversation this agent is in, so nothing is sent to it from here. The terminal still works.'
+  )
+}
+
+/**
  * Builds the call a control makes, from what this view has read of the session's agent.
  *
  * The call names the package that recognised the agent, the control's registered action, and the
@@ -353,12 +376,7 @@ export function composerOffers({
     }
     if (binding === null) return { offered: false, reason: 'No agent is running in this session.' }
     if (binding.rich_mutations_suspended) {
-      return {
-        offered: false,
-        reason:
-          binding.suspension_reason ??
-          'The host could not confirm which conversation this agent is in, so nothing is sent to it from here. The terminal still works.'
-      }
+      return { offered: false, reason: suspensionOf(binding) }
     }
     if ((action === 'steer' || action === 'interrupt') && binding.turn_id === null) {
       return { offered: false, reason: 'The agent is not running a turn.' }
@@ -370,7 +388,7 @@ export function composerOffers({
     if (record.state !== 'qualified_available') {
       return {
         offered: false,
-        reason: record.disabled_reason ?? 'This agent cannot do this right now.'
+        reason: hostSentence(record.disabled_reason ?? 'This agent cannot do this right now.')
       }
     }
     if (rights === null) {
@@ -503,19 +521,22 @@ const NO_APPROVAL_RECORD =
  *
  * It says nothing before the records are read, before a live connection has said what it may do,
  * for an agent whose package is not in [`CHANNEL_PACKAGES`], and while the approval capability is
- * usable. A record that
- * is present and not usable gives its own reason, with one sentence per state where it gave none; an
- * absent record gives the instance's own refusal where it has one. The terminal is offered only
- * with a live connection and the right to type in it.
+ * usable and the binding's rich mutations are not suspended. A suspended binding gives the host's
+ * reason for it, the one the decisions show. A record that is present and not usable gives its own
+ * reason, with one sentence per state where it gave none; an absent record gives the instance's own
+ * refusal where it has one. Each reason is shown as a sentence ([`hostSentence`]). The terminal is
+ * offered only with a live connection and the right to type in it.
  */
 export function approvalNoticeFor({
   instance,
   capabilities,
+  binding,
   connected,
   rights
 }: {
   readonly instance: AgentInstanceSummary | null
   readonly capabilities: ReadonlyMap<string, InstanceCapabilityRecord> | null
+  readonly binding: AgentBindingState | null
   readonly connected: boolean
   readonly rights: ReadonlySet<string> | null
 }): ApprovalNotice | null {
@@ -525,12 +546,15 @@ export function approvalNoticeFor({
   if (connected && rights === null) return null
   const record = capabilities.get(COMPOSER_CAPABILITIES.answer)
   let sentence: string
-  if (record === undefined) {
-    sentence = instance.refusal ?? NO_APPROVAL_RECORD
+  if (binding?.rich_mutations_suspended === true) {
+    // The host holds rich mutations back, and the buttons give the same reason: it comes first.
+    sentence = suspensionOf(binding)
+  } else if (record === undefined) {
+    sentence = hostSentence(instance.refusal ?? NO_APPROVAL_RECORD)
   } else if (record.state === 'qualified_available') {
     return null
   } else {
-    sentence = record.disabled_reason ?? APPROVAL_STATE_SENTENCES[record.state]
+    sentence = hostSentence(record.disabled_reason ?? APPROVAL_STATE_SENTENCES[record.state])
   }
   const terminal = !connected
     ? 'not_connected'
