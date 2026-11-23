@@ -19,8 +19,9 @@ use kr_client::services::{
 };
 use kr_controller::backup::store::{
     AttemptOutcome, AttemptStatus, BackupStore, FenceRelease, GenerationRecord, LocalState,
-    MadeFrom, NewGeneration, NewObject, ObligationKind, Production, Publication, Remote,
-    SCHEMA_VERSION, SetupCommit, SetupRecord, Step, UploadRecord,
+    MadeFrom, NewGeneration, NewObject, ObligationKind, Production, Publication,
+    READS_THROUGH_SCHEMA_VERSION, Remote, SCHEMA_VERSION, SetupCommit, SetupRecord, Step,
+    UploadRecord, VERSION_9_RELEASE_RULE,
 };
 use kr_controller::backup::uploader::{
     EXECUTOR as UPLOADER, Idle, SERVICE_CHAIN_LENGTH, Stepped, Uploader, generations_kept,
@@ -5754,6 +5755,366 @@ fn a_version_7_store_holding_a_rule_this_build_never_wrote_is_refused_and_left_a
         )
         .expect("the schema");
     assert_eq!(tables, 0, "the step left nothing behind");
+}
+
+/// Every table, index and trigger one backup store holds, each with the statement that made it.
+fn schema_text(connection: &rusqlite::Connection) -> Vec<(String, String)> {
+    let mut statement = connection
+        .prepare(
+            "SELECT type || ' ' || name, COALESCE(sql, '') FROM sqlite_master
+              WHERE name NOT GLOB 'sqlite_*' ORDER BY type, name",
+        )
+        .expect("the schema is read");
+    statement
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .expect("the schema is read")
+        .map(|row| row.expect("a row of the schema"))
+        .collect()
+}
+
+/// Writes a store forward to the schema the build after this one writes: this build's with the
+/// rule for which generation's objects are deleted widened, at version 9.
+fn as_version_9(state: &std::path::Path) {
+    let connection =
+        rusqlite::Connection::open(state.join("backup.sqlite")).expect("the backup store");
+    connection
+        .execute_batch(&format!(
+            "DROP TRIGGER only_an_object_of_a_generation_no_publication_can_name_is_deleted;
+             {VERSION_9_RELEASE_RULE}
+             UPDATE schema_version SET version = 9;"
+        ))
+        .expect("the store is written forward to version 9");
+    assert_eq!(schema_version(&connection), READS_THROUGH_SCHEMA_VERSION);
+}
+
+/// A store at version 9, which a later build writes, is opened as it is found: what it holds is
+/// read, a row this build writes goes in beside it, and neither its version nor its schema moves.
+/// Version 9 is this build's schema with the one rule widened and nothing else.
+#[test]
+fn a_version_9_store_is_opened_as_it_is_found_and_its_version_and_schema_are_left_alone() {
+    let (_root, state) = state_directory();
+    let (member, upload) = a_store_with_an_upload_in_flight(&state);
+    let first = BackupGeneration::new(1);
+    let connection =
+        rusqlite::Connection::open(state.join("backup.sqlite")).expect("the backup store");
+    let schema_of_version_8 = schema_text(&connection);
+    drop(connection);
+    let (generations, attempts, objects) = {
+        let store = BackupStore::open(&state).expect("the backup store");
+        (
+            store.generations().expect("a read"),
+            store.attempts().expect("a read"),
+            store.objects(archive_id(), first).expect("a read"),
+        )
+    };
+    as_version_9(&state);
+    let connection =
+        rusqlite::Connection::open(state.join("backup.sqlite")).expect("the backup store");
+    let schema_of_version_9 = schema_text(&connection);
+    drop(connection);
+    let changed: Vec<&str> = schema_of_version_9
+        .iter()
+        .filter(|entry| !schema_of_version_8.contains(entry))
+        .map(|(name, _)| name.as_str())
+        .collect();
+    assert_eq!(
+        changed,
+        ["trigger only_an_object_of_a_generation_no_publication_can_name_is_deleted"],
+        "version 9 is version 8 with one rule replaced and nothing else"
+    );
+    assert_eq!(schema_of_version_9.len(), schema_of_version_8.len());
+
+    let opened = BackupStore::open(&state);
+    assert!(
+        opened.is_ok(),
+        "a version-9 store is opened as it is found: {:?}",
+        opened.err()
+    );
+    let mut store = opened.expect("opened");
+    assert_eq!(store.generations().expect("a read"), generations);
+    assert_eq!(store.attempts().expect("a read"), attempts);
+    assert_eq!(store.objects(archive_id(), first).expect("a read"), objects);
+    store
+        .record_upload(upload, archive_id(), first, member, "upload-one")
+        .expect("a row this build writes is recorded in it");
+    drop(store);
+
+    let connection =
+        rusqlite::Connection::open(state.join("backup.sqlite")).expect("the backup store");
+    assert_eq!(
+        schema_version(&connection),
+        READS_THROUGH_SCHEMA_VERSION,
+        "this build wrote no version"
+    );
+    assert_eq!(
+        schema_text(&connection),
+        schema_of_version_9,
+        "and migrated nothing"
+    );
+    drop(connection);
+    let store = BackupStore::open(&state).expect("it opens again");
+    assert_eq!(
+        store.uploads().expect("a read").len(),
+        1,
+        "what was written"
+    );
+}
+
+/// A store that records version 9 and holds any other schema is refused, and so is one above 9,
+/// each by the first object that is not version 9's, and the store is left exactly as it was
+/// found: a number says which build wrote a store, and what it enforces is read from the schema.
+#[test]
+fn a_store_recording_9_with_another_schema_or_a_version_above_9_is_refused_and_left_as_found() {
+    // What each refused store is made of, from a store at version 9.
+    let cases: [(&str, &str, &str); 6] = [
+        (
+            "version 8's rule under a 9",
+            "DROP TRIGGER only_an_object_of_a_generation_no_publication_can_name_is_deleted;
+             CREATE TRIGGER only_an_object_of_a_generation_no_publication_can_name_is_deleted
+             BEFORE INSERT ON releases
+             WHEN NOT EXISTS (SELECT 1 FROM generations
+                               WHERE archive_id = NEW.archive_id
+                                 AND backup_generation = NEW.backup_generation
+                                 AND ((production = 'cancelled' AND remote = 'unknown')
+                                      OR (production IN ('complete', 'cancelled')
+                                          AND remote = 'published')))
+             BEGIN
+                 SELECT RAISE(ABORT, 'only an object of a generation whose production ended with \
+                                      its outcome unknown, or of a published generation whose \
+                                      production is over, is deleted');
+             END;",
+            "only_an_object_of_a_generation_no_publication_can_name_is_deleted",
+        ),
+        (
+            "a rule widened past version 9's",
+            "DROP TRIGGER only_an_object_of_a_generation_no_publication_can_name_is_deleted;
+             CREATE TRIGGER only_an_object_of_a_generation_no_publication_can_name_is_deleted
+             BEFORE INSERT ON releases
+             WHEN NOT EXISTS (SELECT 1 FROM generations
+                               WHERE archive_id = NEW.archive_id
+                                 AND backup_generation = NEW.backup_generation
+                                 AND remote IN ('unknown', 'objects', 'published'))
+             BEGIN
+                 SELECT RAISE(ABORT, 'only an object of a generation whose production ended with \
+                                      its outcome unknown or with ciphertext at a service and no \
+                                      descriptor published, or of a published generation whose \
+                                      production is over, is deleted');
+             END;",
+            "only_an_object_of_a_generation_no_publication_can_name_is_deleted",
+        ),
+        (
+            "a table version 9 does not define",
+            "CREATE TABLE elsewhere (note TEXT);",
+            "elsewhere",
+        ),
+        (
+            "a rule version 9 defines, missing",
+            "DROP TRIGGER a_deletion_asked_for_is_never_taken_back;",
+            "a_deletion_asked_for_is_never_taken_back",
+        ),
+        (
+            "a trigger that deletes",
+            "CREATE TRIGGER sqliteXforget AFTER INSERT ON writers
+             BEGIN
+                 DELETE FROM outbox WHERE status = 'terminal';
+             END;",
+            "sqliteXforget",
+        ),
+        (
+            "a version above the one it reads",
+            "UPDATE schema_version SET version = 10;",
+            "schema version 10",
+        ),
+    ];
+    for (what, change, named) in cases {
+        let (_root, state) = state_directory();
+        a_store_with_an_upload_in_flight(&state);
+        as_version_9(&state);
+        rusqlite::Connection::open(state.join("backup.sqlite"))
+            .expect("the backup store")
+            .execute_batch(change)
+            .expect("the change is made");
+        let found = std::fs::read(state.join("backup.sqlite")).expect("the store's file");
+
+        let opened = BackupStore::open(&state);
+        assert!(opened.is_err(), "{what}: the store was opened");
+        let message = opened.expect_err("a refusal").to_string();
+        assert!(
+            message.contains(named),
+            "{what}: the refusal names what is wrong: {message}"
+        );
+        assert_eq!(
+            std::fs::read(state.join("backup.sqlite")).expect("the store's file"),
+            found,
+            "{what}: the refused store is left byte for byte as it was found"
+        );
+    }
+    // The refusal of a version above 9 says what this build writes and reads.
+    let (_root, state) = state_directory();
+    a_store_with_an_upload_in_flight(&state);
+    as_version_9(&state);
+    rusqlite::Connection::open(state.join("backup.sqlite"))
+        .expect("the backup store")
+        .execute_batch("UPDATE schema_version SET version = 10;")
+        .expect("the version moves");
+    let message = BackupStore::open(&state).expect_err("refused").to_string();
+    assert!(
+        message.contains("writes 8") && message.contains("reads 9"),
+        "{message}"
+    );
+}
+
+/// KR-REQ-24.29: a store holds what a deletion of one object's ciphertext may be asked of by its
+/// generation's state. Version 8 admits a generation whose outcome is unknown and one that is
+/// published; version 9 admits one more, a generation whose production was cancelled with
+/// ciphertext at a service and no descriptor published, and no other.
+#[test]
+fn version_9_admits_a_deletion_of_a_cancelled_objects_generation_and_version_8_does_not() {
+    // (production, remote, version 8 admits, version 9 admits)
+    let states: [(&str, &str, bool, bool); 9] = [
+        ("cancelled", "objects", false, true),
+        ("producing", "objects", false, false),
+        ("complete", "objects", false, false),
+        ("cancelled", "none", false, false),
+        ("cancelled", "unknown", true, true),
+        ("cancelled", "published", true, true),
+        ("complete", "published", true, true),
+        ("producing", "published", false, false),
+        ("producing", "unknown", false, false),
+    ];
+    for version in [8, 9] {
+        let host = Host::open();
+        let connection =
+            rusqlite::Connection::open(host.state.join("backup.sqlite")).expect("the backup store");
+        for (index, (production, remote, _, _)) in states.iter().enumerate() {
+            let generation = index as u64 + 1;
+            host.admit(generation, &[64]);
+            connection
+                .execute(
+                    "UPDATE generations SET production = ?2, remote = ?3
+                      WHERE backup_generation = ?1",
+                    rusqlite::params![generation as i64, production, remote],
+                )
+                .expect("the generation is in the state");
+        }
+        drop(connection);
+        if version == 9 {
+            as_version_9(&host.state);
+        }
+        let connection =
+            rusqlite::Connection::open(host.state.join("backup.sqlite")).expect("the backup store");
+        for (index, (production, remote, at_8, at_9)) in states.iter().enumerate() {
+            let generation = index as u64 + 1;
+            let asked = connection.execute(
+                "INSERT INTO releases (archive_id, backup_generation, object_id, asked_at_ms)
+                 VALUES (?1, ?2, ?3, 1)",
+                rusqlite::params![
+                    archive_id().get().as_bytes().as_slice(),
+                    generation as i64,
+                    member_of(generation, 0).get().as_bytes().as_slice(),
+                ],
+            );
+            let expected = if version == 8 { *at_8 } else { *at_9 };
+            assert_eq!(
+                asked.is_ok(),
+                expected,
+                "version {version}, production {production}, remote {remote}: {asked:?}"
+            );
+            if let Err(refusal) = asked {
+                assert!(
+                    refusal
+                        .to_string()
+                        .contains("only an object of a generation"),
+                    "the rule is what refused it: {refusal}"
+                );
+            }
+        }
+    }
+}
+
+/// KR-REQ-24.29: a deletion a later build asked for, of a generation whose ciphertext a service
+/// holds and no descriptor was published, is shown by this build as asked and not confirmed. This
+/// build cannot judge it, so it sends nothing of it, and it asks no such deletion itself: the
+/// generations stay listed with their reason and not deletable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_version_9_store_shows_a_deletion_this_build_cannot_judge_and_sends_nothing_of_it() {
+    let mut host = Host::open();
+    host.set_up();
+    host.admit(1, &[64]);
+    host.admit(2, &[64]);
+    // Production of both was cancelled after the service acknowledged their ciphertext.
+    rusqlite::Connection::open(host.state.join("backup.sqlite"))
+        .expect("the backup store")
+        .execute_batch(
+            "UPDATE outbox SET status = 'terminal', outcome = 'cancelled', settled_at_ms = 5200;
+             UPDATE generations SET production = 'cancelled', remote = 'objects';",
+        )
+        .expect("both generations are cancelled with ciphertext at the service");
+    as_version_9(&host.state);
+    // The build that writes version 9 asked the service to delete every object of generation 1.
+    let asked = rusqlite::Connection::open(host.state.join("backup.sqlite"))
+        .expect("the backup store")
+        .execute(
+            "INSERT INTO releases (archive_id, backup_generation, object_id, asked_at_ms)
+             SELECT archive_id, backup_generation, object_id, 50000 FROM objects
+              WHERE backup_generation = 1",
+            [],
+        )
+        .expect("version 9's rule admits it");
+    assert_eq!(asked, 2, "a member and the manifest");
+
+    let (mut uploader, _) = host.restart(60_000).await;
+    let listed = privacy(&host.service).exported().expect("a list");
+    assert_eq!(listed.len(), 2);
+    assert!(
+        listed.iter().any(|copy| copy.kind
+            == "backup archive, deletion asked and not yet confirmed"
+            && !copy.deletable),
+        "the deletion that was asked is shown as asked and not confirmed: {listed:?}"
+    );
+    assert!(
+        listed
+            .iter()
+            .any(|copy| copy.kind.starts_with("backup object ciphertext") && !copy.deletable),
+        "the generation nobody asked for is listed with its reason and not deletable: {listed:?}"
+    );
+
+    passes(&mut uploader, 61_000).await;
+    passes(&mut uploader, 62_000).await;
+    assert_eq!(
+        deletions(&host),
+        0,
+        "this build cannot judge the deletion, so it sends none"
+    );
+    for object in host
+        .service
+        .objects(archive_id(), BackupGeneration::new(1))
+        .expect("a read")
+    {
+        assert!(object.deletion_asked_at_ms.is_some());
+        assert!(object.released_at_ms.is_none());
+    }
+    let refused = host.service.ask_deletion(
+        archive_id(),
+        BackupGeneration::new(2),
+        TimestampMs::new(63_000),
+        &|write| write(),
+    );
+    match refused {
+        Err(ControllerError::Refused { detail, .. }) => assert!(
+            detail.contains("no descriptor was published"),
+            "the reason is the generation's state: {detail}"
+        ),
+        other => panic!("this build asked a deletion it does not write: {other:?}"),
+    }
+    assert!(
+        host.service
+            .objects(archive_id(), BackupGeneration::new(2))
+            .expect("a read")
+            .iter()
+            .all(|object| object.deletion_asked_at_ms.is_none()),
+        "nothing was written down for generation 2"
+    );
 }
 
 /// A deletion is written down before it is asked for, once, and the store decides it from its own

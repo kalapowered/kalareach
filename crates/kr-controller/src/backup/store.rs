@@ -67,6 +67,23 @@ const VERSION_WITHOUT_SETUP: i64 = 7;
 /// The oldest schema version this build brings forward.
 pub const OLDEST_SCHEMA_VERSION: i64 = VERSION_WITHOUT_UPLOADS;
 
+/// The newest schema version above [`SCHEMA_VERSION`] that this build reads without writing it.
+///
+/// Version 9 is this build's schema with one rule widened and nothing else: the rule that decides
+/// which generation's objects are deleted ([`VERSION_9_RELEASE_RULE`]) also admits an object of a
+/// generation whose production was cancelled after a service acknowledged ciphertext of it and
+/// before a descriptor was published. No table, column, index or row changes shape, and every row
+/// this build writes satisfies the wider rule. A store that records version 9 is opened as it is
+/// found: nothing is migrated and no version is written, and it is refused unless its schema is
+/// exactly version 9's. This build never asks for the deletion of such a generation, and nothing
+/// of it writes version 9's rule.
+///
+/// The build that writes version 9 writes exactly that schema: this build's with
+/// [`VERSION_9_RELEASE_RULE`] in place of this build's rule. A store holding any other
+/// schema under a 9 is one this build refuses. A change to what version 9 holds beyond that rule
+/// takes version 10, which a build before the one that writes it reads ahead.
+pub const READS_THROUGH_SCHEMA_VERSION: i64 = 9;
+
 /// Whether this host may go on producing for one generation.
 ///
 /// This is permission, and nothing else. What a service holds is [`Remote`], recorded beside it:
@@ -783,11 +800,16 @@ impl BackupStore {
             if version == VERSION_WITHOUT_SETUP {
                 return self.migrate_from_version_7();
             }
+            if (SCHEMA_VERSION + 1..=READS_THROUGH_SCHEMA_VERSION).contains(&version) {
+                // Written by a later build and read as it is found: nothing is brought forward and
+                // no version is written. What it enforces is still compared, against version 9's.
+                return self.expect_the_schema(&definition_of_version_9()?);
+            }
             if version != SCHEMA_VERSION {
                 return Err(ControllerError::RegistryUnavailable {
                     detail: format!(
-                        "this backup store is at schema version {version}; this build reads \
-                         {SCHEMA_VERSION}"
+                        "this backup store is at schema version {version}; this build writes \
+                         {SCHEMA_VERSION} and reads {READS_THROUGH_SCHEMA_VERSION} as it finds it"
                     ),
                 });
             }
@@ -838,13 +860,17 @@ impl BackupStore {
     /// of whoever changed a rule last. So what is compared is the schema itself, against the one
     /// this build makes from nothing, object by object.
     fn expect_the_schema_this_build_writes(&self) -> Result<()> {
-        let expected = definition_this_build_writes()?;
+        self.expect_the_schema(&definition_this_build_writes()?)
+    }
+
+    /// Refuses a store whose schema is not `expected`, naming the first object that differs.
+    fn expect_the_schema(&self, expected: &[(String, String)]) -> Result<()> {
         let found = read_definition(&self.connection)?;
         if found == expected {
             return Ok(());
         }
         Err(ControllerError::RegistryUnavailable {
-            detail: first_difference(&found, &expected),
+            detail: first_difference(&found, expected),
         })
     }
 
@@ -930,6 +956,22 @@ impl BackupStore {
         }
         transaction.commit().map_err(ControllerError::registry)
     }
+}
+
+/// The schema of version 9, as a database made from nothing holds it: this build's, with the rule
+/// of version 9 in place of its own, in the way [`BackupStore::migrate_from_version_7`] replaces one.
+fn definition_of_version_9() -> Result<Vec<(String, String)>> {
+    let fresh = Database::in_memory().map_err(ControllerError::registry)?;
+    fresh
+        .run_script(DEFINITION)
+        .map_err(ControllerError::registry)?;
+    fresh
+        .run_script(DROP_RELEASE_RULE)
+        .map_err(ControllerError::registry)?;
+    fresh
+        .run_script(RELEASE_RULE_9)
+        .map_err(ControllerError::registry)?;
+    read_definition(&fresh)
 }
 
 /// The schema this build writes, as a database made from nothing holds it.
@@ -1116,6 +1158,38 @@ macro_rules! release_rule {
     };
 }
 
+/// Version 9's rule for which generation's objects may be asked to be deleted: version 8's, and an
+/// object of a generation whose production was cancelled with ciphertext at a service and no
+/// descriptor published. Production that was cancelled never resumes, so no publication can name
+/// those objects later.
+///
+/// One text, which is both the schema a store at version 9 is read against and the rule the build
+/// that writes version 9 puts in `DEFINITION` in place of `release_rule!`.
+macro_rules! release_rule_9 {
+    () => {
+        "
+                 CREATE TRIGGER IF NOT EXISTS only_an_object_of_a_generation_no_publication_can_name_is_deleted
+                 BEFORE INSERT ON releases
+                 WHEN NOT EXISTS (SELECT 1 FROM generations
+                                   WHERE archive_id = NEW.archive_id
+                                     AND backup_generation = NEW.backup_generation
+                                     AND ((production = 'cancelled'
+                                           AND remote IN ('unknown', 'objects'))
+                                          OR (production IN ('complete', 'cancelled')
+                                              AND remote = 'published')))
+                 BEGIN
+                     SELECT RAISE(ABORT, 'only an object of a generation whose production ended \
+                                          with its outcome unknown or with ciphertext at a service \
+                                          and no descriptor published, or of a published \
+                                          generation whose production is over, is deleted');
+                 END;"
+    };
+}
+
+/// The text of version 9's rule, for the build that writes version 9 and for a test that makes a
+/// store of that version.
+pub const VERSION_9_RELEASE_RULE: &str = release_rule_9!();
+
 /// What this host recorded when its owner set up backups, and the fingerprint of what each
 /// generation was made from.
 ///
@@ -1214,6 +1288,11 @@ const RELEASES: Statement = sql!(releases_definition!());
 
 /// What a version-7 store gains: the rule that decides which generation's objects are deleted.
 const RELEASE_RULE: Statement = sql!(release_rule!());
+
+/// Version 9's rule, and the statement that removes this build's in its place.
+const RELEASE_RULE_9: Statement = sql!(release_rule_9!());
+const DROP_RELEASE_RULE: Statement =
+    sql!("DROP TRIGGER only_an_object_of_a_generation_no_publication_can_name_is_deleted;");
 
 /// What an earlier store gains: the setup record and the fingerprints of what generations were
 /// made from.
