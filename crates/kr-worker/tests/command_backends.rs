@@ -576,6 +576,122 @@ async fn kr_req_12_07_a_runtime_directory_too_long_for_a_backends_socket_establi
     );
 }
 
+/// KR-REQ-12.07: on Windows a runtime directory with no room for the gateway's socket below it is
+/// refused before anything is created, and the refusal names the socket's path and how long it
+/// may be. One with exactly the room is not refused for it, so the refusal is made at the
+/// platform's own limit and not before it. The bound is the 107 bytes of a Unix-domain socket's
+/// path, and only the gateway's socket is measured: a launch's bridge is a pipe there.
+///
+/// What the gateway adds below its runtime directory is read from the refusal of a runtime
+/// directory that is certainly too long, as the difference between the socket path's length the
+/// refusal states and the directory's. A Windows host establishes no gateway here, so there is no
+/// endpoint to read it from; the refusal a gateway's route ends with, which is reached only after
+/// the room is judged, shows that a directory with the room was let through.
+#[cfg(windows)]
+#[tokio::test]
+async fn kr_req_12_07_a_runtime_directory_too_long_for_a_gateways_socket_establishes_nothing() {
+    // Windows holds a socket's path in the 108 bytes of `sun_path`, and the last is the terminator.
+    const LIMIT: usize = 107;
+    kr_worker::windows::uds::gateway_socket_names_its_peers()
+        .expect("this Windows build names a socket's peers, which is judged before the room");
+
+    let integration = codex_integration();
+    let launch = invocation_adding(&["codex"], &["--remote", "{gateway}"]);
+    let establish = |runtime: &std::path::Path| {
+        let setup = Setup::shaped(
+            &fixture::Shape::codex_backend(),
+            &["bin", "codex"],
+            |config| CommandBackendsConfig {
+                runtime_dir: runtime.to_path_buf(),
+                ..config
+            },
+        );
+        let answer = setup
+            .backends
+            .establish(&request(&setup, &launch, &integration, 1));
+        (setup, answer)
+    };
+    let refused_for_room = |why: &str| why.contains("a socket's path is at most");
+    let stated_length = |why: &str| -> usize {
+        why.split(" bytes, and a socket's path is at most ")
+            .next()
+            .and_then(|before| before.rsplit(' ').next())
+            .and_then(|digits| digits.parse().ok())
+            .unwrap_or_else(|| panic!("the refusal states the socket path's length: {why}"))
+    };
+
+    let probe = a_private_directory_of(LIMIT + 1);
+    let (_probed, answer) = establish(&probe.0);
+    let why = answer.expect_err("a runtime directory certainly too long for the socket");
+    assert!(
+        why.contains(&format!(
+            "a socket's path is at most {LIMIT} on this platform"
+        )),
+        "the refusal states the limit: {why}"
+    );
+    let added = stated_length(&why) - probe.0.as_os_str().len();
+    let room = LIMIT - added;
+
+    let fits = a_private_directory_of(room);
+    assert_eq!(
+        fits.0.as_os_str().len(),
+        room,
+        "a directory of the length the room allows"
+    );
+    let (_fitted, answer) = establish(&fits.0);
+    let why = answer.expect_err("a gateway's route ends in a refusal on this platform");
+    assert!(
+        !refused_for_room(&why) && why.contains("this platform runs none"),
+        "a runtime directory with just the room is let through to the route's last refusal: {why}"
+    );
+
+    // The same directory named with a separator at its end is the same place, and the same room.
+    let with_a_separator = PathBuf::from(format!("{}\\", fits.0.display()));
+    let (_separated, answer) = establish(&with_a_separator);
+    let why = answer.expect_err("a gateway's route ends in a refusal on this platform");
+    assert!(
+        !refused_for_room(&why) && why.contains("this platform runs none"),
+        "a separator at the end of the runtime directory takes no room: {why}"
+    );
+
+    let too_long = a_private_directory_of(room + 1);
+    let (setup, answer) = establish(&too_long.0);
+    let why = answer.expect_err("a runtime directory one byte too long for the socket");
+    assert!(
+        refused_for_room(&why) && !why.contains("this platform runs none"),
+        "the refusal is the room's: {why}"
+    );
+    assert_eq!(
+        stated_length(&why),
+        LIMIT + 1,
+        "the socket's path is one byte over: {why}"
+    );
+    assert!(
+        why.contains(&too_long.0.display().to_string()),
+        "the refusal names the runtime directory: {why}"
+    );
+    assert!(
+        why.ends_with("so this invocation runs as typed"),
+        "the invocation runs as typed: {why}"
+    );
+    assert!(
+        setup.backends.root().is_none(),
+        "no directory was made for the session"
+    );
+    assert!(
+        setup.established().is_empty(),
+        "a refusal creates nothing: {:?}",
+        setup.established()
+    );
+    assert!(
+        std::fs::read_dir(&too_long.0)
+            .expect("the runtime directory")
+            .next()
+            .is_none(),
+        "nothing was made in the runtime directory"
+    );
+}
+
 /// KR-REQ-12.07: a session's entry names the package it was created with. Where another package
 /// integrates the command here, even one that declares the same flags, the entry establishes
 /// nothing, so a package whose integration the configuration never turned on is never taken for
