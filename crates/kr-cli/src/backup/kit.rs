@@ -16,9 +16,11 @@
 //! ends still reads; a leading mark and the CRs are removed in that buffer, and the kit's own
 //! bound ([`kr_client::recovery::MAX_RECOVERY_KIT_BYTES`]) applies to what is left.
 //!
-//! A read can be cancelled: a pipe is waited on in short turns that look at a flag, and a terminal
-//! is read with a short timeout that does the same. When it ends, however it ends, the terminal's
-//! modes come back with the input still waiting discarded (`OptionalActions::Flush`), so what was
+//! A read can be cancelled: on Unix a pipe is waited on in short turns that look at a flag, and a
+//! terminal or a Windows console is read with a short timeout that does the same. A pipe on Windows
+//! is read without the interrupt handler, because a blocking read cannot be ended. When a terminal
+//! read ends, however it ends, the terminal's modes come back with the input still waiting
+//! discarded (`OptionalActions::Flush` on Unix, `FlushConsoleInputBuffer` on Windows), so what was
 //! pasted past the end of the kit never reaches the shell or its history. A paste that arrives
 //! after that still does; for a paste the size of a kit it is unlikely, and the documentation says
 //! so.
