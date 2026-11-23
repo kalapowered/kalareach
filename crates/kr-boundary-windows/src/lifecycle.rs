@@ -11,6 +11,7 @@ use crate::frame::invocation::{
     Cleanup, ConfigurationState, EndedBy, InvocationReply, LeftoverClass as ReplyClass,
     MAX_DETAIL_BYTES, Notes, RefusedKind, printable,
 };
+use crate::journal::limits::{PATH_JSON_BYTES, short_within};
 use crate::journal::rows::{LeftoverClass, Row};
 use crate::refusal::Refusal;
 
@@ -304,12 +305,25 @@ pub fn closing_rows(closing: &Closing) -> Vec<Row> {
 /// The name of an object of the private root as the journal and the reply give it: the root's
 /// path, then the object's name below the root with a backslash between. The root itself has no
 /// name below it, and its own path is the name.
+///
+/// A child can make a name that no row takes, and a row that the journal refuses would block the
+/// tree for good. Such a name is cut to the longest directory of it that a row takes: the cut name
+/// is a real directory of the root that holds the object, so it still says where to look. A name
+/// that a row takes is given whole. The cut depends on the name alone, so the removal that finds
+/// the object again names it as the journal already holds it.
 #[must_use]
 pub fn root_object(root: &str, below: &str) -> String {
     if below.is_empty() {
-        root.to_owned()
-    } else {
-        format!("{root}\\{below}")
+        return root.to_owned();
+    }
+    let whole = format!("{root}\\{below}");
+    let start = short_within(&whole, PATH_JSON_BYTES);
+    if start.len() == whole.len() || whole[start.len()..].starts_with('\\') {
+        return start;
+    }
+    match start.rfind('\\') {
+        Some(directory) if directory >= root.len() => start[..directory].to_owned(),
+        _ => start,
     }
 }
 
