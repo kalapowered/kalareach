@@ -214,6 +214,16 @@ if [ -f '{tools}/refusal' ]; then
   cat '{tools}/refusal'
   exec cat >/dev/null
 fi
+# A test that wants a helper that runs and ends with a code of its own says so with a file.
+if [ -f '{tools}/helper-ends' ]; then
+  exit 3
+fi
+# A test that wants a helper the remote shell cannot find says so with a file: the shell there ends
+# with 127, and `ssh` hands the code on.
+if [ -f '{tools}/helper-not-found' ]; then
+  echo 'bash: /usr/local/bin/kr: No such file or directory' >&2
+  exit 127
+fi
 # A test that wants the destination unreachable says so with a file, and the connection is refused
 # the way `ssh` refuses one.
 if [ -f '{tools}/unreachable' ]; then
@@ -338,6 +348,10 @@ case "$1" in
         waited=$((waited + 1))
       done
       exit 255
+    fi
+    # A test that wants a helper that runs and ends with a code of its own says so with a file.
+    if [ -f '{tools}/helper-ends' ]; then
+      exit 3
     fi
     # A test that wants the helper unreachable says so with a file: the container runs, and the
     # runtime cannot start the program in it.
@@ -2273,27 +2287,34 @@ async fn a_helper_that_exits_before_the_environment_answers_is_told_with_its_pro
     for (label, access, target, program) in DESTINATIONS {
         enrolled_and_answering(&world, label, access, target);
         // The stand-ins end with the codes `ssh` and the runtime end with, and say why on their
-        // standard error.
-        // `ssh` ends with 255 when it is the program that failed. The container runtime's own code
-        // is 125, and the stand-in ends with the 127 of a helper that is not in the container, which
-        // is the helper's.
-        let (ended, said) = if access == "ssh" {
-            (
+        // standard error. `ssh` ends with 255 when it is the program that failed, and the runtime
+        // with 125. A code of 127 is the shell's: the helper was not found, so it never ran. Any
+        // other code is the helper's own.
+        let not_run = format!(
+            "{program} ran, and the helper could not be run before the environment answered"
+        );
+        let mut cases = vec![(
+            "helper-ends",
+            format!(
+                "{program} ran, and the helper ended with exit code 3 before the environment answered"
+            ),
+            "kr-test-nothing-printed",
+        )];
+        if access == "ssh" {
+            cases.push((
+                "unreachable",
                 format!("{program} ended with exit code 255 before the environment answered"),
                 "Connection refused",
-            )
+            ));
+            cases.push(("helper-not-found", not_run, "No such file or directory"));
         } else {
-            (
-                format!(
-                    "{program} ran, and the helper ended with exit code 127 before the \
-                     environment answered"
-                ),
-                "executable file not found",
-            )
-        };
-        with_the_switch_on(&world, "unreachable", label, || {
-            assert_refresh_says(&world, label, &ended, &[said]);
-        });
+            cases.push(("unreachable", not_run, "executable file not found"));
+        }
+        for (switch, ended, said) in cases {
+            with_the_switch_on(&world, switch, label, || {
+                assert_refresh_says(&world, label, &ended, &[said]);
+            });
+        }
     }
 }
 

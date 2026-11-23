@@ -1951,7 +1951,8 @@ async fn an_ssh_host_registers_its_identity_and_channel_from_its_helper() {
 
 /// KR-REQ-18.11, the part about connection diagnostics: a helper that acknowledged the bridge and
 /// then ended before it answered the read is told by the program the host ran and how it ended,
-/// rather than as a stream that failed, and the record keeps no channel for it.
+/// rather than as a stream that failed, and the record keeps no channel for it. The helper has run
+/// by then, so the code is its own and not the launcher's.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_helper_that_ends_after_it_acknowledged_is_told_by_its_program() {
     let daemon = FixtureDaemon::start();
@@ -1971,7 +1972,7 @@ async fn a_helper_that_ends_after_it_acknowledged_is_told_by_its_program() {
     assert!(!refreshed.row.readiness.channel_scoped);
     let said = refreshed.connection.as_str();
     assert!(
-        said.starts_with("the WSL launcher (wsl.exe) ended with exit code ")
+        said.starts_with("the WSL launcher (wsl.exe) ran, and the helper ended with exit code ")
             && said.ends_with(
                 " after the environment acknowledged the bridge, before it answered the read",
             ),

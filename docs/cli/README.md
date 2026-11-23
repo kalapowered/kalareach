@@ -1872,7 +1872,10 @@ could not be ended, where the host did not see the end), that this host could no
 printed or could not wait for it, that its answer to the look could not be read, and that the
 environment refused the bridge, in which case the line gives the refusal's code. The container
 runtime's code 125 and `ssh`'s 255 are the program's own; any other code is the helper's, and the
-line says so. A failed look does not say the environment is not running, which the host does not
+line says so, except the 126 and 127 that the shell there ends with when it cannot run or find the
+helper: before the destination acknowledged the bridge, the line says that the helper could not be
+run. `wsl.exe` has no code of its own that the host can tell apart: before the acknowledgement the
+line tells a code as the launcher's, and after it, as the helper's. A failed look does not say the environment is not running, which the host does not
 then know: the row reads stale. That holds for the look at a WSL distribution, whether the listing of
 registered or of running distributions failed, and for a look that fails after `--start` started the
 environment: the first line says that the refresh started it, and the second says how the look
