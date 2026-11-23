@@ -263,6 +263,7 @@ async fn a_daemon_starts_over_the_document_the_release_before_it_accepted_at_ver
 /// KR-REQ-22.10: a daemon that starts with no document on disk over a copy of the one it accepted,
 /// which holds the owner's description budgets, keeps the budgets the copy holds, as it keeps the
 /// session number and the other ceilings: a file that is gone is not a document that lifts them.
+/// The report says that the host is still enforcing the number, and names no document as its source.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_daemon_with_no_document_keeps_the_description_budgets_its_accepted_copy_holds() {
     let temp = a_stopped_environment().await;
@@ -287,6 +288,19 @@ async fn a_daemon_with_no_document_keeps_the_description_budgets_its_accepted_co
         ceiling.value.clone().render(),
         (2_u64 << 30).to_string(),
         "the ceiling the copy holds is in force, not the 4 GiB default"
+    );
+    // The report says why that number is in force, and names no document: none decided it.
+    let why = match &ceiling.narrowed_by.0 {
+        Some(sentence) => sentence.clone().render(),
+        None => panic!("the report does not say that the host still enforces the copy's number"),
+    };
+    assert!(
+        why.starts_with("this host is still enforcing"),
+        "the report says the number is the one this host last accepted: {why}"
+    );
+    assert_eq!(
+        ceiling.origin.0, None,
+        "no document is in front of the report, so the row names no path"
     );
     drop(controller);
 }
