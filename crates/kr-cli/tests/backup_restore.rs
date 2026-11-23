@@ -295,6 +295,7 @@ fn bundle_at(
         checkpoints: checkpoint.into_iter().collect(),
         revision: U64::new(3),
         written_at_ms: TimestampMs::new(2_000),
+        device_settings: None,
     };
     let key = world
         .seed

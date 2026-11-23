@@ -272,6 +272,7 @@ impl World {
                 .collect(),
             revision: U64::new(shape.revision.unwrap_or(3)),
             written_at_ms: TimestampMs::new(2_000),
+            device_settings: None,
         };
         let key = self
             .seed

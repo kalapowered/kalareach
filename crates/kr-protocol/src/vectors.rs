@@ -1103,6 +1103,11 @@ fn services() -> Value {
                 "The recovery bundle's plaintext before it is sealed under the key the recovery seed derives, as a device that saves no settings writes it: where the owner's collections live, the writers and producers a restore may trust, the checkpoints, the revision and the instant. These canonical bytes are fixed: a build that adds a member to the bundle writes the same bytes for a bundle that has none.",
                 &recovery_bundle(),
             ),
+            recovery_bundle_case(
+                "recovery_bundle_with_settings",
+                "The same bundle once the owner device has saved its settings in it: one more member, an opaque byte string that only the settings restore reads, here 1,024 fixed bytes. The member sits in the canonical map under its own name, and the bundle's schema version is the same.",
+                &recovery_bundle_with_settings(),
+            ),
         ],
     })
 }
@@ -1142,6 +1147,16 @@ fn recovery_bundle() -> RecoveryBundle {
         .collect(),
         revision: U64::new(3),
         written_at_ms: TimestampMs::new(NOW_MS + 180_000),
+        device_settings: None,
+    }
+}
+
+/// The same bundle once a settings member is saved in it. The member is opaque here: this crate
+/// carries its bytes, and the bytes below stand for any member of a bucket's length.
+fn recovery_bundle_with_settings() -> RecoveryBundle {
+    RecoveryBundle {
+        device_settings: Some(Bytes::new(vec![0xd5; 1024])),
+        ..recovery_bundle()
     }
 }
 
@@ -1428,6 +1443,67 @@ mod tests {
             .join(relative);
         std::fs::read_to_string(&path)
             .unwrap_or_else(|error| panic!("read {}: {error}", path.display()))
+    }
+
+    /// KR-REQ-20.17, KR-REQ-18.05: a bundle that holds no settings member encodes to the bytes the
+    /// published vector holds and decodes from them, and one that holds a member reads back as it
+    /// was written. A bundle that holds none has no such member in its encoding, in its JSON or in
+    /// its schema's required members.
+    #[test]
+    fn a_bundle_with_no_settings_member_encodes_as_it_did_and_one_with_it_round_trips() {
+        let document: Value =
+            serde_json::from_str(&fixture("fixtures/service/services.json")).expect("the vectors");
+        let published = document["cases"]
+            .as_array()
+            .expect("the cases")
+            .iter()
+            .find(|case| case["id"] == "recovery_bundle")
+            .expect("the bundle vector");
+        let pinned = hex::decode(published["cbor_hex"].as_str().expect("hex text")).expect("hex");
+
+        let bundle = recovery_bundle();
+        assert_eq!(bundle.device_settings, None);
+        let encoded = kr_cbor::to_canonical_vec_within(&bundle, &RECOVERY_BUNDLE_LIMITS)
+            .expect("the bundle encodes");
+        assert_eq!(
+            encoded, pinned,
+            "a bundle with no settings member writes the bytes it always did"
+        );
+        let decoded: RecoveryBundle =
+            kr_cbor::from_canonical_slice(&pinned, &RECOVERY_BUNDLE_LIMITS)
+                .expect("the published bytes decode");
+        assert_eq!(decoded, bundle);
+        assert!(
+            serde_json::to_value(&bundle)
+                .expect("json")
+                .get("device_settings")
+                .is_none()
+        );
+
+        let with = recovery_bundle_with_settings();
+        let encoded_with = kr_cbor::to_canonical_vec_within(&with, &RECOVERY_BUNDLE_LIMITS)
+            .expect("the bundle with its member encodes");
+        assert_ne!(encoded_with, pinned);
+        let decoded: RecoveryBundle =
+            kr_cbor::from_canonical_slice(&encoded_with, &RECOVERY_BUNDLE_LIMITS)
+                .expect("the bundle with its member decodes");
+        assert_eq!(decoded, with);
+        assert!(
+            serde_json::to_value(&with)
+                .expect("json")
+                .get("device_settings")
+                .is_some()
+        );
+        let published_with = document["cases"]
+            .as_array()
+            .expect("the cases")
+            .iter()
+            .find(|case| case["id"] == "recovery_bundle_with_settings")
+            .expect("the vector of a bundle with its member");
+        assert_eq!(
+            published_with["cbor_hex"].as_str().expect("hex text"),
+            hex(&encoded_with)
+        );
     }
 
     /// KR-REQ-16.05: the origin lists are the verdicts this crate actually gives.

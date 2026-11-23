@@ -706,6 +706,18 @@ pub struct RecoveryBundle {
     pub revision: U64,
     /// When the owner wrote it, in UTC milliseconds.
     pub written_at_ms: TimestampMs,
+    /// The owner device's saved configuration, which only the settings restore reads.
+    ///
+    /// Section 20 ¶10's list of what the bundle holds is not exclusive: the bundle may also carry
+    /// the values a person chose on the owner device. They are not session content and grant
+    /// nothing. This crate carries the bytes and does not read them, so a member that no build can
+    /// read fails the settings restore and nothing else: a data restore, a checkpoint write and a
+    /// host's cover read and write it as it is. A bundle that holds none leaves the member out of
+    /// its encoding, so its bytes are the bytes a build without the member wrote, and a build
+    /// without the member refuses a bundle that holds one. The schema version stays the same.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "Bytes")]
+    pub device_settings: Option<Bytes>,
 }
 
 impl RecoveryKit {

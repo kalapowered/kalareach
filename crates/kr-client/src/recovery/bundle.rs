@@ -553,6 +553,7 @@ impl BundleStore {
             checkpoints: [].into_iter().collect(),
             revision: U64::new(0),
             written_at_ms: now_ms,
+            device_settings: None,
         }
     }
 

@@ -144,6 +144,7 @@ pub fn prepare_setup(inputs: &SetupInputs<'_>) -> Result<PreparedSetup> {
         checkpoints: std::iter::empty().collect(),
         revision: U64::new(1),
         written_at_ms: inputs.enabled_at_ms,
+        device_settings: None,
     };
     let key = seed.bundle_key_for(&context)?;
     let sealed = kr_crypto::archive::encrypt_recovery_bundle(&key, &bundle)?;

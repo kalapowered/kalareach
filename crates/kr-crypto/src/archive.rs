@@ -613,6 +613,7 @@ mod tests {
             .collect::<CanonicalSet<_>>(),
             revision: U64::new(3),
             written_at_ms: TimestampMs::new(2),
+            device_settings: None,
         };
         let object = encrypt_recovery_bundle(&key, &bundle).expect("an encrypted bundle");
         assert_eq!(

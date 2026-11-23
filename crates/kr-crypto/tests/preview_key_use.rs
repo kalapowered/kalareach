@@ -250,6 +250,7 @@ fn a_recovery_bundle_cannot_be_encrypted_under_a_preview_key() {
         checkpoints: CanonicalSet::new(),
         revision: U64::new(3),
         written_at_ms: TimestampMs::new(NOW_MS),
+        device_settings: None,
     };
     let sealed = encrypt_recovery_bundle(&key, &bundle).expect("an encrypted bundle");
     assert_eq!(

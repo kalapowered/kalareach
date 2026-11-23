@@ -33277,6 +33277,10 @@
           },
           "type": "array"
         },
+        "device_settings": {
+          "$ref": "#/$defs/Bytes",
+          "description": "The owner device's saved configuration, which only the settings restore reads.\n\nSection 20 ¶10's list of what the bundle holds is not exclusive: the bundle may also carry\nthe values a person chose on the owner device. They are not session content and grant\nnothing. This crate carries the bytes and does not read them, so a member that no build can\nread fails the settings restore and nothing else: a data restore, a checkpoint write and a\nhost's cover read and write it as it is. A bundle that holds none leaves the member out of\nits encoding, so its bytes are the bytes a build without the member wrote, and a build\nwithout the member refuses a bundle that holds one. The schema version stays the same."
+        },
         "revision": {
           "$ref": "#/$defs/U64",
           "description": "The bundle revision, advanced on every compare-and-swap write."
