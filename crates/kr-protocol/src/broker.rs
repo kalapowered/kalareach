@@ -1250,42 +1250,11 @@ pub enum InstanceInvalidation {
     // Raised by `BrokerState::advance_binding` when an instance's binding moves.
     /// The active binding changed.
     BindingChanged,
-    // No broker writer names this cause and no detector raises it. It stays because it is part of
-    // level 0.78's wire form; it is removed when the protocol level moves past 0.78.
-    /// The upstream schema or protocol version changed.
-    SchemaChanged,
-    // No broker writer names this cause and no detector raises it. It stays because it is part of
-    // level 0.78's wire form; it is removed when the protocol level moves past 0.78.
-    /// An operating-system permission changed.
-    OsPermissionChanged,
-    // No broker writer names this cause and no detector raises it. It stays because it is part of
-    // level 0.78's wire form; it is removed when the protocol level moves past 0.78.
-    /// The desktop session generation changed.
-    DesktopGenerationChanged,
-    // No broker writer names this cause and no detector raises it. It stays because it is part of
-    // level 0.78's wire form; it is removed when the protocol level moves past 0.78.
-    /// The signed qualification profile in the catalogue changed.
-    QualificationProfileChanged,
-    // No broker writer names this cause and no detector raises it. It stays because it is part of
-    // level 0.78's wire form; it is removed when the protocol level moves past 0.78.
-    /// The host's own launch profile changed.
-    ///
-    /// Separate from the catalogue's qualification profile, because a record gathered under one
-    /// argument vector says nothing about another and neither implies the other changed.
-    LaunchProfileChanged,
 }
 
 impl InstanceInvalidation {
     /// Every trigger, in declaration order.
-    pub const ALL: &'static [Self] = &[
-        Self::BinaryChanged,
-        Self::BindingChanged,
-        Self::SchemaChanged,
-        Self::OsPermissionChanged,
-        Self::DesktopGenerationChanged,
-        Self::QualificationProfileChanged,
-        Self::LaunchProfileChanged,
-    ];
+    pub const ALL: &'static [Self] = &[Self::BinaryChanged, Self::BindingChanged];
 
     /// Returns the stable wire string.
     #[must_use]
@@ -1293,11 +1262,6 @@ impl InstanceInvalidation {
         match self {
             Self::BinaryChanged => "binary_changed",
             Self::BindingChanged => "binding_changed",
-            Self::SchemaChanged => "schema_changed",
-            Self::OsPermissionChanged => "os_permission_changed",
-            Self::DesktopGenerationChanged => "desktop_generation_changed",
-            Self::QualificationProfileChanged => "qualification_profile_changed",
-            Self::LaunchProfileChanged => "launch_profile_changed",
         }
     }
 }
@@ -1424,13 +1388,9 @@ impl InstanceCapabilityRecord {
         if self.invalidated_by.is_empty() {
             return Err(CapabilityError::NoInvalidation);
         }
-        // A record that a changed qualification profile invalidates has to name the profile it
-        // came from, whatever produced it: without that name there is nothing to compare a new
-        // profile against, and the trigger could never fire.
-        if (self.source == InstanceEvidenceSource::SignedRecord
-            || self
-                .invalidated_by
-                .contains(&InstanceInvalidation::QualificationProfileChanged))
+        // A record a signed profile made has to name the profile it came from: without that name
+        // there is nothing to compare a new profile against.
+        if self.source == InstanceEvidenceSource::SignedRecord
             && !self.identity.qualification_profile_digest.is_present()
         {
             return Err(CapabilityError::MissingProfileIdentity);
@@ -1931,9 +1891,7 @@ mod tests {
             revision: CapabilityRevision::new(1),
             state: InstanceCapabilityState::VersionQualified,
             source: InstanceEvidenceSource::SignedRecord,
-            invalidated_by: [InstanceInvalidation::QualificationProfileChanged]
-                .into_iter()
-                .collect(),
+            invalidated_by: [InstanceInvalidation::BinaryChanged].into_iter().collect(),
             disabled_reason: Nullable::some("not tried on this host".to_owned()),
             observed_at: TimestampMs::new(1),
         };

@@ -539,7 +539,7 @@ mod tests {
             .record(record(
                 "agent.prompt",
                 InstanceCapabilityState::PermissionRequired,
-                InstanceInvalidation::OsPermissionChanged,
+                InstanceInvalidation::BinaryChanged,
             ))
             .expect("recorded");
         let refusal = owner

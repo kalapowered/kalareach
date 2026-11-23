@@ -160,14 +160,7 @@ export type MethodTableVersionText = string
 /**
  * What makes a capability record stale.
  */
-export type InstanceInvalidation =
-  | 'binary_changed'
-  | 'binding_changed'
-  | 'schema_changed'
-  | 'os_permission_changed'
-  | 'desktop_generation_changed'
-  | 'qualification_profile_changed'
-  | 'launch_profile_changed'
+export type InstanceInvalidation = 'binary_changed' | 'binding_changed'
 /**
  * One foreground application within a terminal session.
  */

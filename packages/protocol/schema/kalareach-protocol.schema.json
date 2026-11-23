@@ -20407,31 +20407,6 @@
           "const": "binding_changed",
           "description": "The active binding changed.",
           "type": "string"
-        },
-        {
-          "const": "schema_changed",
-          "description": "The upstream schema or protocol version changed.",
-          "type": "string"
-        },
-        {
-          "const": "os_permission_changed",
-          "description": "An operating-system permission changed.",
-          "type": "string"
-        },
-        {
-          "const": "desktop_generation_changed",
-          "description": "The desktop session generation changed.",
-          "type": "string"
-        },
-        {
-          "const": "qualification_profile_changed",
-          "description": "The signed qualification profile in the catalogue changed.",
-          "type": "string"
-        },
-        {
-          "const": "launch_profile_changed",
-          "description": "The host's own launch profile changed.\n\nSeparate from the catalogue's qualification profile, because a record gathered under one\nargument vector says nothing about another and neither implies the other changed.",
-          "type": "string"
         }
       ]
     },
