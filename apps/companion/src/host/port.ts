@@ -2102,11 +2102,12 @@ export interface HostPort {
   ): () => void
   /**
    * Calls `listener` when what a view's reads depend on changes: the host, whether it is connected,
-   * its environment, the rights, whether it is paired, a replacement or a new connection. It is not
-   * called for the host's contact, for the reason, for the other hosts or for the inbox's epoch, and
-   * never for the state the registration finds. Resolves once the port has a state, from a read or
-   * from the first change it hears, with the function that stops the listener: a read made after
-   * that cannot miss a change. A failed read of the first state does not reject it.
+   * its environment, the rights, whether it is paired, whether its grant answers to an organisation,
+   * a replacement or a new connection. It is not called for the host's contact, for the reason, for
+   * the other hosts or for the inbox's epoch, and never for the state the registration finds.
+   * Resolves once the port has a state, from a read or from the first change it hears, with the
+   * function that stops the listener: a read made after that cannot miss a change. A failed read of
+   * the first state does not reject it.
    */
   onConnection(listener: (state: ConnectionState) => void): Promise<() => void>
   /** The latest state the port has taken in, or null before it has one. */
