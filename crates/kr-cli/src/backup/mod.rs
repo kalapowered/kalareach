@@ -126,7 +126,8 @@ async fn restore(
         )),
     };
 
-    // The kit: read with a handler installed, so Ctrl-C puts the terminal back and clears it.
+    // The kit: read at a terminal with a handler installed, so Ctrl-C puts the terminal back and
+    // clears it. A pipe is read without one on Windows, and the handler is armed after it.
     let mut interrupt = Interrupt::install()?;
     let from = arguments
         .kit_file

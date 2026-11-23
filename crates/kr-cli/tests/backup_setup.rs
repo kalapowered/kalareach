@@ -3,8 +3,9 @@
 //!
 //! The cases run on Windows as well as on Unix: there the command runs on a pseudo-console, with
 //! no shell around it, and the window says `kr ended <code>` where a Unix shell does. A case
-//! that needs what only Unix has (a terminal whose modes are read, an interrupt typed as Ctrl-C,
-//! the shell that is left waiting for a line) is Unix's alone, and says so with its `cfg`.
+//! that needs what only Unix has (a terminal whose modes are read, the shell that is left waiting
+//! for a line) is Unix's alone, and says so with its `cfg`; of the cases that type Ctrl-C, the
+//! ones that read no terminal mode run on Windows too.
 //!
 //! The owner's command makes the recovery seed in its own process, shows the kit once, and gives
 //! the daemon what it needs to write the bundle, enrol the host's writer and record the setup, and
@@ -1497,8 +1498,8 @@ async fn a_host_whose_storage_is_a_service_its_owner_runs_is_set_up_there_and_th
 }
 
 /// Ctrl-C at a question ends the command with the terminal as it was found and nothing sent: at the
-/// plan nothing was shown, and after the kit was shown the kit opens nothing.
-#[cfg(unix)]
+/// plan nothing was shown, and after the kit was shown the kit opens nothing. Where the terminal's
+/// modes can be read, they are as they were found.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_interrupt_at_a_question_sets_nothing_up_and_puts_the_terminal_back() {
     let rig = Rig::start().await;
@@ -1509,6 +1510,7 @@ async fn an_interrupt_at_a_question_sets_nothing_up_and_puts_the_terminal_back()
     let shown = window.wait_for("kr ended");
     assert!(!shown.contains("kr ended 0"), "{shown}");
     assert!(shown.contains("Nothing was set up."), "{shown}");
+    #[cfg(unix)]
     assert!(window.echoes(), "echo is on");
     assert!(!shown.contains("kalareach-recovery-kit"), "{shown}");
 
@@ -1518,6 +1520,7 @@ async fn an_interrupt_at_a_question_sets_nothing_up_and_puts_the_terminal_back()
     let shown = window.wait_for("kr ended");
     assert!(!shown.contains("kr ended 0"), "{shown}");
     assert!(shown.contains("opens nothing"), "{shown}");
+    #[cfg(unix)]
     assert!(window.echoes(), "echo is on");
 
     assert_eq!(rig.requests_to(SYNC), 0);
@@ -1527,7 +1530,6 @@ async fn an_interrupt_at_a_question_sets_nothing_up_and_puts_the_terminal_back()
 /// Ctrl-C while the daemon has the call says to keep the kit, and the kit is in use: the daemon
 /// records the setup after the command has gone. A command that told the person to delete the kit
 /// here would have them delete the only way to read these backups.
-#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_interrupt_while_the_daemon_has_the_call_says_to_keep_the_kit() {
     let rig = Rig::start().await;
@@ -1552,6 +1554,7 @@ async fn an_interrupt_while_the_daemon_has_the_call_says_to_keep_the_kit() {
     assert!(said.contains(&kit.fingerprint()), "{said}");
     assert!(!shown.contains("Nothing was set up"), "{shown}");
     assert!(!shown.contains("opens nothing: delete it"), "{shown}");
+    #[cfg(unix)]
     assert!(window.echoes(), "echo is on");
 
     go.send(()).expect("the commit is waiting");

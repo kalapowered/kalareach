@@ -112,7 +112,10 @@ pub async fn run(
     .await?;
     terminal::keep_out_of_a_dump()?;
 
-    let interrupt = Interrupt::install()?;
+    // Armed at once: every wait of the dialogue can be dropped by it, so a handler never holds the
+    // command, on Windows too.
+    let mut interrupt = Interrupt::install()?;
+    interrupt.arm()?;
     // Held from here to the end, so that every exit puts the terminal back and drops what is
     // waiting in it.
     let _terminal = Terminal::hold()?;

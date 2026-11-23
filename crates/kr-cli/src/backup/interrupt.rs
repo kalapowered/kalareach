@@ -7,9 +7,10 @@
 //! this makes the wait cancellable, because a blocking read is not ended by a signal that
 //! restarts it.
 //!
-//! Windows polls sockets only, so a command there reads its secret without a handler and installs
-//! one afterwards ([`Interrupt::arm`]): before that, Ctrl-C ends the process, which has written and
-//! changed nothing.
+//! Windows catches Ctrl-C and Ctrl-Break once [`Interrupt::arm`] has installed the handler. A
+//! command arms it before it reads a console, which it reads in short turns that look at a flag,
+//! and does not arm it before it reads a pipe, which a handler cannot end: there Ctrl-C ends the
+//! process, which has written and changed nothing.
 
 use kr_client::shown;
 use kr_client::shown::Shown;
@@ -27,7 +28,10 @@ pub struct Interrupt {
     #[cfg(unix)]
     quit: tokio::signal::unix::Signal,
     #[cfg(windows)]
-    ctrl_c: Option<tokio::signal::windows::CtrlC>,
+    handlers: Option<(
+        tokio::signal::windows::CtrlC,
+        tokio::signal::windows::CtrlBreak,
+    )>,
 }
 
 kr_client::debug_as_name!(Interrupt);
@@ -58,25 +62,29 @@ impl Interrupt {
         }
         #[cfg(windows)]
         {
-            Ok(Self { ctrl_c: None })
+            Ok(Self { handlers: None })
         }
     }
 
-    /// Installs what [`Self::install`] could not, once nothing is being read that a handler cannot
-    /// end.
+    /// Installs what [`Self::install`] could not, before anything is read that a handler can end,
+    /// and not before a read that it cannot.
     ///
     /// # Errors
     ///
     /// Returns a failure when the handler cannot be installed.
     pub fn arm(&mut self) -> Result<()> {
         #[cfg(windows)]
-        if self.ctrl_c.is_none() {
-            self.ctrl_c = Some(tokio::signal::windows::ctrl_c().map_err(|error| {
+        if self.handlers.is_none() {
+            let failed = |error: std::io::Error| {
                 CliError::Other(shown!(
                     "the interrupt could not be handled: {}",
                     Shown::io(&error)
                 ))
-            })?);
+            };
+            self.handlers = Some((
+                tokio::signal::windows::ctrl_c().map_err(failed)?,
+                tokio::signal::windows::ctrl_break().map_err(failed)?,
+            ));
         }
         Ok(())
     }
@@ -94,9 +102,12 @@ impl Interrupt {
         }
         #[cfg(windows)]
         {
-            match self.ctrl_c.as_mut() {
-                Some(ctrl_c) => {
-                    ctrl_c.recv().await;
+            match self.handlers.as_mut() {
+                Some((ctrl_c, ctrl_break)) => {
+                    tokio::select! {
+                        _ = ctrl_c.recv() => {}
+                        _ = ctrl_break.recv() => {}
+                    }
                 }
                 None => std::future::pending::<()>().await,
             }

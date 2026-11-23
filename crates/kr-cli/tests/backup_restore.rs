@@ -4627,6 +4627,29 @@ async fn at_a_console_only_yes_writes() {
     assert!(names(&fixture.into).contains(&"restore.json".to_owned()));
 }
 
+/// Ctrl-C while a kit is half pasted at a console ends the command and says that it stopped, so the
+/// handler took the way out that puts the console back and throws away the paste still waiting. The
+/// half-pasted kit is not used.
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_interrupt_while_a_kit_is_half_pasted_at_a_console_ends_the_command_and_says_so() {
+    let fixture = Fixture::new().await;
+    let into = fixture.folder_arg();
+    let seed = fixture.world.seed_text();
+    let mut window = Window::run(
+        &fixture.rig,
+        &["backup", "restore", "--into", &into, "--preview"],
+    );
+    window.wait_for("Nothing you paste is shown.");
+    window.type_bytes(format!("kalareach-recovery-kit/1\rseed: {seed}\r").as_bytes());
+    window.type_bytes(&[0x03]);
+    let shown = window.wait_for("kr ended");
+    assert!(!shown.contains("kr ended 0"), "{shown}");
+    assert!(shown.contains("stopped before it finished"), "{shown}");
+    assert!(!shown.contains(&seed), "the seed was shown");
+    assert_eq!(fixture.bundle_reads(), 0, "the half-pasted kit was used");
+}
+
 /// The kit pasted at a console: nothing is shown as it is pasted, the document ends at a blank line,
 /// what is shown back names the locator by its first eight characters, and the kit is not used
 /// unless the person says it is the one they meant.
