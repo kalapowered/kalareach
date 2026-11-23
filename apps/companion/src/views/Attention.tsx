@@ -395,7 +395,13 @@ export function Attention({ latest }: { readonly latest: ConnectionState | null 
                       {row.detail}
                     </p>
                     {approvals ? (
-                      <ApprovalRequests sessionId={sessionId} onAnswered={readAgain} offerTerminal />
+                      <ApprovalRequests
+                        sessionId={sessionId}
+                        onAnswered={readAgain}
+                        openTerminal={() => {
+                          go({ view: 'session', sessionId, pane: 'terminal' })
+                        }}
+                      />
                     ) : null}
                     {questions && sessionId !== null ? (
                       <QuestionRequests sessionId={sessionId} onAnswered={readAgain} />

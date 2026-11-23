@@ -162,7 +162,7 @@ export function Conversation({
   /** How many times the person has asked the session to try again. */
   readonly retried: number
 }): ReactNode {
-  const { port, say, drafts: book, paths, receiptReads } = useApp()
+  const { port, go, say, drafts: book, paths, receiptReads } = useApp()
   const { rights, paired } = useHeldConnection()
   const { state, update } = useSession(sessionId)
   // The draft belongs to the window, not to this view: it is kept on this device as it is typed,
@@ -982,7 +982,12 @@ export function Conversation({
       </div>
 
       {approvalNotice === null ? null : (
-        <ApprovalOffer sessionId={sessionId} notice={approvalNotice} />
+        <ApprovalOffer
+          notice={approvalNotice}
+          onOpenTerminal={() => {
+            go({ view: 'session', sessionId, pane: 'terminal' })
+          }}
+        />
       )}
       <ApprovalRequests sessionId={sessionId} onAnswered={refresh} />
       <QuestionRequests sessionId={sessionId} onAnswered={refresh} />

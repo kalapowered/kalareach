@@ -83,13 +83,13 @@ function sourceText(encoded: string): { readonly text: string; readonly more: nu
  * answered here, and offers the way to the terminal where it can.
  */
 export function ApprovalOffer({
-  sessionId,
-  notice
+  notice,
+  onOpenTerminal
 }: {
-  readonly sessionId: string
   readonly notice: ApprovalNotice
+  /** Takes the person to the session's terminal, in whichever shell draws the notice. */
+  readonly onOpenTerminal: () => void
 }): ReactNode {
-  const { go } = useApp()
   return (
     <section className="approval-offer" aria-label="Approvals" data-testid="approval-offer">
       <p>Claude Code asks for approvals in its terminal. Answer them there.</p>
@@ -97,13 +97,7 @@ export function ApprovalOffer({
         {notice.sentence}
       </p>
       {notice.terminal === 'offer' ? (
-        <Button
-          onClick={() => {
-            go({ view: 'session', sessionId, pane: 'terminal' })
-          }}
-        >
-          Open the terminal
-        </Button>
+        <Button onClick={onOpenTerminal}>Open the terminal</Button>
       ) : (
         <p className="small muted" data-testid="approval-offer-terminal">
           {notice.terminal === 'no_input'
@@ -119,16 +113,17 @@ export function ApprovalOffer({
 export function ApprovalRequests({
   sessionId,
   onAnswered,
-  offerTerminal = false
+  openTerminal
 }: {
   readonly sessionId: string
   /** Called once an answer has been taken, so what listed the request can read again. */
   readonly onAnswered?: () => void
   /**
-   * Whether a request that cannot be answered here is given the notice that says where to answer
-   * it, which a conversation draws once above its requests and the inbox draws on the card.
+   * Given, a request that cannot be answered here gets the notice that says where to answer it,
+   * which a conversation draws once above its requests and the inbox draws on the card; this takes
+   * the person to the session's terminal.
    */
-  readonly offerTerminal?: boolean
+  readonly openTerminal?: () => void
 }): ReactNode {
   const { port, say } = useApp()
   const rights = useConnectionRights()
@@ -348,7 +343,7 @@ export function ApprovalRequests({
         // Once the connection has said what it may do: before that, the card does not tell a device
         // that it may not type.
         const notice =
-          offerTerminal && rights !== null
+          openTerminal !== undefined && rights !== null
             ? approvalNoticeFor({
                 instance: request.instance,
                 capabilities: capabilityRecords(facts.capabilities.records),
@@ -403,8 +398,8 @@ export function ApprovalRequests({
                 </CommitButton>
               ))}
             </div>
-            {notice !== null ? (
-              <ApprovalOffer sessionId={sessionId} notice={notice} />
+            {notice !== null && openTerminal !== undefined ? (
+              <ApprovalOffer notice={notice} onOpenTerminal={openTerminal} />
             ) : offer.reason !== null ? (
               <p className="small warning-text" data-testid="approval-unavailable">
                 {offer.reason}

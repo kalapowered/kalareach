@@ -199,6 +199,7 @@ export function MobileSession({
   surface,
   lifecycle,
   connected,
+  initialPane = 'semantic',
   onOpenKept,
   onBack
 }: {
@@ -207,6 +208,8 @@ export function MobileSession({
   readonly grantId?: string | null
   readonly surface: Surface
   readonly lifecycle: Lifecycle
+  /** The pane the screen opens on: the conversation, unless the route into it names another. */
+  readonly initialPane?: Pane
   /** Opens the list of kept drafts, where the shell has one. */
   readonly onOpenKept?: () => void
   /** Goes back to the list of sessions. */
@@ -220,7 +223,7 @@ export function MobileSession({
   const { drafts: composers, status: draftsStatus, problem: draftsProblem } = shown
   const channelShelf = useChannelMessages()
   const keptEntryLine = keptEntry(shown, channelShelf, useWaitingHolds(channelShelf.holds))
-  const [pane, setPane] = useState<Pane>('semantic')
+  const [pane, setPane] = useState<Pane>(initialPane)
   // The session's agent, read from its own worker while this screen is open, into the session's
   // own store: nothing of another session is ever shown under this one.
   const { state: session } = useSession(sessionId)

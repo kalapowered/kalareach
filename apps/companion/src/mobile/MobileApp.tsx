@@ -55,6 +55,8 @@ interface Place {
   readonly sessionId?: string
   /** The share the session is opened under, for a session that is shared with this phone. */
   readonly grantId?: string
+  /** The pane the session opens on, where the way into it names one. */
+  readonly pane?: 'terminal'
   readonly settings?: boolean
   /** The voice screen, over the sessions list: opened from it, and left the way a session is. */
   readonly voice?: boolean
@@ -371,6 +373,7 @@ export function MobileApp({
           <MobileSession
             sessionId={place.sessionId}
             grantId={place.grantId ?? null}
+            initialPane={place.pane}
             surface={resolved}
             lifecycle={lifecycle}
             connected={connection?.connected ?? null}
