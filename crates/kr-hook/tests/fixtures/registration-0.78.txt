@@ -1,0 +1,8 @@
+endpoint=/tmp/kr-record-tmp/kr-6eda8681/launch/a-1267bb9c8031.sock
+profile=lp-1795438838982-52d145db-f66e-43f3-aa79-bef40e81ed81
+instance=a9472a94-1f6c-4f1d-a037-3eea8911c129
+pid=2042090
+start=534059390
+credential=/tmp/kr-record-tmp/kr-6eda8681/launch/credential
+release=0.78.0+e03f8dd17f5c
+framing=json_lines
