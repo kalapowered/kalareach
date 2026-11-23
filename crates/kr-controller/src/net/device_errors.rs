@@ -1092,6 +1092,8 @@ fn why_mutations_wait(reason: &str) -> Wait {
     if [
         kr_worker::broker::THREAD_NOT_READ,
         kr_worker::broker::bridge::UNVERIFIED_THREAD,
+        kr_worker::broker::volatile::GATEWAY_FENCED,
+        kr_worker::broker::volatile::GATEWAY_RECOVERING,
         SELECTION_IN_FLIGHT,
         SELECTION_UNKNOWN,
     ]
@@ -2622,6 +2624,19 @@ mod tests {
         let free = binding(None);
         for device in bindings_a_device_reads(&free) {
             assert_eq!(device, free);
+        }
+    }
+
+    #[test]
+    fn the_gateways_fence_is_told_to_a_device_as_the_host_wrote_it() {
+        for reason in [
+            kr_worker::broker::volatile::GATEWAY_FENCED,
+            kr_worker::broker::volatile::GATEWAY_RECOVERING,
+        ] {
+            let owner = binding(Some(reason));
+            for device in bindings_a_device_reads(&owner) {
+                assert_eq!(device, owner, "{reason}");
+            }
         }
     }
 

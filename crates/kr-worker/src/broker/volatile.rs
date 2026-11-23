@@ -17,6 +17,15 @@ use kr_protocol::session::Durability;
 
 use crate::broker::error::{BrokerError, Result};
 
+/// Why rich work is refused while the gateway is fenced. A device is told it as written, so a
+/// change here is a change of what a paired device reads.
+pub const GATEWAY_FENCED: &str = "approvals cannot be recorded while the record store has a fault, \
+     so they are answered in the terminal, which goes on working";
+
+/// Why rich work is refused while the gateway recovers. A device is told it as written.
+pub const GATEWAY_RECOVERING: &str = "storage is back and the records it missed are being written; \
+     approvals return here when that is done";
+
 /// What one transition did.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VolatileTransition {
@@ -190,16 +199,8 @@ impl VolatileState {
         }
         Err(BrokerError::RichWorkFenced {
             detail: match self.mode {
-                GatewayMode::NativeOnlyVolatile => {
-                    "approvals cannot be recorded while the record store has a fault, so they \
-                     are answered in the terminal, which goes on working"
-                        .to_owned()
-                }
-                GatewayMode::Recovering => {
-                    "storage is back and the records it missed are being written; approvals \
-                     return here when that is done"
-                        .to_owned()
-                }
+                GatewayMode::NativeOnlyVolatile => GATEWAY_FENCED.to_owned(),
+                GatewayMode::Recovering => GATEWAY_RECOVERING.to_owned(),
                 GatewayMode::Normal => unreachable!("normal admits rich work"),
             },
         })
