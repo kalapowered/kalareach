@@ -183,6 +183,11 @@ const TURN_MILLISECONDS: u32 = 200;
 /// How many input records one read asks the console for.
 const RECORDS: usize = 32;
 
+/// How many reads of records one call of [`Prompt::read`] makes at most while the records that
+/// arrive hold no character. The bound keeps an endless stream of them from holding off the
+/// caller's own checks (a cancelled read, an idle limit).
+const RECORD_READS: usize = 64;
+
 /// How many times a record can stand for its character: a held key repeats up to this many times.
 const MAX_REPEAT: u16 = 16;
 
@@ -317,8 +322,14 @@ impl Prompt {
     ///
     /// Returns the error that waiting for the console or reading it gave.
     pub fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
-        if self.pending.is_empty() {
-            self.fill()?;
+        // A key's release, a modifier key and a change of focus arrive as records with no
+        // character, and a paste is made of them as much as of its text. They do not say that the
+        // input stopped, so the read goes on in the same turn, and says that nothing came only
+        // after a turn in which no record came.
+        for _ in 0..RECORD_READS {
+            if !self.pending.is_empty() || !self.fill()? {
+                break;
+            }
         }
         let taken = buffer.len().min(self.pending.len());
         buffer[..taken].copy_from_slice(&self.pending[..taken]);
@@ -330,6 +341,7 @@ impl Prompt {
     /// silence.
     fn next(&mut self) -> std::io::Result<Option<char>> {
         if self.pending.is_empty() {
+            // Records with no character leave it empty: the caller's turn is over, and it asks again.
             self.fill()?;
         }
         let Some(&first) = self.pending.first() else {
@@ -397,12 +409,13 @@ impl Prompt {
     }
 
     /// Waits one turn for the console's input and takes the characters of the key events in it.
-    fn fill(&mut self) -> std::io::Result<()> {
+    /// Returns whether any record came: none means the turn passed in silence.
+    fn fill(&mut self) -> std::io::Result<bool> {
         let handle = self.input.as_raw_handle().cast();
         // SAFETY: the handle is open for as long as `self.input` is.
         match unsafe { WaitForSingleObject(handle, TURN_MILLISECONDS) } {
             WAIT_OBJECT_0 => {}
-            WAIT_TIMEOUT => return Ok(()),
+            WAIT_TIMEOUT => return Ok(false),
             _ => return Err(std::io::Error::last_os_error()),
         }
         // SAFETY: an all-zero record is a valid value of the type, which is plain data.
@@ -437,7 +450,7 @@ impl Prompt {
                 self.take(unit);
             }
         }
-        Ok(())
+        Ok(true)
     }
 
     /// Takes one UTF-16 unit: a surrogate waits for its pair, and Ctrl-Z becomes the byte that
@@ -518,7 +531,7 @@ mod tests {
     use std::sync::{Mutex, PoisonError};
 
     use windows_sys::Win32::System::Console::{
-        INPUT_RECORD_0, KEY_EVENT_RECORD, KEY_EVENT_RECORD_0,
+        INPUT_RECORD_0, KEY_EVENT_RECORD, KEY_EVENT_RECORD_0, WriteConsoleInputW,
     };
 
     use super::*;
@@ -580,6 +593,45 @@ mod tests {
             "{refused}"
         );
         assert_eq!(mode_of(&input), before, "the modes are as they were found");
+    }
+
+    /// A paste after the blank line arrives as key releases and modifier keys that carry no
+    /// character, as much as of text. A read that came back with only those has not seen the input
+    /// stop: it reads on, and says that nothing came only after a turn with no record at all.
+    #[test]
+    fn a_read_goes_on_past_records_with_no_character_until_the_input_is_quiet() {
+        let _alone = CONSOLE.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut prompt = Prompt::enter_on(console_input(true)).expect("a prompt on the console");
+        let writer = console_input(true);
+        let inject = |records: &[INPUT_RECORD]| {
+            let mut written = 0_u32;
+            // SAFETY: the handle is open for as long as `writer` is, the records are as many as
+            // the call is told, and `written` is a live `u32`.
+            let done = unsafe {
+                WriteConsoleInputW(
+                    writer.as_raw_handle().cast(),
+                    records.as_ptr(),
+                    records.len() as u32,
+                    &raw mut written,
+                )
+            };
+            assert_ne!(done, 0, "the records are written");
+            assert_eq!(written as usize, records.len());
+        };
+
+        // A key release first, which holds no character, and the text a little later.
+        inject(&[key(false, u16::from(b'a'))]);
+        let mut buffer = [0_u8; 16];
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                inject(&[key(true, u16::from(b'x')), key(false, u16::from(b'x'))]);
+            });
+            let taken = prompt.read(&mut buffer).expect("reads the console");
+            assert_eq!(&buffer[..taken], b"x", "the text that followed the release");
+        });
+        // No record came in a whole turn: the read says so.
+        assert_eq!(prompt.read(&mut buffer).expect("reads the console"), 0);
     }
 
     /// The most one read can bring into a prompt fits the room it was given before any secret was
