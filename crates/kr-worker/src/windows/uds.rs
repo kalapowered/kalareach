@@ -591,15 +591,20 @@ pub fn gateway_socket_names_its_peers() -> Result<(), String> {
     PROBE.get_or_init(probe).clone()
 }
 
-/// Runs the probe in a folder of its own, which it removes.
+/// Runs the probe in a folder of its own below the temporary directory, which it removes.
 fn probe() -> Result<(), String> {
+    probe_in(&std::env::temp_dir())
+}
+
+/// Runs the probe in a folder of its own below `base`, which it removes.
+fn probe_in(base: &Path) -> Result<(), String> {
     let name: String = kr_ipc::new_uuid()
         .to_string()
         .chars()
         .filter(char::is_ascii_hexdigit)
         .take(8)
         .collect();
-    let directory = std::env::temp_dir().join(format!("kr-q-{name}"));
+    let directory = base.join(format!("kr-q-{name}"));
     kr_ipc::paths::create_private_directory(&directory).map_err(|error| {
         format!(
             "the folder {} for asking this Windows build ({}) which process connects to a \
@@ -608,8 +613,27 @@ fn probe() -> Result<(), String> {
             windows_build()
         )
     })?;
-    let outcome = prove_the_build_names_a_peer(&directory.join("p.sock"));
-    let _ = std::fs::remove_dir_all(&directory);
+    // The folder is opened as itself, and what is removed is removed through handles: the socket
+    // by the identity it had, and then the folder by the handle that opened it.
+    let held = open_directory_without_following(
+        &directory,
+        DELETE | FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+    )
+    .map_err(|error| {
+        format!(
+            "the folder {} for asking this Windows build ({}) which process connects to a \
+             Unix-domain socket could not be opened: {error}",
+            directory.display(),
+            windows_build()
+        )
+    })?;
+    let socket = directory.join("p.sock");
+    let outcome = prove_the_build_names_a_peer(&socket);
+    if let Some(made) = socket_object(&socket) {
+        remove_socket_made(&socket, made);
+    }
+    let _ = delete_through(&held);
     outcome
 }
 
@@ -909,6 +933,28 @@ mod tests {
         if let Err(detail) = gateway_socket_names_its_peers() {
             panic!("the build ({build}) does not name its peers: {detail}");
         }
+    }
+
+    /// KR-REQ-07.45: the probe removes the folder it made and the socket in it, each through the
+    /// handle that stands for it, and leaves nothing below the folder it was given.
+    #[test]
+    fn the_probe_leaves_nothing_behind() {
+        let name: String = kr_ipc::new_uuid()
+            .to_string()
+            .chars()
+            .filter(char::is_ascii_hexdigit)
+            .take(8)
+            .collect();
+        let base = std::env::temp_dir().join(format!("kr-t-{name}"));
+        kr_ipc::paths::create_private_directory(&base).expect("a private directory is made");
+        let outcome = probe_in(&base);
+        let left: Vec<_> = std::fs::read_dir(&base)
+            .expect("the folder is read")
+            .map(|entry| entry.expect("an entry").file_name())
+            .collect();
+        let _ = std::fs::remove_dir_all(&base);
+        outcome.expect("this build names its peers");
+        assert!(left.is_empty(), "the probe left {left:?}");
     }
 
     /// A build whose control call fails binds nothing: the refusal is the probe's own words, naming
