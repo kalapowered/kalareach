@@ -1548,14 +1548,16 @@ fn a_child_that_hides_from_the_scan_changes_nothing_because_the_end_rests_on_the
 }
 
 /// Runs an invocation in which the service is told to stop at `point`, with a copy of the token
-/// held so that the end cannot be proved, and returns the replies. The tree has a reader that runs
-/// the stand-in with `reader`, or none.
+/// held so that the end cannot be proved, and returns the replies and the logon session, after the
+/// copy is closed. The tree has a reader that runs the stand-in with `reader`, or none. The caller
+/// reads the replies first and then waits for the session to leave the list, so that a session
+/// that stays does not hide what the replies said.
 fn stopped_at(
     setting: &Setting,
     point: &'static str,
     reader: Option<&[&str]>,
     how: How,
-) -> Vec<InvocationReply> {
+) -> (Vec<InvocationReply>, u64) {
     let edit = |env: &mut Environment| {
         env.bounds.session = Duration::from_secs(2);
     };
@@ -1594,8 +1596,7 @@ fn stopped_at(
     let luid = hooks::session();
     hooks::set_hook(None);
     drop(held.lock().unwrap().take());
-    absent_session(luid);
-    replies
+    (replies, luid)
 }
 
 #[test]
@@ -1607,7 +1608,7 @@ fn a_stop_of_the_service_during_the_reader_or_the_wait_for_the_pipes_ends_by_the
     }
     let setting = Setting::new();
     // The reader is running when the service is told to stop, and the end cannot be proved.
-    let replies = stopped_at(
+    let (replies, luid) = stopped_at(
         &setting,
         "reader resumed",
         Some(&["sleep", "120000"]),
@@ -1625,9 +1626,10 @@ fn a_stop_of_the_service_during_the_reader_or_the_wait_for_the_pipes_ends_by_the
         ),
         "{replies:?}"
     );
+    absent_session(luid);
     // The service is told to stop while the client is to connect the data pipes.
     forget_journals(&setting);
-    let replies = stopped_at(&setting, "accepted", None, How::NeverConnects);
+    let (replies, luid) = stopped_at(&setting, "accepted", None, How::NeverConnects);
     assert!(
         matches!(
             replies.last(),
@@ -1640,6 +1642,7 @@ fn a_stop_of_the_service_during_the_reader_or_the_wait_for_the_pipes_ends_by_the
         ),
         "{replies:?}"
     );
+    absent_session(luid);
 }
 
 /// The service is told to stop after the reader ended and left a live process: the wait for the
@@ -1652,7 +1655,7 @@ fn a_stop_of_the_service_while_a_process_of_the_reader_lives_ends_by_the_stop() 
         return;
     }
     let setting = Setting::new();
-    let replies = stopped_at(&setting, "reader ended", Some(&["leave"]), How::Reads);
+    let (replies, luid) = stopped_at(&setting, "reader ended", Some(&["leave"]), How::Reads);
     assert!(
         matches!(
             replies.last(),
@@ -1665,6 +1668,7 @@ fn a_stop_of_the_service_while_a_process_of_the_reader_lives_ends_by_the_stop() 
         ),
         "{replies:?}"
     );
+    absent_session(luid);
 }
 
 /// Runs `body` on this thread under a copy of this process's token that holds no privilege, which is
