@@ -2498,6 +2498,21 @@ impl ConsoleMouse {
     }
 }
 
+/// Has the console spell its keys while the application has bracketed paste on, and report them as
+/// records again when it stops.
+///
+/// A console that reports its keys as records reports no boundaries of a paste, so an application
+/// that asked for them is given the paste with none. The console's own spelling of the keys has
+/// them, and costs the records' key releases, repeat counts and scan codes, which are only the
+/// console's while the application has bracketed paste off. A console the session refused the
+/// records of is left as it is: it spells for good, or cannot be typed at. A console that will not
+/// change its mode keeps its records, and is asked again at the next output.
+fn follow_paste(switch: &crate::attach::InputSwitch, fallback: &Fallback, mouse: &ConsoleMouse) {
+    if fallback.how.is_none() {
+        let _ = switch.follow_paste(mouse.reporting.bracketed_paste());
+    }
+}
+
 /// Has the console report its mouse, or gives the mouse back to it, and says whether the console
 /// took the change.
 #[cfg(not(unix))]
@@ -2796,6 +2811,7 @@ async fn drive(
                                 epoch.is_some(),
                                 reading,
                             );
+                            follow_paste(switch, fallback, &console_mouse);
                             // What the terminal is written after a sequence that would leave it
                             // in another state than the session goes in the middle of the event.
                             let mut handle = output.as_ref();
@@ -2914,6 +2930,7 @@ async fn drive(
                             }
                             if !drawn.bytes.is_empty() {
                                 console_mouse.painted(&drawn.bytes, terminal, epoch.is_some());
+                                follow_paste(switch, fallback, &console_mouse);
                                 let mut handle = output.as_ref();
                                 if handle.write_all(&drawn.bytes).is_err() {
                                     return AttachOutcome::Disconnected;

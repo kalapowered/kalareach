@@ -20,7 +20,10 @@
 //!
 //! When the session cannot take the records, the console is asked to spell its keys itself, and
 //! from then on its text is read as text ([`RecordReader::read_text`]), exactly as the console hands
-//! it over: a record is never turned into bytes here. A read of the console's text waits until the
+//! it over: a record is never turned into bytes here. The console is asked the same while the
+//! session's application has bracketed paste on, because a console that reports records drops the
+//! two markers of a paste before a record exists; it reports records again when the application
+//! turns bracketed paste off. A read of the console's text waits until the
 //! console has some to give, and a thread in it cannot be woken without the console losing the next
 //! key, so [`RecordReader::text_waiting`] says first whether there is any.
 
