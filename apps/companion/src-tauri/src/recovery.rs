@@ -77,8 +77,8 @@ mod restoring;
 mod saving;
 
 pub use restoring::{
-    EXPORT_PANEL, KIT_PANEL, NativePanels, OpenPanels, SettingsRestored, restore_settings,
-    settings_restored,
+    EXPORT_PANEL, KIT_PANEL, NativePanels, OpenPanels, SettingsRestored, kit_service_unreachable,
+    not_a_path, panel_unanswered, restore_settings, settings_restored,
 };
 pub use saving::{
     NotSavedWhy, SETTINGS_READ_FROM, SettingsLine, SettingsRemoved, SettingsSource, SettingsStep,

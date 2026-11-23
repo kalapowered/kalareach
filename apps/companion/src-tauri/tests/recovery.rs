@@ -5265,7 +5265,8 @@ async fn a_restore_puts_the_colour_mode_back_on_a_fresh_device_and_replaces_noth
     )
     .expect("a kit file");
     let (_directory, untouched) = fresh_device();
-    page.recovery
+    let refused = page
+        .recovery
         .restore_settings_with(
             &Chooses::answering(vec![Some(other_path)]),
             &page.account,
@@ -5274,6 +5275,10 @@ async fn a_restore_puts_the_colour_mode_back_on_a_fresh_device_and_replaces_noth
         )
         .await
         .expect_err("the kit does not open the bundle");
+    assert_eq!(
+        refused.message,
+        "the recovery bundle did not authenticate at that origin and locator"
+    );
     assert_eq!(untouched.local().chosen_colour_mode(), None);
 }
 
@@ -5394,23 +5399,40 @@ async fn a_kit_or_export_file_that_is_not_one_is_refused_in_words() {
             "{path:?}"
         );
     }
-    // A kit that is not a kit, or too long, shows the library's words.
+    // A file over a kit's size, and text that is no kit, show the library's own words.
     let long = join("long.txt");
     std::fs::write(&long, vec![b'a'; 4096]).expect("a file");
-    assert!(
-        !refused(vec![Some(long)], false).await.is_empty(),
-        "a file over a kit's size is refused"
+    assert_eq!(
+        refused(vec![Some(long)], false).await,
+        format!(
+            "the recovery kit renders to {} bytes, over the {}-byte limit",
+            kr_client::recovery::MAX_RECOVERY_KIT_BYTES + 1,
+            kr_client::recovery::MAX_RECOVERY_KIT_BYTES
+        ),
+        "the read stops one byte past a kit's size"
+    );
+    let no_kit = join("no-kit.txt");
+    std::fs::write(&no_kit, b"this is not a kit").expect("a file");
+    assert_eq!(
+        refused(vec![Some(no_kit)], false).await,
+        "that is not a recovery kit: a first line that is not this kit format"
     );
 
-    // An export that is a folder or missing is unreadable, one over the cap is too large, and
-    // one that is no export is none.
-    for path in [folder, join("missing.krexport")] {
-        assert_eq!(
-            refused(vec![Some(kit_path.clone()), Some(path.clone())], true).await,
-            "the export file could not be read",
-            "{path:?}"
-        );
-    }
+    // An export that is a folder is no regular file, and one that is missing cannot be read: the
+    // words are those of `kr backup restore`. One over the cap is too large, and one that is no
+    // export is none.
+    assert_eq!(
+        refused(vec![Some(kit_path.clone()), Some(folder)], true).await,
+        "the export file has to be a regular file"
+    );
+    assert_eq!(
+        refused(
+            vec![Some(kit_path.clone()), Some(join("missing.krexport"))],
+            true
+        )
+        .await,
+        "the export file could not be read"
+    );
     let huge = join("huge.krexport");
     std::fs::File::create(&huge)
         .and_then(|file| file.set_len(kr_client::recovery::MAX_EXPORT_BYTES + 2 * 1024 * 1024))
@@ -5422,10 +5444,67 @@ async fn a_kit_or_export_file_that_is_not_one_is_refused_in_words() {
     let garbage = join("garbage.krexport");
     std::fs::write(&garbage, b"this is not an export").expect("a file");
     assert_eq!(
-        refused(vec![Some(kit_path), Some(garbage)], true).await,
+        refused(vec![Some(kit_path.clone()), Some(garbage)], true).await,
         "that file is not an offline export"
     );
+    // An export of another format than this release reads: the same bytes with the format's last
+    // character changed, which keeps the canonical encoding.
+    let exported = join("exported.krexport");
+    page.dialog_returns(&exported);
+    page.call(
+        "recovery_export_offline",
+        json!({ "path": exported.to_string_lossy(), "archive": null }),
+    )
+    .expect("exported");
+    let format = kr_client::recovery::OFFLINE_EXPORT_FORMAT.as_bytes();
+    let mut newer = std::fs::read(&exported).expect("the export");
+    let at = newer
+        .windows(format.len())
+        .position(|window| window == format)
+        .expect("the export names its format");
+    newer[at + format.len() - 1] = b'2';
+    let newer_file = join("newer.krexport");
+    std::fs::write(&newer_file, newer).expect("a file");
+    assert_eq!(
+        refused(vec![Some(kit_path), Some(newer_file)], true).await,
+        "that file is an offline export in a format this release does not read"
+    );
     assert_eq!(fresh.local().chosen_colour_mode(), None);
+}
+
+/// KR-REQ-20.17: a kit that names no service, a service that no transport can be made to, and the
+/// two ways an open panel fails are refused in the words the person reads.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_kit_that_names_no_service_and_the_failures_of_a_panel_are_refused_in_words() {
+    let (computer, _out, _kit_path, kit) = computer_with_saved_mode(ColourMode::Dark).await;
+    let page = computer.page().await;
+    let nameless = RecoverySeed::generate()
+        .expect("a seed")
+        .to_kit(vec!["not an origin".to_owned()], kit.bundle_locator.clone());
+    let error = GatewayOrigin::new("not an origin").expect_err("no origin");
+    let refused = page
+        .recovery
+        .account_source_for(&page.account, &nameless)
+        .err()
+        .expect("a kit that names no service is refused");
+    assert_eq!(
+        refused.message,
+        format!("the service the kit names is not one this device can reach: {error}")
+    );
+    // A transport cannot be made to fail for an origin that parsed, so the words are pinned where
+    // they are made.
+    assert_eq!(
+        companion_tauri::recovery::kit_service_unreachable("no transport").message,
+        "this device cannot reach the service the kit names: no transport"
+    );
+    assert_eq!(
+        companion_tauri::recovery::panel_unanswered().message,
+        "the open dialog did not answer"
+    );
+    assert_eq!(
+        companion_tauri::recovery::not_a_path("it names no file").message,
+        "that file is not a path: it names no file"
+    );
 }
 
 /// KR-REQ-20.17: a kit whose service this device is not signed in to is refused before anything is

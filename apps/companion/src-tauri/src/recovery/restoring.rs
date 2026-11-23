@@ -63,6 +63,26 @@ pub enum SettingsRestored {
     Cancelled,
 }
 
+/// What the person is told when an open panel never answered.
+#[must_use]
+pub fn panel_unanswered() -> CommandError {
+    CommandError::local_failure("the open dialog did not answer")
+}
+
+/// What the person is told when the file an open panel returned is not a path.
+#[must_use]
+pub fn not_a_path(error: impl std::fmt::Display) -> CommandError {
+    CommandError::invalid(format!("that file is not a path: {error}"))
+}
+
+/// What the person is told when no transport can be made to the service the kit names.
+#[must_use]
+pub fn kit_service_unreachable(error: impl std::fmt::Display) -> CommandError {
+    CommandError::local_failure(format!(
+        "this device cannot reach the service the kit names: {error}"
+    ))
+}
+
 /// Where the person chooses a file: the platform's open panels, which this process raises. A test
 /// answers for the person.
 pub trait OpenPanels: Send + Sync {
@@ -98,15 +118,9 @@ impl<R: tauri::Runtime> OpenPanels for NativePanels<R> {
                 .pick_file(move |path| {
                     let _ = sender.send(path);
                 });
-            let chosen = receiver
-                .await
-                .map_err(|_| CommandError::local_failure("the open dialog did not answer"))?;
+            let chosen = receiver.await.map_err(|_| panel_unanswered())?;
             chosen
-                .map(|path| {
-                    path.into_path().map_err(|error| {
-                        CommandError::invalid(format!("that file is not a path: {error}"))
-                    })
-                })
+                .map(|path| path.into_path().map_err(not_a_path))
                 .transpose()
         })
     }
@@ -138,11 +152,7 @@ impl Recovery {
             HttpDeadlines::default(),
             managed_response_limits(),
         )
-        .map_err(|error| {
-            CommandError::local_failure(format!(
-                "this device cannot reach the service the kit names: {error}"
-            ))
-        })?;
+        .map_err(kit_service_unreachable)?;
         let tokens: Arc<dyn AccountTokenSource> = account.tokens();
         Ok(Arc::new(AccountSource::new(
             origin,
@@ -217,7 +227,9 @@ fn file_source(path: &Path) -> Result<Arc<dyn RestoreSource>> {
     let unreadable = || CommandError::invalid("the export file could not be read");
     let metadata = std::fs::symlink_metadata(path).map_err(|_| unreadable())?;
     if !metadata.is_file() {
-        return Err(unreadable());
+        return Err(CommandError::invalid(
+            "the export file has to be a regular file",
+        ));
     }
     // The cap leaves room for the bundle and the file's own framing beside the archive.
     let limit = MAX_EXPORT_BYTES + 1024 * 1024;
