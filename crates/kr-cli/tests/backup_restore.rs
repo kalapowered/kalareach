@@ -55,7 +55,9 @@ use kr_protocol::archive::{
 use kr_protocol::ids::{
     ArchiveId, BackupGeneration, BackupObjectId, BackupWriterRevision, BuildId, DeviceId,
 };
-use kr_protocol::scalars::{AuthorisationKey, Nullable, Signature64, TimestampMs, U64, Uuid};
+use kr_protocol::scalars::{
+    AuthorisationKey, Bytes, Nullable, Signature64, TimestampMs, U64, Uuid,
+};
 use kr_protocol::service::{GatewayOrigin, ServiceRequestSigner};
 use kr_service_stand_in::{ACCOUNT, Moment, Served, ServiceWeb, TOKEN, serve};
 use serde_json::Value;
@@ -1783,6 +1785,186 @@ async fn a_restore_records_the_generation_it_verified_in_the_bundle() {
         after,
         "nothing newer to record"
     );
+}
+
+/// The bundle of [`bundle_at`] with `settings` saved in it and the locator of its first collection
+/// padded to `padding` more characters, so that a test can bring the sealed bundle to the bound a
+/// service keeps.
+fn bundle_with_settings(world: &World, origin: &str, settings: &Bytes, padding: usize) -> Vec<u8> {
+    let bundle = RecoveryBundle {
+        schema_version: U64::new(RECOVERY_BUNDLE_SCHEMA_VERSION),
+        collections: vec![CollectionLocator {
+            service_origin: origin.to_owned(),
+            locator: format!("collection-1{}", "x".repeat(padding)),
+            archive_id: archive(),
+        }],
+        trusted_writers: [world.trusted_writer()].into_iter().collect(),
+        trusted_producers: [world.trusted_producer()].into_iter().collect(),
+        checkpoints: std::iter::empty().collect(),
+        revision: U64::new(3),
+        written_at_ms: TimestampMs::new(2_000),
+        device_settings: Some(settings.clone()),
+    };
+    let key = world
+        .seed
+        .bundle_key_for(&RecoveryContext {
+            service_origin: origin.to_owned(),
+            bundle_locator: world.locator.clone(),
+        })
+        .expect("a bundle key");
+    kr_crypto::archive::encrypt_recovery_bundle(&key, &bundle).expect("a sealed bundle")
+}
+
+/// The sealed bundle of [`bundle_with_settings`] that leaves `room` bytes under the bound a
+/// service keeps.
+fn bundle_leaving(world: &World, origin: &str, settings: &Bytes, room: usize) -> Vec<u8> {
+    let target = usize::try_from(kr_protocol::sync::MAX_SEALED_RECOVERY_BUNDLE_BYTES)
+        .expect("a length")
+        - room;
+    let mut padding = 100_000_usize;
+    for _ in 0..6 {
+        let sealed = bundle_with_settings(world, origin, settings, padding);
+        if sealed.len() == target {
+            return sealed;
+        }
+        padding = (padding + target).saturating_sub(sealed.len());
+    }
+    panic!("the bundle never reached {room} bytes under the bound");
+}
+
+/// What `kr backup restore` says of the saved settings when a restore had to take them out of the
+/// bundle to make room for the record.
+const SETTINGS_REMOVED: &str = "The recovery bundle had no room for this record and the saved \
+    settings, so the settings were removed from it. A later restore does not bring them back.";
+
+/// KR-REQ-20.17: `kr backup restore` over a recovery bundle that is at the size a service keeps,
+/// with the owner device's settings saved in it. Recording the generation the restore verified
+/// leaves the bundle no room for both, so the settings go and the record stays, and the command
+/// says so: the sentence follows the line about the record, in the text a person reads and in the
+/// document's `checkpoint` member, and the bundle the service holds afterwards has the record and
+/// no settings. A bundle with room for both says nothing of the settings and keeps them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_restore_that_leaves_the_saved_settings_out_of_a_full_bundle_says_so() {
+    let world = World::new();
+    let rig = Rig::start(SignIn::Usable).await;
+    let held = members();
+    let sealed = seal(&world, 2, &borrowed(&held));
+    let settings = Bytes::new(vec![0x5a; 1024]);
+    rig.put_with(
+        &world,
+        &sealed,
+        bundle_leaving(&world, rig.origin(), &settings, 20),
+    )
+    .await;
+    let before = stored_bundle(&rig, &world);
+    assert_eq!(before.device_settings, Some(settings.clone()));
+    assert!(before.checkpoints.iter().next().is_none());
+    let recorded = |revision: u64| {
+        format!(
+            "The recovery bundle now records generation 2 as the newest this kit has verified \
+             (bundle revision {revision}). A later restore refuses a service that offers an older \
+             one. The first restore after a loss still has nothing to compare with, and a service \
+             can hold the bundle back as well."
+        )
+    };
+
+    let kit = rig.work.join("kit.txt");
+    std::fs::write(&kit, world.kit_text(&[rig.origin()])).expect("the kit file");
+    let kit_arg = kit.display().to_string();
+    // A preview, then the restore it confirms, into a folder of its own.
+    let restore = |name: &'static str, json: bool| {
+        let (rig, kit_arg) = (&rig, &kit_arg);
+        async move {
+            let into = folder(rig, name).display().to_string();
+            let mut preview = vec![
+                "backup",
+                "restore",
+                "--into",
+                &into,
+                "--kit-file",
+                kit_arg,
+                "--preview",
+            ];
+            if json {
+                preview.push("--json");
+            }
+            let previewed = rig.run(&preview, None).await;
+            assert!(previewed.status.success(), "{}", text(&previewed.stderr));
+            let digest = if json {
+                digest_of(&previewed)
+            } else {
+                text(&previewed.stdout)
+                    .lines()
+                    .find_map(|line| line.strip_prefix("Digest of this plan: "))
+                    .expect("the preview prints its digest")
+                    .trim()
+                    .to_owned()
+            };
+            let mut confirmed = vec![
+                "backup",
+                "restore",
+                "--into",
+                &into,
+                "--kit-file",
+                kit_arg,
+                "--confirm-plan",
+                &digest,
+            ];
+            if json {
+                confirmed.push("--json");
+            }
+            let restored = rig.run(&confirmed, None).await;
+            assert!(restored.status.success(), "{}", text(&restored.stderr));
+            restored
+        }
+    };
+
+    // The document: the `checkpoint` member carries the sentence after the record's line.
+    let restored = restore("json", true).await;
+    let report: Value = serde_json::from_slice(&restored.stdout).expect("a document");
+    assert_eq!(report["checkpoint_recorded"], true, "{report}");
+    assert_eq!(
+        report["checkpoint"],
+        format!("{} {SETTINGS_REMOVED}", recorded(before.revision.get() + 1)),
+        "{report}"
+    );
+    let after = stored_bundle(&rig, &world);
+    assert_eq!(after.device_settings, None, "the settings left the bundle");
+    assert_eq!(after.checkpoints.len(), 1, "the record is in it");
+    assert_eq!(after.revision.get(), before.revision.get() + 1);
+
+    // The text: the same bundle put back as it was, and the same words in the lines a person reads.
+    rig.served.web().put_bundle(
+        &world.locator,
+        ACCOUNT,
+        bundle_leaving(&world, rig.origin(), &settings, 20),
+    );
+    let restored = restore("text", false).await;
+    let said = text(&restored.stdout);
+    let line = format!("{} {SETTINGS_REMOVED}", recorded(before.revision.get() + 1));
+    assert!(
+        said.lines().any(|printed| printed == line),
+        "the text names the record and then the settings: {said}"
+    );
+    assert_eq!(stored_bundle(&rig, &world).device_settings, None);
+
+    // A bundle with room for the record and the settings keeps both and says nothing of them.
+    rig.served.web().put_bundle(
+        &world.locator,
+        ACCOUNT,
+        bundle_with_settings(&world, rig.origin(), &settings, 0),
+    );
+    let restored = restore("room", false).await;
+    let said = text(&restored.stdout);
+    assert!(
+        said.lines()
+            .any(|printed| printed == recorded(before.revision.get() + 1)),
+        "the text names the record alone: {said}"
+    );
+    assert!(!said.contains("no room"), "{said}");
+    let kept = stored_bundle(&rig, &world);
+    assert_eq!(kept.device_settings, Some(settings));
+    assert_eq!(kept.checkpoints.len(), 1);
 }
 
 /// KR-REQ-24.16: a bundle that records a generation makes a service that offers an older one a
