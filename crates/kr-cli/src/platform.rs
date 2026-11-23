@@ -341,14 +341,13 @@ mod console {
 
         /// What makes this console spell its keys itself: its virtual-terminal input, which turns
         /// the keys into the sequences a terminal sends. It is asked for on the mode the console
-        /// has then, and put back with the rest when the attachment ends.
+        /// has then, taken off again when the keys go back to being records, and put back with the
+        /// rest when the attachment ends.
         ///
         /// # Errors
         ///
         /// Returns an error when the console's input handle cannot be duplicated.
         pub fn input_switch(&self) -> Result<crate::attach::InputSwitch> {
-            use windows_sys::Win32::System::Console::ENABLE_VIRTUAL_TERMINAL_INPUT;
-
             let input = self
                 .input
                 .try_clone()
@@ -359,11 +358,11 @@ mod console {
             Ok(crate::attach::InputSwitch::new(
                 move || {
                     let mode = console_mode(&input)?;
-                    set_console_mode(&input, mode | ENABLE_VIRTUAL_TERMINAL_INPUT)
+                    set_console_mode(&input, crate::mouse::keys_spelled_mode(mode, true))
                 },
                 move || {
                     let mode = console_mode(&spelled)?;
-                    set_console_mode(&spelled, mode & !ENABLE_VIRTUAL_TERMINAL_INPUT)
+                    set_console_mode(&spelled, crate::mouse::keys_spelled_mode(mode, false))
                 },
             ))
         }

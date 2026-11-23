@@ -666,9 +666,23 @@ pub struct InputSwitch {
     ask: std::sync::Arc<dyn Fn() -> Result<()> + Send + Sync>,
     /// Asks the console to report its keys as records again.
     give_back: std::sync::Arc<dyn Fn() -> Result<()> + Send + Sync>,
+    /// Why the console spells its keys, when it does.
+    why: std::sync::Mutex<Spelled>,
     /// The reader, once one that can make the change is running.
     #[cfg(any(not(unix), test))]
     reader: std::sync::Mutex<Option<ReaderLine>>,
+}
+
+/// Why a console spells its keys.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Spelled {
+    /// It does not: the reader hands on its records.
+    Not,
+    /// The session's application has bracketed paste on, and a console that reports records gives
+    /// the paste no boundaries. The console reports records again when the application stops.
+    ForPaste,
+    /// The session refused the records. The console goes on spelling for good.
+    ForRefusal,
 }
 
 impl InputSwitch {
@@ -682,18 +696,62 @@ impl InputSwitch {
         Self {
             ask: std::sync::Arc::new(ask),
             give_back: std::sync::Arc::new(give_back),
+            why: std::sync::Mutex::new(Spelled::Not),
             #[cfg(any(not(unix), test))]
             reader: std::sync::Mutex::new(None),
         }
     }
 
-    /// Asks the console to spell its keys, and from then on the reader hands on bytes.
+    /// Asks the console to spell its keys because the session refused the records, and from then
+    /// on the reader hands on bytes. The console is not given the records back.
     ///
     /// # Errors
     ///
     /// Returns why the console would not, and the reader goes on handing on records, or that the
     /// reader did not answer.
     pub fn engage(&self) -> Result<()> {
+        let mut why = self
+            .why
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // A console that already spells its keys is not asked again.
+        if *why == Spelled::Not {
+            self.ask_the_console(true)?;
+        }
+        *why = Spelled::ForRefusal;
+        Ok(())
+    }
+
+    /// Has the console spell its keys while the application has bracketed paste on, and report
+    /// them as records again when it has not. A console that spells because the session refused
+    /// the records goes on spelling.
+    ///
+    /// # Errors
+    ///
+    /// Returns why the console would not, or that the reader did not answer: nothing has changed
+    /// then, and the next call asks again.
+    pub fn follow_paste(&self, wanted: bool) -> Result<()> {
+        let mut why = self
+            .why
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match (*why, wanted) {
+            (Spelled::Not, true) => {
+                self.ask_the_console(true)?;
+                *why = Spelled::ForPaste;
+            }
+            (Spelled::ForPaste, false) => {
+                self.ask_the_console(false)?;
+                *why = Spelled::Not;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Asks the console to spell its keys (`spell`) or to report records again, through the reader
+    /// where there is one, which makes the change between two of its reads.
+    fn ask_the_console(&self, spell: bool) -> Result<()> {
         #[cfg(any(not(unix), test))]
         if let Some(line) = self
             .reader
@@ -701,22 +759,13 @@ impl InputSwitch {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .as_ref()
         {
-            return line.ask_the_reader();
+            return line.ask_the_reader(spell);
         }
-        (self.ask)()
-    }
-}
-
-impl InputSwitch {
-    /// Has the console spell its keys while the application has bracketed paste on, and report
-    /// them as records again when it has not.
-    ///
-    /// # Errors
-    ///
-    /// Returns why the console would not.
-    pub fn follow_paste(&self, wanted: bool) -> Result<()> {
-        let _ = (wanted, &self.give_back);
-        Ok(())
+        if spell {
+            (self.ask)()
+        } else {
+            (self.give_back)()
+        }
     }
 }
 
@@ -763,6 +812,8 @@ struct ReaderLine {
     answers: std::sync::mpsc::Receiver<Result<()>>,
     /// Where the request is.
     state: std::sync::Arc<std::sync::atomic::AtomicU8>,
+    /// What the request is: to spell the keys, or to report them as records again.
+    spell: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[cfg(any(not(unix), test))]
@@ -772,11 +823,12 @@ impl ReaderLine {
     /// A request the reader has not begun on when the wait ends is withdrawn, so that it does not
     /// take effect after the attachment has been told it failed. One the reader is part way through
     /// is waited for: the console's answer is a call that returns.
-    fn ask_the_reader(&self) -> Result<()> {
+    fn ask_the_reader(&self, spell: bool) -> Result<()> {
         use std::sync::atomic::Ordering::SeqCst;
 
         let gone =
             || CliError::Terminal(shown!("the reader of the console's input did not answer"));
+        self.spell.store(spell, SeqCst);
         self.state.store(request::PENDING, SeqCst);
         (self.wake)();
         match self.answers.recv_timeout(READER_ANSWER_WAIT) {
@@ -804,10 +856,14 @@ impl ReaderLine {
 struct Switching {
     /// Asks the console to spell its keys.
     ask: std::sync::Arc<dyn Fn() -> Result<()> + Send + Sync>,
+    /// Asks the console to report its keys as records again.
+    give_back: std::sync::Arc<dyn Fn() -> Result<()> + Send + Sync>,
     /// Where the console's answer goes.
     answers: std::sync::mpsc::Sender<Result<()>>,
     /// Where the request is.
     state: std::sync::Arc<std::sync::atomic::AtomicU8>,
+    /// What the request is.
+    spell: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// What ended a wait of the reader.
@@ -984,10 +1040,13 @@ pub(crate) fn start_reader<C: ConsoleInput + Send + 'static>(
     let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
     let (answer_to, answers) = std::sync::mpsc::channel();
     let state = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(request::IDLE));
+    let spell = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
     let switching = Switching {
         ask: std::sync::Arc::clone(&switch.ask),
+        give_back: std::sync::Arc::clone(&switch.give_back),
         answers: answer_to,
         state: std::sync::Arc::clone(&state),
+        spell: std::sync::Arc::clone(&spell),
     };
     *switch
         .reader
@@ -996,6 +1055,7 @@ pub(crate) fn start_reader<C: ConsoleInput + Send + 'static>(
         wake: wakes.ask,
         answers,
         state,
+        spell,
     });
     let stopped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let thread = {
@@ -1048,6 +1108,44 @@ impl Outlet<'_> {
             }
         }
     }
+}
+
+/// What handing on the text a console holds came to.
+#[cfg(any(not(unix), test))]
+enum Handed {
+    /// The console has no more.
+    Empty,
+    /// It had more than [`DRAINS_BEFORE_THE_CHANGE_WAITS`] reads of it.
+    Flood,
+    /// The stop was made, or nobody receives any more.
+    Ended,
+}
+
+/// Hands on, as text, what the console holds, without waiting for more.
+#[cfg(any(not(unix), test))]
+fn hand_on_the_text(console: &mut impl ConsoleInput, outlet: &mut Outlet<'_>) -> Handed {
+    for _ in 0..DRAINS_BEFORE_THE_CHANGE_WAITS {
+        if !outlet.may_touch_the_console() {
+            return Handed::Ended;
+        }
+        match console.bytes() {
+            Ok(bytes) if bytes.is_empty() => {
+                return if outlet.may_touch_the_console() {
+                    Handed::Empty
+                } else {
+                    Handed::Ended
+                };
+            }
+            Ok(bytes) => {
+                if !outlet.send(TerminalInput::Bytes(bytes)) {
+                    return Handed::Ended;
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return Handed::Ended,
+        }
+    }
+    Handed::Flood
 }
 
 /// Reads `console` until its input ends, a batch has nowhere to go, or the stop is made, and
@@ -1141,20 +1239,42 @@ fn read_console(
                     );
                     continue;
                 }
-                // The half of a character the reader held, with the records after it, is the last
-                // it will read, and it is handed on to be dropped with the others and counted.
-                let held = console.held();
-                if !held.is_empty() && !outlet.send(TerminalInput::Keys(held)) {
-                    break;
-                }
-                // The console is not asked once the stop has been made: the mode it would be given
-                // is the person's to choose again.
-                if !outlet.may_touch_the_console() {
-                    break;
-                }
-                // A console that already spells its keys is not asked again.
-                let answer = if spelled { Ok(()) } else { (switching.ask)() };
-                spelled = answer.is_ok();
+                let answer = if switching.spell.load(SeqCst) {
+                    // The half of a character the reader held, with the records after it, is the
+                    // last it will read, and it is handed on to be dropped with the others and
+                    // counted.
+                    let held = console.held();
+                    if !held.is_empty() && !outlet.send(TerminalInput::Keys(held)) {
+                        break;
+                    }
+                    // The console is not asked once the stop has been made: the mode it would be
+                    // given is the person's to choose again.
+                    if !outlet.may_touch_the_console() {
+                        break;
+                    }
+                    // A console that already spells its keys is not asked again.
+                    let answer = if spelled { Ok(()) } else { (switching.ask)() };
+                    spelled = answer.is_ok();
+                    answer
+                } else if !spelled {
+                    // A console that was never asked has nothing to give back.
+                    Ok(())
+                } else {
+                    // What was typed ahead is text the console already spelled: it is handed on as
+                    // text before the console reports records again, since a record read after the
+                    // change would be a character of a sequence the console had spelled.
+                    match hand_on_the_text(console, &mut outlet) {
+                        Handed::Ended => break,
+                        Handed::Flood => Err(CliError::Terminal(shown!(
+                            "the console still has text typed ahead, so its keys are not given back yet"
+                        ))),
+                        Handed::Empty => {
+                            let answer = (switching.give_back)();
+                            spelled = answer.is_err();
+                            answer
+                        }
+                    }
+                };
                 // The request is over before its answer can be heard, so that the next one is not
                 // taken for this one.
                 switching.state.store(request::IDLE, SeqCst);
@@ -2257,7 +2377,12 @@ mod reader {
         run.switch.follow_paste(false).expect("given back");
         run.switch.follow_paste(false).expect("already given back");
         run.switch.follow_paste(true).expect("spelled again");
-        assert_eq!(run.ends(), ["ask", "give back", "ask"]);
+        let changes: Vec<_> = run
+            .ends()
+            .into_iter()
+            .filter(|step| *step != "bytes")
+            .collect();
+        assert_eq!(changes, ["ask", "give back", "ask"]);
     }
 
     /// A console the session refused the records of is asked to spell its keys for good: the end of

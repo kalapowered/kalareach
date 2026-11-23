@@ -614,7 +614,10 @@ const _: () = {
 /// The console input mode a record reader needs, made from `saved`, the mode the console had.
 ///
 /// `ENABLE_VIRTUAL_TERMINAL_INPUT` is deliberately absent: it is the console translating records
-/// into VT sequences, which is the translation this path exists to avoid. Line input, echo and
+/// into VT sequences, which is the translation this path exists to avoid. It is asked for
+/// ([`keys_spelled_mode`]) only while the session's application has bracketed paste on, because a
+/// console that reports records reports no boundaries of a paste, and when the session refuses the
+/// records. Line input, echo and
 /// the console's own handling of Ctrl-C are absent as well: every key, the interrupt among them,
 /// is a record to hand on to the session. Mouse and window-size records are not asked for here:
 /// the console keeps the mouse for selecting text, as it does for any command that does not ask for
@@ -669,8 +672,11 @@ pub const fn mouse_input_mode(current: u32, attached: u32, asked: bool) -> u32 {
 /// the private flags stay as `current` holds them.
 #[must_use]
 pub const fn keys_spelled_mode(current: u32, spelled: bool) -> u32 {
-    let _ = spelled;
-    current
+    if spelled {
+        current | ENABLE_VIRTUAL_TERMINAL_INPUT
+    } else {
+        current & !ENABLE_VIRTUAL_TERMINAL_INPUT
+    }
 }
 
 #[cfg(test)]
