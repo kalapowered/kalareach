@@ -1432,6 +1432,7 @@ impl IoFault {
 
     /// The operating system's code for it, when it came from the operating system.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn raw_os_error(&self) -> Option<i32> {
         self.0.raw_os_error()
     }

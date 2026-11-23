@@ -784,6 +784,7 @@ impl RestorePlan {
 
     /// The plaintext this plan writes, in bytes.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn restored_bytes(&self) -> u64 {
         self.restored()
             .map(|(member, _, _)| member.plaintext_len.unwrap_or(0))

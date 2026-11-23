@@ -13,10 +13,15 @@
 use std::collections::BTreeMap;
 
 use kr_protocol::envelope::Notification;
-use kr_protocol::ids::{ActionId, AttachmentId, EventSequence, SessionId, StreamId};
+use kr_protocol::ids::{ActionId, EventSequence, StreamId};
+#[cfg(any(test, feature = "testing"))]
+use kr_protocol::ids::{AttachmentId, SessionId};
 use kr_protocol::receipt::{Receipt, ReceiptState};
+#[cfg(any(test, feature = "testing"))]
 use kr_protocol::recovery::{EventStream, EventsSubscribeParams};
-use kr_protocol::scalars::{CanonicalSet, Nullable, U64};
+use kr_protocol::scalars::U64;
+#[cfg(any(test, feature = "testing"))]
+use kr_protocol::scalars::{CanonicalSet, Nullable};
 
 /// What a client has received and what it has actually applied, per subscribed stream.
 ///
@@ -88,6 +93,7 @@ impl StreamCursors {
 
     /// Returns true when this stream needs a fresh snapshot before it is usable.
     #[must_use]
+    #[cfg(test)]
     pub fn needs_snapshot(&self, stream_id: &StreamId) -> bool {
         self.needs_snapshot.contains(stream_id)
     }
@@ -109,6 +115,7 @@ impl StreamCursors {
     ///
     /// The cursor only moves forwards. An event that was delivered and never folded into a
     /// consumer's state leaves the cursor where it was, so the next subscription asks for it again.
+    #[cfg(any(test, feature = "testing"))]
     pub fn applied_content(&mut self, stream_id: &StreamId, cursor: U64) {
         if self.needs_snapshot.contains(stream_id) {
             return;
@@ -131,6 +138,7 @@ impl StreamCursors {
     /// event of the new subscription read as a duplicate and the client would drop it. What does
     /// carry across is where each stream's content had been applied to, which is what the new
     /// subscription asks to resume from.
+    #[cfg(any(test, feature = "testing"))]
     pub fn reconnected(&mut self) {
         self.received.clear();
         self.applied.clear();
@@ -218,6 +226,7 @@ impl StreamCursors {
     /// Events that arrived while the snapshot was being prepared are ahead of its base, and they
     /// are still this stream's contiguous history: the received position therefore never moves
     /// backwards here. Moving it back would make the next event look like a gap.
+    #[cfg(test)]
     pub fn installed_snapshot(&mut self, stream_id: &StreamId, sequence: EventSequence) {
         self.needs_snapshot.remove(stream_id);
         // Events that arrived while the snapshot was being prepared continue it when their run
@@ -367,6 +376,7 @@ impl Restoration {
     ///
     /// Returns [`OutOfOrder`] when the stream is not waiting to subscribe. Subscribing again after
     /// the subscription succeeded would restart the stream and lose whatever came in between.
+    #[cfg(any(test, feature = "testing"))]
     pub fn subscribe_params(
         &self,
         session_id: SessionId,
@@ -391,6 +401,7 @@ impl Restoration {
     /// # Errors
     ///
     /// Returns [`OutOfOrder`] when the stream is not waiting to subscribe.
+    #[cfg(any(test, feature = "testing"))]
     pub fn subscribed(&mut self) -> std::result::Result<(), OutOfOrder> {
         match self.step {
             RestorationStep::SubscribeFrom(_) | RestorationStep::SubscribeFromStart => {
@@ -419,6 +430,7 @@ impl Restoration {
 
     /// Returns true once the stream is live.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn is_live(&self) -> bool {
         self.step == RestorationStep::Live
     }
@@ -476,6 +488,7 @@ impl ReceiptTracker {
     /// These are what a reconnecting client asks about. It never redispatches them: section 9 says
     /// an action identifier is never dispatched again simply because its receipt is incomplete.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn unresolved(&self) -> Vec<ActionId> {
         self.receipts
             .values()

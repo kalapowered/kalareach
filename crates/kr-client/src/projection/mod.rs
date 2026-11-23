@@ -243,6 +243,7 @@ impl Screen {
     /// Reconnection restores these so a later click still works. Nothing here activates anything:
     /// a scheme that would launch an external application needs the client's own policy first.
     #[must_use]
+    #[cfg(test)]
     pub fn hyperlink_at(&self, row: u64, column: u64) -> Option<&ProjectedHyperlink> {
         self.hyperlinks
             .get(&(self.active_buffer, row))?

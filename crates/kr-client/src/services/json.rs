@@ -86,6 +86,7 @@ enum Fault {
 impl Unreadable {
     /// Whether the text was refused because an object in it names one member twice.
     #[must_use]
+    #[cfg(test)]
     pub fn names_a_member_twice(&self) -> bool {
         self.fault == Fault::NamedTwice
     }

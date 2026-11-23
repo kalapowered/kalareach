@@ -46,8 +46,10 @@
 use kr_ipc::endpoint::Connection;
 use kr_ipc::framed::{FrameReader, FrameWriter, split};
 use kr_ipc::paths::{Endpoint, EnvironmentPaths};
+#[cfg(any(test, feature = "testing"))]
+use kr_protocol::envelope::Request;
 use kr_protocol::envelope::{
-    ActionTarget, ControlEvent, ControlFrame, MutationRequest, Outcome, ParamsValue, Request,
+    ActionTarget, ControlEvent, ControlFrame, MutationRequest, Outcome, ParamsValue,
 };
 use kr_protocol::error::ErrorCode;
 use kr_protocol::frame::{StreamHeader, StreamKind, StreamResource};
@@ -55,10 +57,13 @@ use kr_protocol::hello::{ActionWindow, PROTOCOL_VERSION, ReceiveLimits};
 use kr_protocol::ids::{ActionId, ActionWindowId, BuildId, EnvironmentId, RequestId, TransferId};
 use kr_protocol::local::{LocalClientKind, LocalHello, LocalRole};
 use kr_protocol::method::Method;
-use kr_protocol::scalars::{Bytes, CanonicalSet, Digest256, DurationMs, Nullable};
+#[cfg(any(test, feature = "testing"))]
+use kr_protocol::scalars::{Bytes, Digest256};
+use kr_protocol::scalars::{CanonicalSet, DurationMs, Nullable};
+#[cfg(any(test, feature = "testing"))]
+use kr_protocol::transfer::{ChunkDescriptor, DownloadChunkParams, DownloadChunkResult};
 use kr_protocol::transfer::{
-    ChunkDescriptor, DownloadChunkParams, DownloadChunkResult, TransferStreamsParams,
-    TransferStreamsResult, UploadChunkParams, UploadChunkResult,
+    TransferStreamsParams, TransferStreamsResult, UploadChunkParams, UploadChunkResult,
 };
 use kr_transport::TransportError;
 use kr_transport::deadlines::{DeadlineKind, Deadlines, TimerDeadlines};
@@ -365,6 +370,7 @@ impl Carrier {
 impl ChunkLane {
     /// The transfer this lane carries.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn transfer_id(&self) -> TransferId {
         self.transfer_id
     }
@@ -467,6 +473,7 @@ impl ChunkLane {
     /// paired host's connection a call that has no stream opens the lane's stream, and returns the
     /// failures of the open that [`ChunkLane::send_chunk`] names, and the reason this device ended
     /// the connection, as [`ClientError::Host`], when the transport recorded one.
+    #[cfg(any(test, feature = "testing"))]
     pub async fn read_chunk(&mut self, expected: &ChunkDescriptor) -> Result<Bytes> {
         let carrier = &mut self.carrier;
         carrier.usable()?;

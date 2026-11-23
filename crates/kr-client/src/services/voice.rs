@@ -634,6 +634,7 @@ pub enum VoiceCommand {
 
 impl VoiceCommand {
     /// Every command, in a fixed order.
+    #[cfg(any(test, feature = "testing"))]
     pub const ALL: &'static [Self] = &[
         Self::Mute,
         Self::Unmute,
@@ -661,6 +662,7 @@ impl VoiceCommand {
     /// A provider event type resolves to nothing here, which is what makes "zero raw provider
     /// control events" a property of the type rather than a promise.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn from_wire(value: &str) -> Option<Self> {
         Self::ALL
             .iter()

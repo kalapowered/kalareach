@@ -396,6 +396,7 @@ impl AuthorityFeedState {
     /// acknowledges it as complete or refuses it. A record with a pending acknowledgement is still
     /// outstanding, because the dispatch barrier has not held.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn is_outstanding(&self, request_id: RevocationRequestId) -> bool {
         self.record(request_id).is_some_and(|record| {
             record.rejected.0.is_none()

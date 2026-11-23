@@ -403,6 +403,7 @@ impl HttpService {
     /// One per transport, and a clone reports to the same one, which is what makes a gateway's
     /// several service clients one account of what that gateway is doing.
     #[must_use]
+    #[cfg(test)]
     pub fn reporting_to(mut self, progress: Arc<dyn ExchangeProgress>) -> Self {
         self.progress = Some(progress);
         self
@@ -429,6 +430,7 @@ impl HttpService {
 
     /// The bounds it reads answers under.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn limits(&self) -> &ResponseLimits {
         &self.limits
     }

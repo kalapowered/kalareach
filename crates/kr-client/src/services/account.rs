@@ -94,10 +94,12 @@ use crate::shown::Shown;
 pub const ACCOUNT_ORIGIN: &str = kr_protocol::service::OFFICIAL_GATEWAY_ORIGIN;
 
 /// The passkey relying party: the origin's host, which is how the service derives it.
+#[cfg(any(test, feature = "testing"))]
 pub const RELYING_PARTY_ID: &str = "reach.kala.to";
 
 /// The managed service's issuer, which its callbacks and ID tokens are checked against: it is
 /// [`issuer_of`] [`ACCOUNT_ORIGIN`].
+#[cfg(any(test, feature = "testing"))]
 pub const ISSUER: &str = "https://reach.kala.to/auth";
 
 /// Where a service mounts its authorisation server, below its origin.
@@ -720,6 +722,7 @@ impl AuthorisationRequest {
 
     /// The scopes this request asks for, in the order it states them.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn scopes(&self) -> &[String] {
         &self.scopes
     }
@@ -876,11 +879,13 @@ impl PendingAuthorisation {
 
     /// Whether an answer can still be accepted.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn is_waiting(&self) -> bool {
         self.request.is_some()
     }
 
     /// Ends the attempt without an answer.
+    #[cfg(any(test, feature = "testing"))]
     pub fn abandon(&mut self) {
         self.request = None;
     }
@@ -1209,6 +1214,7 @@ impl ManagedAccountService {
 
     /// Reads the time in seconds since the Unix epoch from `clock`, for a test.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn with_clock(mut self, clock: fn() -> u64) -> Self {
         self.clock = clock;
         self
@@ -1809,6 +1815,7 @@ impl StoredGrant {
 
     /// The identifier fixed at sign-in, which a pending revocation names.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn grant_id(&self) -> &str {
         &self.grant_id
     }
@@ -1839,18 +1846,21 @@ impl StoredGrant {
 
     /// The nonce the sign-in's ID token carried.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn nonce(&self) -> &str {
         &self.nonce
     }
 
     /// The refresh token.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn refresh_token(&self) -> &RefreshToken {
         &self.refresh_token
     }
 
     /// The scopes granted.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn scopes(&self) -> &[String] {
         &self.scopes
     }
@@ -2202,6 +2212,7 @@ impl SignedInAccount {
 
     /// Reads the time in milliseconds since the Unix epoch from `clock`, for a test.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn with_clock(mut self, clock: fn() -> u64) -> Self {
         self.clock_ms = clock;
         self

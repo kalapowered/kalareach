@@ -540,6 +540,7 @@ impl EndpointPool {
     /// a relay run under a private authority is reached with that authority pinned, which adds
     /// trust and never replaces it. A test pins the certificate its own relay generated.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn trusting_relays(mut self, roots: Vec<Vec<u8>>) -> Self {
         self.relay_roots = roots;
         self
@@ -741,6 +742,7 @@ impl IrohLink {
 
     /// The pool this link dials through.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn pool(&self) -> &Arc<EndpointPool> {
         &self.pool
     }

@@ -28,13 +28,22 @@
 //! Hiding is a courtesy either way. The host rechecks the condition and the actor's rights when the
 //! action arrives, so a control that appears when it should not is a control that then fails.
 
+#[cfg(any(test, feature = "testing"))]
 use kr_plugin_sdk::capability::{CapabilityState, PluginCapability};
+#[cfg(any(test, feature = "testing"))]
 use kr_plugin_sdk::effect::ActionRight;
-use kr_plugin_sdk::ids::{ActionName, ControlId, NodeId};
-use kr_plugin_sdk::predicate::{BindingState, Predicate, PredicateError, PresentationFlag};
-use kr_plugin_sdk::presentation::{
-    Control, DocumentNode, NodeRevision, UnsupportedNode, read_node,
-};
+#[cfg(any(test, feature = "testing"))]
+use kr_plugin_sdk::ids::NodeId;
+use kr_plugin_sdk::ids::{ActionName, ControlId};
+#[cfg(any(test, feature = "testing"))]
+use kr_plugin_sdk::predicate::Predicate;
+use kr_plugin_sdk::predicate::PredicateError;
+#[cfg(any(test, feature = "testing"))]
+use kr_plugin_sdk::predicate::{BindingState, PresentationFlag};
+#[cfg(any(test, feature = "testing"))]
+use kr_plugin_sdk::presentation::{Control, read_node};
+use kr_plugin_sdk::presentation::{DocumentNode, NodeRevision, UnsupportedNode};
+#[cfg(any(test, feature = "testing"))]
 use kr_protocol::ids::ApprovalRequestId;
 
 /// What a client knows about the facts a visibility predicate can name.
@@ -46,6 +55,7 @@ use kr_protocol::ids::ApprovalRequestId;
 /// has them has all of them: the question is whether it was told at all, which is what the option
 /// answers.
 #[derive(Clone, Default)]
+#[cfg(any(test, feature = "testing"))]
 pub struct ControlState {
     capabilities: Vec<(PluginCapability, CapabilityState)>,
     rights: Option<Vec<ActionRight>>,
@@ -55,6 +65,7 @@ pub struct ControlState {
     pending_approvals: Option<Vec<ApprovalRequestId>>,
 }
 
+#[cfg(any(test, feature = "testing"))]
 impl ControlState {
     /// A state that knows nothing.
     #[must_use]
@@ -64,6 +75,7 @@ impl ControlState {
 
     /// Records whether one presentation fact holds.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn with_flag(mut self, flag: PresentationFlag, holds: bool) -> Self {
         self.flags.retain(|(held, _)| *held != flag);
         self.flags.push((flag, holds));
@@ -72,6 +84,7 @@ impl ControlState {
 
     /// Records every approval request pending for the binding, by its upstream identifier.
     #[must_use]
+    #[cfg(test)]
     pub fn with_pending_approvals(
         mut self,
         requests: impl IntoIterator<Item = ApprovalRequestId>,
@@ -80,6 +93,7 @@ impl ControlState {
         self
     }
 
+    #[cfg(any(test, feature = "testing"))]
     fn capability(&self, capability: PluginCapability, state: CapabilityState) -> Truth {
         self.capabilities
             .iter()
@@ -89,23 +103,27 @@ impl ControlState {
             })
     }
 
+    #[cfg(any(test, feature = "testing"))]
     fn right(&self, right: ActionRight) -> Truth {
         self.rights
             .as_ref()
             .map_or(Truth::Unknown, |held| Truth::from(held.contains(&right)))
     }
 
+    #[cfg(any(test, feature = "testing"))]
     fn binding(&self, state: BindingState) -> Truth {
         self.binding_state
             .map_or(Truth::Unknown, |current| Truth::from(current == state))
     }
 
+    #[cfg(any(test, feature = "testing"))]
     fn node_present(&self, node_id: &NodeId) -> Truth {
         self.present_nodes
             .as_ref()
             .map_or(Truth::Unknown, |nodes| Truth::from(nodes.contains(node_id)))
     }
 
+    #[cfg(any(test, feature = "testing"))]
     fn flag(&self, flag: PresentationFlag) -> Truth {
         self.flags
             .iter()
@@ -113,6 +131,7 @@ impl ControlState {
             .map_or(Truth::Unknown, |(_, holds)| Truth::from(*holds))
     }
 
+    #[cfg(any(test, feature = "testing"))]
     fn pending_approval(&self, request_id: &ApprovalRequestId) -> Truth {
         self.pending_approvals
             .as_ref()
@@ -124,20 +143,24 @@ impl ControlState {
 
 /// A predicate's answer when the client may not know everything.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(any(test, feature = "testing"))]
 enum Truth {
     True,
     False,
     Unknown,
 }
 
+#[cfg(any(test, feature = "testing"))]
 impl From<bool> for Truth {
     fn from(value: bool) -> Self {
         if value { Self::True } else { Self::False }
     }
 }
 
+#[cfg(any(test, feature = "testing"))]
 impl Truth {
     /// Negation: an unknown fact stays unknown rather than becoming its opposite.
+    #[cfg(any(test, feature = "testing"))]
     const fn not(self) -> Self {
         match self {
             Self::True => Self::False,
@@ -209,6 +232,7 @@ pub enum Visibility {
 impl Visibility {
     /// Returns true when the control is shown.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn is_shown(&self) -> bool {
         matches!(self, Self::Shown)
     }
@@ -227,6 +251,7 @@ impl Visibility {
 ///
 /// The bounds are checked first, so a predicate outside the grammar is reported rather than walked.
 #[must_use]
+#[cfg(any(test, feature = "testing"))]
 pub fn evaluate(predicate: &Predicate, state: &ControlState) -> Visibility {
     if let Err(error) = predicate.validate() {
         return Visibility::Hidden(Hidden::OutsideTheGrammar(error));
@@ -242,10 +267,12 @@ pub fn evaluate(predicate: &Predicate, state: &ControlState) -> Visibility {
 
 /// Returns whether a control is shown.
 #[must_use]
+#[cfg(any(test, feature = "testing"))]
 pub fn visibility(control: &Control, state: &ControlState) -> Visibility {
     evaluate(&control.visible_when, state)
 }
 
+#[cfg(any(test, feature = "testing"))]
 fn truth(predicate: &Predicate, state: &ControlState) -> Truth {
     match predicate {
         Predicate::Always {} => Truth::True,
@@ -292,6 +319,7 @@ fn truth(predicate: &Predicate, state: &ControlState) -> Truth {
 /// Only a branch whose own truth is unknown is followed. A branch a known term already settled can
 /// still contain an unknown leaf, and naming that leaf would tell a person the control is waiting on
 /// something it is not waiting on.
+#[cfg(any(test, feature = "testing"))]
 fn unknown_fact(predicate: &Predicate, state: &ControlState) -> Option<String> {
     match predicate {
         Predicate::Always {} | Predicate::Never {} => None,
@@ -400,6 +428,7 @@ crate::display_as_said!(NotInvocable);
 /// # Errors
 ///
 /// Returns [`NotInvocable`] when the control is hidden or disabled.
+#[cfg(any(test, feature = "testing"))]
 pub fn invoke(
     control: &Control,
     state: &ControlState,
@@ -455,6 +484,7 @@ impl Rendered {
     /// cannot reach an action through a node an older client cannot read, because the node it could
     /// not read carries nothing to invoke.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn controls(&self) -> &[Control] {
         match self {
             Self::Node(node) => node.body.controls(),
@@ -464,6 +494,7 @@ impl Rendered {
 
     /// Returns true when this is an unsupported-content block.
     #[must_use]
+    #[cfg(test)]
     pub const fn is_unsupported(&self) -> bool {
         matches!(self, Self::Unsupported(_))
     }
@@ -474,6 +505,7 @@ impl Rendered {
 /// One node a client does not know never discards the document around it, and never becomes an
 /// error a person sees instead of their conversation.
 #[must_use]
+#[cfg(any(test, feature = "testing"))]
 pub fn read_document(nodes: &[serde_json::Value]) -> Vec<Rendered> {
     nodes
         .iter()

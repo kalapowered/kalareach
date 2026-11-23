@@ -536,6 +536,7 @@ impl RequestRecord {
 
     /// Returns the sealed object, while this request still carries one.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn ciphertext(&self) -> Option<&[u8]> {
         match &self.state {
             RequestState::Admitted { ciphertext } | RequestState::Dispatched { ciphertext } => {
@@ -685,6 +686,7 @@ pub struct Publication {
 impl Publication {
     /// Returns the collection the object was published in.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn collection(&self) -> String {
         collection_of(self.kind, self.object_id)
     }
@@ -1909,43 +1911,6 @@ impl SyncStore {
         })
     }
 
-    /// Claims one request, whether or not this store still holds a staged record for it.
-    ///
-    /// A late answer is a decision about a request as much as a settlement is, and a request whose
-    /// staged record has gone can still receive one: it was discarded, or something else settled
-    /// it. Deciding about it takes the same lock, so a claim here is what a caller holding no
-    /// dispatch of its own presents.
-    ///
-    /// The answer is read against the history every attempt at the request was made in, and not
-    /// against the one this device reads when the answer arrives: a collection put back while the
-    /// answer was on its way cannot make an older answer look like news.
-    ///
-    /// Returns nothing when somebody has a call out for the request.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`SyncError::Storage`] when the lock or the record cannot be read.
-    pub fn claim_request(&self, work_id: Uuid) -> Result<Option<Dispatch>> {
-        let Some(owned) = Lock::try_take(&self.named(work_id, CALLOUT_EXTENSION))? else {
-            return Ok(None);
-        };
-        // A late answer answers an attempt that has already left, so it is read against the history
-        // that attempt was made in, never against the one this device reads now: the collection may
-        // have been put back since, and an answer from a history this device never met, read
-        // against the newer one, would move the device away from the history it serves. A record
-        // that has gone leaves nothing an answer could write.
-        let guard = self.lock()?;
-        let held = self.read_request(&self.named(work_id, REQUEST_EXTENSION));
-        drop(guard);
-        let basis = Basis(held?.and_then(|record| record.attempted_in.0));
-        Ok(Some(Dispatch {
-            directory: self.directory.clone(),
-            work_id,
-            basis,
-            _lock: owned,
-        }))
-    }
-
     /// Makes one attempt at publishing a draft: the first, which admits the publication, or a later
     /// one, which presents the publication already out for that revision again.
     ///
@@ -2330,6 +2295,7 @@ impl SyncStore {
     /// # Errors
     ///
     /// Returns [`SyncError::Storage`] when a record cannot be read or removed.
+    #[cfg(any(test, feature = "testing"))]
     pub fn take_back_undispatched(&self, generation: u64) -> Result<u64> {
         let guard = self.lock()?;
         let outcome = (|| {
@@ -2902,22 +2868,6 @@ impl SyncStore {
 
     // -- conflict copies ----------------------------------------------------------------------
 
-    /// Keeps a copy beside this device's own content, bounded by section 20's limit.
-    ///
-    /// The oldest copy is dropped first when the limit is reached, so the newest refusal is always
-    /// the one that is kept: a device that never resolves its conflicts cannot spend a person's
-    /// storage without bound, and the copy that matters most is the one that just arrived.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`SyncError::TooLarge`] or [`SyncError::Storage`].
-    pub fn keep_conflict(&self, copy: &ConflictCopy) -> Result<()> {
-        let guard = self.lock()?;
-        let outcome = self.write_conflict(copy);
-        drop(guard);
-        outcome
-    }
-
     /// Writes one copy and prunes the object's oldest, keeping the one just written.
     ///
     /// The caller holds the lock.
@@ -3082,18 +3032,6 @@ impl SyncStore {
 
     // -- publications -------------------------------------------------------------------------
 
-    /// Records that this device published one collection.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`SyncError::Storage`] when the record cannot be written.
-    pub fn record_publication(&self, publication: &Publication) -> Result<bool> {
-        let guard = self.lock()?;
-        let outcome = self.write_publication(publication);
-        drop(guard);
-        Ok(matches!(outcome?, Standing::Later | Standing::Same))
-    }
-
     /// Writes a publication record unless a later one already stands.
     ///
     /// The caller holds the lock.
@@ -3186,6 +3124,7 @@ impl SyncStore {
     /// # Errors
     ///
     /// Returns [`SyncError::Storage`] when the labels cannot be written.
+    #[cfg(any(test, feature = "testing"))]
     pub fn pin_label(&self, label: impl Into<String>, now: TimestampMs) -> Result<()> {
         let label = label.into();
         let guard = self.lock()?;
@@ -3211,6 +3150,7 @@ impl SyncStore {
     /// # Errors
     ///
     /// Returns [`SyncError::Storage`] when the labels cannot be written.
+    #[cfg(any(test, feature = "testing"))]
     pub fn clear_pinned_label(&self, label: &str) -> Result<bool> {
         let guard = self.lock()?;
         let outcome = (|| {
@@ -3535,6 +3475,7 @@ impl SyncStore {
             .unwrap_or_default())
     }
 
+    #[cfg(any(test, feature = "testing"))]
     fn write_labels(&self, labels: &[PinnedLabel]) -> Result<()> {
         let bytes = encode_within_limit(&labels.to_vec(), MAX_CONFLICT_COPY_BYTES)?;
         self.write_bytes(&self.directory.join(LABELS_NAME), &bytes.0)

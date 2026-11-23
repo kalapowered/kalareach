@@ -77,7 +77,7 @@ futures-util = { workspace = true, optional = true }
 iroh = { workspace = true, optional = true }
 kr-cbor = { workspace = true, optional = true }
 # The paired device is this library, with the projected screen a client draws from.
-kr-client = { workspace = true, features = ["terminal"], optional = true }
+kr-client = { workspace = true, features = ["terminal", "testing"], optional = true }
 # The owner-confirmation digest of a catalogue enrolment, the pairing clock and the host's worker
 # registry. The host itself is the `kr-controller` binary, never this library.
 kr-controller = { workspace = true, optional = true }

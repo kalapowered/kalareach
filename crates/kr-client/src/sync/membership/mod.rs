@@ -184,6 +184,7 @@ impl Device {
 
     /// The device one key pair set is.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn from_keys(keys: &DeviceKeys) -> Self {
         Self {
             authorisation: *keys.authorisation.public(),

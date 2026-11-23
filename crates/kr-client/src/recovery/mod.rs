@@ -473,6 +473,7 @@ pub enum SeedSource {
 
 impl SeedSource {
     /// Every way a seed is obtained.
+    #[cfg(any(test, feature = "testing"))]
     pub const ALL: [Self; 2] = [Self::Kit, Self::SecureStore];
 
     /// Returns the stable name a report uses.

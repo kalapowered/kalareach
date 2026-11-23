@@ -275,6 +275,10 @@ enum Continuation {
     /// A new intent.
     None,
     /// The action a host asked about, and whose answer this is.
+    #[cfg_attr(
+        not(any(test, feature = "testing")),
+        expect(dead_code, reason = "built only by the call that continues an action")
+    )]
     Of(ActionId),
 }
 
@@ -750,6 +754,7 @@ impl Session {
     }
 
     /// Returns the action window the host last issued.
+    #[cfg(any(test, feature = "testing"))]
     pub async fn action_window(&self) -> ActionWindow {
         self.state.action_window.borrow().window.clone()
     }
@@ -761,6 +766,7 @@ impl Session {
     }
 
     /// Returns the cursors this session has reached.
+    #[cfg(any(test, feature = "testing"))]
     pub async fn cursors(&self) -> StreamCursors {
         self.state.cursors.lock().await.clone()
     }
@@ -791,6 +797,7 @@ impl Session {
     ///
     /// A reconnect takes both in one step: a receipt that arrives between two separate reads would
     /// be missing from one and already removed from the other.
+    #[cfg(any(test, feature = "testing"))]
     pub async fn outcomes(&self) -> (ReceiptTracker, Vec<SubmittedAction>) {
         let outcomes = self.state.outcomes.lock().await;
         (
@@ -808,6 +815,7 @@ impl Session {
     }
 
     /// Records that a snapshot at `sequence` was installed, which makes the stream usable again.
+    #[cfg(test)]
     pub async fn installed_snapshot(
         &self,
         stream_id: &StreamId,
@@ -1140,6 +1148,7 @@ impl Session {
     /// The same as [`Session::mutate`], and a refusal when `continues` names an action this client
     /// is still waiting on or already holds a receipt for.
     #[allow(clippy::too_many_arguments)]
+    #[cfg(any(test, feature = "testing"))]
     pub async fn mutate_continuing<P, E>(
         &self,
         continues: ActionId,
@@ -1600,6 +1609,7 @@ impl Session {
     ///
     /// Returns the host's refusal, including [`ClientError::ResyncRequired`] when the client's
     /// position is no longer usable.
+    #[cfg(any(test, feature = "testing"))]
     pub async fn subscribe_events(
         &self,
         params: &kr_protocol::recovery::EventsSubscribeParams,
@@ -1612,6 +1622,7 @@ impl Session {
     /// # Errors
     ///
     /// Returns the host's refusal.
+    #[cfg(test)]
     pub async fn events_snapshot(
         &self,
         params: &kr_protocol::recovery::EventsSnapshotParams,
@@ -1624,6 +1635,7 @@ impl Session {
     /// # Errors
     ///
     /// Returns the host's refusal.
+    #[cfg(any(test, feature = "testing"))]
     pub async fn history_page(
         &self,
         params: &kr_protocol::recovery::HistoryPageParams,
@@ -1643,6 +1655,7 @@ impl Session {
     ///
     /// Returns the host's refusal. A resource of another instance, one no decoder interpreted and
     /// one the host does not hold are one refusal, and the host does not say which it was.
+    #[cfg(any(test, feature = "testing"))]
     pub async fn inspect_approval(
         &self,
         params: &kr_protocol::agent::AgentApprovalInspectParams,
@@ -1661,6 +1674,7 @@ impl Session {
     ///
     /// Returns the host's refusal, including the lease refusal when this attachment no longer
     /// holds input.
+    #[cfg(any(test, feature = "testing"))]
     pub async fn write_input(
         &self,
         params: &kr_protocol::input::InputWriteParams,
@@ -1699,6 +1713,7 @@ impl Session {
     ///
     /// This is the position the next subscription resumes from, so only a consumer that has folded
     /// the content into its state moves it.
+    #[cfg(any(test, feature = "testing"))]
     pub async fn applied_content(&self, stream_id: &StreamId, cursor: kr_protocol::scalars::U64) {
         self.state
             .cursors
@@ -1712,6 +1727,7 @@ impl Session {
     /// A client that carries its cursors onto a new connection calls this: the host numbers a
     /// fresh subscription's events from its own beginning, so the previous connection's sequences
     /// would make the first event of the new one read as a duplicate.
+    #[cfg(any(test, feature = "testing"))]
     pub async fn reconnected(&self) {
         self.state.cursors.lock().await.reconnected();
     }

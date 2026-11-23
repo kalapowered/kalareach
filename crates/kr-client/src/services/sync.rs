@@ -114,8 +114,11 @@
 //! declared size and where it stands, and nothing sealed. A key record renders its collection,
 //! epoch, revision and how many members it names, and nothing else.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
+#[cfg(any(test, feature = "testing"))]
+use std::collections::BTreeSet;
 use std::fmt;
+#[cfg(any(test, feature = "testing"))]
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
@@ -139,9 +142,10 @@ use super::{
 };
 use crate::error::{ClientError, Result};
 use crate::shown::Shown;
+#[cfg(any(test, feature = "testing"))]
+use crate::sync::membership::MembershipStatus;
 use crate::sync::membership::{
-    CollectionRef, KeyRecordService, KeyRecords, MembershipStatus, RecordAt, RekeyAnswer,
-    RekeyFence, RekeyStatus,
+    CollectionRef, KeyRecordService, KeyRecords, RecordAt, RekeyAnswer, RekeyFence, RekeyStatus,
 };
 
 /// Where every settings-sync member is served.
@@ -159,6 +163,7 @@ pub const MAX_SYNC_REQUEST_BYTES: usize = 256 * 1024;
 ///
 /// The service's own page. It is stated here because the bound an answer is read under has to
 /// cover it.
+#[cfg(test)]
 pub const SYNC_ANSWER_PAGE: u64 = 64;
 
 /// How many bytes of a settings-sync answer this client reads.
@@ -681,8 +686,22 @@ struct RemovedObject {
 struct ObjectPosition {
     object_id: SyncObjectId,
     revision: SyncRevision,
+    #[cfg_attr(
+        not(any(test, feature = "testing")),
+        expect(
+            dead_code,
+            reason = "held to the answer's schema and read only by the cases that check a comparison"
+        )
+    )]
     write_sequence: U64,
     #[serde(default)]
+    #[cfg_attr(
+        not(any(test, feature = "testing")),
+        expect(
+            dead_code,
+            reason = "held to the answer's schema and read only by the cases that check a comparison"
+        )
+    )]
     key_epoch: Option<U64>,
 }
 
@@ -948,12 +967,14 @@ pub struct Inventory {
 impl Inventory {
     /// Whether the read reached the end of the copies.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn is_complete(&self) -> bool {
         self.resume_after.is_none()
     }
 
     /// Every epoch something the read found is sealed under.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn epochs(&self) -> BTreeSet<u64> {
         self.objects
             .iter()
@@ -966,6 +987,7 @@ impl Inventory {
     /// found something, and it may whenever the read stopped before the end, because what it did
     /// not reach cannot be shown not to be.
     #[must_use]
+    #[cfg(test)]
     pub fn may_hold_epoch(&self, epoch: u64) -> bool {
         !self.is_complete() || self.epochs().contains(&epoch)
     }
@@ -993,6 +1015,7 @@ impl MembershipListing {
     /// It is a reason to refresh and nothing more. The index admits nobody, so nothing in an entry
     /// changes what this device holds: only the records the collection itself answers do.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn names_news(&self, held: &MembershipStatus) -> bool {
         self.collection == held.collection
             && (self.head.recovery != held.recovery || self.head.revision > held.head)
@@ -1565,6 +1588,7 @@ impl ManagedSyncService {
     /// # Errors
     ///
     /// As [`Self::compare_shared`]. A collection that does not list this installation is `None`.
+    #[cfg(any(test, feature = "testing"))]
     pub async fn inventory(
         &self,
         collection: &CollectionRef,

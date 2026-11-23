@@ -127,6 +127,7 @@ impl SharedCollectionService {
 
     /// The collection this reaches.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn collection(&self) -> &CollectionRef {
         &self.collection
     }

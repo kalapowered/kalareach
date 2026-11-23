@@ -155,6 +155,7 @@ impl MemoryCollectionKeys {
     /// # Errors
     ///
     /// Returns an error when the random generator is unavailable.
+    #[cfg(any(test, feature = "testing"))]
     pub fn draw(&self, collection: &str, epoch: u64) -> Result<SymmetricKey> {
         let key = Secret::random().map_err(|error| sealing_failed(&error))?;
         self.put(collection, epoch, key.clone())?;
@@ -401,6 +402,7 @@ impl CollectionSealer {
 
     /// The collection this sealer belongs to.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn collection(&self) -> &str {
         &self.collection
     }

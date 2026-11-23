@@ -95,6 +95,7 @@ impl Viewport {
     /// this is the client's own answer to the same question, which is what lets it know what it is
     /// about to be sent.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn presentation(self) -> Presentation {
         if self.columns == self.canonical_columns && self.rows == self.canonical_rows {
             Presentation::Direct
@@ -138,6 +139,7 @@ impl Viewport {
     /// The origin is clamped, because a grid that shrank can leave the window looking past its
     /// right-hand edge, and a window showing blank columns it could fill is worse than one that
     /// moved.
+    #[cfg(test)]
     pub const fn canonical_resized(&mut self, canonical: (u32, u32)) {
         self.canonical_columns = if canonical.0 == 0 { 1 } else { canonical.0 };
         self.canonical_rows = if canonical.1 == 0 { 1 } else { canonical.1 };
@@ -154,6 +156,7 @@ impl Viewport {
     /// Moves the window by `columns` and `rows`, clamped to the grid.
     ///
     /// Returns whether the origin moved.
+    #[cfg(any(test, feature = "testing"))]
     pub const fn pan(&mut self, columns: i64, rows: i64) -> bool {
         let before = (self.origin_column, self.origin_row);
         self.origin_column = shift(self.origin_column, columns);
@@ -169,6 +172,7 @@ impl Viewport {
     /// keystroke is unreadable.
     ///
     /// Returns whether the origin moved.
+    #[cfg(test)]
     pub const fn reveal(&mut self, column: u32, row: u32) -> bool {
         let before = (self.origin_column, self.origin_row);
         if column < self.origin_column {
@@ -201,6 +205,7 @@ impl Viewport {
 /// The arithmetic is done in the wider type and saturated rather than added, because a pan by
 /// `i64::MAX` from a large origin overflows a signed addition and a wrapped origin is a window
 /// somewhere else entirely.
+#[cfg(any(test, feature = "testing"))]
 const fn shift(value: u32, delta: i64) -> u32 {
     let moved = (value as i64).saturating_add(delta);
     if moved < 0 {
@@ -340,6 +345,7 @@ pub struct Display {
     missing_until: Option<u64>,
     switching: Option<Switch>,
     /// Counts the switches this display has begun, so a snapshot for an older one is refused.
+    #[cfg(test)]
     switch_generation: u64,
 }
 
@@ -377,12 +383,14 @@ impl Display {
             needs_snapshot: false,
             missing_until: None,
             switching: None,
+            #[cfg(test)]
             switch_generation: 0,
         }
     }
 
     /// Returns the viewport.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn viewport(&self) -> Viewport {
         self.viewport
     }
@@ -401,12 +409,14 @@ impl Display {
 
     /// Returns how the host says this client is being shown the session.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn presentation(&self) -> Presentation {
         self.presentation
     }
 
     /// Returns true when the state on screen cannot be used and only a snapshot can replace it.
     #[must_use]
+    #[cfg(test)]
     pub const fn needs_snapshot(&self) -> bool {
         self.needs_snapshot
     }
@@ -415,6 +425,7 @@ impl Display {
     ///
     /// Leaving it puts the wheel back where it belongs, so the window follows again from wherever
     /// the person left it until the next thing it has to reveal.
+    #[cfg(any(test, feature = "testing"))]
     pub const fn set_mode(&mut self, mode: PanMode) {
         self.mode = mode;
     }
@@ -424,6 +435,7 @@ impl Display {
     /// Only view mode pans. In follow mode the window belongs to the session, so a pan request is
     /// refused rather than quietly applied: a client that panned while following would fight the
     /// application's own cursor.
+    #[cfg(any(test, feature = "testing"))]
     pub const fn pan(&mut self, columns: i64, rows: i64) -> bool {
         if matches!(self.mode, PanMode::Follow) {
             return false;
@@ -435,6 +447,7 @@ impl Display {
     ///
     /// This is what follow mode does with the application's cursor. In view mode the person is
     /// looking somewhere of their own choosing and the window stays where they left it.
+    #[cfg(test)]
     pub const fn reveal(&mut self, column: u32, row: u32) -> bool {
         if matches!(self.mode, PanMode::View) {
             return false;
@@ -451,6 +464,7 @@ impl Display {
     }
 
     /// Records that the session's canonical grid changed size.
+    #[cfg(test)]
     pub const fn canonical_resized(&mut self, canonical: (u32, u32)) {
         self.viewport.canonical_resized(canonical);
     }
@@ -460,6 +474,7 @@ impl Display {
     /// It returns the viewport, unchanged, because that is the whole content of the rule: section 8
     /// separates the two ownerships, and keyboard takeover does not also transfer geometry. Nothing
     /// here asks for a resize, and nothing here moves the window.
+    #[cfg(test)]
     pub const fn took_the_keyboard(&mut self) -> Viewport {
         self.viewport
     }
@@ -470,6 +485,7 @@ impl Display {
     /// scrollback working inside a full-screen program. In view mode the wheel pans and the rest
     /// still reaches the application at the cell it was mapped to.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn pointer(&self, column: u32, row: u32, wheel: Option<i64>) -> PointerOutcome {
         if let Some(rows) = wheel
             && matches!(self.mode, PanMode::View)
@@ -492,6 +508,7 @@ impl Display {
     /// Beginning a second switch supersedes the first. The snapshot the first one asked for is then
     /// refused by [`Display::install`], because installing it would replace the state of a
     /// presentation this client has already left.
+    #[cfg(test)]
     pub fn begin_switch(&mut self, into: Presentation) -> u64 {
         self.switch_generation = self.switch_generation.saturating_add(1);
         let held = self
@@ -511,6 +528,7 @@ impl Display {
 
     /// Returns true while a repaint is being installed.
     #[must_use]
+    #[cfg(test)]
     pub const fn is_painting(&self) -> bool {
         self.switching.is_some()
     }
@@ -637,6 +655,7 @@ impl Display {
 
     /// Returns the generation of the switch in progress, for [`Display::install`].
     #[must_use]
+    #[cfg(test)]
     pub const fn switch_generation(&self) -> u64 {
         self.switch_generation
     }
@@ -653,6 +672,7 @@ impl Display {
     /// still needs one after it: beginning a switch is asking for the snapshot, not having it.
     ///
     /// Returns the held output to draw, which is empty when a snapshot is needed instead.
+    #[cfg(test)]
     pub fn abandon_switch(&mut self, repaint_reached_the_screen: bool) -> Vec<Vec<u8>> {
         let Some(switch) = self.switching.take() else {
             return Vec::new();

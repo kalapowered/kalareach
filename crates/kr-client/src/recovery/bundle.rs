@@ -1300,6 +1300,7 @@ impl std::fmt::Debug for WriterEnabled {
 impl WriterEnabled {
     /// Returns the writer this evidence is for.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn writer_key_id(&self) -> KeyId {
         self.writer_key_id
     }
@@ -1322,6 +1323,7 @@ impl WriterEnabled {
 
     /// Returns where the service put the write that carries the writer.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn bundle_position(&self) -> SyncPosition {
         self.bundle_position
     }

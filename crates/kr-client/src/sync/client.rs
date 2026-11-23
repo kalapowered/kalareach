@@ -470,6 +470,7 @@ impl SyncClient {
     /// # Errors
     ///
     /// Returns [`SyncError::Storage`] when the record cannot be read.
+    #[cfg(any(test, feature = "testing"))]
     pub fn generation(&self) -> Result<u64> {
         Ok(self.store.privacy()?.generation.get())
     }
@@ -1247,6 +1248,7 @@ impl SyncClient {
     ///
     /// Returns [`SyncError::Storage`] when a staged file cannot be read or removed, and
     /// [`SyncError::LateResult`] when a later generation has overtaken this cleanup.
+    #[cfg(any(test, feature = "testing"))]
     pub async fn cancel_undispatched(
         &self,
         generation: u64,
@@ -1285,6 +1287,7 @@ impl SyncClient {
     ///
     /// Returns [`SyncError::Storage`] when a file cannot be removed, and [`SyncError::LateResult`]
     /// when a later generation has overtaken this cleanup.
+    #[cfg(any(test, feature = "testing"))]
     pub async fn remove_retained(&self, generation: u64, now: TimestampMs) -> Result<Removed> {
         self.own_generation(generation)?;
         // The local removal first, so a cleanup a later generation has overtaken is refused
@@ -1304,6 +1307,7 @@ impl SyncClient {
     /// Whether the step still owns that generation is decided inside the store, in the same hold
     /// that does the deleting: a check out here could be overtaken between the answer and the
     /// deletion it was meant to authorise.
+    #[cfg(any(test, feature = "testing"))]
     fn own_generation(&self, generation: u64) -> Result<()> {
         self.store.advance_privacy(generation)?;
         Ok(())
@@ -1410,6 +1414,7 @@ impl SyncClient {
     /// # Errors
     ///
     /// Returns [`SyncError::Storage`] when the publication records cannot be read.
+    #[cfg(any(test, feature = "testing"))]
     pub fn exported(&self) -> Result<Vec<Exported>> {
         let left = self.store.what_left()?;
         let (publications, requests) = (left.publications, left.requests);
@@ -1496,6 +1501,7 @@ impl SyncClient {
     /// # Errors
     ///
     /// Returns [`SyncError::Storage`] when the privacy record cannot be read.
+    #[cfg(any(test, feature = "testing"))]
     pub fn accepts_result(&self, produced_under: u64) -> Result<bool> {
         Ok(self.generation()? == produced_under)
     }

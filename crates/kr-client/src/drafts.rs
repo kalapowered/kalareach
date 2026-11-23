@@ -131,6 +131,7 @@ impl DraftTarget {
 
     /// Names the application and binding this draft was written against.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn in_application(
         mut self,
         application_instance_id: ApplicationInstanceId,
@@ -247,6 +248,7 @@ impl Draft {
     /// Rebinding is not retargeting. A draft that has already been marked stays marked until a
     /// caller says otherwise, because the host agreeing with itself a second time is not a person
     /// deciding what to do with the text.
+    #[cfg(any(test, feature = "testing"))]
     pub fn rebind(&mut self, observed: Option<&DraftTarget>) -> DraftState {
         let Some(observed) = observed else {
             self.state = DraftState::Orphaned;
@@ -308,6 +310,7 @@ impl Associations {
 
     /// Returns the drafts one attachment is presenting.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn drafts_of(&self, attachment_id: AttachmentId) -> Vec<DraftId> {
         let mut found: Vec<DraftId> = self
             .by_draft
@@ -327,6 +330,7 @@ impl Associations {
     /// Removes every association, which is what losing a connection means.
     ///
     /// It returns nothing a caller could submit. The drafts are on disk and are not consulted.
+    #[cfg(any(test, feature = "testing"))]
     pub fn connection_lost(&mut self) {
         self.by_draft.clear();
     }
@@ -568,6 +572,7 @@ impl DraftStore {
     ///
     /// Returns [`DraftError::Storage`] when the file cannot be written, and
     /// [`DraftError::TooLarge`] when the text does not fit the contract.
+    #[cfg(any(test, feature = "testing"))]
     pub fn create(&self, target: DraftTarget, text: String, now: TimestampMs) -> Result<Draft> {
         self.create_whole(target, text, Vec::new(), DraftState::Open, now)
     }
@@ -943,6 +948,7 @@ impl DraftStore {
     /// # Errors
     ///
     /// Returns [`DraftError::Storage`] when the note cannot be read or written.
+    #[cfg(any(test, feature = "testing"))]
     pub fn record_checkpoint(
         &self,
         draft_id: DraftId,

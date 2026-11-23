@@ -77,6 +77,7 @@ use serde::{Deserialize, Serialize};
 use tokio::task::AbortHandle;
 
 use super::alternatives::Alternatives;
+#[cfg(any(test, feature = "testing"))]
 use super::matrix::ReleaseGate;
 use super::relay::{ManagedRelayLeaseService, ServiceHttp, ServiceSigner};
 use super::{ServiceFuture, relay};
@@ -306,6 +307,7 @@ impl ManagedPairingAdmission {
 
     /// The same client, asking `gate` before it sends an admission request.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn gated_by(self, gate: Arc<ReleaseGate>) -> Self {
         Self {
             service: self.service.gated_by(gate),
@@ -687,6 +689,7 @@ impl PairingAdmissions {
 
     /// The same, reading `clock`, so that a test can make time pass.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn on_clock(mut self, clock: AdmissionClock) -> Self {
         self.clock = clock;
         self

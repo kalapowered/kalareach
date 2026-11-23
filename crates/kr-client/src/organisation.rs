@@ -1190,6 +1190,7 @@ fn by_rule(rule: &str, presented: Presented) -> Next {
 /// Every rule of a lease the host can refuse that this build knows, so that a suite holds the host's
 /// list to this one.
 #[must_use]
+#[cfg(any(test, feature = "testing"))]
 pub fn known_rules() -> Vec<&'static str> {
     RULES.iter().map(|(name, _)| *name).collect()
 }

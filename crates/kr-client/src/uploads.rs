@@ -381,6 +381,7 @@ impl Upload {
     ///
     /// Empty content is complete as soon as the transfer is reserved, because it has no chunks.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn progress(&self) -> f64 {
         let total = self.layout.chunk_count.get();
         if total == 0 {

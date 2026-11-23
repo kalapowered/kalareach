@@ -58,6 +58,7 @@ pub const MAX_AUTOMATIC_RETRIES: u32 = 3;
 /// What section 27's KR-PERF-006 gives a reconnect to reach a usable screen.
 ///
 /// It is not this module's bound to enforce; it is the one the delays here must stay clear of.
+#[cfg(any(test, feature = "testing"))]
 pub const RECONNECT_BUDGET: Duration = Duration::from_secs(2);
 
 /// The longest *one* delay may be before the library hands the decision back instead of waiting.
@@ -90,6 +91,7 @@ pub enum RequestClass {
 
 impl RequestClass {
     /// The three classes section 23 permits an automatic retry for.
+    #[cfg(any(test, feature = "testing"))]
     pub const AUTOMATIC: [Self; 3] = [
         Self::IdempotentRead,
         Self::TransferChunk,
@@ -97,6 +99,7 @@ impl RequestClass {
     ];
 
     /// Every class, in declaration order.
+    #[cfg(any(test, feature = "testing"))]
     pub const ALL: [Self; 4] = [
         Self::IdempotentRead,
         Self::TransferChunk,
@@ -153,6 +156,7 @@ pub enum UserAction {
 
 impl UserAction {
     /// Every action, in declaration order.
+    #[cfg(any(test, feature = "testing"))]
     pub const ALL: [Self; 8] = [
         Self::PairAgain,
         Self::SignIn,
@@ -263,12 +267,14 @@ pub struct Decision {
 impl Decision {
     /// Returns true when the library sends this request again by itself.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn retries_automatically(&self) -> bool {
         matches!(self.recovery, Recovery::Retry { .. })
     }
 
     /// Returns the delay a retry or a repeat waits, when there is one.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn delay(&self) -> Option<Duration> {
         match self.recovery {
             Recovery::Retry { delay } | Recovery::RepeatNoSoonerThan { delay } => Some(delay),

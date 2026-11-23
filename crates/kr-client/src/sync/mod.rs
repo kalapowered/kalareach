@@ -99,6 +99,7 @@ pub enum StorageFeature {
 
 impl StorageFeature {
     /// Every part, in the order section 18 states them.
+    #[cfg(any(test, feature = "testing"))]
     pub const ALL: [Self; 3] = [
         Self::SettingsSync,
         Self::HistoryBackups,
@@ -121,12 +122,14 @@ impl StorageFeature {
     /// says so of the recovery seed. Settings sync is the feature itself, so there is nothing left
     /// of it to turn off.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn is_optional(self) -> bool {
         matches!(self, Self::HistoryBackups | Self::RecoveryMaterial)
     }
 
     /// Returns what a person does without this part.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn alternative(self) -> &'static str {
         match self {
             Self::SettingsSync => "set each device up the way you want it",
@@ -330,6 +333,7 @@ pub struct ClientSelection {
 impl ClientSelection {
     /// Returns a selection that names nothing, which is where a client starts.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn nothing_selected() -> Self {
         Self {
             environment_id: Nullable::null(),

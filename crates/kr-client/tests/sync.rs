@@ -17,11 +17,10 @@ use kr_client::services::{
     SyncRequestFence, SyncRequestStatus, SyncRevision,
 };
 use kr_client::sync::{
-    Across, Claimed, ClientSelection, ConflictCopy, Dispatch, Outcome, PrivacyRecord, Publication,
-    PublishGate, Published, Reconciled, RequestRecord, RequestRevision, RequestState, Resolutions,
-    Restored, SettingValue, Settlement, StorageFeature, SyncBody, SyncCheckpoint, SyncClient,
-    SyncError, SyncObject, SyncSettings, SyncStore, Unread, fresh_object_id, fresh_revision,
-    sync_collection,
+    Claimed, ClientSelection, Dispatch, Outcome, PrivacyRecord, PublishGate, Published, Reconciled,
+    RequestRecord, RequestRevision, RequestState, Resolutions, Restored, SettingValue, Settlement,
+    StorageFeature, SyncBody, SyncCheckpoint, SyncClient, SyncError, SyncObject, SyncSettings,
+    SyncStore, Unread, fresh_object_id, fresh_revision, sync_collection,
 };
 use kr_crypto::envelope::{open_sync_object, seal_sync_object};
 use kr_crypto::secret::{Secret, SymmetricKey};
@@ -1110,36 +1109,12 @@ fn object(object_id: SyncObjectId, device_byte: u8, body: SyncBody, at_ms: u64) 
     }
 }
 
-/// One conflict copy of `other`, recorded at `at_ms`.
-fn conflict(object_id: SyncObjectId, other: &SyncObject, at_ms: u64) -> ConflictCopy {
-    ConflictCopy {
-        conflict_id: SyncConflictId::new(
-            kr_transport::random::fresh_uuid_v4().expect("an identity"),
-        ),
-        object_id,
-        offered_revision: fresh_revision().expect("a revision"),
-        retained: Nullable::null(),
-        expected: Nullable::null(),
-        current: at(1),
-        other: other.clone(),
-        recorded_at_ms: TimestampMs::new(at_ms),
-    }
-}
-
 /// Claims one request's dispatch, which is what a settlement is decided under.
 fn claim(store: &SyncStore, work_id: Uuid) -> Dispatch {
     match store.claim_dispatched(work_id).expect("a claim") {
         Claimed::Taken(dispatch, _) => dispatch,
         other => panic!("that request is not claimable: {other:?}"),
     }
-}
-
-/// Claims one request whose staged record has already gone, for a late answer about it.
-fn claim_after_discard(store: &SyncStore, work_id: Uuid) -> Dispatch {
-    store
-        .claim_request(work_id)
-        .expect("a claim")
-        .expect("nobody is waiting on it")
 }
 
 /// One device: its own store and its own client over the shared service.
@@ -1752,52 +1727,6 @@ async fn an_object_that_is_not_the_one_the_collection_was_asked_for_is_refused()
             .await,
         Err(SyncError::NotThatObject { .. })
     ));
-}
-
-#[tokio::test]
-async fn a_copy_that_arrives_out_of_order_is_kept_rather_than_pruning_itself() {
-    let directory = tempfile::tempdir().expect("a directory");
-    let store = SyncStore::open(directory.path().join("one")).expect("a store");
-    let object_id = fresh_object_id().expect("an identity");
-    let other = object(
-        object_id,
-        1,
-        SyncBody::Settings(settings(&[("theme", "dark")], &[])),
-        NOW,
-    );
-
-    // Eight copies, all at one instant, which is what two answers finishing out of order or a
-    // clock that stepped back produce.
-    let mut kept = Vec::new();
-    for _ in 0..MAX_SYNC_CONFLICT_COPIES {
-        let copy = conflict(object_id, &other, NOW);
-        kept.push(copy.conflict_id);
-        store.keep_conflict(&copy).expect("kept");
-    }
-    assert_eq!(
-        store.conflicts(object_id).expect("copies").len() as u64,
-        MAX_SYNC_CONFLICT_COPIES
-    );
-
-    // A ninth at an *earlier* instant. It is the one just admitted, so it is never the one pruned:
-    // a caller holding its identity must find it stored.
-    let newest = conflict(object_id, &other, NOW - 1);
-    store.keep_conflict(&newest).expect("kept");
-    let copies = store.conflicts(object_id).expect("copies");
-    assert_eq!(copies.len() as u64, MAX_SYNC_CONFLICT_COPIES);
-    assert!(
-        copies
-            .items
-            .iter()
-            .any(|copy| copy.conflict_id == newest.conflict_id),
-        "the copy just admitted is never the one pruned"
-    );
-    assert!(
-        store
-            .resolve_conflict(newest.conflict_id)
-            .expect("resolved")
-            .is_some()
-    );
 }
 
 // ---------------------------------------------------------------------------
@@ -4333,7 +4262,7 @@ fn a_note_is_never_replaced_by_an_answer_that_does_not_follow_it() {
 
     // One write sequence names one write for the life of a collection, so an answer naming the
     // same place under another name comes from a second history rather than from a later write.
-    // The note this device established stands, and so does the account of what it published.
+    // The note this device established stands.
     assert!(
         !store
             .record_checkpoint(object_id, note(forked))
@@ -4353,37 +4282,11 @@ fn a_note_is_never_replaced_by_an_answer_that_does_not_follow_it() {
         at(5)
     );
 
-    let published = |position| Publication {
-        object_id,
-        kind: SyncObjectKind::Settings,
-        position,
-        published_at_ms: TimestampMs::new(NOW),
-    };
-    assert!(
-        store
-            .record_publication(&published(at(5)))
-            .expect("a record")
-    );
-    assert!(
-        !store
-            .record_publication(&published(forked))
-            .expect("a record")
-    );
-    assert_eq!(
-        store.publications().expect("records").items[0].position,
-        at(5)
-    );
-
-    // A later write still lands, on both.
+    // A later write still lands.
     assert!(
         store
             .record_checkpoint(object_id, note(at(6)))
             .expect("a note")
-    );
-    assert!(
-        store
-            .record_publication(&published(at(6)))
-            .expect("a record")
     );
 }
 
@@ -5765,113 +5668,6 @@ async fn records_stored_before_positions_named_their_history_read_as_never_put_b
             .position,
         at(2)
     );
-}
-
-#[tokio::test]
-async fn a_late_answer_is_read_against_the_history_its_attempt_was_made_in() {
-    let directory = tempfile::tempdir().expect("a directory");
-    let service = Arc::new(Service::default());
-    let (client, object_id) = device_client(directory.path(), "one", &service);
-    let collection = sync_collection(SyncObjectKind::Settings, object_id);
-    let mine = object(
-        object_id,
-        1,
-        SyncBody::Settings(settings(&[("theme", "dark")], &[])),
-        NOW,
-    );
-    client.store().put_object(&mine).expect("stored");
-
-    // A publication leaves in a history never put back, and the call that sent it walks away.
-    let staged = client
-        .store()
-        .admit(object_id, |object| {
-            Ok(kr_cbor::to_canonical_vec(object).expect("canonical bytes"))
-        })
-        .expect("admitted");
-    drop(
-        client
-            .store()
-            .begin_dispatch(staged.work_id, object_id, TimestampMs::new(NOW))
-            .expect("dispatched"),
-    );
-
-    // The service is put back twice while the answer is on its way. This device reads the
-    // collection after the second restore, at write five.
-    let (first, second) = (recovery(0xc1), recovery(0xc2));
-    let theirs = object(
-        object_id,
-        2,
-        SyncBody::Settings(settings(&[("theme", "light")], &[])),
-        NOW,
-    );
-    service
-        .put_back(
-            &Export {
-                objects: [(collection.clone(), (at(5), sealed_object(&theirs)))].into(),
-                ..Export::default()
-            },
-            second,
-        )
-        .await;
-    client
-        .fetch(
-            SyncObjectKind::Settings,
-            object_id,
-            TimestampMs::new(NOW + 1),
-        )
-        .await
-        .expect("the collection put back is followed");
-
-    // The answer that arrives late names the first restore, which this device never met. It is
-    // read against the history the attempt was made in, not the one this device reads now, so it
-    // cannot move the device out of the history the service serves: nothing follows from it but
-    // the account of the write.
-    let settled = client
-        .store()
-        .settle(
-            &claim_after_discard(client.store(), staged.work_id),
-            &staged,
-            Outcome::Accepted {
-                position: in_history(at(3), Some(first)),
-            },
-        )
-        .expect("settled");
-    assert_eq!(settled.across, Across::Unfollowed);
-    assert_eq!(client.outstanding().expect("a count"), 0);
-
-    // The collection is still read in the history the second restore began, and within it the
-    // order rules hold: an answer behind the note is a service that went back.
-    assert_eq!(
-        client
-            .store()
-            .checkpoint(object_id)
-            .expect("a note")
-            .expect("one stands")
-            .position,
-        in_history(at(5), Some(second))
-    );
-    service
-        .hold(
-            &collection,
-            in_history(at(3), Some(second)),
-            sealed_object(&theirs),
-        )
-        .await;
-    assert!(matches!(
-        client
-            .fetch(
-                SyncObjectKind::Settings,
-                object_id,
-                TimestampMs::new(NOW + 2)
-            )
-            .await
-            .expect_err("write three is behind write five in the same history"),
-        SyncError::StaleCheckpoint {
-            expected: 5,
-            found: 3,
-            ..
-        }
-    ));
 }
 
 // ---------------------------------------------------------------------------
@@ -7882,30 +7678,11 @@ async fn a_request_the_service_will_never_run_leaves_the_store_with_nothing_to_a
     assert_eq!(left.requests.len(), 1, "only the work that never went");
     assert!(left.requests.items[0].admitted());
 
-    // Closing it twice is closing nothing, whoever asks.
-    assert!(
-        !store
-            .close_unexecuted(&claim_after_discard(&store, staged.work_id), staged.work_id)
-            .expect("nothing to close")
-    );
-
-    // An answer that arrives afterwards changes nothing and publishes nothing. It is refused by
-    // the generation rule rather than reported as settled, so a caller cannot report a late
-    // old-generation result as an accepted publication.
-    assert_eq!(
-        store
-            .settle(
-                &claim_after_discard(&store, staged.work_id),
-                &staged,
-                Outcome::Accepted { position: at(7) },
-            )
-            .expect("settled")
-            .settlement,
-        Settlement::Discarded {
-            produced_under: 0,
-            current: 4
-        }
-    );
+    // A closed request has nothing left to claim, so nothing publishes under it afterwards.
+    assert!(matches!(
+        store.claim_dispatched(staged.work_id).expect("a claim"),
+        Claimed::Gone
+    ));
     assert!(
         store.checkpoint(object_id).expect("a note").is_none(),
         "no checkpoint moves for a result privacy mode refused"
@@ -8013,67 +7790,6 @@ async fn one_window_never_decides_what_became_of_another_windows_live_dispatch()
     let exported = two.exported().expect("exported");
     assert_eq!(exported.len(), 1);
     assert!(exported[0].reference.contains("write 1"));
-}
-
-#[tokio::test]
-async fn an_answer_to_a_request_something_else_settled_is_still_checked_against_the_generation() {
-    let directory = tempfile::tempdir().expect("a directory");
-    let service = Arc::new(GatedService::new());
-    let one = gated_client(directory.path(), "shared", &service);
-    let two = gated_client(directory.path(), "shared", &service);
-    let object_id = fresh_object_id().expect("an identity");
-    let mine = object(
-        object_id,
-        1,
-        SyncBody::Settings(settings(&[("theme", "dark")], &[])),
-        NOW,
-    );
-    one.store().put_object(&mine).expect("stored");
-
-    // The service commits the write, its reply is held on the way back, and the window that sent
-    // it stops waiting. The request is claimable again, and the write happened all the same.
-    service.hold_the_answer_instead().await;
-    let publishing = tokio::spawn({
-        let one = Arc::clone(&one);
-        async move { one.publish(object_id, TimestampMs::new(NOW)).await }
-    });
-    service.wait_for_a_publication().await;
-    let staged = two.store().requests().expect("requests").items[0].clone();
-    publishing.abort();
-    assert!(publishing.await.expect_err("abandoned").is_cancelled());
-
-    // The other window claims what nobody is holding and settles it from the receipt.
-    let reconciled = two
-        .reconcile_unsettled(TimestampMs::new(NOW + 1))
-        .await
-        .expect("reconciled");
-    assert_eq!(reconciled.settled, 1);
-    assert_eq!(two.outstanding().expect("a count"), 0);
-
-    // Privacy mode then moves past the generation that admitted the work, and the answer to that
-    // request arrives late, to a store holding no record of it at all. It is refused by the
-    // generation rule: saying "already settled" here would report a publication under a generation
-    // privacy mode had closed.
-    two.fence(3).expect("fenced");
-    assert_eq!(
-        two.store()
-            .settle(
-                &claim_after_discard(two.store(), staged.work_id),
-                &staged,
-                Outcome::Accepted { position: at(1) },
-            )
-            .expect("settled")
-            .settlement,
-        Settlement::Discarded {
-            produced_under: 0,
-            current: 3
-        }
-    );
-    assert_eq!(
-        two.store().publications().expect("records").len(),
-        1,
-        "the settlement recorded the upload once"
-    );
 }
 
 #[tokio::test]
@@ -8191,23 +7907,7 @@ async fn a_device_that_stopped_part_way_through_a_transition_counts_the_request_
     );
     assert_eq!(client.outstanding().expect("a count"), 1);
 
-    // A dispatch names one request in one store. Another store's claim on the same identity
-    // decides nothing here, and work that has left does not leave a second time under one account.
-    let elsewhere = SyncStore::open(directory.path().join("two")).expect("a store");
-    assert_eq!(
-        client
-            .store()
-            .close_unexecuted(
-                &elsewhere
-                    .claim_request(staged.work_id)
-                    .expect("a claim")
-                    .expect("nobody is waiting on it"),
-                staged.work_id,
-            )
-            .expect_err("that claim is another store's")
-            .code(),
-        ErrorCode::InvalidArgument
-    );
+    // Work that has left does not leave a second time under one account.
     assert!(
         client
             .store()
