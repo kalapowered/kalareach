@@ -155,8 +155,9 @@ pub const FROZEN_VARIANTS: &[&str] = &[
 /// could not start sends it in place of its claim, on the rendezvous connection only, to the
 /// launcher of the release that started it. An installed daemon starts the host from beside its own
 /// release's worker and takes no `--worker`; a pair of two releases exists only in a layout with no
-/// store, and there a launcher of the earlier release keeps the frame as a refusal and waits to its
-/// own deadline, as it did before.
+/// store, and there a launcher of release `0.78.0+66f10e25ea2d` or later, the release before among
+/// them, reads a frame for its own reservation as the host's reason and ends its wait; a launcher
+/// of an earlier release keeps it as a refusal and waits to its own deadline.
 pub const PLUGIN_HOST_PROTOCOL: &str = "kr-plugin-host/3";
 
 /// The definition that names the parameters of a read the control daemon makes of a worker itself,

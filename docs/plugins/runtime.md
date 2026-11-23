@@ -553,8 +553,9 @@ change to a frame, or to one of the rules a host reads a request under, would ne
 release can make one today: a retained level must record this release's protocol name ([the support
 window](../releases/support-window.md)). One frame was added after the release: the start failure
 frame, which a host that could not start sends in place of its claim, on the rendezvous connection
-only, to the launcher that started it. An earlier launcher keeps it as a refusal and waits for its own
-deadline. The rules are these.
+only, to the launcher that started it. A launcher of release `0.78.0+66f10e25ea2d` or later reads it
+as the host's reason and ends its wait; an earlier launcher keeps it as a refusal and waits for its
+own deadline. The rules are these.
 
 - The reading task answers `hello`, `verify`, `event`, `health`, `revise_facts`, `revise_attachments`
   and `privacy` without entering a component. The other requests that name a binding run in a task of

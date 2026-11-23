@@ -174,8 +174,8 @@ async fn the_arguments_a_launcher_starts_the_host_of_the_release_before_with_are
 
 /// The frame a host that could not start sends and the claim a host that started sends are closed
 /// shapes that each refuse the other's bytes, so a launcher that tries the claim first and the
-/// failure second cannot take one for the other, and a launcher of the release before, which reads
-/// only the claim, refuses the failure frame.
+/// failure second cannot take one for the other, and a launcher of a release that reads only the
+/// claim (a 0.78 release before `+66f10e25ea2d`) refuses the failure frame.
 #[test]
 fn the_start_failure_frame_and_the_claim_refuse_each_other() {
     let record: Value = serde_json::from_str(RECORD).expect("the record");
