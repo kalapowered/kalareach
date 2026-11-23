@@ -1771,6 +1771,8 @@ impl Desk {
         if live.generation.load(Ordering::Acquire) != generation {
             return;
         }
+        #[cfg(feature = "testing")]
+        testing::pause(live.key, testing::Point::Settling);
         let file = live.file();
         let error = match result {
             Ok(handle) => {
@@ -1786,10 +1788,11 @@ impl Desk {
         if by_this_device && !account_paused {
             // The sign-in this upload was sent under is not the one in force: it stops for good, and
             // the copy of the person's file goes with it.
-            if let Ok(store) = self.store() {
-                let _ = store.remove(file.key);
-            }
-            return self.end_as(live, generation, Outcome::Failed(CommandError::from(error)));
+            return self.end_removing_as(
+                live,
+                generation,
+                Outcome::Failed(CommandError::from(error)),
+            );
         }
         let transfer = live.transfer();
         if live.journal_failed.load(Ordering::Acquire) {
@@ -1803,10 +1806,7 @@ impl Desk {
                 );
             } else {
                 // Nothing was asked of the host.
-                if let Ok(store) = self.store() {
-                    let _ = store.remove(file.key);
-                }
-                self.end_as(live, generation, Outcome::Failed(CommandError::from(error)));
+                self.end_removing_as(live, generation, Outcome::Failed(CommandError::from(error)));
             }
             return;
         }
@@ -1826,14 +1826,13 @@ impl Desk {
             || error.code() == ErrorCode::OutcomeUnknown;
         let words = host_words(&error).map_or_else(|| error.to_string(), str::to_owned);
         let failure = CommandError::from(error);
-        if let Ok(store) = self.store() {
-            if transfer.is_none() && !uncertain {
-                // A reservation the host refused leaves nothing behind.
-                let _ = store.remove(file.key);
-            } else if transfer.is_some() && !uncertain {
-                // Refused for good while the host holds the reservation: the entry stays, and says so.
-                locked(&self.verdicts).insert(file.key, Verdict::Failed(words));
-            }
+        if transfer.is_none() && !uncertain {
+            // A reservation the host refused leaves nothing behind.
+            return self.end_removing_as(live, generation, Outcome::Failed(failure));
+        }
+        if transfer.is_some() && !uncertain && self.store().is_ok() {
+            // Refused for good while the host holds the reservation: the entry stays, and says so.
+            locked(&self.verdicts).insert(file.key, Verdict::Failed(words));
         }
         self.end_as(live, generation, Outcome::Failed(failure));
     }
@@ -1849,6 +1848,20 @@ impl Desk {
     fn end_as(&self, live: &Arc<Live>, generation: u64, outcome: Outcome) {
         let mut registry = locked(&self.registry);
         if live.generation.load(Ordering::Acquire) == generation {
+            Self::end_under(&mut registry, live, outcome);
+        }
+    }
+
+    /// As [`Self::end_as`], and removes the entry and the copy of the upload's key in the same
+    /// section: a sender that a stop took over removes no file, so a cleanup that stopped the upload
+    /// finds its files while it holds the upload `Stopping`.
+    fn end_removing_as(&self, live: &Arc<Live>, generation: u64, outcome: Outcome) {
+        let store = self.store();
+        let mut registry = locked(&self.registry);
+        if live.generation.load(Ordering::Acquire) == generation {
+            if let Ok(store) = store {
+                let _ = store.remove(live.key);
+            }
             Self::end_under(&mut registry, live, outcome);
         }
     }
@@ -3189,6 +3202,9 @@ pub mod testing {
         AfterCopy,
         /// A sender has its result and is about to take the gate for its decision. Held.
         SettleBeforeGate,
+        /// A sender has its result and has checked that it is the sender in force, and has not yet
+        /// read how its send ended or removed a file. Held.
+        Settling,
         /// A sender task ended, however it ended: finished, stopped, or panicked. Noted, never held.
         SenderExit,
         /// The host was reached, and every task the reach starts is registered with the desk. Noted

@@ -5227,6 +5227,62 @@ async fn kr_req_13_12_a_resolution_does_not_start_an_upload_whose_copy_is_not_pl
     adopted.stop().await;
 }
 
+/// KR-REQ-13.12 (FU20): a sender that a stop took over removes no file of the upload. The host
+/// refuses the begin for the size of the file, and the sender has read that result and has not yet
+/// removed the entry and the copy when a cleanup stops the upload. The cleanup finds the entry and
+/// the copy while it holds the upload `Stopping`; it then removes them itself.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_13_12_a_stopped_sender_removes_no_file_of_the_upload_a_cleanup_holds() {
+    use testing::Point;
+
+    let adopted = Adopted::start(1).await;
+    let (phone, _control) = phone_for(&adopted).await;
+    let desk = desk_of(&phone.companion);
+    let paired = paired_of(&phone.companion).await;
+    let key = kr_ipc::new_uuid();
+    let bytes = vec![5_u8; 16];
+    host_allows(&adopted, 1);
+    let settling = testing::hold_at(key, Point::Settling);
+    let waiting = testing::hold_at(key, Point::CancelWaiting);
+    let stopped = testing::hold_at(key, Point::Stopped);
+    let send = {
+        let sent = request(&adopted, &bytes, Arc::new(Held::new(bytes.clone())), key);
+        let (desk, paired) = (Arc::clone(&desk), paired.clone());
+        tokio::spawn(async move { desk.send(paired, sent).await })
+    };
+    settling.until_passed(1).await;
+    // The cleanup stops the upload, and waits for the sender, which is held with its result.
+    desk.forgotten(paired.device_id);
+    waiting.until_passed(1).await;
+    settling.release();
+    stopped.until_passed(1).await;
+    let (entries, copies) = (entries_in(&folder(&phone)), copies_in(&folder(&phone)));
+    let phase = desk.phase_for_test(key);
+    stopped.release();
+    assert_eq!(phase, Some("stopping"), "the cleanup holds the upload");
+    assert_eq!(
+        entries, 1,
+        "the stopped sender left the entry to the cleanup"
+    );
+    assert_eq!(copies, 1, "the stopped sender left the copy to the cleanup");
+    let _ = tokio::time::timeout(WATCHDOG, send)
+        .await
+        .expect("the send answers")
+        .expect("the task ran");
+    settled(&desk).await;
+    assert_eq!(
+        entries_in(&folder(&phone)),
+        0,
+        "the cleanup removed the entry"
+    );
+    assert_eq!(
+        copies_in(&folder(&phone)),
+        0,
+        "the cleanup removed the copy"
+    );
+    adopted.stop().await;
+}
+
 /// KR-REQ-13.12 (FU7): a panic in the desk's task of a send leaves no upload admitted with no
 /// sender. The caller is answered, the copy is gone, and the key is free for a new send.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
