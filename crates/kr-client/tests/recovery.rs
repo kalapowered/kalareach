@@ -4815,6 +4815,8 @@ fn a_checkpoint_the_bundle_carries_is_the_one_a_restore_compares_against() {
         collections: Vec::new(),
         checkpoints: bundle.checkpoints.iter().cloned().collect(),
         bundle_revision: bundle.revision.get(),
+        bundle_written_at_ms: bundle.written_at_ms,
+        device_settings: None,
     };
     assert_eq!(
         material

@@ -68,7 +68,8 @@ use crate::recovery::capacity::{Sealed, Write, seal};
 use crate::recovery::checkpoint::Strongest;
 use crate::recovery::{
     ExportedArchive, ExportedObject, FreshRestore, MAX_EXPORT_BYTES, OfflineExport, RecoveryError,
-    RetrievalPolicy, ServiceAccess, TrustedMaterial, advance_checkpoint,
+    RetrievalPolicy, SavedSettings, ServiceAccess, TrustedMaterial, advance_checkpoint,
+    decode_member,
 };
 use crate::retry::{Attempts, Failure, Recovery, RequestClass};
 use crate::services::{
@@ -1267,6 +1268,35 @@ async fn read_whole(
 pub struct FilesRestore;
 
 impl FilesRestore {
+    /// Reads the owner's saved settings out of the recovery bundle, with the kit and nothing else.
+    ///
+    /// The bundle is read through `source`, a service or an export file, and authenticated under
+    /// the key the kit and the origin derive, as a restore of the data does. Only the settings
+    /// member is decoded. What comes back is the values and when the bundle was last written, and
+    /// no key, membership or note: the table is asked for device configuration and nothing else is
+    /// read out of the bundle.
+    ///
+    /// # Errors
+    ///
+    /// Returns the refusals [`Self::prepare`] meets in reading the bundle, and
+    /// [`RestoreError::Recovery`] with [`RecoveryError::SettingsUnusable`] for a member that cannot
+    /// be read, which says nothing of what a restore of the data does.
+    pub async fn settings(
+        kit: RecoveryKit,
+        source: Arc<dyn RestoreSource>,
+    ) -> Result<SavedSettings, RestoreError> {
+        let Opened { material, .. } = open_bundle(kit, source).await?;
+        let Some(member) = &material.device_settings else {
+            return Ok(SavedSettings::NoneSaved);
+        };
+        let settings =
+            decode_member(member).map_err(|error| RestoreError::Recovery(Box::new(error)))?;
+        Ok(SavedSettings::Found {
+            settings,
+            bundle_written_at_ms: material.bundle_written_at_ms,
+        })
+    }
+
     /// Opens the bundle, chooses the archive, verifies its newest publication and its manifest, and
     /// makes the plan. Nothing is written and nothing but the manifest object is read.
     ///

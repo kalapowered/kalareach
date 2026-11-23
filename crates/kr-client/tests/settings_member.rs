@@ -16,13 +16,21 @@
 //! | `an_unreadable_settings_file_keeps_the_member_the_bundle_holds` | an absent choice and an unreadable file |
 //! | `removing_the_member_leaves_collections_keys_and_checkpoints_byte_for_byte` | the removal by its own compare-and-swap |
 //! | `a_removal_whose_answer_is_lost_stays_unconfirmed_until_it_is_ended` | an unconfirmed removal stays visible |
+//! | `a_restore_with_only_the_kit_returns_the_settings_member_and_nothing_that_grants` | the restore from a service |
+//! | `a_bundle_with_no_settings_member_restores_no_settings_and_says_so` | a bundle from before the member |
+//! | `a_restore_from_an_export_file_returns_the_settings_with_no_account_and_no_network` | the restore from a file |
+//! | `a_settings_member_that_no_build_can_read_fails_only_the_settings_restore` | what a bad member leaves alone |
+//! | `the_member_and_the_settings_a_restore_returns_hold_none_of_the_private_keys_the_device_keeps` | the key scan |
 
 use std::sync::{Arc, Mutex};
 
 use kr_client::error::ClientError;
 use kr_client::recovery::{
-    BundleStore, DeviceSettings, LocalSettings, LostWrite, MAX_DEVICE_SETTINGS_BYTES,
-    RecoveryError, SettingsRemoval, SettingsSaved, TRUST_ROOM_BYTES, decode_member, encode_member,
+    ArchiveEntries, BundleStore, DeviceSettings, ExportSource, FilesRestore, FreshRestore,
+    LocalSettings, LostWrite, MAX_DEVICE_SETTINGS_BYTES, OfflineExport, RecoveryError,
+    RestoreError, RestoreSource, RetrievalPolicy, SavedSettings, ServiceAccess, SettingsRemoval,
+    SettingsSaved, SourceService, SourceSignIn, TRUST_ROOM_BYTES, advance_checkpoint,
+    decode_member, encode_member,
 };
 use kr_client::services::{
     ServiceFuture, SyncBackupService, SyncExchanged, SyncFetched, SyncPosition, SyncRequestFence,
@@ -30,6 +38,7 @@ use kr_client::services::{
 };
 use kr_client::sync::SettingValue;
 use kr_crypto::kdf::RecoverySeed;
+use kr_crypto::keys::DeviceKeys;
 use kr_protocol::archive::{CollectionLocator, RecoveryBundle, RecoveryContext};
 use kr_protocol::error::ErrorCode;
 use kr_protocol::ids::ArchiveId;
@@ -37,7 +46,7 @@ use kr_protocol::scalars::{Bytes, TimestampMs, Uuid};
 use kr_protocol::sync::MAX_SEALED_RECOVERY_BUNDLE_BYTES;
 
 const ORIGIN: &str = "https://reach.kala.to";
-const LOCATOR: &str = "b7f1c0d2-recovery-bundle";
+const LOCATOR: &str = "0b7f1c0d-2a3b-4c5d-8e6f-7a8b9c0d1e2f";
 
 /// The position this service gives the nth write.
 fn at(write_sequence: u64) -> SyncPosition {
@@ -777,4 +786,474 @@ async fn a_removal_whose_answer_is_lost_stays_unconfirmed_until_it_is_ended() {
             .device_settings
             .is_none()
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// A restore with the kit alone.
+// ---------------------------------------------------------------------------------------------
+
+/// A service as a restore reaches it: the one bundle this suite keeps, and no archive.
+#[derive(Debug)]
+struct ServiceSource {
+    bundles: Arc<MemoryBundles>,
+}
+
+impl RestoreSource for ServiceSource {
+    fn service(&self) -> ServiceFuture<'_, SourceService> {
+        Box::pin(async {
+            Ok(SourceService {
+                origin: ORIGIN.to_owned(),
+                managed_origin: ORIGIN.to_owned(),
+                sign_in: SourceSignIn::Usable,
+            })
+        })
+    }
+
+    fn bundle<'a>(&'a self, locator: &'a str) -> ServiceFuture<'a, SyncFetched> {
+        Box::pin(async move {
+            self.bundles
+                .fetch(&format!("recovery_bundle/{locator}"))
+                .await
+        })
+    }
+
+    fn generation<'a>(
+        &'a self,
+        _archive: ArchiveId,
+        _checkpoint: Option<&'a kr_protocol::archive::ArchiveCheckpoint>,
+    ) -> ServiceFuture<'a, Option<kr_protocol::archive::BackupGenerationPublication>> {
+        Box::pin(async { Ok(None) })
+    }
+
+    fn object(
+        &self,
+        _archive: ArchiveId,
+        _object: kr_protocol::ids::BackupObjectId,
+        _offset: u64,
+        _length: u64,
+    ) -> ServiceFuture<'_, Vec<u8>> {
+        Box::pin(async { Err(unsupported()) })
+    }
+}
+
+fn kit_of(seed: &RecoverySeed) -> kr_protocol::archive::RecoveryKit {
+    seed.to_kit(vec![ORIGIN.to_owned()], LOCATOR.to_owned())
+}
+
+/// A bundle store over a service that keeps one bundle with the settings `mode` saved in it.
+async fn saved(seed: &RecoverySeed, mode: Option<&str>) -> Arc<MemoryBundles> {
+    let service = Arc::new(MemoryBundles::default());
+    let (mut store, _directory) = store_over(&service);
+    let mut bundle = BundleStore::empty(now());
+    bundle.collections.push(collection("collection-1"));
+    store
+        .commit(seed, &mut bundle, now())
+        .await
+        .expect("the bundle");
+    if let Some(mode) = mode {
+        store
+            .save_settings(seed, local(mode), now())
+            .await
+            .expect("the settings are saved");
+    }
+    service
+}
+
+/// KR-REQ-20.17: a restore that holds only the kit reads the member out of the bundle at the
+/// service and returns the settings. What comes back is the settings and the instant the bundle
+/// was last written, and nothing that grants.
+#[tokio::test]
+async fn a_restore_with_only_the_kit_returns_the_settings_member_and_nothing_that_grants() {
+    let seed = RecoverySeed::generate().expect("a seed");
+    let service = saved(&seed, Some("dark")).await;
+    let source = Arc::new(ServiceSource {
+        bundles: Arc::clone(&service),
+    });
+    let restored = FilesRestore::settings(kit_of(&seed), source)
+        .await
+        .expect("the settings come back");
+    assert_eq!(
+        restored,
+        SavedSettings::Found {
+            settings: colour("dark"),
+            bundle_written_at_ms: now(),
+        }
+    );
+    // What it returns names a setting and its value: no key, no membership and no note.
+    let SavedSettings::Found { settings, .. } = restored else {
+        panic!("settings were saved");
+    };
+    assert_eq!(
+        settings.values().keys().collect::<Vec<_>>(),
+        ["colour_mode"]
+    );
+
+    // Another kit does not open it: the settings are not a way round the kit.
+    let other = RecoverySeed::generate().expect("another seed");
+    assert!(matches!(
+        FilesRestore::settings(
+            kit_of(&other),
+            Arc::new(ServiceSource { bundles: service })
+        )
+        .await,
+        Err(RestoreError::Recovery(error)) if matches!(*error, RecoveryError::BundleNotAuthentic)
+    ));
+}
+
+/// KR-REQ-20.17: a bundle with no settings member, as one written before the member or by a device
+/// that chose nothing is, restores no settings and says so, and the person's own settings stay as
+/// they are.
+#[tokio::test]
+async fn a_bundle_with_no_settings_member_restores_no_settings_and_says_so() {
+    let seed = RecoverySeed::generate().expect("a seed");
+    let service = saved(&seed, None).await;
+    assert_eq!(
+        FilesRestore::settings(kit_of(&seed), Arc::new(ServiceSource { bundles: service }))
+            .await
+            .expect("an answer"),
+        SavedSettings::NoneSaved
+    );
+}
+
+/// KR-REQ-20.17: a restore from an export file returns the settings with no account and no
+/// network. The service is gone when the file is read; the kit and the file are all that is left.
+#[tokio::test]
+async fn a_restore_from_an_export_file_returns_the_settings_with_no_account_and_no_network() {
+    let seed = RecoverySeed::generate().expect("a seed");
+    let service = saved(&seed, Some("light")).await;
+    let file = OfflineExport::new(ORIGIN.to_owned(), service.sealed(), None)
+        .to_canonical_bytes()
+        .expect("the file");
+    drop(service);
+
+    let export = OfflineExport::from_canonical_slice(&file).expect("the file reads back");
+    let restored = FilesRestore::settings(kit_of(&seed), Arc::new(ExportSource::new(export)))
+        .await
+        .expect("the settings come back from the file");
+    assert!(matches!(
+        restored,
+        SavedSettings::Found { settings, .. } if settings == colour("light")
+    ));
+}
+
+/// KR-REQ-20.17: a settings member that no build can read fails the settings restore and nothing
+/// else. The member is garbage, or over its cap: a data restore reads the bundle, a checkpoint
+/// carries it through unchanged, and a host's cover writes the bundle with it as it is, while the
+/// settings restore says the settings cannot be used.
+#[tokio::test]
+async fn a_settings_member_that_no_build_can_read_fails_only_the_settings_restore() {
+    for (what, member) in [
+        ("garbage", Bytes::new(vec![0xff; 64])),
+        (
+            "over its cap",
+            Bytes::new(vec![0; MAX_DEVICE_SETTINGS_BYTES + 1]),
+        ),
+    ] {
+        let seed = RecoverySeed::generate().expect("a seed");
+        let service = Arc::new(MemoryBundles::default());
+        let (mut store, _directory) = store_over(&service);
+        let mut bundle = BundleStore::empty(now());
+        bundle.collections.push(collection("collection-1"));
+        bundle.device_settings = Some(member.clone());
+        store
+            .commit(&seed, &mut bundle, now())
+            .await
+            .expect("a bundle with a member is written");
+
+        // The settings restore.
+        assert!(
+            matches!(
+                FilesRestore::settings(
+                    kit_of(&seed),
+                    Arc::new(ServiceSource {
+                        bundles: Arc::clone(&service)
+                    })
+                )
+                .await,
+                Err(RestoreError::Recovery(error))
+                    if matches!(*error, RecoveryError::SettingsUnusable { .. })
+            ),
+            "{what}: the settings restore says they cannot be used"
+        );
+
+        // The data restore reads the same bundle and finds the collection.
+        let mut fresh = FreshRestore::new(kit_of(&seed), RetrievalPolicy::Account);
+        fresh
+            .obtained_access(ServiceAccess::new(
+                RetrievalPolicy::Account,
+                ORIGIN,
+                Arc::clone(&service) as Arc<dyn SyncBackupService>,
+            ))
+            .expect("access");
+        let material = fresh.open_bundle(ORIGIN).await.expect("the data restore");
+        assert_eq!(material.collections, [collection("collection-1")]);
+
+        // A checkpoint and a host's cover write the bundle on and carry the member as it is.
+        let checkpoint = kr_protocol::archive::ArchiveCheckpoint {
+            archive_id: ArchiveId::new(Uuid::from_bytes([0x38; 16])),
+            backup_generation: kr_protocol::ids::BackupGeneration::new(1),
+            encrypted_manifest_hash: kr_protocol::scalars::Digest256::from_bytes([1; 32]),
+            verified_at_ms: now(),
+        };
+        let held = store.fetch(&seed).await.expect("the bundle");
+        let advanced = advance_checkpoint(&held, &checkpoint)
+            .expect("a checkpoint")
+            .expect("it advances");
+        assert_eq!(advanced.device_settings, Some(member.clone()));
+        let writer = kr_protocol::archive::TrustedWriter {
+            writer_key_id: kr_protocol::scalars::KeyId::from_bytes([0x73; 32]),
+            signing_key: kr_protocol::scalars::AuthorisationKey::from_bytes([0x74; 32]),
+            enrolled_at_ms: now(),
+        };
+        let entries = ArchiveEntries {
+            collection: collection("collection-2"),
+            writer,
+            producer: kr_protocol::archive::TrustedProducer {
+                sender_key_id: kr_protocol::scalars::KeyId::from_bytes([0x78; 32]),
+                stored_envelope_key: kr_protocol::scalars::StoredEnvelopeKey::from_bytes(
+                    [0x79; 32],
+                ),
+                enrolled_at_ms: now(),
+            },
+        };
+        let mut covered = store.fetch(&seed).await.expect("the bundle");
+        entries
+            .commit(&mut store, &seed, &mut covered, now())
+            .await
+            .expect("a cover still runs");
+        let after = store.fetch(&seed).await.expect("the bundle");
+        assert_eq!(
+            after.device_settings,
+            Some(member),
+            "{what}: carried as it is"
+        );
+        assert_eq!(after.collections.len(), 2);
+    }
+}
+
+/// KR-REQ-20.17, 18.05: the private keys a device keeps are in neither the member as it is
+/// encoded, nor the bundle as a restore opens it, nor the settings a restore returns when they are
+/// encoded again. Each key is looked for as bytes, in hexadecimal of either case, in either base64
+/// alphabet and as a list of numbers. The controls are the scan finding a key where one is put: in
+/// a setting's value, in each form. The sealed bundle the service holds is ciphertext and is
+/// read only as that.
+#[tokio::test]
+async fn the_member_and_the_settings_a_restore_returns_hold_none_of_the_private_keys_the_device_keeps()
+ {
+    let keys = DeviceKeys::generate().expect("a device's keys");
+    let kept = private_keys_of(&keys);
+    let seed = RecoverySeed::generate().expect("a seed");
+    let service = saved(&seed, Some("dark")).await;
+    let key = seed.bundle_key_for(&context()).expect("the bundle's key");
+
+    let opened = kr_crypto::archive::decrypt_recovery_bundle(&key, &service.sealed())
+        .expect("the kit's seed opens the bundle");
+    let member = opened.device_settings.clone().expect("the member");
+    let restored = FilesRestore::settings(
+        kit_of(&seed),
+        Arc::new(ServiceSource {
+            bundles: Arc::clone(&service),
+        }),
+    )
+    .await
+    .expect("the settings come back");
+    let SavedSettings::Found { settings, .. } = restored else {
+        panic!("settings were saved");
+    };
+    let encoded_again = encode_member(&settings).expect("the restored settings, encoded again");
+    assert_eq!(encoded_again, member, "what comes back is what went in");
+
+    let looked_at = [
+        ("the member as encoded", member.as_slice().to_vec()),
+        (
+            "the bundle as a restore opens it",
+            kr_cbor::to_canonical_vec(&opened).expect("canonical bytes"),
+        ),
+        (
+            "the restored settings, encoded again",
+            encoded_again.as_slice().to_vec(),
+        ),
+        (
+            "the restored settings as JSON",
+            serde_json::to_vec(
+                &settings
+                    .values()
+                    .iter()
+                    .map(|(name, value)| (name.clone(), format!("{value:?}")))
+                    .collect::<std::collections::BTreeMap<_, _>>(),
+            )
+            .expect("json"),
+        ),
+        ("the sealed bundle the service holds", service.sealed()),
+    ];
+    for (label, bytes) in &looked_at {
+        for (name, private) in &kept {
+            assert_eq!(
+                carried_in(bytes, private),
+                None,
+                "{label} carries the {name}"
+            );
+        }
+    }
+
+    // The controls: put each key in a setting's value in each form, spelled here and not by the
+    // scan's own list of forms, and the scan finds it in the member. A form dropped from the scan
+    // fails here.
+    for (name, private) in &kept {
+        let lower: String = private.iter().map(|byte| format!("{byte:02x}")).collect();
+        let url = kr_protocol::scalars::to_base64url(private);
+        let numbers = private
+            .iter()
+            .map(u8::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        for (form, text) in [
+            ("in lower-case hexadecimal", lower.clone()),
+            ("in upper-case hexadecimal", lower.to_uppercase()),
+            ("in base64url", url.clone()),
+            ("in base64", url.replace('-', "+").replace('_', "/")),
+            ("as a list of numbers", format!("[{numbers}]")),
+        ] {
+            let planted = DeviceSettings::new(
+                [("colour_mode".to_owned(), SettingValue::Text(text))]
+                    .into_iter()
+                    .collect(),
+            )
+            .expect("settings");
+            let encoded = encode_member(&planted).expect("a member");
+            assert!(
+                carried_in(encoded.as_slice(), private).is_some(),
+                "the scan misses the {name} {form}"
+            );
+        }
+        let raw = [b"colour_mode".as_slice(), private.as_slice()].concat();
+        assert!(
+            carried_in(&raw, private).is_some(),
+            "the scan misses the {name} as bytes"
+        );
+    }
+}
+
+/// The forms in which a document could carry `key`, as the bytes to look for in it: the bytes
+/// themselves and their hexadecimal in either case; and base64 in either alphabet, which puts three
+/// bytes in four characters, so that the characters standing for the key's whole groups of three are
+/// the same wherever the key lies in a longer value. Which groups those are depends on where the key
+/// starts, so each of the three ways it can start is looked for.
+fn forms_of(key: &[u8]) -> Vec<(String, Vec<u8>)> {
+    let hex = |upper: bool| -> Vec<u8> {
+        key.iter()
+            .map(|byte| {
+                if upper {
+                    format!("{byte:02X}")
+                } else {
+                    format!("{byte:02x}")
+                }
+            })
+            .collect::<String>()
+            .into_bytes()
+    };
+    let mut forms = vec![
+        ("as bytes".to_owned(), key.to_vec()),
+        ("in lower-case hexadecimal".to_owned(), hex(false)),
+        ("in upper-case hexadecimal".to_owned(), hex(true)),
+    ];
+    for start in 0..3 {
+        let whole = &key[start..start + (key.len() - start) / 3 * 3];
+        let url = kr_protocol::scalars::to_base64url(whole);
+        forms.push((
+            format!("in base64url from its byte {start}"),
+            url.clone().into_bytes(),
+        ));
+        forms.push((
+            format!("in base64 from its byte {start}"),
+            url.replace('-', "+").replace('_', "/").into_bytes(),
+        ));
+    }
+    forms
+}
+
+/// How `key` is carried in `haystack`, in a form [`forms_of`] names or as serde writes a list of
+/// bytes, a list of numbers, with any space between its items; nothing when it is not.
+fn carried_in(haystack: &[u8], key: &[u8]) -> Option<String> {
+    let found = |needle: &[u8], haystack: &[u8]| {
+        !needle.is_empty()
+            && haystack
+                .windows(needle.len())
+                .any(|window| window == needle)
+    };
+    if let Some((form, _)) = forms_of(key)
+        .into_iter()
+        .find(|(_, needle)| found(needle, haystack))
+    {
+        return Some(form);
+    }
+    let compact: Vec<u8> = haystack
+        .iter()
+        .copied()
+        .filter(|byte| !byte.is_ascii_whitespace())
+        .collect();
+    let numbers = key
+        .iter()
+        .map(u8::to_string)
+        .collect::<Vec<_>>()
+        .join(",")
+        .into_bytes();
+    found(&numbers, &compact).then(|| "as a list of numbers".to_owned())
+}
+
+/// The private keys a device keeps, as their bytes with a name: the four seeds, and the private
+/// keys of the two X25519 pairs, which are made from their seeds by a hash (the first half of the
+/// seed's SHA-512, which is what libsodium's `crypto_box_seed_keypair` makes of it) and are checked
+/// here against the public key the pair has.
+fn private_keys_of(keys: &DeviceKeys) -> Vec<(String, Vec<u8>)> {
+    use kr_crypto::store::{MemoryStore, SecretName, SecretStore as _, store_device_keys};
+    use kr_protocol::pairing::KeyPurpose;
+    use sha2::Digest as _;
+
+    // The seeds are read from a store they are written to, as the device's own are.
+    let store = MemoryStore::new();
+    store_device_keys(&store, "device", keys).expect("the keys are stored");
+    let mut kept = Vec::new();
+    for (purpose, public) in [
+        (KeyPurpose::Transport, None),
+        (KeyPurpose::Authorisation, None),
+        (
+            KeyPurpose::StoredEnvelope,
+            Some(*keys.stored_envelope.public().as_bytes()),
+        ),
+        (
+            KeyPurpose::NotificationPreview,
+            Some(*keys.notification_preview.public().as_bytes()),
+        ),
+    ] {
+        let name = SecretName::device_key("device", purpose).expect("a name");
+        let seed = store
+            .get(&name)
+            .expect("the store reads")
+            .unwrap_or_else(|| panic!("the store kept a {purpose:?} key"))
+            .expose()
+            .to_vec();
+        kept.push((format!("{purpose:?} seed"), seed.clone()));
+        if let Some(public) = public {
+            let secret = sha2::Sha512::digest(&seed)[..32].to_vec();
+            let derived = aws_lc_rs::agreement::PrivateKey::from_private_key(
+                &aws_lc_rs::agreement::X25519,
+                &secret,
+            )
+            .expect("an X25519 private key")
+            .compute_public_key()
+            .expect("its public key");
+            assert_eq!(
+                derived.as_ref(),
+                public.as_slice(),
+                "the {purpose:?} private key is the first half of its seed's hash"
+            );
+            kept.push((format!("{purpose:?} private key (derived)"), secret));
+        }
+    }
+    assert_eq!(kept.len(), 6, "four seeds and two keys made from them");
+    for (name, key) in &kept {
+        assert!(key.len() >= 32, "the {name} is a key, not a stub");
+    }
+    kept
 }

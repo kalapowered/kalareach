@@ -23,7 +23,7 @@
 use std::collections::BTreeMap;
 
 use kr_crypto::backup::{Admission, Material, may_back_up, may_restore};
-use kr_protocol::scalars::Bytes;
+use kr_protocol::scalars::{Bytes, TimestampMs};
 use serde::{Deserialize, Serialize};
 
 use crate::recovery::{MaterialName, RecoveryError, Result};
@@ -241,4 +241,20 @@ pub enum SettingsRemoval {
     },
     /// The bundle held no settings, so nothing was written.
     NothingSaved,
+}
+
+/// What a restore with the kit found of the owner's saved settings.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SavedSettings {
+    /// The bundle holds saved settings.
+    Found {
+        /// The settings, which are values and nothing that grants.
+        settings: DeviceSettings,
+        /// When the bundle was last written. A newer save cannot be proven: every writer and
+        /// checkpoint write moves it, and a service can hold back a later write.
+        bundle_written_at_ms: TimestampMs,
+    },
+    /// The bundle holds none: it was written before the member, or by a device that chose
+    /// nothing. The person's own settings stay as they are.
+    NoneSaved,
 }

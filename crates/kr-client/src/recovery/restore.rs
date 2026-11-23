@@ -11,6 +11,7 @@ use kr_protocol::archive::{
     ArchiveCheckpoint, CollectionLocator, RecoveryContext, RecoveryKit, TrustedProducer,
     TrustedWriter,
 };
+use kr_protocol::scalars::{Bytes, TimestampMs};
 
 use crate::recovery::bundle::read_bundle;
 use crate::recovery::{RecoveryError, Result};
@@ -138,6 +139,12 @@ pub struct TrustedMaterial {
     pub checkpoints: Vec<ArchiveCheckpoint>,
     /// The bundle revision this came from.
     pub bundle_revision: u64,
+    /// When the bundle was last written, in UTC milliseconds. Every writer and checkpoint write
+    /// moves it, so it does not date a change to the settings.
+    pub bundle_written_at_ms: TimestampMs,
+    /// The owner device's saved settings, as the bundle carries them, which only the settings
+    /// restore decodes. Nothing else in a restore reads the bytes.
+    pub device_settings: Option<Bytes>,
 }
 
 impl std::fmt::Debug for TrustedMaterial {
@@ -155,6 +162,7 @@ impl std::fmt::Debug for TrustedMaterial {
             .field("collections", &self.collections.len())
             .field("checkpoints", &self.checkpoints.len())
             .field("bundle_revision", &self.bundle_revision)
+            .field("holds_device_settings", &self.device_settings.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -275,6 +283,8 @@ impl FreshRestore {
             collections: bundle.collections.clone(),
             checkpoints: bundle.checkpoints.iter().cloned().collect(),
             bundle_revision: bundle.revision.get(),
+            bundle_written_at_ms: bundle.written_at_ms,
+            device_settings: bundle.device_settings.clone(),
         })
     }
 
@@ -311,11 +321,14 @@ mod tests {
             collections: Vec::new(),
             checkpoints: Vec::new(),
             bundle_revision: 8,
+            bundle_written_at_ms: TimestampMs::new(2),
+            device_settings: Some(Bytes::new(vec![0x5a; 1024])),
         };
         renders_only(
             &material,
             "TrustedMaterial{service_origin:\"https://reach.example\",trusted_writers:0,\
-             trusted_producers:0,collections:0,checkpoints:0,bundle_revision:8,..}",
+             trusted_producers:0,collections:0,checkpoints:0,bundle_revision:8,\
+             holds_device_settings:true,..}",
         );
     }
 }
