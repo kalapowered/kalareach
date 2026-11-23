@@ -909,15 +909,20 @@ impl Registry {
     /// Ends the admission of `live`, whose send ended before its start was decided: only its own
     /// upload, still admitted, and its own copy go, in one section under the gate. A cleanup may
     /// have stopped the upload and let the key be used again, and then neither the upload nor the
-    /// copy is this send's to remove.
+    /// copy is this send's to remove. An upload that has started has a sender and is held until
+    /// that sender ends it: its copy is what a resume reads, so it stays. A panic between the
+    /// start's change of the phase and the task it makes leaves the upload held with no sender,
+    /// and nothing here ends that.
     fn drop_admitted(&mut self, store: &Store, live: &Arc<Live>) {
-        self.remove_copy_of(store, live);
-        if self
+        let ours = self
             .held
             .get(&live.key)
-            .is_some_and(|held| Arc::ptr_eq(held, live))
-            && *locked(&live.phase) == Phase::Admitted
-        {
+            .is_some_and(|held| Arc::ptr_eq(held, live));
+        if ours && *locked(&live.phase) != Phase::Admitted {
+            return;
+        }
+        self.remove_copy_of(store, live);
+        if ours {
             self.held.remove(&live.key);
         }
     }
@@ -1576,6 +1581,10 @@ impl Desk {
         *locked(&live.task) = Some(task);
         #[cfg(feature = "testing")]
         testing::pause(live.key, testing::Point::Started);
+        #[cfg(feature = "testing")]
+        if testing::take(live.key, testing::Fault::PanicAfterStart) {
+            panic!("a fault injected after an upload's start");
+        }
         true
     }
 
@@ -3171,6 +3180,9 @@ pub mod testing {
         CopyFails,
         /// The desk's task of a send panics, once, after the copy is placed and before the start.
         PanicInSend,
+        /// The desk's task of a send panics, once, in the section that starts the upload, after its
+        /// sender is made and its handle stored.
+        PanicAfterStart,
     }
 
     static ARMED: LazyLock<Mutex<HashSet<(Uuid, Fault)>>> = LazyLock::new(Mutex::default);

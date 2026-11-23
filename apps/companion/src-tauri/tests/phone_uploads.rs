@@ -4471,6 +4471,43 @@ async fn kr_req_13_12_a_send_whose_copy_fails_leaves_no_copy_and_no_place() {
     adopted.stop().await;
 }
 
+/// KR-REQ-13.12 (FU9): a panic in the desk's task of a send after its upload started leaves that
+/// upload its copy. The caller is answered, and the upload goes on: its sender runs and its copy is
+/// what a resume reads.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_13_12_a_panic_after_the_upload_started_leaves_its_copy() {
+    use testing::{Fault, Point};
+
+    let adopted = Adopted::start(1).await;
+    let (phone, _control) = phone_for(&adopted).await;
+    let desk = desk_of(&phone.companion);
+    let paired = paired_of(&phone.companion).await;
+    let key = kr_ipc::new_uuid();
+    let bytes = vec![5_u8; 16];
+    let sender = testing::hold_at(key, Point::SenderStarting);
+    let panics = testing::arm(key, Fault::PanicAfterStart);
+    let sent = request(&adopted, &bytes, Arc::new(Held::new(bytes.clone())), key);
+    let answered = tokio::time::timeout(WATCHDOG, desk.send(paired, sent))
+        .await
+        .expect("the send answers");
+    assert!(answered.is_err(), "the send that panicked has no outcome");
+    drop(panics);
+    sender.until_passed(1).await;
+    desk.sends_idle().await;
+    assert_eq!(
+        testing::read_copy(&folder(&phone), key),
+        Some(bytes),
+        "the started upload keeps its copy"
+    );
+    assert!(
+        desk.generation_for_test(key).is_some(),
+        "the started upload is still held"
+    );
+    sender.release();
+    settled(&desk).await;
+    adopted.stop().await;
+}
+
 /// KR-REQ-13.12 (FU7): a panic in the desk's task of a send leaves no upload admitted with no
 /// sender. The caller is answered, the copy is gone, and the key is free for a new send.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
