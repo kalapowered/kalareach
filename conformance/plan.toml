@@ -2761,3 +2761,31 @@ cases = ['a_phone_registers_with_a_gateway_and_is_delivered_to_through_it']
 kind = 'command'
 file = 'scripts/e2e-push-device.sh'
 line = 'KR_HARNESS_DIR="$harness" KR_HARNESS_PEER="$1" KR_HARNESS_SECONDS=1500 KR_PUSH_ANDROID_STATES="$states" KR_PUSH_GATEWAY="$gateway_origin" KR_PUSH_FCM_PORT="$fcm_port" KR_PUSH_TOKEN="$token" host_start "$harness_exe" --ignored --exact a_phone_registers_with_a_gateway_and_is_delivered_to_through_it --nocapture >"$artefacts/harness.log" 2>&1 &'
+
+[[ignored_run]]
+package = 'kr-transport'
+target = '--test real_proxy'
+[ignored_run.runs]
+kind = 'by_hand'
+why = 'they run only against a squid proxy that `scripts/real-proxy.sh start <run folder> basic` starts and names in the `env.sh` of its run folder, and no step of this repository installs squid or starts that script: a person starts the proxy, sources `env.sh` and runs the target with `--ignored`'
+
+[[ignored_run]]
+package = 'kr-transport'
+target = '--test real_proxy_bump'
+[ignored_run.runs]
+kind = 'by_hand'
+why = 'they run only against a squid proxy that intercepts TLS, which `scripts/real-proxy.sh start <run folder> bump` starts and names in the `env.sh` of its run folder, and no step of this repository installs squid or starts that script: a person starts the proxy, sources `env.sh` and runs the target with `--ignored`'
+
+[[ignored_run]]
+package = 'kr-controller'
+target = '--test proxy_front'
+[ignored_run.runs]
+kind = 'by_hand'
+why = 'it runs only against a squid proxy that `scripts/real-proxy.sh start <run folder> basic` starts and names in the `env.sh` of its run folder, and no step of this repository installs squid or starts that script: a person starts the proxy, sources `env.sh` and runs the target with `--ignored`'
+
+[[ignored_run]]
+package = 'kr-controller'
+target = '--test proxy_login_daemon'
+[ignored_run.runs]
+kind = 'by_hand'
+why = 'they run only against two squid proxies, one that asks for a Basic login and one that offers Digest only, which `scripts/real-proxy.sh start <run folder> basic` and `... digest` start and name in the `env.sh` of each run folder, and no step of this repository installs squid or starts that script: a person starts both proxies, sources both `env.sh` files and runs the target with `--ignored`'
