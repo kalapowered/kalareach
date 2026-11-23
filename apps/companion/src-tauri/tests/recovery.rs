@@ -4529,6 +4529,56 @@ async fn every_trigger_shares_one_deadline_and_a_change_in_the_window_stays_sche
     );
 }
 
+/// KR-REQ-20.17: the first write that carries the settings counts against the one deadline, whether
+/// or not its reply came back. The first bundle lands with a dark mode in it and its reply is lost;
+/// the person then chooses light and settles the write; the step that follows finds the window
+/// open and writes nothing, so the bundle holds the dark mode until the window ends.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_first_write_of_the_settings_whose_reply_was_lost_still_counts_against_the_window() {
+    let timing = SettingsTiming {
+        quiet: Duration::ZERO,
+        window: Duration::from_secs(600),
+    };
+    let computer = Computer::new().await;
+    let (page, settings) = computer.saving_page(timing).await;
+    settings
+        .set_colour_mode(ColourMode::Dark)
+        .await
+        .expect("kept");
+    computer.served.web().fail(SYNC_PATH, 1, Moment::After);
+    let lost = page
+        .call("recovery_turn_on", json!({}))
+        .expect_err("the answer to the first write was lost");
+    assert_eq!(lost["code"], "OUTCOME_UNKNOWN");
+    assert_eq!(writes_sent(&computer), 1);
+
+    settings
+        .set_colour_mode(ColourMode::Light)
+        .await
+        .expect("kept");
+    let settled = page.call("recovery_settle", json!({})).expect("settled");
+    assert_eq!(settled["state"], "on");
+    let step = page
+        .recovery
+        .save_settings(&page.account)
+        .await
+        .expect("a step");
+    assert!(
+        matches!(step, SettingsStep::Deferred { .. }),
+        "the first write used the window: {step:?}"
+    );
+    assert_eq!(
+        writes_sent(&computer),
+        1,
+        "no second write inside the window"
+    );
+    assert_eq!(
+        colour_in(&bundle_of(&computer, &page).await).as_deref(),
+        Some("dark"),
+        "the bundle holds what the first write carried"
+    );
+}
+
 /// KR-REQ-20.15: nothing outstanding to settle is read as settled, not refused: a step may have
 /// ended the write between the page's view and the person's press.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

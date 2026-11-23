@@ -575,6 +575,7 @@ impl Recovery {
             _ => None,
         };
         let mut with_settings = false;
+        let mut settings_sent = false;
         let written_here = {
             let mut store = self.store_over(&record, Arc::clone(&tokens) as _)?;
             let mut first = BundleStore::empty(now);
@@ -591,12 +592,23 @@ impl Recovery {
                         }
                         other => {
                             with_settings = other.is_ok();
+                            settings_sent = matches!(
+                                &other,
+                                Ok(_)
+                                    | Err(RecoveryError::BundleOutcomeUnknown { .. }
+                                        | RecoveryError::BundleConflict { .. })
+                            );
                             other
                         }
                     }
                 }
                 None => store.commit(&seed, &mut first, now).await,
             };
+            // A write that carries the settings uses the window whatever came back: one whose answer
+            // was lost may have landed, and the step that follows must not write them again at once.
+            if settings_sent {
+                self.saving.window_from_now(&step);
+            }
             match written {
                 Ok(_) => true,
                 // Something is at the locator already: this device's own first write, whose
