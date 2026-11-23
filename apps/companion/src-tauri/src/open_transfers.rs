@@ -196,10 +196,32 @@ impl Store {
             .map_err(|fault| fault.error)
     }
 
-    fn write_copy(&self, key: Uuid, bytes: &[u8]) -> std::io::Result<()> {
+    /// Writes the copy of `key` beside its name, and gives it the name while the guard that
+    /// `placing` answers is held, until the name is proved durable. `placing` answers none when the
+    /// copy is not to be placed: nothing is left then, and the answer is still `Ok`.
+    fn write_copy<G>(
+        &self,
+        key: Uuid,
+        bytes: &[u8],
+        placing: impl FnOnce() -> std::io::Result<Option<G>>,
+    ) -> std::io::Result<()> {
         std::fs::create_dir_all(&self.root)?;
-        crate::drafts::publish(&self.path(key, COPY_EXTENSION), bytes, || Ok(()))
-            .map_err(|fault| fault.error)
+        let to = self.path(key, COPY_EXTENSION);
+        let staged = crate::drafts::stage(&to, bytes)?;
+        let held = match placing() {
+            Ok(Some(held)) => held,
+            Ok(None) => {
+                let _ = std::fs::remove_file(&staged);
+                return Ok(());
+            }
+            Err(error) => {
+                let _ = std::fs::remove_file(&staged);
+                return Err(error);
+            }
+        };
+        let placed = crate::drafts::place(&staged, &to).map_err(|fault| fault.error);
+        drop(held);
+        placed
     }
 
     fn read_copy(&self, key: Uuid) -> std::io::Result<Vec<u8>> {
@@ -1352,17 +1374,32 @@ impl Desk {
         let key = live.key;
         if let Keeping::Copy(bytes) = keeping {
             let copied = store.clone();
-            let written =
-                tauri::async_runtime::spawn_blocking(move || copied.write_copy(key, &bytes))
-                    .await
-                    .map_err(|error| CommandError::local_failure(error.to_string()))
-                    .and_then(|written| {
-                        written.map_err(|error| {
-                            CommandError::local_failure(format!(
-                                "this device could not keep a copy of the file: {error}"
-                            ))
-                        })
-                    });
+            let (desk, own) = (Arc::clone(self), Arc::clone(live));
+            // The copy is written beside its name, on this blocking thread, and given the name only
+            // while this send's upload still holds the key. The check and the rename are one section
+            // under the gate, so that a cleanup that ended the upload, and a new upload that took the
+            // key, never have their copy replaced by this one.
+            let written = tauri::async_runtime::spawn_blocking(move || {
+                copied.write_copy(key, &bytes, || {
+                    #[cfg(feature = "testing")]
+                    testing::copy_staged(key);
+                    let registry = locked(&desk.registry);
+                    let holds = registry
+                        .held
+                        .get(&key)
+                        .is_some_and(|held| Arc::ptr_eq(held, &own));
+                    Ok(holds.then_some(registry))
+                })
+            })
+            .await
+            .map_err(|error| CommandError::local_failure(error.to_string()))
+            .and_then(|written| {
+                written.map_err(|error| {
+                    CommandError::local_failure(format!(
+                        "this device could not keep a copy of the file: {error}"
+                    ))
+                })
+            });
             if let Err(error) = written {
                 // Only this send's own upload, still admitted, and its own copy go, in one section
                 // under the gate: a cleanup may have stopped the upload and let the key be used
@@ -3007,6 +3044,9 @@ pub mod testing {
         TurnQueued,
         /// A barrier answered `Skipped` because its job is not owed. Noted, never held.
         Skipped,
+        /// A send has written the copy of its content beside the copy's name and has not placed it
+        /// there. Held, the blocking thread that writes it goes no further until released.
+        CopyStaged,
         /// A send has written the copy of its content and holds the gate that
         /// `hold_after_copy_for_test` opens, before it waits for it. Noted, never held.
         AfterCopy,
@@ -3245,6 +3285,12 @@ pub mod testing {
         }
     }
 
+    /// Holds the thread of a send that has written its copy beside the copy's name and has not
+    /// placed it, while a hold is set for `key`.
+    pub(super) fn copy_staged(key: Uuid) {
+        pause(key, Point::CopyStaged);
+    }
+
     /// Holds a sender task at its first line while a hold is set for `key`, and then gives the
     /// runtime a turn, so that a stop that came during the hold takes effect before the task asks
     /// the host for anything.
@@ -3359,7 +3405,7 @@ pub mod testing {
         Store {
             root: root.to_path_buf(),
         }
-        .write_copy(key, bytes)
+        .write_copy(key, bytes, || Ok(Some(())))
         .expect("the copy is kept");
     }
 
@@ -3425,7 +3471,9 @@ mod tests {
             ..file(key, transfer, reached)
         };
         store.write(&entry).expect("the entry");
-        store.write_copy(key, b"mine").expect("the copy");
+        store
+            .write_copy(key, b"mine", || Ok(Some(())))
+            .expect("the copy");
         let live = Live::new(entry, Arc::new(Held::new(vec![1; 4])), true);
         locked(&desk.registry).held.insert(key, Arc::clone(&live));
         (dir, desk, live, store)

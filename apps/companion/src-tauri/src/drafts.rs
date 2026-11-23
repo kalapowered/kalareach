@@ -156,8 +156,44 @@ pub(crate) fn publish(
     bytes: &[u8],
     before_rename: impl FnOnce() -> std::io::Result<()>,
 ) -> std::result::Result<(), PublishFault> {
+    let staged = stage(to, bytes).map_err(|error| PublishFault {
+        renamed: false,
+        error,
+    })?;
+    if let Err(error) = before_rename() {
+        let _ = std::fs::remove_file(&staged);
+        return Err(PublishFault {
+            renamed: false,
+            error,
+        });
+    }
+    place(&staged, to)
+}
+
+/// Writes `bytes` beside the name `to` under a name of their own (owner-only, flushed), and answers
+/// that name. Nothing is under `to` yet: [`place`] gives it, or the caller removes the staged file.
+pub(crate) fn stage(to: &Path, bytes: &[u8]) -> std::io::Result<PathBuf> {
     static STAGED: AtomicU64 = AtomicU64::new(0);
 
+    let directory = to
+        .parent()
+        .ok_or_else(|| std::io::Error::other("a file with no directory"))?;
+    let name = to
+        .file_name()
+        .ok_or_else(|| std::io::Error::other("a path with no file name"))?
+        .to_string_lossy();
+    let staged = directory.join(format!(
+        "{name}.staged-{}-{}",
+        std::process::id(),
+        STAGED.fetch_add(1, Ordering::Relaxed)
+    ));
+    kr_client::drafts::write_whole(&staged, bytes)?;
+    Ok(staged)
+}
+
+/// Gives the file `staged` the name `to` by a rename, and flushes the directory. A rename that
+/// fails removes the staged file. Every error is returned, and one made after the rename says so.
+pub(crate) fn place(staged: &Path, to: &Path) -> std::result::Result<(), PublishFault> {
     let before = |error| PublishFault {
         renamed: false,
         error,
@@ -165,20 +201,8 @@ pub(crate) fn publish(
     let directory = to
         .parent()
         .ok_or_else(|| before(std::io::Error::other("a file with no directory")))?;
-    let name = to
-        .file_name()
-        .ok_or_else(|| before(std::io::Error::other("a path with no file name")))?
-        .to_string_lossy();
-    let staged = directory.join(format!(
-        "{name}.staged-{}-{}",
-        std::process::id(),
-        STAGED.fetch_add(1, Ordering::Relaxed)
-    ));
-    kr_client::drafts::write_whole(&staged, bytes).map_err(before)?;
-    if let Err(error) =
-        before_rename().and_then(|()| kr_flush::retry_while_held(|| std::fs::rename(&staged, to)))
-    {
-        let _ = std::fs::remove_file(&staged);
+    if let Err(error) = kr_flush::retry_while_held(|| std::fs::rename(staged, to)) {
+        let _ = std::fs::remove_file(staged);
         return Err(before(error));
     }
     flush_directory(directory, NameKind::File).map_err(|error| PublishFault {

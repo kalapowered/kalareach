@@ -4246,6 +4246,77 @@ async fn kr_req_13_12_a_refused_send_leaves_the_copy_of_the_upload_that_took_its
     adopted.stop().await;
 }
 
+/// KR-REQ-13.12 (FU5): a copy is placed only while its own upload holds the key. A cleanup that
+/// records no cancel ended the first send's upload while its copy was written beside the copy's
+/// name, a second send under the same key placed its copy since, and the first send's copy is not
+/// given the name over it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_13_12_a_copy_written_for_an_ended_upload_is_not_placed_over_the_copy_of_the_upload_that_took_its_key()
+ {
+    use testing::Point;
+
+    let adopted = Adopted::start(1).await;
+    let (phone, _control) = phone_for(&adopted).await;
+    let desk = desk_of(&phone.companion);
+    let paired = paired_of(&phone.companion).await;
+    let key = kr_ipc::new_uuid();
+    let first_bytes = vec![5_u8; 16];
+    let second_bytes = vec![6_u8; 16];
+    // The second upload's sender is held at its first line, so that its copy stays where it was
+    // placed.
+    let sender = testing::hold_at(key, Point::SenderStarting);
+    let staged = testing::hold_at(key, Point::CopyStaged);
+    let first = {
+        let sent = request(
+            &adopted,
+            &first_bytes,
+            Arc::new(Held::new(first_bytes.clone())),
+            key,
+        );
+        let (desk, paired) = (Arc::clone(&desk), paired.clone());
+        tokio::spawn(async move { desk.send(paired, sent).await })
+    };
+    staged.until_passed(1).await;
+    desk.forgotten(paired.device_id);
+    settled(&desk).await;
+    // The second send's thread is let through its own hold at once.
+    testing::hold_at(key, Point::CopyStaged).release();
+    let second = {
+        let sent = request(
+            &adopted,
+            &second_bytes,
+            Arc::new(Held::new(second_bytes.clone())),
+            key,
+        );
+        let (desk, paired) = (Arc::clone(&desk), paired.clone());
+        tokio::spawn(async move { desk.send(paired, sent).await })
+    };
+    sender.until_passed(1).await;
+    assert_eq!(
+        testing::read_copy(&folder(&phone), key),
+        Some(second_bytes.clone()),
+        "the second send placed its copy"
+    );
+    staged.release();
+    let refused = tokio::time::timeout(WATCHDOG, first)
+        .await
+        .expect("the first send answers")
+        .expect("the task ran");
+    assert!(refused.is_err(), "the first send was refused");
+    assert_eq!(
+        testing::read_copy(&folder(&phone), key),
+        Some(second_bytes),
+        "the first send's copy was not placed over the second send's"
+    );
+    sender.release();
+    tokio::time::timeout(WATCHDOG, second)
+        .await
+        .expect("the second send answers")
+        .expect("the task ran")
+        .expect("the second upload publishes");
+    adopted.stop().await;
+}
+
 /// KR-REQ-13.12 (FU1b): a send that the start section refuses, under a key that no upload holds but
 /// whose entry is kept, leaves the copy: the entry names it, and it is not the refused send's. A
 /// cleanup that records no cancel ended the send's upload, and a record of another upload was kept
