@@ -2368,7 +2368,7 @@ mod reader {
     /// asked of it when the state is the one it is in.
     #[test]
     fn a_console_is_asked_once_for_each_change_of_bracketed_paste() {
-        let mut run = Run::start(true, Vec::new());
+        let run = Run::start(true, Vec::new());
         run.switch
             .follow_paste(false)
             .expect("nothing to give back");
