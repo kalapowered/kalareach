@@ -874,20 +874,23 @@ impl EnvironmentPrivacy {
         // record that fails changes nothing there; a fence that fails leaves the readiness guard
         // withholding production, and the steps below try it again.
         let record = &mut inner.record;
+        // The moment the record stored, read once every wait was over; it is published as it was
+        // stored.
+        let mut took_effect_ms = now_ms.get();
         let _raised = self.backup.raise_fence_recorded(generation, now_ms, || {
             let recorded = record.enable(generation, &owing, now_ms, admitted);
             #[cfg(test)]
             if recorded.is_ok() {
                 self.after_record.wait();
             }
-            recorded
+            recorded.map(|stored| took_effect_ms = stored)
         })?;
         inner.mode = mode;
         inner.changed_at_ms = now_ms;
         change.publish(Published {
             generation,
             private: true,
-            since_ms: now_ms.get(),
+            since_ms: took_effect_ms,
         });
         // Raised as soon as the state says so, before the steps that follow: a tick that waits on
         // the record then runs its pass behind this hold on the record, whether or not the steps
@@ -945,18 +948,23 @@ impl EnvironmentPrivacy {
         }
         let mut mode = inner.mode;
         let resumed = mode.disable(now_ms);
-        inner.record.disable(resumed.generation, now_ms, admitted)?;
+        // The state's write side is taken before the record is written, as an enabling takes it:
+        // taking it waits for every reader that holds the state this replaces, so none of them
+        // holds it when the record changes or when the moment is read, and what any of them
+        // produced is at or before that moment. A record that fails gives the change up with
+        // nothing published.
+        let change = self.state.change();
+        // Read inside the record's transaction once every wait is over, stored with the
+        // generation, and published as it was stored: not the moment the change was asked for,
+        // which the waits for the readers and for the store can put before the moment it took
+        // effect.
+        let took_effect_ms = inner.record.disable(resumed.generation, now_ms, admitted)?;
         inner.mode = mode;
         inner.changed_at_ms = now_ms;
-        // Read with the write side held, not when the change was asked for and not before the
-        // wait for that side: the request can have waited for the store, and a reader can hold the
-        // state it replaces. What is produced while privacy mode still stands is at or before
-        // this moment, and what follows it is not.
-        let change = self.state.change();
         change.publish(Published {
             generation: resumed.generation,
             private: false,
-            since_ms: kr_ipc::now_ms().get(),
+            since_ms: took_effect_ms,
         });
         for progress in inner.sessions.values_mut() {
             progress.notices = Backoff::default();
@@ -2596,14 +2604,15 @@ impl Record {
     }
 
     /// Records that privacy mode is on at `generation`, with an obligation for each session, in
-    /// one transaction, written under `admitted` once the transaction is held.
+    /// one transaction, written under `admitted` once the transaction is held. Returns the moment
+    /// the change took effect, which the record stores with the generation.
     fn enable(
         &mut self,
         generation: PrivacyGeneration,
         sessions: &[SessionId],
         now_ms: TimestampMs,
         admitted: Admitted<'_>,
-    ) -> Result<()> {
+    ) -> Result<u64> {
         // Taking the transaction is the record's one wait: another writer holds it for up to the
         // busy timeout. The admission is asked once it is held, and the transaction is rolled
         // back unwritten when it refuses.
@@ -2612,15 +2621,23 @@ impl Record {
                 .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
                 .map_err(ControllerError::registry)?,
         );
+        let mut took_effect = None;
         admitted(&mut || {
             let transaction = transaction.take().ok_or_else(|| {
                 ControllerError::registry("the privacy record's transaction was already written")
             })?;
+            let moment = took_effect_at(now_ms);
+            took_effect = Some(moment);
             transaction
                 .execute(
-                    "UPDATE privacy_record SET generation = ?1, enabled = 1, changed_at_ms = ?2
+                    "UPDATE privacy_record SET generation = ?1, enabled = 1, changed_at_ms = ?2,
+                            effective_at_ms = ?3, effective_generation = ?1
                       WHERE id = 0",
-                    params![as_i64(generation.get()), as_i64(now_ms.get())],
+                    params![
+                        as_i64(generation.get()),
+                        as_i64(now_ms.get()),
+                        as_i64(moment)
+                    ],
                 )
                 .map_err(ControllerError::registry)?;
             for session_id in sessions {
@@ -2640,34 +2657,49 @@ impl Record {
                     .map_err(ControllerError::registry)?;
             }
             transaction.commit().map_err(ControllerError::registry)
+        })?;
+        took_effect.ok_or_else(|| {
+            ControllerError::registry("the privacy record was written with no moment")
         })
     }
 
     /// Records that privacy mode is off from `generation`, written under `admitted` once the
-    /// record's transaction is held.
+    /// record's transaction is held. Returns the moment the change took effect, which the record
+    /// stores with the generation.
     fn disable(
         &mut self,
         generation: PrivacyGeneration,
         now_ms: TimestampMs,
         admitted: Admitted<'_>,
-    ) -> Result<()> {
+    ) -> Result<u64> {
         let mut transaction = Some(
             self.connection
                 .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
                 .map_err(ControllerError::registry)?,
         );
+        let mut took_effect = None;
         admitted(&mut || {
             let transaction = transaction.take().ok_or_else(|| {
                 ControllerError::registry("the privacy record's transaction was already written")
             })?;
+            let moment = took_effect_at(now_ms);
+            took_effect = Some(moment);
             transaction
                 .execute(
-                    "UPDATE privacy_record SET generation = ?1, enabled = 0, changed_at_ms = ?2
+                    "UPDATE privacy_record SET generation = ?1, enabled = 0, changed_at_ms = ?2,
+                            effective_at_ms = ?3, effective_generation = ?1
                       WHERE id = 0",
-                    params![as_i64(generation.get()), as_i64(now_ms.get())],
+                    params![
+                        as_i64(generation.get()),
+                        as_i64(now_ms.get()),
+                        as_i64(moment)
+                    ],
                 )
                 .map_err(ControllerError::registry)?;
             transaction.commit().map_err(ControllerError::registry)
+        })?;
+        took_effect.ok_or_else(|| {
+            ControllerError::registry("the privacy record was written with no moment")
         })
     }
 
@@ -2711,6 +2743,13 @@ fn as_i64(value: u64) -> i64 {
     i64::try_from(value).unwrap_or(i64::MAX)
 }
 
+/// The moment a change takes effect: now, on this host's wall clock, and never before the moment
+/// the change was asked for, so that the record's pair always reads as valid once it is written.
+/// It is read once every wait the change has is over, inside the record's transaction.
+fn took_effect_at(asked: TimestampMs) -> u64 {
+    kr_ipc::now_ms().get().max(asked.get())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2734,6 +2773,9 @@ mod tests {
         ArchiveId, BackupGeneration, BackupObjectId, DeviceId, EnvironmentId, NotificationId,
     };
     use kr_protocol::scalars::Uuid;
+    use kr_voice::seams::ContextItem;
+
+    use crate::voice::WorkerHalf;
 
     /// Who these tests hand a dispatch attempt to.
     const EXECUTOR: &str = "the test transport";
@@ -3180,6 +3222,11 @@ mod tests {
             "the queued work was not taken back for a privacy mode that was never recorded"
         );
         assert!(host.privacy.report_now(at(10)).obligations.is_empty());
+        assert_eq!(
+            stored_pair(&host),
+            (None, None),
+            "a record that was refused stored no moment"
+        );
 
         refuse
             .execute_batch("DROP TRIGGER refuse_the_record")
@@ -3205,6 +3252,11 @@ mod tests {
             )
             .expect("the record");
         assert_eq!((generation, enabled), (1, 1));
+        assert_eq!(
+            stored_pair(&host).1,
+            Some(1),
+            "the generation the change took effect at is stored with it"
+        );
         assert_eq!(host.backup.fenced_at().expect("a read"), Some(1));
         assert!(host.delivery_is_fenced());
     }
@@ -3510,6 +3562,250 @@ mod tests {
         );
     }
 
+    /// The pair the record holds of its last change, read over a connection of the test's own: the
+    /// moment the change took effect and the generation it took effect at.
+    fn stored_pair(host: &Host) -> (Option<u64>, Option<u64>) {
+        let record = Connection::open(host.root.path().join(PRIVACY_RECORD)).expect("the record");
+        record
+            .query_row(
+                "SELECT effective_at_ms, effective_generation FROM privacy_record WHERE id = 0",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<i64>>(0)?
+                            .and_then(|moment| u64::try_from(moment).ok()),
+                        row.get::<_, Option<i64>>(1)?
+                            .and_then(|generation| u64::try_from(generation).ok()),
+                    ))
+                },
+            )
+            .expect("the pair")
+    }
+
+    /// Returns the first moment of the clock after `moment`.
+    fn after_the_clock_passes(moment: u64) -> u64 {
+        // Bounds only a case that has failed.
+        let gives_up = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let now = kr_ipc::now_ms().get();
+            if now > moment {
+                return now;
+            }
+            assert!(
+                std::time::Instant::now() < gives_up,
+                "the clock never moved on"
+            );
+            std::thread::yield_now();
+        }
+    }
+
+    /// Waits until a change of the state has asked for its write side, which it does before it
+    /// waits for it, or has ended.
+    fn until_a_change_is_asked(state: &PrivacyState, ended: impl Fn() -> bool) {
+        // Bounds only a case that has failed.
+        let gives_up = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !state.observed().changing && !ended() {
+            assert!(
+                std::time::Instant::now() < gives_up,
+                "the change never asked for the state"
+            );
+            std::thread::yield_now();
+        }
+    }
+
+    /// Runs `change` while another connection holds the record's write side, so that the change
+    /// has the state and waits for the record, and lets the record go after the clock has moved
+    /// on. Returns the moment the record was let go at, or before it.
+    fn behind_the_record_held(host: &Host, change: impl FnOnce(&Host) -> Report + Send) -> u64 {
+        let holder = Connection::open(host.root.path().join(PRIVACY_RECORD)).expect("the record");
+        holder
+            .execute_batch("BEGIN IMMEDIATE")
+            .expect("the record's write side is held");
+        let state = host.privacy.state();
+        let mut let_go_at = 0;
+        std::thread::scope(|scope| {
+            let changing = scope.spawn(|| change(host));
+            until_a_change_is_asked(&state, || changing.is_finished());
+            // Long enough for the change to be waiting for the record, which is all it has left to
+            // wait for. A change that was slower to start only shortens its wait.
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            assert!(!changing.is_finished(), "the change waits for the record");
+            let_go_at = after_the_clock_passes(kr_ipc::now_ms().get());
+            holder
+                .execute_batch("ROLLBACK")
+                .expect("the record is let go");
+            changing.join().expect("the change ends");
+        });
+        let_go_at
+    }
+
+    /// KR-REQ-15.20: a disabling takes the state's write side before it writes the record, as an
+    /// enabling does, so no reader holds the state it replaces when the record changes or when the
+    /// moment is read. The moment is stored with the generation and published as one value, after
+    /// everything the reader produced, and nothing stamped at or before it reaches a call.
+    #[test]
+    fn a_disabling_writes_after_the_readers_it_waits_for_and_publishes_the_moment_it_wrote() {
+        let mut host = Host::open();
+        host.privacy
+            .enable(&[], at(0), &standing)
+            .expect("privacy mode is enabled");
+        let on = stored_pair(&host);
+        let record = Connection::open(host.root.path().join(PRIVACY_RECORD)).expect("the record");
+        let state = host.privacy.state();
+        let reader = state.reading();
+        let mut produced_while_on = 0;
+        std::thread::scope(|scope| {
+            let disabling = scope.spawn(|| {
+                host.privacy
+                    .disable(at(10), &standing)
+                    .expect("privacy mode is disabled")
+            });
+            until_a_change_is_asked(&state, || disabling.is_finished());
+            let (generation, enabled): (i64, i64) = record
+                .query_row(
+                    "SELECT generation, enabled FROM privacy_record WHERE id = 0",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .expect("the record");
+            assert_eq!(
+                (generation, enabled),
+                (1, 1),
+                "the record is not written while a reader holds the state it replaces"
+            );
+            assert_eq!(stored_pair(&host), on, "nor is its pair");
+            // The reader still holds privacy mode on: from the first moment of the clock after
+            // this, nothing is produced under it.
+            produced_while_on = kr_ipc::now_ms().get();
+            after_the_clock_passes(produced_while_on);
+            drop(reader);
+            disabling.join().expect("the disabling ends");
+        });
+
+        let published = state.reading().published();
+        assert!(!published.private);
+        assert_eq!(
+            stored_pair(&host),
+            (Some(published.since_ms), Some(published.generation.get())),
+            "the record holds the moment and the generation that were published"
+        );
+        assert!(
+            published.since_ms > produced_while_on,
+            "published as of {}, while a reader held privacy mode on at {produced_while_on}",
+            published.since_ms
+        );
+        let held = |boundary: u64| {
+            let item = |text: &str, at: u64| ContextItem::new(text.to_owned(), at);
+            WorkerHalf {
+                messages: vec![
+                    item("produced while privacy mode stood", produced_while_on),
+                    item("produced after it", published.since_ms + 1),
+                ],
+                ..WorkerHalf::default()
+            }
+            .after(Some(boundary))
+            .messages
+            .into_iter()
+            .map(|item| item.text)
+            .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            held(published.since_ms),
+            ["produced after it"],
+            "a call is given nothing stamped at or before the moment"
+        );
+        host.reopen_privacy();
+        let restored = host.privacy.state().reading().published();
+        assert!(
+            !held(restored.since_ms).contains(&"produced while privacy mode stood".to_owned()),
+            "nor after a restart"
+        );
+    }
+
+    /// KR-REQ-15.20: a disabling that waits for the record's own transaction reads its moment once
+    /// the wait is over, and stores and publishes that moment.
+    #[test]
+    fn a_disabling_reads_its_moment_once_the_record_has_let_it_in() {
+        let host = Host::open();
+        host.privacy
+            .enable(&[], at(0), &standing)
+            .expect("privacy mode is enabled");
+        let let_go_at = behind_the_record_held(&host, |host| {
+            host.privacy
+                .disable(at(10), &standing)
+                .expect("privacy mode is disabled")
+        });
+        let published = host.privacy.state().reading().published();
+        assert!(!published.private);
+        assert!(
+            published.since_ms >= let_go_at,
+            "published as of {}, before the record let the change in at {let_go_at}",
+            published.since_ms
+        );
+        assert_eq!(
+            stored_pair(&host),
+            (Some(published.since_ms), Some(published.generation.get()))
+        );
+    }
+
+    /// KR-REQ-15.20: an enabling stores the moment it took effect with its generation, reads it
+    /// once the record's own wait is over, and publishes that moment and not the one it was asked
+    /// for.
+    #[test]
+    fn an_enabling_reads_its_moment_once_the_record_has_let_it_in_and_publishes_what_it_wrote() {
+        let host = Host::open();
+        let let_go_at = behind_the_record_held(&host, |host| {
+            host.privacy
+                .enable(&[], at(10), &standing)
+                .expect("privacy mode is enabled")
+        });
+        let published = host.privacy.state().reading().published();
+        assert!(published.private);
+        assert!(
+            published.since_ms >= let_go_at,
+            "published as of {}, before the record let the change in at {let_go_at}",
+            published.since_ms
+        );
+        assert_eq!(
+            stored_pair(&host),
+            (Some(published.since_ms), Some(published.generation.get()))
+        );
+    }
+
+    /// KR-REQ-15.20: an enabling waits for the admissions taken before it, and its moment is read
+    /// after that wait.
+    #[test]
+    fn an_enabling_reads_its_moment_after_the_admissions_it_waited_for() {
+        let host = Host::open();
+        let state = host.privacy.state();
+        let admission = state
+            .admit_send(PrivacyGeneration::INITIAL)
+            .expect("an exchange is admitted while privacy mode is off");
+        let mut produced = 0;
+        std::thread::scope(|scope| {
+            let enabling = scope.spawn(|| {
+                host.privacy
+                    .enable(&[], at(10), &standing)
+                    .expect("privacy mode is enabled")
+            });
+            until_a_change_is_asked(&state, || enabling.is_finished());
+            produced = kr_ipc::now_ms().get();
+            after_the_clock_passes(produced);
+            drop(admission);
+            enabling.join().expect("the enabling ends");
+        });
+        let published = state.reading().published();
+        assert!(
+            published.since_ms > produced,
+            "published as of {}, while an exchange was admitted at {produced}",
+            published.since_ms
+        );
+        assert_eq!(
+            stored_pair(&host),
+            (Some(published.since_ms), Some(published.generation.get()))
+        );
+    }
+
     /// KR-REQ-24.27: a disabling that is refused, or whose store refuses the write, leaves the row
     /// it found: privacy mode on at its generation, nothing published and nothing left raised. One
     /// that stops after the record committed and before it published leaves the new row whole, and
@@ -3528,6 +3824,7 @@ mod tests {
             .read()
             .expect("the record reads");
         let published_on = state.now();
+        let pair_on = stored_pair(&host);
         let stands_as_it_was = |host: &Host| {
             let stored = host
                 .privacy
@@ -3536,6 +3833,7 @@ mod tests {
                 .read()
                 .expect("the record reads");
             assert_eq!(stored, on, "the row is the one found");
+            assert_eq!(stored_pair(host), pair_on, "and so is its pair");
             assert_eq!(state.now(), published_on, "nothing was published");
             assert!(!state.observed().changing, "nothing is left raised");
         };
@@ -3590,6 +3888,11 @@ mod tests {
             .expect("the record reads");
         assert!(!off.enabled);
         assert_eq!(off.generation, PrivacyGeneration::new(2));
+        assert_eq!(
+            stored_pair(&host).1,
+            Some(2),
+            "the row that committed carries its own pair"
+        );
         assert!(state.now().private, "nothing was published");
         let started = kr_ipc::now_ms().get();
         host.reopen_privacy();
