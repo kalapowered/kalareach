@@ -2733,7 +2733,11 @@ boundary: code that runs as your account is not stopped by it. Where the command
 session, run it in a terminal that was not opened through the KalaReach profile, or an SSH login.
 Where a worker cannot say, another terminal gets the same refusal: the command says that it is not
 known whether the terminal is inside a session, and to run the checks again when that session
-answers or has ended.
+answers or has ended. Where the host's own records cannot be read (its directories, this boot or
+its environments, an environment's sessions, or a session's descriptor), no session is the one that
+did not say: the command says that it is not known whether the terminal is inside a session, that
+`kr doctor` says why the host's records cannot be read, and to run the checks again when it
+reports no fault.
 
 A run that ends without findings is a failure, exit 1, and the message says why in the words the
 setup page uses: no session of the kind the host creates is running, or the session's worker
