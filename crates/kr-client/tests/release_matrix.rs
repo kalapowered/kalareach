@@ -188,7 +188,7 @@ mod the_signing_bytes_agree_with_the_websites {
 /* -------------------------------------------------------------------------- */
 
 /// KR-REQ-17.46: the matrix the managed service publishes, saved whole as it was served, verifies
-/// under the key this build pins and serves release 0.78.0 the compatible tier.
+/// under the key this build pins and serves release 0.79.0 the compatible tier.
 ///
 /// The fixture is a single reply of the public route, kept byte for byte. It is read again when the
 /// pin or the schema changes, and replaced by a newer reply when the published ranges move.
@@ -207,7 +207,7 @@ mod the_deployed_document {
             Document::verify(DEPLOYED, &Pins::production()).expect("the deployed matrix verifies");
         assert_eq!(document.revision(), 2);
         assert_eq!(
-            document.serve(build(0, 78, 0)),
+            document.serve(build(0, 79, 0)),
             Verdict::Served { compatible: true },
             "the release the matrix was published for is in the compatible tier"
         );
@@ -452,16 +452,16 @@ mod nothing_unverified_is_acted_on {
     const NOW: u64 = 1_000;
 
     fn this_build() -> PackageVersion {
-        build(0, 78, 0)
+        build(0, 79, 0)
     }
 
     fn skew_matrix(revision: &str) -> Value {
         // The compatible tier ends before this build: it is in no tier.
-        matrix(revision, ("0.70.0", "0.77.99"), ("0.70.0", "0.77.99"))
+        matrix(revision, ("0.70.0", "0.78.99"), ("0.70.0", "0.78.99"))
     }
 
     fn supported_matrix(revision: &str) -> Value {
-        matrix(revision, ("0.70.0", "0.78.99"), ("0.70.0", "0.78.99"))
+        matrix(revision, ("0.70.0", "0.79.99"), ("0.70.0", "0.79.99"))
     }
 
     fn take_under(
@@ -663,7 +663,7 @@ mod nothing_unverified_is_acted_on {
     fn a_higher_revision_replaces_and_the_same_revision_is_a_reread_by_the_reading_build() {
         let key = AuthorisationKeyPair::generate().expect("a key pair");
         let held = HeldMatrix::none();
-        let older_build = build(0, 77, 4);
+        let older_build = build(0, 78, 4);
         take(&held, &key, &skew_matrix("5"), older_build, NOW).expect("held");
         // After an update the copy was read by the older build: this build does not act on its skew.
         let view = held.view(ORIGIN, this_build()).expect("a copy");

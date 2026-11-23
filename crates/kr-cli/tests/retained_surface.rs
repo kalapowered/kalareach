@@ -122,54 +122,7 @@ struct Same {
     reason: &'static str,
 }
 
-const SAME: &[Same] = &[
-    Same {
-        root: "the attention text a worker serves",
-        digest: "e93a3879ea3bcb47d54d7e68724a6f0f4381abe849272bc6a8d52bb593042edb",
-        reason: "A host event of a kind that carries a line of identifiers is answered with the \
-                 words after the line, as its page carries them, and not with the line and the \
-                 words together. The retained level answers the whole detail for every kind. A \
-                 kind it writes without such a line is answered as before; for the adapter \
-                 kinds, whose first line names the package, the answer is now the warning alone, \
-                 which is what their page has always carried.",
-    },
-    Same {
-        root: "AttentionSource",
-        digest: "415befd07fa85ab6141cfc8fcdde142f37070a4889f3444e326fe2a1e02e585f",
-        reason: "Only the description of the host events source changed: it now says the source \
-                 also holds the turns and commands the worker records of the session's own work. \
-                 The sources, their names and what is accepted for each are as the retained \
-                 level has them.",
-    },
-    Same {
-        root: "AttentionHostRecord",
-        digest: "5e8a7b903039d58297233e2b2b1ce7f986d6d6161f058cf1bb0917ffb71e8878",
-        reason: "A member that is absent from the wire unless this build's worker recorded an agent \
-             turn that ended or a command that failed. A worker of the retained level never \
-             writes it, and this build reads a record without it as one that records no such \
-             work, so what that level writes is read as before.",
-    },
-    Same {
-        root: "Sentence",
-        digest: "423f7e31f152001115ead12955b5c3e2eb0b960ddf22eaf43497f413300ae634",
-        reason: "Only a row of the export table changed: the class of a desktop context's account \
-                 number is a name where it was a number, so a sentence that quoted the field \
-                 would withhold it. No sentence quotes it, and the export of a desktop context \
-                 writes the number as none. The retained level carries no desktop context, so \
-                 nothing it reads or writes changes, and the rules by which a sentence is read \
-                 are as that level has them.",
-    },
-    Same {
-        root: "the envelope a worker checks",
-        digest: "670be1d3a4a028b44f5f5fbc5c7cb20eeed1398c6fef1ef521d2fffa69934143",
-        reason: "The session is now the caller's: the check takes it as a parameter, held across \
-                 the envelope's checks, where it took the session itself for the read of the \
-                 session's identifier and epoch and let it go. No check changed. The environment, \
-                 the session, the epoch, the resources and the grant are asked in the same order \
-                 of the same values, so what a worker of the retained level accepts and refuses \
-                 for an envelope is as that level has it.",
-    },
-];
+const SAME: &[Same] = &[];
 
 /// The rules of the surface, as the roots the walker follows them from:
 ///
@@ -230,6 +183,17 @@ fn roots(tree: &Tree) -> Vec<Root> {
         "the envelope a worker checks",
         "kr_worker",
         &["check_envelope"],
+        Depth::Alone,
+    ));
+    // The rule that refuses a resource named on a plugin action. The root is the function alone, so
+    // no digest binds where it is called or on which actions. Two cases of `kr-worker`'s
+    // `agent_service` test fail when the call is removed:
+    // `a_resource_named_on_an_action_that_answers_no_request_is_refused_before_its_marker` and
+    // `a_resource_named_on_a_presentation_action_is_refused_by_the_rule_before_its_route`.
+    roots.push(root(
+        "the resource a plugin action names",
+        "kr_worker",
+        &["Broker::check_resource_named"],
         Depth::Alone,
     ));
     roots

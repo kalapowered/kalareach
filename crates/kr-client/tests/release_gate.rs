@@ -35,7 +35,7 @@ const PAYER: &str = "/api/relay/payer-authorisation/sign-in";
 const ADMISSION: &str = "/api/relay/admission";
 
 fn this_build() -> PackageVersion {
-    PackageVersion::new(0, 78, 0)
+    PackageVersion::new(0, 79, 0)
 }
 
 /// An installation's authorisation key, held the way a client holds one.
@@ -108,14 +108,14 @@ fn matrix(revision: &str, highest: &str) -> Value {
     })
 }
 
-/// A matrix that lists this build (0.78.0).
+/// A matrix that lists this build (0.79.0).
 fn supporting(revision: &str) -> Value {
-    matrix(revision, "0.78.99")
+    matrix(revision, "0.79.99")
 }
 
-/// A matrix that lists nothing at 0.78.
+/// A matrix that lists nothing at 0.79.
 fn skewing(revision: &str) -> Value {
-    matrix(revision, "0.77.99")
+    matrix(revision, "0.78.99")
 }
 
 /// The stand-in, the signer of its matrix, and the copy a host holds of it.

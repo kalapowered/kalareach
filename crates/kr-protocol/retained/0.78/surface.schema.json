@@ -742,6 +742,11 @@
       ],
       "type": "object"
     },
+    "AgentTurnId": {
+      "maxLength": 256,
+      "minLength": 1,
+      "type": "string"
+    },
     "AnswerRecord": {
       "additionalProperties": false,
       "properties": {
@@ -1083,6 +1088,16 @@
         },
         "sequence": {
           "$ref": "#/$defs/U64"
+        },
+        "session_event": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SessionEventNotice"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "text": {
           "anyOf": [
@@ -6501,6 +6516,52 @@
     "SessionEpoch": {
       "pattern": "^(0|[1-9][0-9]*)$",
       "type": "string"
+    },
+    "SessionEventNotice": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "turn_completed": {
+              "additionalProperties": false,
+              "properties": {
+                "turn_id": {
+                  "$ref": "#/$defs/AgentTurnId"
+                }
+              },
+              "required": [
+                "turn_id"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "turn_completed"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "command_completed": {
+              "additionalProperties": false,
+              "properties": {
+                "exit_status": {
+                  "$ref": "#/$defs/U64"
+                }
+              },
+              "required": [
+                "exit_status"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "command_completed"
+          ],
+          "type": "object"
+        }
+      ]
     },
     "SessionId": {
       "format": "uuid",
