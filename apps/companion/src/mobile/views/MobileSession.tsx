@@ -52,6 +52,7 @@ import {
   composerInstance,
   composerOffers,
   hasUnreadRequest,
+  slashCommandsFor,
   subjectOf,
   withheldTotal
 } from '../../model/agent'
@@ -259,6 +260,9 @@ export function MobileSession({
   const busy = busyUnder === (token ?? '')
   // Whether the terminal's status shows all it says, rather than its first two lines.
   const [statusOpen, setStatusOpen] = useState(false)
+  // Whether the commands the agent advertises are listed under the field: while the person types a
+  // draft that starts with a slash, until they choose one.
+  const [slashOpen, setSlashOpen] = useState(false)
   const statusId = useId()
   const modeButtonId = useId()
   const noControlId = useId()
@@ -287,7 +291,7 @@ export function MobileSession({
   const held = composers.find((each) => each.target.sessionId === sessionId)
   // The conversation the session's agent is in now: what a draft is written for, and what it is
   // checked against before it is sent.
-  const { instance: liveInstance, binding: liveBinding, capabilities } = session.agent
+  const { instance: liveInstance, binding: liveBinding, capabilities, commands } = session.agent
   const currentTarget: DraftTarget | null = useMemo(
     () =>
       liveInstance === null || liveBinding === null
@@ -395,6 +399,8 @@ export function MobileSession({
           }).submit,
     [over, session.agent.instances, liveInstance, liveBinding, capabilities, rights]
   )
+  // The commands the draft asks for while it starts with a slash.
+  const offeredCommands = useMemo(() => slashCommandsFor(commands, draft.text), [commands, draft.text])
 
   /**
    * Records what the person typed on top of the draft as it is stored now.
@@ -1111,10 +1117,14 @@ export function MobileSession({
       id={`composer-${sessionId}`}
       rows={pane === 'terminal' ? 1 : undefined}
       value={draft.text}
-      placeholder="Message this session"
+      // The field as the composer's line is one short line beside Send, with no room for more.
+      placeholder={
+        commands.length > 0 && !asLine ? 'Message this session, or type / for a command' : 'Message this session'
+      }
       aria-describedby={describedBy}
       onChange={(event) => {
         typeInto(event.target.value)
+        setSlashOpen(event.target.value.startsWith('/'))
       }}
       onKeyDown={(event) => {
         // Control-Tab and Control-Shift-Tab move on from the field as they do from the program's
@@ -1650,6 +1660,28 @@ export function MobileSession({
               </>
             ) : null}
           </div>
+
+          {typingToProgram || !slashOpen || offeredCommands.length === 0 ? null : (
+            <ul className="m-slash-commands" data-testid="slash-commands">
+              {offeredCommands.map((command) => (
+                <li key={command.name}>
+                  <Button
+                    data-wraps
+                    style={{ minBlockSize: target }}
+                    onClick={() => {
+                      typeInto(`/${command.name} `)
+                      setSlashOpen(false)
+                      // The person goes on typing what the command takes, so the field keeps the focus.
+                      document.getElementById(`composer-${sessionId}`)?.focus()
+                    }}
+                  >
+                    <code>/{command.name}</code>
+                    <span className="m-slash-summary">{command.summary}</span>
+                  </Button>
+                </li>
+              ))}
+            </ul>
+          )}
 
           {pane === 'semantic' ? (
             <>

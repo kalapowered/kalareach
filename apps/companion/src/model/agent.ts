@@ -12,6 +12,7 @@
 
 import type {
   AgentBindingState,
+  AgentCommand,
   AgentInstanceSummary,
   AgentMutationTarget,
   AgentSnapshotEntry,
@@ -413,6 +414,20 @@ export function composerOffers({
     interrupt: offer('interrupt'),
     answer: offer('answer')
   }
+}
+
+/**
+ * The commands a draft that starts with a slash asks for: those the agent advertises whose name
+ * starts with what follows the slash, in the agent's order. A draft that does not start with a
+ * slash asks for none.
+ */
+export function slashCommandsFor(
+  commands: readonly AgentCommand[],
+  draftText: string
+): readonly AgentCommand[] {
+  if (!draftText.startsWith('/')) return []
+  const typed = draftText.slice(1).toLowerCase()
+  return commands.filter((command) => command.name.toLowerCase().startsWith(typed))
 }
 
 /** What decides whether a file is offered. */

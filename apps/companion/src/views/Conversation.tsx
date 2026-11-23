@@ -61,6 +61,7 @@ import {
   drawnUnder,
   hasUnreadRequest,
   invocationOf,
+  slashCommandsFor,
   subjectOf,
   targetOf,
   withheldTotal,
@@ -1585,9 +1586,7 @@ function Composer({
 }): ReactNode {
   const [showCommands, setShowCommands] = useState(false)
   const reasonId = useId()
-  const typed = draft.text.startsWith('/') ? draft.text.slice(1).toLowerCase() : null
-  const offered =
-    typed === null ? [] : commands.filter((command) => command.name.toLowerCase().startsWith(typed))
+  const offered = slashCommandsFor(commands, draft.text)
   // Why the agent cannot take a message at all comes first, for every draft, an empty one included.
   // The draft's own reason follows it: a detached, conflicted or empty draft says so.
   const reasons = [offers.submit.offered ? null : offers.submit.reason, notSubmittableBecause(draft)].filter(
