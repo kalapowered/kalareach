@@ -1596,8 +1596,8 @@ pub(super) async fn read_bundle(
     };
     diagnose(seen, position)?;
     let key = seed.bundle_key_for(context)?;
-    // A bundle that opened and cannot be read was written by a later build, and is not one that
-    // failed to open: the first says what it needs, the second that the key was wrong.
+    // A bundle that opened and cannot be read is not one that failed to open: the first says that
+    // a later version may have written it, the second that the key was wrong.
     let bundle = kr_crypto::archive::decrypt_recovery_bundle(&key, &ciphertext).map_err(
         |error| match error {
             kr_crypto::CryptoError::Unreadable { .. } => RecoveryError::BundleNeedsANewerKr,

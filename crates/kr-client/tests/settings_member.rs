@@ -326,7 +326,8 @@ fn a_member_that_cannot_be_written_or_read_is_unusable_settings() {
 }
 
 /// KR-REQ-20.17: a bundle that opened under the kit and holds what this build does not read, as a
-/// later build writes it, says what it needs; one that did not open says it did not authenticate.
+/// later build writes it, says that a later version may have written it and to update; one that did
+/// not open says it did not authenticate.
 #[tokio::test]
 async fn a_bundle_that_opened_and_cannot_be_read_says_what_it_needs() {
     let seed = RecoverySeed::generate().expect("a seed");
@@ -353,7 +354,8 @@ async fn a_bundle_that_opened_and_cannot_be_read_says_what_it_needs() {
     assert!(matches!(error, RecoveryError::BundleNeedsANewerKr));
     assert_eq!(
         error.to_string(),
-        "this bundle holds saved settings that need `kr` 0.79 or later"
+        "Your recovery bundle opened, but this version of KalaReach cannot read it. A later \
+         version may have written it. Update KalaReach, then try again."
     );
 
     // The same bytes under another seed do not open, which is another failure.

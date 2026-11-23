@@ -136,13 +136,18 @@ pub enum RecoveryError {
     /// nothing else: no writer key is taken from the archive to make up for it.
     #[error("the recovery bundle did not authenticate at that origin and locator")]
     BundleNotAuthentic,
-    /// The bundle opened under the key the kit derives and holds what this build does not read.
+    /// The bundle opened under the key the kit derives and this build cannot read what it holds.
     ///
-    /// It authenticated, so it is what its owner wrote, and the bytes were not changed on the way:
-    /// a later build wrote it with a member this build has no name for, which is what saved
-    /// settings are to a build from before them. It is told apart from
-    /// [`Self::BundleNotAuthentic`], which says the key was wrong.
-    #[error("this bundle holds saved settings that need `kr` 0.79 or later")]
+    /// It authenticated, so it is what its owner wrote, and the bytes were not changed on the way.
+    /// A bundle that holds a member this build has no name for, a schema version it does not read,
+    /// or bytes that are not canonical or are past the limits arrives here, and a later version of
+    /// the program may have written it. The sentence names no version and no program but the
+    /// product, because the companion shows it too, on every read of the bundle. It is told apart
+    /// from [`Self::BundleNotAuthentic`], which says the key was wrong.
+    #[error(
+        "Your recovery bundle opened, but this version of KalaReach cannot read it. A later \
+         version may have written it. Update KalaReach, then try again."
+    )]
     BundleNeedsANewerKr,
     /// The settings saved with the bundle cannot be written, read or decoded.
     ///
