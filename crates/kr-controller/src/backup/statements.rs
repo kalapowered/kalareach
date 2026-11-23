@@ -151,6 +151,7 @@ impl Database {
     }
 
     /// Refuses or admits writes on this connection, for a caller that is only reading.
+    #[cfg(any(test, feature = "testing"))]
     pub(super) fn set_query_only(&mut self, query_only: bool) -> rusqlite::Result<()> {
         self.connection
             .pragma_update(None, "query_only", if query_only { "ON" } else { "OFF" })

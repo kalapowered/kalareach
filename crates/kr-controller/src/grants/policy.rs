@@ -31,7 +31,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use kr_protocol::account::{MEMBERSHIP_LEASE_MAX_LIFETIME_MS, OrganisationPolicy, PolicyAuthority};
+#[cfg(any(test, feature = "testing"))]
+use kr_protocol::account::MEMBERSHIP_LEASE_MAX_LIFETIME_MS;
+use kr_protocol::account::{OrganisationPolicy, PolicyAuthority};
 use kr_protocol::actor::ActorIngress;
 use kr_protocol::grant::{Grant, GrantExpiry};
 use kr_protocol::ids::{AccountId, AuthorityRevision, DeviceId, OrganisationId, PluginId};
@@ -1298,6 +1300,7 @@ impl HostPolicy {
 
     /// The longest a lease this host will install may last.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn maximum_lease_lifetime_ms() -> u64 {
         MEMBERSHIP_LEASE_MAX_LIFETIME_MS
     }

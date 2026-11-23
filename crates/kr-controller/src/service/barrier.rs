@@ -1589,6 +1589,7 @@ impl Controller {
     ///
     /// Returns an error when the registry cannot be written. The debt stays published then, every
     /// admission and forward is refused, and the debt pass, woken for it, raises the barrier.
+    #[cfg(any(test, feature = "testing"))]
     pub async fn revoke_authority(&self) -> Result<RevocationBarrier> {
         let own = self.publish_debts(&[(crate::grants::store::DebtId::fresh(), Reach::Host)]);
         self.barrier(own).await
@@ -2504,6 +2505,7 @@ impl Controller {
     /// # Errors
     ///
     /// Returns an error when the registry cannot be read.
+    #[cfg(any(test, feature = "testing"))]
     pub async fn revision_pending(&self) -> Result<Vec<SessionId>> {
         let registry = self.registry.lock().await;
         let revision = registry.authority_revision()?;

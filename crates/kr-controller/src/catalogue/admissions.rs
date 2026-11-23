@@ -200,6 +200,7 @@ fn measure<T: serde::Serialize + ?Sized>(value: &T) -> usize {
 /// # Errors
 ///
 /// Returns what the catalogue returned when its records, an index or a package cannot be read.
+#[cfg(any(test, feature = "testing"))]
 pub fn snapshot(
     catalogue: &Catalogue,
     bridges: &NativeBridges,

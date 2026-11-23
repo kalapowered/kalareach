@@ -291,6 +291,7 @@ impl WorkerBridge {
 
     /// Returns true when this is a member.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn holds(&self, session_id: SessionId) -> bool {
         self.members().members.contains_key(&session_id)
     }
@@ -408,6 +409,7 @@ impl WorkerBridge {
 
     /// Returns true when the member is reconciled at `revision`.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn reconciled(&self, session_id: SessionId, revision: u64) -> bool {
         self.members()
             .members

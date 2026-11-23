@@ -609,6 +609,7 @@ impl Controller {
     /// # Errors
     ///
     /// Returns the registry's refusal, or the archive's.
+    #[cfg(any(test, feature = "testing"))]
     pub async fn session_archive(
         self: &Arc<Self>,
         session_id: SessionId,

@@ -364,6 +364,7 @@ impl InstalledLease {
 
     /// The SHA-256 digest of its signing input.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn digest(&self) -> Digest256 {
         self.digest
     }
@@ -479,12 +480,14 @@ impl VerifiedEnrolment {
 
     /// The first revision's link: the organisation's identity.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn root(&self) -> &PolicyAuthorityLink {
         &self.root
     }
 
     /// The link of the revision the head named: what rotation is followed from.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn anchor(&self) -> &PolicyAuthorityLink {
         &self.anchor
     }
@@ -780,6 +783,7 @@ impl Enrolment {
 
     /// The links this host authenticated and keeps, oldest first.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn links(&self) -> &[PolicyAuthorityLink] {
         &self.links
     }
@@ -854,6 +858,7 @@ impl Enrolment {
     }
 
     /// Every lease installed for one member account, on any device.
+    #[cfg(any(test, feature = "testing"))]
     pub fn installed_for<'a>(
         &'a self,
         account_id: &'a AccountId,

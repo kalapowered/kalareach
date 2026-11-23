@@ -137,6 +137,7 @@ pub enum Incompleteness {
 impl Incompleteness {
     /// Returns a sentence for a person, naming what is missing rather than why it matters.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn describe(&self) -> String {
         match self {
             Self::JournalMissing => "this session's journal is not on this host".to_owned(),
@@ -199,6 +200,7 @@ pub struct Archive {
 impl Archive {
     /// Returns true when nothing is missing.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn is_complete(&self) -> bool {
         self.incompleteness.is_empty()
     }
@@ -347,6 +349,7 @@ pub struct RecoveryOwnership {
 impl RecoveryOwnership {
     /// The session whose stores this owns, and the only one it opens.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn session_id(&self) -> SessionId {
         self.session_id
     }
@@ -354,6 +357,7 @@ impl RecoveryOwnership {
     /// The identity the kernel confirmed had ended, where ownership rests on a death validated
     /// here.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn ended(&self) -> Option<&ProcessStartIdentity> {
         self.ended.as_ref()
     }
@@ -1215,6 +1219,7 @@ impl ArchiveService {
     ///
     /// Returns an error only when a path this host owns cannot be built. Everything about the
     /// stores themselves is reported as incompleteness.
+    #[cfg(any(test, feature = "testing"))]
     pub fn archive(&self, session_id: SessionId) -> Result<Archive> {
         self.archive_beside(session_id, None)
     }
@@ -1803,6 +1808,7 @@ impl ArchiveRetention {
 
     /// Returns true when this session keeps what was submitted to it.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn retains(&self, session_id: SessionId) -> bool {
         self.sessions.contains(&session_id)
     }
@@ -1815,12 +1821,14 @@ impl ArchiveRetention {
 
     /// Returns how many sessions are retained.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn len(&self) -> usize {
         self.sessions.len()
     }
 
     /// Returns true when no session is retained.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn is_empty(&self) -> bool {
         self.sessions.is_empty()
     }

@@ -49,12 +49,14 @@ use kr_delivery::journal::{
     Claim, ClaimedDelivery, DeliveryJournal, DeliveryState, DestinationRemoval, DueDelivery,
     Transition,
 };
+#[cfg(any(test, feature = "testing"))]
 use kr_delivery::preview;
 use kr_delivery::producer::{Producer, RecipientAuthority};
 use kr_delivery::push::{DeliveryStatus, NextAction, PushSender, SenderCredentials, StatusAnswer};
 use kr_ipc::paths::EnvironmentPaths;
 use kr_protocol::delivery::DestinationSecret;
 use kr_protocol::ids::PushSenderRecordId;
+#[cfg(any(test, feature = "testing"))]
 use kr_protocol::method::Method;
 use kr_protocol::push::{PushDeliveryCredential, PushDeliveryRequest};
 use kr_protocol::scalars::{NotificationPreviewKey, TimestampMs};
@@ -554,6 +556,7 @@ impl DeliveryModule {
 
     /// Returns true when this module serves `method`.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn serves(method: Method) -> bool {
         matches!(
             method,
@@ -787,6 +790,7 @@ impl DeliveryModule {
     /// to, an endpoint or a retry claim its kind does not take, or a credentialed kind with no
     /// credential of its kind kept under the identifier, and [`ControllerError::Storage`] when the
     /// secret store or the journal cannot be read or written.
+    #[cfg(any(test, feature = "testing"))]
     pub fn configure(&self, record: &DestinationRecord) -> Result<()> {
         self.configure_if(record, &|| Ok(())).map(|_| ())
     }
@@ -2276,6 +2280,7 @@ pub const fn first_preview_keys(update: PreviewKeyUpdate) -> PreviewKeys {
 /// # Errors
 ///
 /// Returns [`ControllerError::Storage`] when the request cannot be measured.
+#[cfg(any(test, feature = "testing"))]
 pub fn provider_payload_bytes(request: &PushDeliveryRequest) -> Result<u64> {
     preview::provider_payload_bytes(request).map_err(unavailable)
 }

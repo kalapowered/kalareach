@@ -50,6 +50,7 @@ impl Controller {
     /// a file that may since have moved. A document edited outside this daemon therefore takes
     /// effect - ceiling, fence and capability invalidation alike - the next time anything asks
     /// this question, rather than at the next restart.
+    #[cfg(any(test, feature = "testing"))]
     pub async fn effective_configuration(&self) -> kr_protocol::hostinfo::EffectiveConfiguration {
         let accepted = self.accept_configuration().await;
         self.report_configuration(&accepted).await

@@ -143,6 +143,7 @@ impl SingletonLock {
 
     /// Returns the generation this daemon speaks for.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn generation(&self) -> ControllerGeneration {
         self.generation
     }

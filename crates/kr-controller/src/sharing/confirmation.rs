@@ -110,6 +110,7 @@ impl ConfirmedAction {
 
     /// The digest this confirmation is about.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn action_digest(&self) -> Digest256 {
         self.action_digest
     }

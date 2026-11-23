@@ -55,16 +55,20 @@
 //! so waking up never brings an expired action window, lease or grant back.
 
 use std::process::{Child, Command, Stdio};
+#[cfg(any(test, feature = "testing"))]
 use std::sync::Arc;
 
 use kr_protocol::desktop::{
     InhibitionMechanism, InhibitionReason, PowerSource, SleepInhibitionSetting,
     SleepInhibitionState,
 };
+#[cfg(any(test, feature = "testing"))]
 use kr_protocol::hostinfo::configuration::Change;
 use kr_protocol::scalars::{Nullable, TimestampMs, U64};
+#[cfg(any(test, feature = "testing"))]
 use kr_transport::clock::{ContinuousClock, ContinuousInstant};
 
+#[cfg(any(test, feature = "testing"))]
 use crate::error::Result;
 
 /// How long a facility is given to exit after its input ends.
@@ -126,6 +130,7 @@ impl Demand {
 /// and one at a version this build does not know all read as off: the setting is the owner's
 /// explicit choice, so the absence of one is never taken for consent.
 #[must_use]
+#[cfg(any(test, feature = "testing"))]
 pub fn read(paths: &kr_ipc::paths::EnvironmentPaths) -> SleepInhibitionSetting {
     crate::config::sleep_inhibition(paths)
 }
@@ -138,6 +143,7 @@ pub fn read(paths: &kr_ipc::paths::EnvironmentPaths) -> SleepInhibitionSetting {
 /// # Errors
 ///
 /// Returns an error when the edit is refused or the state directory cannot be written.
+#[cfg(any(test, feature = "testing"))]
 pub fn write(
     paths: &kr_ipc::paths::EnvironmentPaths,
     chosen: SleepInhibitionSetting,
@@ -421,6 +427,7 @@ fn withheld_reason(
 /// spent. Waking up therefore never brings an expired action window, lease or grant back, and this
 /// function is the comparison that says so.
 #[must_use]
+#[cfg(any(test, feature = "testing"))]
 pub fn expired_at_wake(clock: &Arc<dyn ContinuousClock>, deadline: ContinuousInstant) -> bool {
     clock.now() >= deadline
 }

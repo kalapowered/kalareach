@@ -129,6 +129,7 @@ pub struct Answered {
 impl Answered {
     /// The frame this answers with.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn frame(&self) -> &ControlFrame {
         &self.frame
     }

@@ -286,6 +286,7 @@ impl MailSubmission {
 
     /// The same submission, keeping other deadlines.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn with_deadlines(mut self, deadlines: MailDeadlines) -> Self {
         self.deadlines = deadlines;
         self

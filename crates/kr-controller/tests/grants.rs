@@ -3407,20 +3407,14 @@ fn a_lease_the_pinned_policy_signing_authority_did_not_sign_is_refused() {
 // ---------------------------------------------------------------------------------------------
 
 /// KR-REQ-10.46: the host's feed takes its revisions from the host's own registry and never from a
-/// request, keeps a request's record until every enrolled host has acknowledged it, owes a
-/// synchronisation after a reconnect, states the next poll thirty seconds after the last
-/// synchronisation, shows an unreachable feed as stale without ceasing to serve work the host is
-/// authorised for, and gives back after a restart the revision it had accepted.
+/// request, keeps a request's record until every enrolled host has acknowledged it, shows an
+/// unreachable feed as stale, and gives back after a restart the revision it had accepted.
 #[test]
 fn only_the_host_issues_ordered_revisions_and_records_are_retained_until_acknowledged() {
     use kr_protocol::pairing::{RevocationRequest, RevocationTarget};
 
     let host = device_id(0xf0);
     let mut feed = AuthorityFeed::new(host, AuthorityRevision::new(3));
-    assert!(
-        feed.synchronisation_owed(),
-        "a host that has not heard from the feed owes a synchronisation before remote work"
-    );
 
     let published = |byte: u8| RevocationRequest {
         request_id: RevocationRequestId::new(Uuid::from_bytes([byte; 16])),
@@ -3550,24 +3544,14 @@ fn only_the_host_issues_ordered_revisions_and_records_are_retained_until_acknowl
         "a republished request after settlement is not taken as new"
     );
 
-    // Reconnecting owes a synchronisation again, and an unreachable feed is stale rather than
-    // silently current.
+    // An unreachable feed is stale rather than silently current.
     let clock = ManualClock::new();
     feed.synchronised(3_000, clock.now());
-    assert!(!feed.synchronisation_owed());
     assert!(!feed.status(clock.now()).stale);
-    assert_eq!(feed.next_poll_due_ms(), Some(33_000));
     feed.unreachable();
     assert!(feed.status(clock.now()).stale);
-    assert!(
-        !feed.synchronisation_owed(),
-        "an unreachable feed is not a reason to stop serving work this host is authorised for"
-    );
-    feed.reconnected();
-    assert!(feed.synchronisation_owed());
 
-    // What is written down comes back, and a restarted host owes a synchronisation whatever it
-    // last recorded.
+    // What is written down comes back, and a restarted host is stale whatever it last recorded.
     let stored = feed.snapshot();
     let restored = AuthorityFeed::restore(&stored, Some("https://feed.example"));
     assert_eq!(restored.accepted_revision(), feed.accepted_revision());
@@ -3590,7 +3574,6 @@ fn only_the_host_issues_ordered_revisions_and_records_are_retained_until_acknowl
             .map(|record| record.authority_revision),
         Some(Some(AuthorityRevision::new(4)))
     );
-    assert!(restored.synchronisation_owed());
     assert!(restored.status(clock.now()).stale);
 }
 
@@ -3828,51 +3811,6 @@ fn a_feed_stored_before_removals_were_kept_reads_back() {
             .last_synchronised_at_ms,
         Nullable::some(TimestampMs::new(5_000))
     );
-}
-
-/// KR-REQ-10.46: a host that has accepted a revision rejects a record at that revision and one
-/// below it, and accepts the one that follows.
-#[test]
-fn a_feed_record_at_or_below_the_accepted_revision_is_refused() {
-    use kr_protocol::pairing::AuthorityRevisionRecord;
-
-    let host = device_id(0xf0);
-    let mut feed = AuthorityFeed::new(host, AuthorityRevision::new(5));
-    let replayed = AuthorityRevisionRecord {
-        host_device_id: host,
-        authority_revision: AuthorityRevision::new(4),
-        previous_revision: AuthorityRevision::new(3),
-        applied_requests: CanonicalSet::from_iter([]),
-        issued_at_ms: TimestampMs::new(1_000),
-        host_key_id: kr_protocol::scalars::KeyId::from_bytes([7; 32]),
-        signature: Signature64::from_bytes([0; 64]),
-    };
-    assert_eq!(
-        feed.accept(&replayed),
-        Err(FeedRefusal::OutOfOrder {
-            accepted: AuthorityRevision::new(5),
-            offered: AuthorityRevision::new(4)
-        })
-    );
-    let repeated = AuthorityRevisionRecord {
-        authority_revision: AuthorityRevision::new(5),
-        previous_revision: AuthorityRevision::new(4),
-        ..replayed.clone()
-    };
-    assert_eq!(
-        feed.accept(&repeated),
-        Err(FeedRefusal::OutOfOrder {
-            accepted: AuthorityRevision::new(5),
-            offered: AuthorityRevision::new(5)
-        })
-    );
-    let following = AuthorityRevisionRecord {
-        authority_revision: AuthorityRevision::new(6),
-        previous_revision: AuthorityRevision::new(5),
-        ..replayed
-    };
-    feed.accept(&following).expect("the next one is accepted");
-    assert_eq!(feed.accepted_revision(), AuthorityRevision::new(6));
 }
 
 // ---------------------------------------------------------------------------------------------

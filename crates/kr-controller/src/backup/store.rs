@@ -260,6 +260,7 @@ impl AttemptStatus {
 
     /// Returns true when this host is still owed an answer about the attempt.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn is_open(self) -> bool {
         matches!(self, Self::Queued | Self::Dispatched)
     }
@@ -400,6 +401,7 @@ pub struct Obligation {
 impl Obligation {
     /// Returns a line naming what is owed, for a report a person reads.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn describe(&self) -> String {
         match self.last_error.as_deref() {
             Some(error) => format!(
@@ -721,6 +723,7 @@ impl BackupStore {
     /// # Errors
     ///
     /// Returns [`ControllerError::RegistryUnavailable`] when the database cannot be created.
+    #[cfg(any(test, feature = "testing"))]
     pub fn in_memory(staging_root: &Path) -> Result<Self> {
         std::fs::create_dir_all(staging_root).map_err(ControllerError::registry)?;
         Self::opened(
@@ -3424,6 +3427,7 @@ impl BackupStore {
     }
 
     #[doc(hidden)]
+    #[cfg(any(test, feature = "testing"))]
     pub fn set_query_only(&mut self, query_only: bool) -> Result<()> {
         self.connection
             .set_query_only(query_only)

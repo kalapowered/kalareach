@@ -121,7 +121,9 @@ pub use start::{BOOT_FILE, ControllerSetup, JOB_SWEEP_BOUND};
 use admission::{
     AdmittedConnection, FeedStanding, LeaseDenied, remaining_deadline, remaining_deadlines,
 };
-use barrier::{Debts, Reach};
+use barrier::Debts;
+#[cfg(any(test, feature = "testing"))]
+use barrier::Reach;
 use capabilities::DesktopReading;
 use create::PendingCreate;
 use inhibition::DemandScan;
@@ -1405,6 +1407,7 @@ impl Controller {
     /// The host's clock floor: the one reading of UTC every process of this environment decides
     /// from in this boot.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn utc_floor(&self) -> &Arc<crate::grants::policy::UtcFloor> {
         &self.utc_floor
     }
@@ -1872,12 +1875,14 @@ impl Controller {
     /// What reads this host's own mailbox, when its configuration document selects an authority
     /// feed, whose service holds that mailbox.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn mailbox_reader(&self) -> Option<&crate::mailbox_reader::MailboxReader> {
         self.mailbox_reader.as_ref()
     }
 
     /// What reads the signed release matrix, when this host's `relay.origin` is the managed service.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn release_matrix(&self) -> Option<&crate::release_matrix::ReleaseMatrixRuntime> {
         self.release_matrix.as_ref()
     }

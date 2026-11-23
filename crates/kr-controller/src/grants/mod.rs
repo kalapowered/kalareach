@@ -65,6 +65,7 @@ pub use store::{
     GrantRevocation, MAX_GRANTS_PER_TREE, OfferRecord, Probe, Scope, ShareSubject,
     an_owner_device_can_recover, can_recover,
 };
+#[cfg(any(test, feature = "testing"))]
 pub use vocabulary::{rights_for, unconditional_rights_for};
 
 /// One request, as the intersection sees it.
@@ -382,6 +383,7 @@ pub struct Permitted {
 impl Permitted {
     /// Returns true when every requirement of the method was answered here.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn is_complete(&self) -> bool {
         self.unresolved.is_empty()
     }

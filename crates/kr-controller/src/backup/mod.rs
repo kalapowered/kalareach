@@ -51,10 +51,12 @@ use kr_worker::privacy::{
     Unavailable,
 };
 
+#[cfg(any(test, feature = "testing"))]
+use crate::backup::store::PrivacyRequest;
 use crate::backup::store::{
     Attempt, AttemptStatus, BackupStore, FenceRelease, GenerationRecord, MadeFrom, NewGeneration,
-    NewObject, ObjectRecord, Obligation, ObligationKind, PrivacyRequest, PrivacyStatus,
-    Publication, Remote, Setup, SetupCommit, SetupRecord, Step,
+    NewObject, ObjectRecord, Obligation, ObligationKind, PrivacyStatus, Publication, Remote, Setup,
+    SetupCommit, SetupRecord, Step,
 };
 use crate::error::{ControllerError, Result};
 
@@ -194,6 +196,7 @@ pub struct OutstandingWork {
 impl OutstandingWork {
     /// Returns true when nothing is left: no fence, no obligation, no unanswered attempt.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn is_complete(&self) -> bool {
         self.obligations.is_empty()
             && self.failed_steps.is_empty()
@@ -204,6 +207,7 @@ impl OutstandingWork {
 
     /// Returns a line per outstanding thing, for a report a person reads.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn describe(&self) -> Vec<String> {
         let mut lines: Vec<String> = self.obligations.iter().map(Obligation::describe).collect();
         if self.dispatched_attempts > 0 {
@@ -251,6 +255,7 @@ pub struct Reconciliation {
 impl Reconciliation {
     /// Returns true when there was nothing to reconcile.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn is_empty(&self) -> bool {
         self.resumed.is_empty()
             && self.no_longer_authorised.is_empty()
@@ -364,6 +369,7 @@ impl BackupService {
     /// # Errors
     ///
     /// Returns [`ControllerError::RegistryUnavailable`] when the store cannot be created.
+    #[cfg(any(test, feature = "testing"))]
     pub fn in_memory(staging_root: &Path) -> Result<Self> {
         let store = BackupStore::in_memory(staging_root)?;
         let binding = binding_of(&store)?;
@@ -504,6 +510,7 @@ impl BackupService {
     ///
     /// Returns [`ControllerError::RegistryUnavailable`] when the store cannot be read. The error
     /// is the answer: a host that cannot read what it owes does not owe nothing.
+    #[cfg(any(test, feature = "testing"))]
     pub fn obligations(&self) -> Result<Vec<Obligation>> {
         self.store().obligations()
     }
@@ -519,6 +526,7 @@ impl BackupService {
 
     /// Returns the directory this service's staged ciphertext lives in, and owns exclusively.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn staging_root(&self) -> PathBuf {
         self.store().staging_root().to_path_buf()
     }
@@ -533,6 +541,7 @@ impl BackupService {
     ///
     /// Returns [`ControllerError::InvalidArgument`] when the generation is older than the one in
     /// force, and [`ControllerError::RegistryUnavailable`] when the store refuses the write.
+    #[cfg(any(test, feature = "testing"))]
     pub fn accept_privacy_request(
         &self,
         generation: PrivacyGeneration,
@@ -831,6 +840,7 @@ impl BackupService {
     }
 
     #[doc(hidden)]
+    #[cfg(any(test, feature = "testing"))]
     pub fn set_query_only(&self, query_only: bool) -> Result<()> {
         self.store().set_query_only(query_only)
     }
@@ -1354,6 +1364,7 @@ impl BackupService {
 
     /// Whether a production pass holds the staging directory now.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn production_running(&self) -> bool {
         self.leases().any()
     }
@@ -1933,6 +1944,7 @@ impl BackupService {
     /// # Errors
     ///
     /// Returns [`ControllerError::RegistryUnavailable`] when the store cannot be read.
+    #[cfg(any(test, feature = "testing"))]
     pub fn fenced_at(&self) -> Result<Option<u64>> {
         self.store().fenced_at()
     }

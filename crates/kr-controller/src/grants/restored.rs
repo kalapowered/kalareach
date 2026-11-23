@@ -86,6 +86,7 @@ pub struct Record {
 impl Record {
     /// A record of this format that owes nothing.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn of(subject: Digest256, found_at_ms: TimestampMs) -> Self {
         Self {
             version: RECORD_VERSION,
@@ -279,6 +280,7 @@ pub fn read(file: &Path) -> Found {
 /// Returns an error when the record cannot be written. What was there is then as it was, except
 /// when the file was replaced and the directory then could not be flushed: the new file is there,
 /// and the error says the write is not known to be durable.
+#[cfg(any(test, feature = "testing"))]
 pub fn write(file: &Path, record: &Record) -> Result<()> {
     publish(file, &encode(record)?)
 }
@@ -415,6 +417,7 @@ impl Kept {
 
     /// The record known to be durable.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn record(&self) -> Option<&Record> {
         if self.durable {
             self.known.as_ref()

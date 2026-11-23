@@ -24,9 +24,8 @@ use kr_client::services::authority::{
     AUTHORITY_SYNC_PATH, FeedAnnouncement, MAX_AUTHORITY_REQUEST_BYTES, RejectionReason,
     announcement_expiry,
 };
-use kr_client::services::http::ExchangePhase;
 use kr_client::services::signed::SignedService;
-use kr_controller::grants::feed::{AuthorityFeed, Basis, FeedRefusal};
+use kr_controller::grants::feed::{AuthorityFeed, Basis};
 use kr_crypto::envelope::{PairedSenders, ReplayLedger, open_delivered_envelope, seal_envelope};
 use kr_crypto::keys::StoredEnvelopeKeyPair;
 use kr_pairing::grants::{
@@ -749,56 +748,25 @@ async fn kr_req_10_46_an_acknowledgement_outside_the_revision_that_applied_it_is
     .await;
 }
 
-/// KR-REQ-10.46: a host is the sole issuer of its ordered authority revisions, and it rejects one
-/// at or below the revision it has accepted, whether it is running or has come back from the
-/// snapshot it writes down. What the snapshot is written to and read from is the controller's own
-/// store and is not exercised here.
+/// KR-REQ-10.46: a host is the sole issuer of its ordered authority revisions: a record rebuilt
+/// from the snapshot it writes down holds the revision it accepted, and the deployment refuses an
+/// owner's revision, a gap and a rewrite. What the snapshot is written to and read from is the
+/// controller's own store and is not exercised here.
 #[tokio::test]
 async fn kr_req_10_46_a_revision_that_does_not_follow_the_accepted_one_is_rejected() {
     leg(|feed| async move {
-        // The host's own record rejects a revision at or below the one it has accepted, whatever
-        // its signature says, so a replayed feed entry cannot put authority back.
+        // What the host accepted is what its snapshot carries: a record rebuilt from one holds the
+        // same revision, and it is stale because what it knew before it stopped is not evidence
+        // about the feed now. Writing that snapshot down and reading it back is the controller's
+        // own store, which this leg does not reach.
         let mut held = AuthorityFeed::new(feed.host.device_id(), AuthorityRevision::new(5));
-        let stale = feed.revision(AuthorityRevision::new(3), &[]);
-        assert_eq!(stale.authority_revision, AuthorityRevision::new(4));
-        assert_eq!(
-            held.accept(&stale),
-            Err(FeedRefusal::OutOfOrder {
-                accepted: AuthorityRevision::new(5),
-                offered: AuthorityRevision::new(4),
-            })
-        );
-        let mut equal = feed.revision(AuthorityRevision::new(4), &[]);
-        equal.previous_revision = AuthorityRevision::new(4);
-        assert_eq!(equal.authority_revision, AuthorityRevision::new(5));
-        assert_eq!(
-            held.accept(&equal),
-            Err(FeedRefusal::OutOfOrder {
-                accepted: AuthorityRevision::new(5),
-                offered: AuthorityRevision::new(5),
-            }),
-            "the revision it already holds is not a later one"
-        );
         let following = feed.revision(AuthorityRevision::new(5), &[]);
-        held.accept(&following).expect("it follows what was held");
+        assert_eq!(following.authority_revision, AuthorityRevision::new(6));
+        held.note_revision(following.authority_revision);
         assert_eq!(held.accepted_revision(), AuthorityRevision::new(6));
-
-        // And what it accepted is what its snapshot carries: a record rebuilt from one holds the
-        // same revision and refuses that revision again, and it owes a synchronisation because what
-        // it knew before it stopped is not evidence about the feed now. Writing that snapshot down
-        // and reading it back is the controller's own store, which this leg does not reach.
-        let mut restarted = AuthorityFeed::restore(&held.snapshot(), None);
+        let restarted = AuthorityFeed::restore(&held.snapshot(), None);
         assert_eq!(restarted.accepted_revision(), AuthorityRevision::new(6));
-        assert!(restarted.synchronisation_owed());
         assert!(restarted.status(SystemContinuousClock::new().now()).stale);
-        assert_eq!(
-            restarted.accept(&following),
-            Err(FeedRefusal::OutOfOrder {
-                accepted: AuthorityRevision::new(6),
-                offered: AuthorityRevision::new(6),
-            }),
-            "the revision it came back holding is not one it accepts again"
-        );
 
         // An owner's client will not carry a host's revision at all, so nothing is sent.
         let never_sent = feed
@@ -880,72 +848,7 @@ async fn kr_req_10_46_a_revision_that_does_not_follow_the_accepted_one_is_reject
             Nullable(Some(first.authority_revision))
         );
 
-        "a revision is the host's own and follows the one already held: the record rejects an older revision and the one it already holds, a record restored from its snapshot keeps the revision it accepted and refuses that revision again, and the deployment refuses an owner's revision, a gap and a rewrite".to_owned()
-    })
-    .await;
-}
-
-/// KR-REQ-10.46: a host's record reports a synchronisation owed from the moment a connection is
-/// established until one has happened, and counts the next poll from the interval the feed states.
-/// Holding affected remote access back until it is not owed, and polling at that interval, are what
-/// a caller does with those two answers; what is proved here is the answers.
-#[tokio::test]
-async fn kr_req_10_46_a_synchronisation_is_owed_from_the_connection_until_one_happens() {
-    leg(|feed| async move {
-        // A host that has just connected owes a synchronisation, before any remote access it might
-        // affect.
-        let mut held = feed.record();
-        let clock = SystemContinuousClock::new();
-        assert!(held.synchronisation_owed());
-        assert!(held.status(clock.now()).stale);
-
-        // A feed that answered nothing does not satisfy it. The service the leg calls holds its own
-        // port and closes every connection it accepts, so the exchange ends at the socket.
-        let silent = SilentService::start().await;
-        let failure = silent
-            .deployment()
-            .authority_feed(&feed.host)
-            .read(feed.address(), None, true)
-            .await
-            .expect_err("nothing answers there");
-        assert_eq!(
-            failure.code(),
-            ErrorCode::OutcomeUnknown,
-            "a request that was written and not answered is an unknown outcome"
-        );
-        assert_eq!(
-            ExchangePhase::of(&failure),
-            Some(ExchangePhase::Request),
-            "the exchange ended with the request on its way"
-        );
-        held.unreachable();
-        assert!(
-            held.synchronisation_owed(),
-            "an attempt that reached nothing is not a synchronisation"
-        );
-
-        // An actual one does.
-        let at = now_ms();
-        let state = feed
-            .host_client
-            .read(feed.address(), None, true)
-            .await
-            .expect("the host reads its feed");
-        held.synchronised(at, clock.now());
-        assert!(!held.synchronisation_owed());
-        assert!(!held.status(clock.now()).stale);
-        assert_eq!(
-            u64::from(state.summary.poll_interval_seconds) * 1000,
-            held.next_poll_due_ms().expect("a poll is due") - at,
-            "the host polls at the interval the feed states while it is online"
-        );
-
-        // And a connection that was replaced owes one again.
-        held.reconnected();
-        assert!(held.synchronisation_owed());
-        assert!(held.status(clock.now()).stale);
-
-        "the record reports a synchronisation owed from the moment a connection is established, keeps reporting it after an attempt that was not answered, stops once a read succeeded, counts the next poll from the interval the feed states, and owes one again when the connection is replaced".to_owned()
+        "a revision is the host's own and follows the one already held: a record restored from its snapshot keeps the revision it accepted, and the deployment refuses an owner's revision, a gap and a rewrite".to_owned()
     })
     .await;
 }

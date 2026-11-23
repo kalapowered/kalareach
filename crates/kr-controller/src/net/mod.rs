@@ -315,6 +315,7 @@ impl NetworkGuard {
     }
 
     /// Stops accepting connections, ends this host's own tasks and closes the endpoint.
+    #[cfg(any(test, feature = "testing"))]
     async fn shutdown(&self) {
         self.stop_tasks();
         let listener = self
@@ -396,6 +397,7 @@ impl Network {
     /// # Errors
     ///
     /// Returns an error when a selected service cannot be expressed as a network hint.
+    #[cfg(any(test, feature = "testing"))]
     pub fn network_config(&self) -> Result<NetworkConfig> {
         self.guard.network_config()
     }
@@ -406,12 +408,14 @@ impl Network {
     /// They are not the sockets it bound: a socket bound to the unspecified address answers on the
     /// machine's own addresses, and the endpoint names those rather than the unspecified address.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn direct_addresses(&self) -> Vec<std::net::SocketAddr> {
         self.guard.direct_addresses()
     }
 
     /// Returns the sockets this endpoint is bound to, one per IP transport.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn bound_sockets(&self) -> Vec<std::net::SocketAddr> {
         self.guard.bound_sockets()
     }
@@ -522,12 +526,14 @@ impl Network {
 
     /// Returns the host's pairing service.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn pairing(&self) -> &Arc<PairingHost> {
         &self.guard.host.pairing
     }
 
     /// Returns the device directory this host authorises connections against.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn devices(&self) -> &Arc<DeviceDirectory> {
         &self.guard.host.devices
     }
@@ -546,6 +552,7 @@ impl Network {
     /// # Errors
     ///
     /// Returns an error when the record or the revision cannot be written.
+    #[cfg(any(test, feature = "testing"))]
     pub async fn revoke_device(
         &self,
         device_id: DeviceId,
@@ -642,6 +649,7 @@ impl Network {
     }
 
     /// Stops accepting connections and closes the endpoint.
+    #[cfg(any(test, feature = "testing"))]
     pub async fn shutdown(self) {
         self.guard.shutdown().await;
     }
@@ -695,6 +703,7 @@ pub const DEVICE_LIVE_CONNECTIONS: usize = 2 * DEVICE_CONNECTIONS_IN_USE;
 /// at the host's reading when another arrives, before the host may withdraw it for the new one: more
 /// than a keepalive interval, one reading and an allowance for delay. See the notes on
 /// [`DEVICE_LIVE_CONNECTIONS`].
+#[cfg(any(test, feature = "testing"))]
 pub const DEVICE_SILENT_FOR: std::time::Duration = heard::SILENT_FOR;
 
 /// The connections this host serves for each device, in the order they were counted.
@@ -1205,6 +1214,7 @@ impl NetworkHost {
     /// The order is the contract: the debt, then the live fence, the record and the barrier. A
     /// failure after the fence is reported with the fence standing rather than silently leaving it
     /// undone.
+    #[cfg(any(test, feature = "testing"))]
     async fn revoke_device(
         &self,
         device_id: DeviceId,
@@ -1286,6 +1296,7 @@ impl NetworkHost {
     /// Withdrawing the registration stops the next request; this stops the writes and releases
     /// what the connection owned at its worker, which is what a revoked device's attachment and
     /// input lease would otherwise keep holding.
+    #[cfg(any(test, feature = "testing"))]
     fn withdraw_device(&self, device_id: DeviceId) {
         for remote in self.live_connections(|remote| remote.device_id() == device_id) {
             remote.output().withdraw();

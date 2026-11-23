@@ -3031,6 +3031,7 @@ impl AutomationModule {
 
     /// Returns the service itself.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn service(&self) -> &Arc<AutomationService> {
         &self.service
     }

@@ -9,8 +9,11 @@
 //! What is here instead is the two questions a caller of the table asks that the table does not
 //! answer in that shape: which rights a method needs, and which methods a right reaches.
 
+#[cfg(any(test, feature = "testing"))]
 use kr_protocol::authority::{RequiredAuthority, RightCondition};
+#[cfg(any(test, feature = "testing"))]
 use kr_protocol::method::{Method, REGISTRY};
+#[cfg(any(test, feature = "testing"))]
 use kr_protocol::rights::ActionRight;
 
 /// Every right one method can require, including the ones required only under a condition.
@@ -18,6 +21,7 @@ use kr_protocol::rights::ActionRight;
 /// A caller that wants to know what a method might ask for uses this. A caller deciding one actual
 /// request uses [`super::decide`], which evaluates the conditions against that request.
 #[must_use]
+#[cfg(any(test, feature = "testing"))]
 pub fn rights_for(method: Method) -> Vec<ActionRight> {
     let mut rights: Vec<ActionRight> = entry(method)
         .required_rights
@@ -34,6 +38,7 @@ pub fn rights_for(method: Method) -> Vec<ActionRight> {
 
 /// The rights one method requires of every caller, whatever the request says.
 #[must_use]
+#[cfg(any(test, feature = "testing"))]
 pub fn unconditional_rights_for(method: Method) -> Vec<ActionRight> {
     let mut rights: Vec<ActionRight> = entry(method)
         .required_rights
@@ -49,6 +54,7 @@ pub fn unconditional_rights_for(method: Method) -> Vec<ActionRight> {
     rights
 }
 
+#[cfg(any(test, feature = "testing"))]
 fn entry(method: Method) -> &'static kr_protocol::authority::MethodEntry {
     REGISTRY
         .iter()

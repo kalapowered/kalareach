@@ -211,6 +211,7 @@ impl Accepted {
     /// without one describes: one reading, nothing outstanding, and this document's own numbers
     /// in force.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn in_force(resolver: Resolver, limits: HardLimits) -> Self {
         let sessions = session_limit_in_force(&resolver, limits).map_or(
             Enforced {
@@ -610,6 +611,7 @@ pub struct Applied {
 ///
 /// Returns [`ControllerError::Configuration`] when the document may not be edited, when the result
 /// does not validate, or when another writer moved the revision first.
+#[cfg(any(test, feature = "testing"))]
 pub fn apply(paths: &EnvironmentPaths, change: &Change, limits: HardLimits) -> Result<WrittenEdit> {
     apply_standing(paths, change, limits, &|write| write())
 }
@@ -1507,6 +1509,7 @@ pub fn secret_line(effective: &EffectiveConfiguration) -> Sentence {
 /// The one reader the power module and the diagnostics both use, so the setting and the report
 /// about it can never disagree.
 #[must_use]
+#[cfg(any(test, feature = "testing"))]
 pub fn sleep_inhibition(paths: &EnvironmentPaths) -> SleepInhibitionSetting {
     Resolver::open(paths).sleep_inhibition(None).value
 }

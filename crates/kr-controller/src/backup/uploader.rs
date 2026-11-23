@@ -317,6 +317,7 @@ pub enum Stepped {
 impl Stepped {
     /// One line for a report a person reads.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn describe(&self) -> String {
         match self {
             Self::Dispatched { sequence } => format!("backup attempt {sequence} is under way"),
@@ -537,6 +538,7 @@ pub struct PassReport {
 impl PassReport {
     /// One line per step, after the reason for an idle pass, for a report a person reads.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn describe(&self) -> Vec<String> {
         let mut lines: Vec<String> = match &self.idle {
             Some(Idle::Unready { reason }) => vec![format!("backup is not uploading: {reason}")],
@@ -1067,6 +1069,7 @@ impl Uploader {
     /// # Errors
     ///
     /// Returns [`ControllerError::RegistryUnavailable`] when the store cannot be read or written.
+    #[cfg(any(test, feature = "testing"))]
     pub async fn step(&mut self, now: TimestampMs) -> Result<Option<Stepped>> {
         self.next(now, &mut Turn::default()).await
     }

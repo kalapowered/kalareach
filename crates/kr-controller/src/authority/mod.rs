@@ -1047,6 +1047,7 @@ impl AuthorityBarrier {
 
     /// Returns the generation this barrier speaks for.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn generation(&self) -> ControllerGeneration {
         self.leases.generation()
     }
@@ -1410,6 +1411,7 @@ impl AuthorityBarrier {
 
     /// Returns true when renewal for this worker is fenced.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn is_fenced(&self, session_id: SessionId) -> bool {
         self.leases.is_fenced(session_id)
     }
@@ -1432,6 +1434,7 @@ impl AuthorityBarrier {
 
     /// Returns the lease a worker currently holds, if any.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn current_lease(&self, session_id: SessionId) -> Option<DispatchLease> {
         self.leases.current_lease(session_id)
     }
@@ -1452,6 +1455,7 @@ impl AuthorityBarrier {
     ///
     /// A worker nothing can ask about any more is not one of them.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn workers_held(&self) -> usize {
         self.leases.workers_held()
     }

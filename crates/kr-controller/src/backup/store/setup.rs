@@ -91,6 +91,7 @@ impl BackupStore {
     /// # Errors
     ///
     /// Returns [`ControllerError::RegistryUnavailable`] when the store cannot be read.
+    #[cfg(test)]
     pub fn privacy_generation(&self) -> Result<u64> {
         Ok(u64::try_from(super::current_generation(&self.connection)?).unwrap_or(0))
     }

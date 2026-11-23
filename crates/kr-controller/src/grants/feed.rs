@@ -20,9 +20,6 @@
 //!   not share mailbox expiry or notification coalescing, so [`AuthorityFeed::retained`] holds them
 //!   until [`AuthorityFeed::acknowledge`] has heard from each enrolled host or that host is
 //!   explicitly removed.
-//! * **A synchronisation is owed from the moment a connection is established.**
-//!   [`AuthorityFeed::synchronisation_owed`] is the question a connection asks, and it stays true
-//!   until a synchronisation has actually happened.
 //! * **When the feed is unavailable, the status is stale and says so.** It is never reported as
 //!   up to date because nothing contradicted it: [`AuthorityFeed::status`] reads as stale when the
 //!   carrier said so, when the last synchronisation is older than [`STALE_AFTER`] (three polls) on
@@ -38,8 +35,8 @@
 //! records it still owes delivery of, which enrolled hosts have answered, and whether what it is
 //! showing is current. It is not the transport. Validating a remote owner's authority over a
 //! published request, applying that request's revocation, signing an acknowledgement, holding
-//! remote work back until the synchronisation it says is owed has happened, and polling every
-//! thirty seconds are each somebody's to do with this record; none of them happens inside it. The
+//! remote work back until a synchronisation has happened, and polling every thirty seconds are
+//! each somebody's to do with this record; none of them happens inside it. The
 //! web side of the feed - the durable service that stores and distributes these records - is the
 //! web repository's.
 
@@ -47,7 +44,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use kr_protocol::ids::{AuthorityRevision, DeviceId, RevocationRequestId};
-use kr_protocol::pairing::{AuthorityRevisionRecord, RevocationRequest};
+use kr_protocol::pairing::RevocationRequest;
 use kr_protocol::scalars::{Nullable, TimestampMs};
 use kr_protocol::sharing::AuthorityFeedStatus;
 use kr_transport::clock::ContinuousInstant;
@@ -128,13 +125,6 @@ pub struct Basis<'a> {
 /// Why this host would not act on a feed entry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FeedRefusal {
-    /// The record's revision is at or below the one this host has accepted.
-    OutOfOrder {
-        /// What this host holds.
-        accepted: AuthorityRevision,
-        /// What the record offered.
-        offered: AuthorityRevision,
-    },
     /// The record was issued by another host.
     AnotherHost,
     /// This request has already been applied.
@@ -166,8 +156,6 @@ pub struct AuthorityFeed {
     /// What the carrier last said: true after a failed pass, a removal, a replaced connection, or
     /// before the first synchronisation. [`Self::status`] adds what the clock says.
     stale: bool,
-    /// True until this host has synchronised on the connection it now holds.
-    owes_synchronisation: bool,
     /// The feed's answer that this host was removed from it.
     removal: Option<Removal>,
     /// True while what a snapshot would hold differs from what was last written down, so a write
@@ -187,9 +175,9 @@ struct Removal {
 impl AuthorityFeed {
     /// A feed for one host at one revision.
     ///
-    /// A fresh feed owes a synchronisation: a host that has just started has not heard from the
-    /// feed, and section 10 requires the synchronisation before affected remote access rather than
-    /// after the first request that needed it.
+    /// A fresh feed is stale: a host that has just started has not heard from the feed, and
+    /// section 10 requires the synchronisation before affected remote access rather than after
+    /// the first request that needed it.
     #[must_use]
     pub fn new(host_device_id: DeviceId, accepted: AuthorityRevision) -> Self {
         Self {
@@ -200,7 +188,6 @@ impl AuthorityFeed {
             last_synchronised_at_ms: None,
             synchronised_on: None,
             stale: true,
-            owes_synchronisation: true,
             removal: None,
             unwritten: true,
         }
@@ -219,6 +206,7 @@ impl AuthorityFeed {
 
     /// The latest revision this host has accepted.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn accepted_revision(&self) -> AuthorityRevision {
         self.accepted
     }
@@ -330,30 +318,6 @@ impl AuthorityFeed {
         }
     }
 
-    /// Accepts an authority revision record this host issued earlier and is now reading back.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`FeedRefusal::AnotherHost`] for a record from another host and
-    /// [`FeedRefusal::OutOfOrder`] for one at or below the revision this host has accepted.
-    pub fn accept(
-        &mut self,
-        record: &AuthorityRevisionRecord,
-    ) -> std::result::Result<(), FeedRefusal> {
-        if record.host_device_id != self.host_device_id {
-            return Err(FeedRefusal::AnotherHost);
-        }
-        if record.authority_revision.get() <= self.accepted.get() {
-            return Err(FeedRefusal::OutOfOrder {
-                accepted: self.accepted,
-                offered: record.authority_revision,
-            });
-        }
-        self.accepted = record.authority_revision;
-        self.unwritten = true;
-        Ok(())
-    }
-
     /// Notes that `host` refused `request`, which it began to take, before the refusal is sent, so
     /// a refusal that never arrives is made again and a request published again is refused again.
     /// A request that took effect is not refused: it has a revision. A note that holds another
@@ -402,6 +366,7 @@ impl AuthorityFeed {
 
     /// Every revocation record this host has applied, settled or not.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn applied(&self) -> Vec<&RetainedRevocation> {
         self.records.values().collect()
     }
@@ -416,7 +381,6 @@ impl AuthorityFeed {
         self.last_synchronised_at_ms = Some(at_ms);
         self.synchronised_on = Some(on);
         self.stale = false;
-        self.owes_synchronisation = false;
     }
 
     /// Records that the feed could not be reached.
@@ -427,29 +391,6 @@ impl AuthorityFeed {
     /// offline-grant or organisation lease policy rather than with a refusal.
     pub const fn unreachable(&mut self) {
         self.stale = true;
-    }
-
-    /// Records that this host's connection was replaced, so a synchronisation is owed again.
-    pub const fn reconnected(&mut self) {
-        self.owes_synchronisation = true;
-        self.stale = true;
-    }
-
-    /// Whether remote work must wait for a synchronisation.
-    ///
-    /// True from the moment a connection is established until a synchronisation has happened on
-    /// it. Section 10: "Synchronise at reconnect before affected remote access when the feed is
-    /// reachable."
-    #[must_use]
-    pub const fn synchronisation_owed(&self) -> bool {
-        self.owes_synchronisation
-    }
-
-    /// When the next poll is due, while this host is online.
-    #[must_use]
-    pub fn next_poll_due_ms(&self) -> Option<u64> {
-        self.last_synchronised_at_ms
-            .map(|last| last.saturating_add(FEED_POLL_INTERVAL_MS))
     }
 
     /// Records that the feed at `origin` answered that this host was removed from it.
@@ -605,7 +546,6 @@ impl AuthorityFeed {
             last_synchronised_at_ms: stored.last_synchronised_at_ms.as_ref().map(|at| at.get()),
             synchronised_on: None,
             stale: true,
-            owes_synchronisation: true,
             removal: None,
             unwritten: false,
         }

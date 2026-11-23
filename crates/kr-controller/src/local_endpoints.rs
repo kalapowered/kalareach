@@ -42,6 +42,7 @@ enum Cause {
 impl BindFailure {
     /// The endpoint that could not be bound.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn role(&self) -> ListenRole {
         self.role
     }

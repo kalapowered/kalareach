@@ -72,6 +72,7 @@ impl Default for Collection {
 impl Collection {
     /// Returns a receiver of the number of passes that have ended.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn passes(&self) -> tokio::sync::watch::Receiver<u64> {
         self.passes.subscribe()
     }

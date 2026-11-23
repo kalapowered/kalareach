@@ -2047,6 +2047,7 @@ pub fn serve(controller: &Arc<Controller>) -> Result<()> {
 ///
 /// Returns [`ControllerError::NotConfigured`] when the endpoint cannot be addressed, or the bind
 /// failure when the address is taken.
+#[cfg(any(test, feature = "testing"))]
 pub fn bind_chunk_endpoint(paths: &kr_ipc::paths::EnvironmentPaths) -> Result<Listener> {
     let endpoint = kr_transfer::chunks::chunk_endpoint(paths).map_err(|error| {
         ControllerError::NotConfigured(format!(

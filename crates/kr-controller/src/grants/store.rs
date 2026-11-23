@@ -546,6 +546,7 @@ impl GrantDirectory {
     /// # Errors
     ///
     /// Returns an error when the table cannot be created.
+    #[cfg(any(test, feature = "testing"))]
     pub fn in_memory() -> Result<Self> {
         Self::prepare(Connection::open_in_memory().map_err(ControllerError::registry)?)
     }
@@ -3131,6 +3132,7 @@ impl GrantDirectory {
     /// # Errors
     ///
     /// Returns a storage error when the rows cannot be read or one does not decode.
+    #[cfg(any(test, feature = "testing"))]
     pub fn organisation_events(&self) -> Result<Vec<BindingEvent>> {
         type Columns = (Vec<u8>, Vec<u8>, String, Vec<u8>, Vec<u8>, i64);
         let rows: Vec<Columns> = self.with(|connection| {

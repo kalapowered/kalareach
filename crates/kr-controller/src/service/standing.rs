@@ -90,6 +90,7 @@ impl Controller {
     /// Returns a storage error when the device's grants, the clock's record or the policy cannot be
     /// read or written, what the admission refuses with, and why a newer chain does not verify;
     /// nothing is installed or bound then. A lease a rule refuses is the inner error.
+    #[cfg(any(test, feature = "testing"))]
     pub fn present_membership_lease(
         &self,
         device_id: kr_protocol::ids::DeviceId,

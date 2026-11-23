@@ -442,6 +442,7 @@ impl GrantLifetimes {
     /// # Errors
     ///
     /// Returns an error when the store cannot be read or written.
+    #[cfg(test)]
     pub fn stored_in_force(&self, store: &GrantDirectory, record: &GrantRecord) -> Result<bool> {
         Ok(self.stored_standing(store, record)? == GrantStanding::InForce)
     }

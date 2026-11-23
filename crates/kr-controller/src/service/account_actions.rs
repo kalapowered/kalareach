@@ -186,6 +186,7 @@ impl Controller {
 
     /// This host's own sign-in to the managed account service.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn host_account(&self) -> &Arc<crate::account::HostAccount> {
         &self.account
     }

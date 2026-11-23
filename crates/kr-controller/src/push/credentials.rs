@@ -186,6 +186,7 @@ pub struct HeldCredentials {
 impl HeldCredentials {
     /// Builds an empty store with no way to renew yet.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn new() -> Self {
         Self::default()
     }

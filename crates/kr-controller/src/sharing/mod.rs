@@ -112,6 +112,7 @@ impl SharingService {
     /// # Errors
     ///
     /// Returns an error when either store cannot be created.
+    #[cfg(any(test, feature = "testing"))]
     pub fn in_memory(host_device_id: DeviceId) -> Result<Self> {
         Ok(Self::new(GrantDirectory::in_memory()?, host_device_id))
     }
@@ -133,6 +134,7 @@ impl SharingService {
     /// # Errors
     ///
     /// Returns an error when the row cannot be read.
+    #[cfg(any(test, feature = "testing"))]
     pub fn invitation(&self, invitation_id: InvitationId) -> Result<Option<InvitationRecord>> {
         self.grants.invitation(invitation_id)
     }

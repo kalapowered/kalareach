@@ -137,6 +137,7 @@ impl GrantedRecipients {
 
     /// The lifetimes this answers on, and through them the directory of paired devices it reads.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn lifetimes(&self) -> &Arc<GrantLifetimes> {
         &self.lifetimes
     }
@@ -150,6 +151,7 @@ impl GrantedRecipients {
     /// Panics when the in-memory records the anchors are kept in cannot be opened, or this boot
     /// cannot be identified.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn at(
         sharing: Arc<SharingService>,
         policy: Arc<Mutex<HostPolicy>>,

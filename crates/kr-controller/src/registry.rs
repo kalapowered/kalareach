@@ -95,6 +95,7 @@ macro_rules! stored_words {
 
         impl $name {
             /// Every variant, in the order they are declared.
+            #[cfg(any(test, feature = "testing"))]
             pub const ALL: &'static [Self] = &[$(Self::$variant,)+];
 
             /// Returns the stable stored string.
@@ -899,6 +900,7 @@ impl Registry {
     /// # Errors
     ///
     /// Returns [`ControllerError::RegistryUnavailable`] when the database cannot be created.
+    #[cfg(any(test, feature = "testing"))]
     pub fn in_memory(environment_id: EnvironmentId) -> Result<Self> {
         Self::prepare(
             Connection::open_in_memory().map_err(ControllerError::registry)?,

@@ -339,6 +339,7 @@ pub enum LaunchOutcome {
 impl LaunchOutcome {
     /// Renders the outcome as the failure a caller is given.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn failure(&self) -> Option<ControllerError> {
         match self {
             Self::Started(_) => None,

@@ -1181,6 +1181,7 @@ impl AttentionModule {
 
     /// Serves one read of this group and returns the frame it answers with, its session text
     /// released now when its ticket holds and withheld otherwise.
+    #[cfg(any(test, feature = "testing"))]
     pub async fn read_frame(
         &self,
         reach: &dyn Reach,
@@ -1200,6 +1201,7 @@ impl AttentionModule {
     /// # Errors
     ///
     /// Returns the refusal the store decided.
+    #[cfg(any(test, feature = "testing"))]
     pub async fn read(
         &self,
         reach: &dyn Reach,
@@ -1406,6 +1408,7 @@ impl AttentionModule {
     /// No delivery path sends session text today: this is the interface a per-chunk writer would
     /// use, and it sends the text only through [`Self::release_delivery`]. No production sender
     /// writes in one non-waiting call, which that contract needs.
+    #[cfg(any(test, feature = "testing"))]
     pub async fn delivery_texts(
         &self,
         reach: &dyn Reach,
@@ -1435,6 +1438,7 @@ impl AttentionModule {
     /// when this answers nothing drops the text and every byte of it not yet sent and ends a
     /// message partly sent. A transport that sends bytes it holds later on its own cannot carry
     /// session text.
+    #[cfg(any(test, feature = "testing"))]
     pub async fn release_delivery<T>(
         &self,
         ticket: &Ticket,

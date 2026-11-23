@@ -294,12 +294,14 @@ impl MailboxReader {
     /// pass, whether it read the mailbox through, stopped on a fault or stopped at the page limit,
     /// and after a wait that made no pass because the service had asked to be left alone.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn passes(&self) -> watch::Receiver<u64> {
         self.shared.passes.subscribe()
     }
 
     /// The record of the items this host accepted.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn record(&self) -> &Arc<Record> {
         &self.shared.record
     }

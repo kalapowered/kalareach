@@ -14,8 +14,9 @@ publish.workspace = true
 kr-cli.workspace = true
 # The projection a client holds, and the painter a terminal of the session's size is drawn with.
 kr-client = { workspace = true, features = ["terminal"] }
-# Simulated time hands a daemon the clocks it starts on.
-kr-controller.workspace = true
+# Simulated time hands a daemon the clocks it starts on, and the harness reads a daemon through the
+# accessors only tests build.
+kr-controller = { workspace = true, features = ["testing"] }
 # Identifiers for the sessions and attachments the harness makes.
 kr-ipc.workspace = true
 kr-protocol.workspace = true

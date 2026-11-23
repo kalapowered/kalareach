@@ -363,6 +363,7 @@ impl ReleaseMatrixRuntime {
 
     /// A count that changes each time the reader begins to wait between two reads.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn passes(&self) -> watch::Receiver<u64> {
         self.shared.passes.subscribe()
     }

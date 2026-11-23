@@ -342,6 +342,7 @@ impl DeliveryRuntime {
     /// The senders every external destination is sent through (webhooks, the chat services and
     /// mail), once a transport has been attached. They are the ones a pass uses.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn external_senders(&self) -> Option<&ExternalSenders> {
         self.adapters.get().map(|adapters| &adapters.external)
     }

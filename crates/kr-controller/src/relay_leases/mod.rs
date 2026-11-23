@@ -618,6 +618,7 @@ impl RelayKeeper {
 
     /// A count of the passes the keeper has finished, which changes each time one ends.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn passes(&self) -> watch::Receiver<u64> {
         self.shared.passes.subscribe()
     }

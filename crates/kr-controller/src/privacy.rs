@@ -245,6 +245,7 @@ impl PrivacyState {
 
     /// Returns true while privacy mode is on.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn is_private(&self) -> bool {
         self.now().private
     }
@@ -301,6 +302,7 @@ impl PrivacyState {
     /// Only the generation in force is accepted: an older one belongs to work privacy mode drew a
     /// line under, and a newer one to no generation this environment has recorded.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn accepts_result(&self, produced_under: PrivacyGeneration) -> bool {
         self.now().generation == produced_under
     }

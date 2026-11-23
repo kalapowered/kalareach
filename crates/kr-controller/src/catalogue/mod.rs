@@ -546,6 +546,7 @@ impl CatalogueModule {
     /// Returns the native bridges installed packages put in place, which say what each applied
     /// release yields.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn native_bridges(&self) -> &native_bridge::NativeBridges {
         &self.bridges
     }
@@ -1227,6 +1228,7 @@ impl CatalogueModule {
 
     /// Returns the catalogue itself, for a caller that already holds the daemon.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn catalogue(&self) -> &Arc<Mutex<Catalogue>> {
         &self.catalogue
     }

@@ -1643,6 +1643,7 @@ impl OwnerAuthority {
     ///
     /// Returns `OWNER_CONFIRMATION_REQUIRED` when no answered challenge matches, and a registry
     /// error when the consumption cannot be recorded.
+    #[cfg(any(test, feature = "testing"))]
     pub fn consume_for(
         &self,
         expectation: &ConfirmationExpectation<'_>,

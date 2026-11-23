@@ -199,6 +199,7 @@ pub fn check(source: Option<&dyn CatalogueEvidence>, budgets: EnrolmentBudgets) 
 /// Nothing here invents a record: evidence this host has not been given is evidence it does not
 /// have.
 #[must_use]
+#[cfg(any(test, feature = "testing"))]
 pub fn capabilities(source: Option<&dyn CatalogueEvidence>) -> Vec<CapabilityRecord> {
     source
         .map(|source| {

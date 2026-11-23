@@ -14,8 +14,9 @@ kr-client.workspace = true
 kr-cbor.workspace = true
 # The host's own record of what it has accepted, acknowledged and still owes. The legs drive it
 # with what the feed answers, because the record and the service are the two halves of section 10's
-# division and a leg that exercised only one of them would prove neither.
-kr-controller.workspace = true
+# division and a leg that exercised only one of them would prove neither. The legs read the record
+# through the accessors only tests build.
+kr-controller = { workspace = true, features = ["testing"] }
 kr-crypto.workspace = true
 # Signing a revocation request as a remote owner, and a host's own authority revision.
 kr-pairing.workspace = true

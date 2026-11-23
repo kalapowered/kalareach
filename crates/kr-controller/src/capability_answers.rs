@@ -246,6 +246,7 @@ impl Record {
     /// # Errors
     ///
     /// Returns an error when the record cannot be read.
+    #[cfg(any(test, feature = "testing"))]
     pub fn len(&self) -> Result<usize> {
         self.with(|connection| {
             connection
@@ -261,6 +262,7 @@ impl Record {
     /// # Errors
     ///
     /// Returns an error when the record cannot be read.
+    #[cfg(any(test, feature = "testing"))]
     pub fn is_empty(&self) -> Result<bool> {
         self.len().map(|count| count == 0)
     }

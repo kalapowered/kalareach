@@ -196,6 +196,7 @@ impl Marker {
 
     /// What the file holds.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn attempt(&self) -> &Attempt {
         &self.attempt
     }

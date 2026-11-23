@@ -173,6 +173,7 @@ impl VoiceModule {
     /// this is for a provider that document cannot name: a backend of the person's own, or a
     /// stand-in. Until a provider is attached this host brokers no managed call, which is a
     /// complete host and says so.
+    #[cfg(any(test, feature = "testing"))]
     pub fn attach_provider(&self, provider: Option<Arc<dyn ManagedVoiceService>>) {
         self.coordinator.attach_provider(provider);
     }

@@ -747,12 +747,14 @@ impl FeedRuntime {
 
     /// The origin this carrier reads.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn origin(&self) -> &str {
         &self.shared.origin
     }
 
     /// The identifier of the host key the feed is addressed by, which a remote owner publishes to.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn feed(&self) -> KeyId {
         self.shared.own_feed
     }
@@ -828,6 +830,7 @@ impl FeedRuntime {
 
     /// A count of the passes the carrier has finished, which changes each time one ends.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn passes(&self) -> tokio::sync::watch::Receiver<u64> {
         self.shared.passes.subscribe()
     }

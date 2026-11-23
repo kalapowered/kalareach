@@ -137,6 +137,7 @@ impl PendingExpiry {
 
     /// Returns how many records are still owed. A test reads it; nothing else needs it.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn owed(&self) -> usize {
         self.owed
             .lock()
@@ -535,6 +536,7 @@ impl DeviceDirectory {
     /// # Errors
     ///
     /// Returns an error when the tables cannot be created.
+    #[cfg(any(test, feature = "testing"))]
     pub fn in_memory() -> Result<Self> {
         Self::prepare(
             Connection::open_in_memory().map_err(ControllerError::registry)?,
@@ -774,6 +776,7 @@ impl DeviceDirectory {
     ///
     /// Returns an error when the row cannot be written, including when this endpoint already has a
     /// record: an endpoint identity belongs to one device.
+    #[cfg(any(test, feature = "testing"))]
     pub fn commit(&self, record: &DeviceRecord) -> Result<()> {
         self.transaction(|transaction| insert_record(transaction, record))?;
         self.note_change();

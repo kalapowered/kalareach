@@ -354,6 +354,7 @@ impl Record {
     /// # Errors
     ///
     /// Returns an error when the store cannot be read.
+    #[cfg(any(test, feature = "testing"))]
     pub fn standing(&self, actor: ActorId) -> Result<Option<Row>> {
         let connection = self
             .connection

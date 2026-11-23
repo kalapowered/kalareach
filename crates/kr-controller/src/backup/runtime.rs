@@ -903,6 +903,7 @@ impl BackupRuntime {
     /// The public half of the key this host publishes as, which an owner enrols at the service as
     /// the writer of a collection.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn writer_public_key(&self) -> AuthorisationKey {
         self.writer_public
     }
@@ -961,6 +962,7 @@ impl BackupRuntime {
     /// A count of the passes the carrier has finished, which changes each time one ends, so that
     /// whatever waits for the carrier to have seen something waits for that and not for a time.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn passes(&self) -> tokio::sync::watch::Receiver<u64> {
         self.shared.passes.subscribe()
     }

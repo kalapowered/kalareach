@@ -1316,6 +1316,7 @@ impl Controller {
     /// # Errors
     ///
     /// Returns an error when the registry cannot be read or written.
+    #[cfg(any(test, feature = "testing"))]
     pub async fn retire(self: &Arc<Self>, record: &ClosureRecord) -> Result<()> {
         self.retire_as(record, Whose::Worker).await
     }

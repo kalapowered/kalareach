@@ -449,6 +449,7 @@ impl WorkerProxy {
     /// # Errors
     ///
     /// As [`Self::forward_mutation`].
+    #[cfg(any(test, feature = "testing"))]
     pub async fn read<T: serde::Serialize + ?Sized>(
         &self,
         method: Method,
