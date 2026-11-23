@@ -190,3 +190,46 @@ fn the_launch_answer_keeps_its_earlier_shape() {
         "a launch answer that names a provenance is not one it reads"
     );
 }
+
+/// The answer to `input.write` as a reader built from the 0.78 package has it: closed, with the
+/// three members that package named.
+#[derive(Debug, serde::Deserialize, serde::Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct EarlierWriteResult {
+    sequence: kr_protocol::ids::InputSequence,
+    forwarded_bytes: U64,
+    held_prefix_bytes: U64,
+}
+
+/// The answer to `input.interrupt` and `input.release` as that reader has it.
+#[derive(Debug, serde::Deserialize, serde::Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct EarlierLeaseResult {
+    lease: kr_protocol::input::InputLeaseState,
+}
+
+/// KR-REQ-12.09: a strict reader built from the 0.78 package reads the answers a worker sends that
+/// names no provenance, which is every answer of a release, and a release's answer to `input.release`;
+/// and it refuses, by the member it does not know, the answer to a write or an interrupt that names
+/// one. No 0.78 product reader decodes these two answers, so no product is affected; this is the
+/// break the release notes name.
+#[test]
+fn a_strict_reader_of_the_earlier_package_cannot_read_an_input_answer_that_names_a_provenance() {
+    let unnamed = write_answer(None);
+    assert!(
+        unnamed.to_typed::<EarlierWriteResult>().is_ok(),
+        "an answer that names no provenance reads"
+    );
+    assert!(lease_answer(None).to_typed::<EarlierLeaseResult>().is_ok());
+
+    let named = write_answer(Some("terminal_input"));
+    let refusal = named
+        .to_typed::<EarlierWriteResult>()
+        .expect_err("the earlier reader refuses the answer to a write that names one");
+    assert_eq!(refusal.rule(), "unknown_field", "{refusal}");
+    let named = lease_answer(Some("terminal_input"));
+    let refusal = named
+        .to_typed::<EarlierLeaseResult>()
+        .expect_err("and the answer to an interrupt");
+    assert_eq!(refusal.rule(), "unknown_field", "{refusal}");
+}

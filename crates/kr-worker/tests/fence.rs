@@ -9567,6 +9567,199 @@ async fn wired_ignoring_interrupts() -> Wired {
     .await
 }
 
+/// What a reader built from the 0.78 package decodes of the answer to a launch: the three members
+/// that package named, in a type that is closed as that package's was.
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct EarlierLaunchResult {
+    fence_id: kr_protocol::root::FenceId,
+    prompt_generation: PromptGeneration,
+    buffer_revision: EditorBufferRevision,
+}
+
+/// The answer to a launch, read as a 0.78 reader reads it, with the members it has on the wire.
+fn read_as_the_earlier_package(answer: &kr_protocol::envelope::ParamsValue) -> EarlierLaunchResult {
+    let mut members: Vec<&str> = answer
+        .as_value()
+        .as_map()
+        .expect("an answer is a map")
+        .entries()
+        .iter()
+        .map(|(name, _)| name.as_str())
+        .collect();
+    members.sort_unstable();
+    assert_eq!(
+        members,
+        ["buffer_revision", "fence_id", "prompt_generation"],
+        "the answer to a launch has the members it had at the 0.78 package, and no provenance"
+    );
+    kr_cbor::from_canonical_value(answer.as_value())
+        .expect("a reader built from the 0.78 package reads the answer to a launch")
+}
+
+/// What `action.read` returns as the result of `action_id`.
+async fn kept_result_of(
+    client: &mut LocalClient,
+    action_id: ActionId,
+) -> kr_protocol::envelope::ParamsValue {
+    let read: kr_protocol::receipt::ActionReadResult = client
+        .request(
+            Method::ActionRead,
+            &kr_protocol::receipt::ActionReadParams {
+                action_id,
+                session_id: None,
+            },
+        )
+        .await
+        .expect("reaches the worker")
+        .expect("the receipt is read")
+        .to_typed()
+        .expect("decodes");
+    read.result.0.expect("the launch's result is kept")
+}
+
+/// KR-REQ-12.09: the answer to a launch keeps the shape a reader built from the 0.78 package reads,
+/// on the answer the caller waits for, on a repeat of the action and on `action.read`; and a second
+/// press, a fresh action identifier at the surface the first press quoted, installs nothing again:
+/// the reader is asked once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_launch_answer_keeps_the_earlier_shape_and_a_second_press_installs_nothing_twice() {
+    let mut wired = wired().await;
+    let mut client = surface_client(&wired).await;
+    let _holder = holder_over(&mut client, &wired).await;
+    let fence = fenced(&mut wired, 1, 1).await;
+    let surface = surface_over(&mut client, wired.session_id).await;
+    let (generation, revision, _) = verified_numbers(&surface);
+    let params = launch_quoting(&wired, generation, revision, &["claude"]);
+    let target = wired.target();
+    let first = ActionId::new(kr_ipc::new_uuid());
+
+    let calling = tokio::spawn({
+        let (params, target) = (params.clone(), target.clone());
+        async move {
+            let outcome = client
+                .mutate(Method::ShellLaunch, first, target, &params)
+                .await
+                .expect("reaches the worker");
+            (client, outcome)
+        }
+    });
+    let request = the_reader_is_asked(&mut wired).await;
+    the_reader_installs(
+        &mut wired,
+        &request,
+        generation,
+        EditorBufferRevision::new(2),
+    )
+    .await;
+    let (mut client, outcome) = calling.await.expect("joins");
+    let answer = outcome.expect("the reader installed it");
+    let read = read_as_the_earlier_package(&answer);
+    assert_eq!(read.fence_id, fence.fence_id);
+    assert_eq!(read.prompt_generation, generation);
+    assert_eq!(read.buffer_revision, EditorBufferRevision::new(2));
+
+    // The same action again is answered with what was kept, and the reader is not asked again.
+    let repeated = client
+        .mutate(Method::ShellLaunch, first, target.clone(), &params)
+        .await
+        .expect("reaches the worker")
+        .expect("the kept answer");
+    assert_eq!(
+        kr_cbor::encode(repeated.as_value()),
+        kr_cbor::encode(answer.as_value())
+    );
+    let kept = kept_result_of(&mut client, first).await;
+    assert_eq!(
+        kr_cbor::encode(kept.as_value()),
+        kr_cbor::encode(answer.as_value())
+    );
+    read_as_the_earlier_package(&kept);
+
+    // A second press: the page's surface has not moved, so it quotes the same numbers under a fresh
+    // action identifier. The worker asks the reader, as it asks for every press, and the reader,
+    // whose buffer is no longer at the revision the press quoted, refuses it. Nothing is installed
+    // again: the refusal reaches the caller as it is, and the session records no installation of
+    // its own.
+    let second = pressing(client, target, params);
+    let asked = the_reader_is_asked(&mut wired).await;
+    the_reader_refuses(
+        &mut wired,
+        &asked,
+        LaunchRejectionReason::BufferRevisionMismatch,
+        generation,
+    )
+    .await;
+    let (_client, outcome) = tokio::time::timeout(SOON, second)
+        .await
+        .expect("the caller was answered")
+        .expect("joins");
+    assert_eq!(
+        outcome.expect_err("the second press installs nothing").code,
+        ErrorCode::DraftConflict
+    );
+    assert_eq!(
+        wired.runtime.session().late_installations().len(),
+        0,
+        "the session recorded no installation of its own"
+    );
+    wired.close().await;
+}
+
+/// KR-REQ-12.09: a reader that answers after the launch's hold has been revoked is believed and the
+/// caller is told what happened. That answer, and the kept result `action.read` returns, keep the
+/// shape a reader built from the 0.78 package reads.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_launch_installed_after_its_revocation_is_answered_in_the_earlier_shape() {
+    let mut wired = wired().await;
+    let mut client = surface_client(&wired).await;
+    let _holder = holder_over(&mut client, &wired).await;
+    let fence = fenced(&mut wired, 1, 1).await;
+    let surface = surface_over(&mut client, wired.session_id).await;
+    let (generation, revision, _) = verified_numbers(&surface);
+    let target = wired.target();
+    let params = launch_quoting(&wired, generation, revision, &["claude"]);
+    let action = ActionId::new(kr_ipc::new_uuid());
+
+    let calling = tokio::spawn(async move {
+        let outcome = client
+            .mutate(Method::ShellLaunch, action, target, &params)
+            .await
+            .expect("reaches the worker");
+        (client, outcome)
+    });
+    let request = the_reader_is_asked(&mut wired).await;
+    wired.pass(THE_HOLD);
+    loop {
+        if let ToBridge::LaunchRevoked { transaction, .. } = wired.next().await {
+            assert_eq!(transaction, request.transaction);
+            break;
+        }
+    }
+    the_reader_installs(
+        &mut wired,
+        &request,
+        generation,
+        EditorBufferRevision::new(2),
+    )
+    .await;
+    let (mut client, outcome) = tokio::time::timeout(SOON, calling)
+        .await
+        .expect("the caller was answered")
+        .expect("joins");
+    let answer = outcome.expect("the caller is told what happened");
+    let read = read_as_the_earlier_package(&answer);
+    assert_eq!(read.fence_id, fence.fence_id);
+    assert_eq!(read.buffer_revision, EditorBufferRevision::new(2));
+    let kept = kept_result_of(&mut client, action).await;
+    read_as_the_earlier_package(&kept);
+    assert_eq!(
+        kr_cbor::encode(kept.as_value()),
+        kr_cbor::encode(answer.as_value())
+    );
+    wired.close().await;
+}
+
 /// KR-REQ-13.11: a press that quotes what a verified read named is installed by the reader, and the
 /// read then follows the editor: it is a launch in progress while the reader holds the command, no
 /// prompt once the reader leaves, and verified at the next prompt with that prompt's numbers.

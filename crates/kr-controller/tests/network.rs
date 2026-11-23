@@ -1476,6 +1476,79 @@ fn undialable(
         })
 }
 
+/// KR-REQ-12.09: a paired device reaches the worker through the daemon, and the answer to its
+/// interrupt carries what the worker recorded: terminal input.
+#[ignore = "launches a worker process; run through scripts/end-to-end.sh"]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_devices_interrupt_answer_names_terminal_input_through_the_daemon() {
+    let host = Host::create();
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let daemon = host.start(loopback(), &owner).await;
+    let mut local = host.client().await;
+    let created = create(&mut local, &host).await;
+    let session_id = created.session.session_id;
+
+    let device = Device::create(&loopback()).await;
+    let record = pair(&daemon, &device, &owner).await;
+    let session = connect(&daemon, &device, &record).await;
+    let attached = attach(&session, host.environment_id, session_id).await;
+    let target = ActionTarget {
+        environment_id: host.environment_id,
+        session_id: Nullable::some(session_id),
+        session_epoch: Nullable::some(kr_protocol::ids::SessionEpoch::V1),
+        application_instance_id: Nullable::null(),
+        agent_binding_revision: Nullable::null(),
+    };
+    let acquired: InputAcquireResult = within_patience(
+        "the host to settle the input lease",
+        session.mutate(
+            Method::InputAcquire,
+            target.clone(),
+            None,
+            &ParamsValue::empty(),
+            &InputAcquireParams {
+                session_id,
+                attachment_id: attached.typing,
+                expected_epoch: Nullable::null(),
+            },
+            DurationMs::new(120_000),
+        ),
+    )
+    .await
+    .expect("the lease is settled")
+    .to_typed()
+    .expect("a lease");
+
+    let interrupted: kr_protocol::input::InputLeaseResult = within_patience(
+        "the host to take the interrupt",
+        session.mutate(
+            Method::InputInterrupt,
+            target,
+            None,
+            &ParamsValue::empty(),
+            &kr_protocol::input::InputInterruptParams {
+                session_id,
+                attachment_id: attached.typing,
+                epoch: acquired.lease.epoch,
+                action: kr_protocol::input::InterruptAction::NativeInterrupt,
+            },
+            DurationMs::new(120_000),
+        ),
+    )
+    .await
+    .expect("the interrupt is taken")
+    .to_typed()
+    .expect("a lease result");
+    assert_eq!(
+        interrupted.provenance,
+        Some(kr_protocol::broker::ActionProvenance::TerminalInput),
+        "the device reads the interrupt's provenance as the worker recorded it"
+    );
+
+    close_session(&mut local, &host, session_id).await;
+    daemon.stop().await;
+}
+
 // Ignored by default like the rest of this suite: the host fixture needs the worker binary that
 // `scripts/end-to-end.sh` builds, and that script runs the suite with `--include-ignored`.
 /// KR-REQ-17.45: a host's current direct addresses reach a device through the pairing exchange

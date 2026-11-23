@@ -888,6 +888,178 @@ async fn kr_req_13_11_a_devices_launch_reaches_the_worker_under_the_devices_gran
     adopted.stop().await;
 }
 
+/// What a reader built from the 0.78 package decodes of the answer to a launch: the three members
+/// that package named, in a type that is closed as that package's was.
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct EarlierLaunchResult {
+    #[allow(dead_code)]
+    fence_id: kr_protocol::root::FenceId,
+    #[allow(dead_code)]
+    prompt_generation: kr_protocol::root::PromptGeneration,
+    buffer_revision: kr_protocol::root::EditorBufferRevision,
+}
+
+/// The answer to a launch, read as a 0.78 reader reads it, with the members it has on the wire.
+fn read_as_the_earlier_package(answer: &kr_protocol::envelope::ParamsValue) -> EarlierLaunchResult {
+    let mut members: Vec<&str> = answer
+        .as_value()
+        .as_map()
+        .expect("an answer is a map")
+        .entries()
+        .iter()
+        .map(|(name, _)| name.as_str())
+        .collect();
+    members.sort_unstable();
+    assert_eq!(
+        members,
+        ["buffer_revision", "fence_id", "prompt_generation"],
+        "the answer to a launch has the members it had at the 0.78 package, and no provenance"
+    );
+    kr_cbor::from_canonical_value(answer.as_value())
+        .expect("a reader built from the 0.78 package reads the answer to a launch")
+}
+
+/// A launch of `claude` that quotes the numbers the managed reader entered the prompt with.
+fn the_press(session_id: SessionId) -> kr_protocol::root::ShellLaunchParams {
+    use kr_protocol::root::{
+        EditorBufferRevision, LaunchCommand, PromptGeneration, ShellLaunchParams,
+    };
+    let numbers = net_support::worker::MANAGED_NUMBERS;
+    ShellLaunchParams {
+        session_id,
+        command: LaunchCommand::Arguments(vec!["claude".to_owned()]),
+        expected_prompt_generation: PromptGeneration::new(numbers.prompt_generation),
+        expected_buffer_revision: EditorBufferRevision::new(numbers.buffer_revision),
+        after_input: None,
+    }
+}
+
+/// A paired device whose attachment holds the input lease of the managed session, with the reader
+/// at the prompt and a fence proved, and the device that owns the connection.
+async fn a_device_holding_the_keys(
+    adopted: &Adopted,
+    session_id: SessionId,
+) -> (Device, RawDevice, kr_protocol::ids::AttachmentId) {
+    use kr_protocol::input::{InputAcquireParams, InputAcquireResult};
+    let worker = &adopted.workers[0];
+    tokio::time::timeout(PATIENCE, async {
+        worker
+            .reader()
+            .await
+            .enters_the_prompt()
+            .await
+            .expect("the reader enters the prompt");
+    })
+    .await
+    .expect("the worker handled the prompt");
+    let (device, record) = viewer(
+        adopted,
+        &[ActionRight::SessionView, ActionRight::TerminalInput],
+    )
+    .await;
+    let (connection, attachment) = attached_for_input(adopted, &device, &record, session_id).await;
+    let acquire = InputAcquireParams {
+        session_id,
+        attachment_id: attachment,
+        expected_epoch: Nullable::null(),
+    };
+    let (acquired, _) = tokio::join!(
+        connection.mutate(
+            Method::InputAcquire,
+            ActionId::new(kr_ipc::new_uuid()),
+            on_the_session(&adopted.host, session_id),
+            &acquire,
+        ),
+        async {
+            tokio::time::timeout(PATIENCE, async {
+                worker.reader().await.proves_a_fence().await
+            })
+            .await
+            .expect("the worker asked for a fence")
+            .expect("the reader answers")
+        }
+    );
+    acquired
+        .expect("the lease is settled")
+        .to_typed::<InputAcquireResult>()
+        .expect("a lease");
+    // The worker has handled what the reader sent, so the press meets a settled prompt.
+    tokio::time::timeout(PATIENCE, async {
+        worker.reader().await.settled_seeing().await
+    })
+    .await
+    .expect("the worker handled the events")
+    .expect("handled");
+    // The device is handed back with its connection: the connection ends with the device.
+    (device, connection, attachment)
+}
+
+/// The result `action.read` returns, through the daemon, for `action_id`.
+async fn kept_result_through_the_daemon(
+    connection: &RawDevice,
+    session_id: SessionId,
+    action_id: ActionId,
+) -> kr_protocol::envelope::ParamsValue {
+    let read: kr_protocol::receipt::ActionReadResult = connection
+        .read(
+            Method::ActionRead,
+            &kr_protocol::receipt::ActionReadParams {
+                action_id,
+                session_id: Some(session_id),
+            },
+        )
+        .await
+        .expect("the daemon forwards the read")
+        .to_typed()
+        .expect("decodes");
+    read.result.0.expect("the launch's result is kept")
+}
+
+/// KR-REQ-12.09: the answer to a paired device's launch press, forwarded by the daemon from a
+/// worker that names provenance on its input answers, keeps the shape a reader built from the 0.78
+/// package reads, and `action.read` through the daemon returns the same kept result.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_12_09_a_devices_launch_answer_through_the_daemon_keeps_the_earlier_shape() {
+    let adopted = Adopted::start_managed().await;
+    let worker = &adopted.workers[0];
+    let session_id = worker.session_id;
+    let (_device, connection, _attachment) = a_device_holding_the_keys(&adopted, session_id).await;
+    let action_id = ActionId::new(kr_ipc::new_uuid());
+    let press = the_press(session_id);
+    let (pressed, ()) = tokio::join!(
+        connection.mutate(
+            Method::ShellLaunch,
+            action_id,
+            on_the_session(&adopted.host, session_id),
+            &press,
+        ),
+        async {
+            let mut reader = worker.reader().await;
+            let asked = tokio::time::timeout(PATIENCE, reader.install_asked())
+                .await
+                .expect("the reader is asked")
+                .expect("a request");
+            reader.installs(&asked).await.expect("the reader installs");
+        }
+    );
+    let answer = pressed.expect("the press is installed and answered");
+    let read = read_as_the_earlier_package(&answer);
+    assert_eq!(
+        read.buffer_revision,
+        kr_protocol::root::EditorBufferRevision::new(
+            net_support::worker::MANAGED_NUMBERS.buffer_revision + 1
+        )
+    );
+    let kept = kept_result_through_the_daemon(&connection, session_id, action_id).await;
+    assert_eq!(
+        kr_cbor::encode(kept.as_value()),
+        kr_cbor::encode(answer.as_value())
+    );
+    connection.close();
+    adopted.stop().await;
+}
+
 /// A share's end ends its own connection and no other: two shares of one session on two
 /// connections, one revoked, the other still served, and the connection opened for the host
 /// untouched.
