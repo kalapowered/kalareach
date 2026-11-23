@@ -1439,7 +1439,7 @@ read_command!(
 /// dialog (`choose_authorised_file`), which this process holds and sends with this request and no
 /// other; with none chosen the host is sent none. While that dialog is open the request is refused:
 /// the dialog may replace the file, and the page that asks is not the one that opened it. Every
-/// screen is told when the file held changes ([`AUTHORISED_FILE_EVENT`]). The checks belong to the
+/// screen is told when the file held changes ([`AUTHORISED_FILE_EVENT`](crate::AUTHORISED_FILE_EVENT)). The checks belong to the
 /// host on this computer, not to one this device is paired with.
 #[tauri::command]
 pub async fn environment_capabilities_check<R: tauri::Runtime>(
@@ -1592,7 +1592,7 @@ fn authorised_file_changed<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
 /// and whether the platform's file dialog that may replace it is open.
 ///
 /// The page asks when it opens and when it is told that the file held changed
-/// ([`AUTHORISED_FILE_EVENT`]), so that what it says of the choice is what this process holds,
+/// ([`AUTHORISED_FILE_EVENT`](crate::AUTHORISED_FILE_EVENT)), so that what it says of the choice is what this process holds,
 /// whatever the page did before: a page that was reloaded, or that was told a run was refused
 /// before it took the choice, or that was left and opened again while the dialog was open, says the
 /// same as one that never left. It changes nothing.
