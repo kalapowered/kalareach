@@ -422,7 +422,11 @@ async fn a_join_writes_what_the_service_described_and_a_second_changes_nothing()
     assert_eq!(shown["changed"], true, "{shown}");
     assert_eq!(shown["signed"], true, "{shown}");
     let written = tree.document();
-    assert_eq!(written["version"], 3, "{written}");
+    assert_eq!(
+        written["version"],
+        kr_protocol::hostinfo::configuration::VERSION,
+        "{written}"
+    );
     assert_eq!(written["revision"], 1, "{written}");
     assert_eq!(
         written["level"], 4,
