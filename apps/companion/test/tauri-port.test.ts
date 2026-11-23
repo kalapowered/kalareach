@@ -17,6 +17,7 @@ import { READ_SUPERSEDED, type ConnectionState } from '../src/host/port'
 import {
   CONNECTION_EVENT,
   HOST_EVENT,
+  RECOVERY_EVENT,
   SETTINGS_EVENT,
   STANDING_EVENT,
   tauriPort
@@ -1240,5 +1241,15 @@ describe('the desktop port and the person\'s settings', () => {
     const published = { colour_mode: 'light' }
     shell.handlers.get(SETTINGS_EVENT)?.({ payload: published })
     expect(heard).toEqual([published])
+  })
+
+  it('tells the listener when native code says where recovery stands may have changed', async () => {
+    let told = 0
+    await tauriPort().onRecovery(() => {
+      told += 1
+    })
+    shell.handlers.get(RECOVERY_EVENT)?.({ payload: null })
+    shell.handlers.get(RECOVERY_EVENT)?.({ payload: null })
+    expect(told).toBe(2)
   })
 })

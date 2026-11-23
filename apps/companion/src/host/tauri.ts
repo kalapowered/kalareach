@@ -100,6 +100,9 @@ export const ACCOUNT_EVENT = 'kr://account'
 /** The event the backend publishes the person's settings on when they change by themselves. */
 export const SETTINGS_EVENT = 'kr://settings'
 
+/** The event the backend publishes on when where recovery stands may have changed by itself. */
+export const RECOVERY_EVENT = 'kr://recovery'
+
 /** The event the backend publishes a change of an opened session's standing on. */
 export const STANDING_EVENT = 'kr://standing'
 
@@ -703,6 +706,7 @@ export function tauriPort(): HostPort {
     settingsConflictResolve: (keep) =>
       call<SettingsView>('settings_conflict_resolve', { keep }),
     onSettings: (listener) => listening<SettingsView>(SETTINGS_EVENT, listener),
+    onRecovery: (listener) => listening<null>(RECOVERY_EVENT, () => listener()),
     recoveryView: () => call<RecoveryView>('recovery_view', {}),
     recoveryTurnOn: () => call<RecoveryView>('recovery_turn_on', {}),
     recoverySettle: () => call<RecoveryView>('recovery_settle', {}),

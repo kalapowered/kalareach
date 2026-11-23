@@ -76,6 +76,10 @@ use crate::sync_service::{SyncService, SyncServiceView, host_of};
 mod restoring;
 mod saving;
 
+/// The event the page is told on when where recovery stands may have changed with no action of the
+/// person's: a step that saves the settings ended. The page reads recovery again.
+pub const RECOVERY_EVENT: &str = "kr://recovery";
+
 pub use restoring::{
     EXPORT_PANEL, KIT_PANEL, NativePanels, OpenPanels, SettingsRestored, kit_service_unreachable,
     not_a_path, panel_unanswered, restore_settings, settings_restored,

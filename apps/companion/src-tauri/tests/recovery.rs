@@ -279,7 +279,15 @@ impl Computer {
         account: Arc<Account>,
         clients: Option<Arc<dyn companion_tauri::services::SyncServices>>,
     ) -> Page {
+        // What the application tells the page on the recovery event, as it hands it over.
+        let recovery_told = Arc::new(Mutex::new(0_usize));
+        let counting = Arc::clone(&recovery_told);
         let app = mock_builder()
+            .manage(companion_tauri::told::Tap::new(move |event, _text| {
+                if event == "kr://recovery" {
+                    *counting.lock().expect("the record") += 1;
+                }
+            }))
             .manage(AppState::new())
             .manage(AccountSlot::ready(Arc::clone(&account)))
             .invoke_handler(tauri::generate_handler![
@@ -322,6 +330,7 @@ impl Computer {
             recovery,
             account,
             told: Mutex::new(Vec::new()),
+            recovery_told,
         }
     }
 
@@ -355,6 +364,8 @@ struct Page {
     account: Arc<Account>,
     /// Everything the page was sent, as the text it received.
     told: Mutex<Vec<String>>,
+    /// How many times the page was told on the recovery event to read recovery again.
+    recovery_told: Arc<Mutex<usize>>,
 }
 
 impl Page {
@@ -4412,6 +4423,56 @@ async fn a_failed_write_is_retried_at_the_end_of_the_window_and_saved_shows_only
     assert_eq!(
         colour_in(&bundle_of(&computer, &page).await).as_deref(),
         Some("dark")
+    );
+}
+
+/// KR-REQ-20.17: a step the application runs by itself tells the page on the recovery event, and
+/// the page that reads recovery each time it is told follows a failed save and the retry that
+/// mends it with no action of the person's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_step_that_ends_by_itself_tells_the_page_to_read_recovery_again() {
+    let window = Duration::from_millis(1500);
+    let timing = SettingsTiming {
+        quiet: Duration::from_millis(50),
+        window,
+    };
+    let computer = Computer::new().await;
+    let (page, settings) = computer.running_page(timing).await;
+    page.call("recovery_turn_on", json!({})).expect("on");
+    // The first write after this one fails before the service sees it.
+    computer
+        .served
+        .web()
+        .fail_with_member(SYNC_PATH, "exchange", 1, Moment::Before);
+    let mut seen = 0;
+    settings
+        .set_colour_mode(ColourMode::Dark)
+        .await
+        .expect("kept");
+    // The card, which reads recovery when it is told and at no other time, until it has shown the
+    // failed save and then the saved one.
+    let failed = json!({ "state": "not_saved", "why": "service" });
+    let saved = json!({ "state": "saved" });
+    let mut lines = Vec::new();
+    let end = std::time::Instant::now() + Duration::from_secs(10);
+    while std::time::Instant::now() < end
+        && !(lines.contains(&failed) && lines.last() == Some(&saved))
+    {
+        let told = *page.recovery_told.lock().expect("the record");
+        if told > seen {
+            seen = told;
+            lines.push(line_of(&page));
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        lines.contains(&failed),
+        "the failed save was told: {lines:?}"
+    );
+    assert_eq!(
+        lines.last(),
+        Some(&saved),
+        "the retry that mended it was told: {lines:?}"
     );
 }
 

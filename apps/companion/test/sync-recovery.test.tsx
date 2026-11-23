@@ -257,6 +257,49 @@ describe('recovery', () => {
     })
   })
 
+  it('ends as settled when the backend settled the write before the person pressed Settle it', async () => {
+    const { person, controls, sheet } = await openSheet()
+    act(() => {
+      controls.recovery.set({ state: 'unsettled', kept_at: 'reach.kala.to' })
+      controls.account.set(SIGNED_IN)
+    })
+    const recovery = await within(sheet).findByTestId('recovery')
+    await waitFor(() => {
+      expect(recovery).toHaveAttribute('data-state', 'unsettled')
+    })
+    // A step ended the write after the card was read and before the person pressed the control,
+    // and the card was not told: the backend answers with where recovery stands now.
+    act(() => {
+      controls.recovery.set({ state: 'on' })
+    })
+    expect(recovery).toHaveAttribute('data-state', 'unsettled')
+    await person.click(within(recovery).getByTestId('recovery-settle'))
+    await waitFor(() => {
+      expect(recovery).toHaveAttribute('data-state', 'on')
+    })
+    expect(controls.recovery.settled).toBe(1)
+    expect(within(sheet).queryByRole('alert')).toBeNull()
+  })
+
+  it('shows what a step that ended by itself left, with no action of the person', async () => {
+    const { controls, sheet } = await openSheet()
+    act(() => {
+      controls.recovery.set({ state: 'unsettled', kept_at: 'reach.kala.to' })
+      controls.account.set(SIGNED_IN)
+    })
+    const recovery = await within(sheet).findByTestId('recovery')
+    await waitFor(() => {
+      expect(recovery).toHaveAttribute('data-state', 'unsettled')
+    })
+    act(() => {
+      controls.recovery.changeByItself({ state: 'on' })
+    })
+    await waitFor(() => {
+      expect(recovery).toHaveAttribute('data-state', 'on')
+    })
+    expect(controls.recovery.settled).toBe(0)
+  })
+
   it('covers the host on this computer, says why it cannot, and replaces a setup only on a second, confirmed choice', async () => {
     const { person, controls, sheet } = await openSheet()
     act(() => {
@@ -643,6 +686,35 @@ describe('the settings saved with the recovery bundle', () => {
       'data-state',
       line.state
     )
+  })
+
+  it('shows a failed save and then a saved one as a step ends by itself, with no action of the person', async () => {
+    const { controls, recovery } = await openOn({ state: 'saved' })
+    const line = () => within(recovery).getByTestId('recovery-settings')
+    expect(await within(recovery).findByTestId('recovery-settings')).toHaveAttribute(
+      'data-state',
+      'saved'
+    )
+    act(() => {
+      controls.recovery.changeByItself({ settings: { state: 'not_saved', why: 'service' } })
+    })
+    await waitFor(() => {
+      expect(line()).toHaveAttribute('data-state', 'not_saved')
+    })
+    expect(line()).toHaveTextContent('the sync service could not be reached')
+    act(() => {
+      controls.recovery.changeByItself({ settings: { state: 'saved' } })
+    })
+    await waitFor(() => {
+      expect(line()).toHaveAttribute('data-state', 'saved')
+    })
+    // A change that the bundle does not hold yet takes the line away.
+    act(() => {
+      controls.recovery.changeByItself({ settings: undefined })
+    })
+    await waitFor(() => {
+      expect(within(recovery).queryByTestId('recovery-settings')).toBeNull()
+    })
   })
 
   it('says nothing while no step has ended or this release does not save them', async () => {

@@ -155,6 +155,24 @@ export function SyncPanel({
   // A sign-in that changes what the account may do changes what stops recovery, so it is read again.
   const standing = account?.state === 'signed_in' ? account.generation : (account?.state ?? null)
 
+  /** Reads recovery again, and shows what it answers or why it could not. */
+  const readRecovery = useCallback(
+    (): Promise<void> =>
+      desktop
+        ? port
+            .recoveryView()
+            .then((view) => {
+              setRecovery(view)
+              setRecoveryProblem(null)
+            })
+            .catch((error: unknown) => {
+              setRecovery(null)
+              setRecoveryProblem(failureMessage(error))
+            })
+        : Promise.resolve(),
+    [port, desktop]
+  )
+
   /**
    * Reads both cards again. Each promise is settled once its card's read has answered or failed;
    * recovery's read waits for any other companion's step to end, so a card never waits on the other.
@@ -186,21 +204,33 @@ export function SyncPanel({
           setSettingsProblem(failureMessage(error))
         })
     })
-    const recovery = desktop
-      ? port
-          .recoveryView()
-          .then((view) => {
-            setRecovery(view)
-            setRecoveryProblem(null)
-          })
-          .catch((error: unknown) => {
-            setRecovery(null)
-            setRecoveryProblem(failureMessage(error))
-          })
-      : Promise.resolve()
+    const recovery = readRecovery()
     // The devices card is read with the settings: its state is in the same view.
     return { service, settings, devices: settings, recovery, restore: recovery }
-  }, [port, desktop])
+  }, [port, readRecovery])
+
+  // A step that saves the settings ended by itself: where recovery stands may be different, and the
+  // person did nothing to ask. Recovery is read again.
+  useEffect(() => {
+    if (!desktop) return undefined
+    let stop: (() => void) | null = null
+    let ended = false
+    port
+      .onRecovery(() => {
+        void readRecovery()
+      })
+      .then(
+        (unlisten) => {
+          if (ended) unlisten()
+          else stop = unlisten
+        },
+        () => undefined
+      )
+    return () => {
+      ended = true
+      stop?.()
+    }
+  }, [port, desktop, readRecovery])
 
   // Another device's change, a step that ended by itself and content waiting for a choice arrive
   // here as they happen. It is registered before the first read is made.

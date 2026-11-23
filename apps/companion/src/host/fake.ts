@@ -465,6 +465,11 @@ export interface FakeRecovery {
   readonly exportsMade: readonly { readonly path: string; readonly archive: string | null }[]
   /** Sets where recovery stands, as the backend would report it. */
   set(view: Partial<Omit<RecoveryView, 'sync_service'>>): void
+  /**
+   * Sets where recovery stands and tells the page, as the backend does when a step it ran by
+   * itself ended: the page reads recovery again with no action of the person's.
+   */
+  changeByItself(view: Partial<Omit<RecoveryView, 'sync_service'>>): void
   /** Makes every read of recovery refuse with these words until it is given none. */
   failReads(message: string | null): void
   /**
@@ -1689,6 +1694,7 @@ export function fakeHost(
   let settingsSyncRuns = 0
   let settingsKeepFails: string | null = null
   const settingsListeners = new Set<(view: SettingsView) => void>()
+  const recoveryListeners = new Set<() => void>()
   const setSettings = (view: SettingsView) => {
     settings = view
     for (const listener of settingsListeners) listener(view)
@@ -3656,6 +3662,7 @@ export function fakeHost(
       return Promise.resolve(settingsOf())
     },
     onSettings: (listener) => register(settingsListeners, listener),
+    onRecovery: (listener) => register(recoveryListeners, listener),
     recoveryView: () => {
       const answer = (): Promise<RecoveryView> =>
         recoveryReadFails === null
@@ -3775,6 +3782,10 @@ export function fakeHost(
       },
       set(view) {
         recovery = { ...recovery, ...view }
+      },
+      changeByItself(view) {
+        recovery = { ...recovery, ...view }
+        for (const listener of recoveryListeners) listener()
       },
       failReads(message) {
         recoveryReadFails = message

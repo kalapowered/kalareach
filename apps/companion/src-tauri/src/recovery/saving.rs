@@ -65,6 +65,7 @@ use super::{Named, Recovery, RecoveryView, Step, blocker, now, refuse_if_blocked
 use crate::account::Account;
 use crate::error::{CommandError, Result};
 use crate::retained::NO_SAVED_SETTINGS;
+use crate::settings::Told;
 
 /// The first level whose builds read a settings member in a recovery bundle.
 pub const SETTINGS_READ_FROM: CompatibilityLevel =
@@ -195,6 +196,8 @@ pub(super) struct Saving {
     wanted: Mutex<Option<Instant>>,
     wake: Notify,
     stopped: AtomicBool,
+    /// What the page is told when a step that ran by itself ended.
+    told: Told,
 }
 
 /// What saving is given: where the settings come from, and whether the writer's level lets it write.
@@ -213,6 +216,7 @@ impl Saving {
             wanted: Mutex::new(None),
             wake: Notify::new(),
             stopped: AtomicBool::new(false),
+            told: Told::default(),
         }
     }
 
@@ -414,6 +418,13 @@ impl Recovery {
         self.saving.want_now();
     }
 
+    /// What telling the page does when a step that ran by itself ended: where recovery stands may
+    /// have changed, and the page reads it again.
+    #[must_use]
+    pub fn told(&self) -> &Told {
+        &self.saving.told
+    }
+
     /// Sets the times saving waits, for a test that cannot wait out the application's.
     #[cfg(feature = "testing")]
     pub fn set_settings_timing(&self, timing: SettingsTiming) {
@@ -465,6 +476,9 @@ impl Recovery {
                 }) => self.saving.want_at(at),
                 Ok(_) | Err(_) => {}
             }
+            // Whatever the step came to, it may have ended a write or moved the line, and nobody
+            // asked for it: the page reads recovery again.
+            self.saving.told.tell();
         }
     }
 

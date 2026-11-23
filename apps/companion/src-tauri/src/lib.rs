@@ -1011,6 +1011,14 @@ fn start_saving<R: tauri::Runtime>(
         .local()
         .changed()
         .by(move || changed.settings_changed());
+    let emitter = app.clone();
+    recovery.told().by(move || {
+        use tauri::Emitter as _;
+
+        #[cfg(feature = "testing")]
+        told::tap(&emitter, recovery::RECOVERY_EVENT, &());
+        let _ = emitter.emit(recovery::RECOVERY_EVENT, ());
+    });
     recovery.settings_wanted();
     let handle = app.clone();
     tauri::async_runtime::spawn(async move {
