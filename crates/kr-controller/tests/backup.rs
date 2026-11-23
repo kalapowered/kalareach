@@ -6032,13 +6032,11 @@ fn version_9_admits_a_deletion_of_a_cancelled_objects_generation_and_version_8_d
     }
 }
 
-/// KR-REQ-24.29: a deletion a later build asked for, of a generation whose ciphertext a service
-/// holds and no descriptor was published, is shown by this build as asked and not confirmed. This
-/// build cannot judge it, so it sends nothing of it, and it asks no such deletion itself: the
-/// generations stay listed with their reason and not deletable.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_version_9_store_shows_a_deletion_this_build_cannot_judge_and_sends_nothing_of_it() {
-    let mut host = Host::open();
+/// A host whose store a later build wrote at version 9: two generations whose production was
+/// cancelled after the service acknowledged their ciphertext, and a deletion of every object of the
+/// first that the later build asked for. This build has not opened the store since.
+fn a_host_a_later_build_asked_a_deletion_of_a_generation_this_build_cannot_judge() -> Host {
+    let host = Host::open();
     host.set_up();
     host.admit(1, &[64]);
     host.admit(2, &[64]);
@@ -6062,7 +6060,16 @@ async fn a_version_9_store_shows_a_deletion_this_build_cannot_judge_and_sends_no
         )
         .expect("version 9's rule admits it");
     assert_eq!(asked, 2, "a member and the manifest");
+    host
+}
 
+/// KR-REQ-24.29: a deletion a later build asked for, of a generation whose ciphertext a service
+/// holds and no descriptor was published, is shown by this build as asked and not confirmed. This
+/// build cannot judge it, so it sends nothing of it, and it asks no such deletion itself: the
+/// generations stay listed with their reason and not deletable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_version_9_store_shows_a_deletion_this_build_cannot_judge_and_sends_nothing_of_it() {
+    let mut host = a_host_a_later_build_asked_a_deletion_of_a_generation_this_build_cannot_judge();
     let (mut uploader, _) = host.restart(60_000).await;
     let listed = privacy(&host.service).exported().expect("a list");
     assert_eq!(listed.len(), 2);
@@ -6114,6 +6121,43 @@ async fn a_version_9_store_shows_a_deletion_this_build_cannot_judge_and_sends_no
             .iter()
             .all(|object| object.deletion_asked_at_ms.is_none()),
         "nothing was written down for generation 2"
+    );
+}
+
+/// KR-REQ-24.29: the store decides again, before a request leaves, a deletion that is written
+/// down, and refuses one of a generation whose ciphertext a service holds and no descriptor was
+/// published: this build has no record of asking such a deletion and cannot judge it. This is the
+/// store's own hold, whatever the uploader leaves out of what it sends.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_store_refuses_to_confirm_a_deletion_a_later_build_asked_of_a_generation_it_cannot_judge()
+ {
+    let mut host = a_host_a_later_build_asked_a_deletion_of_a_generation_this_build_cannot_judge();
+    let (_uploader, _) = host.restart(60_000).await;
+    let confirmed = host.service.confirm_asked_deletion(
+        archive_id(),
+        BackupGeneration::new(1),
+        member_of(1, 0),
+    );
+    match confirmed {
+        Err(ControllerError::Refused { detail, .. }) => assert!(
+            detail.contains("no descriptor was published"),
+            "the reason is the generation's state: {detail}"
+        ),
+        other => panic!("the store confirmed a deletion it cannot judge: {other:?}"),
+    }
+}
+
+/// KR-REQ-24.29: a pass takes no step for a deletion of that kind. The uploader leaves such a
+/// generation as it stands, so the pass does not spend itself on a request that cannot leave, and
+/// it reports no step waiting on it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pass_takes_no_step_for_a_deletion_a_later_build_asked_of_a_generation_it_cannot_judge() {
+    let mut host = a_host_a_later_build_asked_a_deletion_of_a_generation_this_build_cannot_judge();
+    let (mut uploader, _) = host.restart(60_000).await;
+    let steps = passes(&mut uploader, 61_000).await;
+    assert!(
+        steps.is_empty(),
+        "no step is taken for a deletion this build cannot judge: {steps:?}"
     );
 }
 
