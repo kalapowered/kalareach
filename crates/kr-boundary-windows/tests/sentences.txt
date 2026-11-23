@@ -757,7 +757,7 @@ listed | pub const | win/install.rs | 3 | names, keys, limits, encodings and pat
 listed | pub const | win/verify.rs | 1 | names, keys, limits, encodings and paths; no sentence for a person
 listed | pub fn | env.rs | 2 | names, keys, limits, encodings and paths; no sentence for a person
 listed | pub fn | frame/invocation.rs | 2 | names, keys, limits, encodings and paths; no sentence for a person
-listed | pub fn | journal/limits.rs | 5 | names, keys, limits, encodings and paths; no sentence for a person
+listed | pub fn | journal/limits.rs | 6 | names, keys, limits, encodings and paths; no sentence for a person
 listed | pub fn | journal/replay.rs | 1 | names, keys, limits, encodings and paths; no sentence for a person
 listed | pub fn | journal/rows.rs | 2 | names, keys, limits, encodings and paths; no sentence for a person
 listed | pub fn | manifest.rs | 2 | names, keys, limits, encodings and paths; no sentence for a person; and, in the test build only, the words of a failure that a case forces (`forced::failure_at`), which reach no person
