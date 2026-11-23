@@ -263,3 +263,111 @@ describe("the phone's Steer (KR-REQ-13.12)", () => {
     expect(screen.getByRole('button', { name: 'Steer' })).toBeDisabled()
   })
 })
+
+describe("the phone's Interrupt (KR-REQ-13.12)", () => {
+  const INTERRUPT = 'Interrupt the current turn'
+
+  it('interrupts the running turn, naming the conversation as it is now, and leaves what was written alone', async () => {
+    const person = userEvent.setup()
+    const interrupted: { turn: string; revision: string; opening: string | undefined }[] = []
+    await open((port) => ({
+      ...port,
+      composerInterrupt: (params, opening) => {
+        interrupted.push({
+          turn: params.turn_id,
+          revision: params.target.binding_revision,
+          opening
+        })
+        return port.composerInterrupt(params, opening)
+      }
+    }))
+    const field = screen.getByLabelText('Message this session')
+    await person.type(field, 'half a thought')
+
+    await person.click(await screen.findByRole('button', { name: INTERRUPT }))
+
+    await waitFor(() => {
+      expect(interrupted).toHaveLength(1)
+    })
+    expect(interrupted[0]).toMatchObject({ turn: 'turn-9', revision: '4' })
+    expect(typeof interrupted[0]?.opening).toBe('string')
+    expect(field).toHaveValue('half a thought')
+  })
+
+  it('is offered with nothing written, and not while no turn runs', async () => {
+    await open()
+    expect(await screen.findByRole('button', { name: INTERRUPT })).toBeEnabled()
+    cleanup()
+
+    await open(undefined, (host) => {
+      host.controls.records.endTurn(SESSION_MAIN)
+    })
+    expect(screen.queryByRole('button', { name: INTERRUPT })).toBeNull()
+  })
+
+  it('is not offered where the agent has not said it can cancel, or the device was not granted it', async () => {
+    await open(undefined, (host) => {
+      host.controls.records.withoutCapability(SESSION_MAIN, 'agent.cancel')
+    })
+    expect(screen.queryByRole('button', { name: INTERRUPT })).toBeNull()
+    cleanup()
+
+    const host = await open()
+    await screen.findByRole('button', { name: INTERRUPT })
+    act(() => {
+      host.controls.setRights(EVERY_RIGHT.filter((right) => right !== 'agent.cancel'))
+    })
+    await waitFor(() => {
+      expect(screen.queryByRole('button', { name: INTERRUPT })).toBeNull()
+    })
+  })
+
+  it('is not held by a prompt on its way to the host, or by an action nobody knows the end of', async () => {
+    const person = userEvent.setup()
+    const host = await open()
+    const field = screen.getByLabelText('Message this session')
+    const held = host.controls.holdMutation()
+
+    await person.type(field, 'run the tests')
+    await person.click(screen.getByRole('button', { name: 'Send' }))
+    await waitFor(() => {
+      expect(held.count).toBe(1)
+    })
+    expect(screen.getByRole('button', { name: 'Send' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: INTERRUPT })).toBeEnabled()
+    held.release()
+
+    host.controls.leaveNextSendUnconfirmed()
+    await person.type(field, 'and the linter')
+    await person.click(screen.getByRole('button', { name: 'Send' }))
+    await screen.findByTestId('composer-send-anyway')
+    expect(screen.getByRole('button', { name: INTERRUPT })).toBeEnabled()
+  })
+
+  it('is sent once while it is on its way, however often it is pressed', async () => {
+    const person = userEvent.setup()
+    let answer: () => void = () => undefined
+    let calls = 0
+    await open((port) => ({
+      ...port,
+      composerInterrupt: (params, opening) => {
+        calls += 1
+        return new Promise((resolve) => {
+          answer = () => {
+            resolve(port.composerInterrupt(params, opening))
+          }
+        })
+      }
+    }))
+    const button = await screen.findByRole('button', { name: INTERRUPT })
+
+    await person.click(button)
+    await person.click(button)
+    await person.click(button)
+    expect(calls).toBe(1)
+
+    act(() => {
+      answer()
+    })
+  })
+})

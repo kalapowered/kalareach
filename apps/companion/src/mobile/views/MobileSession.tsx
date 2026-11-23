@@ -1268,12 +1268,31 @@ export function MobileSession({
       Steer
     </Button>
   ) : null
-  const composerActions = steerButton === null && queueButton === null ? null : (
-    <>
-      {steerButton}
-      {queueButton}
-    </>
-  )
+  // Interrupting the running turn needs nothing written and is held back by nothing but the
+  // connection: not by a prompt on its way, nor by an action nobody knows the end of, which is when
+  // it is most wanted. Pressed while one is on its way it is not sent again.
+  const interruptButton = offers.interrupt.offered ? (
+    <Button
+      aria-label="Interrupt the current turn"
+      title="Interrupt the current turn"
+      data-testid="composer-interrupt"
+      disabled={connected !== true}
+      style={{ minBlockSize: target, minInlineSize: target }}
+      onClick={() => {
+        send('interrupt', '')
+      }}
+    >
+      &#9632;
+    </Button>
+  ) : null
+  const composerActions =
+    interruptButton === null && steerButton === null && queueButton === null ? null : (
+      <>
+        {interruptButton}
+        {steerButton}
+        {queueButton}
+      </>
+    )
   // The actions that are not finished, other than the newest, which the badge beside Send shows: an
   // action sent past one nobody knows the end of leaves that one listed, with its own status.
   const earlier = unresolved(mine).filter((submission) => submission !== mine.at(-1))
