@@ -290,14 +290,14 @@ jobs:
     # were gone, and a linker that was ended by SIGBUS. The workspace's tests are now three steps
     # (kr-controller; companion-tauri with kr-worker; the rest), and the plan states each step's
     # seconds from that night as its `weight`, so that the report cuts the steps into parts of
-    # nearly equal time and not by count. The weights of the three are estimates, because that night
-    # ran them as one step; from them the parts take about 106, 116 and 79 minutes (each holds the
-    # worker's build, 239 seconds). A part that holds a package step also builds, before it, the
+    # nearly equal time and not by count. The weights are now measured, from the three-part run of
+    # 22 November (45081811835): the parts' weights come to 5,965, 8,562 and 5,100 seconds (99.4,
+    # 142.7 and 85.0 minutes), and the parts' steps took 6,448, 8,797 and 5,040 seconds (107.5,
+    # 146.6 and 84.0 minutes). A part that holds a package step also builds, before it, the
     # programs its suites start from other packages: a set-up step of the plan, which states no
     # weight of its own. Its build is not shared with the package steps, which build with their own
-    # feature sets, so each part's estimate counts the shared crates once and its real time runs
-    # above the estimate. The first run of the three parts measures them, and the weights are
-    # refreshed from it. A part that fails does not stop the others.
+    # feature sets, so a part's time can run above the sum of its weights. A part that fails does
+    # not stop the others.
     strategy:
       fail-fast: false
       matrix:
@@ -457,21 +457,23 @@ jobs:
 
       # The step runs the groups of its part of the platform's plan one after the other, and it
       # grows with the suites. The whole plan took 207 to 240 minutes on the eleven nights of 30
-      # October to 9 November, when taking the steps a night did not reach at the pace of the steps
-      # it did gave 262 minutes for 8 November, and then 282 minutes on 14 November and more than
-      # 287 on 15 November. The limit is what the job's limit leaves once
-      # the other steps have theirs, less 3 minutes for the set-up and clean-up that no step limit
-      # counts. Those steps' limits add up to 65 minutes, each at least twice the longest its step
-      # took in the eleven nights (the disk step, at 3.8 minutes, has 8; the closing report, which
-      # also reads the kernel's log for failed writes to the volume, has 4), so the limits of the
-      # job's steps add up to 352 of its 355 minutes, under GitHub's six hours. The step's 287
-      # minutes and the job's 355 are unchanged by the three parts: the longest part is estimated at
-      # 116 minutes (see the job's note above), which leaves 171 minutes, 1.5 times the estimate (the
-      # whole 287 is 2.5 times it), for a slower runner or an estimate that is short; they are
-      # lowered from the first run's measured times. Part 1 of the two parts took 215 minutes of the
-      # step on 21 November, which is what the three parts replace.
+      # October to 9 November, 282 minutes on 14 November and more than 287 on 15 November, and part
+      # 1 of the two parts took 215 minutes of the step on 21 November, which is what the three
+      # parts replace. The limit now comes from the plan's measured weights: the longest part's come
+      # to 8,562 seconds (142.7 minutes), and that part, part 2, took 8,797 seconds (146.6 minutes)
+      # in the run of 22 November. The limit is 220 minutes, 73 minutes (50 percent) over that time,
+      # for a slower runner or a suite that has grown; it was 287, which with the other steps' 72
+      # came to 359 minutes, 4 over the job's 355. The other steps' limits are each at least twice
+      # the longest their step took in the eleven nights (the disk step, at 3.8 minutes, has 8; the
+      # closing report, which also reads the kernel's log for failed writes to the volume, has 4).
+      # They include the evidence upload's 5 minutes, the pause's 2 and the second try's 5, so the
+      # limits of the job's steps add up to 292 of its 355 minutes, under GitHub's six hours: when
+      # every step before the upload has used its whole limit, the upload and its second try still
+      # have theirs, and 63 minutes (18 percent of the job's limit) remain, 3 of them for the
+      # set-up and clean-up that no step limit counts. tests/conformance/tests/ci_evidence.rs fails
+      # a job whose steps' limits and those 3 minutes reach the job's own.
       - name: The conformance report
-        timeout-minutes: 287
+        timeout-minutes: 220
         env:
           REPORT_GROUPS: ${{ inputs.groups }}
           REPORT_PART: ${{ matrix.part }}
@@ -677,11 +679,17 @@ jobs:
       # The step builds and runs the suites of its part in turn, with no build cache, and it grows
       # with the suites. The whole plan took 102 to 143 minutes with 76 to 81 steps (16 to 25
       # October), 185 minutes with 91 (29 October), 191 with 92 (3 November), and 252 minutes with 96
-      # on 11 and 12 November. The limit is what this job's limit leaves once the other steps have
-      # theirs, less 3 minutes for the set-up and clean-up that no step limit counts: the limits of
-      # the job's steps add up to 352 of its 355 minutes. A part takes about half of the plan and
-      # the two builds that open it: 128 and 123 minutes in the run of 12 November, so the limit
-      # is more than twice what a part needs and a part keeps more than a quarter of it.
+      # on 11 and 12 November. A part takes about half of the plan and the two builds that open it:
+      # 128 and 123 minutes in the run of 12 November, and 125.2 and 76.4 minutes (7,510 and 4,582
+      # seconds of steps) in the run of 22 November (45081811835). The limit is 260 minutes, more
+      # than twice the longest of those (2.03 times 128, 2.08 times 125.2); it was 281, which with
+      # the other steps' 83 came to 364 minutes, 9 over the job's 355. The other steps' limits
+      # include the evidence upload's 10 minutes, the pause's 2 and the second try's 10, so the
+      # limits of the job's steps add up to 343 of its 355 minutes: when every step before the
+      # upload has used its whole limit, the upload and its second try still have theirs, and 12
+      # minutes (3 percent of the job's limit) remain, 3 of them for the set-up and clean-up that no
+      # step limit counts. tests/conformance/tests/ci_evidence.rs fails a job whose steps' limits and
+      # those 3 minutes reach the job's own.
       #
       # The report runs from a copy of its program, in a folder of this run's own under the
       # temporary directory, as scripts/run-conformance.sh runs it on the other platforms: a step of
@@ -691,7 +699,7 @@ jobs:
       # temporary directory.
       - name: The conformance report
         if: ${{ !cancelled() }}
-        timeout-minutes: 281
+        timeout-minutes: 260
         env:
           REPORT_GROUPS: ${{ inputs.groups }}
           REPORT_PART: ${{ matrix.part }}
