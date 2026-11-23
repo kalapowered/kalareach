@@ -2934,3 +2934,128 @@ fn paste_mode_probe_in_the_console() {
     ));
     say("kr-probe:end".to_owned());
 }
+
+/// What the application in a session is given when a paste and a mouse report are written straight
+/// to the session as input bytes, as the typist writes them: no outer console and no `kr attach`
+/// reader stand between the typist and the session's pseudo-console. It prints, byte for byte,
+/// what the application was given and what each outcome means, and asserts nothing about it.
+///
+/// The typist ends each write with the carriage return of the Enter key, so a `0d` follows each
+/// write in what the application is given. The application asked for bracketed paste and for
+/// clicks, as the cases above do; nothing here reacts to its requests.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn scratch_what_an_application_is_given_of_a_paste_and_a_mouse_report_written_to_its_session()
+{
+    const NAME: &str =
+        "scratch_what_an_application_is_given_of_a_paste_and_a_mouse_report_written_to_its_session";
+    const REPORT: &[u8] = b"\x1b[<0;10;5M";
+    const OPENING: &[u8] = b"\x1b[200~";
+    const CLOSING: &[u8] = b"\x1b[201~";
+    if std::env::var_os(BYTES_READER).is_some() {
+        bytes_reader_in_the_session();
+        return;
+    }
+    let host = WorkerHost::start().await;
+    let (session_id, dimensions) = host
+        .kr_new(&["--shell-mode", "native_compat", "--shell", &command_shell()])
+        .await
+        .session();
+    let environment = host.tree.environment();
+    let mut typist = WorkerTerminal::attach(&environment, session_id, dimensions).await;
+    let directory = tempfile::tempdir().expect("a directory on the internal disk");
+    let reader = std::env::current_exe().expect("this test binary");
+    typist
+        .type_line(&format!(
+            "set {BYTES_READER}=1&& set {BYTES_ASK}=2004,1000&& set \"{BYTES_DIRECTORY}={}\"&& \
+             \"{}\" --exact {NAME} --nocapture --test-threads=1",
+            directory.path().display(),
+            reader.display()
+        ))
+        .await;
+    typist
+        .shown(
+            "kr-bytes-waiting",
+            "the application waits to ask for its modes",
+        )
+        .await;
+    std::fs::write(directory.path().join("gate"), b"open")
+        .expect("the file the application waits for");
+    typist
+        .shown(
+            "kr-bytes-ready",
+            "the application asked for its modes and said so",
+        )
+        .await;
+
+    // Two writes of the typist: a mouse report, then a paste and the capital letter that ends what
+    // the application reads. The typist adds a carriage return to each.
+    typist
+        .type_line(std::str::from_utf8(REPORT).expect("ASCII"))
+        .await;
+    typist.type_line("\x1b[200~12\x1b[201~Z").await;
+
+    // The application keeps reading after the last carriage return, so what it was given is read
+    // once it holds the letter and has held the same bytes for a while.
+    let given = directory.path().join("given");
+    let started = Instant::now();
+    let mut told = Vec::new();
+    let mut unchanged_since = Instant::now();
+    while started.elapsed() < LIVENESS_DEADLINE {
+        typist.watch(Duration::from_millis(200)).await;
+        let now = std::fs::read(&given).unwrap_or_default();
+        if now != told {
+            told = now;
+            unchanged_since = Instant::now();
+        } else if told.contains(&b'Z') && unchanged_since.elapsed() > Duration::from_millis(2000) {
+            break;
+        }
+    }
+
+    let holds = |part: &[u8]| told.windows(part.len()).any(|window| window == part);
+    println!(
+        "wp1-sep: written: report {}, then 0d, then paste-and-Z {}, then 0d",
+        hex(REPORT),
+        hex(b"\x1b[200~12\x1b[201~Z")
+    );
+    println!("wp1-sep: given ({} bytes): {}", told.len(), hex(&told));
+    println!(
+        "wp1-sep: given as text: {:?}",
+        told.iter()
+            .map(|&byte| match byte {
+                0x1b => "<ESC>".to_owned(),
+                0x0d => "<CR>".to_owned(),
+                0x20..=0x7e => char::from(byte).to_string(),
+                other => format!("<{other:02x}>"),
+            })
+            .collect::<String>()
+    );
+    println!(
+        "wp1-sep: the opening marker whole: {}; the closing marker whole: {}; the mouse report whole: {}; \
+         the letter: {}",
+        holds(OPENING),
+        holds(CLOSING),
+        holds(REPORT),
+        holds(b"Z")
+    );
+    println!(
+        "wp1-sep: if the application was given ESC, 12, ESC and Z (the markers' and the report's \
+         brackets gone, one ESC left of each): the loss is at or after the worker, in the session's \
+         own pseudo-console, and no change in `kr attach` cures it; the cure is in how the worker \
+         writes a paste and a mouse report into the pseudo-console"
+    );
+    println!(
+        "wp1-sep: if the application was given both markers whole and the report whole: the loss is \
+         in the outer console in the real flow, and `kr attach` must read the console's own mode \
+         before the first press"
+    );
+
+    drop(typist);
+    let closed = host
+        .kr(&["--json", "close", &session_id.to_string()], &[])
+        .await;
+    println!(
+        "wp1-sep: the session closed with {}: {}",
+        closed.status,
+        String::from_utf8_lossy(&closed.stdout)
+    );
+}
