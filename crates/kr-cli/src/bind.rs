@@ -427,22 +427,58 @@ pub async fn require_outside_to_end_a_daemon(
 /// the place an agent runs: the checks are the person's to ask for, and the file they read is the
 /// person's to name.
 ///
-/// The test is [`require_outside_to_end_a_daemon`]'s: `KR_SESSION` or `KR_ATTACHMENT` set here
-/// refuses at once, and otherwise every live session's worker is asked whether this process is
-/// inside its session; a worker that cannot say lets the command go on.
+/// The guard stops a command started by accident inside a session; as [`require_outside`] says, it
+/// is not isolation from other code running as the same user. `KR_SESSION` or `KR_ATTACHMENT` set
+/// here refuses at once. Otherwise every live session's worker is asked at once
+/// ([`membership_together`]) whether this process is inside its session, and the command goes on
+/// only where every one says it is not ([`outside_to_run_the_checks`]): a worker that cannot say
+/// refuses it, as [`require_outside`] does, since nothing here needs a host that cannot answer.
 ///
 /// # Errors
 ///
-/// Returns a refusal with `PERMISSION_DENIED`, in its own words, that says nothing was run.
+/// Returns a refusal with `PERMISSION_DENIED`, in its own words, that says no checks were run.
 pub async fn require_outside_to_run_the_checks(build_id: &BuildId) -> Result<()> {
-    match found_inside(build_id).await {
-        Some(found) => Err(inside(shown!(
-            "kr host desktop-checks runs outside a KalaReach session, and {}. {} No checks were run.",
-            found,
-            WHERE_TO_RUN
-        ))),
-        None => Ok(()),
+    if let Some(found) = variable_set_here() {
+        return Err(refused_to_run_the_checks(&found));
     }
+    outside_to_run_the_checks(membership_together(build_id).await)
+}
+
+/// What the answer of the sessions' workers comes to for a command that starts the checks: it goes
+/// on only where every worker said this process is not its own.
+fn outside_to_run_the_checks(membership: Membership) -> Result<()> {
+    match membership {
+        Membership::Outside => Ok(()),
+        Membership::Inside(session_id) => Err(refused_to_run_the_checks(&shown!(
+            "this process is inside session {}",
+            session_id
+        ))),
+        Membership::Unknown(why) => Err(refused_to_run_the_checks(&shown!(
+            "whether this process is inside a KalaReach session cannot be established ({})",
+            why
+        ))),
+    }
+}
+
+/// The refusal of the command that starts the checks, ended with where to run it.
+fn refused_to_run_the_checks(found: &Shown) -> CliError {
+    inside(shown!(
+        "kr host desktop-checks runs outside a KalaReach session, and {}. {} No checks were run.",
+        *found,
+        WHERE_TO_RUN
+    ))
+}
+
+/// How this process is found to be inside a session by what is set in its environment, said as the
+/// end of a clause: `KR_SESSION` or `KR_ATTACHMENT` set here.
+fn variable_set_here() -> Option<Shown> {
+    [
+        crate::resolve::SESSION_VARIABLE,
+        crate::resolve::ATTACHMENT_VARIABLE,
+    ]
+    .into_iter()
+    .find(|variable| std::env::var_os(variable).is_some())
+    .map(|variable| shown!("{} is set here", variable))
 }
 
 /// How this process is found to be inside a session, said as the end of a clause, or `None` where
@@ -450,13 +486,8 @@ pub async fn require_outside_to_run_the_checks(build_id: &BuildId) -> Result<()>
 /// live session's worker is asked at once ([`membership_together`]), and a worker that cannot say
 /// finds nothing.
 async fn found_inside(build_id: &BuildId) -> Option<Shown> {
-    for variable in [
-        crate::resolve::SESSION_VARIABLE,
-        crate::resolve::ATTACHMENT_VARIABLE,
-    ] {
-        if std::env::var_os(variable).is_some() {
-            return Some(shown!("{} is set here", variable));
-        }
+    if let Some(found) = variable_set_here() {
+        return Some(found);
     }
     match membership_together(build_id).await {
         Membership::Inside(session_id) => {
@@ -800,5 +831,30 @@ mod tests {
         })
         .await;
         assert!(matches!(answered, Membership::Unknown(_)), "{answered:?}");
+    }
+
+    /// A command that starts the checks goes on only where every worker said this process is not
+    /// its own: a worker that could not say refuses it, as one that said it is does, where the
+    /// command that ends a daemon lets it go on.
+    #[test]
+    fn the_checks_are_refused_unless_every_worker_said_this_process_is_outside() {
+        assert!(outside_to_run_the_checks(Membership::Outside).is_ok());
+        for (membership, said) in [
+            (
+                Membership::Inside(SessionId::new(Uuid::from_bytes([2; 16]))),
+                "this process is inside session",
+            ),
+            (
+                Membership::Unknown(Shown::said("it did not answer in time")),
+                "cannot be established (it did not answer in time)",
+            ),
+        ] {
+            let refused = outside_to_run_the_checks(membership.clone())
+                .expect_err(&format!("{membership:?} refuses the command"));
+            assert_eq!(refused.code(), ErrorCode::PermissionDenied, "{refused}");
+            let words = refused.to_string();
+            assert!(words.contains(said), "{words}");
+            assert!(words.ends_with("No checks were run."), "{words}");
+        }
     }
 }

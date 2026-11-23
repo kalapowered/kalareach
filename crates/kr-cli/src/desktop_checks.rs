@@ -7,8 +7,10 @@
 //! bounded time, and prints the records the way `kr doctor` does, so one renderer says what each
 //! check found wherever a person reads it.
 //!
-//! The command runs outside every session, as `kr host stop` does: an agent in a session does not
-//! start the checks or name a file for them.
+//! The command runs outside every session, as `kr host stop` does, and refuses where whether it is
+//! inside one cannot be established. The guard stops a command started by accident in a session
+//! from starting the checks or naming a file for them; it is not isolation from other code that
+//! runs as the same user.
 //!
 //! `--file` names the file the read check reads. A path relative to the directory the command runs
 //! in is made absolute here, because the host reads it from a worker that runs elsewhere. Without

@@ -2712,9 +2712,11 @@ worker reads that file in this run and in no other. With no file the read check 
 says so. A run that is already going is not started again: the command waits for it, and the file
 that run was asked to read stands, not the one this command names.
 
-The command runs outside every session, as `kr host stop` does: where `KR_SESSION` or `KR_ATTACHMENT` is set, or a
-session's worker says the command runs inside its session, it refuses with `PERMISSION_DENIED` and runs no checks.
-Run it in a terminal that was not opened through the KalaReach profile, or an SSH login.
+The command runs outside every session: where `KR_SESSION` or `KR_ATTACHMENT` is set, where a
+session's worker says the command runs inside its session, and where a worker cannot say whether it
+does, it refuses with `PERMISSION_DENIED` and runs no checks. This stops an accident and is no
+boundary: code that runs as your account is not stopped by it. Run it in a terminal that was not
+opened through the KalaReach profile, or an SSH login.
 
 A run that ends without findings is a failure, exit 1, and the message says why in the words the
 setup page uses: no session of the kind the host creates is running, or the session's worker
