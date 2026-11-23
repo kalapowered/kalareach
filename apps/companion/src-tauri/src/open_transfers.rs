@@ -89,6 +89,9 @@ pub const UNRECOVERABLE: &str = "this device asked the host to take this file an
 /// What the command that waited for an upload is told when the person cancelled it.
 pub const CANCELLED: &str = "this file was cancelled before it was sent in full";
 
+/// What the command that waited for an upload is told when its send ended with no answer.
+const ENDED_WITHOUT_OUTCOME: &str = "the upload ended without an outcome";
+
 /// A cancel names no upload this device holds, or one that is another account's.
 pub const NO_OPEN_UPLOAD: &str = "no open upload has that key";
 
@@ -902,6 +905,22 @@ impl Registry {
         }
     }
 
+    /// Ends the admission of `live`, whose send ended before its start was decided: only its own
+    /// upload, still admitted, and its own copy go, in one section under the gate. A cleanup may
+    /// have stopped the upload and let the key be used again, and then neither the upload nor the
+    /// copy is this send's to remove.
+    fn drop_admitted(&mut self, store: &Store, live: &Arc<Live>) {
+        self.remove_copy_of(store, live);
+        if self
+            .held
+            .get(&live.key)
+            .is_some_and(|held| Arc::ptr_eq(held, live))
+            && *locked(&live.phase) == Phase::Admitted
+        {
+            self.held.remove(&live.key);
+        }
+    }
+
     /// Holds `live`, made from an entry a restart found, unless the person cancelled its key since
     /// the entry was read or it is held already.
     fn admit_restarted(&mut self, live: &Arc<Live>) -> bool {
@@ -1349,15 +1368,22 @@ impl Desk {
         {
             let (desk, live) = (Arc::clone(self), Arc::clone(&live));
             self.sends.spawn(async move {
-                let answered = desk
-                    .keep_and_start(&store, &live, request.keeping, &paired)
-                    .await;
+                // A panic ends the send before it is decided: the upload is not left admitted with no
+                // sender, and the caller is answered.
+                let answered =
+                    AssertUnwindSafe(desk.keep_and_start(&store, &live, request.keeping, &paired))
+                        .catch_unwind()
+                        .await
+                        .unwrap_or_else(|_| {
+                            locked(&desk.registry).drop_admitted(&store, &live);
+                            Err(CommandError::local_failure(ENDED_WITHOUT_OUTCOME))
+                        });
                 let _ = told.send(answered);
             });
         }
         answer
             .await
-            .map_err(|_| CommandError::local_failure("the upload ended without an outcome"))??;
+            .map_err(|_| CommandError::local_failure(ENDED_WITHOUT_OUTCOME))??;
         Self::outcome_of(&live).await
     }
 
@@ -1401,21 +1427,7 @@ impl Desk {
                 })
             });
             if let Err(error) = written {
-                // Only this send's own upload, still admitted, and its own copy go, in one section
-                // under the gate: a cleanup may have stopped the upload and let the key be used
-                // again, and then neither the upload nor the copy is this send's to remove.
-                {
-                    let mut registry = locked(&self.registry);
-                    registry.remove_copy_of(store, live);
-                    if registry
-                        .held
-                        .get(&key)
-                        .is_some_and(|held| Arc::ptr_eq(held, live))
-                        && *locked(&live.phase) == Phase::Admitted
-                    {
-                        registry.held.remove(&key);
-                    }
-                }
+                locked(&self.registry).drop_admitted(store, live);
                 return Err(error);
             }
         }
@@ -1426,6 +1438,10 @@ impl Desk {
                 testing::note(key, testing::Point::AfterCopy);
                 let _ = gate.acquire().await;
             }
+        }
+        #[cfg(feature = "testing")]
+        if testing::take(key, testing::Fault::PanicInSend) {
+            panic!("a fault injected into a send");
         }
         // The check and the start are one section under the gate. A cancel that came while the copy
         // was written has recorded the key, or has ended this upload, and the start refuses; one that
@@ -3150,6 +3166,8 @@ pub mod testing {
         /// The write of a send's copy fails, once, after the copy is written beside its name and
         /// before it is placed.
         CopyFails,
+        /// The desk's task of a send panics, once, after the copy is placed and before the start.
+        PanicInSend,
     }
 
     static ARMED: LazyLock<Mutex<HashSet<(Uuid, Fault)>>> = LazyLock::new(Mutex::default);

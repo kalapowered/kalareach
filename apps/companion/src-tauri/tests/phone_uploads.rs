@@ -4396,6 +4396,54 @@ async fn kr_req_13_12_a_send_whose_copy_fails_leaves_the_copy_and_the_place_of_t
     adopted.stop().await;
 }
 
+/// KR-REQ-13.12 (FU7): a panic in the desk's task of a send leaves no upload admitted with no
+/// sender. The caller is answered, the copy is gone, and the key is free for a new send.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_13_12_a_panic_in_the_task_of_a_send_leaves_no_admitted_upload() {
+    use testing::Fault;
+
+    let adopted = Adopted::start(1).await;
+    let (phone, _control) = phone_for(&adopted).await;
+    let desk = desk_of(&phone.companion);
+    let paired = paired_of(&phone.companion).await;
+    let key = kr_ipc::new_uuid();
+    let first_bytes = vec![5_u8; 16];
+    let second_bytes = vec![6_u8; 16];
+    let panics = testing::arm(key, Fault::PanicInSend);
+    let first = request(
+        &adopted,
+        &first_bytes,
+        Arc::new(Held::new(first_bytes.clone())),
+        key,
+    );
+    let answered = tokio::time::timeout(WATCHDOG, desk.send(paired.clone(), first))
+        .await
+        .expect("the send answers");
+    assert!(answered.is_err(), "the send that panicked has no outcome");
+    drop(panics);
+    desk.sends_idle().await;
+    assert_eq!(
+        testing::read_copy(&folder(&phone), key),
+        None,
+        "the panicked send left no copy"
+    );
+    assert!(
+        desk.generation_for_test(key).is_none(),
+        "the panicked send left no upload admitted"
+    );
+    let second = request(
+        &adopted,
+        &second_bytes,
+        Arc::new(Held::new(second_bytes.clone())),
+        key,
+    );
+    tokio::time::timeout(WATCHDOG, desk.send(paired, second))
+        .await
+        .expect("the second send answers")
+        .expect("the key is free: the second upload publishes");
+    adopted.stop().await;
+}
+
 /// KR-REQ-13.12 (FU1b): a send that the start section refuses, under a key that no upload holds but
 /// whose entry is kept, leaves the copy: the entry names it, and it is not the refused send's. A
 /// cleanup that records no cancel ended the send's upload, and a record of another upload was kept
