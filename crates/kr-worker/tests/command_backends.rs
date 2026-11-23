@@ -1580,8 +1580,9 @@ async fn kr_req_12_07_an_integration_that_declares_a_backend_establishes_nothing
 
 /// KR-REQ-07.45: a Windows build that cannot name the process at the other end of a Unix-domain
 /// socket establishes nothing for an integration that declares a backend, and says why by name
-/// before anything is made: the invocation runs as typed. The probe's answer is forced here, so the
-/// case shows what a build that does not answer the control call does on a build that does.
+/// before anything is made: the invocation runs as typed. The control call's failure is forced
+/// here, so the case shows what a build that does not answer it does on a build that does, in the
+/// words the probe itself writes.
 #[cfg(windows)]
 #[tokio::test]
 async fn kr_req_07_45_a_build_that_cannot_name_a_sockets_peer_establishes_nothing_and_says_so() {
@@ -1591,11 +1592,7 @@ async fn kr_req_07_45_a_build_that_cannot_name_a_sockets_peer_establishes_nothin
         |config| config,
     );
     let integration = codex_integration();
-    let _forced = kr_worker::windows::uds::force_the_probe_to_fail(
-        "this Windows build (Windows 10.0 build 17134) does not answer SIO_AF_UNIX_GETPEERPID \
-         (the answer names no process), so the process at the other end of a Unix-domain socket \
-         cannot be named",
-    );
+    let _forced = kr_worker::windows::uds::force_the_ioctl_to_fail("the answer names no process");
     let names_in = |directory: &std::path::Path| {
         let mut names: Vec<_> = std::fs::read_dir(directory)
             .expect("the runtime directory")
@@ -1611,7 +1608,13 @@ async fn kr_req_07_45_a_build_that_cannot_name_a_sockets_peer_establishes_nothin
         .establish(&request(&setup, &launch, &integration, 1))
         .expect_err("no backend is established where the build names no peer");
     assert!(why.contains("SIO_AF_UNIX_GETPEERPID"), "{why}");
-    assert!(why.contains("Windows 10.0 build 17134"), "{why}");
+    assert!(
+        why.contains(&format!(
+            "this Windows build ({})",
+            kr_worker::windows::uds::windows_build()
+        )),
+        "{why}"
+    );
     assert!(why.ends_with("so this invocation runs as typed"), "{why}");
     assert!(
         setup.backends.root().is_none(),

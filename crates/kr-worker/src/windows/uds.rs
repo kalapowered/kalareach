@@ -387,8 +387,8 @@ thread_local! {
     static FORCED: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
 }
 
-/// What a case that forces the probe to fail holds while it does: the failure is put back as it was
-/// when this is dropped.
+/// What a case that forces the control call to fail holds while it does: the failure is put back as
+/// it was when this is dropped.
 #[cfg(any(test, feature = "testing"))]
 #[derive(Debug)]
 pub struct ForcedProbeFailure(Option<String>);
@@ -400,14 +400,15 @@ impl Drop for ForcedProbeFailure {
     }
 }
 
-/// Makes the probe fail with `detail` on this thread until the value returned is dropped, whatever
-/// the build answers.
+/// Makes the control call that names a connection's peer fail with `detail` on this thread until the
+/// value returned is dropped, whatever the build answers.
 ///
-/// A case on a build that answers the control call uses it to show what a build that does not
-/// answer it does.
+/// The probe runs for real and says what it says of a failed call, so a case shows the refusal this
+/// module writes, and not words the case wrote. While a failure is forced the probe is neither read
+/// from the cache nor kept in it.
 #[cfg(any(test, feature = "testing"))]
 #[must_use]
-pub fn force_the_probe_to_fail(detail: &str) -> ForcedProbeFailure {
+pub fn force_the_ioctl_to_fail(detail: &str) -> ForcedProbeFailure {
     ForcedProbeFailure(FORCED.with(|forced| forced.borrow_mut().replace(detail.to_owned())))
 }
 
@@ -423,8 +424,8 @@ pub fn force_the_probe_to_fail(detail: &str) -> ForcedProbeFailure {
 /// Returns the refusal, which names the control call and the Windows build.
 pub fn gateway_socket_names_its_peers() -> Result<(), String> {
     #[cfg(any(test, feature = "testing"))]
-    if let Some(forced) = FORCED.with(|forced| forced.borrow().clone()) {
-        return Err(forced);
+    if FORCED.with(|forced| forced.borrow().is_some()) {
+        return probe();
     }
     PROBE.get_or_init(probe).clone()
 }
@@ -518,6 +519,10 @@ fn prove_the_build_names_a_peer(path: &Path) -> Result<(), String> {
 /// The count of bytes the call returns is not read: an older build answers with a valid process and
 /// a count of zero. What is refused is no process.
 fn peer_process_of(socket: &impl AsRawSocket) -> std::io::Result<u32> {
+    #[cfg(any(test, feature = "testing"))]
+    if let Some(forced) = FORCED.with(|forced| forced.borrow().clone()) {
+        return Err(std::io::Error::other(forced));
+    }
     let raw = usize::try_from(socket.as_raw_socket())
         .map_err(|_| std::io::Error::other("a socket handle that is not a handle"))?;
     let mut pid = 0_u32;
@@ -549,7 +554,8 @@ fn peer_process_of(socket: &impl AsRawSocket) -> std::io::Result<u32> {
 }
 
 /// The Windows build this is, as the system states it.
-fn windows_build() -> String {
+#[must_use]
+pub fn windows_build() -> String {
     let mut information = OSVERSIONINFOW {
         dwOSVersionInfoSize: u32::try_from(std::mem::size_of::<OSVERSIONINFOW>()).unwrap_or(0),
         ..OSVERSIONINFOW::default()
@@ -686,16 +692,20 @@ mod tests {
         }
     }
 
-    /// A build whose probe fails binds nothing: the refusal is the probe's own words, and no socket
-    /// file is made.
+    /// A build whose control call fails binds nothing: the refusal is the probe's own words, naming
+    /// the call and the build, and no socket file is made.
     #[test]
     fn a_bind_where_the_probe_fails_makes_nothing_and_says_why() {
         let directory = Directory::new();
         let path = directory.0.join("p.sock");
-        let forced = force_the_probe_to_fail("SIO_AF_UNIX_GETPEERPID is not answered on build 0");
+        let forced = force_the_ioctl_to_fail("the answer names no process");
         match Listener::bind(&path) {
             Err(BindFailure::NoPeerProcess(detail)) => {
                 assert!(detail.contains("SIO_AF_UNIX_GETPEERPID"), "{detail}");
+                assert!(
+                    detail.contains(&format!("this Windows build ({})", windows_build())),
+                    "{detail}"
+                );
             }
             other => panic!("a refusal by name, not {other:?}"),
         }
