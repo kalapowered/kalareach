@@ -1862,18 +1862,18 @@ selected only with `--start`.
 
 A refresh of a running environment also opens a bridge to it and reports what answered: the
 environment identity, the user the helper runs as inside it, the protocol version and the frame
-bound. That line is the connection diagnostic. It names the step that failed by its role and then its
-program (the container runtime (`podman`) for a container, the SSH client (`ssh`) for an SSH host,
-the WSL launcher (`wsl.exe`) for a WSL distribution) and how it failed, whichever step it was: the
-look at whether the environment runs, its start with `--start`, or the opening of the bridge. The
-classes are that the program was not found, that it could not be started, that it ended with an exit
-code, that a signal ended it, that it did not answer within a number of seconds and was ended (or that the host could not confirm that it ended, so it may
-still be running), that this host could not read what it
-printed or could not wait for it, that its answer to the look could not be read, and that the
-environment refused the bridge, in which case the line gives the refusal's code. Before the
-destination acknowledged the bridge, the line tells every exit code as the program's own, since the
-program passes the helper's code on and the host cannot tell the two apart. The exception is the 126
-and 127 that the container runtime ends with when it cannot run or find the helper, and that the
+bound. That line is the connection diagnostic. It names the step that failed by its role and then
+its program (the container runtime (`podman`) for a container, the SSH client (`ssh`) for an SSH
+host, the WSL launcher (`wsl.exe`) for a WSL distribution) and how it failed, whichever step it was:
+the look at whether the environment runs, its start with `--start`, or the opening of the bridge.
+The classes are that the program was not found, that it could not be started, that it ended with an
+exit code, that a signal ended it, that it did not answer within a number of seconds and was ended
+(or that the host could not confirm that it ended, so it may still be running), that this host could
+not read what it printed or could not wait for it, that its answer to the look could not be read,
+and that the environment refused the bridge, in which case the line gives the refusal's code. Before
+the destination acknowledged the bridge, the line tells every exit code as the program's own, since
+the program passes the helper's code on and the host cannot tell the two apart. The exception is the
+126 and 127 that the container runtime ends with when it cannot run or find the helper, and that the
 shell on an SSH host ends with for the same reasons: the line says that the helper could not be run.
 `wsl.exe` runs the helper with no shell, so it has no such exception. After the acknowledgement the
 helper has run: the container runtime's 125 and `ssh`'s 255 are the program's own, and any other
@@ -1881,12 +1881,12 @@ code of either is the helper's. For `wsl.exe` a code above 255 is the launcher's
 from 0 to 255 may be the helper's or the launcher's, which ends with 1 when the channel that carries
 the helper's status is lost, so the line says that the launcher reported it and not which program
 ended with it. A failed look does not say the environment is not running, which the host does not
-then know: the row reads stale. That holds for the look at a WSL distribution, whether the listing of
-registered or of running distributions failed, and for a look that fails after `--start` started the
-environment: the first line says that the refresh started it, and the second says how the look
-failed. What the operating system or the
-destination wrote in its own words, and what a program printed, show only as a class and length, as
-every message from the host does. `--json` carries the same sentence in `connection`.
+then know: the row reads stale. That holds for the look at a WSL distribution, whether the listing
+of registered or of running distributions failed, and for a look that fails after `--start` started
+the environment: the first line says that the refresh started it, and the second says how the look
+failed. What the operating system or the destination wrote in its own words, and what a program
+printed, show only as a class and length, as every message from the host does. `--json` carries the
+same sentence in `connection`.
 
 An SSH host is enrolled with `--access ssh`, and `--probe` asks its helper over ssh which
 environment it is. The same refresh registers it: the helper answers once, over ssh, and the answer
