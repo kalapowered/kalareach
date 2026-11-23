@@ -428,11 +428,12 @@ fn replaced<R>(seen: CapabilityChecks) -> Followed<R> {
     }
 }
 
-/// What a person is told where another run took the place of the one the command started.
+/// What a person is told where another run took the place of the one the command was following,
+/// which it began, or, with no file named, found going.
 fn replaced_words() -> Shown {
     shown!(
-        "Another run of the checks replaced the one this command started, so what the host holds \
-         now is not this run's findings. Run the command again."
+        "Another run of the checks replaced the one this command was following, so what the host \
+         holds now is not that run's findings. Run the command again."
     )
 }
 
@@ -987,6 +988,27 @@ mod tests {
                 "{words}"
             );
         }
+    }
+
+    /// With no file named the command follows a run that may have been going before it asked, and
+    /// where another run takes its place the words do not say that this command started the one
+    /// that was replaced: they say it was following it, which is true of a run it began as well.
+    #[tokio::test(start_paused = true)]
+    async fn the_words_for_a_replaced_run_do_not_say_that_this_command_started_it() {
+        let going = stands(CapabilityChecksState::Running, 10, 1, None);
+        let replacement = stands(CapabilityChecksState::Current, 20, 1, None);
+        let mut script = Script::new(
+            Answer::Stands(going.clone()),
+            vec![Answer::Stands(replacement)],
+        );
+        let (followed, _) = run_naming(&mut script, None).await;
+        let (seen, words) = unfinished_with(followed);
+        assert_eq!(seen, Some(going));
+        assert!(
+            words.contains("replaced the one this command was following"),
+            "{words}"
+        );
+        assert!(!words.contains("started"), "{words}");
     }
 
     /// The control of the case above: the run this command started is reported when it ends.
