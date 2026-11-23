@@ -106,6 +106,38 @@ describe("the phone's slash commands (KR-REQ-13.12)", () => {
     expect(screen.queryByTestId('slash-commands')).toBeNull()
   })
 
+  it('tells a screen reader that the field controls a list and whether it is open', async () => {
+    const person = userEvent.setup()
+    await open()
+    const field = screen.getByLabelText('Message this session')
+    expect(field).toHaveAttribute('aria-expanded', 'false')
+    expect(field).not.toHaveAttribute('aria-controls')
+
+    await person.type(field, '/')
+    const list = await screen.findByTestId('slash-commands')
+    expect(field).toHaveAttribute('aria-expanded', 'true')
+    expect(list.id).not.toBe('')
+    expect(field).toHaveAttribute('aria-controls', list.id)
+
+    await person.click(screen.getByRole('button', { name: /\/model/ }))
+    expect(screen.queryByTestId('slash-commands')).toBeNull()
+    expect(field).toHaveAttribute('aria-expanded', 'false')
+    expect(field).not.toHaveAttribute('aria-controls')
+  })
+
+  it('says nothing of a list where the agent advertises no command', async () => {
+    const person = userEvent.setup()
+    await open((port) => ({
+      ...port,
+      agentCommands: async (params, opening) => ({ ...(await port.agentCommands(params, opening)), commands: [] })
+    }))
+    const field = screen.getByLabelText('Message this session')
+    await person.type(field, '/')
+    expect(screen.queryByTestId('slash-commands')).toBeNull()
+    expect(field).not.toHaveAttribute('aria-expanded')
+    expect(field).not.toHaveAttribute('aria-controls')
+  })
+
   it('says in the field that a slash asks for a command, where the agent advertises some', async () => {
     await open()
     expect(screen.getByLabelText('Message this session')).toHaveAttribute(

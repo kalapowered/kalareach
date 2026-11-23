@@ -429,6 +429,7 @@ export function MobileSession({
   const offeredCommands = useMemo(() => slashCommandsFor(commands, draft.text), [commands, draft.text])
   // Whether the list of them is shown: the person is choosing a command, not an action.
   const listing = slashOpen && offeredCommands.length > 0
+  const slashListId = `slash-commands-${sessionId}`
 
   /**
    * Records what the person typed on top of the draft as it is stored now.
@@ -1198,6 +1199,10 @@ export function MobileSession({
         commands.length > 0 && !asLine ? 'Message this session, or type / for a command' : 'Message this session'
       }
       aria-describedby={describedBy}
+      // The list of commands stands before the field in the reading order, so the field says that
+      // it controls one and whether it is open, for a reader that would not otherwise find it.
+      aria-expanded={commands.length > 0 ? listing : undefined}
+      aria-controls={commands.length > 0 && listing ? slashListId : undefined}
       onChange={(event) => {
         typeInto(event.target.value)
         setSlashOpen(event.target.value.startsWith('/'))
@@ -1808,7 +1813,7 @@ export function MobileSession({
           {/* Above the field, where a keyboard under it and a composer that scrolls from its top do not
               take it out of view. */}
           {typingToProgram || !listing ? null : (
-            <ul className="m-slash-commands" data-testid="slash-commands">
+            <ul className="m-slash-commands" id={slashListId} data-testid="slash-commands">
               {offeredCommands.map((command) => (
                 <li key={command.name}>
                   <Button
