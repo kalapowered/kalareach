@@ -1446,7 +1446,7 @@
           "description": "The launch profile this instance was started under."
         },
         "rich_mutations_suspended": {
-          "description": "True while a native selection could not be observed reliably.\n\nRich mutations are suspended until the binding is verified. The terminal stays available\nthroughout, which is why this is a field rather than an error.",
+          "description": "True while rich mutations are held back: a native selection could not be observed\nreliably, a request was not classified, or the gateway is fenced or recovering because its\nrecord store had a fault.\n\nRich mutations are suspended until the binding is verified or the fence is lifted. The\nterminal stays available throughout, which is why this is a field rather than an error.",
           "type": "boolean"
         },
         "suspension_reason": {

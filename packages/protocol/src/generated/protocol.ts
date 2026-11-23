@@ -4207,10 +4207,12 @@ export interface AgentBindingState {
    */
   profile_id: LaunchProfileId | null
   /**
-   * True while a native selection could not be observed reliably.
+   * True while rich mutations are held back: a native selection could not be observed
+   * reliably, a request was not classified, or the gateway is fenced or recovering because its
+   * record store had a fault.
    *
-   * Rich mutations are suspended until the binding is verified. The terminal stays available
-   * throughout, which is why this is a field rather than an error.
+   * Rich mutations are suspended until the binding is verified or the fence is lifted. The
+   * terminal stays available throughout, which is why this is a field rather than an error.
    */
   rich_mutations_suspended: boolean
   /**
@@ -4289,10 +4291,12 @@ export interface AgentBindingState1 {
    */
   profile_id: LaunchProfileId | null
   /**
-   * True while a native selection could not be observed reliably.
+   * True while rich mutations are held back: a native selection could not be observed
+   * reliably, a request was not classified, or the gateway is fenced or recovering because its
+   * record store had a fault.
    *
-   * Rich mutations are suspended until the binding is verified. The terminal stays available
-   * throughout, which is why this is a field rather than an error.
+   * Rich mutations are suspended until the binding is verified or the fence is lifted. The
+   * terminal stays available throughout, which is why this is a field rather than an error.
    */
   rich_mutations_suspended: boolean
   /**
@@ -4467,10 +4471,12 @@ export interface AgentBindingState2 {
    */
   profile_id: LaunchProfileId | null
   /**
-   * True while a native selection could not be observed reliably.
+   * True while rich mutations are held back: a native selection could not be observed
+   * reliably, a request was not classified, or the gateway is fenced or recovering because its
+   * record store had a fault.
    *
-   * Rich mutations are suspended until the binding is verified. The terminal stays available
-   * throughout, which is why this is a field rather than an error.
+   * Rich mutations are suspended until the binding is verified or the fence is lifted. The
+   * terminal stays available throughout, which is why this is a field rather than an error.
    */
   rich_mutations_suspended: boolean
   /**
@@ -5337,10 +5343,12 @@ export interface AgentBindingState3 {
    */
   profile_id: LaunchProfileId | null
   /**
-   * True while a native selection could not be observed reliably.
+   * True while rich mutations are held back: a native selection could not be observed
+   * reliably, a request was not classified, or the gateway is fenced or recovering because its
+   * record store had a fault.
    *
-   * Rich mutations are suspended until the binding is verified. The terminal stays available
-   * throughout, which is why this is a field rather than an error.
+   * Rich mutations are suspended until the binding is verified or the fence is lifted. The
+   * terminal stays available throughout, which is why this is a field rather than an error.
    */
   rich_mutations_suspended: boolean
   /**

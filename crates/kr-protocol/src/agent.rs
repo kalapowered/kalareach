@@ -146,10 +146,12 @@ pub struct AgentBindingState {
     pub profile_id: Nullable<LaunchProfileId>,
     /// How this instance is integrated.
     pub mode: IntegrationMode,
-    /// True while a native selection could not be observed reliably.
+    /// True while rich mutations are held back: a native selection could not be observed
+    /// reliably, a request was not classified, or the gateway is fenced or recovering because its
+    /// record store had a fault.
     ///
-    /// Rich mutations are suspended until the binding is verified. The terminal stays available
-    /// throughout, which is why this is a field rather than an error.
+    /// Rich mutations are suspended until the binding is verified or the fence is lifted. The
+    /// terminal stays available throughout, which is why this is a field rather than an error.
     pub rich_mutations_suspended: bool,
     /// Why they are suspended, when they are.
     pub suspension_reason: Nullable<String>,

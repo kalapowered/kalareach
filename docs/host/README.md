@@ -9088,7 +9088,9 @@ throughout: suspension is a state a client reads, not an error it hits.
 A terminal served by a gateway has reasons of its own for rich mutations to wait. The binding names
 one at a time: the one an unclassified request placed, else a native bridge's, else the stream's
 (see [What the gateway reads from the stream](#what-the-gateway-reads-from-the-stream)), else the
-unread thread. The unread thread is set before the launch commits and holds until a reply from the
+unread thread. While the gateway is fenced or recovering (see *Volatile-native mode*) the binding
+also reads as suspended, and keeps the reason the instance holds where it has one; where it has
+none, the reason is the fence's. The unread thread is set before the launch commits and holds until a reply from the
 server has named the conversation the terminal selected: until then the binding names no thread and
 nothing vouches for one. A table that says where its messages name a thread lifts it with the first
 such reply. A table that says nothing never lifts it, and rich mutations stay suspended for the
@@ -9501,6 +9503,16 @@ did. The broker refuses them with `UPSTREAM_UNAVAILABLE`; a typed request throug
 receipt path is refused earlier, as `STORAGE_UNAVAILABLE`. A reverse write is refused too, because the marker that has to
 precede it cannot be recorded; a reverse read still runs. Nothing is relabelled: a rich client is
 still a rich client and still cannot forward.
+
+The fence is one fact about the gateway, and an agent instance's binding reports it: while the
+gateway is fenced or recovering, `rich_mutations_suspended` is set and `suspension_reason` is the
+sentence the refused operation gives (`GATEWAY_FENCED` or `GATEWAY_RECOVERING` in
+`broker/volatile.rs`), unless the instance holds a reason of its own, which is kept. The sentence
+says what waits (messages, steering, interrupts and approvals) and that the terminal goes on working,
+so a client that disables a control for it gives the host's own words. A device is told that
+sentence as the host wrote it. A request a channel relayed while the fence was up is recorded and
+forwarded like any native request and is not read into an approval then; when the recovery ends the
+broker reads each such request that nothing has read, so it can be answered here from then on.
 
 The gap is exposed while it is open, with when it started, why, how many native requests and
 responses passed through it, how many rich operations it refused, and how many claimed identifiers
