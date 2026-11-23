@@ -725,13 +725,26 @@ fn read_first_block(path: &Path) -> std::io::Result<FirstBlock> {
 /// The permission a refused read of one path is about, in the platform's own words.
 ///
 /// Naming it is the difference between an answer a person can act on and "permission denied": on
-/// macOS the protected locations are separate grants and Full Disk Access is a fourth that covers
-/// them all, and a path outside every one of them was refused by the filesystem's own permissions
-/// rather than by a privacy grant.
+/// macOS the protected locations are separate grants, a removable volume is another, and Full Disk
+/// Access is one more that covers them all. A path outside every one of them was refused by the
+/// filesystem's own permissions rather than by a privacy grant. Whether a path is on a removable
+/// volume is what the kernel says of the volume, never how the path is spelled.
 #[must_use]
 pub fn permission_for_path(path: &Path) -> &'static str {
+    permission_on(path, volume::flags_of(path))
+}
+
+/// [`permission_for_path`] for a path whose volume's mount flags are `flags`, where they could be
+/// read. The flags are the one thing about a path that a case cannot make on any machine it runs
+/// on, so they are given rather than read.
+fn permission_on(path: &Path, flags: Option<u32>) -> &'static str {
     if !cfg!(target_os = "macos") {
         return "the filesystem's own permissions on that path";
+    }
+    // The volume comes first: a path on a removable one is under that grant whatever its folders
+    // are called.
+    if flags.is_some_and(volume::removable) {
+        return "Files & Folders, for removable volumes";
     }
     let text = path.to_string_lossy();
     for (fragment, permission) in [
@@ -751,6 +764,37 @@ pub fn permission_for_path(path: &Path) -> &'static str {
         }
     }
     "the filesystem's own permissions on that path"
+}
+
+/// What the kernel says about the volume a path is on.
+mod volume {
+    use std::path::Path;
+
+    /// The mount flags of the volume that holds `path`, as the kernel reports them for the nearest
+    /// part of the path it answers for: a path inside a volume that refuses the lookup is still on
+    /// the volume its mount point is.
+    #[cfg(target_os = "macos")]
+    pub(super) fn flags_of(path: &Path) -> Option<u32> {
+        path.ancestors()
+            .find_map(|part| rustix::fs::statfs(part).ok())
+            .map(|volume| volume.f_flags)
+    }
+
+    /// Only macOS asks: the other platforms have no per-volume permission to name.
+    #[cfg(not(target_os = "macos"))]
+    pub(super) const fn flags_of(_: &Path) -> Option<u32> {
+        None
+    }
+
+    /// `MNT_REMOVABLE` of the system's `sys/mount.h`: the volume is on removable media. The
+    /// platform's own account of it is the one macOS files a grant under, and `libc` has no name
+    /// for the flag.
+    const MNT_REMOVABLE: u32 = 0x0000_0200;
+
+    /// Whether a volume with these mount flags is a removable one.
+    pub(super) const fn removable(flags: u32) -> bool {
+        flags & MNT_REMOVABLE != 0
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -2155,6 +2199,72 @@ mod tests {
             permission_for_path(Path::new("/tmp/anything")),
             "the filesystem's own permissions on that path"
         );
+    }
+
+    /// The mount flags the kernel reported on one Mac for its sealed system volume, its data
+    /// volume and an external disk mounted below `/Volumes`.
+    const SYSTEM_VOLUME: u32 = 0x4480_d001;
+    const DATA_VOLUME: u32 = 0x0490_9080;
+    const EXTERNAL_DISK: u32 = 0x04a0_9218;
+
+    #[test]
+    fn a_refused_read_on_a_removable_volume_names_the_grant_for_removable_volumes() {
+        let on = |path: &str, flags| permission_on(Path::new(path), Some(flags));
+        let removable = if cfg!(target_os = "macos") {
+            "Files & Folders, for removable volumes"
+        } else {
+            "the filesystem's own permissions on that path"
+        };
+        assert_eq!(on("/Volumes/Backup/notes.txt", EXTERNAL_DISK), removable);
+        // The volume is asked before the folder's name: a folder called Documents on an external
+        // disk is not the Documents folder of the account.
+        assert_eq!(
+            on("/Volumes/Backup/Documents/notes.txt", EXTERNAL_DISK),
+            removable
+        );
+        // A path on an internal volume, whatever it is spelled like, is not one.
+        for flags in [SYSTEM_VOLUME, DATA_VOLUME] {
+            assert_eq!(
+                on("/Volumes/Internal/notes.txt", flags),
+                "the filesystem's own permissions on that path"
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_kernel_answers_for_the_volume_of_a_path_that_is_not_there() {
+        let root = kr_ipc::testing::PrivateTempDir::create();
+        let flags = volume::flags_of(&root.path().join("nobody/wrote/this.txt"))
+            .expect("the kernel answers for the volume of the nearest folder that is there");
+        assert!(
+            !volume::removable(flags),
+            "this machine's temporary folder is on a removable volume: {flags:#x}"
+        );
+    }
+
+    #[test]
+    fn the_sentence_for_a_removable_volume_names_its_grant() {
+        let path = Path::new("/Volumes/Backup/notes.txt");
+        let refused = Outcome::PermissionRefused {
+            permission: permission_on(path, Some(EXTERNAL_DISK)),
+            detail: Sentence::new()
+                .stated("the platform refused to open ")
+                .path(path),
+        };
+        let (state, _, reason) = judge(Check::AuthorisedFileRead, &refused);
+        assert_eq!(state, CapabilityState::PermissionRequired);
+        let reason = reason.expect("a refusal says why");
+        if cfg!(target_os = "macos") {
+            assert!(
+                reason.as_str().ends_with(
+                    "Files & Folders, for removable volumes is granted per signed application, \
+                     and this one does not hold it"
+                ),
+                "{reason}"
+            );
+        }
+        assert!(!reason.as_str().contains("Backup"), "{reason}");
     }
 }
 
