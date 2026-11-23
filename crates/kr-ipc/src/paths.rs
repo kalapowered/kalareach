@@ -1004,14 +1004,15 @@ mod windows {
     };
     use windows_sys::Win32::Security::Authorization::{
         ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
-        ConvertStringSidToSidW, GetSecurityInfo, SDDL_REVISION_1, SE_FILE_OBJECT,
+        ConvertStringSidToSidW, GetSecurityInfo, SDDL_REVISION_1, SE_FILE_OBJECT, SetSecurityInfo,
     };
     use windows_sys::Win32::Security::{
         ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, ATTRIBUTE_SECURITY_INFORMATION,
         DACL_SECURITY_INFORMATION, EqualSid, GetAce, GetKernelObjectSecurity, GetLengthSid,
         GetSecurityDescriptorControl, GetSecurityDescriptorDacl, GetSecurityDescriptorOwner,
         GetSecurityDescriptorSacl, GetTokenInformation, INHERITED_ACE, IsValidSid,
-        LABEL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
+        LABEL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION,
+        PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
         SCOPE_SECURITY_INFORMATION, SE_DACL_AUTO_INHERITED, SE_DACL_PROTECTED,
         SE_SACL_AUTO_INHERITED, SE_SACL_PROTECTED, SECURITY_ATTRIBUTES, SID_AND_ATTRIBUTES,
         TOKEN_GROUPS, TOKEN_INFORMATION_CLASS, TOKEN_OWNER, TOKEN_QUERY, TOKEN_USER, TokenGroups,
@@ -1317,6 +1318,70 @@ mod windows {
         // `list` point into it and are not used after this.
         unsafe {
             LocalFree(descriptor.cast());
+        }
+        outcome
+    }
+
+    /// Gives an opened file a protected list that names its owner and nothing else.
+    ///
+    /// The list the file inherited is replaced, and the new one is protected, so a change to what
+    /// its directory passes down later does not reach the file. `OW` is OWNER RIGHTS, which resolves
+    /// to whoever owns the file: the account that created it. The handle must have been opened with
+    /// the right to write the list.
+    ///
+    /// # Errors
+    ///
+    /// Returns the operating system's error when the list cannot be built or set.
+    pub fn protect_with_owner_only_list(handle: BorrowedHandle<'_>) -> std::io::Result<()> {
+        let wide_descriptor = wide_str("D:P(A;;GA;;;OW)");
+        let mut built: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+        // SAFETY: the text is a null-terminated wide buffer this function owns for the call, `built`
+        // is a live out parameter, and the size parameter is optional.
+        let parsed = unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                wide_descriptor.as_ptr(),
+                SDDL_REVISION_1,
+                &raw mut built,
+                std::ptr::null_mut(),
+            )
+        };
+        if parsed == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let mut present = 0;
+        let mut defaulted = 0;
+        let mut list: *mut ACL = std::ptr::null_mut();
+        // SAFETY: the descriptor was just built, and the three out parameters are live.
+        let got = unsafe {
+            GetSecurityDescriptorDacl(built, &raw mut present, &raw mut list, &raw mut defaulted)
+        };
+        let outcome = if got == 0 || present == 0 || list.is_null() {
+            Err(std::io::Error::other(
+                "the owner-only descriptor carries no list",
+            ))
+        } else {
+            // SAFETY: the handle is borrowed for the whole call, `list` points into the descriptor
+            // built above, which is alive until it is freed below, and the other parts are not set.
+            let status = unsafe {
+                SetSecurityInfo(
+                    handle.as_raw_handle(),
+                    SE_FILE_OBJECT,
+                    DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    list,
+                    std::ptr::null(),
+                )
+            };
+            if status == ERROR_SUCCESS {
+                Ok(())
+            } else {
+                Err(std::io::Error::from_raw_os_error(status.cast_signed()))
+            }
+        };
+        // SAFETY: the descriptor came from the conversion above and is freed exactly once.
+        unsafe {
+            LocalFree(built.cast());
         }
         outcome
     }
@@ -2563,6 +2628,7 @@ mod windows {
 #[cfg(windows)]
 pub use self::windows::{
     AccessListRefusal, FileAccess, check_access_list, current_job_limit_flags, open_child,
+    protect_with_owner_only_list,
 };
 /// For this crate's own tests of files a wider list would let another account reach, and of the
 /// access reader.
