@@ -461,6 +461,7 @@ fn a_reserve_below_this_machines_floor_is_refused_at_the_edit() {
     .expect_err("less than this machine keeps free");
     let said = format!("{refused}");
     assert!(said.contains(&floor.to_string()), "{said}");
+    assert!(said.contains("the description reserve"), "{said}");
     assert_eq!(
         open(&environment).revision(),
         0,
@@ -477,6 +478,53 @@ fn a_reserve_below_this_machines_floor_is_refused_at_the_edit() {
     )
     .expect("a reserve this machine can honour");
     assert_eq!(applied.revision, 1);
+}
+
+/// KR-REQ-22.10: a reserve the document already holds that is below this machine's floor does not
+/// block the owner's other edits: the budgets are refused only for an edit that changes them, and
+/// the refusal names the reserve. The owner can turn descriptions off on a machine whose memory
+/// came to make the reserve they wrote the lesser of the two.
+#[test]
+fn a_reserve_below_this_machines_floor_does_not_block_an_edit_of_another_setting() {
+    let temp = kr_ipc::testing::TempHost::create();
+    let environment = temp.environment();
+    let reserve = |bytes: u64| {
+        Change::DescriptionBudgets(Some(DescriptionBudgets {
+            process_memory_bytes: Nullable::null(),
+            reserve_bytes: Nullable::some(bytes),
+        }))
+    };
+    // Written where this reserve was honoured: the floor of an 8 GiB machine is a fifth of it.
+    drop(apply(&environment, &reserve(2 * GIB), machine_with(8 * GIB)).expect("honoured here"));
+
+    let bigger = machine_with(32 * GIB);
+    let turned_off = apply(
+        &environment,
+        &Change::Descriptions {
+            enabled: Some(false),
+            on_battery: None,
+        },
+        bigger,
+    )
+    .expect("an edit that leaves the budgets as they are is written");
+    assert_eq!(turned_off.revision, 2);
+    drop(turned_off);
+    let held = open(&environment).ceilings().description_budgets;
+    assert_eq!(
+        held.map(|budgets| budgets.reserve_bytes),
+        Some(Nullable::some(2 * GIB)),
+        "the reserve the owner wrote is still the one the document holds"
+    );
+
+    // The edit that changes the reserve is the one that is refused, and it says which budget.
+    let refused = apply(&environment, &reserve(3 * GIB), bigger)
+        .expect_err("a reserve below this machine's floor, newly asked for");
+    let said = format!("{refused}");
+    assert!(
+        said.contains("the description reserve is less than the 6871947673 bytes"),
+        "{said}"
+    );
+    assert_eq!(open(&environment).revision(), 2, "and nothing was written");
 }
 
 /// KR-REQ-26.15: a payload budget above the default without the explicit setting is refused.

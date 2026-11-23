@@ -195,9 +195,12 @@ pub fn description_budgets(
             value: floor,
             narrowed_by: Some(
                 Sentence::new()
-                    .stated("this machine keeps at least ")
+                    .stated("the description reserve is less than the ")
                     .number(floor)
-                    .stated(" bytes free: the larger of 1 GiB and a fifth of its memory"),
+                    .stated(
+                        " bytes this machine keeps free, which is the larger of 1 GiB and a fifth \
+                         of its memory",
+                    ),
             ),
             refused: true,
         },

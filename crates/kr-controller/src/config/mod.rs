@@ -648,7 +648,11 @@ pub fn apply_standing(
     // rejects a more permissive value; a document that recorded one and was then quietly read back
     // narrower would be a rejection nobody was told about, and an owner who lowered a number and
     // then raised it past the limit would find the low number gone.
-    if let Some(problem) = refused_ceiling(&edited.document.ceilings, limits) {
+    let held = loaded
+        .document
+        .as_ref()
+        .and_then(|document| document.ceilings.description_budgets);
+    if let Some(problem) = refused_ceiling(&edited.document.ceilings, held, limits) {
         return Err(ControllerError::Configuration(problem.render()));
     }
     standing(&mut || write(paths, &edited))?;
@@ -660,8 +664,14 @@ pub fn apply_standing(
 }
 
 /// Returns why a document's ceilings would not be applied as written, when one would not.
+///
+/// `held` is what the document held for the description budgets before the edit. A description
+/// budget is refused only when the edit changes it: a reserve the owner wrote that this machine's
+/// memory has since made the lesser of the two stays in the document, and must not stop the owner
+/// editing anything else.
 fn refused_ceiling(
     ceilings: &kr_protocol::hostinfo::configuration::ConfigurationCeilings,
+    held: Option<configuration::DescriptionBudgets>,
     limits: HardLimits,
 ) -> Option<Sentence> {
     let sessions = ceilings::session_limit(ceilings, limits);
@@ -685,8 +695,19 @@ fn refused_ceiling(
         }));
     }
     let description = ceilings::description_budgets(ceilings, limits);
-    for budget in [&description.process_memory, &description.reserve] {
-        if budget.refused {
+    let before = held.unwrap_or_default();
+    let after = ceilings.description_budgets.unwrap_or_default();
+    for (altered, budget) in [
+        (
+            before.process_memory_bytes != after.process_memory_bytes,
+            &description.process_memory,
+        ),
+        (
+            before.reserve_bytes != after.reserve_bytes,
+            &description.reserve,
+        ),
+    ] {
+        if altered && budget.refused {
             return Some(budget.narrowed_by.clone().unwrap_or_else(|| {
                 Sentence::new()
                     .stated("this description budget is more permissive than this host allows")
