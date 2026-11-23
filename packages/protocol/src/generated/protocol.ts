@@ -19177,8 +19177,9 @@ export interface InputWriteResult {
    */
   held_prefix_bytes: string
   /**
-   * How the action reached the application: terminal input, which proves the bytes were
-   * written and never that the application took them as a typed answer.
+   * How the action reached the application: as terminal input, which names the route the
+   * action took. It is never a typed answer from the application, and it does not say that
+   * the application has read the bytes.
    *
    * Absent from the wire when a worker does not name it, so an answer built before the member
    * existed is byte for byte what it was.

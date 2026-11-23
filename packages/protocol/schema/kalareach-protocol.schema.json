@@ -20296,7 +20296,7 @@
               "type": "null"
             }
           ],
-          "description": "How the action reached the application: terminal input, which proves the bytes were\nwritten and never that the application took them as a typed answer.\n\nAbsent from the wire when a worker does not name it, so an answer built before the member\nexisted is byte for byte what it was."
+          "description": "How the action reached the application: as terminal input, which names the route the\naction took. It is never a typed answer from the application, and it does not say that\nthe application has read the bytes.\n\nAbsent from the wire when a worker does not name it, so an answer built before the member\nexisted is byte for byte what it was."
         },
         "sequence": {
           "$ref": "#/$defs/InputSequence",
