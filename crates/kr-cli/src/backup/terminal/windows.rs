@@ -13,6 +13,7 @@
 use std::fs::File;
 use std::io::Write as _;
 use std::os::windows::io::{AsHandle as _, AsRawHandle as _, OwnedHandle};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use kr_client::shown;
 use kr_client::shown::Shown;
@@ -31,6 +32,7 @@ use windows_sys::Win32::System::Threading::{
 };
 use zeroize::{Zeroize as _, Zeroizing};
 
+use crate::backup::interrupt;
 use crate::error::{CliError, Result};
 
 /// What is said before the kit is shown.
@@ -392,8 +394,9 @@ impl Prompt {
     /// Reads one answer the way a line is edited at a console: the characters shown as they are
     /// taken, Backspace taking the last one back, Enter ending the line and Ctrl-Z, on an empty
     /// line, ending the input. They are read as input records, as the kit is, so that the console
-    /// keeps no history of the line.
-    fn line(&mut self) -> std::io::Result<Option<String>> {
+    /// keeps no history of the line. The read looks at `cancel` once in each turn of
+    /// [`TURN_MILLISECONDS`] and ends with an interrupted error when it is set.
+    fn line(&mut self, cancel: &AtomicBool) -> std::io::Result<Option<String>> {
         /// An answer is a word; this is more than any answer needs.
         const LONGEST_ANSWER: usize = 4096;
 
@@ -401,6 +404,9 @@ impl Prompt {
         // Made at its largest size, so that it never moves to a new allocation.
         let mut answer = Zeroizing::new(String::with_capacity(LONGEST_ANSWER));
         loop {
+            if cancel.load(Ordering::SeqCst) {
+                return Err(std::io::ErrorKind::Interrupted.into());
+            }
             let Some(character) = self.next()? else {
                 continue;
             };
@@ -531,14 +537,22 @@ pub fn discard_typed_ahead() -> Result<()> {
 ///
 /// The answer is read as input records, as the kit is, and never as a line by the console, which
 /// would keep each line in the command history of the window, where a later question could bring
-/// it back.
+/// it back. The read looks at `cancel` in each turn and, once it is set, puts the console's modes
+/// back before it returns the command's own interrupt.
 ///
 /// # Errors
 ///
-/// Returns a terminal failure when the console cannot be reached, read or put back.
-pub fn read_line() -> Result<Option<String>> {
+/// Returns a terminal failure when the console cannot be reached, read or put back, and the
+/// interrupt's failure when `cancel` was set.
+pub fn read_line(cancel: &AtomicBool) -> Result<Option<String>> {
+    if cancel.load(Ordering::SeqCst) {
+        return Err(interrupt::stopped());
+    }
     let mut prompt = Prompt::answering()?;
-    let line = prompt.line().map_err(|error| {
+    let line = prompt.line(cancel).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::Interrupted {
+            return interrupt::stopped();
+        }
         CliError::Terminal(shown!(
             "your answer could not be read: {}",
             Shown::io(&error)
@@ -678,6 +692,45 @@ mod tests {
         });
         // No record came in a whole turn: the read says so.
         assert_eq!(prompt.read(&mut buffer).expect("reads the console"), 0);
+    }
+
+    /// An answer that is being read when the command is told to stop ends with an interrupted
+    /// error within a turn, and the console's modes are as they were found once the prompt has
+    /// gone: the thread that reads the answer is waited for, and what it changed is back.
+    #[test]
+    fn an_answer_read_that_is_told_to_stop_ends_and_puts_the_console_back() {
+        let _alone = CONSOLE.lock().unwrap_or_else(PoisonError::into_inner);
+        let input = console_input(true);
+        let before = mode_of(&input);
+        let prompt = Prompt::enter_on(input.try_clone().expect("a copy of the handle"))
+            .expect("a prompt on the console");
+        let cancel = std::sync::Arc::new(AtomicBool::new(false));
+        let (done, ended) = std::sync::mpsc::channel();
+        let reader = {
+            let cancel = std::sync::Arc::clone(&cancel);
+            std::thread::spawn(move || {
+                let mut prompt = prompt;
+                let result = prompt.line(&cancel);
+                drop(prompt);
+                let _ = done.send(result);
+            })
+        };
+        // Nothing is typed, so the read waits, in turns, until it is told to stop.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(
+            ended.try_recv().is_err(),
+            "the read ended before it was told to"
+        );
+        cancel.store(true, Ordering::SeqCst);
+        let result = ended
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the read stops when it is told to");
+        reader.join().expect("the reader ends");
+        assert_eq!(
+            result.expect_err("a read that was stopped").kind(),
+            std::io::ErrorKind::Interrupted
+        );
+        assert_eq!(mode_of(&input), before, "the modes are as they were found");
     }
 
     /// The most one read can bring into a prompt fits the room it was given before any secret was

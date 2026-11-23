@@ -265,9 +265,11 @@ impl Dialogue {
     /// Puts `question` to the person and returns the line they typed, or none at the end of the
     /// input. A line is cleared when dropped.
     async fn ask(&mut self, question: &Shown) -> Result<Option<Zeroizing<String>>> {
+        // An interrupt that is already waiting wins, before the question starts a read.
         let answer = tokio::select! {
-            answer = ask_line(question) => answer.map_err(|error| self.failed(error))?,
+            biased;
             () = self.interrupt.arrived() => return Err(self.stopped()),
+            answer = ask_line(question) => answer.map_err(|error| self.failed(error))?,
         };
         Ok(answer.map(Zeroizing::new))
     }

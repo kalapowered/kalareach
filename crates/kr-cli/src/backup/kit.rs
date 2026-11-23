@@ -150,12 +150,15 @@ fn read_blocking(source: &KitSource, cancel: &AtomicBool) -> Result<KitRead> {
 /// What was typed before the question was shown is thrown away, so an answer is to what the person
 /// can see.
 ///
-/// The read is made on a thread of its own and is not waited for when this future is dropped, so
-/// Ctrl-C at a question stops the run at once, however the descriptor behaves: some terminal
-/// devices cannot be waited on with a timeout, and a blocking read is not ended by a signal that
-/// restarts it. The thread holds nothing but a duplicate of the descriptor and the answer so far,
-/// and ends with the process. A caller therefore drops the future only to end the run: the thread
-/// is still reading, and would take the next line a later question asked for.
+/// The read is made on a thread of its own, so that Ctrl-C at a question can stop the run however
+/// the descriptor behaves: some terminal devices cannot be waited on with a timeout, and a blocking
+/// read is not ended by a signal that restarts it. On Unix the thread is not waited for when this
+/// future is dropped. It holds nothing but a duplicate of the descriptor and the answer so far, and
+/// ends with the process; a caller therefore drops the future only to end the run, because the
+/// thread is still reading and would take the next line a later question asked for. On Windows the
+/// thread has changed the console's modes, and a thread that ends with the process leaves them
+/// changed. It reads in turns that look at a flag, so dropping this future sets the flag and waits
+/// until the thread has put the modes back.
 ///
 /// # Errors
 ///
@@ -167,11 +170,21 @@ pub async fn ask_line(question: &Shown) -> Result<Option<String>> {
     discard_typed_ahead()?;
     crate::report::say(question);
     let (answer, arrives) = tokio::sync::oneshot::channel();
-    std::thread::Builder::new()
+    #[cfg(windows)]
+    let cancel = Arc::new(AtomicBool::new(false));
+    let reader = std::thread::Builder::new()
         .name("answer".to_owned())
-        .spawn(move || {
-            // Nobody is waiting once the run was stopped, and the answer is not needed then.
-            let _ = answer.send(read_answer());
+        .spawn({
+            #[cfg(windows)]
+            let cancel = Arc::clone(&cancel);
+            move || {
+                #[cfg(unix)]
+                let read = read_answer();
+                #[cfg(windows)]
+                let read = read_answer(&cancel);
+                // Nobody is waiting once the run was stopped, and the answer is not needed then.
+                let _ = answer.send(read);
+            }
         })
         .map_err(|error| {
             CliError::Terminal(shown!(
@@ -179,9 +192,36 @@ pub async fn ask_line(question: &Shown) -> Result<Option<String>> {
                 Shown::io(&error)
             ))
         })?;
+    #[cfg(windows)]
+    let _reading = Reading {
+        cancel,
+        thread: Some(reader),
+    };
+    #[cfg(unix)]
+    drop(reader);
     arrives
         .await
         .map_err(|_| CliError::Terminal(Shown::said("your answer could not be read")))?
+}
+
+/// The thread that reads an answer at a Windows console. When it is dropped before the answer came,
+/// the thread is told to stop and is waited for, so the console's modes are back before the command
+/// goes on to say that it stopped. It looks at the flag in each turn of a fifth of a second, and
+/// the wait is no longer than that.
+#[cfg(windows)]
+struct Reading {
+    cancel: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(windows)]
+impl Drop for Reading {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::SeqCst);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
 }
 
 /// Throws away what is waiting on a terminal's standard input. It is done before a question is
@@ -257,8 +297,8 @@ fn read_answer() -> Result<Option<String>> {
 }
 
 #[cfg(windows)]
-fn read_answer() -> Result<Option<String>> {
-    super::terminal::read_line()
+fn read_answer(cancel: &AtomicBool) -> Result<Option<String>> {
+    super::terminal::read_line(cancel)
 }
 
 #[cfg(windows)]

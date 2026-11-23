@@ -8,9 +8,10 @@
 
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use portable_pty::{ChildKiller, CommandBuilder, PtyPair, PtySize};
+use windows_sys::Win32::System::Console::{ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT};
 
 /// How long the console's output must stay silent after the command ended before the window says
 /// that it ended.
@@ -168,4 +169,91 @@ pub fn plain(bytes: &[u8]) -> String {
         }
     }
     shown.replace("\r\n", "\n").replace('\r', "")
+}
+
+/// How long a case waits for the probe to say the console's input mode.
+const PROBE_DEADLINE: Duration = Duration::from_secs(60);
+
+/// The environment variable that makes the probe's case do its work: in any other run of the test
+/// program that case does nothing, so it passes.
+const PROBE_MARKER: &str = "KR_CONSOLE_MODE_PROBE";
+
+/// What the probe says before the console's input mode, as hexadecimal digits, and the mark that
+/// ends them.
+const PROBE_SAYS: &str = "console input mode 0x";
+const PROBE_END: char = ';';
+
+/// The console's input mode as it stands now, read by a process of this test program that runs on
+/// the same pseudo-console, after the command that ran there has ended or been interrupted.
+pub fn input_mode(terminal: &PtyPair, seen: &Mutex<Vec<u8>>) -> u32 {
+    let from = seen.lock().unwrap_or_else(PoisonError::into_inner).len();
+    let mut command = CommandBuilder::new(std::env::current_exe().expect("this program's path"));
+    command.args([
+        "--exact",
+        "support::console_window::probe::say_the_console_input_mode",
+        "--nocapture",
+        "--test-threads=1",
+    ]);
+    command.env(PROBE_MARKER, "1");
+    let mut probe = terminal
+        .slave
+        .spawn_command(command)
+        .expect("starts the probe on the console");
+    probe.wait().expect("the probe ends");
+    let started = Instant::now();
+    loop {
+        let text = plain(&seen.lock().unwrap_or_else(PoisonError::into_inner)[from..]);
+        let said = text
+            .split_once(PROBE_SAYS)
+            .and_then(|(_, rest)| rest.split_once(PROBE_END))
+            .and_then(|(digits, _)| u32::from_str_radix(digits, 16).ok());
+        if let Some(mode) = said {
+            return mode;
+        }
+        assert!(
+            started.elapsed() < PROBE_DEADLINE,
+            "the probe never said the input mode: {}",
+            text.escape_debug()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Whether the console echoes what is typed and edits a line, as its input mode says now: how a
+/// console is found, and what a prompt that was left changed takes away.
+pub fn echoes(terminal: &PtyPair, seen: &Mutex<Vec<u8>>) -> bool {
+    let both = ENABLE_ECHO_INPUT | ENABLE_LINE_INPUT;
+    input_mode(terminal, seen) & both == both
+}
+
+#[cfg(test)]
+mod probe {
+    use windows_sys::Win32::System::Console::GetConsoleMode;
+
+    use super::{PROBE_END, PROBE_MARKER, PROBE_SAYS};
+
+    /// Says the input mode of the console this process is on, when a case started it as the probe.
+    /// A plain run of the program does nothing here.
+    #[test]
+    #[expect(
+        unsafe_code,
+        reason = "the console's input mode has no interface but the console API"
+    )]
+    fn say_the_console_input_mode() {
+        use std::os::windows::io::AsRawHandle as _;
+
+        if std::env::var_os(PROBE_MARKER).is_none() {
+            return;
+        }
+        let input = std::fs::File::options()
+            .read(true)
+            .write(true)
+            .open("CONIN$")
+            .expect("the probe runs on a console");
+        let mut mode = 0_u32;
+        // SAFETY: the handle is open for as long as `input` is, and `mode` is a live `u32`.
+        let read = unsafe { GetConsoleMode(input.as_raw_handle().cast(), &raw mut mode) };
+        assert_ne!(read, 0, "the console's mode is read");
+        println!("{PROBE_SAYS}{mode:x}{PROBE_END}");
+    }
 }

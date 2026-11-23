@@ -443,8 +443,7 @@ async fn keep_sign_in(host: &kr_ipc::testing::TempHost, origin: &str) {
 /// A terminal window `kr` runs in, with the person's side of it: what the window has shown, and a
 /// way to type.
 struct Window {
-    // Held so that the console stays open for as long as the window does; only a Unix case reads it.
-    #[cfg_attr(windows, expect(dead_code))]
+    // Held so that the console stays open for as long as the window does, and read for its modes.
     terminal: portable_pty::PtyPair,
     #[cfg(unix)]
     shell: Box<dyn portable_pty::Child + Send + Sync>,
@@ -556,6 +555,12 @@ impl Window {
             typing,
             seen,
         }
+    }
+
+    /// Whether the console echoes what is typed and edits a line, as its input mode says now.
+    #[cfg(windows)]
+    fn echoes(&self) -> bool {
+        support::console_window::echoes(&self.terminal, &self.seen)
     }
 
     /// Every byte the window has shown so far, as the terminal sent it.
@@ -1530,7 +1535,6 @@ async fn an_interrupt_at_a_question_sets_nothing_up_and_puts_the_terminal_back()
     let shown = window.wait_for("kr ended");
     assert!(!shown.contains("kr ended 0"), "{shown}");
     assert!(shown.contains("Nothing was set up."), "{shown}");
-    #[cfg(unix)]
     assert!(window.echoes(), "echo is on");
     assert!(!shown.contains("kalareach-recovery-kit"), "{shown}");
 
@@ -1540,7 +1544,6 @@ async fn an_interrupt_at_a_question_sets_nothing_up_and_puts_the_terminal_back()
     let shown = window.wait_for("kr ended");
     assert!(!shown.contains("kr ended 0"), "{shown}");
     assert!(shown.contains("opens nothing"), "{shown}");
-    #[cfg(unix)]
     assert!(window.echoes(), "echo is on");
 
     assert_eq!(rig.requests_to(SYNC), 0);
@@ -1574,7 +1577,6 @@ async fn an_interrupt_while_the_daemon_has_the_call_says_to_keep_the_kit() {
     assert!(said.contains(&kit.fingerprint()), "{said}");
     assert!(!shown.contains("Nothing was set up"), "{shown}");
     assert!(!shown.contains("opens nothing: delete it"), "{shown}");
-    #[cfg(unix)]
     assert!(window.echoes(), "echo is on");
 
     go.send(()).expect("the commit is waiting");

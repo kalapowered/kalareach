@@ -8,9 +8,11 @@
 //! restarts it.
 //!
 //! Windows catches Ctrl-C and Ctrl-Break once [`Interrupt::arm`] has installed the handler. A
-//! command arms it before it reads a console, which it reads in short turns that look at a flag,
-//! and does not arm it before it reads a pipe, which a handler cannot end: there Ctrl-C ends the
-//! process, which has written and changed nothing.
+//! command arms it before it reads a console, which it reads in short turns that look at a flag:
+//! the kit, and each answer on its thread of its own, which the command waits for so that the
+//! console's modes are back before it says that it stopped. It does not arm it before it reads a
+//! pipe, which a handler cannot end: there Ctrl-C ends the process, which has written and changed
+//! nothing.
 
 use kr_client::shown;
 use kr_client::shown::Shown;

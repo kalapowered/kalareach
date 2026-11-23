@@ -2775,7 +2775,7 @@ fn tree(root: &Path) -> BTreeMap<String, Vec<u8>> {
 /// `kr ended <code>` itself, where a Unix shell does.
 #[cfg(windows)]
 struct Window {
-    _terminal: portable_pty::PtyPair,
+    terminal: portable_pty::PtyPair,
     shell: Box<dyn portable_pty::ChildKiller + Send + Sync>,
     typing: Box<dyn Write + Send>,
     seen: Arc<Mutex<Vec<u8>>>,
@@ -2807,7 +2807,7 @@ impl Window {
             seen,
         } = support::console_window::open(command);
         Self {
-            _terminal: terminal,
+            terminal,
             shell,
             typing,
             seen,
@@ -2817,6 +2817,11 @@ impl Window {
     /// What the window has shown so far, as plain text.
     fn shown(&self) -> String {
         support::console_window::plain(&self.seen.lock().unwrap_or_else(PoisonError::into_inner))
+    }
+
+    /// Whether the console echoes what is typed and edits a line, as its input mode says now.
+    fn echoes(&self) -> bool {
+        support::console_window::echoes(&self.terminal, &self.seen)
     }
 
     /// Waits until the window has shown `marker`, and returns what it has shown. It fails when it
@@ -4648,6 +4653,48 @@ async fn an_interrupt_while_a_kit_is_half_pasted_at_a_console_ends_the_command_a
     assert!(shown.contains("stopped before it finished"), "{shown}");
     assert!(!shown.contains(&seed), "the seed was shown");
     assert_eq!(fixture.bundle_reads(), 0, "the half-pasted kit was used");
+    assert!(window.echoes(), "echo and line input are on");
+}
+
+/// Ctrl-C at the question that follows a kit typed at a console ends the command and says that it
+/// stopped, with the console's modes as they were found: the answer is read on a thread of its own,
+/// which has changed them, and the command waits for it to put them back.
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_interrupt_at_the_question_after_a_kit_typed_at_a_console_puts_the_console_back() {
+    let fixture = Fixture::new().await;
+    let into = fixture.folder_arg();
+    let kit = fixture.world.kit_text(&[fixture.rig.origin()]);
+    let mut window = Window::run(
+        &fixture.rig,
+        &["backup", "restore", "--into", &into, "--preview"],
+    );
+    window.wait_for("Nothing you paste is shown.");
+    window.type_bytes(format!("{kit}\n").replace('\n', "\r").as_bytes());
+    window.wait_for("Type yes if that is the kit you meant");
+    window.type_bytes(&[0x03]);
+    let shown = window.wait_for("kr ended");
+    assert!(!shown.contains("kr ended 0"), "{shown}");
+    assert!(shown.contains("stopped before it finished"), "{shown}");
+    assert!(window.echoes(), "echo and line input are on");
+    assert_eq!(fixture.bundle_reads(), 0, "the kit was used");
+}
+
+/// Ctrl-C at the question that asks whether the files are to be written ends the command and says
+/// that it stopped, with the console's modes as they were found and nothing written.
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_interrupt_at_the_question_before_the_files_are_written_puts_the_console_back() {
+    let fixture = Fixture::new().await;
+    let into = fixture.folder_arg();
+    let mut window = Window::run(&fixture.rig, &fixture.line(&into, &[]));
+    window.wait_for("Type yes to write these files");
+    window.type_bytes(&[0x03]);
+    let shown = window.wait_for("kr ended");
+    assert!(!shown.contains("kr ended 0"), "{shown}");
+    assert!(shown.contains("stopped before it finished"), "{shown}");
+    assert!(window.echoes(), "echo and line input are on");
+    assert!(names(&fixture.into).is_empty(), "files were written");
 }
 
 /// The kit pasted at a console: nothing is shown as it is pasted, the document ends at a blank line,
