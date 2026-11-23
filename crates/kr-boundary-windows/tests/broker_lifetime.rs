@@ -1199,6 +1199,119 @@ impl Drop for Clock {
     }
 }
 
+/// The Windows Time service's image path, which a case can point at a missing file so that the
+/// service cannot be started, and which the drop puts back. It changes the registry of the guest,
+/// which a restore resets, and only behind the gate of the case that uses it.
+struct BrokenImage {
+    was: String,
+    restored: bool,
+}
+
+impl BrokenImage {
+    const KEY: &'static str = r"HKLM\SYSTEM\CurrentControlSet\Services\W32Time";
+
+    fn make() -> BrokenImage {
+        assert!(
+            runs_as_the_system(),
+            "a service's image path changes only in a run as the system"
+        );
+        let read = powershell(
+            "(Get-Item 'HKLM:\\SYSTEM\\CurrentControlSet\\Services\\W32Time').GetValue('ImagePath', $null, 'DoNotExpandEnvironmentNames')",
+        );
+        let was = String::from_utf8_lossy(&read.stdout).trim().to_owned();
+        assert!(
+            read.status.success() && !was.is_empty(),
+            "the image path was not read: {read:?}"
+        );
+        // From here the drop puts the path back, whether or not this call finishes.
+        let image = BrokenImage {
+            was,
+            restored: false,
+        };
+        BrokenImage::write(r"C:\no-such-directory\no-such-service.exe").unwrap();
+        image
+    }
+
+    fn write(value: &str) -> Result<(), String> {
+        let done = std::process::Command::new("reg")
+            .args([
+                "add",
+                BrokenImage::KEY,
+                "/v",
+                "ImagePath",
+                "/t",
+                "REG_EXPAND_SZ",
+                "/d",
+                value,
+                "/f",
+            ])
+            .output()
+            .map_err(|failure| format!("the image path was not written: {failure}"))?;
+        if done.status.success() {
+            Ok(())
+        } else {
+            Err(format!("the image path was not written: {done:?}"))
+        }
+    }
+
+    fn put_back(&mut self) -> Result<(), String> {
+        BrokenImage::write(&self.was)?;
+        self.restored = true;
+        Ok(())
+    }
+}
+
+impl Drop for BrokenImage {
+    fn drop(&mut self) {
+        if !self.restored
+            && let Err(failure) = self.put_back()
+        {
+            eprintln!("the image path of W32Time could not be put back: {failure}");
+        }
+    }
+}
+
+/// A time service that cannot be started again must not keep the other from being put back: the
+/// Windows Time service runs when the case begins, its image path is then made to point at a
+/// missing file, and the restore must still start the Hyper-V time synchronisation service, name
+/// the Windows Time service in its failure, and succeed once the path is back.
+#[test]
+#[ignore = "runs as the system in a disposable guest"]
+fn a_time_service_that_cannot_be_started_does_not_keep_the_other_from_being_put_back() {
+    if !runs_as_the_system() {
+        eprintln!("skipped: needs the system's token");
+        return;
+    }
+    let started = powershell("Start-Service -Name W32Time -ErrorAction Stop");
+    assert!(
+        started.status.success(),
+        "the Windows Time service was not started: {started:?}"
+    );
+    let mut clock = Clock::new();
+    assert!(
+        clock.services.windows_time.runs() && clock.services.hyper_v_sync.runs(),
+        "the case needs both services running when it begins: {:?}",
+        clock.services
+    );
+    let mut image = BrokenImage::make();
+    let failure = clock
+        .restore()
+        .expect_err("the Windows Time service cannot be started");
+    let now = TimeServices::read().unwrap();
+    assert!(
+        now.hyper_v_sync.runs(),
+        "the Hyper-V time synchronisation service was not started after the Windows Time service failed: {failure}"
+    );
+    assert!(failure.contains("W32Time"), "{failure}");
+    image.put_back().unwrap();
+    clock.restore().unwrap();
+    let back = TimeServices::read().unwrap();
+    assert!(
+        back.windows_time.runs() && back.hyper_v_sync.runs(),
+        "{back:?}"
+    );
+}
+
 #[test]
 #[ignore = "runs as the system in a disposable guest"]
 fn the_boot_marker_is_the_same_across_a_change_of_the_clock_and_a_journal_reads_the_same_boot() {
