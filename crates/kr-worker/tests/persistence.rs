@@ -3632,6 +3632,187 @@ async fn answer_beginning(runtime: &SessionRuntime, prefix: &str) -> String {
     }
 }
 
+/// The word the answer names as `provenance` on the wire, when it names one.
+fn provenance_on_the_wire(answer: &kr_protocol::envelope::ParamsValue) -> Option<String> {
+    answer
+        .as_value()
+        .as_map()
+        .expect("an answer is a map")
+        .get("provenance")
+        .map(|member| member.as_text().expect("a word").to_owned())
+}
+
+/// Sends the interrupt `action_id` names and returns the answer.
+async fn interrupt_as(
+    client: &mut LocalClient,
+    host: &Host,
+    action_id: ActionId,
+    attachment_id: kr_protocol::ids::AttachmentId,
+    epoch: kr_protocol::ids::InputLeaseEpoch,
+) -> kr_protocol::envelope::ParamsValue {
+    client
+        .mutate(
+            Method::InputInterrupt,
+            action_id,
+            target(host),
+            &kr_protocol::input::InputInterruptParams {
+                session_id: host.session_id,
+                attachment_id,
+                epoch,
+                action: kr_protocol::input::InterruptAction::NativeInterrupt,
+            },
+        )
+        .await
+        .expect("reaches the worker")
+        .expect("the worker takes the interrupt")
+}
+
+/// The result `action.read` returns for `action_id`.
+async fn result_of(
+    client: &mut LocalClient,
+    action_id: ActionId,
+) -> kr_protocol::envelope::ParamsValue {
+    let read: kr_protocol::receipt::ActionReadResult = client
+        .request(
+            Method::ActionRead,
+            &kr_protocol::receipt::ActionReadParams {
+                action_id,
+                session_id: None,
+            },
+        )
+        .await
+        .expect("reaches the worker")
+        .expect("the receipt is readable")
+        .to_typed()
+        .expect("decodes");
+    read.result.0.expect("the interrupt's result is kept")
+}
+
+/// Writes every kept result that names a provenance back as an earlier package kept it, without
+/// the member, and returns how many it rewrote.
+fn kept_as_the_earlier_package_kept_it(path: &std::path::Path) -> usize {
+    let connection = rusqlite::Connection::open(path).expect("opens the store");
+    let kept: Vec<(String, Vec<u8>, Vec<u8>)> = {
+        let mut statement = connection
+            .prepare("SELECT actor_id, action_id, result FROM results")
+            .expect("prepares the read");
+        statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .expect("reads the results")
+            .map(|row| row.expect("a row"))
+            .collect()
+    };
+    let mut rewritten = 0;
+    for (actor, action, bytes) in kept {
+        let kr_cbor::CanonicalValue::Map(map) =
+            kr_cbor::decode(&bytes, &kr_cbor::Limits::DEFAULT).expect("a kept result decodes")
+        else {
+            continue;
+        };
+        if map.get("provenance").is_none() {
+            continue;
+        }
+        let without: Vec<(String, kr_cbor::CanonicalValue)> = map
+            .into_entries()
+            .into_iter()
+            .filter(|(name, _)| name != "provenance")
+            .collect();
+        let earlier = kr_cbor::encode(&kr_cbor::CanonicalValue::Map(
+            kr_cbor::CanonicalMap::from_entries(without).expect("distinct members"),
+        ));
+        connection
+            .execute(
+                "UPDATE results SET result = ?1 WHERE actor_id = ?2 AND action_id = ?3",
+                rusqlite::params![earlier, actor, action],
+            )
+            .expect("rewrites the kept result");
+        rewritten += 1;
+    }
+    rewritten
+}
+
+/// KR-REQ-12.09: an interrupt is a keyed mutation, so the worker keeps its result and sends the
+/// kept result again on a repeat and on `action.read`. The provenance is part of what is kept: both
+/// return what the first answer named, and a result kept without it (by a worker of an earlier
+/// package) is returned as kept, never rewritten to name one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_repeated_interrupt_and_a_read_of_it_return_the_provenance_the_first_answer_named() {
+    let host = host().await;
+    let mut client = cli(&host).await;
+    let attachment: kr_protocol::attachment::SessionAttachResult = client
+        .mutate(
+            Method::SessionAttach,
+            ActionId::new(kr_ipc::new_uuid()),
+            target(&host),
+            &attach_params(host.session_id),
+        )
+        .await
+        .expect("reaches the worker")
+        .map(|value| value.to_typed().expect("decodes"))
+        .expect("attaches");
+    let attachment_id = attachment.attachment.attachment_id;
+    let lease: kr_protocol::input::InputAcquireResult = client
+        .mutate(
+            Method::InputAcquire,
+            ActionId::new(kr_ipc::new_uuid()),
+            target(&host),
+            &kr_protocol::input::InputAcquireParams {
+                session_id: host.session_id,
+                attachment_id,
+                expected_epoch: Nullable::null(),
+            },
+        )
+        .await
+        .expect("reaches the worker")
+        .map(|value| value.to_typed().expect("decodes"))
+        .expect("acquires the lease");
+    let epoch = lease.lease.epoch;
+
+    let action_id = ActionId::new(kr_ipc::new_uuid());
+    let first = interrupt_as(&mut client, &host, action_id, attachment_id, epoch).await;
+    assert_eq!(
+        provenance_on_the_wire(&first).as_deref(),
+        Some("terminal_input")
+    );
+    let first_bytes = kr_cbor::encode(first.as_value());
+
+    let repeated = interrupt_as(&mut client, &host, action_id, attachment_id, epoch).await;
+    assert_eq!(
+        kr_cbor::encode(repeated.as_value()),
+        first_bytes,
+        "a repeat of the action is answered with the kept result, provenance included"
+    );
+    let read = result_of(&mut client, action_id).await;
+    assert_eq!(
+        kr_cbor::encode(read.as_value()),
+        first_bytes,
+        "action.read returns the kept result, provenance included"
+    );
+
+    assert_eq!(
+        kept_as_the_earlier_package_kept_it(&host.journal_path),
+        1,
+        "the interrupt's result is the one kept result that names a provenance"
+    );
+    let repeated = interrupt_as(&mut client, &host, action_id, attachment_id, epoch).await;
+    assert_eq!(
+        provenance_on_the_wire(&repeated),
+        None,
+        "a result kept without the member is repeated without it"
+    );
+    let read = result_of(&mut client, action_id).await;
+    assert_eq!(
+        provenance_on_the_wire(&read),
+        None,
+        "and is read without it"
+    );
+    assert_eq!(
+        kr_cbor::encode(repeated.as_value()),
+        kr_cbor::encode(read.as_value())
+    );
+    close(&mut client, &host).await;
+}
+
 /// KR-REQ-07.57: with the journal unreadable, the interrupt and the close still work, the close
 /// says its durability is volatile, and a second close is answered against the session itself
 /// rather than against a receipt the store could not keep.

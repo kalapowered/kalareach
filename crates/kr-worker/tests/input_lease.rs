@@ -2056,6 +2056,126 @@ async fn the_input_methods_check_the_encoder_the_lease_epoch_and_the_sequence() 
     drop(client);
 }
 
+/// The word the answer names as `provenance` on the wire, when it names one.
+fn provenance_on_the_wire(answer: &kr_protocol::envelope::ParamsValue) -> Option<String> {
+    answer
+        .as_value()
+        .as_map()
+        .expect("an answer is a map")
+        .get("provenance")
+        .map(|member| member.as_text().expect("a word").to_owned())
+}
+
+/// KR-REQ-12.09: the answer to a write and to an interrupt records that the action reached the
+/// application as terminal input, which proves bytes were written and never that the application
+/// took them as a typed answer. A release acts on the lease alone and records no provenance.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_answers_to_a_write_and_an_interrupt_say_terminal_input_and_a_release_says_nothing() {
+    let wired = wired("stty raw -echo; printf 'kr-ready.'; exec cat").await;
+    retained_within(&wired.runtime, b"kr-ready.", LIVENESS_DEADLINE).await;
+    let mut client = LocalClient::connect(&wired.endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("connects");
+    let attachment_id = attach_over(&mut client, &wired, Some("xterm-256color")).await;
+    let epoch = acquire_over(&mut client, &wired, attachment_id)
+        .await
+        .expect("acquires")
+        .lease
+        .epoch;
+
+    let written = client
+        .request(
+            Method::InputWrite,
+            &InputWriteParams {
+                session_id: wired.session_id,
+                attachment_id,
+                epoch,
+                sequence: kr_protocol::ids::InputSequence::new(0),
+                input: InputContent::Bytes {
+                    bytes: Bytes::new(b"kr-one.".to_vec()),
+                },
+            },
+        )
+        .await
+        .expect("reaches the worker")
+        .expect("accepted");
+    assert_eq!(
+        provenance_on_the_wire(&written).as_deref(),
+        Some("terminal_input"),
+        "the write's answer names terminal input on the wire"
+    );
+    let written: InputWriteResult = written.to_typed().expect("decodes");
+    assert_eq!(
+        written.provenance,
+        Some(kr_protocol::broker::ActionProvenance::TerminalInput)
+    );
+
+    let interrupted = client
+        .mutate(
+            Method::InputInterrupt,
+            ActionId::new(kr_ipc::new_uuid()),
+            wired.target(),
+            &kr_protocol::input::InputInterruptParams {
+                session_id: wired.session_id,
+                attachment_id,
+                epoch,
+                action: kr_protocol::input::InterruptAction::NativeInterrupt,
+            },
+        )
+        .await
+        .expect("reaches the worker")
+        .expect("interrupts");
+    assert_eq!(
+        provenance_on_the_wire(&interrupted).as_deref(),
+        Some("terminal_input"),
+        "the interrupt's answer names terminal input on the wire"
+    );
+    let interrupted: kr_protocol::input::InputLeaseResult =
+        interrupted.to_typed().expect("decodes");
+    assert_eq!(
+        interrupted.provenance,
+        Some(kr_protocol::broker::ActionProvenance::TerminalInput)
+    );
+    assert_eq!(
+        interrupted.lease.epoch, epoch,
+        "the interrupt keeps the lease"
+    );
+
+    // The lease is taken again after the interrupt, and the release is made at that epoch: a release
+    // at the epoch from before the interrupt is refused as `LEASE_LOST`.
+    let epoch = acquire_over(&mut client, &wired, attachment_id)
+        .await
+        .expect("acquires again")
+        .lease
+        .epoch;
+    let released = client
+        .mutate(
+            Method::InputRelease,
+            ActionId::new(kr_ipc::new_uuid()),
+            wired.target(),
+            &kr_protocol::input::InputReleaseParams {
+                session_id: wired.session_id,
+                attachment_id,
+                epoch,
+                after_input: None,
+                fenced_report: false,
+            },
+        )
+        .await
+        .expect("reaches the worker")
+        .expect("releases");
+    assert_eq!(
+        provenance_on_the_wire(&released),
+        None,
+        "the release's answer has no provenance member at all"
+    );
+    let released: kr_protocol::input::InputLeaseResult = released.to_typed().expect("decodes");
+    assert_eq!(released.provenance, None);
+    assert!(!released.lease.holder.is_present());
+
+    drop(client);
+}
+
 /// KR-REQ-23.36: an attachment without the input capability cannot type, whatever it holds.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_attachment_without_the_input_capability_cannot_write() {

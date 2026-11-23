@@ -12516,7 +12516,8 @@ impl WorkerService {
                 sequence: params.sequence,
                 forwarded_bytes: U64::new(accepted.forwarded_bytes),
                 held_prefix_bytes: U64::new(accepted.held_prefix_bytes),
-                provenance: None,
+                // Bytes written into the terminal: convenience, never a typed answer.
+                provenance: Some(kr_protocol::broker::ActionProvenance::TerminalInput),
             });
             // The answer to a lane's frame is queued in this hold, in the order the ledger changed,
             // so that the notice that an epoch ended, which a later hold queues, comes after it.
@@ -12771,7 +12772,7 @@ impl WorkerService {
                     encode(&InputLeaseResult {
                         lease: session.lease(),
                         fenced_bytes: None,
-                        provenance: None,
+                        provenance: Some(kr_protocol::broker::ActionProvenance::TerminalInput),
                     })?,
                     AfterEffect::None,
                 ))
