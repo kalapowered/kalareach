@@ -223,6 +223,22 @@ fn a_page_that_fits_its_table_has_no_problem_and_the_report_is_returned_as_data(
         constructor.lines
     );
     assert!(constructor.lines.contains("    3:   action: 'a',"));
+    // The complete text is kept beside the excerpt, so a change outside the excerpt can be read.
+    assert_eq!(constructor.text, CONSTRUCTOR_TEXT);
+    assert!(
+        constructor
+            .text
+            .contains("import type { PluginActionInvokeParams }"),
+        "{}",
+        constructor.text
+    );
+    assert!(
+        !constructor.lines.contains("import type"),
+        "the first line is outside the excerpt: {}",
+        constructor.lines
+    );
+    assert_eq!(report.texts[0].text, BRIDGE_TEXT);
+    assert_eq!(report.texts[1].text, CALLER_TEXT);
     assert!(report.texts[0].lines.contains("plugin_action_invoke"));
     assert!(
         report.texts[1]

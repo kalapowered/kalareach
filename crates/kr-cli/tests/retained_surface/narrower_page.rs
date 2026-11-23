@@ -94,7 +94,10 @@ pub struct PageShown {
     pub digest: String,
     pub paths: Vec<String>,
     pub tags: Vec<String>,
+    /// The lines that make the file the role's, numbered, with the lines around them.
     pub lines: String,
+    /// The complete text of the file, so that a change outside `lines` can be read.
+    pub text: String,
 }
 
 #[derive(Default, Debug)]
@@ -484,6 +487,7 @@ pub fn audit_page(
                         paths: vec![file.path.clone()],
                         tags: vec![snapshot.at.tag.clone()],
                         lines: excerpt(role, &file.text),
+                        text: file.text.clone(),
                     }),
                 }
             }
@@ -625,14 +629,15 @@ pub fn print_page_report(report: &PageReport) {
     }
     for text in &report.texts {
         println!(
-            "text {} {} at {} tags ({} to {}) in {}:\n{}",
+            "text {} {} at {} tags ({} to {}) in {}:\n{}\ncomplete text of the file:\n{}",
             text.role,
             text.digest,
             text.tags.len(),
             text.tags.first().map_or("", String::as_str),
             text.tags.last().map_or("", String::as_str),
             text.paths.join(", "),
-            text.lines
+            text.lines,
+            text.text
         );
     }
 }
