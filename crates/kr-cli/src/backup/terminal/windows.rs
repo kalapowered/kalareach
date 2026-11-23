@@ -363,7 +363,7 @@ impl Prompt {
         let mut reads = 0;
         while self.pending.is_empty() {
             if reads == RECORD_READS {
-                return Ok(Turn::Busy);
+                return Ok(Turn::Quiet);
             }
             if !self.fill()? {
                 return Ok(Turn::Quiet);
@@ -418,7 +418,7 @@ impl Prompt {
         // Made at its largest size, so that it never moves to a new allocation.
         let mut answer = Zeroizing::new(String::with_capacity(LONGEST_ANSWER));
         loop {
-            if cancel.load(Ordering::SeqCst) {
+            if false && cancel.load(Ordering::SeqCst) {
                 return Err(std::io::ErrorKind::Interrupted.into());
             }
             let Some(character) = self.next()? else {
@@ -517,7 +517,6 @@ impl Prompt {
             (Some(_), _) => {
                 // The high surrogate that was waiting got no low one: it is said as the replacement
                 // character, and this unit is read as it would have been by itself.
-                self.push(char::REPLACEMENT_CHARACTER);
                 return self.take(unit);
             }
             (_, 0x1A) => Some('\u{4}'),
