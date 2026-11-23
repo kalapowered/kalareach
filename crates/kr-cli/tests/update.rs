@@ -11350,8 +11350,23 @@ async fn a_host_whose_daemon_has_run() -> Host {
     host.install(&one);
     let controller = host.store.stable(Program::Controller);
     host.start_daemon(&controller).await;
-    // Privacy mode is turned on and off before any session exists, because turning it off is
-    // refused while one owes cleanup: what the daemon kept is what one that has changed it writes.
+    // Turned on and off before any session exists, because turning it off is refused while one
+    // owes cleanup: what the daemon kept is what one that has changed it writes.
+    privacy_mode_is_turned_on_and_off(&host).await;
+    let (display, session) = host.new_session(&host.store.stable(Program::Kr));
+    let worker = host.worker_process(session);
+    host.close(&host.store.stable(Program::Kr), &display);
+    host.worker_ended(&worker).await;
+    assert!(
+        host.stop_the_daemon().await,
+        "the daemon is stopped through its own door"
+    );
+    host
+}
+
+/// Turns privacy mode on and then off through the stable release's `kr`, and waits for each change to
+/// finish taking effect.
+async fn privacy_mode_is_turned_on_and_off(host: &Host) {
     for word in ["on", "off"] {
         let started = Instant::now();
         loop {
@@ -11369,15 +11384,6 @@ async fn a_host_whose_daemon_has_run() -> Host {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
     }
-    let (display, session) = host.new_session(&host.store.stable(Program::Kr));
-    let worker = host.worker_process(session);
-    host.close(&host.store.stable(Program::Kr), &display);
-    host.worker_ended(&worker).await;
-    assert!(
-        host.stop_the_daemon().await,
-        "the daemon is stopped through its own door"
-    );
-    host
 }
 
 /// What this build says of every store, with the definitions of each database as the daemon's files
@@ -11479,6 +11485,95 @@ async fn the_host_the_lock_is_made_from_has_changed_privacy_mode() {
         at_ms.is_some_and(|moment| moment > 0),
         "the moment the change took effect: {at_ms:?}"
     );
+}
+
+/// KR-REQ-15.20, KR-REQ-26.10, KR-REQ-26.13: a rollback over a host whose daemon, of this build, wrote
+/// the privacy record is refused by a release that lists that record at version 1, naming it and the
+/// version it is at, and nothing is switched; a release that lists it at version 2 goes ahead. The
+/// release lists every other store as this build does, so the privacy record is all either answer
+/// can be about, and the record stays at version 2 either way.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rollback_over_the_privacy_record_at_version_2_is_refused_by_a_release_that_lists_version_1()
+ {
+    for listed_at in [1, 2] {
+        let mut host = Host::bare();
+        let two = Assembled::at_this_level("0.2.0+bbbbbbbbbbbb", 2);
+        host.install(&two);
+        let controller = host.store.stable(Program::Controller);
+        host.start_daemon(&controller).await;
+        privacy_mode_is_turned_on_and_off(&host).await;
+        assert!(
+            host.stop_the_daemon().await,
+            "the daemon is stopped through its own door"
+        );
+        let record = host
+            .tree
+            .environment()
+            .state_dir()
+            .join(kr_controller::privacy::PRIVACY_RECORD);
+        let version = || -> i64 {
+            rusqlite::Connection::open_with_flags(
+                &record,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                    | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            )
+            .expect("the privacy record")
+            .query_row("SELECT version FROM privacy_schema", [], |row| row.get(0))
+            .expect("the version")
+        };
+        assert_eq!(
+            version(),
+            kr_controller::privacy::SCHEMA_VERSION,
+            "a daemon of this build wrote the record at the version it writes"
+        );
+        let one = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1)
+            .reading(stores_with_the_privacy_record_listed_at(listed_at));
+        host.put(&one);
+
+        let (output, said) = host.roll_back_to(&one);
+        if listed_at == 2 {
+            assert!(
+                output.status.success(),
+                "a release that lists version 2 goes back: {said} {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                host.store.current().expect("reads"),
+                Some(one.name().clone())
+            );
+        } else {
+            assert_eq!(output.status.code(), Some(1), "{said}");
+            let message = said["message"].as_str().unwrap_or_default();
+            assert!(
+                message.contains(kr_controller::privacy::PRIVACY_RECORD)
+                    && message.contains("schema version 2")
+                    && !message.contains("registry"),
+                "the refusal names the privacy record and the version it is at, and no other store: {said}"
+            );
+            assert_eq!(
+                host.store.current().expect("reads"),
+                Some(two.name().clone()),
+                "nothing was switched"
+            );
+        }
+        assert_eq!(version(), 2, "the record is as it was found");
+    }
+}
+
+/// The stores of this build, with the privacy record listed at `version`, as a release that wrote it
+/// at that version lists them.
+fn stores_with_the_privacy_record_listed_at(version: u32) -> Vec<ReleaseStore> {
+    release_stores()
+        .into_iter()
+        .map(|store| {
+            if store.store == "privacy" {
+                ReleaseStore { version, ..store }
+            } else {
+                store
+            }
+        })
+        .collect()
 }
 
 /// KR-REQ-26.10, KR-REQ-26.13, KR-REQ-12.06, KR-REQ-24.29: the release lists the backup store at
