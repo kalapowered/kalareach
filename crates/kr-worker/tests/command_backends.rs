@@ -20,6 +20,12 @@ use kr_worker::broker::commands::{CommandBackends, CommandBackendsConfig, Establ
 use kr_worker::broker::connectors::{ConnectorRefusal, ConnectorSource, ConnectorSources, fixture};
 use kr_worker::persistence::JournalHealth;
 
+/// The launcher a Windows case plays over the real frames until the Windows launcher presents
+/// itself to a backend, which needs a program of its own: this one, started again.
+#[cfg(windows)]
+#[path = "support/windows_launcher.rs"]
+mod windows_launcher;
+
 fn session() -> SessionId {
     SessionId::new(Uuid::from_bytes([1; 16]))
 }
@@ -1630,4 +1636,103 @@ async fn kr_req_07_45_a_build_that_cannot_name_a_sockets_peer_establishes_nothin
         before,
         "nothing was made in the runtime directory"
     );
+}
+
+/// Gives the program a launcher is started from the role it plays; it does nothing in an ordinary
+/// run.
+#[cfg(windows)]
+#[test]
+fn the_launcher_fixture_plays_its_role() {
+    windows_launcher::play_when_asked();
+}
+
+/// The launcher fixture connects to the backend's launch record address, presents itself with an
+/// environment, is admitted, creates a program held and names it in `going`, and reads the backend's
+/// commit under its own clock, counted from before `going` was written. The program is held until
+/// the fixture starts it, and ends with the launcher that created it.
+#[cfg(windows)]
+#[tokio::test]
+async fn the_fixture_reads_a_commit_on_the_launchers_clock() {
+    use windows_launcher::{Admission, Answer, COMMIT_DEADLINE, Launch, Launcher};
+
+    let setup = Setup::new();
+    let integration = Setup::integration();
+    let claude = invocation(&["claude", "--resume"]);
+    let answer = setup
+        .backends
+        .establish(&request(&setup, &claude, &integration, 1))
+        .expect("a backend is established");
+    let registration = PathBuf::from(&answer.environment[0].value);
+    let mut launch = Launch::new(&registration, &setup.executable, &claude.arguments);
+    launch.directory.clone_from(&setup.directory);
+    launch
+        .environment
+        .push(("KR_FIXTURE_PRESENTED".to_owned(), "yes".to_owned()));
+
+    let mut launcher = Launcher::start(&launch);
+    let played = launcher.played().await;
+    assert_eq!(played.admission, Admission::Admitted, "{played:?}");
+    assert_eq!(played.answer, Some(Answer::Committed), "{played:?}");
+    assert!(
+        played.after >= std::time::Duration::from_millis(1),
+        "the count began before `going` was written, so the commit took time on it: {played:?}"
+    );
+    assert!(
+        played.in_time(),
+        "the commit was read within the launcher's {COMMIT_DEADLINE:?}: {played:?}"
+    );
+    assert!(
+        !played.resumed,
+        "the fixture was not asked to start the program"
+    );
+
+    // The program the fixture created and named is held, and has not run.
+    let program = played.program.expect("the fixture named a program");
+    let identity = kr_ipc::identity::process_start_identity(program).expect("a process");
+    assert_eq!(
+        kr_ipc::identity::process_state(&identity),
+        kr_ipc::identity::ProcessState::Running,
+        "the program was created and is held, so it has not ended"
+    );
+
+    // And it ends with the launcher that made it.
+    launcher.end().await;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while kr_ipc::identity::process_state(&identity) != kr_ipc::identity::ProcessState::Ended {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the program ended with the launcher that created it"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+/// A backend that refuses what a launcher presents closes the connection without a word, and the
+/// fixture says so: it presents an argument vector the backend did not answer and reads a closed
+/// connection, creates nothing and goes no further.
+#[cfg(windows)]
+#[tokio::test]
+async fn the_fixture_reads_a_closed_connection_when_the_backend_refuses_its_hello() {
+    use windows_launcher::{Admission, Launch, Launcher};
+
+    let setup = Setup::new();
+    let integration = Setup::integration();
+    let claude = invocation(&["claude", "--resume"]);
+    let answer = setup
+        .backends
+        .establish(&request(&setup, &claude, &integration, 1))
+        .expect("a backend is established");
+    let registration = PathBuf::from(&answer.environment[0].value);
+    let mut arguments = claude.arguments.clone();
+    arguments.push("--another".to_owned());
+    let launch = Launch::new(&registration, &setup.executable, &arguments);
+
+    let mut launcher = Launcher::start(&launch);
+    let played = launcher.played().await;
+    assert_eq!(played.admission, Admission::Closed, "{played:?}");
+    assert_eq!(
+        played.program, None,
+        "no program is created for a launcher that was refused"
+    );
+    assert_eq!(played.answer, None);
 }
