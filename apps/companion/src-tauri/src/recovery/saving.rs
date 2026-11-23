@@ -45,8 +45,9 @@
 //! the lock ([`Step`] is the proof), it is a monotonic instant, and it only moves forward. A step
 //! that reaches the service for the settings and does not find them saved moves it to the end of
 //! the next [`SettingsTiming::window`], so this process makes at most one such step per window. A
-//! step that finds the deadline ahead makes no request and tells the loop when to try again, so a
-//! change made during the window is kept scheduled and not dropped. Two processes on one computer
+//! step that finds the deadline ahead asks the service nothing for the settings, though it may
+//! have ended a lost write first, and tells the loop when to try again, so a change made during
+//! the window is kept scheduled and not dropped. Two processes on one computer
 //! take turns under the lock, so the stated limit is one write per process per window; the bundle's
 //! compare-and-swap is the real guard.
 
