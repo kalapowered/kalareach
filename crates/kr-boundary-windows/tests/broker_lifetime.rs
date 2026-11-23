@@ -1116,9 +1116,9 @@ impl Clock {
     /// Puts the clock back, then the services; each step runs whatever the one before it did, and
     /// the failures of all of them are the result. The clock goes first, while both services are
     /// held off: a service that is running sets the clock to the host's time within seconds, and
-    /// a correction made after that would come on top of it.
+    /// a correction made after that would come on top of it. A restore that failed leaves the drop
+    /// to try again once; every step is safe to run twice.
     fn restore(&mut self) -> Result<(), String> {
-        self.restored = true;
         let mut failures = Vec::new();
         let right = self.began + self.at.elapsed();
         let off = seconds_between(std::time::SystemTime::now(), right);
@@ -1127,9 +1127,8 @@ impl Clock {
         {
             failures.push(failure);
         }
-        if let Err(failure) = self.put_services_back() {
-            failures.push(failure);
-        }
+        failures.extend(self.put_services_back());
+        self.restored = failures.is_empty();
         if failures.is_empty() {
             Ok(())
         } else {
@@ -1140,52 +1139,62 @@ impl Clock {
     /// Puts the Windows Time service's start type and the running services back, and reads both
     /// services to see that they are back: a service that ran must run, and neither start type may
     /// differ from what was found. A service that was stopped is left as it stands, because the
-    /// system's own tasks may start it.
-    fn put_services_back(&self) -> Result<(), String> {
+    /// system's own tasks may start it. Each change is an attempt of its own, so that the failure
+    /// of one does not keep the others from being made, and every failure is returned.
+    fn put_services_back(&self) -> Vec<String> {
         let was = &self.services;
-        let flag = |service: &Service| if service.runs() { "$true" } else { "$false" };
-        let script = format!(
-            "$ErrorActionPreference = 'Stop'; \
-             & sc.exe config W32Time start= {start}; \
-             if ($LASTEXITCODE -ne 0) {{ throw 'the start type was not set' }}; \
-             if ({windows_time}) {{ Start-Service -Name W32Time }}; \
-             if ({hyper_v_sync}) {{ Start-Service -Name vmictimesync }}",
-            start = was.windows_time.start,
-            windows_time = flag(&was.windows_time),
-            hyper_v_sync = flag(&was.hyper_v_sync),
-        );
-        let done = std::process::Command::new("powershell")
-            .args(["-NoProfile", "-Command", &script])
-            .output()
-            .map_err(|failure| format!("the time services were not put back: {failure}"))?;
-        if !done.status.success() {
-            return Err(format!("the time services were not put back: {done:?}"));
+        let mut steps = vec![(
+            "W32Time's start type",
+            format!(
+                "& sc.exe config W32Time start= {}; \
+                 if ($LASTEXITCODE -ne 0) {{ throw 'sc.exe config failed' }}",
+                was.windows_time.start
+            ),
+        )];
+        if was.windows_time.runs() {
+            steps.push(("W32Time", "Start-Service -Name W32Time".to_owned()));
         }
-        let now = TimeServices::read()?;
-        let mut wrong = Vec::new();
-        if now.windows_time.start != was.windows_time.start {
-            wrong.push(format!(
-                "W32Time's start type is {}, not {}",
-                now.windows_time.start, was.windows_time.start
+        if was.hyper_v_sync.runs() {
+            steps.push((
+                "vmictimesync",
+                "Start-Service -Name vmictimesync".to_owned(),
             ));
         }
-        if now.hyper_v_sync.start != was.hyper_v_sync.start {
-            wrong.push(format!(
-                "vmictimesync's start type is {}, not {}",
-                now.hyper_v_sync.start, was.hyper_v_sync.start
-            ));
+        let mut failures = Vec::new();
+        for (what, script) in steps {
+            let done = powershell(&format!("$ErrorActionPreference = 'Stop'; {script}"));
+            if !done.status.success() {
+                failures.push(format!(
+                    "{what} was not put back: {}, {}",
+                    done.status,
+                    String::from_utf8_lossy(&done.stderr).trim()
+                ));
+            }
         }
-        if was.windows_time.runs() && !now.windows_time.runs() {
-            wrong.push("W32Time does not run".to_owned());
+        match TimeServices::read() {
+            Err(failure) => failures.push(failure),
+            Ok(now) => {
+                if now.windows_time.start != was.windows_time.start {
+                    failures.push(format!(
+                        "W32Time's start type is {}, not {}",
+                        now.windows_time.start, was.windows_time.start
+                    ));
+                }
+                if now.hyper_v_sync.start != was.hyper_v_sync.start {
+                    failures.push(format!(
+                        "vmictimesync's start type is {}, not {}",
+                        now.hyper_v_sync.start, was.hyper_v_sync.start
+                    ));
+                }
+                if was.windows_time.runs() && !now.windows_time.runs() {
+                    failures.push("W32Time does not run".to_owned());
+                }
+                if was.hyper_v_sync.runs() && !now.hyper_v_sync.runs() {
+                    failures.push("vmictimesync does not run".to_owned());
+                }
+            }
         }
-        if was.hyper_v_sync.runs() && !now.hyper_v_sync.runs() {
-            wrong.push("vmictimesync does not run".to_owned());
-        }
-        if wrong.is_empty() {
-            Ok(())
-        } else {
-            Err(wrong.join(", "))
-        }
+        failures
     }
 }
 
