@@ -5037,6 +5037,77 @@ async fn kr_req_13_12_a_refused_send_leaves_the_copy_of_an_upload_that_a_cleanup
     adopted.stop().await;
 }
 
+/// KR-REQ-13.12 (FU17): a send whose start is refused because the person cancelled its key while the
+/// copy was written ends its admission at once: the upload leaves the desk and its copy goes while
+/// the cancel's barrier still waits, held before it reads what the key holds. The cancel recorded
+/// the key before its barrier took the turn. The barrier then finds nothing and answers
+/// `forgotten`, and the send is told it was cancelled.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_13_12_a_send_refused_for_a_cancelled_key_leaves_the_desk_before_the_cancel_reads_it()
+ {
+    use kr_protocol::method::Method;
+    use testing::{Awaited, Point};
+
+    let adopted = Adopted::start(1).await;
+    let (phone, control) = phone_for(&adopted).await;
+    let desk = desk_of(&phone.companion);
+    let paired = paired_of(&phone.companion).await;
+    let key = kr_ipc::new_uuid();
+    let bytes = vec![5_u8; 16];
+    let gate = desk.hold_after_copy_for_test();
+    let after = testing::hold_at(key, Point::AfterCopy);
+    let before = testing::hold_awaited(key, Awaited::BeforeOwed);
+    let send = {
+        let sent = request(&adopted, &bytes, Arc::new(Held::new(bytes.clone())), key);
+        let (desk, paired) = (Arc::clone(&desk), paired.clone());
+        tokio::spawn(async move { desk.send(paired, sent).await })
+    };
+    after.until_passed(1).await;
+    assert_eq!(
+        desk.phase_for_test(key),
+        Some("admitted"),
+        "the send placed its copy and waits before its start"
+    );
+    let cancel = {
+        let (desk, paired) = (Arc::clone(&desk), paired.clone());
+        tokio::spawn(async move { desk.cancel(paired.who(), Some(paired), key).await })
+    };
+    before.until_arrived(1).await;
+    gate.add_permits(1);
+    let told = tokio::time::timeout(WATCHDOG, send)
+        .await
+        .expect("the send answers")
+        .expect("the task ran")
+        .expect_err("the start of a cancelled key is refused");
+    assert_eq!(told.message, companion_tauri::open_transfers::CANCELLED);
+    assert_eq!(
+        desk.phase_for_test(key),
+        None,
+        "the refused send's upload left the desk while the cancel's barrier still waits"
+    );
+    assert_eq!(
+        testing::read_copy(&folder(&phone), key),
+        None,
+        "the refused send removed its copy"
+    );
+    before.release();
+    let answered = tokio::time::timeout(WATCHDOG, cancel)
+        .await
+        .expect("the cancel answers")
+        .expect("the task ran")
+        .expect("the cancel is answered");
+    assert_eq!(answered.state, "forgotten");
+    settled(&desk).await;
+    assert_eq!(entries_in(&folder(&phone)), 0, "no entry is left");
+    assert_eq!(copies_in(&folder(&phone)), 0, "no copy is left");
+    assert_eq!(
+        control.sent(Method::UploadBegin),
+        0,
+        "nothing reached the host"
+    );
+    adopted.stop().await;
+}
+
 /// KR-REQ-13.12 (FU7): a panic in the desk's task of a send leaves no upload admitted with no
 /// sender. The caller is answered, the copy is gone, and the key is free for a new send.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
