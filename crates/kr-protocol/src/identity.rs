@@ -928,6 +928,16 @@ const REFUSAL_FORMS: &[&str] = &[
     "{program} was not found",
     "{program} could not be started: {message}",
     "{program} ended with exit code {n} before the environment answered",
+    "{program} ran, and the helper ended with exit code {n} before the environment answered",
+    "{program} ran, and the helper ended with exit code {n} after the environment acknowledged the bridge, \
+     before it answered the read",
+    "{program} ended with exit code {n} when asked whether the environment is running",
+    "{program} ended with exit code {n} when asked to start the environment",
+    "{program} said nothing for {n} seconds when asked whether the environment is running, so it was \
+     ended",
+    "{program} said nothing for {n} seconds when asked to start the environment, so it was ended",
+    "{program} gave an answer that could not be read when asked whether the environment is running",
+    "{program} gave an answer that could not be read when asked to start the environment",
     "{program} was ended by signal {n} before the environment answered",
     "{program} ended the connection before the environment answered",
     "{program} ended with exit code {n} after the environment acknowledged the bridge, before it \
@@ -949,7 +959,7 @@ const REFUSAL_FORMS: &[&str] = &[
      record",
     "{program} ran, and the environment refused the bridge: {code} ({message})",
     "{program} ran, and the environment answered the read with an error: {code} ({message})",
-    "that session is closed",
+    "{program} ran, and the environment says that session is closed",
     "{program} said nothing for {n} seconds, so it was ended",
     "{program} ran, and the helper that answered ran as {name}, not as the user {name} the \
      enrolment names",

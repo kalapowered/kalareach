@@ -425,6 +425,34 @@ impl Store {
         })
     }
 
+    /// What a refresh takes in when the platform could not be asked: the environment as stale, which
+    /// is what a daemon records of an environment it could observe nothing about, and not started.
+    ///
+    /// # Errors
+    ///
+    /// Returns a failure when this host has no enrolled environment `environment_id`.
+    pub fn unobserved(&self, environment_id: EnvironmentId) -> Result<Observed> {
+        let enrolment = self
+            .enrolment(environment_id)
+            .ok_or_else(|| {
+                ControllerError::InvalidArgument(format!(
+                    "this host has no enrolled environment {environment_id}"
+                ))
+            })?
+            .clone();
+        let instance = self.instance_of(environment_id).ok_or_else(|| {
+            ControllerError::supervision(format!(
+                "this host has no approved record for environment {environment_id}"
+            ))
+        })?;
+        Ok(Observed {
+            enrolment,
+            instance,
+            status: EnvironmentPresence::Stale,
+            started: false,
+        })
+    }
+
     /// Takes in what [`Self::observe`] saw, and answers with the row as observed at `now_ms`.
     ///
     /// # Errors

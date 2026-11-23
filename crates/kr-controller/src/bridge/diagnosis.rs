@@ -19,6 +19,7 @@ use kr_protocol::ids::EnvironmentId;
 
 use crate::bridge::invoke::{HelperEnd, Refusal};
 use crate::bridge::launch::{self, LaunchError};
+use crate::bridge::platform::{Step, StepFailure};
 
 /// How far a bridge got before it was refused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -71,10 +72,18 @@ pub fn of(refusal: &Refusal, access: EnvironmentAccess, stage: Stage) -> Sentenc
                 }
             };
             match helper {
-                Some(HelperEnd::Exited(code)) => program()
-                    .stated(" ended with exit code ")
-                    .number(u64::from(u32::from_ne_bytes(code.to_ne_bytes())))
-                    .stated(before),
+                // The container runtime ends with 125, and `ssh` with 255, when they themselves fail.
+                // Any other code is the helper's own, which the program passes through.
+                Some(HelperEnd::Exited(code)) => {
+                    let ended = if is_the_programs_own(access, *code) {
+                        program().stated(" ended with exit code ")
+                    } else {
+                        program().stated(" ran, and the helper ended with exit code ")
+                    };
+                    ended
+                        .number(u64::from(u32::from_ne_bytes(code.to_ne_bytes())))
+                        .stated(before)
+                }
                 Some(HelperEnd::Signalled(signal)) => program()
                     .stated(" was ended by signal ")
                     .number(u64::from(u32::from_ne_bytes(signal.to_ne_bytes())))
@@ -126,7 +135,9 @@ pub fn of(refusal: &Refusal, access: EnvironmentAccess, stage: Stage) -> Sentenc
             .stated(" (")
             .withheld(ContentClass::Message, &error.message)
             .stated(")"),
-        Refusal::SessionClosed => Sentence::new().stated("that session is closed"),
+        Refusal::SessionClosed => {
+            program().stated(" ran, and the environment says that session is closed")
+        }
         Refusal::Silent { waited } => program()
             .stated(" said nothing for ")
             .number(waited.as_secs())
@@ -177,6 +188,48 @@ pub fn of(refusal: &Refusal, access: EnvironmentAccess, stage: Stage) -> Sentenc
                 .withheld(ContentClass::Message, detail)
                 .stated("; it may still be running, and this host no longer waits for it")
         }
+    }
+}
+
+/// Whether `code` is one the program ends with when it is the program that failed: the container
+/// runtime's 125 and `ssh`'s 255. Every other code is the helper's, which the program passes on.
+const fn is_the_programs_own(access: EnvironmentAccess, code: i32) -> bool {
+    match access {
+        EnvironmentAccess::Container => code == 125,
+        EnvironmentAccess::SshHost => code == 255,
+        _ => true,
+    }
+}
+
+/// Returns the sentence for a step of a refresh that asks the platform, the look at whether the
+/// environment runs or its start, and failed: the step by its role, and how it failed. What the
+/// program printed and what the operating system said are not in it, except as a class and length.
+#[must_use]
+pub fn platform(access: EnvironmentAccess, step: Step, failure: &StepFailure) -> Sentence {
+    let program = Sentence::new().stated(connection_step(launch::program_of(access)));
+    let asked = match step {
+        Step::Look => "when asked whether the environment is running",
+        Step::Start => "when asked to start the environment",
+    };
+    match failure {
+        StepFailure::NotFound => program.stated(" was not found"),
+        StepFailure::NotStarted { message } => program
+            .stated(" could not be started: ")
+            .withheld(ContentClass::Message, message),
+        StepFailure::Exited(code) => program
+            .stated(" ended with exit code ")
+            .number(u64::from(u32::from_ne_bytes(code.to_ne_bytes())))
+            .stated(" ")
+            .stated(asked),
+        StepFailure::NoAnswer { seconds } => program
+            .stated(" said nothing for ")
+            .number(*seconds)
+            .stated(" seconds ")
+            .stated(asked)
+            .stated(", so it was ended"),
+        StepFailure::Unreadable => program
+            .stated(" gave an answer that could not be read ")
+            .stated(asked),
     }
 }
 
@@ -415,7 +468,12 @@ mod tests {
                     ARRIVED.len()
                 ),
             ),
-            (Refusal::SessionClosed, "that session is closed".to_owned()),
+            (
+                Refusal::SessionClosed,
+                "the container runtime (podman) ran, and the environment says that session is \
+                 closed"
+                    .to_owned(),
+            ),
             (
                 Refusal::Silent {
                     waited: std::time::Duration::from_secs(20),
@@ -514,26 +572,107 @@ mod tests {
     /// program says so in the same place.
     #[test]
     fn each_access_class_names_the_step_the_host_runs_for_it() {
-        let ended = Refusal::Stream {
+        let ended = |code| Refusal::Stream {
             detail: ARRIVED.to_owned(),
-            helper: Some(HelperEnd::Exited(255)),
+            helper: Some(HelperEnd::Exited(code)),
         };
-        for (access, step) in [
-            (EnvironmentAccess::SshHost, "the SSH client (ssh)"),
+        for (access, step, code) in [
+            (EnvironmentAccess::SshHost, "the SSH client (ssh)", 255),
             (
                 EnvironmentAccess::Container,
                 "the container runtime (podman)",
+                125,
             ),
             (
                 EnvironmentAccess::WslDistribution,
                 "the WSL launcher (wsl.exe)",
+                255,
             ),
-            (EnvironmentAccess::PairedHost, "the helper program"),
+            (EnvironmentAccess::PairedHost, "the helper program", 255),
         ] {
             assert_eq!(
-                of(&ended, access, Stage::Opening).as_str(),
-                format!("{step} ended with exit code 255 before the environment answered")
+                of(&ended(code), access, Stage::Opening).as_str(),
+                format!("{step} ended with exit code {code} before the environment answered")
             );
+        }
+    }
+
+    /// KR-REQ-18.11, the part about connection diagnostics: the container runtime ends with 125 and
+    /// `ssh` with 255 when they themselves fail, and any other code is the helper's, which the
+    /// program passes through. The sentence says whose it is.
+    #[test]
+    fn an_exit_code_is_told_as_the_programs_own_or_as_the_helpers() {
+        let ended = |code| Refusal::Stream {
+            detail: ARRIVED.to_owned(),
+            helper: Some(HelperEnd::Exited(code)),
+        };
+        for (access, step, own, helpers) in [
+            (
+                EnvironmentAccess::Container,
+                "the container runtime (podman)",
+                125,
+                127,
+            ),
+            (EnvironmentAccess::SshHost, "the SSH client (ssh)", 255, 1),
+        ] {
+            assert_eq!(
+                of(&ended(own), access, Stage::Opening).as_str(),
+                format!("{step} ended with exit code {own} before the environment answered")
+            );
+            let said = of(&ended(helpers), access, Stage::Opening);
+            assert_eq!(
+                said.as_str(),
+                format!(
+                    "{step} ran, and the helper ended with exit code {helpers} before the \
+                     environment answered"
+                )
+            );
+            assert!(is_composed_connection(said.as_str()), "{said}");
+            let read = of(&ended(helpers), access, Stage::Read);
+            assert!(is_composed_connection(read.as_str()), "{read}");
+        }
+    }
+
+    /// KR-REQ-18.11, the part about connection diagnostics: each step of a refresh that asks the
+    /// platform, the look and the start, is told by its role and by one class of failure, with the
+    /// operating system's message as its class and length and none of what the program printed.
+    #[test]
+    fn a_platform_step_that_failed_is_told_by_its_role_and_its_class() {
+        let access = EnvironmentAccess::Container;
+        let step = "the container runtime (podman)";
+        for (look, asked) in [
+            (Step::Look, "when asked whether the environment is running"),
+            (Step::Start, "when asked to start the environment"),
+        ] {
+            for (failure, expected) in [
+                (StepFailure::NotFound, format!("{step} was not found")),
+                (
+                    StepFailure::NotStarted {
+                        message: ARRIVED.to_owned(),
+                    },
+                    format!(
+                        "{step} could not be started: [message withheld, {} bytes]",
+                        ARRIVED.len()
+                    ),
+                ),
+                (
+                    StepFailure::Exited(125),
+                    format!("{step} ended with exit code 125 {asked}"),
+                ),
+                (
+                    StepFailure::NoAnswer { seconds: 60 },
+                    format!("{step} said nothing for 60 seconds {asked}, so it was ended"),
+                ),
+                (
+                    StepFailure::Unreadable,
+                    format!("{step} gave an answer that could not be read {asked}"),
+                ),
+            ] {
+                let said = platform(access, look, &failure);
+                assert_eq!(said.as_str(), expected, "{failure:?}");
+                assert!(is_composed_connection(said.as_str()), "{said}");
+                assert!(!said.as_str().contains(ARRIVED), "{said}");
+            }
         }
     }
 

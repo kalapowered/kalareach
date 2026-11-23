@@ -2207,18 +2207,25 @@ async fn a_helper_that_exits_before_the_environment_answers_is_told_with_its_pro
         enrolled_and_answering(&world, label, access, target);
         // The stand-ins end with the codes `ssh` and the runtime end with, and say why on their
         // standard error.
-        let (code, said) = if access == "ssh" {
-            (255, "Connection refused")
+        // `ssh` ends with 255 when it is the program that failed. The container runtime's own code
+        // is 125, and the stand-in ends with the 127 of a helper that is not in the container, which
+        // is the helper's.
+        let (ended, said) = if access == "ssh" {
+            (
+                format!("{program} ended with exit code 255 before the environment answered"),
+                "Connection refused",
+            )
         } else {
-            (127, "executable file not found")
+            (
+                format!(
+                    "{program} ran, and the helper ended with exit code 127 before the \
+                     environment answered"
+                ),
+                "executable file not found",
+            )
         };
         with_the_switch_on(&world, "unreachable", label, || {
-            assert_refresh_says(
-                &world,
-                label,
-                &format!("{program} ended with exit code {code} before the environment answered"),
-                &[said],
-            );
+            assert_refresh_says(&world, label, &ended, &[said]);
         });
     }
 }
@@ -2325,6 +2332,57 @@ async fn a_helper_whose_answer_cannot_be_read_is_told_with_its_step_and_the_leng
         );
         std::fs::remove_file(world.tools.join("refusal")).expect("what it writes is taken away");
     }
+}
+
+/// KR-REQ-18.11, the part about connection diagnostics, for a container runtime that is not on this
+/// host: the refresh answers with a connection sentence that names the step by its role and says it
+/// was not found, in `--json` and in the lines, and a stale row. It is not refused with the
+/// operating system's message, and it does not say a worker could not be started.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_container_runtime_that_is_not_on_this_host_is_told_as_not_found() {
+    if ["/usr/bin/podman", "/bin/podman"]
+        .iter()
+        .any(|path| Path::new(path).exists())
+    {
+        eprintln!("skipped: this host has a podman on the path the daemon is given");
+        return;
+    }
+    let _turn = CONTAINER_RUNTIME_TURN.lock().await;
+    let world = world_whose_destination_answers().await;
+    enrolled_and_answering(&world, "box", "container", STAND_IN_CONTAINER_NAME);
+    let present = world.tools.join("podman");
+    let away = world.tools.join("podman-away");
+    std::fs::rename(&present, &away).expect("the runtime is taken off the path");
+    let told = refreshed_both_ways(&world, "box");
+    std::fs::rename(&away, &present).expect("the runtime is put back");
+    let expected = "the container runtime (podman) was not found";
+    assert_eq!(told.document["connection"], expected, "{told:?}");
+    assert_eq!(told.lines[1].trim_start(), expected, "{told:?}");
+    assert_eq!(told.document["row"]["status"], "stale", "{told:?}");
+    assert!(!told.everything.contains("os error"), "{told:?}");
+}
+
+/// KR-REQ-18.11, the part about connection diagnostics, for a look at the container that fails: the
+/// runtime exits with its own code, and the refresh says the look ended with it, in `--json` and in
+/// the lines. It does not say the environment is not running, which the host does not know, and
+/// what the runtime printed is in neither output.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_look_at_the_container_that_fails_is_told_as_its_step_and_not_as_a_stopped_environment() {
+    let _turn = CONTAINER_RUNTIME_TURN.lock().await;
+    let world = world_whose_destination_answers().await;
+    enrolled_and_answering(&world, "box", "container", STAND_IN_CONTAINER_NAME);
+    with_the_switch_on(&world, "running-fails", "box", || {
+        let told = refreshed_both_ways(&world, "box");
+        let expected = "the container runtime (podman) ended with exit code 125 when asked \
+                        whether the environment is running";
+        assert_eq!(told.document["connection"], expected, "{told:?}");
+        assert_eq!(told.lines[1].trim_start(), expected, "{told:?}");
+        assert!(!told.everything.contains("not running"), "{told:?}");
+        assert!(
+            !told.everything.contains("cannot connect to the store"),
+            "{told:?}"
+        );
+    });
 }
 
 /// KR-REQ-18.11, the part about connection diagnostics, for a refresh that finds nothing wrong:

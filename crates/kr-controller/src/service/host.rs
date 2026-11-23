@@ -557,16 +557,31 @@ impl Controller {
                         #[cfg(feature = "testing")]
                         asking.after_the_environment_record_is_taken.wait();
                         asking.check_registration(&carried)?;
-                        let observed = store.observe(
+                        // A step that asks the platform and fails is a failed look or start, which the
+                        // refresh answers with its row as stale and a sentence that names the step:
+                        // not a refusal of the refresh.
+                        let (observed, failed) = match store.observe(
                             params.environment_id,
                             params.start,
                             platform.as_ref(),
                             &|| asking.check_registration(&carried),
-                        )?;
+                        ) {
+                            Ok(observed) => (observed, None),
+                            Err(ControllerError::Platform {
+                                access,
+                                step,
+                                failure,
+                            }) => (
+                                store.unobserved(params.environment_id)?,
+                                Some(crate::bridge::diagnosis::platform(access, step, &failure)),
+                            ),
+                            Err(other) => return Err(other),
+                        };
                         let started = observed.started();
                         asking
                             .under_registration(&carried, || store.record(observed, now_ms))
                             .and_then(|recorded| recorded)
+                            .map(|recorded| (recorded, failed))
                             .map_err(|refusal| {
                                 if started {
                                     ControllerError::Uncertain {
@@ -585,119 +600,123 @@ impl Controller {
                 .map_err(|error| ControllerError::supervision(error.to_string()))??;
                 #[cfg(feature = "testing")]
                 self.after_the_environment_is_recorded.wait();
-                let crate::bridge::store::Refreshed {
-                    mut row,
-                    started,
-                    instance,
-                } = refreshed;
+                let (
+                    crate::bridge::store::Refreshed {
+                        mut row,
+                        started,
+                        instance,
+                    },
+                    failed,
+                ) = refreshed;
 
                 // Only a running environment is worth opening a bridge to, and only a process
                 // bridge has one to open. Everything else says so rather than starting anything:
                 // section 3 leaves starting to the caller that asked for it.
-                let (verification, connection) =
-                    if row.status != kr_protocol::identity::EnvironmentPresence::Running {
-                        (Nullable::null(), crate::bridge::diagnosis::not_running())
-                    } else if let Err(refusal) = controller.check_registration(&carried) {
-                        // The platform has been asked and the record is made. Opening a bridge reaches
-                        // into another environment, so it waits on the admission; what it refuses is
-                        // not a refusal of the refresh, which has run.
-                        (
-                            Nullable::null(),
-                            crate::bridge::diagnosis::not_opened(&refusal.to_string()),
-                        )
-                    } else {
-                        // Opening a bridge reaches into another environment, after waits of its own.
-                        let opened_for = row.enrolment.clone();
-                        match crate::bridge::verify::through_bridge(
-                            actor,
-                            bridged,
-                            &opened_for,
-                            self.paths.environment_id(),
-                            self.build_id.clone(),
-                        )
-                        .await
-                        {
-                            Ok(verification) => {
-                                // The destination answered on its own local channel, inside its own
-                                // environment. That is section 25's scoped channel, established rather
-                                // than assumed, so the record keeps it — against the approved record
-                                // the bridge was opened for, which another caller may have replaced
-                                // since.
-                                match self
-                                    .record_outcome(
-                                        carried,
-                                        environment_id,
-                                        instance,
-                                        crate::bridge::store::BridgeAnswer::Answered,
-                                        now_ms,
-                                    )
-                                    .await
-                                {
-                                    Ok(outcome) => {
-                                        // The record decides, including when it has gone: the
-                                        // readiness that comes back is read from it after the result
-                                        // was written.
-                                        row.readiness = outcome.readiness;
-                                        let detail = if outcome.established {
-                                            crate::bridge::diagnosis::answered(
-                                                &verification.environment_id,
-                                                &verification.os_user,
-                                                false,
-                                            )
-                                        } else {
-                                            crate::bridge::diagnosis::record_changed(false)
-                                        };
-                                        (Nullable::some(verification), detail)
-                                    }
-                                    // The refresh has run, and a refusal here is not a refusal of it.
-                                    Err(refusal) => (
-                                        Nullable::null(),
-                                        crate::bridge::diagnosis::answered_not_recorded(
-                                            &refusal.to_string(),
-                                        ),
-                                    ),
-                                }
-                            }
-                            Err(refused) => {
-                                // Nothing answered. What an earlier bridge established for this record
-                                // is not evidence about it any more, so it is taken back rather than
-                                // left standing beside a failure.
-                                match self
-                                    .record_outcome(
-                                        carried,
-                                        environment_id,
-                                        instance,
-                                        crate::bridge::store::BridgeAnswer::Refused,
-                                        now_ms,
-                                    )
-                                    .await
-                                {
-                                    Ok(outcome) => {
-                                        row.readiness = outcome.readiness;
-                                        (
-                                            Nullable::null(),
-                                            crate::bridge::diagnosis::of(
-                                                &refused.refusal,
-                                                opened_for.access,
-                                                refused.stage,
-                                            ),
+                let (verification, connection) = if let Some(sentence) = failed {
+                    (Nullable::null(), sentence)
+                } else if row.status != kr_protocol::identity::EnvironmentPresence::Running {
+                    (Nullable::null(), crate::bridge::diagnosis::not_running())
+                } else if let Err(refusal) = controller.check_registration(&carried) {
+                    // The platform has been asked and the record is made. Opening a bridge reaches
+                    // into another environment, so it waits on the admission; what it refuses is
+                    // not a refusal of the refresh, which has run.
+                    (
+                        Nullable::null(),
+                        crate::bridge::diagnosis::not_opened(&refusal.to_string()),
+                    )
+                } else {
+                    // Opening a bridge reaches into another environment, after waits of its own.
+                    let opened_for = row.enrolment.clone();
+                    match crate::bridge::verify::through_bridge(
+                        actor,
+                        bridged,
+                        &opened_for,
+                        self.paths.environment_id(),
+                        self.build_id.clone(),
+                    )
+                    .await
+                    {
+                        Ok(verification) => {
+                            // The destination answered on its own local channel, inside its own
+                            // environment. That is section 25's scoped channel, established rather
+                            // than assumed, so the record keeps it — against the approved record
+                            // the bridge was opened for, which another caller may have replaced
+                            // since.
+                            match self
+                                .record_outcome(
+                                    carried,
+                                    environment_id,
+                                    instance,
+                                    crate::bridge::store::BridgeAnswer::Answered,
+                                    now_ms,
+                                )
+                                .await
+                            {
+                                Ok(outcome) => {
+                                    // The record decides, including when it has gone: the
+                                    // readiness that comes back is read from it after the result
+                                    // was written.
+                                    row.readiness = outcome.readiness;
+                                    let detail = if outcome.established {
+                                        crate::bridge::diagnosis::answered(
+                                            &verification.environment_id,
+                                            &verification.os_user,
+                                            false,
                                         )
-                                    }
-                                    Err(unrecorded) => (
-                                        Nullable::null(),
-                                        crate::bridge::diagnosis::and_not_recorded(
-                                            crate::bridge::diagnosis::of(
-                                                &refused.refusal,
-                                                opened_for.access,
-                                                refused.stage,
-                                            ),
-                                            &unrecorded.to_string(),
-                                        ),
-                                    ),
+                                    } else {
+                                        crate::bridge::diagnosis::record_changed(false)
+                                    };
+                                    (Nullable::some(verification), detail)
                                 }
+                                // The refresh has run, and a refusal here is not a refusal of it.
+                                Err(refusal) => (
+                                    Nullable::null(),
+                                    crate::bridge::diagnosis::answered_not_recorded(
+                                        &refusal.to_string(),
+                                    ),
+                                ),
                             }
                         }
-                    };
+                        Err(refused) => {
+                            // Nothing answered. What an earlier bridge established for this record
+                            // is not evidence about it any more, so it is taken back rather than
+                            // left standing beside a failure.
+                            match self
+                                .record_outcome(
+                                    carried,
+                                    environment_id,
+                                    instance,
+                                    crate::bridge::store::BridgeAnswer::Refused,
+                                    now_ms,
+                                )
+                                .await
+                            {
+                                Ok(outcome) => {
+                                    row.readiness = outcome.readiness;
+                                    (
+                                        Nullable::null(),
+                                        crate::bridge::diagnosis::of(
+                                            &refused.refusal,
+                                            opened_for.access,
+                                            refused.stage,
+                                        ),
+                                    )
+                                }
+                                Err(unrecorded) => (
+                                    Nullable::null(),
+                                    crate::bridge::diagnosis::and_not_recorded(
+                                        crate::bridge::diagnosis::of(
+                                            &refused.refusal,
+                                            opened_for.access,
+                                            refused.stage,
+                                        ),
+                                        &unrecorded.to_string(),
+                                    ),
+                                ),
+                            }
+                        }
+                    }
+                };
                 encode(&EnvironmentRefreshResult {
                     row,
                     started,
@@ -740,30 +759,43 @@ impl Controller {
         )
         .await
         {
-            Ok(verification) => {
-                let outcome = self
-                    .record_outcome(
-                        carried,
-                        environment_id,
-                        instance,
-                        crate::bridge::store::BridgeAnswer::Answered,
-                        now_ms,
-                    )
-                    .await?;
-                row.readiness = outcome.readiness;
-                let detail = if outcome.established {
-                    crate::bridge::diagnosis::answered(
-                        &verification.environment_id,
-                        &verification.os_user,
-                        true,
-                    )
-                } else {
-                    crate::bridge::diagnosis::record_changed(true)
-                };
-                (Nullable::some(verification), detail)
-            }
+            Ok(verification) => match self
+                .record_outcome(
+                    carried,
+                    environment_id,
+                    instance,
+                    crate::bridge::store::BridgeAnswer::Answered,
+                    now_ms,
+                )
+                .await
+            {
+                Ok(outcome) => {
+                    row.readiness = outcome.readiness;
+                    let detail = if outcome.established {
+                        crate::bridge::diagnosis::answered(
+                            &verification.environment_id,
+                            &verification.os_user,
+                            true,
+                        )
+                    } else {
+                        crate::bridge::diagnosis::record_changed(true)
+                    };
+                    (Nullable::some(verification), detail)
+                }
+                // The helper answered and this host could not record it: the refresh says so, and
+                // is not refused with the host's own sentence.
+                Err(error) => (
+                    Nullable::some(verification),
+                    crate::bridge::diagnosis::answered_not_recorded(&error.to_string()),
+                ),
+            },
             Err(refusal) => {
-                let outcome = self
+                let said = crate::bridge::diagnosis::of(
+                    &refusal,
+                    opened_for.access,
+                    crate::bridge::diagnosis::Stage::Opening,
+                );
+                match self
                     .record_outcome(
                         carried,
                         environment_id,
@@ -771,16 +803,18 @@ impl Controller {
                         crate::bridge::store::BridgeAnswer::Refused,
                         now_ms,
                     )
-                    .await?;
-                row.readiness = outcome.readiness;
-                (
-                    Nullable::null(),
-                    crate::bridge::diagnosis::of(
-                        &refusal,
-                        opened_for.access,
-                        crate::bridge::diagnosis::Stage::Opening,
+                    .await
+                {
+                    Ok(outcome) => {
+                        row.readiness = outcome.readiness;
+                        (Nullable::null(), said)
+                    }
+                    // The probe's own sentence stays, and the refresh says it did not record it.
+                    Err(error) => (
+                        Nullable::null(),
+                        crate::bridge::diagnosis::and_not_recorded(said, &error.to_string()),
                     ),
-                )
+                }
             }
         };
         encode(&EnvironmentRefreshResult {

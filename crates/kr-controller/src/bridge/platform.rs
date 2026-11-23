@@ -60,15 +60,26 @@ impl Observer for PlatformObserver {
     fn start(&self, enrolment: &EnvironmentEnrolment) -> Result<()> {
         let command = launch::start(enrolment)
             .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
-        let output = run(&command.program, &command.arguments)?;
+        let step = |failure| ControllerError::Platform {
+            access: enrolment.access,
+            step: Step::Start,
+            failure,
+        };
+        let output = run_within_as(
+            &command.program,
+            &command.arguments,
+            platform_limit(),
+            |failure| step(failure_of(failure)),
+        )?;
         if output.code == Some(0) {
             return Ok(());
         }
-        Err(ControllerError::supervision(format!(
-            "{} could not be started: {}",
-            enrolment.label,
-            output.text.trim()
-        )))
+        // What the program printed is not told: the person reads that the step ended, and how.
+        Err(step(
+            output
+                .code
+                .map_or(StepFailure::Unreadable, StepFailure::Exited),
+        ))
     }
 }
 
@@ -87,16 +98,32 @@ fn observe_enrolment(
             registered,
             running,
         } => {
-            let registered = run_within(&registered.program, &registered.arguments, LISTING_LIMIT)?;
-            let running = run_within(&running.program, &running.arguments, LISTING_LIMIT)?;
+            let look = |failure| ControllerError::Platform {
+                access: enrolment.access,
+                step: Step::Look,
+                failure: failure_of(failure),
+            };
+            let registered = run_within_as(
+                &registered.program,
+                &registered.arguments,
+                LISTING_LIMIT,
+                look,
+            )?;
+            let running = run_within_as(&running.program, &running.arguments, LISTING_LIMIT, look)?;
             Ok(wsl_state(&registered, &running, &enrolment.target))
         }
         Observation::Inspection(command) => {
-            let output = run(&command.program, &command.arguments)?;
+            let look = |failure| ControllerError::Platform {
+                access: enrolment.access,
+                step: Step::Look,
+                failure: failure_of(failure),
+            };
+            let output =
+                run_within_as(&command.program, &command.arguments, platform_limit(), look)?;
             if strict {
                 presence_after_inspection(&named(&command.program, &command.arguments), &output)
             } else {
-                Ok(container_state(&output))
+                presence_after_look(enrolment.access, &output)
             }
         }
     }
@@ -482,7 +509,90 @@ fn run_within(
     arguments: &[String],
     limit: std::time::Duration,
 ) -> Result<CommandOutput> {
-    let output = run_bounded(program, arguments, limit)?;
+    run_within_as(program, arguments, limit, ControllerError::from)
+}
+
+/// Which step of a refresh asked the platform.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Step {
+    /// The look at whether the environment runs.
+    Look,
+    /// The start of the environment.
+    Start,
+}
+
+/// How a step of a refresh that asks the platform failed, in the classes a person is told. None
+/// carries what the program printed; the operating system's message is kept only to be given as its
+/// class and length.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StepFailure {
+    /// The program is not there.
+    NotFound,
+    /// The program is there and could not be run.
+    NotStarted {
+        /// What the operating system said.
+        message: String,
+    },
+    /// The program ended with a code.
+    Exited(i32),
+    /// The program did not end within its bound, in seconds.
+    NoAnswer {
+        /// The bound.
+        seconds: u64,
+    },
+    /// The program ended without a code, or answered with something that is not an answer.
+    Unreadable,
+}
+
+/// The class a failed call falls in.
+fn failure_of(failure: CallFailure) -> StepFailure {
+    match failure {
+        CallFailure::NotRun { error, .. } if error.kind() == std::io::ErrorKind::NotFound => {
+            StepFailure::NotFound
+        }
+        CallFailure::NotRun { error, .. } => StepFailure::NotStarted {
+            message: error.to_string(),
+        },
+        CallFailure::Deadline { limit, .. } => StepFailure::NoAnswer {
+            seconds: limit.as_secs(),
+        },
+        CallFailure::Unknown { .. } => StepFailure::Unreadable,
+    }
+}
+
+/// What a look that a refresh makes shows: a container the runtime says it does not know is stale,
+/// and a look that ended non-zero in any other way, or that ended well with an answer that is
+/// neither `true` nor `false`, is the failure of its step, and not a container that is not running.
+fn presence_after_look(
+    access: kr_protocol::identity::EnvironmentAccess,
+    output: &CommandOutput,
+) -> Result<EnvironmentPresence> {
+    let failed = |failure| ControllerError::Platform {
+        access,
+        step: Step::Look,
+        failure,
+    };
+    if output.code != Some(0) && !says_there_is_no_such_container(&output.text) {
+        return Err(failed(
+            output
+                .code
+                .map_or(StepFailure::Unreadable, StepFailure::Exited),
+        ));
+    }
+    if output.code == Some(0) && !matches!(output.stdout.trim(), "true" | "false") {
+        return Err(failed(StepFailure::Unreadable));
+    }
+    Ok(container_state(output))
+}
+
+/// [`run_within`], with the failure of the call made into the refusal `refuse` says.
+fn run_within_as(
+    program: &str,
+    arguments: &[String],
+    limit: std::time::Duration,
+    refuse: impl FnOnce(CallFailure) -> ControllerError,
+) -> Result<CommandOutput> {
+    let output = run_bounded(program, arguments, limit).map_err(refuse)?;
     let mut stdout = decode_output(&output.stdout);
     let stderr = decode_output(&output.stderr);
     // Retain any remaining non-null characters to guard against stray nulls.
@@ -579,6 +689,56 @@ fn container_state(output: &CommandOutput) -> EnvironmentPresence {
 
 #[cfg(test)]
 mod tests {
+    /// KR-REQ-18.11, the part about connection diagnostics: a look at a container that ended
+    /// non-zero in any way but not knowing the container, or that ended well with an answer that is
+    /// neither true nor false, is the failure of the look and names its class; it is not a container
+    /// that is not running. A container the runtime does not know is stale, as before.
+    #[test]
+    fn a_look_that_failed_is_a_failed_look_and_not_a_stopped_environment() {
+        use kr_protocol::identity::EnvironmentAccess::Container;
+        let output = |code, text: &str, stdout: &str| CommandOutput {
+            code,
+            text: text.to_owned(),
+            stdout: stdout.to_owned(),
+        };
+        let failure = |said| match presence_after_look(Container, &said) {
+            Err(ControllerError::Platform { step, failure, .. }) => (step, failure),
+            other => panic!("{said:?} is not a failed look: {other:?}"),
+        };
+        assert_eq!(
+            failure(output(Some(125), "Error: cannot connect to the store", "")),
+            (Step::Look, StepFailure::Exited(125))
+        );
+        assert_eq!(
+            failure(output(None, "", "")),
+            (Step::Look, StepFailure::Unreadable)
+        );
+        assert_eq!(
+            failure(output(Some(0), "maybe", "maybe")),
+            (Step::Look, StepFailure::Unreadable)
+        );
+        for (answered, expected) in [
+            (
+                output(Some(0), "true", "true"),
+                EnvironmentPresence::Running,
+            ),
+            (
+                output(Some(0), "false", "false"),
+                EnvironmentPresence::EnvironmentStopped,
+            ),
+            (
+                output(Some(125), "Error: no such container \"x\"", ""),
+                EnvironmentPresence::Stale,
+            ),
+        ] {
+            assert_eq!(
+                presence_after_look(Container, &answered).expect("a look that answered"),
+                expected,
+                "{answered:?}"
+            );
+        }
+    }
+
     thread_local! {
         /// Whether the thread that asks refuses to start the threads this module makes.
         static THREADS_REFUSED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };

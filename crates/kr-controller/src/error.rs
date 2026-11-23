@@ -112,6 +112,17 @@ pub enum ControllerError {
     /// instead of a document that was written and then found to be wrong.
     #[error("this configuration edit was refused: {0}")]
     Configuration(String),
+    /// A step of a refresh that asks the platform failed. A person is told the step by its role and
+    /// the class of its failure, and none of what the program printed.
+    #[error("{}", crate::bridge::diagnosis::platform(*access, *step, failure).as_str())]
+    Platform {
+        /// The access class of the environment.
+        access: kr_protocol::identity::EnvironmentAccess,
+        /// The step.
+        step: crate::bridge::platform::Step,
+        /// How it failed.
+        failure: crate::bridge::platform::StepFailure,
+    },
     /// A worker could not be started.
     #[error("could not start a worker: {detail}")]
     Supervision {
@@ -436,6 +447,7 @@ impl ControllerError {
             Self::AlreadyRunning { .. } => ErrorCode::ResourceUnavailable,
             Self::SessionLimit { .. } => ErrorCode::SessionLimit,
             Self::Supervision { .. }
+            | Self::Platform { .. }
             | Self::WorkInAnotherSession { .. }
             | Self::ResourceShort { .. }
             | Self::ClockNotRead { .. }
