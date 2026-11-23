@@ -22,7 +22,7 @@ use std::ops::ControlFlow;
 
 use kr_flush::NameKind;
 use kr_protocol::ids::{ActorId, GrantId, TransferId};
-use kr_protocol::scalars::{Bytes, Digest256, TimestampMs, U64};
+use kr_protocol::scalars::{Digest256, TimestampMs, U64};
 use kr_protocol::transfer::{
     ChunkBitmap, ChunkDescriptor, ChunkLayout, DownloadBeginParams, DownloadBeginResult,
     DownloadChunkParams, DownloadChunkResult, DownloadImmutability, DownloadPlacement,
@@ -1288,19 +1288,4 @@ pub fn publish_transfer(
     }
     writer.publish()?;
     Ok(begun.byte_len.get())
-}
-
-/// Returns the bytes of a chunk sequence, for a caller assembling one in memory.
-///
-/// Bounded by the caller's own choice of transfer: a client that wants a file on disk uses
-/// [`DownloadWriter`] instead, which never holds more than one chunk.
-#[must_use]
-pub fn concatenate(chunks: &[(ChunkDescriptor, Bytes)]) -> Vec<u8> {
-    let mut ordered: Vec<_> = chunks.iter().collect();
-    ordered.sort_by_key(|(chunk, _)| chunk.index.get());
-    let mut bytes = Vec::new();
-    for (_, chunk) in ordered {
-        bytes.extend_from_slice(chunk.as_slice());
-    }
-    bytes
 }

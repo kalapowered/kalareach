@@ -44,7 +44,7 @@ use kr_term::budget::GridSize;
 use kr_term::engine::{Engine, EngineConfig, FeedOutcome};
 use kr_term::lane::LaneGate;
 use kr_term::modes::KeyboardEncoding;
-use kr_term::sideeffect::{LeaseHolder, SideEffect, SideEffectKind};
+use kr_term::sideeffect::{LeaseHolder, SideEffect};
 use kr_term::snapshot::{Snapshot, Viewport, restoration_operations};
 
 use crate::error::{Result, WorkerError};
@@ -1140,12 +1140,6 @@ fn term_failure(error: kr_term::TermError) -> WorkerError {
         },
         _ => WorkerError::InvalidArgument(error.to_string()),
     }
-}
-
-/// Returns whether a side effect is one a terminal is shown at all.
-#[must_use]
-pub const fn is_displayable(kind: &SideEffectKind) -> bool {
-    !matches!(kind, SideEffectKind::ClipboardRead { .. })
 }
 
 #[cfg(test)]

@@ -5289,22 +5289,6 @@ impl Session {
         self.begin_close(reason).initiated
     }
 
-    /// Records that the pseudo-terminal closed, which means the root shell has ended.
-    ///
-    /// The shell's real status is read from the child rather than assumed, so a shell that was
-    /// signalled is recorded as signalled.
-    pub fn note_terminal_ended(&mut self) -> ClosureRecord {
-        let exit = self
-            .shell
-            .as_mut()
-            .and_then(|shell| shell.wait().ok())
-            .unwrap_or(ShellExit {
-                code: 0,
-                signal: None,
-            });
-        self.note_shell_exit(exit)
-    }
-
     /// Records that the root shell ended on its own.
     ///
     /// An explicit `exit`, an end of file at the root prompt or a crash all close the session.

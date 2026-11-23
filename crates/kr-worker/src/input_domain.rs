@@ -607,12 +607,6 @@ impl InputDomain {
         Arc::clone(&self.writer.delivered_paste_open)
     }
 
-    /// Returns the published fence the writer compares every queued batch against.
-    #[must_use]
-    pub fn input_fence_handle(&self) -> Arc<AtomicU64> {
-        Arc::clone(&self.writer.input_fence)
-    }
-
     /// Returns the epoch a batch must carry to still be written.
     ///
     /// Everything queued under an earlier epoch is stale. A takeover, a release, a detach or a
