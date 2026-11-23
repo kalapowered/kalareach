@@ -10,9 +10,12 @@
 import type {
   HostCoverView,
   HostLeft,
+  NotSavedWhy,
   RecoveryArchive,
   RecoveryBlocker,
-  RecoveryView
+  RecoveryView,
+  SettingsLine,
+  SettingsRestored
 } from '../host/port'
 
 /** What recovery is for, and what the kit is. */
@@ -205,4 +208,124 @@ export function describeArchive(archive: RecoveryArchive): string {
   }
   const day = new Date(archive.published_at_ms).toISOString().slice(0, 10)
   return `${name}, generation ${archive.generation}, backed up ${day}.`
+}
+
+/* ---- The settings saved with the recovery bundle ---------------------------------------------- */
+
+/** Why the settings are not in the bundle yet, said after "Settings are not saved yet:". */
+const NOT_SAVED_BECAUSE: Readonly<Record<Exclude<NotSavedWhy, 'no_room'>, string>> = {
+  service: 'the sync service could not be reached',
+  moved: 'your recovery bundle changed during the save, so KalaReach will try again',
+  settings_file: "this device's settings file cannot be read",
+  seed: "this device's recovery seed could not be read",
+  bundle: "the recovery bundle at the service does not open with this device's seed",
+  records: "this device's recovery records could not be read"
+}
+
+/** The button that turns the saving of settings back on, after the person removed them. */
+export const SAVE_SETTINGS_AGAIN = 'Save them again'
+
+/** Where the settings stand in the bundle, in one sentence. */
+export function describeSettingsLine(line: SettingsLine): string {
+  switch (line.state) {
+    case 'saved':
+      return 'Settings are saved with your recovery bundle.'
+    case 'not_saved':
+      return line.why === 'no_room'
+        ? 'Your recovery bundle has no room for your settings.'
+        : `Settings are not saved yet: ${NOT_SAVED_BECAUSE[line.why]}.`
+    case 'stopped':
+      return 'Saving settings with your recovery bundle is off.'
+  }
+}
+
+/** The reference the settings saved with the recovery bundle are listed under. */
+export const SAVED_SETTINGS_REFERENCE = 'settings-saved'
+
+/** The button that removes the settings saved with the recovery bundle. */
+export const REMOVE_SAVED_SETTINGS = 'Remove from the bundle'
+
+/** What the page says once the service confirmed the removal. */
+export const SAVED_SETTINGS_REMOVED = 'Removed. The service confirmed it.'
+
+/** Where the removal of the saved settings stands on the page. */
+export type RemovalStep = 'idle' | 'waiting' | 'deleting' | 'unconfirmed'
+
+/** What the page says of the saved settings and of their removal, by where the removal stands. */
+export function describeSavedSettingsRemoval(step: RemovalStep): string {
+  switch (step) {
+    case 'idle':
+      return (
+        'This removes the settings from your recovery bundle. A confirmation dialog comes first, ' +
+        'and saving settings stays off until you turn it on again.'
+      )
+    case 'waiting':
+      return 'Waiting for your answer in the dialog.'
+    case 'deleting':
+      return 'Asking the service to remove them…'
+    case 'unconfirmed':
+      return (
+        'You asked for the removal, and the service has not confirmed it yet. The settings stay ' +
+        'listed until it does.'
+      )
+  }
+}
+
+/* ---- Restoring the settings with the kit ------------------------------------------------------- */
+
+/** The title of the card that restores the settings on a device that has not turned recovery on. */
+export const RESTORE_TITLE = 'Restore your settings'
+
+/** What the card does, and what it does not bring back. */
+export const RESTORE_HELP =
+  'Choose the recovery kit you saved. KalaReach opens your recovery bundle with it and puts your ' +
+  'settings back on this device. It does not bring back your hosts or your pairings: pair this ' +
+  'device with a host again.'
+
+/** Where the bundle is read from: the service the account is signed in to, or a file. */
+export const RESTORE_SOURCES = [
+  { fromFile: false, label: 'From my account' },
+  { fromFile: true, label: 'From an exported bundle file' }
+] as const
+
+/** The button that opens the panels and restores. */
+export const RESTORE_BUTTON = 'Choose kit and restore'
+
+/**
+ * What a restore came to, in words; nothing for a panel the person closed. The day the bundle was
+ * last written is shown as the page shows the day a device was paired: in the person's own time
+ * zone and locale.
+ */
+export function describeRestored(restored: SettingsRestored): string | null {
+  switch (restored.state) {
+    case 'restored':
+      return (
+        'Your settings are back on this device. Your recovery bundle was last written on ' +
+        `${new Date(restored.bundle_written_at_ms).toLocaleDateString()}; changes you made ` +
+        'after that are not in it. To sync them, pair this device with your host again and ' +
+        'confirm the pairing as the owner. Then join the settings that another of your devices ' +
+        'shares, or start syncing them from this device.'
+      )
+    case 'already_chosen':
+      return (
+        'This device already has settings of its own, so nothing was replaced. Restore on a ' +
+        'device you have not set up, or change the settings yourself.'
+      )
+    case 'file_unreadable':
+      return "This device's settings file cannot be read, so nothing was changed."
+    case 'none_saved':
+      return 'Your recovery bundle holds no saved settings, so nothing was changed on this device.'
+    case 'unusable':
+      return (
+        'The settings saved with your recovery bundle cannot be used on this device, so nothing ' +
+        'was changed.'
+      )
+    case 'needs_newer':
+      return (
+        'Your recovery bundle opened, but this version of KalaReach cannot read it. A later ' +
+        'version may have written it. Update KalaReach, then try again.'
+      )
+    case 'cancelled':
+      return null
+  }
 }

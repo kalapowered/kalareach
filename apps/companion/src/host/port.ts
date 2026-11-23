@@ -497,6 +497,25 @@ export type RecoveryBlocker =
       readonly account: string
     }
 
+/** Why this computer's settings are not in the recovery bundle. */
+export type NotSavedWhy =
+  | 'service'
+  | 'moved'
+  | 'no_room'
+  | 'settings_file'
+  | 'seed'
+  | 'bundle'
+  | 'records'
+
+/**
+ * Where this computer's settings stand in the recovery bundle. `stopped` is the person's own
+ * choice, made by removing them from the bundle.
+ */
+export type SettingsLine =
+  | { readonly state: 'saved' }
+  | { readonly state: 'not_saved'; readonly why: NotSavedWhy }
+  | { readonly state: 'stopped' }
+
 /** Everything the recovery section shows. */
 export interface RecoveryView {
   readonly sync_service: SyncServiceView
@@ -504,7 +523,29 @@ export interface RecoveryView {
   /** The host of the service the record names, once recovery has been started. */
   readonly kept_at: string | null
   readonly blocker: RecoveryBlocker | null
+  /**
+   * Where the settings stand in the bundle. Absent while recovery is not on, while no step has
+   * ended, and while this release does not save them.
+   */
+  readonly settings?: SettingsLine
 }
+
+/**
+ * What restoring the saved settings with the kit came to. A closed panel is `cancelled`, and the
+ * page is told no path and no key.
+ */
+export type SettingsRestored =
+  | {
+      readonly state: 'restored'
+      /** When the bundle was last written, in UTC milliseconds. */
+      readonly bundle_written_at_ms: number
+    }
+  | { readonly state: 'already_chosen' }
+  | { readonly state: 'file_unreadable' }
+  | { readonly state: 'none_saved' }
+  | { readonly state: 'unusable' }
+  | { readonly state: 'needs_newer' }
+  | { readonly state: 'cancelled' }
 
 /** Where a recovery kit was written. */
 export interface KitSaved {
@@ -2583,6 +2624,13 @@ export interface HostPort {
   retainedSyncCopies(): Promise<readonly PrivacyExported[]>
 
   /**
+   * The settings saved with this computer's recovery bundle, listed as a copy that left this
+   * device, or null when the bundle holds none. It reads the service. Removing them is
+   * `retainedDeleteAsk` and `retainedDeleteFinish`, under the reference listed here.
+   */
+  retainedSavedSettings(): Promise<PrivacyExported | null>
+
+  /**
    * Asks the person, in a dialog native code raises, whether to delete the copy listed under
    * `reference`. The page cannot answer it. A yes returns the token that finishes the deletion
    * once; a no returns none. Refuses a reference no one deletable copy is listed under, and a
@@ -2952,6 +3000,18 @@ export interface HostPort {
   recoveryTurnOn(): Promise<RecoveryView>
   /** Ends a write to the recovery bundle that was not answered, so the next one can go. */
   recoverySettle(): Promise<RecoveryView>
+  /**
+   * Turns the saving of this computer's settings with the recovery bundle on again, after the
+   * person removed them.
+   */
+  recoveryResumeSettings(): Promise<RecoveryView>
+  /**
+   * Restores this computer's settings with the recovery kit. Native code raises the open panel for
+   * the kit and, from a file, the one for an exported bundle file; it reads them and puts the
+   * settings back only where this computer has chosen none. The page names no path and is told no
+   * key.
+   */
+  recoveryRestoreSettings(fromFile: boolean): Promise<SettingsRestored>
   /**
    * Writes the recovery kit to `path`, which must be one `chooseExportPath` returned. Native code
    * writes it; nothing the kit holds reaches the page.

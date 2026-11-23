@@ -15,6 +15,7 @@ import userEvent from '@testing-library/user-event'
 import { App } from '../src/App'
 import { AppProvider } from '../src/app/state'
 import { fakeHost } from '../src/host/fake'
+import type { RecoveryView } from '../src/host/port'
 import { MobileApp } from '../src/mobile/MobileApp'
 import { PURCHASE_WORDS } from './purchase-words'
 import { readAloud, shown } from './live-regions'
@@ -590,3 +591,173 @@ describe('recovery', () => {
     }
   })
 })
+
+describe('the settings saved with the recovery bundle', () => {
+  const ON = { state: 'on', kept_at: 'reach.kala.to' } as const
+
+  async function openOn(settings?: RecoveryView['settings']) {
+    const opened = await openSheet()
+    act(() => {
+      opened.controls.recovery.set(settings === undefined ? ON : { ...ON, settings })
+      opened.controls.account.set(SIGNED_IN)
+    })
+    const recovery = await within(opened.sheet).findByTestId('recovery')
+    await waitFor(() => {
+      expect(recovery).toHaveAttribute('data-state', 'on')
+    })
+    return { ...opened, recovery }
+  }
+
+  it.each([
+    [{ state: 'saved' }, 'Settings are saved with your recovery bundle.'],
+    [
+      { state: 'not_saved', why: 'service' },
+      'Settings are not saved yet: the sync service could not be reached.'
+    ],
+    [
+      { state: 'not_saved', why: 'moved' },
+      'Settings are not saved yet: your recovery bundle changed during the save, so KalaReach will try again.'
+    ],
+    [
+      { state: 'not_saved', why: 'settings_file' },
+      "Settings are not saved yet: this device's settings file cannot be read."
+    ],
+    [
+      { state: 'not_saved', why: 'seed' },
+      "Settings are not saved yet: this device's recovery seed could not be read."
+    ],
+    [
+      { state: 'not_saved', why: 'bundle' },
+      "Settings are not saved yet: the recovery bundle at the service does not open with this device's seed."
+    ],
+    [
+      { state: 'not_saved', why: 'records' },
+      "Settings are not saved yet: this device's recovery records could not be read."
+    ],
+    [{ state: 'not_saved', why: 'no_room' }, 'Your recovery bundle has no room for your settings.'],
+    [{ state: 'stopped' }, 'Saving settings with your recovery bundle is off.']
+  ] as const)('says where they stand: %j', async (line, words) => {
+    const { recovery } = await openOn(line)
+    expect(await within(recovery).findByTestId('recovery-settings')).toHaveTextContent(words)
+    expect(within(recovery).getByTestId('recovery-settings')).toHaveAttribute(
+      'data-state',
+      line.state
+    )
+  })
+
+  it('says nothing while no step has ended or this release does not save them', async () => {
+    const { recovery } = await openOn()
+    expect(within(recovery).queryByTestId('recovery-settings')).toBeNull()
+    expect(within(recovery).queryByTestId('recovery-resume-settings')).toBeNull()
+  })
+
+  it('offers "Save them again" only where saving is off', async () => {
+    const { recovery } = await openOn({ state: 'saved' })
+    expect(within(recovery).queryByRole('button', { name: 'Save them again' })).toBeNull()
+  })
+
+  it('turns saving back on from the stopped line', async () => {
+    const { person, controls, recovery } = await openOn({ state: 'stopped' })
+    await person.click(within(recovery).getByRole('button', { name: 'Save them again' }))
+    await waitFor(() => {
+      expect(controls.recovery.settingsResumed).toBe(1)
+    })
+    await waitFor(() => {
+      expect(within(recovery).queryByTestId('recovery-settings')).toBeNull()
+    })
+    expect(within(recovery).queryByRole('button', { name: 'Save them again' })).toBeNull()
+  })
+})
+
+describe('restoring the settings with the kit', () => {
+  async function openOff() {
+    const opened = await openSheet()
+    act(() => {
+      opened.controls.account.set(SIGNED_IN)
+    })
+    const restore = await within(opened.sheet).findByTestId('recovery-restore')
+    return { ...opened, restore }
+  }
+
+  it('is offered where recovery is off, in the approved words, and not where it is on', async () => {
+    const { restore, sheet } = await openOff()
+    expect(within(sheet).getByText('Restore your settings')).toBeInTheDocument()
+    expect(restore).toHaveTextContent(
+      'Choose the recovery kit you saved. KalaReach opens your recovery bundle with it and puts ' +
+        'your settings back on this device. It does not bring back your hosts or your pairings: ' +
+        'pair this device with a host again.'
+    )
+    expect(within(restore).getByLabelText('From my account')).toBeChecked()
+    expect(within(restore).getByLabelText('From an exported bundle file')).not.toBeChecked()
+    expect(within(restore).getByRole('button', { name: 'Choose kit and restore' })).toBeEnabled()
+  })
+
+  it('is not offered where recovery is on', async () => {
+    const { sheet, controls } = await openSheet()
+    act(() => {
+      controls.recovery.set({ state: 'on', kept_at: 'reach.kala.to' })
+      controls.account.set(SIGNED_IN)
+    })
+    const recovery = await within(sheet).findByTestId('recovery')
+    await waitFor(() => {
+      expect(recovery).toHaveAttribute('data-state', 'on')
+    })
+    expect(within(sheet).queryByTestId('recovery-restore')).toBeNull()
+    expect(within(sheet).queryByText('Restore your settings')).toBeNull()
+  })
+
+  it('asks for the account or the file by the person’s choice, and names no path', async () => {
+    const { person, controls, restore } = await openOff()
+    controls.recovery.restoreAnswers({ state: 'cancelled' })
+    await person.click(within(restore).getByRole('button', { name: 'Choose kit and restore' }))
+    await waitFor(() => {
+      expect(controls.recovery.restoresAsked).toEqual([{ fromFile: false }])
+    })
+    await person.click(within(restore).getByLabelText('From an exported bundle file'))
+    await person.click(within(restore).getByRole('button', { name: 'Choose kit and restore' }))
+    await waitFor(() => {
+      expect(controls.recovery.restoresAsked).toEqual([{ fromFile: false }, { fromFile: true }])
+    })
+    // A panel the person closed shows nothing.
+    expect(within(restore).queryByTestId('recovery-restore-said')).toBeNull()
+  })
+
+  it.each([
+    [
+      { state: 'restored', bundle_written_at_ms: Date.UTC(2026, 10, 20, 9) },
+      'Your settings are back on this device. Your recovery bundle was last written on ' +
+        `${new Date(Date.UTC(2026, 10, 20, 9)).toLocaleDateString()}; ` +
+        'changes you made after that are not in it. To sync them, pair this device with your host ' +
+        'again and confirm the pairing as the owner. Then join the settings that another of your ' +
+        'devices shares, or start syncing them from this device.'
+    ],
+    [
+      { state: 'already_chosen' },
+      'This device already has settings of its own, so nothing was replaced. Restore on a device ' +
+        'you have not set up, or change the settings yourself.'
+    ],
+    [
+      { state: 'file_unreadable' },
+      "This device's settings file cannot be read, so nothing was changed."
+    ],
+    [
+      { state: 'none_saved' },
+      'Your recovery bundle holds no saved settings, so nothing was changed on this device.'
+    ],
+    [
+      { state: 'unusable' },
+      'The settings saved with your recovery bundle cannot be used on this device, so nothing was changed.'
+    ],
+    [
+      { state: 'needs_newer' },
+      'Your recovery bundle opened, but this version of KalaReach cannot read it. A later version ' +
+        'may have written it. Update KalaReach, then try again.'
+    ]
+  ] as const)('says what it came to: %j', async (answer, words) => {
+    const { person, controls, restore } = await openOff()
+    controls.recovery.restoreAnswers(answer)
+    await person.click(within(restore).getByRole('button', { name: 'Choose kit and restore' }))
+    expect(await within(restore).findByTestId('recovery-restore-said')).toHaveTextContent(words)
+  })
+})
+

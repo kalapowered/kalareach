@@ -57,6 +57,7 @@ import type {
   ReviewOutcome,
   SessionAgents,
   SessionSubject,
+  SettingsRestored,
   Settled,
   SettingsChoice,
   SettingsPane,
@@ -538,6 +539,7 @@ export function tauriPort(): HostPort {
     privacyStatus: () => read('privacy_status', {}),
 
     retainedSyncCopies: () => call('retained_sync_copies', {}),
+    retainedSavedSettings: () => call('retained_saved_settings', {}),
     retainedDeleteAsk: (reference) => call('retained_delete_ask', { reference }),
     retainedDeleteFinish: (token) => call('retained_delete_finish', { token }),
     retainedDeleteCancel: (token) => call<undefined>('retained_delete_cancel', { token }),
@@ -704,6 +706,9 @@ export function tauriPort(): HostPort {
     recoveryView: () => call<RecoveryView>('recovery_view', {}),
     recoveryTurnOn: () => call<RecoveryView>('recovery_turn_on', {}),
     recoverySettle: () => call<RecoveryView>('recovery_settle', {}),
+    recoveryResumeSettings: () => call<RecoveryView>('recovery_resume_settings', {}),
+    recoveryRestoreSettings: (fromFile) =>
+      call<SettingsRestored>('recovery_restore_settings', { fromFile }),
     recoverySaveKit: (path) => call<KitSaved>('recovery_save_kit', { path }),
     recoveryCoverHost: (replace) => call<HostCoverView>('recovery_cover_host', { replace }),
     recoverySaveKitQr: (path) => call<KitSaved>('recovery_save_kit_qr', { path }),

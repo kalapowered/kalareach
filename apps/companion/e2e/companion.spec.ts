@@ -3787,6 +3787,34 @@ test.describe('a control that commits on a completed action', () => {
   })
 })
 
+test.describe('the settings saved with the recovery bundle, among what has left the host', () => {
+  test('are removed by the person answering a dialog, and the reference is not shown', async ({
+    page
+  }) => {
+    await open(page)
+    await page.evaluate(() => {
+      window.krTestHost?.retained.keepSavedSettings('1700000000000')
+    })
+    await page.getByRole('button', { name: 'Change sets' }).click()
+    const retained = page.getByTestId('retained-artefacts')
+    const row = retained.getByTestId('left-copy').filter({ hasText: 'Settings saved with your recovery bundle' })
+    await expect(row).toBeVisible()
+    await expect(row).not.toContainText('settings-saved')
+    await expect(row.getByTestId('removal')).toContainText('This removes the settings from your recovery bundle.')
+    await row.getByRole('button', { name: 'Remove from the bundle' }).click()
+    await expect(row.getByTestId('removal')).toHaveText('Waiting for your answer in the dialog.')
+    await page.screenshot({
+      path: shot(`recovery-settings-waiting-${test.info().project.name}`),
+      fullPage: true
+    })
+    await page.evaluate(() => {
+      window.krTestHost?.retained.answerDialog(true)
+    })
+    await expect(row).toHaveCount(0)
+    await expect(page.locator('.toast-text', { hasText: 'Removed. The service confirmed it.' })).toBeVisible()
+  })
+})
+
 test.describe('what has left the host', () => {
   test('each copy is listed with whether it can be deleted', async ({ page }) => {
     await open(page)

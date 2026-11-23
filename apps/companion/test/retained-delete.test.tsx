@@ -283,3 +283,85 @@ describe('a deletion the service did not confirm', () => {
     expect(within(rowOf(retained, ARCHIVE)).queryByRole('button')).toBeNull()
   })
 })
+
+describe('the settings saved with the recovery bundle', () => {
+  const KIND = 'Settings saved with your recovery bundle'
+
+  async function openWithSettings() {
+    const host = fakeHost()
+    host.controls.retained.keepSavedSettings('1700000000000')
+    return open(host, 5)
+  }
+
+  it('is removed by the person answering a dialog, in its own words and under its own button', async () => {
+    const { controls, retained, person } = await openWithSettings()
+    const row = rowOf(retained, KIND)
+    expect(within(row).getByTestId('removal')).toHaveTextContent(
+      'This removes the settings from your recovery bundle. A confirmation dialog comes first, and ' +
+        'saving settings stays off until you turn it on again.'
+    )
+    // The reference is the page's handle for the row and not words for the person.
+    expect(row).not.toHaveTextContent('settings-saved')
+    await person.click(within(row).getByRole('button', { name: 'Remove from the bundle' }))
+
+    expect(within(rowOf(retained, KIND)).getByTestId('removal')).toHaveTextContent(
+      'Waiting for your answer in the dialog.'
+    )
+    expect(within(rowOf(retained, KIND)).getByRole('button')).toBeDisabled()
+    expect(controls.retained.asked).toEqual(['settings-saved'])
+    expect(controls.retained.finished).toEqual([])
+
+    await answerDialog(controls, true)
+    expect(await screen.findByText('Removed. The service confirmed it.')).toBeInTheDocument()
+    expect(controls.retained.finished).toEqual(['settings-saved'])
+    await waitFor(() => {
+      expect(within(retained).queryByText(KIND)).toBeNull()
+    })
+  })
+
+  it('stays listed, with a note that says so, when the service has not confirmed the removal', async () => {
+    const { controls, retained, person } = await openWithSettings()
+    controls.retained.serviceDoesNotConfirm(true)
+    await person.click(
+      within(rowOf(retained, KIND)).getByRole('button', { name: 'Remove from the bundle' })
+    )
+    await answerDialog(controls, true)
+    await waitFor(() => {
+      expect(within(rowOf(retained, KIND)).getByTestId('removal')).toHaveTextContent(
+        'You asked for the removal, and the service has not confirmed it yet. The settings stay ' +
+          'listed until it does.'
+      )
+    })
+    expect(within(rowOf(retained, KIND)).getByRole('button')).toHaveTextContent(
+      'Remove from the bundle'
+    )
+  })
+
+  it('is left alone when the person says no, and says why when the bundle holds none', async () => {
+    const { controls, retained, person } = await openWithSettings()
+    await person.click(
+      within(rowOf(retained, KIND)).getByRole('button', { name: 'Remove from the bundle' })
+    )
+    await answerDialog(controls, false)
+    await waitFor(() => {
+      expect(within(rowOf(retained, KIND)).getByTestId('removal')).toHaveTextContent(
+        'This removes the settings from your recovery bundle.'
+      )
+    })
+    expect(controls.retained.finished).toEqual([])
+
+    controls.retained.refuseNextAsk('Your recovery bundle holds no saved settings.')
+    await person.click(
+      within(rowOf(retained, KIND)).getByRole('button', { name: 'Remove from the bundle' })
+    )
+    expect(await within(rowOf(retained, KIND)).findByRole('alert')).toHaveTextContent(
+      'Your recovery bundle holds no saved settings.'
+    )
+  })
+
+  it('is not listed when the bundle holds none', async () => {
+    const { retained } = await open()
+    expect(within(retained).queryByText(KIND)).toBeNull()
+  })
+})
+

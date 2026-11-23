@@ -89,6 +89,7 @@ import type {
   PushView,
   IntakeView,
   RecoveryView,
+  SettingsRestored,
   RevocationStanding,
   RevocationView,
   SettingsChoice,
@@ -448,6 +449,12 @@ export interface FakeRecovery {
   readonly kitsSaved: readonly string[]
   /** What the page asked when it asked to cover the host on this computer, in order. */
   readonly hostCovers: readonly { readonly replace: boolean }[]
+  /** How many times the page asked to save the settings again. */
+  readonly settingsResumed: number
+  /** What the page asked when it asked to restore the settings, in order. */
+  readonly restoresAsked: readonly { readonly fromFile: boolean }[]
+  /** Sets what the backend answers to the next requests to restore the settings. */
+  restoreAnswers(answer: SettingsRestored): void
   /** Sets what the backend answers to the next requests to cover the host. */
   coverHostAnswers(answer: HostCoverView): void
   /** The destinations the page asked to have the kit drawn as a QR code to. */
@@ -1628,6 +1635,9 @@ export function fakeHost(
   let recovery: Omit<RecoveryView, 'sync_service'> = { state: 'off', kept_at: null, blocker: null }
   let recoveryTurnOns = 0
   let recoverySettles = 0
+  let settingsResumes = 0
+  const restoresAsked: { readonly fromFile: boolean }[] = []
+  let restoreAnswer: SettingsRestored = { state: 'cancelled' }
   let recoverySignIns = 0
   let recoveryReadFails: string | null = null
   let hostCoverAnswer: HostCoverView = {
@@ -2854,6 +2864,7 @@ export function fakeHost(
         return retained.report()
       }),
     retainedSyncCopies: () => attempting(() => retained.syncCopies()),
+    retainedSavedSettings: () => attempting(() => retained.savedSettings()),
     retainedDeleteAsk: (reference) => retained.ask(reference),
     retainedDeleteFinish: (token) => retained.finish(token),
     retainedDeleteCancel: (token) => {
@@ -3676,6 +3687,19 @@ export function fakeHost(
       recovery = { ...recovery, state: recovery.kept_at === null ? 'unfinished' : 'on' }
       return Promise.resolve(recoveryView())
     },
+    recoveryResumeSettings: () => {
+      settingsResumes += 1
+      recovery = {
+        state: recovery.state,
+        kept_at: recovery.kept_at,
+        blocker: recovery.blocker
+      }
+      return Promise.resolve(recoveryView())
+    },
+    recoveryRestoreSettings: (fromFile) => {
+      restoresAsked.push({ fromFile })
+      return Promise.resolve(restoreAnswer)
+    },
     recoverySaveKit: (path): Promise<KitSaved> => {
       if (recovery.state !== 'on') {
         refuse('PERMISSION_DENIED', 'Recovery is not on, so there is no kit.')
@@ -3736,6 +3760,13 @@ export function fakeHost(
       hostCovers,
       qrSaved,
       exportsMade,
+      get settingsResumed() {
+        return settingsResumes
+      },
+      restoresAsked,
+      restoreAnswers(answer) {
+        restoreAnswer = answer
+      },
       coverHostAnswers(answer) {
         hostCoverAnswer = answer
       },

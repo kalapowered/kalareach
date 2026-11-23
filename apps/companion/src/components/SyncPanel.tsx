@@ -52,12 +52,19 @@ import {
   QR_FILE_NAME,
   QR_HELP,
   RECOVERY_HELP,
+  RESTORE_BUTTON,
+  RESTORE_HELP,
+  RESTORE_SOURCES,
+  RESTORE_TITLE,
+  SAVE_SETTINGS_AGAIN,
   SETTLE_HELP,
   SYNC_SERVICE_HELP,
   describeArchive,
   describeBlocker,
   describeHostCover,
   describeRecovery,
+  describeRestored,
+  describeSettingsLine,
   describeStaysAt,
   exportFileName,
   offersReplacement
@@ -76,7 +83,7 @@ import { SettingsDevices } from './SettingsDevices'
 import { Button, Card, Switch } from './ui'
 
 /** Which card a step belongs to, so the status it ends with is said in that card. */
-type Place = 'service' | 'settings' | 'devices' | 'recovery'
+type Place = 'service' | 'settings' | 'devices' | 'recovery' | 'restore'
 
 /** What the last step said. */
 interface Said {
@@ -113,6 +120,7 @@ export function SyncPanel({
   const desktop = surface === 'desktop'
   const target = minimumTarget(surface)
   const inputId = useId()
+  const restoreTitleId = useId()
   const serviceStatusId = useId()
   const draftsHelpId = useId()
   const [service, setService] = useState<SyncServiceView | null>(null)
@@ -125,6 +133,8 @@ export function SyncPanel({
   const [hostCover, setHostCover] = useState<HostCoverView | null>(null)
   const [confirmingReplace, setConfirmingReplace] = useState(false)
   const [copies, setCopies] = useState<readonly RecoveryArchive[] | null>(null)
+  // Whether the settings are restored from an exported bundle file and not from the account.
+  const [restoreFromFile, setRestoreFromFile] = useState(false)
   const [changing, setChanging] = useState(false)
   const [draft, setDraft] = useState('')
   const [said, setSaid] = useState<Said | null>(null)
@@ -133,6 +143,7 @@ export function SyncPanel({
   const settingsStatus = useRef<HTMLDivElement | null>(null)
   const devicesStatus = useRef<HTMLDivElement | null>(null)
   const recoveryStatus = useRef<HTMLDivElement | null>(null)
+  const restoreStatus = useRef<HTMLDivElement | null>(null)
   const serviceInput = useRef<HTMLInputElement | null>(null)
   const finished = useRef<Finished | null>(null)
   // How many settings the backend has told this card of, so that a read that was asked for before
@@ -188,7 +199,7 @@ export function SyncPanel({
           })
       : Promise.resolve()
     // The devices card is read with the settings: its state is in the same view.
-    return { service, settings, devices: settings, recovery }
+    return { service, settings, devices: settings, recovery, restore: recovery }
   }, [port, desktop])
 
   // Another device's change, a step that ended by itself and content waiting for a choice arrive
@@ -265,7 +276,9 @@ export function SyncPanel({
           ? settingsStatus
           : place === 'devices'
             ? devicesStatus
-            : recoveryStatus
+            : place === 'restore'
+              ? restoreStatus
+              : recoveryStatus
     const card = status.current?.closest('[data-card]') ?? null
     const active = document.activeElement
     const free = active === null || active === document.body || (card?.contains(active) ?? false)
@@ -679,6 +692,15 @@ export function SyncPanel({
                 {recovery?.state === 'off' ? (
                   <p className="account-note">{RECOVERY_HELP}</p>
                 ) : null}
+                {recovery?.state === 'on' && recovery.settings !== undefined ? (
+                  <p
+                    className="account-note"
+                    data-testid="recovery-settings"
+                    data-state={recovery.settings.state}
+                  >
+                    {describeSettingsLine(recovery.settings)}
+                  </p>
+                ) : null}
                 {recovery?.state === 'on' && hostCover === null ? (
                   <p className="account-note" data-testid="recovery-host-help">
                     {HOST_COVER_HELP}
@@ -750,6 +772,18 @@ export function SyncPanel({
                     }}
                   >
                     Sign in again
+                  </Button>
+                ) : null}
+                {recovery?.state === 'on' && recovery.settings?.state === 'stopped' ? (
+                  <Button
+                    data-testid="recovery-resume-settings"
+                    disabled={busy}
+                    style={{ minBlockSize: target }}
+                    onClick={() => {
+                      step('recovery', () => port.recoveryResumeSettings().then(() => null))
+                    }}
+                  >
+                    {SAVE_SETTINGS_AGAIN}
                   </Button>
                 ) : null}
                 {recovery?.state === 'unsettled' && blocker === null ? (
@@ -923,6 +957,65 @@ export function SyncPanel({
               ) : null}
             </div>
           </Card>
+          {recovery?.state === 'off' ? (
+            <>
+              <p className="account-section-title" id={restoreTitleId}>
+                {RESTORE_TITLE}
+              </p>
+              <Card data-card="restore" data-testid="recovery-restore">
+                <div className="account-state">
+                  <div
+                    className="account-status"
+                    aria-live="polite"
+                    tabIndex={-1}
+                    ref={restoreStatus}
+                    data-testid="recovery-restore-status"
+                  >
+                    <p className="account-note">{RESTORE_HELP}</p>
+                    {said?.place === 'restore' ? (
+                      <p className="account-note" data-testid="recovery-restore-said">
+                        {said.text}
+                      </p>
+                    ) : null}
+                  </div>
+                  <div role="radiogroup" aria-labelledby={restoreTitleId}>
+                    {RESTORE_SOURCES.map((source) => (
+                      <label key={source.label} className="account-note">
+                        <input
+                          type="radio"
+                          name="restore-source"
+                          data-testid={
+                            source.fromFile ? 'recovery-restore-file' : 'recovery-restore-account'
+                          }
+                          checked={restoreFromFile === source.fromFile}
+                          disabled={busy}
+                          onChange={() => {
+                            setRestoreFromFile(source.fromFile)
+                          }}
+                        />{' '}
+                        {source.label}
+                      </label>
+                    ))}
+                  </div>
+                  <div className="account-actions">
+                    <Button
+                      tone="primary"
+                      data-testid="recovery-restore-choose"
+                      disabled={busy}
+                      style={{ minBlockSize: target }}
+                      onClick={() => {
+                        step('restore', async () =>
+                          describeRestored(await port.recoveryRestoreSettings(restoreFromFile))
+                        )
+                      }}
+                    >
+                      {RESTORE_BUTTON}
+                    </Button>
+                  </div>
+                </div>
+              </Card>
+            </>
+          ) : null}
         </>
       ) : null}
     </>

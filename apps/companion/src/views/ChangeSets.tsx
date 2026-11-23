@@ -182,11 +182,18 @@ export function ChangeSets(): ReactNode {
         setPrivacy(null)
       })
     setSyncReading(true)
-    ask(() => port.retainedSyncCopies())
-      .then((copies) => {
+    // The settings saved with the recovery bundle are listed beside them. That read goes to the
+    // service, and a bundle that cannot be asked lists nothing here.
+    ask(() =>
+      Promise.all([
+        port.retainedSyncCopies(),
+        port.retainedSavedSettings().catch(() => null)
+      ])
+    )
+      .then(([copies, savedSettings]) => {
         if (!current()) return
         retrying.current = false
-        setSyncCopies(copies)
+        setSyncCopies(savedSettings === null ? copies : [...copies, savedSettings])
         setSyncFailure(null)
         setSyncReading(false)
       })

@@ -35,6 +35,11 @@ export interface FakeRetained {
   refuseNextAsk(message: string | null): void
   /** Makes the next finish wait until `release`, as a service that is slow to answer does. */
   holdNextFinish(): { release(): void }
+  /**
+   * Lists the settings saved with the recovery bundle, as the bundle at the service holds them. A
+   * deletion removes them, and with the service not confirming it they stay listed.
+   */
+  keepSavedSettings(leftAtMs: string): void
   /** Lists a copy the sync service kept, as this computer's own sync would. */
   keepSyncCopy(copy: PrivacyExported): void
   /** Makes this computer's own sync list fail with these words, as a store that cannot be read does, or stops that. */
@@ -48,6 +53,8 @@ interface Entry {
   readonly copy: PrivacyExported
   /** Whether the entry is one of this computer's own sync's. */
   readonly sync: boolean
+  /** Whether the entry is the settings saved with the recovery bundle, which sync does not list. */
+  readonly settings?: boolean
 }
 
 function refuse(code: string, message: string): never {
@@ -147,6 +154,19 @@ export class ScriptedRetained implements FakeRetained {
     return held
   }
 
+  keepSavedSettings(leftAtMs: string): void {
+    this.entries.push({
+      sync: true,
+      settings: true,
+      copy: {
+        kind: 'Settings saved with your recovery bundle',
+        reference: 'settings-saved',
+        left_at_ms: leftAtMs,
+        deletable: true
+      }
+    })
+  }
+
   keepSyncCopy(copy: PrivacyExported): void {
     this.entries.push({ sync: true, copy })
   }
@@ -189,7 +209,15 @@ export class ScriptedRetained implements FakeRetained {
   /** What this computer's own sync lists. */
   syncCopies(): readonly PrivacyExported[] {
     if (this.listFailure !== null) refuse('LOCAL_FAILURE', this.listFailure)
-    return this.entries.filter((entry) => entry.sync).map((entry) => ({ ...entry.copy }))
+    return this.entries
+      .filter((entry) => entry.sync && entry.settings !== true)
+      .map((entry) => ({ ...entry.copy }))
+  }
+
+  /** The settings saved with the recovery bundle, when it holds them. */
+  savedSettings(): PrivacyExported | null {
+    const entry = this.entries.find((each) => each.settings === true)
+    return entry === undefined ? null : { ...entry.copy }
   }
 
   /** The dialog the person answers, and the token a yes returns. */
@@ -201,6 +229,9 @@ export class ScriptedRetained implements FakeRetained {
       refuse('PERMISSION_DENIED', words)
     }
     const entry = this.entries.find((each) => each.copy.reference === reference)
+    if (entry === undefined && reference === 'settings-saved') {
+      refuse('INVALID_ARGUMENT', 'Your recovery bundle holds no saved settings.')
+    }
     if (entry === undefined) refuse('INVALID_ARGUMENT', 'the host lists no one copy under that reference')
     if (!entry.sync && !this.mayDeleteHere()) {
       refuse(

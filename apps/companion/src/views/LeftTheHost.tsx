@@ -21,6 +21,12 @@ import { useApp } from '../app/state'
 import { useHeldConnection } from '../app/rights'
 import { failureMessage } from '../host/port'
 import { ask } from '../mobile/model/call'
+import {
+  REMOVE_SAVED_SETTINGS,
+  SAVED_SETTINGS_REFERENCE,
+  SAVED_SETTINGS_REMOVED,
+  describeSavedSettingsRemoval
+} from '../model/recovery'
 
 /** Where one copy's deletion stands on this page. */
 type Step =
@@ -48,8 +54,14 @@ const LABEL: Readonly<Record<Step, string>> = {
   unconfirmed: 'Ask again…'
 }
 
+/** Whether the row is the settings saved with the recovery bundle, which are removed and not deleted. */
+function isSavedSettings(row: Row): boolean {
+  return row.sync && row.copy.reference === SAVED_SETTINGS_REFERENCE
+}
+
 /** What the page says of a copy, in words that say where the copy is deleted from. */
 function removalNote(row: Row, step: Step, here: boolean): string {
+  if (isSavedSettings(row)) return describeSavedSettingsRemoval(step)
   if (step === 'waiting') return 'Waiting for your answer in the dialog.'
   if (step === 'deleting') return 'Asking the service to delete it…'
   if (step === 'unconfirmed') {
@@ -162,7 +174,10 @@ export function LeftTheHost({
         if (!open.current) return
         if (finished.deleted) {
           setStep(reference, 'idle')
-          say('Deleted. The service confirmed it.', 'success')
+          say(
+            isSavedSettings(row) ? SAVED_SETTINGS_REMOVED : 'Deleted. The service confirmed it.',
+            'success'
+          )
         } else {
           setStep(reference, 'unconfirmed')
         }
@@ -232,7 +247,7 @@ export function LeftTheHost({
                 <div className="spacer">
                   <strong>{row.copy.kind}</strong>
                   <p className="muted small">
-                    {reference} ·{' '}
+                    {isSavedSettings(row) ? null : `${reference} · `}
                     {Number(row.copy.left_at_ms) === 0
                       ? 'left at a time not known'
                       : `left ${new Date(Number(row.copy.left_at_ms)).toLocaleString()}`}
@@ -249,14 +264,18 @@ export function LeftTheHost({
                 {offered ? (
                   <Button
                     data-testid="delete-copy"
-                    aria-label={`${step === 'unconfirmed' ? 'Ask again to delete' : 'Delete'} ${row.copy.kind}, ${reference}`}
+                    aria-label={
+                      isSavedSettings(row)
+                        ? undefined
+                        : `${step === 'unconfirmed' ? 'Ask again to delete' : 'Delete'} ${row.copy.kind}, ${reference}`
+                    }
                     aria-busy={step === 'waiting' || step === 'deleting'}
                     disabled={step === 'waiting' || step === 'deleting'}
                     onClick={() => {
                       remove(row)
                     }}
                   >
-                    {LABEL[step]}
+                    {isSavedSettings(row) ? REMOVE_SAVED_SETTINGS : LABEL[step]}
                   </Button>
                 ) : null}
               </div>
