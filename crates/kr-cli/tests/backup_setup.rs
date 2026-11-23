@@ -1,13 +1,16 @@
 //! `kr backup setup`, against a real control daemon, the storage service stand-in and the real `kr`
 //! binary on a pseudo-terminal.
 //!
+//! The cases run on Windows as well as on Unix: there the command runs on a pseudo-console, with
+//! no shell around it, and the window says `kr ended <code>` where a Unix shell does. A case
+//! that needs what only Unix has (a terminal whose modes are read, an interrupt typed as Ctrl-C,
+//! the shell that is left waiting for a line) is Unix's alone, and says so with its `cfg`.
+//!
 //! The owner's command makes the recovery seed in its own process, shows the kit once, and gives
 //! the daemon what it needs to write the bundle, enrol the host's writer and record the setup, and
 //! nothing that opens a backup.
 //! Everything but the service is real. The service is the stand-in (`kr-service-stand-in`), which
 //! answers as the deployed Worker does and is held to a recording of it.
-
-#![cfg(unix)]
 
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
@@ -79,7 +82,7 @@ struct Rig {
     served: Arc<Served>,
     timer: Arc<HeldTimer>,
     endpoint: Endpoint,
-    controller: Arc<Controller>,
+    controller: Option<Arc<Controller>>,
     serving: Vec<tokio::task::JoinHandle<kr_controller::error::Result<()>>>,
     work: PathBuf,
     home: PathBuf,
@@ -88,9 +91,40 @@ struct Rig {
 }
 
 impl Drop for Rig {
+    /// Ends the daemon before the tree goes.
+    ///
+    /// The daemon holds `controller.lock` open until the daemon value is gone, and Windows refuses
+    /// the removal of a folder below an open file: the tree would stay in the temporary folder for
+    /// good. So the tasks that serve are cancelled, the rig lets go of the daemon, and the tree is
+    /// removed here for as long as the removal is refused. The cancelled tasks need another thread
+    /// of the runtime to end, so a case that holds a rig runs on the multi-thread runtime.
     fn drop(&mut self) {
         for task in &self.serving {
             task.abort();
+        }
+        #[cfg(windows)]
+        {
+            drop(self.controller.take());
+            let root = self.temp.root().to_path_buf();
+            let begun = Instant::now();
+            loop {
+                match std::fs::remove_dir_all(&root) {
+                    Ok(()) => break,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+                    Err(error) if begun.elapsed() < LIVENESS_DEADLINE => {
+                        let _ = error;
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => {
+                        assert!(
+                            std::thread::panicking(),
+                            "{} is left in the temporary folder, and its removal is refused: {error}",
+                            root.display()
+                        );
+                        break;
+                    }
+                }
+            }
         }
     }
 }
@@ -189,7 +223,7 @@ impl Rig {
             served,
             timer,
             endpoint,
-            controller,
+            controller: Some(controller),
             serving,
             work,
             home,
@@ -200,13 +234,58 @@ impl Rig {
         self.served.origin()
     }
 
+    /// The daemon, which the rig holds until it goes.
+    fn controller(&self) -> &Arc<Controller> {
+        self.controller.as_ref().expect("the daemon is held")
+    }
+
     /// The requests the stand-in has been given for `path`.
     fn requests_to(&self, path: &str) -> usize {
         self.served.web().requests_to(path)
     }
 
+    /// The environment every `kr` this test runs is given on Windows: what a program needs to start
+    /// there, and this host's directories.
+    #[cfg(windows)]
+    fn variables(&self) -> Vec<(&'static str, String)> {
+        let mut variables = Vec::new();
+        for name in [
+            "SystemRoot",
+            "SystemDrive",
+            "windir",
+            "TEMP",
+            "TMP",
+            "ComSpec",
+            "PATHEXT",
+        ] {
+            if let Ok(value) = std::env::var(name) {
+                variables.push((name, value));
+            }
+        }
+        let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_owned());
+        variables.push(("PATH", format!(r"{root}\System32")));
+        // The folders a program keeps its data in are the host's own below its home.
+        variables.push(("USERPROFILE", self.home.display().to_string()));
+        for (name, below) in [("LOCALAPPDATA", "Local"), ("APPDATA", "Roaming")] {
+            variables.push((
+                name,
+                self.home.join("AppData").join(below).display().to_string(),
+            ));
+        }
+        variables.push((
+            "KR_RUNTIME_DIR",
+            self.temp.paths().runtime_root().display().to_string(),
+        ));
+        variables.push((
+            "KR_STATE_DIR",
+            self.temp.paths().state_root().display().to_string(),
+        ));
+        variables
+    }
+
     /// The environment every `kr` this test runs is given: this host's directories, a home of its
     /// own, and nothing of the person running the test.
+    #[cfg(unix)]
     fn variables(&self) -> Vec<(&'static str, String)> {
         vec![
             ("PATH", "/usr/bin:/bin".to_owned()),
@@ -258,7 +337,7 @@ impl Rig {
 
     /// Whether the daemon's record shows `generation` of `archive` as made and published.
     fn published(&self, archive: ArchiveId, generation: u64) -> bool {
-        self.controller
+        self.controller()
             .backup()
             .generation(archive, BackupGeneration::new(generation))
             .expect("the store reads")
@@ -282,7 +361,7 @@ impl Rig {
         deadline: Duration,
     ) {
         let mut passes = self
-            .controller
+            .controller()
             .backup_runtime()
             .expect("a carrier")
             .passes();
@@ -363,8 +442,13 @@ async fn keep_sign_in(host: &kr_ipc::testing::TempHost, origin: &str) {
 /// A terminal window `kr` runs in, with the person's side of it: what the window has shown, and a
 /// way to type.
 struct Window {
+    // Held so that the console stays open for as long as the window does; only a Unix case reads it.
+    #[cfg_attr(windows, expect(dead_code))]
     terminal: portable_pty::PtyPair,
+    #[cfg(unix)]
     shell: Box<dyn portable_pty::Child + Send + Sync>,
+    #[cfg(windows)]
+    shell: Box<dyn portable_pty::ChildKiller + Send + Sync>,
     typing: Box<dyn Write + Send>,
     seen: Arc<Mutex<Vec<u8>>>,
 }
@@ -372,6 +456,7 @@ struct Window {
 impl Drop for Window {
     fn drop(&mut self) {
         let _ = self.shell.kill();
+        #[cfg(unix)]
         let _ = self.shell.wait();
     }
 }
@@ -385,6 +470,36 @@ impl Window {
     }
 
     /// As [`Self::run`], with more variables in the command's environment.
+    #[cfg(windows)]
+    fn run_with(rig: &Rig, arguments: &[&str], more: &[(&str, &str)]) -> Self {
+        let mut command = portable_pty::CommandBuilder::new(kr());
+        for argument in arguments {
+            command.arg(argument);
+        }
+        command.env_clear();
+        for (name, value) in rig.variables() {
+            command.env(name, value);
+        }
+        for (name, value) in more {
+            command.env(name, value);
+        }
+        command.cwd(&rig.work);
+        let support::console_window::Opened {
+            terminal,
+            shell,
+            typing,
+            seen,
+        } = support::console_window::open(command);
+        Self {
+            terminal,
+            shell,
+            typing,
+            seen,
+        }
+    }
+
+    /// As [`Self::run`], with more variables in the command's environment.
+    #[cfg(unix)]
     fn run_with(rig: &Rig, arguments: &[&str], more: &[(&str, &str)]) -> Self {
         let terminal = portable_pty::native_pty_system()
             .openpty(portable_pty::PtySize {
@@ -452,8 +567,11 @@ impl Window {
 
     /// What the window has shown so far, with the terminal's own line endings made plain.
     fn shown(&self) -> String {
-        String::from_utf8_lossy(&self.seen.lock().unwrap_or_else(PoisonError::into_inner))
-            .replace("\r\n", "\n")
+        let seen = self.seen.lock().unwrap_or_else(PoisonError::into_inner);
+        #[cfg(windows)]
+        return support::console_window::plain(&seen);
+        #[cfg(unix)]
+        String::from_utf8_lossy(&seen).replace("\r\n", "\n")
     }
 
     /// Waits until the window has shown `marker`, and returns what it has shown. It fails when it
@@ -502,10 +620,13 @@ impl Window {
 
     /// Types one line, as a person does.
     fn type_line(&mut self, line: &str) {
-        self.type_bytes(format!("{line}\n").as_bytes());
+        // Enter is a carriage return on a console.
+        let end = if cfg!(windows) { "\r" } else { "\n" };
+        self.type_bytes(format!("{line}{end}").as_bytes());
     }
 
     /// Whether the terminal echoes what is typed, as its modes say now.
+    #[cfg(unix)]
     fn echoes(&self) -> bool {
         use std::os::unix::fs::OpenOptionsExt as _;
 
@@ -634,6 +755,16 @@ fn tree(root: &Path) -> BTreeMap<String, Vec<u8>> {
                 let bytes = match std::fs::read(&path) {
                     Ok(bytes) => bytes,
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    // The daemon holds its lock file open without sharing on Windows, so it cannot be
+                    // read while the daemon runs; it holds a process number and no secret.
+                    Err(error)
+                        if error.raw_os_error() == Some(32)
+                            && path
+                                .file_name()
+                                .is_some_and(|name| name == "controller.lock") =>
+                    {
+                        continue;
+                    }
                     Err(error) => panic!("{} cannot be read: {error}", path.display()),
                 };
                 into.insert(
@@ -1170,6 +1301,7 @@ async fn a_wrong_end_of_the_seed_or_an_answer_but_yes_sets_nothing_up() {
 /// Text pasted after the last answer never reaches the shell the command was run from: the
 /// command puts the terminal back with the input still waiting discarded, so the next thing the
 /// shell reads is the next thing typed.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn text_pasted_past_the_last_answer_never_reaches_the_shell() {
     let rig = Rig::start().await;
@@ -1348,7 +1480,7 @@ async fn a_host_whose_storage_is_a_service_its_owner_runs_is_set_up_there_and_th
     );
     assert_eq!(rig.recorded_kit().await, Some(kit.fingerprint()));
     assert!(
-        rig.controller
+        rig.controller()
             .storage_account()
             .token_scopes_asked()
             .iter()
@@ -1356,7 +1488,7 @@ async fn a_host_whose_storage_is_a_service_its_owner_runs_is_set_up_there_and_th
         "the host's account at that service carried the setup"
     );
     assert!(
-        rig.controller
+        rig.controller()
             .host_account()
             .token_scopes_asked()
             .is_empty(),
@@ -1366,6 +1498,7 @@ async fn a_host_whose_storage_is_a_service_its_owner_runs_is_set_up_there_and_th
 
 /// Ctrl-C at a question ends the command with the terminal as it was found and nothing sent: at the
 /// plan nothing was shown, and after the kit was shown the kit opens nothing.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_interrupt_at_a_question_sets_nothing_up_and_puts_the_terminal_back() {
     let rig = Rig::start().await;
@@ -1394,10 +1527,11 @@ async fn an_interrupt_at_a_question_sets_nothing_up_and_puts_the_terminal_back()
 /// Ctrl-C while the daemon has the call says to keep the kit, and the kit is in use: the daemon
 /// records the setup after the command has gone. A command that told the person to delete the kit
 /// here would have them delete the only way to read these backups.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_interrupt_while_the_daemon_has_the_call_says_to_keep_the_kit() {
     let rig = Rig::start().await;
-    let (arrived, go) = rig.controller.backup().pause_the_next_setup_commit();
+    let (arrived, go) = rig.controller().backup().pause_the_next_setup_commit();
     let mut window = Window::run(&rig, &["backup", "setup"]);
     let kit = window.bring_up_the_kit();
     window.confirm(&kit);
@@ -1435,6 +1569,7 @@ async fn an_interrupt_while_the_daemon_has_the_call_says_to_keep_the_kit() {
 /// whose fingerprint in `kr doctor` voids the new kit, because the new setup may be made and then
 /// replaced by another before the person looks: a kit that opens nothing is the earlier setup
 /// standing, and any other fingerprint is a reason to keep the new kit.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_interrupt_during_a_replacement_voids_the_new_kit_only_by_the_earlier_fingerprint() {
     let rig = Rig::start().await;
@@ -1444,7 +1579,7 @@ async fn an_interrupt_during_a_replacement_voids_the_new_kit_only_by_the_earlier
     window.wait_for("kr ended 0");
     let first_fingerprint = first.fingerprint();
 
-    let (arrived, go) = rig.controller.backup().pause_the_next_setup_commit();
+    let (arrived, go) = rig.controller().backup().pause_the_next_setup_commit();
     let mut window = Window::run(&rig, &["backup", "setup", "--replace"]);
     let second = window.bring_up_the_kit();
     window.confirm(&second);
@@ -1481,6 +1616,7 @@ async fn an_interrupt_during_a_replacement_voids_the_new_kit_only_by_the_earlier
 
 /// Ctrl-C while the command waits for a daemon that has accepted the connection and says nothing
 /// ends the command at once, and says that nothing was set up.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_interrupt_while_the_daemon_says_nothing_ends_the_command_at_once() {
     let mut rig = Rig::start().await;
@@ -1506,6 +1642,7 @@ async fn an_interrupt_while_the_daemon_says_nothing_ends_the_command_at_once() {
 /// As the case above, after the kit was shown and `yes` was typed: the call's own connection is the
 /// one that waits. The interrupt is said once, and says that the kit opens nothing, because
 /// nothing has been sent.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_interrupt_while_the_daemon_says_nothing_to_the_call_is_said_once() {
     let mut rig = Rig::start().await;
@@ -1615,6 +1752,7 @@ async fn a_decline_that_follows_a_lost_answer_says_to_keep_the_kit() {
 /// A daemon that cannot be reached when the call is to be made has been given nothing, so the kit
 /// that was shown opens nothing. The call is made over a connection of its own: one kept from the
 /// start of the dialogue would still reach the daemon here, and the setup would be made.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_daemon_that_cannot_be_reached_when_the_call_is_made_has_been_given_nothing() {
     let mut rig = Rig::start().await;
@@ -1906,7 +2044,7 @@ async fn a_generation_deleted_under_privacy_mode_is_one_a_fresh_host_can_no_long
     // A day later, with the configuration changed, the host makes a second generation.
     rig.timer.advance_day(Duration::from_secs(25 * 3600));
     write_document_at(&rig.temp, rig.origin(), 2);
-    rig.controller.backup().signals().produce.notify_one();
+    rig.controller().backup().signals().produce.notify_one();
     rig.until_published(archive_id, 2).await;
 
     // Another collection of the account, which no deletion of this host's may touch.
@@ -1920,7 +2058,7 @@ async fn a_generation_deleted_under_privacy_mode_is_one_a_fresh_host_can_no_long
     );
 
     let objects_of = |generation: u64| -> Vec<kr_protocol::ids::BackupObjectId> {
-        rig.controller
+        rig.controller()
             .backup()
             .objects(archive_id, BackupGeneration::new(generation))
             .expect("the store reads")
