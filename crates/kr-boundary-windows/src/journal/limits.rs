@@ -206,14 +206,20 @@ pub fn cut(text: &str, max: usize) -> String {
 /// the text's own: the row that carries the cut text is never refused for its length.
 #[must_use]
 pub fn short(text: &str) -> String {
-    if json_bytes(text) <= TEXT_BYTES {
+    short_within(text, TEXT_BYTES)
+}
+
+/// As [`short`], for a field that a row caps at `max` bytes as it writes them.
+#[must_use]
+pub fn short_within(text: &str, max: usize) -> String {
+    if json_bytes(text) <= max {
         return text.to_owned();
     }
     let mut taken = 0;
     let mut end = 0;
     for (start, character) in text.char_indices() {
         taken += json_bytes(character.encode_utf8(&mut [0; 4]));
-        if taken > TEXT_BYTES {
+        if taken > max {
             break;
         }
         end = start + character.len_utf8();
