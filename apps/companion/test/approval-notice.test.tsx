@@ -264,6 +264,34 @@ describe('the notice while the host suspends rich mutations', () => {
     expect(within(approval).queryByTestId('approval-unavailable')).toBeNull()
   })
 
+  it('a_record_that_is_not_usable_gives_its_own_reason_before_the_suspension', async () => {
+    open((controls) => {
+      controls.records.setCapability(
+        SESSION_MAIN,
+        'agent.approval',
+        'incompatible',
+        'This version of Claude Code does not relay approvals.'
+      )
+      controls.records.suspend(SESSION_MAIN, FENCE)
+    })
+    const region = await notice()
+    const reason = within(region).getByTestId('approval-offer-reason')
+    expect(reason).toHaveTextContent('This version of Claude Code does not relay approvals.')
+    expect(reason).not.toHaveTextContent('record store')
+  })
+
+  it('an_instance_with_its_own_refusal_gives_it_before_the_suspension', async () => {
+    open((controls) => {
+      controls.records.withoutCapability(SESSION_MAIN, 'agent.approval')
+      controls.records.refuseInstance(SESSION_MAIN, 'The launch did not keep the channel flag.')
+      controls.records.suspend(SESSION_MAIN, FENCE)
+    })
+    const region = await notice()
+    const reason = within(region).getByTestId('approval-offer-reason')
+    expect(reason).toHaveTextContent('The launch did not keep the channel flag.')
+    expect(reason).not.toHaveTextContent('record store')
+  })
+
   it('an_agent_that_does_not_use_channels_gets_no_notice_for_a_suspension', async () => {
     open((controls) => {
       controls.records.suspend(SESSION_MAIN, FENCE)

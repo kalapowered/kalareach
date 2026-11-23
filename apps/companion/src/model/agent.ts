@@ -521,11 +521,13 @@ const NO_APPROVAL_RECORD =
  *
  * It says nothing before the records are read, before a live connection has said what it may do,
  * for an agent whose package is not in [`CHANNEL_PACKAGES`], and while the approval capability is
- * usable and the binding's rich mutations are not suspended. A suspended binding gives the host's
- * reason for it, the one the decisions show. A record that is present and not usable gives its own
- * reason, with one sentence per state where it gave none; an absent record gives the instance's own
- * refusal where it has one. Each reason is shown as a sentence ([`hostSentence`]). The terminal is
- * offered only with a live connection and the right to type in it.
+ * usable and the binding's rich mutations are not suspended. A record that is present and not
+ * usable gives its own reason, with one sentence per state where it gave none, and an absent record
+ * gives the instance's own refusal where it has one: those come first, because they stay true when
+ * a suspension ends. Otherwise a suspended binding gives the host's reason for it, the one the
+ * decisions show, and an absent record with no refusal says that Channels has not shown it is on.
+ * Each reason is shown as a sentence ([`hostSentence`]). The terminal is offered only with a live
+ * connection and the right to type in it.
  */
 export function approvalNoticeFor({
   instance,
@@ -545,16 +547,24 @@ export function approvalNoticeFor({
   // A connection that has not said what it may do is not told it may not type.
   if (connected && rights === null) return null
   const record = capabilities.get(COMPOSER_CAPABILITIES.answer)
+  // What the instance's own records say about answering approvals here comes first: a suspension
+  // that ends does not change it, so it is the reason that is still true when the host recovers.
+  let own: string | null = null
+  if (record === undefined) {
+    if (typeof instance.refusal === 'string') own = hostSentence(instance.refusal)
+  } else if (record.state !== 'qualified_available') {
+    own = hostSentence(record.disabled_reason ?? APPROVAL_STATE_SENTENCES[record.state])
+  }
   let sentence: string
-  if (binding?.rich_mutations_suspended === true) {
-    // The host holds rich mutations back, and the buttons give the same reason: it comes first.
+  if (own !== null) {
+    sentence = own
+  } else if (binding?.rich_mutations_suspended === true) {
+    // The host holds rich mutations back, and the buttons give the same reason.
     sentence = suspensionOf(binding)
   } else if (record === undefined) {
-    sentence = hostSentence(instance.refusal ?? NO_APPROVAL_RECORD)
-  } else if (record.state === 'qualified_available') {
-    return null
+    sentence = hostSentence(NO_APPROVAL_RECORD)
   } else {
-    sentence = hostSentence(record.disabled_reason ?? APPROVAL_STATE_SENTENCES[record.state])
+    return null
   }
   const terminal = !connected
     ? 'not_connected'
