@@ -26820,15 +26820,17 @@ export interface RecoveryBundle {
    */
   collections: CollectionLocator[]
   /**
-   * The owner device's saved configuration, which only the settings restore reads.
+   * The owner device's saved configuration, which the settings restore reads and
+   * `BundleStore::save_settings` decodes to compare it with what the device chose.
    *
    * Section 20 ¶10's list of what the bundle holds is not exclusive: the bundle may also carry
    * the values a person chose on the owner device. They are not session content and grant
-   * nothing. This crate carries the bytes and does not read them, so a member that no build can
-   * read fails the settings restore and nothing else: a data restore, a checkpoint write and a
-   * host's cover read and write it as it is. A bundle that holds none leaves the member out of
-   * its encoding, so its bytes are the bytes a build without the member wrote, and a build
-   * without the member refuses a bundle that holds one. The schema version stays the same.
+   * nothing. This crate carries the bytes and does not read them. A member that no build can
+   * read fails the settings restore, and the next save of the settings replaces or removes it;
+   * a data restore, a checkpoint write and a host's cover read and write it as it is. A bundle
+   * that holds none leaves the member out of its encoding, so its bytes are the bytes a build
+   * without the member wrote, and a build without the member refuses a bundle that holds one.
+   * The schema version stays the same.
    */
   device_settings?: string
   /**
