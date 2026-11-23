@@ -1378,6 +1378,165 @@ fn paste_probe_in_the_console() {
     let _console = reading.stops();
 }
 
+/// The variable that makes this test binary, started in the session's console, ask for bracketed
+/// paste and write what it is given to a file.
+const PASTE_READER: &str = "KR_ATTACH_PASTE_READER";
+
+/// The directory the application waits for its gate in and writes what it was given to.
+const PASTE_DIRECTORY: &str = "KR_ATTACH_PASTE_DIRECTORY";
+
+/// The letters typed before the paste. A console records a character as two key records, a key
+/// going down and coming up, and `kr attach` reads 256 records at a time, so 125 characters put
+/// the 256th record between the `2` and the `0` of the paste's opening marker.
+const BEFORE_THE_PASTE: usize = 125;
+
+/// The characters pasted. With the markers either side, the 512th record falls between the `2` and
+/// the `0` of the closing marker.
+const PASTED_TEXT: usize = 122;
+
+/// KR-REQ-08.56: a paste at the outer console reaches the session's application, which asked for
+/// bracketed paste, as one paste whose boundaries are the two markers the terminal sent, on the
+/// path that hands keys on as records, with the markers and the text whole where the reader's
+/// reads end inside them.
+///
+/// The session's root shell starts this test binary, which gives the console virtual-terminal
+/// input as a terminal application does, and, once `kr attach` is attached and a gate exists, asks
+/// for bracketed paste and writes every byte it is given to a file. The console that `kr attach`
+/// runs in is then written letters, a paste in the form a terminal sends it, the opening marker,
+/// the pasted text and the closing marker, and a capital letter after it, in one write. The reader takes
+/// 256 records at a time and the letters before the paste are as many as put the end of its first
+/// read inside the opening marker and the end of its second inside the closing one. The
+/// application is given the letters, the opening marker, the text, the closing marker and the capital
+/// letter, each where it was typed and none twice or changed: a marker lost, cut or read as keys
+/// of its own, or text that came after the closing marker, is the paste's boundary lost.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_paste_at_an_attached_console_reaches_the_application_that_asked_for_it_with_its_boundaries()
+ {
+    if std::env::var_os(PASTE_READER).is_some() {
+        paste_reader_in_the_session();
+        return;
+    }
+
+    let host = WorkerHost::start().await;
+    let (session_id, dimensions) = host
+        .kr_new(&["--shell-mode", "native_compat", "--shell", &command_shell()])
+        .await
+        .session();
+    let environment = host.tree.environment();
+    let mut typist = WorkerTerminal::attach(&environment, session_id, dimensions).await;
+    let directory = tempfile::tempdir().expect("a directory on the internal disk");
+    let reader = std::env::current_exe().expect("this test binary");
+    typist
+        .type_line(&format!(
+            "set {PASTE_READER}=1&& set \"{PASTE_DIRECTORY}={}\"&& \"{}\" --exact \
+             a_paste_at_an_attached_console_reaches_the_application_that_asked_for_it_with_its_boundaries \
+             --nocapture --test-threads=1",
+            directory.path().display(),
+            reader.display()
+        ))
+        .await;
+    typist
+        .shown(
+            "kr-paste-waiting",
+            "the application waits to ask for a paste",
+        )
+        .await;
+
+    let mut console = Attached::start(&host, &session_id.to_string(), dimensions);
+    console.shows(
+        "the session's screen",
+        |text| text.matches("kr-paste-waiting").count(),
+        1,
+    );
+    std::fs::write(directory.path().join("gate"), b"open")
+        .expect("the file the application waits for");
+    typist
+        .shown(
+            "kr-paste-ready",
+            "the application asked for bracketed paste and said so",
+        )
+        .await;
+    console.shows(
+        "the application's request for bracketed paste",
+        |text| text.matches("kr-paste-ready").count(),
+        1,
+    );
+
+    let before: String = (b'a'..=b'z')
+        .cycle()
+        .take(BEFORE_THE_PASTE)
+        .map(char::from)
+        .collect();
+    let text: String = (b'0'..=b'9')
+        .cycle()
+        .take(PASTED_TEXT)
+        .map(char::from)
+        .collect();
+    let typed = format!("{before}\x1b[200~{text}\x1b[201~Z");
+    console.press(typed.as_bytes());
+
+    let given = directory.path().join("given");
+    let started = Instant::now();
+    let told = loop {
+        let told = std::fs::read(&given).unwrap_or_default();
+        if told.ends_with(b"Z") || started.elapsed() > LIVENESS_DEADLINE {
+            break told;
+        }
+        typist.watch(Duration::from_millis(200)).await;
+    };
+    assert_eq!(
+        hex(&told),
+        hex(typed.as_bytes()),
+        "the application was given the letters, the paste's two markers and its text, and the capital letter \
+         after it, as they were typed; the end of what the outer console shows: {:?}",
+        end_of(&console.output.text())
+    );
+
+    let _ = console.child.kill();
+    drop(typist);
+    let closed = host
+        .kr(&["--json", "close", &session_id.to_string()], &[])
+        .await;
+    assert!(
+        closed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&closed.stdout)
+    );
+}
+
+/// The session half of the test above: gives the console virtual-terminal input as a terminal
+/// application does, asks for bracketed paste once the gate exists, and writes every byte it is
+/// given to a file, each time it is given some, until a `Z` ends what it has.
+fn paste_reader_in_the_session() {
+    use kr_cli::platform::ControllingTerminal;
+
+    let directory = PathBuf::from(std::env::var_os(PASTE_DIRECTORY).expect("the directory to use"));
+    let console = ControllingTerminal::open().expect("this process has a console");
+    let _modes = console
+        .enter_raw_mode()
+        .expect("the console is given virtual-terminal input");
+    // The console the mode left on does not return the carriage at a line feed, so each line ends
+    // with both, and a word is not broken across two rows of the screen.
+    print!("kr-paste-waiting\r\n");
+    std::io::stdout().flush().expect("flushes the first word");
+    while !directory.join("gate").exists() {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    print!("\x1b[?2004hkr-paste-ready\r\n");
+    std::io::stdout().flush().expect("flushes the request");
+    let mut input = console.handle();
+    let mut seen = Vec::new();
+    let mut buffer = [0_u8; 256];
+    while !seen.ends_with(b"Z") {
+        let read = input.read(&mut buffer).expect("reads the console's input");
+        assert_ne!(read, 0, "the console's input ended");
+        seen.extend_from_slice(&buffer[..read]);
+        std::fs::write(directory.join("given"), &seen).expect("writes what was given");
+    }
+    print!("kr-paste-end\r\n");
+    std::io::stdout().flush().expect("flushes the end");
+}
+
 /// The variable that makes this test binary, started in the session's console, read key records
 /// there and print them.
 const RECORD_READER: &str = "KR_ATTACH_RECORD_READER";
