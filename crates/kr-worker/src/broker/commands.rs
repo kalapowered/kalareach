@@ -315,7 +315,7 @@ struct Backend {
 }
 
 /// The file name of the socket a program connects to the gateway at, in its backend's directory.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 const GATEWAY_SOCKET: &str = "gw.sock";
 
 /// How long a launcher waits for the answer to the launch it said it is going with, counted from
@@ -1355,6 +1355,30 @@ impl CommandBackends {
         Ok(())
     }
 
+    /// Refuses a runtime directory with no room for the gateway's socket below it.
+    ///
+    /// Only the gateway's socket is measured, and only for an integration that declares a backend,
+    /// because that is the one socket here that is bound as a socket: a launch's bridge is a pipe on
+    /// Windows, with a bound of its own. The path is built with the joins that make the real one, so
+    /// a runtime directory that ends in a separator is measured as the bind will see it, and a
+    /// path that is not text is refused by name.
+    #[cfg(windows)]
+    fn refuse_a_runtime_directory_with_no_room_for_the_gateway_socket(
+        &self,
+    ) -> std::result::Result<(), String> {
+        let digits = "0".repeat(NAME_DIGITS);
+        let socket = self
+            .runtime_dir
+            .join(format!("{SESSION_ROOT_PREFIX}{digits}"))
+            .join(&digits)
+            .join(GATEWAY_SOCKET);
+        crate::broker::endpoint::require_room_for_a_socket_path(
+            &socket,
+            crate::broker::endpoint::WINDOWS_SOCKET_PATH_LIMIT,
+        )
+        .map_err(|refusal| refusal.to_string())
+    }
+
     /// Says why a launch of a program that has a server cannot be served by a gateway on this
     /// host, where it cannot.
     #[cfg(unix)]
@@ -1387,6 +1411,18 @@ impl CommandBackends {
         _request: &EstablishRequest<'_>,
         plugin: kr_protocol::ids::PluginId,
     ) -> std::result::Result<(), String> {
+        // A gateway's socket is a Unix-domain socket, and one is served only where the kernel
+        // names the process that connects to it and where the socket's path fits. Both are judged
+        // here, before anything is made or committed, so an invocation that cannot be served runs
+        // as typed and is not told of a gateway it would then fail to reach.
+        #[cfg(windows)]
+        {
+            crate::windows::uds::gateway_socket_names_its_peers()
+                .and_then(|()| {
+                    self.refuse_a_runtime_directory_with_no_room_for_the_gateway_socket()
+                })
+                .map_err(|why| format!("{why}, so this invocation runs as typed"))?;
+        }
         Err(format!(
             "{plugin} declares a backend, and this platform runs none, so this invocation runs as \
              typed"
