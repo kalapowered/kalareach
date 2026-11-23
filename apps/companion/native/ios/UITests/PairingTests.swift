@@ -1026,8 +1026,8 @@ final class PairingTests: DeviceTestCase {
         XCTAssertEqual(read("received-1-2.txt"), "h1s1=0 h1s2=1 h2s1=1 target=h1s2 text=\(commandFirst)", "choosing a host sent something")
         say("PAIRING the phone chose the first host again and lists its two sessions, and choosing a host sent no agent anything")
 
-        // A message written in the first host's first session reaches that host's agent: the choice back
-        // reached the host, which the host's connection count alone does not show (the phone keeps both).
+        // A message written in the first host's first session reaches that host's agent: the phone sends it to the host
+        // in use again, which the host's connection count alone does not show (the phone keeps both).
         openSession(1)
         writeAndSend(commandThird)
         screenshot("first-host-session-one-message-sent")

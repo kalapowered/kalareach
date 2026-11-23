@@ -1464,8 +1464,8 @@ def sessions(adb: str, serial: str, directory: Path, shots: Path, port: str) -> 
         raise SystemExit(f"choosing a host sent something: {read(directory, 'received-1-2.txt')}")
     say("the phone chose the first host again and lists its two sessions, and choosing a host sent no agent anything")
 
-    # A message written in the first host's first session reaches that host's agent: the choice back reached
-    # the host, which the host's connection count alone does not show (the phone keeps both).
+    # A message written in the first host's first session reaches that host's agent: the phone sends it to the host
+    # in use again, which the host's connection count alone does not show (the phone keeps both).
     open_a_session(phone, 1)
     write_and_send(phone, COMMAND_THIRD)
     phone.shot("first-host-session-one-message-sent")

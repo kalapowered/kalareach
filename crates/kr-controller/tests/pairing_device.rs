@@ -872,7 +872,7 @@ impl Run {
     /// serving one. The phone keeps a connection to each host it is paired with, so a host that was not
     /// chosen can already be serving one: the record shows that the phone is in contact with the named
     /// host, not that it chose it. What shows the choice is what `received` records for a message
-    /// written in that host's session.
+    /// written in that host's session, together with the list of sessions the phone shows.
     async fn chosen(&self) {
         let which = self.wanted("chosen");
         let phone_of_first = self
