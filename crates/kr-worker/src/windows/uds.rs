@@ -160,8 +160,18 @@ fn accept_raw(listener: &impl AsRawSocket) -> std::io::Result<sockets::SOCKET> {
     Ok(accepted)
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Whether a case makes the clearing of the inherit flag fail on its own thread.
+    static CLEAR_FAILS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// Clears the flag that lets a process this one starts inherit `socket`.
 fn clear_inherit(socket: sockets::SOCKET) -> std::io::Result<()> {
+    #[cfg(test)]
+    if CLEAR_FAILS.with(std::cell::Cell::get) {
+        return Err(std::io::Error::other("the flag could not be cleared"));
+    }
     // SAFETY: the socket is open and is a handle for this call, which changes one flag of it.
     let cleared = unsafe {
         windows_sys::Win32::Foundation::SetHandleInformation(
@@ -434,14 +444,13 @@ impl Listener {
             .inner
             .read_with(|registered| accept_raw(&registered.0))
             .await?;
+        // SAFETY: the socket was just accepted and nothing else holds it, so the stream owns it
+        // from here and closes it when it is dropped, whatever the next call does.
+        let owned = unsafe { uds_windows::UnixStream::from_raw_socket(accepted as u64) };
         // A socket the listening socket hands over is made as the listening socket is. Clearing the
         // flag again is a belt, and a case reads the socket before it.
         clear_inherit(accepted)?;
-        let raw = u64::try_from(accepted)
-            .map_err(|_| std::io::Error::other("a socket that is not one"))?;
-        // SAFETY: the socket was just accepted and nothing else holds it, so the stream owns it
-        // and closes it when it is dropped.
-        Stream::new(unsafe { uds_windows::UnixStream::from_raw_socket(raw) })
+        Stream::new(owned)
     }
 }
 
@@ -510,8 +519,12 @@ fn accept_within_the_wait(
 ) -> std::io::Result<uds_windows::UnixStream> {
     let mut waited = Duration::ZERO;
     loop {
-        match listener.accept() {
-            Ok((accepted, _)) => return Ok(accepted),
+        match accept_raw(listener) {
+            // SAFETY: the socket was just accepted and nothing else holds it, so the stream owns it
+            // and closes it when it is dropped.
+            Ok(accepted) => {
+                return Ok(unsafe { uds_windows::UnixStream::from_raw_socket(accepted as u64) });
+            }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock && waited < PROBE_WAIT => {
                 std::thread::sleep(PROBE_STEP);
                 waited += PROBE_STEP;
@@ -1235,6 +1248,33 @@ mod tests {
             "the accepted stream the module returns"
         );
         drop((client, second));
+    }
+
+    /// KR-REQ-07.45: a socket the listener accepted is owned before anything that can fail is done
+    /// to it: where the flag cannot be cleared the accept fails and the socket is closed, so the
+    /// peer reads the end of the stream and not a connection that waits.
+    #[tokio::test]
+    async fn an_accepted_socket_whose_flag_cannot_be_cleared_is_closed() {
+        let directory = Directory::new();
+        let path = directory.0.join("p.sock");
+        let (listener, _) = Listener::bind(&path).expect("the socket binds");
+        let mut client = uds_windows::UnixStream::connect(&path).expect("the socket is reached");
+        CLEAR_FAILS.with(|fails| fails.set(true));
+        let refused = listener.accept().await;
+        CLEAR_FAILS.with(|fails| fails.set(false));
+        assert!(
+            refused.is_err(),
+            "the flag could not be cleared: {refused:?}"
+        );
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("a timeout is set");
+        let mut byte = [0_u8; 1];
+        let read = client.read(&mut byte);
+        assert!(
+            matches!(read, Ok(0)),
+            "the accepted socket was closed, so the client reads the end: {read:?}"
+        );
     }
 
     /// Bytes go both ways through the tokio traits.
