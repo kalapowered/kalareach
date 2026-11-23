@@ -162,6 +162,9 @@ mod console {
         /// The console's input mode when the attachment began, which the console is given back
         /// with the mouse: whether it had quick edit on, and whether it reported its private flags.
         attached_input: std::sync::atomic::AtomicU32,
+        /// Whether the console has been given the mouse, which a console that spells its keys
+        /// keeps when it reports them as records again.
+        mouse_asked: std::sync::Arc<std::sync::atomic::AtomicBool>,
     }
 
     impl ControllingTerminal {
@@ -185,6 +188,7 @@ mod console {
                 input,
                 output,
                 attached_input: std::sync::atomic::AtomicU32::new(0),
+                mouse_asked: std::sync::Arc::default(),
             })
         }
 
@@ -298,7 +302,9 @@ mod console {
             set_console_mode(
                 &self.input,
                 crate::mouse::mouse_input_mode(current, self.attached_input.load(SeqCst), asked),
-            )
+            )?;
+            self.mouse_asked.store(asked, SeqCst);
+            Ok(())
         }
 
         /// Throws away what has been typed and not yet read.
@@ -341,8 +347,9 @@ mod console {
 
         /// What makes this console spell its keys itself: its virtual-terminal input, which turns
         /// the keys into the sequences a terminal sends. It is asked for on the mode the console
-        /// has then, taken off again when the keys go back to being records, and put back with the
-        /// rest when the attachment ends.
+        /// has then, with the mouse and window flags the console had when the attachment began,
+        /// taken off again with those two when the keys go back to being records, and put back with
+        /// the rest when the attachment ends.
         ///
         /// # Errors
         ///
@@ -355,14 +362,29 @@ mod console {
             let spelled = input
                 .try_clone()
                 .map_err(|error| CliError::Terminal(Shown::io(&error)))?;
+            // The mode the console had when the attachment began is known by now: the console is
+            // put in its record mode before the switch is made.
+            let attached = self
+                .attached_input
+                .load(std::sync::atomic::Ordering::SeqCst);
+            let asked = std::sync::Arc::clone(&self.mouse_asked);
+            let given = std::sync::Arc::clone(&self.mouse_asked);
             Ok(crate::attach::InputSwitch::new(
                 move || {
                     let mode = console_mode(&input)?;
-                    set_console_mode(&input, crate::mouse::keys_spelled_mode(mode, true))
+                    let asked = asked.load(std::sync::atomic::Ordering::SeqCst);
+                    set_console_mode(
+                        &input,
+                        crate::mouse::keys_spelled_mode(mode, attached, asked, true),
+                    )
                 },
                 move || {
                     let mode = console_mode(&spelled)?;
-                    set_console_mode(&spelled, crate::mouse::keys_spelled_mode(mode, false))
+                    let asked = given.load(std::sync::atomic::Ordering::SeqCst);
+                    set_console_mode(
+                        &spelled,
+                        crate::mouse::keys_spelled_mode(mode, attached, asked, false),
+                    )
                 },
             ))
         }

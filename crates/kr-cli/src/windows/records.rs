@@ -39,8 +39,8 @@ use std::os::windows::io::AsRawHandle as _;
 use kr_term::win32::{KeyRecord, PairHold};
 use windows_sys::Win32::Foundation::{HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows_sys::Win32::System::Console::{
-    GetNumberOfConsoleInputEvents, INPUT_RECORD, KEY_EVENT, MOUSE_EVENT, PeekConsoleInputW,
-    ReadConsoleInputW, ReadConsoleW, WINDOW_BUFFER_SIZE_EVENT,
+    GetConsoleMode, GetNumberOfConsoleInputEvents, INPUT_RECORD, KEY_EVENT, MOUSE_EVENT,
+    PeekConsoleInputW, ReadConsoleInputW, ReadConsoleW, WINDOW_BUFFER_SIZE_EVENT,
 };
 use windows_sys::Win32::System::Threading::{
     CreateEventW, INFINITE, ResetEvent, SetEvent, WaitForMultipleObjects,
@@ -210,6 +210,25 @@ impl RecordReader {
             )));
         }
         Ok(count)
+    }
+
+    /// The console's input mode as it stands, read from the console itself.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the console will not answer.
+    pub fn input_mode(&self) -> Result<u32> {
+        let mut mode = 0_u32;
+        // SAFETY: the handle is this reader's own and open for the call, and the mode is a local
+        // this thread owns.
+        let asked = unsafe { GetConsoleMode(self.handle.as_raw_handle().cast(), &raw mut mode) };
+        if asked == 0 {
+            return Err(CliError::Terminal(shown!(
+                "read the console's input mode: {}",
+                Shown::io(&std::io::Error::last_os_error())
+            )));
+        }
+        Ok(mode)
     }
 
     /// Reads the records the console has, waiting for at least one.

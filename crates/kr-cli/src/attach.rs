@@ -912,6 +912,10 @@ pub(crate) trait ConsoleInput {
     /// Reads the text the console has spelled as UTF-8, without waiting for more: nothing when what
     /// the console holds makes no text, which it then takes off.
     fn bytes(&mut self) -> std::io::Result<Vec<u8>>;
+
+    /// Reads the console's input mode and says whether it spells its keys itself, as the console
+    /// says and not as the reader believes.
+    fn keys_spelled(&mut self) -> Result<bool>;
 }
 
 /// How long the stop waits for the reader to end.
@@ -1188,6 +1192,42 @@ fn hand_on_the_text(
     Handed::Flood
 }
 
+/// Makes one switch of the console's input mode with `change`, to the keys spelled or to records
+/// (`spell`), and reads the mode back: `spelled` is what the console says of its mode afterwards,
+/// whatever `change` said, and the answer is `change`'s unless the mode does not show the switch.
+///
+/// A reader that could not read the mode back leaves `spelled` as it was, and answers that it
+/// could not.
+#[cfg(any(not(unix), test))]
+fn switched(
+    console: &mut impl ConsoleInput,
+    spell: bool,
+    change: &dyn Fn() -> Result<()>,
+    spelled: &mut bool,
+) -> Result<()> {
+    let answer = change();
+    let now = match console.keys_spelled() {
+        Ok(now) => now,
+        Err(error) => {
+            answer?;
+            return Err(error);
+        }
+    };
+    *spelled = now;
+    answer?;
+    if now == spell {
+        Ok(())
+    } else if spell {
+        Err(CliError::Terminal(shown!(
+            "the console's input mode does not show that its keys are spelled"
+        )))
+    } else {
+        Err(CliError::Terminal(shown!(
+            "the console's input mode does not show that its keys are records again"
+        )))
+    }
+}
+
 /// Reads `console` until its input ends, a batch has nowhere to go, or the stop is made, and
 /// returns what it had taken from the console and not handed on.
 ///
@@ -1303,9 +1343,11 @@ fn read_console(
                         break;
                     }
                     // A console that already spells its keys is not asked again.
-                    let answer = if spelled { Ok(()) } else { (switching.ask)() };
-                    spelled = answer.is_ok();
-                    answer
+                    if spelled {
+                        Ok(())
+                    } else {
+                        switched(console, true, &*switching.ask, &mut spelled)
+                    }
                 } else if !spelled {
                     // A console that was never asked has nothing to give back.
                     Ok(())
@@ -1319,8 +1361,8 @@ fn read_console(
                             "the console still has text typed ahead, so its keys are not given back yet"
                         ))),
                         Handed::Empty => {
-                            let answer = (switching.give_back)();
-                            spelled = answer.is_err();
+                            let answer =
+                                switched(console, false, &*switching.give_back, &mut spelled);
                             if !spelled {
                                 // A paste that never closed does not go on into the next time the
                                 // console spells its keys.
@@ -1641,6 +1683,10 @@ impl ConsoleInput for WindowsConsole {
         let read = self.reader.read_text(&mut units)?;
         Ok(utf8_of_console_text(&units[..read], &mut self.carry))
     }
+
+    fn keys_spelled(&mut self) -> Result<bool> {
+        Ok(crate::mouse::keys_are_spelled(self.reader.input_mode()?))
+    }
 }
 
 /// What ends the thread [`spawn_input_reader`] started.
@@ -1959,6 +2005,28 @@ mod reader {
     /// Whether the thread ends is decided by the thread, and never by how much of this has passed.
     const LIVENESS: std::time::Duration = std::time::Duration::from_secs(60);
 
+    /// What a console says of its input mode, and whether it takes a change of it.
+    #[derive(Default)]
+    struct Mode {
+        /// Whether the console spells its keys.
+        spelled: std::sync::atomic::AtomicBool,
+        /// Whether the console answers a change and keeps its mode as it was.
+        keeps_its_mode: std::sync::atomic::AtomicBool,
+        /// Whether the console does not answer when its mode is read.
+        unreadable: std::sync::atomic::AtomicBool,
+    }
+
+    impl Mode {
+        /// The console takes a change of its mode, unless the case says it keeps its mode.
+        fn takes(&self, spelled: bool) {
+            use std::sync::atomic::Ordering::SeqCst;
+
+            if !self.keeps_its_mode.load(SeqCst) {
+                self.spelled.store(spelled, SeqCst);
+            }
+        }
+    }
+
     /// A console that answers a wait with what the case sent it, hands over the key records the
     /// case scripted, and hands over the bytes the case sends. A request goes ahead of the input
     /// the console holds only when the reader says it should.
@@ -1972,6 +2040,7 @@ mod reader {
         bytes: mpsc::Receiver<Vec<u8>>,
         steps: Steps,
         bounds: Bounds,
+        mode: Arc<Mode>,
         /// Holds the thread inside one of its calls, once, until the case lets it go.
         pause: Option<Pause>,
     }
@@ -2051,6 +2120,17 @@ mod reader {
             self.paused_at("bytes");
             Ok(read)
         }
+
+        fn keys_spelled(&mut self) -> Result<bool> {
+            use std::sync::atomic::Ordering::SeqCst;
+
+            if self.mode.unreadable.load(SeqCst) {
+                return Err(CliError::Terminal(Shown::said(
+                    "the console did not answer",
+                )));
+            }
+            Ok(self.mode.spelled.load(SeqCst))
+        }
     }
 
     /// The reads of a console that reports key runs only.
@@ -2082,6 +2162,8 @@ mod reader {
         release: mpsc::Sender<()>,
         steps: Steps,
         bounds: Bounds,
+        /// What the console says of its input mode.
+        mode: Arc<Mode>,
         stop: Option<ReaderStop>,
     }
 
@@ -2137,10 +2219,14 @@ mod reader {
             let bounds: Bounds = Arc::default();
             let asked = Arc::clone(&steps);
             let given_back = Arc::clone(&steps);
+            let mode: Arc<Mode> = Arc::default();
+            let spells = Arc::clone(&mode);
+            let reports = Arc::clone(&mode);
             let switch = InputSwitch::new(
                 move || {
                     asked.lock().expect("steps").push("ask");
                     if will_spell {
+                        spells.takes(true);
                         Ok(())
                     } else {
                         Err(CliError::Terminal(Shown::said("the console refused")))
@@ -2148,6 +2234,7 @@ mod reader {
                 },
                 move || {
                     given_back.lock().expect("steps").push("give back");
+                    reports.takes(false);
                     Ok(())
                 },
             );
@@ -2160,6 +2247,7 @@ mod reader {
                 bytes: spelled,
                 steps: Arc::clone(&steps),
                 bounds: Arc::clone(&bounds),
+                mode: Arc::clone(&mode),
                 pause: pause_at.map(|at| Pause {
                     at,
                     arrived,
@@ -2208,6 +2296,7 @@ mod reader {
                 release,
                 steps,
                 bounds,
+                mode,
                 stop: Some(stop),
             }
         }
@@ -2637,6 +2726,72 @@ mod reader {
             .expect("a console that was never spelled has nothing to give back");
         let steps = run.ends();
         assert_eq!(times(&steps, "give back"), 0, "{steps:?}");
+    }
+
+    /// What the reader believes of the console is what the console's input mode says, not what the
+    /// change answered: a console that takes the call and keeps its mode is read as records and the
+    /// answer says it did not spell, and the next change asks again.
+    #[test]
+    fn a_console_whose_mode_does_not_show_its_keys_spelled_is_read_as_records() {
+        let down = key(u16::from(b'A'), u16::from(b'a'), true);
+        let mut run = Run::start(true, vec![vec![vec![down]]]);
+        run.mode
+            .keeps_its_mode
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(run.switch.follow_paste(true).is_err());
+        run.has_input();
+        assert_eq!(run.next(), TerminalInput::Keys(vec![down]));
+        assert!(
+            run.switch.follow_paste(true).is_err(),
+            "asked again at the next change, and the mode still does not show it"
+        );
+        let steps = run.ends();
+        assert_eq!(times(&steps, "ask"), 2, "{steps:?}");
+        assert!(
+            !steps.contains(&"bytes"),
+            "no byte was read from a console whose mode shows no spelling: {steps:?}"
+        );
+    }
+
+    /// A console that answers the change that gives its keys back as records and keeps its mode
+    /// still spells them: its text is still read as text, and the answer says so.
+    #[test]
+    fn a_console_whose_mode_still_shows_its_keys_spelled_is_read_as_text() {
+        let mut run = Run::start(true, Vec::new());
+        run.switch.follow_paste(true).expect("spelled");
+        run.mode
+            .keeps_its_mode
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(run.switch.follow_paste(false).is_err());
+        run.bytes.send(b"x".to_vec()).expect("the reader waits");
+        run.has_input();
+        assert_eq!(run.next(), TerminalInput::Bytes(b"x".to_vec()));
+        run.mode
+            .keeps_its_mode
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        run.switch
+            .follow_paste(false)
+            .expect("the console takes the change");
+        assert_eq!(times(&run.ends(), "give back"), 2);
+    }
+
+    /// A reader that cannot read the console's mode says so and believes what it did before.
+    #[test]
+    fn a_console_whose_mode_cannot_be_read_leaves_the_reader_as_it_was() {
+        let mut run = Run::start(true, Vec::new());
+        run.mode
+            .unreadable
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(run.switch.follow_paste(true).is_err());
+        run.mode
+            .unreadable
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        run.switch
+            .follow_paste(true)
+            .expect("the console shows its keys spelled");
+        run.bytes.send(b"x".to_vec()).expect("the reader waits");
+        run.has_input();
+        assert_eq!(run.next(), TerminalInput::Bytes(b"x".to_vec()));
     }
 
     /// A console that keeps having text when the application turns bracketed paste off is not given

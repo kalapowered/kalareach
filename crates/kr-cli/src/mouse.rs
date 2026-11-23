@@ -863,7 +863,7 @@ pub const fn record_input_mode(saved: u32) -> u32 {
 /// once the extended flags are set and quick edit is removed. When the application stops, the
 /// console has the mouse again: quick edit comes back if `attached` had it on. Nothing else of
 /// `current` changes, so a console that has been asked to spell its keys itself goes on spelling
-/// them.
+/// them, and goes on having the mouse flag as `attached` had it ([`keys_spelled_mode`]).
 ///
 /// A console whose mode had no `ENABLE_EXTENDED_FLAGS` reports none of its private flags, whatever
 /// they are, and a mode that sets the extended flags sets each of them as that mode states it: the
@@ -873,11 +873,16 @@ pub const fn record_input_mode(saved: u32) -> u32 {
 /// stopping clears it. The console then reports the mouse as records only while quick edit is off.
 #[must_use]
 pub const fn mouse_input_mode(current: u32, attached: u32, asked: bool) -> u32 {
+    let kept = if current & ENABLE_VIRTUAL_TERMINAL_INPUT != 0 {
+        attached & ENABLE_MOUSE_INPUT
+    } else {
+        0
+    };
     if attached & ENABLE_EXTENDED_FLAGS == 0 {
         return if asked {
             current | ENABLE_MOUSE_INPUT
         } else {
-            current & !ENABLE_MOUSE_INPUT
+            (current & !ENABLE_MOUSE_INPUT) | kept
         };
     }
     if asked {
@@ -885,19 +890,43 @@ pub const fn mouse_input_mode(current: u32, attached: u32, asked: bool) -> u32 {
     } else {
         (current & !(ENABLE_MOUSE_INPUT | ENABLE_QUICK_EDIT_MODE))
             | (attached & ENABLE_QUICK_EDIT_MODE)
+            | kept
     }
 }
 
-/// The console input mode `current` becomes when the console is asked to spell the keys itself
-/// (`spelled`), or to report them as records again. Only the one flag changes: the mouse's flags and
-/// the private flags stay as `current` holds them.
+/// The console input mode `current` becomes when the console is asked to spell its keys itself
+/// (`spelled`), or to report them as records again. `attached` is the mode the console had when the
+/// attachment began, and `mouse_asked` says whether the session's application asks to be told of
+/// the mouse ([`mouse_input_mode`]).
+///
+/// A console that spells its keys is given the virtual-terminal flag and keeps `ENABLE_MOUSE_INPUT`
+/// and `ENABLE_WINDOW_INPUT` as `attached` had them, which is the input mode of a command that
+/// reads bytes (`ControllingTerminal::enter_raw_mode`) and the one in which a console was seen to
+/// hand on a paste's two markers whole. The rest of the mouse's flags and the private flags stay as
+/// `current` holds them.
+///
+/// A console that reports records again has both flags off, as the record mode of the attachment
+/// has them, except the mouse's while the application asks for the mouse.
 #[must_use]
-pub const fn keys_spelled_mode(current: u32, spelled: bool) -> u32 {
+pub const fn keys_spelled_mode(
+    current: u32,
+    attached: u32,
+    mouse_asked: bool,
+    spelled: bool,
+) -> u32 {
+    const KEPT: u32 = ENABLE_MOUSE_INPUT | ENABLE_WINDOW_INPUT;
     if spelled {
-        current | ENABLE_VIRTUAL_TERMINAL_INPUT
+        current | ENABLE_VIRTUAL_TERMINAL_INPUT | (attached & KEPT)
     } else {
-        current & !ENABLE_VIRTUAL_TERMINAL_INPUT
+        let mouse = if mouse_asked { ENABLE_MOUSE_INPUT } else { 0 };
+        (current & !(ENABLE_VIRTUAL_TERMINAL_INPUT | KEPT)) | mouse
     }
+}
+
+/// Whether a console whose input mode is `mode` spells its keys itself.
+#[must_use]
+pub const fn keys_are_spelled(mode: u32) -> bool {
+    mode & ENABLE_VIRTUAL_TERMINAL_INPUT != 0
 }
 
 #[cfg(test)]
@@ -907,7 +936,7 @@ mod tests {
         ENABLE_PROCESSED_INPUT, ENABLE_QUICK_EDIT_MODE, ENABLE_VIRTUAL_TERMINAL_INPUT,
         ENABLE_WINDOW_INPUT, Follow, LEFT, MIDDLE, MOUSE_MOVED, MOUSE_WHEELED, MouseRecord,
         MouseReporting, MouseSpeller, RESTORATION_CHUNK, RIGHT, Reading, Restoration, Tracking,
-        Window, keys_spelled_mode, mouse_input_mode, record_input_mode,
+        Window, keys_are_spelled, keys_spelled_mode, mouse_input_mode, record_input_mode,
     };
     use super::{Part, SgrMouseFilter};
 
@@ -1638,12 +1667,12 @@ mod tests {
     /// The modes an attachment writes to a console, in order: when it begins, when the application
     /// asks for the mouse, when it stops, and the console's own mode put back at the end.
     fn written(attached: u32, spelling: bool) -> [u32; 4] {
-        let begun = record_input_mode(attached)
-            | if spelling {
-                ENABLE_VIRTUAL_TERMINAL_INPUT
-            } else {
-                0
-            };
+        let records = record_input_mode(attached);
+        let begun = if spelling {
+            keys_spelled_mode(records, attached, false, true)
+        } else {
+            records
+        };
         let asked = mouse_input_mode(begun, attached, true);
         let stopped = mouse_input_mode(asked, attached, false);
         [begun, asked, stopped, attached]
@@ -1665,8 +1694,8 @@ mod tests {
         assert_eq!(written(without, false), [0x1a0, 0x1b0, 0x1a0, 0x1b7]);
         assert_eq!(
             written(attached, true),
-            [0x3e0, 0x3b0, 0x3e0, 0x1f7],
-            "the console that spells its keys goes on spelling them"
+            [0x3f0, 0x3b0, 0x3f0, 0x1f7],
+            "the console that spells its keys goes on spelling them, with the mouse flag it had"
         );
     }
 
@@ -1740,30 +1769,78 @@ mod tests {
         }
     }
 
-    /// Asking the console to spell the keys itself changes its virtual-terminal flag and no other,
-    /// the mouse's among them, and giving the keys back as records restores exactly what the mode
-    /// was.
+    /// Asking the console to spell the keys itself sets its virtual-terminal flag and gives the
+    /// mouse and window flags the console had when the attachment began, and changes no other flag.
+    /// Giving the keys back as records restores exactly the mode there was, and the application's
+    /// stopping to ask for the mouse while the keys are spelled leaves the mouse flag as the console
+    /// had it.
     #[test]
-    fn spelling_the_keys_changes_the_one_flag_and_giving_them_back_restores_the_mode() {
+    fn spelling_the_keys_keeps_the_mouse_and_window_flags_as_they_were_and_giving_them_back_restores_the_mode()
+     {
+        const KEPT: u32 = ENABLE_MOUSE_INPUT | ENABLE_WINDOW_INPUT;
         for attached in [
             0x1f7_u32,
             0x1a7,
             0x7,
+            0x18,
+            ENABLE_WINDOW_INPUT,
+            ENABLE_MOUSE_INPUT,
             ENABLE_QUICK_EDIT_MODE | ENABLE_EXTENDED_FLAGS,
         ] {
             let records = record_input_mode(attached);
             let mouse = mouse_input_mode(records, attached, true);
-            for current in [records, mouse] {
-                let spelled = keys_spelled_mode(current, true);
+            for (current, asked) in [(records, false), (mouse, true)] {
+                let spelled = keys_spelled_mode(current, attached, asked, true);
+                let context = format!("attached {attached:#x}, current {current:#x}");
+                assert_ne!(spelled & ENABLE_VIRTUAL_TERMINAL_INPUT, 0, "{context}");
                 assert_eq!(
-                    spelled,
-                    current | ENABLE_VIRTUAL_TERMINAL_INPUT,
-                    "attached {attached:#x}, current {current:#x}"
+                    spelled & KEPT,
+                    (current | attached) & KEPT,
+                    "the two flags are as the console had them, or as the mouse asked: {context}"
                 );
-                assert_eq!(keys_spelled_mode(spelled, false), current);
-                assert_eq!(keys_spelled_mode(current, false), current);
+                assert_eq!(
+                    spelled & !(ENABLE_VIRTUAL_TERMINAL_INPUT | KEPT),
+                    current & !(ENABLE_VIRTUAL_TERMINAL_INPUT | KEPT),
+                    "no other flag changes: {context}"
+                );
+                assert_eq!(
+                    keys_spelled_mode(spelled, attached, asked, false),
+                    current,
+                    "{context}"
+                );
+                assert_eq!(
+                    keys_spelled_mode(current, attached, asked, false),
+                    current,
+                    "{context}"
+                );
             }
+            // The application stops asking for the mouse while the keys are spelled: the console
+            // is as it was when it began to spell, not as the mouse's flag alone would leave it.
+            let asked_and_spelled = keys_spelled_mode(mouse, attached, true, true);
+            assert_eq!(
+                mouse_input_mode(asked_and_spelled, attached, false),
+                keys_spelled_mode(records, attached, false, true),
+                "attached {attached:#x}"
+            );
         }
+    }
+
+    /// The mode a console that spells its keys is given, for the console's usual mode and for one
+    /// that had neither the mouse nor the window flag: the virtual-terminal flag on, line, echo and
+    /// processed input off, and the two flags as the console had them. A mode is read as saying
+    /// whether the keys are spelled by its virtual-terminal flag alone.
+    #[test]
+    fn a_console_asked_to_spell_its_keys_is_given_the_mode_of_a_command_that_reads_bytes() {
+        // The console's usual mode has the mouse flag and not the window flag.
+        assert_eq!(record_input_mode(0x1f7), 0x1e0);
+        assert_eq!(keys_spelled_mode(0x1e0, 0x1f7, false, true), 0x3f0);
+        assert_eq!(keys_spelled_mode(0x1e0, 0x1ff, false, true), 0x3f8);
+        assert_eq!(keys_spelled_mode(0x1e0, 0x1e7, false, true), 0x3e0);
+        assert_eq!(keys_spelled_mode(0x3f8, 0x1ff, false, false), 0x1e0);
+        assert_eq!(keys_spelled_mode(0x3f0, 0x1f7, true, false), 0x1f0);
+        assert!(keys_are_spelled(0x3f0));
+        assert!(!keys_are_spelled(0x1e0));
+        assert!(!keys_are_spelled(0));
     }
 
     /// What an application that wrote `asked` is told of the text `input`, which a console spelled:
