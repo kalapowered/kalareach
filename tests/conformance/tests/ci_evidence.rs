@@ -1871,11 +1871,15 @@ fn the_linux_job_of_the_conformance_workflow_runs_its_plan_in_two_parts_and_the_
 }
 
 /// Every job of the conformance workflow has a limit of its own, under the 360 minutes at which
-/// GitHub ends a hosted job, and the Linux job's steps have limits that add up to less than its 340
-/// minutes, so that a step that hangs is ended by its own limit and the steps after it still
-/// report.
+/// GitHub ends a hosted job, and each job's steps have limits that add up to less than it, with
+/// 3 minutes over for the set-up and clean-up that no step limit counts. So a step that hangs is
+/// ended by its own limit, the steps after it still report, and the evidence upload and its second
+/// try, which are among the steps counted, keep their own time when every step before them has used
+/// its whole limit.
 #[test]
-fn every_job_of_the_conformance_workflow_has_a_limit_under_githubs_and_the_linux_steps_fit_in_it() {
+fn every_job_of_the_conformance_workflow_has_a_limit_under_githubs_and_its_steps_limits_fit_in_it()
+{
+    const SET_UP_AND_CLEAN_UP_MINUTES: u32 = 3;
     let workflow = fs::read_to_string(repository().join(".github/workflows/conformance.yml"))
         .expect("the conformance workflow");
     let jobs = jobs_of(&workflow);
@@ -1888,30 +1892,31 @@ fn every_job_of_the_conformance_workflow_has_a_limit_under_githubs_and_the_linux
     let minutes = |text: &str, indent: usize| {
         value_at(text, indent, "timeout-minutes").and_then(|value| value.parse::<u32>().ok())
     };
-    for name in jobs.iter().filter(|name| name.as_str() != "linux") {
-        let limit = minutes(&header(&job(&workflow, name)), 4)
+    for name in &jobs {
+        let text = job(&workflow, name);
+        let limit = minutes(&header(&text), 4)
             .unwrap_or_else(|| panic!("the {name} job has no limit of its own"));
         assert!(
             limit < 360,
             "the {name} job's limit of {limit} minutes is not under the 360 GitHub ends a hosted job at"
         );
+        let total: u32 = steps_of(&text)
+            .iter()
+            .map(|step| {
+                minutes(step, 8)
+                    .unwrap_or_else(|| panic!("a step of the {name} job has no limit:\n{step}"))
+            })
+            .sum();
+        assert!(
+            total + SET_UP_AND_CLEAN_UP_MINUTES <= limit,
+            "the {name} job's steps' limits add up to {total} minutes, which with the \
+             {SET_UP_AND_CLEAN_UP_MINUTES} for the set-up and clean-up reach its {limit}"
+        );
     }
-    let linux = job(&workflow, "linux");
     assert_eq!(
-        minutes(&header(&linux), 4),
+        minutes(&header(&job(&workflow, "linux")), 4),
         Some(340),
         "the linux job's limit of its own is not its 340 minutes"
-    );
-    let total: u32 = steps_of(&linux)
-        .iter()
-        .map(|step| {
-            minutes(step, 8)
-                .unwrap_or_else(|| panic!("a step of the linux job has no limit:\n{step}"))
-        })
-        .sum();
-    assert!(
-        total < 340,
-        "the linux job's steps' limits add up to {total} minutes, which its 340 does not exceed"
     );
 }
 
