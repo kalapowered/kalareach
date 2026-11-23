@@ -887,6 +887,134 @@ impl companion_tauri::services::SyncServices for Recording {
     }
 }
 
+/// The transport of the sync service this computer reaches, with one fault: the first write of the
+/// bundle is applied by the service, and the answer names a place of nought, where no write of a
+/// bundle can be. The write has been sent and the store refuses what the service says about it.
+#[derive(Debug)]
+struct Misreads {
+    http: HttpService,
+    armed: std::sync::atomic::AtomicBool,
+}
+
+impl Misreads {
+    /// The answer to `request`, with the place of nought in it when this is the first write.
+    fn misread(
+        &self,
+        request: &[u8],
+        mut answer: kr_client::services::ServiceHttpAnswer,
+    ) -> kr_client::services::ServiceHttpAnswer {
+        fn nought(value: &mut Value) {
+            match value {
+                Value::Object(members) => {
+                    for (name, member) in members.iter_mut() {
+                        if name == "current_write_sequence" && member.is_string() {
+                            *member = json!("0");
+                        } else {
+                            nought(member);
+                        }
+                    }
+                }
+                Value::Array(items) => items.iter_mut().for_each(nought),
+                _ => {}
+            }
+        }
+        let writes = serde_json::from_slice::<Value>(request)
+            .is_ok_and(|document| document["body"].get("exchange").is_some());
+        if !writes || !self.armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            return answer;
+        }
+        if let Ok(mut parsed) = serde_json::from_slice::<Value>(&answer.body) {
+            nought(&mut parsed);
+            answer.body = serde_json::to_vec(&parsed).expect("json");
+        }
+        answer
+    }
+}
+
+impl ServiceHttp for Misreads {
+    fn post_json<'a>(
+        &'a self,
+        url: &'a str,
+        body: &'a [u8],
+        headers: &'a [(&'a str, &'a str)],
+    ) -> ServiceFuture<'a, kr_client::services::ServiceHttpAnswer> {
+        Box::pin(async move {
+            let answer = self.http.post_json(url, body, headers).await?;
+            Ok(self.misread(body, answer))
+        })
+    }
+
+    fn post_json_by<'a>(
+        &'a self,
+        url: &'a str,
+        body: &'a [u8],
+        headers: &'a [(&'a str, &'a str)],
+        gate: &'a kr_client::services::SendGate,
+    ) -> ServiceFuture<'a, Option<kr_client::services::ServiceHttpAnswer>> {
+        Box::pin(async move {
+            Ok(self
+                .http
+                .post_json_by(url, body, headers, gate)
+                .await?
+                .map(|answer| self.misread(body, answer)))
+        })
+    }
+}
+
+/// The application's clients of the sync service this computer reaches, over [`Misreads`].
+#[derive(Debug)]
+struct Misreading {
+    service: GatewayOrigin,
+    key: AuthorisationKeyPair,
+    http: Arc<Misreads>,
+}
+
+impl Misreading {
+    fn of(computer: &Computer) -> Arc<Self> {
+        let service = computer.origin();
+        let http = HttpService::with(
+            service.clone(),
+            HttpDeadlines::default(),
+            managed_response_limits(),
+        )
+        .expect("a transport");
+        Arc::new(Self {
+            service,
+            key: computer.identity().keys.authorisation.clone(),
+            http: Arc::new(Misreads {
+                http,
+                armed: std::sync::atomic::AtomicBool::new(true),
+            }),
+        })
+    }
+
+    fn client(&self) -> ManagedSyncService {
+        ManagedSyncService::new(
+            self.service.clone(),
+            Arc::clone(&self.http) as Arc<dyn ServiceHttp>,
+            Arc::new(Installation(self.key.clone())),
+        )
+    }
+}
+
+impl companion_tauri::services::SyncServices for Misreading {
+    fn installation(
+        &self,
+        _origin: &GatewayOrigin,
+    ) -> companion_tauri::error::Result<Arc<dyn kr_client::services::SharedSyncService>> {
+        Ok(Arc::new(self.client()))
+    }
+
+    fn presenting(
+        &self,
+        _origin: &GatewayOrigin,
+        tokens: Arc<dyn kr_client::services::AccountTokenSource>,
+        scope: &'static str,
+    ) -> companion_tauri::error::Result<Arc<dyn kr_client::services::SharedSyncService>> {
+        Ok(Arc::new(self.client().presenting(tokens, scope)))
+    }
+}
+
 /// KR-REQ-17.14: recovery's bundle store reaches the sync service through the clients the
 /// application was given, and at the origin its record names. The bundle is written through the
 /// client it is given: a fork's client of a service of its own receives the write and the service
@@ -3908,7 +4036,17 @@ impl Computer {
         timing: SettingsTiming,
         oldest: CompatibilityLevel,
     ) -> (Page, Arc<Settings>) {
-        let page = self.page().await;
+        self.saving_page_over(timing, oldest, None).await
+    }
+
+    /// As [`Self::saving_page_at`], with `clients` as the application's clients of the sync service.
+    async fn saving_page_over(
+        &self,
+        timing: SettingsTiming,
+        oldest: CompatibilityLevel,
+        clients: Option<Arc<dyn companion_tauri::services::SyncServices>>,
+    ) -> (Page, Arc<Settings>) {
+        let page = self.page_with(clients).await;
         let settings = {
             let state = page.app.state::<AppState>();
             state.keep_under(self.data.path());
@@ -4885,6 +5023,57 @@ async fn a_first_write_of_the_settings_whose_reply_was_lost_still_counts_against
         .call("recovery_turn_on", json!({}))
         .expect_err("the answer to the first write was lost");
     assert_eq!(lost["code"], "OUTCOME_UNKNOWN");
+    assert_eq!(writes_sent(&computer), 1);
+
+    settings
+        .set_colour_mode(ColourMode::Light)
+        .await
+        .expect("kept");
+    let settled = page.call("recovery_settle", json!({})).expect("settled");
+    assert_eq!(settled["state"], "on");
+    let step = page
+        .recovery
+        .save_settings(&page.account)
+        .await
+        .expect("a step");
+    assert!(
+        matches!(step, SettingsStep::Deferred { .. }),
+        "the first write used the window: {step:?}"
+    );
+    assert_eq!(
+        writes_sent(&computer),
+        1,
+        "no second write inside the window"
+    );
+    assert_eq!(
+        colour_in(&bundle_of(&computer, &page).await).as_deref(),
+        Some("dark"),
+        "the bundle holds what the first write carried"
+    );
+}
+
+/// KR-REQ-20.17: the first write that carries the settings counts against the one deadline when
+/// the service applied it and the store refuses the place it answers with, as it does a place no
+/// write of the bundle can be at: the write has left this device and stays outstanding. The first
+/// bundle lands with a dark mode in it; the person then chooses light and settles the write; the
+/// step that follows finds the window open and writes nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_first_write_of_the_settings_whose_applied_reply_is_refused_still_counts_against_the_window()
+ {
+    let timing = SettingsTiming {
+        quiet: Duration::ZERO,
+        window: Duration::from_secs(600),
+    };
+    let computer = Computer::new().await;
+    let (page, settings) = computer
+        .saving_page_over(timing, level(OPEN), Some(Misreading::of(&computer) as _))
+        .await;
+    settings
+        .set_colour_mode(ColourMode::Dark)
+        .await
+        .expect("kept");
+    page.call("recovery_turn_on", json!({}))
+        .expect_err("the place the service answered is no place a write of the bundle is at");
     assert_eq!(writes_sent(&computer), 1);
 
     settings

@@ -597,20 +597,16 @@ impl Recovery {
                         }
                         other => {
                             with_settings = other.is_ok();
-                            settings_sent = matches!(
-                                &other,
-                                Ok(_)
-                                    | Err(RecoveryError::BundleOutcomeUnknown { .. }
-                                        | RecoveryError::BundleConflict { .. })
-                            );
+                            settings_sent = left_this_device(&other);
                             other
                         }
                     }
                 }
                 None => store.commit(&seed, &mut first, now).await,
             };
-            // A write that carries the settings uses the window whatever came back: one whose answer
-            // was lost may have landed, and the step that follows must not write them again at once.
+            // A write that carries the settings uses the window once it has left this device,
+            // whatever came back: one whose answer was lost or refused may have landed, and the step
+            // that follows must not write them again at once.
             if settings_sent {
                 self.saving.window_from_now(&step);
             }
@@ -1239,6 +1235,24 @@ fn refuse_if_blocked(account: &Account, used: &GatewayOrigin, named: Named) -> R
             ),
         })),
     }
+}
+
+/// Whether a write of the bundle left this device, whatever came back: an answer of any kind, an
+/// applied answer the store refuses for the place it names (which leaves the write outstanding),
+/// or none at all. A write stopped before anything was sent, or by a bundle that does not fit,
+/// did not.
+fn left_this_device<T>(written: &std::result::Result<T, RecoveryError>) -> bool {
+    matches!(
+        written,
+        Ok(_)
+            | Err(RecoveryError::BundleOutcomeUnknown { .. }
+                | RecoveryError::BundleConflict { .. }
+                | RecoveryError::BundleNotAWrite { .. }
+                | RecoveryError::BundlePutBack { .. }
+                | RecoveryError::BundleWentBack { .. }
+                | RecoveryError::BundleHistoryForked { .. }
+                | RecoveryError::BundleDidNotMoveOn { .. })
+    )
 }
 
 /// What a recovery failure is to the person.
