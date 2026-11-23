@@ -131,23 +131,35 @@ describe("the phone's slash commands (KR-REQ-13.12)", () => {
     expect(screen.queryByTestId('slash-commands')).toBeNull()
   })
 
-  it('tells a screen reader that the field controls a list and whether it is open', async () => {
+  it('tells a screen reader which list the field controls and how many commands it holds, and nothing once it closes', async () => {
     const person = userEvent.setup()
     await open()
     const field = screen.getByLabelText('Message this session')
-    expect(field).toHaveAttribute('aria-expanded', 'false')
+    // A textbox does not take aria-expanded; the list is named by aria-controls while it shows.
+    expect(field).not.toHaveAttribute('aria-expanded')
     expect(field).not.toHaveAttribute('aria-controls')
+    // The status is a polite one that is there before it has anything to say, so a reader hears it.
+    const status = screen.getByTestId('slash-count')
+    expect(status).toHaveAttribute('role', 'status')
+    expect(status).toHaveClass('visually-hidden')
+    expect(status).toHaveTextContent(/^$/)
 
     await person.type(field, '/')
     const list = await screen.findByTestId('slash-commands')
-    expect(field).toHaveAttribute('aria-expanded', 'true')
+    expect(field).not.toHaveAttribute('aria-expanded')
     expect(list.id).not.toBe('')
     expect(field).toHaveAttribute('aria-controls', list.id)
+    expect(status).toHaveTextContent(/^3 commands$/)
 
-    await person.click(screen.getByRole('button', { name: /\/model/ }))
+    // The list changes length: one command is "1 command".
+    await person.type(field, 're')
+    expect(within(screen.getByTestId('slash-commands')).getAllByRole('button')).toHaveLength(1)
+    expect(status).toHaveTextContent(/^1 command$/)
+
+    await person.click(screen.getByRole('button', { name: /\/review/ }))
     expect(screen.queryByTestId('slash-commands')).toBeNull()
-    expect(field).toHaveAttribute('aria-expanded', 'false')
     expect(field).not.toHaveAttribute('aria-controls')
+    expect(status).toHaveTextContent(/^$/)
   })
 
   it('says nothing of a list where the agent advertises no command', async () => {
@@ -159,6 +171,7 @@ describe("the phone's slash commands (KR-REQ-13.12)", () => {
     const field = screen.getByLabelText('Message this session')
     await person.type(field, '/')
     expect(screen.queryByTestId('slash-commands')).toBeNull()
+    expect(screen.queryByTestId('slash-count')).toBeNull()
     expect(field).not.toHaveAttribute('aria-expanded')
     expect(field).not.toHaveAttribute('aria-controls')
   })

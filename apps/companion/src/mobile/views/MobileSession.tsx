@@ -209,6 +209,11 @@ function localId(sessionId: string): string {
   return `local:${sessionId}:${key}`
 }
 
+/** What a screen reader is told of a list of commands that opens or changes length. */
+function slashCountWords(count: number): string {
+  return count === 1 ? '1 command' : `${String(count)} commands`
+}
+
 /** Whether a submission belongs to one session. */
 function isForSession(id: string, sessionId: string): boolean {
   return id.startsWith(`local:${sessionId}:`)
@@ -1207,10 +1212,9 @@ export function MobileSession({
         commands.length > 0 && !asLine ? 'Message this session, or type / for a command' : 'Message this session'
       }
       aria-describedby={describedBy}
-      // The list of commands stands before the field in the reading order, so the field says that
-      // it controls one and whether it is open, for a reader that would not otherwise find it.
-      aria-expanded={commands.length > 0 ? listing : undefined}
-      aria-controls={commands.length > 0 && listing ? slashListId : undefined}
+      // The list of commands stands before the field in the reading order, so the field names it
+      // while it shows. A textbox takes no aria-expanded: the status above the list says it opened.
+      aria-controls={listing ? slashListId : undefined}
       onChange={(event) => {
         typeInto(event.target.value)
         setSlashOpen(event.target.value.startsWith('/'))
@@ -1820,6 +1824,13 @@ export function MobileSession({
           ) : null}
           {/* Above the field, where a keyboard under it and a composer that scrolls from its top do not
               take it out of view. */}
+          {typingToProgram || commands.length === 0 ? null : (
+            // A polite status that is there before it has anything to say, so that a reader hears how
+            // many commands the list holds when it opens or changes length, and nothing when it closes.
+            <p className="visually-hidden" role="status" data-testid="slash-count">
+              {listing ? slashCountWords(offeredCommands.length) : ''}
+            </p>
+          )}
           {typingToProgram || !listing ? null : (
             <ul className="m-slash-commands" id={slashListId} data-testid="slash-commands">
               {offeredCommands.map((command) => (
