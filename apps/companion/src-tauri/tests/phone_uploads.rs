@@ -4174,7 +4174,9 @@ async fn kr_req_13_12_a_late_reach_of_an_old_pairing_does_not_finish_its_own_can
 
 /// KR-REQ-13.12 (FU1): a send that the start section refuses removes no copy but its own. A cleanup
 /// that records no cancel ended the first send's upload and its copy, a second send under the same
-/// key wrote a copy since, and the refused send leaves that copy.
+/// key wrote a copy since, and the refused send leaves that copy. Each send waits on a gate of its
+/// own, so that the second cannot go on while the first is let go: the copy that is read after the
+/// first send's answer is the one the first send left.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn kr_req_13_12_a_refused_send_leaves_the_copy_of_the_upload_that_took_its_key() {
     use testing::Point;
@@ -4186,7 +4188,7 @@ async fn kr_req_13_12_a_refused_send_leaves_the_copy_of_the_upload_that_took_its
     let key = kr_ipc::new_uuid();
     let first_bytes = vec![5_u8; 16];
     let second_bytes = vec![6_u8; 16];
-    let after_copy = desk.hold_after_copy_for_test();
+    let first_gate = desk.hold_after_copy_for_test();
     let after = testing::hold_at(key, Point::AfterCopy);
     let first = {
         let sent = request(
@@ -4206,6 +4208,8 @@ async fn kr_req_13_12_a_refused_send_leaves_the_copy_of_the_upload_that_took_its
         None,
         "the cleanup removed the first send's copy"
     );
+    // The first send already holds its gate; the second is given one of its own.
+    let second_gate = desk.hold_after_copy_for_test();
     let second = {
         let sent = request(
             &adopted,
@@ -4217,8 +4221,12 @@ async fn kr_req_13_12_a_refused_send_leaves_the_copy_of_the_upload_that_took_its
         tokio::spawn(async move { desk.send(paired, sent).await })
     };
     after.until_passed(2).await;
-    // The first send waits first, so the permit lets it go.
-    after_copy.add_permits(1);
+    assert_eq!(
+        testing::read_copy(&folder(&phone), key),
+        Some(second_bytes.clone()),
+        "the second send wrote its copy"
+    );
+    first_gate.add_permits(1);
     let refused = tokio::time::timeout(WATCHDOG, first)
         .await
         .expect("the first send answers")
@@ -4229,7 +4237,7 @@ async fn kr_req_13_12_a_refused_send_leaves_the_copy_of_the_upload_that_took_its
         Some(second_bytes),
         "the refused send left the second send's copy"
     );
-    after_copy.add_permits(1);
+    second_gate.add_permits(1);
     tokio::time::timeout(WATCHDOG, second)
         .await
         .expect("the second send answers")
