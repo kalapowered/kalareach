@@ -2704,9 +2704,10 @@ kr host desktop-checks --file ./notes.txt    # the read check reads this file
 kr host desktop-checks --json                # the same, as one document
 ```
 
-The command asks the control daemon to run the checks, waits up to five minutes for the run to
-end, and prints `Disclosed desktop checks` and then one line for each check, the line `kr doctor`
-prints for the same record. `--file` names the file the read check reads, as a full path or a path
+The command asks the control daemon to run the checks and waits for the run to end, and it stops
+five minutes after it started, whether it waits for the host to answer or for the run: a host that
+does not answer is a failure that says so. It prints `Disclosed desktop checks` and then one line
+for each check, the line `kr doctor` prints for the same record. `--file` names the file the read check reads, as a full path or a path
 from the directory the command runs in; the command makes it a full path before it sends it. The
 worker reads that file in this run and in no other. With no file the read check reads nothing and
 says so. A run that is already going is not started again: the command waits for it, and the file
