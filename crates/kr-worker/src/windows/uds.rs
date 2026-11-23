@@ -791,7 +791,7 @@ fn open_directory_without_following(
 /// [`HeldDirectory::is_still_named_by`] says where the path names another directory afterwards.
 #[derive(Debug)]
 pub struct HeldDirectory {
-    _held: std::fs::File,
+    held: std::fs::File,
     object: Object,
 }
 
@@ -807,13 +807,46 @@ pub fn hold_directory(path: &Path) -> std::io::Result<HeldDirectory> {
         FILE_SHARE_READ | FILE_SHARE_WRITE,
     )?;
     let object = file::object_of(&held)?;
-    Ok(HeldDirectory {
-        _held: held,
-        object,
-    })
+    Ok(HeldDirectory { held, object })
 }
 
 impl HeldDirectory {
+    /// Returns where the held directory really is: its final path, every link in the way followed,
+    /// as the system names it for the open handle.
+    ///
+    /// # Errors
+    ///
+    /// Returns the operating system's failure.
+    pub fn final_path(&self) -> std::io::Result<std::path::PathBuf> {
+        use std::os::windows::ffi::OsStringExt as _;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_NAME_NORMALIZED, GetFinalPathNameByHandleW, VOLUME_NAME_DOS,
+        };
+        let mut buffer = vec![0_u16; 512];
+        loop {
+            // SAFETY: the handle is open for the call, and the buffer is a live local of the
+            // length told.
+            let length = unsafe {
+                GetFinalPathNameByHandleW(
+                    self.held.as_raw_handle().cast(),
+                    buffer.as_mut_ptr(),
+                    u32::try_from(buffer.len()).unwrap_or(u32::MAX),
+                    FILE_NAME_NORMALIZED | VOLUME_NAME_DOS,
+                )
+            };
+            let length = usize::try_from(length).unwrap_or(usize::MAX);
+            if length == 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if length < buffer.len() {
+                return Ok(std::path::PathBuf::from(std::ffi::OsString::from_wide(
+                    &buffer[..length],
+                )));
+            }
+            buffer.resize(length + 1, 0);
+        }
+    }
+
     /// Returns true when `path` names the directory that is held, opened now as itself.
     #[must_use]
     ///

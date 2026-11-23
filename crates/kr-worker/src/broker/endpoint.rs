@@ -329,9 +329,15 @@ impl BoundEndpoint {
                 })?;
                 crate::broker::process::check_private_directory(parent)?;
                 // The default root lies in the profile, whose folders no other account writes, and
-                // is left as it is. Any other directory can be anywhere, below a folder another
-                // account controls or a junction it made, so what is above it is read first.
-                if !kr_ipc::paths::lies_inside_the_default_runtime_root(parent) {
+                // is left as it is: a directory is in it when the held directory's final path is
+                // inside the default root's final path, so a name below the default that a
+                // junction leads out of is not. Any other directory can be anywhere, below a
+                // folder another account controls or a junction it made, so what is above it is
+                // read first.
+                let inside_the_default_root = held
+                    .final_path()
+                    .is_ok_and(|real| kr_ipc::paths::lies_inside_the_default_runtime_root(&real));
+                if !inside_the_default_root {
                     crate::broker::process::check_the_directories_above(parent)?;
                 }
                 #[cfg(test)]
@@ -1041,6 +1047,56 @@ mod tests {
         std::fs::remove_dir(&run).expect("the junction is removed as itself");
         let _ = std::fs::remove_dir_all(&outer);
         let _ = std::fs::remove_dir_all(&decoy);
+    }
+
+    /// KR-REQ-07.45: a directory called by a name below the default root, where a junction leads
+    /// out of it, is not in the default root: the walk runs, finds the junction and refuses. The
+    /// exemption rests on where the held directory really is.
+    #[cfg(windows)]
+    #[test]
+    fn a_custom_runtime_root_below_a_junction_inside_the_default_name_is_walked() {
+        assert!(
+            std::env::var_os(kr_ipc::paths::RUNTIME_DIR_VARIABLE).is_none(),
+            "this case runs with the variable unset"
+        );
+        let default = std::path::PathBuf::from(
+            std::env::var_os("LOCALAPPDATA").expect("the profile's local folder is named"),
+        )
+        .join("KalaReach")
+        .join("run");
+        std::fs::create_dir_all(&default).expect("the default root exists");
+        let short = |kind: &str| {
+            let name: String = kr_ipc::new_uuid()
+                .to_string()
+                .chars()
+                .filter(char::is_ascii_hexdigit)
+                .take(8)
+                .collect();
+            format!("kr-{kind}-{name}")
+        };
+        let target = std::env::temp_dir().join(short("t"));
+        std::fs::create_dir_all(&target).expect("the directory is created");
+        let link = default.join(short("r"));
+        let made = std::process::Command::new("cmd")
+            .arg("/c")
+            .arg("mklink")
+            .arg("/J")
+            .arg(&link)
+            .arg(&target)
+            .output()
+            .expect("cmd runs");
+        assert!(made.status.success(), "the junction is made: {made:?}");
+        let run = private_run_directory_in(&link);
+        let refusal = BoundEndpoint::bind_named(&run, "gw.sock")
+            .map(|_| ())
+            .expect_err("a junction below the default root's name leads out of it");
+        assert!(refusal.to_string().contains("is a link"), "{refusal}");
+        assert!(
+            std::fs::symlink_metadata(target.join("run").join("gw.sock")).is_err(),
+            "no socket was made where the junction leads"
+        );
+        std::fs::remove_dir(&link).expect("the junction is removed as itself");
+        let _ = std::fs::remove_dir_all(&target);
     }
 
     /// KR-REQ-07.45: a runtime directory that is not in the default root binds nothing below a

@@ -3650,16 +3650,20 @@ fn lies_inside_by_name(root: &Path, path: &Path) -> bool {
         })
 }
 
-/// Whether `path` lies inside the default runtime root, `%LOCALAPPDATA%\KalaReach\run`, by its own
-/// name.
+/// Whether `real`, the final path of a directory with every link in the way followed, lies inside
+/// the final path of the default runtime root, `%LOCALAPPDATA%\KalaReach\run`.
 ///
-/// A runtime directory is given to a worker as an argument, whatever chose it, so this reads the
-/// directory and not the worker's environment: where it is not inside the default root, someone
-/// chose it, and nothing is known of who can write the folders above it.
+/// A runtime directory is given to a worker as an argument, whatever chose it, so this reads where
+/// the directory really is and not what it was called by: a directory called by a name below the
+/// default root that a junction leads out of it is elsewhere, and is not inside. A default root that
+/// does not exist has no final path, and nothing is inside it.
 #[cfg(windows)]
 #[must_use]
-pub fn lies_inside_the_default_runtime_root(path: &Path) -> bool {
-    default_runtime_root().is_ok_and(|root| lies_inside_by_name(&root, path))
+pub fn lies_inside_the_default_runtime_root(real: &Path) -> bool {
+    default_runtime_root()
+        .ok()
+        .and_then(|root| std::fs::canonicalize(root).ok())
+        .is_some_and(|root| lies_inside_by_name(&root, real))
 }
 
 #[cfg(windows)]
