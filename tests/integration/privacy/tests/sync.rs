@@ -9,7 +9,7 @@
 //!
 //! | Row | What proves it |
 //! | --- | --- |
-//! | KR-REQ-24.27, client side of sync and settings backup | `kr_req_24_28_privacy_enabled_while_a_settings_write_and_a_draft_publication_are_in_flight` |
+//! | KR-REQ-24.27, client side of sync (the device's settings saved in the recovery bundle are not session content and privacy mode does not stop them, as it does not stop the colour mode's sync) | `kr_req_24_28_privacy_enabled_while_a_settings_write_and_a_draft_publication_are_in_flight` |
 //! | KR-REQ-24.28, client side, sync upload in flight | the same leg |
 //!
 //! # Two devices, one installation
@@ -30,7 +30,6 @@ use std::sync::Arc;
 use kr_client::drafts::{
     DraftSealer, DraftStore, DraftSync, DraftTarget, Published as DraftPublished, draft_collection,
 };
-use kr_client::recovery::{RecoveryError, export_settings};
 use kr_client::services::relay::{ServiceHttp, ServiceSigner};
 use kr_client::services::sync::ManagedSyncService;
 use kr_client::services::{SyncBackupService, SyncExchanged};
@@ -483,10 +482,6 @@ async fn kr_req_24_28_privacy_enabled_while_a_settings_write_and_a_draft_publica
             sent,
             "nothing left the device once the fence was up"
         );
-        assert!(matches!(
-            export_settings(one.store(), c),
-            Err(RecoveryError::Sync(SyncError::Fenced { generation: 1 }))
-        ));
 
         let cancelled = one.cancel_undispatched(1, now()).await.expect("cancelled");
         assert_eq!(
@@ -693,7 +688,6 @@ async fn kr_req_24_28_privacy_enabled_while_a_settings_write_and_a_draft_publica
         assert_eq!(one.outstanding().expect("a count"), 0);
         assert!(!ciphertext_held(s) && !ciphertext_held(d_object) && !ciphertext_held(u));
         assert_eq!(drafts.load(d.draft_id).expect("the draft"), edited_d);
-        assert!(export_settings(one.store(), c).is_ok());
         let n = fresh_object_id().expect("an identity");
         one.store()
             .put_object(&settings_object(n, 1, labelled.clone()))

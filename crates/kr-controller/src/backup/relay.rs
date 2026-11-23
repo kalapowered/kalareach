@@ -24,9 +24,10 @@
 //!   read that finds privacy mode on, or changed since the read began, or a delay owed, sends
 //!   nothing. A request already on its way when privacy mode is turned on cannot be recalled; its
 //!   answer is not given (`Controller::backup_read` compares the state after the read).
-//! * **The bundle's write is not held to privacy mode.** The recovery bundle is key material, not
-//!   content, so the write that records a checkpoint in it is sent whatever privacy mode says, as
-//!   the bundle's setup is. The restore that asks for it refuses to run under privacy mode first.
+//! * **The bundle's write is not held to privacy mode.** The recovery bundle is what the kit opens:
+//!   the keys a restore trusts, the checkpoints and, when the owner device saved them, its settings.
+//!   None of that is session content, so the write that records a checkpoint in it is sent
+//!   whatever privacy mode says, as the bundle's setup is. The restore that asks for it refuses to run under privacy mode first.
 //!   A delay the service named holds it, as it holds every request.
 //! * **The service's words stay out.** A refusal by the service reaches the person as its code with
 //!   a sentence of this program's own, never as the service's text, which can repeat what was
@@ -69,8 +70,9 @@ use crate::quiet::Quiet;
 tokio::task_local! {
     /// The privacy state a read began under, for the read being answered in this task.
     static READING: Published;
-    /// Set while a write of the recovery bundle is being answered in this task. The bundle is key
-    /// material, not content, so privacy mode neither stops that write nor is stopped by it.
+    /// Set while a write of the recovery bundle is being answered in this task. The bundle holds
+    /// what the kit opens and no session content, so privacy mode neither stops that write nor is
+    /// stopped by it.
     static WRITING: ();
 }
 
@@ -366,8 +368,8 @@ impl BackupRelay {
     /// It moves a bundle that is there: the call names the place the bundle was read at, and a
     /// service that holds it elsewhere answers [`BackupBundleWriteResult::Conflict`]. Nothing is
     /// kept here about the write, so a write whose answer is lost is the caller's to read about.
-    /// The bundle is key material, so privacy mode does not hold the write back; a delay the
-    /// service named does.
+    /// The bundle holds what the kit opens and no session content, so privacy mode does not hold
+    /// the write back; a delay the service named does.
     ///
     /// # Errors
     ///

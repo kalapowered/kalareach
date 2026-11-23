@@ -11,8 +11,7 @@
 //!    bundle's, it has no usable sign-in, a setup of it is under way, or it was set up under
 //!    another kit and a replacement was not asked for.
 //! 2. It commits the bundle naming the archive, the host's producer and the host's writer, by
-//!    compare-and-swap, as [`SettingsArchive::enable`](crate::recovery::SettingsArchive::enable)
-//!    does, through the one composition [`ArchiveEntries`] holds.
+//!    compare-and-swap, through the one composition [`ArchiveEntries`] holds.
 //! 3. It reads the sealed bytes as the service now holds them and sends them to the host with this
 //!    computer's recipient: the host writes nothing of the bundle that is already there, and goes
 //!    on only if what is there is these bytes.

@@ -12,16 +12,20 @@
 //!   locator, so a bundle copied to another location does not authenticate there. A migration is
 //!   therefore a deliberate act with its own record, not a copy.
 //!
-//! # The bundle is key material, and it settles itself
+//! # The bundle is the owner's kit-opened record, and it settles itself
 //!
-//! Section 20 ¶11 says what a bundle holds: collection locators, trusted backup-writer signing
-//! public keys and generation checkpoints. None of that is session content, so the bundle is not
-//! one of section 24's content-bearing outboxes: enabling privacy mode does not fence it, does not
-//! cancel a write of it and does not delete it, because a deleted bundle is a restore that cannot
-//! verify an archive the owner still holds. It follows that a bundle write needs none of the
-//! request accounting the settings-sync outbox keeps, which exists for content under a privacy
-//! generation and keeps the content it sends. This is a direct, synchronous consumer of
-//! [`SyncBackupService`], and the two paths share the service and nothing else.
+//! Section 20 ¶10 says what a bundle holds for a restore: collection locators, trusted backup-writer
+//! signing public keys and generation checkpoints. That list is not exclusive: the bundle may also
+//! carry the owner device's configuration, the values a person chose on it, as one opaque member
+//! that only the settings restore reads ([`crate::recovery::DeviceSettings`]). None of it is
+//! session content and none of it grants anything, so the bundle is not one of section 24's
+//! content-bearing outboxes: enabling privacy mode does not fence it, does not cancel a write of
+//! it and does not delete it, because a deleted bundle is a restore that cannot verify an archive
+//! the owner still holds, and the member goes either way, as the colour mode's own sync does. It
+//! follows that a bundle write needs none of the request accounting the settings-sync outbox
+//! keeps, which exists for content under a privacy generation and keeps the content it sends. This
+//! is a direct, synchronous consumer of [`SyncBackupService`], and the two paths share the service
+//! and nothing else.
 //!
 //! What a direct consumer still owes is an answer for a write it never heard back about. Every
 //! write carries a fresh identity and the instant the call was made, nothing is retried on its own,

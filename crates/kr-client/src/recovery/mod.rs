@@ -21,12 +21,13 @@
 //! * **A restore puts back data and device configuration, and nothing that would recreate
 //!   authority.** [`may_back_up`] and [`may_restore`] are that rule, each case with the reason it
 //!   is refused.
-//! * **Settings come back as the device's own, and nothing comes back with them.**
-//!   [`export_settings`] and [`import_settings`] are the paths this device's settings object takes
-//!   into a recovery-enabled archive and out of one, and each asks the table for what it carries.
-//!   Neither carries a settings collection's key, its key records, this device's membership or
-//!   where the object stood on the sync service, so a restored device joins a collection only once
-//!   the owner has paired it again and a member has authorised it.
+//! * **Settings come back as values, and nothing comes back with them.** The bundle may carry the
+//!   owner device's settings as one opaque member ([`DeviceSettings`], [`encode_member`] and
+//!   [`decode_member`]), and [`FilesRestore::settings`] reads it with the kit alone. Each side asks
+//!   the table for what it carries. The member holds the values a person chose and no settings
+//!   collection's key, no key record, no membership and no note of where an object stood on the
+//!   sync service, so a restored device joins a collection only once the owner has paired it
+//!   again and a member has authorised it.
 //!
 //! # What the seed is, and is not
 //!
@@ -35,7 +36,6 @@
 //! list of places a seed comes from, and a service is not one of them.
 
 mod account_source;
-mod archive;
 mod bundle;
 mod capacity;
 mod checkpoint;
@@ -45,7 +45,6 @@ mod host_archive;
 mod kit;
 mod record;
 mod restore;
-mod settings;
 mod settings_member;
 mod setup;
 
@@ -56,9 +55,6 @@ use crate::services::SyncPosition;
 use crate::shown::{IoFault, Said, Shown};
 
 pub use crate::recovery::account_source::AccountSource;
-pub use crate::recovery::archive::{
-    ArchiveServices, SettingsArchive, SettingsBackedUp, SettingsCollection, Unsettled,
-};
 pub use crate::recovery::bundle::{
     BundleStore, LostWrite, Migrated, MigrationRecord, WriterEnabled, bundle_collection,
     fresh_locator,
@@ -84,9 +80,6 @@ pub use crate::recovery::kit::{
     MAX_RECOVERY_KIT_BYTES, RECOVERY_KIT_FORMAT, parse_kit, qr_payload, render_kit,
 };
 pub use crate::recovery::restore::{FreshRestore, RetrievalPolicy, ServiceAccess, TrustedMaterial};
-pub use crate::recovery::settings::{
-    ExportedSettings, ImportedSettings, SETTINGS_FILENAME, export_settings, import_settings,
-};
 pub use crate::recovery::settings_member::{
     DEVICE_SETTINGS_BUCKET_BYTES, DeviceSettings, LocalSettings, MAX_DEVICE_SETTINGS_BYTES,
     SavedSettings, SettingsRemoval, SettingsSaved, decode_member, encode_member,
@@ -442,15 +435,6 @@ pub enum RecoveryError {
         /// The table's reason.
         because: &'static str,
     },
-    /// What was offered as this device's settings is not its settings object.
-    #[error("that is not this device's settings: {what}")]
-    NotSettings {
-        /// What it is instead.
-        what: &'static str,
-    },
-    /// This device's sync store refused.
-    #[error("{0}")]
-    Sync(#[from] crate::sync::SyncError),
     /// The service failed.
     #[error("{0}")]
     Service(#[from] crate::error::ClientError),
