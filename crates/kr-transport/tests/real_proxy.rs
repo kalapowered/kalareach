@@ -5,8 +5,8 @@
 //! The stand-in proxies of the other suites say what a client sent. This proxy says what a
 //! maintained proxy accepted and answered: its own access log is the record of which tunnels it
 //! opened, for whom, and which requests it turned away, and its `407` is the one the library's
-//! connector reads. Each case runs only against a proxy the environment names; see
-//! `support/real_proxy.rs`.
+//! connector reads. Each case but the last, which checks the login check itself and runs with no
+//! proxy, runs only against a proxy the environment names; see `support/real_proxy.rs`.
 
 // The digest proxy is read by the suites that share this module, not by this one.
 #[path = "support/real_proxy.rs"]

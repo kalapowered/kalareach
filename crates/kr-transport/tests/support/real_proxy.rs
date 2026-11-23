@@ -27,6 +27,8 @@ pub const WRONG_PASSWORD: &str = "not-this-password";
 /// `Proxy-Authorization` value: the two forms a login can leave in a log.
 pub fn holds_login(text: &str, user: &str, password: &str) -> bool {
     use base64::Engine as _;
+    // Every text holds the empty string, so an empty password would find a login in any log.
+    assert!(!password.is_empty(), "a login check needs a password");
     let basic = base64::engine::general_purpose::STANDARD.encode(format!("{user}:{password}"));
     text.contains(password) || text.contains(&basic)
 }

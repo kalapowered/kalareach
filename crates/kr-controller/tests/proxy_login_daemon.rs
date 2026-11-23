@@ -307,7 +307,8 @@ async fn a_daemon_behind_a_proxy_that_asks_for_a_login_starts_says_so_and_takes_
         proxy.logins()
     );
     daemon.stop();
-    let log = std::fs::read_to_string(host.root().join("daemon.log")).unwrap_or_default();
+    let log = std::fs::read_to_string(host.root().join("daemon.log"))
+        .expect("the daemon's log can be read");
     assert!(!log.contains(PASSWORD), "the daemon's log holds the login");
     let basic = base64::engine::general_purpose::STANDARD.encode(format!("user:{PASSWORD}"));
     assert!(!log.contains(&basic), "the daemon's log holds the login");
@@ -339,7 +340,8 @@ async fn a_wrong_login_is_sent_once_and_the_daemon_stops_every_request_through_t
         "the check's own request, and no other"
     );
     daemon.stop();
-    let log = std::fs::read_to_string(host.root().join("daemon.log")).unwrap_or_default();
+    let log = std::fs::read_to_string(host.root().join("daemon.log"))
+        .expect("the daemon's log can be read");
     assert!(!log.contains("not-the-password"), "the log holds the login");
 }
 
@@ -380,7 +382,8 @@ async fn a_refusal_after_a_good_start_closes_the_endpoint_and_the_daemon_keeps_s
         "the daemon keeps serving: {said}"
     );
     daemon.stop();
-    let log = std::fs::read_to_string(host.root().join("daemon.log")).unwrap_or_default();
+    let log = std::fs::read_to_string(host.root().join("daemon.log"))
+        .expect("the daemon's log can be read");
     assert!(!log.contains(PASSWORD), "the daemon's log holds the login");
 }
 
@@ -458,7 +461,8 @@ async fn an_unreadable_item_and_an_item_for_another_proxy_send_no_login() {
             "{label}: the proxy was written no login"
         );
         daemon.stop();
-        let log = std::fs::read_to_string(host.root().join("daemon.log")).unwrap_or_default();
+        let log = std::fs::read_to_string(host.root().join("daemon.log"))
+            .expect("the daemon's log can be read");
         assert!(!log.contains(PASSWORD), "{label}: the log holds the login");
     }
 }
@@ -664,7 +668,8 @@ async fn a_request_the_proxy_refuses_without_a_word_is_found_by_the_recheck_at_i
         "each request to the address carried the login the proxy takes: {calls:?}"
     );
     daemon.stop();
-    let log = std::fs::read_to_string(host.root().join("daemon.log")).unwrap_or_default();
+    let log = std::fs::read_to_string(host.root().join("daemon.log"))
+        .expect("the daemon's log can be read");
     assert!(!log.contains(PASSWORD), "the daemon's log holds the login");
 }
 
@@ -753,7 +758,8 @@ async fn a_trust_anchor_that_cannot_be_read_ends_the_start_with_its_own_error_an
     .await
     .expect("the daemon's process ended with the anchors' error");
     assert!(!status.success(), "the start ended in failure: {status}");
-    let log = std::fs::read_to_string(host.root().join("daemon.log")).unwrap_or_default();
+    let log = std::fs::read_to_string(host.root().join("daemon.log"))
+        .expect("the daemon's log can be read");
     assert!(
         log.contains("network.relay_trust_anchors entry 1") && log.contains("is not usable"),
         "the start says why it ended: {log}"
@@ -882,7 +888,8 @@ async fn a_daemon_behind_a_real_proxy_starts_says_so_and_takes_the_login_at_its_
             .all(|line| !(line.status == 407 && line.user == proxy.user())),
         "the proxy refused no login the daemon sent: {lines:?}"
     );
-    let log = std::fs::read_to_string(host.root().join("daemon.log")).unwrap_or_default();
+    let log = std::fs::read_to_string(host.root().join("daemon.log"))
+        .expect("the daemon's log can be read");
     assert!(
         !proxy.holds_own_login(&log),
         "the daemon's log holds the login"
@@ -928,7 +935,8 @@ async fn a_wrong_login_is_written_to_a_real_proxy_once_and_the_daemon_stops_ever
         "the proxy was asked for nothing after the refusal"
     );
     daemon.stop();
-    let log = std::fs::read_to_string(host.root().join("daemon.log")).unwrap_or_default();
+    let log = std::fs::read_to_string(host.root().join("daemon.log"))
+        .expect("the daemon's log can be read");
     assert!(
         !holds_login(&log, proxy.user(), "not-the-password"),
         "the daemon's log holds the login"
@@ -969,7 +977,8 @@ async fn a_real_proxy_that_offers_digest_only_is_unsupported_whether_or_not_a_lo
         assert_eq!(lines[0].method, "CONNECT");
         assert_eq!(lines[0].status, 407, "{label}: {lines:?}");
         daemon.stop();
-        let log = std::fs::read_to_string(host.root().join("daemon.log")).unwrap_or_default();
+        let log = std::fs::read_to_string(host.root().join("daemon.log"))
+            .expect("the daemon's log can be read");
         assert!(
             !holds_login(&log, proxy.user(), STORED),
             "{label}: the daemon's log holds the login"
