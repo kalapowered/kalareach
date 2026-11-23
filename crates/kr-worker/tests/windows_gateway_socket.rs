@@ -2,10 +2,9 @@
 //! connects to a socket this host binds, and the kernel names the Codex process that connected.
 //!
 //! Everything else the Windows gateway does rests on this. The terminal is started the way a person
-//! starts it against a remote App Server, `codex --remote unix://<path>`, with no login, on a
-//! the product's own pseudo-console, and the listener is the one the gateway binds, in a private
-//! folder. What is
-//! shown is that the WebSocket upgrade request arrives on the socket and that the peer the broker
+//! starts it against a remote App Server, `codex --remote unix://<path>`, with no login, on the
+//! product's own pseudo-console, and the listener is the one the gateway binds, in a private folder.
+//! What is shown is that the WebSocket upgrade request arrives on the socket and that the peer the broker
 //! reads from the kernel (the process, its start, and its account) is the Codex process the test
 //! started, whose image is `codex.exe`. A run that fails says whether the terminal had ended and
 //! what it last drew, because a login screen, a trust prompt, a connection error and an early exit
@@ -187,7 +186,12 @@ async fn the_real_codex_terminal_connects_to_a_socket_this_host_binds_and_the_ke
             diagnosis(child.as_mut(), &tail)
         ),
     };
-    let started = child.process_id().expect("the terminal has a process");
+    let Some(started) = child.process_id() else {
+        panic!(
+            "the terminal has a process; {}",
+            diagnosis(child.as_mut(), &tail)
+        );
+    };
     assert_eq!(
         accepted.peer.process().pid.get(),
         u64::from(started),
@@ -199,7 +203,13 @@ async fn the_real_codex_terminal_connects_to_a_socket_this_host_binds_and_the_ke
         "its account is this account; {}",
         diagnosis(child.as_mut(), &tail)
     );
-    let facts = kr_ipc::starter::process_facts(started).expect("the process is read");
+    let facts = match kr_ipc::starter::process_facts(started) {
+        Ok(facts) => facts,
+        Err(error) => panic!(
+            "the process is read: {error}; {}",
+            diagnosis(child.as_mut(), &tail)
+        ),
+    };
     assert!(
         facts
             .image
