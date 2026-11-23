@@ -2867,9 +2867,17 @@ fn a_ceiling_the_owner_changes_while_the_process_lives_is_the_one_it_is_held_to(
         ),
     ] {
         rig.service().set_owner_budgets(owner, None);
-        let reports = rig.until(&roomy(), at(3_000), change, |_, driver| {
-            driver.limit_held_bytes() == Some(held)
-        });
+        // The driver follows the ceiling in the turn that finds it changed, so one turn is read,
+        // not waited for.
+        let reports = rig
+            .driver
+            .turn(&roomy(), at(3_000))
+            .expect("a turn after the ceiling changed");
+        assert_eq!(
+            rig.driver.limit_held_bytes(),
+            Some(held),
+            "{change}: the limit the process is held to follows the owner's ceiling"
+        );
         assert!(!the_process_ended(&reports), "{change}: {reports:?}");
         assert_eq!(
             rig.driver.pid(),
