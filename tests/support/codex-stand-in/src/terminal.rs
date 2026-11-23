@@ -107,7 +107,7 @@ pub async fn run(contract: Contract, variants: Variants, socket: &str, prompt: &
     // would.
     let mut origin = variants.origin;
     let mut connection = loop {
-        let stream = match tokio::net::UnixStream::connect(socket).await {
+        let stream = match crate::socket::connect(socket).await {
             Ok(stream) => stream,
             Err(error) => {
                 say!(

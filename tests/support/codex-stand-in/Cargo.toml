@@ -35,7 +35,16 @@ tokio-websockets.workspace = true
 rustix = { workspace = true, features = ["fs", "process", "termios"] }
 
 [target.'cfg(windows)'.dependencies]
-# The server starts each command in a job of its own and ends all of one's processes at once.
+# The terminal reaches the gateway's socket through `uds_windows`, a non-blocking stream registered
+# with `async-io` and read and written through the tokio traits, as the host's own socket is.
+async-io.workspace = true
+# The record is written through the handles and the access-list checks the host's own private
+# files are.
+kr-ipc.workspace = true
+tokio-util = { workspace = true, features = ["compat"] }
+uds_windows.workspace = true
+# The server starts each command in a job of its own and ends all of one's processes at once, and
+# the terminal reads the console's modes and size.
 windows-sys.workspace = true
 
 [dev-dependencies]
@@ -45,7 +54,6 @@ tokio-websockets = { workspace = true, features = ["server"] }
 [target.'cfg(windows)'.dev-dependencies]
 # A case that stands in for the gateway on Windows binds the socket the host's own code binds and
 # reads the process the kernel names at the other end of a connection.
-kr-ipc.workspace = true
 kr-worker.workspace = true
 
 # The workspace forbids unsafe code. This package denies it and allows it only in the module whose

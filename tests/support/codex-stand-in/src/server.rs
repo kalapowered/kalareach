@@ -746,7 +746,6 @@ impl Server {
     /// names, a line that marks the turn's start and a line that holds its prompt, in the file of
     /// the thread. Nothing is written for a turn whose input holds no text, or where `CODEX_HOME`
     /// is not set, or where it does not name a directory inside the run ([`crate::record`]).
-    #[cfg(unix)]
     fn writes_the_record(request: &Value, thread_id: &str, turn_id: &str) {
         let Some(home) = std::env::var_os(crate::variants::CONFIG_VARIABLE) else {
             return;
@@ -773,7 +772,7 @@ impl Server {
         );
         let written = crate::record::appends(
             &home,
-            std::env::var_os("TMPDIR").as_deref(),
+            std::env::var_os(crate::record::TEMPORARY_VARIABLE).as_deref(),
             &below.iter().map(String::as_str).collect::<Vec<_>>(),
             &format!("rollout-{thread_id}.jsonl"),
             lines.as_bytes(),
@@ -781,12 +780,6 @@ impl Server {
         if let Err(error) = written {
             eprintln!("stand-in: the record of {turn_id} could not be written: {error}");
         }
-    }
-
-    /// No record is written where the program has no writer of it.
-    #[cfg(not(unix))]
-    fn writes_the_record(_request: &Value, _thread_id: &str, turn_id: &str) {
-        eprintln!("stand-in: the record of {turn_id} is not written on this platform");
     }
 
     /// Under `answer-the-sum`, writes the sum a turn's input asks for as the agent's message of

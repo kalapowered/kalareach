@@ -28,15 +28,15 @@ fn newer() -> bool {
     option_env!("CARGO_BIN_NAME") == Some("codex-stand-in-newer")
 }
 
+#[cfg(windows)]
+mod console;
 mod contract;
 #[cfg(windows)]
 mod job;
-#[cfg(unix)]
 mod keyboard;
-#[cfg(unix)]
 mod record;
 mod server;
-#[cfg(unix)]
+mod socket;
 mod terminal;
 mod variants;
 
@@ -60,13 +60,11 @@ async fn main() {
         ),
         // The pinned build, started by hand where no gateway serves it: a composer, and nothing to
         // serve.
-        #[cfg(unix)]
         [] if variants.by_hand && !newer() => by_hand(None),
         // The pinned build, started by hand on a saved conversation: its own `resume` or `fork` and
         // the conversation's identifier. The stand-in saves none, so it only says what it was asked.
         // As with a start by hand on nothing, the case says so in `STAND_IN`: a start that does not
         // is one no gateway served, and ends on the last arm.
-        #[cfg(unix)]
         [word @ ("resume" | "fork"), id] if variants.by_hand && !newer() => {
             by_hand(Some(format!("{word} {id}")))
         }
@@ -83,7 +81,6 @@ async fn main() {
         #[cfg(unix)]
         ["--move-work"] => move_work(),
         ["app-server", "--listen", "stdio://"] => server::run(variants).await,
-        #[cfg(unix)]
         ["--remote", remote, words @ ..] | [words @ .., "--remote", remote]
             if remote.starts_with("unix://") =>
         {
@@ -109,13 +106,11 @@ async fn main() {
 }
 
 /// What the line says when a program started by hand is up: the screen shows it before any key.
-#[cfg(unix)]
 const BY_HAND: &str = "codex-stand-in: by hand";
 
 /// What the program does when a person starts it by hand: draws a composer, shows what is typed at
 /// it, says what a typed line or command comes to, and goes on until its input ends or it is ended.
 /// `on` is the saved-conversation command it was started with, where it was.
-#[cfg(unix)]
 fn by_hand(on: Option<String>) -> ! {
     use std::io::Read as _;
     let mut screen = keyboard::Screen::open();

@@ -11,10 +11,14 @@
 use std::fmt::Display;
 use std::io::Write as _;
 
+#[cfg(unix)]
 use rustix::termios::{self, LocalModes, OptionalActions, SpecialCodeIndex, Termios};
 use serde_json::Value;
 use tokio::io::AsyncReadExt as _;
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
+
+#[cfg(windows)]
+use crate::console::Raw;
 
 /// What the composer's row starts with.
 const PROMPT: &str = "> ";
@@ -149,10 +153,12 @@ impl Decoder {
 }
 
 /// The modes of the terminal as they were, put back when this goes.
+#[cfg(unix)]
 struct Raw {
     saved: Termios,
 }
 
+#[cfg(unix)]
 impl Raw {
     /// Puts standard input into the mode keys are read in, one at a time and not shown by the
     /// terminal itself, where it is a terminal.
@@ -170,8 +176,16 @@ impl Raw {
         termios::tcsetattr(&input, OptionalActions::Now, &keys).ok()?;
         Some(Self { saved })
     }
+
+    /// How many columns the terminal has.
+    fn columns(&self) -> Option<usize> {
+        termios::tcgetwinsize(std::io::stdin())
+            .ok()
+            .map(|size| usize::from(size.ws_col))
+    }
 }
 
+#[cfg(unix)]
 impl Drop for Raw {
     fn drop(&mut self) {
         let _ = termios::tcsetattr(std::io::stdin(), OptionalActions::Now, &self.saved);
@@ -219,10 +233,7 @@ impl Screen {
     }
 
     fn with(raw: Option<Raw>) -> Self {
-        let columns = raw
-            .as_ref()
-            .and_then(|_| termios::tcgetwinsize(std::io::stdin()).ok())
-            .map_or(0, |size| usize::from(size.ws_col));
+        let columns = raw.as_ref().and_then(Raw::columns).unwrap_or(0);
         Self {
             raw,
             width: if columns > 20 { columns - 1 } else { 79 },

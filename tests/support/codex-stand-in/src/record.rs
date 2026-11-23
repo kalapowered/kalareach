@@ -10,19 +10,46 @@
 //! without blocking, and checked after: it must be a regular file with one name on the root's
 //! device.
 //! Anything else writes nothing.
+//!
+//! On Windows the same rules are read through handles (see `windows`): the run's temporary
+//! directory is `TEMP` there, a path may start with a drive (`C:\` or `\\?\C:\`), the places a
+//! link can be are reparse points, and the root's mode is its access list.
+
+#[cfg(windows)]
+mod windows;
 
 use std::ffi::OsStr;
+#[cfg(unix)]
 use std::io::Write as _;
 use std::path::{Component, Path};
 
+#[cfg(unix)]
 use rustix::fs::{Mode, OFlags};
 
-/// Whether `path` is absolute and made of plain names: no `..` and no `.` part.
+#[cfg(windows)]
+use self::windows::writes;
+
+/// The variable that names the run's temporary directory.
+#[cfg(unix)]
+pub const TEMPORARY_VARIABLE: &str = "TMPDIR";
+
+/// The variable that names the run's temporary directory.
+#[cfg(windows)]
+pub const TEMPORARY_VARIABLE: &str = "TEMP";
+
+/// Whether `path` is absolute and made of plain names: no `..` and no `.` part. On Windows the
+/// path may start with a drive.
 fn is_plain_and_absolute(path: &Path) -> bool {
     path.is_absolute()
-        && path
-            .components()
-            .all(|part| matches!(part, Component::RootDir | Component::Normal(_)))
+        && path.components().all(|part| match part {
+            Component::RootDir | Component::Normal(_) => true,
+            #[cfg(windows)]
+            Component::Prefix(prefix) => matches!(
+                prefix.kind(),
+                std::path::Prefix::Disk(_) | std::path::Prefix::VerbatimDisk(_)
+            ),
+            _ => false,
+        })
 }
 
 /// Whether `root` has the mark that only a run's root has: its name is `krm-` and eight lowercase
@@ -42,6 +69,7 @@ fn has_a_runs_name(root: &Path) -> bool {
 /// Opens the root's own path one part at a time, from `/` or, where it is not absolute, from the
 /// directory the process is in, each part with no link followed, and returns the root with what
 /// the system says of it.
+#[cfg(unix)]
 fn opens_root(root: &Path) -> Result<(std::os::fd::OwnedFd, rustix::fs::Stat), String> {
     let start = if root.is_absolute() { "/" } else { "." };
     let mut directory = rustix::fs::open(
@@ -71,6 +99,7 @@ fn opens_root(root: &Path) -> Result<(std::os::fd::OwnedFd, rustix::fs::Stat), S
 /// Opens the directory `name` of `directory`, which is made if it is not there, with no link
 /// followed: a link, or anything that is not a directory, is refused, and so is a directory on
 /// another device than `device`, as a volume mounted there would be.
+#[cfg(unix)]
 fn opens_part(
     directory: &std::os::fd::OwnedFd,
     name: &OsStr,
@@ -138,13 +167,30 @@ pub fn appends(
         .strip_prefix(root)
         .map_err(|_| "the agent folder is not inside the run's root".to_owned())?;
     for part in below.iter().chain(&[file]) {
-        if part.is_empty() || part.contains('/') || *part == "." || *part == ".." {
+        if part.is_empty()
+            || part.contains(std::path::is_separator)
+            || *part == "."
+            || *part == ".."
+        {
             return Err(format!("{part:?} is not a plain name"));
         }
     }
     if !has_a_runs_name(root) {
         return Err("the run's root has not the name only a run's root has".to_owned());
     }
+    writes(root, inside, below, file, bytes)
+}
+
+/// Appends `bytes` to the record file `file`, below the root's parts `inside` and `below`, where
+/// the root is opened with no link followed and has the mode only a run's root has.
+#[cfg(unix)]
+fn writes(
+    root: &Path,
+    inside: &Path,
+    below: &[&str],
+    file: &str,
+    bytes: &[u8],
+) -> Result<(), String> {
     let (mut directory, root_status) = opens_root(root)?;
     if root_status.st_mode & 0o777 != 0o700 {
         return Err("the run's root has not the mode only a run's root has".to_owned());
@@ -165,6 +211,7 @@ pub fn appends(
 /// without blocking (a pipe at its name must not hold the writer), and then looked at through the
 /// handle, so that what was opened is what is checked. It must be a regular file with one name on
 /// the device `device`, the run's root's, as every directory above it is.
+#[cfg(unix)]
 fn opens_record(
     directory: &std::os::fd::OwnedFd,
     file: &str,
@@ -195,7 +242,7 @@ fn opens_record(
     Ok(std::fs::File::from(handle))
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::os::unix::fs::symlink;
