@@ -248,8 +248,14 @@ async fn the_real_codex_terminal_connects_to_a_socket_this_host_binds_and_the_ke
         diagnosis(child.as_mut(), &tail)
     );
 
+    // The owner of the volume's root is what the walk above a runtime directory meets first, so
+    // each guest records it.
+    let owner_of_the_root = said_by(
+        "powershell",
+        &["-NoProfile", "-Command", "(Get-Acl C:\\).Owner"],
+    );
     eprintln!(
-        "premise: {} ; {version} ; process {started} ; {}",
+        "premise: {} ; {version} ; process {started} ; {} ; owner of C:\\ {owner_of_the_root}",
         said_by("cmd", &["/c", "ver"]),
         facts.image.display()
     );

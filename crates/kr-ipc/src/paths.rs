@@ -1191,6 +1191,14 @@ mod windows {
     /// this user. The owner itself is trusted separately. Every other account is a refusal.
     const TRUSTED_ACCOUNTS: &[&str] = &["S-1-5-18", "S-1-5-32-544", "S-1-3-0", "S-1-3-4"];
 
+    /// `NT SERVICE\TrustedInstaller`, the servicing stack's account, which owns the system's own
+    /// folders: `C:\` among them on a default install. Only SYSTEM runs as it. It is trusted as the
+    /// owner of, and in the list of, a directory that lies above a boundary directory, as the
+    /// boundary crate's own walk above an installation's trees counts it a system owner, and nowhere
+    /// else.
+    const TRUSTED_INSTALLER: &str =
+        "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464";
+
     /// An entry that grants access.
     const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
     /// An entry that denies access, which cannot widen anything.
@@ -1479,6 +1487,9 @@ mod windows {
         let mut trusted = Vec::with_capacity(TRUSTED_ACCOUNTS.len());
         for text in TRUSTED_ACCOUNTS {
             trusted.push(OwnedSid::parse(text)?);
+        }
+        if matches!(check, Check::Ancestor) {
+            trusted.push(OwnedSid::parse(TRUSTED_INSTALLER)?);
         }
         // Two different rules, so they are two different predicates. The owner has to be an account
         // this process could have created the directory as. The machine's own accounts are trusted
