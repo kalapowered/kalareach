@@ -1527,7 +1527,9 @@ impl Desk {
     /// so an upload has one task, and a connection of another sign-in or of an older pairing never
     /// carries the upload. The task and its handle are made here, in one step under the gate, so a
     /// stop finds the handle. An upload just admitted that is refused for its pairing is ended, and
-    /// so is one whose copy was removed, which has nothing to send or resume from.
+    /// so is an admitted or paused one whose copy was removed, which has nothing to send or resume
+    /// from. A stopping one is refused first: the cleanup that holds it ends it, and its key is
+    /// not free before.
     fn start_under(
         self: &Arc<Self>,
         registry: &mut Registry,
@@ -1544,12 +1546,6 @@ impl Desk {
             || live.cancel_asked.load(Ordering::Acquire)
             || live.owner.account != connection.account
         {
-            return false;
-        }
-        // An upload whose copy was removed has nothing to send or resume from. It ends here, in the
-        // one section every start goes through, and its key is free again.
-        if live.copy_gone.load(Ordering::Acquire) {
-            Self::end_under(registry, live, Outcome::Cancelled);
             return false;
         }
         // A pairing that is no longer the one in force starts nothing: the pairing in force removes
@@ -1571,6 +1567,15 @@ impl Desk {
         {
             let mut phase = locked(&live.phase);
             if !matches!(*phase, Phase::Admitted | Phase::Paused) {
+                return false;
+            }
+            // An upload whose copy was removed has nothing to send or resume from. It ends here,
+            // in the one section every start goes through, and its key is free again. A stopping
+            // upload is refused above: the cleanup that holds it ends it, and the key stays
+            // unavailable until it does.
+            if live.copy_gone.load(Ordering::Acquire) {
+                drop(phase);
+                Self::end_under(registry, live, Outcome::Cancelled);
                 return false;
             }
             *phase = Phase::Sending;
