@@ -2082,21 +2082,57 @@ fn enrolled_and_answering(world: &World, label: &str, access: &str, target: &str
     );
 }
 
+/// What a run of `kr` printed, on standard output and on standard error. A failed `kr --json` says
+/// why in a document on standard output, so a message that held only standard error was empty for it.
+fn printed(output: &std::process::Output) -> String {
+    format!(
+        "standard output: {}; standard error: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )
+}
+
+/// Checks that a run of `kr` succeeded, and reports what it printed when it did not.
+#[track_caller]
+fn assert_ran(output: &std::process::Output, call: &str) {
+    assert!(
+        output.status.success(),
+        "{call} failed: {}",
+        printed(output)
+    );
+}
+
+/// A run of `kr` that failed is reported with what it printed on both streams, and with the call
+/// that made it.
+#[test]
+fn a_failed_run_is_reported_with_what_it_printed_on_both_streams() {
+    let mut output = std::process::Command::new("/usr/bin/false")
+        .output()
+        .expect("false runs");
+    output.stdout = b"kr-test-the-document".to_vec();
+    output.stderr = b"kr-test-the-line".to_vec();
+    let reported = std::panic::catch_unwind(|| assert_ran(&output, "kr --json list"))
+        .expect_err("a failed run is reported");
+    let said = reported
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| reported.downcast_ref::<&str>().map(ToString::to_string))
+        .expect("a message");
+    assert!(
+        said.contains("kr-test-the-document")
+            && said.contains("kr-test-the-line")
+            && said.contains("kr --json list"),
+        "{said}"
+    );
+}
+
 /// Refreshes `label` as `--json` and as lines of text.
 fn refreshed_both_ways(world: &World, label: &str) -> Told {
     let json = world.run(&["--json", "bridge", "refresh", label]);
-    assert!(
-        json.status.success(),
-        "{label}: {}",
-        String::from_utf8_lossy(&json.stderr)
-    );
+    assert_ran(&json, &format!("{label}: kr --json bridge refresh"));
     let document: Value = serde_json::from_slice(&json.stdout).expect("kr printed JSON");
     let said = world.run(&["bridge", "refresh", label]);
-    assert!(
-        said.status.success(),
-        "{label}: {}",
-        String::from_utf8_lossy(&said.stderr)
-    );
+    assert_ran(&said, &format!("{label}: kr bridge refresh"));
     let stdout = String::from_utf8_lossy(&said.stdout).into_owned();
     Told {
         lines: stdout.lines().map(str::to_owned).collect(),
@@ -2570,11 +2606,7 @@ async fn an_ssh_host_registers_its_identity_and_channel_through_a_real_ssh_to_a_
     // The rows `kr bridge list` prints, from a command that succeeded.
     let rows = || -> Vec<Value> {
         let listed = world.run(&["--json", "bridge", "list"]);
-        assert!(
-            listed.status.success(),
-            "{}",
-            String::from_utf8_lossy(&listed.stderr)
-        );
+        assert_ran(&listed, "kr --json bridge list");
         let listed: Value = serde_json::from_slice(&listed.stdout).expect("kr printed JSON");
         listed["rows"].as_array().expect("rows").clone()
     };
@@ -3049,11 +3081,7 @@ async fn an_enrolment_can_name_only_the_terminal_as_its_clipboard_destination() 
     );
 
     let accepted = world.enrolling(Some("terminal"));
-    assert!(
-        accepted.status.success(),
-        "{}",
-        String::from_utf8_lossy(&accepted.stderr)
-    );
+    assert_ran(&accepted, "kr --json bridge enrol --clipboard terminal");
     let listed = world.run(&["--json", "bridge", "list"]);
     let listed: Value = serde_json::from_slice(&listed.stdout).expect("kr printed JSON");
     assert_eq!(
