@@ -207,11 +207,12 @@ enum Followed<R> {
 
 /// Asks for a run and follows it until it ends or `deadline` passes.
 ///
-/// The deadline bounds every call the command makes, the first request and each read, and the wait
-/// between reads, and no read starts at it or after it. A run still going when it passes is
-/// reported as still going, with what the last read found; a daemon that holds its connection open
-/// and never answers ends the command at the deadline with nothing to show but the words that say
-/// so.
+/// The deadline bounds every call the command makes: the read before the request, the request, each
+/// read, and the wait between reads. No call starts at the deadline or after it, so a command that
+/// begins past it, or whose answer to one call comes at it, asks the host nothing more. A run still
+/// going when it passes is reported as still going, with what the last read found; a daemon that
+/// holds its connection open and never answers ends the command at the deadline with nothing to
+/// show but the words that say so.
 ///
 /// The run is the one the host named in its first answer ([`Run`]), and the command reports no
 /// other: a read that finds another run, which a second caller began once this one ended, ends the
@@ -281,14 +282,6 @@ async fn follow<A: Asked>(
     // What the host held when the last read of a run that was still going answered.
     let mut held: Option<A::Records> = None;
     loop {
-        // No read starts at the deadline or after it: it could not be answered in time.
-        if Instant::now() >= deadline {
-            return Ok(if running {
-                out_of_time(seen, held)
-            } else {
-                kept(seen, None, true)
-            });
-        }
         let asked_at = Instant::now();
         let (checks, records) = match within(deadline, asked.read()).await {
             Some(Ok(answer)) => answer,
@@ -354,8 +347,15 @@ impl Run {
     }
 }
 
-/// The outcome of a call, or `None` where `deadline` passed before the host answered it.
+/// The outcome of a call, or `None` where `deadline` had passed before the call started or passes
+/// before the host answers it.
+///
+/// A call that starts at the deadline or after it could not be answered in time, and the clock is
+/// read first because `timeout_at` polls the call before it looks at the deadline.
 async fn within<T>(deadline: Instant, call: impl Future<Output = T>) -> Option<T> {
+    if Instant::now() >= deadline {
+        return None;
+    }
     tokio::time::timeout_at(deadline, call).await.ok()
 }
 
@@ -761,6 +761,78 @@ mod tests {
             *last < origin + WAIT,
             "a read started {:?} after the command began",
             *last - origin
+        );
+    }
+
+    /// Follows a script as [`try_naming`] does, from a command whose deadline is `deadline`.
+    async fn follow_until(
+        script: &mut Script,
+        file: Option<&str>,
+        deadline: Instant,
+    ) -> Followed<Option<usize>> {
+        tokio::time::timeout(
+            WAIT + Duration::from_secs(60),
+            follow(script, file.map(str::to_owned), deadline, || {}),
+        )
+        .await
+        .expect("the command ended")
+        .expect("the scripted host does not fail")
+    }
+
+    /// A command that begins past its deadline asks the host nothing, whether it names a file, which
+    /// it reads the host before the request for, or not: a call that starts there cannot be answered
+    /// in time, and the host that answers it at once would be taken for one that answered in time.
+    #[tokio::test(start_paused = true)]
+    async fn a_command_that_begins_past_its_deadline_asks_the_host_nothing() {
+        for file in [None, Some(NOTES)] {
+            let running = stands(CapabilityChecksState::Running, 10, 1, None);
+            let mut script = Script::new(
+                Answer::Stands(running.clone()),
+                vec![Answer::Stands(running)],
+            );
+            let deadline = Instant::now();
+            tokio::time::advance(Duration::from_millis(1)).await;
+            let followed = follow_until(&mut script, file, deadline).await;
+            assert!(
+                script.asked_at.is_empty(),
+                "the host was read past the deadline (file {file:?})"
+            );
+            assert_eq!(
+                script.begins, 0,
+                "the request was made past the deadline (file {file:?})"
+            );
+            let (seen, words) = unfinished_with(followed);
+            assert_eq!(seen, None);
+            assert!(
+                words.contains("did not answer within five minutes"),
+                "{words}"
+            );
+        }
+    }
+
+    /// The read before the request that answers at the deadline is not followed by the request: the
+    /// deadline bounds the request as it bounds each read.
+    #[tokio::test(start_paused = true)]
+    async fn a_read_before_the_request_that_answers_at_the_deadline_is_not_followed_by_the_request()
+    {
+        let current = stands(CapabilityChecksState::Current, 10, 1, None);
+        let mut script = Script::new(
+            Answer::Stands(current.clone()),
+            vec![Answer::Stands(current)],
+        );
+        script.read_takes = WAIT;
+        let (followed, took) = run_naming(&mut script, Some(NOTES)).await;
+        assert_eq!(
+            script.taken, 1,
+            "the host was read once, before the request"
+        );
+        assert_eq!(script.begins, 0, "the request was made at the deadline");
+        assert!(took <= WAIT, "the command took {took:?}");
+        let (seen, words) = unfinished_with(followed);
+        assert_eq!(seen, None);
+        assert!(
+            words.contains("did not answer within five minutes"),
+            "{words}"
         );
     }
 
