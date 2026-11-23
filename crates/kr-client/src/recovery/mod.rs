@@ -45,6 +45,7 @@ mod kit;
 mod record;
 mod restore;
 mod settings;
+mod settings_member;
 mod setup;
 
 use kr_protocol::ids::SyncConflictId;
@@ -83,6 +84,10 @@ pub use crate::recovery::kit::{
 pub use crate::recovery::restore::{FreshRestore, RetrievalPolicy, ServiceAccess, TrustedMaterial};
 pub use crate::recovery::settings::{
     ExportedSettings, ImportedSettings, SETTINGS_FILENAME, export_settings, import_settings,
+};
+pub use crate::recovery::settings_member::{
+    DEVICE_SETTINGS_BUCKET_BYTES, DeviceSettings, MAX_DEVICE_SETTINGS_BYTES, decode_member,
+    encode_member,
 };
 pub use crate::recovery::setup::{PreparedSetup, SetupInputs, kit_fingerprint, prepare_setup};
 // One definition of what a backup carries, in the crate that owns the backup layer. A device and a
@@ -136,6 +141,36 @@ pub enum RecoveryError {
     /// nothing else: no writer key is taken from the archive to make up for it.
     #[error("the recovery bundle did not authenticate at that origin and locator")]
     BundleNotAuthentic,
+    /// The bundle opened under the key the kit derives and holds what this build does not read.
+    ///
+    /// It authenticated, so it is what its owner wrote, and the bytes were not changed on the way:
+    /// a later build wrote it with a member this build has no name for, which is what saved
+    /// settings are to a build from before them. It is told apart from
+    /// [`Self::BundleNotAuthentic`], which says the key was wrong.
+    #[error("this bundle holds saved settings that need `kr` 0.79 or later")]
+    BundleNeedsANewerKr,
+    /// The settings saved with the bundle cannot be written, read or decoded.
+    ///
+    /// It says nothing about the rest of the bundle: a data restore, a checkpoint and a host's
+    /// cover go on as they would, and only the settings are lost.
+    #[error("the settings saved with the recovery bundle cannot be used: {what}")]
+    SettingsUnusable {
+        /// Why they cannot.
+        what: &'static str,
+    },
+    /// The recovery bundle has no room for the settings.
+    ///
+    /// The member is over its cap, or the sealed bundle would leave less room under the bound
+    /// than the trust entries are kept.
+    #[error(
+        "the recovery bundle has no room for the settings: {len} bytes, over the {limit}-byte limit"
+    )]
+    SettingsDoNotFit {
+        /// The size that did not fit.
+        len: usize,
+        /// The most that fits.
+        limit: usize,
+    },
     /// The kit names another bundle than the one this store holds.
     ///
     /// It is the caller's kit that is wrong, not the bytes a service served, which is why it is

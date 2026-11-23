@@ -1415,6 +1415,7 @@ impl std::fmt::Debug for Migrated {
 /// # Errors
 ///
 /// Returns [`RecoveryError::BundleNotAuthentic`] when the bytes do not open here,
+/// [`RecoveryError::BundleNeedsANewerKr`] when they open and hold what this build does not read,
 /// [`RecoveryError::BundlePutBackEmpty`] when the locator holds no bundle in another history than
 /// the one `seen` is in, the refusals of a place [`BundleStore::commit`] lists, and a service
 /// error when the fetch fails or the locator holds no bundle.
@@ -1444,8 +1445,14 @@ pub(super) async fn read_bundle(
     };
     diagnose(seen, position)?;
     let key = seed.bundle_key_for(context)?;
-    let bundle = kr_crypto::archive::decrypt_recovery_bundle(&key, &ciphertext)
-        .map_err(|_| RecoveryError::BundleNotAuthentic)?;
+    // A bundle that opened and cannot be read was written by a later build, and is not one that
+    // failed to open: the first says what it needs, the second that the key was wrong.
+    let bundle = kr_crypto::archive::decrypt_recovery_bundle(&key, &ciphertext).map_err(
+        |error| match error {
+            kr_crypto::CryptoError::Unreadable { .. } => RecoveryError::BundleNeedsANewerKr,
+            _ => RecoveryError::BundleNotAuthentic,
+        },
+    )?;
     Ok(Baseline {
         position,
         bundle,
