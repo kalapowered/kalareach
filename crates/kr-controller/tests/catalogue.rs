@@ -5126,6 +5126,143 @@ mod native_bridges {
         );
     }
 
+    /// KR-REQ-12.25: the consent a person gives to Claude Code's Channels bridge is a
+    /// confirmation of the words its own manifest makes of it, and it is asked for before anything
+    /// is installed. The host describes the installation from the repository: the statement is the
+    /// one the release's manifest makes of its bridge, the host's notice of a native bridge goes
+    /// with it, and the digest the owner's device builds from what it is shown is the digest the
+    /// host asks to be confirmed. The control is the same plan with one word of the statement
+    /// changed, which has another digest, so a confirmation of other words cannot stand for these.
+    ///
+    /// Windows applies no native bridge (`refused_on_windows`), so this runs on the other
+    /// platforms.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn kr_req_12_25_the_owner_confirms_the_words_the_channels_bridge_makes_of_itself() {
+        use kr_protocol::confirmation::{
+            ConfirmationDisplay, ConfirmationSubject, NATIVE_BRIDGE_NOTICE, install_notices,
+        };
+        let site = Site::new();
+        let host = host(&site);
+        let digest = synchronised(&host).await;
+        let subject = ConfirmationSubject::PluginInstall(Box::new(wire::PluginInstallParams {
+            environment_id: host.environment_id,
+            catalogue_id: "development".to_owned(),
+            plugin_id: claude_code(),
+            version: "0.3.0".to_owned(),
+            package_digest: digest,
+            grant: GRANT.iter().map(|name| (*name).to_owned()).collect(),
+            owner_confirmation: Nullable::null(),
+        }));
+
+        let resolved = host
+            .module
+            .resolve_confirmation(&subject)
+            .await
+            .expect("the repository says what the release's bridge does");
+        let ConfirmationDisplay::PluginInstall {
+            grant,
+            grant_statement,
+            ..
+        } = &resolved.display
+        else {
+            panic!("an installation is shown as one: {:?}", resolved.display);
+        };
+        assert_eq!(
+            grant_statement.0,
+            Some(release_statement()),
+            "the owner is shown the words the manifest makes of the bridge, whole"
+        );
+        assert_eq!(
+            install_notices(grant),
+            [NATIVE_BRIDGE_NOTICE],
+            "and the host's own notice of a native bridge goes with them"
+        );
+
+        // The owner's device builds the digest from what it is shown.
+        let shown = PluginInstallPlan::of_display(&resolved.display).expect("a display of a plan");
+        assert_eq!(shown.action_digest().expect("a digest"), resolved.digest);
+
+        // Control: other words are another confirmation.
+        let other_words = release_statement().replacen("three registration files", "no files", 1);
+        assert_ne!(other_words, release_statement(), "the words did change");
+        let other = PluginInstallPlan {
+            grant_statement: Some(other_words),
+            ..shown
+        };
+        assert_ne!(
+            other.action_digest().expect("a digest"),
+            resolved.digest,
+            "a confirmation of other words is not this one"
+        );
+    }
+
+    /// KR-REQ-12.25: a confirmation the owner gave to other words installs nothing, and the
+    /// confirmation of the words the manifest makes installs the release and records the package
+    /// hash the owner confirmed with the grant it holds. Nothing is written in Claude Code's
+    /// directory by either: the recipe applies when the installation is enabled.
+    ///
+    /// Windows applies no native bridge (`refused_on_windows`), so this runs on the other
+    /// platforms.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn kr_req_12_25_a_confirmation_of_other_words_installs_nothing_and_the_manifests_words_install_it()
+     {
+        let site = Site::new();
+        let host = host(&site);
+        let digest = synchronised(&host).await;
+        let before = site.tree();
+        let other_words = release_statement().replacen("three registration files", "no files", 1);
+        assert_ne!(other_words, release_statement(), "the words did change");
+
+        let refused = refusal(
+            install_release(
+                &host,
+                "development",
+                &claude_code(),
+                &other_words,
+                &digest,
+                true,
+            )
+            .await,
+        );
+        assert_eq!(
+            refused.code,
+            ErrorCode::PermissionDenied,
+            "a confirmation of other words does not authorise this installation: {refused:?}"
+        );
+        assert!(
+            host.module
+                .catalogue()
+                .lock()
+                .await
+                .installation(host.environment_id, &claude_code())
+                .expect("readable")
+                .is_none(),
+            "no installation was recorded"
+        );
+        assert_eq!(site.tree(), before, "nothing was written");
+
+        // Control: the confirmation of the words the manifest makes installs it, and the result
+        // names the hash and the bridge capability the owner confirmed.
+        let installed: wire::PluginInstallResult = ok(install(&host, &digest, true).await);
+        assert_eq!(installed.plugin.package_digest, digest);
+        assert!(
+            installed.capabilities.iter().any(|grant| grant
+                .capability
+                .as_str()
+                .contains("native_bridge.install")
+                && grant.permitted),
+            "the bridge capability is held: {:?}",
+            installed.capabilities
+        );
+        assert_eq!(
+            site.tree(),
+            before,
+            "installing places nothing until enabled"
+        );
+    }
+
     /// KR-REQ-11.42: the organisation's list is in force when the catalogue opens, before any
     /// bridge is brought to what its installation wants, so a restart puts back no registration
     /// the list excludes. The control is a restart with no list, which puts it back.
