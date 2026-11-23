@@ -9,6 +9,7 @@
 //! | `lineage` | Which process started a process and when, on the kernel's interrupt clock |
 //! | `launch` | Starting an agent in its jobs with only the handles it is given |
 //! | `pin` | Holding the directory a command's program works in, so a grant is made of the directory it is in |
+//! | `uds` | A Unix-domain socket, and the process at the other end of one, named by the kernel |
 //!
 //! Section 7 puts the three together. The worker holds the sole owning handle for a per-session
 //! job object with kill-on-close; every process it starts joins that job **before** it runs, which
@@ -36,3 +37,5 @@ pub mod launch;
 pub mod lineage;
 #[cfg(any(windows, test))]
 pub mod pin;
+#[cfg(windows)]
+pub mod uds;

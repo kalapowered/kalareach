@@ -628,6 +628,10 @@ pub fn bridge_of(stream: kr_worker::broker::Stream) -> Bridge {
         kr_worker::broker::Stream::Socket(socket) => socket,
         #[cfg(windows)]
         kr_worker::broker::Stream::Pipe(pipe) => pipe,
+        #[cfg(windows)]
+        kr_worker::broker::Stream::Uds(_) => {
+            panic!("a launch's bridge connects to a pipe, not to a gateway socket")
+        }
     }
 }
 

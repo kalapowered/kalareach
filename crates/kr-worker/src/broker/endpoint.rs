@@ -14,11 +14,17 @@
 //! * **The address is local.** An address something other than this machine could reach is refused
 //!   before it is published; section 12 never exposes this listener through iroh.
 //!
-//! Windows has no Unix socket, so its endpoint is a named pipe that carries its owner's own access
-//! list: another account is refused when it opens the pipe, and the kernel names the process on the
-//! other end, exactly as on a private socket. The two platforms differ only in the transport. A
-//! connection whose peer the kernel will not name is refused on both, so no admission rests on an
-//! identity the connecting side presented.
+//! Windows has two kinds. A launch's bridge connects to a named pipe that carries its owner's own
+//! access list: another account is refused when it opens the pipe, and the kernel names the process
+//! on the other end, exactly as on a private socket. The gateway's agent program connects to a
+//! Unix-domain socket inside the owner-only directory, which Windows also has. What an admission
+//! rests on there is the peer check: the kernel names the process on the other end and that
+//! process's own token names its account, both before a byte of what the peer sent is read. The
+//! socket's file also carries a protected list that names its owner only, as defence in depth: no
+//! admission relies on it. A build that cannot name the process on the other end of a socket binds
+//! none, and says so before any launch is committed. A connection whose peer the kernel will not
+//! name is refused on every kind, so no admission rests on an identity the connecting side
+//! presented.
 
 use kr_protocol::identity::ProcessStartIdentity;
 
@@ -79,11 +85,18 @@ pub enum Stream {
     /// A named pipe that carries its owner's access list.
     #[cfg(windows)]
     Pipe(kr_ipc::endpoint::Connection),
+    /// A Unix-domain socket inside the owner-only runtime directory.
+    #[cfg(windows)]
+    Uds(crate::windows::uds::Stream),
 }
 
 /// The device and inode of a socket file.
 #[cfg(unix)]
 pub(crate) type SocketIdentity = (u64, u64);
+
+/// The volume and file id of a socket file.
+#[cfg(windows)]
+pub(crate) type SocketIdentity = crate::windows::file::Object;
 
 /// The identity of the socket that stands at `path` now, or none where nothing does or something
 /// else does.
@@ -97,6 +110,13 @@ pub(crate) fn socket_identity(path: &std::path::Path) -> Option<SocketIdentity> 
         .then(|| (metadata.dev(), metadata.ino()))
 }
 
+/// The identity of the socket that stands at `path` now, or none where nothing does or something
+/// else does.
+#[cfg(windows)]
+pub(crate) fn socket_identity(path: &std::path::Path) -> Option<SocketIdentity> {
+    crate::windows::uds::socket_object(path)
+}
+
 /// Removes what stands at `path` only when it is the socket whose identity `made` is: a path that
 /// names another socket, a file or nothing is left as it is, because it is not what a bind made.
 #[cfg(unix)]
@@ -104,6 +124,51 @@ pub(crate) fn remove_socket_made(path: &std::path::Path, made: SocketIdentity) {
     if socket_identity(path) == Some(made) {
         let _ = std::fs::remove_file(path);
     }
+}
+
+/// Removes what stands at `path` only when it is the socket whose identity `made` is, as the handle
+/// that removes it reads it.
+#[cfg(windows)]
+pub(crate) fn remove_socket_made(path: &std::path::Path, made: SocketIdentity) {
+    crate::windows::uds::remove_socket_made(path, made);
+}
+
+/// The longest path a socket this host binds has on Windows.
+///
+/// Windows holds a socket's path in the 108 bytes of `sun_path`, and the last is the terminator.
+/// `kr_ipc::paths::MAX_SOCKET_PATH_LEN` is the bound of a pipe's name there and is not this.
+#[cfg(any(windows, test))]
+pub(crate) const WINDOWS_SOCKET_PATH_LIMIT: usize = 107;
+
+/// Refuses a socket path longer than `limit` bytes, one that is not text and one with a NUL in it,
+/// by name.
+///
+/// The address is a path, and the platform bounds it, so a runtime directory that is most of the
+/// bound leaves no room for the file name below it. The refusal says how long the path is and how
+/// long it may be, and how to leave room.
+#[cfg(any(windows, test))]
+pub(crate) fn require_room_for_a_socket_path(path: &std::path::Path, limit: usize) -> Result<()> {
+    let Some(text) = path.to_str() else {
+        return Err(BrokerError::invalid(format!(
+            "the socket path {} is not text, and a socket's address is",
+            path.display()
+        )));
+    };
+    if text.contains('\0') {
+        return Err(BrokerError::invalid(format!(
+            "the socket path {} has a NUL in it, and a socket's address ends at one",
+            text.escape_debug()
+        )));
+    }
+    let length = text.len();
+    if length > limit {
+        return Err(BrokerError::invalid(format!(
+            "the socket path {text} is {length} bytes, and a socket's path is at most {limit} on \
+             this platform; a shorter runtime directory ({}) leaves room",
+            kr_ipc::paths::RUNTIME_DIR_VARIABLE
+        )));
+    }
+    Ok(())
 }
 
 /// The endpoint a launched agent's bridge connects to.
@@ -123,6 +188,13 @@ enum Bound {
     Socket(tokio::net::UnixListener),
     #[cfg(windows)]
     Pipe(kr_ipc::endpoint::Listener),
+    /// A Unix-domain socket and the identity of its file, read as soon as its bind succeeded: what
+    /// its end removes, and nothing else.
+    #[cfg(windows)]
+    Uds {
+        listener: crate::windows::uds::Listener,
+        made: SocketIdentity,
+    },
 }
 
 impl BoundEndpoint {
@@ -145,7 +217,7 @@ impl BoundEndpoint {
     /// # Errors
     ///
     /// Returns what [`BoundEndpoint::bind`] does.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub fn bind_named(runtime_directory: &std::path::Path, name: &str) -> Result<Self> {
         if !runtime_directory.is_absolute() {
             return Err(BrokerError::invalid(
@@ -215,7 +287,38 @@ impl BoundEndpoint {
                     made,
                 })
             }
-            #[cfg(not(unix))]
+            #[cfg(windows)]
+            ListenerAddress::PrivateSocket(path) => {
+                require_room_for_a_socket_path(path, WINDOWS_SOCKET_PATH_LIMIT)?;
+                // The directory is read again here, as for a socket on Unix: a directory whose
+                // list changed between choosing the address and binding it is one this socket
+                // must not be created in.
+                let parent = path.parent().ok_or_else(|| {
+                    BrokerError::invalid("a private socket lives inside a directory")
+                })?;
+                crate::broker::process::check_private_directory(parent)?;
+                // The bind proves the build names its peers, makes the socket's file, gives it
+                // the owner-only list through the handle it opened and reads that list back from
+                // the same handle, and returns the identity of the file it made.
+                let (listener, made) =
+                    crate::windows::uds::Listener::bind(path).map_err(|failure| match failure {
+                        crate::windows::uds::BindFailure::Bind(error) => bind_refusal(path, &error),
+                        // The build cannot name the process that connects, so nothing bound here
+                        // could be told who connected to it: the launch is refused by name and the
+                        // program runs as typed.
+                        crate::windows::uds::BindFailure::NoPeerProcess(detail) => {
+                            BrokerError::UnsupportedCapability { detail }
+                        }
+                        crate::windows::uds::BindFailure::Unprotected(detail) => {
+                            BrokerError::ledger(detail)
+                        }
+                    })?;
+                Ok(Self {
+                    address,
+                    listener: Bound::Uds { listener, made },
+                })
+            }
+            #[cfg(not(any(unix, windows)))]
             ListenerAddress::PrivateSocket(_) => Err(BrokerError::UnsupportedCapability {
                 detail: "this platform has no private socket".to_owned(),
             }),
@@ -327,6 +430,33 @@ impl BoundEndpoint {
                     stream: Stream::Pipe(connection),
                 })
             }
+            #[cfg(windows)]
+            Bound::Uds { listener, .. } => {
+                let stream = listener.accept().await.map_err(|error| {
+                    BrokerError::ledger(format!("the endpoint could not accept: {error}"))
+                })?;
+                // The kernel names the process, and its own token says whose it is: nothing the
+                // connecting side wrote is read.
+                let pid = stream.peer_process().map_err(|error| {
+                    BrokerError::denied(format!(
+                        "the operating system would not name the connecting process: {error}"
+                    ))
+                })?;
+                let process = kr_ipc::identity::process_start_identity(pid).map_err(|error| {
+                    BrokerError::denied(format!(
+                        "the connecting process could not be identified: {error}"
+                    ))
+                })?;
+                let owner = crate::windows::uds::process_is_this_account(pid).map_err(|error| {
+                    BrokerError::denied(format!(
+                        "the account of the connecting process could not be read: {error}"
+                    ))
+                })?;
+                Ok(Accepted {
+                    peer: PeerIdentity { process, owner },
+                    stream: Stream::Uds(stream),
+                })
+            }
         }
     }
 }
@@ -346,6 +476,17 @@ impl BoundEndpoint {
             remove_socket_made(path, self.made);
         }
     }
+
+    /// Removes the socket file this endpoint made, if it still stands at its address and is that
+    /// socket.
+    #[cfg(windows)]
+    pub(crate) fn remove_its_socket(&self) {
+        if let (ListenerAddress::PrivateSocket(path), Bound::Uds { made, .. }) =
+            (&self.address, &self.listener)
+        {
+            remove_socket_made(path, *made);
+        }
+    }
 }
 
 impl Drop for BoundEndpoint {
@@ -354,7 +495,7 @@ impl Drop for BoundEndpoint {
         // launch refuse to bind. Removing it is the endpoint's own business, because it is the
         // only thing that knows it created it, and it removes that socket and nothing else: a
         // path that names another socket by now is another program's.
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         self.remove_its_socket();
     }
 }
@@ -498,6 +639,193 @@ mod tests {
         let _ = std::fs::remove_dir_all(&directory);
     }
 
+    /// A private directory under the temporary one, which a socket's path stays short in.
+    #[cfg(windows)]
+    fn private_directory() -> std::path::PathBuf {
+        let name: String = kr_ipc::new_uuid()
+            .to_string()
+            .chars()
+            .filter(char::is_ascii_hexdigit)
+            .take(8)
+            .collect();
+        let directory = std::env::temp_dir().join(format!("kr-e-{name}"));
+        kr_ipc::paths::create_private_directory(&directory).expect("a private directory is made");
+        directory
+    }
+
+    /// KR-REQ-07.45: on Windows a gateway's socket is a Unix-domain socket in the owner-only
+    /// directory, reachable from this machine only, and named by the kernel's own reading of the
+    /// process that connects and by that process's own token.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_bound_socket_names_the_process_that_connects() {
+        let directory = private_directory();
+        let endpoint =
+            BoundEndpoint::bind_named(&directory, "gw.sock").expect("the endpoint binds");
+        let ListenerAddress::PrivateSocket(path) = endpoint.address().clone() else {
+            panic!("a named bind on this platform is a private socket");
+        };
+        assert_eq!(path, directory.join("gw.sock"));
+        assert!(endpoint.address().is_local());
+
+        let connect = tokio::spawn(async move {
+            crate::windows::uds::Stream::connect(&path).expect("the program connects")
+        });
+        let accepted = endpoint.accept().await.expect("the connection is accepted");
+        assert!(accepted.peer.is_owner());
+        assert_eq!(
+            accepted.peer.process().pid.get(),
+            u64::from(std::process::id()),
+            "the identity is the kernel's reading of the connecting process"
+        );
+        assert!(matches!(accepted.stream, Stream::Uds(_)));
+        drop(connect.await.expect("the connecting task finishes"));
+        drop(endpoint);
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// KR-REQ-07.45: a socket is never created in a directory that is not private: an ordinary
+    /// directory under the temporary one carries the profile's own inherited entries.
+    #[cfg(windows)]
+    #[test]
+    fn a_socket_in_a_directory_that_is_not_private_binds_nothing() {
+        let directory = std::env::temp_dir().join(format!("kr-e-{}", kr_ipc::new_uuid()));
+        std::fs::create_dir_all(&directory).expect("the directory is created");
+        assert!(BoundEndpoint::bind_named(&directory, "gw.sock").is_err());
+        assert!(
+            std::fs::symlink_metadata(directory.join("gw.sock")).is_err(),
+            "no socket was made"
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// KR-REQ-12.07: a path that is not text is refused by name, and a path of two-byte characters is
+    /// measured in bytes, not in characters.
+    #[cfg(windows)]
+    #[test]
+    fn a_socket_path_is_measured_in_utf8_bytes_and_must_be_text() {
+        use std::os::windows::ffi::OsStringExt as _;
+        let not_text = std::path::PathBuf::from(std::ffi::OsString::from_wide(&[
+            u16::from(b'C'),
+            u16::from(b':'),
+            u16::from(b'\\'),
+            0xD800,
+        ]));
+        let refusal = require_room_for_a_socket_path(&not_text, WINDOWS_SOCKET_PATH_LIMIT)
+            .expect_err("an unpaired surrogate is no text");
+        assert!(refusal.to_string().contains("not text"), "{refusal}");
+
+        // Fifty-four characters of two bytes each fit a limit of 107 bytes by characters and not by
+        // bytes.
+        let wide = std::path::PathBuf::from(format!("C:\\{}", "\u{e9}".repeat(54)));
+        assert!(
+            wide.to_str()
+                .is_some_and(|text| text.chars().count() < WINDOWS_SOCKET_PATH_LIMIT)
+        );
+        assert!(require_room_for_a_socket_path(&wide, WINDOWS_SOCKET_PATH_LIMIT).is_err());
+    }
+
+    /// KR-REQ-07.45: the socket's own list is protected, so widening what its directory passes down
+    /// after the bind does not reach it: it still names its owner only, read from its own handle,
+    /// while the directory itself no longer counts as private.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_socket_stays_owner_only_when_its_directory_s_inheritable_list_widens() {
+        let directory = private_directory();
+        let endpoint =
+            BoundEndpoint::bind_named(&directory, "gw.sock").expect("the endpoint binds");
+        let path = directory.join("gw.sock");
+        crate::windows::uds::check_access_list(&path, true).expect("protected at the bind");
+        // Everyone may read what the directory holds and what is made in it from now on, and the
+        // change is carried to everything below that inherits.
+        let widened = std::process::Command::new("icacls")
+            .arg(&directory)
+            .args(["/grant", "*S-1-1-0:(OI)(CI)(R)"])
+            .output()
+            .expect("icacls runs");
+        assert!(widened.status.success(), "the entry is added: {widened:?}");
+        assert!(
+            crate::broker::process::check_private_directory(&directory).is_err(),
+            "the widened directory is no longer private"
+        );
+        crate::windows::uds::check_access_list(&path, true)
+            .expect("the socket's own list is still protected and names no other account");
+        drop(endpoint);
+        assert_eq!(socket_identity(&path), None, "its end still removes it");
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// KR-REQ-12.07: a path over the limit is refused by name and makes nothing, and a path of
+    /// exactly the limit binds.
+    #[cfg(windows)]
+    #[test]
+    fn a_socket_path_over_the_limit_binds_nothing() {
+        let directory = private_directory();
+        let base = directory.to_str().expect("a text path").len() + 1;
+        let fits = "s".repeat(WINDOWS_SOCKET_PATH_LIMIT - base);
+        let bound =
+            BoundEndpoint::bind_named(&directory, &fits).expect("a path at the limit binds");
+        drop(bound);
+
+        let too_long = "s".repeat(WINDOWS_SOCKET_PATH_LIMIT - base + 1);
+        let refusal = BoundEndpoint::bind_named(&directory, &too_long)
+            .map(|_| ())
+            .expect_err("a path over the limit is refused");
+        assert!(
+            matches!(refusal, BrokerError::InvalidArgument(_)),
+            "{refusal:?}"
+        );
+        assert!(refusal.to_string().contains("at most 107"), "{refusal}");
+        assert!(
+            std::fs::symlink_metadata(directory.join(&too_long)).is_err(),
+            "no socket was made"
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// KR-REQ-12.07: an endpoint removes the socket file it made and no other: a path that names
+    /// another socket, or a file, by the time the endpoint ends is not its own and stays, and the
+    /// socket it made is removed where nothing has replaced it.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_socket_is_removed_only_when_it_is_the_one_made() {
+        let directory = private_directory();
+        let path = directory.join("gw.sock");
+
+        let untouched = BoundEndpoint::bind_named(&directory, "gw.sock").expect("it binds");
+        let Bound::Uds { made, .. } = &untouched.listener else {
+            panic!("a named bind on this platform is a socket");
+        };
+        assert_eq!(socket_identity(&path), Some(*made));
+        drop(untouched);
+        assert_eq!(
+            socket_identity(&path),
+            None,
+            "the socket it made is removed"
+        );
+
+        let replaced = BoundEndpoint::bind_named(&directory, "gw.sock").expect("it binds");
+        std::fs::remove_file(&path).expect("another program takes the path");
+        let other = uds_windows::UnixListener::bind(&path).expect("another socket");
+        drop(replaced);
+        assert!(
+            uds_windows::UnixStream::connect(&path).is_ok(),
+            "the other program's socket was not removed"
+        );
+        drop(other);
+        std::fs::remove_file(&path).expect("the other program's socket is cleared");
+
+        let overwritten = BoundEndpoint::bind_named(&directory, "gw.sock").expect("it binds");
+        std::fs::remove_file(&path).expect("something takes the path");
+        std::fs::write(&path, b"a file").expect("a file stands there");
+        drop(overwritten);
+        assert_eq!(
+            std::fs::read(&path).expect("the file was not removed"),
+            b"a file"
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
     /// A runtime directory that is not private binds nothing, where the list says so: an ordinary
     /// directory under the temporary one carries the profile's own inherited entries.
     #[cfg(windows)]
@@ -507,6 +835,33 @@ mod tests {
         std::fs::create_dir_all(&directory).expect("the directory is created");
         assert!(BoundEndpoint::bind(&directory).is_err());
         let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// KR-REQ-12.07: a socket path with no room is refused by name, once, with the length it has and
+    /// the length it may have: a path of exactly the limit is not refused, and one byte more is.
+    #[test]
+    fn a_path_over_the_limit_is_refused_by_name() {
+        assert_eq!(
+            WINDOWS_SOCKET_PATH_LIMIT, 107,
+            "a socket's path is held in the 108 bytes of `sun_path`, and one is the terminator"
+        );
+        let limit = WINDOWS_SOCKET_PATH_LIMIT;
+        let at_the_limit = std::path::PathBuf::from(format!("/{}", "x".repeat(limit - 1)));
+        assert_eq!(at_the_limit.as_os_str().len(), limit);
+        require_room_for_a_socket_path(&at_the_limit, limit).expect("a path at the limit has room");
+
+        let over = std::path::PathBuf::from(format!("/{}", "x".repeat(limit)));
+        let refusal = require_room_for_a_socket_path(&over, limit).expect_err("one byte too many");
+        assert!(matches!(refusal, BrokerError::InvalidArgument(_)));
+        let said = refusal.to_string();
+        assert!(said.contains(&format!("is {} bytes", limit + 1)), "{said}");
+        assert!(said.contains(&format!("at most {limit}")), "{said}");
+        assert!(said.contains(kr_ipc::paths::RUNTIME_DIR_VARIABLE), "{said}");
+
+        let with_a_nul = std::path::PathBuf::from("/a\0b");
+        let refusal = require_room_for_a_socket_path(&with_a_nul, limit)
+            .expect_err("an address ends at a NUL");
+        assert!(refusal.to_string().contains("NUL"), "{refusal}");
     }
 
     // Unix only: the directory decides who may connect only where the endpoint is a socket in it.
@@ -527,13 +882,20 @@ mod tests {
 /// moment: something that is not a socket is named for what it is, a socket is said to occupy the
 /// address (the launch's directory is new, so nothing there is the broker's to replace, and no
 /// claim about whether its listener runs is made), and any other failure is the bind step's own.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn bind_refusal(path: &std::path::Path, error: &std::io::Error) -> BrokerError {
     use kr_ipc::listen::{ListenRefusal, ListenStep, ObjectKind};
-    use std::os::unix::fs::FileTypeExt as _;
+
+    #[cfg(unix)]
+    let is_a_socket = |metadata: &std::fs::Metadata| {
+        use std::os::unix::fs::FileTypeExt as _;
+        metadata.file_type().is_socket()
+    };
+    #[cfg(windows)]
+    let is_a_socket = |_: &std::fs::Metadata| socket_identity(path).is_some();
 
     let refusal = match std::fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_socket() => ListenRefusal::Occupied,
+        Ok(metadata) if is_a_socket(&metadata) => ListenRefusal::Occupied,
         Ok(metadata) => ListenRefusal::NotASocket {
             object: ObjectKind::of(metadata.file_type()),
         },
@@ -592,5 +954,60 @@ mod bind_tests {
         }
         assert_eq!(std::fs::read(&file).expect("the file"), b"mine");
         assert!(directory.is_dir() && socket.exists());
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_bind_tests {
+    use super::*;
+    use kr_ipc::listen::{ListenRefusal, ObjectKind};
+
+    /// A launch's socket that cannot be bound is named for what stands at its address: a file, a
+    /// directory or a socket, each left alone.
+    #[tokio::test]
+    async fn a_broker_bind_names_what_stands_at_the_path() {
+        let name: String = kr_ipc::new_uuid()
+            .to_string()
+            .chars()
+            .filter(char::is_ascii_hexdigit)
+            .take(8)
+            .collect();
+        let folder = std::env::temp_dir().join(format!("kr-e-{name}"));
+        kr_ipc::paths::create_private_directory(&folder).expect("a private directory is made");
+        let file = folder.join("file.sock");
+        std::fs::write(&file, b"mine").expect("a file");
+        let directory = folder.join("directory.sock");
+        std::fs::create_dir(&directory).expect("a directory");
+        let socket = folder.join("socket.sock");
+        let _listener = uds_windows::UnixListener::bind(&socket).expect("a socket");
+        for (name, expected) in [
+            (
+                "file.sock",
+                ListenRefusal::NotASocket {
+                    object: ObjectKind::File,
+                },
+            ),
+            (
+                "directory.sock",
+                ListenRefusal::NotASocket {
+                    object: ObjectKind::Directory,
+                },
+            ),
+            ("socket.sock", ListenRefusal::Occupied),
+        ] {
+            let error = BoundEndpoint::bind_named(&folder, name)
+                .map(|_| ())
+                .expect_err("the address is taken");
+            match error {
+                BrokerError::Listen { endpoint, refusal } => {
+                    assert_eq!(refusal, expected, "{name}");
+                    assert_eq!(endpoint, folder.join(name).to_string_lossy());
+                }
+                other => panic!("a listen refusal, not {other:?}"),
+            }
+        }
+        assert_eq!(std::fs::read(&file).expect("the file"), b"mine");
+        assert!(directory.is_dir() && socket_identity(&socket).is_some());
+        let _ = std::fs::remove_dir_all(&folder);
     }
 }

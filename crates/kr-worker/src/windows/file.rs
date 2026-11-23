@@ -16,8 +16,9 @@ use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle};
 
 use windows_sys::Win32::Foundation::{ERROR_INVALID_PARAMETER, HANDLE};
 use windows_sys::Win32::Storage::FileSystem::{
-    FILE_BASIC_INFO, FILE_ID_INFO, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
-    FILE_SHARE_WRITE, FileBasicInfo, FileIdInfo, GetFileInformationByHandleEx,
+    FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO, FILE_BASIC_INFO, FILE_ID_INFO,
+    FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    FileAttributeTagInfo, FileBasicInfo, FileIdInfo, GetFileInformationByHandleEx,
 };
 use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
 
@@ -89,6 +90,35 @@ pub fn object_of(file: &std::fs::File) -> std::io::Result<Object> {
         volume: information.VolumeSerialNumber,
         id: u128::from_le_bytes(information.FileId.Identifier),
     })
+}
+
+/// Reads which kind of reparse point an opened file is, or none where it is not one.
+///
+/// A link, a mount point and a Unix-domain socket's file are each a reparse point with a tag of
+/// their own, which is what tells them apart where the volume gives them all the same attributes.
+///
+/// # Errors
+///
+/// Returns the operating system's failure.
+pub fn reparse_tag_of(file: &std::fs::File) -> std::io::Result<Option<u32>> {
+    // SAFETY: all zeroes is a structure of integers.
+    let mut information: FILE_ATTRIBUTE_TAG_INFO = unsafe { std::mem::zeroed() };
+    // SAFETY: as for the id: an open handle and a local of the size told.
+    let read = unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle().cast(),
+            FileAttributeTagInfo,
+            std::ptr::from_mut(&mut information).cast(),
+            u32::try_from(std::mem::size_of::<FILE_ATTRIBUTE_TAG_INFO>()).unwrap_or(0),
+        )
+    };
+    if read == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(
+        (information.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0)
+            .then_some(information.ReparseTag),
+    )
 }
 
 /// Reads when an opened file was last written and last changed.

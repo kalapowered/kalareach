@@ -1253,6 +1253,11 @@ fn split_stream(stream: Stream) -> Halves {
             let (reader, writer) = tokio::io::split(pipe);
             (Box::new(reader), Box::new(writer))
         }
+        #[cfg(windows)]
+        Stream::Uds(socket) => {
+            let (reader, writer) = tokio::io::split(socket);
+            (Box::new(reader), Box::new(writer))
+        }
     }
 }
 
