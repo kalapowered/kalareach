@@ -11,7 +11,7 @@
 //! | [`contract`] | The commit points and the flush policy that keeps grouping safe |
 //! | [`stores`] | Every store's durability, retention, content class, cleanup and reconciliation |
 //! | [`fault`] | The journal-fault and recovery seam: fault detected, rich work fenced, gap committed |
-//! | [`outbox`] | A state transition and its event in one transaction, with at-least-once idempotent fan-out |
+//! | [`outbox`] | A state transition and its event in one transaction |
 //! | [`capacity`] | A full durable store refusing new mutations before dispatch, with the stated exceptions |
 //! | [`migration`] | Forward-only transactional migrations, and the version range they cover |
 //! | [`import`] | The explicit importer for a journal older than that range |
@@ -32,7 +32,8 @@ pub use crate::persistence::fault::{
     DurabilityPosture, FaultKind, JournalCondition, JournalFault, JournalHealth, RecoveryGap,
     WorkClass,
 };
-pub use crate::persistence::outbox::{OutboxCursor, OutboxEvent, OutboxRecord};
+#[cfg(any(test, feature = "testing"))]
+pub use crate::persistence::outbox::{OutboxEvent, OutboxRecord};
 pub use crate::persistence::retention::{Eviction, OutputRetention, RetentionLimit};
 pub use crate::persistence::stores::{
     ContentClass, Durability, Reconciliation, Retention, STORES, StoreDescriptor,

@@ -1018,7 +1018,7 @@ impl Journal {
         Ok(())
     }
 
-    /// Records a side effect that had no attachment to go to.
+    /// Records side effects that had no attachment to go to, in one transaction.
     ///
     /// Section 8 sends a side effect to exactly one destination: the attachment holding the input
     /// lease. When nothing holds it there is no destination, and the effect becomes a durable host
@@ -1026,19 +1026,6 @@ impl Journal {
     /// the effect asked for and where in the stream it happened; a clipboard write's own content is
     /// deliberately not kept, because nothing has asked for it and a durable copy of it is a copy
     /// of somebody's data with no reader.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`WorkerError::JournalUnavailable`] when the write fails.
-    pub fn record_host_event(
-        &mut self,
-        effect: &kr_term::sideeffect::SideEffect,
-        now_ms: TimestampMs,
-    ) -> Result<()> {
-        self.record_host_events([effect], now_ms)
-    }
-
-    /// Records several side effects that had no attachment to go to, in one transaction.
     ///
     /// The store commits once for all of them, so a holder that has stopped taking output, whose
     /// every later bell has nowhere to go, costs the read loop one commit for the output it reads
@@ -1199,6 +1186,7 @@ impl Journal {
     /// # Errors
     ///
     /// Returns [`WorkerError::JournalUnavailable`] when the read fails.
+    #[cfg(any(test, feature = "testing"))]
     pub fn host_events(&self) -> Result<Vec<HostEvent>> {
         let mut statement = self
             .connection
@@ -1648,6 +1636,7 @@ impl Journal {
     /// # Errors
     ///
     /// Returns [`WorkerError::JournalUnavailable`] when the read fails.
+    #[cfg(any(test, feature = "testing"))]
     pub fn read_intent(&self, actor_id: &ActorId, action_id: ActionId) -> Result<Option<Vec<u8>>> {
         // Two absences, one answer: there is no such receipt, or it is one an earlier schema wrote
         // without recording what the action was. Neither is a failure to read the journal.
@@ -1764,6 +1753,7 @@ impl Journal {
     ///
     /// Returns [`WorkerError::JournalUnavailable`] when the read fails or the stored provenance is
     /// not one this build writes.
+    #[cfg(any(test, feature = "testing"))]
     pub fn channel_end_provenance(
         &self,
         actor_id: &ActorId,
@@ -1883,6 +1873,7 @@ impl Journal {
     /// # Errors
     ///
     /// Returns [`WorkerError::JournalUnavailable`] when the read fails.
+    #[cfg(any(test, feature = "testing"))]
     pub fn events_after(&self, sequence: u64, limit: u64) -> Result<Vec<ReceiptEvent>> {
         let mut statement = self
             .connection
@@ -4058,6 +4049,7 @@ impl Journal {
     }
 
     /// Reads a stored sixteen-byte identifier.
+    #[cfg(any(test, feature = "testing"))]
     fn uuid_from(&self, bytes: &[u8]) -> Result<Uuid> {
         let raw: [u8; 16] = bytes
             .try_into()
@@ -4258,6 +4250,7 @@ impl Journal {
     /// # Errors
     ///
     /// Returns [`WorkerError::JournalUnavailable`] when the read fails.
+    #[cfg(any(test, feature = "testing"))]
     pub fn schema_version(&self) -> Result<i64> {
         self.connection
             .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
@@ -4269,6 +4262,7 @@ impl Journal {
     /// # Errors
     ///
     /// Returns [`WorkerError::JournalUnavailable`] when the read fails.
+    #[cfg(any(test, feature = "testing"))]
     pub fn table_names(&self) -> Result<Vec<String>> {
         let mut statement = self
             .connection
@@ -4289,6 +4283,7 @@ impl Journal {
     /// # Errors
     ///
     /// Returns [`WorkerError::JournalUnavailable`] when the read fails.
+    #[cfg(any(test, feature = "testing"))]
     pub fn pragma_string(&self, name: &str) -> Result<String> {
         self.connection
             .query_row(&format!("PRAGMA {name}"), [], |row| row.get(0))
@@ -4300,6 +4295,7 @@ impl Journal {
     /// # Errors
     ///
     /// Returns [`WorkerError::JournalUnavailable`] when the read fails.
+    #[cfg(any(test, feature = "testing"))]
     pub fn pragma_i64(&self, name: &str) -> Result<i64> {
         self.connection
             .query_row(&format!("PRAGMA {name}"), [], |row| row.get(0))
@@ -4312,6 +4308,7 @@ impl Journal {
     /// written anything at all. It is the store's own count, so nothing about it depends on
     /// timing.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn total_changes(&self) -> u64 {
         self.connection.total_changes()
     }
@@ -4325,6 +4322,7 @@ impl Journal {
     /// # Errors
     ///
     /// Returns [`WorkerError::JournalUnavailable`] when the setting cannot be applied.
+    #[cfg(any(test, feature = "testing"))]
     pub fn cap_at_current_size(&self) -> Result<()> {
         let pages: i64 = self
             .connection
@@ -4340,6 +4338,7 @@ impl Journal {
     /// # Errors
     ///
     /// Returns [`WorkerError::JournalUnavailable`] when the setting cannot be applied.
+    #[cfg(any(test, feature = "testing"))]
     pub fn release_size_cap(&self) -> Result<()> {
         self.connection
             .pragma_update(None, "max_page_count", i64::MAX)
@@ -4351,6 +4350,7 @@ impl Journal {
     /// # Errors
     ///
     /// Returns [`WorkerError::JournalUnavailable`] when the checkpoint fails.
+    #[cfg(any(test, feature = "testing"))]
     pub fn checkpoint(&self) -> Result<()> {
         self.connection
             .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
@@ -4495,19 +4495,14 @@ impl Journal {
         Ok(gaps)
     }
 
-    /// Returns one page of the outbox after a cursor.
+    /// Returns one page of the outbox after a cursor, for a test to read what a transition left.
     ///
-    /// Delivery is at-least-once: this read takes nothing and moves nothing, so a consumer that
-    /// dies before it records its cursor is handed the same page again. The immutable event
-    /// identifier is what lets it apply each record once.
-    ///
-    /// The page is bounded by [`crate::persistence::outbox::MAX_OUTBOX_PAGE`], which is what a
-    /// consumer's de-duplication window covers: a page larger than that window could displace an
-    /// identifier the same page still needs.
+    /// The read takes nothing and moves nothing.
     ///
     /// # Errors
     ///
     /// Returns [`WorkerError::JournalUnavailable`] when the read fails.
+    #[cfg(any(test, feature = "testing"))]
     pub fn outbox_after(
         &self,
         cursor: u64,
@@ -4515,7 +4510,6 @@ impl Journal {
     ) -> Result<Vec<crate::persistence::outbox::OutboxRecord>> {
         use crate::persistence::outbox::{OutboxEvent, OutboxRecord, Subsystem};
 
-        let limit = limit.clamp(1, crate::persistence::outbox::MAX_OUTBOX_PAGE);
         let mut statement = self
             .connection
             .prepare(
@@ -4591,62 +4585,6 @@ impl Journal {
             });
         }
         Ok(records)
-    }
-
-    /// Returns where one consumer has got to.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`WorkerError::JournalUnavailable`] when the read fails.
-    pub fn outbox_cursor(
-        &self,
-        consumer: &str,
-    ) -> Result<crate::persistence::outbox::OutboxCursor> {
-        let row: Option<(i64, i64)> = self
-            .connection
-            .query_row(
-                "SELECT cursor, delivered FROM outbox_cursors WHERE consumer = ?1",
-                params![consumer],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()
-            .map_err(|error| faulted(&self.health, error))?;
-        let (cursor, delivered) = row.unwrap_or((0, 0));
-        Ok(crate::persistence::outbox::OutboxCursor {
-            consumer: consumer.to_owned(),
-            cursor: u64::try_from(cursor).unwrap_or(0),
-            delivered: u64::try_from(delivered).unwrap_or(0),
-        })
-    }
-
-    /// Records that a consumer has taken everything up to a cursor.
-    ///
-    /// A cursor never goes backwards: a consumer that replays an older page and then records what
-    /// it took would otherwise hand itself every record between twice.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`WorkerError::JournalUnavailable`] when the write fails.
-    pub fn note_outbox_consumed(
-        &mut self,
-        consumer: &str,
-        cursor: u64,
-        applied: u64,
-    ) -> Result<()> {
-        self.connection
-            .execute(
-                "INSERT INTO outbox_cursors (consumer, cursor, delivered) VALUES (?1, ?2, ?3)
-                 ON CONFLICT (consumer) DO UPDATE SET
-                     cursor = MAX(outbox_cursors.cursor, excluded.cursor),
-                     delivered = outbox_cursors.delivered + excluded.delivered",
-                params![
-                    consumer,
-                    i64::try_from(cursor).unwrap_or(i64::MAX),
-                    i64::try_from(applied).unwrap_or(i64::MAX),
-                ],
-            )
-            .map_err(|error| faulted(&self.health, error))?;
-        Ok(())
     }
 
     /// Writes down what the host's time contract has to survive a restart.
@@ -5461,6 +5399,7 @@ fn faulted(
 /// Used where the failure is a decoding failure rather than the store refusing to answer: what a
 /// stored row means is this build's business, and a value it cannot read is not the store saying
 /// it has stopped working.
+#[cfg(any(test, feature = "testing"))]
 fn parse_stream(value: &str) -> Option<kr_protocol::recovery::EventStream> {
     kr_protocol::recovery::EventStream::ALL
         .iter()
@@ -5468,6 +5407,7 @@ fn parse_stream(value: &str) -> Option<kr_protocol::recovery::EventStream> {
         .find(|stream| stream.as_str() == value)
 }
 
+#[cfg(any(test, feature = "testing"))]
 fn parse_content_class(value: &str) -> Option<crate::persistence::stores::ContentClass> {
     use crate::persistence::stores::ContentClass;
 

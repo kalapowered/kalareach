@@ -421,8 +421,8 @@ fn notify(host: &Host, body: &str) {
     session
         .journal_mut()
         .expect("the harness journals its session")
-        .record_host_event(
-            &kr_term::sideeffect::SideEffect {
+        .record_host_events(
+            [&kr_term::sideeffect::SideEffect {
                 kind: kr_term::sideeffect::SideEffectKind::Notification {
                     title: None,
                     body: body.to_owned(),
@@ -432,7 +432,7 @@ fn notify(host: &Host, body: &str) {
                 },
                 destination: kr_term::sideeffect::SideEffectDestination::HostEvent,
                 at: 0,
-            },
+            }],
             kr_ipc::now_ms(),
         )
         .expect("the journal records it");
@@ -1929,8 +1929,8 @@ async fn a_journal_is_brought_forward_to_the_privacy_record_it_needs() {
 
 fn record_notice(journal: &mut Journal, body: &str) {
     journal
-        .record_host_event(
-            &kr_term::sideeffect::SideEffect {
+        .record_host_events(
+            [&kr_term::sideeffect::SideEffect {
                 kind: kr_term::sideeffect::SideEffectKind::Notification {
                     title: None,
                     body: body.to_owned(),
@@ -1940,7 +1940,7 @@ fn record_notice(journal: &mut Journal, body: &str) {
                 },
                 destination: kr_term::sideeffect::SideEffectDestination::HostEvent,
                 at: 0,
-            },
+            }],
             kr_ipc::now_ms(),
         )
         .expect("the journal records it");

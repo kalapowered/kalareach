@@ -110,8 +110,8 @@ fn plant_notice(host: &Host, session_id: SessionId, body: &str) {
         .journal_database(session_id);
     let mut journal = Journal::open(&path).expect("opens the journal");
     journal
-        .record_host_event(
-            &kr_term::sideeffect::SideEffect {
+        .record_host_events(
+            [&kr_term::sideeffect::SideEffect {
                 kind: kr_term::sideeffect::SideEffectKind::Notification {
                     title: None,
                     body: body.to_owned(),
@@ -121,7 +121,7 @@ fn plant_notice(host: &Host, session_id: SessionId, body: &str) {
                 },
                 destination: kr_term::sideeffect::SideEffectDestination::HostEvent,
                 at: 0,
-            },
+            }],
             kr_ipc::now_ms(),
         )
         .expect("the journal records the notice");

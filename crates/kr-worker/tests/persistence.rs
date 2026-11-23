@@ -31,7 +31,6 @@ use kr_worker::journal::{Journal, RETENTION_MS, Submission};
 use kr_worker::persistence::contract::{CommitPoint, FlushPolicy, WriteKind, flush_policy};
 use kr_worker::persistence::fault::{FaultKind, WorkClass};
 use kr_worker::persistence::migration::{self, MigrationError};
-use kr_worker::persistence::outbox::{Fanout, MAX_OUTBOX_PAGE, REMEMBERED_EVENT_IDS};
 use kr_worker::persistence::retention::{OutputRetention, RetentionLimit};
 use kr_worker::persistence::stores;
 use kr_worker::pty::ShellCommand;
@@ -259,17 +258,6 @@ async fn closed(client: &mut LocalClient, host: &Host) -> kr_protocol::session::
 
 fn actor() -> ActorId {
     ActorId::new("test:persistence").expect("an actor")
-}
-
-/// A submission under a distinct identifier, for a test that needs more than a byte's worth.
-fn numbered_submission(index: u16) -> Submission {
-    let mut identifier = [0_u8; 16];
-    identifier[0] = (index >> 8) as u8;
-    identifier[1] = index as u8;
-    Submission {
-        action_id: kr_worker::journal::action_id_from(identifier),
-        ..submission(1, 1)
-    }
 }
 
 fn attach_params(session_id: SessionId) -> kr_protocol::attachment::SessionAttachParams {
@@ -555,7 +543,7 @@ fn a_transition_its_event_and_its_outbox_row_go_back_together_when_one_fails() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// KR-REQ-24.20, 24.21: the outbox, its fan-out, and what never reaches the control log
+// KR-REQ-24.20, 24.21: the outbox, and what never reaches the control log
 // ---------------------------------------------------------------------------------------------
 
 #[test]
@@ -607,91 +595,20 @@ fn every_transition_leaves_one_outbox_row_in_this_journals_own_order() {
 }
 
 #[test]
-fn a_page_asked_for_again_before_its_cursor_is_recorded_is_applied_once() {
-    // KR-REQ-24.20, second half: fan-out is at-least-once and idempotent. The durable half is the
-    // consumer's cursor, which bounds what a redelivery replays; the in-process half is the
-    // de-duplication window, which covers the interval between applying a record and recording
-    // the cursor past it.
-    let path = journal_path("outbox-fanout");
-    let mut journal = Journal::open(&path).expect("opens");
-    for action in 1..=3 {
-        journal
-            .accept(&submission(action, action))
-            .expect("accepts");
-    }
-    let mut consumer = Fanout::new();
-    let cursor = journal.outbox_cursor("attention").expect("a cursor");
-    assert_eq!(cursor.cursor, 0);
-    let page = journal.outbox_after(cursor.cursor, 64).expect("a page");
-    // The consumer applies each record and says so, which is the order that matters: a record
-    // remembered before its effect ran would be suppressed after that effect failed.
-    let fresh: Vec<_> = consumer.fresh(&page).into_iter().cloned().collect();
-    assert_eq!(fresh.len(), 3);
-    for record in &fresh {
-        consumer.note_applied(record);
-    }
-    // The cursor is not recorded here, so the same page is asked for again inside this process
-    // and the window is what suppresses it. What this stages is the omission rather than a write
-    // that failed: to the consumer they are the same thing, which is being handed a page it has
-    // not recorded as taken.
-    let again = journal.outbox_after(0, 64).expect("a page");
-    assert!(consumer.fresh(&again).is_empty());
-    assert_eq!(consumer.applied(), 3);
-    assert_eq!(consumer.suppressed(), 3);
-
-    let last = page.last().expect("a record").cursor;
-    journal
-        .note_outbox_consumed("attention", last, 3)
-        .expect("records the cursor");
-    let recorded = journal.outbox_cursor("attention").expect("a cursor");
-    assert_eq!(recorded.cursor, last);
-    assert_eq!(recorded.delivered, 3);
-    assert!(
-        journal
-            .outbox_after(recorded.cursor, 64)
-            .expect("a page")
-            .is_empty()
-    );
-
-    // A consumer that restarted remembers nothing, and the recorded cursor is what stops it
-    // replaying the journal: it is handed what it has not recorded as taken, and nothing before
-    // it. A record applied but not recorded before the restart would be applied again, which is
-    // the consumer's own to close rather than this journal's.
-    let mut restarted = Fanout::new();
-    let resumed = journal.outbox_after(recorded.cursor, 64).expect("a page");
-    assert!(restarted.fresh(&resumed).is_empty());
-    drop(journal);
-    std::fs::remove_dir_all(path.parent().expect("a parent")).ok();
-}
-
-#[test]
-fn a_page_of_the_outbox_never_outruns_the_window_that_covers_it() {
-    // The de-duplication window is what makes a replayed page idempotent, so a page larger than
-    // the window could displace an identifier the same page still needs. The journal bounds it.
-    let path = journal_path("outbox-page-bound");
-    let mut journal = Journal::open(&path).expect("opens");
-    for index in 0..u16::try_from(MAX_OUTBOX_PAGE + 4).expect("fits") {
-        journal
-            .accept(&numbered_submission(index))
-            .expect("accepts");
-    }
-    let page = journal.outbox_after(0, u64::MAX).expect("a page");
-    assert_eq!(page.len() as u64, MAX_OUTBOX_PAGE);
-    assert!(MAX_OUTBOX_PAGE as usize <= REMEMBERED_EVENT_IDS);
-    drop(journal);
-    std::fs::remove_dir_all(path.parent().expect("a parent")).ok();
-}
-
-#[test]
 fn collecting_receipts_never_takes_an_event_a_consumer_still_owes() {
     // KR-REQ-24.20 again, and the failure it guards against: a receipt written thirty days ago
     // can have produced its outcome event this minute, and a consumer that has recorded no
-    // cursor past it has never been offered it.
+    // cursor past it has never been offered it. A journal an earlier build wrote can hold such a
+    // cursor, so the case registers one in the store itself.
     let path = journal_path("outbox-collection");
     let mut journal = Journal::open(&path).expect("opens");
     journal.accept(&submission(1, 1)).expect("accepts");
-    journal
-        .note_outbox_consumed("attention", 0, 0)
+    let store = rusqlite::Connection::open(&path).expect("the same database");
+    store
+        .execute(
+            "INSERT INTO outbox_cursors (consumer, cursor, delivered) VALUES ('attention', 0, 0)",
+            [],
+        )
         .expect("a consumer registers");
     // Long past the retention period, so the receipt itself is collectable.
     let later = TimestampMs::new(kr_ipc::now_ms().get() + RETENTION_MS + 60_000);
@@ -700,11 +617,15 @@ fn collecting_receipts_never_takes_an_event_a_consumer_still_owes() {
     assert_eq!(owed.len(), 1, "the registered consumer is still owed it");
 
     // Once it has taken it, collection may have it.
-    journal
-        .note_outbox_consumed("attention", owed[0].cursor, 1)
+    store
+        .execute(
+            "UPDATE outbox_cursors SET cursor = ?1, delivered = 1 WHERE consumer = 'attention'",
+            [i64::try_from(owed[0].cursor).expect("fits")],
+        )
         .expect("records the cursor");
     journal.prune(later).expect("prunes");
     assert!(journal.outbox_after(0, 64).expect("a page").is_empty());
+    drop(store);
     drop(journal);
     std::fs::remove_dir_all(path.parent().expect("a parent")).ok();
 }
@@ -739,7 +660,7 @@ async fn no_terminal_body_and_no_provider_key_reaches_the_control_log() {
         session
             .journal_mut()
             .expect("a journal")
-            .record_host_event(&effect, TimestampMs::new(1_500))
+            .record_host_events([&effect], TimestampMs::new(1_500))
             .expect("records the host event");
     }
     // The acceptance and dispatch commit points, so the search covers the mutation path as well

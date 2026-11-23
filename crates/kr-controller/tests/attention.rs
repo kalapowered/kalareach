@@ -313,8 +313,8 @@ fn notify_titled(worker: &Worker, title: Option<&str>, body: &str) {
     session
         .journal_mut()
         .expect("the harness journals its session")
-        .record_host_event(
-            &kr_term::sideeffect::SideEffect {
+        .record_host_events(
+            [&kr_term::sideeffect::SideEffect {
                 kind: kr_term::sideeffect::SideEffectKind::Notification {
                     title: title.map(str::to_owned),
                     body: body.to_owned(),
@@ -324,7 +324,7 @@ fn notify_titled(worker: &Worker, title: Option<&str>, body: &str) {
                 },
                 destination: kr_term::sideeffect::SideEffectDestination::HostEvent,
                 at: 0,
-            },
+            }],
             kr_ipc::now_ms(),
         )
         .expect("the journal records it");
