@@ -17,7 +17,9 @@ path = "src/bin/kr-shell-fixtures.rs"
 # `KR_TERMINAL_PREFERENCES_DIR` names and takes Terminal's and iTerm2's preferences from the files
 # under it, since `defaults` reads the user's own preferences whatever `HOME` says. It compiles to
 # nothing without this feature, and no shipped build enables it. kr-cli's tests enable it through
-# their development dependency on this crate, which gives the `kr` they start the feature too.
+# their development dependency on this crate, which gives the `kr` they start the feature too. It
+# also builds the reference bridge, the client half of the endpoint that the worker's and the
+# controller's tests drive a real socket with, and the tables and accessors their tests read.
 testing = []
 
 [dependencies]
@@ -41,6 +43,8 @@ thiserror.workspace = true
 rustix = { workspace = true, features = ["fs", "process"] }
 
 [dev-dependencies]
+# The package tests replay the contract's scenarios and read its tables through the test builds.
+kr-shell-integration = { path = ".", features = ["testing"] }
 # The tests act exactly when a held rename was refused, through the retry's own seam.
 kr-flush = { workspace = true, features = ["testing"] }
 # Where the package tests keep their records.

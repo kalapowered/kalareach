@@ -31,6 +31,7 @@ pub mod phase;
 pub mod question;
 pub mod quoting;
 pub mod refusal;
+#[cfg(any(test, feature = "testing"))]
 pub mod scripted;
 pub mod startup;
 pub mod terminal;

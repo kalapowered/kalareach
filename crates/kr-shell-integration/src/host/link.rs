@@ -240,6 +240,7 @@ impl BridgeWriter {
 
     /// Returns true while this connection is still usable.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn is_live(&self) -> bool {
         self.live.check().is_ok()
     }

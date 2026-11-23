@@ -18,11 +18,15 @@
 //!
 //! The secret never leaves this module: the contract takes a [`ProofVerdict`], not bytes.
 
-use kr_crypto::kdf::{hmac_sha256, verify_hmac_sha256};
+#[cfg(any(test, feature = "testing"))]
+use kr_crypto::kdf::hmac_sha256;
+use kr_crypto::kdf::verify_hmac_sha256;
 use kr_crypto::secret::SymmetricKey;
 use kr_ipc::peer::PeerIdentity;
 use kr_protocol::identity::ProcessStartIdentity;
-use kr_protocol::scalars::{Bytes, Mac256};
+#[cfg(any(test, feature = "testing"))]
+use kr_protocol::scalars::Bytes;
+use kr_protocol::scalars::Mac256;
 
 use crate::contract::transport::{
     BridgeAccepted, BridgeEndpoint, BridgeHello, HandshakeOutcome, ObservedPeer, ProofVerdict,
@@ -54,6 +58,7 @@ pub fn observe(peer: &PeerIdentity) -> ObservedPeer {
 /// # Errors
 ///
 /// Returns [`crate::host::HostError::Frame`] when the transcript cannot be encoded canonically.
+#[cfg(any(test, feature = "testing"))]
 pub fn proof(
     secret: &SymmetricKey,
     session_id: kr_protocol::ids::SessionId,
@@ -139,6 +144,7 @@ pub fn admit_observed(
 /// # Errors
 ///
 /// Returns [`crate::host::HostError::Frame`] when the transcript cannot be encoded canonically.
+#[cfg(any(test, feature = "testing"))]
 pub fn proof_bytes(
     secret: &SymmetricKey,
     session_id: kr_protocol::ids::SessionId,

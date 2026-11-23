@@ -324,6 +324,7 @@ impl ProfileHome {
     /// applications are the ones in the home's `Applications` folder, and the preferences it names
     /// are files in the home, so nothing here reaches the person's own.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn under(home: &Path, programs: Vec<PathBuf>) -> Self {
         Self {
             confined_to: None,

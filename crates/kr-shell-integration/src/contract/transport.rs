@@ -29,7 +29,9 @@
 
 use kr_cbor::CborError;
 use kr_protocol::error::{ErrorCode, ProtocolError};
-use kr_protocol::frame::{FrameCodec, StreamKind};
+#[cfg(any(test, feature = "testing"))]
+use kr_protocol::frame::FrameCodec;
+use kr_protocol::frame::StreamKind;
 use kr_protocol::identity::ProcessStartIdentity;
 use kr_protocol::ids::{RequestId, SessionId};
 use kr_protocol::root::{
@@ -65,6 +67,7 @@ pub const SECRET_VARIABLE: &str = "KR_SHELL_BRIDGE_SECRET";
 pub const BOOTSTRAP_VARIABLES: &[&str] = &[ENDPOINT_VARIABLE, SECRET_VARIABLE];
 
 /// The length of the bootstrap secret in bytes.
+#[cfg(any(test, feature = "testing"))]
 pub const BOOTSTRAP_SECRET_LEN: usize = 32;
 
 /// The length of the proof over the bootstrap secret in bytes.
@@ -94,6 +97,7 @@ pub const BRIDGE_STREAM_KIND: StreamKind = StreamKind::Control;
 
 /// Returns the frame codec both sides of the bridge use.
 #[must_use]
+#[cfg(any(test, feature = "testing"))]
 pub const fn frame_codec() -> FrameCodec {
     FrameCodec::new(BRIDGE_STREAM_KIND)
 }
@@ -111,6 +115,7 @@ pub enum EndpointKind {
 impl EndpointKind {
     /// Returns the stable wire string.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::UnixSocket => "unix_socket",
@@ -223,6 +228,7 @@ pub enum SecretLocation {
 impl SecretLocation {
     /// Returns the stable wire string.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::ExportedEnvironment => "exported_environment",
@@ -261,6 +267,7 @@ impl Bootstrap {
     /// a user's startup file could read them. The bridges wipe their own copy of the secret at the
     /// same moment, because nothing reads it after the proof.
     #[must_use]
+    #[cfg(test)]
     pub fn retain_after_handshake(self) -> RetainedBootstrap {
         RetainedBootstrap {
             endpoint: self.endpoint,
@@ -309,6 +316,7 @@ pub enum SkipReason {
 impl SkipReason {
     /// Returns the stable wire string.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::NoEndpoint => "no_endpoint",
@@ -334,6 +342,7 @@ pub enum Activation {
 /// the exported environment there is nothing to attempt, and after the root handshake there are no
 /// bootstrap values to inherit.
 #[must_use]
+#[cfg(any(test, feature = "testing"))]
 pub const fn decide_activation(inputs: &ActivationInputs) -> Activation {
     match inputs.exported_endpoint {
         None => Activation::Skip(SkipReason::NoEndpoint),
@@ -606,6 +615,7 @@ pub enum HandshakeOutcome {
 impl HandshakeOutcome {
     /// Returns the refusal's reason, or `None` when the bridge was accepted.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn refusal(&self) -> Option<QualificationReason> {
         match self {
             Self::Accepted(_) => None,

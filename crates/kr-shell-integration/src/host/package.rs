@@ -805,6 +805,7 @@ impl PackageSet {
 
     /// Returns what is wrong with one shell's installed record, when this host cannot read it.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn fault(&self, kind: ShellKind) -> Option<&PackageFault> {
         self.faults.get(&kind)
     }

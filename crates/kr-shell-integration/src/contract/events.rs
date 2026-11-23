@@ -33,9 +33,9 @@ use kr_protocol::root::{
 use kr_protocol::scalars::U64;
 use serde::{Deserialize, Serialize};
 
-use crate::contract::qualification::{
-    DetachCondition, DetachEligibility, DetachExclusion, IntegrationLoss,
-};
+#[cfg(any(test, feature = "testing"))]
+use crate::contract::qualification::DetachEligibility;
+use crate::contract::qualification::{DetachCondition, DetachExclusion, IntegrationLoss};
 
 /// The byte a terminal's `VEOF` carries by default.
 pub const DEFAULT_EOF_BYTE: u8 = 0x04;
@@ -71,6 +71,7 @@ impl Default for EofGesture {
 impl EofGesture {
     /// Returns true when `key` is this gesture.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn matches(&self, key: &PressedKey) -> bool {
         match (self, key) {
             (Self::TerminalEof { byte }, PressedKey::Byte { byte: pressed }) => byte == pressed,
@@ -143,6 +144,7 @@ pub enum PatchAnswer {
 impl PatchAnswer {
     /// Returns the stable wire string.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Native => "native",
@@ -176,6 +178,7 @@ pub enum ConsumeReason {
 impl ConsumeReason {
     /// Returns the stable wire string.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::FenceMissing => "fence_missing",
@@ -266,6 +269,7 @@ impl BridgeFenceView {
     }
 
     /// Records a fence the worker published.
+    #[cfg(any(test, feature = "testing"))]
     pub fn publish(&mut self, fence: EditorFence) {
         self.fence = Some(fence);
     }
@@ -275,6 +279,7 @@ impl BridgeFenceView {
     /// After this, a repeated gesture is consumed rather than submitted, and its hint names no
     /// attachment: a gesture that was already delivered cannot take on the identity of whichever
     /// attachment arrives next.
+    #[cfg(any(test, feature = "testing"))]
     pub fn invalidate(&mut self) {
         self.fence = None;
     }
@@ -303,6 +308,7 @@ impl BridgeFenceView {
     }
 
     /// Decides what to do with a character the native hook offered.
+    #[cfg(any(test, feature = "testing"))]
     pub fn decide(&mut self, context: &PreEofContext) -> PreEofDecision {
         self.promote_gesture(context.prompt_generation);
         if self.gesture == EofGesture::Disabled {
@@ -341,6 +347,7 @@ impl BridgeFenceView {
         }
     }
 
+    #[cfg(any(test, feature = "testing"))]
     fn promote_gesture(&mut self, prompt: PromptGeneration) {
         let Some(pending) = self.pending_gesture.as_ref() else {
             return;

@@ -40,11 +40,12 @@ use crate::contract::events::{
     BridgeFenceView, ConsumeReason, DEFAULT_EOF_BYTE, EofGesture, EofGestureChange, NativeReason,
     PreEofContext, PreEofDecision, PressedKey, ReaderIdle,
 };
+#[cfg(any(test, feature = "testing"))]
+use crate::contract::fence::FenceMachine;
 use crate::contract::fence::{
     ActionShape, AmbiguityReason, ContinuousMs, DetachRejection, DetachTarget, DiscardReason,
-    EditorEntered, FenceInvalidation, FenceMachine, InputArrived, InputRef, InputRefusal,
-    InterruptRequested, LaunchRequested, LeaseChanged, LeaseFault, LeaseView, ReaderIdled,
-    StaleMessage, Stimulus,
+    EditorEntered, FenceInvalidation, InputArrived, InputRef, InputRefusal, InterruptRequested,
+    LaunchRequested, LeaseChanged, LeaseFault, LeaseView, ReaderIdled, StaleMessage, Stimulus,
 };
 use crate::contract::qualification::{
     BridgeAbi, CancellationMechanism, DetachCondition, DetachExclusion, FenceProofMechanism,
@@ -56,10 +57,11 @@ use crate::contract::requests::{
     LaunchRejectionReason, LaunchTransactionId,
 };
 use crate::contract::transport::{
-    Activation, ActivationInputs, BridgeHello, HandshakeOutcome, ModuleEntry, ObservedPeer,
-    PatchRevision, ProofVerdict, SecretLocation, ShellIdentity, SkipReason, WorkerExpectation,
-    decide_activation, decide_handshake,
+    Activation, ActivationInputs, BridgeHello, ModuleEntry, ObservedPeer, PatchRevision,
+    ProofVerdict, SecretLocation, ShellIdentity, SkipReason, WorkerExpectation,
 };
+#[cfg(any(test, feature = "testing"))]
+use crate::contract::transport::{HandshakeOutcome, decide_activation, decide_handshake};
 
 /// Where the committed scenarios live, relative to the repository root.
 pub const FIXTURES_DIRECTORY: &str = "fixtures/shell-bridge";
@@ -257,6 +259,7 @@ pub enum PreEofStep {
 }
 
 /// What a replay found.
+#[cfg(any(test, feature = "testing"))]
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Replay {
     /// How many expectations were compared.
@@ -265,6 +268,7 @@ pub struct Replay {
     pub failures: Vec<String>,
 }
 
+#[cfg(any(test, feature = "testing"))]
 impl Replay {
     /// Returns true when every expectation held.
     #[must_use]
@@ -291,6 +295,7 @@ impl Replay {
 
 /// Replays one scenario and returns what did not match.
 #[must_use]
+#[cfg(any(test, feature = "testing"))]
 pub fn replay(scenario: &Scenario) -> Replay {
     let mut replay = Replay::default();
     match &scenario.script {
@@ -301,6 +306,7 @@ pub fn replay(scenario: &Scenario) -> Replay {
     replay
 }
 
+#[cfg(any(test, feature = "testing"))]
 fn replay_handshake(id: &str, script: &HandshakeScript, replay: &mut Replay) {
     for case in &script.cases {
         let expectation = case.expectation.as_ref().unwrap_or(&script.expectation);
@@ -329,6 +335,7 @@ fn replay_handshake(id: &str, script: &HandshakeScript, replay: &mut Replay) {
     }
 }
 
+#[cfg(any(test, feature = "testing"))]
 fn replay_fence(id: &str, script: &FenceScript, replay: &mut Replay) {
     let mut machine = FenceMachine::new(script.session_id, script.lease);
     for (index, step) in script.steps.iter().enumerate() {
@@ -356,6 +363,7 @@ fn replay_fence(id: &str, script: &FenceScript, replay: &mut Replay) {
     }
 }
 
+#[cfg(any(test, feature = "testing"))]
 fn replay_pre_eof(id: &str, script: &PreEofScript, replay: &mut Replay) {
     let mut view = script.view.clone();
     for step in &script.steps {

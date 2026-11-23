@@ -17,9 +17,11 @@ use kr_ipc::paths::Endpoint;
 use kr_protocol::ids::SessionId;
 use kr_protocol::scalars::Bytes;
 
+#[cfg(any(test, feature = "testing"))]
+use crate::contract::transport::ENDPOINT_BASENAME;
 #[cfg(not(unix))]
 use crate::contract::transport::WINDOWS_PIPE_PREFIX;
-use crate::contract::transport::{Bootstrap, BridgeEndpoint, ENDPOINT_BASENAME};
+use crate::contract::transport::{Bootstrap, BridgeEndpoint};
 use crate::host::error::{HostError, Result};
 
 /// How many characters of an identifier a bridge endpoint's name carries.
@@ -35,6 +37,7 @@ const ENDPOINT_NAME_ATTEMPTS: usize = 8;
 /// address behind for a later process to connect to.
 #[derive(Debug)]
 pub struct HostEndpoint {
+    #[cfg(any(test, feature = "testing"))]
     session_id: SessionId,
     listener: Listener,
     address: BridgeEndpoint,
@@ -61,6 +64,7 @@ impl HostEndpoint {
     /// Returns [`HostError::Directory`] when the directory is not owner-only, [`HostError::Endpoint`]
     /// when the resulting address does not fit a socket address, [`HostError::Crypto`] when the
     /// secret cannot be generated, and [`HostError::Ipc`] when the endpoint cannot be bound.
+    #[cfg(any(test, feature = "testing"))]
     pub fn open(session_id: SessionId, directory: &Path) -> Result<Self> {
         Self::open_named(session_id, directory, ENDPOINT_BASENAME)
     }
@@ -79,6 +83,7 @@ impl HostEndpoint {
         // socket's own identity first, so a replacement bound by somebody else is left alone.
         let listener = Listener::bind(&bound)?;
         Ok(Self {
+            #[cfg(any(test, feature = "testing"))]
             session_id,
             listener,
             address,
@@ -161,6 +166,7 @@ impl HostEndpoint {
 
     /// Returns the session this endpoint belongs to.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn session_id(&self) -> SessionId {
         self.session_id
     }

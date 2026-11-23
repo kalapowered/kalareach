@@ -40,6 +40,7 @@ pub enum Source {
 impl Source {
     /// Returns the stable wire string.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Profile => "profile",

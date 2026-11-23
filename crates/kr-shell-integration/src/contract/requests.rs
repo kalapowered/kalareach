@@ -45,6 +45,7 @@ impl LaunchTransactionId {
 
     /// Returns the raw identifier.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn get(self) -> Uuid {
         self.0
     }
@@ -157,6 +158,7 @@ pub enum LaunchRejectionReason {
 
 impl LaunchRejectionReason {
     /// Every reason, in declaration order.
+    #[cfg(any(test, feature = "testing"))]
     pub const ALL: &'static [Self] = &[
         Self::EditorLeft,
         Self::QueuedPriorInput,
@@ -250,6 +252,7 @@ pub enum LaunchDecision {
 impl LaunchDecision {
     /// Returns the rejection's reason, or `None` when the launch was installed.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn rejection(&self) -> Option<LaunchRejectionReason> {
         match self {
             Self::Accepted(_) => None,
@@ -310,6 +313,7 @@ impl CancelledOperations {
 
     /// Returns true when at least one operation was ended.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn any(self) -> bool {
         self.partial_escape
             || self.quoted_insertion

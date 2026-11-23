@@ -94,6 +94,7 @@ pub enum MailboxMechanism {
 
 impl MailboxMechanism {
     /// Every mechanism, in declaration order.
+    #[cfg(any(test, feature = "testing"))]
     pub const ALL: &'static [Self] = &[
         Self::KeySequenceBoundaryMailbox,
         Self::IdleReaderMailbox,
@@ -156,6 +157,7 @@ pub enum PreEofMechanism {
 
 impl PreEofMechanism {
     /// Every mechanism, in declaration order.
+    #[cfg(any(test, feature = "testing"))]
     pub const ALL: &'static [Self] = &[
         Self::NativeHook,
         Self::NamedReaderBinding,
@@ -209,6 +211,7 @@ pub enum FenceProofMechanism {
 
 impl FenceProofMechanism {
     /// Every mechanism, in declaration order.
+    #[cfg(any(test, feature = "testing"))]
     pub const ALL: &'static [Self] = &[
         Self::AtomicReaderState,
         Self::PromptHook,
@@ -275,6 +278,7 @@ pub enum CancellationMechanism {
 impl CancellationMechanism {
     /// Returns the stable wire string.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::NonDestructiveKeyWait => "non_destructive_key_wait",
@@ -307,6 +311,7 @@ pub enum LaunchDelivery {
 impl LaunchDelivery {
     /// Returns the stable wire string.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::ReaderMailbox => "reader_mailbox",
@@ -400,6 +405,7 @@ pub enum QualificationReason {
 
 impl QualificationReason {
     /// Every reason, in declaration order.
+    #[cfg(any(test, feature = "testing"))]
     pub const ALL: &'static [Self] = &[
         Self::ProtocolMismatch,
         Self::SessionMismatch,
@@ -532,6 +538,7 @@ pub enum InputSource {
 
 impl InputSource {
     /// Every source, in declaration order.
+    #[cfg(any(test, feature = "testing"))]
     pub const ALL: &'static [Self] = &[
         Self::Terminal,
         Self::Typeahead,
@@ -542,6 +549,7 @@ impl InputSource {
 
     /// Returns the stable wire string.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Terminal => "terminal",
@@ -612,6 +620,7 @@ impl DetachExclusion {
     ///
     /// [`Self::NotManagedRootEditor`] is not among them: it is the requirement that the contract
     /// applies at all, and a reader that fails it is not a managed root editor being excluded.
+    #[cfg(any(test, feature = "testing"))]
     pub const ALL: &'static [Self] = &[
         Self::ContinuationInput,
         Self::ReadBuiltin,
@@ -627,6 +636,7 @@ impl DetachExclusion {
 
     /// Returns the stable wire string.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::NotManagedRootEditor => "not_managed_root_editor",
@@ -671,6 +681,7 @@ pub enum IntegrationPhase {
 
 impl IntegrationPhase {
     /// Every phase, in order of how far it has got.
+    #[cfg(any(test, feature = "testing"))]
     pub const ALL: &'static [Self] = &[
         Self::Unauthenticated,
         Self::Authenticated,
@@ -681,6 +692,7 @@ impl IntegrationPhase {
 
     /// Returns the stable wire string.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Unauthenticated => "unauthenticated",
@@ -752,6 +764,7 @@ pub enum IntegrationLoss {
 
 impl IntegrationLoss {
     /// Every loss, in declaration order.
+    #[cfg(any(test, feature = "testing"))]
     pub const ALL: &'static [Self] = &[
         Self::PostStartupFailure,
         Self::SemanticHookLoss,
@@ -761,6 +774,7 @@ impl IntegrationLoss {
 
     /// Returns the stable wire string.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::PostStartupFailure => "post_startup_failure",
@@ -819,6 +833,7 @@ pub enum DetachEligibility {
 impl DetachEligibility {
     /// Returns true when the gesture may be submitted as a detach.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn is_eligible(self) -> bool {
         matches!(self, Self::Eligible)
     }

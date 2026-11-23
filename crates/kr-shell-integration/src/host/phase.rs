@@ -80,6 +80,7 @@ impl PhaseGate {
 
     /// Returns the losses this session has recorded, in the order they happened.
     #[must_use]
+    #[cfg(test)]
     pub fn losses(&self) -> &[IntegrationLoss] {
         &self.history
     }

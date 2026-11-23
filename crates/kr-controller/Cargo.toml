@@ -110,6 +110,8 @@ rustix = { workspace = true, features = ["fs", "process", "pty"] }
 exacl.workspace = true
 
 [dev-dependencies]
+# The reference bridge the tests drive the worker's endpoint with.
+kr-shell-integration = { workspace = true, features = ["testing"] }
 # The tests act exactly when a held rename was refused, through the retry's own seam, and make the
 # flush of a directory fail after a rename.
 kr-flush = { workspace = true, features = ["testing"] }

@@ -348,6 +348,7 @@ pub enum LeaseFault {
 impl LeaseFault {
     /// Returns the error code the refusal carries.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn code(self) -> ErrorCode {
         match self {
             Self::LeaseLost | Self::NotHolder => ErrorCode::LeaseLost,
@@ -653,6 +654,7 @@ pub enum ActionShape {
 impl Action {
     /// Reduces this action to what a scenario asserts.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn shape(&self) -> ActionShape {
         match self {
             Self::AskFence(params) => ActionShape::AskFence {
@@ -761,6 +763,7 @@ pub struct Outcome {
 impl Outcome {
     /// Returns the actions reduced to what a scenario asserts.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn shapes(&self) -> Vec<ActionShape> {
         self.actions.iter().map(Action::shape).collect()
     }
@@ -791,6 +794,7 @@ pub enum DetachTarget {
 impl DetachTarget {
     /// Returns the error code an ambiguous target is reported with.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn code(self) -> Option<ErrorCode> {
         match self {
             Self::Attachment(_) => None,

@@ -52,6 +52,7 @@ pub enum Resolution {
 impl Resolution {
     /// Returns the argument vector that will actually run.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn arguments(&self) -> &[String] {
         match self {
             Self::Integrated { arguments, .. } | Self::Bypassed { arguments, .. } => arguments,

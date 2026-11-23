@@ -5217,6 +5217,7 @@ dependencies = [
  "kr-flush",
  "kr-ipc",
  "kr-protocol",
+ "kr-shell-integration",
  "kr-test-artifacts",
  "portable-pty",
  "rustix",
