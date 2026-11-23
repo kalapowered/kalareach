@@ -2233,6 +2233,10 @@ export function fakeHost(
       return Promise.resolve({ name: dialogAnswer })
     },
 
+    // As in the application, a run that is refused before it takes the choice leaves it held.
+    heldAuthorisedFile: () =>
+      Promise.resolve(chosenFile === null ? null : { name: chosenFile }),
+
     setupIdentity: () => Promise.resolve(setupIdentity(identityStable, connected)),
 
     openSettingsPane: (pane) => {

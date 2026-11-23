@@ -386,8 +386,15 @@ describe('what setup costs a person', () => {
           'onSettings'
         ].includes(name)
     )
+    // Setup reads the host's checks and descriptions, this application's identity, and which file
+    // this application holds for the read check, which reaches no host either.
     expect(new Set(own)).toEqual(
-      new Set(['setupIdentity', 'environmentCapabilities', 'descriptionSetup'])
+      new Set([
+        'setupIdentity',
+        'environmentCapabilities',
+        'descriptionSetup',
+        'heldAuthorisedFile'
+      ])
     )
     // Nothing on this path signs in, pairs, pays or registers for anything. The shell's read of
     // where the account stands, and its subscription to changes, sign nothing in.

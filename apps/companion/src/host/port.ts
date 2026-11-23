@@ -2217,6 +2217,13 @@ export interface HostPort {
    * never names one.
    */
   chooseAuthorisedFile(): Promise<ChosenFile | null>
+  /**
+   * Which file the application holds for the next run of the read check: the name of the one the
+   * person chose that no run has taken, or null. Native code is the one place that knows, so the
+   * page asks it when it opens and after every dialog and every run, and says what it answers.
+   * Asking changes nothing.
+   */
+  heldAuthorisedFile(): Promise<ChosenFile | null>
 
   /**
    * What the session's worker says of a launch at its root editor now, read on the link every

@@ -80,6 +80,27 @@ async function step(page: Page, name: string): Promise<void> {
   await page.getByTestId(`setup-panel-${name}`).waitFor()
 }
 
+/** What the sheet says while the file the dialog answers with, `notes.txt`, is held. */
+const HELD_NOTES = 'File chosen: notes.txt. The next run reads it once.'
+
+/** Opens the sheet that lists the checks, with its run button, from the capabilities step. */
+async function openChecksSheet(page: Page): Promise<void> {
+  await page.getByTestId('setup-run-checks').click()
+  await expect(page.getByTestId('sheet')).toHaveAttribute('data-presentation', 'here', {
+    timeout: PRESENTATION_DEADLINE
+  })
+}
+
+/** Closes the sheet, leaves the setup view for another one and opens it again, at the capabilities step. */
+async function leaveSetupAndReturn(page: Page): Promise<void> {
+  await page.getByTestId('setup-checks-not-now').click()
+  await expect(page.getByTestId('sheet')).toBeHidden({ timeout: PRESENTATION_DEADLINE })
+  await page.getByRole('button', { name: 'Sessions' }).click()
+  await page.getByRole('button', { name: 'Set up this Mac' }).click()
+  await page.getByTestId('setup').waitFor()
+  await step(page, 'capabilities')
+}
+
 test.describe('the first-start assistant', () => {
   test('checks the application identity before it guides a single permission', async ({ page }) => {
     await openSetup(page)
@@ -536,6 +557,67 @@ test.describe('the first-start assistant', () => {
     await expect(line).toHaveText(none)
     await page.getByTestId('setup-checks-run').click()
     await expect.poll(files).toEqual(['notes.txt', null])
+  })
+
+  // KR-REQ-03.29: what the sheet says of the chosen file is what the application holds, so the
+  // page never says no file is chosen while one is held. The application holds the choice, not the
+  // page, so it outlasts the page's own state: the setup view is left and opened again.
+  test('names the chosen file again when the setup view is opened again', async ({ page }) => {
+    await openSetup(page)
+    await step(page, 'capabilities')
+    const line = page.getByTestId('setup-checks-file')
+    await openChecksSheet(page)
+    await page.getByTestId('setup-checks-choose').click()
+    await expect(line).toHaveText(HELD_NOTES)
+
+    await leaveSetupAndReturn(page)
+    await openChecksSheet(page)
+    await expect(line).toHaveText(HELD_NOTES)
+    // The line changes while the person is at the button, so it is announced.
+    await expect(line).toHaveAttribute('aria-live', 'polite')
+  })
+
+  test('keeps the chosen file named when the dialog is closed with no choice, and when the view is opened again', async ({
+    page
+  }) => {
+    await openSetup(page)
+    await step(page, 'capabilities')
+    const line = page.getByTestId('setup-checks-file')
+    await openChecksSheet(page)
+    await page.getByTestId('setup-checks-choose').click()
+    await expect(line).toHaveText(HELD_NOTES)
+    await page.evaluate(() => {
+      window.krTestHost?.answerFileDialog(null)
+    })
+    await page.getByTestId('setup-checks-choose').click()
+    await expect(line).toHaveText(HELD_NOTES)
+
+    await leaveSetupAndReturn(page)
+    await openChecksSheet(page)
+    await expect(line).toHaveText(HELD_NOTES)
+  })
+
+  // A request the application refuses before it takes the choice leaves the choice held, and the
+  // sheet says so: the page cleared its own record at the press, and that made the line false.
+  test('keeps the chosen file named when the request is refused before it takes the file', async ({
+    page
+  }) => {
+    await openSetup(page)
+    await step(page, 'capabilities')
+    const line = page.getByTestId('setup-checks-file')
+    await openChecksSheet(page)
+    await page.getByTestId('setup-checks-choose').click()
+    await expect(line).toHaveText(HELD_NOTES)
+
+    // The device is paired with another host after the choice: the application refuses the checks
+    // for a host that is not this computer, before it takes the file.
+    await page.evaluate(() => {
+      window.krTestHost?.reachAsPairedDevice()
+    })
+    await page.getByTestId('setup-checks-run').click()
+    await expect(page.locator('.toast')).toContainText('paired device')
+    await openChecksSheet(page)
+    await expect(line).toHaveText(HELD_NOTES)
   })
 
   // KR-REQ-03.29: at the largest text size, on a wide window and on a narrow one, the controls that

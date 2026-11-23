@@ -242,9 +242,12 @@ export function Setup(): ReactNode {
   const [effectsRunnable, setEffectsRunnable] = useState(false)
   // The request to run the checks is on its way to the host, and has not been answered yet.
   const [asking, setAsking] = useState(false)
-  // The name of the file the person chose for the read check, which the next run reads and uses up.
-  // The path is never here: native code keeps it.
-  const [chosen, setChosen] = useState<string | null>(null)
+  // The name of the file the application holds for the read check, which the next run reads and
+  // uses up, or null when it holds none. The path is never here: native code keeps it. This is what
+  // the application last said, read when the screen opens and after every dialog and every run, and
+  // the page keeps no choice of its own: it cannot say that none is chosen while one is held. It is
+  // undefined until the first answer, and the line says nothing until then.
+  const [chosen, setChosen] = useState<string | null | undefined>(undefined)
   // The platform's file dialog is open, and has not been answered yet.
   const [choosing, setChoosing] = useState(false)
   // The environment in which the host last said a run is going, until an answer says it is not. A
@@ -316,6 +319,21 @@ export function Setup(): ReactNode {
       })
   }, [load, apply, refuse])
 
+  const readChosen = useCallback(() => {
+    port
+      .heldAuthorisedFile()
+      .then((file) => {
+        setChosen(file === null ? null : file.name)
+      })
+      .catch((error: unknown) => {
+        say(failureMessage(error), 'danger')
+      })
+  }, [port, say])
+
+  useEffect(() => {
+    readChosen()
+  }, [readChosen])
+
   const environmentId = capabilities?.environment_id ?? null
   const watching = accepted
   const checking = watching !== null
@@ -326,8 +344,6 @@ export function Setup(): ReactNode {
     if (environmentId === null) return
     setEffectsOpen(false)
     setAsking(true)
-    // The run takes the choice with it, so the sheet does not offer a file that has been read.
-    setChosen(null)
     port
       .environmentCapabilitiesCheck({ environment_id: environmentId })
       .then((settled) => {
@@ -346,24 +362,26 @@ export function Setup(): ReactNode {
       })
       .finally(() => {
         setAsking(false)
+        // Whether the run took the choice is the application's to say: a request it refused before
+        // it took the file leaves the file held.
+        readChosen()
       })
-  }, [port, environmentId, load, apply, say])
+  }, [port, environmentId, load, apply, say, readChosen])
 
-  // The platform's own dialog answers. Closing it with no choice leaves an earlier choice as it was.
+  // The platform's own dialog answers. Closing it with no choice leaves an earlier choice as it was,
+  // and either way the line says what the application holds afterwards.
   const chooseFile = useCallback(() => {
     setChoosing(true)
     port
       .chooseAuthorisedFile()
-      .then((file) => {
-        if (file !== null) setChosen(file.name)
-      })
       .catch((error: unknown) => {
         say(failureMessage(error), 'danger')
       })
       .finally(() => {
         setChoosing(false)
+        readChosen()
       })
-  }, [port, say])
+  }, [port, say, readChosen])
 
   // While the host says a run is going, ask where it stands. The interval is cleared the moment
   // the answer changes or the page goes, so nothing asks after the run has ended.
@@ -586,10 +604,12 @@ export function Setup(): ReactNode {
                   >
                     Choose a file
                   </Button>
-                  <p className="faint small" data-testid="setup-checks-file">
-                    {chosen === null
-                      ? 'No file chosen. The read check will read nothing and say so.'
-                      : `File chosen: ${chosen}. The next run reads it once.`}
+                  <p className="faint small" data-testid="setup-checks-file" aria-live="polite">
+                    {chosen === undefined
+                      ? ''
+                      : chosen === null
+                        ? 'No file chosen. The read check will read nothing and say so.'
+                        : `File chosen: ${chosen}. The next run reads it once.`}
                   </p>
                 </div>
               ) : null}

@@ -424,6 +424,7 @@ export function tauriPort(): HostPort {
     // The platform's file dialog answers, and native code keeps the path for the one run that
     // reads it. The page is told the file's name and never names a path of its own.
     chooseAuthorisedFile: () => call<ChosenFile | null>('choose_authorised_file', {}),
+    heldAuthorisedFile: () => call<ChosenFile | null>('held_authorised_file', {}),
 
     launchSurface: (params) => read('launch_surface', params),
     launchCommands: () => call<LaunchCommandsReading>('launch_commands_list', {}),
