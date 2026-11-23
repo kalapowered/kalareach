@@ -44,6 +44,8 @@ export interface FakeRetained {
   keepSyncCopy(copy: PrivacyExported): void
   /** Makes this computer's own sync list fail with these words, as a store that cannot be read does, or stops that. */
   syncListFails(message: string | null): void
+  /** Makes the read of the settings saved with the recovery bundle fail with these words, as a service that cannot be asked does, or stops that. */
+  savedSettingsFail(message: string | null): void
   /** Lists the host's copy as deleted and awaiting removal at the service, as it is once the service confirms. */
   serviceHasDeleted(reference: string): void
 }
@@ -79,6 +81,7 @@ export class ScriptedRetained implements FakeRetained {
   private confirming = true
   private refusal: string | null = null
   private listFailure: string | null = null
+  private savedFailure: string | null = null
   private heldFinish: { release: () => void } | null = null
   private holdingFinish: Promise<void> | null = null
 
@@ -175,6 +178,10 @@ export class ScriptedRetained implements FakeRetained {
     this.listFailure = message
   }
 
+  savedSettingsFail(message: string | null): void {
+    this.savedFailure = message
+  }
+
   serviceHasDeleted(reference: string): void {
     const at = this.entries.findIndex((each) => each.copy.reference === reference)
     const entry = this.entries[at]
@@ -216,6 +223,7 @@ export class ScriptedRetained implements FakeRetained {
 
   /** The settings saved with the recovery bundle, when it holds them. */
   savedSettings(): PrivacyExported | null {
+    if (this.savedFailure !== null) refuse('LOCAL_FAILURE', this.savedFailure)
     const entry = this.entries.find((each) => each.settings === true)
     return entry === undefined ? null : { ...entry.copy }
   }

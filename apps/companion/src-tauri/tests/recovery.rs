@@ -4911,6 +4911,66 @@ async fn nothing_is_asked_about_settings_the_bundle_does_not_hold() {
     assert!(says.asked.lock().expect("the record").is_empty());
 }
 
+/// KR-REQ-20.17: a computer that cannot ask the service for the bundle says why, and never says
+/// that the bundle holds no saved settings: the listing fails with words for each way the account
+/// is blocked, and so does the question about the settings. A computer with no record has nothing
+/// to ask, and lists none.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_listing_that_cannot_ask_the_service_says_why_and_never_says_none() {
+    let computer = Computer::new().await;
+    let elsewhere = serve().await;
+    let (ours, theirs) = (
+        host_of(computer.served.origin()),
+        host_of(elsewhere.origin()),
+    );
+    let (page, _) = computer.saving_page(NO_WAIT).await;
+    assert_eq!(
+        page.call("retained_saved_settings", json!({}))
+            .expect("no record: none"),
+        Value::Null
+    );
+    page.call("recovery_turn_on", json!({})).expect("on");
+    drop(page);
+
+    let origin = GatewayOrigin::new(computer.served.origin()).expect("an origin");
+    let blocked = [
+        (
+            computer.start(account(&origin, None).await),
+            format!(
+                "this device is signed out, so the settings saved with your recovery bundle \
+                 cannot be read. Sign in to {ours}, then try again"
+            ),
+        ),
+        (
+            computer.start(account(&origin, Some(&[])).await),
+            "this sign-in does not let KalaReach keep recovery data. Sign in again to allow it"
+                .to_owned(),
+        ),
+        (
+            moved_to(&computer, &elsewhere).await,
+            format!(
+                "this computer's recovery record names {ours} as the service for its bundle, \
+                 but this device is signed in to {theirs}, and the account's sign-in is not sent \
+                 to another service. Recovery waits until this device is signed in to {ours}; \
+                 choosing another sync service does not move the bundle"
+            ),
+        ),
+    ];
+    for (page, words) in blocked {
+        let refused = page
+            .call("retained_saved_settings", json!({}))
+            .expect_err("the service was not asked, which is no answer");
+        assert_eq!(refused["message"], words.as_str());
+        let (_directory, settings) = fresh_device();
+        let asked = page
+            .deletions()
+            .ask(None, &settings, &Says::yes(), "settings-saved")
+            .await
+            .expect_err("the question fails the same way");
+        assert_eq!(asked.message, words);
+    }
+}
+
 /// KR-REQ-20.17: the writer's level binds the saving step and nothing the person does.
 /// A bundle that holds a member (only a later build can have written one) lists the row and lets
 /// the person remove it, with the gate closed; a bundle with none lists nothing and the removal

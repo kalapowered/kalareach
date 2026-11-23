@@ -85,6 +85,7 @@ export function LeftTheHost({
   privacy,
   syncCopies,
   syncFailure,
+  savedFailure,
   syncReading,
   reload,
   retry
@@ -95,6 +96,8 @@ export function LeftTheHost({
   readonly syncCopies: readonly PrivacyExported[]
   /** Why this computer's own sync records could not be read, when they could not: the list is then incomplete. */
   readonly syncFailure: string | null
+  /** Why the settings saved with the recovery bundle could not be read, when they could not: the list may not be current. */
+  readonly savedFailure: string | null
   /** Whether those records are being read. */
   readonly syncReading: boolean
   /** Reads both lists again, after a deletion. */
@@ -114,8 +117,8 @@ export function LeftTheHost({
   useEffect(() => {
     if (!retried.current || syncReading) return
     retried.current = false
-    if (syncFailure === null) heading.current?.focus()
-  }, [syncReading, syncFailure])
+    if (syncFailure === null && savedFailure === null) heading.current?.focus()
+  }, [syncReading, syncFailure, savedFailure])
   // Whether this section is still on the screen: a dialog that is answered after it closed has no
   // page left to tell, and its token is dropped.
   const open = useRef(true)
@@ -192,7 +195,14 @@ export function LeftTheHost({
     })()
   }
 
-  if (privacy === null && syncCopies.length === 0 && syncFailure === null) return null
+  if (
+    privacy === null &&
+    syncCopies.length === 0 &&
+    syncFailure === null &&
+    savedFailure === null
+  ) {
+    return null
+  }
 
   return (
     <section className="stack" data-testid="retained-artefacts">
@@ -213,7 +223,7 @@ export function LeftTheHost({
       </header>
       <Card>
         <div className="card-body">
-          {rows.length === 0 && syncFailure === null ? (
+          {rows.length === 0 && syncFailure === null && savedFailure === null ? (
             <p className="muted small">Nothing this host knows of has left it.</p>
           ) : null}
           {syncFailure === null ? null : (
@@ -221,6 +231,23 @@ export function LeftTheHost({
               <p className="small warning-text spacer" role="alert">
                 The copies this computer’s own sync kept could not be read, so this list may be
                 missing some: {syncFailure}
+              </p>
+              <Button
+                aria-busy={syncReading}
+                onClick={() => {
+                  retried.current = true
+                  retry()
+                }}
+              >
+                Try again
+              </Button>
+            </div>
+          )}
+          {savedFailure === null || syncFailure !== null ? null : (
+            <div className="divided-row" data-testid="saved-settings-unread">
+              <p className="small warning-text spacer" role="alert">
+                The settings saved with your recovery bundle could not be read, so this list may not
+                be up to date: {savedFailure}
               </p>
               <Button
                 aria-busy={syncReading}

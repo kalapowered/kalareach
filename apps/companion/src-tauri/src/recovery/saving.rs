@@ -335,20 +335,20 @@ impl Recovery {
     /// When the bundle was last written, if it holds saved settings now: a read of the service.
     ///
     /// This is what is stored, not what a step may write, so it does not depend on the writer's
-    /// level: a member that a later build wrote is listed. A computer with no kept record, or one
-    /// that cannot use the account now, lists nothing.
+    /// level: a member that a later build wrote is listed. A computer with no kept record has
+    /// nothing to ask and lists nothing. One that cannot use the account now was not asked, which
+    /// is no answer, so it fails with why and never lists nothing.
     ///
     /// # Errors
     ///
-    /// Returns a failure to read the bundle.
+    /// Refuses when the account cannot be used at the service the record names, and returns a
+    /// failure to read the bundle.
     pub async fn saved_settings_listed(&self, account: &Account) -> Result<Option<TimestampMs>> {
         let _step = self.step().await?;
         let Some(record) = self.record()?.filter(|record| record.kept) else {
             return Ok(None);
         };
-        if blocker(account, &record.origin()?).is_some() {
-            return Ok(None);
-        }
+        refuse_if_blocked(account, &record.origin()?, Named::ByListing)?;
         let seed = self.seed(false)?;
         let mut store = self.store(&record, account)?;
         let bundle = store.fetch(&seed).await.map_err(said)?;

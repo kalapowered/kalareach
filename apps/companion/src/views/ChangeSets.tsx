@@ -123,6 +123,11 @@ export function ChangeSets(): ReactNode {
   const [syncCopies, setSyncCopies] = useState<readonly PrivacyExported[]>([])
   // Why those records could not be read: an empty list is then not an answer.
   const [syncFailure, setSyncFailure] = useState<string | null>(null)
+  // The settings saved with the recovery bundle are a read of the service of their own. A read that
+  // failed is not a read that found none: the row last read stays listed, with the note of an
+  // unconfirmed removal, until a read confirms that the bundle holds no settings.
+  const [savedSettings, setSavedSettings] = useState<PrivacyExported | null>(null)
+  const [savedFailure, setSavedFailure] = useState<string | null>(null)
   const [syncReading, setSyncReading] = useState(false)
   // Set when the person asked to read again after a failure, so that a second failure is said and
   // not left to look like nothing happened.
@@ -183,17 +188,26 @@ export function ChangeSets(): ReactNode {
       })
     setSyncReading(true)
     // The settings saved with the recovery bundle are listed beside them. That read goes to the
-    // service, and a bundle that cannot be asked lists nothing here.
+    // service, and its failure is told as a failure: it says nothing of what the bundle holds.
     ask(() =>
       Promise.all([
         port.retainedSyncCopies(),
-        port.retainedSavedSettings().catch(() => null)
+        port.retainedSavedSettings().then(
+          (row) => ({ read: true as const, row }),
+          (error: unknown) => ({ read: false as const, words: failureMessage(error) })
+        )
       ])
     )
-      .then(([copies, savedSettings]) => {
+      .then(([copies, saved]) => {
         if (!current()) return
         retrying.current = false
-        setSyncCopies(savedSettings === null ? copies : [...copies, savedSettings])
+        setSyncCopies(copies)
+        if (saved.read) {
+          setSavedSettings(saved.row)
+          setSavedFailure(null)
+        } else {
+          setSavedFailure(saved.words)
+        }
         setSyncFailure(null)
         setSyncReading(false)
       })
@@ -373,8 +387,9 @@ export function ChangeSets(): ReactNode {
 
       <LeftTheHost
         privacy={privacy}
-        syncCopies={syncCopies}
+        syncCopies={savedSettings === null ? syncCopies : [...syncCopies, savedSettings]}
         syncFailure={syncFailure}
+        savedFailure={savedFailure}
         syncReading={syncReading}
         reload={load}
         retry={() => {

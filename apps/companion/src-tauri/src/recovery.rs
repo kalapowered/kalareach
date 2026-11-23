@@ -1164,6 +1164,9 @@ enum Named {
     /// The recovery kit the person chose, which names the service its bundle is at. Nothing the
     /// person can change on this device moves the bundle, so the refusal says to sign in there.
     ByKit,
+    /// The record, to read what the bundle holds. The person has turned recovery on, so the
+    /// refusal does not tell them to.
+    ByListing,
 }
 
 /// Refuses, before anything is made or sent, when the account cannot be used at `used`.
@@ -1174,9 +1177,17 @@ enum Named {
 fn refuse_if_blocked(account: &Account, used: &GatewayOrigin, named: Named) -> Result<()> {
     match blocker(account, used) {
         None => Ok(()),
-        Some(Blocker::SignedOut) => Err(CommandError::refused(
-            "sign in before turning recovery on: it keeps its bundle with the account",
-        )),
+        Some(Blocker::SignedOut) => Err(CommandError::refused(match named {
+            Named::ByListing => format!(
+                "this device is signed out, so the settings saved with your recovery bundle \
+                 cannot be read. Sign in to {}, then try again",
+                host_of(used)
+            ),
+            Named::BySetting | Named::ByRecord | Named::ByKit => {
+                "sign in before turning recovery on: it keeps its bundle with the account"
+                    .to_owned()
+            }
+        })),
         Some(Blocker::NeedsSignIn) => Err(CommandError::refused(
             "this sign-in does not let KalaReach keep recovery data. Sign in again to allow it",
         )),
@@ -1189,7 +1200,7 @@ fn refuse_if_blocked(account: &Account, used: &GatewayOrigin, named: Named) -> R
                  device is signed in to ({account}), so the account's sign-in is not sent there. \
                  Choose {account} as the sync service to keep recovery data"
             ),
-            Named::ByRecord => format!(
+            Named::ByRecord | Named::ByListing => format!(
                 "this computer's recovery record names {sync_service} as the service for its \
                  bundle, but this device is signed in to {account}, and the account's sign-in is \
                  not sent to another service. Recovery waits until this device is signed in to \

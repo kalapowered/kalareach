@@ -363,5 +363,57 @@ describe('the settings saved with the recovery bundle', () => {
     const { retained } = await open()
     expect(within(retained).queryByText(KIND)).toBeNull()
   })
+
+  const UNREAD =
+    'The settings saved with your recovery bundle could not be read, so this list may not be up ' +
+    'to date: the sync service could not be reached'
+
+  it('says the read failed, and keeps the row and its unconfirmed removal, until a read finds none', async () => {
+    const { controls, retained, person } = await openWithSettings()
+    controls.retained.serviceDoesNotConfirm(true)
+    await person.click(
+      within(rowOf(retained, KIND)).getByRole('button', { name: 'Remove from the bundle' })
+    )
+    await answerDialog(controls, true)
+    await waitFor(() => {
+      expect(within(rowOf(retained, KIND)).getByTestId('removal')).toHaveTextContent(
+        'You asked for the removal, and the service has not confirmed it yet.'
+      )
+    })
+
+    // The service cannot be asked when the list is read again: that is no answer about the
+    // settings, so the row stays with its note, and the page says the read failed.
+    controls.retained.savedSettingsFail('the sync service could not be reached')
+    await person.click(
+      within(rowOf(retained, KIND)).getByRole('button', { name: 'Remove from the bundle' })
+    )
+    await answerDialog(controls, true)
+    expect(await within(retained).findByTestId('saved-settings-unread')).toHaveTextContent(UNREAD)
+    expect(within(rowOf(retained, KIND)).getByTestId('removal')).toHaveTextContent(
+      'You asked for the removal, and the service has not confirmed it yet.'
+    )
+
+    // A read that works, and finds the removal done, takes the row and the line away.
+    controls.retained.savedSettingsFail(null)
+    controls.retained.serviceDoesNotConfirm(false)
+    await person.click(within(retained).getByRole('button', { name: 'Try again' }))
+    await person.click(
+      await within(retained).findByRole('button', { name: 'Remove from the bundle' })
+    )
+    await answerDialog(controls, true)
+    await waitFor(() => {
+      expect(within(retained).queryByText(KIND)).toBeNull()
+    })
+    expect(within(retained).queryByTestId('saved-settings-unread')).toBeNull()
+  })
+
+  it('says the read failed when the first read fails, and lists nothing it cannot know', async () => {
+    const host = fakeHost()
+    host.controls.retained.keepSavedSettings('1700000000000')
+    host.controls.retained.savedSettingsFail('the sync service could not be reached')
+    const { retained } = await open(host, 4)
+    expect(await within(retained).findByTestId('saved-settings-unread')).toHaveTextContent(UNREAD)
+    expect(within(retained).queryByText(KIND)).toBeNull()
+  })
 })
 
