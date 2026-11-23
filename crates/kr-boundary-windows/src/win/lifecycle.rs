@@ -618,7 +618,7 @@ impl Run<'_> {
                 return Ok(());
             }
             if self.env.stop.is_set() {
-                return Err(stopping());
+                return Ok(());
             }
             if Instant::now() >= until {
                 return Err(not_started(format!(
