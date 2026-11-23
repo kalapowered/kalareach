@@ -6609,3 +6609,42 @@ async fn a_device_on_a_platform_with_no_ceremony_is_not_offered_the_settings() {
         1
     );
 }
+
+/// KR-REQ-20.17: what the recovery bundle saves of this computer's settings is what the person
+/// chose, in the one form settings sync carries, and a settings file that cannot be read is no
+/// choice of nothing.
+#[test]
+fn the_settings_the_bundle_saves_are_the_persons_choice_and_an_unreadable_file_is_none() {
+    use companion_tauri::settings::{ColourMode, LocalSettings};
+    use kr_client::recovery::LocalSettings as Chosen;
+    use kr_client::sync::SettingValue;
+
+    let data = tempfile::tempdir().expect("a directory");
+    let local = LocalSettings::open(data.path());
+    let Chosen::Values(nothing) = local.for_backup() else {
+        panic!("a computer that chose nothing has settings with no value in them");
+    };
+    assert!(nothing.is_empty());
+
+    for mode in [ColourMode::Light, ColourMode::Dark, ColourMode::System] {
+        local.set_colour_mode(mode).expect("the choice is kept");
+        let Chosen::Values(chosen) = local.for_backup() else {
+            panic!("a readable file gives its values");
+        };
+        assert_eq!(chosen.values().len(), 1, "{mode:?}");
+        assert_eq!(
+            chosen.get("colour_mode"),
+            Some(&SettingValue::Text(mode.as_str().to_owned())),
+            "{mode:?}"
+        );
+    }
+
+    let file = data.path().join(companion_tauri::settings::FILE);
+    std::fs::write(&file, b"this is not settings").expect("a file");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).expect("private");
+    }
+    assert_eq!(local.for_backup(), Chosen::Unreadable);
+}

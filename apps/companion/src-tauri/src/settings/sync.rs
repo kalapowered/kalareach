@@ -79,9 +79,9 @@ use kr_client::sync::membership::{
     CollectionRef, Device, DeviceDirectory, KeyRecordService, SyncMembership,
 };
 use kr_client::sync::{
-    CollectionKeys, ConflictCopy, KeptCopy, Published, Restored, SettingValue,
-    SharedCollectionService, StoredCollectionKeys, SyncBody, SyncCheckpoint, SyncClient, SyncError,
-    SyncObject, SyncSettings, SyncStore, Unread, fresh_object_id, fresh_revision,
+    CollectionKeys, ConflictCopy, KeptCopy, Published, Restored, SharedCollectionService,
+    StoredCollectionKeys, SyncBody, SyncCheckpoint, SyncClient, SyncError, SyncObject,
+    SyncSettings, SyncStore, Unread, fresh_object_id, fresh_revision,
 };
 use kr_crypto::keys::DeviceKeys;
 use kr_crypto::store::SecretStore;
@@ -107,7 +107,7 @@ pub use members::{
 };
 pub use requests::Requests;
 
-use super::{ColourMode, Hosts, LocalSettings};
+use super::{COLOUR_MODE, ColourMode, Hosts, LocalSettings};
 use crate::error::{CommandError, Result};
 use crate::recovery::now;
 use crate::services::SyncServices;
@@ -138,9 +138,6 @@ const MEMBERSHIP: &str = "membership";
 
 /// The most a record may be, in bytes. It is a few lines of text.
 const RECORD_LIMIT: u64 = 16 * 1024;
-
-/// The name a setting is synchronised under.
-const COLOUR_MODE: &str = "colour_mode";
 
 /// Where settings sync stands on this computer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -1537,10 +1534,8 @@ impl SettingsSync {
             Some(SyncBody::Settings(settings)) => settings.clone(),
             _ => SyncSettings::default(),
         };
-        settings.values.insert(
-            COLOUR_MODE.to_owned(),
-            SettingValue::Text(mode.as_str().to_owned()),
-        );
+        let (name, value) = mode.as_setting();
+        settings.values.insert(name, value);
         Ok(SyncObject {
             object_id,
             revision: fresh_revision().map_err(CommandError::from)?,
@@ -1671,10 +1666,10 @@ fn carrying(mut object: SyncObject, copies: &[ConflictCopy]) -> SyncObject {
 /// The colour mode a settings object carries, when it carries one this build reads.
 fn colour_mode_of(object: &SyncObject) -> Option<ColourMode> {
     match &object.body {
-        SyncBody::Settings(settings) => match settings.values.get(COLOUR_MODE) {
-            Some(SettingValue::Text(word)) => ColourMode::from_word(word),
-            _ => None,
-        },
+        SyncBody::Settings(settings) => settings
+            .values
+            .get(COLOUR_MODE)
+            .and_then(ColourMode::from_setting),
         SyncBody::ClientSelection(_) => None,
     }
 }

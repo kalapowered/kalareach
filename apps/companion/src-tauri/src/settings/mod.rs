@@ -23,6 +23,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
+use kr_client::recovery::DeviceSettings;
+use kr_client::sync::SettingValue;
 use kr_ipc::paths::{read_owner_only_file, write_owner_only_file};
 use serde::{Deserialize, Serialize};
 
@@ -68,6 +70,10 @@ const LIMIT: u64 = 16 * 1024;
 /// The name of the page-visible global the settings are put on before the page's first script.
 const GLOBAL: &str = "kalareachSettings";
 
+/// The name the colour mode is synchronised under, and saved under in the recovery bundle's
+/// settings member.
+pub(crate) const COLOUR_MODE: &str = "colour_mode";
+
 /// How the window is coloured: light, dark, or whatever the device is set to.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -100,6 +106,23 @@ impl ColourMode {
             "dark" => Some(Self::Dark),
             "system" => Some(Self::System),
             _ => None,
+        }
+    }
+
+    /// The setting this choice is, by its name and value. Settings sync and the recovery bundle's
+    /// settings member both build a setting here, so they cannot disagree on what one is.
+    pub(crate) fn as_setting(self) -> (String, SettingValue) {
+        (
+            COLOUR_MODE.to_owned(),
+            SettingValue::Text(self.as_str().to_owned()),
+        )
+    }
+
+    /// The mode a setting's value names, when it names one this build reads.
+    pub(crate) fn from_setting(value: &SettingValue) -> Option<Self> {
+        match value {
+            SettingValue::Text(word) => Self::from_word(word),
+            SettingValue::Number(_) | SettingValue::Flag(_) => None,
         }
     }
 }
@@ -212,6 +235,23 @@ impl LocalSettings {
     #[must_use]
     pub fn chosen_colour_mode(&self) -> Option<ColourMode> {
         self.read().0.colour_mode
+    }
+
+    /// What this computer has chosen, as the recovery bundle's settings member holds it.
+    ///
+    /// A file that cannot be read is [`kr_client::recovery::LocalSettings::Unreadable`] and not a
+    /// choice of nothing: the bundle keeps the settings it holds until the file reads again.
+    #[must_use]
+    pub fn for_backup(&self) -> kr_client::recovery::LocalSettings {
+        let (kept, readable) = self.read();
+        if !readable {
+            return kr_client::recovery::LocalSettings::Unreadable;
+        }
+        let values = kept.colour_mode.map(ColourMode::as_setting).into_iter();
+        DeviceSettings::new(values.collect()).map_or(
+            kr_client::recovery::LocalSettings::Unreadable,
+            kr_client::recovery::LocalSettings::Values,
+        )
     }
 
     /// Keeps the person's choice of colour mode.
