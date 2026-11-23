@@ -42,8 +42,8 @@ use std::sync::{Arc, Mutex, PoisonError};
 use kr_client::Shown;
 use kr_client::recovery::{
     AccountSource, BundleStore, CandidateState, FilesRestore, HostBackups, HostCover, Left,
-    LostWrite, RecoveryError, RestoreError, RestoreSource, cover_host_archive, fresh_locator,
-    qr_payload, render_kit,
+    LocalSettings, LostWrite, RecoveryError, RestoreError, RestoreSource, cover_host_archive,
+    fresh_locator, qr_payload, render_kit,
 };
 use kr_client::services::account::{
     AccountMark, AccountToken, AccountTokenSource, BACKUP_WRITE_SCOPE, SignedInAccount,
@@ -72,6 +72,10 @@ use crate::account::Account;
 use crate::error::{CommandError, Result};
 use crate::services::SyncServices;
 use crate::sync_service::{SyncService, SyncServiceView, host_of};
+
+mod saving;
+
+pub use saving::{NotSavedWhy, SettingsLine, SettingsSource, SettingsStep, SettingsTiming};
 
 /// The scope in the device's secure store that the recovery seed is kept under.
 pub const SEED_SCOPE: &str = "owner";
@@ -138,6 +142,10 @@ pub struct RecoveryView {
     pub kept_at: Option<String>,
     /// What stops the next step now.
     pub blocker: Option<Blocker>,
+    /// Where the device's settings stand in the bundle, once recovery is on and a step has ended
+    /// in this run or the person turned saving them off.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub settings: Option<SettingsLine>,
 }
 
 /// What the page is told once a kit has been written.
@@ -282,6 +290,10 @@ struct Record {
     bundle_locator: String,
     /// True once the first write is known to have landed.
     kept: bool,
+    /// True while the person has saving their settings with the bundle turned off. It is kept
+    /// before anything is sent, so that a step that had already begun finds it under the lock.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    settings_stopped: bool,
 }
 
 impl Record {
@@ -374,6 +386,8 @@ pub struct Recovery {
     /// writes one bundle from this device at a time, and it is opened for a step and closed at its
     /// end, so two steps at once would be two writers.
     steps: tokio::sync::Mutex<()>,
+    /// What saving the device's settings with the bundle keeps between steps.
+    saving: saving::Saving,
 }
 
 impl std::fmt::Debug for Recovery {
@@ -415,6 +429,7 @@ impl Recovery {
             service,
             clients,
             steps: tokio::sync::Mutex::new(()),
+            saving: saving::Saving::new(),
         })
     }
 
@@ -489,11 +504,21 @@ impl Recovery {
                 (state, origin, Some(host))
             }
         };
+        let settings = match (&record, state) {
+            (Some(record), RecoveryState::On) if record.settings_stopped => {
+                Some(SettingsLine::Stopped)
+            }
+            (Some(_), RecoveryState::On) => {
+                Some(self.saving.line()).filter(|line| *line != SettingsLine::Waiting)
+            }
+            _ => None,
+        };
         Ok(RecoveryView {
             sync_service: self.service.view(),
             state,
             kept_at,
             blocker: blocker(account, &used),
+            settings,
         })
     }
 
@@ -512,7 +537,7 @@ impl Recovery {
     /// been made or sent; `OUTCOME_UNKNOWN` when the write was not answered, which has to be
     /// settled before anything else is written; and a local failure otherwise.
     pub async fn turn_on(&self, account: &Account) -> Result<RecoveryView> {
-        let _step = self.step().await?;
+        let step = self.step().await?;
         let mut record = match self.record()? {
             Some(record) if record.kept => return self.view_of(account),
             Some(record) => record,
@@ -524,6 +549,7 @@ impl Recovery {
                     service_origin: selected.as_str().to_owned(),
                     bundle_locator: fresh_locator().map_err(said)?,
                     kept: false,
+                    settings_stopped: false,
                 };
                 self.keep(&record)?;
                 record
@@ -533,9 +559,36 @@ impl Recovery {
         let seed = self.seed(true)?;
         let now = now();
         let tokens = Arc::new(MarkedTokens::new(account));
+        // The first bundle carries the settings the person has chosen, in the one write: a device
+        // turned on after choosing a colour mode needs no second write for it.
+        let chosen = match self.saving.chosen_now() {
+            Some(LocalSettings::Values(values)) if !values.is_empty() => Some(values),
+            _ => None,
+        };
+        let mut with_settings = false;
         let written_here = {
             let mut store = self.store_over(&record, Arc::clone(&tokens) as _)?;
-            match store.commit(&seed, &mut BundleStore::empty(now), now).await {
+            let mut first = BundleStore::empty(now);
+            let written = match &chosen {
+                Some(values) => {
+                    match store
+                        .set_settings(&seed, &mut first, Some(values), now)
+                        .await
+                    {
+                        // No room beside the trust entries: the bundle goes without them, and a
+                        // step says why they are not saved.
+                        Err(RecoveryError::SettingsDoNotFit { .. }) => {
+                            store.commit(&seed, &mut first, now).await
+                        }
+                        other => {
+                            with_settings = other.is_ok();
+                            other
+                        }
+                    }
+                }
+                None => store.commit(&seed, &mut first, now).await,
+            };
+            match written {
                 Ok(_) => true,
                 // Something is at the locator already: this device's own first write, whose
                 // landing was never recorded. Reading it with the seed adopts it if the seed
@@ -555,6 +608,9 @@ impl Recovery {
         // knows, and is left so.
         if written_here && let Some(mark) = tokens.last() {
             self.keep_owner(&record, mark);
+        }
+        if with_settings {
+            self.saving.wrote_settings(&step);
         }
         self.view_of(account)
     }

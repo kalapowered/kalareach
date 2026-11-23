@@ -15,12 +15,17 @@
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use companion_tauri::AppState;
 use companion_tauri::account::carrier::{Boxed, Carrier, Ending, Plan, Unavailable};
 use companion_tauri::account::{Account, AccountSlot};
 use companion_tauri::device::DeviceIdentity;
-use companion_tauri::recovery::{HostCoverView, LeftView, Recovery, SEED_SCOPE};
+use companion_tauri::recovery::{
+    HostCoverView, LeftView, NotSavedWhy, Recovery, SEED_SCOPE, SettingsLine, SettingsSource,
+    SettingsStep, SettingsTiming,
+};
+use companion_tauri::settings::{ColourMode, Settings};
 use kr_client::recovery::{BundleStore, HostBackups, parse_kit};
 use kr_client::services::account::{
     ACCOUNT_ORIGIN, AccountMark, AccountToken, AccountTokenSource, BACKUP_RESTORE_SCOPE,
@@ -33,6 +38,7 @@ use kr_client::services::{
     BackupManifestService as _, HttpDeadlines, HttpService, ManagedSyncService, NullService,
     ServiceFuture, ServiceHttp, ServiceSigner, managed_response_limits,
 };
+use kr_client::sync::SettingValue;
 use kr_crypto::backup::{
     ArchivePlan, ArchiveRecipients, CollectionKind, ObjectSource, StagedObject, seal_archive,
     stage_object,
@@ -3758,4 +3764,382 @@ async fn a_bundle_adopted_from_an_earlier_run_has_no_owner_and_is_left_by_a_dele
         .await
         .expect("nothing to clear");
     assert_eq!(page.view()["state"], "on");
+}
+
+/* -------------------------------------------------------------------------- */
+/* Saving the device's settings with the bundle                                */
+/* -------------------------------------------------------------------------- */
+
+/// What saving waits, for a case that calls the step itself: nothing.
+const NO_WAIT: SettingsTiming = SettingsTiming {
+    quiet: Duration::ZERO,
+    window: Duration::ZERO,
+};
+
+impl Computer {
+    /// As [`Self::page`], with this computer's settings opened and given to recovery as what its
+    /// steps save. No loop runs: the case calls each step itself.
+    async fn saving_page(&self, timing: SettingsTiming) -> (Page, Arc<Settings>) {
+        let page = self.page().await;
+        let settings = {
+            let state = page.app.state::<AppState>();
+            state.keep_under(self.data.path());
+            state.settings().expect("the settings are open")
+        };
+        page.recovery
+            .save_settings_from(Arc::clone(&settings) as Arc<dyn SettingsSource>);
+        page.recovery.set_settings_timing(timing);
+        (page, settings)
+    }
+
+    /// Records in this computer's recovery record that the person turned saving settings off.
+    fn stop_saving_settings(&self) {
+        let path = self.data.path().join("recovery").join("recovery.json");
+        let mut record: Value =
+            serde_json::from_slice(&std::fs::read(&path).expect("the record")).expect("json");
+        record["settings_stopped"] = json!(true);
+        std::fs::write(&path, serde_json::to_vec_pretty(&record).expect("json")).expect("written");
+    }
+}
+
+/// The colour mode the bundle's settings member holds, when it holds one.
+fn colour_in(bundle: &RecoveryBundle) -> Option<String> {
+    let member = bundle.device_settings.as_ref()?;
+    let saved = kr_client::recovery::decode_member(member).expect("a member this build reads");
+    match saved.get("colour_mode") {
+        Some(SettingValue::Text(word)) => Some(word.clone()),
+        other => panic!("the member holds no colour mode but {other:?}"),
+    }
+}
+
+/// The bundle at the service, read with the kit the page saves.
+async fn bundle_of(computer: &Computer, page: &Page) -> RecoveryBundle {
+    let out = tempfile::tempdir().expect("a directory");
+    let (_, kit) = page.kit(out.path());
+    read_with_only_the_kit(&computer.served, &kit).await
+}
+
+/// KR-REQ-20.17: turning recovery on writes the settings the person has chosen in the first
+/// bundle, in the one write, and a step that finds the bundle holding them writes nothing more.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn turning_recovery_on_writes_the_settings_in_the_first_bundle() {
+    let computer = Computer::new().await;
+    let (page, settings) = computer.saving_page(NO_WAIT).await;
+    settings
+        .set_colour_mode(ColourMode::Dark)
+        .await
+        .expect("the choice is kept");
+    page.call("recovery_turn_on", json!({})).expect("on");
+    assert_eq!(
+        writes_sent(&computer),
+        1,
+        "the bundle and the settings go in one write"
+    );
+    assert_eq!(
+        colour_in(&bundle_of(&computer, &page).await).as_deref(),
+        Some("dark")
+    );
+    assert_eq!(page.view()["settings"], json!({ "state": "saved" }));
+
+    let step = page
+        .recovery
+        .save_settings(&page.account)
+        .await
+        .expect("a step");
+    assert_eq!(
+        step,
+        SettingsStep::Ended {
+            line: SettingsLine::Saved,
+            retry_at: None
+        }
+    );
+    assert_eq!(
+        writes_sent(&computer),
+        1,
+        "a bundle that holds them is not written again"
+    );
+}
+
+/// KR-REQ-20.17: a step writes a changed setting once, saves nothing for a computer that chose
+/// nothing, and an unchanged setting is read and not written; "saved" is said only for what the
+/// bundle holds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_step_writes_a_changed_setting_once_and_an_unchanged_one_not_at_all() {
+    let computer = Computer::new().await;
+    let (page, settings) = computer.saving_page(NO_WAIT).await;
+    page.call("recovery_turn_on", json!({})).expect("on");
+    assert_eq!(
+        colour_in(&bundle_of(&computer, &page).await),
+        None,
+        "nothing was chosen"
+    );
+    assert_eq!(
+        page.view().get("settings"),
+        None,
+        "no step has ended: no line"
+    );
+
+    settings
+        .set_colour_mode(ColourMode::Light)
+        .await
+        .expect("kept");
+    let before = writes_sent(&computer);
+    let step = page
+        .recovery
+        .save_settings(&page.account)
+        .await
+        .expect("a step");
+    assert_eq!(
+        step,
+        SettingsStep::Ended {
+            line: SettingsLine::Saved,
+            retry_at: None
+        }
+    );
+    assert_eq!(writes_sent(&computer), before + 1);
+    assert_eq!(
+        colour_in(&bundle_of(&computer, &page).await).as_deref(),
+        Some("light")
+    );
+
+    page.recovery
+        .save_settings(&page.account)
+        .await
+        .expect("a step");
+    assert_eq!(
+        writes_sent(&computer),
+        before + 1,
+        "the same settings are not written again"
+    );
+}
+
+/// KR-REQ-20.15: a write of the bundle whose answer was lost, a cover's too, is ended by the next
+/// step with no action by the person, and the step goes on to save the settings.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_lost_background_write_is_ended_by_the_next_step_with_no_action_by_the_person() {
+    for moment in [Moment::After, Moment::Before] {
+        let computer = Computer::new().await;
+        let (page, settings) = computer.saving_page(NO_WAIT).await;
+        page.call("recovery_turn_on", json!({})).expect("on");
+        let host = Host::new(&computer, computer.served.origin());
+        host.sets_up();
+        computer.served.web().fail(SYNC_PATH, 2, moment);
+        let lost = page
+            .recovery
+            .cover_host(&page.account, &host, false)
+            .await
+            .expect_err("no evidence without an answer");
+        assert_eq!(lost.code, ErrorCode::OutcomeUnknown, "{moment:?}");
+        assert_eq!(page.view()["state"], "unsettled", "{moment:?}");
+
+        settings
+            .set_colour_mode(ColourMode::Light)
+            .await
+            .expect("kept");
+        let step = page
+            .recovery
+            .save_settings(&page.account)
+            .await
+            .expect("a step");
+        assert_eq!(page.view()["state"], "on", "{moment:?}: the step ended it");
+        assert_eq!(
+            step,
+            SettingsStep::Ended {
+                line: SettingsLine::Saved,
+                retry_at: None
+            },
+            "{moment:?}"
+        );
+        assert_eq!(
+            colour_in(&bundle_of(&computer, &page).await).as_deref(),
+            Some("light"),
+            "{moment:?}"
+        );
+    }
+}
+
+/// KR-REQ-20.15: the card says a write is unsettled only while the service cannot be asked to end
+/// it, and says nothing of the settings then.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_card_says_unsettled_only_when_the_service_cannot_be_asked() {
+    let computer = Computer::new().await;
+    let (page, settings) = computer.saving_page(NO_WAIT).await;
+    page.call("recovery_turn_on", json!({})).expect("on");
+    let host = Host::new(&computer, computer.served.origin());
+    host.sets_up();
+    computer.served.web().fail(SYNC_PATH, 2, Moment::Before);
+    page.recovery
+        .cover_host(&page.account, &host, false)
+        .await
+        .expect_err("no answer");
+    settings
+        .set_colour_mode(ColourMode::Dark)
+        .await
+        .expect("kept");
+
+    // The service cannot be asked: the write stays lost, and the card says so and nothing else.
+    computer.served.web().fail(SYNC_PATH, 1, Moment::Before);
+    let step = page
+        .recovery
+        .save_settings(&page.account)
+        .await
+        .expect("a step");
+    assert!(
+        matches!(
+            step,
+            SettingsStep::Ended {
+                line: SettingsLine::NotSaved {
+                    why: NotSavedWhy::Service
+                },
+                retry_at: Some(_)
+            }
+        ),
+        "{step:?}"
+    );
+    let view = page.view();
+    assert_eq!(view["state"], "unsettled");
+    assert_eq!(view.get("settings"), None);
+
+    // It can be asked again: the next step ends the write and saves the settings.
+    page.recovery
+        .save_settings(&page.account)
+        .await
+        .expect("a step");
+    assert_eq!(page.view()["state"], "on");
+    assert_eq!(page.view()["settings"], json!({ "state": "saved" }));
+}
+
+/// KR-REQ-20.17: a step ends a lost write before it looks at whether saving was turned off, then
+/// stops there: nothing is written back, and the line says saving is off.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_step_for_a_computer_that_stopped_saving_ends_a_lost_write_and_writes_no_settings() {
+    let computer = Computer::new().await;
+    let (page, settings) = computer.saving_page(NO_WAIT).await;
+    page.call("recovery_turn_on", json!({})).expect("on");
+    let host = Host::new(&computer, computer.served.origin());
+    host.sets_up();
+    computer.served.web().fail(SYNC_PATH, 2, Moment::After);
+    page.recovery
+        .cover_host(&page.account, &host, false)
+        .await
+        .expect_err("no answer");
+    assert_eq!(page.view()["state"], "unsettled");
+
+    computer.stop_saving_settings();
+    settings
+        .set_colour_mode(ColourMode::Dark)
+        .await
+        .expect("kept");
+    let writes = writes_sent(&computer);
+    let step = page
+        .recovery
+        .save_settings(&page.account)
+        .await
+        .expect("a step");
+    assert_eq!(
+        step,
+        SettingsStep::Ended {
+            line: SettingsLine::Stopped,
+            retry_at: None
+        }
+    );
+    assert_eq!(page.view()["state"], "on", "the lost write was ended first");
+    assert_eq!(page.view()["settings"], json!({ "state": "stopped" }));
+    assert_eq!(
+        writes_sent(&computer),
+        writes,
+        "the settings are not written"
+    );
+    assert_eq!(colour_in(&bundle_of(&computer, &page).await), None);
+}
+
+/// KR-REQ-20.17: a write of the step's own whose answer is lost is ended at once, and what the
+/// line says follows what the service says: saved only if it landed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_write_of_the_step_whose_answer_is_lost_is_ended_at_once_and_saved_follows_the_service() {
+    for (moment, landed) in [(Moment::After, true), (Moment::Before, false)] {
+        let computer = Computer::new().await;
+        let (page, settings) = computer.saving_page(NO_WAIT).await;
+        page.call("recovery_turn_on", json!({})).expect("on");
+        settings
+            .set_colour_mode(ColourMode::Dark)
+            .await
+            .expect("kept");
+        // The step reads the bundle and then writes it: the second request.
+        computer.served.web().fail(SYNC_PATH, 2, moment);
+        let step = page
+            .recovery
+            .save_settings(&page.account)
+            .await
+            .expect("a step");
+        assert_eq!(page.view()["state"], "on", "{moment:?}: ended at once");
+        let bundle = bundle_of(&computer, &page).await;
+        if landed {
+            assert_eq!(
+                step,
+                SettingsStep::Ended {
+                    line: SettingsLine::Saved,
+                    retry_at: None
+                },
+                "{moment:?}"
+            );
+            assert_eq!(colour_in(&bundle).as_deref(), Some("dark"), "{moment:?}");
+        } else {
+            assert!(
+                matches!(
+                    step,
+                    SettingsStep::Ended {
+                        line: SettingsLine::NotSaved {
+                            why: NotSavedWhy::Service
+                        },
+                        retry_at: Some(_)
+                    }
+                ),
+                "{moment:?}: {step:?}"
+            );
+            assert_eq!(colour_in(&bundle), None, "{moment:?}: not saved");
+            assert_eq!(
+                page.view()["settings"],
+                json!({ "state": "not_saved", "why": "service" })
+            );
+        }
+    }
+}
+
+/// KR-REQ-20.17: a settings file that cannot be read is not a choice of nothing: the step keeps the
+/// settings the bundle holds and says why they are not saved.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_settings_file_that_cannot_be_read_keeps_what_the_bundle_holds() {
+    let computer = Computer::new().await;
+    let (page, settings) = computer.saving_page(NO_WAIT).await;
+    settings
+        .set_colour_mode(ColourMode::Dark)
+        .await
+        .expect("kept");
+    page.call("recovery_turn_on", json!({})).expect("on");
+    let file = computer.data.path().join(companion_tauri::settings::FILE);
+    std::fs::write(&file, b"this is not settings").expect("a file");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).expect("private");
+    }
+    let step = page
+        .recovery
+        .save_settings(&page.account)
+        .await
+        .expect("a step");
+    assert_eq!(
+        step,
+        SettingsStep::Ended {
+            line: SettingsLine::NotSaved {
+                why: NotSavedWhy::SettingsFile
+            },
+            retry_at: None
+        }
+    );
+    assert_eq!(
+        colour_in(&bundle_of(&computer, &page).await).as_deref(),
+        Some("dark")
+    );
 }
