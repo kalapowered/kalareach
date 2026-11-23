@@ -22,7 +22,9 @@
 //!
 //! A socket's file is a reparse point of its own kind. Every read of it and every removal of it
 //! opens it without following, and acts on what the open handle is: a path that names something
-//! else by then is left alone.
+//! else by then is left alone. A bind learns which file is its own by connecting to the path and
+//! finding the connection in its own queue, and only a file so proved is protected or removed by
+//! the bind.
 
 #![expect(
     unsafe_code,
@@ -180,7 +182,8 @@ pub enum BindFailure {
     /// instead.
     NoPeerProcess(String),
     /// The socket's file could not be given the owner-only list it must carry, or does not carry it
-    /// when read back from the file itself. The socket was removed.
+    /// when read back from the file itself, or what stands at the path is not the socket this bind
+    /// made. A file the bind proved to be its own was removed; anything else was left as found.
     Unprotected(String),
 }
 
@@ -193,39 +196,49 @@ pub struct Listener {
 impl Listener {
     /// Binds a socket at `path`, which must not exist, and gives its file the owner-only list.
     ///
-    /// The list is set on the open handle of the file the bind made, read back from that same handle
-    /// and required to be protected, so a directory whose inheritable list widens later does not
-    /// reach the file. The identity of that file is returned with the listener: what the socket's end
-    /// removes, and nothing else.
+    /// What stands at the path after the bind is opened once, without following, and a connection
+    /// to the path must come out of this listener's own queue before the file is taken for the one
+    /// the bind made: a path that was replaced by then, by a file or by another socket, is left as
+    /// it is and is neither protected nor removed. The list is set on that open handle, read back
+    /// from it and required to be protected, so a directory whose inheritable list widens later
+    /// does not reach the file. The identity of that file is returned with the listener: what the
+    /// socket's end removes, and nothing else.
     ///
     /// # Errors
     ///
     /// Returns [`BindFailure::NoPeerProcess`] when this build cannot name the process at the other
     /// end of a connection, [`BindFailure::Bind`] when the system refuses, and
-    /// [`BindFailure::Unprotected`] when the file's list cannot be set or read back as asked. A bind
-    /// that fails after the file was made removes it.
+    /// [`BindFailure::Unprotected`] when the file's list cannot be set or read back as asked or the
+    /// path is not the socket this bind made. A file proved to be the bind's own is removed when
+    /// the bind fails after that; nothing else is.
     pub fn bind(path: &Path) -> Result<(Self, Object), BindFailure> {
         gateway_socket_names_its_peers().map_err(BindFailure::NoPeerProcess)?;
         let listener = uds_windows::UnixListener::bind(path).map_err(BindFailure::Bind)?;
+        // Until the file is proved to be the bind's own, a failure leaves the path as it is: a
+        // path cannot be named by identity before that, and removing by name would remove what
+        // another program put there.
+        let left_as_found = |detail: String| {
+            BindFailure::Unprotected(format!(
+                "the socket at {} could not be taken for the one this bind made, and is left as \
+                 it is: {detail}",
+                path.display()
+            ))
+        };
+        listener
+            .set_nonblocking(true)
+            .map_err(|error| left_as_found(error.to_string()))?;
+        #[cfg(test)]
+        run_the_hook_after_the_bind(path);
         // The file the bind made is opened once, without following, and everything done to it is
         // done through that handle.
         let rights = FILE_READ_ATTRIBUTES | READ_CONTROL | WRITE_DAC | DELETE;
-        let file = match open_without_following(path, rights) {
-            Ok(file) => file,
-            Err(error) => {
-                // The file is the one this bind just made, because a bind refuses a path that
-                // exists, but it cannot be named by identity when it cannot be opened.
-                drop(listener);
-                let _ = std::fs::remove_file(path);
-                return Err(BindFailure::Unprotected(format!(
-                    "the socket at {} could not be opened to protect it: {error}",
-                    path.display()
-                )));
-            }
-        };
-        let protected = protect(&file, path);
-        match protected {
-            Ok(made) => match Async::new(Registered(listener)) {
+        let file = open_without_following(path, rights)
+            .map_err(|error| left_as_found(format!("it could not be opened: {error}")))?;
+        let made = prove_it_is_the_bound_socket(&listener, path, &file).map_err(left_as_found)?;
+        // From here the handle holds the socket this bind made, and removing through it removes
+        // that socket.
+        match protect(&file, path) {
+            Ok(()) => match Async::new(Registered(listener)) {
                 Ok(inner) => Ok((Self { inner }, made)),
                 Err(error) => {
                     let _ = delete_through(&file);
@@ -257,15 +270,36 @@ impl Listener {
     }
 }
 
-/// Gives the open file of a socket its protected owner-only list, reads the list back from the same
-/// handle, and returns the file's identity.
-fn protect(file: &std::fs::File, path: &Path) -> Result<Object, String> {
+/// Shows that the open file at `path` is the socket `listener` bound, and returns its identity.
+///
+/// The file must be a socket's file, a connection to the path must reach `listener`'s own queue, and
+/// the path must still name the file's object afterwards. A path that names a file, or another
+/// socket, or that was swapped again meanwhile, is none of those and is refused.
+fn prove_it_is_the_bound_socket(
+    listener: &uds_windows::UnixListener,
+    path: &Path,
+    file: &std::fs::File,
+) -> Result<Object, String> {
     if file::reparse_tag_of(file).map_err(|error| error.to_string())?
         != Some(IO_REPARSE_TAG_AF_UNIX)
     {
-        return Err("what the bind made is not a socket's file".to_owned());
+        return Err("what stands there is not a socket's file".to_owned());
     }
     let made = file::object_of(file).map_err(|error| error.to_string())?;
+    let _client = uds_windows::UnixStream::connect(path)
+        .map_err(|error| format!("it could not be connected to: {error}"))?;
+    let _accepted = accept_within_the_wait(listener).map_err(|error| {
+        format!("a connection to it did not reach the listener that bound it: {error}")
+    })?;
+    if socket_object(path) != Some(made) {
+        return Err("the path names another object than the one that was opened".to_owned());
+    }
+    Ok(made)
+}
+
+/// Gives the open file of a socket its protected owner-only list and reads the list back from the
+/// same handle.
+fn protect(file: &std::fs::File, path: &Path) -> Result<(), String> {
     kr_ipc::paths::protect_with_owner_only_list(file.as_handle())
         .map_err(|error| format!("its list could not be set: {error}"))?;
     kr_ipc::paths::check_access_list(file.as_handle(), &path.display().to_string(), true).map_err(
@@ -273,8 +307,43 @@ fn protect(file: &std::fs::File, path: &Path) -> Result<Object, String> {
             kr_ipc::paths::AccessListRefusal::Policy(detail)
             | kr_ipc::paths::AccessListRefusal::Unreadable(detail) => detail,
         },
-    )?;
-    Ok(made)
+    )
+}
+
+/// Accepts one connection from a non-blocking `listener` that must already stand in its queue, and
+/// waits no longer than [`PROBE_WAIT`] for it.
+fn accept_within_the_wait(
+    listener: &uds_windows::UnixListener,
+) -> std::io::Result<uds_windows::UnixStream> {
+    let mut waited = Duration::ZERO;
+    loop {
+        match listener.accept() {
+            Ok((accepted, _)) => return Ok(accepted),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock && waited < PROBE_WAIT => {
+                std::thread::sleep(PROBE_STEP);
+                waited += PROBE_STEP;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+#[cfg(test)]
+type AfterTheBind = Box<dyn FnOnce(&Path)>;
+
+#[cfg(test)]
+thread_local! {
+    /// What a case does to the path between the bind and the first open, on its own thread, once.
+    static AFTER_THE_BIND: std::cell::RefCell<Option<AfterTheBind>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Runs, once, what a case put between the bind and the first open of the file.
+#[cfg(test)]
+fn run_the_hook_after_the_bind(path: &Path) {
+    if let Some(hook) = AFTER_THE_BIND.with(|hook| hook.borrow_mut().take()) {
+        hook(path);
+    }
 }
 
 /// What the probe found, once for this process.
@@ -392,22 +461,12 @@ fn prove_the_build_names_a_peer(path: &Path) -> Result<(), String> {
              {error}"
         )
     })?;
-    let mut waited = Duration::ZERO;
-    let accepted = loop {
-        match listener.accept() {
-            Ok((accepted, _)) => break accepted,
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock && waited < PROBE_WAIT => {
-                std::thread::sleep(PROBE_STEP);
-                waited += PROBE_STEP;
-            }
-            Err(error) => {
-                return Err(format!(
-                    "the probe's socket did not accept its own connection on this Windows build \
-                     ({build}): {error}"
-                ));
-            }
-        }
-    };
+    let accepted = accept_within_the_wait(&listener).map_err(|error| {
+        format!(
+            "the probe's socket did not accept its own connection on this Windows build \
+             ({build}): {error}"
+        )
+    })?;
     match peer_process_of(&accepted) {
         Ok(pid) if pid == own => Ok(()),
         Ok(pid) => Err(format!(
@@ -704,6 +763,67 @@ mod tests {
         let (listener, _) = Listener::bind(&path).expect("the socket binds");
         check_access_list(&path, true).expect("the list is protected and names no other account");
         drop(listener);
+    }
+
+    /// Puts `hook` between the next bind on this thread and its first open of the file.
+    fn after_the_bind(hook: impl FnOnce(&Path) + 'static) {
+        AFTER_THE_BIND.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+    }
+
+    /// KR-REQ-12.07: a path that an ordinary file replaced after the bind is not the socket the bind
+    /// made: the bind is refused, and the file is neither protected nor removed.
+    #[test]
+    fn a_file_that_replaces_the_socket_before_it_is_protected_is_left_in_place() {
+        let directory = Directory::new();
+        let path = directory.0.join("p.sock");
+        after_the_bind(|path| {
+            std::fs::remove_file(path).expect("the socket's file is taken away");
+            std::fs::write(path, b"a file").expect("a file stands there");
+        });
+        match Listener::bind(&path) {
+            Err(BindFailure::Unprotected(detail)) => {
+                assert!(detail.contains("left as it is"), "{detail}");
+            }
+            other => panic!("a refusal that leaves the path, not {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read(&path).expect("the file was not removed"),
+            b"a file"
+        );
+    }
+
+    /// KR-REQ-12.07: a path that another socket took after the bind is not the socket this bind
+    /// made: the bind is refused, and the other socket stays, reachable and with the list it had.
+    #[test]
+    fn a_socket_that_replaces_the_socket_before_it_is_protected_is_left_in_place() {
+        let directory = Directory::new();
+        let path = directory.0.join("p.sock");
+        let other = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let keeps = std::rc::Rc::clone(&other);
+        after_the_bind(move |path| {
+            std::fs::remove_file(path).expect("the socket's file is taken away");
+            *keeps.borrow_mut() =
+                Some(uds_windows::UnixListener::bind(path).expect("another socket binds"));
+        });
+        match Listener::bind(&path) {
+            Err(BindFailure::Unprotected(detail)) => {
+                assert!(detail.contains("left as it is"), "{detail}");
+            }
+            other => panic!("a refusal that leaves the path, not {other:?}"),
+        }
+        assert!(
+            socket_object(&path).is_some(),
+            "the other program's socket stands"
+        );
+        assert!(
+            uds_windows::UnixStream::connect(&path).is_ok(),
+            "the other program's socket is reachable"
+        );
+        assert!(
+            check_access_list(&path, true).is_err(),
+            "the other program's socket kept the list it was made with"
+        );
+        drop(other);
     }
 
     /// The access list of a file is read from the file: an entry for another account is refused,
