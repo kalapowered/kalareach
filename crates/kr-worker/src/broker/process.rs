@@ -439,6 +439,68 @@ fn check_private_directory_list(directory: &std::path::Path) -> Result<()> {
         })
 }
 
+/// Refuses a runtime directory whose ancestors another account could replace.
+///
+/// Every directory above `directory`, up to the volume's root, is opened as itself and must be no
+/// link or junction, and its list must not let an account this host does not trust delete it or what
+/// it holds, write its list or take it over. A bind by path resolves each of them, so a directory
+/// above the private one that another account can swap would put the socket somewhere this check
+/// never read. A directory's own entries for other accounts to read and pass through are fine: a
+/// profile's folders and `C:\Users` carry them.
+///
+/// # Errors
+///
+/// Returns [`BrokerError::LedgerUnavailable`] when a directory above cannot be read, is a link, or
+/// lets another account replace it.
+#[cfg(windows)]
+pub fn check_the_directories_above(directory: &std::path::Path) -> Result<()> {
+    use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
+    use std::os::windows::io::AsHandle as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+    };
+    for above in directory
+        .ancestors()
+        .skip(1)
+        .filter(|above| !above.as_os_str().is_empty())
+    {
+        let unreadable = |error: std::io::Error| {
+            BrokerError::ledger(format!(
+                "could not read {}, which lies above the runtime directory {}: {error}",
+                above.display(),
+                directory.display()
+            ))
+        };
+        let opened = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(above)
+            .map_err(unreadable)?;
+        let attributes = opened.metadata().map_err(unreadable)?.file_attributes();
+        if attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(BrokerError::ledger(format!(
+                "{} lies above the runtime directory {} and is a link, so what is below it can be \
+                 moved elsewhere",
+                above.display(),
+                directory.display()
+            )));
+        }
+        kr_ipc::paths::check_ancestor_access_list(opened.as_handle(), &above.display().to_string())
+            .map_err(|refusal| match refusal {
+                kr_ipc::paths::AccessListRefusal::Policy(detail)
+                | kr_ipc::paths::AccessListRefusal::Unreadable(detail) => {
+                    BrokerError::ledger(format!(
+                        "{} lies above the runtime directory {} and is not safe to bind below: \
+                         {detail}",
+                        above.display(),
+                        directory.display()
+                    ))
+                }
+            })?;
+    }
+    Ok(())
+}
+
 /// The check of [`check_private_directory`] where the platform has owners and mode bits.
 #[cfg(not(windows))]
 fn check_private_directory_mode(directory: &std::path::Path) -> Result<()> {

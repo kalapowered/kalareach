@@ -1010,8 +1010,8 @@ mod windows {
         ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, ATTRIBUTE_SECURITY_INFORMATION,
         DACL_SECURITY_INFORMATION, EqualSid, GetAce, GetKernelObjectSecurity, GetLengthSid,
         GetSecurityDescriptorControl, GetSecurityDescriptorDacl, GetSecurityDescriptorOwner,
-        GetSecurityDescriptorSacl, GetTokenInformation, INHERITED_ACE, IsValidSid,
-        LABEL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION,
+        GetSecurityDescriptorSacl, GetTokenInformation, INHERIT_ONLY_ACE, INHERITED_ACE,
+        IsValidSid, LABEL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION,
         PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
         SCOPE_SECURITY_INFORMATION, SE_DACL_AUTO_INHERITED, SE_DACL_PROTECTED,
         SE_SACL_AUTO_INHERITED, SE_SACL_PROTECTED, SECURITY_ATTRIBUTES, SID_AND_ATTRIBUTES,
@@ -1019,9 +1019,9 @@ mod windows {
         TokenOwner, TokenUser,
     };
     use windows_sys::Win32::Storage::FileSystem::{
-        CreateDirectoryW, FILE_ALL_ACCESS, FILE_ATTRIBUTE_ENCRYPTED, FILE_GENERIC_EXECUTE,
-        FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE,
-        FILE_SHARE_READ, FILE_SHARE_WRITE, READ_CONTROL,
+        CreateDirectoryW, DELETE, FILE_ALL_ACCESS, FILE_ATTRIBUTE_ENCRYPTED, FILE_DELETE_CHILD,
+        FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_READ_ATTRIBUTES,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, READ_CONTROL, WRITE_DAC, WRITE_OWNER,
     };
     use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
     use windows_sys::Win32::System::SystemServices::{
@@ -1289,6 +1289,50 @@ mod windows {
         what: &str,
         require_protected: bool,
     ) -> std::result::Result<(), AccessListRefusal> {
+        check_list(handle, what, Check::Boundary { require_protected })
+    }
+
+    /// Checks the access-control list of an opened directory that lies above a boundary directory.
+    ///
+    /// Such a directory is not this installation's: a profile's own folder and the folders above it
+    /// carry entries for other accounts to read and to pass through, and those are fine. What is
+    /// refused is a list that lets an account this host does not trust replace the directory, or
+    /// change who can reach it: delete it or what it holds, write its list, or take its ownership,
+    /// where the entry applies to the directory itself. A directory owned by such an account is
+    /// refused, because an owner can always write its list. Entries that only the directory's
+    /// children inherit are not read.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AccessListRefusal::Unreadable`] when the list cannot be read and
+    /// [`AccessListRefusal::Policy`] when it lets an account this host does not trust replace the
+    /// directory or change who can reach it.
+    pub fn check_ancestor_access_list(
+        handle: BorrowedHandle<'_>,
+        what: &str,
+    ) -> std::result::Result<(), AccessListRefusal> {
+        check_list(handle, what, Check::Ancestor)
+    }
+
+    /// What a list is read for.
+    #[derive(Clone, Copy)]
+    enum Check {
+        /// The directory is a boundary this host keeps: nothing but its owner and the machine's own
+        /// accounts may be named in it, and a protected list may be required.
+        Boundary { require_protected: bool },
+        /// The directory lies above one: it must not let another account replace it.
+        Ancestor,
+    }
+
+    /// The rights that replace a directory, or let an account take them: remove it or what it
+    /// holds, write its list, or take it over.
+    const ANCESTOR_CHANGES: u32 = DELETE | FILE_DELETE_CHILD | WRITE_DAC | WRITE_OWNER;
+
+    fn check_list(
+        handle: BorrowedHandle<'_>,
+        what: &str,
+        check: Check,
+    ) -> std::result::Result<(), AccessListRefusal> {
         let mut owner: PSID = std::ptr::null_mut();
         let mut list: *mut ACL = std::ptr::null_mut();
         let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
@@ -1313,7 +1357,7 @@ mod windows {
                 std::io::Error::from_raw_os_error(status.cast_signed())
             )));
         }
-        let outcome = evaluate(owner, list, descriptor, what, require_protected);
+        let outcome = evaluate(owner, list, descriptor, what, check);
         // SAFETY: the descriptor came from the call above and is freed exactly once. `owner` and
         // `list` point into it and are not used after this.
         unsafe {
@@ -1392,14 +1436,19 @@ mod windows {
         list: *mut ACL,
         descriptor: PSECURITY_DESCRIPTOR,
         what: &str,
-        require_protected: bool,
+        check: Check,
     ) -> std::result::Result<(), AccessListRefusal> {
         if owner.is_null() {
             return Err(AccessListRefusal::Policy(format!(
                 "{what} records no owner"
             )));
         }
-        if require_protected {
+        if matches!(
+            check,
+            Check::Boundary {
+                require_protected: true
+            }
+        ) {
             let mut control: u16 = 0;
             let mut revision: u32 = 0;
             // SAFETY: the descriptor is the one just read, and both out parameters are live.
@@ -1439,11 +1488,20 @@ mod windows {
         let permitted = |sid: PSID| {
             is_owner(sid) || trusted.iter().any(|account| equal(sid, account.as_psid()))
         };
-        if !is_owner(owner) {
-            return Err(AccessListRefusal::Policy(format!(
-                "{what} belongs to {}, and this host runs as another account",
-                describe(owner)
-            )));
+        match check {
+            Check::Boundary { .. } if !is_owner(owner) => {
+                return Err(AccessListRefusal::Policy(format!(
+                    "{what} belongs to {}, and this host runs as another account",
+                    describe(owner)
+                )));
+            }
+            Check::Ancestor if !permitted(owner) => {
+                return Err(AccessListRefusal::Policy(format!(
+                    "{what} belongs to {}, which can change who reaches it",
+                    describe(owner)
+                )));
+            }
+            _ => {}
         }
         // SAFETY: `list` points at the list inside the descriptor read above.
         let count = unsafe { (*list).AceCount };
@@ -1480,12 +1538,35 @@ mod windows {
                     .add(std::mem::offset_of!(ACCESS_ALLOWED_ACE, SidStart))
             }
             .cast();
-            if !permitted(sid) {
-                return Err(AccessListRefusal::Policy(format!(
-                    "the access-control list of {what} grants access to {}, which is neither its \
-                     owner nor an account that already holds this machine",
-                    describe(sid)
-                )));
+            match check {
+                Check::Boundary { .. } if !permitted(sid) => {
+                    return Err(AccessListRefusal::Policy(format!(
+                        "the access-control list of {what} grants access to {}, which is neither \
+                         its owner nor an account that already holds this machine",
+                        describe(sid)
+                    )));
+                }
+                Check::Ancestor if !permitted(sid) => {
+                    // SAFETY: the entry is an allow, whose mask lies inside the list this pointer
+                    // came from.
+                    let mask = file_rights(unsafe {
+                        std::ptr::read_unaligned(
+                            entry
+                                .cast::<u8>()
+                                .add(std::mem::offset_of!(ACCESS_ALLOWED_ACE, Mask))
+                                .cast::<u32>(),
+                        )
+                    });
+                    let for_children_only = u32::from(header.AceFlags) & INHERIT_ONLY_ACE != 0;
+                    if !for_children_only && mask & ANCESTOR_CHANGES != 0 {
+                        return Err(AccessListRefusal::Policy(format!(
+                            "the access-control list of {what} lets {} replace it or change who \
+                             reaches it",
+                            describe(sid)
+                        )));
+                    }
+                }
+                _ => {}
             }
         }
         Ok(())
@@ -2627,8 +2708,8 @@ mod windows {
 
 #[cfg(windows)]
 pub use self::windows::{
-    AccessListRefusal, FileAccess, check_access_list, current_job_limit_flags, open_child,
-    protect_with_owner_only_list,
+    AccessListRefusal, FileAccess, check_access_list, check_ancestor_access_list,
+    current_job_limit_flags, open_child, protect_with_owner_only_list,
 };
 /// For this crate's own tests of files a wider list would let another account reach, and of the
 /// access reader.

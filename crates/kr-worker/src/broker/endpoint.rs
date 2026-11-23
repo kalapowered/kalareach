@@ -21,7 +21,9 @@
 //! rests on there is the peer check: the kernel names the process on the other end and that
 //! process's own token names its account, both before a byte of what the peer sent is read. The
 //! socket's file also carries a protected list that names its owner only, as defence in depth: no
-//! admission relies on it. A build that cannot name the process on the other end of a socket binds
+//! admission relies on it. A runtime root the person names is bound below only when no directory
+//! above it is a link or can be replaced by another account; the default root in the profile is not
+//! read so. A build that cannot name the process on the other end of a socket binds
 //! none, and says so before any launch is committed. A connection whose peer the kernel will not
 //! name is refused on every kind, so no admission rests on an identity the connecting side
 //! presented.
@@ -171,6 +173,27 @@ pub(crate) fn require_room_for_a_socket_path(path: &std::path::Path, limit: usiz
     Ok(())
 }
 
+#[cfg(all(windows, test))]
+thread_local! {
+    /// What a case says of the runtime root on its own thread, in place of the environment.
+    static CONFIGURED_ROOT: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Whether the runtime root was named by the person, through `KR_RUNTIME_DIR`, rather than left to
+/// the profile.
+///
+/// The default root lies in the profile, whose folders no other account writes, and is left as it
+/// is. A root that is named can be anywhere, below a folder another account controls or a junction
+/// it made, so the directories above it are checked before a socket is bound below them.
+#[cfg(windows)]
+fn the_root_is_configured() -> bool {
+    #[cfg(test)]
+    if let Some(forced) = CONFIGURED_ROOT.with(std::cell::Cell::get) {
+        return forced;
+    }
+    std::env::var_os(kr_ipc::paths::RUNTIME_DIR_VARIABLE).is_some()
+}
+
 /// The endpoint a launched agent's bridge connects to.
 #[derive(Debug)]
 pub struct BoundEndpoint {
@@ -297,6 +320,9 @@ impl BoundEndpoint {
                     BrokerError::invalid("a private socket lives inside a directory")
                 })?;
                 crate::broker::process::check_private_directory(parent)?;
+                if the_root_is_configured() {
+                    crate::broker::process::check_the_directories_above(parent)?;
+                }
                 // The bind proves the build names its peers, makes the socket's file, gives it
                 // the owner-only list through the handle it opened and reads that list back from
                 // the same handle, and returns the identity of the file it made.
@@ -824,6 +850,99 @@ mod tests {
             b"a file"
         );
         let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// What a case holds while it says the runtime root is, or is not, one the person named: the
+    /// reading is put back when this is dropped.
+    #[cfg(windows)]
+    struct ConfiguredRoot(Option<bool>);
+
+    #[cfg(windows)]
+    impl Drop for ConfiguredRoot {
+        fn drop(&mut self) {
+            CONFIGURED_ROOT.with(|slot| slot.set(self.0));
+        }
+    }
+
+    #[cfg(windows)]
+    fn say_the_root_is_configured(configured: bool) -> ConfiguredRoot {
+        ConfiguredRoot(CONFIGURED_ROOT.with(|slot| slot.replace(Some(configured))))
+    }
+
+    /// A private runtime directory named `run` below `outer`.
+    #[cfg(windows)]
+    fn private_run_directory_in(outer: &std::path::Path) -> std::path::PathBuf {
+        let run = outer.join("run");
+        kr_ipc::paths::create_private_directory(&run).expect("a private directory is made");
+        run
+    }
+
+    /// KR-REQ-07.45: a runtime root the person named binds nothing below a directory that another
+    /// account can replace, because the bind resolves that directory and the check of the private
+    /// one below it never read where it leads; the default root is left as it is.
+    #[cfg(windows)]
+    #[test]
+    fn a_named_runtime_root_below_a_directory_another_account_can_replace_binds_nothing() {
+        let outer = std::env::temp_dir().join(format!("kr-e-{}", kr_ipc::new_uuid()));
+        std::fs::create_dir_all(&outer).expect("the directory is created");
+        let run = private_run_directory_in(&outer);
+        let _named = say_the_root_is_configured(true);
+        drop(BoundEndpoint::bind_named(&run, "gw.sock").expect("it binds below an ordinary one"));
+
+        // Everyone may modify the directory above the private one, which includes deleting it.
+        let widened = std::process::Command::new("icacls")
+            .arg(&outer)
+            .args(["/grant", "*S-1-1-0:(M)"])
+            .output()
+            .expect("icacls runs");
+        assert!(widened.status.success(), "the entry is added: {widened:?}");
+        let refusal = BoundEndpoint::bind_named(&run, "gw.sock")
+            .map(|_| ())
+            .expect_err("a directory above that another account can replace");
+        assert!(refusal.to_string().contains("replace it"), "{refusal}");
+        assert!(
+            std::fs::symlink_metadata(run.join("gw.sock")).is_err(),
+            "no socket was made"
+        );
+
+        let _default = say_the_root_is_configured(false);
+        drop(
+            BoundEndpoint::bind_named(&run, "gw.sock")
+                .expect("the default root is read as it always was"),
+        );
+        let _ = std::fs::remove_dir_all(&outer);
+    }
+
+    /// KR-REQ-07.45: a runtime root the person named binds nothing below a junction: the bind
+    /// resolves it, and where it leads is not what was read.
+    #[cfg(windows)]
+    #[test]
+    fn a_named_runtime_root_below_a_junction_binds_nothing() {
+        let outer = std::env::temp_dir().join(format!("kr-e-{}", kr_ipc::new_uuid()));
+        let real = outer.join("real");
+        std::fs::create_dir_all(&real).expect("the directory is created");
+        let link = outer.join("link");
+        let made = std::process::Command::new("cmd")
+            .arg("/c")
+            .arg("mklink")
+            .arg("/J")
+            .arg(&link)
+            .arg(&real)
+            .output()
+            .expect("cmd runs");
+        assert!(made.status.success(), "the junction is made: {made:?}");
+        let run = private_run_directory_in(&link);
+        let _named = say_the_root_is_configured(true);
+        let refusal = BoundEndpoint::bind_named(&run, "gw.sock")
+            .map(|_| ())
+            .expect_err("a junction above the private directory");
+        assert!(refusal.to_string().contains("is a link"), "{refusal}");
+        assert!(
+            std::fs::symlink_metadata(real.join("run").join("gw.sock")).is_err(),
+            "no socket was made where the junction leads"
+        );
+        std::fs::remove_dir(&link).expect("the junction is removed as itself");
+        let _ = std::fs::remove_dir_all(&outer);
     }
 
     /// A runtime directory that is not private binds nothing, where the list says so: an ordinary
