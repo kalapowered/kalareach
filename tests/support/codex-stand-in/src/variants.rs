@@ -3,7 +3,8 @@
 //! The variants are named in `STAND_IN`, separated by commas. Without any, the stand-in behaves
 //! as the pinned release was measured to: its commands lead a session and a process group of their
 //! own, it ends them and exits when its input ends or when it is asked to terminate, and a
-//! hang-up kills it at once and leaves its commands behind.
+//! hang-up kills it at once and leaves its commands behind. On Windows its commands run in a job
+//! of their own in place of a group, and there is no request to terminate or hang-up.
 
 /// The variable that names the variants.
 pub const VARIABLE: &str = "STAND_IN";
@@ -37,6 +38,10 @@ pub const RECEIVED_VARIABLE: &str = "STAND_IN_RECEIVED";
 /// identifier, or `name=identifier` for one that has a name too. A terminal started with
 /// `resume <word>` can resume one by either.
 pub const SAVED_VARIABLE: &str = "STAND_IN_SAVED";
+
+/// The identifier the terminal gives its request to start a turn: under `colliding-ids` the server
+/// asks for its approval under the same one.
+pub const TURN: i64 = 3;
 
 /// The program the terminal runs once, before it connects, under the `leave-a-host` variant: what an
 /// agent that rewrites the host's state in the account it runs in does.
@@ -167,7 +172,18 @@ impl Variants {
             match name {
                 "by-hand" => variants.by_hand = true,
                 "ignore-eof" => variants.ignore_eof = true,
-                "ignore-term" => variants.ignore_term = true,
+                "ignore-term" => {
+                    // A request to terminate is a Unix signal. Windows has none, so a run that asks
+                    // to ignore it would pass by doing nothing.
+                    #[cfg(windows)]
+                    panic!(
+                        "`ignore-term` needs a request to terminate, which this platform has none of"
+                    );
+                    #[cfg(unix)]
+                    {
+                        variants.ignore_term = true;
+                    }
+                }
                 "command-shares-group" => variants.command_shares_group = true,
                 "die-first" => variants.die_first = true,
                 "flood-stderr" => variants.flood_stderr = true,

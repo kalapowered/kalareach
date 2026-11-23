@@ -11,6 +11,7 @@ use std::process::Stdio;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
 use tokio::process::{Child, Command};
+#[cfg(unix)]
 use tokio::signal::unix::{Signal, SignalKind, signal};
 
 use crate::contract::{Contract, Frame, RELEASE, Side};
@@ -23,6 +24,7 @@ const APPROVAL: &str = "approval-1";
 const SECOND_APPROVAL: &str = "approval-2";
 
 /// The program's argument that makes it lead a session of its own and run a command in it.
+#[cfg(unix)]
 pub const EXEC_IN_NEW_SESSION: &str = "--exec-in-new-session";
 
 /// Where a connection is in the handshake.
@@ -36,10 +38,121 @@ enum Phase {
     Ready,
 }
 
-/// A command the server started, and whether it leads a process group of its own.
+/// The words that run `command` in the system's shell: `/bin/sh -c` on Unix, `cmd.exe /d /c` on
+/// Windows, where `/d` leaves out the shell's start-up commands.
+fn shell(command: String) -> Vec<String> {
+    let (program, switches): (&str, &[&str]) = if cfg!(windows) {
+        ("cmd.exe", &["/d", "/c"])
+    } else {
+        ("/bin/sh", &["-c"])
+    };
+    std::iter::once(program)
+        .chain(switches.iter().copied())
+        .map(str::to_owned)
+        .chain([command])
+        .collect()
+}
+
+/// A command the server started, and what ends everything it started: the process group it leads
+/// on Unix, the job it runs in on Windows.
 struct Started {
     child: Child,
+    /// Whether the command leads a process group of its own.
+    #[cfg(unix)]
     leads_group: bool,
+    /// The job the command runs in, where it has one of its own.
+    #[cfg(windows)]
+    job: Option<crate::job::Job>,
+}
+
+impl Started {
+    /// Starts `words` with nothing on its standard streams. A command that leads a group runs in a
+    /// session of its own: the program runs itself in one, which the command then leads, and a
+    /// session leader leads a process group too.
+    #[cfg(unix)]
+    fn start(words: &[String], leads_group: bool) -> std::io::Result<Self> {
+        let mut command = if leads_group {
+            let mut command = Command::new(std::env::current_exe().expect("this program's path"));
+            command.arg(EXEC_IN_NEW_SESSION).args(words);
+            command
+        } else {
+            let mut command = Command::new(&words[0]);
+            command.args(&words[1..]);
+            command
+        };
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        Ok(Self {
+            child: command.spawn()?,
+            leads_group,
+        })
+    }
+
+    /// Ends the command, and then what it started where it leads a group. A command that has not
+    /// yet made its session has no group to end, and ending it first is what leaves nothing for
+    /// it to start.
+    #[cfg(unix)]
+    fn end(&mut self) {
+        let leader = self.child.id().and_then(|pid| i32::try_from(pid).ok());
+        let _ = self.child.start_kill();
+        if self.leads_group
+            && let Some(group) = leader.and_then(rustix::process::Pid::from_raw)
+        {
+            let _ = rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
+        }
+    }
+
+    /// Starts `words` with nothing on its standard streams. A command that leads a group is
+    /// created suspended and joins a job of its own before it runs, as the pinned release's server
+    /// starts one. Where the job cannot be made or the command cannot join it, the command runs
+    /// outside a job of its own, and the reason is said on the error stream.
+    #[cfg(windows)]
+    fn start(words: &[String], leads_group: bool) -> std::io::Result<Self> {
+        use crate::job::{CREATE_SUSPENDED, Job, resume};
+
+        let mut command = Command::new(&words[0]);
+        command
+            .args(&words[1..])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        if leads_group {
+            command.creation_flags(CREATE_SUSPENDED);
+        }
+        let mut child = command.spawn()?;
+        let mut job = None;
+        if leads_group {
+            let Some(process) = child.raw_handle() else {
+                let _ = child.start_kill();
+                return Err(std::io::Error::other("the command has no handle"));
+            };
+            match Job::create() {
+                Ok(made) => match made.assign(process) {
+                    Ok(()) => job = Some(made),
+                    Err(error) => {
+                        eprintln!("stand-in: the command is outside a job of its own: {error}");
+                    }
+                },
+                Err(error) => eprintln!("stand-in: no job was made: {error}"),
+            }
+            if let Err(error) = resume(process) {
+                let _ = child.start_kill();
+                return Err(error);
+            }
+        }
+        Ok(Self { child, job })
+    }
+
+    /// Ends the command, and every process in its job where it has one.
+    #[cfg(windows)]
+    fn end(&mut self) {
+        let _ = self.child.start_kill();
+        if let Some(job) = &self.job {
+            job.terminate();
+        }
+    }
 }
 
 /// The turn that is running, and the approval it waits on.
@@ -201,13 +314,7 @@ impl Server {
         use std::io::Write as _;
         let _ = writeln!(std::io::stderr(), "stand-in: ending its commands");
         for started in &mut self.commands {
-            let leader = started.child.id().and_then(|pid| i32::try_from(pid).ok());
-            let _ = started.child.start_kill();
-            if started.leads_group
-                && let Some(group) = leader.and_then(rustix::process::Pid::from_raw)
-            {
-                let _ = rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
-            }
+            started.end();
         }
         for started in &mut self.commands {
             let _ = started.child.wait().await;
@@ -225,30 +332,25 @@ impl Server {
     /// started.
     fn run_command(&mut self, words: &[String]) -> Option<usize> {
         let leads_group = !self.variants.command_shares_group;
-        let mut command = if leads_group {
-            // The program runs itself in a session of its own, which the command then leads: a
-            // session leader leads a process group too.
-            let mut command = Command::new(std::env::current_exe().expect("this program's path"));
-            command.arg(EXEC_IN_NEW_SESSION).args(words);
-            command
-        } else {
-            let mut command = Command::new(&words[0]);
-            command.args(&words[1..]);
-            command
-        };
-        command
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        match command.spawn() {
-            Ok(child) => {
+        let started = Started::start(words, leads_group);
+        match started {
+            Ok(started) => {
                 // Said on the error stream, where a test that wants the command's identifier
                 // reads it.
+                let pid = started.child.id().unwrap_or_default();
+                eprintln!("stand-in: started command {pid}");
+                // Said after it, where a test that wants to know whether the command is in a job
+                // of its own reads it: it is outside one where the job could not be made or joined.
+                #[cfg(windows)]
                 eprintln!(
-                    "stand-in: started command {}",
-                    child.id().unwrap_or_default()
+                    "stand-in: command {pid} runs {} a job of its own",
+                    if started.job.is_some() {
+                        "in"
+                    } else {
+                        "outside"
+                    }
                 );
-                self.commands.push(Started { child, leads_group });
+                self.commands.push(started);
                 Some(self.commands.len() - 1)
             }
             Err(error) => {
@@ -413,8 +515,7 @@ impl Server {
                             frame["result"]["decision"].as_str(),
                             Some("accept" | "acceptForSession")
                         )
-                        && let Some(place) =
-                            self.run_command(&["/bin/sh".to_owned(), "-c".to_owned(), command])
+                        && let Some(place) = self.run_command(&shell(command))
                     {
                         self.awaited = Some(place);
                         if let Some(running) = &mut self.running {
@@ -462,7 +563,7 @@ impl Server {
             self.send(json!({ "id": id, "result": {
                 "userAgent": format!("codex-stand-in/{RELEASE}"),
                 "codexHome": "/stand-in",
-                "platformFamily": "unix",
+                "platformFamily": if cfg!(windows) { "windows" } else { "unix" },
                 "platformOs": std::env::consts::OS
             }}))
             .await;
@@ -645,6 +746,7 @@ impl Server {
     /// names, a line that marks the turn's start and a line that holds its prompt, in the file of
     /// the thread. Nothing is written for a turn whose input holds no text, or where `CODEX_HOME`
     /// is not set, or where it does not name a directory inside the run ([`crate::record`]).
+    #[cfg(unix)]
     fn writes_the_record(request: &Value, thread_id: &str, turn_id: &str) {
         let Some(home) = std::env::var_os(crate::variants::CONFIG_VARIABLE) else {
             return;
@@ -679,6 +781,12 @@ impl Server {
         if let Err(error) = written {
             eprintln!("stand-in: the record of {turn_id} could not be written: {error}");
         }
+    }
+
+    /// No record is written where the program has no writer of it.
+    #[cfg(not(unix))]
+    fn writes_the_record(_request: &Value, _thread_id: &str, turn_id: &str) {
+        eprintln!("stand-in: the record of {turn_id} is not written on this platform");
     }
 
     /// Under `answer-the-sum`, writes the sum a turn's input asks for as the agent's message of
@@ -828,7 +936,7 @@ impl Server {
             return;
         }
         let approval = json!({
-            "id": if self.variants.colliding_ids { json!(crate::terminal::TURN) } else { json!(APPROVAL) },
+            "id": if self.variants.colliding_ids { json!(crate::variants::TURN) } else { json!(APPROVAL) },
             "method": "item/commandExecution/requestApproval",
             "params": {
                 "itemId": "item-1",
@@ -894,9 +1002,38 @@ impl Server {
     }
 }
 
-/// Waits for the next signal to terminate, for ever when there is none to wait for.
-async fn terminated(terminate: &mut Signal) {
-    terminate.recv().await;
+/// What tells the server to terminate: the signal of that name on Unix. Windows has no request
+/// to terminate that a program can receive, only an end by force, so the server there is never
+/// asked and waits for it for ever.
+#[cfg(unix)]
+struct Terminate(Signal);
+
+#[cfg(windows)]
+struct Terminate;
+
+impl Terminate {
+    /// Installs the handler for the request.
+    #[cfg(unix)]
+    fn install() -> Self {
+        Self(signal(SignalKind::terminate()).expect("a handler for terminate"))
+    }
+
+    /// There is no handler to install.
+    #[cfg(windows)]
+    fn install() -> Self {
+        Self
+    }
+}
+
+/// Waits for the next request to terminate, for ever when there is none to wait for.
+async fn terminated(terminate: &mut Terminate) {
+    #[cfg(unix)]
+    terminate.0.recv().await;
+    #[cfg(windows)]
+    {
+        let _ = terminate;
+        std::future::pending::<()>().await;
+    }
 }
 
 /// Runs the server until its input ends, or for ever when it is told to ignore that.
@@ -904,7 +1041,7 @@ async fn terminated(terminate: &mut Signal) {
 /// The handler for terminate is installed before anything else is done, so that a program that
 /// takes a while to start is not one a signal can kill before it is ready for it.
 pub async fn run(variants: Variants) -> ! {
-    let mut terminate = signal(SignalKind::terminate()).expect("a handler for terminate");
+    let mut terminate = Terminate::install();
     Server::note_received("server started");
     let contract = Contract::pinned();
     if variants.report_environment {
@@ -1019,6 +1156,7 @@ pub async fn run(variants: Variants) -> ! {
 }
 
 /// Runs `words` in a session of its own, which it leads, in place of this program.
+#[cfg(unix)]
 pub fn exec_in_new_session(words: &[String]) -> ! {
     use std::os::unix::process::CommandExt as _;
     let _ = rustix::process::setsid();

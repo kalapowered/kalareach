@@ -17,33 +17,29 @@
 //! (see `contract`), so a gateway that makes a frame the pinned release would not write is caught.
 //! A test makes a run misbehave by naming variants in `STAND_IN` (see `variants`).
 //!
-//! The release's terminal reaches a gateway over a socket in a file and its server starts commands
-//! in process groups, so the program is built for Unix; elsewhere it only says so.
+//! The release's terminal reaches a gateway over a socket in a file. On Unix its server starts
+//! commands in process groups; on Windows it starts them in jobs.
 
 /// The release the newer program of this source is.
-#[cfg(unix)]
 const NEWER_RELEASE: &str = "0.156.1";
 
 /// Whether this program is the newer build of the source: the second `[[bin]]` of the package.
-#[cfg(unix)]
 fn newer() -> bool {
     option_env!("CARGO_BIN_NAME") == Some("codex-stand-in-newer")
 }
 
-#[cfg(unix)]
 mod contract;
+#[cfg(windows)]
+mod job;
 #[cfg(unix)]
 mod keyboard;
 #[cfg(unix)]
 mod record;
-#[cfg(unix)]
 mod server;
 #[cfg(unix)]
 mod terminal;
-#[cfg(unix)]
 mod variants;
 
-#[cfg(unix)]
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     let arguments: Vec<String> = std::env::args().skip(1).collect();
@@ -64,11 +60,13 @@ async fn main() {
         ),
         // The pinned build, started by hand where no gateway serves it: a composer, and nothing to
         // serve.
+        #[cfg(unix)]
         [] if variants.by_hand && !newer() => by_hand(None),
         // The pinned build, started by hand on a saved conversation: its own `resume` or `fork` and
         // the conversation's identifier. The stand-in saves none, so it only says what it was asked.
         // As with a start by hand on nothing, the case says so in `STAND_IN`: a start that does not
         // is one no gateway served, and ends on the last arm.
+        #[cfg(unix)]
         [word @ ("resume" | "fork"), id] if variants.by_hand && !newer() => {
             by_hand(Some(format!("{word} {id}")))
         }
@@ -80,9 +78,12 @@ async fn main() {
         // What an agent that rewrites its own configuration at a start does: a line is added to the
         // `config.toml` that `CODEX_HOME` names.
         ["--rewrite-config"] => rewrite_config(),
-        // What an agent that moves its working directory out from under its caller does.
+        // What an agent that moves its working directory out from under its caller does. A
+        // Windows process holds its working directory open, so nothing can move it away.
+        #[cfg(unix)]
         ["--move-work"] => move_work(),
         ["app-server", "--listen", "stdio://"] => server::run(variants).await,
+        #[cfg(unix)]
         ["--remote", remote, words @ ..] | [words @ .., "--remote", remote]
             if remote.starts_with("unix://") =>
         {
@@ -95,6 +96,7 @@ async fn main() {
                 terminal::run(contract::Contract::pinned(), variants, socket, &prompt).await;
             std::process::exit(status);
         }
+        #[cfg(unix)]
         [server::EXEC_IN_NEW_SESSION, _, ..] => server::exec_in_new_session(&arguments[1..]),
         _ => {
             eprintln!(
@@ -142,7 +144,6 @@ fn by_hand(on: Option<String>) -> ! {
 
 /// What the newer build does when it runs as typed: says so on its terminal and waits to be ended.
 /// The wait is a bound and not a decision: the program ends by itself after an hour.
-#[cfg(unix)]
 fn run_as_typed() -> ! {
     eprintln!(
         "codex-stand-in: serves nothing as typed (newer build {NEWER_RELEASE}, {})",
@@ -157,7 +158,6 @@ fn run_as_typed() -> ! {
 /// # Panics
 ///
 /// Panics when the directory is not named or the file cannot be appended to.
-#[cfg(unix)]
 fn rewrite_config() {
     use std::io::Write as _;
     let directory = std::env::var_os("CODEX_HOME").expect("CODEX_HOME names the configuration");
@@ -189,10 +189,4 @@ fn move_work() {
     std::fs::rename(&work, holder.with_file_name(name)).expect("moves the directory away");
     std::fs::create_dir(&work).expect("makes another directory at the old place");
     println!("codex-cli moved its working directory");
-}
-
-#[cfg(not(unix))]
-fn main() {
-    eprintln!("codex-stand-in: built for Unix only");
-    std::process::exit(2);
 }

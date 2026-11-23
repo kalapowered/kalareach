@@ -22,13 +22,12 @@ use tokio_websockets::{ClientBuilder, Message};
 
 use crate::contract::{Contract, Frame, RELEASE, Side};
 use crate::keyboard::{self, Command, DIRECTORY, Decoder, Screen, Typed};
-use crate::variants::{KEY_VARIABLE, RELEASE_VARIABLE, Variants, padded};
+use crate::variants::{KEY_VARIABLE, RELEASE_VARIABLE, TURN, Variants, padded};
 
 /// The identifiers the terminal gives its requests, after `initialize`'s.
 const ACCOUNT: i64 = 1;
 const SIGN_IN: i64 = 4;
 const THREAD: i64 = 2;
-pub(crate) const TURN: i64 = 3;
 /// The requests a person's commands make: forking the thread, and starting a new one.
 const FORK: i64 = 5;
 const NEW: i64 = 6;
