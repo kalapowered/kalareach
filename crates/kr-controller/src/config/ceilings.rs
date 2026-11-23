@@ -14,7 +14,10 @@
 use kr_protocol::admission::RevocationPolicy;
 use kr_protocol::grant::Grant;
 use kr_protocol::hostinfo::CeilingValue;
-use kr_protocol::hostinfo::configuration::{ConfigurationCeilings, EnrolmentBudgets};
+use kr_protocol::hostinfo::configuration::{
+    ConfigurationCeilings, DESCRIPTION_CEILING_RANGE, DESCRIPTION_PROCESS_MEMORY_CEILING_BYTES,
+    DESCRIPTION_RESERVE_FIXED_BYTES, DESCRIPTION_RESERVE_RANGE, EnrolmentBudgets,
+};
 use kr_protocol::hostinfo::export::Sentence;
 use kr_protocol::limits::DEFAULT_MAX_SESSIONS_PER_ENVIRONMENT;
 use kr_protocol::rights::ActionRight;
@@ -54,6 +57,9 @@ pub struct Ceiling<T> {
 pub struct HardLimits {
     /// The most sessions this machine's own resources allow, where this host has established it.
     pub sessions_per_environment: Option<u64>,
+    /// The physical memory this machine has, where this host reads it. The reserve the description
+    /// process keeps free is held to a floor that depends on it.
+    pub physical_memory_bytes: Option<u64>,
 }
 
 /// Intersects the configured session number with the hard resource limit.
@@ -125,6 +131,92 @@ pub fn enrolment(ceilings: &ConfigurationCeilings) -> Ceiling<EnrolmentBudgets> 
         value: configured,
         narrowed_by: None,
         refused: false,
+    }
+}
+
+/// The owner's two description budgets after they have been intersected.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DescriptionCeilings {
+    /// The most memory the description process may use, in bytes.
+    pub process_memory: Ceiling<u64>,
+    /// The memory kept free while descriptions run, in bytes.
+    pub reserve: Ceiling<u64>,
+}
+
+/// Intersects the owner's description budgets with what section 22 fixes and this machine allows.
+///
+/// A ceiling applies when it is above 0 and no more than the 4 GiB section 22 fixes. A reserve
+/// applies when it is no less than the floor in force, which is the larger of 1 GiB and a fifth of
+/// this machine's memory: the owner's reserve only ever raises the floor, so a lower one is a more
+/// permissive value and is refused with the floor in force, and is never shown as the reserve in
+/// force. Where this host does not know its memory, the floor it can state is the fixed 1 GiB.
+#[must_use]
+pub fn description_budgets(
+    ceilings: &ConfigurationCeilings,
+    limits: HardLimits,
+) -> DescriptionCeilings {
+    let configured = ceilings.description_budgets.unwrap_or_default();
+
+    let default_ceiling = DESCRIPTION_PROCESS_MEMORY_CEILING_BYTES;
+    let asked = configured.process_memory_bytes.0;
+    let process_memory = match asked {
+        Some(asked) if asked == 0 || asked > default_ceiling => Ceiling {
+            configured: Some(asked),
+            value: default_ceiling,
+            narrowed_by: Some(Sentence::new().stated(DESCRIPTION_CEILING_RANGE)),
+            refused: true,
+        },
+        Some(asked) => Ceiling {
+            configured: Some(asked),
+            value: asked,
+            narrowed_by: None,
+            refused: false,
+        },
+        None => Ceiling {
+            configured: None,
+            value: default_ceiling,
+            narrowed_by: None,
+            refused: false,
+        },
+    };
+
+    let floor =
+        kr_describe::resource::reserve_floor_bytes(limits.physical_memory_bytes.unwrap_or(0));
+    let asked = configured.reserve_bytes.0;
+    let reserve = match asked {
+        Some(asked) if asked < DESCRIPTION_RESERVE_FIXED_BYTES => Ceiling {
+            configured: Some(asked),
+            value: floor,
+            narrowed_by: Some(Sentence::new().stated(DESCRIPTION_RESERVE_RANGE)),
+            refused: true,
+        },
+        Some(asked) if asked < floor => Ceiling {
+            configured: Some(asked),
+            value: floor,
+            narrowed_by: Some(
+                Sentence::new()
+                    .stated("this machine keeps at least ")
+                    .number(floor)
+                    .stated(" bytes free: the larger of 1 GiB and a fifth of its memory"),
+            ),
+            refused: true,
+        },
+        Some(asked) => Ceiling {
+            configured: Some(asked),
+            value: asked,
+            narrowed_by: None,
+            refused: false,
+        },
+        None => Ceiling {
+            configured: None,
+            value: floor,
+            narrowed_by: None,
+            refused: false,
+        },
+    };
+    DescriptionCeilings {
+        process_memory,
+        reserve,
     }
 }
 

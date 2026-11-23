@@ -57,7 +57,8 @@ impl Budgets {
         max_output_tokens: 128,
         context_debounce_ms: 2_000,
         session_cooldown_ms: 30_000,
-        process_memory_ceiling_bytes: 4 * GIB,
+        process_memory_ceiling_bytes:
+            kr_protocol::hostinfo::configuration::DESCRIPTION_PROCESS_MEMORY_CEILING_BYTES,
         execution_deadline_ms: 30_000,
     };
 

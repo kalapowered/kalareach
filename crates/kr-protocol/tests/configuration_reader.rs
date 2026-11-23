@@ -168,7 +168,12 @@ fn the_document_this_build_writes_is_the_golden_document_at_the_version_it_write
 fn this_build_writes_the_golden_document_with_the_description_budgets_byte_for_byte() {
     let golden = fixture("version-4-description-budgets.json");
     let loaded = load(&golden);
-    assert_eq!(loaded.status.state, DocumentState::Loaded, "{:?}", loaded.status);
+    assert_eq!(
+        loaded.status.state,
+        DocumentState::Loaded,
+        "{:?}",
+        loaded.status
+    );
     assert!(!loaded.fails_closed());
     let document: ConfigurationDocument = loaded.document.expect("the document is used");
     assert_eq!(document.version, configuration::VERSION);
@@ -194,9 +199,17 @@ fn the_description_budgets_read_as_absent_as_one_budget_or_as_a_document_that_is
     assert_eq!(document.ceilings.description_budgets, None);
 
     let null = load(&with_ceiling(name, member, &Value::Null));
-    assert_eq!(null.status.state, DocumentState::Loaded, "{:?}", null.status);
     assert_eq!(
-        null.document.expect("the document is used").ceilings.description_budgets,
+        null.status.state,
+        DocumentState::Loaded,
+        "{:?}",
+        null.status
+    );
+    assert_eq!(
+        null.document
+            .expect("the document is used")
+            .ceilings
+            .description_budgets,
         None,
         "null is absent"
     );
@@ -221,8 +234,14 @@ fn the_description_budgets_read_as_absent_as_one_budget_or_as_a_document_that_is
             "a nested unknown member",
             serde_json::json!({ "process_memory_bytes": 1, "reserve_bytes": 2, "soft_bytes": 3 }),
         ),
-        ("a budget that is not a number", serde_json::json!({ "reserve_bytes": "big" })),
-        ("a budget below zero", serde_json::json!({ "process_memory_bytes": -1 })),
+        (
+            "a budget that is not a number",
+            serde_json::json!({ "reserve_bytes": "big" }),
+        ),
+        (
+            "a budget below zero",
+            serde_json::json!({ "process_memory_bytes": -1 }),
+        ),
     ] {
         let loaded = load(&with_ceiling(name, member, &value));
         assert_eq!(
@@ -232,6 +251,66 @@ fn the_description_budgets_read_as_absent_as_one_budget_or_as_a_document_that_is
             loaded.status
         );
         assert!(loaded.fails_closed(), "{what}");
-        assert!(loaded.document.is_none(), "{what}: nothing is read out of it");
+        assert!(
+            loaded.document.is_none(),
+            "{what}: nothing is read out of it"
+        );
+    }
+}
+
+/// KR-REQ-22.10: a document that holds a description budget the host cannot honour is unusable
+/// whole, as one with a session ceiling of 0 is, and says which rule it broke: the host fails
+/// closed and nothing is read out of it.
+#[test]
+fn a_document_with_a_description_budget_the_host_cannot_honour_is_unusable() {
+    let name = "version-4-description-budgets.json";
+    let member = "description_budgets";
+    for (what, value, rule) in [
+        (
+            "a ceiling of 0",
+            serde_json::json!({ "process_memory_bytes": 0 }),
+            "the description process's memory ceiling is more than 0 and at most 4 GiB",
+        ),
+        (
+            "a ceiling above 4 GiB",
+            serde_json::json!({ "process_memory_bytes": 4_294_967_297u64 }),
+            "the description process's memory ceiling is more than 0 and at most 4 GiB",
+        ),
+        (
+            "a reserve below 1 GiB",
+            serde_json::json!({ "reserve_bytes": 1_073_741_823u64 }),
+            "the description reserve is at least 1 GiB",
+        ),
+    ] {
+        let loaded = load(&with_ceiling(name, member, &value));
+        assert_eq!(
+            loaded.status.state,
+            DocumentState::Invalid,
+            "{what}: {:?}",
+            loaded.status
+        );
+        assert!(loaded.fails_closed(), "{what}");
+        assert!(
+            loaded.document.is_none(),
+            "{what}: nothing is read out of it"
+        );
+        assert!(
+            loaded.status.detail.as_str().contains(rule),
+            "{what}: {:?}",
+            loaded.status
+        );
+    }
+    // The edges are the owner's: 4 GiB exactly, and a reserve of exactly 1 GiB.
+    for value in [
+        serde_json::json!({ "process_memory_bytes": 4_294_967_296u64 }),
+        serde_json::json!({ "reserve_bytes": 1_073_741_824u64 }),
+    ] {
+        let loaded = load(&with_ceiling(name, member, &value));
+        assert_eq!(
+            loaded.status.state,
+            DocumentState::Loaded,
+            "{value}: {:?}",
+            loaded.status
+        );
     }
 }

@@ -154,7 +154,8 @@ configuration file this host reads.
     "session_limit": 16,
     "grant_rights": null,
     "enrolment": { "retained_generations": 5 },
-    "disable_policy": "disable_at_next_admission"
+    "disable_policy": "disable_at_next_admission",
+    "description_budgets": { "process_memory_bytes": 2147483648, "reserve_bytes": 8589934592 }
   },
   "secrets": [{ "name": "relay", "store": "login_keychain", "item": "kalareach/relay" }],
   "network": { "enabled": true, "relay_urls": ["https://relay.example.com"] },
@@ -1047,6 +1048,7 @@ force is refused and reported as refused.
 | `session_limit` | what this machine's own resources allow. 128 is the product default rather than a maximum: the owner may set a higher number, and this host establishes no resource limit, so nothing narrows the choice and `kr doctor` says so |
 | `grant_rights` | the rights the grant and this host's policy already allow, which the grant intersection decides; this ceiling only removes |
 | `disable_policy` | not an intersection but the administrator's own setting: what happens to a live binding whose release its repository revokes. `warn_only` (the default), `disable_at_next_admission` or `disable_at_once` |
+| `description_budgets.process_memory_bytes`, `description_budgets.reserve_bytes` | section 22's own figures for session descriptions: the 4 GiB the description process may use, and the memory this host keeps free while it runs, which is the larger of 1 GiB and a fifth of this machine's memory. The owner may only narrow them: a ceiling of 0 or above 4 GiB is refused, and so is a reserve below 1 GiB; a reserve between 1 GiB and this machine's floor is refused and reported with the floor as what is in force |
 | `enrolment` | section 11's own budgets: what one repository's metadata, kept generations and cached payloads may cost, how large one package may be and how many bytes one synchronisation may transfer; a cached payload budget above 1 GiB is a full mirror and needs `full_offline_mirror` set explicitly |
 
 A ceiling is applied where the thing it restricts reads it, and an edit whose value the intersection
@@ -1133,6 +1135,15 @@ the default. A document that does not use the setting has no `disable_policy` me
 `disable_at_next_admission` a binding on a revoked release keeps observing and is refused every
 rich admission; under `disable_at_once` it ends at its next admission boundary once the request it
 admitted has completed.
+
+`description_budgets` is the owner's own choice, written in the document: there is no command that
+sets it. Both budgets are numbers of bytes, and each may be left out or written as `null` for the
+default. A document that holds a ceiling of 0 or above 4 GiB, or a reserve below 1 GiB, is refused
+whole when this host reads it, with "the description process's memory ceiling is more than 0 and at
+most 4 GiB" or "the description reserve is at least 1 GiB". A document that does not use the
+ceiling has no `description_budgets` member. The member raised the document's version to 4, and a
+release that lacks it refuses a document that holds it rather than run descriptions with more
+memory than the owner allowed. Restoring a backup never sets or clears it.
 
 A secret is never in the document. `secrets` holds named references: what this configuration calls
 it, which secure store it lives in and its name inside that store. There is no field a value would

@@ -432,9 +432,7 @@ impl Controller {
         };
         if let Some(limit) = crate::config::session_limit_in_force(
             &startup_configuration,
-            crate::config::HardLimits {
-                sessions_per_environment: None,
-            },
+            crate::config::HardLimits::default(),
         ) {
             registry.set_session_limit(limit)?;
             accepted_configuration.sessions = limit;

@@ -35,6 +35,34 @@ fn context_for(session_id: &SessionId, revision: u64) -> DescriptionContext {
 }
 
 /// KR-REQ-22.12: the reserve is the larger of one gibibyte and a fifth of physical memory.
+/// KR-REQ-22.10: the floor the report states is the policy's own: the larger of 1 GiB and a fifth of
+/// physical memory, which the owner's reserve only raises; and the ceiling default is the 4 GiB
+/// the configuration document's rule is written against.
+#[test]
+fn the_reserve_floor_the_report_states_is_the_one_the_policy_keeps() {
+    use kr_describe::resource::reserve_floor_bytes;
+    use kr_protocol::hostinfo::configuration::{
+        DESCRIPTION_PROCESS_MEMORY_CEILING_BYTES, DESCRIPTION_RESERVE_FIXED_BYTES,
+    };
+
+    assert_eq!(DESCRIPTION_RESERVE_FIXED_BYTES, GIB);
+    assert_eq!(DESCRIPTION_PROCESS_MEMORY_CEILING_BYTES, 4 * GIB);
+    assert_eq!(
+        Budgets::DEFAULTS.process_memory_ceiling_bytes,
+        DESCRIPTION_PROCESS_MEMORY_CEILING_BYTES
+    );
+    let policy = ResourcePolicy::new(ResourceSettings::default(), Budgets::DEFAULTS);
+    for physical in [0, 2 * GIB, 5 * GIB, 5 * GIB + 5, 32 * GIB, 128 * GIB] {
+        assert_eq!(
+            reserve_floor_bytes(physical),
+            policy.required_reserve_bytes(physical),
+            "{physical}"
+        );
+    }
+    assert_eq!(reserve_floor_bytes(0), GIB);
+    assert_eq!(reserve_floor_bytes(32 * GIB), 32 * GIB / 5);
+}
+
 #[test]
 fn the_reserve_is_the_larger_of_a_gibibyte_and_a_fifth_of_the_memory() {
     let policy = ResourcePolicy::new(ResourceSettings::default(), Budgets::DEFAULTS);

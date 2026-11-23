@@ -30,7 +30,9 @@
 //! [`ResourcePolicy::evaluate`] moves out of it on the next tick that finds the pressure gone. A
 //! worker restart is not part of any path through this module.
 
-use crate::budget::{Budgets, GIB, ResidentCost};
+use kr_protocol::hostinfo::configuration::DESCRIPTION_RESERVE_FIXED_BYTES;
+
+use crate::budget::{Budgets, ResidentCost};
 
 /// A reading this host either has or explicitly does not.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -215,6 +217,21 @@ impl Default for ResourceSettings {
     }
 }
 
+/// The floor section 22 fixes for the reserve this host keeps free: the larger of 1 GiB and a fifth
+/// of `physical_memory_bytes`.
+///
+/// The owner's reserve only ever raises it, so this is what is in force when the owner chose
+/// nothing, and what is in force when the owner chose less.
+#[must_use]
+pub const fn reserve_floor_bytes(physical_memory_bytes: u64) -> u64 {
+    let fifth = physical_memory_bytes / 5;
+    if fifth > DESCRIPTION_RESERVE_FIXED_BYTES {
+        fifth
+    } else {
+        DESCRIPTION_RESERVE_FIXED_BYTES
+    }
+}
+
 /// The resource and power policy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ResourcePolicy {
@@ -256,7 +273,7 @@ impl ResourcePolicy {
     /// less safety than the product was qualified with, and it is ignored.
     #[must_use]
     pub fn required_reserve_bytes(&self, physical_memory_bytes: u64) -> u64 {
-        let floor = GIB.max(physical_memory_bytes / 5);
+        let floor = reserve_floor_bytes(physical_memory_bytes);
         match self.settings.owner_reserve_bytes {
             Some(owner) if owner > floor => owner,
             _ => floor,
@@ -395,6 +412,15 @@ impl Transition {
 /// nothing else.
 pub mod platform {
     use super::{HostConditions, PowerSource, Signal, ThermalState};
+
+    /// The physical memory this host has, in bytes, when it reports one.
+    #[must_use]
+    pub fn physical_memory_bytes() -> Option<u64> {
+        match memory().0 {
+            Signal::Qualified(bytes) => Some(bytes),
+            Signal::Unqualified { .. } => None,
+        }
+    }
 
     /// Reads what this host will tell this build.
     ///

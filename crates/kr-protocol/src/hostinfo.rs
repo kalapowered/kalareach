@@ -2014,6 +2014,24 @@ pub mod configuration {
     /// else would be a restriction nobody was told about.
     pub const MAX_SESSION_LIMIT: u64 = i64::MAX as u64;
 
+    /// What the description process may use of memory, in bytes, unless the owner chooses less:
+    /// section 22's 4 GiB process-memory ceiling. The owner's ceiling is at most this.
+    pub const DESCRIPTION_PROCESS_MEMORY_CEILING_BYTES: u64 = 4 << 30;
+
+    /// The part of the description reserve that no configuration lowers, in bytes: section 22 fixes
+    /// the reserve at the larger of this and a fifth of physical memory. The owner's reserve is at
+    /// least this.
+    pub const DESCRIPTION_RESERVE_FIXED_BYTES: u64 = 1 << 30;
+
+    /// What a document is told when the owner's description process memory ceiling is not one the
+    /// host can honour: 0, or more than the 4 GiB section 22 fixes.
+    pub const DESCRIPTION_CEILING_RANGE: &str =
+        "the description process's memory ceiling is more than 0 and at most 4 GiB";
+
+    /// What a document is told when the owner's description reserve is below the fixed part of the
+    /// floor section 22 fixes.
+    pub const DESCRIPTION_RESERVE_RANGE: &str = "the description reserve is at least 1 GiB";
+
     /// The largest revision this host can record.
     ///
     /// The same signed 64-bit column the session ceiling is bounded by. A document whose revision
@@ -2327,9 +2345,11 @@ pub mod configuration {
         /// The memory the description process may use and the memory the host keeps free while
         /// it runs, as section 22 lets the owner configure them.
         ///
-        /// Absent leaves the defaults section 22 fixes. Present narrows them. A document that does
-        /// not use the ceiling writes no member for it. A release that lacks the member refuses
-        /// the document whole, which is why the document's version rose with it.
+        /// Absent leaves the defaults section 22 fixes. Present narrows them: a ceiling of 0 or
+        /// above 4 GiB, and a reserve below 1 GiB, are values the host cannot honour, and the
+        /// document that holds one is refused. A document that does not use the ceiling writes no
+        /// member for it. A release that lacks the member refuses the document whole, which is
+        /// why the document's version rose with it.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub description_budgets: Option<DescriptionBudgets>,
     }
@@ -3612,6 +3632,21 @@ pub mod configuration {
                 );
             }
         }
+        if let Some(budgets) = document.ceilings.description_budgets.as_ref() {
+            // Refused rather than recorded and then clamped, as the session ceiling is: a report
+            // that printed what the document asked for while the host enforced something else
+            // would be a limit nobody was told about.
+            if let Some(ceiling) = budgets.process_memory_bytes.as_ref()
+                && (*ceiling == 0 || *ceiling > DESCRIPTION_PROCESS_MEMORY_CEILING_BYTES)
+            {
+                problems.push(Sentence::new().stated(DESCRIPTION_CEILING_RANGE));
+            }
+            if let Some(reserve) = budgets.reserve_bytes.as_ref()
+                && *reserve < DESCRIPTION_RESERVE_FIXED_BYTES
+            {
+                problems.push(Sentence::new().stated(DESCRIPTION_RESERVE_RANGE));
+            }
+        }
         if let Some(rights) = document.ceilings.grant_rights.as_ref() {
             for right in rights {
                 if crate::rights::ActionRight::from_wire(right).is_none() {
@@ -4343,6 +4378,11 @@ pub mod configuration {
         /// The whole section, not one budget of it: what this names becomes what the document
         /// says, and a budget left out of it goes back to the schema's own number.
         Enrolment(ConfiguredEnrolmentBudgets),
+        /// Set the owner's description budgets, or clear them.
+        ///
+        /// Both budgets together: what this names becomes what the document says, and a budget
+        /// left out of it goes back to the default section 22 fixes. Naming neither clears them.
+        DescriptionBudgets(Option<DescriptionBudgets>),
         /// Choose how this environment's control daemon is started when a command finds none
         /// running, or clear the choice so that none is started.
         ControllerStartup(Option<ControllerStartup>),
@@ -4398,6 +4438,7 @@ pub mod configuration {
                 Self::SessionLimit(_) => "session_limit",
                 Self::GrantRights(_) => "grant_rights",
                 Self::Enrolment(_) => "enrolment",
+                Self::DescriptionBudgets(_) => "description_budgets",
                 Self::ControllerStartup(_) => STARTUP_CONTROLLER.key,
                 Self::CommandIntegration { .. } => COMMAND_INTEGRATIONS.key,
                 Self::Descriptions { .. } => "descriptions",
@@ -4416,6 +4457,7 @@ pub mod configuration {
                 | Self::SessionLimit(_)
                 | Self::GrantRights(_)
                 | Self::Enrolment(_)
+                | Self::DescriptionBudgets(_)
                 | Self::PushGateways(_)
                 | Self::Descriptions { .. } => ValueEffect::Immediately,
                 // Each part takes effect as it does alone: the descriptions at once, the profile and
@@ -4793,6 +4835,12 @@ pub mod configuration {
             }
             Change::Enrolment(budgets) => {
                 document.ceilings.enrolment = Nullable::some(*budgets);
+            }
+            Change::DescriptionBudgets(budgets) => {
+                // Neither budget chosen is no member at all, so a document that does not use the
+                // ceiling is the document every reader already reads.
+                document.ceilings.description_budgets =
+                    (*budgets).filter(|budgets| !budgets.is_unset());
             }
             Change::ControllerStartup(startup) => {
                 document.startup.controller = Nullable(*startup);
@@ -6417,11 +6465,12 @@ pub mod configuration {
     }
 
     /// The ceilings a report names, which are the ceilings a document may carry.
-    pub const CEILINGS: [&str; 4] = [
+    pub const CEILINGS: [&str; 5] = [
         "session_limit",
         "enrolment",
         "grant_rights",
         "disable_policy",
+        "description_budgets",
     ];
 
     /// The repository enrolment budgets a document may name.
@@ -11388,6 +11437,111 @@ mod tests {
         );
     }
 
+    /// KR-REQ-22.10: the owner's description budgets are edited whole. A ceiling of 0 or above 4 GiB
+    /// and a reserve below 1 GiB are values the host cannot honour, and are refused with the
+    /// sentence that says the range; the edge values are accepted.
+    #[test]
+    fn a_description_budget_the_host_cannot_honour_is_refused_at_the_edit() {
+        const GIB: u64 = 1 << 30;
+        let loaded = configuration::load(None);
+        let budgets = |ceiling: Option<u64>, reserve: Option<u64>| {
+            Change::DescriptionBudgets(Some(configuration::DescriptionBudgets {
+                process_memory_bytes: Nullable(ceiling),
+                reserve_bytes: Nullable(reserve),
+            }))
+        };
+        let ceiling_rule =
+            "the description process's memory ceiling is more than 0 and at most 4 GiB";
+        for asked in [0, 4 * GIB + 1, u64::MAX] {
+            let refused = configuration::edit(&loaded, &budgets(Some(asked), None))
+                .expect_err("a ceiling the host cannot honour");
+            assert!(
+                matches!(refused, configuration::EditRefused::Invalid(_)),
+                "{asked}: {refused}"
+            );
+            assert!(
+                format!("{refused}").contains(ceiling_rule),
+                "{asked}: {refused}"
+            );
+        }
+        let reserve_rule = "the description reserve is at least 1 GiB";
+        for asked in [0, 1, GIB - 1] {
+            let refused = configuration::edit(&loaded, &budgets(None, Some(asked)))
+                .expect_err("a reserve below the fixed part of the floor");
+            assert!(
+                format!("{refused}").contains(reserve_rule),
+                "{asked}: {refused}"
+            );
+        }
+        for (ceiling, reserve) in [(Some(1), None), (Some(4 * GIB), None), (None, Some(GIB))] {
+            let applied = configuration::edit(&loaded, &budgets(ceiling, reserve))
+                .expect("a value inside the range is the owner's choice");
+            assert_eq!(applied.revision, 1);
+            assert_eq!(applied.effect, configuration::ValueEffect::Immediately);
+            let held = applied.document.ceilings.description_budgets.expect("held");
+            assert_eq!(held.process_memory_bytes.0, ceiling);
+            assert_eq!(held.reserve_bytes.0, reserve);
+        }
+    }
+
+    /// KR-REQ-22.10: the budgets are written as a whole and cleared as a whole, and a budget with
+    /// neither value is written as no member at all, so a document that does not use the ceiling
+    /// is the document every reader already reads.
+    #[test]
+    fn the_description_budgets_are_written_whole_and_cleared_to_no_member() {
+        const GIB: u64 = 1 << 30;
+        let loaded = configuration::load(None);
+        let set = configuration::edit(
+            &loaded,
+            &Change::DescriptionBudgets(Some(configuration::DescriptionBudgets {
+                process_memory_bytes: Nullable::some(2 * GIB),
+                reserve_bytes: Nullable::some(3 * GIB),
+            })),
+        )
+        .expect("the owner's choice");
+        assert!(
+            set.contents.contains("\"description_budgets\""),
+            "{}",
+            set.contents
+        );
+        let written = configuration::load(Some(set.contents.as_bytes()));
+        assert_eq!(
+            written.document,
+            Some(set.document.clone()),
+            "it reads back as written"
+        );
+
+        // Naming one budget replaces the whole: the other goes back to the default.
+        let replaced = configuration::edit(
+            &written,
+            &Change::DescriptionBudgets(Some(configuration::DescriptionBudgets {
+                process_memory_bytes: Nullable::some(GIB),
+                reserve_bytes: Nullable::null(),
+            })),
+        )
+        .expect("the owner's choice");
+        let held = replaced
+            .document
+            .ceilings
+            .description_budgets
+            .expect("held");
+        assert_eq!(held.process_memory_bytes.0, Some(GIB));
+        assert_eq!(held.reserve_bytes.0, None);
+
+        for clear in [
+            Change::DescriptionBudgets(None),
+            Change::DescriptionBudgets(Some(configuration::DescriptionBudgets::default())),
+        ] {
+            let cleared = configuration::edit(&written, &clear).expect("the owner's choice");
+            assert_eq!(cleared.document.ceilings.description_budgets, None);
+            assert!(
+                !cleared.contents.contains("description_budgets"),
+                "{}",
+                cleared.contents
+            );
+        }
+    }
+
     /// KR-REQ-26.13: one function, and the order section 26 states.
     #[test]
     fn the_ladder_is_request_then_profile_then_host_then_default() {
@@ -11479,6 +11633,7 @@ mod tests {
                     "grant_rights",
                     "enrolment",
                     "disable_policy",
+                    "description_budgets",
                     "authority"
                 ]
                 .contains(&preference.key),

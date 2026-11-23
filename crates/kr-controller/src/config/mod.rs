@@ -684,6 +684,15 @@ fn refused_ceiling(
                 .stated("this enrolment budget is more permissive than section 11 allows")
         }));
     }
+    let description = ceilings::description_budgets(ceilings, limits);
+    for budget in [&description.process_memory, &description.reserve] {
+        if budget.refused {
+            return Some(budget.narrowed_by.clone().unwrap_or_else(|| {
+                Sentence::new()
+                    .stated("this description budget is more permissive than this host allows")
+            }));
+        }
+    }
     None
 }
 
@@ -911,6 +920,23 @@ pub fn effective(
     } else {
         (configuration::ValueSource::Default, None)
     };
+    // The owner's description budgets: each is the owner's where the document wrote it, and the
+    // number in force is the intersection's, never the one the document wrote when it is refused.
+    let description = ceilings::description_budgets(&ceilings, limits);
+    let chosen = ceilings.description_budgets.unwrap_or_default();
+    let described = |written: bool| {
+        if written {
+            (
+                configuration::ValueSource::HostConfiguration,
+                Some(doc_path.clone()),
+            )
+        } else {
+            (configuration::ValueSource::Default, None)
+        }
+    };
+    let (process_memory_source, process_memory_origin) =
+        described(chosen.process_memory_bytes.is_present());
+    let (reserve_source, reserve_origin) = described(chosen.reserve_bytes.is_present());
     let policy_line = |policy: &Option<kr_protocol::admission::RevocationPolicy>| match policy {
         None => Sentence::new().stated("not known: the policy this host holds could not be read"),
         Some(kr_protocol::admission::RevocationPolicy::WarnOnly) => Sentence::new()
@@ -1051,6 +1077,22 @@ pub fn effective(
                 policy_origin,
                 configuration::ValueEffect::Immediately,
                 policy_line,
+            ),
+            ceilings::report(
+                "description_budgets.process_memory_bytes",
+                &description.process_memory,
+                process_memory_source,
+                process_memory_origin,
+                configuration::ValueEffect::Immediately,
+                |bytes| Sentence::new().number(*bytes),
+            ),
+            ceilings::report(
+                "description_budgets.reserve_bytes",
+                &description.reserve,
+                reserve_source,
+                reserve_origin,
+                configuration::ValueEffect::Immediately,
+                |bytes| Sentence::new().number(*bytes),
             ),
             kr_protocol::hostinfo::CeilingValue {
                 key: "grant_rights".to_owned(),

@@ -9518,7 +9518,7 @@
               "type": "null"
             }
           ],
-          "description": "The memory the description process may use and the memory the host keeps free while\nit runs, as section 22 lets the owner configure them.\n\nAbsent leaves the defaults section 22 fixes. Present narrows them. A document that does\nnot use the ceiling writes no member for it. A release that lacks the member refuses\nthe document whole, which is why the document's version rose with it."
+          "description": "The memory the description process may use and the memory the host keeps free while\nit runs, as section 22 lets the owner configure them.\n\nAbsent leaves the defaults section 22 fixes. Present narrows them: a ceiling of 0 or\nabove 4 GiB, and a reserve below 1 GiB, are values the host cannot honour, and the\ndocument that holds one is refused. A document that does not use the ceiling writes no\nmember for it. A release that lacks the member refuses the document whole, which is\nwhy the document's version rose with it."
         },
         "disable_policy": {
           "anyOf": [

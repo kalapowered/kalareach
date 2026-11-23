@@ -3,7 +3,7 @@
 use kr_protocol::desktop::CapabilityInvalidation;
 use kr_protocol::hostinfo::configuration::{
     Change, ConfigurationCeilings, ConfigurationDocument, ConfiguredEnrolmentBudgets,
-    DocumentState, EnrolmentBudgets, ValueEffect, ValueSource,
+    DescriptionBudgets, DocumentState, EnrolmentBudgets, ValueEffect, ValueSource,
 };
 use kr_protocol::hostinfo::export::Sentence;
 use kr_protocol::scalars::Nullable;
@@ -200,6 +200,7 @@ fn the_configured_session_number_is_narrowed_only_by_a_resource_limit() {
 
     let measured = HardLimits {
         sessions_per_environment: Some(64),
+        ..HardLimits::default()
     };
     let ceiling = ceilings::session_limit(&raised, measured);
     assert_eq!(ceiling.value, 64);
@@ -230,6 +231,7 @@ fn an_edit_the_intersection_would_refuse_leaves_the_document_alone() {
 
     let measured = HardLimits {
         sessions_per_environment: Some(4),
+        ..HardLimits::default()
     };
     let refused = apply(&environment, &Change::SessionLimit(Some(512)), measured)
         .expect_err("more than this machine allows");
@@ -244,6 +246,237 @@ fn an_edit_the_intersection_would_refuse_leaves_the_document_alone() {
         Some(3),
         "and the number the owner accepted is still the one in force"
     );
+}
+
+const GIB: u64 = 1 << 30;
+
+/// A machine with `physical` bytes of memory and nothing else established.
+fn machine_with(physical: u64) -> HardLimits {
+    HardLimits {
+        physical_memory_bytes: Some(physical),
+        ..HardLimits::default()
+    }
+}
+
+/// The ceilings of a document that chose these two description budgets.
+fn choosing(ceiling: Option<u64>, reserve: Option<u64>) -> ConfigurationCeilings {
+    ConfigurationCeilings {
+        description_budgets: Some(DescriptionBudgets {
+            process_memory_bytes: Nullable(ceiling),
+            reserve_bytes: Nullable(reserve),
+        }),
+        ..ConfigurationCeilings::default()
+    }
+}
+
+/// KR-REQ-22.10: both description budgets are intersected like every ceiling. The owner's ceiling
+/// applies when it is not above the 4 GiB section 22 fixes; the owner's reserve applies when it is
+/// not below the larger of 1 GiB and a fifth of this machine's memory. A value the host cannot
+/// honour is reported refused with what is in force, and is never the number in force.
+#[test]
+fn the_description_budgets_are_intersected_with_the_defaults_and_this_machines_floor() {
+    let machine = machine_with(32 * GIB);
+    let floor = 32 * GIB / 5;
+
+    // Nothing chosen: the defaults section 22 fixes, and nothing configured.
+    let unset = ceilings::description_budgets(&ConfigurationCeilings::default(), machine);
+    assert_eq!(unset.process_memory.configured, None);
+    assert_eq!(unset.process_memory.value, 4 * GIB);
+    assert!(!unset.process_memory.refused);
+    assert_eq!(unset.reserve.configured, None);
+    assert_eq!(unset.reserve.value, floor);
+    assert!(!unset.reserve.refused);
+
+    // A stricter ceiling and a stricter reserve are the owner's, and nothing narrows them.
+    let strict = ceilings::description_budgets(&choosing(Some(2 * GIB), Some(8 * GIB)), machine);
+    assert_eq!(strict.process_memory.configured, Some(2 * GIB));
+    assert_eq!(strict.process_memory.value, 2 * GIB);
+    assert_eq!(strict.reserve.configured, Some(8 * GIB));
+    assert_eq!(strict.reserve.value, 8 * GIB);
+    assert!(!strict.process_memory.refused && !strict.reserve.refused);
+    assert!(strict.process_memory.narrowed_by.is_none() && strict.reserve.narrowed_by.is_none());
+
+    // A ceiling of 0 and one above 4 GiB are refused, and 4 GiB stays in force.
+    for asked in [0, 4 * GIB + 1] {
+        let refused = ceilings::description_budgets(&choosing(Some(asked), None), machine);
+        assert_eq!(refused.process_memory.configured, Some(asked));
+        assert_eq!(refused.process_memory.value, 4 * GIB, "{asked}");
+        assert!(refused.process_memory.refused, "{asked}");
+        assert_eq!(
+            refused
+                .process_memory
+                .narrowed_by
+                .expect("says why")
+                .render(),
+            "the description process's memory ceiling is more than 0 and at most 4 GiB"
+        );
+    }
+
+    // A reserve between 1 GiB and this machine's floor is more permissive than the floor: refused,
+    // with the floor in force, never the number the document wrote.
+    let between = ceilings::description_budgets(&choosing(None, Some(2 * GIB)), machine);
+    assert_eq!(between.reserve.configured, Some(2 * GIB));
+    assert_eq!(between.reserve.value, floor);
+    assert!(between.reserve.refused);
+    let why = between.reserve.narrowed_by.expect("says why").render();
+    assert!(why.contains(&floor.to_string()), "{why}");
+
+    // A reserve below the fixed 1 GiB is refused with the sentence of the rule.
+    let below = ceilings::description_budgets(&choosing(None, Some(GIB - 1)), machine);
+    assert_eq!(below.reserve.value, floor);
+    assert!(below.reserve.refused);
+    assert_eq!(
+        below.reserve.narrowed_by.expect("says why").render(),
+        "the description reserve is at least 1 GiB"
+    );
+
+    // On a small machine the floor is the fixed 1 GiB, and 1 GiB is the owner's own number.
+    let small = ceilings::description_budgets(&choosing(None, Some(GIB)), machine_with(2 * GIB));
+    assert_eq!(small.reserve.value, GIB);
+    assert!(!small.reserve.refused);
+
+    // Where this host does not know its memory, the floor it can state is the fixed part.
+    let unknown = ceilings::description_budgets(&choosing(None, Some(GIB)), HardLimits::default());
+    assert_eq!(unknown.reserve.value, GIB);
+    assert!(!unknown.reserve.refused);
+}
+
+/// KR-REQ-22.10: the report lists both budgets with what the document asked for, what is in force,
+/// where it came from and what narrowed it; a hand-written reserve below the floor is shown
+/// refused, with the floor in force.
+#[test]
+fn the_description_budgets_are_reported_with_their_source_and_what_narrowed_them() {
+    let temp = kr_ipc::testing::TempHost::create();
+    let environment = temp.environment();
+    let machine = machine_with(32 * GIB);
+    let floor = 32 * GIB / 5;
+    let row = |report: &EffectiveConfiguration, key: &str| {
+        report
+            .ceilings
+            .iter()
+            .find(|ceiling| ceiling.key == key)
+            .unwrap_or_else(|| panic!("the report has a {key} ceiling"))
+            .clone()
+    };
+    let report_on = |limits: HardLimits| {
+        effective(
+            &Accepted::in_force(open(&environment), limits),
+            limits,
+            WorkerProfile::HeadlessUser,
+        )
+    };
+
+    // Nothing chosen: the defaults, from the product.
+    let report = report_on(machine);
+    let ceiling = row(&report, "description_budgets.process_memory_bytes");
+    assert_eq!(ceiling.value.render(), (4 * GIB).to_string());
+    assert!(!ceiling.configured.is_present());
+    assert_eq!(ceiling.source, ValueSource::Default);
+    assert!(!ceiling.refused);
+    let reserve = row(&report, "description_budgets.reserve_bytes");
+    assert_eq!(reserve.value.render(), floor.to_string());
+    assert_eq!(reserve.source, ValueSource::Default);
+
+    // Chosen through the edit: the owner's numbers, from the host configuration, in force at once.
+    apply(
+        &environment,
+        &Change::DescriptionBudgets(Some(DescriptionBudgets {
+            process_memory_bytes: Nullable::some(2 * GIB),
+            reserve_bytes: Nullable::some(8 * GIB),
+        })),
+        machine,
+    )
+    .expect("the owner's choice");
+    let report = report_on(machine);
+    let ceiling = row(&report, "description_budgets.process_memory_bytes");
+    assert_eq!(ceiling.value.render(), (2 * GIB).to_string());
+    assert_eq!(
+        ceiling
+            .configured
+            .as_ref()
+            .map(|asked| asked.clone().render()),
+        Some((2 * GIB).to_string())
+    );
+    assert_eq!(ceiling.source, ValueSource::HostConfiguration);
+    assert_eq!(ceiling.effect, ValueEffect::Immediately);
+    assert!(ceiling.origin.is_present(), "and it says which document");
+    assert!(!ceiling.refused);
+    let reserve = row(&report, "description_budgets.reserve_bytes");
+    assert_eq!(reserve.value.render(), (8 * GIB).to_string());
+    assert_eq!(reserve.source, ValueSource::HostConfiguration);
+
+    // Written by hand below this machine's floor: refused, and the floor is what is in force.
+    let by_hand = ConfigurationDocument {
+        ceilings: choosing(None, Some(2 * GIB)),
+        ..ConfigurationDocument::empty()
+    };
+    kr_ipc::paths::write_owner_only_file(
+        &kr_worker::config::document_path(&environment),
+        configuration::contents(&by_hand).as_bytes(),
+    )
+    .expect("writes the document");
+    let report = report_on(machine);
+    let reserve = row(&report, "description_budgets.reserve_bytes");
+    assert_eq!(
+        reserve
+            .configured
+            .as_ref()
+            .map(|asked| asked.clone().render()),
+        Some((2 * GIB).to_string())
+    );
+    assert_eq!(
+        reserve.value.render(),
+        floor.to_string(),
+        "never shown as in force"
+    );
+    assert!(reserve.refused);
+    assert!(reserve.narrowed_by.is_present());
+    assert_eq!(reserve.source, ValueSource::HostConfiguration);
+    let ceiling = row(&report, "description_budgets.process_memory_bytes");
+    assert_eq!(
+        ceiling.source,
+        ValueSource::Default,
+        "the ceiling was not chosen"
+    );
+}
+
+/// KR-REQ-22.10: an edit that names a reserve below this machine's floor is refused before it is
+/// written, as an edit above a machine's session limit is, and says what the floor is; one the
+/// machine can honour is written.
+#[test]
+fn a_reserve_below_this_machines_floor_is_refused_at_the_edit() {
+    let temp = kr_ipc::testing::TempHost::create();
+    let environment = temp.environment();
+    let machine = machine_with(32 * GIB);
+    let floor = 32 * GIB / 5;
+
+    let refused = apply(
+        &environment,
+        &Change::DescriptionBudgets(Some(DescriptionBudgets {
+            process_memory_bytes: Nullable::null(),
+            reserve_bytes: Nullable::some(2 * GIB),
+        })),
+        machine,
+    )
+    .expect_err("less than this machine keeps free");
+    let said = format!("{refused}");
+    assert!(said.contains(&floor.to_string()), "{said}");
+    assert_eq!(
+        open(&environment).revision(),
+        0,
+        "a refused edit applies no revision"
+    );
+
+    let applied = apply(
+        &environment,
+        &Change::DescriptionBudgets(Some(DescriptionBudgets {
+            process_memory_bytes: Nullable::null(),
+            reserve_bytes: Nullable::some(8 * GIB),
+        })),
+        machine,
+    )
+    .expect("a reserve this machine can honour");
+    assert_eq!(applied.revision, 1);
 }
 
 /// KR-REQ-26.15: a payload budget above the default without the explicit setting is refused.

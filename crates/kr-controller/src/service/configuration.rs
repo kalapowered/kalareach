@@ -643,9 +643,10 @@ impl Controller {
     /// processes short is refused on its own (`service::resources`). The value is here rather than
     /// at each call site so the day a number is measured there is one place to answer from.
     #[must_use]
-    pub const fn hard_limits(&self) -> crate::config::HardLimits {
+    pub fn hard_limits(&self) -> crate::config::HardLimits {
         crate::config::HardLimits {
             sessions_per_environment: None,
+            physical_memory_bytes: kr_describe::resource::platform::physical_memory_bytes(),
         }
     }
 }
