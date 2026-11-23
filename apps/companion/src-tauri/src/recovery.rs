@@ -75,7 +75,10 @@ use crate::sync_service::{SyncService, SyncServiceView, host_of};
 
 mod saving;
 
-pub use saving::{NotSavedWhy, SettingsLine, SettingsSource, SettingsStep, SettingsTiming};
+pub use saving::{
+    NotSavedWhy, SETTINGS_READ_FROM, SettingsLine, SettingsSource, SettingsStep, SettingsTiming,
+    oldest_retained_level,
+};
 
 /// The scope in the device's secure store that the recovery seed is kept under.
 pub const SEED_SCOPE: &str = "owner";
@@ -505,6 +508,7 @@ impl Recovery {
             }
         };
         let settings = match (&record, state) {
+            _ if !self.saving.is_open() => None,
             (Some(record), RecoveryState::On) if record.settings_stopped => {
                 Some(SettingsLine::Stopped)
             }

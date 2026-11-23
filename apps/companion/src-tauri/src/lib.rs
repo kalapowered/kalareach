@@ -818,7 +818,7 @@ fn open_recovery(app: &tauri::AppHandle) {
             tracing::warn!(%error, "this computer cannot take part in settings sync");
         }
     }
-    if let Err(error) = start_settings_saving(app) {
+    if let Err(error) = start_settings_saving(app, recovery::oldest_retained_level()) {
         tracing::warn!(%error, "this computer cannot save its settings with its recovery bundle");
     }
 }
@@ -963,11 +963,16 @@ pub fn start_recovery<R: tauri::Runtime>(
 /// Starts saving this computer's settings with the recovery bundle: a step runs now, after a change
 /// to the settings once they have been quiet, after a recovery step that reached the service, and
 /// at the end of the window after a step that failed. The settings and recovery are opened first.
+/// `oldest_retained` is the oldest level this release retains: while it is below the first level
+/// that reads a settings member, nothing is written (see [`recovery::SETTINGS_READ_FROM`]).
 ///
 /// # Errors
 ///
 /// Returns a local failure when the settings or recovery were not opened.
-pub fn start_settings_saving<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> Result<()> {
+pub fn start_settings_saving<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    oldest_retained: kr_protocol::update::CompatibilityLevel,
+) -> Result<()> {
     use std::sync::Arc;
 
     use tauri::Manager as _;
@@ -975,7 +980,10 @@ pub fn start_settings_saving<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> Re
     let state = app.state::<AppState>();
     let settings = state.settings()?;
     let recovery = state.recovery()?;
-    recovery.save_settings_from(Arc::clone(&settings) as Arc<dyn recovery::SettingsSource>);
+    recovery.save_settings_from(
+        Arc::clone(&settings) as Arc<dyn recovery::SettingsSource>,
+        oldest_retained,
+    );
     let changed = Arc::clone(&recovery);
     settings
         .local()

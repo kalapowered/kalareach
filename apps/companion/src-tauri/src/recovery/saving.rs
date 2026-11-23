@@ -18,6 +18,18 @@
 //! the page shows says "saved" only after a write the service confirmed or a read of the bundle
 //! that holds the same settings.
 //!
+//! # The writer's level
+//!
+//! Once any device writes the member, a build that cannot read it fails every read of the bundle:
+//! a cover, a settle, a checkpoint. Devices of one account update on their own schedules, so no
+//! step writes the member while the oldest level its release retains is below
+//! [`SETTINGS_READ_FROM`], the first level whose builds read it. [`Recovery::save_settings_from`]
+//! takes that level as an input, and while it is below, the first bundle carries no member, a step
+//! does nothing and the page is told nothing of saving. The gate binds the saving step and nothing
+//! the person does: restoring a member that a later build wrote, listing the member the bundle
+//! holds and removing it do not depend on it. The gate opens by itself when a release retains a
+//! level that reads the member.
+//!
 //! # When a step runs
 //!
 //! Five things want a step: the application's start, a change to the settings file (after
@@ -41,12 +53,30 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 use kr_client::recovery::{LocalSettings, LostWrite, RecoveryError, SettingsSaved};
+use kr_protocol::hello::PackageVersion;
+use kr_protocol::retained::RETAINED_WORKER_LEVELS;
+use kr_protocol::update::{CompatibilityLevel, THIS_LEVEL};
 use serde::Serialize;
 use tokio::sync::Notify;
 
 use super::{Recovery, Step, blocker, now};
 use crate::account::Account;
 use crate::error::Result;
+
+/// The first level whose builds read a settings member in a recovery bundle.
+pub const SETTINGS_READ_FROM: CompatibilityLevel =
+    CompatibilityLevel::of(PackageVersion::new(0, 79, 0));
+
+/// The oldest level this release's control daemon still speaks to: the oldest build the settings
+/// member has to be readable by.
+#[must_use]
+pub fn oldest_retained_level() -> CompatibilityLevel {
+    RETAINED_WORKER_LEVELS
+        .iter()
+        .copied()
+        .min()
+        .unwrap_or(THIS_LEVEL)
+}
 
 /// Where a step reads what this computer has chosen.
 pub trait SettingsSource: Send + Sync {
@@ -120,8 +150,8 @@ pub enum NotSavedWhy {
 /// What one step came to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SettingsStep {
-    /// Nothing to do, and nothing was asked of the service: saving has no source, recovery is not
-    /// on, or the account cannot be used now.
+    /// Nothing to do, and nothing was asked of the service: saving has no source or the writer's
+    /// level is closed, recovery is not on, or the account cannot be used now.
     Idle,
     /// The eligibility deadline is ahead, so nothing was asked of the service. The step is wanted
     /// again at `until`.
@@ -140,7 +170,7 @@ pub enum SettingsStep {
 
 /// What saving the settings keeps between steps. Everything but the line is about when.
 pub(super) struct Saving {
-    source: OnceLock<Arc<dyn SettingsSource>>,
+    source: OnceLock<Saves>,
     timing: Mutex<SettingsTiming>,
     /// The earliest moment a step may reach the service for the settings again. Read and moved
     /// only through a [`Step`].
@@ -150,6 +180,12 @@ pub(super) struct Saving {
     wanted: Mutex<Option<Instant>>,
     wake: Notify,
     stopped: AtomicBool,
+}
+
+/// What saving is given: where the settings come from, and whether the writer's level lets it write.
+struct Saves {
+    source: Arc<dyn SettingsSource>,
+    open: bool,
 }
 
 impl Saving {
@@ -181,7 +217,21 @@ impl Saving {
     /// What this computer has chosen now, when saving has a source: the settings a first bundle
     /// carries.
     pub(super) fn chosen_now(&self) -> Option<LocalSettings> {
-        self.source.get().map(|source| source.chosen())
+        self.writer().map(|source| source.chosen())
+    }
+
+    /// The source of what a step may write: none until saving has a source, and none while the
+    /// writer's level is closed.
+    fn writer(&self) -> Option<&Arc<dyn SettingsSource>> {
+        self.source
+            .get()
+            .filter(|saves| saves.open)
+            .map(|saves| &saves.source)
+    }
+
+    /// Whether the writer's level lets saving write or remove the member.
+    pub(super) fn is_open(&self) -> bool {
+        self.writer().is_some()
     }
 
     /// The deadline, read while a step holds the lock.
@@ -248,9 +298,18 @@ impl Saving {
 }
 
 impl Recovery {
-    /// Gives saving a source for what this computer has chosen. Nothing is saved before it has one.
-    pub fn save_settings_from(&self, source: Arc<dyn SettingsSource>) {
-        let _ = self.saving.source.set(source);
+    /// Gives saving a source for what this computer has chosen, and the oldest level this release
+    /// retains. Nothing is saved before it has a source, or while that level is below
+    /// [`SETTINGS_READ_FROM`].
+    pub fn save_settings_from(
+        &self,
+        source: Arc<dyn SettingsSource>,
+        oldest_retained: CompatibilityLevel,
+    ) {
+        let _ = self.saving.source.set(Saves {
+            source,
+            open: oldest_retained >= SETTINGS_READ_FROM,
+        });
     }
 
     /// Tells saving the settings file changed. A step is wanted once the settings have been quiet.
@@ -351,7 +410,7 @@ impl Recovery {
         step: &Step<'_>,
         account: &Account,
     ) -> std::result::Result<SettingsStep, NotSavedWhy> {
-        let Some(source) = self.saving.source.get() else {
+        let Some(source) = self.saving.writer() else {
             return Ok(SettingsStep::Idle);
         };
         let record = match self.record() {

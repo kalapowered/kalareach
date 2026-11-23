@@ -58,8 +58,10 @@ use kr_protocol::backup_setup::{
     BackupStorageState, BackupStorageUnread,
 };
 use kr_protocol::error::ErrorCode;
+use kr_protocol::hello::PackageVersion;
 use kr_protocol::scalars::{AuthorisationKey, Signature64, TimestampMs};
 use kr_protocol::service::{GatewayOrigin, ServiceRequestSigner};
+use kr_protocol::update::CompatibilityLevel;
 use kr_service_stand_in::{ACCOUNT, Moment, RESTORE_TOKEN, Served, TOKEN, serve};
 use serde_json::{Value, json};
 use tauri::Manager as _;
@@ -3801,10 +3803,29 @@ const NO_WAIT: SettingsTiming = SettingsTiming {
     window: Duration::ZERO,
 };
 
+/// The minor number of the first level whose builds read a settings member, and of the level a
+/// release that retains one below it still speaks to.
+const OPEN: u16 = 79;
+const CLOSED: u16 = 78;
+
+/// The compatibility level of protocol 0.`minor`.
+fn level(minor: u16) -> CompatibilityLevel {
+    CompatibilityLevel::of(PackageVersion::new(0, minor, 0))
+}
+
 impl Computer {
     /// As [`Self::page`], with this computer's settings opened and given to recovery as what its
     /// steps save. No loop runs: the case calls each step itself.
     async fn saving_page(&self, timing: SettingsTiming) -> (Page, Arc<Settings>) {
+        self.saving_page_at(timing, level(OPEN)).await
+    }
+
+    /// As [`Self::saving_page`], for a release whose oldest retained level is `oldest`.
+    async fn saving_page_at(
+        &self,
+        timing: SettingsTiming,
+        oldest: CompatibilityLevel,
+    ) -> (Page, Arc<Settings>) {
         let page = self.page().await;
         let settings = {
             let state = page.app.state::<AppState>();
@@ -3812,7 +3833,7 @@ impl Computer {
             state.settings().expect("the settings are open")
         };
         page.recovery
-            .save_settings_from(Arc::clone(&settings) as Arc<dyn SettingsSource>);
+            .save_settings_from(Arc::clone(&settings) as Arc<dyn SettingsSource>, oldest);
         page.recovery.set_settings_timing(timing);
         (page, settings)
     }
@@ -4202,6 +4223,15 @@ impl Computer {
     /// As [`Self::saving_page`], with the loop that runs the steps started as the application
     /// starts it, and no step called by the case.
     async fn running_page(&self, timing: SettingsTiming) -> (Page, Arc<Settings>) {
+        self.running_page_at(timing, level(OPEN)).await
+    }
+
+    /// As [`Self::running_page`], for a release whose oldest retained level is `oldest`.
+    async fn running_page_at(
+        &self,
+        timing: SettingsTiming,
+        oldest: CompatibilityLevel,
+    ) -> (Page, Arc<Settings>) {
         let page = self.page().await;
         let settings = {
             let state = page.app.state::<AppState>();
@@ -4209,7 +4239,7 @@ impl Computer {
             state.settings().expect("the settings are open")
         };
         page.recovery.set_settings_timing(timing);
-        companion_tauri::start_settings_saving(page.app.handle()).expect("saving starts");
+        companion_tauri::start_settings_saving(page.app.handle(), oldest).expect("saving starts");
         (page, settings)
     }
 }
@@ -4438,4 +4468,92 @@ async fn settling_with_nothing_outstanding_is_read_as_settled() {
     page.call("recovery_turn_on", json!({})).expect("on");
     let settled = page.call("recovery_settle", json!({})).expect("settled");
     assert_eq!(settled["state"], "on");
+}
+
+/* -------------------------------------------------------------------------- */
+/* The writer's level                                                          */
+/* -------------------------------------------------------------------------- */
+
+/// KR-REQ-20.17, writer's level: while the oldest level a release retains cannot read the settings
+/// member, nothing writes it: not the first bundle, not a step, not a step the loop runs after a
+/// change. The page shows no saving line, whatever the record says.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nothing_writes_the_settings_member_while_the_oldest_retained_level_cannot_read_it() {
+    let computer = Computer::new().await;
+    let (page, settings) = computer.saving_page_at(NO_WAIT, level(CLOSED)).await;
+    settings
+        .set_colour_mode(ColourMode::Dark)
+        .await
+        .expect("the choice is kept");
+    page.call("recovery_turn_on", json!({})).expect("on");
+    assert_eq!(writes_sent(&computer), 1, "the bundle alone is written");
+    assert_eq!(
+        colour_in(&bundle_of(&computer, &page).await),
+        None,
+        "the first bundle carries no member"
+    );
+    assert_eq!(line_of(&page), Value::Null, "no saving line is shown");
+
+    settings
+        .set_colour_mode(ColourMode::Light)
+        .await
+        .expect("the choice is kept");
+    let step = page
+        .recovery
+        .save_settings(&page.account)
+        .await
+        .expect("a step");
+    assert_eq!(
+        step,
+        SettingsStep::Idle,
+        "the step asks nothing of the service"
+    );
+    assert_eq!(writes_sent(&computer), 1, "nothing more is written");
+    computer.stop_saving_settings();
+    assert_eq!(
+        line_of(&page),
+        Value::Null,
+        "a record that stopped saving shows no line either"
+    );
+}
+
+/// KR-REQ-20.17, writer's level: the loop that runs the steps writes nothing either, after a change
+/// to the settings and after a recovery step.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_loop_writes_no_settings_while_the_oldest_retained_level_cannot_read_the_member() {
+    let timing = SettingsTiming {
+        quiet: Duration::from_millis(100),
+        window: Duration::ZERO,
+    };
+    let computer = Computer::new().await;
+    let (page, settings) = computer.running_page_at(timing, level(CLOSED)).await;
+    page.call("recovery_turn_on", json!({})).expect("on");
+    let before = writes_sent(&computer);
+    settings
+        .set_colour_mode(ColourMode::Dark)
+        .await
+        .expect("kept");
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    assert_eq!(writes_sent(&computer), before, "no write follows a change");
+    assert_eq!(colour_in(&bundle_of(&computer, &page).await), None);
+    assert_eq!(line_of(&page), Value::Null);
+}
+
+/// KR-REQ-20.17, writer's level: the gate is the level that reads the member and every level above it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_first_bundle_carries_the_member_only_when_the_oldest_retained_level_reads_it() {
+    for (minor, carried) in [(CLOSED, false), (OPEN, true), (80, true)] {
+        let computer = Computer::new().await;
+        let (page, settings) = computer.saving_page_at(NO_WAIT, level(minor)).await;
+        settings
+            .set_colour_mode(ColourMode::Dark)
+            .await
+            .expect("kept");
+        page.call("recovery_turn_on", json!({})).expect("on");
+        assert_eq!(
+            colour_in(&bundle_of(&computer, &page).await).is_some(),
+            carried,
+            "the oldest retained level 0.{minor}"
+        );
+    }
 }
