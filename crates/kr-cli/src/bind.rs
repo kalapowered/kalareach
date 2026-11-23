@@ -133,13 +133,14 @@ pub enum Membership {
     /// A session's worker recognised this process as one of its own.
     Inside(SessionId),
     /// A worker did not say: one the kernel reports running that gave neither answer or could not
-    /// establish one, or one whose process state could not be read. The reason names its session,
-    /// and the session answering or ending is what settles it.
+    /// establish one. The reason names its session, and the session answering or ending is what
+    /// settles it.
     Unknown(Shown),
-    /// The host's records of its sessions could not be read, so no session is the one that did not
-    /// say: this host's directories, this boot or the list of environments, an environment's
-    /// sessions, or a session descriptor. The reason says which, and what settles it is the
-    /// records becoming readable, not a session.
+    /// What the host records of its sessions could not be read, so no worker is waited for: this
+    /// host's directories, this boot or the list of environments, an environment's sessions, a
+    /// session descriptor, or whether a session's worker is running, which the kernel would not
+    /// say and the walk therefore asks the worker nothing about. The reason says which, and what
+    /// settles it is the records becoming readable or the session ending, not a worker answering.
     Unreadable(Shown),
 }
 
@@ -151,9 +152,8 @@ enum Walked {
     /// A worker that is live: its descriptor names this boot and the kernel reports its process
     /// running.
     Worker(WorkerDescriptor),
-    /// A worker that could hold this process, whose state could not be read, with the reason.
-    Undecided(Shown),
-    /// The host's records could not be read, with the reason.
+    /// What the host records could not be read, with the reason: the records of its sessions, or
+    /// whether a worker that could hold this process is running.
     Unreadable(Shown),
 }
 
@@ -215,21 +215,25 @@ fn walk_in(paths: &kr_ipc::paths::HostPaths) -> Vec<Walked> {
             if descriptor.boot_identity != boot {
                 continue;
             }
-            match kr_ipc::identity::process_state(&descriptor.process_start_identity) {
-                ProcessState::Ended => continue,
-                ProcessState::Unknown { .. } => {
-                    walked.push(Walked::Undecided(shown!(
-                        "whether the worker of session {} is running cannot be read",
-                        descriptor.session_id
-                    )));
-                    continue;
-                }
-                ProcessState::Running => {}
-            }
-            walked.push(Walked::Worker(descriptor));
+            let state = kr_ipc::identity::process_state(&descriptor.process_start_identity);
+            walked.extend(by_process_state(descriptor, &state));
         }
     }
     walked
+}
+
+/// What a worker's descriptor comes to once the kernel has said whether its process runs: a worker
+/// that runs, nothing for one that has ended, and, for one whose process the kernel would not
+/// describe, records that could not be read: the worker is not asked, so it cannot answer.
+fn by_process_state(descriptor: WorkerDescriptor, state: &ProcessState) -> Option<Walked> {
+    match state {
+        ProcessState::Ended => None,
+        ProcessState::Unknown { .. } => Some(Walked::Unreadable(shown!(
+            "whether the worker of session {} is running cannot be read",
+            descriptor.session_id
+        ))),
+        ProcessState::Running => Some(Walked::Worker(descriptor)),
+    }
 }
 
 /// What one live worker said, within [`MEMBERSHIP_PROBE_DEADLINE`].
@@ -261,9 +265,6 @@ pub async fn membership(build_id: &BuildId) -> Membership {
     let mut unknown = None;
     for item in walk() {
         match item {
-            Walked::Undecided(why) => {
-                unknown.get_or_insert(Membership::Unknown(why));
-            }
             Walked::Unreadable(why) => {
                 unknown.get_or_insert(Membership::Unreadable(why));
             }
@@ -304,7 +305,6 @@ where
     let mut slots = Vec::with_capacity(walked.len());
     for (place, item) in walked.into_iter().enumerate() {
         slots.push(match item {
-            Walked::Undecided(why) => Slot::Unknown(Membership::Unknown(why)),
             Walked::Unreadable(why) => Slot::Unknown(Membership::Unreadable(why)),
             Walked::Worker(descriptor) => {
                 let session_id = descriptor.session_id;
@@ -919,23 +919,23 @@ mod tests {
     #[tokio::test]
     async fn records_that_cannot_be_read_and_a_worker_that_cannot_say_are_told_apart() {
         let records = || Walked::Unreadable(Shown::said("a descriptor cannot be read"));
-        let worker = || Walked::Undecided(Shown::said("a worker's state cannot be read"));
-        let never_asked = |_| async { Probe::Outside };
+        let silent_worker = || Walked::Worker(worker(1));
+        let says_nothing = |_| async { Probe::Silent(Shown::said("it did not answer in time")) };
+        let unreadable = Membership::Unreadable(Shown::said("a descriptor cannot be read"));
         assert_eq!(
-            ask_together(vec![records()], never_asked).await,
-            Membership::Unreadable(Shown::said("a descriptor cannot be read"))
+            ask_together(vec![records()], says_nothing).await,
+            unreadable
         );
+        let silent = ask_together(vec![silent_worker()], says_nothing).await;
+        assert!(matches!(silent, Membership::Unknown(_)), "{silent:?}");
         assert_eq!(
-            ask_together(vec![worker()], never_asked).await,
-            Membership::Unknown(Shown::said("a worker's state cannot be read"))
+            ask_together(vec![records(), silent_worker()], says_nothing).await,
+            unreadable
         );
-        assert_eq!(
-            ask_together(vec![records(), worker()], never_asked).await,
-            Membership::Unreadable(Shown::said("a descriptor cannot be read"))
-        );
-        assert_eq!(
-            ask_together(vec![worker(), records()], never_asked).await,
-            Membership::Unknown(Shown::said("a worker's state cannot be read"))
+        let silent_first = ask_together(vec![silent_worker(), records()], says_nothing).await;
+        assert!(
+            matches!(silent_first, Membership::Unknown(_)),
+            "{silent_first:?}"
         );
     }
 
@@ -945,10 +945,40 @@ mod tests {
             .iter()
             .map(|item| match item {
                 Walked::Worker(descriptor) => format!("worker {}", descriptor.session_id),
-                Walked::Undecided(why) => format!("undecided: {why}"),
                 Walked::Unreadable(why) => format!("unreadable: {why}"),
             })
             .collect()
+    }
+
+    /// A worker whose process the kernel would not describe is not one that did not answer: the
+    /// walk asks it nothing, so no answer from its session settles it, and the person is told as
+    /// for records that cannot be read, which is what the kernel's reading is.
+    #[tokio::test]
+    async fn a_worker_whose_process_cannot_be_read_is_told_as_records_that_cannot_be_read() {
+        let session = || worker(7);
+        let id = session().session_id;
+        let reason = format!("whether the worker of session {id} is running cannot be read");
+        let state = ProcessState::Unknown {
+            detail: "the kernel did not answer".to_owned(),
+        };
+        let found = by_process_state(session(), &state).expect("what could not be established");
+        assert_eq!(kinds(&[found]), vec![format!("unreadable: {reason}")]);
+        let never_asked = |_| async { Probe::Outside };
+        let unreadable = by_process_state(session(), &state).into_iter().collect();
+        assert_eq!(
+            ask_together(unreadable, never_asked).await,
+            Membership::Unreadable(shown!(
+                "whether the worker of session {} is running cannot be read",
+                id
+            ))
+        );
+        // The control: a worker that runs is asked, and one that has ended holds nothing.
+        let running = by_process_state(session(), &ProcessState::Running);
+        assert_eq!(
+            kinds(&running.into_iter().collect::<Vec<_>>()),
+            vec![format!("worker {id}")]
+        );
+        assert!(by_process_state(session(), &ProcessState::Ended).is_none());
     }
 
     /// A host whose records cannot be read is not one with a worker that did not say: a session
