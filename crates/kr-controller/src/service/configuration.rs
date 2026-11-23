@@ -828,6 +828,42 @@ mod tests {
         assert!(controller.description_settings().enabled);
     }
 
+    /// KR-REQ-22.10: an acceptance reads the configuration document once, and what it derives from
+    /// the document, the settings the description host takes among it, comes from that reading: a
+    /// second reading is a second chance for the file to have moved between the two.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_acceptance_reads_the_configuration_document_once() {
+        use kr_protocol::hostinfo::configuration::{
+            ConfigurationCeilings, ConfigurationDocument, DescriptionBudgets, contents,
+        };
+
+        let temp = kr_ipc::testing::TempHost::create();
+        let controller = daemon(&temp).await;
+        let document = ConfigurationDocument {
+            ceilings: ConfigurationCeilings {
+                description_budgets: Some(DescriptionBudgets {
+                    process_memory_bytes: Nullable::some(2 << 30),
+                    reserve_bytes: Nullable::null(),
+                }),
+                ..ConfigurationCeilings::default()
+            },
+            ..ConfigurationDocument::empty()
+        };
+        kr_ipc::paths::write_owner_only_file(
+            controller.configuration().document(),
+            contents(&document).as_bytes(),
+        )
+        .expect("writes the document");
+
+        let before = crate::config::reads::of(&controller.paths);
+        controller.accept_configuration().await;
+        assert_eq!(
+            crate::config::reads::of(&controller.paths) - before,
+            1,
+            "one acceptance, one reading of the document"
+        );
+    }
+
     /// KR-REQ-22.10: the settings an acceptance gives the description host come from the reading
     /// that acceptance took, and from no second reading of the file: a document edited between the
     /// reading and the settings does not make the host take other budgets than the ones its report

@@ -43,7 +43,39 @@ pub use ceilings::HardLimits;
 /// Reads this environment's configuration.
 #[must_use]
 pub fn open(paths: &EnvironmentPaths) -> Resolver {
+    #[cfg(test)]
+    reads::note(paths);
     Resolver::open(paths)
+}
+
+/// How often this crate's cases read each environment's document through [`open`], so a case can
+/// say that one acceptance read it once.
+#[cfg(test)]
+pub(crate) mod reads {
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
+    use std::sync::{Mutex, PoisonError};
+
+    use kr_ipc::paths::EnvironmentPaths;
+
+    static READS: Mutex<BTreeMap<PathBuf, u64>> = Mutex::new(BTreeMap::new());
+
+    pub(super) fn note(paths: &EnvironmentPaths) {
+        let mut reads = READS.lock().unwrap_or_else(PoisonError::into_inner);
+        *reads
+            .entry(kr_worker::config::document_path(paths))
+            .or_default() += 1;
+    }
+
+    /// The reads of this environment's document so far.
+    pub(crate) fn of(paths: &EnvironmentPaths) -> u64 {
+        READS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&kr_worker::config::document_path(paths))
+            .copied()
+            .unwrap_or(0)
+    }
 }
 
 /// Returns one configuration document as this host records it.
