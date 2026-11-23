@@ -4246,6 +4246,70 @@ async fn kr_req_13_12_a_refused_send_leaves_the_copy_of_the_upload_that_took_its
     adopted.stop().await;
 }
 
+/// KR-REQ-13.12 (FU1b): a send that the start section refuses, under a key that no upload holds but
+/// whose entry is kept, leaves the copy: the entry names it, and it is not the refused send's. A
+/// cleanup that records no cancel ended the send's upload, and a record of another upload was kept
+/// under the key since. The record is written into the folder, as a restart's finding is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_13_12_a_refused_send_leaves_the_copy_a_kept_entry_names() {
+    use testing::Point;
+
+    let adopted = Adopted::start(1).await;
+    let (phone, _control) = phone_for(&adopted).await;
+    let desk = desk_of(&phone.companion);
+    let paired = paired_of(&phone.companion).await;
+    let key = kr_ipc::new_uuid();
+    let sent_bytes = vec![5_u8; 16];
+    let kept_bytes = vec![6_u8; 32];
+    let gate = desk.hold_after_copy_for_test();
+    let after = testing::hold_at(key, Point::AfterCopy);
+    let sending = {
+        let sent = request(
+            &adopted,
+            &sent_bytes,
+            Arc::new(Held::new(sent_bytes.clone())),
+            key,
+        );
+        let (desk, paired) = (Arc::clone(&desk), paired.clone());
+        tokio::spawn(async move { desk.send(paired, sent).await })
+    };
+    after.until_passed(1).await;
+    desk.forgotten(paired.device_id);
+    settled(&desk).await;
+    assert_eq!(
+        testing::read_copy(&folder(&phone), key),
+        None,
+        "the cleanup removed the send's copy"
+    );
+    testing::keep(
+        &folder(&phone),
+        key,
+        paired.environment_id,
+        paired.device_id,
+        None,
+        net_support::on_the_host(&adopted.host),
+        Some(kr_protocol::ids::TransferId::new(kr_ipc::new_uuid())),
+        testing::Got::Begun,
+        32,
+        Held::new(kept_bytes.clone()).digest(),
+        testing::Where::Copy,
+    );
+    testing::keep_copy(&folder(&phone), key, &kept_bytes);
+    gate.add_permits(1);
+    let refused = tokio::time::timeout(WATCHDOG, sending)
+        .await
+        .expect("the send answers")
+        .expect("the task ran");
+    assert!(refused.is_err(), "the send was refused");
+    assert_eq!(
+        testing::read_copy(&folder(&phone), key),
+        Some(kept_bytes),
+        "the refused send left the copy the kept entry names"
+    );
+    assert_eq!(entries_in(&folder(&phone)), 1, "and the entry");
+    adopted.stop().await;
+}
+
 /// KR-REQ-13.12 (FU3): an upload belongs to the desk from its admission. A send whose caller is
 /// dropped while the copy of the content is kept still has its upload started.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
