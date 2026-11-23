@@ -2713,7 +2713,7 @@ worker reads that file in this run and in no other. With no file the read check 
 says so. A run that is already going is not started again. With `--file` the command reads what the
 host holds before it asks: a run that was going then, and is the same one in the host's answer, was
 going already, so the command fails and says that the file was not read, because the findings the
-host holds are of a run that was asked to read another file. A run that had ended before the
+host holds are of a run that this command did not ask for. A run that had ended before the
 request is never taken for it. The host tells runs apart by when each began, in milliseconds of its
 clock, and by its session, and checks no more: a run that ends before the request, and a run the
 request then begins in the same session in the same millisecond, which a clock set back can repeat,

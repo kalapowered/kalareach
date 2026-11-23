@@ -292,19 +292,25 @@ async fn follow<A: Asked>(
     let mut seen = begun;
     // What the host held when the last read of a run that was still going answered.
     let mut held: Option<A::Records> = None;
+    // The longest the host has taken to answer one read, which the read the deadline cuts off is
+    // measured against, and no less than one wait between reads.
+    let mut slowest = POLL;
     loop {
         let asked_at = Instant::now();
         let (checks, records) = match within(deadline, asked.read()).await {
-            Some(Ok(answer)) => answer,
+            Some(Ok(answer)) => {
+                slowest = slowest.max(asked_at.elapsed());
+                answer
+            }
             // The first answer already gave the verdict, and a read that only brings the records
             // that go with it does not take it back by failing or by not answering.
             _ if !running => return Ok(kept(seen, None, true)),
             Some(Err(error)) => return Err(error),
-            // A read that the deadline cut off soon after it was asked is the deadline's doing, and
-            // the run was still going when the host last answered. One that had been out longer is
-            // a host that stopped answering.
+            // A read that the deadline cut off after no longer than the host took to answer one
+            // before is the deadline's doing, and the run was still going when the host last
+            // answered. One that had been out longer is a host that stopped answering.
             None => {
-                return Ok(if deadline.saturating_duration_since(asked_at) <= POLL {
+                return Ok(if deadline.saturating_duration_since(asked_at) <= slowest {
                     out_of_time(seen, held)
                 } else {
                     unanswered(Some(seen))
@@ -331,12 +337,13 @@ async fn follow<A: Asked>(
 }
 
 /// What the command comes to where its deadline passed while the run it follows was going: the run
-/// as the host last said it, with what the host held then, where a read answered. A run that has
-/// not ended has no findings to be read as anyone's.
+/// as the host last said it, with what the host held then, where a read answered since the request.
+/// A run that has not ended has no findings to be read as anyone's.
 fn out_of_time<R>(seen: CapabilityChecks, held: Option<R>) -> Followed<R> {
-    match held {
-        Some(records) => ended(seen, records, true),
-        None => unanswered(Some(seen)),
+    Followed::Unfinished {
+        words: unfinished(&seen).unwrap_or_else(unanswered_words),
+        checks: Some(seen),
+        records: held,
     }
 }
 
@@ -440,11 +447,16 @@ fn unanswered<R>(seen: Option<CapabilityChecks>) -> Followed<R> {
     Followed::Unfinished {
         checks: seen,
         records: None,
-        words: shown!(
-            "The host did not answer within five minutes, so it is not known where the checks \
-             stand. Run kr doctor to see what the host holds once it answers."
-        ),
+        words: unanswered_words(),
     }
+}
+
+/// What a person is told where the host did not answer a call in time.
+fn unanswered_words() -> Shown {
+    shown!(
+        "The host did not answer within five minutes, so it is not known where the checks \
+         stand. Run kr doctor to see what the host holds once it answers."
+    )
 }
 
 /// Says on standard error that the checks are running, and what a person may be asked meanwhile.
@@ -590,6 +602,8 @@ mod tests {
         asked_at: Vec<Instant>,
         /// How many times the request was made.
         begins: usize,
+        /// How long the request takes to be answered.
+        begin_takes: Duration,
         /// The length of the path the read check's record shows, where it shows one.
         path_bytes: Option<usize>,
     }
@@ -603,6 +617,7 @@ mod tests {
                 read_takes: Duration::ZERO,
                 asked_at: Vec::new(),
                 begins: 0,
+                begin_takes: Duration::ZERO,
                 path_bytes: None,
             }
         }
@@ -613,6 +628,7 @@ mod tests {
 
         async fn begin(&mut self, _authorised_file: Option<String>) -> Result<CapabilityChecks> {
             self.begins += 1;
+            tokio::time::sleep(self.begin_takes).await;
             match self.begun.clone() {
                 Answer::Stands(checks) => Ok(checks),
                 Answer::Silent => std::future::pending().await,
@@ -843,6 +859,69 @@ mod tests {
         assert_eq!(seen, None);
         assert!(
             words.contains("did not answer within five minutes"),
+            "{words}"
+        );
+    }
+
+    /// A read that the deadline cut off after no longer than the host took to answer a read before
+    /// is the deadline's doing, however long that is, and not a host that stopped answering: the run
+    /// was going when the host last answered, and is said to be still going.
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_read_that_the_deadline_cut_off_does_not_make_a_host_that_stopped_answering() {
+        let running = stands(CapabilityChecksState::Running, 10, 1, None);
+        let mut script = Script::new(
+            Answer::Stands(running.clone()),
+            vec![Answer::Stands(running.clone())],
+        );
+        // The last read starts 298.8 s in and is cut off after 1.2 s, which is more than POLL and
+        // less than the 1.3 s that the reads before it took.
+        script.read_takes = Duration::from_millis(1300);
+        let (followed, _) = run_naming(&mut script, None).await;
+        let Followed::Unfinished {
+            checks,
+            records,
+            words,
+        } = followed
+        else {
+            panic!("the command reported findings of a run that had not ended");
+        };
+        assert_eq!(checks, Some(running));
+        assert!(
+            records.is_some(),
+            "the last answered read's records were dropped"
+        );
+        assert!(
+            words
+                .to_string()
+                .contains("still running after five minutes"),
+            "{words}"
+        );
+    }
+
+    /// A request that the host answers with the run going just before the deadline is said to be
+    /// still going where no read can answer before the deadline: the host did answer, and the run was
+    /// going when it did.
+    #[tokio::test(start_paused = true)]
+    async fn a_run_going_in_the_answer_to_the_request_just_before_the_deadline_is_said_to_be_still_going()
+     {
+        let running = stands(CapabilityChecksState::Running, 10, 1, None);
+        let mut script = Script::new(Answer::Stands(running.clone()), vec![Answer::Silent]);
+        script.begin_takes = WAIT - Duration::from_millis(100);
+        let (followed, _) = run_naming(&mut script, None).await;
+        let Followed::Unfinished {
+            checks,
+            records,
+            words,
+        } = followed
+        else {
+            panic!("the command reported findings of a run that had not ended");
+        };
+        assert_eq!(checks, Some(running));
+        assert!(records.is_none());
+        assert!(
+            words
+                .to_string()
+                .contains("still running after five minutes"),
             "{words}"
         );
     }
