@@ -225,8 +225,8 @@ enum Followed<R> {
 /// can: another caller's request may be admitted between the command's clock reading and its own.
 /// So where a file is named, the command reads the host once before the request. The same run
 /// before and in the answer, going at both, was going already, and the file named was not read. A
-/// run that had ended before the request is never taken for one going already, whatever start and
-/// session it bears. Any other run in the answer is taken for the one this request began, and the
+/// run that had ended when the host was read before the request is not taken for one going
+/// already, whatever start and session it bears. Any other run in the answer is taken for the one this request began, and the
 /// findings are reported as a read of the file named only where the read check's record shows a path
 /// of the length of that file's: a record that shows another length, or none, may be another
 /// caller's run, begun at the same moment, and the command says it is not known whether the file
@@ -234,9 +234,11 @@ enum Followed<R> {
 /// this command's own.
 ///
 /// A run is told by its start, in milliseconds of the daemon's wall clock, and its session, and the
-/// daemon checks no uniqueness. So one limit remains: a run going before the request that ends
-/// before it, and a run that this request begins in the same session in the same millisecond, which
-/// a clock set back can repeat, are taken for one run going already.
+/// daemon checks no uniqueness. So a limit remains: a run that was going when the host was read
+/// before the request and ended before it, and a run that this request begins in the same session in
+/// the same millisecond, which a clock set back can repeat, are taken for one run going already.
+/// The reads that follow the run tell it by the same pair, so there too a run of another caller in
+/// the same session and the same millisecond is taken for this command's own.
 ///
 /// `announce` is called once the host has started a run.
 async fn follow<A: Asked>(
@@ -348,8 +350,9 @@ fn out_of_time<R>(seen: CapabilityChecks, held: Option<R>) -> Followed<R> {
 }
 
 /// A run of the checks as the host names it: when it began and the session whose worker performs
-/// it. Another run has another pair, so a command that reads the host again can tell that the run
-/// it asked for is no longer the one the host holds.
+/// it. Another run has another pair unless the daemon's clock gives two runs of one session the same
+/// start, so a command that reads the host again can tell, within the limit stated at `follow`,
+/// that the run it asked for is no longer the one the host holds.
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct Run {
     started_at_ms: Option<TimestampMs>,
