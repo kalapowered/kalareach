@@ -239,12 +239,19 @@ pub enum Outcome {
         /// its class and its length.
         detail: Sentence,
     },
-    /// The filesystem refused it, and no privacy permission is known for that path.
+    /// The permissions on the file or on a folder above it refused it.
     ///
     /// A permission a person could grant is named by [`Outcome::PermissionRefused`]. This is the
-    /// same refusal for a path that none of them covers: the permissions on the file or on a folder
-    /// above it refuse this account, and no grant changes that.
+    /// refusal of a mode or an access list, which no privacy grant is about, on whatever volume and
+    /// in whatever folder the file is.
     FilesystemRefused {
+        /// What the platform said, as this check read it: what the platform printed is said as
+        /// its class and its length.
+        detail: Sentence,
+    },
+    /// A privacy protection of the operating system refused it, at a place that no permission is
+    /// known for.
+    ProtectionRefused {
         /// What the platform said, as this check read it: what the platform printed is said as
         /// its class and its length.
         detail: Sentence,
@@ -348,6 +355,22 @@ pub fn judge(
                     .stated(
                         ". No privacy permission is known for that path: the permissions on the \
                          file or its folders refuse this account",
+                    ),
+            ),
+        ),
+        Outcome::ProtectionRefused { detail } => (
+            CapabilityState::PermissionRequired,
+            CapabilityEvidenceSource::DisclosedProbe,
+            Some(
+                Sentence::new()
+                    .stated(
+                        "this context performed the operation and the operating system refused \
+                         it: ",
+                    )
+                    .sentence(detail)
+                    .stated(
+                        ". No privacy permission is known for that path: a privacy protection of \
+                         the operating system refuses this account",
                     ),
             ),
         ),
@@ -594,23 +617,29 @@ impl Facilities for Platform {
 /// Reading the whole of a file the check knows nothing about would be a diagnostic that copies a
 /// document into memory, so it reads enough to establish that the bytes come out and stops.
 fn read_authorised_file(plan: &Plan) -> Ran {
-    read_authorised_file_with(plan, |path| read_first_block(&path))
+    read_authorised_file_with(plan, |path| read_first_block(&path), permission_for_path)
 }
 
 /// The authorised-file read, with the read of the file given rather than chosen.
 ///
-/// The product gives [`read_first_block`]. A case can give a read that does not return, to see the
-/// check stop waiting for it at its declared bound: the read is put on a thread here, and waited
-/// for here, whichever read it is.
+/// The product gives [`read_first_block`] and [`permission_for_path`]. A case can give a read that
+/// does not return, or a lookup that does not, to see the check stop waiting for it at its
+/// declared bound: the read and the lookup are put on a thread here, and waited for here, whichever
+/// they are.
 ///
 /// A regular file on a filesystem that has stopped answering blocks in the kernel, and a read has
 /// no deadline of its own. The read is done on a thread and waited for with one, so the check
 /// answers whatever the filesystem does. A read that never returns leaves its thread waiting
 /// rather than the check, which is the trade this makes deliberately: a diagnostic that cannot
 /// answer is worse than a thread that is still asleep when the process ends.
+///
+/// The question that follows a refused open, which permission the path is under, is put to the
+/// filesystem as well, and a network volume can refuse the open at once and then stop answering it.
+/// It is asked on the same thread, after the open, so that it is inside the same bound.
 fn read_authorised_file_with(
     plan: &Plan,
     read: impl FnOnce(PathBuf) -> std::io::Result<FirstBlock> + Send + 'static,
+    lookup: impl FnOnce(&Path) -> Option<&'static str> + Send + 'static,
 ) -> Ran {
     let check = Check::AuthorisedFileRead;
     let Some(path) = plan.authorised_file.as_deref() else {
@@ -629,7 +658,15 @@ fn read_authorised_file_with(
     // a pipe or a device between a look and a read is not read at all. The open itself does not
     // wait for the other end of a pipe, and the whole check answers inside its own bound whatever
     // the filesystem does.
-    let outcome = match on_a_thread(path, check.effects().bound, read) {
+    let outcome = match on_a_thread(path, check.effects().bound, move |path| {
+        match read(path.clone()) {
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                let refusal = refusal_of(&error, &path, lookup);
+                Ok(Read::Refused { error, refusal })
+            }
+            other => other.map(Read::Block),
+        }
+    }) {
         None => Outcome::NotAttempted {
             detail: Sentence::new()
                 .path(path)
@@ -640,27 +677,28 @@ fn read_authorised_file_with(
                      filesystem's to finish",
                 ),
         },
-        Some(Ok(FirstBlock::NotRegular)) => Outcome::NotAttempted {
+        Some(Ok(Read::Block(FirstBlock::NotRegular))) => Outcome::NotAttempted {
             detail: Sentence::new()
                 .path(path)
                 .stated(" is not a regular file, and this check reads only a file"),
         },
-        Some(Ok(FirstBlock::Read(count))) => Outcome::Performed {
+        Some(Ok(Read::Block(FirstBlock::Read(count)))) => Outcome::Performed {
             detail: Sentence::new()
                 .stated("it read ")
                 .number(count as u64)
                 .stated(" bytes of ")
                 .path(path),
         },
-        Some(Err(error)) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+        Some(Ok(Read::Refused { error, refusal })) => {
             let detail = Sentence::new()
                 .stated("the platform refused to open ")
                 .path(path)
                 .stated(": ")
                 .withheld(ContentClass::Message, &error.to_string());
-            match permission_for_path(path) {
-                Some(permission) => Outcome::PermissionRefused { permission, detail },
-                None => Outcome::FilesystemRefused { detail },
+            match refusal {
+                Refusal::Grant(permission) => Outcome::PermissionRefused { permission, detail },
+                Refusal::Protection => Outcome::ProtectionRefused { detail },
+                Refusal::Permissions => Outcome::FilesystemRefused { detail },
             }
         }
         Some(Err(error)) if error.kind() == std::io::ErrorKind::NotFound => Outcome::NotAttempted {
@@ -677,6 +715,49 @@ fn read_authorised_file_with(
         check,
         facility: None,
         outcome,
+    }
+}
+
+/// What the thread that opened the nominated file brings back.
+enum Read {
+    /// The open was not refused for want of a permission.
+    Block(FirstBlock),
+    /// The open was refused for want of a permission, and what that refusal is about.
+    Refused {
+        error: std::io::Error,
+        refusal: Refusal,
+    },
+}
+
+/// What a refused open is about.
+#[derive(Debug, PartialEq, Eq)]
+enum Refusal {
+    /// A privacy protection of the operating system, at a place under this permission.
+    Grant(&'static str),
+    /// A privacy protection of the operating system, at a place no permission is known for.
+    Protection,
+    /// The permissions on the file or on a folder above it.
+    Permissions,
+}
+
+/// What the refusal of an open is about, by the error number the platform gave.
+///
+/// macOS refuses with `EPERM` where a privacy protection does and with `EACCES` where the mode of
+/// a file or an access list does, and the place of the path says nothing of which it was: a file in
+/// a folder that a grant covers is refused by its mode, too. So the place is asked only of the
+/// first, and the second is the filesystem's own. The other platforms have no privacy permission
+/// to name.
+fn refusal_of(
+    error: &std::io::Error,
+    path: &Path,
+    lookup: impl FnOnce(&Path) -> Option<&'static str>,
+) -> Refusal {
+    if !cfg!(target_os = "macos") || error.raw_os_error() != Some(libc::EPERM) {
+        return Refusal::Permissions;
+    }
+    match lookup(path) {
+        Some(permission) => Refusal::Grant(permission),
+        None => Refusal::Protection,
     }
 }
 
@@ -749,15 +830,16 @@ fn read_first_block(path: &Path) -> std::io::Result<FirstBlock> {
     }
 }
 
-/// The permission a refused read of one path is about, in the platform's own words.
+/// The permission a path is under, where a privacy protection refuses a read of it, in the
+/// platform's own words.
 ///
 /// Naming it is the difference between an answer a person can act on and "permission denied": on
 /// macOS the protected locations are separate grants, a removable volume and a network volume are
-/// two more, and Full Disk Access is one more that covers them all. A path outside every one of
-/// them was refused by the filesystem's own permissions rather than by a privacy grant, and no
-/// permission is named for it. Whether a path is on a removable or a network volume is what the
-/// kernel says of the volume, never how the path is spelled, and a protected folder is the
-/// account's own: the one in its home directory.
+/// two more, and Full Disk Access is one more that covers them all. A path in none of them has no
+/// permission to name. Whether a refusal is a privacy protection's at all is the error number's to
+/// say, never the path's: this only says which grant the place is under. Whether a path is on a
+/// removable or a network volume is what the kernel says of the volume, never how the path is
+/// spelled, and a protected folder is the account's own: the one in its home directory.
 #[must_use]
 pub fn permission_for_path(path: &Path) -> Option<&'static str> {
     permission_on(
@@ -2115,16 +2197,20 @@ mod tests {
         let finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let stand_in_finished = std::sync::Arc::clone(&finished);
         let began = std::time::Instant::now();
-        let ran = read_authorised_file_with(&plan, move |_| {
-            started_tell
-                .send(())
-                .expect("the case is waiting for the stand-in");
-            // Kept here until the case lets it go, or for the longest it stays.
-            let _ = released.recv_timeout(stays);
-            stand_in_finished.store(true, std::sync::atomic::Ordering::SeqCst);
-            let _ = ended_tell.send(());
-            Ok(FirstBlock::Read(0))
-        });
+        let ran = read_authorised_file_with(
+            &plan,
+            move |_| {
+                started_tell
+                    .send(())
+                    .expect("the case is waiting for the stand-in");
+                // Kept here until the case lets it go, or for the longest it stays.
+                let _ = released.recv_timeout(stays);
+                stand_in_finished.store(true, std::sync::atomic::Ordering::SeqCst);
+                let _ = ended_tell.send(());
+                Ok(FirstBlock::Read(0))
+            },
+            |_| None,
+        );
         let elapsed = began.elapsed();
 
         assert_eq!(ran.check, Check::AuthorisedFileRead);
@@ -2183,6 +2269,110 @@ mod tests {
         ended
             .recv_timeout(SLACK)
             .expect("the stand-in read ended once it was let go");
+    }
+
+    /// The file check, on a nominated file in the account's Documents folder whose open is refused
+    /// with `errno`, where `lookup` says which permission the place is under.
+    #[cfg(unix)]
+    fn refused_with(
+        errno: i32,
+        lookup: impl FnOnce(&Path) -> Option<&'static str> + Send + 'static,
+    ) -> Outcome {
+        let plan = Plan {
+            authorised_file: Some(PathBuf::from("/Users/someone/Documents/notes.txt")),
+            ..Plan::in_directory("/nonexistent/scratch")
+        };
+        read_authorised_file_with(
+            &plan,
+            move |_| Err(std::io::Error::from_raw_os_error(errno)),
+            lookup,
+        )
+        .outcome
+    }
+
+    #[cfg(unix)]
+    const DOCUMENTS: &str = "Files & Folders, for the Documents folder";
+
+    /// A privacy protection of macOS refuses an open with `EPERM`; the mode of a file or an access
+    /// list refuses it with `EACCES`. The error number decides what the refusal is about, and the
+    /// place only says which grant when it was a privacy protection.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_refusal_by_a_privacy_protection_names_the_grant_of_the_place_it_is_in() {
+        match refused_with(libc::EPERM, |_| Some(DOCUMENTS)) {
+            Outcome::PermissionRefused { permission, .. } => assert_eq!(permission, DOCUMENTS),
+            other => panic!("a privacy refusal in a place with a grant names it: {other:?}"),
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_refusal_by_a_privacy_protection_at_a_place_no_grant_is_known_for_says_so() {
+        let outcome = refused_with(libc::EPERM, |_| None);
+        assert!(
+            matches!(outcome, Outcome::ProtectionRefused { .. }),
+            "{outcome:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_refusal_by_a_mode_or_an_access_list_names_no_grant_in_a_place_that_has_one() {
+        // The place that the case above names a grant for: a folder that a grant covers is refused
+        // by a file's mode too, and that is not the grant's doing.
+        let outcome = refused_with(libc::EACCES, |_| Some(DOCUMENTS));
+        assert!(
+            matches!(outcome, Outcome::FilesystemRefused { .. }),
+            "{outcome:?}"
+        );
+    }
+
+    /// KR-REQ-11.16, the bounded clause, for the lookup that follows a refused open: the question of
+    /// which place a refused path is in is put to the filesystem, and a network volume can refuse
+    /// the open at once and then not answer that. It is waited for with the open, so the check
+    /// answers at its declared bound and the run is not held.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_lookup_that_stalls_after_a_refused_open_is_stopped_waiting_for_at_the_declared_bound() {
+        const SLACK: Duration = Duration::from_secs(5);
+
+        let bound = Check::AuthorisedFileRead.effects().bound;
+        let stays = (bound + SLACK) * 2;
+        let plan = Plan {
+            authorised_file: Some(PathBuf::from("/Volumes/Share/notes.txt")),
+            ..Plan::in_directory("/nonexistent/scratch")
+        };
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let (ended_tell, ended) = std::sync::mpsc::channel();
+        let began = std::time::Instant::now();
+        let ran = read_authorised_file_with(
+            &plan,
+            |_| Err(std::io::Error::from_raw_os_error(libc::EPERM)),
+            move |_| {
+                // Kept here until the case lets it go, or for the longest it stays.
+                let _ = released.recv_timeout(stays);
+                let _ = ended_tell.send(());
+                Some(DOCUMENTS)
+            },
+        );
+        let elapsed = began.elapsed();
+
+        assert!(
+            matches!(ran.outcome, Outcome::NotAttempted { .. }),
+            "the check did not answer that it was not attempted: {:?}",
+            ran.outcome
+        );
+        assert!(
+            elapsed < bound + SLACK,
+            "the check waited {elapsed:?} for a lookup that was not coming, past its declared \
+             bound of {bound:?}"
+        );
+
+        // The thread the check left waiting ends when the stand-in is let go.
+        release.send(()).expect("the stand-in is still waiting");
+        ended
+            .recv_timeout(SLACK)
+            .expect("the stand-in lookup ended once it was let go");
     }
 
     #[test]
@@ -2378,6 +2568,31 @@ mod tests {
             "{reason}"
         );
         assert!(!reason.as_str().contains("Backup"), "{reason}");
+    }
+
+    #[test]
+    fn a_privacy_protection_at_a_place_no_grant_is_known_for_says_so_and_names_no_grant() {
+        let refused = Outcome::ProtectionRefused {
+            detail: Sentence::new()
+                .stated("the platform refused to open ")
+                .path(Path::new("/opt/kr-marker/notes.txt")),
+        };
+        let (state, source, reason) = judge(Check::AuthorisedFileRead, &refused);
+        assert_eq!(state, CapabilityState::PermissionRequired);
+        assert_eq!(source, CapabilityEvidenceSource::DisclosedProbe);
+        let reason = reason.expect("a refusal says why");
+        assert!(
+            reason.as_str().ends_with(
+                "No privacy permission is known for that path: a privacy protection of the \
+                 operating system refuses this account"
+            ),
+            "{reason}"
+        );
+        assert!(
+            !reason.as_str().contains("granted per signed application"),
+            "{reason}"
+        );
+        assert!(!reason.as_str().contains("kr-marker"), "{reason}");
     }
 
     #[test]
