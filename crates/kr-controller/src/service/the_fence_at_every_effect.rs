@@ -2566,6 +2566,15 @@ async fn a_fence_that_lands_while_a_refresh_opens_a_bridge_leaves_it_answered() 
 #[cfg(unix)]
 const WITH_AN_ANSWERING_BRIDGE: &str = "KR_TEST_HOST_WITH_AN_ANSWERING_BRIDGE";
 
+/// Set in the program that runs the ssh host's case again, which finds the stand-in for `ssh` first
+/// on its search path.
+#[cfg(unix)]
+const WITH_AN_ANSWERING_SSH_HOST: &str = "KR_TEST_HOST_WITH_AN_ANSWERING_SSH_HOST";
+
+/// The ssh host's case's name as the test program lists it.
+#[cfg(unix)]
+const THE_ANSWERING_SSH_HOST_CASE: &str = "service::the_fence_at_every_effect::a_fence_that_lands_after_an_ssh_hosts_helper_answered_stops_what_the_answer_would_write";
+
 /// The case's name as the test program lists it.
 #[cfg(unix)]
 const THE_ANSWERING_BRIDGE_CASE: &str = "service::the_fence_at_every_effect::a_fence_that_lands_after_a_bridge_has_answered_says_the_answer_was_not_recorded";
@@ -2622,31 +2631,51 @@ fn what_an_answering_helper_writes(byte: u8) -> Vec<u8> {
 
 /// Runs the case below again as a program whose search path finds, first, a `wsl.exe` that answers
 /// a bridge as the helper of the environment `enrolment_of(1)` names would.
-///
-/// The launcher is a program of a fixed name that a refresh finds on the search path, and a search
-/// path belongs to the whole process, so a case that wants a bridge to answer cannot change it for
-/// itself. The stand-in is placed and started once here, where nothing is timed.
 #[cfg(unix)]
 fn run_again_with_an_answering_bridge() {
+    run_again_with_an_answering_launcher(
+        "wsl.exe",
+        "--version",
+        1,
+        THE_ANSWERING_BRIDGE_CASE,
+        WITH_AN_ANSWERING_BRIDGE,
+    );
+}
+
+/// Runs the case `case` again as a program whose search path finds, first, a `launcher` that
+/// answers as the helper of the environment `enrolment_of(byte)` names would, and that ends at once
+/// when it is asked `version`. The program that runs the case again is told so by `marker`.
+///
+/// The launcher is a program of a fixed name that a refresh finds on the search path, and a search
+/// path belongs to the whole process, so a case that wants a destination to answer cannot change it
+/// for itself. The stand-in is placed and started once here, where nothing is timed.
+#[cfg(unix)]
+fn run_again_with_an_answering_launcher(
+    launcher: &str,
+    version: &str,
+    byte: u8,
+    case: &str,
+    marker: &str,
+) {
     let kept = tempfile::tempdir().expect("a directory for the stand-in");
     let bin = kept.path().join("bin");
     std::fs::create_dir_all(&bin).expect("the stand-in's directory");
     let answer = kept.path().join("answer");
-    std::fs::write(&answer, what_an_answering_helper_writes(1)).expect("the answer");
+    std::fs::write(&answer, what_an_answering_helper_writes(byte)).expect("the answer");
     let answer_path = answer.to_str().expect("a temporary path is text");
     assert!(
         !answer_path.contains('\''),
         "the stand-in quotes its answer with single quotes: {answer_path}"
     );
-    let text = kept.path().join("wsl.exe.text");
+    let text = kept.path().join(format!("{launcher}.text"));
     std::fs::write(
         &text,
         format!(
-            "#!/bin/sh\ncase \"$1\" in\n  --version) exit 0 ;;\nesac\n/bin/cat '{answer_path}'\nexec /bin/cat >/dev/null\n"
+            "#!/bin/sh\ncase \"$1\" in\n  {version}) exit 0 ;;\nesac\n/bin/cat '{answer_path}'\nexec /bin/cat >/dev/null\n"
         ),
     )
     .expect("the stand-in's text");
-    kr_ipc::testing::place_and_start_once(&text, &bin.join("wsl.exe"), &["--version"]);
+    kr_ipc::testing::place_and_start_once(&text, &bin.join(launcher), &[version]);
 
     let mut path = std::ffi::OsString::from(bin.as_os_str());
     if let Some(inherited) = std::env::var_os("PATH") {
@@ -2654,9 +2683,9 @@ fn run_again_with_an_answering_bridge() {
         path.push(inherited);
     }
     let output = std::process::Command::new(std::env::current_exe().expect("this test program"))
-        .args(["--exact", THE_ANSWERING_BRIDGE_CASE, "--test-threads=1"])
+        .args(["--exact", case, "--test-threads=1"])
         .env("PATH", path)
-        .env(WITH_AN_ANSWERING_BRIDGE, "1")
+        .env(marker, "1")
         .output()
         .expect("this test program runs again");
     let report = String::from_utf8_lossy(&output.stdout);
@@ -3423,14 +3452,15 @@ async fn a_fence_this_host_owes_stops_an_ssh_hosts_refresh_before_its_helper_is_
     refused_for_a_fence(&refused.to_protocol_error());
 }
 
-/// KR-REQ-09.09, 09.12 and 26.16: what an ssh host's helper answered is written to the enrolment
-/// record only while this host owes no fence. The control: with nothing owed, a refusal takes back
-/// the scoped channel an earlier answer established. With a fence that lands after the helper has
-/// answered, the refresh is answered and not refused, since the helper has run: its own sentence
-/// stays and says that this host did not record it, and the channel stands. The refresh's actor is a
-/// paired device's, which no helper is started for, so the answer is the refusal and nothing runs.
+/// KR-REQ-09.09, 09.12 and 26.16: what a refusal of an ssh host's refresh would write to the
+/// enrolment record is written only while this host owes no fence. The control: with nothing owed, a
+/// refusal takes back the scoped channel an earlier answer established. With a fence that lands
+/// after the refusal, the refresh is answered and not refused: this host's own sentence stays and
+/// says that this host did not record it, and the channel stands. The refresh's actor is a paired
+/// device's, which no helper is started for, so no helper runs and nothing but the record is
+/// stopped.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_fence_that_lands_after_an_ssh_hosts_helper_answered_stops_what_the_answer_would_write() {
+async fn a_fence_that_lands_after_a_refusal_on_this_host_stops_the_record_of_it() {
     use kr_protocol::identity::{
         EnvironmentAccess, EnvironmentEnrolParams, EnvironmentRefreshParams,
         EnvironmentRefreshResult,
@@ -3537,10 +3567,10 @@ async fn a_fence_that_lands_after_an_ssh_hosts_helper_answered_stops_what_the_an
     controller.hold_fence(false);
     let result: EnvironmentRefreshResult = answered
         .into_answer_for_test()
-        .expect("the helper has run, so a fence that landed after its answer leaves the refresh answered")
+        .expect("a refusal on this host is answered with the not-recorded words, and the fence stopped the record")
         .to_typed()
         .expect("a result");
-    // The helper's own sentence stays, and then what this host did not do: it did not record it.
+    // This host's own sentence stays, and then what this host did not do: it did not record it.
     let said = result.connection.as_str();
     assert!(
         said.starts_with("a process bridge carries locally authenticated invocations only")
@@ -3556,6 +3586,158 @@ async fn a_fence_that_lands_after_an_ssh_hosts_helper_answered_stops_what_the_an
     assert!(
         scoped(),
         "what the answer would have written was not written"
+    );
+}
+
+/// KR-REQ-09.09, 09.12 and 26.16: what an ssh host's helper answered is written to the enrolment
+/// record only while this host owes no fence. A fence that lands after the helper has answered, and
+/// before this host records what answered, leaves the refresh answered and not refused, since the
+/// helper has run: its answer is shown with its verification and with the words that this host did
+/// not record it, the answer establishes no scoped channel, and the same helper registers once
+/// nothing is owed.
+///
+/// The destination answers through a stand-in for `ssh`, so the helper really is asked and really
+/// answers.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fence_that_lands_after_an_ssh_hosts_helper_answered_stops_what_the_answer_would_write() {
+    use kr_protocol::identity::{
+        EnvironmentAccess, EnvironmentEnrolParams, EnvironmentRefreshParams,
+        EnvironmentRefreshResult,
+    };
+    if std::env::var_os(WITH_AN_ANSWERING_SSH_HOST).is_none() {
+        run_again_with_an_answering_launcher(
+            "ssh",
+            "-V",
+            4,
+            THE_ANSWERING_SSH_HOST_CASE,
+            WITH_AN_ANSWERING_SSH_HOST,
+        );
+        return;
+    }
+    let (temp, controller, _clock) = daemon().await;
+    let (connection_id, actor_id) = admitted(&controller).await;
+    let carried = crate::authority::AdmittedMutation {
+        connection_id,
+        admitted_revision: controller
+            .admitted_revision(connection_id)
+            .expect("the connection is registered"),
+        deadline: None,
+    };
+    let mut enrolment = enrolment_of(4);
+    enrolment.access = EnvironmentAccess::SshHost;
+    enrolment.target = "build.example".to_owned();
+    let environment_id = enrolment.environment_id;
+    let actor = super::routes::local_actor(actor_id, connection_id, controller.generation);
+    controller
+        .environment_record(
+            &actor,
+            false,
+            &mutation_of(
+                &temp,
+                Method::EnvironmentEnrol,
+                ParamsValue::from_typed(&EnvironmentEnrolParams { enrolment }).expect("encodes"),
+            ),
+            Method::EnvironmentEnrol,
+            carried,
+        )
+        .await
+        .into_answer_for_test()
+        .expect("the ssh host is enrolled");
+    let state_dir = controller.paths.state_dir().to_path_buf();
+    let scoped = || {
+        crate::bridge::store::Store::with_locked(&state_dir, |store| {
+            Ok(store
+                .row_of(environment_id, 0)
+                .expect("the record is there")
+                .readiness
+                .channel_scoped)
+        })
+        .expect("the record opens")
+    };
+    let refresh = || {
+        let controller = Arc::clone(&controller);
+        let actor = actor.clone();
+        let mutation = mutation_of(
+            &temp,
+            Method::EnvironmentRefresh,
+            ParamsValue::from_typed(&EnvironmentRefreshParams {
+                environment_id,
+                start: false,
+            })
+            .expect("encodes"),
+        );
+        async move {
+            controller
+                .environment_record(
+                    &actor,
+                    false,
+                    &mutation,
+                    Method::EnvironmentRefresh,
+                    carried,
+                )
+                .await
+        }
+    };
+    assert!(
+        !scoped(),
+        "an enrolled host has registered nothing until its helper has answered"
+    );
+
+    // The record's pause fires where the helper's outcome is recorded, which is after the helper
+    // has answered, and a fence lands there.
+    let answered = stopped_after_the_environment_record_is_taken(&controller, refresh(), || {
+        controller.hold_fence(true);
+    })
+    .await;
+    controller.hold_fence(false);
+    let result: EnvironmentRefreshResult = answered
+        .into_answer_for_test()
+        .expect("the helper's answer is told with the not-recorded words, and the fence stopped the record")
+        .to_typed()
+        .expect("a result");
+    let said = result.connection.as_str();
+    assert!(
+        said.contains("answered, and this host did not record that, because [message withheld, ")
+            && said.ends_with(" bytes]"),
+        "{said}"
+    );
+    assert!(
+        !said.contains("failed") && !said.contains("write"),
+        "the words say that nothing was recorded, not that a write failed: {said}"
+    );
+    assert!(
+        result.verification.0.is_some(),
+        "the helper answered, and what it answered is shown: {said}"
+    );
+    assert!(
+        !scoped(),
+        "what the answer would have written was not written"
+    );
+
+    // The control: with nothing owed the same helper answers and the refresh records it.
+    let recorded: EnvironmentRefreshResult = refresh()
+        .await
+        .into_answer_for_test()
+        .expect("a refresh with nothing owed is answered")
+        .to_typed()
+        .expect("a result");
+    assert!(
+        recorded.verification.0.is_some(),
+        "the helper answered: {}",
+        recorded.connection
+    );
+    assert!(
+        recorded
+            .connection
+            .as_str()
+            .contains("no request crosses ssh"),
+        "{}",
+        recorded.connection
+    );
+    assert!(
+        scoped(),
+        "the helper's answer is recorded once nothing is owed"
     );
 }
 
