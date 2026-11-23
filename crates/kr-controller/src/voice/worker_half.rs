@@ -13,10 +13,12 @@
 //! # Privacy mode
 //!
 //! While privacy mode is on nothing of this half is read. After it is turned off again only what
-//! was produced after the moment privacy mode last took effect, or after this daemon last
-//! started if that is later, is carried (`Published::since_ms`): a worker of an earlier release
-//! keeps its history through the change, a decision can stay pending through it, and what a worker
-//! holds of the interval before is not for a call.
+//! was produced after the moment privacy mode last took effect is carried (`Published::since_ms`):
+//! a worker of an earlier release keeps its history through the change, a decision can stay
+//! pending through it, and what a worker holds of the interval before is not for a call. A daemon
+//! over a record that holds no valid moment for the change carries only what is produced after
+//! the later of the change and its own start, and says so with a reason of its own
+//! (`Published::since_source`).
 //!
 //! # What a decision is
 //!

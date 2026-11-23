@@ -11341,14 +11341,34 @@ async fn a_command_whose_registration_cannot_be_written_writes_nothing() {
 /* The stored formats                                                                            */
 /* -------------------------------------------------------------------------------------------- */
 
-/// A host whose daemon has run: a session created and closed, and the daemon stopped through its own
-/// door, so that what it kept is on disk as a stopped daemon leaves it.
+/// A host whose daemon has run: privacy mode turned on and off, a session created and closed, and
+/// the daemon stopped through its own door, so that what it kept is on disk as a stopped daemon
+/// leaves it.
 async fn a_host_whose_daemon_has_run() -> Host {
     let mut host = Host::bare();
     let one = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1);
     host.install(&one);
     let controller = host.store.stable(Program::Controller);
     host.start_daemon(&controller).await;
+    // Privacy mode is turned on and off before any session exists, because turning it off is
+    // refused while one owes cleanup: what the daemon kept is what one that has changed it writes.
+    for word in ["on", "off"] {
+        let started = Instant::now();
+        loop {
+            let output = host.run(&host.store.stable(Program::Kr), &["privacy", word]);
+            if output.status.success() {
+                break;
+            }
+            assert!(
+                started.elapsed() < LIVENESS_DEADLINE,
+                "kr privacy {word} said {}: {}{}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
     let (display, session) = host.new_session(&host.store.stable(Program::Kr));
     let worker = host.worker_process(session);
     host.close(&host.store.stable(Program::Kr), &display);
@@ -11419,6 +11439,45 @@ async fn the_lock_names_every_store_at_the_version_and_digest_the_code_has() {
         found.is_empty(),
         "stored-formats.lock does not match the code:\n{}",
         found.join("\n")
+    );
+}
+
+/// KR-REQ-15.20: the host the lock is made from has changed privacy mode, so the record the lock
+/// holds the tables of is one a daemon wrote after a change: it holds the moment the change took
+/// effect and the generation it took effect at.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn the_host_the_lock_is_made_from_has_changed_privacy_mode() {
+    let host = a_host_whose_daemon_has_run().await;
+    let record = rusqlite::Connection::open_with_flags(
+        host.tree
+            .environment()
+            .state_dir()
+            .join(kr_controller::privacy::PRIVACY_RECORD),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .expect("the privacy record");
+    let (generation, enabled, at_ms, at_generation): (i64, i64, Option<i64>, Option<i64>) = record
+        .query_row(
+            "SELECT generation, enabled, effective_at_ms, effective_generation
+               FROM privacy_record WHERE id = 0",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .expect("the record");
+    assert_eq!(
+        (generation, enabled),
+        (2, 0),
+        "privacy mode was turned on and off"
+    );
+    assert_eq!(
+        at_generation,
+        Some(2),
+        "the generation the change took effect at"
+    );
+    assert!(
+        at_ms.is_some_and(|moment| moment > 0),
+        "the moment the change took effect: {at_ms:?}"
     );
 }
 

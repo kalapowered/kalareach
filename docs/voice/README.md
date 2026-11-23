@@ -256,11 +256,24 @@ What a model wrote, what the description host saw and what the worker holds leav
 while the privacy mode is in the same state as it was when they were read. Privacy mode removes the
 first two when it is turned on, and a worker removes its semantic history and records none while it
 is on. The daemon reads none of them while it is on. After privacy mode is turned off the daemon
-carries only what was produced after the moment it took effect, because a worker of an earlier
-release keeps its history through the change and a decision can stay pending through it; what that
-keeps out is counted. The record keeps when a change was asked for and not when it took effect, so
-a daemon that starts over a host that has ever changed privacy mode carries only what is produced
-after its own start. A report a hook made over a connection admitted in privacy mode, or before
+carries only what was produced after the moment the change took effect, because a worker of an
+earlier release keeps its history through the change and a decision can stay pending through it;
+what that keeps out is counted as "produced at or before privacy mode last changed". The record
+stores that moment with the generation it took effect at, so a daemon that starts again over the
+same record draws its line there and does not count its own start as a change. A record that holds
+no valid moment for its generation, as one migrated from an earlier release is until its next
+change, cannot say when the change took effect: the daemon then carries only what is produced after
+the later of the change and its own start, and counts what that keeps out as "produced before
+privacy mode last changed or this daemon last started, whichever is later". The moment is read
+inside the record's transaction, after every wait the change has, and published as it was stored.
+It is never before the moment the change was asked for, which `kr privacy status` shows, and a
+wait for a reader or for the store can put it later. Two windows follow from where it is read. The
+commit window lies between the moment and the publication of the change: a decision made in it, and
+the history a worker of an earlier release records through privacy mode in it, are stamped after
+the moment and are carried. The crash window opens when a daemon stops after the record has
+committed and before the change was published: the stored moment stays in force while the daemon is
+down, the workers are told of nothing and stay private, and what they decide in that time is
+carried after the restart. A report a hook made over a connection admitted in privacy mode, or before
 privacy mode last changed, is not kept by the worker; a hook that started in privacy mode and
 connected after it ended is kept, because the platform's record of when a hook started is on a
 clock that has no reading of now to compare it with. If the privacy mode is turned on whilst the
