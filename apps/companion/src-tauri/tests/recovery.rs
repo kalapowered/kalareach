@@ -4637,6 +4637,109 @@ async fn a_change_made_while_a_save_is_in_flight_leaves_no_saved_line() {
     assert_eq!(line_of(&page), Value::Null, "saved does not stand");
 }
 
+/// What this computer can read of a host's privacy mode, scripted: every host is in privacy mode,
+/// and the reads are counted.
+struct HostsInPrivacyMode {
+    reads: Mutex<usize>,
+}
+
+impl companion_tauri::settings::Hosts for HostsInPrivacyMode {
+    fn device_lists(
+        &self,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = companion_tauri::settings::HostLists> + Send + '_>,
+    > {
+        Box::pin(std::future::ready(
+            companion_tauri::settings::HostLists::default(),
+        ))
+    }
+
+    fn holds(
+        &self,
+        _session: kr_protocol::ids::SessionId,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = companion_tauri::settings::Holds> + Send + '_>,
+    > {
+        Box::pin(std::future::ready(
+            companion_tauri::settings::Holds::Unknown,
+        ))
+    }
+
+    fn privacy(
+        &self,
+        _environment: kr_protocol::ids::EnvironmentId,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = companion_tauri::settings::HostPrivacy> + Send + '_>,
+    > {
+        *self.reads.lock().expect("the record") += 1;
+        Box::pin(std::future::ready(
+            companion_tauri::settings::HostPrivacy::On { generation: 1 },
+        ))
+    }
+}
+
+/// The person's confirmation, always given.
+struct Confirms;
+
+impl kr_client::pairing::owner::Ceremony for Confirms {
+    fn kind(&self) -> kr_client::pairing::owner::CeremonyKind {
+        kr_client::pairing::owner::CeremonyKind::TouchId
+    }
+
+    fn verify<'a>(
+        &'a self,
+        _reason: &'a str,
+        _within: Duration,
+    ) -> BoxFuture<'a, kr_client::pairing::owner::CeremonyOutcome> {
+        Box::pin(std::future::ready(
+            kr_client::pairing::owner::CeremonyOutcome::Confirmed,
+        ))
+    }
+}
+
+/// KR-REQ-20.17, KR-REQ-18.05: privacy mode does not stop the settings from being saved with the
+/// bundle, as it does not stop the colour mode's sync: with settings sync taking part beside hosts
+/// that are all in privacy mode and the writer's level open, a change to the colour mode reaches the
+/// bundle, and the step never reads a host's privacy mode.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_colour_change_beside_hosts_in_privacy_mode_is_saved_with_the_bundle() {
+    let timing = SettingsTiming {
+        quiet: Duration::from_millis(50),
+        window: Duration::ZERO,
+    };
+    let computer = Computer::new().await;
+    let (page, settings) = computer.running_page(timing).await;
+    let hosts = Arc::new(HostsInPrivacyMode {
+        reads: Mutex::new(0),
+    });
+    companion_tauri::start_settings_sync(
+        page.app.handle(),
+        &computer.identity(),
+        Arc::clone(&hosts) as Arc<dyn companion_tauri::settings::Hosts>,
+        Arc::new(Confirms),
+    )
+    .expect("settings sync opens");
+    page.call("recovery_turn_on", json!({})).expect("on");
+    settings
+        .set_colour_mode(ColourMode::Dark)
+        .await
+        .expect("kept");
+    assert!(
+        until(Duration::from_secs(10), || async {
+            colour_in(&bundle_of(&computer, &page).await).as_deref() == Some("dark")
+        })
+        .await,
+        "the colour mode reached the bundle: {}",
+        line_of(&page)
+    );
+    assert_eq!(line_of(&page), json!({ "state": "saved" }));
+    assert_eq!(
+        *hosts.reads.lock().expect("the record"),
+        0,
+        "the step asked no host about privacy mode"
+    );
+}
+
 /// KR-REQ-20.17: a device turned on before the settings were saved with the bundle saves them at
 /// its next start.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
