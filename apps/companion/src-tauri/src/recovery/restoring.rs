@@ -31,7 +31,7 @@ use zeroize::Zeroizing;
 use super::{Named, Recovery, refuse_if_blocked, said, said_by_restore};
 use crate::account::Account;
 use crate::error::{CommandError, Result};
-use crate::settings::{COLOUR_MODE, ColourMode, LocalSettings};
+use crate::settings::{COLOUR_MODE, ColourMode, LocalSettings, Settings};
 
 /// The title of the panel that chooses the kit.
 pub const KIT_PANEL: &str = "Choose your recovery kit";
@@ -153,7 +153,9 @@ impl Recovery {
     }
 
     /// Asks the person for a recovery kit, and for an exported bundle file when `from_file`, and
-    /// puts the settings saved in the bundle on this device where it has chosen nothing.
+    /// puts the settings saved in the bundle on this device where it has chosen nothing. A restore
+    /// that puts them back tells the window, as any other change to the settings does, so that the
+    /// window shows the restored mode at once.
     ///
     /// # Errors
     ///
@@ -165,7 +167,7 @@ impl Recovery {
         &self,
         panels: &dyn OpenPanels,
         account: &Account,
-        local: &LocalSettings,
+        settings: &Settings,
         from_file: bool,
     ) -> Result<SettingsRestored> {
         let Some(kit_path) = panels.choose(KIT_PANEL).await? else {
@@ -180,7 +182,11 @@ impl Recovery {
         } else {
             self.account_source_for(account, &kit)?
         };
-        restore_settings(kit, source, local).await
+        let restored = restore_settings(kit, source, settings.local()).await?;
+        if matches!(restored, SettingsRestored::Restored { .. }) {
+            settings.told().tell();
+        }
+        Ok(restored)
     }
 }
 

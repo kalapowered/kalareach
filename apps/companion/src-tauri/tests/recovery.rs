@@ -5124,10 +5124,21 @@ async fn a_restore_puts_the_colour_mode_back_on_a_fresh_device_and_replaces_noth
     let (page, _) = computer.saving_page_at(NO_WAIT, level(CLOSED)).await;
 
     let (_directory, fresh) = fresh_device();
+    // What the window is told, and the mode the settings hold when it is.
+    let heard = Arc::new(Mutex::new(Vec::new()));
+    {
+        let (settings, heard) = (Arc::clone(&fresh), Arc::clone(&heard));
+        fresh.told().by(move || {
+            heard
+                .lock()
+                .expect("the record")
+                .push(settings.view().colour_mode);
+        });
+    }
     let chooses = Chooses::answering(vec![Some(kit_path.clone())]);
     let restored = page
         .recovery
-        .restore_settings_with(&chooses, &page.account, fresh.local(), false)
+        .restore_settings_with(&chooses, &page.account, &fresh, false)
         .await
         .expect("a restore");
     assert!(
@@ -5135,6 +5146,11 @@ async fn a_restore_puts_the_colour_mode_back_on_a_fresh_device_and_replaces_noth
         "{restored:?}"
     );
     assert_eq!(fresh.local().chosen_colour_mode(), Some(ColourMode::Dark));
+    assert_eq!(
+        *heard.lock().expect("the record"),
+        vec![ColourMode::Dark],
+        "the window is told once, with the mode the restore put back"
+    );
     assert_eq!(chooses.titles(), vec![KIT_PANEL], "one panel, for the kit");
     let told = serde_json::to_string(&restored).expect("the answer");
     assert!(
@@ -5152,12 +5168,19 @@ async fn a_restore_puts_the_colour_mode_back_on_a_fresh_device_and_replaces_noth
         .local()
         .set_colour_mode(ColourMode::Light)
         .expect("kept");
+    let heard_by_the_one_that_chose = Arc::new(Mutex::new(0_usize));
+    {
+        let heard = Arc::clone(&heard_by_the_one_that_chose);
+        chose
+            .told()
+            .by(move || *heard.lock().expect("the record") += 1);
+    }
     assert_eq!(
         page.recovery
             .restore_settings_with(
                 &Chooses::answering(vec![Some(kit_path.clone())]),
                 &page.account,
-                chose.local(),
+                &chose,
                 false
             )
             .await
@@ -5165,6 +5188,11 @@ async fn a_restore_puts_the_colour_mode_back_on_a_fresh_device_and_replaces_noth
         SettingsRestored::AlreadyChosen
     );
     assert_eq!(chose.local().chosen_colour_mode(), Some(ColourMode::Light));
+    assert_eq!(
+        *heard_by_the_one_that_chose.lock().expect("the record"),
+        0,
+        "nothing changed, so the window is told nothing"
+    );
 
     // A device whose settings file cannot be read is left as it is, and the answer says so.
     let (directory, unreadable) = fresh_device();
@@ -5180,7 +5208,7 @@ async fn a_restore_puts_the_colour_mode_back_on_a_fresh_device_and_replaces_noth
             .restore_settings_with(
                 &Chooses::answering(vec![Some(kit_path.clone())]),
                 &page.account,
-                unreadable.local(),
+                &unreadable,
                 false
             )
             .await
@@ -5209,7 +5237,7 @@ async fn a_restore_puts_the_colour_mode_back_on_a_fresh_device_and_replaces_noth
         .restore_settings_with(
             &Chooses::answering(vec![Some(other_path)]),
             &page.account,
-            untouched.local(),
+            &untouched,
             false,
         )
         .await
@@ -5237,7 +5265,7 @@ async fn a_restore_from_an_export_file_needs_no_account_and_no_network() {
     let signed_out = account(&computer.origin(), None).await;
     let restored = page
         .recovery
-        .restore_settings_with(&chooses, &signed_out, fresh.local(), true)
+        .restore_settings_with(&chooses, &signed_out, &fresh, true)
         .await
         .expect("a restore");
     assert!(
@@ -5272,7 +5300,7 @@ async fn closing_either_panel_reads_nothing_and_changes_nothing() {
         let chooses = Chooses::answering(answers);
         assert_eq!(
             page.recovery
-                .restore_settings_with(&chooses, &page.account, fresh.local(), from_file)
+                .restore_settings_with(&chooses, &page.account, &fresh, from_file)
                 .await
                 .expect("an answer"),
             SettingsRestored::Cancelled
@@ -5301,7 +5329,7 @@ async fn a_kit_or_export_file_that_is_not_one_is_refused_in_words() {
                 .restore_settings_with(
                     &Chooses::answering(answers),
                     &page.account,
-                    fresh.local(),
+                    &fresh,
                     from_file,
                 )
                 .await
@@ -5388,7 +5416,7 @@ async fn a_kit_for_another_service_than_the_one_signed_in_is_refused_before_anyt
         .restore_settings_with(
             &Chooses::answering(vec![Some(kit_path)]),
             &elsewhere,
-            fresh.local(),
+            &fresh,
             false,
         )
         .await
@@ -5424,7 +5452,7 @@ async fn a_bundle_with_no_saved_settings_restores_none_and_an_unusable_one_says_
             .restore_settings_with(
                 &Chooses::answering(vec![Some(kit_path)]),
                 &page.account,
-                fresh.local(),
+                &fresh,
                 false
             )
             .await
@@ -5549,7 +5577,7 @@ async fn the_saved_settings_and_everything_that_carries_them_hold_none_of_the_ke
         .restore_settings_with(
             &Chooses::answering(vec![Some(kit_path.clone())]),
             &page.account,
-            from_account.local(),
+            &from_account,
             false,
         )
         .await
@@ -5564,7 +5592,7 @@ async fn the_saved_settings_and_everything_that_carries_them_hold_none_of_the_ke
         .restore_settings_with(
             &Chooses::answering(vec![Some(kit_path), Some(export)]),
             &page.account,
-            from_file.local(),
+            &from_file,
             true,
         )
         .await

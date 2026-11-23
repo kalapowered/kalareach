@@ -6227,7 +6227,7 @@ pub async fn recovery_restore_settings<R: tauri::Runtime>(
     let panels = crate::recovery::NativePanels::new(app);
     state
         .recovery()?
-        .restore_settings_with(&panels, account.get().await?, settings.local(), from_file)
+        .restore_settings_with(&panels, account.get().await?, &settings, from_file)
         .await
 }
 
