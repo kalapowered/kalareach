@@ -1012,6 +1012,66 @@ async fn an_attach_to_a_closed_session_in_a_stopped_environment_says_how_it_ende
     );
 }
 
+/// What a `kr --json` that had to succeed printed, as a document.
+fn succeeded_with(output: &std::process::Output, what: &str) -> Value {
+    let shown = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "{what}: {shown}{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout)
+        .unwrap_or_else(|error| panic!("{what} printed no document ({error}): {shown}"))
+}
+
+/// KR-REQ-26.42: an ordinary user with no account and no managed service enrols an environment
+/// with `kr bridge enrol`. The host has no configuration document, so it selects no managed
+/// service, and holds no account; the enrolment succeeds and the environment is listed as
+/// enrolled, and the host is as it was: no configuration document appears, the host still holds
+/// no account and says it names no managed service, and `kr doctor` still names each managed
+/// integration as one the host does without. The command asks for no account.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_26_42_an_environment_is_enrolled_with_no_account_and_no_managed_service() {
+    let world = World::start().await;
+    let document = world.source.environment().state_dir().join("config.json");
+    let no_account_and_no_managed_service = |when: &str| {
+        assert!(
+            !document.exists(),
+            "{when}: the host has no configuration, so it names no managed service"
+        );
+        let shown = succeeded_with(
+            &world.run(&["--json", "account", "show"]),
+            "kr account show",
+        );
+        assert_eq!(shown["state"], "signed_out", "{when}: {shown}");
+        assert_eq!(
+            shown["unavailable"], "no_managed_service",
+            "{when}: {shown}"
+        );
+        let report = succeeded_with(&world.run(&["--json", "doctor"]), "kr doctor");
+        support::the_managed_integrations_are_named_as_ones_the_host_does_without(&report);
+    };
+    no_account_and_no_managed_service("on a first run");
+
+    let enrolled = world.enrolling(None);
+    assert!(
+        enrolled.status.success(),
+        "kr bridge enrol with no account: {}{}",
+        String::from_utf8_lossy(&enrolled.stdout),
+        String::from_utf8_lossy(&enrolled.stderr)
+    );
+    let listed = succeeded_with(&world.run(&["--json", "bridge", "list"]), "kr bridge list");
+    let rows = listed["rows"].as_array().expect("the inventory's rows");
+    assert_eq!(rows.len(), 1, "the one enrolment is listed: {listed}");
+    assert_eq!(rows[0]["enrolment"]["label"], "dest", "{listed}");
+    assert_eq!(
+        rows[0]["enrolment"]["environment_id"],
+        world.destination.environment_id().to_string(),
+        "{listed}"
+    );
+    no_account_and_no_managed_service("after the enrolment");
+}
+
 /// A terminal whose output is being read, with no command on it yet.
 ///
 /// The replies it owes are registered here, before [`World::terminal_running`] starts the command
