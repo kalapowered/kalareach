@@ -293,6 +293,11 @@ case "$1" in
         if [ -f '{tools}/running-signalled' ]; then
           kill -9 $$
         fi
+        # The runtime that says it does not know the container and is then ended by a signal.
+        if [ -f '{tools}/running-signalled-after-no-such-container' ]; then
+          echo 'Error: no container with name or ID "x" found: no such container' >&2
+          kill -9 $$
+        fi
         if [ -f '{tools}/running-stalls' ]; then
           exec sleep 60
         fi
@@ -2579,9 +2584,10 @@ async fn world_whose_platform_commands_end_within(limit: Duration) -> World {
 
 /// KR-REQ-18.11, the part about connection diagnostics, for each way a step that asks the container
 /// runtime can fail: the look at whether the environment runs, and its start with `--start`. A signal
-/// ends the program, an answer that is neither `true` nor `false`, a program that does not answer
-/// within its bound and is ended, and an exit code are each told by their class, in `--json` and in
-/// the lines, with the row stale. What the program printed is in neither.
+/// ends the program (also one that said first that it does not know the container), an answer that
+/// is neither `true` nor `false`, a program that does not answer within its bound and is ended, and
+/// an exit code are each told by their class, in `--json` and in the lines, with the row stale.
+/// What the program printed is in neither.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_step_of_the_platform_that_fails_is_told_by_the_class_of_its_failure() {
     let _turn = CONTAINER_RUNTIME_TURN.lock().await;
@@ -2593,6 +2599,11 @@ async fn a_step_of_the_platform_that_fails_is_told_by_the_class_of_its_failure()
     let cases = [
         (
             "running-signalled",
+            false,
+            format!("{step} was ended by signal 9 {look}"),
+        ),
+        (
+            "running-signalled-after-no-such-container",
             false,
             format!("{step} was ended by signal 9 {look}"),
         ),

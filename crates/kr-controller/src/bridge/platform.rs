@@ -624,8 +624,9 @@ fn ended_badly(output: &CommandOutput) -> StepFailure {
 }
 
 /// What a look that a refresh makes shows: a container the runtime says it does not know is stale,
-/// and a look that ended non-zero in any other way, or that ended well with an answer that is
-/// neither `true` nor `false`, is the failure of its step, and not a container that is not running.
+/// and a look that ended non-zero in any other way (a signal that ended the runtime after it said so
+/// included), or that ended well with an answer that is neither `true` nor `false`, is the failure
+/// of its step, and not a container that is not running.
 fn presence_after_look(
     access: kr_protocol::identity::EnvironmentAccess,
     output: &CommandOutput,
@@ -635,7 +636,10 @@ fn presence_after_look(
         step: Step::Look,
         failure,
     };
-    if output.code != Some(0) && !says_there_is_no_such_container(&output.text) {
+    let ended_by_a_signal = output.code.is_none() && output.signal.is_some();
+    if output.code != Some(0)
+        && (ended_by_a_signal || !says_there_is_no_such_container(&output.text))
+    {
         return Err(failed(ended_badly(output)));
     }
     if output.code == Some(0) && !matches!(output.stdout.trim(), "true" | "false") {
@@ -787,6 +791,15 @@ mod tests {
             failure(CommandOutput {
                 signal: Some(9),
                 ..output(None, "", "")
+            }),
+            (Step::Look, StepFailure::Signalled(9))
+        );
+        // What the runtime printed before the signal does not make it a container that is not
+        // there: the signal is what ended it, and it is told as one.
+        assert_eq!(
+            failure(CommandOutput {
+                signal: Some(9),
+                ..output(None, "Error: no such container \"x\"", "")
             }),
             (Step::Look, StepFailure::Signalled(9))
         );
