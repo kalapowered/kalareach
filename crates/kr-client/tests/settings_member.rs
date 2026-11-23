@@ -811,18 +811,22 @@ async fn a_save_reads_the_bundle_again_after_it_moved_three_times_in_all() {
         saved.err()
     );
 
-    // It moves after all three reads: the conflict of the last is what the caller gets, and
-    // nothing of this save was written.
-    the_bundle_moves_after_the_next(&service, 3);
+    // It moves after every read, as often as a fourth would be: the conflict of the last of three
+    // reads is what the caller gets, and nothing of this save was written. The first save left the
+    // bundle at the fourth place, so the three reads are of the fourth, fifth and sixth.
+    the_bundle_moves_after_the_next(&service, 10);
     let refused = store.save_settings(&seed, local("light"), now()).await;
-    assert!(
-        matches!(refused, Err(RecoveryError::BundleConflict { .. })),
-        "{:?}",
-        refused.ok()
-    );
+    match refused {
+        Err(RecoveryError::BundleConflict { expected, .. }) => assert_eq!(
+            expected,
+            Some(at(6)),
+            "the conflict of the third read, not the first"
+        ),
+        other => panic!("a conflict was expected: {:?}", other.ok()),
+    }
     assert_eq!(
         *service.moves_after_a_fetch.lock().expect("a count"),
-        0,
+        7,
         "three reads were made, and no fourth"
     );
     let held =
