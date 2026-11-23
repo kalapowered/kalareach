@@ -1892,7 +1892,8 @@ delivers to whatever is in front instead, so it is not performed here at all: it
 nothing was established either way rather than claiming an answer.
 
 Every result is a capability record in the shared shape: the state, `disclosed_probe` as what
-produced it, the exact facility it was established about, and what makes it stale. That last part
+produced it, the exact facility it was established about (the read of a file a person nominated is
+about the file: it names no facility and no path), and what makes it stale. That last part
 is what decides when findings stop standing: a facility being installed, removed or replaced, the
 host agent being replaced, a new login, or a different execution profile. An operating-system
 permission changing is on the list but
@@ -1903,7 +1904,9 @@ image of your screen for no reason. Nothing runs again on its own.
 ### What each answer means
 
 `ready` is an operation that was performed and worked. `permission_required` is one the operating
-system refused, and the record names which grant. `desktop_unavailable` is a desktop that is not
+system refused, and the record names the grant when the platform places the refusal in one; a
+refusal by a file's own permissions, or by a protection that no grant is known for, says so
+instead. `desktop_unavailable` is a desktop that is not
 there to act on, and a check that ran on a desktop that is there and did not get far enough says
 that instead. A capability nothing has performed the operation for says so, and that is an answer
 rather than a failure: it means nothing is known either way, which is different from knowing it
