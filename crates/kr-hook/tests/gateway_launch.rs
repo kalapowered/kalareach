@@ -1210,7 +1210,7 @@ fn kr_req_12_07_a_retired_backend_removes_its_own_sockets_and_leaves_what_replac
         let mut launched = shell.launch(
             &answer,
             "retired",
-            &[("KR_STAND_IN", "stay"), ("KR_STAND_IN_COMMAND", COMMAND)],
+            &[("STAND_IN", "stay"), ("STAND_IN_COMMAND", COMMAND)],
         );
         launched.prints("TUI: turn/completed");
         let started = shell.announcement();
