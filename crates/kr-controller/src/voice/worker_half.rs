@@ -25,6 +25,7 @@
 //! it, though section 10 would admit a current decision the grant names: this is the narrower
 //! reading, and a voice grant names none.
 
+use crate::privacy::{CutoffSource, Published};
 use kr_protocol::agent::AgentSnapshotEntry;
 use kr_protocol::gateway::{PendingKind, PendingResource};
 use kr_protocol::question::Question;
@@ -40,9 +41,13 @@ pub const MAX_HISTORY_PARTS: usize = 64;
 /// The reason given when privacy mode is on.
 pub const PRIVACY_ON: &str = "privacy mode is on, so none of the session's worker was read";
 
-/// The reason given for what was produced before the moment the context may start from: privacy
-/// mode's last change, or this daemon's last start, whichever is later.
-pub const BEFORE_PRIVACY_CHANGE: &str =
+/// The reason given for what was produced at or before the moment privacy mode last changed.
+pub const AT_OR_BEFORE_PRIVACY_CHANGE: &str = "produced at or before privacy mode last changed";
+
+/// The reason given for what was produced before the moment the context may start from when that
+/// is not the moment privacy mode last changed: privacy mode's last change, or this daemon's last
+/// start, whichever is later.
+pub const BEFORE_PRIVACY_CHANGE_OR_START: &str =
     "produced before privacy mode last changed or this daemon last started, whichever is later";
 
 /// What the daemon read of one session's worker for the default context.
@@ -78,12 +83,19 @@ impl WorkerHalf {
         });
     }
 
-    /// Keeps only what was produced after `boundary_ms`, the moment the context may start from
-    /// (`Published::since_ms`), and says how many items that kept out.
+    /// Keeps only what was produced after the moment the context may start from
+    /// (`Published::since_ms`), and says how many items that kept out and why: at or before the
+    /// moment privacy mode last changed, or before this daemon's start. A host that has never
+    /// changed privacy mode has no moment to start from.
     #[must_use]
-    pub fn after(mut self, boundary_ms: Option<u64>) -> Self {
-        let Some(boundary) = boundary_ms else {
+    pub fn after(mut self, published: Published) -> Self {
+        if published.generation.get() == 0 {
             return self;
+        }
+        let boundary = published.since_ms;
+        let reason = match published.since_source {
+            CutoffSource::PrivacyChange => AT_OR_BEFORE_PRIVACY_CHANGE,
+            CutoffSource::Restart => BEFORE_PRIVACY_CHANGE_OR_START,
         };
         let mut kept_out = 0u64;
         for items in [&mut self.decisions, &mut self.messages] {
@@ -93,7 +105,7 @@ impl WorkerHalf {
         }
         if kept_out > 0 {
             self.unavailable.push(WithheldRun {
-                reason: BEFORE_PRIVACY_CHANGE.to_owned(),
+                reason: reason.to_owned(),
                 count: kept_out,
             });
         }
@@ -164,6 +176,7 @@ mod tests {
     use super::*;
     use kr_protocol::ids::AgentBindingRevision;
     use kr_protocol::scalars::{Nullable, TimestampMs, U64};
+    use kr_worker::privacy::PrivacyGeneration;
 
     fn entry(node: u64, text: &str, at: u64, omitted: u64) -> AgentSnapshotEntry {
         AgentSnapshotEntry {
@@ -202,24 +215,68 @@ mod tests {
         );
     }
 
-    /// What was produced at or before the moment privacy mode last changed is kept out and counted.
-    #[test]
-    fn what_was_produced_before_privacy_mode_last_changed_is_kept_out_and_counted() {
-        let half = WorkerHalf {
+    /// The state a context is read under, with its line drawn at `since_ms` for `source`.
+    fn published(since_ms: u64, since_source: CutoffSource) -> Published {
+        Published {
+            generation: PrivacyGeneration::new(1),
+            private: false,
+            since_ms,
+            since_source,
+        }
+    }
+
+    fn held() -> WorkerHalf {
+        WorkerHalf {
             decisions: vec![ContextItem::new("d", 50)],
             messages: vec![ContextItem::new("m1", 100), ContextItem::new("m2", 101)],
             unavailable: Vec::new(),
-        };
-        let kept = half.clone().after(Some(100));
+        }
+    }
+
+    /// What was produced at or before the moment privacy mode last changed is kept out and counted
+    /// with that moment's reason, and what was produced at the moment itself is kept out with it.
+    #[test]
+    fn what_was_produced_at_or_before_a_privacy_change_is_kept_out_and_counted_as_that() {
+        let kept = held().after(published(100, CutoffSource::PrivacyChange));
         assert_eq!(kept.messages, vec![ContextItem::new("m2", 101)]);
         assert!(kept.decisions.is_empty());
         assert_eq!(
             kept.unavailable,
             vec![WithheldRun {
-                reason: BEFORE_PRIVACY_CHANGE.to_owned(),
+                reason: AT_OR_BEFORE_PRIVACY_CHANGE.to_owned(),
                 count: 2
             }]
         );
-        assert_eq!(half.clone().after(None), half, "no change to be after");
+    }
+
+    /// What was produced before a start that is not a privacy change is kept out and counted with
+    /// the reason that names the start, and an item at the moment itself is kept out as well.
+    #[test]
+    fn what_was_produced_before_a_restart_is_kept_out_and_counted_as_that() {
+        let kept = held().after(published(100, CutoffSource::Restart));
+        assert_eq!(kept.messages, vec![ContextItem::new("m2", 101)]);
+        assert!(kept.decisions.is_empty());
+        assert_eq!(
+            kept.unavailable,
+            vec![WithheldRun {
+                reason: BEFORE_PRIVACY_CHANGE_OR_START.to_owned(),
+                count: 2
+            }]
+        );
+    }
+
+    /// A host that has never changed privacy mode has no moment to start from, and nothing is
+    /// kept out.
+    #[test]
+    fn a_host_that_has_never_changed_privacy_mode_keeps_nothing_out() {
+        let half = held();
+        assert_eq!(half.clone().after(Published::default()), half);
+    }
+
+    /// Nothing is counted when nothing is kept out, whichever moment the line is drawn at.
+    #[test]
+    fn nothing_is_counted_when_nothing_is_kept_out() {
+        let kept = held().after(published(10, CutoffSource::PrivacyChange));
+        assert_eq!(kept, held());
     }
 }

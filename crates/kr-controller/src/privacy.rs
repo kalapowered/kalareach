@@ -183,6 +183,24 @@ pub struct Published {
     /// and what it produces in between is stamped after this moment and is carried. It is the wall
     /// clock's, so a step of the clock back across it can put an earlier stamp after it.
     pub since_ms: u64,
+    /// What [`Self::since_ms`] stands for, in the same reading: whether it is the moment privacy
+    /// mode last took effect or only this daemon's start, which is what a reader that withholds
+    /// what came before it tells a person.
+    pub since_source: CutoffSource,
+}
+
+/// What the moment [`Published::since_ms`] stands for.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CutoffSource {
+    /// This daemon's start, or a moment the record cannot vouch for: a daemon that starts over a
+    /// record with no valid evidence of when privacy mode last took effect cannot tell what was
+    /// produced while it stood from what came after, and so serves only what is produced after
+    /// the later of the last change and its own start.
+    #[default]
+    Restart,
+    /// The moment the last change took effect, as the record stored it with the generation it
+    /// took effect at.
+    PrivacyChange,
 }
 
 impl Published {
@@ -724,19 +742,12 @@ impl EnvironmentPrivacy {
         let stored = record.read()?;
         let obligations = record.obligations()?;
         let state = delivery.privacy_state().clone();
-        // What was produced before this start cannot be told from what was produced while privacy
-        // mode still stood, because the record keeps the moment the last change was asked for and
-        // not the moment it took effect. A host that has changed privacy mode serves, from this
-        // start, only what is produced after it.
-        let since_ms = if stored.generation.get() == 0 {
-            0
-        } else {
-            kr_ipc::now_ms().get().max(stored.changed_at_ms.get())
-        };
+        let (since_ms, since_source) = restored_cutoff(&stored, kr_ipc::now_ms().get());
         state.publish(Published {
             generation: stored.generation,
             private: stored.enabled,
             since_ms,
+            since_source,
         });
         Ok(Self {
             inner: Mutex::new(Inner {
@@ -891,6 +902,7 @@ impl EnvironmentPrivacy {
             generation,
             private: true,
             since_ms: took_effect_ms,
+            since_source: CutoffSource::PrivacyChange,
         });
         // Raised as soon as the state says so, before the steps that follow: a tick that waits on
         // the record then runs its pass behind this hold on the record, whether or not the steps
@@ -965,6 +977,7 @@ impl EnvironmentPrivacy {
             generation: resumed.generation,
             private: false,
             since_ms: took_effect_ms,
+            since_source: CutoffSource::PrivacyChange,
         });
         for progress in inner.sessions.values_mut() {
             progress.notices = Backoff::default();
@@ -2453,6 +2466,18 @@ struct Stored {
     generation: PrivacyGeneration,
     enabled: bool,
     changed_at_ms: TimestampMs,
+    /// What the record stores of the moment the last change took effect and the generation it took
+    /// effect at: none for a record that was migrated and has not changed since, and a record that
+    /// holds only one of the two.
+    effective: Option<Effective>,
+}
+
+/// The moment a change took effect and the generation it took effect at, as the record stores
+/// them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Effective {
+    at_ms: u64,
+    generation: u64,
 }
 
 /// `privacy.sqlite3`: the environment's privacy record and its session obligations.
@@ -2562,18 +2587,40 @@ impl Record {
     }
 
     fn read(&self) -> Result<Stored> {
-        let (generation, enabled, changed_at_ms): (i64, i64, i64) = self
+        type Row = (i64, i64, i64, Option<i64>, Option<i64>);
+        let (generation, enabled, changed_at_ms, effective_at_ms, effective_generation): Row = self
             .connection
             .query_row(
-                "SELECT generation, enabled, changed_at_ms FROM privacy_record WHERE id = 0",
+                "SELECT generation, enabled, changed_at_ms, effective_at_ms, effective_generation
+                   FROM privacy_record WHERE id = 0",
                 [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
             )
             .map_err(ControllerError::registry)?;
+        // A value that is not a moment or a generation is no evidence: the pair is read only when
+        // both are there.
+        let effective =
+            effective_at_ms
+                .zip(effective_generation)
+                .and_then(|(at_ms, generation)| {
+                    Some(Effective {
+                        at_ms: u64::try_from(at_ms).ok()?,
+                        generation: u64::try_from(generation).ok()?,
+                    })
+                });
         Ok(Stored {
             generation: PrivacyGeneration::new(u64::try_from(generation).unwrap_or(0)),
             enabled: enabled != 0,
             changed_at_ms: TimestampMs::new(u64::try_from(changed_at_ms).unwrap_or(0)),
+            effective,
         })
     }
 
@@ -2736,6 +2783,40 @@ impl Record {
             )
             .map_err(ControllerError::registry)?;
         Ok(())
+    }
+}
+
+/// Where a daemon that starts at `start_ms` over `stored` draws the line a context read is held
+/// to, and what the line stands for.
+///
+/// A host that has never changed privacy mode has no line. A valid pair is the line: it is for
+/// the generation in force and is neither nought nor before the moment the change was asked for.
+/// It is a privacy change when it is at or before the start. One later than the start is still the
+/// line, as the restart's, because it names a moment this daemon has not seen. A record with no
+/// valid pair, such as one migrated from version 1 that has not changed since or one restored from
+/// a copy made before the migration, cannot say when the change took effect, and the line is the
+/// later of the change and the start.
+fn restored_cutoff(stored: &Stored, start_ms: u64) -> (u64, CutoffSource) {
+    if stored.generation.get() == 0 {
+        return (0, CutoffSource::Restart);
+    }
+    match stored.effective {
+        Some(effective)
+            if effective.generation == stored.generation.get()
+                && effective.at_ms >= stored.changed_at_ms.get()
+                && effective.at_ms > 0 =>
+        {
+            let source = if effective.at_ms <= start_ms {
+                CutoffSource::PrivacyChange
+            } else {
+                CutoffSource::Restart
+            };
+            (effective.at_ms, source)
+        }
+        _ => (
+            start_ms.max(stored.changed_at_ms.get()),
+            CutoffSource::Restart,
+        ),
     }
 }
 
@@ -3694,7 +3775,7 @@ mod tests {
             "published as of {}, while a reader held privacy mode on at {produced_while_on}",
             published.since_ms
         );
-        let held = |boundary: u64| {
+        let held = |published: Published| {
             let item = |text: &str, at: u64| ContextItem::new(text.to_owned(), at);
             WorkerHalf {
                 messages: vec![
@@ -3703,21 +3784,21 @@ mod tests {
                 ],
                 ..WorkerHalf::default()
             }
-            .after(Some(boundary))
+            .after(published)
             .messages
             .into_iter()
             .map(|item| item.text)
             .collect::<Vec<_>>()
         };
         assert_eq!(
-            held(published.since_ms),
+            held(published),
             ["produced after it"],
             "a call is given nothing stamped at or before the moment"
         );
         host.reopen_privacy();
         let restored = host.privacy.state().reading().published();
         assert!(
-            !held(restored.since_ms).contains(&"produced while privacy mode stood".to_owned()),
+            !held(restored).contains(&"produced while privacy mode stood".to_owned()),
             "nor after a restart"
         );
     }
@@ -3894,7 +3975,9 @@ mod tests {
             "the row that committed carries its own pair"
         );
         assert!(state.now().private, "nothing was published");
-        let started = kr_ipc::now_ms().get();
+        let committed = stored_pair(&host)
+            .0
+            .expect("the row that committed has its moment");
         host.reopen_privacy();
         let restored = host.privacy.state().now();
         assert_eq!(
@@ -3902,24 +3985,129 @@ mod tests {
             (false, 2),
             "the next start serves the new state"
         );
-        assert!(
-            restored.since_ms >= started,
-            "the next start serves from its own start ({started}), not from {}",
-            restored.since_ms
+        assert_eq!(
+            (restored.since_ms, restored.since_source),
+            (committed, CutoffSource::PrivacyChange),
+            "the next start serves from the moment the row that committed took effect"
         );
     }
 
-    /// KR-REQ-15.20 and KR-REQ-24.27: a daemon that starts over a record that has changed serves
-    /// only what is produced after the start. The record keeps the moment the last change was asked
-    /// for, which a wait for the store can put before the moment it took effect, and a host that
-    /// has never changed it has nothing to draw a line at.
+    /// A record as a host leaves it that changed privacy mode at generation `generation`, asked
+    /// for at `changed_at_ms`, with `pair` as the moment and generation it took effect at.
+    fn stored_with(generation: u64, changed_at_ms: u64, pair: Option<(u64, u64)>) -> Stored {
+        Stored {
+            generation: PrivacyGeneration::new(generation),
+            enabled: false,
+            changed_at_ms: TimestampMs::new(changed_at_ms),
+            effective: pair.map(|(at_ms, generation)| Effective { at_ms, generation }),
+        }
+    }
+
+    /// KR-REQ-15.20: a daemon that starts over a record draws its line at the moment the last
+    /// change took effect when the record holds it, valid, at or before the start, and says it is
+    /// a privacy change. A moment later than the start is kept, as the start's. A record with no
+    /// evidence, or evidence that is not valid, falls to the later of the last change and the
+    /// start, as the restart's.
     #[test]
-    fn a_restored_state_carries_the_moment_of_the_start_once_privacy_mode_has_changed() {
+    fn a_start_draws_its_line_by_what_the_record_can_vouch_for() {
+        use CutoffSource::{PrivacyChange, Restart};
+        let start = 10_000;
+        // A host that has never changed privacy mode has no line.
+        assert_eq!(
+            restored_cutoff(&stored_with(0, 0, None), start),
+            (0, Restart)
+        );
+        // Valid evidence at or before the start is a privacy change, at the stored moment.
+        for (changed, effective) in [(9_000, 9_500), (9_000, 9_000), (9_900, start)] {
+            assert_eq!(
+                restored_cutoff(&stored_with(2, changed, Some((effective, 2))), start),
+                (effective, PrivacyChange),
+                "asked at {changed}, took effect at {effective}"
+            );
+        }
+        // A moment later than the start is the stored moment, for the restart's reason: it
+        // withholds as much as it did before the record kept it.
+        assert_eq!(
+            restored_cutoff(&stored_with(2, 9_000, Some((start + 1, 2))), start),
+            (start + 1, Restart)
+        );
+        // What the record cannot vouch for is the later of the last change and the start.
+        let invalid = [
+            ("none", stored_with(2, 9_000, None)),
+            (
+                "another generation",
+                stored_with(2, 9_000, Some((9_500, 1))),
+            ),
+            (
+                "a later generation",
+                stored_with(2, 9_000, Some((9_500, 3))),
+            ),
+            ("before the change", stored_with(2, 9_000, Some((8_999, 2)))),
+            ("nought", stored_with(2, 0, Some((0, 2)))),
+        ];
+        for (what, stored) in invalid {
+            assert_eq!(restored_cutoff(&stored, start), (start, Restart), "{what}");
+        }
+        assert_eq!(
+            restored_cutoff(&stored_with(2, start + 5, None), start),
+            (start + 5, Restart),
+            "a change asked for later than the start is the line"
+        );
+        assert_eq!(
+            restored_cutoff(&stored_with(2, start + 5, Some((start + 4, 2))), start),
+            (start + 5, Restart),
+            "a moment before the change was asked for is not evidence"
+        );
+    }
+
+    /// KR-REQ-15.20: the record's pair is read only when it is whole and a moment and a
+    /// generation: one value alone, or one that is not a number a moment can be, is none.
+    #[test]
+    fn the_record_reads_a_pair_only_when_it_holds_both_halves() {
+        let directory = tempfile::tempdir().expect("a directory");
+        let record = Record::open(directory.path()).expect("a new store");
+        let connection = Connection::open(directory.path().join(PRIVACY_RECORD)).expect("the file");
+        for (at_ms, generation, read) in [
+            (
+                "5",
+                "2",
+                Some(Effective {
+                    at_ms: 5,
+                    generation: 2,
+                }),
+            ),
+            ("NULL", "2", None),
+            ("5", "NULL", None),
+            ("NULL", "NULL", None),
+            ("-5", "2", None),
+            ("5", "-2", None),
+        ] {
+            connection
+                .execute_batch(&format!(
+                    "UPDATE privacy_record SET effective_at_ms = {at_ms},
+                            effective_generation = {generation} WHERE id = 0"
+                ))
+                .expect("the pair");
+            assert_eq!(
+                record.read().expect("the record").effective,
+                read,
+                "{at_ms} and {generation}"
+            );
+        }
+    }
+
+    /// KR-REQ-15.20 and KR-REQ-24.27: a daemon that starts over a record that has changed serves
+    /// what is produced after the moment the last change took effect, as that change's; a record
+    /// that holds no evidence of it serves only what is produced after the start, as the start's;
+    /// and a host that has never changed it has nothing to draw a line at.
+    #[test]
+    fn a_restored_state_carries_the_moment_privacy_mode_took_effect_when_the_record_has_it() {
         let mut host = Host::open();
         host.reopen_privacy();
+        let never = host.privacy.state().reading().published();
         assert_eq!(
-            host.privacy.state().reading().published().since_ms,
-            0,
+            (never.since_ms, never.since_source),
+            (0, CutoffSource::Restart),
             "a host that has never changed privacy mode has no line to draw"
         );
 
@@ -3929,18 +4117,43 @@ mod tests {
         host.privacy
             .disable(at(10), &standing)
             .expect("privacy mode is disabled");
-        let before = kr_ipc::now_ms().get();
+        let took_effect = stored_pair(&host)
+            .0
+            .expect("the moment the change took effect");
+        let published = host.privacy.state().reading().published();
+        assert_eq!(
+            took_effect, published.since_ms,
+            "the moment that was published"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
         host.reopen_privacy();
         let restored = host.privacy.state().reading().published();
         assert!(!restored.private);
-        assert!(
-            restored.since_ms >= before,
-            "restored as of {}, which is the moment the change was asked for and not the start at {before}",
-            restored.since_ms
+        assert_eq!(
+            (restored.since_ms, restored.since_source),
+            (took_effect, CutoffSource::PrivacyChange),
+            "a start over a change that took effect is not a change of its own"
         );
 
-        // A record whose moment is later than the start (the clock stepped back between them)
-        // keeps the later one.
+        // A record migrated from version 1, which holds no pair, serves from the start.
+        let before = kr_ipc::now_ms().get();
+        let record = Connection::open(host.root.path().join(PRIVACY_RECORD)).expect("the record");
+        record
+            .execute_batch(
+                "UPDATE privacy_record SET effective_at_ms = NULL, effective_generation = NULL",
+            )
+            .expect("a record with no evidence");
+        host.reopen_privacy();
+        let restored = host.privacy.state().reading().published();
+        assert!(
+            restored.since_ms >= before,
+            "restored as of {}, and not the start at {before}",
+            restored.since_ms
+        );
+        assert_eq!(restored.since_source, CutoffSource::Restart);
+
+        // A moment later than the start (the clock stepped back between them) is kept, as the
+        // start's.
         let ahead = kr_ipc::now_ms().get() + 3_600_000;
         host.privacy
             .enable(&[], at(20), &standing)
@@ -3949,9 +4162,10 @@ mod tests {
             .disable(TimestampMs::new(ahead), &standing)
             .expect("privacy mode is disabled again");
         host.reopen_privacy();
+        let restored = host.privacy.state().reading().published();
         assert_eq!(
-            host.privacy.state().reading().published().since_ms,
-            ahead,
+            (restored.since_ms, restored.since_source),
+            (ahead, CutoffSource::Restart),
             "a moment later than the start is kept"
         );
     }

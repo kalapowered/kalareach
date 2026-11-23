@@ -217,7 +217,6 @@ impl Controller {
         let Some(published) = published.filter(|published| !published.private) else {
             return WorkerHalf::not_read(PRIVACY_ON);
         };
-        let boundary = (published.generation.get() > 0).then_some(published.since_ms);
         let Some(worker) = self.directory.lock().await.get(session_id).cloned() else {
             return WorkerHalf::not_read("this session has no worker to read");
         };
@@ -268,7 +267,7 @@ impl Controller {
         } else {
             half.could_not_read("the session's agents");
         }
-        half.after(boundary)
+        half.after(published)
     }
 
     /// The live agent instances of a session and the approvals waiting on a person, paged to the

@@ -297,6 +297,32 @@ impl World {
         }
     }
 
+    /// When privacy mode last took effect, on the host's clock, as the record stores it with the
+    /// generation it took effect at.
+    fn privacy_took_effect_at(&self) -> u64 {
+        let record = rusqlite::Connection::open(self.adopted.host.privacy_database())
+            .expect("the privacy record");
+        let moment: i64 = record
+            .query_row(
+                "SELECT effective_at_ms FROM privacy_record WHERE id = 0",
+                [],
+                |row| row.get(0),
+            )
+            .expect("the record holds the moment the change took effect");
+        u64::try_from(moment).expect("a moment")
+    }
+
+    /// Leaves the record as a build that did not store when a change took effect left it, which
+    /// a record migrated from that build still is until it changes.
+    fn forget_when_privacy_took_effect(&self) {
+        rusqlite::Connection::open(self.adopted.host.privacy_database())
+            .expect("the privacy record")
+            .execute_batch(
+                "UPDATE privacy_record SET effective_at_ms = NULL, effective_generation = NULL",
+            )
+            .expect("the record has no evidence");
+    }
+
     /// When privacy mode last changed, on the host's clock.
     async fn privacy_changed_at(&self) -> u64 {
         let report: kr_protocol::privacy::PrivacyReport = self
@@ -829,7 +855,7 @@ async fn nothing_produced_before_privacy_mode_last_changed_is_carried_after_it()
         "{result:?}"
     );
     assert_eq!(
-        withheld(&result, kr_controller::voice::BEFORE_PRIVACY_CHANGE),
+        withheld(&result, kr_controller::voice::AT_OR_BEFORE_PRIVACY_CHANGE),
         Some(2),
         "the entry and the decision from before are counted: {result:?}"
     );
@@ -837,12 +863,77 @@ async fn nothing_produced_before_privacy_mode_last_changed_is_carried_after_it()
 }
 
 /// KR-REQ-15.20 and KR-REQ-24.27: after a restart over a host that has changed privacy mode, the
-/// context carries only what is produced after the daemon's start. The record keeps the moment the
-/// last change was asked for, so what the worker produced between that moment and the start is
-/// kept out and counted with the boundary's reason, whatever the worker still holds, and what it
-/// produces after the start is carried.
+/// context carries what was produced after the moment the change took effect, and keeps out what
+/// was produced at or before it, whatever the worker still holds. The record keeps that moment, so
+/// the restart is not a privacy change of its own and what the worker produced between the change
+/// and the start is carried; what is kept out is counted with the change's reason.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_restart_keeps_out_what_came_before_the_start_and_carries_what_comes_after() {
+async fn a_restart_carries_what_came_after_the_change_and_keeps_out_what_came_at_or_before_it() {
+    let world = World::start().await;
+    let agent = world.agent();
+    world.worker().ask("before");
+
+    world.adopted.set_privacy(true).await;
+    world.adopted.set_privacy(false).await;
+    let took_effect = world.privacy_took_effect_at();
+
+    // What the worker holds after the change and before the restart: entries stamped before the
+    // change and at its moment, which a worker that kept its history would still hold, and an
+    // entry and a decision stamped after it. The restart comes later than all of them.
+    world.said(agent, "kept from before the change", took_effect - 1);
+    world.said(agent, "stamped at the change", took_effect);
+    world.said(agent, "after the change", took_effect + 1);
+    world.worker().ask_at("between", took_effect + 1);
+    until_the_clock_passes(took_effect + 1).await;
+
+    let world = world.restarted().await;
+    assert_eq!(
+        world.privacy_took_effect_at(),
+        took_effect,
+        "the record keeps the moment the change took effect, and a restart reads it back as it is"
+    );
+    let after_the_restart = world.context().await;
+    assert_eq!(
+        after_the_restart.selection.recent_messages,
+        vec!["message: after the change".to_owned()],
+        "{after_the_restart:?}"
+    );
+    assert_eq!(
+        after_the_restart.selection.pending_decisions.len(),
+        1,
+        "{after_the_restart:?}"
+    );
+    assert!(
+        after_the_restart.selection.pending_decisions[0].contains("(between)"),
+        "{after_the_restart:?}"
+    );
+    assert_eq!(
+        withheld(
+            &after_the_restart,
+            kr_controller::voice::AT_OR_BEFORE_PRIVACY_CHANGE
+        ),
+        Some(3),
+        "the two entries and the decision at or before the change are counted: {after_the_restart:?}"
+    );
+    assert_eq!(
+        withheld(
+            &after_the_restart,
+            kr_controller::voice::BEFORE_PRIVACY_CHANGE_OR_START
+        ),
+        None,
+        "none is counted as the start's: {after_the_restart:?}"
+    );
+    world.stop().await;
+}
+
+/// KR-REQ-15.20 and KR-REQ-24.27: after a restart over a record that holds no evidence of when the
+/// change took effect, as a record migrated from an earlier build does, the context carries only
+/// what is produced after the daemon's start. The record keeps the moment the last change was
+/// asked for, so what the worker produced between that moment and the start is kept out and
+/// counted with the start's reason, whatever the worker still holds, and what it produces after
+/// the start is carried.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_restart_over_a_record_with_no_evidence_keeps_out_what_came_before_the_start() {
     let world = World::start().await;
     let agent = world.agent();
     world.worker().ask("before");
@@ -859,6 +950,7 @@ async fn a_restart_keeps_out_what_came_before_the_start_and_carries_what_comes_a
     world.worker().ask_at("between", changed + 1);
     until_the_clock_passes(changed + 1).await;
 
+    world.forget_when_privacy_took_effect();
     let world = world.restarted().await;
     assert_eq!(
         world.privacy_changed_at().await,
@@ -874,10 +966,18 @@ async fn a_restart_keeps_out_what_came_before_the_start_and_carries_what_comes_a
     assert_eq!(
         withheld(
             &before_the_start,
-            kr_controller::voice::BEFORE_PRIVACY_CHANGE
+            kr_controller::voice::BEFORE_PRIVACY_CHANGE_OR_START
         ),
         Some(4),
         "the two entries and the two decisions from before the start are counted: {before_the_start:?}"
+    );
+    assert_eq!(
+        withheld(
+            &before_the_start,
+            kr_controller::voice::AT_OR_BEFORE_PRIVACY_CHANGE
+        ),
+        None,
+        "none is counted as the change's: {before_the_start:?}"
     );
 
     let later = kr_ipc::now_ms().get() + 5;
@@ -901,7 +1001,7 @@ async fn a_restart_keeps_out_what_came_before_the_start_and_carries_what_comes_a
     assert_eq!(
         withheld(
             &after_the_start,
-            kr_controller::voice::BEFORE_PRIVACY_CHANGE
+            kr_controller::voice::BEFORE_PRIVACY_CHANGE_OR_START
         ),
         Some(4),
         "what came before the start stays counted: {after_the_start:?}"

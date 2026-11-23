@@ -1283,6 +1283,15 @@ impl Host {
             .join("attention.sqlite3")
     }
 
+    /// The daemon's privacy record, for a suite that reads what it stored or puts a record in it
+    /// that an earlier release left.
+    pub fn privacy_database(&self) -> PathBuf {
+        self.temp
+            .environment()
+            .state_dir()
+            .join(kr_controller::privacy::PRIVACY_RECORD)
+    }
+
     /// The record of the answers the daemon gave to a request for the disclosed checks, for a
     /// suite that puts a fault in it.
     pub fn capability_answers_database(&self) -> PathBuf {

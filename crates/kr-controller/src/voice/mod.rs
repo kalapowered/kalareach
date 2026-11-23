@@ -43,8 +43,8 @@ pub use context::{
 pub use host::{ControllerDispatch, ControllerFacts};
 pub use submit::{HostDispatch, ProposalSubmitter, method_for};
 pub use worker_half::{
-    BEFORE_PRIVACY_CHANGE, MAX_HISTORY_PARTS, PRIVACY_ON, WorkerHalf, approval, decisions, message,
-    messages, question,
+    AT_OR_BEFORE_PRIVACY_CHANGE, BEFORE_PRIVACY_CHANGE_OR_START, MAX_HISTORY_PARTS, PRIVACY_ON,
+    WorkerHalf, approval, decisions, message, messages, question,
 };
 
 use crate::error::{ControllerError, Result};
