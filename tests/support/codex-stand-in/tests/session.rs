@@ -4,8 +4,6 @@
 //! terminal's WebSocket and relays each message to and from a server of the stand-in's own, or
 //! sends the terminal frames of its own making.
 
-#![cfg(unix)]
-
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -15,13 +13,28 @@ use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, Buf
 use tokio::process::{Child, ChildStdin, Command};
 use tokio_websockets::{Message, ServerBuilder};
 
+mod common;
+
+#[cfg(windows)]
+use common::windows::EndsGroup;
+use common::{Gateway, remove_tree};
+
 const PROGRAM: &str = env!("CARGO_BIN_EXE_codex-stand-in");
 
 /// A binary that was just built can take the system most of a minute to start the first time.
 const WAIT: Duration = Duration::from_secs(180);
 
 /// The command the server starts: a shell that starts a process of its own and waits for it.
+#[cfg(unix)]
 const COMMAND: &str = r#"["/bin/sh", "-c", "sleep 120 & wait"]"#;
+#[cfg(windows)]
+const COMMAND: &str = r#"["cmd.exe", "/d", "/c", "ping -n 120 127.0.0.1 >nul"]"#;
+
+/// The variable that names a run's temporary directory.
+const TEMPORARY: &str = if cfg!(windows) { "TEMP" } else { "TMPDIR" };
+
+/// What the command a turn asks to run writes: a line, as the shell ends it.
+const RAN: &str = if cfg!(windows) { "ran\r\n" } else { "ran\n" };
 
 fn server(variants: &str, command: Option<&str>) -> Child {
     let mut server = Command::new(PROGRAM);
@@ -65,6 +78,7 @@ fn turn_request(thread: &str) -> Value {
         "threadId":thread,"input":[{"type":"text","text":"go","text_elements":[]}]}})
 }
 
+#[cfg(unix)]
 fn status_of(command: &str, arguments: &[&str]) -> Option<String> {
     let output = std::process::Command::new(command)
         .args(arguments)
@@ -75,6 +89,107 @@ fn status_of(command: &str, arguments: &[&str]) -> Option<String> {
         .status
         .success()
         .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
+/// The processes of the command the server started that are running now, as numbers: its process
+/// group on Unix, and on Windows the command and everything below it.
+fn members(started: &str) -> Vec<String> {
+    #[cfg(unix)]
+    {
+        status_of("/usr/bin/pgrep", &["-g", started]).map_or_else(Vec::new, |members| {
+            members.lines().map(str::to_owned).collect()
+        })
+    }
+    #[cfg(windows)]
+    {
+        started.parse().map_or_else(
+            |_| Vec::new(),
+            |root| {
+                common::windows::tree(root)
+                    .iter()
+                    .map(u32::to_string)
+                    .collect()
+            },
+        )
+    }
+}
+
+/// Waits until the command's group holds the command and a process of its own, and names them.
+async fn group_of_two(started: &str) -> Vec<String> {
+    tokio::time::timeout(WAIT, async {
+        loop {
+            let group = members(started);
+            if group.len() >= 2 {
+                return group;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the command's group holds the command and a process of its own")
+}
+
+/// Waits until none of the command's group is left, where `seen` names what it held. An ended
+/// process is collected by whatever adopted it, which is not at the same moment.
+async fn nothing_left(started: &str, seen: &[String]) {
+    tokio::time::timeout(WAIT, async {
+        loop {
+            #[cfg(unix)]
+            let left = !members(started).is_empty();
+            #[cfg(windows)]
+            let left = seen
+                .iter()
+                .any(|member| member.parse().is_ok_and(common::windows::running));
+            if !left {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("nothing of the command's group is left");
+    let _ = (started, seen);
+}
+
+/// Whether the command leads a process group of its own on Unix, and on Windows runs in a job of
+/// its own, which the server says on its error stream after it names the command.
+fn leads_its_own_group(started: &str, said: &[String]) -> bool {
+    #[cfg(unix)]
+    {
+        let _ = said;
+        status_of("/bin/ps", &["-o", "pgid=", "-p", started]).as_deref() == Some(started)
+    }
+    #[cfg(windows)]
+    {
+        said.contains(&format!(
+            "stand-in: command {started} runs in a job of its own"
+        ))
+    }
+}
+
+/// The text a turn gives to run a command that appends a line to `output`.
+fn echo_into(output: &std::path::Path) -> String {
+    if cfg!(windows) {
+        format!("echo ran>> {}", output.display())
+    } else {
+        format!("echo ran >> {}", output.display())
+    }
+}
+
+/// Makes the root of a run: a directory only this account reaches, with the run's temporary
+/// directory in it.
+fn make_a_runs_root(root: &std::path::Path) {
+    #[cfg(unix)]
+    {
+        std::fs::create_dir_all(root.join("tmp")).expect("a run");
+        std::fs::set_permissions(root, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .expect("the mode of a run's root");
+    }
+    #[cfg(windows)]
+    {
+        kr_ipc::paths::create_private_directory(root).expect("a run's root");
+        std::fs::create_dir_all(root.join("tmp")).expect("a run");
+    }
 }
 
 /// The server answers a session's requests, asks for one approval and completes the turn when it
@@ -149,39 +264,28 @@ async fn the_server_runs_a_turn_and_ends_its_commands_with_its_input() {
     // The command's group is ended by this guard if the test stops before the server has ended it,
     // since the server can end it only while its input is open.
     let mut ending = EndsGroup(Some(started.clone()));
-    let group = tokio::time::timeout(WAIT, async {
-        loop {
-            let members = status_of("/usr/bin/pgrep", &["-g", &started]);
-            if members
-                .as_deref()
-                .is_some_and(|members| members.lines().count() >= 2)
-            {
-                return members.expect("members");
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .expect("the command's group holds the command and a process of its own");
-    assert!(group.lines().any(|member| member == started), "{group}");
-    assert_eq!(
-        status_of("/bin/ps", &["-o", "pgid=", "-p", &started]),
-        Some(started.clone())
-    );
+    // Where a command runs in a job, the server says whether it does on the line after the one that
+    // names the command.
+    #[cfg(unix)]
+    let said: Vec<String> = Vec::new();
+    #[cfg(windows)]
+    let said = vec![
+        tokio::time::timeout(WAIT, errors.next_line())
+            .await
+            .expect("the server says where its command runs")
+            .expect("readable")
+            .expect("not ended"),
+    ];
+    let group = group_of_two(&started).await;
+    assert!(group.contains(&started), "{group:?}");
+    assert!(leads_its_own_group(&started, &said), "{said:?}");
     drop(stdin);
     let status = tokio::time::timeout(WAIT, child.wait())
         .await
         .expect("the server ends with its input")
         .expect("waited");
     assert!(status.success());
-    // An ended process is collected by whatever adopted it, which is not at the same moment.
-    tokio::time::timeout(WAIT, async {
-        while status_of("/usr/bin/pgrep", &["-g", &started]).is_some() {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .expect("nothing of the command's group is left");
+    nothing_left(&started, &group).await;
     ending.0 = None;
 }
 
@@ -227,15 +331,7 @@ async fn the_server_ends_its_commands_when_nothing_reads_its_error_stream() {
     };
     // The command's group is ended by this guard if the server does not end it.
     let mut ending = EndsGroup(Some(started.clone()));
-    tokio::time::timeout(WAIT, async {
-        while status_of("/usr/bin/pgrep", &["-g", &started])
-            .is_none_or(|members| members.lines().count() < 2)
-        {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .expect("the command's group holds the command and a process of its own");
+    let group = group_of_two(&started).await;
     // Nothing reads the error stream now; then the input ends.
     drop(errors);
     drop(stdin);
@@ -244,13 +340,7 @@ async fn the_server_ends_its_commands_when_nothing_reads_its_error_stream() {
         .expect("the server ends with its input")
         .expect("waited");
     assert!(status.success(), "{status}");
-    tokio::time::timeout(WAIT, async {
-        while status_of("/usr/bin/pgrep", &["-g", &started]).is_some() {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .expect("nothing of the command's group is left");
+    nothing_left(&started, &group).await;
     ending.0 = None;
 }
 
@@ -383,8 +473,10 @@ async fn the_server_steers_interrupts_resumes_forks_and_unsubscribes() {
 }
 
 /// Ends the process group a test names, when the test stops before it has been ended.
+#[cfg(unix)]
 struct EndsGroup(Option<String>);
 
+#[cfg(unix)]
 impl Drop for EndsGroup {
     fn drop(&mut self) {
         let group = self
@@ -633,8 +725,8 @@ fn jsonl_files(directory: &std::path::Path) -> Vec<(std::path::PathBuf, String)>
 /// names, a line that marks the turn's start and a line that holds the prompt; a turn with no text
 /// (the terminal's own, with no prompt typed), a server where the variant is not named and one
 /// with no `CODEX_HOME` write nothing, and neither does a server whose `CODEX_HOME` is relative,
-/// has a `..` part or lies outside the run (the directory its `TMPDIR` lies in), or whose `TMPDIR`
-/// is not set.
+/// has a `..` part or lies outside the run (the directory its temporary directory lies in), or whose
+/// temporary directory is not set.
 #[tokio::test]
 async fn the_server_records_a_turn_with_a_prompt_in_the_agents_folder_only_under_the_variant() {
     let question = "(mark) What is 612 plus 1034? Reply with only the number.";
@@ -663,18 +755,16 @@ async fn the_server_records_a_turn_with_a_prompt_in_the_agents_folder_only_under
         ("write-the-record", Some(sideways), false),
         ("write-the-record", Some(outside.join("agent")), false),
     ] {
-        let _ = std::fs::remove_dir_all(&home);
-        let _ = std::fs::remove_dir_all(&outside);
-        std::fs::create_dir_all(home.join("tmp")).expect("a run");
-        std::fs::set_permissions(&home, std::os::unix::fs::PermissionsExt::from_mode(0o700))
-            .expect("the mode of a run's root");
+        remove_tree(&home);
+        remove_tree(&outside);
+        make_a_runs_root(&home);
         std::fs::create_dir_all(&outside).expect("a directory outside it");
         let mut command = Command::new(PROGRAM);
         command
             .args(["app-server", "--listen", "stdio://"])
             .env("STAND_IN", variants)
             .env("STAND_IN_COMMAND", COMMAND)
-            .env("TMPDIR", home.join("tmp"))
+            .env(TEMPORARY, home.join("tmp"))
             .current_dir(&home)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -749,8 +839,8 @@ async fn the_server_records_a_turn_with_a_prompt_in_the_agents_folder_only_under
             "the turn with no prompt is not recorded: {text}"
         );
     }
-    let _ = std::fs::remove_dir_all(&home);
-    let _ = std::fs::remove_dir_all(&outside);
+    remove_tree(&home);
+    remove_tree(&outside);
 }
 
 /// The terminal writes the message of a turn as a row of its own under `answer-the-sum`, and no
@@ -793,20 +883,11 @@ async fn relay_asking(
     drop_after: Option<usize>,
     prompt: &str,
 ) -> Relayed {
-    static RELAYS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-    let directory = std::env::temp_dir().join(format!(
-        "kr-si-{}-{}",
-        std::process::id(),
-        RELAYS.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-    ));
-    std::fs::create_dir_all(&directory).expect("a directory");
-    let socket = directory.join(format!("{}.sock", drop_after.map_or(0, |n| n + 1)));
-    let _ = std::fs::remove_file(&socket);
-    let listener = tokio::net::UnixListener::bind(&socket).expect("a socket");
+    let gateway = Gateway::bind("relay");
     let mut terminal = Command::new(PROGRAM);
     terminal
         .arg("--remote")
-        .arg(format!("unix://{}", socket.display()))
+        .arg(format!("unix://{}", gateway.socket()))
         .arg(prompt)
         .env("STAND_IN", variants)
         .stdout(Stdio::piped())
@@ -816,12 +897,11 @@ async fn relay_asking(
         terminal.env(name, value);
     }
     let mut terminal = terminal.spawn().expect("the terminal starts");
-    let (stream, _) = tokio::time::timeout(WAIT, listener.accept())
+    let connected = tokio::time::timeout(WAIT, gateway.accept())
         .await
-        .expect("the terminal connects")
-        .expect("accepted");
+        .expect("the terminal connects");
     let (request, mut connection) = ServerBuilder::new()
-        .accept(stream)
+        .accept(connected.stream)
         .await
         .expect("the upgrade");
     assert_eq!(request.uri().path(), "/rpc");
@@ -870,7 +950,6 @@ async fn relay_asking(
         .read_to_string(&mut screen)
         .await
         .expect("the screen is readable");
-    let _ = std::fs::remove_dir_all(&directory);
     Relayed {
         status: status.code(),
         screen,
@@ -973,25 +1052,20 @@ async fn the_terminal_ends_with_a_status_on_a_frame_the_server_would_not_write()
         ),
         ("a message that is not JSON", Message::text("not json")),
     ] {
-        let directory = std::env::temp_dir().join(format!("kr-si-neg-{}", std::process::id()));
-        std::fs::create_dir_all(&directory).expect("a directory");
-        let socket = directory.join("n.sock");
-        let _ = std::fs::remove_file(&socket);
-        let listener = tokio::net::UnixListener::bind(&socket).expect("a socket");
+        let gateway = Gateway::bind("neg");
         let mut terminal = Command::new(PROGRAM)
             .arg("--remote")
-            .arg(format!("unix://{}", socket.display()))
+            .arg(format!("unix://{}", gateway.socket()))
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true)
             .spawn()
             .expect("the terminal starts");
-        let (stream, _) = tokio::time::timeout(WAIT, listener.accept())
+        let connected = tokio::time::timeout(WAIT, gateway.accept())
             .await
-            .expect("the terminal connects")
-            .expect("accepted");
+            .expect("the terminal connects");
         let (_, mut connection) = ServerBuilder::new()
-            .accept(stream)
+            .accept(connected.stream)
             .await
             .expect("the upgrade");
         // The terminal's first request, then the frame it must not accept.
@@ -1005,7 +1079,6 @@ async fn the_terminal_ends_with_a_status_on_a_frame_the_server_would_not_write()
             .unwrap_or_else(|_| panic!("{what} ends the terminal"))
             .expect("waited");
         assert_eq!(status.code(), Some(3), "{what}");
-        let _ = std::fs::remove_dir_all(&directory);
     }
 }
 
@@ -1072,12 +1145,12 @@ async fn server_with_a_thread(
 #[tokio::test]
 async fn the_server_runs_the_command_a_turn_asks_for_once_and_only_where_it_is_allowed() {
     let directory = std::env::temp_dir().join(format!("kr-si-command-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&directory);
+    remove_tree(&directory);
     std::fs::create_dir_all(&directory).expect("a directory");
     let (_server, mut stdin, mut lines) = server_with_a_thread(None).await;
     for (decision, number) in [("decline", 4_u64), ("accept", 5)] {
         let output = directory.join(decision);
-        let command = format!("echo ran >> {}", output.display());
+        let command = echo_into(&output);
         write(
             &mut stdin,
             &turn_asking(
@@ -1108,9 +1181,9 @@ async fn the_server_runs_the_command_a_turn_asks_for_once_and_only_where_it_is_a
         }
         // The turn ended after the command did: what it wrote is there, once.
         let written = std::fs::read_to_string(&output).unwrap_or_default();
-        assert_eq!(written, if decision == "accept" { "ran\n" } else { "" });
+        assert_eq!(written, if decision == "accept" { RAN } else { "" });
     }
-    let _ = std::fs::remove_dir_all(&directory);
+    remove_tree(&directory);
 }
 
 /// A thread whose record the agent's folder holds is resumed by a server that did not make it, as
@@ -1118,7 +1191,7 @@ async fn the_server_runs_the_command_a_turn_asks_for_once_and_only_where_it_is_a
 #[tokio::test]
 async fn a_server_resumes_a_thread_the_agents_record_holds_and_no_other() {
     let directory = std::env::temp_dir().join(format!("kr-si-saved-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&directory);
+    remove_tree(&directory);
     let day = directory.join("sessions/2026/11/12");
     std::fs::create_dir_all(&day).expect("a directory");
     std::fs::write(day.join("rollout-thread-7.jsonl"), "{}\n").expect("a record");
@@ -1137,7 +1210,7 @@ async fn a_server_resumes_a_thread_the_agents_record_holds_and_no_other() {
     let refused = next(&mut lines).await;
     assert_eq!(refused["id"], "r2");
     assert!(refused.get("error").is_some(), "{refused}");
-    let _ = std::fs::remove_dir_all(&directory);
+    remove_tree(&directory);
 }
 
 /// A thread the terminal starts for its own purposes (the title of a conversation) is described as
@@ -1208,4 +1281,83 @@ async fn a_thread_started_for_a_title_is_marked_and_its_turn_is_not_the_conversa
     // The conversation's first turn is still turn-1, which asks for the approval.
     write(&mut stdin, &turn_request("thread-1")).await;
     assert_eq!(next(&mut lines).await["result"]["turn"]["id"], "turn-1");
+}
+
+/// A command that starts a program with `CREATE_BREAKAWAY_FROM_JOB`, under a server that a job
+/// from outside holds as the broker's job holds the one it starts, does not leave that job: the
+/// system refuses to start the program, or the program is in the job. Which of the two happens is
+/// said on the error stream of the case's run.
+#[cfg(windows)]
+#[tokio::test]
+async fn a_command_that_breaks_away_does_not_leave_the_job_that_holds_the_server() {
+    let directory = std::env::temp_dir().join(format!("kr-si-away-{}", std::process::id()));
+    remove_tree(&directory);
+    std::fs::create_dir_all(&directory).expect("a directory");
+    let report = directory.join("report");
+    let words = json!([
+        PROGRAM,
+        "--break-away",
+        "cmd.exe",
+        "/d",
+        "/c",
+        "ping -n 120 127.0.0.1 >nul"
+    ]);
+    let mut command = Command::new(PROGRAM);
+    command
+        .args(["app-server", "--listen", "stdio://"])
+        .env("STAND_IN_COMMAND", words.to_string())
+        .env("STAND_IN_BREAKAWAY", &report)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    let (mut child, outer) =
+        common::windows::start_in_a_job(&mut command).expect("the server starts in a job");
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut lines = BufReader::new(child.stdout.take().expect("stdout")).lines();
+    write(&mut stdin, &initialize()).await;
+    assert_eq!(next(&mut lines).await["id"], "initialize");
+    assert_eq!(
+        next(&mut lines).await["method"],
+        "remoteControl/status/changed"
+    );
+    write(&mut stdin, &json!({"method":"initialized"})).await;
+    write(
+        &mut stdin,
+        &json!({"id":2,"method":"thread/start","params":{}}),
+    )
+    .await;
+    assert!(next(&mut lines).await["result"]["thread"]["id"].is_string());
+    assert_eq!(next(&mut lines).await["method"], "thread/started");
+    write(&mut stdin, &turn_request("thread-1")).await;
+    assert!(next(&mut lines).await["result"]["turn"].is_object());
+    assert_eq!(next(&mut lines).await["method"], "turn/started");
+    let said = tokio::time::timeout(WAIT, async {
+        loop {
+            if let Ok(said) = std::fs::read_to_string(&report) {
+                return said;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the command says what came of its start");
+    println!("a command that breaks away: {said}");
+    if let Some(started) = said.strip_prefix("created ") {
+        let started: u32 = started.trim().parse().expect("a process number");
+        assert!(
+            outer.holds(started).expect("the job answers"),
+            "the program that broke away left the job that holds the server: {said}"
+        );
+    } else {
+        assert!(said.starts_with("refused "), "{said}");
+    }
+    drop(stdin);
+    let status = tokio::time::timeout(WAIT, child.wait())
+        .await
+        .expect("the server ends with its input")
+        .expect("waited");
+    assert!(status.success(), "{status}");
+    drop(outer);
+    remove_tree(&directory);
 }

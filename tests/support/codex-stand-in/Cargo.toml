@@ -55,6 +55,8 @@ tokio-websockets = { workspace = true, features = ["server"] }
 # A case that stands in for the gateway on Windows binds the socket the host's own code binds and
 # reads the process the kernel names at the other end of a connection.
 kr-worker.workspace = true
+# The cases list the processes of a command in place of a process group.
+windows-sys = { workspace = true, features = ["Win32_System_Diagnostics_ToolHelp"] }
 
 # The workspace forbids unsafe code. This package denies it and allows it only in the module whose
 # native calls have no safe form, with the reason stated there. Nothing else in the package may

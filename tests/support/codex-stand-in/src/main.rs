@@ -9,6 +9,9 @@
 //!   session of its own, as the pinned release's server does.
 //! * `codex --rewrite-config` appends a line to the configuration file `CODEX_HOME` names, as an
 //!   agent that rewrites its configuration at a start does.
+//! * `codex --break-away PROGRAM [arguments]` (Windows only) is a command that starts a program with
+//!   `CREATE_BREAKAWAY_FROM_JOB`, as an agent that starts a daemon of its own does, and writes into
+//!   the file `STAND_IN_BREAKAWAY` names whether the system allowed it.
 //! * `codex --move-work` moves the directory it runs in to a place beside the directory that
 //!   holds it and makes an empty directory of the same name in its place, as an agent that moves
 //!   its working directory away at a start does.
@@ -93,6 +96,8 @@ async fn main() {
                 terminal::run(contract::Contract::pinned(), variants, socket, &prompt).await;
             std::process::exit(status);
         }
+        #[cfg(windows)]
+        ["--break-away", program, rest @ ..] => break_away(program, rest),
         #[cfg(unix)]
         [server::EXEC_IN_NEW_SESSION, _, ..] => server::exec_in_new_session(&arguments[1..]),
         _ => {
@@ -162,6 +167,41 @@ fn rewrite_config() {
         .expect("the configuration file");
     writeln!(file, "# rewritten by a start of the agent").expect("appends to it");
     println!("codex-cli rewrote its configuration");
+}
+
+/// Starts `program` with `CREATE_BREAKAWAY_FROM_JOB`, writes `created` and the new process's number
+/// or `refused` and the system's reason into the file `STAND_IN_BREAKAWAY` names, and waits for the
+/// program. Where every job that holds this process lets one break away the program leaves them;
+/// where one does not, the system refuses to start it.
+///
+/// # Panics
+///
+/// Panics when the file is not named.
+#[cfg(windows)]
+fn break_away(program: &str, arguments: &[&str]) -> ! {
+    use std::os::windows::process::CommandExt as _;
+    let report = std::env::var_os("STAND_IN_BREAKAWAY").expect("STAND_IN_BREAKAWAY names the file");
+    let mut command = std::process::Command::new(program);
+    command
+        .args(arguments)
+        .creation_flags(windows_sys::Win32::System::Threading::CREATE_BREAKAWAY_FROM_JOB)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    let spawned = command.spawn();
+    let text = match &spawned {
+        Ok(child) => format!("created {}", child.id()),
+        Err(error) => format!("refused {error}"),
+    };
+    // Written whole and then renamed into place, so that whoever sees the file reads all of it.
+    let mut part = report.clone();
+    part.push(".part");
+    let _ = std::fs::write(&part, text);
+    let _ = std::fs::rename(&part, &report);
+    if let Ok(mut child) = spawned {
+        let _ = child.wait();
+    }
+    std::process::exit(0);
 }
 
 /// Moves the directory it runs in to a sibling of the directory that holds it, named after that
