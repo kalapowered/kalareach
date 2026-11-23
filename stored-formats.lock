@@ -92,7 +92,8 @@
           "table": "schema_version"
         },
         "version": 8,
-        "migrates_from": 6
+        "migrates_from": 6,
+        "reads_through": 9
       },
       "digest": "48f8d9eab9aa9ab622a2725a33beea08446e058e191888e278e88fcc7d325200",
       "kept": [

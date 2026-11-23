@@ -11418,13 +11418,14 @@ async fn the_lock_names_every_store_at_the_version_and_digest_the_code_has() {
     );
 }
 
-/// KR-REQ-26.10, KR-REQ-26.13, KR-REQ-12.06: the release lists the registry at schema version 17, the
-/// configuration document at version 4 and the transfers journal at version 6 as read through, and no
-/// other store. The release after this one writes the registry and the document, so a rollback to
-/// this one is not refused for a store at those versions; the journal at version 6 is what a build
-/// before this one wrote, and a daemon of this release brings it to version 5.
+/// KR-REQ-26.10, KR-REQ-26.13, KR-REQ-12.06, KR-REQ-24.29: the release lists the backup store at
+/// schema version 9, the registry at schema version 17, the configuration document at version 4 and
+/// the transfers journal at version 6 as read through, and no other store. The release after this one
+/// writes the backup store's widened rule, the registry and the document, so a rollback to this one
+/// is not refused for a store at those versions; the journal at version 6 is what a build before this
+/// one wrote, and a daemon of this release brings it to version 5.
 #[test]
-fn the_release_reads_through_the_registry_the_configuration_document_and_the_transfers_journal_and_no_other_store()
+fn the_release_reads_through_the_backup_store_the_registry_the_configuration_document_and_the_transfers_journal_and_no_other_store()
  {
     let through: Vec<(String, u32)> = stored_formats::table::table()
         .into_iter()
@@ -11433,6 +11434,7 @@ fn the_release_reads_through_the_registry_the_configuration_document_and_the_tra
     assert_eq!(
         through,
         vec![
+            ("backup".to_owned(), 9),
             ("configuration".to_owned(), 4),
             ("registry".to_owned(), 17),
             ("transfers".to_owned(), 6),
@@ -12537,6 +12539,30 @@ fn the_lock_check_fails_on_a_moved_digest_and_the_writer_refuses_it() {
     assert!(dropped[0].contains("would leave the lock"), "{dropped:?}");
     // And a store the lock lists that the code does not declare is found.
     assert!(!stored_formats::findings(&written, &[], &[]).is_empty());
+}
+
+/// KR-REQ-24.29: a release lists the backup store as written at schema version 8 and read through
+/// 9, in the lock and in the code alike, so the update check and a rollback accept a store of the
+/// next version, which a later release writes with its one widened rule, and refuse one above it.
+#[cfg(unix)]
+#[test]
+fn the_backup_store_is_listed_as_read_through_schema_version_9() {
+    let listed = |entries: Vec<ReleaseStore>| {
+        entries
+            .into_iter()
+            .find(|entry| entry.store == "backup")
+            .expect("the backup store is listed")
+    };
+    let locked = listed(stored_formats::Lock::committed().release_stores());
+    assert_eq!(locked.reads_through, Some(9), "the lock reads through 9");
+    assert_eq!((locked.version, locked.migrates_from), (8, 6));
+    let in_the_code = listed(
+        stored_formats::table::table()
+            .into_iter()
+            .map(|store| store.entry)
+            .collect(),
+    );
+    assert_eq!(in_the_code, locked, "the code lists what the lock does");
 }
 
 /// What the digest leaves out and what it keeps: the words of a doc comment, the spacing and the

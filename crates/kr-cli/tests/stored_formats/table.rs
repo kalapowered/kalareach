@@ -725,13 +725,19 @@ pub fn table() -> Vec<Store> {
         Store {
             levels: None,
             writers: Writers::Daemon,
-            entry: entry(
-                "backup",
-                StoreScope::Environment,
-                "backup.sqlite",
-                sqlite_table("schema_version"),
-                version(kr_controller::backup::store::SCHEMA_VERSION),
-                version(kr_controller::backup::store::OLDEST_SCHEMA_VERSION),
+            // This release reads the schema after its own as it finds it: version 8 with the rule
+            // for which generation's objects are deleted widened, which the release after this
+            // one writes.
+            entry: reading_through(
+                entry(
+                    "backup",
+                    StoreScope::Environment,
+                    "backup.sqlite",
+                    sqlite_table("schema_version"),
+                    version(kr_controller::backup::store::SCHEMA_VERSION),
+                    version(kr_controller::backup::store::OLDEST_SCHEMA_VERSION),
+                ),
+                version(kr_controller::backup::store::READS_THROUGH_SCHEMA_VERSION),
             ),
             owned: Vec::new(),
             kept: vec![protocol::<archive::ArchiveDescriptor>("ArchiveDescriptor")],
