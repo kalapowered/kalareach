@@ -6057,6 +6057,12 @@ pub mod configuration {
     /// The key of the row [`push_row`] contributes, and of the change that sets it.
     pub const PUSH_GATEWAYS_KEY: &str = "push.gateways";
 
+    /// The key of the report's ceiling for the memory the description process may use.
+    pub const DESCRIPTION_PROCESS_MEMORY_KEY: &str = "description_budgets.process_memory_bytes";
+
+    /// The key of the report's ceiling for the memory this host keeps free while descriptions run.
+    pub const DESCRIPTION_RESERVE_KEY: &str = "description_budgets.reserve_bytes";
+
     /// The row the `push` section contributes to the effective-value report: the gateways this
     /// host delivers through besides the official one, as they are in force, or `none`.
     ///
@@ -6442,6 +6448,8 @@ pub mod configuration {
             || SELECTIONS.iter().any(|selection| selection.key == value)
             || value == AGENTS_OWNERSHIP_KEY
             || value == PUSH_GATEWAYS_KEY
+            || value == DESCRIPTION_PROCESS_MEMORY_KEY
+            || value == DESCRIPTION_RESERVE_KEY
             || value == IGNORED_MEMBERS_KEY
             || SELECTION_WORDS.contains(&value)
             || CEILINGS.contains(&value)

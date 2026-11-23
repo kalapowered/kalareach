@@ -480,6 +480,38 @@ fn a_reserve_below_this_machines_floor_is_refused_at_the_edit() {
     assert_eq!(applied.revision, 1);
 }
 
+/// KR-REQ-22.10: every ceiling the report names carries a key that prints as itself, as the push
+/// row's key does: `kr doctor` and an export print a term that is not a known one as its class and
+/// length, and the owner could not tell which setting a row is about. The two description rows
+/// are among them.
+#[test]
+fn every_ceiling_key_of_the_report_prints_as_itself() {
+    let temp = kr_ipc::testing::TempHost::create();
+    let environment = temp.environment();
+    let machine = machine_with(32 * GIB);
+    let report = effective(
+        &Accepted::in_force(open(&environment), machine),
+        machine,
+        WorkerProfile::HeadlessUser,
+    );
+    for key in [
+        "description_budgets.process_memory_bytes",
+        "description_budgets.reserve_bytes",
+    ] {
+        assert!(
+            report.ceilings.iter().any(|ceiling| ceiling.key == key),
+            "the report has a {key} ceiling"
+        );
+    }
+    for ceiling in &report.ceilings {
+        assert!(
+            kr_protocol::hostinfo::configuration::is_known_term(&ceiling.key),
+            "the ceiling {} would print as its class and length",
+            ceiling.key
+        );
+    }
+}
+
 /// KR-REQ-22.10: a reserve the document already holds that is below this machine's floor does not
 /// block the owner's other edits: the budgets are refused only for an edit that changes them, and
 /// the refusal names the reserve. The owner can turn descriptions off on a machine whose memory

@@ -1100,7 +1100,7 @@ pub fn effective(
                 policy_line,
             ),
             ceilings::report(
-                "description_budgets.process_memory_bytes",
+                configuration::DESCRIPTION_PROCESS_MEMORY_KEY,
                 &description.process_memory,
                 process_memory_source,
                 process_memory_origin,
@@ -1108,7 +1108,7 @@ pub fn effective(
                 |bytes| Sentence::new().number(*bytes),
             ),
             ceilings::report(
-                "description_budgets.reserve_bytes",
+                configuration::DESCRIPTION_RESERVE_KEY,
                 &description.reserve,
                 reserve_source,
                 reserve_origin,
