@@ -133,8 +133,8 @@ part of the plan, and the result's `run.part` names the part. A group with no st
 that part with nothing to run. The Windows and Linux jobs run their plans as two parts, cut by count
 with the workspace's tests alone in part 1 on Linux, and the macOS job runs its plan as three parts,
 cut by time: the workspace's tests are three steps there (kr-controller; companion-tauri with
-kr-worker; the rest), and the weights of those three are estimates until a run of the three parts
-measures them. A suite starts programs that its own package does not build, and a `cargo test -p`
+kr-worker; the rest), and every step's weight is the seconds it took in a run of the three parts,
+which its `weighed` names. A suite starts programs that its own package does not build, and a `cargo test -p`
 builds only the programs of the packages it names, so each of the three steps names a set-up step
 in `after` that builds the programs the suites start, by the form of the landing workflow's macOS
 legs: `cargo build --workspace --examples` with each program named, which gives them the features

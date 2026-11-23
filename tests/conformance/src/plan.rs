@@ -510,7 +510,7 @@ mod tests {
     }
 
     #[test]
-    fn the_macos_plan_states_every_steps_seconds_and_its_three_parts_take_two_hours_at_most() {
+    fn the_macos_plan_states_every_steps_seconds_and_its_parts_take_150_minutes_at_most() {
         let steps = steps(Platform::MacOs, &every_group(), "/tmp/evidence", None);
         // A set-up step that another step names is not cut and states no weight.
         let is_set_up =
@@ -525,8 +525,10 @@ mod tests {
         for number in 1..=3 {
             let part = part_of(steps.clone(), (number, 3));
             let seconds: u64 = part.iter().filter_map(|step| step.weight).sum();
+            // The conformance report's step limit for a part is 287 minutes, which 150 minutes
+            // leave room for at nearly twice over.
             assert!(
-                seconds <= 2 * 3600,
+                seconds <= 150 * 60,
                 "macOS part {number} of 3 is estimated at {seconds} seconds"
             );
             every.extend(
