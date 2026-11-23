@@ -186,6 +186,10 @@ const EVENTS_PER_BATCH: usize = 256;
 /// names the one in force. Terminal.app and iTerm return the default at a reset of either, so after
 /// a sequence that leaves them elsewhere than the session, live output is followed by the resets of
 /// both modes and the set of the one in force.
+///
+/// Whether the application has bracketed paste on is read from the same output, since a console
+/// that reports its keys as records reports no paste boundaries and is asked to spell its keys
+/// while the application wants them.
 pub struct MouseReporting {
     /// The mouse modes, as the worker records them.
     modes: ModeState,
@@ -303,11 +307,11 @@ impl MouseReporting {
             .map(u32::from)
     }
 
-    /// Whether the application asked for bracketed paste.
+    /// Whether the application asked for bracketed paste (DEC mode 2004), which a console reports
+    /// no boundaries of while it reports its keys as records.
     #[must_use]
     pub fn bracketed_paste(&self) -> bool {
-        let _ = &self.modes;
-        false
+        self.modes.is_set(ModeKind::Dec, 2004)
     }
 
     /// Acts on one event of the lexer, and says whether it set or reset an encoding.
@@ -384,6 +388,12 @@ impl MouseReporting {
                 self.modes.set(ModeKind::Dec, mode, set);
                 self.reset_by_either = set.then_some(u32::from(mode));
                 true
+            }
+            // Bracketed paste is one flag, read the same under every reading, and it asks nothing
+            // of the terminal: the output is written as it is.
+            2004 => {
+                self.modes.set(ModeKind::Dec, mode, set);
+                false
             }
             _ => false,
         }
