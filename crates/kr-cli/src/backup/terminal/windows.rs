@@ -28,7 +28,7 @@ use windows_sys::Win32::System::Diagnostics::Debug::{
 use windows_sys::Win32::System::Threading::{
     GetCurrentProcess, TerminateProcess, WaitForSingleObject,
 };
-use zeroize::Zeroizing;
+use zeroize::{Zeroize as _, Zeroizing};
 
 use crate::error::{CliError, Result};
 
@@ -174,6 +174,32 @@ const TURN_MILLISECONDS: u32 = 200;
 /// How many input records one read asks the console for.
 const RECORDS: usize = 32;
 
+/// How many times a record can stand for its character: a held key repeats up to this many times.
+const MAX_REPEAT: u16 = 16;
+
+/// The most bytes one read can leave pending: every record at its repeat limit and every character
+/// four bytes long. `pending` is made this size before any secret is read, so it never grows: a
+/// vector that grows leaves its old allocation behind, with a kit's fragments in it, uncleared.
+const PENDING_BOUND: usize = RECORDS * MAX_REPEAT as usize * 4;
+
+/// The input records of one read. The characters of a kit pass through them, so they are cleared
+/// when the read ends, however it ends.
+struct Clearing<'a>(&'a mut [INPUT_RECORD; RECORDS]);
+
+impl Drop for Clearing<'_> {
+    fn drop(&mut self) {
+        // SAFETY: a record is plain data, so zero bytes are a valid value of it, and the slice
+        // covers the array and nothing else.
+        let bytes = unsafe {
+            std::slice::from_raw_parts_mut(
+                self.0.as_mut_ptr().cast::<u8>(),
+                std::mem::size_of_val(self.0),
+            )
+        };
+        bytes.zeroize();
+    }
+}
+
 /// The console's modes while the kit is typed: no echo, no line editing, and a read that returns
 /// after a fifth of a second with or without input. Processed input stays, so Ctrl-C is still an
 /// interrupt.
@@ -218,17 +244,23 @@ impl Prompt {
         if unsafe { SetConsoleMode(handle, silent) } == 0 {
             return Err(modes_not_changed(&std::io::Error::last_os_error()));
         }
-        let prompt = Self {
-            input,
-            saved,
-            restored: false,
-            high: None,
-            pending: Zeroizing::new(Vec::new()),
-        };
+        let prompt = Self::holding(input, saved);
         // What was typed before this prompt was shown was echoed, and is not part of the kit. If it
         // cannot be thrown away the prompt is not entered: dropping it puts the modes back.
         discard(handle)?;
         Ok(prompt)
+    }
+
+    /// A prompt on `input` whose modes are already set and were `saved` before, with room for the
+    /// largest read.
+    fn holding(input: OwnedHandle, saved: u32) -> Self {
+        Self {
+            input,
+            saved,
+            restored: false,
+            high: None,
+            pending: Zeroizing::new(Vec::with_capacity(PENDING_BOUND)),
+        }
     }
 
     /// Puts the modes back, discarding the input still waiting: what was pasted past the end of the
@@ -283,17 +315,23 @@ impl Prompt {
             _ => return Err(std::io::Error::last_os_error()),
         }
         // SAFETY: an all-zero record is a valid value of the type, which is plain data.
-        let mut records: [INPUT_RECORD; RECORDS] = unsafe { std::mem::zeroed() };
+        let mut array: [INPUT_RECORD; RECORDS] = unsafe { std::mem::zeroed() };
+        let records = Clearing(&mut array);
         let mut count = 0_u32;
         // SAFETY: the buffer holds `RECORDS` records, which is what the call is told, and `count`
         // is a live `u32`. The signalled handle has an event, so the call does not wait.
         if unsafe {
-            ReadConsoleInputW(handle, records.as_mut_ptr(), RECORDS as u32, &raw mut count)
+            ReadConsoleInputW(
+                handle,
+                records.0.as_mut_ptr(),
+                RECORDS as u32,
+                &raw mut count,
+            )
         } == 0
         {
             return Err(std::io::Error::last_os_error());
         }
-        for record in &records[..count as usize] {
+        for record in &records.0[..count as usize] {
             if u32::from(record.EventType) != KEY_EVENT {
                 continue;
             }
@@ -304,7 +342,7 @@ impl Prompt {
             }
             // SAFETY: the character is a 16-bit unit in either view of the union.
             let unit = unsafe { key.uChar.UnicodeChar };
-            for _ in 0..key.wRepeatCount.clamp(1, 16) {
+            for _ in 0..key.wRepeatCount.clamp(1, MAX_REPEAT) {
                 self.take(unit);
             }
         }
@@ -410,6 +448,10 @@ pub fn read_line() -> std::io::Result<Option<String>> {
 mod tests {
     use std::sync::{Mutex, PoisonError};
 
+    use windows_sys::Win32::System::Console::{
+        INPUT_RECORD_0, KEY_EVENT_RECORD, KEY_EVENT_RECORD_0,
+    };
+
     use super::*;
 
     /// The tests that touch the console's input share one console, so they run one at a time.
@@ -424,6 +466,23 @@ mod tests {
             .open("CONIN$")
             .expect("the test runs on a console")
             .into()
+    }
+
+    /// A key event for one UTF-16 unit.
+    fn key(down: bool, unit: u16) -> INPUT_RECORD {
+        INPUT_RECORD {
+            EventType: KEY_EVENT as u16,
+            Event: INPUT_RECORD_0 {
+                KeyEvent: KEY_EVENT_RECORD {
+                    bKeyDown: i32::from(down),
+                    wRepeatCount: 1,
+                    wVirtualKeyCode: 0,
+                    wVirtualScanCode: 0,
+                    uChar: KEY_EVENT_RECORD_0 { UnicodeChar: unit },
+                    dwControlKeyState: 0,
+                },
+            },
+        }
     }
 
     fn mode_of(input: &OwnedHandle) -> u32 {
@@ -454,6 +513,52 @@ mod tests {
         assert_eq!(mode_of(&input), before, "the modes are as they were found");
     }
 
+    /// The most one read can bring into a prompt fits the room it was given before any secret was
+    /// read, so what it holds never moves to a new allocation and leaves the old one behind.
+    #[test]
+    fn the_longest_read_fits_the_room_a_prompt_made_before_any_secret() {
+        let nowhere: OwnedHandle = File::options()
+            .read(true)
+            .write(true)
+            .open("NUL")
+            .expect("opens the null device")
+            .into();
+        let mut prompt = Prompt::holding(nowhere, 0);
+        // There is no console to put back.
+        prompt.restored = true;
+        assert!(
+            prompt.pending.capacity() >= PENDING_BOUND,
+            "room is made first"
+        );
+        let room = (prompt.pending.as_ptr(), prompt.pending.capacity());
+        // Every record at its repeat limit, every character four bytes: U+1F600.
+        for _ in 0..RECORDS * usize::from(MAX_REPEAT) {
+            prompt.take(0xD83D);
+            prompt.take(0xDE00);
+        }
+        assert_eq!(prompt.pending.len(), PENDING_BOUND);
+        assert_eq!(
+            (prompt.pending.as_ptr(), prompt.pending.capacity()),
+            room,
+            "what a prompt holds does not move"
+        );
+    }
+
+    /// The input records of a read hold the kit's characters and are cleared when the read ends.
+    #[test]
+    fn the_input_records_of_a_read_are_cleared_when_it_ends() {
+        let mut array = [key(true, u16::from(b'K')); RECORDS];
+        drop(Clearing(&mut array));
+        // SAFETY: a record is plain data, and the array is whole and still alive.
+        let bytes = unsafe {
+            std::slice::from_raw_parts(array.as_ptr().cast::<u8>(), std::mem::size_of_val(&array))
+        };
+        assert!(
+            bytes.iter().all(|byte| *byte == 0),
+            "a record still held a character"
+        );
+    }
+
     /// A prompt that could not throw the waiting input away is not counted as left, so that
     /// dropping it tries again.
     #[test]
@@ -461,13 +566,7 @@ mod tests {
         let _alone = CONSOLE.lock().unwrap_or_else(PoisonError::into_inner);
         let input = console_input(false);
         let saved = mode_of(&input);
-        let mut prompt = Prompt {
-            input,
-            saved,
-            restored: false,
-            high: None,
-            pending: Zeroizing::new(Vec::new()),
-        };
+        let mut prompt = Prompt::holding(input, saved);
         let error = prompt.leave().expect_err("leaving is refused");
         assert!(
             error.to_string().contains("could not be thrown away"),
