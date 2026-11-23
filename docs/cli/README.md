@@ -2711,9 +2711,13 @@ for each check, the line `kr doctor` prints for the same record. `--file` names 
 from the directory the command runs in; the command makes it a full path before it sends it. The
 worker reads that file in this run and in no other. With no file the read check reads nothing and
 says so. A run that is already going is not started again. With `--file` the command reads what the
-host holds before it asks: a run that is the same one in the host's answer was going already, so the
-command fails and says that the file was not read, because the findings the host holds are of a run
-that was asked to read another file. Any other run in the answer is the one the command's request
+host holds before it asks: a run that was going then, and is the same one in the host's answer, was
+going already, so the command fails and says that the file was not read, because the findings the
+host holds are of a run that was asked to read another file. A run that had ended before the
+request is never taken for it. The host tells runs apart by when each began, in milliseconds of its
+clock, and by its session, and checks no more: a run that ends before the request, and a run the
+request then begins in the same session in the same millisecond, which a clock set back can repeat,
+cannot be told apart. Any other run in the answer is the one the command's request
 began, and the command reports it as the read of your file only where the read check's record shows
 a path as long as your file's path, in bytes: the record holds the path as its class and its length
 and not the path itself. A record that shows another length, or none, makes the command fail and say

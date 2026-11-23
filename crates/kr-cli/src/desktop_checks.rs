@@ -224,12 +224,19 @@ enum Followed<R> {
 /// The answer to the request does not say whether the request began the run it names, and no clock
 /// can: another caller's request may be admitted between the command's clock reading and its own.
 /// So where a file is named, the command reads the host once before the request. The same run
-/// before and in the answer was going already, and the file named was not read. Any other run in the
-/// answer is taken for the one this request began, and the findings are reported as a read of the
-/// file named only where the read check's record shows a path of the length of that file's: a record
-/// that shows another length, or none, may be another caller's run, begun at the same moment, and
-/// the command says it is not known whether the file was read. A run of another caller with a
-/// file whose path has the same length cannot be told from this command's own.
+/// before and in the answer, going at both, was going already, and the file named was not read. A
+/// run that had ended before the request is never taken for one going already, whatever start and
+/// session it bears. Any other run in the answer is taken for the one this request began, and the
+/// findings are reported as a read of the file named only where the read check's record shows a path
+/// of the length of that file's: a record that shows another length, or none, may be another
+/// caller's run, begun at the same moment, and the command says it is not known whether the file
+/// was read. A run of another caller with a file whose path has the same length cannot be told from
+/// this command's own.
+///
+/// A run is told by its start, in milliseconds of the daemon's wall clock, and its session, and the
+/// daemon checks no uniqueness. So one limit remains: a run going before the request that ends
+/// before it, and a run that this request begins in the same session in the same millisecond, which
+/// a clock set back can repeat, are taken for one run going already.
 ///
 /// `announce` is called once the host has started a run.
 async fn follow<A: Asked>(
@@ -238,9 +245,13 @@ async fn follow<A: Asked>(
     deadline: Instant,
     announce: impl FnOnce(),
 ) -> Result<Followed<A::Records>> {
-    let before = if authorised_file.is_some() {
+    let going_before = if authorised_file.is_some() {
         match within(deadline, asked.read()).await.transpose()? {
-            Some((checks, _)) => Some(Run::of(&checks)),
+            // Only a run that was going can be the one the request finds going: a run that had
+            // ended before, whatever start and session it bears, is not.
+            Some((checks, _)) => {
+                (checks.state == CapabilityChecksState::Running).then(|| Run::of(&checks))
+            }
             None => return Ok(unanswered(None)),
         }
     } else {
@@ -253,10 +264,10 @@ async fn follow<A: Asked>(
     else {
         return Ok(unanswered(None));
     };
-    // A run that the host held before the request and holds in its answer was going already, and
-    // the host does not start a run it is already performing: it answers with that run and the file
-    // this command named is lost.
-    if begun.state == CapabilityChecksState::Running && before == Some(Run::of(&begun)) {
+    // A run that was going when the host was read before the request and is going in its answer was
+    // going already, and the host does not start a run it is already performing: it answers with
+    // that run and the file this command named is lost.
+    if begun.state == CapabilityChecksState::Running && going_before == Some(Run::of(&begun)) {
         return Ok(Followed::Unfinished {
             checks: Some(begun),
             records: None,
@@ -1078,6 +1089,41 @@ mod tests {
                 script.taken, 1,
                 "the command reads the host once, before its request, and not after it"
             );
+        }
+    }
+
+    /// A run that had ended before the request is not one going already, whatever start and session
+    /// it bears: where the run this request begins has the start and session of the one that ended,
+    /// which the daemon's wall clock can give it, the command follows it as its own and reports the
+    /// file as read.
+    #[tokio::test(start_paused = true)]
+    async fn a_run_that_had_ended_before_the_request_is_not_taken_for_one_going_already() {
+        for ended in [
+            stands(CapabilityChecksState::Current, 10, 1, None),
+            stands(
+                CapabilityChecksState::Failed,
+                10,
+                1,
+                Some(CapabilityChecksFailure::WorkerRefused),
+            ),
+            stands(CapabilityChecksState::Stale, 10, 1, None),
+        ] {
+            let ours = stands(CapabilityChecksState::Running, 10, 1, None);
+            let done = stands(CapabilityChecksState::Current, 10, 1, None);
+            let mut script = Script::new(
+                Answer::Stands(ours.clone()),
+                vec![
+                    Answer::Stands(ended.clone()),
+                    Answer::Stands(ours),
+                    Answer::Stands(done.clone()),
+                ],
+            );
+            script.path_bytes = Some(NOTES.len());
+            let (followed, _) = run_naming(&mut script, Some(NOTES)).await;
+            let Followed::Found { checks, .. } = followed else {
+                panic!("the run this request began was not followed (run before: {ended:?})");
+            };
+            assert_eq!(checks, done);
         }
     }
 
