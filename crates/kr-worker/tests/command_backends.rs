@@ -1596,6 +1596,15 @@ async fn kr_req_07_45_a_build_that_cannot_name_a_sockets_peer_establishes_nothin
          (the answer names no process), so the process at the other end of a Unix-domain socket \
          cannot be named",
     );
+    let names_in = |directory: &std::path::Path| {
+        let mut names: Vec<_> = std::fs::read_dir(directory)
+            .expect("the runtime directory")
+            .map(|entry| entry.expect("an entry").file_name())
+            .collect();
+        names.sort();
+        names
+    };
+    let before = names_in(&setup.runtime);
     let launch = invocation_adding(&["codex"], &["--remote", "{gateway}"]);
     let why = setup
         .backends
@@ -1605,8 +1614,17 @@ async fn kr_req_07_45_a_build_that_cannot_name_a_sockets_peer_establishes_nothin
     assert!(why.contains("Windows 10.0 build 17134"), "{why}");
     assert!(why.ends_with("so this invocation runs as typed"), "{why}");
     assert!(
+        setup.backends.root().is_none(),
+        "no directory was made for the session"
+    );
+    assert!(
         setup.established().is_empty(),
         "a refusal creates nothing: {:?}",
         setup.established()
+    );
+    assert_eq!(
+        names_in(&setup.runtime),
+        before,
+        "nothing was made in the runtime directory"
     );
 }
