@@ -2186,9 +2186,11 @@ mod tests {
             ..Plan::in_directory(root.path().join("scratch"))
         };
         let bound = Check::AuthorisedFileRead.effects().bound;
-        // Twice the longest a check that keeps its bound takes, the bound and the slack, so that a
-        // check that did not stop at its bound sees the stand-in return, and fails on what that
-        // makes of its answer. It follows the declared bound, whatever that is.
+        // Twice the longest a check that keeps its bound takes (the bound and the slack): the
+        // stand-in is still held when a check that keeps its bound answers, and when the case lets
+        // it go. A check that waits for the read returns when the stand-in does; one that stops
+        // late, but before that, fails the upper limit. It follows the declared bound, whatever
+        // that is.
         let stays = (bound + SLACK) * 2;
 
         let (started_tell, started) = std::sync::mpsc::channel();
