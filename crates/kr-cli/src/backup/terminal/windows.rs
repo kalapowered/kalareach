@@ -492,11 +492,16 @@ impl Prompt {
         Ok(true)
     }
 
-    /// Takes one UTF-16 unit: a surrogate waits for its pair, and Ctrl-Z becomes the byte that
-    /// ends a document typed at a terminal.
+    /// Takes one UTF-16 unit: a high surrogate waits for its pair, and Ctrl-Z becomes the byte that
+    /// ends a document typed at a terminal. A surrogate that has no pair is the replacement
+    /// character, so a stray one before `yes` makes an answer that is not `yes`.
     fn take(&mut self, unit: u16) {
+        // A unit of zero is a record with no character. It neither completes a pair nor breaks one,
+        // so a waiting high surrogate keeps waiting.
+        if unit == 0 {
+            return;
+        }
         let character = match (self.high.take(), unit) {
-            (_, 0) => return,
             (None, 0xD800..=0xDBFF) => {
                 self.high = Some(unit);
                 return;
@@ -504,16 +509,24 @@ impl Prompt {
             (Some(high), 0xDC00..=0xDFFF) => char::decode_utf16([high, unit])
                 .next()
                 .and_then(std::result::Result::ok),
+            (Some(_), _) => {
+                // The high surrogate that was waiting got no low one: it is said as the replacement
+                // character, and this unit is read as it would have been by itself.
+                self.push(char::REPLACEMENT_CHARACTER);
+                return self.take(unit);
+            }
             (_, 0x1A) => Some('\u{4}'),
             (_, other) => char::from_u32(u32::from(other)),
         };
+        self.push(character.unwrap_or(char::REPLACEMENT_CHARACTER));
+    }
+
+    /// Adds one character to what is pending, which was made large enough for the most one read
+    /// can add, so it does not move.
+    fn push(&mut self, character: char) {
         let mut encoded = [0_u8; 4];
-        self.pending.extend_from_slice(
-            character
-                .unwrap_or(char::REPLACEMENT_CHARACTER)
-                .encode_utf8(&mut encoded)
-                .as_bytes(),
-        );
+        self.pending
+            .extend_from_slice(character.encode_utf8(&mut encoded).as_bytes());
     }
 }
 
@@ -810,10 +823,9 @@ mod tests {
         assert_eq!(answer.as_deref().map(String::as_str), Some("yes"));
     }
 
-    /// The most one read can bring into a prompt fits the room it was given before any secret was
-    /// read, so what it holds never moves to a new allocation and leaves the old one behind.
-    #[test]
-    fn the_longest_read_fits_the_room_a_prompt_made_before_any_secret() {
+    /// A prompt that reads nothing: its input is the null device, so there is no console to put
+    /// back.
+    fn without_a_console() -> Prompt {
         let nowhere: OwnedHandle = File::options()
             .read(true)
             .write(true)
@@ -821,8 +833,39 @@ mod tests {
             .expect("opens the null device")
             .into();
         let mut prompt = Prompt::holding(nowhere, 0);
-        // There is no console to put back.
         prompt.restored = true;
+        prompt
+    }
+
+    /// A high surrogate that no low surrogate follows is the replacement character, and the text
+    /// after it is read as typed: `yes` after one is not `yes`. A lone low surrogate is the
+    /// replacement character as well, and a pair is still the one character it stands for.
+    #[test]
+    fn an_unmatched_surrogate_reads_as_the_replacement_character() {
+        let said = |units: &[u16]| {
+            let mut prompt = without_a_console();
+            for &unit in units {
+                prompt.take(unit);
+            }
+            String::from_utf8(prompt.pending.to_vec()).expect("pending text is whole characters")
+        };
+        let yes: Vec<u16> = "yes".encode_utf16().collect();
+        let high = 0xD83D;
+        let low = 0xDE00;
+        assert_eq!(said(&[&[high][..], &yes].concat()), "\u{fffd}yes");
+        assert_eq!(
+            said(&[&[high, high][..], &yes].concat()),
+            "\u{fffd}\u{fffd}yes"
+        );
+        assert_eq!(said(&[&[low][..], &yes].concat()), "\u{fffd}yes");
+        assert_eq!(said(&[&[high, 0, low][..], &yes].concat()), "\u{1f600}yes");
+    }
+
+    /// The most one read can bring into a prompt fits the room it was given before any secret was
+    /// read, so what it holds never moves to a new allocation and leaves the old one behind.
+    #[test]
+    fn the_longest_read_fits_the_room_a_prompt_made_before_any_secret() {
+        let mut prompt = without_a_console();
         assert!(
             prompt.pending.capacity() >= PENDING_BOUND,
             "room is made first"
