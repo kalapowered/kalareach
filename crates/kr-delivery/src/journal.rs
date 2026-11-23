@@ -76,16 +76,14 @@ use crate::error::{DeliveryError, Result};
 /// may have left this host in an object placed in a device's mailbox, which is a copy that left
 /// whether or not the push that refers to it ever did. Version 11 is version 10 without the
 /// `signed_authority_object` payload type of a sealed envelope, which nothing produced, and
-/// nothing else: its tables, columns and rows are version 10's, so the step from 10 records the
-/// version only. A journal written under version 6, 7, 8, 9 or 10 is brought forward in place,
-/// once, when it is opened (`migrate_forward`); a journal written under a version below 6 or
-/// above this one is refused rather than read with the columns of another shape, matched against
+/// nothing else: its tables, columns and rows are version 10's. A journal written under any
+/// other version is refused rather than read with the columns of another shape, matched against
 /// bindings this build no longer computes the same way, or trusted to hold no request it should
 /// not.
 pub const SCHEMA_VERSION: i64 = 11;
 
-/// The oldest schema this build brings forward rather than refusing.
-pub const OLDEST_SCHEMA_VERSION: i64 = 6;
+/// The oldest schema version this build opens: it reads no other.
+pub const OLDEST_SCHEMA_VERSION: i64 = SCHEMA_VERSION;
 
 /// The binding a notification is given when its destination is removed while an attempt is on the
 /// wire. A destination's digest is 64 hexadecimal characters, so no destination configured under
@@ -746,7 +744,7 @@ impl DeliveryJournal {
         Self::prepare(Connection::open_in_memory()?)
     }
 
-    fn prepare(mut connection: Connection) -> Result<Self> {
+    fn prepare(connection: Connection) -> Result<Self> {
         connection.busy_timeout(BUSY_TIMEOUT)?;
         // Foreign keys are what make "the event first" a property of the store. They are off by
         // default in SQLite, so turning them on is part of opening rather than a call somebody
@@ -780,12 +778,6 @@ impl DeliveryJournal {
             // EXISTS` over a store that has lost a table would answer every read from an empty one,
             // and an empty outbox and an empty privacy row say the opposite of what is true.
             Some(version) if version == SCHEMA_VERSION => {
-                let journal = Self { connection };
-                journal.check_schema()?;
-                Ok(journal)
-            }
-            Some(version) if (OLDEST_SCHEMA_VERSION..SCHEMA_VERSION).contains(&version) => {
-                migrate_forward(&mut connection)?;
                 let journal = Self { connection };
                 journal.check_schema()?;
                 Ok(journal)
@@ -4195,79 +4187,6 @@ fn insert_notification(
     Ok(())
 }
 
-/// Brings a version 6, 7, 8, 9 or 10 journal forward to version 11, in one transaction.
-///
-/// Version 7 added one column, the stamp of the stored credential an external destination sends
-/// with. No destination a version 6 journal holds has one, because version 6 had no way to keep a
-/// credential, so every row gets none and every binding it computed is computed the same way.
-/// Version 8 adds one column to the privacy row, the time privacy mode was last turned off. A
-/// journal that has never been through privacy mode has none, which reads as no time at all. One
-/// that has been through it and is out of it is given the time of this migration: the earlier
-/// build did not record when, so everything decided before this moment may have been decided while
-/// privacy mode was on, and none of it is sent. A journal that is still fenced records the time
-/// when it is lifted. Version 9 adds the table of revocations this host owes a gateway, which no
-/// earlier journal can hold one of: an earlier build revoked nothing at unpairing. Version 10 adds
-/// the mark on a notification whose detail may have been placed in a device's mailbox; no earlier
-/// build placed one, so every row gets none. Version 11 changes no table, column or row: it
-/// records that the payload type a sealed envelope no longer names is gone, so the step from 10
-/// records the version only.
-/// The version is read again inside the transaction, so two openers cannot both add a column.
-///
-/// Remove this upgrade, with the arm of the open that calls it, once no supported upgrade starts
-/// from a journal written under version 6, 7, 8, 9 or 10; `OLDEST_SCHEMA_VERSION` then moves up
-/// with it.
-fn migrate_forward(connection: &mut Connection) -> Result<()> {
-    let transaction =
-        connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-    let version: i64 =
-        transaction.query_row("SELECT version FROM delivery_schema LIMIT 1", [], |row| {
-            row.get(0)
-        })?;
-    if !(OLDEST_SCHEMA_VERSION..=SCHEMA_VERSION).contains(&version) {
-        return Err(DeliveryError::JournalUnreadable(
-            "the delivery journal changed schema version while it was being brought forward",
-        ));
-    }
-    if version == 6 {
-        transaction
-            .execute_batch("ALTER TABLE delivery_destinations ADD COLUMN credential_stamp TEXT;")?;
-    }
-    if version <= 7 {
-        transaction.execute_batch(
-            "ALTER TABLE delivery_privacy ADD COLUMN lifted_at_ms INTEGER NOT NULL DEFAULT 0;",
-        )?;
-        transaction.execute(
-            "UPDATE delivery_privacy SET lifted_at_ms = ?1 WHERE generation > 0 AND fenced = 0",
-            params![as_i64(wall_ms())],
-        )?;
-    }
-    if version <= 8 {
-        transaction.execute_batch(
-            "CREATE TABLE IF NOT EXISTS delivery_revocations (
-                sender_record_id TEXT PRIMARY KEY,
-                gateway_origin TEXT NOT NULL,
-                queued_at_ms INTEGER NOT NULL,
-                attempts INTEGER NOT NULL,
-                next_attempt_at_ms INTEGER NOT NULL
-            );",
-        )?;
-    }
-    if version <= 9 {
-        transaction.execute_batch(
-            "ALTER TABLE delivery_notifications
-                 ADD COLUMN detail_left INTEGER NOT NULL DEFAULT 0;",
-        )?;
-    }
-    if version < SCHEMA_VERSION {
-        transaction.execute(
-            "UPDATE delivery_schema SET version = ?1",
-            params![SCHEMA_VERSION],
-        )?;
-    }
-    transaction.commit()?;
-    Ok(())
-}
-
 /// What a delivery whose outcome this host cannot establish is recorded as.
 ///
 /// A notification the gateway holds can be asked about by its identifier, so it is the outcome
@@ -7427,8 +7346,7 @@ mod tests {
         assert_eq!(journal.outstanding().expect("a count"), 1);
     }
 
-    /// A journal another schema version wrote is refused at open, whichever version it was, except
-    /// the versions this build brings forward.
+    /// A journal another schema version wrote is refused at open, whichever version it was.
     #[test]
     fn a_journal_written_under_another_schema_version_is_refused() {
         for version in [OLDEST_SCHEMA_VERSION - 1, SCHEMA_VERSION + 1] {
@@ -7447,260 +7365,6 @@ mod tests {
                 ),
                 "version {version} is refused"
             );
-        }
-    }
-
-    /// A version 10 journal, which the release before wrote, is brought forward to 11 when it is
-    /// opened: the version is the only thing that changes, and the destination, the event and the
-    /// queued notification it holds are read as they were.
-    #[test]
-    fn a_version_10_journal_is_brought_forward_to_11_and_keeps_what_it_holds() {
-        let directory = tempfile::tempdir().expect("a directory");
-        let path = directory.path().join("delivery.sqlite3");
-        {
-            let mut journal = DeliveryJournal::open(&path).expect("a journal");
-            journal
-                .register_consumer(&consumer(), 1)
-                .expect("registration");
-            journal
-                .configure_destination(&destination("hook"))
-                .expect("a destination");
-            journal
-                .take_events(&consumer(), &[taken(1, 1)], 1)
-                .expect("a page");
-            journal
-                .admit(&delivery(1, event(1), "hook"))
-                .expect("admitted");
-        }
-        let version_of = |path: &Path| -> i64 {
-            rusqlite::Connection::open(path)
-                .expect("a connection")
-                .query_row("SELECT version FROM delivery_schema", [], |row| row.get(0))
-                .expect("a version")
-        };
-        rusqlite::Connection::open(&path)
-            .expect("a connection")
-            .execute("UPDATE delivery_schema SET version = 10", [])
-            .expect("the version changes");
-        assert_eq!(version_of(&path), 10);
-
-        let mut journal = DeliveryJournal::open(&path).expect("brought forward");
-        assert_eq!(version_of(&path), 11, "and only the version changed");
-        assert_eq!(SCHEMA_VERSION, 11);
-        assert_eq!(
-            journal
-                .destination(&DestinationId::new("hook").expect("an identifier"))
-                .expect("a read")
-                .expect("the destination is still configured"),
-            destination("hook")
-        );
-        assert!(
-            matches!(
-                journal
-                    .claim(NotificationId::new(uuid(1)), 2_000)
-                    .expect("a claim"),
-                Claim::Taken(_)
-            ),
-            "the notification admitted under version 10 is claimed under version 11"
-        );
-    }
-
-    /// Makes the journal at `path` look exactly as version 6 wrote it: no credential column, and
-    /// version 6 recorded.
-    fn as_version_6(path: &Path) {
-        let connection = rusqlite::Connection::open(path).expect("a connection");
-        connection
-            .execute_batch(
-                "ALTER TABLE delivery_destinations DROP COLUMN credential_stamp;
-                 ALTER TABLE delivery_privacy DROP COLUMN lifted_at_ms;
-                 DROP TABLE delivery_revocations;
-                 ALTER TABLE delivery_notifications DROP COLUMN detail_left;
-                 UPDATE delivery_schema SET version = 6;",
-            )
-            .expect("the version 6 shape");
-    }
-
-    /// A version 6 journal is brought forward when it is opened, keeping its destinations and its
-    /// queued work, and every binding it computed still matches: a notification admitted under
-    /// version 6 is claimed and sent under version 7.
-    #[test]
-    fn a_version_6_journal_is_brought_forward_with_its_work_and_its_bindings() {
-        let directory = tempfile::tempdir().expect("a directory");
-        let path = directory.path().join("delivery.sqlite3");
-        {
-            let mut journal = DeliveryJournal::open(&path).expect("a journal");
-            journal
-                .register_consumer(&consumer(), 1)
-                .expect("registration");
-            journal
-                .configure_destination(&destination("hook"))
-                .expect("a destination");
-            journal
-                .take_events(&consumer(), &[taken(1, 1)], 1)
-                .expect("a page");
-            journal
-                .admit(&delivery(1, event(1), "hook"))
-                .expect("admitted");
-        }
-        as_version_6(&path);
-
-        let mut journal = DeliveryJournal::open(&path).expect("brought forward");
-        let version: i64 = journal
-            .connection
-            .query_row("SELECT version FROM delivery_schema", [], |row| row.get(0))
-            .expect("a version");
-        assert_eq!(version, SCHEMA_VERSION);
-        assert!(
-            journal.exported().expect("a read").is_empty(),
-            "and the column version 10 added reads as no copy left"
-        );
-        let hook = journal
-            .destination(&DestinationId::new("hook").expect("an identifier"))
-            .expect("a read")
-            .expect("the destination is still configured");
-        assert_eq!(
-            hook,
-            destination("hook"),
-            "and reads back as it was written"
-        );
-        assert!(
-            matches!(
-                journal
-                    .claim(NotificationId::new(uuid(1)), 2_000)
-                    .expect("a claim"),
-                Claim::Taken(_)
-            ),
-            "the binding version 6 recorded is the binding the current version computes"
-        );
-        drop(journal);
-        assert!(
-            DeliveryJournal::open(&path).is_ok(),
-            "and it opens again as the current version"
-        );
-    }
-
-    /// A version 9 journal is brought forward in place and lists no copy of a detail in a mailbox,
-    /// because no earlier build placed one; a copy marked afterwards is listed whatever became of
-    /// the push that refers to it.
-    #[test]
-    fn a_version_9_journal_is_brought_forward_and_lists_a_detail_left_in_a_mailbox() {
-        let directory = tempfile::tempdir().expect("a directory");
-        let path = directory.path().join("delivery.sqlite3");
-        {
-            let mut journal = DeliveryJournal::open(&path).expect("a journal");
-            journal
-                .register_consumer(&consumer(), 1)
-                .expect("registration");
-            journal
-                .configure_destination(&destination("hook"))
-                .expect("a destination");
-            journal
-                .take_events(&consumer(), &[taken(1, 1)], 1)
-                .expect("a page");
-            journal
-                .admit(&delivery(1, event(1), "hook"))
-                .expect("admitted");
-        }
-        {
-            let connection = rusqlite::Connection::open(&path).expect("a connection");
-            connection
-                .execute_batch(
-                    "ALTER TABLE delivery_notifications DROP COLUMN detail_left;
-                     UPDATE delivery_schema SET version = 9;",
-                )
-                .expect("the version 9 shape");
-        }
-
-        let mut journal = DeliveryJournal::open(&path).expect("brought forward");
-        assert!(journal.exported().expect("a read").is_empty());
-        journal
-            .note_detail_left(NotificationId::new(uuid(1)))
-            .expect("a mark");
-        let exported = journal.exported().expect("a read");
-        assert_eq!(exported.len(), 1, "the copy is listed with the push unsent");
-        assert!(
-            exported[0].reference.contains("mailbox"),
-            "{}",
-            exported[0].reference
-        );
-        assert_eq!(
-            journal
-                .delivery(NotificationId::new(uuid(1)))
-                .expect("a read")
-                .expect("the record")
-                .state,
-            DeliveryState::Admitted,
-            "and the push is as it was"
-        );
-    }
-
-    /// A version 7 journal is brought forward in place: its privacy row gains the time privacy mode
-    /// was last turned off, which reads as no time at all, and its fence stays where it stood.
-    #[test]
-    fn a_version_7_journal_is_brought_forward_with_its_fence_where_it_stood() {
-        let directory = tempfile::tempdir().expect("a directory");
-        let path = directory.path().join("delivery.sqlite3");
-        {
-            let mut journal = DeliveryJournal::open(&path).expect("a journal");
-            journal.fence(3).expect("a fence");
-        }
-        {
-            let connection = rusqlite::Connection::open(&path).expect("a connection");
-            connection
-                .execute_batch(
-                    "ALTER TABLE delivery_notifications DROP COLUMN detail_left;
-                     ALTER TABLE delivery_privacy DROP COLUMN lifted_at_ms;
-                     UPDATE delivery_schema SET version = 7;",
-                )
-                .expect("the version 7 shape");
-        }
-        let journal = DeliveryJournal::open(&path).expect("brought forward");
-        assert_eq!(
-            journal.standing().expect("a read"),
-            PrivacyStanding {
-                generation: 3,
-                fenced: true
-            }
-        );
-        assert_eq!(journal.lifted_at_ms().expect("a read"), 0);
-    }
-
-    /// A version 7 journal that has been through privacy mode and is out of it has no record of
-    /// when, so it is given the time of its migration: nothing decided before it is sent. One that
-    /// has never been through it keeps no time at all.
-    #[test]
-    fn a_version_7_journal_that_has_left_privacy_mode_is_given_a_boundary_when_brought_forward() {
-        for left_it in [true, false] {
-            let directory = tempfile::tempdir().expect("a directory");
-            let path = directory.path().join("delivery.sqlite3");
-            {
-                let mut journal = DeliveryJournal::open(&path).expect("a journal");
-                if left_it {
-                    journal.fence(1).expect("a fence");
-                    journal.lift_fence(2).expect("a lift");
-                }
-            }
-            {
-                let connection = rusqlite::Connection::open(&path).expect("a connection");
-                connection
-                    .execute_batch(
-                        "ALTER TABLE delivery_notifications DROP COLUMN detail_left;
-                     ALTER TABLE delivery_privacy DROP COLUMN lifted_at_ms;
-                         UPDATE delivery_schema SET version = 7;",
-                    )
-                    .expect("the version 7 shape");
-            }
-            let before = wall_ms();
-            let journal = DeliveryJournal::open(&path).expect("brought forward");
-            let lifted = journal.lifted_at_ms().expect("a read");
-            if left_it {
-                assert!(
-                    lifted >= before,
-                    "the time of the migration, which is not before it began"
-                );
-            } else {
-                assert_eq!(lifted, 0, "never in privacy mode, so no boundary");
-            }
         }
     }
 
