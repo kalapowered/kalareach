@@ -1867,8 +1867,8 @@ program (the container runtime (`podman`) for a container, the SSH client (`ssh`
 the WSL launcher (`wsl.exe`) for a WSL distribution) and how it failed, whichever step it was: the
 look at whether the environment runs, its start with `--start`, or the opening of the bridge. The
 classes are that the program was not found, that it could not be started, that it ended with an exit
-code, that a signal ended it, that it did not answer within a number of seconds and was ended (or
-could not be ended, where the host did not see the end), that this host could not read what it
+code, that a signal ended it, that it did not answer within a number of seconds and was ended (or that the host could not confirm that it ended, so it may
+still be running), that this host could not read what it
 printed or could not wait for it, that its answer to the look could not be read, and that the
 environment refused the bridge, in which case the line gives the refusal's code. The container
 runtime's code 125 and `ssh`'s 255 are the program's own; any other code is the helper's, and the

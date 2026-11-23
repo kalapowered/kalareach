@@ -276,7 +276,7 @@ pub fn platform(access: EnvironmentAccess, step: Step, failure: &StepFailure) ->
             .stated(if *ended {
                 ", so it was ended"
             } else {
-                ", and it could not be ended"
+                ", and this host could not confirm that it ended; it may still be running"
             }),
         StepFailure::Unread { message } => program
             .stated(" ran, and this host could not read what it printed ")
@@ -783,7 +783,8 @@ mod tests {
                         ended: false,
                     },
                     format!(
-                        "{step} did not answer within 60 seconds {asked}, and it could not be ended"
+                        "{step} did not answer within 60 seconds {asked}, and this host could not \
+                         confirm that it ended; it may still be running"
                     ),
                 ),
                 (

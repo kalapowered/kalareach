@@ -400,7 +400,7 @@ impl std::fmt::Display for CallFailure {
                 if *ended {
                     "was ended"
                 } else {
-                    "could not be ended"
+                    "this host could not confirm that it ended"
                 }
             ),
             Self::Unknown { call, error } => {
@@ -1038,9 +1038,19 @@ mod tests {
             limit: std::time::Duration::from_secs(60),
             ended: false,
         };
+        // The runner ignores the result of the kill and does not see the end, so it says only that
+        // it could not confirm it, both to the person and in the supervision failure.
+        assert_eq!(
+            unended.to_string(),
+            "podman container inspect did not end within 60 seconds and this host could not \
+             confirm that it ended"
+        );
         assert_eq!(
             told(super::failure_of(unended)),
-            format!("{step} did not answer within 60 seconds {look}, and it could not be ended")
+            format!(
+                "{step} did not answer within 60 seconds {look}, and this host could not confirm \
+                 that it ended; it may still be running"
+            )
         );
 
         let unknown = super::CallFailure::Unknown {

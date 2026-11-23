@@ -940,10 +940,10 @@ const REFUSAL_FORMS: &[&str] = &[
      was ended",
     "{program} did not answer within {n} seconds when asked to start the environment, so it was \
      ended",
-    "{program} did not answer within {n} seconds when asked whether the environment is running, and it \
-     could not be ended",
-    "{program} did not answer within {n} seconds when asked to start the environment, and it could \
-     not be ended",
+    "{program} did not answer within {n} seconds when asked whether the environment is running, and \
+     this host could not confirm that it ended; it may still be running",
+    "{program} did not answer within {n} seconds when asked to start the environment, and this host \
+     could not confirm that it ended; it may still be running",
     "{program} ran, and this host could not read what it printed when asked whether the environment \
      is running: {message}",
     "{program} ran, and this host could not read what it printed when asked to start the \
