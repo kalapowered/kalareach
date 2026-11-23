@@ -4551,6 +4551,11 @@ async fn kr_req_13_12_a_send_whose_copy_flush_fails_after_a_cleanup_stopped_its_
         answered.is_err(),
         "the flush of the copy's directory failed"
     );
+    assert_eq!(
+        desk.phase_for_test(key),
+        Some("stopping"),
+        "the send left the upload held, stopped, for the cleanup that ends it"
+    );
     drop(flush);
     removed.release();
     settled(&desk).await;
