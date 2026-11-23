@@ -3426,12 +3426,14 @@ async fn a_fence_this_host_owes_stops_an_ssh_hosts_refresh_before_its_helper_is_
 /// KR-REQ-09.09, 09.12 and 26.16: what an ssh host's helper answered is written to the enrolment
 /// record only while this host owes no fence. The control: with nothing owed, a refusal takes back
 /// the scoped channel an earlier answer established. With a fence that lands after the helper has
-/// answered, the refresh is refused for the fence and the channel stands. The refresh's actor is a
+/// answered, the refresh is answered and not refused, since the helper has run: its own sentence
+/// stays and says that this host did not record it, and the channel stands. The refresh's actor is a
 /// paired device's, which no helper is started for, so the answer is the refusal and nothing runs.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_fence_that_lands_after_an_ssh_hosts_helper_answered_stops_what_the_answer_would_write() {
     use kr_protocol::identity::{
         EnvironmentAccess, EnvironmentEnrolParams, EnvironmentRefreshParams,
+        EnvironmentRefreshResult,
     };
     let (temp, controller, _clock) = daemon().await;
     let (connection_id, actor_id) = admitted(&controller).await;
@@ -3528,17 +3530,29 @@ async fn a_fence_that_lands_after_an_ssh_hosts_helper_answered_stops_what_the_an
 
     establish();
     assert!(scoped(), "the channel is established again");
-    let refused = stopped_after_the_environment_record_is_taken(&controller, refresh(), || {
+    let answered = stopped_after_the_environment_record_is_taken(&controller, refresh(), || {
         controller.hold_fence(true);
     })
     .await;
     controller.hold_fence(false);
-    refused_for_a_fence(
-        &refused
-            .into_answer_for_test()
-            .expect_err("a fence that landed after the answer stops its write")
-            .to_protocol_error(),
+    let result: EnvironmentRefreshResult = answered
+        .into_answer_for_test()
+        .expect("the helper has run, so a fence that landed after its answer leaves the refresh answered")
+        .to_typed()
+        .expect("a result");
+    // The helper's own sentence stays, and then what this host did not do: it did not record it.
+    let said = result.connection.as_str();
+    assert!(
+        said.starts_with("a process bridge carries locally authenticated invocations only")
+            && said.contains("; and this host did not record that, because [message withheld, ")
+            && said.ends_with(" bytes]"),
+        "{said}"
     );
+    assert!(
+        !said.contains("failed") && !said.contains("write"),
+        "the words say that nothing was recorded, not that a write failed: {said}"
+    );
+    assert!(result.verification.0.is_none());
     assert!(
         scoped(),
         "what the answer would have written was not written"
