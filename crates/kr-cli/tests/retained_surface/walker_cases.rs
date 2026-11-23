@@ -539,3 +539,149 @@ fn a_name_the_compiler_gives_a_sighting_resolves_with_a_digest_that_holds_its_fi
     };
     assert!(error.contains("lib.rs"), "{error}");
 }
+
+/// W5: the identity of a name is every item of that name in its crate. A product item and an item
+/// in a file no build reads share the name `send`; a change to either moves the one digest, so the
+/// sighted item cannot hide behind its namesake. A namesake beside the product item in its own file
+/// (a test item) counts too, and a name that only the walker's item has keeps the walker's digest.
+#[test]
+fn the_identity_of_a_name_is_every_item_of_that_name_in_its_crate() {
+    let lib = "crates/kr-sender/src/lib.rs";
+    let unreached = "crates/kr-sender/src/unreached.rs";
+    let product = "pub fn send() {}\npub fn only_here() {}\n";
+    let sender = |unreached_body: &str, test_body: &str| {
+        let folder = small_tree(&format!(
+            "{product}#[cfg(test)]\nmod tests {{\n    fn twice() {{ {test_body} }}\n}}\npub fn twice() {{}}\n"
+        ));
+        write(
+            folder.path(),
+            unreached,
+            &format!("fn send() {{ {unreached_body} }}\n"),
+        );
+        folder
+    };
+    let base = sender("first();", "one();");
+    let tree = tree_at(base.path()).expect("the tree");
+    let source = tree
+        .source("kr_sender", "send")
+        .expect("read")
+        .expect("found");
+    assert_eq!(
+        source.files,
+        vec![lib.to_owned(), unreached.to_owned()],
+        "the product item's file and the namesake's file"
+    );
+    let before = digest_of(&tree, "send");
+    // A change to the unreached item moves the name's digest; it moves no other name's.
+    let moved = sender("second();", "one();");
+    let tree_moved = tree_at(moved.path()).expect("the tree");
+    assert_ne!(digest_of(&tree_moved, "send"), before);
+    assert_eq!(
+        digest_of(&tree_moved, "only_here"),
+        digest_of(&tree, "only_here")
+    );
+    assert_eq!(
+        tree.source("kr_sender", "only_here")
+            .expect("read")
+            .expect("found")
+            .files,
+        vec![lib.to_owned()],
+        "a name the walker's file alone holds is the walker's"
+    );
+    // A test item beside the product item of one name, in the same file, moves the digest too.
+    let before_twice = digest_of(&tree, "twice");
+    let test_moved = sender("first();", "two();");
+    let tree_test_moved = tree_at(test_moved.path()).expect("the tree");
+    assert_ne!(digest_of(&tree_test_moved, "twice"), before_twice);
+}
+
+/// W5: a plain name that only files no build reads hold, in two files, is one identity of both: a
+/// change to either file moves it, and each file's path is in it.
+#[test]
+fn a_name_in_two_files_is_one_identity_that_holds_both_files() {
+    let two_files = |first: &str, second: &str| {
+        let folder = small_tree("pub fn worker_side() {}\n");
+        write(
+            folder.path(),
+            "crates/kr-sender/src/one.rs",
+            &format!("fn helper() {{ {first} }}\n"),
+        );
+        write(
+            folder.path(),
+            "crates/kr-sender/src/two.rs",
+            &format!("fn helper() {{ {second} }}\n"),
+        );
+        folder
+    };
+    let base = two_files("a();", "b();");
+    let tree = tree_at(base.path()).expect("the tree");
+    let source = tree
+        .source("kr_sender", "helper")
+        .expect("read")
+        .expect("found");
+    assert_eq!(
+        source.files,
+        vec![
+            "crates/kr-sender/src/one.rs".to_owned(),
+            "crates/kr-sender/src/two.rs".to_owned()
+        ]
+    );
+    assert!(source.text.contains("a ()") && source.text.contains("b ()"));
+    let before = digest_of(&tree, "helper");
+    for (first, second) in [("c();", "b();"), ("a();", "c();")] {
+        let changed = two_files(first, second);
+        let tree_changed = tree_at(changed.path()).expect("the tree");
+        assert_ne!(
+            digest_of(&tree_changed, "helper"),
+            before,
+            "{first} {second}"
+        );
+    }
+}
+
+/// W5: a `file:`, `use:` or invocation name reads a file under the tree's root and no other: an
+/// absolute path, a path with `..` and a link that leads out of the tree are refused in words.
+#[test]
+fn a_name_that_names_a_file_outside_the_tree_is_refused() {
+    let folder = small_tree(SCANNED);
+    let outside = tempfile::tempdir().expect("a folder outside the tree");
+    write(outside.path(), "secret.rs", "pub fn leaked() {}\n");
+    write(outside.path(), "secret.json", "{\"a\": 1}\n");
+    write(
+        folder.path(),
+        "crates/kr-sender/data/inside.json",
+        "{\"b\": 2}\n",
+    );
+    std::os::unix::fs::symlink(
+        outside.path().join("secret.json"),
+        folder.path().join("crates/kr-sender/data/link.json"),
+    )
+    .expect("a link");
+    let tree = tree_at(folder.path()).expect("the tree");
+    let absolute_rust = outside.path().join("secret.rs").display().to_string();
+    let absolute_json = outside.path().join("secret.json").display().to_string();
+    let names = [
+        format!("file:{absolute_json}"),
+        "file:../../secret.json".to_owned(),
+        "file:crates/kr-sender/../kr-sender/data/inside.json".to_owned(),
+        format!("use:{absolute_rust}"),
+        "use:../outside/secret.rs".to_owned(),
+        format!("gen! invocation @{absolute_rust}"),
+        "gen! invocation @../outside/secret.rs".to_owned(),
+        "file:crates/kr-sender/data/link.json".to_owned(),
+    ];
+    for name in names {
+        match tree.item("kr_sender", &name) {
+            Lookup::Failed(error) => assert!(
+                error.contains("under the tree's root") || error.contains("leads out"),
+                "{name}: {error}"
+            ),
+            other => panic!("{name} is refused: {other:?}"),
+        }
+    }
+    // The same name by a path under the root is read.
+    assert!(matches!(
+        tree.item("kr_sender", "file:crates/kr-sender/data/inside.json"),
+        Lookup::Found(_)
+    ));
+}

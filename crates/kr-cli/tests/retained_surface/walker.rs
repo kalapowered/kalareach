@@ -1387,12 +1387,19 @@ impl Tree {
     }
 
     /// The item `name` in `krate`, alone. `None` where the crate or the name is absent.
+    ///
+    /// A name's identity is every item of that name in its crate: the items the walker indexes, and
+    /// the items it does not (a test item, an item in a file no build reads, an item beside another
+    /// of the same name), each with its file's path. A change to any of them moves the digest, so
+    /// the item a sighting is in cannot hide behind a namesake. Where the scan finds nothing but
+    /// the walker's own item, the digest is the walker's.
     pub fn source(&self, krate: &str, name: &str) -> Result<Option<Source>, String> {
         match self.krate(krate) {
             Lookup::Found(_) => {}
             Lookup::Absent => return Ok(None),
             Lookup::Failed(error) => return Err(error),
         }
+        let scanned = self.scan_items(krate, name)?;
         match self.followed_set(krate, &[name], Depth::Alone) {
             Err(WalkError::Undefined(_)) => {}
             Err(WalkError::Other(error)) => return Err(error),
@@ -1411,6 +1418,19 @@ impl Tree {
                         files.push(item.file.clone());
                     }
                 }
+                let indexed = files.clone();
+                for (file, found) in &scanned {
+                    if indexed.contains(file) && found.len() == 1 {
+                        continue;
+                    }
+                    let found = found.join("\n");
+                    digest
+                        .extend_from_slice(format!("{krate} {file} {name}\n{found}\n").as_bytes());
+                    text.push(found);
+                    if !files.contains(file) {
+                        files.push(file.clone());
+                    }
+                }
                 return Ok(Some(Source {
                     digest: hex(&kr_cbor::sha256(&digest)),
                     text: text.join("\n"),
@@ -1418,7 +1438,7 @@ impl Tree {
                 }));
             }
         }
-        self.scan_source(krate, name)
+        Ok(Self::joined(krate, name, &scanned))
     }
 
     /// The items of a Rust file by the names a sighting gets, read once.
@@ -1448,63 +1468,95 @@ impl Tree {
             .join("/")
     }
 
-    /// A name the compiler's reading gives a sighting and the walker does not index: `file:<path>`
-    /// (a file that is no Rust file), `use:<file>`, `<macro>! invocation @<file>`, `macro:<name>`
-    /// and the items under `#[cfg(test)]` or in a file no build reads. Its digest is over each file's
-    /// `{krate} {file} {name}`, a newline, the tokens of the items of that name in the file in file
-    /// order, and a newline, so that a file's path is part of it, as the walker's is.
-    fn scan_source(&self, krate: &str, name: &str) -> Result<Option<Source>, String> {
-        let mut found: Vec<(String, String)> = Vec::new();
+    /// `path` as a file of the tree: relative, with plain parts only, and not a link that leads out of
+    /// the root, so that no name reads a file the tree does not hold.
+    fn inside(&self, name: &str, path: &str) -> Result<PathBuf, String> {
+        let relative = Path::new(path);
+        let plain = !path.is_empty()
+            && relative
+                .components()
+                .all(|part| matches!(part, std::path::Component::Normal(_)));
+        if !plain {
+            return Err(format!(
+                "{name}: {path} is not a path under the tree's root, so no file of the tree is read"
+            ));
+        }
+        let at = self.root.join(relative);
+        if let (Ok(root), Ok(real)) = (
+            std::fs::canonicalize(&self.root),
+            std::fs::canonicalize(&at),
+        ) && !real.starts_with(&root)
+        {
+            return Err(format!("{name}: {path} leads out of the tree's root"));
+        }
+        Ok(at)
+    }
+
+    /// The items a name stands for that the walker may not index, by file: `file:<path>` (a file that
+    /// is no Rust file), `use:<file>`, `<macro>! invocation @<file>`, `macro:<name>`, and the items
+    /// under `#[cfg(test)]` or in a file no build reads. The three forms that name a file read that
+    /// file alone, and only a path under the tree's root; any other name reads each Rust file under
+    /// the crate's `src`. A file's entry holds the tokens of each of its items of the name, in file
+    /// order.
+    fn scan_items(&self, krate: &str, name: &str) -> Result<Vec<(String, Vec<String>)>, String> {
+        let mut found: Vec<(String, Vec<String>)> = Vec::new();
         if let Some(path) = name.strip_prefix("file:") {
-            match std::fs::read_to_string(self.root.join(path)) {
-                Ok(text) => found.push((path.to_owned(), text)),
+            let at = self.inside(name, path)?;
+            match std::fs::read_to_string(&at) {
+                Ok(text) => found.push((path.to_owned(), vec![text])),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => return Err(format!("{path}: {error}")),
             }
-        } else {
-            let named = name
-                .strip_prefix("use:")
-                .or_else(|| name.split_once("! invocation @").map(|(_, file)| file));
-            let files = match named {
-                Some(file) => vec![self.root.join(file)],
-                None => {
-                    let source = self
-                        .crates
-                        .get(krate)
-                        .ok_or_else(|| format!("{krate} is no crate of this workspace"))?;
-                    rust_files(source)?
-                }
+            return Ok(found);
+        }
+        let named = name
+            .strip_prefix("use:")
+            .or_else(|| name.split_once("! invocation @").map(|(_, file)| file));
+        let files = match named {
+            Some(file) => vec![self.inside(name, file)?],
+            None => {
+                let source = self
+                    .crates
+                    .get(krate)
+                    .ok_or_else(|| format!("{krate} is no crate of this workspace"))?;
+                rust_files(source)?
+            }
+        };
+        for file in files {
+            let Some(items) = self.scanned(&file)? else {
+                continue;
             };
-            for file in files {
-                let Some(items) = self.scanned(&file)? else {
-                    continue;
-                };
-                let texts: Vec<&str> = items
-                    .iter()
-                    .filter(|(item, _)| item == name)
-                    .map(|(_, text)| text.as_str())
-                    .collect();
-                if !texts.is_empty() {
-                    found.push((self.relative(&file), texts.join("\n")));
-                }
+            let texts: Vec<String> = items
+                .iter()
+                .filter(|(item, _)| item == name)
+                .map(|(_, text)| text.clone())
+                .collect();
+            if !texts.is_empty() {
+                found.push((self.relative(&file), texts));
             }
         }
+        Ok(found)
+    }
+
+    /// The digest of the items a scan found: over each file's `{krate} {file} {name}`, a newline,
+    /// the tokens of the items of that name in the file in file order, and a newline, so that a
+    /// file's path is part of it, as the walker's is.
+    fn joined(krate: &str, name: &str, found: &[(String, Vec<String>)]) -> Option<Source> {
         if found.is_empty() {
-            return Ok(None);
+            return None;
         }
         let mut digest = Vec::new();
-        for (file, text) in &found {
-            digest.extend_from_slice(format!("{krate} {file} {name}\n{text}\n").as_bytes());
+        let mut text = Vec::new();
+        for (file, texts) in found {
+            let texts = texts.join("\n");
+            digest.extend_from_slice(format!("{krate} {file} {name}\n{texts}\n").as_bytes());
+            text.push(texts);
         }
-        Ok(Some(Source {
+        Some(Source {
             digest: hex(&kr_cbor::sha256(&digest)),
-            text: found
-                .iter()
-                .map(|(_, text)| text.as_str())
-                .collect::<Vec<_>>()
-                .join("\n"),
-            files: found.into_iter().map(|(file, _)| file).collect(),
-        }))
+            text: text.join("\n"),
+            files: found.iter().map(|(file, _)| file.clone()).collect(),
+        })
     }
 
     pub fn item(&self, krate: &str, name: &str) -> Lookup {
