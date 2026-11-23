@@ -674,6 +674,19 @@ describe('a reason the host gives, shown as a sentence', () => {
     )
   })
 
+  it('keeps the case of a method name that has no punctuation', () => {
+    const reason = 'is not classified by this connector’s table, so what the terminal asked for is unknown'
+    expect(hostSentence(`ping ${reason}`)).toBe(`ping ${reason}.`)
+    expect(hostSentence(`initialize ${reason}`)).toBe(`initialize ${reason}.`)
+    expect(hostSentence(`shutdown ${reason}.`)).toBe(`shutdown ${reason}.`)
+    // A clause the host worded for its log is still raised.
+    expect(hostSentence('storage is back and the records it missed are being written')).toBe(
+      'Storage is back and the records it missed are being written.'
+    )
+    expect(hostSentence('nothing is classified here')).toBe('Nothing is classified here.')
+    expect(hostSentence('storage is not available')).toBe('Storage is not available.')
+  })
+
   it('is what an offer gives for a suspension the host worded as a clause', () => {
     const offers = composerOffers({
       known: true,

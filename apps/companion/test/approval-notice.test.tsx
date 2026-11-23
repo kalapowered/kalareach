@@ -294,6 +294,16 @@ describe('the notice while the host suspends rich mutations', () => {
     expect(reason).not.toHaveTextContent('record store')
   })
 
+  it('keeps_the_case_of_a_plain_method_name_that_starts_the_reason', async () => {
+    const reason =
+      'ping is not classified by this connector’s table, so what the terminal asked for is unknown'
+    open((controls) => {
+      controls.records.suspend(SESSION_MAIN, reason)
+    })
+    const region = await notice()
+    expect(within(region).getByTestId('approval-offer-reason').textContent).toBe(`${reason}.`)
+  })
+
   it('an_instance_with_its_own_refusal_gives_it_before_the_suspension', async () => {
     open((controls) => {
       controls.records.withoutCapability(SESSION_MAIN, 'agent.approval')

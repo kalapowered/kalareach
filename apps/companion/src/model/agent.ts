@@ -121,13 +121,18 @@ export function unboundBecause(instance: AgentInstanceSummary): string {
  * stop. Every reason this page shows on its own line goes through here: a first letter that is
  * lower case is raised, and a reason that does not end in a full stop, a question mark or an
  * exclamation mark gets a full stop. A reason that is a sentence already is not changed. A reason
- * that starts with a method name, which is the upstream's and keeps its case, is not raised.
+ * that starts with a method name, which is the upstream's and keeps its case, is not raised: a name
+ * with punctuation (`thread/x`) is told from a word by it, and a plain one (`ping`) by the host's
+ * wording of the one reason that starts with a method, "<method> is not classified".
  */
 export function hostSentence(reason: string): string {
   const text = reason.trim()
   if (text === '') return ''
   const first = text.split(/\s/, 1)[0] ?? ''
-  const raised = /^\p{Ll}+[,;:]?$/u.test(first) ? text.charAt(0).toUpperCase() + text.slice(1) : text
+  const raised =
+    /^\p{Ll}+[,;:]?$/u.test(first) && !/^\S+ is not classified\b/.test(text)
+      ? text.charAt(0).toUpperCase() + text.slice(1)
+      : text
   return /[.!?]$/.test(raised) ? raised : `${raised}.`
 }
 
