@@ -389,6 +389,64 @@ fn the_level_a_document_states_is_checked() {
     }
 }
 
+/// KR-REQ-26.13: the version that brought the level member is version 3, whatever version this
+/// build writes: a document at version 3 that states its level is the document the release before
+/// this one writes, it loads, and the level it states is checked as at any later version. One at
+/// version 2 states none.
+#[test]
+fn a_document_at_the_version_that_brought_levels_may_state_its_level() {
+    let written = load_in(Some(br#"{"version": 3, "level": 1, "revision": 2}"#), &R1);
+    assert_eq!(
+        written.status.state,
+        DocumentState::Loaded,
+        "{:?}",
+        written.status
+    );
+    let document = written.document.expect("used");
+    assert_eq!(
+        (document.version, document.level, document.revision),
+        (VERSION, BASE_LEVEL, 2)
+    );
+    assert!(
+        written
+            .status
+            .detail
+            .as_str()
+            .contains("version 3, read as version"),
+        "{:?}",
+        written.status
+    );
+
+    let above = load_in(
+        Some(br#"{"version": 3, "level": 2, "ceilings": {"session_limit": 4}}"#),
+        &R1,
+    );
+    assert_eq!(
+        above.status.state,
+        DocumentState::Loaded,
+        "{:?}",
+        above.status
+    );
+    assert_eq!(above.newer.as_ref().map(|newer| newer.declared), Some(2));
+
+    for refused in [
+        r#"{"version": 3, "level": 0}"#,
+        r#"{"version": 3, "level": "2"}"#,
+    ] {
+        let loaded = load_in(Some(refused.as_bytes()), &R1);
+        assert_eq!(loaded.status.state, DocumentState::Invalid, "{refused}");
+    }
+    let too_low =
+        format!(r#"{{"version": 3, "level": 1, "voice": {{"broker_origin": "{BROKER}"}}}}"#);
+    let loaded = load_in(Some(too_low.as_bytes()), &R2);
+    assert_eq!(
+        loaded.status.state,
+        DocumentState::Invalid,
+        "{:?}",
+        loaded.status
+    );
+}
+
 /// KR-REQ-26.13: the members a release knows stay strict at every depth in a document above its
 /// level, a section the release lists above its level is refused whenever it is present, and a
 /// misspelling of a known name is refused instead of being taken for a section of a newer release

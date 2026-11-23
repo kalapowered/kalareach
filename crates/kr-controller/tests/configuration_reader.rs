@@ -210,6 +210,56 @@ async fn a_daemon_starts_over_the_next_registry_version_and_the_document_it_acce
     );
 }
 
+/// KR-REQ-26.13, KR-REQ-26.10: a daemon starts over the copy of the document that the release
+/// before this one accepted, which records it at version 3 with the level it states, and over the
+/// same document on disk. The registry's version is the one it has; the daemon reads the copy
+/// through the document reader, so a copy that reader refuses would stop the start. The first
+/// question about what is in force accepts the document and records it at the version this build
+/// writes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_daemon_starts_over_the_document_the_release_before_it_accepted_at_version_3() {
+    let temp = a_stopped_environment().await;
+    let saved = fixture("version-3.json");
+    assert!(
+        saved.contains("\"version\": 3") && saved.contains("\"level\": 1"),
+        "the saved copy is a version-3 document that states its level"
+    );
+    let registry_version = recorded(&temp).0;
+    as_a_later_release_left_it(&temp, registry_version, Some(&saved));
+    write_the_document(&temp, &saved);
+
+    let controller = start(&temp)
+        .await
+        .expect("the daemon starts over a saved version-3 copy of the accepted document");
+    let effective = controller.effective_configuration().await;
+    assert_eq!(
+        effective.status.state,
+        DocumentState::Loaded,
+        "{:?}",
+        effective.status
+    );
+    drop(controller);
+    let as_this_build_reads_it = configuration::load(Some(saved.as_bytes()))
+        .document
+        .expect("this build reads the document");
+    assert_eq!(as_this_build_reads_it.version, configuration::VERSION);
+    let accepted = recorded(&temp);
+    assert_eq!(
+        accepted.0, registry_version,
+        "the registry's version is as it was"
+    );
+    assert_eq!(
+        accepted.1.as_deref(),
+        Some(configuration::contents(&as_this_build_reads_it).as_str()),
+        "the copy is recorded as this build reads it, at the version this build writes"
+    );
+    assert_eq!(
+        std::fs::read_to_string(document_path(&temp)).expect("the document"),
+        saved,
+        "the file is the owner's"
+    );
+}
+
 /// KR-REQ-26.13, KR-REQ-26.10: a daemon refuses to start over a copy of the accepted document that
 /// it cannot read, whatever the form of the ceiling it lacks, and changes nothing: not the
 /// registry's version, not the copy, not the generation, and not the document on disk, which is
