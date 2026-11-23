@@ -6,7 +6,7 @@
 //!
 //! * a file the person names ([`KitSource::File`]), which has to be a regular file;
 //! * standard input when it is not a terminal, such as a pipe;
-//! * standard input when it is a terminal (Unix only): one pasted document, with nothing shown,
+//! * standard input when it is a terminal or a console: one pasted document, with nothing shown,
 //!   that ends at the first blank line after its first line, at Ctrl-D, or at the size bound.
 //!
 //! Every read is made into one buffer of a fixed size that clears itself when it is dropped, from a
@@ -47,8 +47,11 @@ pub const RAW_LIMIT: usize = 2048;
 /// The buffer's size: one byte past the limit, so a document over it is seen as over.
 const CAPACITY: usize = RAW_LIMIT + 1;
 
+/// What the prompt for a typed kit says.
+const PASTE_THE_KIT: &str =
+    "Paste the recovery kit, then press Enter on an empty line. Nothing you paste is shown.";
+
 /// How long a person may leave the terminal prompt without typing before the command gives up.
-#[cfg(unix)]
 const IDLE_LIMIT: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 
 /// Where a kit is read from.
@@ -150,7 +153,6 @@ fn read_blocking(source: &KitSource, cancel: &AtomicBool) -> Result<KitRead> {
 ///
 /// Returns a terminal failure when the answer cannot be read.
 pub async fn ask_line(question: &Shown) -> Result<Option<String>> {
-    #[cfg(unix)]
     discard_typed_ahead();
     crate::report::say(question);
     let (answer, arrives) = tokio::sync::oneshot::channel();
@@ -245,13 +247,14 @@ fn read_answer() -> Result<Option<String>> {
 
 #[cfg(windows)]
 fn read_answer() -> Result<Option<String>> {
-    Err(CliError::Usage(Shown::said(
-        "this build does not ask at a console; run the command with --preview and then with \
-         --confirm-plan and the digest it printed",
-    )))
+    super::terminal::read_line().map_err(|error| answer_unreadable(&error))
 }
 
-#[cfg(unix)]
+#[cfg(windows)]
+fn discard_typed_ahead() {
+    super::terminal::discard_typed_ahead();
+}
+
 fn answer_unreadable(error: &std::io::Error) -> CliError {
     CliError::Terminal(shown!(
         "your answer could not be read: {}",
@@ -307,7 +310,6 @@ impl Document {
     }
 
     /// Adds one byte, and says whether there was room.
-    #[cfg(unix)]
     fn push(&mut self, byte: u8) -> bool {
         if self.full() {
             return false;
@@ -318,7 +320,6 @@ impl Document {
     }
 
     /// Takes the last byte back and clears it.
-    #[cfg(unix)]
     fn pop(&mut self) {
         if self.len > 0 {
             self.len -= 1;
@@ -326,7 +327,6 @@ impl Document {
         }
     }
 
-    #[cfg(unix)]
     fn last(&self) -> Option<u8> {
         self.len.checked_sub(1).map(|at| self.bytes[at])
     }
@@ -500,15 +500,13 @@ fn read_stream(input: &mut File, document: &mut Document, cancel: &AtomicBool) -
 }
 
 #[cfg(windows)]
-fn read_standard_input(document: &mut Document, _cancel: &AtomicBool) -> Result<Entered> {
+fn read_standard_input(document: &mut Document, cancel: &AtomicBool) -> Result<Entered> {
     use std::io::IsTerminal as _;
     use std::os::windows::io::AsHandle as _;
 
     if std::io::stdin().is_terminal() {
-        return Err(CliError::Usage(Shown::said(
-            "this build does not read a recovery kit typed at a console; name it with --kit-file, \
-             or pipe it to standard input",
-        )));
+        read_console(document, cancel)?;
+        return Ok(Entered::Typed);
     }
     let duplicate = std::io::stdin()
         .as_handle()
@@ -522,6 +520,21 @@ fn read_standard_input(document: &mut Document, _cancel: &AtomicBool) -> Result<
 /* -------------------------------------------------------------------------- */
 /* The terminal                                                                */
 /* -------------------------------------------------------------------------- */
+
+/// Reads the kit typed or pasted at the console, the way the Unix half reads it at a terminal.
+#[cfg(windows)]
+fn read_console(document: &mut Document, cancel: &AtomicBool) -> Result<()> {
+    let mut prompt = super::terminal::Prompt::enter()?;
+    crate::report::say(&Shown::said(PASTE_THE_KIT));
+    let mut read = |chunk: &mut [u8]| prompt.read(chunk).map_err(|error| unreadable(&error));
+    let typed = type_document(&mut read, document, cancel)
+        .inspect(|()| discard_the_rest(&mut read, cancel));
+    let left = prompt.leave();
+    // The cursor is where the paste left it.
+    crate::report::say(&Shown::said(""));
+    typed?;
+    left
+}
 
 /// The terminal's modes while the kit is typed: no echo, no line editing, and a read that returns
 /// after two tenths of a second with or without input. `ISIG` stays, so Ctrl-C is still an
@@ -605,11 +618,17 @@ impl Drop for Prompt<'_> {
 #[cfg(unix)]
 fn read_terminal(terminal: &File, document: &mut Document, cancel: &AtomicBool) -> Result<()> {
     let mut prompt = Prompt::enter(terminal)?;
-    crate::report::say(&Shown::said(
-        "Paste the recovery kit, then press Enter on an empty line. Nothing you paste is shown.",
-    ));
-    let typed =
-        type_document(terminal, document, cancel).inspect(|()| discard_the_rest(terminal, cancel));
+    crate::report::say(&Shown::said(PASTE_THE_KIT));
+    let mut read = |chunk: &mut [u8]| match rustix::io::read(terminal, chunk) {
+        Ok(taken) => Ok(taken),
+        Err(rustix::io::Errno::INTR) => Ok(0),
+        Err(error) => Err(CliError::Terminal(shown!(
+            "the recovery kit could not be read: {}",
+            crate::shown::errno(error)
+        ))),
+    };
+    let typed = type_document(&mut read, document, cancel)
+        .inspect(|()| discard_the_rest(&mut read, cancel));
     let left = prompt.leave();
     // The cursor is where the paste left it.
     crate::report::say(&Shown::said(""));
@@ -620,15 +639,14 @@ fn read_terminal(terminal: &File, document: &mut Document, cancel: &AtomicBool) 
 /// Reads and throws away what is still arriving after the document ended, until a read finds
 /// nothing more or the read is cancelled, so that a paste that comes in more than one piece does
 /// not reach the shell.
-#[cfg(unix)]
-fn discard_the_rest(terminal: &File, cancel: &AtomicBool) {
+fn discard_the_rest(read: &mut impl FnMut(&mut [u8]) -> Result<usize>, cancel: &AtomicBool) {
     let mut chunk = Zeroizing::new([0_u8; 256]);
     // Bounded, so input that never stops cannot hold the command.
     for _ in 0..64 {
         if cancel.load(Ordering::SeqCst) {
             break;
         }
-        match rustix::io::read(terminal, &mut chunk[..]) {
+        match read(&mut chunk[..]) {
             Ok(0) | Err(_) => break,
             Ok(_) => {}
         }
@@ -636,8 +654,11 @@ fn discard_the_rest(terminal: &File, cancel: &AtomicBool) {
 }
 
 /// Reads what is typed until the document ends.
-#[cfg(unix)]
-fn type_document(terminal: &File, document: &mut Document, cancel: &AtomicBool) -> Result<()> {
+fn type_document(
+    read: &mut impl FnMut(&mut [u8]) -> Result<usize>,
+    document: &mut Document,
+    cancel: &AtomicBool,
+) -> Result<()> {
     let mut chunk = Zeroizing::new([0_u8; 256]);
     let mut typing = Typing::default();
     let mut last_input = std::time::Instant::now();
@@ -645,16 +666,7 @@ fn type_document(terminal: &File, document: &mut Document, cancel: &AtomicBool) 
         if cancel.load(Ordering::SeqCst) {
             return Err(interrupt::stopped());
         }
-        let taken = match rustix::io::read(terminal, &mut chunk[..]) {
-            Ok(taken) => taken,
-            Err(rustix::io::Errno::INTR) => continue,
-            Err(error) => {
-                return Err(CliError::Terminal(shown!(
-                    "the recovery kit could not be read: {}",
-                    crate::shown::errno(error)
-                )));
-            }
-        };
+        let taken = read(&mut chunk[..])?;
         if taken == 0 {
             if last_input.elapsed() > IDLE_LIMIT {
                 return Err(CliError::Usage(Shown::said(
@@ -672,7 +684,6 @@ fn type_document(terminal: &File, document: &mut Document, cancel: &AtomicBool) 
     }
 }
 
-#[cfg(unix)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Typed {
     More,
@@ -680,7 +691,6 @@ enum Typed {
 }
 
 /// Where the typing is inside an escape sequence.
-#[cfg(unix)]
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 enum Escape {
     #[default]
@@ -690,7 +700,6 @@ enum Escape {
 }
 
 /// The minimal line editing the prompt does for itself, with the terminal's own turned off.
-#[cfg(unix)]
 #[derive(Default)]
 struct Typing {
     escape: Escape,
@@ -700,7 +709,6 @@ struct Typing {
     after_return: bool,
 }
 
-#[cfg(unix)]
 impl Typing {
     fn feed(&mut self, byte: u8, document: &mut Document) -> Typed {
         match self.escape {

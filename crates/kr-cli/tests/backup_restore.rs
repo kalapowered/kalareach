@@ -2770,6 +2770,87 @@ fn tree(root: &Path) -> BTreeMap<String, Vec<u8>> {
 /* A terminal window                                                           */
 /* -------------------------------------------------------------------------- */
 
+/// A console window `kr` runs in on Windows, with the person's side of it: what the window has
+/// shown, and a way to type. There is no shell around the command, so the window says
+/// `kr ended <code>` itself, where a Unix shell does.
+#[cfg(windows)]
+struct Window {
+    _terminal: portable_pty::PtyPair,
+    shell: Box<dyn portable_pty::ChildKiller + Send + Sync>,
+    typing: Box<dyn Write + Send>,
+    seen: Arc<Mutex<Vec<u8>>>,
+}
+
+#[cfg(windows)]
+impl Drop for Window {
+    fn drop(&mut self) {
+        let _ = self.shell.kill();
+    }
+}
+
+#[cfg(windows)]
+impl Window {
+    fn run(rig: &Rig, arguments: &[&str]) -> Self {
+        let mut command = portable_pty::CommandBuilder::new(kr());
+        for argument in arguments {
+            command.arg(argument);
+        }
+        command.env_clear();
+        for (name, value) in rig.variables() {
+            command.env(name, value);
+        }
+        command.cwd(&rig.work);
+        let support::console_window::Opened {
+            terminal,
+            shell,
+            typing,
+            seen,
+        } = support::console_window::open(command);
+        Self {
+            _terminal: terminal,
+            shell,
+            typing,
+            seen,
+        }
+    }
+
+    /// What the window has shown so far, as plain text.
+    fn shown(&self) -> String {
+        support::console_window::plain(&self.seen.lock().unwrap_or_else(PoisonError::into_inner))
+    }
+
+    /// Waits until the window has shown `marker`, and returns what it has shown. It fails when it
+    /// never does.
+    fn wait_for(&self, marker: &str) -> String {
+        let started = Instant::now();
+        loop {
+            let shown = self.shown();
+            if shown.contains(marker) {
+                return shown;
+            }
+            assert!(
+                started.elapsed() < LIVENESS_DEADLINE,
+                "the window never showed {marker:?}: {}",
+                shown.escape_debug()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Types bytes as they are.
+    fn type_bytes(&mut self, bytes: &[u8]) {
+        self.typing
+            .write_all(bytes)
+            .and_then(|()| self.typing.flush())
+            .expect("types into the window");
+    }
+
+    /// Types one line, as a person does: Enter is a carriage return on a console.
+    fn type_line(&mut self, line: &str) {
+        self.type_bytes(format!("{line}\r").as_bytes());
+    }
+}
+
 /// A terminal window `kr` runs in, with the person's side of it: what the window has shown, and a
 /// way to type.
 #[cfg(unix)]
@@ -4519,6 +4600,83 @@ async fn lines_typed_before_the_kit_prompt_appears_are_not_part_of_the_kit() {
     window.type_line("no");
     let shown = window.wait_for("kr ended");
     assert!(!shown.contains("kr ended 0"), "{shown}");
+}
+
+/// At a console the command asks, and only yes writes.
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn at_a_console_only_yes_writes() {
+    let fixture = Fixture::new().await;
+    let into = fixture.folder_arg();
+    let question = "Type yes to write these files";
+
+    let mut window = Window::run(&fixture.rig, &fixture.line(&into, &[]));
+    window.wait_for(question);
+    window.type_line("no");
+    let shown = window.wait_for("kr ended");
+    assert!(!shown.contains("kr ended 0"), "{shown}");
+    assert!(
+        names(&fixture.into).is_empty(),
+        "an answer but yes writes nothing"
+    );
+
+    let mut window = Window::run(&fixture.rig, &fixture.line(&into, &[]));
+    window.wait_for(question);
+    window.type_line("yes");
+    window.wait_for("kr ended 0");
+    assert!(names(&fixture.into).contains(&"restore.json".to_owned()));
+}
+
+/// The kit pasted at a console: nothing is shown as it is pasted, the document ends at a blank line,
+/// what is shown back names the locator by its first eight characters, and the kit is not used
+/// unless the person says it is the one they meant.
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_kit_pasted_at_a_console_is_not_shown_and_is_used_only_when_the_person_says_it_is_the_one_meant()
+ {
+    let fixture = Fixture::new().await;
+    let into = fixture.folder_arg();
+    let kit = fixture.world.kit_text(&[fixture.rig.origin()]);
+    let seed = fixture.world.seed_text();
+    let locator = fixture.world.locator.clone();
+    let line = ["backup", "restore", "--into", &into, "--preview"];
+
+    let mut window = Window::run(&fixture.rig, &line);
+    window.wait_for("Nothing you paste is shown.");
+    // The kit and a blank line, with Enter as a console sends it.
+    window.type_bytes(format!("{kit}\n").replace('\n', "\r").as_bytes());
+    let shown = window.wait_for("Type yes if that is the kit you meant");
+    assert!(!shown.contains(&seed), "the seed was shown");
+    assert!(
+        !shown.contains(&locator[..9]),
+        "more of the locator than eight characters was shown"
+    );
+    assert!(
+        shown.contains(&locator[..8]),
+        "the first eight characters are shown back"
+    );
+    window.type_line("yes");
+    let shown = window.wait_for("kr ended 0");
+    assert!(
+        shown.contains("Digest of this plan") || shown.contains("digest"),
+        "{shown}"
+    );
+
+    let used = fixture.bundle_reads();
+    assert!(used > 0, "the kit the person confirmed was used");
+
+    let mut window = Window::run(&fixture.rig, &line);
+    window.wait_for("Nothing you paste is shown.");
+    window.type_bytes(format!("{kit}\n").replace('\n', "\r").as_bytes());
+    window.wait_for("Type yes if that is the kit you meant");
+    window.type_line("no");
+    let shown = window.wait_for("kr ended");
+    assert!(!shown.contains("kr ended 0"), "{shown}");
+    assert_eq!(
+        fixture.bundle_reads(),
+        used,
+        "the kit the person refused was not used"
+    );
 }
 
 /// A bundle that names more than one archive at the service is refused with each listed, and

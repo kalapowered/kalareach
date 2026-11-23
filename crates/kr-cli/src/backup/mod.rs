@@ -19,6 +19,7 @@ pub mod setup;
 pub mod source;
 pub mod terminal;
 
+use std::io::IsTerminal as _;
 use std::sync::Arc;
 
 use kr_client::shown;
@@ -55,16 +56,9 @@ pub async fn run(paths: &HostPaths, command: BackupCommand, json: bool) -> Resul
 }
 
 /// What a command that has no way to ask says.
-#[cfg(unix)]
 const CONFIRMATION_NEEDED: &str = "this command shows what it would write before it writes it and \
      needs your confirmation: run it at a terminal, or run it with --preview and then with \
      --confirm-plan and the digest it printed";
-
-/// What a command that never asks at a console says.
-#[cfg(windows)]
-const CONFIRMATION_NEEDED: &str = "this command shows what it would write before it writes it and \
-     needs your confirmation: run it with --preview and then with --confirm-plan and the digest \
-     it printed";
 
 /// What the arguments ask of the confirmation, settled before anything is read.
 fn decide(arguments: &BackupRestoreArguments) -> Result<Decision> {
@@ -83,14 +77,8 @@ fn decide(arguments: &BackupRestoreArguments) -> Result<Decision> {
         }
         return Ok(Decision::Confirmed(digest.clone()));
     }
-    // A console is not asked: the confirmation there is the digest, given back.
-    #[cfg(unix)]
-    {
-        use std::io::IsTerminal as _;
-
-        if std::io::stdin().is_terminal() && report::is_terminal() {
-            return Ok(Decision::Ask);
-        }
+    if std::io::stdin().is_terminal() && report::is_terminal() {
+        return Ok(Decision::Ask);
     }
     Err(CliError::Usage(Shown::said(CONFIRMATION_NEEDED)))
 }
