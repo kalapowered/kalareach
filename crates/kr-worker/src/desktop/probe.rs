@@ -662,6 +662,13 @@ fn read_authorised_file_with(
         match read(path.clone()) {
             Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
                 let refusal = refusal_of(&error, &path, lookup);
+                // Windows refuses the open of a folder as it refuses a file the account may not
+                // read. A folder is not a file this check reads, whatever its permissions are.
+                if matches!(refusal, Refusal::Permissions)
+                    && std::fs::metadata(&path).is_ok_and(|found| found.is_dir())
+                {
+                    return Ok(Read::Block(FirstBlock::NotRegular));
+                }
                 Ok(Read::Refused { error, refusal })
             }
             other => other.map(Read::Block),
@@ -2327,6 +2334,29 @@ mod tests {
             matches!(outcome, Outcome::FilesystemRefused { .. }),
             "{outcome:?}"
         );
+    }
+
+    /// A folder is not a file this check reads, whatever the platform says of opening it: Windows
+    /// refuses the open of a folder as it refuses a file the account may not read, and a person
+    /// told that the permissions on the file refuse this account has been told something false.
+    #[test]
+    fn a_folder_whose_open_is_refused_is_not_a_file_this_check_reads() {
+        let root = kr_ipc::testing::PrivateTempDir::create();
+        let plan = Plan {
+            authorised_file: Some(root.path().to_owned()),
+            ..Plan::in_directory(root.path().join("scratch"))
+        };
+        let ran = read_authorised_file_with(
+            &plan,
+            |_| Err(std::io::ErrorKind::PermissionDenied.into()),
+            |_| None,
+        );
+        match &ran.outcome {
+            Outcome::NotAttempted { detail } => {
+                assert!(detail.as_str().contains("not a regular file"), "{detail}");
+            }
+            other => panic!("a folder is not a file this check reads: {other:?}"),
+        }
     }
 
     /// KR-REQ-11.16, the bounded clause, for the lookup that follows a refused open: the question of
