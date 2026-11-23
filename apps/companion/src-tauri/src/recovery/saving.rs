@@ -18,6 +18,14 @@
 //! the page shows says "saved" only after a write the service confirmed or a read of the bundle
 //! that holds the same settings.
 //!
+//! # When a step runs
+//!
+//! Five things want a step: the application's start, a change to the settings file (after
+//! [`SettingsTiming::quiet`] with no further change), a recovery step that reached the service,
+//! the person turning saving on again, and the end of the window after a step that failed. None of
+//! them waits inside the lock: each only records that a step is wanted. One loop runs the steps.
+//!
+//!
 //! There is one eligibility deadline for the process. It is read and moved only while a step holds
 //! the lock ([`Step`] is the proof), it is a monotonic instant, and it only moves forward. A step
 //! that reaches the service for the settings and does not find them saved moves it to the end of
@@ -27,11 +35,14 @@
 //! take turns under the lock, so the stated limit is one write per process per window; the bundle's
 //! compare-and-swap is the real guard.
 
+use std::future::Future;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 use kr_client::recovery::{LocalSettings, LostWrite, RecoveryError, SettingsSaved};
 use serde::Serialize;
+use tokio::sync::Notify;
 
 use super::{Recovery, Step, blocker, now};
 use crate::account::Account;
@@ -135,6 +146,10 @@ pub(super) struct Saving {
     /// only through a [`Step`].
     eligible: Mutex<Option<Instant>>,
     line: Mutex<SettingsLine>,
+    /// When a step is next wanted, if one is.
+    wanted: Mutex<Option<Instant>>,
+    wake: Notify,
+    stopped: AtomicBool,
 }
 
 impl Saving {
@@ -144,6 +159,9 @@ impl Saving {
             timing: Mutex::new(SettingsTiming::PRODUCT),
             eligible: Mutex::new(None),
             line: Mutex::new(SettingsLine::Waiting),
+            wanted: Mutex::new(None),
+            wake: Notify::new(),
+            stopped: AtomicBool::new(false),
         }
     }
 
@@ -190,12 +208,59 @@ impl Saving {
         self.moved_to(step, until);
         until
     }
+
+    /// Wants a step at `at`, or sooner if one is wanted sooner.
+    pub(super) fn want_at(&self, at: Instant) {
+        let mut wanted = self.wanted.lock().unwrap_or_else(PoisonError::into_inner);
+        *wanted = Some(wanted.map_or(at, |held| held.min(at)));
+        drop(wanted);
+        self.wake.notify_one();
+    }
+
+    /// Wants a step now.
+    pub(super) fn want_now(&self) {
+        self.want_at(Instant::now());
+    }
+
+    /// Wants a step once the settings have been quiet for [`SettingsTiming::quiet`]: each change
+    /// moves the moment out again.
+    fn want_after_quiet(&self) {
+        let at = Instant::now() + self.timing().quiet;
+        *self.wanted.lock().unwrap_or_else(PoisonError::into_inner) = Some(at);
+        self.wake.notify_one();
+    }
+
+    /// When a step is wanted, if one is.
+    fn due(&self) -> Option<Instant> {
+        *self.wanted.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Takes the want, if it is due, so that a want made while the step runs is a want of its own.
+    fn take_if_due(&self) -> bool {
+        let mut wanted = self.wanted.lock().unwrap_or_else(PoisonError::into_inner);
+        if wanted.is_some_and(|at| at <= Instant::now()) {
+            *wanted = None;
+            true
+        } else {
+            false
+        }
+    }
 }
 
 impl Recovery {
     /// Gives saving a source for what this computer has chosen. Nothing is saved before it has one.
     pub fn save_settings_from(&self, source: Arc<dyn SettingsSource>) {
         let _ = self.saving.source.set(source);
+    }
+
+    /// Tells saving the settings file changed. A step is wanted once the settings have been quiet.
+    pub fn settings_changed(&self) {
+        self.saving.want_after_quiet();
+    }
+
+    /// Wants a step now: the application started, or a recovery step has reached the service.
+    pub fn settings_wanted(&self) {
+        self.saving.want_now();
     }
 
     /// Sets the times saving waits, for a test that cannot wait out the application's.
@@ -206,6 +271,50 @@ impl Recovery {
             .timing
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = timing;
+    }
+
+    /// Ends the loop that runs the steps. A test that starts the application again ends the old
+    /// one's loop first, so that two never share a directory.
+    pub fn stop_saving_settings(&self) {
+        self.saving.stopped.store(true, Ordering::SeqCst);
+        self.saving.wake.notify_one();
+    }
+
+    /// Runs the steps that are wanted, each when it is due, until [`Self::stop_saving_settings`].
+    /// `account` says which account a step uses; one that cannot be had now is a step not run.
+    pub async fn keep_settings_saved<F, Fut>(&self, account: F)
+    where
+        F: Fn() -> Fut,
+        Fut: Future<Output = Result<Arc<Account>>>,
+    {
+        loop {
+            if self.saving.stopped.load(Ordering::SeqCst) {
+                return;
+            }
+            let Some(at) = self.saving.due() else {
+                self.saving.wake.notified().await;
+                continue;
+            };
+            if at > Instant::now() {
+                tokio::select! {
+                    () = tokio::time::sleep_until(at.into()) => {}
+                    () = self.saving.wake.notified() => continue,
+                }
+            }
+            if !self.saving.take_if_due() {
+                continue;
+            }
+            let Ok(account) = account().await else {
+                continue;
+            };
+            match self.save_settings(&account).await {
+                Ok(SettingsStep::Deferred { until }) => self.saving.want_at(until),
+                Ok(SettingsStep::Ended {
+                    retry_at: Some(at), ..
+                }) => self.saving.want_at(at),
+                Ok(_) | Err(_) => {}
+            }
+        }
     }
 
     /// One step of saving the settings: see the module's account of the order.

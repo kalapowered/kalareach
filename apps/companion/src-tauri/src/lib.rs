@@ -818,6 +818,9 @@ fn open_recovery(app: &tauri::AppHandle) {
             tracing::warn!(%error, "this computer cannot take part in settings sync");
         }
     }
+    if let Err(error) = start_settings_saving(app) {
+        tracing::warn!(%error, "this computer cannot save its settings with its recovery bundle");
+    }
 }
 
 /// Opens this computer's reader of its own mailbox, once the pairing records and the sync service
@@ -954,6 +957,47 @@ pub fn start_recovery<R: tauri::Runtime>(
         state.sync_clients(identity),
     )?;
     state.recovery_opened(Arc::new(recovery));
+    Ok(())
+}
+
+/// Starts saving this computer's settings with the recovery bundle: a step runs now, after a change
+/// to the settings once they have been quiet, after a recovery step that reached the service, and
+/// at the end of the window after a step that failed. The settings and recovery are opened first.
+///
+/// # Errors
+///
+/// Returns a local failure when the settings or recovery were not opened.
+pub fn start_settings_saving<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> Result<()> {
+    use std::sync::Arc;
+
+    use tauri::Manager as _;
+
+    let state = app.state::<AppState>();
+    let settings = state.settings()?;
+    let recovery = state.recovery()?;
+    recovery.save_settings_from(Arc::clone(&settings) as Arc<dyn recovery::SettingsSource>);
+    let changed = Arc::clone(&recovery);
+    settings
+        .local()
+        .changed()
+        .by(move || changed.settings_changed());
+    recovery.settings_wanted();
+    let handle = app.clone();
+    tauri::async_runtime::spawn(async move {
+        recovery
+            .keep_settings_saved(|| {
+                let handle = handle.clone();
+                async move {
+                    match handle.try_state::<account::AccountSlot>() {
+                        Some(slot) => slot.get().await.cloned(),
+                        None => Err(CommandError::local_failure(
+                            "this computer's account could not be opened",
+                        )),
+                    }
+                }
+            })
+            .await;
+    });
     Ok(())
 }
 

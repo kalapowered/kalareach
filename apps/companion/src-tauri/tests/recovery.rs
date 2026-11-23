@@ -1340,84 +1340,109 @@ async fn a_host_that_cannot_be_covered_as_it_stands_is_left_alone_and_nothing_is
 }
 
 /// KR-REQ-20.15: a write of the bundle whose answer is lost declares nothing and keeps the host
-/// from being asked, holds back every other write until it is settled, and a restart keeps that;
-/// and a host that does not say how its setup ended is no evidence either.
+/// from being asked, and holds back every other write until it is ended. Where the service cannot
+/// be asked when the application starts, the write stays lost across the restart and the person
+/// settles it; where it can be asked, the start of the application ends it with no action by the
+/// person. A host that does not say how its setup ended is no evidence either.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_write_whose_answer_was_lost_blocks_the_next_until_it_is_settled() {
+    // A window that outlasts the case: a step that fails is not tried again inside it.
+    let timing = SettingsTiming {
+        quiet: Duration::ZERO,
+        window: Duration::from_secs(60),
+    };
     for (moment, landed) in [(Moment::After, true), (Moment::Before, false)] {
-        let computer = Computer::new().await;
-        let page = computer.page().await;
-        page.call("recovery_turn_on", json!({})).expect("on");
-        let out = tempfile::tempdir().expect("a directory");
-        let (_, kit) = page.kit(out.path());
-        let host = Host::new(&computer, computer.served.origin());
-        host.sets_up();
+        for available in [false, true] {
+            let label = format!("{moment:?}, the service can be asked at start: {available}");
+            let computer = Computer::new().await;
+            let page = computer.page().await;
+            page.call("recovery_turn_on", json!({})).expect("on");
+            let out = tempfile::tempdir().expect("a directory");
+            let (_, kit) = page.kit(out.path());
+            let host = Host::new(&computer, computer.served.origin());
+            host.sets_up();
 
-        // The bundle write is the second request to the route: a read, then the write.
-        computer.served.web().fail(SYNC_PATH, 2, moment);
-        let lost = page
-            .recovery
-            .cover_host(&page.account, &host, false)
-            .await
-            .expect_err("no evidence without an answer");
-        assert_eq!(lost.code, ErrorCode::OutcomeUnknown, "{moment:?}");
-        assert!(
-            host.setups_sent().is_empty(),
-            "{moment:?}: the host is not asked"
-        );
-        assert_eq!(page.view()["state"], "unsettled", "{moment:?}");
-
-        // The application is closed and started again: the lost write is still outstanding.
-        drop(page);
-        let page = computer.page().await;
-        assert_eq!(
-            page.view()["state"],
-            "unsettled",
-            "{moment:?}, after a restart"
-        );
-
-        if !landed {
-            // A read that finds the old bundle settles nothing, and nothing more is written.
-            let before = writes_sent(&computer);
-            let blocked = page
+            // The bundle write is the second request to the route: a read, then the write.
+            computer.served.web().fail(SYNC_PATH, 2, moment);
+            let lost = page
                 .recovery
                 .cover_host(&page.account, &host, false)
                 .await
-                .expect_err("a write waits for the lost one");
-            assert_eq!(blocked.code, ErrorCode::PermissionDenied, "{moment:?}");
-            assert_eq!(
-                writes_sent(&computer),
-                before,
-                "{moment:?}: nothing was sent"
+                .expect_err("no evidence without an answer");
+            assert_eq!(lost.code, ErrorCode::OutcomeUnknown, "{label}");
+            assert!(
+                host.setups_sent().is_empty(),
+                "{label}: the host is not asked"
             );
-            assert!(host.setups_sent().is_empty());
+            assert_eq!(page.view()["state"], "unsettled", "{label}");
+
+            // The application is closed and started again, and its start runs the settings step.
+            drop(page);
+            let arrived = computer.served.web().arrived().len();
+            if !available {
+                // The first request of the start step fails before the service sees it.
+                computer.served.web().fail(SYNC_PATH, 1, Moment::Before);
+            }
+            let (page, _) = computer.running_page(timing).await;
+            if available {
+                assert!(
+                    until(Duration::from_secs(10), || async {
+                        page.view()["state"] == "on"
+                    })
+                    .await,
+                    "{label}: the start ended the lost write with no action by the person"
+                );
+            } else {
+                assert!(
+                    until(Duration::from_secs(10), || async {
+                        computer.served.web().arrived().len() > arrived
+                    })
+                    .await,
+                    "{label}: the start step asked"
+                );
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                assert_eq!(
+                    page.view()["state"],
+                    "unsettled",
+                    "{label}: the write stays lost while the service cannot be asked"
+                );
+                if !landed {
+                    // A read that finds the old bundle settles nothing, and nothing more is written.
+                    let before = writes_sent(&computer);
+                    let blocked = page
+                        .recovery
+                        .cover_host(&page.account, &host, false)
+                        .await
+                        .expect_err("a write waits for the lost one");
+                    assert_eq!(blocked.code, ErrorCode::PermissionDenied, "{label}");
+                    assert_eq!(writes_sent(&computer), before, "{label}: nothing was sent");
+                    assert!(host.setups_sent().is_empty());
+                }
+                let settled = page
+                    .call("recovery_settle", json!({}))
+                    .expect("the person settles the lost write");
+                assert_eq!(settled["state"], "on", "{label}");
+            }
+
+            // Ended, the next try goes: the host is asked with the bundle that is at the service.
+            let covered = page
+                .recovery
+                .cover_host(&page.account, &host, false)
+                .await
+                .expect("the host is covered");
+            assert!(matches!(covered, HostCoverView::Covered { .. }), "{label}");
+            let sent = host.setups_sent();
+            assert_eq!(sent.len(), 1, "{label}");
+            assert!(sent[0].1, "{label}: the bundle was at the service");
+            let bundle = read_with_only_the_kit(&computer.served, &kit).await;
+            assert!(
+                bundle
+                    .trusted_writers
+                    .iter()
+                    .any(|held| held.writer_key_id == host.keys.writer_key_id),
+                "{label}"
+            );
         }
-
-        let settled = page
-            .call("recovery_settle", json!({}))
-            .expect("the lost write is settled");
-        assert_eq!(settled["state"], "on", "{moment:?}");
-
-        // Settled, the next try goes: the host is asked with the bundle that is at the service.
-        let covered = page
-            .recovery
-            .cover_host(&page.account, &host, false)
-            .await
-            .expect("the host is covered");
-        assert!(
-            matches!(covered, HostCoverView::Covered { .. }),
-            "{moment:?}"
-        );
-        let sent = host.setups_sent();
-        assert_eq!(sent.len(), 1);
-        assert!(sent[0].1, "{moment:?}: the bundle was at the service");
-        let bundle = read_with_only_the_kit(&computer.served, &kit).await;
-        assert!(
-            bundle
-                .trusted_writers
-                .iter()
-                .any(|held| held.writer_key_id == host.keys.writer_key_id)
-        );
     }
 
     // A host that carried the setup out and did not say so is no evidence: the answer is unknown.
@@ -4142,4 +4167,275 @@ async fn a_settings_file_that_cannot_be_read_keeps_what_the_bundle_holds() {
         colour_in(&bundle_of(&computer, &page).await).as_deref(),
         Some("dark")
     );
+}
+
+/* -------------------------------------------------------------------------- */
+/* When the steps run                                                          */
+/* -------------------------------------------------------------------------- */
+
+impl Drop for Page {
+    /// A case that starts the application again ends the old one's loop first, so that two loops
+    /// never share a directory.
+    fn drop(&mut self) {
+        self.recovery.stop_saving_settings();
+    }
+}
+
+/// Polls until `condition` holds, for at most `limit`.
+async fn until<F: std::future::Future<Output = bool>>(
+    limit: Duration,
+    mut condition: impl FnMut() -> F,
+) -> bool {
+    let end = std::time::Instant::now() + limit;
+    loop {
+        if condition().await {
+            return true;
+        }
+        if std::time::Instant::now() >= end {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+impl Computer {
+    /// As [`Self::saving_page`], with the loop that runs the steps started as the application
+    /// starts it, and no step called by the case.
+    async fn running_page(&self, timing: SettingsTiming) -> (Page, Arc<Settings>) {
+        let page = self.page().await;
+        let settings = {
+            let state = page.app.state::<AppState>();
+            state.keep_under(self.data.path());
+            state.settings().expect("the settings are open")
+        };
+        page.recovery.set_settings_timing(timing);
+        companion_tauri::start_settings_saving(page.app.handle()).expect("saving starts");
+        (page, settings)
+    }
+}
+
+/// What this computer's settings show of saving, as the page reads it.
+fn line_of(page: &Page) -> Value {
+    page.view().get("settings").cloned().unwrap_or(Value::Null)
+}
+
+/// KR-REQ-20.17: a change to the colour mode rewrites the member, and three changes in quick
+/// succession make one write.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_colour_change_rewrites_the_member_and_three_quick_changes_make_one_write() {
+    let timing = SettingsTiming {
+        quiet: Duration::from_millis(400),
+        window: Duration::ZERO,
+    };
+    let computer = Computer::new().await;
+    let (page, settings) = computer.running_page(timing).await;
+    page.call("recovery_turn_on", json!({})).expect("on");
+    let before = writes_sent(&computer);
+    for mode in [ColourMode::Dark, ColourMode::System, ColourMode::Light] {
+        settings.set_colour_mode(mode).await.expect("kept");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        until(Duration::from_secs(10), || async {
+            writes_sent(&computer) > before
+        })
+        .await,
+        "the settings were written"
+    );
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    assert_eq!(
+        writes_sent(&computer),
+        before + 1,
+        "one write for three changes"
+    );
+    assert_eq!(
+        colour_in(&bundle_of(&computer, &page).await).as_deref(),
+        Some("light")
+    );
+}
+
+/// KR-REQ-20.17: a write that fails is tried again at the end of the window, and the line says
+/// "saved" only once a write is confirmed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_write_is_retried_at_the_end_of_the_window_and_saved_shows_only_after_a_confirmed_write()
+ {
+    let window = Duration::from_millis(1500);
+    let timing = SettingsTiming {
+        quiet: Duration::from_millis(50),
+        window,
+    };
+    let computer = Computer::new().await;
+    let (page, settings) = computer.running_page(timing).await;
+    page.call("recovery_turn_on", json!({})).expect("on");
+    // The first write after this one fails before the service sees it.
+    computer
+        .served
+        .web()
+        .fail_with_member(SYNC_PATH, "exchange", 1, Moment::Before);
+    settings
+        .set_colour_mode(ColourMode::Dark)
+        .await
+        .expect("kept");
+    assert!(
+        until(Duration::from_secs(10), || async {
+            line_of(&page) == json!({ "state": "not_saved", "why": "service" })
+        })
+        .await,
+        "the failed write is told: {}",
+        line_of(&page)
+    );
+    let failed_at = std::time::Instant::now();
+    assert_eq!(
+        colour_in(&bundle_of(&computer, &page).await),
+        None,
+        "nothing was saved"
+    );
+
+    let seen_saved_early = std::cell::Cell::new(false);
+    assert!(
+        until(Duration::from_secs(10), || async {
+            let saved = line_of(&page) == json!({ "state": "saved" });
+            if saved && failed_at.elapsed() < window - Duration::from_millis(300) {
+                seen_saved_early.set(true);
+            }
+            saved
+        })
+        .await
+    );
+    assert!(
+        !seen_saved_early.get(),
+        "it was retried before the window ended"
+    );
+    assert!(failed_at.elapsed() >= window - Duration::from_millis(300));
+    assert_eq!(
+        colour_in(&bundle_of(&computer, &page).await).as_deref(),
+        Some("dark")
+    );
+}
+
+/// KR-REQ-20.17: a device turned on before the settings were saved with the bundle saves them at
+/// its next start.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_device_turned_on_before_this_change_saves_its_settings_at_the_next_start() {
+    let computer = Computer::new().await;
+    let earlier = computer.page().await;
+    earlier.call("recovery_turn_on", json!({})).expect("on");
+    drop(earlier);
+    Settings::open(computer.data.path())
+        .local()
+        .set_colour_mode(ColourMode::Dark)
+        .expect("kept");
+
+    let (page, _) = computer.running_page(NO_WAIT).await;
+    assert!(
+        until(Duration::from_secs(10), || async {
+            line_of(&page) == json!({ "state": "saved" })
+        })
+        .await,
+        "the start saved them: {}",
+        line_of(&page)
+    );
+    assert_eq!(
+        colour_in(&bundle_of(&computer, &page).await).as_deref(),
+        Some("dark")
+    );
+}
+
+/// KR-REQ-20.17: a cover that reaches the service runs a fresh comparison, so a setting changed
+/// where no change was heard is saved after it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cover_that_reaches_the_service_runs_a_fresh_comparison() {
+    let timing = SettingsTiming {
+        quiet: Duration::from_secs(600),
+        window: Duration::ZERO,
+    };
+    let computer = Computer::new().await;
+    let (page, _) = computer.running_page(timing).await;
+    page.call("recovery_turn_on", json!({})).expect("on");
+    // A change made through another reader of the file, which no one here heard.
+    Settings::open(computer.data.path())
+        .local()
+        .set_colour_mode(ColourMode::Dark)
+        .expect("kept");
+    let host = Host::new(&computer, computer.served.origin());
+    host.sets_up();
+    page.recovery
+        .cover_host(&page.account, &host, false)
+        .await
+        .expect("the host is covered");
+    assert!(
+        until(Duration::from_secs(10), || async {
+            colour_in(&bundle_of(&computer, &page).await).as_deref() == Some("dark")
+        })
+        .await,
+        "the comparison after the cover wrote the settings"
+    );
+}
+
+/// KR-REQ-20.17: every trigger shares one deadline, and a change made inside the window stays
+/// scheduled: it is written when the window ends and not before, whichever trigger asked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn every_trigger_shares_one_deadline_and_a_change_in_the_window_stays_scheduled() {
+    let window = Duration::from_millis(2500);
+    let timing = SettingsTiming {
+        quiet: Duration::from_millis(50),
+        window,
+    };
+    let computer = Computer::new().await;
+    let (page, settings) = computer.running_page(timing).await;
+    page.call("recovery_turn_on", json!({})).expect("on");
+    settings
+        .set_colour_mode(ColourMode::Dark)
+        .await
+        .expect("kept");
+    assert!(
+        until(Duration::from_secs(10), || async {
+            line_of(&page) == json!({ "state": "saved" })
+                && colour_in(&bundle_of(&computer, &page).await).as_deref() == Some("dark")
+        })
+        .await
+    );
+    let first = std::time::Instant::now();
+
+    // Inside the window: a change (one trigger) and a cover that reaches the service (another).
+    settings
+        .set_colour_mode(ColourMode::Light)
+        .await
+        .expect("kept");
+    let host = Host::new(&computer, computer.served.origin());
+    host.sets_up();
+    page.recovery
+        .cover_host(&page.account, &host, false)
+        .await
+        .expect("the host is covered");
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    assert_eq!(
+        colour_in(&bundle_of(&computer, &page).await).as_deref(),
+        Some("dark"),
+        "no trigger wrote the settings before the window ended"
+    );
+
+    assert!(
+        until(Duration::from_secs(15), || async {
+            colour_in(&bundle_of(&computer, &page).await).as_deref() == Some("light")
+        })
+        .await,
+        "the change inside the window was kept scheduled"
+    );
+    assert!(
+        first.elapsed() >= window - Duration::from_millis(300),
+        "{:?}",
+        first.elapsed()
+    );
+}
+
+/// KR-REQ-20.15: nothing outstanding to settle is read as settled, not refused: a step may have
+/// ended the write between the page's view and the person's press.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn settling_with_nothing_outstanding_is_read_as_settled() {
+    let computer = Computer::new().await;
+    let page = computer.page().await;
+    page.call("recovery_turn_on", json!({})).expect("on");
+    let settled = page.call("recovery_settle", json!({})).expect("settled");
+    assert_eq!(settled["state"], "on");
 }

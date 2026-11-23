@@ -157,6 +157,8 @@ pub struct LocalSettings {
     /// Held from the moment a change is begun to the moment it is written, so that two changes
     /// made together in this run are made one after the other.
     keeping: Mutex<()>,
+    /// What is told after a change this build wrote to the file, whoever asked for it.
+    changed: Told,
 }
 
 impl LocalSettings {
@@ -175,6 +177,7 @@ impl LocalSettings {
             kept: Mutex::new(Kept::default()),
             unreadable: AtomicBool::new(false),
             keeping: Mutex::new(()),
+            changed: Told::default(),
         };
         settings.read();
         settings
@@ -229,6 +232,14 @@ impl LocalSettings {
     #[must_use]
     pub fn colour_mode(&self) -> ColourMode {
         self.chosen_colour_mode().unwrap_or_default()
+    }
+
+    /// What is told after this build writes a change to the file. Saving the settings with the
+    /// recovery bundle listens here: every write of the file, from the person's choice, from
+    /// settings sync's resolving and from its following another device, comes through one place.
+    #[must_use]
+    pub const fn changed(&self) -> &Told {
+        &self.changed
     }
 
     /// The colour mode the person chose, when they have.
@@ -309,6 +320,7 @@ impl LocalSettings {
             ))
         })?;
         *self.kept.lock().unwrap_or_else(PoisonError::into_inner) = next;
+        self.changed.tell();
         Ok(true)
     }
 

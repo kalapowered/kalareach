@@ -612,6 +612,7 @@ impl Recovery {
         if with_settings {
             self.saving.wrote_settings(&step);
         }
+        self.saving.want_now();
         self.view_of(account)
     }
 
@@ -628,19 +629,25 @@ impl Recovery {
         };
         refuse_if_blocked(account, &record.origin()?, Named::ByRecord)?;
         let seed = self.seed(false)?;
-        let settled = {
+        let ended = {
             let mut store = self.store(&record, account)?;
             if store.lost_write().is_none() {
-                return Err(CommandError::refused(
-                    "no write to the recovery bundle is waiting to be settled",
-                ));
+                None
+            } else {
+                Some(store.end_lost_write(&seed).await.map_err(said)?)
             }
-            store.end_lost_write(&seed).await.map_err(said)?
+        };
+        // A step may have ended the write between the page's view and the person's press: a write
+        // that is not outstanding is settled, and the view says so. The store is closed first, as
+        // the view opens one of its own.
+        let Some(settled) = ended else {
+            return self.view_of(account);
         };
         if matches!(settled, Some(LostWrite::Applied)) && !record.kept {
             record.kept = true;
             self.keep(&record)?;
         }
+        self.saving.want_now();
         self.view_of(account)
     }
 
@@ -888,10 +895,13 @@ impl Recovery {
         refuse_if_blocked(account, &record.origin()?, Named::ByRecord)?;
         let seed = self.seed(false)?;
         let mut store = self.store(&record, account)?;
-        cover_host_archive(host, &mut store, &seed, replace, now())
+        let covered = cover_host_archive(host, &mut store, &seed, replace, now())
             .await
             .map(HostCoverView::from)
-            .map_err(said)
+            .map_err(said);
+        // The cover reached the service, whatever came of it: the settings are compared afresh.
+        self.saving.want_now();
+        covered
     }
 
     /* ---------------------------------------------------------------------- */
