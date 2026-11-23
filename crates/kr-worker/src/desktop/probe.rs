@@ -239,6 +239,16 @@ pub enum Outcome {
         /// its class and its length.
         detail: Sentence,
     },
+    /// The filesystem refused it, and no privacy permission is known for that path.
+    ///
+    /// A permission a person could grant is named by [`Outcome::PermissionRefused`]. This is the
+    /// same refusal for a path that none of them covers: the permissions on the file or on a folder
+    /// above it refuse this account, and no grant changes that.
+    FilesystemRefused {
+        /// What the platform said, as this check read it: what the platform printed is said as
+        /// its class and its length.
+        detail: Sentence,
+    },
     /// The facility this check performs the operation with is not installed.
     FacilityMissing,
     /// The facility did not answer inside the check's own bound.
@@ -323,6 +333,22 @@ pub fn judge(
                     .stated(". ")
                     .stated(permission)
                     .stated(" is granted per signed application, and this one does not hold it"),
+            ),
+        ),
+        Outcome::FilesystemRefused { detail } => (
+            CapabilityState::PermissionRequired,
+            CapabilityEvidenceSource::DisclosedProbe,
+            Some(
+                Sentence::new()
+                    .stated(
+                        "this context performed the operation and the operating system refused \
+                         it: ",
+                    )
+                    .sentence(detail)
+                    .stated(
+                        ". No privacy permission is known for that path: the permissions on the \
+                         file or its folders refuse this account",
+                    ),
             ),
         ),
         Outcome::FacilityMissing => (
@@ -627,13 +653,14 @@ fn read_authorised_file_with(
                 .path(path),
         },
         Some(Err(error)) if error.kind() == std::io::ErrorKind::PermissionDenied => {
-            Outcome::PermissionRefused {
-                permission: permission_for_path(path),
-                detail: Sentence::new()
-                    .stated("the platform refused to open ")
-                    .path(path)
-                    .stated(": ")
-                    .withheld(ContentClass::Message, &error.to_string()),
+            let detail = Sentence::new()
+                .stated("the platform refused to open ")
+                .path(path)
+                .stated(": ")
+                .withheld(ContentClass::Message, &error.to_string());
+            match permission_for_path(path) {
+                Some(permission) => Outcome::PermissionRefused { permission, detail },
+                None => Outcome::FilesystemRefused { detail },
             }
         }
         Some(Err(error)) if error.kind() == std::io::ErrorKind::NotFound => Outcome::NotAttempted {
@@ -727,11 +754,12 @@ fn read_first_block(path: &Path) -> std::io::Result<FirstBlock> {
 /// Naming it is the difference between an answer a person can act on and "permission denied": on
 /// macOS the protected locations are separate grants, a removable volume and a network volume are
 /// two more, and Full Disk Access is one more that covers them all. A path outside every one of
-/// them was refused by the filesystem's own permissions rather than by a privacy grant. Whether a
-/// path is on a removable or a network volume is what the kernel says of the volume, never how the
-/// path is spelled, and a protected folder is the account's own: the one in its home directory.
+/// them was refused by the filesystem's own permissions rather than by a privacy grant, and no
+/// permission is named for it. Whether a path is on a removable or a network volume is what the
+/// kernel says of the volume, never how the path is spelled, and a protected folder is the
+/// account's own: the one in its home directory.
 #[must_use]
-pub fn permission_for_path(path: &Path) -> &'static str {
+pub fn permission_for_path(path: &Path) -> Option<&'static str> {
     permission_on(
         path,
         volume::flags_of(path),
@@ -743,17 +771,17 @@ pub fn permission_for_path(path: &Path) -> &'static str {
 /// whose home directory is `home`, where they could be read. The flags are the one thing about a
 /// path that a case cannot make on any machine it runs on, so they are given rather than read, and
 /// so is the home directory.
-fn permission_on(path: &Path, flags: Option<u32>, home: Option<&Path>) -> &'static str {
+fn permission_on(path: &Path, flags: Option<u32>, home: Option<&Path>) -> Option<&'static str> {
     if !cfg!(target_os = "macos") {
-        return "the filesystem's own permissions on that path";
+        return None;
     }
     // The volume comes first: a path on a removable one is under that grant whatever its folders
     // are called.
     if flags.is_some_and(volume::removable) {
-        return "Files & Folders, for removable volumes";
+        return Some("Files & Folders, for removable volumes");
     }
     if flags.is_some_and(volume::network) {
-        return "Files & Folders, for network volumes";
+        return Some("Files & Folders, for network volumes");
     }
     let path = lexically_clean(path);
     if let Some(home) = home.map(lexically_clean) {
@@ -770,15 +798,15 @@ fn permission_on(path: &Path, flags: Option<u32>, home: Option<&Path>) -> &'stat
             ("Library/Safari", "Full Disk Access"),
         ] {
             if path.starts_with(home.join(folder)) {
-                return permission;
+                return Some(permission);
             }
         }
     }
     // The system's own record of what has been granted is kept outside every home directory.
     if path.starts_with("/Library/Application Support/com.apple.TCC") {
-        return "Full Disk Access";
+        return Some("Full Disk Access");
     }
-    "the filesystem's own permissions on that path"
+    None
 }
 
 /// The path with its `.` and `..` parts resolved by their spelling, so that `Documents/../Desktop`
@@ -2218,17 +2246,15 @@ mod tests {
         }
     }
 
+    /// What a path's permission is on this platform: only macOS files a refusal under a grant.
+    fn on_macos(permission: &'static str) -> Option<&'static str> {
+        cfg!(target_os = "macos").then_some(permission)
+    }
+
     #[test]
     fn a_refused_read_names_the_permission_the_path_is_under() {
         let home = Path::new("/Users/someone");
         let on = |path: &str| permission_on(Path::new(path), None, Some(home));
-        let on_macos = |permission| {
-            if cfg!(target_os = "macos") {
-                permission
-            } else {
-                "the filesystem's own permissions on that path"
-            }
-        };
         assert_eq!(
             on("/Users/someone/Documents/notes.txt"),
             on_macos("Files & Folders, for the Documents folder")
@@ -2250,15 +2276,11 @@ mod tests {
             on("/Users/someone/Projects/../Downloads/notes.txt"),
             on_macos("Files & Folders, for the Downloads folder")
         );
-        assert_eq!(
-            on("/tmp/anything"),
-            "the filesystem's own permissions on that path"
-        );
+        assert_eq!(on("/tmp/anything"), None);
     }
 
     #[test]
     fn a_folder_is_one_of_the_account_s_only_where_the_account_keeps_it() {
-        let fallback = "the filesystem's own permissions on that path";
         let home = Path::new("/Users/someone");
         // A folder that is called Documents, a folder whose name begins like a protected one, a
         // path that leaves the folder again and another account's folder are not the account's.
@@ -2272,14 +2294,14 @@ mod tests {
         ] {
             assert_eq!(
                 permission_on(Path::new(path), None, Some(home)),
-                fallback,
+                None,
                 "{path}"
             );
         }
         // Without a home directory no folder is the account's.
         assert_eq!(
             permission_on(Path::new("/Users/someone/Documents/notes.txt"), None, None),
-            fallback
+            None
         );
     }
 
@@ -2292,11 +2314,7 @@ mod tests {
     #[test]
     fn a_refused_read_on_a_removable_volume_names_the_grant_for_removable_volumes() {
         let on = |path: &str, flags| permission_on(Path::new(path), Some(flags), None);
-        let removable = if cfg!(target_os = "macos") {
-            "Files & Folders, for removable volumes"
-        } else {
-            "the filesystem's own permissions on that path"
-        };
+        let removable = on_macos("Files & Folders, for removable volumes");
         assert_eq!(on("/Volumes/Backup/notes.txt", EXTERNAL_DISK), removable);
         // The volume is asked before the folder's name: a folder called Documents on an external
         // disk is not the Documents folder of the account.
@@ -2306,10 +2324,7 @@ mod tests {
         );
         // A path on an internal volume, whatever it is spelled like, is not one.
         for flags in [SYSTEM_VOLUME, DATA_VOLUME] {
-            assert_eq!(
-                on("/Volumes/Internal/notes.txt", flags),
-                "the filesystem's own permissions on that path"
-            );
+            assert_eq!(on("/Volumes/Internal/notes.txt", flags), None);
         }
     }
 
@@ -2320,11 +2335,7 @@ mod tests {
     #[test]
     fn a_refused_read_on_a_network_volume_names_the_grant_for_network_volumes() {
         let on = |path: &str, flags| permission_on(Path::new(path), Some(flags), None);
-        let network = if cfg!(target_os = "macos") {
-            "Files & Folders, for network volumes"
-        } else {
-            "the filesystem's own permissions on that path"
-        };
+        let network = on_macos("Files & Folders, for network volumes");
         assert_eq!(on("/Volumes/Share/notes.txt", NETWORK_VOLUME), network);
         // The volume is asked before the folder's name here too.
         assert_eq!(
@@ -2345,11 +2356,13 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn the_sentence_for_a_removable_volume_names_its_grant() {
         let path = Path::new("/Volumes/Backup/notes.txt");
         let refused = Outcome::PermissionRefused {
-            permission: permission_on(path, Some(EXTERNAL_DISK), None),
+            permission: permission_on(path, Some(EXTERNAL_DISK), None)
+                .expect("a removable volume has a grant to name"),
             detail: Sentence::new()
                 .stated("the platform refused to open ")
                 .path(path),
@@ -2357,16 +2370,39 @@ mod tests {
         let (state, _, reason) = judge(Check::AuthorisedFileRead, &refused);
         assert_eq!(state, CapabilityState::PermissionRequired);
         let reason = reason.expect("a refusal says why");
-        if cfg!(target_os = "macos") {
-            assert!(
-                reason.as_str().ends_with(
-                    "Files & Folders, for removable volumes is granted per signed application, \
-                     and this one does not hold it"
-                ),
-                "{reason}"
-            );
-        }
+        assert!(
+            reason.as_str().ends_with(
+                "Files & Folders, for removable volumes is granted per signed application, \
+                 and this one does not hold it"
+            ),
+            "{reason}"
+        );
         assert!(!reason.as_str().contains("Backup"), "{reason}");
+    }
+
+    #[test]
+    fn a_refusal_no_privacy_permission_covers_says_so_and_names_no_grant() {
+        let refused = Outcome::FilesystemRefused {
+            detail: Sentence::new()
+                .stated("the platform refused to open ")
+                .path(Path::new("/opt/kr-marker/notes.txt")),
+        };
+        let (state, source, reason) = judge(Check::AuthorisedFileRead, &refused);
+        assert_eq!(state, CapabilityState::PermissionRequired);
+        assert_eq!(source, CapabilityEvidenceSource::DisclosedProbe);
+        let reason = reason.expect("a refusal says why");
+        assert!(
+            reason.as_str().ends_with(
+                "No privacy permission is known for that path: the permissions on the file or \
+                 its folders refuse this account"
+            ),
+            "{reason}"
+        );
+        assert!(
+            !reason.as_str().contains("granted per signed application"),
+            "{reason}"
+        );
+        assert!(!reason.as_str().contains("kr-marker"), "{reason}");
     }
 }
 

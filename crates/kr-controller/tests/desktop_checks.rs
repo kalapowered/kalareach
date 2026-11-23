@@ -540,6 +540,19 @@ async fn a_permission_withdrawn_is_found_when_the_checks_are_performed_again() {
         after.evidence_source,
         CapabilityEvidenceSource::DisclosedProbe
     );
+    // A file in a folder that no privacy grant covers is refused by the filesystem's own
+    // permissions, and the reason says so rather than naming a grant to give.
+    let reason = after.disabled_reason.as_ref().expect("a refusal says why");
+    assert!(
+        reason
+            .as_str()
+            .contains("No privacy permission is known for that path"),
+        "{reason}"
+    );
+    assert!(
+        !reason.as_str().contains("granted per signed application"),
+        "{reason}"
+    );
     assert!(
         after.revision.get() > before.revision.get(),
         "a finding that changed is a change of evidence"
