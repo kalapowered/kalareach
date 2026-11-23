@@ -103,19 +103,28 @@ fn a_ceiling_this_build_lacks_makes_the_document_unusable_in_every_form() {
             ("null", with_ceiling(name, member, &Value::Null)),
             ("empty", with_ceiling(name, member, &empty)),
         ];
+        // At the version this build writes and at the one it reads through: a document at the
+        // read-through version is read as the one this build writes, and a ceiling it lacks makes
+        // it unusable all the same.
         for (form, text) in forms {
-            let loaded = load(&text);
-            assert_eq!(
-                loaded.status.state,
-                DocumentState::Invalid,
-                "{member} {form}: {:?}",
-                loaded.status
-            );
-            assert!(loaded.fails_closed(), "{member} {form}");
-            assert!(
-                loaded.document.is_none(),
-                "{member} {form}: nothing is read out of a document with a ceiling this build lacks"
-            );
+            for version in [4, 5] {
+                let text = text.replace("\"version\": 4", &format!("\"version\": {version}"));
+                let loaded = load(&text);
+                assert_eq!(
+                    loaded.status.state,
+                    DocumentState::Invalid,
+                    "{member} {form} at version {version}: {:?}",
+                    loaded.status
+                );
+                assert!(
+                    loaded.fails_closed(),
+                    "{member} {form} at version {version}"
+                );
+                assert!(
+                    loaded.document.is_none(),
+                    "{member} {form} at version {version}: nothing is read out of a document with a ceiling this build lacks"
+                );
+            }
         }
         // The same ceiling at the version before is refused alike: the version does not make a
         // name known.

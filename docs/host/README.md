@@ -144,7 +144,7 @@ configuration file this host reads.
 
 ```json
 {
-  "version": 3,
+  "version": 4,
   "level": 1,
   "revision": 3,
   "preferences": { "sleep_inhibition": "mains_only" },

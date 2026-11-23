@@ -34,7 +34,6 @@ fn context_for(session_id: &SessionId, revision: u64) -> DescriptionContext {
     .build()
 }
 
-/// KR-REQ-22.12: the reserve is the larger of one gibibyte and a fifth of physical memory.
 /// KR-REQ-22.10: the floor the report states is the policy's own: the larger of 1 GiB and a fifth of
 /// physical memory, which the owner's reserve only raises; and the ceiling default is the 4 GiB
 /// the configuration document's rule is written against.
@@ -63,6 +62,7 @@ fn the_reserve_floor_the_report_states_is_the_one_the_policy_keeps() {
     assert_eq!(reserve_floor_bytes(32 * GIB), 32 * GIB / 5);
 }
 
+/// KR-REQ-22.12: the reserve is the larger of one gibibyte and a fifth of physical memory.
 #[test]
 fn the_reserve_is_the_larger_of_a_gibibyte_and_a_fifth_of_the_memory() {
     let policy = ResourcePolicy::new(ResourceSettings::default(), Budgets::DEFAULTS);

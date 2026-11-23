@@ -5262,7 +5262,7 @@ mod tests {
         registry
             .record_accepted_configuration(&AcceptedConfiguration {
                 revision: 4,
-                document: Some(r#"{"version":4,"revision":4}"#.to_owned()),
+                document: Some(r#"{"version":5,"revision":4}"#.to_owned()),
             })
             .expect("records the document");
         drop(registry);
@@ -5287,7 +5287,7 @@ mod tests {
                 .expect("reads the record")
                 .document
                 .as_deref(),
-            Some(r#"{"version":4,"revision":4}"#)
+            Some(r#"{"version":5,"revision":4}"#)
         );
         drop(read);
         let opened = Registry::open(&path, environment_id).expect("the daemon opens it as found");

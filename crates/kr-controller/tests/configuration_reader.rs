@@ -303,15 +303,25 @@ async fn a_daemon_refuses_to_start_over_an_accepted_copy_it_cannot_read() {
     let mut copies: Vec<(String, String)> = Vec::new();
     {
         let (name, member) = ("version-4-limits.json", "limits");
-        copies.push((format!("{member} set"), fixture(name)));
-        copies.push((
-            format!("{member} null"),
-            with_ceiling(name, member, &Value::Null),
-        ));
-        copies.push((
-            format!("{member} empty"),
-            with_ceiling(name, member, &empty),
-        ));
+        let forms = [
+            (format!("{member} set"), fixture(name)),
+            (
+                format!("{member} null"),
+                with_ceiling(name, member, &Value::Null),
+            ),
+            (
+                format!("{member} empty"),
+                with_ceiling(name, member, &empty),
+            ),
+        ];
+        // At the version this build writes and at the one it reads through.
+        for (what, copy) in forms {
+            copies.push((format!("{what} at version 4"), copy.clone()));
+            copies.push((
+                format!("{what} at version 5"),
+                copy.replace("\"version\": 4", "\"version\": 5"),
+            ));
+        }
     }
     copies.push(("not a document".to_owned(), "not json".to_owned()));
     copies.push((

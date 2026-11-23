@@ -343,10 +343,10 @@ fn a_file_changed_to_a_higher_level_since_the_edit_was_prepared_is_not_overwritt
     still_current(&edited, &before).expect("a file that did not change");
 }
 
-/// KR-REQ-26.13: the level a document states is checked: a document at version 3 with no level is at
-/// the base level; a level that is not a whole number of at least the base is refused; a level below
-/// what the sections the document holds need is refused, as the release that wrote them refuses it;
-/// and a document of an earlier version states no level.
+/// KR-REQ-26.13: the level a document states is checked: a document with no level is at the base
+/// level; a level that is not a whole number of at least the base is refused; a level below what
+/// the sections the document holds need is refused, as the release that wrote them refuses it;
+/// and a document of a version before the one that brought levels (version 3) states no level.
 #[test]
 fn the_level_a_document_states_is_checked() {
     let plain = load_in(Some(br#"{"version": 4}"#), &R1);
