@@ -1047,10 +1047,10 @@ mod tests {
         drop(other);
     }
 
-    /// The access list of a file is read from the file: an entry for another account is refused,
-    /// where the owner's own list is not.
+    /// The access list of an ordinary file is read from the file: an entry for another account is
+    /// refused, where the owner's own list is not.
     #[test]
-    fn a_socket_whose_file_has_another_account_in_its_list_is_refused() {
+    fn a_file_whose_list_names_another_account_is_refused() {
         let directory = Directory::new();
         let path = directory.0.join("f");
         std::fs::write(&path, b"a file").expect("a file is made");
