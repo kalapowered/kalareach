@@ -1438,9 +1438,14 @@ read_command!(
 /// check reads is not the page's to name. It is the one the person chose in the platform's file
 /// dialog (`choose_authorised_file`), which this process holds and sends with this request and no
 /// other; with none chosen the host is sent none. While that dialog is open the request is refused:
-/// the dialog may replace the file, and the page that asks is not the one that opened it. Every
-/// screen is told when the file held changes ([`AUTHORISED_FILE_EVENT`](crate::AUTHORISED_FILE_EVENT)). The checks belong to the
-/// host on this computer, not to one this device is paired with.
+/// the dialog may replace the file, and the page that asks is not the one that opened it. So it is
+/// while a run of the checks is going and a file is held: the host answers a request for a run that
+/// is going with that run and drops the file the request carried, so the request would use the
+/// choice up and have nothing read. The file stays held for the next run. A run that another caller
+/// begins between the read that shows none going and the request is not seen, and takes the file as
+/// the host answers. Every screen is told when the file held changes
+/// ([`AUTHORISED_FILE_EVENT`](crate::AUTHORISED_FILE_EVENT)). The checks belong to the host on this
+/// computer, not to one this device is paired with.
 #[tauri::command]
 pub async fn environment_capabilities_check<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
@@ -1450,6 +1455,7 @@ pub async fn environment_capabilities_check<R: tauri::Runtime>(
 ) -> Result<Settled> {
     not_on_a_paired_host(&state, "the disclosed checks")?;
     let asked: kr_protocol::desktop::EnvironmentCapabilitiesParams = decode(params)?;
+    refuse_a_file_for_a_run_going(&state, &asked).await?;
     let authorised_file = state
         .take_authorised_file()
         .map_err(|_| {
@@ -1485,6 +1491,31 @@ pub async fn environment_capabilities_check<R: tauri::Runtime>(
             )
             .await,
     )
+}
+
+/// Refuses a request that would take the file held while a run of the checks is going: the file is
+/// not taken, so it stays held for the next run. With no file held, or while the file dialog is open
+/// (which [`AppState::take_authorised_file`] refuses in its own words), nothing is read, and the
+/// request goes on: a request with no file for a run that is going is answered with that run, which
+/// the page follows.
+async fn refuse_a_file_for_a_run_going(
+    state: &AppState,
+    asked: &kr_protocol::desktop::EnvironmentCapabilitiesParams,
+) -> Result<()> {
+    let held = state.held_authorised_file();
+    if held.dialog_open || held.path.is_none() {
+        return Ok(());
+    }
+    let session = state.session()?;
+    let shown: kr_protocol::desktop::EnvironmentCapabilitiesResult =
+        session.read(Method::EnvironmentCapabilities, asked).await?;
+    if shown.checks.state == kr_protocol::desktop::CapabilityChecksState::Running {
+        return Err(CommandError::refused(
+            "A run of the checks is already going, so the file you chose has not been read. It \
+             stays chosen: run the checks again once that run ends.",
+        ));
+    }
+    Ok(())
 }
 
 /// The file the person chose for the read check, as the page is told of it.

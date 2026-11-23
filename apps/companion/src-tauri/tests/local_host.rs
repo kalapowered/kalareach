@@ -1568,25 +1568,7 @@ async fn a_file_chosen_in_the_dialog_is_read_by_one_run_of_the_checks() {
     use kr_protocol::desktop::{CapabilityState, EnvironmentCapabilitiesResult, capabilities};
 
     let host = Host::start_creating_sessions().await;
-    let work = host.tree.root().join("w");
-    std::fs::create_dir(&work).expect("a directory on the internal disk");
-    let created = host
-        .call_within(
-            "session_create",
-            creation(
-                &host,
-                "native_compat",
-                json!("/bin/sh"),
-                &work.display().to_string(),
-            ),
-            WORKER_START,
-        )
-        .await
-        .expect("the host creates the session a run of the checks needs");
-    let session_id = created["value"]["session"]["session_id"]
-        .as_str()
-        .expect("the new session's identifier")
-        .to_owned();
+    let session_id = create_a_session_for_the_checks(&host).await;
 
     let chosen = host.tree.root().join("chosen.txt");
     std::fs::write(&chosen, b"the person chose this file").expect("the file the person chose");
@@ -1635,6 +1617,133 @@ async fn a_file_chosen_in_the_dialog_is_read_by_one_run_of_the_checks() {
         CapabilityState::QualifiedAvailable,
         "a file nobody chose this time was not read: {read:?}"
     );
+
+    host.call(
+        "session_close",
+        json!({
+            "params": { "session_id": session_id },
+            "subject": { "sessionId": session_id, "sessionEpoch": "1" }
+        }),
+    )
+    .await
+    .expect("the host closes the session");
+}
+
+/// Creates a session whose worker the disclosed checks are performed in, and returns its identifier.
+async fn create_a_session_for_the_checks(host: &Host) -> String {
+    let work = host.tree.root().join("w");
+    std::fs::create_dir(&work).expect("a directory on the internal disk");
+    let created = host
+        .call_within(
+            "session_create",
+            creation(
+                host,
+                "native_compat",
+                json!("/bin/sh"),
+                &work.display().to_string(),
+            ),
+            WORKER_START,
+        )
+        .await
+        .expect("the host creates the session a run of the checks needs");
+    created["value"]["session"]["session_id"]
+        .as_str()
+        .expect("the new session's identifier")
+        .to_owned()
+}
+
+/// A worker that is stopped until this goes: it answers nothing, so a run of the checks that was
+/// given to it stays running.
+struct StoppedWorker(u32);
+
+impl StoppedWorker {
+    /// Stops the one worker the host's only session has, found by its descriptor.
+    fn of(host: &Host) -> Self {
+        let descriptor = kr_ipc::descriptor::read_all(&host.tree.environment())
+            .expect("the session descriptors")
+            .into_iter()
+            .find_map(|entry| entry.descriptor.ok())
+            .expect("the session's descriptor");
+        let pid =
+            u32::try_from(descriptor.process_start_identity.pid.get()).expect("a process number");
+        assert!(signal(pid, "-STOP"), "the worker is stopped");
+        Self(pid)
+    }
+}
+
+impl Drop for StoppedWorker {
+    fn drop(&mut self) {
+        signal(self.0, "-CONT");
+    }
+}
+
+/// Sends `signal` to a process this test's host started, and says whether it was sent.
+fn signal(pid: u32, signal: &str) -> bool {
+    std::process::Command::new("/bin/kill")
+        .arg(signal)
+        .arg(pid.to_string())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+/// KR-REQ-03.29: a run of the checks that is going already takes no file from the page. The host
+/// answers a request for a run that is going with that run and drops the file the request carried,
+/// so a request that took the file would use the choice up and have nothing read; the request is
+/// refused instead, with the file still held, and it reads the file once the run has ended. With no
+/// file held the request is answered with the run that is going, which the page follows.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_run_that_is_going_already_takes_no_file_and_the_file_stays_held() {
+    use kr_protocol::desktop::{CapabilityChecks, CapabilityChecksState};
+
+    let host = Host::start_creating_sessions().await;
+    let session_id = create_a_session_for_the_checks(&host).await;
+    let state = host.app.state::<companion_tauri::AppState>();
+    let chosen = host.tree.root().join("chosen.txt");
+    std::fs::write(&chosen, b"the person chose this file").expect("the file the person chose");
+
+    let stopped = StoppedWorker::of(&host);
+    let going: CapabilityChecks = typed(settled_value(
+        ask_for_the_checks(&host)
+            .await
+            .expect("the checks are asked for with no file held"),
+    ));
+    assert_eq!(going.state, CapabilityChecksState::Running, "{going:?}");
+
+    // The control: with no file held there is nothing to lose, and the run that is going answers.
+    let again: CapabilityChecks = typed(settled_value(
+        ask_for_the_checks(&host)
+            .await
+            .expect("the run that is going is answered"),
+    ));
+    assert_eq!(again.state, CapabilityChecksState::Running, "{again:?}");
+
+    state.hold_authorised_file(chosen.clone());
+    let refusal = ask_for_the_checks(&host)
+        .await
+        .expect_err("a file for a run that is going");
+    assert!(
+        refusal["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("already going"),
+        "{refusal}"
+    );
+    assert_eq!(
+        state.held_authorised_file().path,
+        Some(chosen),
+        "the refused request left the file held"
+    );
+
+    drop(stopped);
+    capabilities_after_a_run_began_after(&host, None).await;
+    ask_for_the_checks(&host)
+        .await
+        .expect("the checks are asked for once the run has ended");
+    assert!(
+        state.held_authorised_file().path.is_none(),
+        "the run that followed took the file"
+    );
+    capabilities_after_a_run_began_after(&host, going.started_at_ms.as_ref().copied()).await;
 
     host.call(
         "session_close",
