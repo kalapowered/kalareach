@@ -274,6 +274,7 @@ export function MobileSession({
   const modeButtonId = useId()
   const noControlId = useId()
   const sendId = useId()
+  const steerNoteId = useId()
   const attachAgainId = useId()
   const keysHelpId = useId()
   // Whether a software keyboard hides part of the session.
@@ -1238,6 +1239,41 @@ export function MobileSession({
       Queue
     </Button>
   ) : null
+  // A steer carries the text the person wrote and no file: on a paired host the files of the draft
+  // go only with the prompt that names it, so Steer stays off while the draft has any, and says why.
+  const steerCarriesFiles = paired && (holdsDraft || draft.attachments.length > 0)
+  const steerNote =
+    !typingToProgram && offers.steer.offered && steerCarriesFiles ? (
+      <p className="m-hint" id={steerNoteId}>
+        A steer carries text only. Remove the files on this draft to steer with it.
+      </p>
+    ) : null
+  // Steering the turn that is running with what was written. The text stays where it was written.
+  const steerButton = offers.steer.offered ? (
+    <Button
+      data-testid="composer-steer"
+      aria-describedby={steerNote === null ? undefined : steerNoteId}
+      disabled={
+        draft.state !== 'bound' ||
+        draft.text.trim().length === 0 ||
+        steerCarriesFiles ||
+        busy ||
+        waiting.length > 0
+      }
+      style={{ minBlockSize: target }}
+      onClick={() => {
+        send('steer', draft.text)
+      }}
+    >
+      Steer
+    </Button>
+  ) : null
+  const composerActions = steerButton === null && queueButton === null ? null : (
+    <>
+      {steerButton}
+      {queueButton}
+    </>
+  )
   // The actions that are not finished, other than the newest, which the badge beside Send shows: an
   // action sent past one nobody knows the end of leaves that one listed, with its own status.
   const earlier = unresolved(mine).filter((submission) => submission !== mine.at(-1))
@@ -1694,6 +1730,7 @@ export function MobileSession({
               {reason}
               {earlierActions}
               {release}
+              {steerNote}
             </>
           ) : null}
           {typingToProgram && unsent !== null ? (
@@ -1711,9 +1748,9 @@ export function MobileSession({
            * or the conversation's. While the view controls the program, the program's keyboard
            * takes the field's place, and Send goes with the draft until control ends.
            */}
-          {asLine && !typingToProgram && queueButton !== null ? (
+          {asLine && !typingToProgram && composerActions !== null ? (
             // The line holds the field and Send only, so the other actions take a row above it.
-            <div className="m-composer-more">{queueButton}</div>
+            <div className="m-composer-more">{composerActions}</div>
           ) : null}
           <div className={asLine ? 'm-composer-line' : 'm-composer-field'}>
             {typingToProgram ? programField : field}
@@ -1752,6 +1789,7 @@ export function MobileSession({
               {reason}
               {earlierActions}
               {release}
+              {steerNote}
               {draft.state === 'conflicted' && currentTarget !== null ? (
                 <Button
                   data-testid="composer-retarget"
@@ -1787,7 +1825,7 @@ export function MobileSession({
 
               {asLine ? null : (
                 <div className="m-composer-actions">
-                  {queueButton}
+                  {composerActions}
                   {sendButton}
                   {lastState}
                 </div>

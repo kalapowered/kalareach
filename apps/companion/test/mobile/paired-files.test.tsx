@@ -679,3 +679,30 @@ describe('the files on the draft go with the prompt that names it', () => {
     expect(controls.pairedUploads.ended).toEqual([SESSION])
   })
 })
+
+describe('the phone steering the running turn on a paired host (KR-REQ-13.12)', () => {
+  it('turns Steer off while the draft carries files, and says that a steer carries text only', async () => {
+    const { controls, person } = await open()
+    await person.type(screen.getByRole('textbox', { name: 'Message this session' }), 'use the other file')
+    const steer = await screen.findByRole('button', { name: 'Steer' })
+    expect(steer).toBeEnabled()
+    expect(screen.queryByText(/A steer carries text only/)).toBeNull()
+
+    await pick(person)
+    const key = await started(controls)
+    act(() => {
+      controls.pairedUploads.finish(key)
+    })
+    await waitFor(() => {
+      expect(line()).toBe('Added to this draft')
+    })
+
+    expect(screen.getByRole('button', { name: 'Steer' })).toBeDisabled()
+    expect(
+      screen.getByText('A steer carries text only. Remove the files on this draft to steer with it.')
+    ).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Steer' })).toHaveAccessibleDescription(
+      /A steer carries text only/
+    )
+  })
+})

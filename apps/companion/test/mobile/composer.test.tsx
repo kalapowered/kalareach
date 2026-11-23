@@ -5,7 +5,7 @@
 
 import type { ReactNode } from 'react'
 import { describe, expect, it } from 'vitest'
-import { act, render, screen, waitFor, within } from '@testing-library/react'
+import { act, cleanup, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 
 import { AppProvider } from '../../src/app/state'
@@ -193,5 +193,73 @@ describe("the phone's Queue (KR-REQ-13.12)", () => {
 
     expect(screen.getByRole('button', { name: 'Send' })).toBeDisabled()
     expect(screen.getByRole('button', { name: 'Queue' })).toBeDisabled()
+  })
+})
+
+describe("the phone's Steer (KR-REQ-13.12)", () => {
+  it('sends the running turn and the text, and leaves the text where it was written', async () => {
+    const person = userEvent.setup()
+    const steered: { turn: string; text: string; revision: string; opening: string | undefined }[] = []
+    await open((port) => ({
+      ...port,
+      composerSteer: (params, opening) => {
+        steered.push({
+          turn: params.turn_id,
+          text: params.text,
+          revision: params.target.binding_revision,
+          opening
+        })
+        return port.composerSteer(params, opening)
+      }
+    }))
+    const field = screen.getByLabelText('Message this session')
+
+    await person.type(field, 'use the other file')
+    await person.click(await screen.findByRole('button', { name: 'Steer' }))
+
+    await waitFor(() => {
+      expect(steered).toHaveLength(1)
+    })
+    expect(steered[0]).toMatchObject({ turn: 'turn-9', text: 'use the other file', revision: '4' })
+    expect(typeof steered[0]?.opening).toBe('string')
+    expect(field).toHaveValue('use the other file')
+    expect(screen.getByRole('button', { name: 'Steer' })).toBeEnabled()
+  })
+
+  it('is off until something is written to steer with', async () => {
+    const person = userEvent.setup()
+    await open()
+    expect(await screen.findByRole('button', { name: 'Steer' })).toBeDisabled()
+    await person.type(screen.getByLabelText('Message this session'), 'x')
+    expect(screen.getByRole('button', { name: 'Steer' })).toBeEnabled()
+  })
+
+  it('is not offered while no turn runs, and not where the agent has not said it can steer', async () => {
+    await open(undefined, (host) => {
+      host.controls.records.endTurn(SESSION_MAIN)
+    })
+    expect(screen.queryByRole('button', { name: 'Steer' })).toBeNull()
+    expect(screen.getByRole('button', { name: 'Queue' })).toBeInTheDocument()
+    cleanup()
+
+    await open(undefined, (host) => {
+      host.controls.records.withoutCapability(SESSION_MAIN, 'agent.steer')
+    })
+    expect(screen.queryByRole('button', { name: 'Steer' })).toBeNull()
+    expect(screen.getByRole('button', { name: 'Queue' })).toBeInTheDocument()
+  })
+
+  it('is held with Send while an earlier action has no confirmed outcome', async () => {
+    const person = userEvent.setup()
+    const host = await open()
+    const field = screen.getByLabelText('Message this session')
+    host.controls.leaveNextSendUnconfirmed()
+
+    await person.type(field, 'run the migration')
+    await person.click(screen.getByRole('button', { name: 'Send' }))
+    await screen.findByTestId('composer-send-anyway')
+    await person.type(field, 'and then the seed')
+
+    expect(screen.getByRole('button', { name: 'Steer' })).toBeDisabled()
   })
 })
