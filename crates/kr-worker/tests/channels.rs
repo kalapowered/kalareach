@@ -2220,14 +2220,25 @@ async fn record_the_frames_of_an_approval_and_its_verdict() {
     })
     .await;
     let resource = relayed(&broker, 2, request_id).expect("recorded");
-    broker
+    let answered = broker
         .agent_approval_respond(
             &caller(),
             &respond(2, &resource, "allow"),
             TimestampMs::new(5),
         )
         .await
-        .expect("the answer is admitted and carried");
+        .expect_err("the answer is written, and a channel confirms nothing");
+    assert_eq!(
+        answered.code(),
+        kr_protocol::error::ErrorCode::OutcomeUnknown
+    );
+    assert!(
+        answered.to_string().contains(
+            "The host cannot tell whether Claude Code took this answer. Claude Code does not \
+             confirm answers."
+        ),
+        "{answered}"
+    );
     let verdict = channel.next().await.expect("the verdict goes out");
     std::fs::write(
         directory.join("channel-frames.json"),
