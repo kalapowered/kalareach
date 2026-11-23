@@ -1925,6 +1925,23 @@ async fn the_owners_description_budgets_apply_to_the_next_admission_without_a_re
     environment.stop().await;
 }
 
+/// What setup shows once the host has taken the settings the daemon posted to it and published the
+/// turn that followed, so a pause that the settings lift is gone from it and one they keep is
+/// still there: the answer is read once, not waited for.
+async fn setup_once_the_host_has_taken_what_was_posted(
+    environment: &Environment,
+) -> kr_protocol::describe::DescriptionSetup {
+    assert!(
+        environment
+            .controller()
+            .descriptions()
+            .until_host_has_taken_what_was_posted_within(PATIENCE)
+            .await,
+        "the host took what was posted within {PATIENCE:?}"
+    );
+    environment.setup().await
+}
+
 /// KR-REQ-22.10: a document that decides nothing leaves the description budgets this host
 /// accepted, as it leaves a session number: the owner's file removed, or one this build cannot read,
 /// does not return descriptions to section 22's defaults, and the report prints the ceiling in
@@ -1967,9 +1984,8 @@ async fn a_document_that_decides_nothing_leaves_the_description_budgets_this_hos
         "1",
         "the report prints what is in force"
     );
-    environment
-        .setup_until("the ceiling still pauses", paused)
-        .await;
+    let shown = setup_once_the_host_has_taken_what_was_posted(&environment).await;
+    assert!(paused(&shown), "the ceiling still pauses: {shown:?}");
 
     // A file this build cannot read decides nothing either.
     kr_ipc::paths::write_owner_only_file(&path, b"not json").expect("writes the file");
