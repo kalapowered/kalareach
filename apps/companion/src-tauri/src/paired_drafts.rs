@@ -376,7 +376,7 @@ fn is_the_count_refusal(error: &ClientError) -> bool {
 /// What a refused create is told as: when the host's own bound on drafts is reached and its build
 /// cannot end one, the person is told to update the host. Otherwise nothing is added.
 fn at_the_bound(discard_refused: bool, error: &ClientError) -> Option<CommandError> {
-    (discard_refused && error.code() == ErrorCode::QuotaExceeded)
+    (discard_refused && is_the_count_refusal(error))
         .then(|| CommandError::unsupported(UPDATE_THE_HOST))
 }
 
@@ -1437,7 +1437,10 @@ mod tests {
     /// is reached, and not for any other refusal.
     #[test]
     fn update_the_host_is_told_only_at_the_bound_of_a_host_that_cannot_end_a_draft() {
-        let bound = refused(ErrorCode::QuotaExceeded, "64 drafts");
+        let bound = refused(
+            ErrorCode::QuotaExceeded,
+            "this device holds 64 of the 64 drafts it may keep open: end a draft it no longer uses",
+        );
         let told = at_the_bound(true, &bound).expect("told at the bound");
         assert_eq!(told.message, UPDATE_THE_HOST);
         assert!(
@@ -1447,6 +1450,17 @@ mod tests {
         assert!(
             at_the_bound(true, &refused(ErrorCode::InvalidArgument, "x")).is_none(),
             "no other refusal"
+        );
+        assert!(
+            at_the_bound(
+                true,
+                &refused(
+                    ErrorCode::QuotaExceeded,
+                    "this draft is larger than a result may be"
+                )
+            )
+            .is_none(),
+            "a draft that is too large is not the bound, and ending another draft would not help it"
         );
     }
 }
