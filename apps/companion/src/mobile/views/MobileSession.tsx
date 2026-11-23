@@ -37,6 +37,8 @@ import {
 } from 'react'
 import { flushSync } from 'react-dom'
 
+import { promptTextProblem } from '@kalareach/protocol'
+
 import { useApp, useKeptPlace, useSession, useWaitingHolds } from '../../app/state'
 import { useSessionAgent } from '../../app/agent'
 import { useSessionOpening } from '../../app/opening'
@@ -777,6 +779,13 @@ export function MobileSession({
         paired &&
         [...uploads.snapshot().values()].some((row) => row.sessionId === sessionId && row.phase.kind === 'bound')
       if (pairedDraft && !uploads.ready(sessionId)) return
+      // Text that goes inline is held to what one prompt carries, as the desktop holds it: it is
+      // kept where it is, and the person is told. A prompt that names the draft the device keeps
+      // carries the draft's text, which the application answers for.
+      if (action !== 'interrupt' && !pairedDraft && promptTextProblem(text) === 'too-long') {
+        say('That is longer than one prompt carries. It is kept here.', 'danger')
+        return
+      }
       // An interrupt is the one action nothing else on this screen holds back, and it sends only once
       // at a time: its second press names the turn the first has already ended.
       if (action === 'interrupt') {

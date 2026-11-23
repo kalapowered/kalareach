@@ -5,7 +5,7 @@
 
 import type { ReactNode } from 'react'
 import { describe, expect, it } from 'vitest'
-import { act, cleanup, render, screen, waitFor, within } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 
 import { AppProvider } from '../../src/app/state'
@@ -482,6 +482,49 @@ describe("the phone's Steer with a file on the draft, on a host it is not paired
       expect(screen.getByText(SENTENCE)).toBeInTheDocument()
       expect(screen.getByRole('button', { name: 'Send' })).toBeDisabled()
       expect(steered).toEqual([])
+    })
+  }
+})
+
+describe('the phone refuses text longer than one prompt carries before it sends it (KR-REQ-13.12)', () => {
+  const LONG = 'é'.repeat(40_000)
+
+  for (const action of ['Send', 'Queue', 'Steer'] as const) {
+    it(`keeps the text and sends nothing for ${action}`, async () => {
+      const person = userEvent.setup()
+      const calls: string[] = []
+      await open((port) => ({
+        ...port,
+        composerSubmit: (params, opening, supersedes, mark) => {
+          calls.push('submit')
+          return port.composerSubmit(params, opening, supersedes, mark)
+        },
+        composerQueue: (params, opening, mark) => {
+          calls.push('queue')
+          return port.composerQueue(params, opening, mark)
+        },
+        composerSteer: (params, opening) => {
+          calls.push('steer')
+          return port.composerSteer(params, opening)
+        }
+      }))
+      const field = screen.getByLabelText('Message this session')
+      // 40,000 accented letters are 80,000 bytes of UTF-8, over the 65,536 that one prompt may be.
+      fireEvent.change(field, { target: { value: LONG } })
+      await screen.findByRole('button', { name: 'Steer' })
+
+      await person.click(await screen.findByRole('button', { name: action }))
+      await new Promise((resolve) => setTimeout(resolve, 50))
+
+      expect(calls).toEqual([])
+      expect(field).toHaveValue(LONG)
+      expect(screen.queryByText('Queued on this device')).toBeNull()
+      // Text that fits goes, so the refusal was about the length.
+      fireEvent.change(field, { target: { value: 'é'.repeat(30_000) } })
+      await person.click(screen.getByRole('button', { name: action }))
+      await waitFor(() => {
+        expect(calls).toHaveLength(1)
+      })
     })
   }
 })
