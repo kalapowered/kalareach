@@ -268,11 +268,15 @@ mod tests {
     }
 
     /// A host that has never changed privacy mode has no moment to start from, and nothing is
-    /// kept out.
+    /// kept out, whatever moment a state of it names.
     #[test]
     fn a_host_that_has_never_changed_privacy_mode_keeps_nothing_out() {
         let half = held();
-        assert_eq!(half.clone().after(Published::default()), half);
+        let never = Published {
+            since_ms: 1_000,
+            ..Published::default()
+        };
+        assert_eq!(half.clone().after(never), half);
     }
 
     /// Nothing is counted when nothing is kept out, whichever moment the line is drawn at.
