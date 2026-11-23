@@ -461,23 +461,14 @@ impl BoundEndpoint {
                 let stream = listener.accept().await.map_err(|error| {
                     BrokerError::ledger(format!("the endpoint could not accept: {error}"))
                 })?;
-                // The kernel names the process, and its own token says whose it is: nothing the
-                // connecting side wrote is read.
-                let pid = stream.peer_process().map_err(|error| {
-                    BrokerError::denied(format!(
-                        "the operating system would not name the connecting process: {error}"
-                    ))
-                })?;
-                let process = kr_ipc::identity::process_start_identity(pid).map_err(|error| {
+                // The kernel names the process, and one handle on it gives its start and its
+                // account: nothing the connecting side wrote is read.
+                let named = stream.peer().map_err(|error| {
                     BrokerError::denied(format!(
                         "the connecting process could not be identified: {error}"
                     ))
                 })?;
-                let owner = crate::windows::uds::process_is_this_account(pid).map_err(|error| {
-                    BrokerError::denied(format!(
-                        "the account of the connecting process could not be read: {error}"
-                    ))
-                })?;
+                let (process, owner) = (named.process, named.owner);
                 Ok(Accepted {
                     peer: PeerIdentity { process, owner },
                     stream: Stream::Uds(stream),

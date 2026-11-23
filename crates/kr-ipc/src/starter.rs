@@ -323,7 +323,7 @@ pub use self::windows::{
     ChildCommand, ChildRefusal, LaunchListener, LaunchStream, LogAccess, MAX_LAUNCH_FRAME,
     NamedLock, PeerProcess, Reached, StartedChild, account_environment, account_sid, connect,
     current_session, current_user_sid, in_any_job, open_log, pipe_client_is_this_user,
-    process_facts, start_child,
+    process_facts, process_is_this_account, start_child,
 };
 
 #[cfg(all(windows, any(test, feature = "testing")))]
@@ -772,6 +772,20 @@ mod windows {
             session: token.session()?,
             same_user: token.same_user_as(&own)?,
         })
+    }
+
+    /// Returns whether the process an open handle names runs as the account this process runs as.
+    ///
+    /// The handle must hold the right to query a process's limited information.
+    ///
+    /// # Errors
+    ///
+    /// Returns the operating system's error when the process's token or this process's own cannot
+    /// be read.
+    pub fn process_is_this_account(process: BorrowedHandle<'_>) -> io::Result<bool> {
+        let token = Token::of(process.as_raw_handle())?;
+        let own = Token::of(current_process())?;
+        token.same_user_as(&own)
     }
 
     /// A lock every process of this user on the machine can take by one name, held until dropped.

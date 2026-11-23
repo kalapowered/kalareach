@@ -123,6 +123,25 @@ pub fn process_start_identity(pid: u32) -> Result<ProcessStartIdentity> {
     }
 }
 
+/// Reads one running process's start identity and, from the very same open handle, whatever `read`
+/// asks of it, so that the two describe one process and not two that held an identifier in turn.
+///
+/// The process is opened once, with the right to wait on it. A process that has ended is refused,
+/// because the kernel keeps describing one for as long as anything holds it open, and its
+/// identifier may by then stand for another.
+///
+/// # Errors
+///
+/// Returns [`IpcError::IdentityUnavailable`] when the process is gone or has ended, when the
+/// operating system does not answer, and when `read` fails.
+#[cfg(windows)]
+pub fn running_process_start_identity_with<T>(
+    pid: u32,
+    read: impl FnOnce(std::os::windows::io::BorrowedHandle<'_>) -> std::io::Result<T>,
+) -> Result<(ProcessStartIdentity, T)> {
+    platform::running_process_with(pid, read)
+}
+
 /// Runs `work` and returns what it returned, with every process this thread read a `/proc` entry
 /// of meanwhile, in the order read, for the host crates' own tests: what a test counts to know
 /// that a question about one session read nothing about any other process.
@@ -2662,8 +2681,9 @@ mod platform {
 #[cfg(windows)]
 mod platform {
     use super::{
-        BootIdentity, BootIdentitySource, ProcessQuery, ProcessStartSource, ProcessState, Result,
-        WindowsReading, boot_records, process_times, unavailable, windows_boot,
+        BootIdentity, BootIdentitySource, ProcessQuery, ProcessStartIdentity, ProcessStartSource,
+        ProcessState, Result, WindowsReading, boot_records, process_times, unavailable,
+        windows_boot,
     };
 
     pub(super) fn account_tasks(_uid: u32) -> Result<u64> {
@@ -2808,6 +2828,48 @@ mod platform {
         super::windows_answer(pid, reading, process_times::now())
     }
 
+    pub(super) fn running_process_with<T>(
+        pid: u32,
+        read: impl FnOnce(std::os::windows::io::BorrowedHandle<'_>) -> std::io::Result<T>,
+    ) -> Result<(ProcessStartIdentity, T)> {
+        let (reading, process) = look(pid, process_times::Rights::QueryAndWait);
+        let identity = match super::windows_answer(pid, reading, process_times::now()) {
+            ProcessQuery::Present(identity) => identity,
+            ProcessQuery::Gone => {
+                return Err(unavailable(
+                    "process start identity",
+                    format!("pid {pid} is gone"),
+                ));
+            }
+            ProcessQuery::CannotEstablish(error) => return Err(error),
+        };
+        let Some(process) = process else {
+            return Err(unavailable(
+                "process start identity",
+                format!("pid {pid} was not kept open"),
+            ));
+        };
+        match process.has_exited() {
+            Ok(false) => {}
+            Ok(true) => {
+                return Err(unavailable(
+                    "process start identity",
+                    format!("pid {pid} has ended"),
+                ));
+            }
+            Err(error) => {
+                return Err(unavailable(
+                    "process start identity",
+                    format!("pid {pid}: whether it has ended could not be read: {error}"),
+                ));
+            }
+        }
+        let read = read(process.handle()).map_err(|error| {
+            unavailable("process start identity", format!("pid {pid}: {error}"))
+        })?;
+        Ok((identity, read))
+    }
+
     /// Opens one process with `rights` and reads its creation time, keeping the handle for a
     /// second question.
     fn look(
@@ -2843,7 +2905,9 @@ mod process_times {
                   no safe interface"
     )]
 
-    use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle};
+    use std::os::windows::io::{
+        AsHandle as _, AsRawHandle as _, BorrowedHandle, FromRawHandle as _, OwnedHandle,
+    };
 
     use windows_sys::Win32::Foundation::{
         ERROR_INVALID_PARAMETER, FILETIME, WAIT_OBJECT_0, WAIT_TIMEOUT,
@@ -2912,6 +2976,11 @@ mod process_times {
     }
 
     impl Process {
+        /// Lends the open handle, for a question another module asks of this same process.
+        pub(super) fn handle(&self) -> BorrowedHandle<'_> {
+            self.0.as_handle()
+        }
+
         /// Returns when the kernel recorded the process's creation, as a `FILETIME`: hundreds of
         /// nanoseconds since the start of 1601, UTC.
         pub(super) fn created(&self) -> std::io::Result<u64> {

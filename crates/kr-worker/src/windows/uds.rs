@@ -5,6 +5,9 @@
 //! connection (`SIO_AF_UNIX_GETPEERPID`) and that process's own token names its account, both read
 //! before a byte of what the peer sent is. Nothing the connecting side says about itself is read.
 //!
+//! An elevated process of the same account counts as the owner: the check compares accounts, and
+//! elevation is not one.
+//!
 //! The socket's file carries a protected list that names its owner only. That is defence in depth,
 //! and no admission relies on it: a check at connect time is not something this module has shown
 //! the system makes of a socket's file, and every account may traverse past a directory's list.
@@ -45,6 +48,7 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use async_io::{Async, IoSafe};
+use kr_protocol::identity::ProcessStartIdentity;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio_util::compat::{Compat, FuturesAsyncReadCompatExt as _};
 use windows_sys::Wdk::System::SystemServices::RtlGetVersion;
@@ -129,14 +133,42 @@ impl Stream {
         Self::new(uds_windows::UnixStream::connect(path)?)
     }
 
-    /// Returns the process the kernel says is at the other end of this connection.
+    /// Names the process at the other end of this connection and its account.
+    ///
+    /// The kernel names the process. That process is opened once, and its start identity and its
+    /// token's account are both read from that one handle, so they describe one process and not two
+    /// that held the identifier in turn. A process that has ended is refused, and so is one the
+    /// kernel names differently once it is open. Nothing the connecting side wrote is read.
     ///
     /// # Errors
     ///
-    /// Returns why the kernel did not name one, which is the Windows build's own answer.
-    pub fn peer_process(&self) -> std::io::Result<u32> {
-        peer_process_of(&self.inner.get_ref().get_ref().0)
+    /// Returns why the kernel did not name a process, or why the process could not be opened, is
+    /// gone or has ended, or why its account could not be read.
+    pub fn peer(&self) -> std::io::Result<Peer> {
+        let socket = &self.inner.get_ref().get_ref().0;
+        let named = peer_process_of(socket)?;
+        let (process, owner) = kr_ipc::identity::running_process_start_identity_with(
+            named,
+            kr_ipc::starter::process_is_this_account,
+        )
+        .map_err(std::io::Error::other)?;
+        let named_again = peer_process_of(socket)?;
+        if named_again != named {
+            return Err(std::io::Error::other(format!(
+                "the kernel named process {named} and then process {named_again} for one connection"
+            )));
+        }
+        Ok(Peer { process, owner })
     }
+}
+
+/// The process at the other end of a connection, as the kernel and that process's own handle say.
+#[derive(Debug)]
+pub struct Peer {
+    /// The process and when it started.
+    pub process: ProcessStartIdentity,
+    /// Whether it runs as the account this process runs as.
+    pub owner: bool,
 }
 
 impl AsyncRead for Stream {
@@ -534,17 +566,6 @@ fn windows_build() -> String {
     }
 }
 
-/// Returns true when the process `pid` runs as the account this process runs as, read from the
-/// process's own token.
-///
-/// # Errors
-///
-/// Returns why the process or its token cannot be read, which includes a process of another account
-/// whose token this one may not open.
-pub fn process_is_this_account(pid: u32) -> std::io::Result<bool> {
-    kr_ipc::starter::process_facts(pid).map(|facts| facts.same_user)
-}
-
 /// Opens what stands at `path` itself, a reparse point as the point and not what it names, with the
 /// rights given.
 fn open_without_following(path: &Path, rights: u32) -> std::io::Result<std::fs::File> {
@@ -697,10 +718,54 @@ mod tests {
         let (listener, _) = Listener::bind(&path).expect("the socket binds");
         let connecting = Stream::connect(&path).expect("the socket is reached");
         let accepted = listener.accept().await.expect("the connection is accepted");
-        let pid = accepted.peer_process().expect("the kernel names the peer");
-        assert_eq!(pid, std::process::id());
-        assert!(process_is_this_account(pid).expect("the account is read"));
+        let peer = accepted.peer().expect("the kernel names the peer");
+        assert_eq!(peer.process.pid.get(), u64::from(std::process::id()));
+        assert!(peer.owner, "its account is read from the process's handle");
         drop(connecting);
+    }
+
+    /// The variable that tells the process a case starts which socket to connect to.
+    const CONNECT_VARIABLE: &str = "KR_UDS_CASE_CONNECT";
+
+    /// What the process an ended-peer case starts runs, and only when that case names a socket: it
+    /// connects, and ends with the test program.
+    #[test]
+    fn a_process_that_connects_to_the_socket_it_is_told_and_ends() {
+        if let Some(path) = std::env::var_os(CONNECT_VARIABLE) {
+            let _stream = uds_windows::UnixStream::connect(Path::new(&path)).expect("it connects");
+        }
+    }
+
+    /// KR-REQ-07.45: a peer that has ended is not named. Its account and start are read from one
+    /// handle, and a process the kernel still names after it ended may no longer own its
+    /// identifier, so what it was is not told.
+    #[tokio::test]
+    async fn a_peer_that_has_ended_is_refused() {
+        let directory = Directory::new();
+        let path = directory.0.join("p.sock");
+        let (listener, _) = Listener::bind(&path).expect("the socket binds");
+        let mut peer = std::process::Command::new(std::env::current_exe().expect("this program"))
+            .args([
+                "--exact",
+                "windows::uds::tests::a_process_that_connects_to_the_socket_it_is_told_and_ends",
+                "--nocapture",
+            ])
+            .env(CONNECT_VARIABLE, &path)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("the process starts");
+        let accepted = tokio::time::timeout(Duration::from_secs(30), listener.accept())
+            .await
+            .expect("the process connected within the wait")
+            .expect("the connection is accepted");
+        // The process is held by this handle until it is dropped, so its identifier is its own.
+        peer.wait().expect("the process ends");
+        let named = accepted.peer();
+        assert!(
+            named.is_err(),
+            "a peer that has ended is not named: {named:?}"
+        );
     }
 
     /// Bytes go both ways through the tokio traits.
