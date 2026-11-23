@@ -2848,7 +2848,9 @@ fn view_of(
 #[cfg(feature = "testing")]
 impl Desk {
     /// Resolves once none of the tasks the desk started for itself is running, so that a suite reads
-    /// what they left only when they are over.
+    /// what they left only when they are over. A send's own task, which keeps the copy of the
+    /// content and starts the upload, is not among them: it is counted by [`Desk::sends_idle`], so
+    /// that a case can hold a send before its start and wait for the rest of the desk's work.
     pub async fn idle(&self) {
         self.work.idle().await;
     }
