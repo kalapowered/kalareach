@@ -337,6 +337,42 @@ describe('the settings saved with the recovery bundle', () => {
     )
   })
 
+  it('keeps the note of an unconfirmed removal through a retry that fails or is not confirmed', async () => {
+    const { controls, retained, person } = await openWithSettings()
+    controls.retained.serviceDoesNotConfirm(true)
+    await person.click(
+      within(rowOf(retained, KIND)).getByRole('button', { name: 'Remove from the bundle' })
+    )
+    await answerDialog(controls, true)
+    const UNCONFIRMED =
+      'You asked for the removal, and the service has not confirmed it yet. The settings stay ' +
+      'listed until it does.'
+    await waitFor(() => {
+      expect(within(rowOf(retained, KIND)).getByTestId('removal')).toHaveTextContent(UNCONFIRMED)
+    })
+
+    // The question that comes before the dialog fails: no read confirmed the settings gone, so the
+    // earlier note stands, and the new failure shows beside it.
+    controls.retained.refuseNextAsk('the sync service could not be reached')
+    await person.click(
+      within(rowOf(retained, KIND)).getByRole('button', { name: 'Remove from the bundle' })
+    )
+    const refusal = await within(rowOf(retained, KIND)).findByTestId('removal-refusal')
+    expect(refusal).toHaveTextContent('the sync service could not be reached')
+    expect(within(rowOf(retained, KIND)).getByTestId('removal')).toHaveTextContent(UNCONFIRMED)
+
+    // The person says no to the dialog of a retry: nothing was asked of the service, and the note
+    // stands.
+    await person.click(
+      within(rowOf(retained, KIND)).getByRole('button', { name: 'Remove from the bundle' })
+    )
+    await answerDialog(controls, false)
+    await waitFor(() => {
+      expect(within(rowOf(retained, KIND)).getByRole('button')).not.toBeDisabled()
+    })
+    expect(within(rowOf(retained, KIND)).getByTestId('removal')).toHaveTextContent(UNCONFIRMED)
+  })
+
   it('is left alone when the person says no, and says why when the bundle holds none', async () => {
     const { controls, retained, person } = await openWithSettings()
     await person.click(

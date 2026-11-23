@@ -154,6 +154,10 @@ export function LeftTheHost({
 
   const remove = (row: Row) => {
     const reference = row.copy.reference
+    // What the row said before this press: a retry that fails or is not confirmed learns nothing
+    // about the copy, so a removal the service had not confirmed stays a removal it had not
+    // confirmed.
+    const before = steps.get(reference) ?? 'idle'
     setStep(reference, 'waiting')
     refuse(reference, null)
     void (async () => {
@@ -162,7 +166,7 @@ export function LeftTheHost({
         const asked = await ask(() => port.retainedDeleteAsk(reference))
         const token = asked.token
         if (!asked.confirmed || token === null) {
-          if (open.current) setStep(reference, 'idle')
+          if (open.current) setStep(reference, before)
           return
         }
         held = token
@@ -189,7 +193,7 @@ export function LeftTheHost({
         const unused = held
         if (unused !== null) await ask(() => port.retainedDeleteCancel(unused)).catch(() => undefined)
         if (!open.current) return
-        setStep(reference, 'idle')
+        setStep(reference, before)
         refuse(reference, failureMessage(failure))
       }
     })()
