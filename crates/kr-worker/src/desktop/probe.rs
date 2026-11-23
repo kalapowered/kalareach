@@ -2359,6 +2359,25 @@ mod tests {
         }
     }
 
+    /// `permission_for_path` joins what the cases above give it: the account's own home directory
+    /// and the volume the kernel says the path is on. A path in a protected folder of the home
+    /// directory is under that grant, unless its volume is a removable or a network one, which
+    /// decides first.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_permission_for_a_protected_folder_of_the_home_directory_is_read_from_the_account() {
+        let home = std::env::home_dir().expect("this account has a home directory");
+        let expected = match volume::flags_of(&home) {
+            Some(flags) if volume::removable(flags) => "Files & Folders, for removable volumes",
+            Some(flags) if volume::network(flags) => "Files & Folders, for network volumes",
+            _ => "Full Disk Access",
+        };
+        assert_eq!(
+            permission_for_path(&home.join("Library/Mail/notes.txt")),
+            Some(expected)
+        );
+    }
+
     /// KR-REQ-11.16, the bounded clause, for the lookup that follows a refused open: the question of
     /// which place a refused path is in is put to the filesystem, and a network volume can refuse
     /// the open at once and then not answer that. It is waited for with the open, so the check
