@@ -671,6 +671,7 @@ mod tests {
             Refusal::NotStarted {
                 program: "podman".to_owned(),
                 detail: "a-value".to_owned(),
+                not_found: false,
             },
             Refusal::Stream {
                 detail: "a-value".to_owned(),

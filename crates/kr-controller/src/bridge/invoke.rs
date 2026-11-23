@@ -128,6 +128,9 @@ pub enum Refusal {
         program: String,
         /// What the operating system said.
         detail: String,
+        /// Whether the operating system said the program is not there, which a person is told
+        /// apart from a program that is there and could not be run.
+        not_found: bool,
     },
     /// A stream to or from the helper failed part way through.
     Stream {
@@ -229,7 +232,9 @@ impl core::fmt::Display for Refusal {
                 formatter.write_str("a request crosses at most one process bridge")
             }
             Self::Launch(error) => write!(formatter, "{error}"),
-            Self::NotStarted { program, detail } => {
+            Self::NotStarted {
+                program, detail, ..
+            } => {
                 write!(formatter, "{program} could not be started: {detail}")
             }
             Self::Stream { detail, .. } => {
@@ -769,15 +774,18 @@ fn start_helper(command: &BridgeCommand) -> Result<Spawned, Refusal> {
     let mut child = process.spawn().map_err(|error| Refusal::NotStarted {
         program: command.program.clone(),
         detail: error.to_string(),
+        not_found: error.kind() == std::io::ErrorKind::NotFound,
     })?;
 
     let stdin = child.stdin.take().ok_or_else(|| Refusal::NotStarted {
         program: command.program.clone(),
         detail: "its standard input is not a pipe".to_owned(),
+        not_found: false,
     })?;
     let stdout = child.stdout.take().ok_or_else(|| Refusal::NotStarted {
         program: command.program.clone(),
         detail: "its standard output is not a pipe".to_owned(),
+        not_found: false,
     })?;
     let diagnostics = Diagnostics::default();
     // Held until the helper is, so a handshake that fails below ends the reader with it.
@@ -788,6 +796,7 @@ fn start_helper(command: &BridgeCommand) -> Result<Spawned, Refusal> {
         .ok_or_else(|| Refusal::NotStarted {
             program: command.program.clone(),
             detail: "its standard error is not a pipe".to_owned(),
+            not_found: false,
         })?;
     Ok(Spawned {
         child,
@@ -2318,6 +2327,75 @@ mod tests {
         );
     }
 
+    /// KR-REQ-18.11, the part about the connection diagnostic, for a program that is not on this
+    /// host: the sentence names the step by its role and says it was not found, whichever access
+    /// class asked for it.
+    #[tokio::test]
+    async fn a_program_that_is_not_on_this_host_is_told_as_not_found() {
+        let command = BridgeCommand {
+            program: "kr-test-no-such-program".to_owned(),
+            arguments: Vec::new(),
+        };
+        let Err(refusal) = start_helper(&command) else {
+            panic!("a program that is not on this host started");
+        };
+        for (access, expected) in [
+            (
+                EnvironmentAccess::Container,
+                "the container runtime (podman) was not found",
+            ),
+            (
+                EnvironmentAccess::SshHost,
+                "the SSH client (ssh) was not found",
+            ),
+            (
+                EnvironmentAccess::WslDistribution,
+                "the WSL launcher (wsl.exe) was not found",
+            ),
+        ] {
+            let said = crate::bridge::diagnosis::of(
+                &refusal,
+                access,
+                crate::bridge::diagnosis::Stage::Opening,
+            );
+            assert_eq!(said.as_str(), expected, "{access:?}");
+            assert!(
+                kr_protocol::identity::is_composed_connection(said.as_str()),
+                "{said}"
+            );
+        }
+    }
+
+    /// KR-REQ-18.11, the part about the connection diagnostic, for a program that is there and
+    /// cannot be run: it is told as not started, with the operating system's message given as its
+    /// class and length, and not as not found.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_program_that_cannot_be_run_is_not_told_as_not_found() {
+        let command = BridgeCommand {
+            program: "/usr/bin".to_owned(),
+            arguments: Vec::new(),
+        };
+        let Err(refusal) = start_helper(&command) else {
+            panic!("a directory started as a program");
+        };
+        let Refusal::NotStarted { detail, .. } = &refusal else {
+            panic!("a program that cannot be run is not started: {refusal:?}");
+        };
+        let said = crate::bridge::diagnosis::of(
+            &refusal,
+            EnvironmentAccess::Container,
+            crate::bridge::diagnosis::Stage::Opening,
+        );
+        assert_eq!(
+            said.as_str(),
+            format!(
+                "the container runtime (podman) could not be started: [message withheld, {} bytes]",
+                detail.len()
+            )
+        );
+    }
+
     /// KR-REQ-18.11, the part about the connection diagnostic: each class of failure of a bridge to
     /// a named environment is worded differently from every other, so what a person reads names
     /// its own cause and not another's. Not shown here: the words reaching the person.
@@ -2336,6 +2414,7 @@ mod tests {
             Refusal::NotStarted {
                 program: "wsl.exe".to_owned(),
                 detail: "no such file".to_owned(),
+                not_found: false,
             },
             Refusal::Stream {
                 detail: "broken pipe".to_owned(),
@@ -2397,6 +2476,7 @@ mod tests {
         let unreachable: crate::error::ControllerError = Refusal::NotStarted {
             program: "wsl.exe".to_owned(),
             detail: "no such file".to_owned(),
+            not_found: false,
         }
         .into();
         assert!(

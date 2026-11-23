@@ -891,12 +891,32 @@ impl EnvironmentRefreshResult {
     }
 }
 
-/// The programs a connection sentence names: the ones the host runs for an environment, and the
-/// words it says when it knows of none.
-const CONNECTION_PROGRAMS: [&str; 4] = ["podman", "ssh", "wsl.exe", "the helper program"];
+/// The programs the host runs for an environment, each with the step it is in a connection
+/// sentence: its role, then its name. A person who does not know the program's name reads the role.
+const CONNECTION_STEPS: [(&str, &str); 3] = [
+    ("podman", "the container runtime (podman)"),
+    ("ssh", "the SSH client (ssh)"),
+    ("wsl.exe", "the WSL launcher (wsl.exe)"),
+];
+
+/// What a connection sentence says of the program when the host runs none for the access class.
+const UNNAMED_STEP: &str = "the helper program";
+
+/// Returns how a connection sentence names `program`, the one the host runs for an environment:
+/// the step it is, by its role and then its name, or the words for no program when there is none.
+#[must_use]
+pub fn connection_step(program: Option<&str>) -> &'static str {
+    program
+        .and_then(|program| {
+            CONNECTION_STEPS
+                .iter()
+                .find_map(|(name, step)| (*name == program).then_some(*step))
+        })
+        .unwrap_or(UNNAMED_STEP)
+}
 
 /// What the host says when opening a bridge was refused, each as the words it is composed of and
-/// its placeholders: `{program}`, `{n}` for a number, `{id}` for an environment identifier, a
+/// its placeholders: `{program}` for the step the host ran ([`connection_step`]), `{n}` for a number, `{id}` for an environment identifier, a
 /// closed word of its own set (`{code}` for an error code, `{role}`, `{access}` and `{ingress}`),
 /// and `{message}` and `{name}` for a value that arrived, as its class and length.
 const REFUSAL_FORMS: &[&str] = &[
@@ -905,6 +925,7 @@ const REFUSAL_FORMS: &[&str] = &[
     "a request crosses at most one process bridge",
     "{access} is not reached by a process bridge; an SSH user runs the command line on the \
      destination host and a paired host is reached through its own endpoint",
+    "{program} was not found",
     "{program} could not be started: {message}",
     "{program} ended with exit code {n} before the environment answered",
     "{program} was ended by signal {n} before the environment answered",
@@ -941,7 +962,7 @@ const REFUSAL_FORMS: &[&str] = &[
      version, and this host speaks protocol {n}.{n}.{n}: update kr in the destination",
     "{program} ran, and the environment that answered sent more than {n} bytes this host had not \
      yet been asked for, so the bridge was ended",
-    "{program} (process {n}) could not be ended: {message}; it may still be running, and this host \
+    "{program} process {n} could not be ended: {message}; it may still be running, and this host \
      no longer waits for it",
     "{program} could not be ended: {message}; it may still be running, and this host no longer \
      waits for it",
@@ -1022,9 +1043,11 @@ fn take_placeholder<'a>(placeholder: &str, text: &'a str) -> Option<&'a str> {
         (end > 0).then(|| &text[end..])
     };
     match placeholder {
-        "program" => CONNECTION_PROGRAMS
+        "program" => CONNECTION_STEPS
             .iter()
-            .find_map(|program| text.strip_prefix(program)),
+            .map(|(_, step)| *step)
+            .chain([UNNAMED_STEP])
+            .find_map(|step| text.strip_prefix(step)),
         "n" => run(|c| c.is_ascii_digit()),
         "code" => take_word(text, |word| ErrorCode::from_wire(word).is_some()),
         "role" => take_word(text, |word| {
@@ -1095,25 +1118,32 @@ mod tests {
     fn a_connection_is_composed_only_when_it_is_one_of_the_hosts_sentences() {
         let id = "18d3ba9f-df2d-43ec-84a3-83475d614273";
         for composed in [
-            "podman could not be started: [message withheld, 38 bytes]".to_owned(),
-            "podman ended with exit code 125 before the environment answered".to_owned(),
-            "ssh ended the connection before the environment answered".to_owned(),
-            "wsl.exe ran, and the environment refused the bridge: PERMISSION_DENIED ([message withheld, 41 bytes])".to_owned(),
+            "the container runtime (podman) could not be started: [message withheld, 38 bytes]".to_owned(),
+            "the container runtime (podman) was not found".to_owned(),
+            "the SSH client (ssh) was not found".to_owned(),
+            "the container runtime (podman) process 4242 could not be ended: [message withheld, 9 bytes]; it may still be running, and this host no longer waits for it".to_owned(),
+            "the container runtime (podman) ended with exit code 125 before the environment answered".to_owned(),
+            "the SSH client (ssh) ended the connection before the environment answered".to_owned(),
+            "the WSL launcher (wsl.exe) ran, and the environment refused the bridge: PERMISSION_DENIED ([message withheld, 41 bytes])".to_owned(),
             format!("environment {id} answered as [name withheld, 1 bytes] over its own local channel"),
             "no bridge was opened, because [message withheld, 12 bytes]".to_owned(),
-            "podman said nothing for 20 seconds, so it was ended; and this host did not record that, because [message withheld, 9 bytes]".to_owned(),
+            "the container runtime (podman) said nothing for 20 seconds, so it was ended; and this host did not record that, because [message withheld, 9 bytes]".to_owned(),
             "no helper was started, because an enrolment carries the label people use".to_owned(),
         ] {
             assert!(is_composed_connection(&composed), "{composed}");
         }
         for raw in [
             "the destination refused the bridge: kr-test-destination-words",
-            "podman could not be started: No such file or directory (os error 2)",
+            "the container runtime (podman) could not be started: No such file or directory (os error 2)",
             "the bridge stream failed: unexpected end of file",
+            // A host of an earlier release named the program and not the step it is.
+            "podman ended with exit code 125 before the environment answered",
+            "ssh said nothing for 20 seconds, so it was ended",
+            "the container runtime (docker) was not found",
             "environment 18d3ba9f-df2d-43ec-84a3-83475d614273 answered as kala over its own local channel",
             "the enrolment names user kala and the helper ran as root",
-            "podman ran, and the environment refused the bridge: PERMISSION_DENIED (kr-test-words)",
-            "podman ended with exit code 125 before the environment answered. kr-test-words",
+            "the container runtime (podman) ran, and the environment refused the bridge: PERMISSION_DENIED (kr-test-words)",
+            "the container runtime (podman) ended with exit code 125 before the environment answered. kr-test-words",
             "no bridge was opened, because the fence says so",
             "",
         ] {
@@ -1142,18 +1172,18 @@ mod tests {
             |word: &str| format!("{word} is not reached by a process bridge, so none was opened");
         let role_sentence = |answered: &str, expected: &str| {
             format!(
-                "podman ran, and the environment that answered is the {answered}, where the \
+                "the container runtime (podman) ran, and the environment that answered is the {answered}, where the \
                  opening asked for the {expected}"
             )
         };
         let opening_refused = |word: &str| {
             format!(
-                "podman ran, and the environment refused the bridge: {word} ([message withheld, 41 bytes])"
+                "the container runtime (podman) ran, and the environment refused the bridge: {word} ([message withheld, 41 bytes])"
             )
         };
         let read_refused = |word: &str| {
             format!(
-                "podman ran, and the environment answered the read with an error: {word} ([message withheld, 41 bytes])"
+                "the container runtime (podman) ran, and the environment answered the read with an error: {word} ([message withheld, 41 bytes])"
             )
         };
 

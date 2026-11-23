@@ -2029,10 +2029,15 @@ async fn a_connection_that_fails_claims_nothing_for_an_ssh_host_or_a_container()
 const DESTINATION_SENTENCE: &str = "kr-test-destination-refused-in-its-own-words";
 
 /// The destinations the diagnostic cases try, each as its label, access class, target and the
-/// program the host runs for it.
+/// step the host runs for it, said by its role and then by the program.
 const DESTINATIONS: [(&str, &str, &str, &str); 2] = [
-    ("sshdest", "ssh", "build.example", "ssh"),
-    ("box", "container", STAND_IN_CONTAINER_NAME, "podman"),
+    ("sshdest", "ssh", "build.example", "the SSH client (ssh)"),
+    (
+        "box",
+        "container",
+        STAND_IN_CONTAINER_NAME,
+        "the container runtime (podman)",
+    ),
 ];
 
 /// What `kr bridge refresh` told a person of one environment, in both forms.
@@ -2166,7 +2171,7 @@ async fn a_helper_that_exits_before_the_environment_answers_is_told_with_its_pro
         enrolled_and_answering(&world, label, access, target);
         // The stand-ins end with the codes `ssh` and the runtime end with, and say why on their
         // standard error.
-        let (code, said) = if program == "ssh" {
+        let (code, said) = if access == "ssh" {
             (255, "Connection refused")
         } else {
             (127, "executable file not found")
@@ -2251,6 +2256,38 @@ async fn an_environment_that_refuses_the_bridge_is_told_with_its_program_and_the
             &[DESTINATION_SENTENCE],
         );
         std::fs::remove_file(world.tools.join("refusal")).expect("the frame is taken away");
+    }
+}
+
+/// KR-REQ-18.11, the part about connection diagnostics, for an environment whose answer this host
+/// cannot read: the sentence names the step, says what it wrote could not be read, and gives its
+/// length, in `--json` and in the lines, and none of what was written is in either.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_helper_whose_answer_cannot_be_read_is_told_with_its_step_and_the_length() {
+    let _turn = CONTAINER_RUNTIME_TURN.lock().await;
+    let world = world_whose_destination_answers().await;
+    for (label, access, target, step) in DESTINATIONS {
+        enrolled_and_answering(&world, label, access, target);
+        std::fs::write(world.tools.join("refusal"), [0xff_u8; 64])
+            .expect("what the stand-in writes");
+        let told = refreshed_both_ways(&world, label);
+        let said = told.document["connection"].as_str().expect("a sentence");
+        let start = format!(
+            "{step} ran, and the environment that answered wrote a frame this host cannot read \
+             ([message withheld, "
+        );
+        assert!(
+            said.starts_with(&start) && said.ends_with(" bytes])"),
+            "{label}: {said}"
+        );
+        assert_eq!(told.lines.len(), 2, "{label}: {:?}", told.lines);
+        assert_eq!(
+            told.lines[1].trim_start(),
+            said,
+            "{label}: {:?}",
+            told.lines
+        );
+        std::fs::remove_file(world.tools.join("refusal")).expect("what it writes is taken away");
     }
 }
 

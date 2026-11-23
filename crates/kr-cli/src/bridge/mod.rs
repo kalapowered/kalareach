@@ -261,7 +261,8 @@ mod tests {
     use crate::output::planted::{only_asked, only_asked_lines, planted};
 
     /// A sentence of the shape the host composes for a bridge that did not answer.
-    const HOST_SENTENCE: &str = "podman ended with exit code 125 before the environment answered";
+    const HOST_SENTENCE: &str =
+        "the container runtime (podman) ended with exit code 125 before the environment answered";
     use crate::shown::marker::MARKER;
 
     /// KR-REQ-18.11: a record that holds a destination this host does not deliver to is shown as one

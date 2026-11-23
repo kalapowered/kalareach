@@ -4,15 +4,17 @@
 //! destination said, so it is for this host's own logs and for the errors it raises. This is the
 //! sentence the refresh answers with, and it leaves the host in an
 //! [`EnvironmentRefreshResult`](kr_protocol::identity::EnvironmentRefreshResult). It names the
-//! program the host ran for the environment and how that went: it could not be started, it ended
-//! with a code, a signal ended it, it said nothing within its bound, or the environment refused.
+//! step the host ran for the environment, by its role and then by its program (the container
+//! runtime (podman), the SSH client (ssh), the WSL launcher (wsl.exe)), and how that went: it was
+//! not found, it could not be started, it ended with a code, a signal ended it, it said nothing
+//! within its bound, its answer could not be read, or the environment refused.
 //! It is composed of words written in this source, numbers, the closed words this build defines,
 //! and the class and length of everything that arrived, so the operating system's message and the
 //! destination's own words are never in it.
 
 use kr_protocol::hello::{PACKAGE_VERSION, PackageVersion};
 use kr_protocol::hostinfo::export::{ContentClass, Sentence};
-use kr_protocol::identity::EnvironmentAccess;
+use kr_protocol::identity::{EnvironmentAccess, connection_step};
 use kr_protocol::ids::EnvironmentId;
 
 use crate::bridge::invoke::{HelperEnd, Refusal};
@@ -31,8 +33,7 @@ pub enum Stage {
 /// the stage it was refused at.
 #[must_use]
 pub fn of(refusal: &Refusal, access: EnvironmentAccess, stage: Stage) -> Sentence {
-    let program =
-        || Sentence::new().stated(launch::program_of(access).unwrap_or("the helper program"));
+    let program = || Sentence::new().stated(connection_step(launch::program_of(access)));
     // What most of the causes that follow an answer say first: the helper ran, and what answered
     // is the matter.
     let ran = || program().stated(" ran, and the environment that answered ");
@@ -56,6 +57,9 @@ pub fn of(refusal: &Refusal, access: EnvironmentAccess, stage: Stage) -> Sentenc
         Refusal::Launch(LaunchError::Incomplete(error)) => Sentence::new()
             .stated("no helper was started, because ")
             .stated(error.describe()),
+        Refusal::NotStarted {
+            not_found: true, ..
+        } => program().stated(" was not found"),
         Refusal::NotStarted { detail, .. } => program()
             .stated(" could not be started: ")
             .withheld(ContentClass::Message, detail),
@@ -165,10 +169,7 @@ pub fn of(refusal: &Refusal, access: EnvironmentAccess, stage: Stage) -> Sentenc
             .stated(" bytes this host had not yet been asked for, so the bridge was ended"),
         Refusal::Unkillable { pid, detail, .. } => {
             let named = match pid {
-                Some(pid) => program()
-                    .stated(" (process ")
-                    .number(u64::from(*pid))
-                    .stated(")"),
+                Some(pid) => program().stated(" process ").number(u64::from(*pid)),
                 None => program(),
             };
             named
@@ -321,9 +322,10 @@ mod tests {
                 Refusal::NotStarted {
                     program: "podman".to_owned(),
                     detail: ARRIVED.to_owned(),
+                    not_found: false,
                 },
                 format!(
-                    "podman could not be started: [message withheld, {} bytes]",
+                    "the container runtime (podman) could not be started: [message withheld, {} bytes]",
                     ARRIVED.len()
                 ),
             ),
@@ -332,42 +334,42 @@ mod tests {
                     detail: ARRIVED.to_owned(),
                     helper: Some(HelperEnd::Exited(125)),
                 },
-                "podman ended with exit code 125 before the environment answered".to_owned(),
+                "the container runtime (podman) ended with exit code 125 before the environment answered".to_owned(),
             ),
             (
                 Refusal::Stream {
                     detail: ARRIVED.to_owned(),
                     helper: Some(HelperEnd::Signalled(9)),
                 },
-                "podman was ended by signal 9 before the environment answered".to_owned(),
+                "the container runtime (podman) was ended by signal 9 before the environment answered".to_owned(),
             ),
             (
                 Refusal::Stream {
                     detail: ARRIVED.to_owned(),
                     helper: Some(HelperEnd::Unaccounted),
                 },
-                "podman ended the connection before the environment answered".to_owned(),
+                "the container runtime (podman) ended the connection before the environment answered".to_owned(),
             ),
             (
                 Refusal::Stream {
                     detail: ARRIVED.to_owned(),
                     helper: None,
                 },
-                "podman ended the connection before the environment answered".to_owned(),
+                "the container runtime (podman) ended the connection before the environment answered".to_owned(),
             ),
             (
                 Refusal::Unreadable {
                     detail: ARRIVED.to_owned(),
                 },
                 format!(
-                    "podman ran, and the environment that answered wrote a frame this host \
+                    "the container runtime (podman) ran, and the environment that answered wrote a frame this host \
                      cannot read ([message withheld, {} bytes])",
                     ARRIVED.len()
                 ),
             ),
             (
                 Refusal::NotAnAcknowledgement,
-                "podman ran, and the environment's first frame was not an acknowledgement of the \
+                "the container runtime (podman) ran, and the environment's first frame was not an acknowledgement of the \
                  opening"
                     .to_owned(),
             ),
@@ -376,7 +378,7 @@ mod tests {
                     destination: 9,
                     invoker: 0,
                 },
-                "podman ran, and the environment that answered speaks protocol major 9, and \
+                "the container runtime (podman) ran, and the environment that answered speaks protocol major 9, and \
                  this host speaks 0"
                     .to_owned(),
             ),
@@ -386,7 +388,7 @@ mod tests {
                     answered: LocalRole::Worker,
                 },
                 format!(
-                    "podman ran, and the environment that answered is the {}, where the opening \
+                    "the container runtime (podman) ran, and the environment that answered is the {}, where the opening \
                      asked for the {}",
                     LocalRole::Worker.as_str(),
                     LocalRole::Controller.as_str()
@@ -398,7 +400,7 @@ mod tests {
                     answered: environment(2),
                 },
                 format!(
-                    "podman ran, and the environment that answered is environment {}, and the \
+                    "the container runtime (podman) ran, and the environment that answered is environment {}, and the \
                      enrolment names environment {}; enrol the environment that is installed \
                      there rather than reusing this record",
                     environment(2),
@@ -408,7 +410,7 @@ mod tests {
             (
                 Refusal::Destination(ProtocolError::new(ErrorCode::PermissionDenied, ARRIVED)),
                 format!(
-                    "podman ran, and the environment refused the bridge: PERMISSION_DENIED \
+                    "the container runtime (podman) ran, and the environment refused the bridge: PERMISSION_DENIED \
                      ([message withheld, {} bytes])",
                     ARRIVED.len()
                 ),
@@ -418,7 +420,7 @@ mod tests {
                 Refusal::Silent {
                     waited: std::time::Duration::from_secs(20),
                 },
-                "podman said nothing for 20 seconds, so it was ended".to_owned(),
+                "the container runtime (podman) said nothing for 20 seconds, so it was ended".to_owned(),
             ),
             (
                 Refusal::UserMismatch {
@@ -426,14 +428,14 @@ mod tests {
                     answered: "another".to_owned(),
                 },
                 format!(
-                    "podman ran, and the helper that answered ran as [name withheld, 7 bytes], not \
+                    "the container runtime (podman) ran, and the helper that answered ran as [name withheld, 7 bytes], not \
                      as the user [name withheld, {} bytes] the enrolment names",
                     ARRIVED.len()
                 ),
             ),
             (
                 Refusal::OwnEnvironment,
-                "podman ran, and the environment that answered is this host's own environment, \
+                "the container runtime (podman) ran, and the environment that answered is this host's own environment, \
                  so it is not another one: a socket forwarded from here does not register an \
                  environment"
                     .to_owned(),
@@ -448,7 +450,7 @@ mod tests {
                     },
                 })),
                 format!(
-                    "podman ran, and the environment that answered runs [name withheld, {} \
+                    "the container runtime (podman) ran, and the environment that answered runs [name withheld, {} \
                      bytes] with protocol 0.1.2, and this host speaks protocol {}.{}.{}: update \
                      kr in the destination or here so both are of one release",
                     ARRIVED.len(),
@@ -460,7 +462,7 @@ mod tests {
             (
                 level(None),
                 format!(
-                    "podman ran, and the environment that answered is of a build that states no \
+                    "the container runtime (podman) ran, and the environment that answered is of a build that states no \
                      protocol version, and this host speaks protocol {}.{}.{}: update kr in the \
                      destination",
                     PACKAGE_VERSION.major, PACKAGE_VERSION.minor, PACKAGE_VERSION.patch
@@ -468,7 +470,7 @@ mod tests {
             ),
             (
                 Refusal::Backlog { limit: 1_048_576 },
-                "podman ran, and the environment that answered sent more than 1048576 bytes \
+                "the container runtime (podman) ran, and the environment that answered sent more than 1048576 bytes \
                  this host had not yet been asked for, so the bridge was ended"
                     .to_owned(),
             ),
@@ -480,7 +482,7 @@ mod tests {
                     answered: false,
                 },
                 format!(
-                    "podman (process 4242) could not be ended: [message withheld, {} bytes]; it \
+                    "the container runtime (podman) process 4242 could not be ended: [message withheld, {} bytes]; it \
                      may still be running, and this host no longer waits for it",
                     ARRIVED.len()
                 ),
@@ -493,7 +495,7 @@ mod tests {
                     answered: true,
                 },
                 format!(
-                    "podman could not be ended: [message withheld, {} bytes]; it may still be \
+                    "the container runtime (podman) could not be ended: [message withheld, {} bytes]; it may still be \
                      running, and this host no longer waits for it",
                     ARRIVED.len()
                 ),
@@ -507,22 +509,30 @@ mod tests {
         }
     }
 
-    /// KR-REQ-18.11, the part about connection diagnostics: each access class names its own
-    /// program, the one this build starts for it.
+    /// KR-REQ-18.11, the part about connection diagnostics: each access class names its own step
+    /// by its role and then by the program this build starts for it, and an access class with no
+    /// program says so in the same place.
     #[test]
-    fn each_access_class_names_the_program_the_host_runs_for_it() {
+    fn each_access_class_names_the_step_the_host_runs_for_it() {
         let ended = Refusal::Stream {
             detail: ARRIVED.to_owned(),
             helper: Some(HelperEnd::Exited(255)),
         };
-        for (access, program) in [
-            (EnvironmentAccess::SshHost, "ssh"),
-            (EnvironmentAccess::Container, "podman"),
-            (EnvironmentAccess::WslDistribution, "wsl.exe"),
+        for (access, step) in [
+            (EnvironmentAccess::SshHost, "the SSH client (ssh)"),
+            (
+                EnvironmentAccess::Container,
+                "the container runtime (podman)",
+            ),
+            (
+                EnvironmentAccess::WslDistribution,
+                "the WSL launcher (wsl.exe)",
+            ),
+            (EnvironmentAccess::PairedHost, "the helper program"),
         ] {
             assert_eq!(
                 of(&ended, access, Stage::Opening).as_str(),
-                format!("{program} ended with exit code 255 before the environment answered")
+                format!("{step} ended with exit code 255 before the environment answered")
             );
         }
     }
@@ -539,33 +549,33 @@ mod tests {
                     detail: ARRIVED.to_owned(),
                     helper: Some(HelperEnd::Exited(125)),
                 },
-                format!("podman ended with exit code 125{after}"),
+                format!("the container runtime (podman) ended with exit code 125{after}"),
             ),
             (
                 Refusal::Stream {
                     detail: ARRIVED.to_owned(),
                     helper: Some(HelperEnd::Signalled(9)),
                 },
-                format!("podman was ended by signal 9{after}"),
+                format!("the container runtime (podman) was ended by signal 9{after}"),
             ),
             (
                 Refusal::Stream {
                     detail: ARRIVED.to_owned(),
                     helper: Some(HelperEnd::Unaccounted),
                 },
-                format!("podman ended the connection{after}"),
+                format!("the container runtime (podman) ended the connection{after}"),
             ),
             (
                 Refusal::Destination(ProtocolError::new(ErrorCode::PermissionDenied, ARRIVED)),
                 format!(
-                    "podman ran, and the environment answered the read with an error: \
+                    "the container runtime (podman) ran, and the environment answered the read with an error: \
                      PERMISSION_DENIED ([message withheld, {} bytes])",
                     ARRIVED.len()
                 ),
             ),
             (
                 Refusal::NotAnAcknowledgement,
-                "podman ran, and the environment answered the read with something that is not an \
+                "the container runtime (podman) ran, and the environment answered the read with something that is not an \
                  answer"
                     .to_owned(),
             ),

@@ -1488,7 +1488,7 @@ async fn held_across(
         Ending::Refused => (
             Nullable::null(),
             arrived(&format!(
-                "wsl.exe ran, and the environment refused the bridge: PERMISSION_DENIED \
+                "the WSL launcher (wsl.exe) ran, and the environment refused the bridge: PERMISSION_DENIED \
                  ([message withheld, {} bytes])",
                 REFUSAL.len()
             )),
@@ -1971,7 +1971,7 @@ async fn a_helper_that_ends_after_it_acknowledged_is_told_by_its_program() {
     assert!(!refreshed.row.readiness.channel_scoped);
     let said = refreshed.connection.as_str();
     assert!(
-        said.starts_with("wsl.exe ended with exit code ")
+        said.starts_with("the WSL launcher (wsl.exe) ended with exit code ")
             && said.ends_with(
                 " after the environment acknowledged the bridge, before it answered the read",
             ),

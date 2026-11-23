@@ -290,19 +290,20 @@ mod tests {
                 refusal: refusal @ Refusal::NotStarted { .. },
                 stage,
             }) => {
-                let Refusal::NotStarted { program, detail } = &refusal else {
+                let Refusal::NotStarted {
+                    program, not_found, ..
+                } = &refusal
+                else {
                     unreachable!("matched above");
                 };
                 assert_eq!(program, crate::bridge::launch::CONTAINER_RUNTIME);
-                // What a person reads names the program and gives the operating system's message
-                // as its class and length.
+                // No runtime is on the path here, so what a person reads names the step and says
+                // it was not found, and gives no word of the operating system's message.
+                assert!(*not_found, "{refusal:?}");
                 assert_eq!(
                     crate::bridge::diagnosis::of(&refusal, EnvironmentAccess::Container, stage)
                         .as_str(),
-                    format!(
-                        "podman could not be started: [message withheld, {} bytes]",
-                        detail.len()
-                    )
+                    "the container runtime (podman) was not found"
                 );
             }
             other => panic!("the runtime cannot be started here, yet {other:?} came back"),
