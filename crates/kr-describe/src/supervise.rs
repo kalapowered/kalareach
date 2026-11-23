@@ -279,6 +279,9 @@ struct Running {
     /// and it was applied.
     #[cfg(windows)]
     system_limit: Option<kr_ipc::memory_limit::MemoryLimit>,
+    /// The figure that limit was last set to, which the ceiling in force is compared with.
+    #[cfg(windows)]
+    system_limit_bytes: u64,
 }
 
 impl Running {
@@ -932,6 +935,8 @@ impl Driver {
             next_sample_ms: u64::MAX,
             #[cfg(windows)]
             system_limit,
+            #[cfg(windows)]
+            system_limit_bytes: self.service.ceiling_bytes(),
         });
         let hello = Request::Hello {
             build: self.build.clone(),
@@ -1210,8 +1215,45 @@ impl Driver {
         Ok(())
     }
 
+    /// Brings the limit the operating system holds around the process to the ceiling in force now,
+    /// when the owner changed the ceiling while the process lives. A limit the system will not
+    /// change is not left standing at the old figure: the process is ended, the next one is started
+    /// under the new limit, and this says so.
+    #[cfg(windows)]
+    fn follow_the_ceiling(&mut self, now: Reading, reports: &mut Vec<Report>) -> Result<()> {
+        let ceiling = self.service.ceiling_bytes();
+        let Some(running) = self.process.as_mut() else {
+            return Ok(());
+        };
+        if running.system_limit_bytes == ceiling {
+            return Ok(());
+        }
+        let Some(limit) = running.system_limit.as_ref() else {
+            // The system holds no limit around this process, so the daemon's own reading, which
+            // follows the ceiling in force, is the only one there is.
+            running.system_limit_bytes = ceiling;
+            return Ok(());
+        };
+        match limit.set_limit(ceiling) {
+            Ok(()) => {
+                running.system_limit_bytes = ceiling;
+                Ok(())
+            }
+            Err(why) => {
+                eprintln!(
+                    "kr-describe: the system's memory limit could not be changed to {ceiling} \
+                     bytes ({why}), so the description process is ended and starts again under \
+                     the new limit"
+                );
+                self.kill(ProcessEnd::MemoryCeiling, now, reports)
+            }
+        }
+    }
+
     /// Ends a process that broke a bound.
     fn on_timers(&mut self, now: Reading, reports: &mut Vec<Report>) -> Result<()> {
+        #[cfg(windows)]
+        self.follow_the_ceiling(now, reports)?;
         let Some(running) = self.process.as_mut() else {
             return Ok(());
         };

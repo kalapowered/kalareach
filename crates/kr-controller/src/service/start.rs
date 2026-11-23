@@ -197,11 +197,21 @@ impl Controller {
     /// anything the owner could have chosen, and the owner's choice is in that document. The
     /// effective-value report reads the same resolver, so it says what the daemon does.
     pub(crate) fn description_settings(&self) -> kr_describe::resource::ResourceSettings {
-        let settings = self.configuration().description_settings();
+        let resolver = self.configuration();
+        let settings = resolver.description_settings();
+        // What the owner chose, as the intersection has it: a ceiling the host cannot honour is
+        // not passed on, and a reserve below the floor is passed as written because the policy
+        // keeps the larger of it and the floor it reads from this machine.
+        let budgets =
+            crate::config::ceilings::description_budgets(&resolver.ceilings(), self.hard_limits());
         kr_describe::resource::ResourceSettings {
             enabled: settings.enabled,
             on_battery: settings.on_battery,
-            ..kr_describe::resource::ResourceSettings::default()
+            owner_ceiling_bytes: budgets
+                .process_memory
+                .configured
+                .filter(|_| !budgets.process_memory.refused),
+            owner_reserve_bytes: budgets.reserve.configured,
         }
     }
 

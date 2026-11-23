@@ -11542,6 +11542,44 @@ mod tests {
         }
     }
 
+    /// KR-REQ-22.10: restoring a backup leaves this host's description budgets as they were. A
+    /// backup holds the device configuration and no ceilings, so it can neither set the budgets
+    /// nor clear them: one whose document held other budgets, and one that held none, both leave
+    /// what this host has.
+    #[test]
+    fn restoring_a_backup_leaves_the_description_budgets_as_they_were() {
+        let budgets = |bytes: u64| configuration::DescriptionBudgets {
+            process_memory_bytes: Nullable::some(bytes),
+            reserve_bytes: Nullable::some(bytes),
+        };
+        let documented = |held: Option<configuration::DescriptionBudgets>| ConfigurationDocument {
+            ceilings: configuration::ConfigurationCeilings {
+                description_budgets: held,
+                ..Default::default()
+            },
+            ..ConfigurationDocument::empty()
+        };
+        let host = documented(Some(budgets(2 << 30)));
+        let loaded = configuration::load(Some(configuration::contents(&host).as_bytes()));
+        for backup in [documented(Some(budgets(3 << 30))), documented(None)] {
+            let device = configuration::DeviceConfiguration::of(&backup);
+            let restored =
+                configuration::edit(&loaded, &Change::DeviceConfiguration(Box::new(device)))
+                    .expect("the backup is restored");
+            assert_eq!(
+                restored.document.ceilings.description_budgets,
+                Some(budgets(2 << 30)),
+                "this host's budgets are as they were"
+            );
+        }
+        // And a host with none is not given the backup's.
+        let bare = configuration::load(None);
+        let device = configuration::DeviceConfiguration::of(&documented(Some(budgets(3 << 30))));
+        let restored = configuration::edit(&bare, &Change::DeviceConfiguration(Box::new(device)))
+            .expect("the backup is restored");
+        assert_eq!(restored.document.ceilings.description_budgets, None);
+    }
+
     /// KR-REQ-26.13: one function, and the order section 26 states.
     #[test]
     fn the_ladder_is_request_then_profile_then_host_then_default() {

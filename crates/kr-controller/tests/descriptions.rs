@@ -1843,6 +1843,88 @@ async fn setup_shows_the_cost_first_and_a_setting_applies_at_once_and_disabling_
     environment.stop().await;
 }
 
+/// Writes the owner's description budgets into the configuration document, the way an owner edits
+/// it, and puts the document into force.
+async fn the_owner_chooses(environment: &Environment, ceiling: Option<u64>, reserve: Option<u64>) {
+    use kr_protocol::hostinfo::configuration::{
+        ConfigurationCeilings, ConfigurationDocument, DescriptionBudgets, contents,
+    };
+    let chosen = DescriptionBudgets {
+        process_memory_bytes: Nullable(ceiling),
+        reserve_bytes: Nullable(reserve),
+    };
+    let document = ConfigurationDocument {
+        ceilings: ConfigurationCeilings {
+            description_budgets: (!chosen.is_unset()).then_some(chosen),
+            ..ConfigurationCeilings::default()
+        },
+        ..ConfigurationDocument::empty()
+    };
+    let path = environment
+        .controller()
+        .configuration()
+        .document()
+        .to_path_buf();
+    kr_ipc::paths::write_owner_only_file(&path, contents(&document).as_bytes())
+        .expect("writes the document");
+    environment.controller().effective_configuration().await;
+}
+
+/// KR-REQ-22.10: the owner's description budgets reach the running host with no restart. A ceiling
+/// below the model's itemised cost pauses with `resource_paused`; a reserve stricter than this
+/// machine's floor pauses while free memory sits above the floor and below the owner's reserve; a
+/// reserve below the floor leaves the floor; clearing the budgets returns to the defaults; and
+/// every change applies to the next admission of the same daemon.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_owners_description_budgets_apply_to_the_next_admission_without_a_restart() {
+    let environment = Environment::start(Setup::new()).await;
+    let session_id = environment.workers[0].session_id;
+    let not_paused = |setup: &kr_protocol::describe::DescriptionSetup| setup.paused.0.is_none();
+
+    // Control: nothing chosen, and the roomy host admits.
+    environment.setup_until("no pause", not_paused).await;
+
+    // (a) A ceiling below the itemised cost of the model: the cost does not fit.
+    the_owner_chooses(&environment, Some(1), None).await;
+    let shown = environment
+        .setup_until("the ceiling's pause", |setup| {
+            setup.paused.0 == Some(DescriptionPause::MemoryReserve)
+        })
+        .await;
+    assert_eq!(shown.state, DescriptionState::ResourcePaused, "{shown:?}");
+
+    // (d) Clearing the member returns to the defaults.
+    the_owner_chooses(&environment, None, None).await;
+    environment.setup_until("no pause again", not_paused).await;
+
+    // (b) A reserve stricter than the floor (3.2 GiB here), above the free memory the host has
+    // once the model's cost is out of it: paused, while the free memory is above the floor.
+    the_owner_chooses(&environment, None, Some(12 * GIB)).await;
+    environment
+        .setup_until("the reserve's pause", |setup| {
+            setup.paused.0 == Some(DescriptionPause::MemoryReserve)
+        })
+        .await;
+
+    // (c) A reserve below the floor leaves the floor: this host admits as it did.
+    the_owner_chooses(&environment, None, Some(2 * GIB)).await;
+    environment.setup_until("the floor", not_paused).await;
+
+    // (e) The same daemon, with no restart in between, describes under the budgets in force.
+    environment.workers[0].report("make", "/home/a/kalareach", None);
+    environment
+        .describe_until("the description", session_id, |described| {
+            described.source == LabelSource::Generated
+        })
+        .await;
+    assert_eq!(
+        environment.figures().started,
+        1,
+        "one process, never restarted"
+    );
+    environment.stop().await;
+}
+
 /// KR-REQ-22.01: turning descriptions off while the model is loading, or while a job runs in the
 /// process, answers with the pause the change causes: the answer is the host's state after the
 /// turn that took the change, and not the state from before it. The control is the answer before

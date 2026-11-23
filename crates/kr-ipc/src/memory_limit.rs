@@ -112,7 +112,7 @@ pub fn resume(process: BorrowedHandle<'_>) -> std::result::Result<(), Refusal> {
 #[derive(Debug)]
 pub struct MemoryLimit {
     /// Kept open for as long as this value lives: the job holds the limit and the process in it.
-    _job: OwnedHandle,
+    job: OwnedHandle,
     /// Where the job posts that a process in it passed the limit.
     port: OwnedHandle,
 }
@@ -174,40 +174,7 @@ impl MemoryLimit {
             return Err("this host would not tie the job to its completion port");
         }
 
-        let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-        limits.BasicLimitInformation.LimitFlags = HELD_FLAGS;
-        limits.ProcessMemoryLimit = wanted;
-        // SAFETY: the call reads one structure of the size given, from a live local.
-        let set = unsafe {
-            SetInformationJobObject(
-                raw_job,
-                JobObjectExtendedLimitInformation,
-                (&raw const limits).cast(),
-                size_of(&limits),
-            )
-        };
-        if set == 0 {
-            return Err("this host refused the process memory limit");
-        }
-
-        let mut held = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-        // SAFETY: the call writes one structure of the size given, through a pointer to a live
-        // local, and nothing else of this process.
-        let read = unsafe {
-            QueryInformationJobObject(
-                raw_job,
-                JobObjectExtendedLimitInformation,
-                (&raw mut held).cast(),
-                size_of(&held),
-                std::ptr::null_mut(),
-            )
-        };
-        if read == 0
-            || held.BasicLimitInformation.LimitFlags & HELD_FLAGS != HELD_FLAGS
-            || held.ProcessMemoryLimit.abs_diff(wanted) >= ROUNDING
-        {
-            return Err("this host did not report the memory limit it was given");
-        }
+        hold(raw_job, wanted)?;
 
         let process: HANDLE = process.as_raw_handle().cast();
         // SAFETY: the call takes two handles, which the caller and this function hold open.
@@ -224,7 +191,24 @@ impl MemoryLimit {
         if asked != 0 && inside == 0 {
             return Err("this host did not report the process in the job");
         }
-        Ok(Self { _job: job, port })
+        Ok(Self { job, port })
+    }
+
+    /// Changes the limit the job holds around the process to `limit_bytes`, and reads it back as
+    /// [`around`](Self::around) does. The process stays in the job, and the job's port still
+    /// records a refusal.
+    ///
+    /// A limit that is lower than what the process has committed does not take memory back: the
+    /// process is refused what it asks for next, and ending it is somebody else's reading.
+    ///
+    /// # Errors
+    ///
+    /// Returns why the limit was not changed: the system refused the call, or reported a limit
+    /// other than the one asked for. What the job holds then is not known to be either limit.
+    pub fn set_limit(&self, limit_bytes: u64) -> std::result::Result<(), Refusal> {
+        let wanted = usize::try_from(limit_bytes)
+            .map_err(|_| "the memory limit is more than this platform addresses")?;
+        hold(self.job.as_raw_handle().cast(), wanted)
     }
 
     /// Whether the job has recorded that the system refused the process a commit because it would
@@ -262,6 +246,46 @@ impl MemoryLimit {
             }
         }
     }
+}
+
+/// Asks the job for a process memory limit of `wanted` bytes with the flags it is held under, and
+/// reads both back from the system.
+fn hold(raw_job: HANDLE, wanted: usize) -> std::result::Result<(), Refusal> {
+    let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+    limits.BasicLimitInformation.LimitFlags = HELD_FLAGS;
+    limits.ProcessMemoryLimit = wanted;
+    // SAFETY: the call reads one structure of the size given, from a live local.
+    let set = unsafe {
+        SetInformationJobObject(
+            raw_job,
+            JobObjectExtendedLimitInformation,
+            (&raw const limits).cast(),
+            size_of(&limits),
+        )
+    };
+    if set == 0 {
+        return Err("this host refused the process memory limit");
+    }
+
+    let mut held = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+    // SAFETY: the call writes one structure of the size given, through a pointer to a live
+    // local, and nothing else of this process.
+    let read = unsafe {
+        QueryInformationJobObject(
+            raw_job,
+            JobObjectExtendedLimitInformation,
+            (&raw mut held).cast(),
+            size_of(&held),
+            std::ptr::null_mut(),
+        )
+    };
+    if read == 0
+        || held.BasicLimitInformation.LimitFlags & HELD_FLAGS != HELD_FLAGS
+        || held.ProcessMemoryLimit.abs_diff(wanted) >= ROUNDING
+    {
+        return Err("this host did not report the memory limit it was given");
+    }
+    Ok(())
 }
 
 /// The size of a structure the system is given, as the system counts it.
@@ -607,6 +631,55 @@ mod tests {
         let status = exit_of(&mut child, "the child that asked four times");
         assert_eq!(status.code(), Some(0), "the child ends when it is done");
         println!("recorded after each of the four requests: {recorded:?}");
+    }
+
+    /// KR-REQ-22.10: a limit changed while the process lives reaches the job: a higher one lets
+    /// the process have what it was refused, a lower one refuses what it was granted, and one
+    /// raised back to the default is the default again. The child asks for 512 MiB at each go.
+    #[test]
+    fn a_limit_changed_while_the_process_lives_is_the_limit_it_is_held_to() {
+        use std::io::Write as _;
+
+        let mut command = Command::new(std::env::current_exe().expect("this test binary"));
+        command
+            .args([
+                "--exact",
+                "memory_limit::tests::the_child_that_asks_the_system_for_memory_again_and_again",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(ASK_AGAIN, (512 * MIB).to_string())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        start_held(&mut command);
+        let mut child = Started(command.spawn().expect("the child starts"));
+        let limit = MemoryLimit::around(child.as_handle(), 256 * MIB)
+            .expect("the limit is applied to the child");
+        resume(child.as_handle()).expect("the child is let run");
+
+        let mut input = child.stdin.take().expect("a pipe");
+        let hear = lines_of(child.stdout.take().expect("a pipe"));
+        text_after(&hear, "request-1-refused");
+
+        // Higher: the next request is granted.
+        limit.set_limit(2048 * MIB).expect("the limit is raised");
+        writeln!(input, "go").expect("the child is told to go on");
+        text_after(&hear, "request-2-granted");
+
+        // Lower: the next request is refused again.
+        limit.set_limit(256 * MIB).expect("the limit is lowered");
+        writeln!(input, "go").expect("the child is told to go on");
+        text_after(&hear, "request-3-refused");
+
+        // Cleared to the default section 22 fixes, which is more than the child asks.
+        limit.set_limit(4096 * MIB).expect("the limit is cleared");
+        writeln!(input, "go").expect("the child is told to go on");
+        text_after(&hear, "request-4-granted");
+
+        drop(input);
+        let status = exit_of(&mut child, "the child that asked four times");
+        assert_eq!(status.code(), Some(0), "the child ends when it is done");
     }
 
     /// The variable that makes the daemon half below hold a process and end.

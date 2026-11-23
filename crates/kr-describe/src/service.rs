@@ -1063,6 +1063,18 @@ impl DescriptionService {
         self.policy = ResourcePolicy::new(self.settings, Budgets::DEFAULTS);
     }
 
+    /// Sets the budgets the owner chose, or clears them with `None`.
+    ///
+    /// They are the policy's own settings, as [`Self::set_enabled`] is: the ceiling bounds what the
+    /// process may use and the reserve is what this host keeps free, each applying only where it
+    /// is stricter than section 22's. They reach the next admission, and the ceiling reaches the
+    /// next reading of a process that is running.
+    pub fn set_owner_budgets(&mut self, ceiling_bytes: Option<u64>, reserve_bytes: Option<u64>) {
+        self.settings.owner_ceiling_bytes = ceiling_bytes;
+        self.settings.owner_reserve_bytes = reserve_bytes;
+        self.policy = ResourcePolicy::new(self.settings, Budgets::DEFAULTS);
+    }
+
     /// Records that a session exists, with the epoch it was addressed in.
     pub fn session_opened(
         &mut self,

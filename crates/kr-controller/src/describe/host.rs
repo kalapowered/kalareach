@@ -90,10 +90,9 @@ enum Message {
     },
     /// A session closed.
     Closed { session_id: SessionId },
-    /// The owner's settings: a setting left `None` is left as it is.
+    /// The owner's settings, all of them: what the document says now.
     Settings {
-        enabled: Option<bool>,
-        on_battery: Option<bool>,
+        settings: kr_describe::resource::ResourceSettings,
     },
     /// Everything posted before this has been taken: answer once the turn that took it has
     /// published what it found.
@@ -677,11 +676,8 @@ impl DescribeHost {
     }
 
     /// Applies the owner's settings, which take effect at the host's next turn.
-    pub(crate) fn settings(&self, enabled: Option<bool>, on_battery: Option<bool>) {
-        self.post(Message::Settings {
-            enabled,
-            on_battery,
-        });
+    pub(crate) fn settings(&self, settings: kr_describe::resource::ResourceSettings) {
+        self.post(Message::Settings { settings });
     }
 
     /// Returns what completes once the host has taken everything posted to it before this call and
@@ -986,16 +982,14 @@ impl Thread {
                     self.last_event.remove(&session_id);
                     self.seen.remove(&session_id);
                 }
-                Message::Settings {
-                    enabled,
-                    on_battery,
-                } => {
-                    if let Some(enabled) = enabled {
-                        self.driver.service_mut().set_enabled(enabled);
-                    }
-                    if let Some(allowed) = on_battery {
-                        self.driver.service_mut().set_on_battery(allowed);
-                    }
+                Message::Settings { settings } => {
+                    let service = self.driver.service_mut();
+                    service.set_enabled(settings.enabled);
+                    service.set_on_battery(settings.on_battery);
+                    service.set_owner_budgets(
+                        settings.owner_ceiling_bytes,
+                        settings.owner_reserve_bytes,
+                    );
                 }
                 Message::Summarise { ask } => {
                     let _ = self.driver.service_mut().summarise(*ask, now);
@@ -2305,8 +2299,10 @@ pub(crate) mod tests {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .send(Message::Settings {
-                enabled: Some(false),
-                on_battery: None,
+                settings: kr_describe::resource::ResourceSettings {
+                    enabled: false,
+                    ..kr_describe::resource::ResourceSettings::default()
+                },
             })
             .expect("the message is posted");
         host.shared.waker.wake();
@@ -2351,7 +2347,10 @@ pub(crate) mod tests {
             "nothing pauses it to begin with"
         );
 
-        handle.settings(Some(false), None);
+        handle.settings(kr_describe::resource::ResourceSettings {
+            enabled: false,
+            ..kr_describe::resource::ResourceSettings::default()
+        });
         let mut acknowledged = handle.turned();
         assert!(
             acknowledged.try_recv().is_err(),

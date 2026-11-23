@@ -302,7 +302,7 @@ impl DescribeModule {
     /// goes on.
     pub(crate) fn apply_settings(&self, settings: kr_describe::resource::ResourceSettings) {
         if let Some(host) = self.host() {
-            host.settings(Some(settings.enabled), Some(settings.on_battery));
+            host.settings(settings);
         }
         let was_enabled = self
             .enabled_seen
