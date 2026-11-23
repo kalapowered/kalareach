@@ -17,12 +17,22 @@ use std::time::Duration;
 
 use companion_tauri::connection::{Connection, Unopened};
 use kr_protocol::agent::{AgentMutationTarget, AgentPromptParams, PromptText};
+use kr_protocol::broker::{
+    ActionProvenance, InstanceCapabilityIdentity, InstanceCapabilityRecord,
+    InstanceCapabilityState, InstanceEvidenceSource, InstanceInvalidation,
+};
+use kr_protocol::gateway::RichOperation;
 use kr_protocol::ids::{
-    ActionId, AgentBindingRevision, ApplicationInstanceId, GrantId, InvitationId, SessionId,
+    ActionId, AgentBindingRevision, AgentTurnId, ApplicationInstanceId, CapabilityId,
+    CapabilityRevision, GrantId, InvitationId, SessionId, UpstreamRequestId,
 };
 use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::{Nullable, TimestampMs};
 use kr_protocol::sharing::{GrantRedeemParams, RoleSelection, SessionRole};
+use kr_worker::broker::{
+    BrokerError, PendingTransmission, UpstreamBody, UpstreamDispatch, UpstreamOutcome,
+    UpstreamRequest,
+};
 use net_support::worker::{Adopted, Upstream, offer, revoke};
 use net_support::{Host, proposal};
 use serde_json::{Value, json};
@@ -292,6 +302,269 @@ async fn kr_req_19_08_a_phone_reads_prompts_and_answers_a_paired_hosts_session()
 
     leave(companion, session, "first-opening");
     adopted.stop().await;
+}
+
+/// One operation a running agent's upstream was handed: what it is, the turn it names and its text.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Handed {
+    operation: RichOperation,
+    turn: Option<String>,
+    text: Option<String>,
+}
+
+/// An agent's upstream that settles every operation it is handed and records it.
+#[derive(Debug, Default)]
+struct Handing {
+    handed: std::sync::Mutex<Vec<Handed>>,
+}
+
+impl Handing {
+    /// Every operation the host handed over, in order.
+    fn handed(&self) -> Vec<Handed> {
+        self.handed
+            .lock()
+            .expect("the record is not poisoned")
+            .clone()
+    }
+}
+
+impl UpstreamDispatch for Handing {
+    fn admit(&self, _request: &UpstreamRequest) -> Result<(), BrokerError> {
+        Ok(())
+    }
+
+    fn submit(&self, request: &UpstreamRequest) -> Result<PendingTransmission, BrokerError> {
+        let text = match &request.body {
+            UpstreamBody::Prompt { text, .. } => text.clone(),
+            UpstreamBody::Steer { text } => Some(text.clone()),
+            _ => None,
+        };
+        self.handed
+            .lock()
+            .expect("the record is not poisoned")
+            .push(Handed {
+                operation: request.operation,
+                turn: request
+                    .turn_id
+                    .as_ref()
+                    .map(|turn| turn.as_str().to_owned()),
+                text,
+            });
+        Ok(PendingTransmission::settled(Ok(UpstreamOutcome {
+            upstream_request_id: Some(UpstreamRequestId::new("upstream-1").expect("valid")),
+            turn_id: request.turn_id.clone(),
+            provenance: ActionProvenance::UpstreamTypedRpc,
+        })))
+    }
+}
+
+/// The turn the agent below is running.
+const RUNNING: &str = "turn-1";
+
+/// A paired host with one agent that is running a turn and takes a queued prompt, a steer and a
+/// cancel, and a phone that holds the rights to send each, with the session open on it.
+struct Running {
+    adopted: Adopted,
+    phone: Phone,
+    session: SessionId,
+    instance: ApplicationInstanceId,
+    upstream: Arc<Handing>,
+}
+
+impl Running {
+    async fn start() -> Self {
+        let adopted = Adopted::start(1).await;
+        let worker = &adopted.workers[0];
+        let upstream = Arc::new(Handing::default());
+        let instance = worker.register_agent_on(Arc::clone(&upstream) as Arc<dyn UpstreamDispatch>);
+        let broker = worker.service.broker();
+        for name in ["agent.prompt.queue", "agent.steer", "agent.cancel"] {
+            broker
+                .record_capability(InstanceCapabilityRecord {
+                    capability_id: CapabilityId::new(name).expect("valid"),
+                    capability_version: "1".to_owned(),
+                    application_instance_id: instance,
+                    identity: InstanceCapabilityIdentity::default(),
+                    revision: CapabilityRevision::new(1),
+                    state: InstanceCapabilityState::QualifiedAvailable,
+                    source: InstanceEvidenceSource::HostProbe,
+                    invalidated_by: [InstanceInvalidation::BindingChanged].into_iter().collect(),
+                    disabled_reason: Nullable::null(),
+                    observed_at: TimestampMs::new(1),
+                })
+                .expect("the capability is recorded");
+        }
+        broker
+            .set_turn(instance, Some(AgentTurnId::new(RUNNING).expect("valid")))
+            .expect("a turn is running");
+        let session = worker.session_id;
+        let phone = phone_under(
+            &adopted,
+            pairing(&[
+                ActionRight::SessionView,
+                ActionRight::AgentPrompt,
+                ActionRight::AgentCancel,
+            ]),
+        )
+        .await;
+        let standing =
+            open(&phone.companion, session, None, "running-opening").expect("the session opens");
+        assert_eq!(standing["state"], "open", "{standing}");
+        let running = Self {
+            adopted,
+            phone,
+            session,
+            instance,
+            upstream,
+        };
+        // What the composer offers its controls from: the turn that runs and a capability each.
+        assert_eq!(running.turn(), RUNNING);
+        running
+    }
+
+    /// The turn the phone reads the agent to be running, `null` where it runs none.
+    fn turn(&self) -> Value {
+        let capabilities = self
+            .phone
+            .companion
+            .call(
+                "agent_capabilities",
+                json!({
+                    "params": { "subject": subject(self.session, self.instance) },
+                    "opening": "running-opening",
+                }),
+            )
+            .expect("the capabilities are read");
+        capabilities["binding"]["turn_id"].clone()
+    }
+
+    /// The target of a steer or a cancel, at the binding revision the phone read.
+    fn target(&self) -> Value {
+        json!({ "subject": subject(self.session, self.instance), "binding_revision": "1" })
+    }
+
+    /// Calls `command` as the page does, with the one opening of the session.
+    fn call(&self, command: &str, params: Value) -> Result<Value, Value> {
+        self.phone.companion.call(
+            command,
+            json!({ "params": params, "opening": "running-opening" }),
+        )
+    }
+
+    async fn stop(self) {
+        leave(&self.phone.companion, self.session, "running-opening");
+        self.adopted.stop().await;
+    }
+}
+
+/// What the page reads as "Applied": the host answered with the method's own result, which it does
+/// only for an action it performed, and the answer was not lost. The result names the turn the
+/// action acted on, and what the upstream called it.
+fn applied(settled: &Value, turn: Value) {
+    assert_eq!(settled["answer_lost"], false, "{settled}");
+    assert_eq!(settled["receipt"], Value::Null, "{settled}");
+    assert_eq!(
+        settled["value"],
+        json!({
+            "binding_revision": "1",
+            "provenance": "upstream_typed_rpc",
+            "turn_id": turn,
+            "upstream_request_id": "upstream-1",
+        }),
+        "{settled}"
+    );
+}
+
+/// KR-REQ-13.12: a phone paired with a host queues a prompt behind its agent's running turn. The
+/// agent's upstream is handed the prompt as a queued one, with its text, and the turn that runs is
+/// not touched; the phone's own read of the agent still shows that turn running.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_13_12_a_phone_queues_a_prompt_behind_the_running_turn_of_a_paired_host() {
+    let running = Running::start().await;
+
+    let settled = running
+        .call(
+            "agent_prompt_queue",
+            prompt(running.session, running.instance, "then run the tests"),
+        )
+        .expect("the prompt is queued");
+
+    applied(&settled, Value::Null);
+    assert_eq!(
+        running.upstream.handed(),
+        [Handed {
+            operation: RichOperation::PromptQueue,
+            turn: None,
+            text: Some("then run the tests".to_owned()),
+        }]
+    );
+    assert_eq!(running.turn(), RUNNING);
+    running.stop().await;
+}
+
+/// KR-REQ-13.12: a phone paired with a host steers its agent's running turn. The agent's upstream
+/// is handed the steer, naming that turn, with its text; the turn goes on, and the phone's own read
+/// still shows it running.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_13_12_a_phone_steers_the_running_turn_of_a_paired_host() {
+    let running = Running::start().await;
+
+    let settled = running
+        .call(
+            "agent_turn_steer",
+            json!({ "target": running.target(), "turn_id": RUNNING, "text": "use the other file" }),
+        )
+        .expect("the turn is steered");
+
+    applied(&settled, json!(RUNNING));
+    assert_eq!(
+        running.upstream.handed(),
+        [Handed {
+            operation: RichOperation::TurnSteer,
+            turn: Some(RUNNING.to_owned()),
+            text: Some("use the other file".to_owned()),
+        }]
+    );
+    assert_eq!(running.turn(), RUNNING);
+    running.stop().await;
+}
+
+/// KR-REQ-13.12: a phone paired with a host cancels its agent's running turn. The agent's upstream
+/// is handed the cancel of that turn and nothing else; the turn stays on the host's record until
+/// the upstream reports its end, and then the phone's own read shows no turn, so that its composer
+/// offers neither Steer nor Interrupt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_13_12_a_phone_cancels_the_running_turn_of_a_paired_host() {
+    let running = Running::start().await;
+
+    let settled = running
+        .call(
+            "agent_turn_cancel",
+            json!({ "target": running.target(), "turn_id": RUNNING }),
+        )
+        .expect("the turn is cancelled");
+
+    applied(&settled, json!(RUNNING));
+    assert_eq!(
+        running.upstream.handed(),
+        [Handed {
+            operation: RichOperation::TurnCancel,
+            turn: Some(RUNNING.to_owned()),
+            text: None,
+        }]
+    );
+    assert_eq!(
+        running.turn(),
+        RUNNING,
+        "the upstream has not said it ended"
+    );
+    running.adopted.workers[0]
+        .service
+        .broker()
+        .set_turn(running.instance, None)
+        .expect("the turn ends");
+    assert_eq!(running.turn(), Value::Null);
+    running.stop().await;
 }
 
 /// KR-REQ-19.08: commands from outside a session screen reach the sessions of a paired host over
