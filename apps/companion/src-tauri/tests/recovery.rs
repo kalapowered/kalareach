@@ -22,10 +22,12 @@ use companion_tauri::account::carrier::{Boxed, Carrier, Ending, Plan, Unavailabl
 use companion_tauri::account::{Account, AccountSlot};
 use companion_tauri::device::DeviceIdentity;
 use companion_tauri::recovery::{
-    HostCoverView, LeftView, NotSavedWhy, Recovery, SEED_SCOPE, SettingsLine, SettingsSource,
-    SettingsStep, SettingsTiming,
+    HostCoverView, LeftView, NotSavedWhy, Recovery, SEED_SCOPE, SettingsLine, SettingsRemoved,
+    SettingsSource, SettingsStep, SettingsTiming,
 };
+use companion_tauri::retained::{Confirm, Deletions, Question, SavedSettings};
 use companion_tauri::settings::{ColourMode, Settings};
+use kr_client::pairing::BoxFuture;
 use kr_client::recovery::{BundleStore, HostBackups, parse_kit};
 use kr_client::services::account::{
     ACCOUNT_ORIGIN, AccountMark, AccountToken, AccountTokenSource, BACKUP_RESTORE_SCOPE,
@@ -290,6 +292,8 @@ impl Computer {
                 companion_tauri::commands::recovery_archives,
                 companion_tauri::commands::recovery_export_offline,
                 companion_tauri::commands::recovery_cover_host,
+                companion_tauri::commands::recovery_resume_settings,
+                companion_tauri::commands::retained_saved_settings,
                 cover_the_host_double,
             ])
             .build(mock_context(noop_assets()))
@@ -4556,4 +4560,319 @@ async fn the_first_bundle_carries_the_member_only_when_the_oldest_retained_level
             "the oldest retained level 0.{minor}"
         );
     }
+}
+
+/* -------------------------------------------------------------------------- */
+/* Removing the saved settings from the bundle                                 */
+/* -------------------------------------------------------------------------- */
+
+/// What the retained flow asks of recovery, over this page's recovery and account.
+struct SavedHere {
+    recovery: Arc<Recovery>,
+    account: Arc<Account>,
+}
+
+impl SavedSettings for SavedHere {
+    fn listed(&self) -> BoxFuture<'_, companion_tauri::error::Result<Option<TimestampMs>>> {
+        Box::pin(async move { self.recovery.saved_settings_listed(&self.account).await })
+    }
+
+    fn remove(&self) -> BoxFuture<'_, companion_tauri::error::Result<SettingsRemoved>> {
+        Box::pin(async move { self.recovery.remove_saved_settings(&self.account).await })
+    }
+}
+
+/// The person's answer to the dialog, and what the dialog asked.
+struct Says {
+    yes: bool,
+    asked: Mutex<Vec<Question>>,
+}
+
+impl Says {
+    fn yes() -> Self {
+        Self {
+            yes: true,
+            asked: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn last(&self) -> Question {
+        self.asked
+            .lock()
+            .expect("the record")
+            .last()
+            .cloned()
+            .expect("the person was asked")
+    }
+}
+
+impl Confirm for Says {
+    fn confirm(&self, question: Question) -> BoxFuture<'_, bool> {
+        self.asked.lock().expect("the record").push(question);
+        Box::pin(async move { self.yes })
+    }
+}
+
+impl Page {
+    /// The retained flow of this page, ready to remove the saved settings.
+    fn deletions(&self) -> Deletions {
+        let deletions = Deletions::default();
+        deletions.saved_settings_from(Arc::new(SavedHere {
+            recovery: Arc::clone(&self.recovery),
+            account: Arc::clone(&self.account),
+        }));
+        deletions
+    }
+}
+
+/// KR-REQ-20.17: the settings saved with the bundle are listed as a copy that left this device,
+/// removed by the person's own confirmed action, and removed alone: collections, writers, producers
+/// and checkpoints leave as they were. Saving then stays off, so a step already waiting writes
+/// nothing back, until the person turns it on again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn removing_the_settings_from_the_bundle_stops_a_pending_step_from_writing_them_back_and_resume_starts_it_again()
+ {
+    let computer = Computer::new().await;
+    let (page, settings) = computer.saving_page(NO_WAIT).await;
+    settings
+        .set_colour_mode(ColourMode::Dark)
+        .await
+        .expect("kept");
+    page.call("recovery_turn_on", json!({})).expect("on");
+    let host = Host::new(&computer, computer.served.origin());
+    host.sets_up();
+    page.recovery
+        .cover_host(&page.account, &host, false)
+        .await
+        .expect("the host is covered");
+    let before = bundle_of(&computer, &page).await;
+    assert_eq!(colour_in(&before).as_deref(), Some("dark"));
+
+    let listed = page
+        .call("retained_saved_settings", json!({}))
+        .expect("listed");
+    assert_eq!(listed["reference"], "settings-saved");
+    assert_eq!(listed["deletable"], true);
+
+    let deletions = page.deletions();
+    let says = Says::yes();
+    let asked = deletions
+        .ask(None, &settings, &says, "settings-saved")
+        .await
+        .expect("asked");
+    let question = says.last();
+    assert_eq!(question.kind, "Settings saved with your recovery bundle");
+    assert_eq!(question.title, "Remove your saved settings?");
+    assert_eq!(question.confirm, "Remove");
+    assert_eq!(
+        question.words,
+        "This removes your saved settings from your recovery bundle. Your recovery bundle and its \
+         keys stay. Copies you exported, and copies your service's providers keep, are not changed."
+    );
+    // Nothing is removed before the person's yes has been finished.
+    assert_eq!(
+        colour_in(&bundle_of(&computer, &page).await).as_deref(),
+        Some("dark")
+    );
+    let token = asked.token.expect("the person said yes");
+    let finished = deletions
+        .finish(None, &settings, &token)
+        .await
+        .expect("finished");
+    assert!(finished.deleted);
+
+    let after = bundle_of(&computer, &page).await;
+    assert_eq!(colour_in(&after), None, "the member is gone");
+    let mut kept = before.clone();
+    kept.device_settings = None;
+    kept.revision = after.revision;
+    kept.written_at_ms = after.written_at_ms;
+    assert_eq!(after, kept, "every other field is as it was");
+    assert_eq!(page.view()["settings"], json!({ "state": "stopped" }));
+    assert_eq!(
+        page.call("retained_saved_settings", json!({}))
+            .expect("listed"),
+        Value::Null
+    );
+
+    // Saving stays off: a change made now, and a step that comes after it, write nothing back.
+    settings
+        .set_colour_mode(ColourMode::Light)
+        .await
+        .expect("kept");
+    let writes = writes_sent(&computer);
+    let step = page
+        .recovery
+        .save_settings(&page.account)
+        .await
+        .expect("a step");
+    assert_eq!(
+        step,
+        SettingsStep::Ended {
+            line: SettingsLine::Stopped,
+            retry_at: None
+        }
+    );
+    assert_eq!(writes_sent(&computer), writes);
+
+    // Turned on again, the step saves what the person has chosen.
+    page.call("recovery_resume_settings", json!({}))
+        .expect("resumed");
+    page.recovery
+        .save_settings(&page.account)
+        .await
+        .expect("a step");
+    assert_eq!(
+        colour_in(&bundle_of(&computer, &page).await).as_deref(),
+        Some("light")
+    );
+    assert_eq!(page.view()["settings"], json!({ "state": "saved" }));
+}
+
+/// KR-REQ-20.17: a removal whose answer is lost is reported unconfirmed and stays visible as an
+/// unsettled write until it is ended, and a write that was outstanding is ended first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_removal_whose_answer_is_lost_stays_unconfirmed_until_a_step_ends_it() {
+    for (moment, landed) in [(Moment::After, true), (Moment::Before, false)] {
+        let computer = Computer::new().await;
+        let (page, settings) = computer.saving_page(NO_WAIT).await;
+        settings
+            .set_colour_mode(ColourMode::Dark)
+            .await
+            .expect("kept");
+        page.call("recovery_turn_on", json!({})).expect("on");
+        let deletions = page.deletions();
+        let says = Says::yes();
+        let token = deletions
+            .ask(None, &settings, &says, "settings-saved")
+            .await
+            .expect("asked")
+            .token
+            .expect("yes");
+        // The removal reads the bundle and then writes it.
+        computer
+            .served
+            .web()
+            .fail_with_member(SYNC_PATH, "exchange", 1, moment);
+        let finished = deletions
+            .finish(None, &settings, &token)
+            .await
+            .expect("finished");
+        assert!(
+            !finished.deleted,
+            "{moment:?}: the service did not confirm it"
+        );
+        assert_eq!(page.view()["state"], "unsettled", "{moment:?}");
+        assert_eq!(page.view().get("settings"), None, "{moment:?}");
+
+        // Saving is off, and a step ends the write first and then stops.
+        page.recovery
+            .save_settings(&page.account)
+            .await
+            .expect("a step");
+        assert_eq!(page.view()["state"], "on", "{moment:?}");
+        let held = colour_in(&bundle_of(&computer, &page).await);
+        assert_eq!(held.is_none(), landed, "{moment:?}: what the service holds");
+    }
+}
+
+/// KR-REQ-20.17: nothing is asked of the person about settings the bundle does not hold.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nothing_is_asked_about_settings_the_bundle_does_not_hold() {
+    let computer = Computer::new().await;
+    let (page, settings) = computer.saving_page(NO_WAIT).await;
+    page.call("recovery_turn_on", json!({})).expect("on");
+    let deletions = page.deletions();
+    let says = Says::yes();
+    let refused = deletions
+        .ask(None, &settings, &says, "settings-saved")
+        .await
+        .expect_err("the bundle holds none");
+    assert_eq!(
+        refused.message,
+        "Your recovery bundle holds no saved settings."
+    );
+    assert!(says.asked.lock().expect("the record").is_empty());
+}
+
+/// KR-REQ-20.17: the writer's level binds the saving step and nothing the person does.
+/// A bundle that holds a member (only a later build can have written one) lists the row and lets
+/// the person remove it, with the gate closed; a bundle with none lists nothing and the removal
+/// refuses.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_closed_gate_still_lists_and_removes_a_member_a_later_build_wrote_and_lists_none_otherwise()
+ {
+    let computer = Computer::new().await;
+    {
+        let (later, settings) = computer.saving_page(NO_WAIT).await;
+        settings
+            .set_colour_mode(ColourMode::Dark)
+            .await
+            .expect("kept");
+        later.call("recovery_turn_on", json!({})).expect("on");
+    }
+    let (page, settings) = computer.saving_page_at(NO_WAIT, level(CLOSED)).await;
+    assert_eq!(
+        colour_in(&bundle_of(&computer, &page).await).as_deref(),
+        Some("dark")
+    );
+    assert_eq!(
+        page.view().get("settings"),
+        None,
+        "no saving line while the gate is closed"
+    );
+    let listed = page
+        .call("retained_saved_settings", json!({}))
+        .expect("listed");
+    assert_eq!(listed["reference"], "settings-saved");
+    assert_eq!(listed["deletable"], true);
+
+    let deletions = page.deletions();
+    let says = Says::yes();
+    let token = deletions
+        .ask(None, &settings, &says, "settings-saved")
+        .await
+        .expect("asked")
+        .token
+        .expect("yes");
+    assert!(
+        deletions
+            .finish(None, &settings, &token)
+            .await
+            .expect("finished")
+            .deleted
+    );
+    assert_eq!(
+        colour_in(&bundle_of(&computer, &page).await),
+        None,
+        "the member is gone"
+    );
+    assert_eq!(
+        page.call("retained_saved_settings", json!({}))
+            .expect("listed"),
+        Value::Null
+    );
+
+    // A build whose gate is closed wrote no member, so there is no row and no removal.
+    let other = Computer::new().await;
+    let (page, settings) = other.saving_page_at(NO_WAIT, level(CLOSED)).await;
+    settings
+        .set_colour_mode(ColourMode::Dark)
+        .await
+        .expect("kept");
+    page.call("recovery_turn_on", json!({})).expect("on");
+    assert_eq!(
+        page.call("retained_saved_settings", json!({}))
+            .expect("listed"),
+        Value::Null
+    );
+    let refused = page
+        .deletions()
+        .ask(None, &settings, &Says::yes(), "settings-saved")
+        .await
+        .expect_err("the bundle holds none");
+    assert_eq!(
+        refused.message,
+        "Your recovery bundle holds no saved settings."
+    );
 }

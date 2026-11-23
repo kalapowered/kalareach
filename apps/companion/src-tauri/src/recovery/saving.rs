@@ -55,13 +55,15 @@ use std::time::{Duration, Instant};
 use kr_client::recovery::{LocalSettings, LostWrite, RecoveryError, SettingsSaved};
 use kr_protocol::hello::PackageVersion;
 use kr_protocol::retained::RETAINED_WORKER_LEVELS;
+use kr_protocol::scalars::TimestampMs;
 use kr_protocol::update::{CompatibilityLevel, THIS_LEVEL};
 use serde::Serialize;
 use tokio::sync::Notify;
 
-use super::{Recovery, Step, blocker, now};
+use super::{Named, Recovery, RecoveryView, Step, blocker, now, refuse_if_blocked, said};
 use crate::account::Account;
-use crate::error::Result;
+use crate::error::{CommandError, Result};
+use crate::retained::NO_SAVED_SETTINGS;
 
 /// The first level whose builds read a settings member in a recovery bundle.
 pub const SETTINGS_READ_FROM: CompatibilityLevel =
@@ -145,6 +147,17 @@ pub enum NotSavedWhy {
     /// This computer's recovery record, or the store's record of its last write, cannot be read,
     /// or the lock cannot be taken.
     Records,
+}
+
+/// What removing the saved settings from the bundle came to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SettingsRemoved {
+    /// The service confirmed that the bundle holds no saved settings now.
+    Removed,
+    /// The removal was sent and the service did not answer. The write is outstanding, so the
+    /// settings stay listed and the page shows the write as unsettled until a step or the person
+    /// ends it.
+    Unconfirmed,
 }
 
 /// What one step came to.
@@ -310,6 +323,78 @@ impl Recovery {
             source,
             open: oldest_retained >= SETTINGS_READ_FROM,
         });
+    }
+
+    /// When the bundle was last written, if it holds saved settings now: a read of the service.
+    ///
+    /// This is what is stored, not what a step may write, so it does not depend on the writer's
+    /// level: a member that a later build wrote is listed. A computer with no kept record, or one
+    /// that cannot use the account now, lists nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns a failure to read the bundle.
+    pub async fn saved_settings_listed(&self, account: &Account) -> Result<Option<TimestampMs>> {
+        let _step = self.step().await?;
+        let Some(record) = self.record()?.filter(|record| record.kept) else {
+            return Ok(None);
+        };
+        if blocker(account, &record.origin()?).is_some() {
+            return Ok(None);
+        }
+        let seed = self.seed(false)?;
+        let mut store = self.store(&record, account)?;
+        let bundle = store.fetch(&seed).await.map_err(said)?;
+        Ok(bundle
+            .device_settings
+            .is_some()
+            .then_some(bundle.written_at_ms))
+    }
+
+    /// Takes the saved settings out of the bundle, and turns saving them off first.
+    ///
+    /// The stop is kept before anything is sent, so a step that had already begun finds it under
+    /// the lock and writes nothing back. The member alone leaves: the bundle, its keys and every
+    /// other entry stay. A removal whose answer never came back is [`SettingsRemoved::Unconfirmed`]
+    /// and is not reported as done; the next step ends the write.
+    ///
+    /// # Errors
+    ///
+    /// Refuses when the bundle holds no saved settings, and returns what the write fails with.
+    pub async fn remove_saved_settings(&self, account: &Account) -> Result<SettingsRemoved> {
+        let _step = self.step().await?;
+        let Some(mut record) = self.record()?.filter(|record| record.kept) else {
+            return Err(CommandError::invalid(NO_SAVED_SETTINGS));
+        };
+        refuse_if_blocked(account, &record.origin()?, Named::ByRecord)?;
+        let seed = self.seed(false)?;
+        if !record.settings_stopped {
+            record.settings_stopped = true;
+            self.keep(&record)?;
+        }
+        let mut store = self.store(&record, account)?;
+        match store.remove_settings(&seed, now()).await {
+            Ok(_) => Ok(SettingsRemoved::Removed),
+            Err(RecoveryError::BundleOutcomeUnknown { .. }) => Ok(SettingsRemoved::Unconfirmed),
+            Err(other) => Err(said(other)),
+        }
+    }
+
+    /// Turns the saving of the settings on again, after the person removed them. A step is wanted
+    /// now, and the line shows nothing until it has ended.
+    ///
+    /// # Errors
+    ///
+    /// Returns a failure to read or keep this computer's recovery record.
+    pub async fn resume_saving_settings(&self, account: &Account) -> Result<RecoveryView> {
+        let _step = self.step().await?;
+        if let Some(mut record) = self.record()?.filter(|record| record.settings_stopped) {
+            record.settings_stopped = false;
+            self.keep(&record)?;
+        }
+        self.saving.say(SettingsLine::Waiting);
+        self.saving.want_now();
+        self.view_of(account)
     }
 
     /// Tells saving the settings file changed. A step is wanted once the settings have been quiet.

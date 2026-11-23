@@ -5,11 +5,13 @@
 //! action: it names a copy and cannot confirm. The confirmation is a native dialog this process
 //! raises and answers, so a page that is compromised, or mistaken, cannot delete anything.
 //!
-//! There are two kinds of copy. What the host sent (its backup archives) is deleted by asking the
+//! There are three kinds of copy. What the host sent (its backup archives) is deleted by asking the
 //! host, which asks the service. What this application's own sync sent (settings and drafts the
 //! sync service refused and kept a copy of) is deleted by asking the sync service, with no host in
-//! between. Both go through the same ceremony of three commands, and the page supplies no method
-//! and no parameter of one:
+//! between. The settings saved with this computer's recovery bundle are removed by writing the
+//! bundle without them, with no host in between either; the bundle and its keys stay. All go
+//! through the same ceremony of three commands, and the page supplies no method and no parameter
+//! of one:
 //!
 //! * **Ask.** The page names a copy by the reference it is listed under. This process reads the
 //!   lists again, requires exactly one entry with that reference and requires it to be deletable,
@@ -29,7 +31,7 @@
 //! only.
 
 use std::collections::BTreeMap;
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 use kr_client::pairing::BoxFuture;
@@ -40,11 +42,13 @@ use kr_protocol::privacy::{
     PrivacyExported, PrivacyReport, PrivacyRetainedDeleteParams, PrivacyRetainedDeleteResult,
     PrivacyStatusParams,
 };
+use kr_protocol::scalars::TimestampMs;
 use serde::Serialize;
 
 use crate::commands::{MUTATION_TTL, NoPreconditions};
 use crate::connection::{Connection, Standing};
 use crate::error::{CommandError, Result};
+use crate::recovery::SettingsRemoved;
 use crate::settings::Settings;
 
 /// How long a token lives: long enough to read the page and press the button, short enough that a
@@ -53,6 +57,30 @@ pub const TOKEN_LIFETIME: Duration = Duration::from_secs(120);
 
 /// The most characters of the host's words a dialog repeats.
 const MOST_SHOWN: usize = 160;
+
+/// The reference the settings saved with the recovery bundle are listed and removed under.
+pub const SETTINGS_REFERENCE: &str = "settings-saved";
+
+/// What the page and the dialog call the settings saved with the recovery bundle.
+pub const SETTINGS_KIND: &str = "Settings saved with your recovery bundle";
+
+/// What removing them asks, in this application's words, and what it leaves alone.
+const SETTINGS_WORDS: &str = "This removes your saved settings from your recovery bundle. Your \
+    recovery bundle and its keys stay. Copies you exported, and copies your service's providers \
+    keep, are not changed.";
+
+/// What the bundle holds none of, said when the page asks to remove them.
+pub const NO_SAVED_SETTINGS: &str = "Your recovery bundle holds no saved settings.";
+
+/// The settings saved with the recovery bundle, as the retained flow lists and removes them. The
+/// application's is [`NativeSavedSettings`]; a test stands in for it.
+pub trait SavedSettings: Send + Sync {
+    /// When the bundle was last written, if it holds saved settings now. A read of the service.
+    fn listed(&self) -> BoxFuture<'_, Result<Option<TimestampMs>>>;
+
+    /// Turns saving off and takes the settings out of the bundle.
+    fn remove(&self) -> BoxFuture<'_, Result<SettingsRemoved>>;
+}
 
 /// The answer to the dialog, which this process asks for. The application's is the platform's
 /// native dialog; a test answers for the person.
@@ -70,6 +98,26 @@ pub struct Question {
     pub reference: String,
     /// What the deletion asks, in this application's words.
     pub words: String,
+    /// The dialog's title.
+    pub title: String,
+    /// The label of the first button, which Return answers: the one that does nothing.
+    pub decline: String,
+    /// The label of the one button that confirms.
+    pub confirm: String,
+}
+
+impl Question {
+    /// A question about a copy that is deleted.
+    fn deletion(kind: String, reference: String, words: String) -> Self {
+        Self {
+            kind,
+            reference,
+            words,
+            title: "Delete this copy?".to_owned(),
+            decline: DONT_DELETE.to_owned(),
+            confirm: DELETE.to_owned(),
+        }
+    }
 }
 
 /// What a copy is bound to between the person's yes and the deletion.
@@ -90,13 +138,26 @@ enum Bound {
     },
     /// A copy this application's own sync lists. Its reference names one copy of this computer.
     Sync,
+    /// The settings saved with this computer's recovery bundle.
+    Settings,
 }
 
 /// The confirmations that are waiting for their deletion.
-#[derive(Debug)]
 pub struct Deletions {
     pending: Mutex<BTreeMap<String, Pending>>,
     lifetime: Duration,
+    saved: OnceLock<Arc<dyn SavedSettings>>,
+}
+
+impl std::fmt::Debug for Deletions {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Deletions")
+            .field("pending", &self.pending)
+            .field("lifetime", &self.lifetime)
+            .field("saved", &self.saved.get().is_some())
+            .finish()
+    }
 }
 
 impl Default for Deletions {
@@ -133,7 +194,38 @@ impl Deletions {
         Self {
             pending: Mutex::default(),
             lifetime,
+            saved: OnceLock::new(),
         }
+    }
+
+    /// Gives the flow the settings saved with the recovery bundle to list and remove.
+    pub fn saved_settings_from(&self, saved: Arc<dyn SavedSettings>) {
+        let _ = self.saved.set(saved);
+    }
+
+    fn saved(&self) -> Result<&Arc<dyn SavedSettings>> {
+        self.saved.get().ok_or_else(|| {
+            CommandError::local_failure("this computer's recovery records could not be opened")
+        })
+    }
+
+    /// The question for the saved settings, when the bundle holds some.
+    async fn settings_question(&self) -> Result<(Question, Bound)> {
+        if self.saved()?.listed().await?.is_none() {
+            return Err(CommandError::invalid(NO_SAVED_SETTINGS));
+        }
+        Ok((
+            Question {
+                kind: SETTINGS_KIND.to_owned(),
+                // The reference is the page's handle for the row, not words for the dialog.
+                reference: String::new(),
+                words: SETTINGS_WORDS.to_owned(),
+                title: "Remove your saved settings?".to_owned(),
+                decline: DONT_REMOVE.to_owned(),
+                confirm: REMOVE.to_owned(),
+            },
+            Bound::Settings,
+        ))
     }
 
     fn held(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, Pending>> {
@@ -154,16 +246,18 @@ impl Deletions {
         confirm: &dyn Confirm,
         reference: &str,
     ) -> Result<Asked> {
-        let (question, bound) = if let Some(copy) = the_deletable_sync_copy(settings, reference)? {
+        let (question, bound) = if reference == SETTINGS_REFERENCE {
+            self.settings_question().await?
+        } else if let Some(copy) = the_deletable_sync_copy(settings, reference)? {
             (
-                Question {
-                    kind: shown(&copy.kind),
-                    reference: shown(&copy.reference),
-                    words: "KalaReach asks the sync service to delete this copy of a change that \
-                            this computer sent and the service did not apply. Nothing restores it \
-                            afterwards."
+                Question::deletion(
+                    shown(&copy.kind),
+                    shown(&copy.reference),
+                    "KalaReach asks the sync service to delete this copy of a change that \
+                     this computer sent and the service did not apply. Nothing restores it \
+                     afterwards."
                         .to_owned(),
-                },
+                ),
                 Bound::Sync,
             )
         } else {
@@ -181,11 +275,7 @@ impl Deletions {
                  privacy mode is off."
             };
             (
-                Question {
-                    kind: shown(&copy.kind),
-                    reference: shown(&copy.reference),
-                    words: words.to_owned(),
-                },
+                Question::deletion(shown(&copy.kind), shown(&copy.reference), words.to_owned()),
                 Bound::Host {
                     environment_id: connection.environment_id(),
                     privacy_generation: report.generation.get(),
@@ -242,6 +332,13 @@ impl Deletions {
         match pending.bound {
             Bound::Sync => Ok(Finished {
                 deleted: settings.drop_sync_copy(&pending.reference).await?,
+                report: None,
+            }),
+            // The person's yes is for this one removal: it turns saving off before anything is
+            // sent, takes the member out by the bundle's own compare-and-swap, and says plainly
+            // when the service did not confirm it.
+            Bound::Settings => Ok(Finished {
+                deleted: matches!(self.saved()?.remove().await?, SettingsRemoved::Removed),
                 report: None,
             }),
             Bound::Host {
@@ -396,32 +493,42 @@ fn shown(text: &str) -> String {
     kept
 }
 
-/// The labels of the deletion dialog's three buttons, in the order the platform adds them.
+/// The labels of the dialog's three buttons, in the order the platform adds them: the question's
+/// own first and confirming labels, and [`CANCEL`].
 ///
 /// The first button is the one a press of Return answers on macOS and the one a Windows task
 /// dialog starts on, and the last is the one Escape answers and the one a dialog that could not be
-/// shown is taken to have. Deleting is neither: a second press of Return on the page's button, or a
-/// dialog that was dismissed, answers no.
+/// shown is taken to have. Confirming is neither: a second press of Return on the page's button,
+/// or a dialog that was dismissed, answers no.
 ///
 /// The three-button layout is the platform's own only where the dialog library draws custom labels:
 /// on Windows that is a task dialog, which the library builds with version 6 of the common controls
 /// (the dialog plugin turns that feature on). A message box would show Yes, No and Cancel and give
 /// the middle label for No, so a build without the feature must not use this layout.
-const BUTTONS: [&str; 3] = ["Don't delete", DELETE, "Cancel"];
+const CANCEL: &str = "Cancel";
 
-/// The label of the one button that deletes.
+/// The labels of the dialog for a copy that is deleted.
+const DONT_DELETE: &str = "Don't delete";
 const DELETE: &str = "Delete";
 
-/// The buttons of the deletion dialog.
-fn buttons() -> tauri_plugin_dialog::MessageDialogButtons {
-    let [first, second, last] = BUTTONS.map(str::to_owned);
-    tauri_plugin_dialog::MessageDialogButtons::YesNoCancelCustom(first, second, last)
+/// The labels of the dialog for the saved settings, which the bundle's removal of them does not
+/// delete a copy of.
+const DONT_REMOVE: &str = "Don't remove";
+const REMOVE: &str = "Remove";
+
+/// The buttons of a dialog whose first label is `decline` and whose confirming label is `confirm`.
+fn buttons(decline: &str, confirm: &str) -> tauri_plugin_dialog::MessageDialogButtons {
+    tauri_plugin_dialog::MessageDialogButtons::YesNoCancelCustom(
+        decline.to_owned(),
+        confirm.to_owned(),
+        CANCEL.to_owned(),
+    )
 }
 
-/// Whether the dialog's answer is the person choosing to delete: the delete button's own label,
-/// and nothing else the platform can answer with.
-fn is_deletion(answer: &tauri_plugin_dialog::MessageDialogResult) -> bool {
-    matches!(answer, tauri_plugin_dialog::MessageDialogResult::Custom(label) if label == DELETE)
+/// Whether the dialog's answer is the person confirming: the confirming button's own label, and
+/// nothing else the platform can answer with.
+fn is_confirmed(answer: &tauri_plugin_dialog::MessageDialogResult, confirm: &str) -> bool {
+    matches!(answer, tauri_plugin_dialog::MessageDialogResult::Custom(label) if label == confirm)
 }
 
 /// The dialog this application shows: the platform's own alert, modal to the application's window.
@@ -444,16 +551,18 @@ impl<R: tauri::Runtime> Confirm for NativeConfirm<R> {
 
         Box::pin(async move {
             let (answered, answer) = tokio::sync::oneshot::channel();
+            let named = if question.reference.is_empty() {
+                question.kind.clone()
+            } else {
+                format!("{}\n{}", question.kind, question.reference)
+            };
             let dialog = self
                 .app
                 .dialog()
-                .message(format!(
-                    "{}\n\n{}\n{}",
-                    question.words, question.kind, question.reference
-                ))
-                .title("Delete this copy?")
+                .message(format!("{}\n\n{named}", question.words))
+                .title(question.title.as_str())
                 .kind(MessageDialogKind::Warning)
-                .buttons(buttons());
+                .buttons(buttons(&question.decline, &question.confirm));
             // The alert belongs to the application's window and is modal to it, so the question is
             // answered before anything else is done there.
             #[cfg(desktop)]
@@ -461,10 +570,57 @@ impl<R: tauri::Runtime> Confirm for NativeConfirm<R> {
                 Some(window) => dialog.parent(&window),
                 None => dialog,
             };
+            let confirm = question.confirm;
             dialog.show_with_result(move |answer| {
-                let _ = answered.send(is_deletion(&answer));
+                let _ = answered.send(is_confirmed(&answer, &confirm));
             });
             answer.await.unwrap_or(false)
+        })
+    }
+}
+
+/// The settings saved with this computer's recovery bundle, as the application lists and removes
+/// them: through its recovery and the account it is signed in with.
+#[derive(Debug)]
+pub struct NativeSavedSettings<R: tauri::Runtime> {
+    app: tauri::AppHandle<R>,
+}
+
+impl<R: tauri::Runtime> NativeSavedSettings<R> {
+    /// The saved settings of `app`.
+    #[must_use]
+    pub const fn new(app: tauri::AppHandle<R>) -> Self {
+        Self { app }
+    }
+
+    async fn parts(
+        &self,
+    ) -> Result<(Arc<crate::recovery::Recovery>, Arc<crate::account::Account>)> {
+        use tauri::Manager as _;
+
+        let recovery = self.app.state::<crate::AppState>().recovery()?;
+        let account = self
+            .app
+            .state::<crate::account::AccountSlot>()
+            .get()
+            .await
+            .cloned()?;
+        Ok((recovery, account))
+    }
+}
+
+impl<R: tauri::Runtime> SavedSettings for NativeSavedSettings<R> {
+    fn listed(&self) -> BoxFuture<'_, Result<Option<TimestampMs>>> {
+        Box::pin(async move {
+            let (recovery, account) = self.parts().await?;
+            recovery.saved_settings_listed(&account).await
+        })
+    }
+
+    fn remove(&self) -> BoxFuture<'_, Result<SettingsRemoved>> {
+        Box::pin(async move {
+            let (recovery, account) = self.parts().await?;
+            recovery.remove_saved_settings(&account).await
         })
     }
 }
@@ -473,28 +629,36 @@ impl<R: tauri::Runtime> Confirm for NativeConfirm<R> {
 mod tests {
     use tauri_plugin_dialog::{MessageDialogButtons, MessageDialogResult};
 
-    use super::{BUTTONS, DELETE, buttons, is_deletion};
+    use super::{CANCEL, DELETE, DONT_DELETE, DONT_REMOVE, REMOVE, buttons, is_confirmed};
 
     /// The dialog's default and its dismissal are safe: the button Return answers, and the one
-    /// Escape and a dialog that could not be shown answer, do not delete, and only the delete
-    /// button's own label does.
+    /// Escape and a dialog that could not be shown answer, do not confirm, and only the confirming
+    /// button's own label does, for the deletion of a copy and for the removal of the saved
+    /// settings alike.
     #[test]
-    fn only_the_delete_button_deletes_and_it_is_neither_the_default_nor_the_dismissal() {
-        let MessageDialogButtons::YesNoCancelCustom(first, second, last) = buttons() else {
-            panic!("the dialog has three buttons");
-        };
-        assert_eq!([first.as_str(), second.as_str(), last.as_str()], BUTTONS);
-        assert_eq!(second, DELETE, "the delete button is the middle one");
-        for answered in [
-            MessageDialogResult::Custom(first),
-            MessageDialogResult::Custom(last),
-            MessageDialogResult::Cancel,
-            MessageDialogResult::Ok,
-            MessageDialogResult::Yes,
-            MessageDialogResult::No,
-        ] {
-            assert!(!is_deletion(&answered), "{answered:?} does not delete");
+    fn only_the_confirming_button_confirms_and_it_is_neither_the_default_nor_the_dismissal() {
+        for (decline, confirm) in [(DONT_DELETE, DELETE), (DONT_REMOVE, REMOVE)] {
+            let MessageDialogButtons::YesNoCancelCustom(first, second, last) =
+                buttons(decline, confirm)
+            else {
+                panic!("the dialog has three buttons");
+            };
+            assert_eq!(
+                [first.as_str(), second.as_str(), last.as_str()],
+                [decline, confirm, CANCEL]
+            );
+            assert_eq!(second, confirm, "the confirming button is the middle one");
+            for answered in [
+                MessageDialogResult::Custom(first),
+                MessageDialogResult::Custom(last),
+                MessageDialogResult::Cancel,
+                MessageDialogResult::Ok,
+                MessageDialogResult::Yes,
+                MessageDialogResult::No,
+            ] {
+                assert!(!is_confirmed(&answered, confirm), "{answered:?} confirms");
+            }
+            assert!(is_confirmed(&MessageDialogResult::Custom(second), confirm));
         }
-        assert!(is_deletion(&MessageDialogResult::Custom(second)));
     }
 }

@@ -186,6 +186,10 @@ pub const NAMED_COMMANDS: &[(&str, Option<Method>)] = &[
     ("retained_delete_finish", None),
     ("retained_delete_cancel", None),
     ("retained_sync_copies", None),
+    // The settings saved with this computer's recovery bundle, listed as a copy that left this
+    // device when the bundle holds them. Removing them is the ceremony above, under the reference
+    // this lists.
+    ("retained_saved_settings", None),
     ("grant_notices", None),
     ("session_screen_preview", Some(Method::SessionScreenPreview)),
     ("grant_create", Some(Method::GrantCreate)),
@@ -295,6 +299,9 @@ pub const NAMED_COMMANDS: &[(&str, Option<Method>)] = &[
     // but whether a replacement is asked for; native code reads the host's status, builds the call
     // from this computer's own seed and bundle, and sends it to the host.
     ("recovery_cover_host", None),
+    // Turning the saving of this computer's settings with the recovery bundle on again, after the
+    // person removed them. The page supplies nothing.
+    ("recovery_resume_settings", None),
     // The person's settings: the colour mode now, and keeping it in step with their other devices.
     // None is a host method. The page names a mode from a closed set and is told where things
     // stand; it holds no copy of its own and is given no key, identity or token.
@@ -744,6 +751,7 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'static
         retained_delete_finish,
         retained_delete_cancel,
         retained_sync_copies,
+        retained_saved_settings,
         session_screen_preview,
         grant_create,
         grant_list,
@@ -822,6 +830,7 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'static
         recovery_archives,
         recovery_export_offline,
         recovery_cover_host,
+        recovery_resume_settings,
         settings_view,
         settings_colour_mode_set,
         settings_sync_turn_on,
@@ -2636,6 +2645,25 @@ pub fn retained_sync_copies(
             deletable: copy.deletable,
         })
         .collect())
+}
+
+/// The settings saved with this computer's recovery bundle, listed as a copy that left this device
+/// when the bundle holds them. Reads the service; nothing is changed.
+#[tauri::command]
+pub async fn retained_saved_settings(
+    state: State<'_, AppState>,
+    account: State<'_, crate::account::AccountSlot>,
+) -> Result<Option<kr_protocol::privacy::PrivacyExported>> {
+    Ok(state
+        .recovery()?
+        .saved_settings_listed(account.get().await?)
+        .await?
+        .map(|left_at_ms| kr_protocol::privacy::PrivacyExported {
+            kind: crate::retained::SETTINGS_KIND.to_owned(),
+            reference: crate::retained::SETTINGS_REFERENCE.to_owned(),
+            left_at_ms,
+            deletable: true,
+        }))
 }
 
 /// Asks the owner devices to confirm handing a session's control to another device. Nothing that
@@ -4825,6 +4853,7 @@ mod tests {
         "retained_delete_finish",
         "retained_delete_cancel",
         "retained_sync_copies",
+        "retained_saved_settings",
         "grant_notices",
         "grant_create",
         "grant_list",
@@ -4899,6 +4928,7 @@ mod tests {
         "recovery_archives",
         "recovery_export_offline",
         "recovery_cover_host",
+        "recovery_resume_settings",
         "settings_view",
         "settings_colour_mode_set",
         "settings_sync_turn_on",
@@ -5076,6 +5106,7 @@ mod tests {
                 "recovery_archives",
                 "recovery_cover_host",
                 "recovery_export_offline",
+                "recovery_resume_settings",
                 "recovery_save_kit",
                 "recovery_save_kit_qr",
                 "recovery_settle",
@@ -5134,6 +5165,7 @@ mod tests {
                 // What the sync service kept of this computer's refused writes, read from this
                 // computer's own records.
                 "retained_sync_copies",
+                "retained_saved_settings",
                 // A hand-over of control: the host describes the plan and asks the owner devices,
                 // native code reads whether one answered, and only then sends the transfer. The
                 // page names a session, a grant, a device and a reference, never a method.
@@ -6154,6 +6186,19 @@ pub async fn recovery_cover_host(
     state
         .recovery()?
         .cover_host(account.get().await?, &host, replace)
+        .await
+}
+
+/// Turns the saving of this computer's settings with the recovery bundle on again, after the person
+/// removed them. The next step saves what the person has chosen.
+#[tauri::command]
+pub async fn recovery_resume_settings(
+    state: State<'_, AppState>,
+    account: State<'_, crate::account::AccountSlot>,
+) -> Result<crate::recovery::RecoveryView> {
+    state
+        .recovery()?
+        .resume_saving_settings(account.get().await?)
         .await
 }
 

@@ -963,6 +963,7 @@ pub fn start_recovery<R: tauri::Runtime>(
 /// Starts saving this computer's settings with the recovery bundle: a step runs now, after a change
 /// to the settings once they have been quiet, after a recovery step that reached the service, and
 /// at the end of the window after a step that failed. The settings and recovery are opened first.
+/// The settings the bundle holds are listed and removed through the retained flow from here on.
 /// `oldest_retained` is the oldest level this release retains: while it is below the first level
 /// that reads a settings member, nothing is written (see [`recovery::SETTINGS_READ_FROM`]).
 ///
@@ -984,6 +985,9 @@ pub fn start_settings_saving<R: tauri::Runtime>(
         Arc::clone(&settings) as Arc<dyn recovery::SettingsSource>,
         oldest_retained,
     );
+    state
+        .retained()
+        .saved_settings_from(Arc::new(retained::NativeSavedSettings::new(app.clone())));
     let changed = Arc::clone(&recovery);
     settings
         .local()

@@ -76,8 +76,8 @@ use crate::sync_service::{SyncService, SyncServiceView, host_of};
 mod saving;
 
 pub use saving::{
-    NotSavedWhy, SETTINGS_READ_FROM, SettingsLine, SettingsSource, SettingsStep, SettingsTiming,
-    oldest_retained_level,
+    NotSavedWhy, SETTINGS_READ_FROM, SettingsLine, SettingsRemoved, SettingsSource, SettingsStep,
+    SettingsTiming, oldest_retained_level,
 };
 
 /// The scope in the device's secure store that the recovery seed is kept under.
