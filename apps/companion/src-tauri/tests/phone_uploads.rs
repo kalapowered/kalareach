@@ -4577,6 +4577,231 @@ async fn kr_req_13_12_a_send_whose_copy_flush_fails_after_a_cleanup_stopped_its_
     adopted.stop().await;
 }
 
+/// KR-REQ-13.12 (FU11): a cleanup whose work panicked before it ended a never-started upload does
+/// not start that upload once the send has removed its copy. The cleanup stops the admitted upload
+/// and its work panics; the send places its copy and its flush fails, so the send ends its admission
+/// and removes the copy while the cleanup still holds the upload `Stopping`. The cleanup's
+/// resolution then ends the upload: a start would send from memory and write a journal entry that
+/// names a copy that is gone, which a later process cannot resume.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_13_12_a_cleanup_that_panicked_does_not_start_an_upload_whose_copy_was_removed() {
+    use testing::{Awaited, Fault, Point};
+
+    let adopted = Adopted::start(1).await;
+    let (phone, _control) = phone_for(&adopted).await;
+    let desk = desk_of(&phone.companion);
+    let paired = paired_of(&phone.companion).await;
+    let key = kr_ipc::new_uuid();
+    let bytes = vec![5_u8; 16];
+    let staged = testing::hold_at(key, Point::CopyStaged);
+    let tail = testing::hold_awaited(key, Awaited::BeforeTail);
+    let sender = testing::hold_at(key, Point::SenderStarting);
+    let _panics = testing::arm(key, Fault::PanicInWork);
+    let _flush = testing::arm(key, Fault::CopyFlushFails);
+    let send = {
+        let sent = request(&adopted, &bytes, Arc::new(Held::new(bytes.clone())), key);
+        let (desk, paired) = (Arc::clone(&desk), paired.clone());
+        tokio::spawn(async move { desk.send(paired, sent).await })
+    };
+    staged.until_passed(1).await;
+    // The cleanup has stopped the upload, its work has panicked before it ended it, and its
+    // resolution has not run.
+    desk.forgotten(paired.device_id);
+    tail.until_arrived(1).await;
+    assert_eq!(
+        desk.phase_for_test(key),
+        Some("stopping"),
+        "the cleanup holds the upload"
+    );
+    staged.release();
+    let answered = tokio::time::timeout(WATCHDOG, send)
+        .await
+        .expect("the send answers")
+        .expect("the task ran");
+    assert!(
+        answered.is_err(),
+        "the flush of the copy's directory failed"
+    );
+    assert_eq!(
+        testing::read_copy(&folder(&phone), key),
+        None,
+        "the send removed the copy it placed"
+    );
+    assert_eq!(
+        desk.phase_for_test(key),
+        Some("stopping"),
+        "the send left the upload to the cleanup that holds it"
+    );
+    tail.release();
+    settled(&desk).await;
+    desk.sends_idle().await;
+    assert_ne!(
+        desk.phase_for_test(key),
+        Some("sending"),
+        "no start took an upload whose copy was removed"
+    );
+    assert!(
+        desk.generation_for_test(key).is_none(),
+        "the cleanup's resolution ended the upload"
+    );
+    assert_eq!(sender.passed(), 0, "no sender reached its first line");
+    assert_eq!(
+        entries_in(&folder(&phone)),
+        0,
+        "no journal entry names the copy that was removed"
+    );
+    assert_eq!(
+        testing::read_copy(&folder(&phone), key),
+        None,
+        "no copy is left for the upload"
+    );
+    adopted.stop().await;
+}
+
+/// `paired` as account `mark` on the connection numbered `after` links above its own.
+fn on_account(paired: &Paired, mark: u8, after: u64) -> Paired {
+    use kr_client::services::AccountMark;
+
+    Paired {
+        account: Some(AccountMark::from_bytes([mark; 32])),
+        link: paired.link + after,
+        ..paired.clone()
+    }
+}
+
+/// KR-REQ-13.12 (FU12): a cleanup whose work panicked ends an upload whose copy the send removed,
+/// also when no connection of the upload's account is there to start it on. The newest connection
+/// the desk knows belongs to another account, so the resolution has nothing to start; it ends the
+/// upload at once and does not leave it paused for a later reach.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_13_12_a_cleanup_ends_an_upload_whose_copy_was_removed_when_it_has_no_connection() {
+    use testing::{Awaited, Fault, Point};
+
+    let adopted = Adopted::start(1).await;
+    let (phone, _control) = phone_for(&adopted).await;
+    let desk = desk_of(&phone.companion);
+    let paired = paired_of(&phone.companion).await;
+    let first = on_account(&paired, 1, 0);
+    let key = kr_ipc::new_uuid();
+    let bytes = vec![5_u8; 16];
+    let staged = testing::hold_at(key, Point::CopyStaged);
+    let tail = testing::hold_awaited(key, Awaited::BeforeTail);
+    let sender = testing::hold_at(key, Point::SenderStarting);
+    let _panics = testing::arm(key, Fault::PanicInWork);
+    let _flush = testing::arm(key, Fault::CopyFlushFails);
+    let send = {
+        let sent = request(&adopted, &bytes, Arc::new(Held::new(bytes.clone())), key);
+        let (desk, first) = (Arc::clone(&desk), first.clone());
+        tokio::spawn(async move { desk.send(first, sent).await })
+    };
+    staged.until_passed(1).await;
+    // Another account's connection is the newest the desk knows for the host.
+    desk.host_reached(on_account(&paired, 2, 1));
+    settled(&desk).await;
+    desk.forgotten(paired.device_id);
+    tail.until_arrived(1).await;
+    assert_eq!(
+        desk.phase_for_test(key),
+        Some("stopping"),
+        "the cleanup holds the upload"
+    );
+    staged.release();
+    let answered = tokio::time::timeout(WATCHDOG, send)
+        .await
+        .expect("the send answers")
+        .expect("the task ran");
+    assert!(
+        answered.is_err(),
+        "the flush of the copy's directory failed"
+    );
+    tail.release();
+    settled(&desk).await;
+    desk.sends_idle().await;
+    assert!(
+        desk.generation_for_test(key).is_none(),
+        "the cleanup's resolution ended the upload that has no copy and no connection"
+    );
+    assert_eq!(sender.passed(), 0, "no sender reached its first line");
+    assert_eq!(
+        entries_in(&folder(&phone)),
+        0,
+        "no journal entry names the copy that was removed"
+    );
+    adopted.stop().await;
+}
+
+/// KR-REQ-13.12 (FU13): a never-started upload that a cleanup left paused, before its copy was
+/// placed, is not started by a later reach once the send has removed that copy. The newest
+/// connection the desk knows belongs to another account when the cleanup resolves, so the upload
+/// is paused and not started; the send then places its copy and its flush fails. The reach of the
+/// upload's own account finds it paused and ends it instead of sending it from memory.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_13_12_a_reach_does_not_start_a_paused_upload_whose_copy_was_removed() {
+    use testing::{Fault, Point};
+
+    let adopted = Adopted::start(1).await;
+    let (phone, _control) = phone_for(&adopted).await;
+    let desk = desk_of(&phone.companion);
+    let paired = paired_of(&phone.companion).await;
+    let first = on_account(&paired, 1, 0);
+    let key = kr_ipc::new_uuid();
+    let bytes = vec![5_u8; 16];
+    let staged = testing::hold_at(key, Point::CopyStaged);
+    let sender = testing::hold_at(key, Point::SenderStarting);
+    let _panics = testing::arm(key, Fault::PanicInWork);
+    let _flush = testing::arm(key, Fault::CopyFlushFails);
+    let send = {
+        let sent = request(&adopted, &bytes, Arc::new(Held::new(bytes.clone())), key);
+        let (desk, first) = (Arc::clone(&desk), first.clone());
+        tokio::spawn(async move { desk.send(first, sent).await })
+    };
+    staged.until_passed(1).await;
+    desk.host_reached(on_account(&paired, 2, 1));
+    settled(&desk).await;
+    // The cleanup stopped the upload and its work panicked: with no connection of the upload's
+    // account to start it on, the resolution paused it.
+    desk.forgotten(paired.device_id);
+    settled(&desk).await;
+    assert_eq!(
+        desk.phase_for_test(key),
+        Some("paused"),
+        "the cleanup left the upload paused before its copy was placed"
+    );
+    staged.release();
+    let answered = tokio::time::timeout(WATCHDOG, send)
+        .await
+        .expect("the send answers")
+        .expect("the task ran");
+    assert!(
+        answered.is_err(),
+        "the flush of the copy's directory failed"
+    );
+    assert_eq!(
+        testing::read_copy(&folder(&phone), key),
+        None,
+        "the send removed the copy it placed"
+    );
+    desk.host_reached(on_account(&paired, 1, 2));
+    settled(&desk).await;
+    desk.sends_idle().await;
+    assert_ne!(
+        desk.phase_for_test(key),
+        Some("sending"),
+        "no start took an upload whose copy was removed"
+    );
+    assert!(
+        desk.generation_for_test(key).is_none(),
+        "the reach ended the upload that has no copy"
+    );
+    assert_eq!(sender.passed(), 0, "no sender reached its first line");
+    assert_eq!(
+        entries_in(&folder(&phone)),
+        0,
+        "no journal entry names the copy that was removed"
+    );
+    adopted.stop().await;
+}
+
 /// KR-REQ-13.12 (FU7): a panic in the desk's task of a send leaves no upload admitted with no
 /// sender. The caller is answered, the copy is gone, and the key is free for a new send.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]

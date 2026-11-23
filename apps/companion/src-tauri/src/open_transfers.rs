@@ -435,6 +435,12 @@ struct Live {
     /// makes its sender, and never cleared. An upload that a stop took before any start has not been
     /// started.
     started: AtomicBool,
+    /// Whether the copy of this never-started upload was removed while the desk went on holding it
+    /// (a cleanup that stopped it still owned it, or it was paused): set under the gate by
+    /// [`Registry::drop_admitted`] and never cleared. Nothing is left to send or resume it from, so
+    /// no start takes an upload that carries it: the decision that would start or pause it, and
+    /// every start, end it instead.
+    copy_gone: AtomicBool,
 }
 
 fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -450,6 +456,7 @@ impl Live {
             reached: AtomicU64::new(0),
             sent_link: AtomicU64::new(0),
             started: AtomicBool::new(false),
+            copy_gone: AtomicBool::new(false),
             published: AtomicBool::new(file.reached == Reached::Published),
             generation: AtomicU64::new(0),
             file: Mutex::new(file),
@@ -923,7 +930,8 @@ impl Registry {
     /// and nothing here ends that. An upload that no start moved loses the copy in any phase, and
     /// leaves the desk here only while it is `Admitted`. A cleanup that stopped it holds it
     /// `Stopping` until the cleanup ends it, and a copy this send placed after the cleanup removed
-    /// the files goes.
+    /// the files goes. An upload that stays held then carries `copy_gone`: it has nothing to send
+    /// or resume from, so no start takes it, and the cleanup's resolution or the next start ends it.
     fn drop_admitted(&mut self, store: &Store, live: &Arc<Live>) {
         let ours = self
             .held
@@ -933,8 +941,12 @@ impl Registry {
             return;
         }
         self.remove_copy_of(store, live);
-        if ours && *locked(&live.phase) == Phase::Admitted {
-            self.held.remove(&live.key);
+        if ours {
+            if *locked(&live.phase) == Phase::Admitted {
+                self.held.remove(&live.key);
+            } else {
+                live.copy_gone.store(true, Ordering::Release);
+            }
         }
     }
 
@@ -1096,7 +1108,8 @@ impl Stopped<'_> {
     }
 
     /// The one resolution of the stop: a published record ends the upload, and anything else goes
-    /// through the decision section. Runs once.
+    /// through the decision section, which ends an upload whose copy was removed meanwhile. Runs
+    /// once.
     fn resolve(&mut self) {
         if self.resolved {
             return;
@@ -1513,7 +1526,8 @@ impl Desk {
     /// in force: a second caller that holds a stale list finds the upload sending and is refused,
     /// so an upload has one task, and a connection of another sign-in or of an older pairing never
     /// carries the upload. The task and its handle are made here, in one step under the gate, so a
-    /// stop finds the handle. An upload just admitted that is refused for its pairing is ended.
+    /// stop finds the handle. An upload just admitted that is refused for its pairing is ended, and
+    /// so is one whose copy was removed, which has nothing to send or resume from.
     fn start_under(
         self: &Arc<Self>,
         registry: &mut Registry,
@@ -1530,6 +1544,12 @@ impl Desk {
             || live.cancel_asked.load(Ordering::Acquire)
             || live.owner.account != connection.account
         {
+            return false;
+        }
+        // An upload whose copy was removed has nothing to send or resume from. It ends here, in the
+        // one section every start goes through, and its key is free again.
+        if live.copy_gone.load(Ordering::Acquire) {
+            Self::end_under(registry, live, Outcome::Cancelled);
             return false;
         }
         // A pairing that is no longer the one in force starts nothing: the pairing in force removes
@@ -2647,6 +2667,9 @@ impl Desk {
     /// `failed` is the outcome a sender's command ends with when the upload stays for a later
     /// connection; it is written in the same section.
     ///
+    /// An upload whose copy `drop_admitted` removed, and whose cancel is not owed, is ended: it has
+    /// nothing to send or resume from, so it is neither started nor paused.
+    ///
     /// An upload that nothing owes is started on the newest connection of its account when that is
     /// newer than every connection `used` names. An upload whose cancel is owed, or one that a reach
     /// went by after the decision `looked` read, is paused and handed to a fresh decision, which
@@ -2682,6 +2705,12 @@ impl Desk {
         let seen = live.reached.load(Ordering::Acquire);
         let owed =
             registry.cancelled.contains(&live.key) || live.cancel_asked.load(Ordering::Acquire);
+        // An upload whose copy was removed has nothing to send or resume from: with no cancel owed
+        // it ends here, and is neither paused for a later start nor started.
+        if live.copy_gone.load(Ordering::Acquire) && !owed {
+            Self::end_under(&mut registry, live, Outcome::Cancelled);
+            return;
+        }
         let usable =
             newest.filter(|newest| newest.account == live.owner.account && newest.link > used);
         // The command's failure is written in the section that validated the sender's generation,
