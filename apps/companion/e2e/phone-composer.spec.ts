@@ -55,33 +55,87 @@ async function keyboard(page: Page, inset: number): Promise<void> {
 }
 
 /**
- * How many pixels of an element lie outside what a person sees of it: past the window, behind a
- * keyboard that covers `covered` pixels, or outside a box around it that clips what it holds.
+ * How many pixels of each control lie outside what a person sees of it: past the window, behind a
+ * keyboard that covers `covered` pixels, or outside a box around it that clips what it holds. It is
+ * read once the layout is steady: every control's box and the pixels it lacks have been the same
+ * over two frames in a row, and for longer than the session takes to settle after a keyboard
+ * (`SETTLE_MS`, 150 ms, in the view), which moves the field again once nothing has changed for that
+ * long. A reading taken at the first moment it passes would be one the layout leaves a moment later.
  */
-function hidden(element: Locator, covered = 0): Promise<number> {
-  return element.evaluate((node, inset) => {
-    const box = node.getBoundingClientRect()
-    let top = 0
-    let bottom = window.innerHeight - inset
-    let left = 0
-    let right = window.innerWidth
-    for (let around = node.parentElement; around !== null; around = around.parentElement) {
-      const style = getComputedStyle(around)
-      if (style.overflowY === 'visible' && style.overflowX === 'visible') continue
-      const clip = around.getBoundingClientRect()
-      top = Math.max(top, clip.top)
-      bottom = Math.min(bottom, clip.bottom)
-      left = Math.max(left, clip.left)
-      right = Math.min(right, clip.right)
-    }
-    const outside =
-      Math.max(0, top - box.top) +
-      Math.max(0, box.bottom - bottom) +
-      Math.max(0, left - box.left) +
-      Math.max(0, box.right - right)
-    return Math.round(outside * 10) / 10
-  }, covered)
+async function hiddenOf(page: Page, controls: readonly Locator[], covered = 0): Promise<number[]> {
+  const nodes = await Promise.all(controls.map((control) => control.elementHandle()))
+  return page.evaluate(
+    ({ elements, inset, still }) =>
+      new Promise<number[]>((resolve, reject) => {
+        const outside = (node: Element): number => {
+          const box = node.getBoundingClientRect()
+          let top = 0
+          let bottom = window.innerHeight - inset
+          let left = 0
+          let right = window.innerWidth
+          for (let around = node.parentElement; around !== null; around = around.parentElement) {
+            const style = getComputedStyle(around)
+            if (style.overflowY === 'visible' && style.overflowX === 'visible') continue
+            const clip = around.getBoundingClientRect()
+            top = Math.max(top, clip.top)
+            bottom = Math.min(bottom, clip.bottom)
+            left = Math.max(left, clip.left)
+            right = Math.min(right, clip.right)
+          }
+          const lacking =
+            Math.max(0, top - box.top) +
+            Math.max(0, box.bottom - bottom) +
+            Math.max(0, left - box.left) +
+            Math.max(0, box.right - right)
+          return Math.round(lacking * 10) / 10
+        }
+        const read = () =>
+          elements.map((node) => {
+            const box = node.getBoundingClientRect()
+            return [box.top, box.bottom, box.left, box.right, outside(node)].join(',')
+          })
+        const begun = performance.now()
+        let last = read().join('|')
+        let changedAt = begun
+        let framesSame = 0
+        const frame = () => {
+          const now = read().join('|')
+          if (now === last) framesSame += 1
+          else {
+            last = now
+            framesSame = 0
+            changedAt = performance.now()
+          }
+          if (framesSame >= 2 && performance.now() - changedAt >= still) {
+            resolve(elements.map(outside))
+          } else if (performance.now() - begun > 4_000) {
+            reject(new Error('the layout did not become steady within four seconds'))
+          } else {
+            requestAnimationFrame(frame)
+          }
+        }
+        requestAnimationFrame(frame)
+      }),
+    { elements: nodes, inset: covered, still: SETTLE_MS + 50 }
+  )
 }
+
+/**
+ * The most a control may lack of being whole in view: 1 px, which nobody sees of a 44 px target.
+ *
+ * What lacks it is the field, above a keyboard, and nothing else; every button stands whole to the
+ * pixel. The view rests the field on the keyboard's top edge and leaves it within half a pixel of
+ * it (`TOLERANCE` in `keyboard.ts`): 0.3 to 0.4 px is what 360 by 800 and 320 by 640 show. At 320 by
+ * 568 in WebKit it is 0.94 px, and that is not the tolerance: the field's edge falls at a fraction
+ * of a pixel (the bar under the session is 85.5 px), WebKit keeps a scroll position in whole pixels
+ * and leaves 36 of the 36.94 it is given (Chromium rounds to 37, and lacks 0.06 px), and the lift
+ * that would close the rest cannot raise the field, because the conversation is at its floor of
+ * three lines: the page grows by what is added instead, which the view's four passes confirm.
+ */
+const SHORT_OF_VIEW = 1
+
+/** The longest the view waits after a change of the keyboard before it works out the field's rest again. */
+const SETTLE_MS = 150
 
 /** Whether a control is a touch target of the platform's size, as it stands, with no scrolling to it. */
 async function expectTouchTarget(control: Locator, target: number): Promise<void> {
@@ -91,16 +145,13 @@ async function expectTouchTarget(control: Locator, target: number): Promise<void
   expect(box?.width ?? 0).toBeGreaterThanOrEqual(target - 0.5)
 }
 
-/** Whether every one of `controls` stands whole in what a person sees, none scrolled to. */
-async function expectInView(controls: readonly Locator[], covered = 0): Promise<void> {
-  for (const control of controls) {
-    await expect(control).toBeVisible()
-    // A keyboard takes a moment to be settled for, so the answer is read until it is steady. A
-    // layout in fractions of a pixel can leave one a pixel short, which nobody sees.
-    await expect
-      .poll(() => hidden(control, covered), { message: 'pixels of the control a person does not see' })
-      .toBeLessThanOrEqual(1)
-  }
+/** Whether every one of `controls` stands whole in what a person sees, none scrolled to, all at once. */
+async function expectInView(page: Page, controls: readonly Locator[], covered = 0): Promise<void> {
+  for (const control of controls) await expect(control).toBeVisible()
+  const lacking = await hiddenOf(page, controls, covered)
+  controls.forEach((control, index) => {
+    expect(lacking[index], `pixels of ${String(control)} that a person does not see`).toBeLessThanOrEqual(SHORT_OF_VIEW)
+  })
 }
 
 /** The vertical middle of an element. */
@@ -125,7 +176,7 @@ for (const phone of PHONES) {
       const commands = list.getByRole('button')
       await expect(commands).toHaveCount(1)
       await expectTouchTarget(commands.first(), phone.target)
-      await expectInView([field, commands.first()])
+      await expectInView(page, [field, commands.first()])
       expect(await overrunning(page, '[data-testid="slash-commands"]'), 'what runs past the window').toEqual([])
       await page.screenshot({ path: shot(`slash-${phone.surface}-${phone.width}`) })
 
@@ -143,7 +194,7 @@ for (const phone of PHONES) {
       await field.fill('/re')
       const command = page.getByTestId('slash-commands').getByRole('button')
       await expect(command).toHaveCount(1)
-      await expectInView([field, command.first()], phone.keyboard)
+      await expectInView(page, [field, command.first()], phone.keyboard)
       await page.screenshot({ path: shot(`slash-keyboard-${phone.surface}-${phone.width}`) })
     })
 
@@ -154,7 +205,7 @@ for (const phone of PHONES) {
       await field.fill('/re')
       const command = page.getByTestId('slash-commands').getByRole('button')
       await expect(command).toHaveCount(1)
-      await expectInView([field, command.first()])
+      await expectInView(page, [field, command.first()])
       await page.screenshot({ path: shot(`slash-short-${phone.surface}-${phone.width}`) })
     })
 
@@ -165,9 +216,9 @@ for (const phone of PHONES) {
       await field.fill('/re')
       const command = page.getByTestId('slash-commands').getByRole('button')
       await expect(command).toHaveCount(1)
-      await expectInView([field, command.first()])
+      await expectInView(page, [field, command.first()])
       await keyboard(page, phone.keyboard)
-      await expectInView([field, command.first()], phone.keyboard)
+      await expectInView(page, [field, command.first()], phone.keyboard)
       await page.screenshot({ path: shot(`slash-terminal-${phone.surface}-${phone.width}`) })
     })
 
@@ -182,12 +233,14 @@ for (const phone of PHONES) {
       for (const control of controls) {
         await expect(control).toBeVisible()
         await expect(control).toBeEnabled()
-        await control.scrollIntoViewIfNeeded()
         await expectTouchTarget(control, phone.target)
         const box = await control.boundingBox()
         expect(box?.x ?? -1).toBeGreaterThanOrEqual(-0.5)
         expect((box?.x ?? 0) + (box?.width ?? 0)).toBeLessThanOrEqual(phone.width + 0.5)
       }
+      // The field, Send and the three actions stand in view together as the composer lies at rest:
+      // nothing is scrolled to.
+      await expectInView(page, [page.getByLabel('Message this session'), ...controls])
       expect(await overrunning(page, '.m-composer'), 'what runs past the window or its box').toEqual([])
       await page.screenshot({ path: shot(`actions-${phone.surface}-${phone.width}`) })
     })
@@ -207,14 +260,18 @@ for (const phone of PHONES) {
       ]
       for (const control of controls) {
         await expect(row.locator(`[data-testid="${await control.getAttribute('data-testid')}"]`)).toBeVisible()
-        await control.scrollIntoViewIfNeeded()
         await expectTouchTarget(control, phone.target)
       }
-      // They stand above the line that holds the field and Send, and that line stays in view.
+      // They stand above the line that holds the field and Send, and all five stand in view at once
+      // as the composer lies at rest: nothing is scrolled to.
       const rowBox = await row.boundingBox()
       const lineBox = await page.locator('.m-composer-line').boundingBox()
       expect((rowBox?.y ?? 0) + (rowBox?.height ?? 0)).toBeLessThanOrEqual((lineBox?.y ?? 0) + 0.5)
-      await expectInView([page.getByLabel('Message this session'), page.getByRole('button', { name: 'Send' })])
+      await expectInView(page, [
+        page.getByLabel('Message this session'),
+        page.getByRole('button', { name: 'Send' }),
+        ...controls
+      ])
       await page.screenshot({ path: shot(`short-${phone.surface}-${phone.width}`) })
     })
 
@@ -230,7 +287,7 @@ for (const phone of PHONES) {
       await expect(page.getByTestId('composer-queue')).toHaveCount(0)
       const send = page.getByRole('button', { name: 'Send' })
       const interrupt = page.getByTestId('composer-interrupt')
-      await expectInView([field, send, interrupt])
+      await expectInView(page, [field, send, interrupt])
       for (const control of [send, interrupt]) await expectTouchTarget(control, phone.target)
       // One row: the three share a middle, to the pixel, and Send comes before Interrupt.
       const middles = [await middle(field), await middle(send), await middle(interrupt)]
@@ -240,7 +297,7 @@ for (const phone of PHONES) {
       expect((sendBox?.x ?? 0) + (sendBox?.width ?? 0)).toBeLessThanOrEqual((interruptBox?.x ?? 0) + 0.5)
       expect(await overrunning(page, '.m-composer-line'), 'what runs past the window or its box').toEqual([])
       await keyboard(page, phone.keyboard)
-      await expectInView([field, send, interrupt], phone.keyboard)
+      await expectInView(page, [field, send, interrupt], phone.keyboard)
       await page.screenshot({ path: shot(`terminal-${phone.surface}-${phone.width}`) })
       await keyboard(page, 0)
 
