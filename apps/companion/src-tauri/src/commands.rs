@@ -49,6 +49,7 @@ pub const NAMED_COMMANDS: &[(&str, Option<Method>)] = &[
         Some(Method::EnvironmentCapabilitiesCheck),
     ),
     ("choose_authorised_file", None),
+    ("held_authorised_file", None),
     ("setup_identity", None),
     ("setup_open_settings", None),
     // Sessions.
@@ -664,6 +665,7 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'static
         environment_capabilities,
         environment_capabilities_check,
         choose_authorised_file,
+        held_authorised_file,
         setup_identity,
         setup_open_settings,
         session_list,
@@ -1509,6 +1511,19 @@ pub async fn choose_authorised_file(
     let name = nominated_file_name(&path)?;
     state.hold_authorised_file(path);
     Ok(Some(ChosenFile { name }))
+}
+
+/// The file the person chose that no run has used, as the page is told of it: its name, or none.
+///
+/// The page asks when it opens and after every run, so that what it says of the choice is what this
+/// process holds, whatever the page did before: a page that was reloaded, or that was told a run
+/// was refused before it took the choice, says the same as one that never left. It changes nothing.
+#[tauri::command]
+pub fn held_authorised_file(state: State<'_, AppState>) -> Result<Option<ChosenFile>> {
+    state
+        .held_authorised_file()
+        .map(|path| nominated_file_name(&path).map(|name| ChosenFile { name }))
+        .transpose()
 }
 
 /// The name of a file the host can be asked to read, or why it cannot be: the protocol carries the
@@ -4615,6 +4630,7 @@ mod tests {
         "environment_capabilities",
         "environment_capabilities_check",
         "choose_authorised_file",
+        "held_authorised_file",
         "setup_identity",
         "setup_open_settings",
         "session_list",
@@ -4842,6 +4858,7 @@ mod tests {
                 "connection_since",
                 "export_asciicast",
                 "export_semantic_json",
+                "held_authorised_file",
                 "import_remote_image",
                 "open_external",
                 "pairing_set_origin",

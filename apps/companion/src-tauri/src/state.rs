@@ -829,6 +829,14 @@ impl AppState {
             .expect("the authorised file's lock is not poisoned") = Some(path);
     }
 
+    /// The chosen file that no run has taken, which the next run would read. It changes nothing.
+    pub fn held_authorised_file(&self) -> Option<std::path::PathBuf> {
+        self.authorised_file
+            .lock()
+            .expect("the authorised file's lock is not poisoned")
+            .clone()
+    }
+
     /// Takes the chosen file for one run, so that a choice serves one run and no more.
     pub fn take_authorised_file(&self) -> Option<std::path::PathBuf> {
         self.authorised_file

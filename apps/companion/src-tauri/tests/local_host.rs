@@ -281,6 +281,7 @@ impl Host {
                 companion_tauri::commands::description_download,
                 companion_tauri::commands::environment_capabilities,
                 companion_tauri::commands::environment_capabilities_check,
+                companion_tauri::commands::held_authorised_file,
                 companion_tauri::commands::launch_commands_list,
                 companion_tauri::commands::launch_commands_save,
                 companion_tauri::commands::launch_commands_remove,
@@ -1644,6 +1645,75 @@ async fn a_file_chosen_in_the_dialog_is_read_by_one_run_of_the_checks() {
     )
     .await
     .expect("the host closes the session");
+}
+
+/// What the page is told of the file this process holds for the next run of the checks: its name,
+/// or null.
+async fn held_file_as_told(host: &Host) -> Value {
+    host.call("held_authorised_file", json!({}))
+        .await
+        .expect("the held file is read")
+}
+
+/// KR-REQ-03.29: the page can read which chosen file this process holds, so that what it says of
+/// the choice is what is held, whatever the page did before: it was reloaded, or it was told that a
+/// request was refused before the request took the choice. The answer is the file's name and no
+/// path, reading changes nothing, and only the run that takes the file uses the choice up.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_page_reads_which_chosen_file_is_held() {
+    let host = Host::start().await;
+    let state = host.app.state::<companion_tauri::AppState>();
+    assert_eq!(held_file_as_told(&host).await, Value::Null, "none chosen");
+
+    let chosen = host.tree.root().join("chosen.txt");
+    state.hold_authorised_file(chosen.clone());
+    let told = held_file_as_told(&host).await;
+    assert_eq!(
+        told,
+        json!({ "name": "chosen.txt" }),
+        "the name and no path"
+    );
+    assert_eq!(
+        held_file_as_told(&host).await,
+        told,
+        "reading the held file leaves it held"
+    );
+
+    // A request refused before it took the choice (a field the page may not send) leaves the file
+    // held, and the page is told that it still is.
+    let refusal = host
+        .call(
+            "environment_capabilities_check",
+            json!({
+                "params": {
+                    "environment_id": host.environment_id(),
+                    "authorised_file": "/etc/hosts"
+                },
+                "subject": {}
+            }),
+        )
+        .await
+        .expect_err("a file the page named");
+    assert!(
+        !refused_by_the_host(&refusal),
+        "refused before it was sent: {refusal}"
+    );
+    assert_eq!(
+        held_file_as_told(&host).await,
+        told,
+        "a request refused before it took the choice leaves the choice held"
+    );
+
+    // The run that takes the file uses it up, whatever the host then answers: this host has no
+    // session, so it starts nothing and says why.
+    ask_for_the_checks(&host)
+        .await
+        .expect("the checks are asked for");
+    assert_eq!(
+        held_file_as_told(&host).await,
+        Value::Null,
+        "the run that took the file used the choice up"
+    );
 }
 
 /// KR-REQ-13.11: the launch commands are read, saved, replaced and removed through the three
