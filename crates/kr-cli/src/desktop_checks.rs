@@ -190,7 +190,8 @@ enum Followed<R> {
 /// other: a read that finds another run, which a second caller began once this one ended, ends the
 /// command with the words that say so, and the findings of that run are not shown as this one's.
 /// Where the first answer already says the run ended, that answer is the command's own, and a later
-/// read only supplies the records if they are still that run's.
+/// read only supplies the records if they are still that run's: a read that fails or does not
+/// answer leaves that answer as the verdict, with no records.
 ///
 /// A file named for a run that was already going is not read, and the command says so instead of
 /// reporting that run: it is not the run the person asked for.
@@ -236,18 +237,29 @@ async fn follow<A: Asked>(
     loop {
         // No read starts at the deadline or after it: it could not be answered in time.
         if Instant::now() >= deadline {
-            return Ok(out_of_time(seen, held));
+            return Ok(if running {
+                out_of_time(seen, held)
+            } else {
+                kept(seen, None)
+            });
         }
         let asked_at = Instant::now();
-        let Some((checks, records)) = within(deadline, asked.read()).await.transpose()? else {
+        let (checks, records) = match within(deadline, asked.read()).await {
+            Some(Ok(answer)) => answer,
+            // The first answer already gave the verdict, and a read that only brings the records
+            // that go with it does not take it back by failing or by not answering.
+            _ if !running => return Ok(kept(seen, None)),
+            Some(Err(error)) => return Err(error),
             // A read that the deadline cut off soon after it was asked is the deadline's doing, and
             // the run was still going when the host last answered. One that had been out longer is
             // a host that stopped answering.
-            return Ok(if deadline.saturating_duration_since(asked_at) <= POLL {
-                out_of_time(seen, held)
-            } else {
-                unanswered(Some(seen))
-            });
+            None => {
+                return Ok(if deadline.saturating_duration_since(asked_at) <= POLL {
+                    out_of_time(seen, held)
+                } else {
+                    unanswered(Some(seen))
+                });
+            }
         };
         let ours = Run::of(&checks) == accepted;
         if !running {
@@ -478,6 +490,12 @@ mod tests {
     enum Answer {
         Stands(CapabilityChecks),
         Silent,
+        Fails,
+    }
+
+    /// What a host that cut the connection gives.
+    fn connection_cut() -> CliError {
+        CliError::Other(shown!("the connection to the host was cut"))
     }
 
     /// A host that answers the request and each read as it is told to, the reads one after the
@@ -510,6 +528,7 @@ mod tests {
             match self.begun.clone() {
                 Answer::Stands(checks) => Ok(checks),
                 Answer::Silent => std::future::pending().await,
+                Answer::Fails => Err(connection_cut()),
             }
         }
 
@@ -521,6 +540,7 @@ mod tests {
             match answer {
                 Answer::Stands(checks) => Ok((checks, ())),
                 Answer::Silent => std::future::pending().await,
+                Answer::Fails => Err(connection_cut()),
             }
         }
     }
@@ -533,14 +553,22 @@ mod tests {
 
     /// Follows a script as [`run_script`] does, from a command that names `file`.
     async fn run_naming(script: &mut Script, file: Option<&str>) -> (Followed<()>, Duration) {
+        let (followed, took) = try_naming(script, file).await;
+        (followed.expect("the scripted host does not fail"), took)
+    }
+
+    /// Follows a script as [`run_naming`] does, and gives the command's failure where it has one.
+    async fn try_naming(
+        script: &mut Script,
+        file: Option<&str>,
+    ) -> (Result<Followed<()>>, Duration) {
         let started = Instant::now();
         let followed = tokio::time::timeout(
             WAIT + Duration::from_secs(60),
             follow(script, file.map(str::to_owned), started + WAIT, || {}),
         )
         .await
-        .expect("the command ended at its deadline")
-        .expect("the scripted host does not fail");
+        .expect("the command ended at its deadline");
         (followed, started.elapsed())
     }
 
@@ -780,6 +808,69 @@ mod tests {
                 .to_string()
                 .contains("No session of the kind this host creates"),
             "{words}"
+        );
+    }
+
+    /// A run the host refused to begin ended in its first answer, and that failure is the
+    /// command's report whatever becomes of the read that only brings the records: the person is
+    /// told why no checks ran, not that the connection was cut or that the host did not answer.
+    async fn the_first_failure_is_the_report_where_the_read_after_it(read: Answer) {
+        let refused = CapabilityChecks {
+            session_id: Nullable::null(),
+            ..stands(
+                CapabilityChecksState::Failed,
+                10,
+                1,
+                Some(CapabilityChecksFailure::NoSession),
+            )
+        };
+        let mut script = Script::new(Answer::Stands(refused.clone()), vec![read]);
+        let (followed, _) = try_naming(&mut script, None).await;
+        let followed = followed.unwrap_or_else(|error| {
+            panic!("the failure of a read replaced the verdict of the first answer: {error:?}")
+        });
+        let Followed::Unfinished {
+            checks,
+            records,
+            words,
+        } = followed
+        else {
+            panic!("the command reported findings");
+        };
+        assert_eq!(checks, Some(refused));
+        assert!(records.is_none());
+        assert!(
+            words
+                .to_string()
+                .contains("No session of the kind this host creates"),
+            "{words}"
+        );
+    }
+
+    /// A read that fails after the first answer ended the run does not replace its verdict.
+    #[tokio::test(start_paused = true)]
+    async fn a_first_failure_is_kept_when_the_read_after_it_fails() {
+        the_first_failure_is_the_report_where_the_read_after_it(Answer::Fails).await;
+    }
+
+    /// A read that never answers after the first answer ended the run does not replace its
+    /// verdict either, and the command does not say that the host did not answer.
+    #[tokio::test(start_paused = true)]
+    async fn a_first_failure_is_kept_when_the_read_after_it_never_answers() {
+        the_first_failure_is_the_report_where_the_read_after_it(Answer::Silent).await;
+    }
+
+    /// A read that fails while the run is still going is the command's failure: nothing says how
+    /// the run ended.
+    #[tokio::test(start_paused = true)]
+    async fn a_read_that_fails_while_the_run_goes_on_fails_the_command() {
+        let running = stands(CapabilityChecksState::Running, 10, 1, None);
+        let mut script = Script::new(Answer::Stands(running), vec![Answer::Fails]);
+        let started = Instant::now();
+        let failed = follow(&mut script, None, started + WAIT, || {}).await;
+        assert!(
+            matches!(failed, Err(CliError::Other(_))),
+            "the connection's failure was not the command's"
         );
     }
 
