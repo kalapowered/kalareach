@@ -4534,8 +4534,7 @@ async fn a_signed_out_device_is_told_to_sign_in_where_a_record_exists_and_before
         page.recovery
             .cover_host(&page.account, &host, false)
             .await
-            .err()
-            .expect("signed out")
+            .expect_err("signed out")
             .message,
         reach
     );
@@ -4543,8 +4542,7 @@ async fn a_signed_out_device_is_told_to_sign_in_where_a_record_exists_and_before
         page.recovery
             .archives(&page.account)
             .await
-            .err()
-            .expect("signed out")
+            .expect_err("signed out")
             .message,
         reach
     );
@@ -4552,8 +4550,7 @@ async fn a_signed_out_device_is_told_to_sign_in_where_a_record_exists_and_before
         page.recovery
             .export_offline(&page.account, &out.path().join("bundle.krexport"), None)
             .await
-            .err()
-            .expect("signed out")
+            .expect_err("signed out")
             .message,
         reach
     );
@@ -4561,8 +4558,7 @@ async fn a_signed_out_device_is_told_to_sign_in_where_a_record_exists_and_before
         page.recovery
             .remove_saved_settings(&page.account)
             .await
-            .err()
-            .expect("signed out")
+            .expect_err("signed out")
             .message,
         removal
     );
@@ -5703,7 +5699,7 @@ async fn a_kit_or_export_file_that_is_not_one_is_refused_in_words() {
                 .restore_settings_with(
                     &Chooses::answering(answers),
                     &page.account,
-                    &fresh,
+                    fresh,
                     from_file,
                 )
                 .await
@@ -5822,8 +5818,7 @@ async fn a_kit_that_names_no_service_and_the_failures_of_a_panel_are_refused_in_
     let refused = page
         .recovery
         .account_source_for(&page.account, &nameless)
-        .err()
-        .expect("a kit that names no service is refused");
+        .expect_err("a kit that names no service is refused");
     assert_eq!(
         refused.message,
         format!("the service the kit names is not one this device can reach: {error}")
