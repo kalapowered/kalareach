@@ -19,6 +19,33 @@ const QUIET: Duration = Duration::from_millis(300);
 /// How many quiet periods a window waits for before it says that the command ended anyway.
 const QUIET_PERIODS: usize = 20;
 
+/// What the console sends to learn where the cursor is. It lets nothing through until the terminal
+/// answers, so a window that never answers sees no output at all.
+const CURSOR_QUERY: &[u8] = b"\x1b[6n";
+
+/// The answer to [`CURSOR_QUERY`]: the cursor is at the top left.
+const CURSOR_REPORT: &[u8] = b"\x1b[1;1R";
+
+/// The console's input, which the window's reader answers the console's queries on and the test
+/// types on, one writer between them.
+struct Typing(Arc<Mutex<Box<dyn Write + Send>>>);
+
+impl Write for Typing {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .write(bytes)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .flush()
+    }
+}
+
 /// A console the command runs on, and the person's side of it.
 pub struct Opened {
     /// Both ends of the pseudo-console, held for as long as the window is.
@@ -41,7 +68,8 @@ pub fn open(command: CommandBuilder) -> Opened {
             pixel_height: 0,
         })
         .expect("opens a console");
-    let typing = terminal.master.take_writer().expect("a writer");
+    let writer = Arc::new(Mutex::new(terminal.master.take_writer().expect("a writer")));
+    let mut answering = Typing(Arc::clone(&writer));
     let mut child = terminal
         .slave
         .spawn_command(command)
@@ -52,14 +80,25 @@ pub fn open(command: CommandBuilder) -> Opened {
     let collected = Arc::clone(&seen);
     std::thread::spawn(move || {
         let mut buffer = [0_u8; 4096];
+        let mut answered = 0;
         while let Ok(read) = reader.read(&mut buffer) {
             if read == 0 {
                 break;
             }
-            collected
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .extend_from_slice(&buffer[..read]);
+            let queries = {
+                let mut shown = collected.lock().unwrap_or_else(PoisonError::into_inner);
+                shown.extend_from_slice(&buffer[..read]);
+                shown
+                    .windows(CURSOR_QUERY.len())
+                    .filter(|window| *window == CURSOR_QUERY)
+                    .count()
+            };
+            while answered < queries {
+                let _ = answering
+                    .write_all(CURSOR_REPORT)
+                    .and_then(|()| answering.flush());
+                answered += 1;
+            }
         }
     });
     let ended = Arc::clone(&seen);
@@ -81,7 +120,7 @@ pub fn open(command: CommandBuilder) -> Opened {
     Opened {
         terminal,
         shell,
-        typing,
+        typing: Box::new(Typing(writer)),
         seen,
     }
 }

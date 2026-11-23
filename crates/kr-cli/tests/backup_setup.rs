@@ -755,6 +755,16 @@ fn tree(root: &Path) -> BTreeMap<String, Vec<u8>> {
                 let bytes = match std::fs::read(&path) {
                     Ok(bytes) => bytes,
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    // The daemon holds its lock file open without sharing on Windows, so it cannot be
+                    // read while the daemon runs; it holds a process number and no secret.
+                    Err(error)
+                        if error.raw_os_error() == Some(32)
+                            && path
+                                .file_name()
+                                .is_some_and(|name| name == "controller.lock") =>
+                    {
+                        continue;
+                    }
                     Err(error) => panic!("{} cannot be read: {error}", path.display()),
                 };
                 into.insert(
