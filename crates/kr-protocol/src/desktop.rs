@@ -108,9 +108,9 @@ pub enum DesktopGenerationSource {
     /// Linux: the kernel's start value for the login session's leader process.
     LinuxSessionLeader,
     /// Windows: the time the system records for the interactive session's user to have logged on,
-    /// in 100 ns ticks since 1601, which the account reads for its own session. A host of some
-    /// earlier releases at this level sends the start value of the session's logon process under
-    /// this source instead, so compare the value and do not read it as a logon time.
+    /// in 100 ns ticks since 1601, which the account reads for its own session. A host of one of
+    /// the first seven releases of level 0.78 sends the start value of the session's logon process
+    /// under this source instead, so compare the value and do not read it as a logon time.
     WindowsSessionLogon,
     /// The platform offered no generation. The identifier and the boot identity carry the identity
     /// alone, which is sound only where the platform does not reuse a session number within a

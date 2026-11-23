@@ -1160,13 +1160,14 @@ impl<C: Codec> Client<C> {
     /// machine's own continuous clock so both processes read the same instant.
     ///
     /// The frame carries no history scope: this is the link a local caller's own action travels,
-    /// and a worker of any build reads it. A scope goes only over a proxy link, to a worker that
-    /// states it holds results to one ([`Self::forward_within`]).
+    /// and a worker of any build reads it. A scope goes only over a proxy link
+    /// ([`Self::forward_within`]), to every worker: each worker of a level this release retains
+    /// states that it holds results to one.
     ///
     /// `lease` is the remote dispatch lease the host took for a paired device's mutation, and a
-    /// local caller's action, which does not depend on the lease, passes none. A link to a worker of
-    /// an earlier release refuses a frame that carries one, so the lease is passed only on a link
-    /// whose worker is at this build's own level.
+    /// local caller's action, which does not depend on the lease, passes none. Every worker of a
+    /// level this release retains reads the lease, so the host passes it on a link whatever its
+    /// worker's level; a worker from before the lease refuses a frame that carries one.
     ///
     /// # Errors
     ///
@@ -1192,7 +1193,8 @@ impl<C: Codec> Client<C> {
     }
 
     /// As [`Self::forward`], with the history scope of the grant the host decided the mutation
-    /// under, for a worker that states it holds results to one.
+    /// under, for a worker that holds results to one, as every worker of a level this release
+    /// retains does.
     ///
     /// # Errors
     ///

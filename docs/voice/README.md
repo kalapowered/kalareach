@@ -237,10 +237,7 @@ questions a verified source asked and the approvals a decoder gave meaning to, e
 or its upstream method and whether it was verified. The request behind an approval is not read: it
 can hold anything the agent was asked to do. Nothing else of the worker is read, so its output, its
 screen, its files, its environment and its attachments never come into the context. A part the
-worker cannot give is reported as withheld, with its reason, and the rest is still served. A
-worker that an earlier release started does not answer the reads that carry its messages and
-decisions in a form this daemon can read, so the selection says that part could not be read and
-carries the daemon's half as before.
+worker cannot give is reported as withheld, with its reason, and the rest is still served.
 
 Both halves go into one selection. The shared history filter is applied to every item, then one
 cap, one set of secret patterns and one set of counts cover everything the selection carries. A

@@ -114,8 +114,8 @@ fn settled_wait(
 #[derive(Debug, Default)]
 pub(crate) struct LocalAccessState {
     drawn: Mutex<Drawn>,
-    /// What this daemon knows of each worker: whether it states `local.access/1`, and the
-    /// highest sequence it has acknowledged.
+    /// What this daemon knows of each worker: whether the link to it took the statement of what
+    /// the local owner may do, and the highest sequence it has acknowledged.
     workers: Mutex<BTreeMap<SessionId, Worker>>,
     wake: std::sync::Arc<tokio::sync::Notify>,
     /// How many times the publisher was woken. For this crate's own tests.
@@ -139,8 +139,9 @@ struct Drawn {
 /// What this daemon knows of one worker's side of the statement.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Worker {
-    /// Whether its hello answer stated `local.access/1`: `None` while no link to it has been
-    /// opened, which counts as lacking it wherever the answer matters.
+    /// Whether the link to it took the statement of `local.access/1`, which a link of a level that
+    /// reads it does: `None` while no link to it has been opened, which counts as lacking it
+    /// wherever the answer matters.
     pub states: Option<bool>,
     /// The highest sequence it acknowledged.
     pub acknowledged: u64,
@@ -191,7 +192,7 @@ impl LocalAccessState {
         statement
     }
 
-    /// Records what a worker's hello said and what it acknowledged.
+    /// Records whether a worker's link took the statement and what it acknowledged.
     pub(crate) fn note_worker(
         &self,
         session_id: SessionId,
