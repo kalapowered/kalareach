@@ -2593,6 +2593,30 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_volume_decides_before_the_folder_when_the_home_directory_is_on_it() {
+        // The cases above give no home directory, so they hold whichever of the two is asked first.
+        // Here the Documents folder is the account's own, and the volume that holds it is a
+        // removable or a network one.
+        let home = below_volumes(&["Backup", "someone"]);
+        let path = home.join("Documents/notes.txt");
+        let on = |flags| permission_on(&path, Some(flags), Some(&home));
+        assert_eq!(
+            on(EXTERNAL_DISK),
+            on_macos("Files & Folders, for removable volumes")
+        );
+        assert_eq!(
+            on(NETWORK_VOLUME),
+            on_macos("Files & Folders, for network volumes")
+        );
+        // The same folder of the same account on an internal volume is the Documents folder's
+        // grant, so the home directory is the account's and the case would not pass without it.
+        assert_eq!(
+            on(DATA_VOLUME),
+            on_macos("Files & Folders, for the Documents folder")
+        );
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn the_kernel_answers_for_the_volume_of_a_path_that_is_not_there() {
