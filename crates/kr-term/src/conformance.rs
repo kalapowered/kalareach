@@ -1220,6 +1220,7 @@ pub fn hex(bytes: &[u8]) -> String {
 
 /// Decodes the hex form fixtures use.
 #[must_use]
+#[cfg(any(test, feature = "testing"))]
 pub fn unhex(text: &str) -> Option<Vec<u8>> {
     let bytes = text.as_bytes();
     if !bytes.len().is_multiple_of(2) {

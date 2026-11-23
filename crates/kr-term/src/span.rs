@@ -94,6 +94,7 @@ pub enum SeqBytes {
 impl SeqBytes {
     /// An empty byte string.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn empty() -> Self {
         Self::Inline {
             buf: [0; INLINE],
@@ -132,6 +133,7 @@ impl SeqBytes {
 
     /// Number of bytes held.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn len(&self) -> usize {
         match self {
             Self::Inline { len, .. } => usize::from(*len),
@@ -141,6 +143,7 @@ impl SeqBytes {
 
     /// Whether no bytes are held.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }

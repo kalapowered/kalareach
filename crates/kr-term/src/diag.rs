@@ -162,6 +162,7 @@ impl DiagnosticSink {
 
     /// How many occurrences of `kind` have been recorded, published or not.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn total(&self, kind: DiagnosticKind) -> u64 {
         self.totals.get(&kind).copied().unwrap_or(0)
     }

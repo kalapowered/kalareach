@@ -131,6 +131,7 @@ impl DynamicColour {
 
     /// The OSC selector for this colour.
     #[must_use]
+    #[cfg(test)]
     pub const fn selector(self) -> u32 {
         match self {
             Self::Foreground => 10,

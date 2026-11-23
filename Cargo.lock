@@ -5252,6 +5252,7 @@ dependencies = [
  "base64 0.23.1",
  "kr-keys",
  "kr-protocol",
+ "kr-term",
  "kr-test-artifacts",
  "kr-width",
  "serde",

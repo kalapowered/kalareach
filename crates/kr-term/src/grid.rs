@@ -437,6 +437,7 @@ pub struct Link {
 impl Link {
     /// A link to `uri` with the parameters `params`, which are spelled as the field documents.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn new(uri: impl Into<String>, params: impl Into<String>) -> Self {
         Self {
             uri: uri.into(),
@@ -662,6 +663,7 @@ impl CanonicalGrid {
     ///
     /// The record it returns carries the actions the adaptation produced, whether or not they were
     /// applied. `Self::apply_handing_over_actions` is the same work without that copy.
+    #[cfg(any(test, feature = "testing"))]
     pub fn apply(&mut self, event: &Event) -> Adapted {
         let adapted = self.adapt_event(event);
         let mut applying = adapted.clone();
@@ -1070,6 +1072,7 @@ impl CanonicalGrid {
     /// its own schedule rather than on every read. This counts both, so a test can hold that a
     /// read's reading is a property of the geometry and the schedule rather than of the history.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn rows_read(&self) -> u64 {
         self.rows_read.load(Ordering::Relaxed)
     }
@@ -1283,6 +1286,7 @@ impl CanonicalGrid {
     /// The grid keeps its own copy of what an OSC title set, and it is cut to the length a session
     /// holds before it arrives, so the two owners hold the same string.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn title(&self) -> &str {
         self.terminal.get_title()
     }
@@ -1760,6 +1764,7 @@ impl CanonicalGrid {
     ///
     /// Cheap, unlike measuring them, so it is what decides when a measurement is worth taking.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn scrollback_rows(&self) -> usize {
         self.primary_screen()
             .scrollback_rows()
@@ -1771,6 +1776,7 @@ impl CanonicalGrid {
     /// Both buffers, because the one that is not showing still holds its own: a session can fill
     /// the primary buffer, switch, and fill the alternate one as well.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn buffer_bytes(&self) -> BufferBytes {
         let screens = self.screen_bytes();
         BufferBytes {
@@ -2056,6 +2062,7 @@ impl CanonicalGrid {
     /// The long way round, and the proof that the carried figure is the right one. Nothing on the
     /// path a printing application takes calls it.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn measure_history_bytes(&self) -> u64 {
         let mut total = 0u64;
         self.walk_history(|charge| total = total.saturating_add(charge));

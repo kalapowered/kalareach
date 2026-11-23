@@ -233,6 +233,7 @@ impl Lexer {
 
     /// The bounds in force.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn limits(&self) -> LexLimits {
         self.limits
     }

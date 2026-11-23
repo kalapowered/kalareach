@@ -30,9 +30,11 @@ use crate::palette::{DynamicColour, Palette, PaletteSource};
 use crate::policy::{Backend, Policy};
 use crate::profile::Profile;
 use crate::sideeffect::{LeaseHolder, SideEffect, SideEffectRefusal};
+#[cfg(any(test, feature = "testing"))]
+use crate::snapshot::HistoryPage;
 use crate::snapshot::{
-    ActiveBuffer, Charsets, CursorState, Delta, HistoryPage, HyperlinkRange, KeyboardSnapshot,
-    Margins, ModeEntry, PaletteSnapshot, Snapshot, Viewport,
+    ActiveBuffer, Charsets, CursorState, Delta, HyperlinkRange, KeyboardSnapshot, Margins,
+    ModeEntry, PaletteSnapshot, Snapshot, Viewport,
 };
 use crate::span::ByteSpan;
 use crate::span::SeqBytes;
@@ -169,6 +171,7 @@ pub struct ResidentPressure {
 impl ResidentPressure {
     /// Whether any bound is exceeded.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn any(self) -> bool {
         self.row_cache || self.session
     }
@@ -229,6 +232,7 @@ const EVENT_BATCH: usize = 256;
 const EVENT_ROOM: usize = 2 * EVENT_BATCH;
 
 /// How many rows a history page builds at a time before checking its byte bound.
+#[cfg(any(test, feature = "testing"))]
 const PAGE_BATCH_ROWS: usize = 32;
 
 /// The terminal engine for one session.
@@ -236,6 +240,7 @@ const PAGE_BATCH_ROWS: usize = 32;
 pub struct Engine {
     lexer: Lexer,
     policy: Policy,
+    #[cfg(any(test, feature = "testing"))]
     profile: Profile,
     grid: CanonicalGrid,
     broker: QueryBroker,
@@ -297,6 +302,7 @@ impl Engine {
         let mut engine = Self {
             lexer: Lexer::with_limits(config.lex),
             policy: config.policy,
+            #[cfg(any(test, feature = "testing"))]
             profile: config.profile,
             grid,
             broker: QueryBroker::new(),
@@ -357,6 +363,7 @@ impl Engine {
     /// and the ones a saved cursor carries. A link that has left all of them stops counting at the
     /// next reading of what the session holds.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn distinct_links(&self) -> usize {
         self.links.len()
     }
@@ -379,6 +386,7 @@ impl Engine {
 
     /// The profile in force.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn profile(&self) -> Profile {
         self.profile
     }
@@ -397,6 +405,7 @@ impl Engine {
 
     /// The titles and the virtual stack.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn titles(&self) -> &TitleState {
         &self.titles
     }
@@ -1928,6 +1937,7 @@ impl Engine {
     /// 1 MiB of encoded content, whichever binds first. The size counts everything the page
     /// carries, not only its text.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn history_page(&self, from: i64) -> HistoryPage {
         let limits = self.budget.limits();
         let mut rows = Vec::new();
@@ -1988,6 +1998,7 @@ impl Engine {
     ///
     /// [`Engine::feed`] already answers every query it sees. This is for a caller holding a query
     /// event that wants the answer without re-feeding the bytes.
+    #[cfg(any(test, feature = "testing"))]
     pub fn answer(&mut self, event: &Event, now_ms: u64) -> usize {
         if event.class != SequenceClass::Query {
             return 0;
@@ -2162,6 +2173,7 @@ fn observe_osc(selector: Option<u32>, parts: &[Vec<u8>], at: u64, outcome: &mut 
 ///
 /// Counting only the text would let a page of short, heavily linked rows pass the bound several
 /// times over, because a hyperlink target can be far longer than the text it covers.
+#[cfg(any(test, feature = "testing"))]
 fn encoded_row_bytes(row: &GridRow) -> usize {
     const ROW_OVERHEAD: usize = 16;
     ROW_OVERHEAD
@@ -2180,6 +2192,7 @@ fn encoded_row_bytes(row: &GridRow) -> usize {
 }
 
 /// Drops runs from the end of a row until its record fits `limit`, and says that it happened.
+#[cfg(any(test, feature = "testing"))]
 fn truncate_row(row: &mut GridRow, limit: usize) {
     while encoded_row_bytes(row) > limit && !row.runs.is_empty() {
         row.runs.pop();

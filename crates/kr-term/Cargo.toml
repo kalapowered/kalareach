@@ -13,6 +13,9 @@ default = ["conformance"]
 # The conformance corpus and the fixture generator. Enabled by default so `cargo test -p kr-term`
 # runs the corpus.
 conformance = ["dep:serde_json", "dep:sha2"]
+# Accessors and constructors that the engine's own tests and other crates' tests read the engine
+# through. The product build leaves them out.
+testing = []
 
 [[bin]]
 name = "kr-term-fixtures"
@@ -36,6 +39,7 @@ wezterm-surface.workspace = true
 wezterm-term.workspace = true
 
 [dev-dependencies]
+kr-term = { path = ".", features = ["testing"] }
 # Where the performance case keeps its figures.
 kr-test-artifacts.workspace = true
 serde_json.workspace = true

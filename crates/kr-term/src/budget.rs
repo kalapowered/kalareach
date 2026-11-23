@@ -82,6 +82,7 @@ impl GridSize {
 
     /// The number of cells, when the size is valid.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn cells(self) -> Option<u32> {
         self.cols.checked_mul(self.rows)
     }
@@ -292,12 +293,14 @@ impl SessionBudget {
 
     /// What the last measurement found inside that reservation.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn usage(&self) -> BudgetUsage {
         self.usage
     }
 
     /// How many times content has been truncated to stay inside a bound.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn truncations(&self) -> u64 {
         self.truncations
     }

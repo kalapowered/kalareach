@@ -91,6 +91,8 @@ testing = ["kr-ipc/testing", "kr-plugin-service/testing"]
 # the interval the dispatch marker divides, because every other seam a test controls is called
 # under the broker's own lock.
 kr-worker = { path = ".", features = ["testing"] }
+# The terminal engine's constructors that the projection's and the renderer's tests build cells with.
+kr-term = { workspace = true, features = ["testing"] }
 # The test that stands the journal in the interval its previous holder is letting go of it.
 kr-flush = { workspace = true, features = ["testing", "sqlite"] }
 kr-cbor.workspace = true

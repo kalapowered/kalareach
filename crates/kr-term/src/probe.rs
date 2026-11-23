@@ -21,7 +21,9 @@ use std::collections::BTreeMap;
 use crate::error::{ProbeFailure, Result, TermError};
 use crate::event::{Event, EventKind};
 use crate::lexer::Lexer;
-use crate::palette::{Palette, PaletteSource, Rgb};
+#[cfg(any(test, feature = "testing"))]
+use crate::palette::Palette;
+use crate::palette::{PaletteSource, Rgb};
 
 /// A mode of the outer terminal that an attachment changes and therefore owes back.
 ///
@@ -171,6 +173,7 @@ impl ProbeItem {
 /// probe-qualified for that profile and belongs on the `--no-probe` path with a saved or
 /// conservative profile. A reply to something the caller did not ask is still recorded, because a
 /// terminal that volunteers one has told the truth about itself either way.
+#[cfg(any(test, feature = "testing"))]
 pub const PROBE_SET: &[ProbeItem] = &[
     ProbeItem::Version,
     ProbeItem::Foreground,
@@ -383,6 +386,7 @@ impl ProbeSession {
     /// Available on a failed exchange too, because a failure does not make their keystrokes
     /// somebody else's.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn typed(&self) -> &[u8] {
         &self.typed
     }
@@ -402,6 +406,7 @@ impl ProbeSession {
     /// A failed exchange does not make somebody's keystrokes nobody's, and the lexer may still be
     /// holding the half of a key they were pressing when the deadline passed.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn into_typing(mut self) -> Vec<u8> {
         let held = self.lexer.take_pending();
         let mut typed = self.typed;
@@ -432,12 +437,14 @@ impl ProbeOutcome {
 
     /// Every answer.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn answers(&self) -> &BTreeMap<ProbeItem, ProbeAnswer> {
         &self.answers
     }
 
     /// The questions this exchange asked, all of which were answered.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn asked(&self) -> Vec<ProbeItem> {
         self.answers.keys().copied().collect()
     }
@@ -463,6 +470,7 @@ impl ProbeOutcome {
     /// made at creation. The source is recorded either way, so a later query describes the session
     /// and can say where the session got its palette.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn adopt_palette(&self) -> Option<Palette> {
         let (Some(ProbeAnswer::Colour(foreground)), Some(ProbeAnswer::Colour(background))) = (
             self.answers.get(&ProbeItem::Foreground),
@@ -497,6 +505,7 @@ pub enum NoProbeProfile {
 impl NoProbeProfile {
     /// The palette a `--no-probe` session starts with.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn palette(&self) -> Palette {
         match self {
             Self::Saved { palette, .. } | Self::ConservativeProjected { palette } => {

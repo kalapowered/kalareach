@@ -24,6 +24,7 @@ pub enum CsiParam {
 impl CsiParam {
     /// The number, when this item is one.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn integer(self) -> Option<i64> {
         match self {
             Self::Integer(v) => Some(v),

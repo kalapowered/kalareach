@@ -323,6 +323,7 @@ pub struct Delta {
 }
 
 /// A page of history rows.
+#[cfg(any(test, feature = "testing"))]
 #[derive(Debug, Clone, PartialEq)]
 pub struct HistoryPage {
     /// The rows.

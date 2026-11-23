@@ -152,6 +152,7 @@ impl Default for KeyRecord {
 /// [`decode`] does - but an application reading this is somebody else's parser, and the form that
 /// asks least of it is the one that spells every field out.
 #[must_use]
+#[cfg(any(test, feature = "testing"))]
 pub fn encode(record: &KeyRecord) -> Vec<u8> {
     let mut out = Vec::with_capacity(24);
     encode_into(record, &mut out);
@@ -318,6 +319,7 @@ fn encode_into(record: &KeyRecord, out: &mut Vec<u8>) {
 }
 
 /// What went wrong reading an encoded record.
+#[cfg(any(test, feature = "testing"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RecordError {
     /// The bytes do not begin `CSI` and end with the final underscore.
@@ -338,6 +340,7 @@ pub enum RecordError {
 /// # Errors
 ///
 /// Returns [`RecordError`] when the bytes are not one record.
+#[cfg(any(test, feature = "testing"))]
 pub fn decode(bytes: &[u8]) -> Result<KeyRecord, RecordError> {
     let body = bytes
         .strip_prefix(b"\x1b[")
@@ -400,12 +403,14 @@ impl Fidelity {
     /// True does not mean the scan codes are a keyboard's: it means they are the console's own and
     /// were not invented here.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn carries_console_scan_codes(&self) -> bool {
         matches!(self, Self::Records)
     }
 
     /// The sentence a receipt or a diagnostic prints.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn describe(&self) -> &'static str {
         match self {
             Self::Records => {

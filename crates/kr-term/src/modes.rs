@@ -290,6 +290,7 @@ impl ModeState {
 
     /// Whether the ConPTY win32 input mode is on for the owned backend.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn win32_input(&self) -> bool {
         self.win32_input
     }
@@ -452,6 +453,7 @@ impl ModeState {
     /// this session once held, but it arrives from outside, and a restoration that took it at its
     /// word could put back flags the profile does not advertise or a stack deeper than one a
     /// session can build.
+    #[cfg(any(test, feature = "testing"))]
     pub fn restore_keyboard(&mut self, modify_other_keys: u8, buffers: [(Option<u8>, Vec<u8>); 2]) {
         self.modify_other_keys = modify_other_keys.min(2);
         for (slot, (flags, stack)) in buffers.into_iter().enumerate() {

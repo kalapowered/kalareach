@@ -109,12 +109,14 @@ impl TitleState {
 
     /// Current depth of the virtual stack.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn depth(&self) -> usize {
         self.stack.len()
     }
 
     /// How many pops have found the stack empty.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn underflows(&self) -> u32 {
         self.underflows
     }
@@ -235,6 +237,7 @@ impl TitleState {
     /// Every title goes through the same per-entry bound a title from the session does. A snapshot
     /// is state this session once held, but it arrives from outside, and a restoration that took
     /// it at its word could put back more than a session is allowed to hold.
+    #[cfg(any(test, feature = "testing"))]
     pub fn restore(&mut self, current: TitleEntry, stack: Vec<SavedTitle>, underflows: u32) {
         self.current = TitleEntry {
             icon: truncated(&current.icon),

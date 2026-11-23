@@ -99,6 +99,7 @@ impl SubjectName {
 
     /// The name.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn as_bytes(&self) -> &[u8] {
         &self.bytes[..usize::from(self.len)]
     }
@@ -302,6 +303,7 @@ impl ResponseLane {
 
     /// The bounds in force.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn limits(&self) -> LaneLimits {
         self.limits
     }
@@ -314,6 +316,7 @@ impl ResponseLane {
 
     /// How many replies have been handed to the session loop.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn delivered(&self) -> u64 {
         self.delivered
     }
@@ -326,6 +329,7 @@ impl ResponseLane {
 
     /// Bytes waiting to be written.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn queued_bytes(&self) -> usize {
         self.queued_bytes
     }
@@ -498,6 +502,7 @@ impl ResponseLane {
     ///
     /// Source loss and reconnection both use this: an undelivered reply from before a disconnect is
     /// not replayed to whoever attaches next.
+    #[cfg(any(test, feature = "testing"))]
     pub fn reset(&mut self) {
         self.queue.clear();
         self.queued_bytes = 0;

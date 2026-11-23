@@ -203,6 +203,7 @@ impl Profile {
 
     /// The profile identity string, `kr-vt/1`.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn identity(&self) -> String {
         format!("{PROFILE_NAME}/{PROFILE_REVISION}")
     }
