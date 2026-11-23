@@ -8,6 +8,11 @@
 //! release writes it, with each new ceiling set; they pin the names of the new ceilings, which the
 //! stored-format lock does not (it holds the version number alone). The later release's writer
 //! has to write them byte for byte.
+//!
+//! This build writes version 4, where the owner's description budgets arrived
+//! (`version-4-description-budgets.json`, which this build writes byte for byte), and reads
+//! through version 5 (`version-5.json`). `version-4-limits.json` pins a ceiling that this build
+//! still lacks.
 
 use std::path::PathBuf;
 
@@ -41,7 +46,7 @@ fn with_ceiling(name: &str, member: &str, value: &Value) -> String {
 /// next edit writes it at that version.
 #[test]
 fn a_document_one_version_ahead_with_no_new_ceiling_is_read_as_the_version_this_build_writes() {
-    let ahead = load(&fixture("version-4.json"));
+    let ahead = load(&fixture("version-5.json"));
     assert_eq!(ahead.status.state, DocumentState::Loaded);
     assert!(!ahead.fails_closed());
     let document = ahead.document.clone().expect("the document is used");
@@ -56,13 +61,13 @@ fn a_document_one_version_ahead_with_no_new_ceiling_is_read_as_the_version_this_
             .status
             .detail
             .as_str()
-            .contains("version 4, read as version 3"),
+            .contains("version 5, read as version 4"),
         "{:?}",
         ahead.status
     );
 
     // The control: the same bytes at the version this build writes are the same document.
-    let own = load(&fixture("version-4.json").replace("\"version\": 4", "\"version\": 3"));
+    let own = load(&fixture("version-5.json").replace("\"version\": 5", "\"version\": 4"));
     assert_eq!(own.status.state, DocumentState::Loaded);
     assert_eq!(own.document, ahead.document);
 
@@ -73,10 +78,14 @@ fn a_document_one_version_ahead_with_no_new_ceiling_is_read_as_the_version_this_
     .expect("a document this build reads is edited");
     let written: Value = serde_json::from_str(&edited.contents).expect("a JSON document");
     assert_eq!(
-        written["version"], 3,
+        written["version"], 4,
         "the edit writes the version this build writes"
     );
     assert_eq!(written["ceilings"]["session_limit"], 16);
+    assert!(
+        written["ceilings"].get("description_budgets").is_none(),
+        "a document that does not use the ceiling writes no member for it"
+    );
 }
 
 /// KR-REQ-26.13: a ceiling this build lacks, in any form, makes the document unusable whole, and
@@ -86,10 +95,7 @@ fn a_document_one_version_ahead_with_no_new_ceiling_is_read_as_the_version_this_
 #[test]
 fn a_ceiling_this_build_lacks_makes_the_document_unusable_in_every_form() {
     let empty = Value::Object(serde_json::Map::new());
-    for (name, member) in [
-        ("version-4-limits.json", "limits"),
-        ("version-4-description-budgets.json", "description_budgets"),
-    ] {
+    for (name, member) in [("version-4-limits.json", "limits")] {
         let set = fixture(name);
         let forms = [
             ("set", set.clone()),
@@ -110,8 +116,8 @@ fn a_ceiling_this_build_lacks_makes_the_document_unusable_in_every_form() {
                 "{member} {form}: nothing is read out of a document with a ceiling this build lacks"
             );
         }
-        // The same ceiling at the version this build writes is refused alike: the version does
-        // not make a name known.
+        // The same ceiling at the version before is refused alike: the version does not make a
+        // name known.
         let at_three = set.replace("\"version\": 4", "\"version\": 3");
         assert_eq!(
             load(&at_three).status.state,
@@ -124,7 +130,7 @@ fn a_ceiling_this_build_lacks_makes_the_document_unusable_in_every_form() {
 /// KR-REQ-26.13: the version after the one this build reads through is still one it does not know.
 #[test]
 fn a_document_two_versions_ahead_is_still_a_version_this_build_does_not_know() {
-    let loaded = load(&fixture("version-4.json").replace("\"version\": 4", "\"version\": 5"));
+    let loaded = load(&fixture("version-5.json").replace("\"version\": 5", "\"version\": 6"));
     assert_eq!(loaded.status.state, DocumentState::UnknownVersion);
     assert!(loaded.fails_closed());
     assert!(loaded.document.is_none());
@@ -134,10 +140,98 @@ fn a_document_two_versions_ahead_is_still_a_version_this_build_does_not_know() {
 /// with the version it reads it at, so a host moving between the two keeps one document.
 #[test]
 fn the_document_this_build_writes_is_the_golden_document_at_the_version_it_writes() {
-    let loaded = load(&fixture("version-4.json"));
+    let loaded = load(&fixture("version-5.json"));
     let document: ConfigurationDocument = loaded.document.expect("the document is used");
     assert_eq!(
         configuration::contents(&document),
-        fixture("version-4.json").replace("\"version\": 4", "\"version\": 3"),
+        fixture("version-5.json").replace("\"version\": 5", "\"version\": 4"),
     );
+    // And the golden that is already at the version this build writes is read as it is and
+    // written as it was.
+    let own = load(&fixture("version-4.json"));
+    assert_eq!(own.status.state, DocumentState::Loaded);
+    assert!(
+        !own.status.detail.as_str().contains("read as"),
+        "{:?}",
+        own.status
+    );
+    assert_eq!(
+        configuration::contents(&own.document.expect("the document is used")),
+        fixture("version-4.json"),
+    );
+}
+
+/// KR-REQ-22.10: the owner's description budgets are a ceiling this build has, at the version it
+/// writes: the golden document is read with both budgets set, and this build writes it back byte
+/// for byte.
+#[test]
+fn this_build_writes_the_golden_document_with_the_description_budgets_byte_for_byte() {
+    let golden = fixture("version-4-description-budgets.json");
+    let loaded = load(&golden);
+    assert_eq!(loaded.status.state, DocumentState::Loaded, "{:?}", loaded.status);
+    assert!(!loaded.fails_closed());
+    let document: ConfigurationDocument = loaded.document.expect("the document is used");
+    assert_eq!(document.version, configuration::VERSION);
+    let budgets = document
+        .ceilings
+        .description_budgets
+        .expect("the document sets the budgets");
+    assert_eq!(budgets.process_memory_bytes.as_ref(), Some(&(2 << 30)));
+    assert_eq!(budgets.reserve_bytes.as_ref(), Some(&(2 << 30)));
+    assert_eq!(configuration::contents(&document), golden);
+}
+
+/// KR-REQ-22.10: a document without the member reads as before, `null` reads as absent, one budget
+/// alone is a document, and a member the budgets do not have, at any depth, makes the document
+/// unusable whole.
+#[test]
+fn the_description_budgets_read_as_absent_as_one_budget_or_as_a_document_that_is_refused() {
+    let name = "version-4-description-budgets.json";
+    let member = "description_budgets";
+
+    let absent = load(&fixture("version-4.json"));
+    let document = absent.document.expect("the document is used");
+    assert_eq!(document.ceilings.description_budgets, None);
+
+    let null = load(&with_ceiling(name, member, &Value::Null));
+    assert_eq!(null.status.state, DocumentState::Loaded, "{:?}", null.status);
+    assert_eq!(
+        null.document.expect("the document is used").ceilings.description_budgets,
+        None,
+        "null is absent"
+    );
+
+    let one = load(&with_ceiling(
+        name,
+        member,
+        &serde_json::json!({ "reserve_bytes": 3_221_225_472u64 }),
+    ));
+    assert_eq!(one.status.state, DocumentState::Loaded, "{:?}", one.status);
+    let budgets = one
+        .document
+        .expect("the document is used")
+        .ceilings
+        .description_budgets
+        .expect("the budgets are set");
+    assert_eq!(budgets.process_memory_bytes.as_ref(), None);
+    assert_eq!(budgets.reserve_bytes.as_ref(), Some(&3_221_225_472));
+
+    for (what, value) in [
+        (
+            "a nested unknown member",
+            serde_json::json!({ "process_memory_bytes": 1, "reserve_bytes": 2, "soft_bytes": 3 }),
+        ),
+        ("a budget that is not a number", serde_json::json!({ "reserve_bytes": "big" })),
+        ("a budget below zero", serde_json::json!({ "process_memory_bytes": -1 })),
+    ] {
+        let loaded = load(&with_ceiling(name, member, &value));
+        assert_eq!(
+            loaded.status.state,
+            DocumentState::Invalid,
+            "{what}: {:?}",
+            loaded.status
+        );
+        assert!(loaded.fails_closed(), "{what}");
+        assert!(loaded.document.is_none(), "{what}: nothing is read out of it");
+    }
 }

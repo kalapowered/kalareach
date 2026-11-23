@@ -1799,7 +1799,13 @@ pub mod configuration {
     /// Version 3 is where levels arrived (`level`). A later section of nullable fields, where an
     /// absent section means it is not used, costs a level and not a version (see [`LEVEL`]); a
     /// release before levels reads a document at version 3 as one at a version it does not know.
-    pub const VERSION: u64 = 3;
+    ///
+    /// Version 4 is where the owner's description budgets arrived (`ceilings.description_budgets`).
+    /// A member of the ceilings narrows what a host may do, so a release that lacks it must not
+    /// read the document as one without it: it would run descriptions with more memory than the
+    /// owner allowed. A release before this one reads a document at version 4 as one at the
+    /// version it reads through, and refuses it whole when it holds the member.
+    pub const VERSION: u64 = 4;
 
     /// The newest version above [`VERSION`] that this build reads without writing it.
     ///
@@ -1812,7 +1818,7 @@ pub mod configuration {
     /// and the copy of the accepted document that the registry keeps is held to the same rule (a
     /// daemon does not start over a copy it cannot read). A document that holds none of those
     /// members is the document this build writes, and the next edit writes it at [`VERSION`].
-    pub const READS_THROUGH: u64 = 4;
+    pub const READS_THROUGH: u64 = 5;
 
     /// The oldest version this build reads and brings forward.
     ///
@@ -2318,6 +2324,14 @@ pub mod configuration {
         /// reads it.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub disable_policy: Option<crate::admission::RevocationPolicy>,
+        /// The memory the description process may use and the memory the host keeps free while
+        /// it runs, as section 22 lets the owner configure them.
+        ///
+        /// Absent leaves the defaults section 22 fixes. Present narrows them. A document that does
+        /// not use the ceiling writes no member for it. A release that lacks the member refuses
+        /// the document whole, which is why the document's version rose with it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub description_budgets: Option<DescriptionBudgets>,
     }
 
     impl Default for ConfigurationCeilings {
@@ -2328,6 +2342,7 @@ pub mod configuration {
                 grant_rights: Nullable::null(),
                 enrolment: Nullable::null(),
                 disable_policy: None,
+                description_budgets: None,
             }
         }
     }
@@ -2340,6 +2355,28 @@ pub mod configuration {
                 EnrolmentBudgets::default,
                 ConfiguredEnrolmentBudgets::resolve,
             )
+        }
+    }
+
+    /// The description process's budgets that the owner chooses, each present only where the
+    /// owner wrote one.
+    ///
+    /// Both are ordinary file numbers, in bytes, as `session_limit` is. A budget left out is the
+    /// default section 22 fixes, and one written as `null` is left out.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields, default)]
+    pub struct DescriptionBudgets {
+        /// The most memory the description process may use, in bytes.
+        pub process_memory_bytes: Nullable<u64>,
+        /// The memory this host keeps free while descriptions run, in bytes.
+        pub reserve_bytes: Nullable<u64>,
+    }
+
+    impl DescriptionBudgets {
+        /// Whether the owner chose neither budget.
+        #[must_use]
+        pub fn is_unset(&self) -> bool {
+            !self.process_memory_bytes.is_present() && !self.reserve_bytes.is_present()
         }
     }
 

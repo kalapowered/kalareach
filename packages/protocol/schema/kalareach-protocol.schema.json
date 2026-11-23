@@ -9509,6 +9509,17 @@
       "additionalProperties": false,
       "description": "The ceilings this host configures.\n\nEvery one of them narrows. A configured value above what authority, an organisation\nrestriction, a grant or a hard resource limit already allows is rejected rather than\napplied, which is section 26's second paragraph and why these are not in\n[`PreferenceSet`].",
       "properties": {
+        "description_budgets": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DescriptionBudgets"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The memory the description process may use and the memory the host keeps free while\nit runs, as section 22 lets the owner configure them.\n\nAbsent leaves the defaults section 22 fixes. Present narrows them. A document that does\nnot use the ceiling writes no member for it. A release that lacks the member refuses\nthe document whole, which is why the document's version rose with it."
+        },
         "disable_policy": {
           "anyOf": [
             {
@@ -9701,7 +9712,7 @@
           "description": "The managed storage service this host uploads its backups to.\n\nRead when the daemon starts, so a change applies at the next start. No environment\nvariable reaches it."
         },
         "version": {
-          "default": 3,
+          "default": 4,
           "description": "The schema version this document is written against.",
           "format": "uint64",
           "minimum": 0,
@@ -12110,6 +12121,41 @@
         "destination_keys",
         "destination_rights"
       ],
+      "type": "object"
+    },
+    "DescriptionBudgets": {
+      "additionalProperties": false,
+      "description": "The description process's budgets that the owner chooses, each present only where the\nowner wrote one.\n\nBoth are ordinary file numbers, in bytes, as `session_limit` is. A budget left out is the\ndefault section 22 fixes, and one written as `null` is left out.",
+      "properties": {
+        "process_memory_bytes": {
+          "anyOf": [
+            {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "The most memory the description process may use, in bytes."
+        },
+        "reserve_bytes": {
+          "anyOf": [
+            {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "The memory this host keeps free while descriptions run, in bytes."
+        }
+      },
       "type": "object"
     },
     "DescriptionCompletion": {

@@ -5232,7 +5232,7 @@ fn not_reading_through() -> Vec<ReleaseStore> {
 /// this one writes it with no new ceiling set: the golden file the document's own cases read.
 fn the_document_one_version_ahead() -> String {
     let path =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/configuration/version-4.json");
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/configuration/version-5.json");
     std::fs::read_to_string(&path).unwrap_or_else(|error| panic!("{}: {error}", path.display()))
 }
 
@@ -6213,7 +6213,7 @@ async fn a_rollback_that_a_store_refuses_after_a_journal_was_brought_back_says_s
         String::from_utf8_lossy(&output.stderr)
     );
 
-    // The owner's choice, which this build writes at version 3: the release before reads 1 to 2.
+    // The owner's choice, which this build writes at version 4: the release before reads 1 to 2.
     let environment = host.tree.environment();
     let writers = kr_cli::barrier::hold_for_configuration(&environment)
         .expect("a test outside a store holds nothing");

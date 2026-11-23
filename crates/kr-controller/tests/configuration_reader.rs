@@ -5,8 +5,8 @@
 //! the document. This build reads both as found when the document holds nothing it lacks. When the
 //! document holds a ceiling this build lacks, the daemon refuses to start: the copy decides the
 //! restrictions in force from the first request, and read as no copy it would lift the rights
-//! ceiling, the enrolment budgets and the disable policy the owner accepted. The golden documents
-//! are in `fixtures/configuration/`.
+//! ceiling, the enrolment budgets, the description budgets and the disable policy the owner
+//! accepted. The golden documents are in `fixtures/configuration/`.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -146,7 +146,7 @@ fn recorded(temp: &kr_ipc::testing::TempHost) -> (i64, Option<String>, i64) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_daemon_starts_over_the_next_registry_version_and_the_document_it_accepted() {
     let temp = a_stopped_environment().await;
-    let golden = fixture("version-4.json");
+    let golden = fixture("version-5.json");
     as_a_later_release_left_it(&temp, NEXT_REGISTRY_VERSION, Some(&golden));
     write_the_document(&temp, &golden);
     let before = recorded(&temp);
@@ -217,13 +217,10 @@ async fn a_daemon_starts_over_the_next_registry_version_and_the_document_it_acce
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_daemon_refuses_to_start_over_an_accepted_copy_it_cannot_read() {
     let temp = a_stopped_environment().await;
-    let readable = fixture("version-4.json");
+    let readable = fixture("version-5.json");
     let empty = Value::Object(serde_json::Map::new());
     let mut copies: Vec<(String, String)> = Vec::new();
-    for (name, member) in [
-        ("version-4-limits.json", "limits"),
-        ("version-4-description-budgets.json", "description_budgets"),
-    ] {
+    for (name, member) in [("version-4-limits.json", "limits")] {
         copies.push((format!("{member} set"), fixture(name)));
         copies.push((
             format!("{member} null"),
@@ -237,7 +234,7 @@ async fn a_daemon_refuses_to_start_over_an_accepted_copy_it_cannot_read() {
     copies.push(("not a document".to_owned(), "not json".to_owned()));
     copies.push((
         "a version this build does not know".to_owned(),
-        readable.replace("\"version\": 4", "\"version\": 5"),
+        readable.replace("\"version\": 5", "\"version\": 6"),
     ));
 
     for (what, copy) in copies {
