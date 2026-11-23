@@ -255,31 +255,18 @@ fn retained_level() -> &'static kr_protocol::retained::RetainedLevel {
         .expect("a level is retained")
 }
 
-/// The commits of the trees the cases of a run build: the release before this one, the newest kept
-/// release of this build's own level, and the newest of that level whose lock names no store of
-/// saved launch commands. Each is kept when another is built.
+/// The commits of the trees the cases of a run build: the release before this one and the newest
+/// kept release of this build's own level. Each is kept when another is built.
 fn trees_a_run_builds() -> Vec<String> {
     let level = retained_level();
     let own = CompatibilityLevel::of(PACKAGE_VERSION);
     [
         Some(recorded(level.release, "commit")),
-        newest_kept_release(own, |_| true).map(|release| release.commit),
-        newest_kept_release(own, lock_names_no_launch_commands).map(|release| release.commit),
+        newest_kept_release(own).map(|release| release.commit),
     ]
     .into_iter()
     .flatten()
     .collect()
-}
-
-/// Whether the committed `stored-formats.lock` of `release` names no store of saved launch
-/// commands, which makes a rollback to it leave that store alone.
-fn lock_names_no_launch_commands(release: &releases::Release) -> bool {
-    let lock = releases::git_in(
-        &repository(),
-        &["show", &format!("{}:stored-formats.lock", release.commit)],
-    )
-    .expect("the lock of a release");
-    !lock.contains("\"store\": \"launch-commands\"")
 }
 
 /// The release before this one, built once for the whole run.
@@ -297,16 +284,13 @@ fn previous() -> &'static Previous {
     })
 }
 
-/// The newest release of `level` in this commit's history that `accepted` takes, by the depth of its
-/// commit; none where this commit's history has none.
+/// The newest release of `level` in this commit's history, by the depth of its commit; none where
+/// this commit's history has none.
 ///
 /// The release tags are this checkout's, which the gates hold equal to origin's: a checkout with no
 /// release tag at all fails the suite, since an empty list is not the answer "no release at the
 /// level".
-fn newest_kept_release(
-    level: CompatibilityLevel,
-    accepted: impl Fn(&releases::Release) -> bool,
-) -> Option<releases::Release> {
+fn newest_kept_release(level: CompatibilityLevel) -> Option<releases::Release> {
     let repository = repository();
     let head = releases::git_in(&repository, &["rev-parse", "--verify", "HEAD^{commit}"])
         .expect("this checkout's head")
@@ -322,7 +306,6 @@ fn newest_kept_release(
     for release in releases::kept(&all, level, &head) {
         if !releases::is_ancestor(&repository, &release.commit, &head)
             .expect("the history of this commit")
-            || !accepted(&release)
         {
             continue;
         }
@@ -339,73 +322,37 @@ fn newest_kept_release(
 }
 
 /// The newest release of this build's own level in this commit's history, built; none where this
-/// commit's history has none, which is the case of a commit that moves the level. The release chosen, or that there is none, is printed on
-/// standard output, which a run shows with `--nocapture`.
+/// commit's history has none, which is the case of a commit that moves the level. The release
+/// chosen, or that there is none, is printed on standard output, which a run shows with
+/// `--nocapture`.
 fn inside_the_level() -> Option<&'static Previous> {
     static INSIDE: OnceLock<Option<Previous>> = OnceLock::new();
     INSIDE
-        .get_or_init(|| built_inside_the_level("", |_| true))
-        .as_ref()
-}
-
-/// The newest release of this build's own level in this commit's history that `accepted` takes,
-/// built, and what was chosen, or that nothing was, printed; `taking` says what `accepted` asks.
-fn built_inside_the_level(
-    taking: &str,
-    accepted: impl Fn(&releases::Release) -> bool,
-) -> Option<Previous> {
-    let level = CompatibilityLevel::of(PACKAGE_VERSION);
-    let Some(release) = newest_kept_release(level, accepted) else {
-        println!(
-            "inside the level: no kept release of level {level}{taking} is in the history of \
-             this commit, so there is no release at this level to update from or roll \
-             back to, and the cases inside the level end here"
-        );
-        return None;
-    };
-    let name = release
-        .tag
-        .strip_prefix("packages/v")
-        .expect("a release tag");
-    println!(
-        "inside the level: the cases update from and roll back to {} ({})",
-        release.tag, release.commit
-    );
-    Some(Previous::built(
-        release.commit.clone(),
-        self::release(name),
-        level,
-    ))
-}
-
-/// The newest release of this build's own level in this commit's history whose committed
-/// `stored-formats.lock` names no store of saved launch commands, built: the release a rollback
-/// leaves the store to, because it never reads it. None where every kept release of the level
-/// names the store, which is the case once a release holds it.
-fn inside_the_level_before_the_launch_commands() -> Option<&'static Previous> {
-    static BEFORE: OnceLock<Option<Previous>> = OnceLock::new();
-    BEFORE
         .get_or_init(|| {
-            built_inside_the_level(
-                " whose lock names no launch-commands store",
-                lock_names_no_launch_commands,
-            )
+            let level = CompatibilityLevel::of(PACKAGE_VERSION);
+            let Some(release) = newest_kept_release(level) else {
+                println!(
+                    "inside the level: no kept release of level {level} is in the history of \
+                     this commit, so there is no release at this level to update from or roll \
+                     back to, and the cases inside the level end here"
+                );
+                return None;
+            };
+            let name = release
+                .tag
+                .strip_prefix("packages/v")
+                .expect("a release tag");
+            println!(
+                "inside the level: the cases update from and roll back to {} ({})",
+                release.tag, release.commit
+            );
+            Some(Previous::built(
+                release.commit.clone(),
+                self::release(name),
+                level,
+            ))
         })
         .as_ref()
-}
-
-/// As [`inside_the_level_before_the_launch_commands`], for the case `case`, which says it did not
-/// run when the commit's history holds no such release.
-fn before_the_launch_commands_for(case: &str) -> Option<&'static Previous> {
-    let found = inside_the_level_before_the_launch_commands();
-    if found.is_none() {
-        println!(
-            "skipped: {case} did not run, because no kept release of level {} whose lock names no \
-             launch-commands store is in the history of this commit",
-            CompatibilityLevel::of(PACKAGE_VERSION)
-        );
-    }
-    found
 }
 
 /// As [`inside_the_level`], for the case `case`, which says it did not run when the commit's
@@ -2665,143 +2612,6 @@ async fn inside_the_level_a_rollback_goes_on_beside_a_worker_of_this_build_and_s
     host.close(&updated.kr_before(), &updated.display);
     host.worker_ended(&updated.worker).await;
     drop(owner);
-}
-
-/// KR-REQ-13.11, KR-REQ-26.10: the saved launch commands are one file in the environment's state
-/// directory. A release whose lock names no such store never reads it, so a rollback to it is not
-/// refused for it and leaves the file as it was, and an update to this build again serves the same
-/// list. The release is the newest of the level that does not name the store; the case ends where
-/// every kept release names it. A rollback to the release before the level is the transfers
-/// store's to refuse and is not this case.
-#[tokio::test(flavor = "multi_thread")]
-async fn inside_the_level_a_rollback_leaves_the_launch_commands_store_and_an_update_again_shows_them()
- {
-    use kr_protocol::launch_commands::{
-        NamedLaunch, ShellLaunchCommandsSaveParams, ShellLaunchCommandsSaveResult,
-    };
-    use kr_protocol::scalars::U64;
-
-    let Some(before) = before_the_launch_commands_for(
-        "inside_the_level_a_rollback_leaves_the_launch_commands_store_and_an_update_again_shows_them",
-    ) else {
-        return;
-    };
-    let updated = Updated::start_on(before, Setup::default()).await;
-    let host = &updated.host;
-    let endpoint = host
-        .tree
-        .environment()
-        .controller_endpoint()
-        .expect("an endpoint");
-    let environment_id = host.tree.environment_id();
-    let saved = |label: &str, arguments: &[&str]| NamedLaunch {
-        label: label.to_owned(),
-        program: "claude".to_owned(),
-        arguments: arguments.iter().map(|word| (*word).to_owned()).collect(),
-    };
-
-    // This build saves two commands, each against the revision the list held.
-    let mut client = LocalClient::connect(&endpoint, LocalClientKind::Cli, build())
-        .await
-        .expect("reaches the daemon");
-    let mut revision = U64::new(0);
-    let mut commands = Vec::new();
-    for command in [
-        saved("Claude", &["--resume", "two words", ""]),
-        saved("Second", &[]),
-    ] {
-        let answer: ShellLaunchCommandsSaveResult = pairing::mutate_as(
-            environment_id,
-            &mut client,
-            kr_protocol::ids::ActionId::new(kr_ipc::new_uuid()),
-            Method::ShellLaunchCommandsSave,
-            &ShellLaunchCommandsSaveParams {
-                expected_revision: revision,
-                command,
-            },
-        )
-        .await
-        .expect("this build saves a launch command");
-        assert!(answer.applied && answer.changed, "{answer:?}");
-        revision = answer.revision;
-        commands = answer.commands;
-    }
-    assert_eq!(commands.len(), 2);
-    let file = host
-        .tree
-        .environment()
-        .state_dir()
-        .join(kr_controller::launch_commands::FILE_NAME);
-    let kept = std::fs::read(&file).expect("the store is a file in the state directory");
-    drop(client);
-
-    // A rollback to the release that does not name the store is not refused for it, and leaves it.
-    let (output, said) = host.kr_json(&["host", "rollback", "--json"]);
-    assert_eq!(
-        output.status.code(),
-        Some(0),
-        "a store the release never reads does not refuse the rollback: {said} {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert_eq!(
-        host.store.current().expect("reads"),
-        Some(updated.one.name().clone())
-    );
-    assert_eq!(
-        host.daemon_build().await,
-        format!("kr-controller/{}", updated.one.name()),
-        "the daemon is the release before's again"
-    );
-    assert_eq!(
-        std::fs::read(&file).expect("the store is still there"),
-        kept,
-        "the rollback leaves the file's bytes as they were"
-    );
-
-    // An update again serves the same list at the same revision.
-    let archive = host.scratch("archives").join("again.tar.gz");
-    updated.two.archive(&archive);
-    let (output, said) = host.kr_json(&[
-        "host",
-        "update",
-        "--archive",
-        &archive.display().to_string(),
-        "--json",
-    ]);
-    assert_eq!(
-        output.status.code(),
-        Some(0),
-        "the update goes on: {said} {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert_eq!(
-        host.daemon_build().await,
-        format!("kr-controller/{}", updated.two.name()),
-        "the daemon is this build's again"
-    );
-    assert_eq!(std::fs::read(&file).expect("the store"), kept);
-    // The person's own `kr`, the one this update installed, reads the list the way they would.
-    let (output, listed) = host.kr_json(&["--json", "launch", "list"]);
-    assert_eq!(
-        output.status.code(),
-        Some(0),
-        "kr launch list reads the list after the update: {listed} {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert_eq!(
-        listed["revision"],
-        revision.to_string(),
-        "the same revision, as the protocol's decimal string"
-    );
-    assert_eq!(
-        listed["commands"],
-        serde_json::to_value(&commands).expect("the commands as JSON"),
-        "the same commands, in order"
-    );
-
-    updated.the_worker_is_as_it_was().await;
-    host.close(&updated.kr_now(), &updated.display);
-    host.worker_ended(&updated.worker).await;
 }
 
 /// A terminal running `program` with the arguments, as a person's does on this host.
