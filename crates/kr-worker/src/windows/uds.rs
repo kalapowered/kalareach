@@ -57,8 +57,8 @@ use windows_sys::Win32::Networking::WinSock as sockets;
 use windows_sys::Win32::Networking::WinSock::{SIO_AF_UNIX_GETPEERPID, WSAIoctl};
 use windows_sys::Win32::Storage::FileSystem::{
     DELETE, FILE_DISPOSITION_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-    FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-    FileDispositionInfo, READ_CONTROL, SetFileInformationByHandle, WRITE_DAC,
+    FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE,
+    FileDispositionInfo, READ_CONTROL, SYNCHRONIZE, SetFileInformationByHandle, WRITE_DAC,
 };
 use windows_sys::Win32::System::SystemInformation::OSVERSIONINFOW;
 use windows_sys::Win32::System::SystemServices::IO_REPARSE_TAG_AF_UNIX;
@@ -781,12 +781,14 @@ fn open_directory_without_following(
         .open(path)
 }
 
-/// A directory held open, as itself, without the sharing that lets it be removed or renamed, and
-/// the identity it had when it was opened.
+/// A directory held open, as itself, and the identity it had when it was opened.
 ///
-/// A socket is bound by path, and the path resolves every folder in it again at the bind. Holding
-/// the folder the socket goes in keeps it and, in practice, what is above it from being moved while
-/// the bind runs; where something was moved anyway, [`HeldDirectory::is_still_named_by`] says so.
+/// The directory is opened with the right to traverse it, which takes part in sharing, and without
+/// the sharing of delete: while it is held, no other open may ask for the right to rename it or
+/// remove it, so its own name stays what it was. An open for its attributes alone takes no part in
+/// sharing and would hold nothing. What is above it is not locked by this: whether a folder with an
+/// open handle below it can be renamed is the file system's rule, which a guest records, and
+/// [`HeldDirectory::is_still_named_by`] says where the path names another directory afterwards.
 #[derive(Debug)]
 pub struct HeldDirectory {
     _held: std::fs::File,
@@ -801,7 +803,7 @@ pub struct HeldDirectory {
 pub fn hold_directory(path: &Path) -> std::io::Result<HeldDirectory> {
     let held = open_directory_without_following(
         path,
-        FILE_READ_ATTRIBUTES,
+        FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
         FILE_SHARE_READ | FILE_SHARE_WRITE,
     )?;
     let object = file::object_of(&held)?;

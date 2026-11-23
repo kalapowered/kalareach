@@ -911,10 +911,44 @@ mod tests {
         let _ = std::fs::remove_dir_all(&outer);
     }
 
+    /// KR-REQ-07.45: the private directory the socket goes in is held from before its checks until
+    /// the bind is over, and a rename of it is refused while it is held, so what the checks read is
+    /// the directory the socket is made in.
+    #[cfg(windows)]
+    #[test]
+    fn the_private_directory_cannot_be_renamed_while_the_bind_runs() {
+        assert!(
+            std::env::var_os(kr_ipc::paths::RUNTIME_DIR_VARIABLE).is_none(),
+            "this case runs with the variable unset"
+        );
+        let outer = std::env::temp_dir().join(format!("kr-e-{}", kr_ipc::new_uuid()));
+        std::fs::create_dir_all(&outer).expect("the directory is created");
+        let run = private_run_directory_in(&outer);
+        let attempt = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let (from, to, slot) = (
+            run.clone(),
+            outer.join("aside"),
+            std::rc::Rc::clone(&attempt),
+        );
+        BEFORE_THE_BIND.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                *slot.borrow_mut() = Some(std::fs::rename(&from, &to));
+            }));
+        });
+        let bound = BoundEndpoint::bind_named(&run, "gw.sock");
+        let attempt = attempt.borrow_mut().take().expect("the hook ran");
+        assert!(
+            attempt.is_err(),
+            "a directory that is held is not renamed: {attempt:?}"
+        );
+        drop(bound.expect("the bind goes on where the directory was read"));
+        let _ = std::fs::remove_dir_all(&outer);
+    }
+
     /// KR-REQ-07.45: a folder above the private directory that is swapped for a junction after the
-    /// directory was read does not move the socket: the directory is held while the bind runs, so
-    /// either the swap cannot be made, and the socket is where it was read, or it is made, and the
-    /// bind is refused and nothing stands where the junction leads.
+    /// directory was read does not move the socket: either the swap cannot be made, which a guest
+    /// says, and the socket is where it was read, or it is made, and the bind is refused and nothing
+    /// stands where the junction leads.
     #[cfg(windows)]
     #[test]
     fn an_ancestor_swapped_after_the_private_directory_was_read_binds_nothing_where_it_leads() {
