@@ -3,10 +3,8 @@
 
 #![allow(dead_code)]
 
-#[cfg(unix)]
 pub mod gateway;
 pub mod launched;
-#[cfg(unix)]
 pub mod session;
 
 use std::io::{Read as _, Write as _};

@@ -24,10 +24,21 @@ use sha2::{Digest as _, Sha256};
 
 /// A command the server starts for the turn: a shell with a process of its own, so that there is
 /// something below the server to end.
+#[cfg(unix)]
 pub const COMMAND: &str = r#"["/bin/sh", "-c", "sleep 120 & wait"]"#;
 
+/// The same on Windows: `cmd.exe` with `ping` as the process of its own.
+#[cfg(windows)]
+pub const COMMAND: &str = r#"["cmd.exe", "/d", "/c", "ping -n 120 127.0.0.1 >nul"]"#;
+
 /// The same, for a command that ignores a terminate and passes that on to what it starts.
+#[cfg(unix)]
 pub const STUBBORN: &str = r#"["/bin/sh", "-c", "trap '' TERM; sleep 120 & wait"]"#;
+
+/// The same on Windows, where nothing asks a process to end and every ending is by force: the
+/// command is the plain one, and a case that uses it passes only where the force ends it.
+#[cfg(windows)]
+pub const STUBBORN: &str = COMMAND;
 
 /// Where a harness session's broker keeps its ledger.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -99,7 +110,11 @@ pub fn built_stand_in() -> PathBuf {
         .parent()
         .and_then(Path::parent)
         .expect("the directory the programs are built in")
-        .join("codex-stand-in");
+        .join(if cfg!(windows) {
+            "codex-stand-in.exe"
+        } else {
+            "codex-stand-in"
+        });
     assert!(
         built.is_file(),
         "{} is not built; run `cargo build -p kr-codex-stand-in` first",
@@ -218,7 +233,7 @@ impl Gateway {
             .build()
             .expect("a runtime");
         let bin = placed.host.root().join("bin");
-        let executable = bin.join("codex");
+        let executable = bin.join(if cfg!(windows) { "codex.exe" } else { "codex" });
         // Placed and started once where nothing is timed: the first start of a program at a new
         // path is the one the operating system checks.
         let _ =
@@ -418,9 +433,6 @@ impl Gateway {
         own: &[(&std::ffi::OsStr, &std::ffi::OsStr)],
         words: &[&str],
     ) -> Launched {
-        use std::os::unix::process::CommandExt as _;
-
-        let printed = self.outputs.join(name);
         let mut arguments = vec![
             "launch",
             "--",
@@ -437,13 +449,20 @@ impl Gateway {
         for (name, value) in own {
             command.env(name, value);
         }
+        self.start(command, name)
+    }
+
+    /// Starts `command` in the group every launch of this test runs in, with no standard input
+    /// and its standard error piped, and its standard output in the file `name` names under the
+    /// harness's outputs, which is what the terminal prints.
+    pub fn start(&self, mut command: std::process::Command, name: &str) -> Launched {
+        let printed = self.outputs.join(name);
         command
-            .process_group(self.group.id())
             .stdin(std::process::Stdio::null())
             .stdout(std::fs::File::create(&printed).expect("a file for the terminal's output"))
             .stderr(std::process::Stdio::piped());
         Launched {
-            child: command.spawn().expect("the launcher starts"),
+            child: self.group.spawn(&mut command).expect("the launcher starts"),
             printed,
         }
     }
@@ -587,10 +606,14 @@ impl Drop for Gateway {
     fn drop(&mut self) {
         let _ = self.backends.close();
         // What a session's closure does for the servers its backends ran, so that none is left
-        // running, and nothing it started, when the test ends.
-        let _entered = self.runtime.enter();
-        self.runtime
-            .block_on(self.backends.end_servers(tokio::time::Instant::now()));
+        // running, and nothing it started, when the test ends. A Windows worker runs no server
+        // yet, so there it has nothing to end: the group the launches run in ends what they held.
+        #[cfg(unix)]
+        {
+            let _entered = self.runtime.enter();
+            self.runtime
+                .block_on(self.backends.end_servers(tokio::time::Instant::now()));
+        }
     }
 }
 

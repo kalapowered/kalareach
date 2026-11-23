@@ -1,4 +1,4 @@
-//! A session the tests launch into, and the process group their launches run in.
+//! A session the tests launch into, and the group their launches run in.
 
 use std::sync::Arc;
 
@@ -11,20 +11,27 @@ pub fn session() -> SessionId {
     SessionId::new(Uuid::from_bytes([1; 16]))
 }
 
-/// The process group every program a test's shell launches runs in, led by a process of the test's
-/// own that ends the whole group once the test's process has gone.
+/// The group every program a test's shell launches runs in, which ends the whole of it once the
+/// test's process has gone.
 ///
 /// A launched program can wait for something only its test does, and a test that stops early,
 /// at a panic or because its process was killed, would otherwise leave the program waiting. The
-/// group is ended when the shell is dropped, which a panic's unwinding does too, and the leader
-/// ends it by itself once the test's process is gone, which is how a killed test's programs end.
-/// The leader is collected only after its group has been ended, so until then its identifier, and
-/// with it the group's, can name no other process: ending the group reaches exactly what this
-/// shell launched.
+/// group is ended when the shell is dropped, which a panic's unwinding does too, and it ends by
+/// itself once the test's process is gone, which is how a killed test's programs end.
+///
+/// On Unix the group is a process group, led by a process of the test's own that ends the group
+/// once the test's process has gone: it is collected only after the group has been ended, so until
+/// then its identifier, and with it the group's, can name no other process, and ending the group
+/// reaches exactly what this shell launched. On Windows it is a job that ends what it holds when
+/// its last handle closes, and the test's process holds the only one.
 pub struct LaunchGroup {
+    #[cfg(unix)]
     leader: std::process::Child,
+    #[cfg(windows)]
+    job: kr_worker::windows::job::AgentJob,
 }
 
+#[cfg(unix)]
 impl LaunchGroup {
     /// Starts the group's leader.
     #[must_use]
@@ -55,14 +62,96 @@ impl LaunchGroup {
     pub fn id(&self) -> i32 {
         i32::try_from(self.leader.id()).expect("a process identifier")
     }
+
+    /// Starts `command` in the group.
+    ///
+    /// # Errors
+    ///
+    /// Returns the system's failure to start the program.
+    pub fn spawn(
+        &self,
+        command: &mut std::process::Command,
+    ) -> std::io::Result<std::process::Child> {
+        use std::os::unix::process::CommandExt as _;
+
+        command.process_group(self.id()).spawn()
+    }
+}
+
+#[cfg(windows)]
+impl LaunchGroup {
+    /// Makes the group's job.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the job cannot be made, or does not end what it holds when it is closed.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            job: kr_worker::windows::job::AgentJob::create_owning()
+                .expect("the launches' job is made"),
+        }
+    }
+
+    /// Starts `command` in the group.
+    ///
+    /// The program is created suspended, put in the job and started only then, so nothing it
+    /// starts can be outside the job: a program put in the job after it ran could already have
+    /// started another.
+    ///
+    /// # Errors
+    ///
+    /// Returns the system's failure to start the program, to put it in the job, or to start it
+    /// there. A program that was created and could not be put in the job is ended and collected.
+    pub fn spawn(
+        &self,
+        command: &mut std::process::Command,
+    ) -> std::io::Result<std::process::Child> {
+        use std::os::windows::io::AsHandle as _;
+
+        let mut child = kr_ipc::memory_limit::start_held(command).spawn()?;
+        let started = self.job.assign(child.id()).and_then(|()| {
+            kr_ipc::memory_limit::resume(child.as_handle()).map_err(std::io::Error::other)
+        });
+        if let Err(error) = started {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
+        }
+        Ok(child)
+    }
+
+    /// The identifiers of the processes the job holds.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the job cannot be read.
+    #[must_use]
+    pub fn members(&self) -> Vec<u32> {
+        self.job.process_ids().expect("the job's members are read")
+    }
 }
 
 impl Drop for LaunchGroup {
+    #[cfg(unix)]
     fn drop(&mut self) {
         let group = rustix::process::Pid::from_child(&self.leader);
         // The leader is uncollected, so the group exists until this signal ends it.
         let _ = rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
         let _ = self.leader.wait();
+    }
+
+    #[cfg(windows)]
+    fn drop(&mut self) {
+        // What the job holds is ended now and waited for, so that a program still holding a file of
+        // the test's tree has let go of it before the tree is removed.
+        let _ = self.job.terminate(1);
+        let ended = std::time::Instant::now() + super::LIVENESS;
+        while std::time::Instant::now() < ended
+            && self.job.process_ids().is_ok_and(|left| !left.is_empty())
+        {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
 }
 
