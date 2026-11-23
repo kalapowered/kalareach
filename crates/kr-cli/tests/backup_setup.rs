@@ -1299,6 +1299,26 @@ async fn a_wrong_end_of_the_seed_or_an_answer_but_yes_sets_nothing_up() {
     ));
 }
 
+/// A console keeps each line a program reads from it as a line, in the history of the window, and
+/// brings it back with the arrow keys at a later question. The command reads its answers as keys
+/// and keeps no line, so Up Up at the last question has nothing to bring back, and the kit is not
+/// stored by an answer the person did not type.
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_answer_typed_at_a_console_is_not_brought_back_by_the_arrow_keys_at_a_later_question() {
+    let rig = Rig::start().await;
+    let mut window = Window::run(&rig, &["backup", "setup"]);
+    // `yes` at the plan, then the end of the seed.
+    let kit = window.bring_up_the_kit();
+    window.type_line(&kit.end_as_typed());
+    window.wait_for("Type yes when the kit is stored");
+    // Up twice, then Enter: the line before the last is `yes`.
+    window.type_bytes(b"\x1b[A\x1b[A\r");
+    let shown = window.wait_for("kr ended");
+    assert!(!shown.contains("kr ended 0"), "{shown}");
+    assert_eq!(rig.recorded_kit().await, None, "the kit was stored");
+}
+
 /// Text pasted after the last answer never reaches the shell the command was run from: the
 /// command puts the terminal back with the input still waiting discarded, so the next thing the
 /// shell reads is the next thing typed.

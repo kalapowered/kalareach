@@ -11,6 +11,7 @@
 )]
 
 use std::fs::File;
+use std::io::Write as _;
 use std::os::windows::io::{AsHandle as _, AsRawHandle as _, OwnedHandle};
 
 use kr_client::shown;
@@ -19,7 +20,7 @@ use windows_sys::Win32::Foundation::{HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows_sys::Win32::System::Console::{
     ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT, ENABLE_PROCESSED_INPUT, ENABLE_VIRTUAL_TERMINAL_INPUT,
     FlushConsoleInputBuffer, GetConsoleMode, INPUT_RECORD, KEY_EVENT, ReadConsoleInputW,
-    ReadConsoleW, SetConsoleMode,
+    SetConsoleMode,
 };
 use windows_sys::Win32::System::Diagnostics::Debug::{
     EXCEPTION_POINTERS, GetErrorMode, SEM_FAILCRITICALERRORS, SEM_NOGPFAULTERRORBOX,
@@ -89,6 +90,14 @@ unsafe extern "system" fn end_at_once(exception: *const EXCEPTION_POINTERS) -> i
     unsafe { TerminateProcess(GetCurrentProcess(), code) };
     // The call ends the process. If it ever returned, the system ends it without a report.
     EXCEPTION_EXECUTE_HANDLER
+}
+
+/// A new handle to the console on standard input.
+fn standard_input() -> Result<OwnedHandle> {
+    std::io::stdin()
+        .as_handle()
+        .try_clone_to_owned()
+        .map_err(|error| modes_not_changed(&error))
 }
 
 /// The failure to change the console's modes.
@@ -200,9 +209,9 @@ impl Drop for Clearing<'_> {
     }
 }
 
-/// The console's modes while the kit is typed: no echo, no line editing, and a read that returns
-/// after a fifth of a second with or without input. Processed input stays, so Ctrl-C is still an
-/// interrupt.
+/// The console's modes while the kit or an answer is typed: no echo, no line editing, and a read
+/// that returns after a fifth of a second with or without input. Processed input stays, so Ctrl-C
+/// is still an interrupt.
 pub struct Prompt {
     input: OwnedHandle,
     saved: u32,
@@ -222,15 +231,31 @@ impl Prompt {
     /// Returns a terminal failure when the console cannot be reached or its modes cannot be
     /// changed.
     pub fn enter() -> Result<Self> {
-        let input = std::io::stdin()
-            .as_handle()
-            .try_clone_to_owned()
-            .map_err(|error| modes_not_changed(&error))?;
-        Self::enter_on(input)
+        Self::enter_on(standard_input()?)
     }
 
     /// As [`Self::enter`], on the console input `input`.
     fn enter_on(input: OwnedHandle) -> Result<Self> {
+        let prompt = Self::silent_on(input)?;
+        // What was typed before this prompt was shown was echoed, and is not part of the kit. If it
+        // cannot be thrown away the prompt is not entered: dropping it puts the modes back.
+        discard(prompt.input.as_raw_handle().cast())?;
+        Ok(prompt)
+    }
+
+    /// Switches the console on standard input to the modes of the prompt for an answer. What was
+    /// typed is left where it is: the question was shown first, so it is the answer.
+    ///
+    /// # Errors
+    ///
+    /// Returns a terminal failure when the console cannot be reached or its modes cannot be
+    /// changed.
+    fn answering() -> Result<Self> {
+        Self::silent_on(standard_input()?)
+    }
+
+    /// The modes of the prompt, set on the console input `input`.
+    fn silent_on(input: OwnedHandle) -> Result<Self> {
         let handle = input.as_raw_handle().cast();
         let mut saved = 0_u32;
         // SAFETY: the handle is open for as long as `input` is, and `saved` is a live `u32`.
@@ -244,11 +269,7 @@ impl Prompt {
         if unsafe { SetConsoleMode(handle, silent) } == 0 {
             return Err(modes_not_changed(&std::io::Error::last_os_error()));
         }
-        let prompt = Self::holding(input, saved);
-        // What was typed before this prompt was shown was echoed, and is not part of the kit. If it
-        // cannot be thrown away the prompt is not entered: dropping it puts the modes back.
-        discard(handle)?;
-        Ok(prompt)
+        Ok(Self::holding(input, saved))
     }
 
     /// A prompt on `input` whose modes are already set and were `saved` before, with room for the
@@ -303,6 +324,76 @@ impl Prompt {
         buffer[..taken].copy_from_slice(&self.pending[..taken]);
         self.pending.drain(..taken);
         Ok(taken)
+    }
+
+    /// The next character the person typed, waiting one turn for it: none when the turn passed in
+    /// silence.
+    fn next(&mut self) -> std::io::Result<Option<char>> {
+        if self.pending.is_empty() {
+            self.fill()?;
+        }
+        let Some(&first) = self.pending.first() else {
+            return Ok(None);
+        };
+        // `pending` holds whole characters, and the first byte of one says how long it is.
+        let width = match first {
+            0x00..=0x7f => 1,
+            0xc0..=0xdf => 2,
+            0xe0..=0xef => 3,
+            _ => 4,
+        };
+        let character = self
+            .pending
+            .get(..width)
+            .and_then(|bytes| std::str::from_utf8(bytes).ok())
+            .and_then(|text| text.chars().next())
+            .unwrap_or(char::REPLACEMENT_CHARACTER);
+        let taken = width.min(self.pending.len());
+        self.pending.drain(..taken);
+        Ok(Some(character))
+    }
+
+    /// Reads one answer the way a line is edited at a console: the characters shown as they are
+    /// taken, Backspace taking the last one back, Enter ending the line and Ctrl-Z, on an empty
+    /// line, ending the input. They are read as input records, as the kit is, so that the console
+    /// keeps no history of the line.
+    fn line(&mut self) -> std::io::Result<Option<String>> {
+        /// An answer is a word; this is more than any answer needs.
+        const LONGEST_ANSWER: usize = 4096;
+
+        let mut shown = open_output()?;
+        // Made at its largest size, so that it never moves to a new allocation.
+        let mut answer = Zeroizing::new(String::with_capacity(LONGEST_ANSWER));
+        loop {
+            let Some(character) = self.next()? else {
+                continue;
+            };
+            match character {
+                '\r' | '\n' => {
+                    shown.write_all(b"\r\n")?;
+                    return Ok(Some(std::mem::take(&mut *answer)));
+                }
+                // Ctrl-Z, as `take` makes it.
+                '\u{4}' if answer.is_empty() => {
+                    shown.write_all(b"\r\n")?;
+                    return Ok(None);
+                }
+                '\u{8}' | '\u{7f}' => {
+                    if answer.pop().is_some() {
+                        shown.write_all(b"\x08 \x08")?;
+                    }
+                }
+                other if other.is_control() => {}
+                other => {
+                    if answer.len() + other.len_utf8() > LONGEST_ANSWER {
+                        shown.write_all(b"\r\n")?;
+                        return Ok(Some(std::mem::take(&mut *answer)));
+                    }
+                    answer.push(other);
+                    shown.write_all(other.encode_utf8(&mut [0_u8; 4]).as_bytes())?;
+                }
+            }
+        }
     }
 
     /// Waits one turn for the console's input and takes the characters of the key events in it.
@@ -398,50 +489,28 @@ pub fn discard_typed_ahead() -> Result<()> {
     discard(handle)
 }
 
-/// Reads one line from the console on standard input, with echo on: `None` at the end of the input
-/// (Ctrl-Z) and for a line of nothing.
+/// Reads one answer from the console on standard input, showing what is typed as it goes: `None` at
+/// the end of the input (Ctrl-Z on an empty line).
+///
+/// The answer is read as input records, as the kit is, and never as a line by the console, which
+/// would keep each line in the command history of the window, where a later question could bring
+/// it back.
 ///
 /// # Errors
 ///
-/// Returns the error that reading the console gave.
-pub fn read_line() -> std::io::Result<Option<String>> {
-    /// An answer is a word; this is more than any answer needs.
-    const LONGEST_ANSWER: usize = 4096;
-
-    let handle = std::io::stdin().as_raw_handle().cast();
-    let mut units: Zeroizing<Vec<u16>> = Zeroizing::new(Vec::new());
-    let mut chunk = Zeroizing::new([0_u16; 256]);
-    loop {
-        let mut read = 0_u32;
-        // SAFETY: the buffer holds 256 units, which is what the call is told, and `read` is a live
-        // `u32`. No input control is given.
-        if unsafe {
-            ReadConsoleW(
-                handle,
-                chunk.as_mut_ptr().cast(),
-                chunk.len() as u32,
-                &raw mut read,
-                std::ptr::null(),
-            )
-        } == 0
-        {
-            return Err(std::io::Error::last_os_error());
-        }
-        if read == 0 {
-            break;
-        }
-        units.extend_from_slice(&chunk[..read as usize]);
-        if units.contains(&0x0A) || units.len() >= LONGEST_ANSWER {
-            break;
-        }
-    }
-    // Ctrl-Z ends the input, where a line of text ends at its first line end.
-    if units.is_empty() || units.first() == Some(&0x1A) {
-        return Ok(None);
-    }
-    let line = units.split(|unit| *unit == 0x0A).next().unwrap_or_default();
-    let line = line.strip_suffix(&[0x0D]).unwrap_or(line);
-    Ok(Some(String::from_utf16_lossy(line)))
+/// Returns a terminal failure when the console cannot be reached, read or put back.
+pub fn read_line() -> Result<Option<String>> {
+    let mut prompt = Prompt::answering()?;
+    let line = prompt.line().map_err(|error| {
+        CliError::Terminal(shown!(
+            "your answer could not be read: {}",
+            Shown::io(&error)
+        ))
+    });
+    let left = prompt.leave();
+    let line = line?;
+    left?;
+    Ok(line)
 }
 
 #[cfg(test)]

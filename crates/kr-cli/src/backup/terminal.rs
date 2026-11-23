@@ -5,7 +5,7 @@
 //! | [`keep_out_of_a_dump`] | Keeps this process out of the dump a crash would make, before the seed exists: a core dump on Unix; on Windows the narrower guard against Windows Error Reporting, as the Windows module says |
 //! | [`Terminal`] | Holds the terminal's modes as found and puts them back, with the waiting input discarded |
 //! | [`open_output`] | Opens the terminal itself for writing, so the kit reaches it through no buffer of ours |
-//! | `Prompt` (Windows only) | The console's modes while the kit is typed, and what is read from it |
+//! | `Prompt` (Windows only) | The console's modes while the kit or an answer is typed, and what is read from it |
 //! | [`KIT_FOLLOWS`] | What is said before the kit, including how long the screen keeps it |
 
 #[cfg(unix)]

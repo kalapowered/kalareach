@@ -258,7 +258,7 @@ fn read_answer() -> Result<Option<String>> {
 
 #[cfg(windows)]
 fn read_answer() -> Result<Option<String>> {
-    super::terminal::read_line().map_err(|error| answer_unreadable(&error))
+    super::terminal::read_line()
 }
 
 #[cfg(windows)]
@@ -266,6 +266,7 @@ fn discard_typed_ahead() -> Result<()> {
     super::terminal::discard_typed_ahead()
 }
 
+#[cfg(unix)]
 fn answer_unreadable(error: &std::io::Error) -> CliError {
     CliError::Terminal(shown!(
         "your answer could not be read: {}",
