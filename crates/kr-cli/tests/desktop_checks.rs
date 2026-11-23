@@ -299,6 +299,23 @@ async fn the_read_check_reads_the_file_a_person_names_and_a_run_with_no_session_
     assert_eq!(state, "qualified_available", "{found}");
     assert!(reason.contains("it read 7 bytes"), "{reason}");
 
+    // A path whose characters take more than one byte each is the file the person meant: the read
+    // check's record shows a path by its length in bytes, and the command reports the run as the
+    // read of the file it named only where that length is its own.
+    let accented = directory.join("caf\u{e9} \u{1f4c4}.txt");
+    std::fs::write(&accented, b"twelve bytes").expect("the file");
+    let found = host.kr_json(&[
+        "host",
+        "desktop-checks",
+        "--file",
+        &accented.display().to_string(),
+        "--json",
+    ]);
+    assert_eq!(found["checks"]["state"], "current", "{found}");
+    let (state, reason) = record_of(&found, READ);
+    assert_eq!(state, "qualified_available", "{found}");
+    assert!(reason.contains("it read 12 bytes"), "{reason}");
+
     // With no file the read check reads nothing.
     let none = host.kr_json(&["host", "desktop-checks", "--json"]);
     assert_eq!(none["checks"]["state"], "current", "{none}");

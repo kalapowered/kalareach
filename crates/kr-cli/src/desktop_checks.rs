@@ -27,9 +27,10 @@ use kr_ipc::paths::HostPaths;
 use kr_protocol::desktop::{
     CapabilityChecks, CapabilityChecksFailure, CapabilityChecksState, DesktopCapabilityReport,
     EnvironmentCapabilitiesCheckParams, EnvironmentCapabilitiesParams,
-    EnvironmentCapabilitiesResult,
+    EnvironmentCapabilitiesResult, capabilities,
 };
 use kr_protocol::error::ErrorCode;
+use kr_protocol::hostinfo::export::{ContentClass, Sentence, withheld};
 use kr_protocol::ids::SessionId;
 use kr_protocol::method::Method;
 use kr_protocol::scalars::{Nullable, TimestampMs};
@@ -122,6 +123,10 @@ trait Asked {
 
     /// Reads where the checks stand and what the host holds.
     async fn read(&mut self) -> Result<(CapabilityChecks, Self::Records)>;
+
+    /// Whether what the host holds shows that the read check read the file at `path`, the path as
+    /// the request carried it.
+    fn shows_the_read_of(records: &Self::Records, path: &str) -> bool;
 }
 
 /// The control daemon of the environment the command works on.
@@ -156,6 +161,28 @@ impl Asked for Calls<'_> {
             .await?;
         Ok((result.checks, result.desktop))
     }
+
+    fn shows_the_read_of(report: &DesktopCapabilityReport, path: &str) -> bool {
+        report
+            .record(capabilities::AUTHORISED_FILE_READ)
+            .and_then(|record| record.disabled_reason.as_ref())
+            .is_some_and(|reason| shows_a_read_of(reason, path))
+    }
+}
+
+/// Whether the words of the read check's record say that it read `path`.
+///
+/// The record holds no path: the worker composes the read check's words with the path as its class
+/// and its length in bytes, `[path withheld, N bytes]` ([`Sentence::path`]), whatever the check
+/// found. The request carries `path` as text and the worker takes it from the daemon unchanged, so
+/// the words hold what [`withheld`] renders for that same text where the check read this path, and
+/// they hold nothing like it where it read none or another path of another length. A path of the
+/// same length cannot be told from this one: that is the one case in which another caller's run, begun at the
+/// same moment as this command's, is taken for its own.
+fn shows_a_read_of(reason: &Sentence, path: &str) -> bool {
+    reason
+        .as_str()
+        .contains(&withheld(ContentClass::Path, path))
 }
 
 /// What the command came to.
@@ -193,8 +220,15 @@ enum Followed<R> {
 /// read only supplies the records if they are still that run's: a read that fails or does not
 /// answer leaves that answer as the verdict, with no records.
 ///
-/// A file named for a run that was already going is not read, and the command says so instead of
-/// reporting that run: it is not the run the person asked for.
+/// The answer to the request does not say whether the request began the run it names, and no clock
+/// can: another caller's request may be admitted between the command's clock reading and its own.
+/// So where a file is named, the command reads the host once before the request. The same run
+/// before and in the answer was going already, and the file named was not read. Any other run in the
+/// answer is taken for the one this request began, and the findings are reported as a read of the
+/// file named only where the read check's record shows a path of the length of that file's: a record
+/// that shows another length, or none, may be another caller's run, begun at the same moment, and
+/// the command says it is not known whether the file was read. A run of another caller with a
+/// file whose path has the same length cannot be told from this command's own.
 ///
 /// `announce` is called once the host has started a run.
 async fn follow<A: Asked>(
@@ -203,20 +237,25 @@ async fn follow<A: Asked>(
     deadline: Instant,
     announce: impl FnOnce(),
 ) -> Result<Followed<A::Records>> {
-    let named = authorised_file.is_some();
-    let before = kr_ipc::now_ms();
+    let before = if authorised_file.is_some() {
+        match within(deadline, asked.read()).await.transpose()? {
+            Some((checks, _)) => Some(Run::of(&checks)),
+            None => return Ok(unanswered(None)),
+        }
+    } else {
+        None
+    };
+    let named = authorised_file.clone();
     let Some(begun) = within(deadline, asked.begin(authorised_file))
         .await
         .transpose()?
     else {
         return Ok(unanswered(None));
     };
-    // A run that began before the request was going already, and the host does not start a run it
-    // is already performing: it answers with that run and the file this command named is lost.
-    if named
-        && begun.state == CapabilityChecksState::Running
-        && begun.started_at_ms.0.is_some_and(|began| began < before)
-    {
+    // A run that the host held before the request and holds in its answer was going already, and
+    // the host does not start a run it is already performing: it answers with that run and the file
+    // this command named is lost.
+    if begun.state == CapabilityChecksState::Running && before == Some(Run::of(&begun)) {
         return Ok(Followed::Unfinished {
             checks: Some(begun),
             records: None,
@@ -226,6 +265,13 @@ async fn follow<A: Asked>(
             ),
         });
     }
+    // Whether what the host holds is no reason to doubt that the run read the file named: no file
+    // named, or a read check whose record shows that file's path.
+    let read = |records: &A::Records| {
+        named
+            .as_deref()
+            .is_none_or(|path| A::shows_the_read_of(records, path))
+    };
     let accepted = Run::of(&begun);
     let running = begun.state == CapabilityChecksState::Running;
     if running {
@@ -240,7 +286,7 @@ async fn follow<A: Asked>(
             return Ok(if running {
                 out_of_time(seen, held)
             } else {
-                kept(seen, None)
+                kept(seen, None, true)
             });
         }
         let asked_at = Instant::now();
@@ -248,7 +294,7 @@ async fn follow<A: Asked>(
             Some(Ok(answer)) => answer,
             // The first answer already gave the verdict, and a read that only brings the records
             // that go with it does not take it back by failing or by not answering.
-            _ if !running => return Ok(kept(seen, None)),
+            _ if !running => return Ok(kept(seen, None, true)),
             Some(Err(error)) => return Err(error),
             // A read that the deadline cut off soon after it was asked is the deadline's doing, and
             // the run was still going when the host last answered. One that had been out longer is
@@ -263,13 +309,16 @@ async fn follow<A: Asked>(
         };
         let ours = Run::of(&checks) == accepted;
         if !running {
-            return Ok(kept(seen, ours.then_some(records)));
+            let records = ours.then_some(records);
+            let shown = records.as_ref().is_none_or(read);
+            return Ok(kept(seen, records, shown));
         }
         if !ours {
             return Ok(replaced(seen));
         }
         if checks.state != CapabilityChecksState::Running {
-            return Ok(ended(checks, records));
+            let shown = read(&records);
+            return Ok(ended(checks, records, shown));
         }
         seen = checks;
         held = Some(records);
@@ -278,10 +327,11 @@ async fn follow<A: Asked>(
 }
 
 /// What the command comes to where its deadline passed while the run it follows was going: the run
-/// as the host last said it, with what the host held then, where a read answered.
+/// as the host last said it, with what the host held then, where a read answered. A run that has
+/// not ended has no findings to be read as anyone's.
 fn out_of_time<R>(seen: CapabilityChecks, held: Option<R>) -> Followed<R> {
     match held {
-        Some(records) => ended(seen, records),
+        Some(records) => ended(seen, records, true),
         None => unanswered(Some(seen)),
     }
 }
@@ -309,10 +359,16 @@ async fn within<T>(deadline: Instant, call: impl Future<Output = T>) -> Option<T
     tokio::time::timeout_at(deadline, call).await.ok()
 }
 
-/// What a run that has stopped, or has gone on to the deadline, comes to.
-fn ended<R>(checks: CapabilityChecks, records: R) -> Followed<R> {
+/// What a run that has stopped, or has gone on to the deadline, comes to. `read` is whether the
+/// records give no reason to doubt that it read the file the command named, where it named one.
+fn ended<R>(checks: CapabilityChecks, records: R, read: bool) -> Followed<R> {
     match unfinished(&checks) {
-        None => Followed::Found { checks, records },
+        None if read => Followed::Found { checks, records },
+        None => Followed::Unfinished {
+            checks: Some(checks),
+            records: Some(records),
+            words: not_known_words(),
+        },
         Some(words) => Followed::Unfinished {
             checks: Some(checks),
             records: Some(records),
@@ -322,12 +378,17 @@ fn ended<R>(checks: CapabilityChecks, records: R) -> Followed<R> {
 }
 
 /// What a run comes to that the host's first answer already ended: that answer says how, and the
-/// records come with it where a later read found them still that run's.
-fn kept<R>(first: CapabilityChecks, records: Option<R>) -> Followed<R> {
+/// records come with it where a later read found them still that run's. `read` is as for [`ended`].
+fn kept<R>(first: CapabilityChecks, records: Option<R>, read: bool) -> Followed<R> {
     match (unfinished(&first), records) {
-        (None, Some(records)) => Followed::Found {
+        (None, Some(records)) if read => Followed::Found {
             checks: first,
             records,
+        },
+        (None, Some(records)) => Followed::Unfinished {
+            words: not_known_words(),
+            checks: Some(first),
+            records: Some(records),
         },
         (words, records) => Followed::Unfinished {
             words: words.unwrap_or_else(replaced_words),
@@ -351,6 +412,15 @@ fn replaced_words() -> Shown {
     shown!(
         "Another run of the checks replaced the one this command started, so what the host holds \
          now is not this run's findings. Run the command again."
+    )
+}
+
+/// What a person is told where the run that ended may be another caller's, begun at the same
+/// moment as this command's, and its records do not show the file that was named.
+fn not_known_words() -> Shown {
+    shown!(
+        "Another run of the checks may have started at the same moment, and it is not known \
+         whether the file you named was read. Run the command again."
     )
 }
 
@@ -507,6 +577,10 @@ mod tests {
         read_takes: Duration,
         /// When each read was asked, on the paused clock.
         asked_at: Vec<Instant>,
+        /// How many times the request was made.
+        begins: usize,
+        /// The length of the path the read check's record shows, where it shows one.
+        path_bytes: Option<usize>,
     }
 
     impl Script {
@@ -517,14 +591,17 @@ mod tests {
                 taken: 0,
                 read_takes: Duration::ZERO,
                 asked_at: Vec::new(),
+                begins: 0,
+                path_bytes: None,
             }
         }
     }
 
     impl Asked for Script {
-        type Records = ();
+        type Records = Option<usize>;
 
         async fn begin(&mut self, _authorised_file: Option<String>) -> Result<CapabilityChecks> {
+            self.begins += 1;
             match self.begun.clone() {
                 Answer::Stands(checks) => Ok(checks),
                 Answer::Silent => std::future::pending().await,
@@ -532,27 +609,34 @@ mod tests {
             }
         }
 
-        async fn read(&mut self) -> Result<(CapabilityChecks, ())> {
+        async fn read(&mut self) -> Result<(CapabilityChecks, Option<usize>)> {
             self.asked_at.push(Instant::now());
             tokio::time::sleep(self.read_takes).await;
             let answer = self.reads[self.taken.min(self.reads.len() - 1)].clone();
             self.taken += 1;
             match answer {
-                Answer::Stands(checks) => Ok((checks, ())),
+                Answer::Stands(checks) => Ok((checks, self.path_bytes)),
                 Answer::Silent => std::future::pending().await,
                 Answer::Fails => Err(connection_cut()),
             }
+        }
+
+        fn shows_the_read_of(records: &Option<usize>, path: &str) -> bool {
+            *records == Some(path.len())
         }
     }
 
     /// Follows a script from a command that began now, and says what it came to and how long the
     /// command took on the paused clock. A command that does not end by its deadline fails here.
-    async fn run_script(mut script: Script) -> (Followed<()>, Duration) {
+    async fn run_script(mut script: Script) -> (Followed<Option<usize>>, Duration) {
         run_naming(&mut script, None).await
     }
 
     /// Follows a script as [`run_script`] does, from a command that names `file`.
-    async fn run_naming(script: &mut Script, file: Option<&str>) -> (Followed<()>, Duration) {
+    async fn run_naming(
+        script: &mut Script,
+        file: Option<&str>,
+    ) -> (Followed<Option<usize>>, Duration) {
         let (followed, took) = try_naming(script, file).await;
         (followed.expect("the scripted host does not fail"), took)
     }
@@ -561,7 +645,7 @@ mod tests {
     async fn try_naming(
         script: &mut Script,
         file: Option<&str>,
-    ) -> (Result<Followed<()>>, Duration) {
+    ) -> (Result<Followed<Option<usize>>>, Duration) {
         let started = Instant::now();
         let followed = tokio::time::timeout(
             WAIT + Duration::from_secs(60),
@@ -573,7 +657,7 @@ mod tests {
     }
 
     /// What a command that gave no findings said, and where it saw the run.
-    fn unfinished_with(followed: Followed<()>) -> (Option<CapabilityChecks>, String) {
+    fn unfinished_with(followed: Followed<Option<usize>>) -> (Option<CapabilityChecks>, String) {
         match followed {
             Followed::Unfinished { checks, words, .. } => (checks, words.to_string()),
             Followed::Found { .. } => panic!("the command reported findings"),
@@ -874,50 +958,221 @@ mod tests {
         );
     }
 
-    /// A file named for a run the host was already performing was not read, and the command says
-    /// that instead of reporting that run's findings, and asks nothing more of the host. Without a
-    /// file, a run already going is followed, and so is a run this command began, with or without
-    /// one.
+    /// The file the cases name.
+    const NOTES: &str = "notes.txt";
+
+    /// Where the checks stood before any run.
+    fn nothing_yet() -> CapabilityChecks {
+        CapabilityChecks {
+            state: CapabilityChecksState::NotRun,
+            started_at_ms: Nullable::null(),
+            finished_at_ms: Nullable::null(),
+            session_id: Nullable::null(),
+            failure: Nullable::null(),
+        }
+    }
+
+    /// A file named for a run that the host held before the request, and holds in its answer, was
+    /// not read, and the command says that and asks nothing more of the host: the request began no
+    /// run. No clock tells it, so whatever date the run bears, it is the same run.
     #[tokio::test(start_paused = true)]
     async fn a_file_named_for_a_run_that_was_already_going_is_not_reported_as_read() {
+        for started in [1, u64::MAX] {
+            let going = stands(CapabilityChecksState::Running, started, 1, None);
+            let current = stands(CapabilityChecksState::Current, started, 1, None);
+            let mut script = Script::new(
+                Answer::Stands(going.clone()),
+                vec![Answer::Stands(going.clone()), Answer::Stands(current)],
+            );
+            script.path_bytes = Some(NOTES.len());
+            let (followed, _) = run_naming(&mut script, Some(NOTES)).await;
+            let Followed::Unfinished {
+                checks,
+                records,
+                words,
+            } = followed
+            else {
+                panic!("the findings of a run that did not read the file were reported");
+            };
+            assert_eq!(checks, Some(going), "a run dated {started}");
+            assert!(records.is_none());
+            assert!(
+                words
+                    .to_string()
+                    .contains("already going, so the file you named was not read"),
+                "{words}"
+            );
+            assert_eq!(
+                script.taken, 1,
+                "the command reads the host once, before its request, and not after it"
+            );
+        }
+    }
+
+    /// With no file named nothing is lost: a run already going is followed to its end, and so is
+    /// a run this command began.
+    #[tokio::test(start_paused = true)]
+    async fn without_a_file_a_run_already_going_is_followed_to_its_end() {
         let going = stands(CapabilityChecksState::Running, 1, 1, None);
         let current = stands(CapabilityChecksState::Current, 1, 1, None);
         let mut script = Script::new(
             Answer::Stands(going.clone()),
             vec![Answer::Stands(current.clone())],
         );
-        let (followed, _) = run_naming(&mut script, Some("notes.txt")).await;
-        let Followed::Unfinished {
-            checks,
-            records,
-            words,
-        } = followed
-        else {
-            panic!("the findings of a run that did not read the file were reported");
+        let (followed, _) = run_naming(&mut script, None).await;
+        let Followed::Found { checks, .. } = followed else {
+            panic!("the run that ended was not reported");
         };
-        assert_eq!(checks, Some(going.clone()));
-        assert!(records.is_none());
+        assert_eq!(checks, current);
+    }
+
+    /// A run in the answer that is not the one the host held before the request, or a run where it
+    /// held none, is the one this request began, and the read check's record says which file it
+    /// read: where that is the file named, the command reports the findings, whatever date the run
+    /// bears, since the command reads no clock.
+    #[tokio::test(start_paused = true)]
+    async fn a_run_that_the_request_began_is_reported_as_having_read_the_file_named() {
+        for before in [
+            nothing_yet(),
+            stands(CapabilityChecksState::Current, 5, 1, None),
+            stands(CapabilityChecksState::Running, 5, 1, None),
+        ] {
+            for started in [1, u64::MAX] {
+                let ours = stands(CapabilityChecksState::Running, started, 2, None);
+                let done = stands(CapabilityChecksState::Current, started, 2, None);
+                let mut script = Script::new(
+                    Answer::Stands(ours.clone()),
+                    vec![
+                        Answer::Stands(before.clone()),
+                        Answer::Stands(ours),
+                        Answer::Stands(done.clone()),
+                    ],
+                );
+                script.path_bytes = Some(NOTES.len());
+                let (followed, _) = run_naming(&mut script, Some(NOTES)).await;
+                let Followed::Found { checks, .. } = followed else {
+                    panic!(
+                        "the findings were not reported (held before: {before:?}, run dated {started})"
+                    );
+                };
+                assert_eq!(checks, done);
+            }
+        }
+    }
+
+    /// A run that ends with no record that it read the file named, or with one that read a file whose
+    /// path has another length, may be another caller's, begun at the same moment: the command
+    /// does not report it as having read the file, and says that it is not known.
+    #[tokio::test(start_paused = true)]
+    async fn a_run_whose_records_do_not_show_the_file_named_is_not_reported_as_having_read_it() {
+        for shown in [Some(NOTES.len() + 1), Some(NOTES.len() - 1), Some(0), None] {
+            let ours = stands(CapabilityChecksState::Running, 20, 2, None);
+            let done = stands(CapabilityChecksState::Current, 20, 2, None);
+            let mut script = Script::new(
+                Answer::Stands(ours.clone()),
+                vec![
+                    Answer::Stands(nothing_yet()),
+                    Answer::Stands(ours),
+                    Answer::Stands(done.clone()),
+                ],
+            );
+            script.path_bytes = shown;
+            let (followed, _) = run_naming(&mut script, Some(NOTES)).await;
+            let Followed::Unfinished {
+                checks,
+                records,
+                words,
+            } = followed
+            else {
+                panic!(
+                    "the findings were reported as a read of the file named (records show {shown:?})"
+                );
+            };
+            assert_eq!(checks, Some(done), "{shown:?}");
+            assert!(records.is_some(), "{shown:?}");
+            assert!(
+                words.to_string().contains(
+                    "may have started at the same moment, and it is not known whether the file \
+                     you named was read"
+                ),
+                "{words}"
+            );
+        }
+    }
+
+    /// A run that does not end with findings says how it ended, whatever file was named: the
+    /// words of a run that failed are not the words of a run that may not be this command's.
+    #[tokio::test(start_paused = true)]
+    async fn a_run_that_failed_says_how_it_failed_where_a_file_was_named() {
+        let ours = stands(CapabilityChecksState::Running, 20, 2, None);
+        let failed = stands(
+            CapabilityChecksState::Failed,
+            20,
+            2,
+            Some(CapabilityChecksFailure::WorkerUnreachable),
+        );
+        let mut script = Script::new(
+            Answer::Stands(ours.clone()),
+            vec![
+                Answer::Stands(nothing_yet()),
+                Answer::Stands(ours),
+                Answer::Stands(failed.clone()),
+            ],
+        );
+        let (followed, _) = run_naming(&mut script, Some(NOTES)).await;
+        let (seen, words) = unfinished_with(followed);
+        assert_eq!(seen, Some(failed));
+        assert!(words.contains("did not answer in time"), "{words}");
+    }
+
+    /// A host that does not answer the read before the request is not asked to begin a run, and the
+    /// command says that the host did not answer; one whose read fails ends the command with that
+    /// failure, before it asks.
+    #[tokio::test(start_paused = true)]
+    async fn the_request_is_not_made_where_the_read_before_it_gets_no_answer() {
+        let running = stands(CapabilityChecksState::Running, 10, 1, None);
+        let mut script = Script::new(Answer::Stands(running.clone()), vec![Answer::Silent]);
+        let (followed, _) = run_naming(&mut script, Some(NOTES)).await;
+        let (seen, words) = unfinished_with(followed);
+        assert!(seen.is_none(), "{seen:?}");
         assert!(
-            words
-                .to_string()
-                .contains("already going, so the file you named was not read"),
+            words.contains("did not answer within five minutes"),
             "{words}"
         );
-        assert_eq!(script.taken, 0, "the command read the host again");
+        assert_eq!(script.begins, 0, "a run was asked for");
 
-        // No file named: nothing is lost, and the run going is followed to its end.
-        let mut script = Script::new(
-            Answer::Stands(going.clone()),
-            vec![Answer::Stands(current.clone())],
-        );
-        let (followed, _) = run_naming(&mut script, None).await;
-        assert!(matches!(followed, Followed::Found { .. }));
+        let mut script = Script::new(Answer::Stands(running), vec![Answer::Fails]);
+        let (followed, _) = try_naming(&mut script, Some(NOTES)).await;
+        assert!(followed.is_err(), "the failed read did not end the command");
+        assert_eq!(script.begins, 0, "a run was asked for");
+    }
 
-        // A run this command began, which the host dates after the request, is its own.
-        let ours = stands(CapabilityChecksState::Running, u64::MAX, 1, None);
-        let done = stands(CapabilityChecksState::Current, u64::MAX, 1, None);
-        let mut script = Script::new(Answer::Stands(ours), vec![Answer::Stands(done)]);
-        let (followed, _) = run_naming(&mut script, Some("notes.txt")).await;
-        assert!(matches!(followed, Followed::Found { .. }));
+    /// The read check's words show a path by its class and its length in bytes, and the command
+    /// takes the length from the same text it sends: a path whose characters take more than a byte
+    /// each is shown at its length in bytes, and a sentence that holds no path, or a path of another
+    /// length, does not show it.
+    #[test]
+    fn the_words_of_the_read_check_show_the_path_the_request_carried() {
+        let said = |path: &str| {
+            Sentence::new()
+                .stated("it read ")
+                .number(23)
+                .stated(" bytes of ")
+                .path(Path::new(path))
+        };
+        let accented = "/Users/someone/Documents/caf\u{e9} \u{1f4c4}.txt";
+        assert!(accented.len() > accented.chars().count());
+        assert!(shows_a_read_of(&said(accented), accented));
+        assert!(!shows_a_read_of(
+            &said(accented),
+            "/Users/someone/Documents/cafe.txt"
+        ));
+        assert!(!shows_a_read_of(
+            &Sentence::new().stated("no file was nominated for this check"),
+            accented
+        ));
+        // The limit that cannot be removed without the host naming the path: another caller's file
+        // whose path is as long is shown alike.
+        assert!(shows_a_read_of(&said("/a/b/c.txt"), "/a/b/d.txt"));
     }
 }
