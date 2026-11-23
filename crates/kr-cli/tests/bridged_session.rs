@@ -188,10 +188,17 @@ exec /usr/bin/env -i PATH=/usr/bin:/bin {home_variable} TMPDIR='{temporary}' \
 
 /// What the stand-in for `ssh` does: skip the options and the host, and run what follows them in
 /// the destination's own environment, as the login on the other side would.
-fn ssh_stand_in(tools: &Path, destination: &Path, home: &Path) -> String {
+fn ssh_stand_in(tools: &Path, destination: &Path, home: &Path, record_dir: &Path) -> String {
     let temporary = std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".to_owned());
     format!(
         r##"#!/bin/sh
+# A test that wants this host's record of its environments to be unreadable from the time the helper
+# is asked says so with a file: the record is set aside and a directory stands in its place, so the
+# answer that follows cannot be recorded. The test puts the record back.
+if [ -f '{tools}/record-write-fails' ] && [ -f '{record_dir}/environments.json' ]; then
+  mv '{record_dir}/environments.json' '{record_dir}/environments.json.kept'
+  mkdir '{record_dir}/environments.json'
+fi
 # A test that wants a connection that never answers says so with a file.
 if [ -f '{tools}/stalls' ]; then
   printf '%s\n' "$$" >'{tools}/stalled.pid'
@@ -236,6 +243,7 @@ shift
 exec /usr/bin/env -i PATH=/usr/bin:/bin HOME='{home}' TMPDIR='{temporary}' \
   KR_RUNTIME_DIR='{runtime}' KR_STATE_DIR='{state}' "$@"
 "##,
+        record_dir = record_dir.display(),
         tools = tools.display(),
         home = home.display(),
         runtime = destination.join("r").display(),
@@ -443,8 +451,16 @@ impl World {
             .expect("the stand-in");
         kr_ipc::testing::place_program(&text, &tools.join("wsl.exe"));
         let ssh_text = tools.join("ssh.text");
-        std::fs::write(&ssh_text, ssh_stand_in(&tools, destination.root(), &home))
-            .expect("the ssh stand-in");
+        std::fs::write(
+            &ssh_text,
+            ssh_stand_in(
+                &tools,
+                destination.root(),
+                &home,
+                source.environment().state_dir(),
+            ),
+        )
+        .expect("the ssh stand-in");
         kr_ipc::testing::place_program(&ssh_text, &tools.join("ssh"));
         // The destination chooses the standalone start, as a person sets a distribution up.
         kr_ipc::paths::write_owner_only_file(
@@ -2680,6 +2696,68 @@ async fn a_container_runtime_that_cannot_be_started_is_told_by_its_step_and_the_
     assert_eq!(told.lines[1].trim_start(), said, "{told:?}");
     assert_eq!(told.document["row"]["status"], "stale", "{told:?}");
     assert!(!told.everything.contains("ermission denied"), "{told:?}");
+}
+
+/// KR-REQ-18.11, the part about connection diagnostics, for an SSH host whose refresh cannot be
+/// recorded: this host's record of its environments cannot be read once the helper is asked. The
+/// refresh is answered and not refused. A helper that answered is said to have answered, with its
+/// verification, and this host's failure to record it is told as its class and length. A helper
+/// that failed keeps its own sentence, followed by the same words.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_ssh_refresh_that_cannot_be_recorded_keeps_what_the_helper_said() {
+    let _turn = CONTAINER_RUNTIME_TURN.lock().await;
+    let world = world_whose_destination_answers().await;
+    let (label, access, target, program) = DESTINATIONS[0];
+    assert_eq!(access, "ssh", "the first destination is the ssh host");
+    enrolled_and_answering(&world, label, access, target);
+    let record = world
+        .source
+        .environment()
+        .state_dir()
+        .join("environments.json");
+    let set_aside = world
+        .source
+        .environment()
+        .state_dir()
+        .join("environments.json.kept");
+    let record_comes_back = || {
+        if record.is_dir() {
+            std::fs::remove_dir(&record).expect("the stand-in directory is removed");
+            std::fs::rename(&set_aside, &record).expect("the record is put back");
+        }
+    };
+    let not_recorded = "this host did not record that, because [message withheld, ";
+    // The helper answers, and the record cannot be written.
+    with_the_switch_on(&world, "record-write-fails", label, || {
+        let json = world.run(&["--json", "bridge", "refresh", label]);
+        record_comes_back();
+        assert_ran(&json, &format!("{label}: kr --json bridge refresh"));
+        let document: Value = serde_json::from_slice(&json.stdout).expect("kr printed JSON");
+        let said = document["connection"].as_str().expect("a sentence");
+        assert!(
+            said.starts_with("the bridge answered, and ") && said.contains(not_recorded),
+            "{document}"
+        );
+        assert!(!document["verification"].is_null(), "{document}");
+    });
+    // The helper fails, and the record cannot be written.
+    with_the_switch_on(&world, "record-write-fails", label, || {
+        with_the_switch_on(&world, "unreachable", label, || {
+            let json = world.run(&["--json", "bridge", "refresh", label]);
+            record_comes_back();
+            assert_ran(&json, &format!("{label}: kr --json bridge refresh"));
+            let document: Value = serde_json::from_slice(&json.stdout).expect("kr printed JSON");
+            let said = document["connection"].as_str().expect("a sentence");
+            let kept =
+                format!("{program} ended with exit code 255 before the environment answered; and ");
+            assert!(
+                said.starts_with(&kept) && said.contains(not_recorded) && said.ends_with(" bytes]"),
+                "{document}"
+            );
+            assert!(document["verification"].is_null(), "{document}");
+            assert!(!said.contains("Connection refused"), "{document}");
+        });
+    });
 }
 
 /// KR-REQ-18.11, the part about connection diagnostics, for a refresh that finds nothing wrong:
