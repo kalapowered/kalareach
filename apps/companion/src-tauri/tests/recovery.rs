@@ -4568,6 +4568,75 @@ async fn a_signed_out_device_is_told_to_sign_in_where_a_record_exists_and_before
     );
 }
 
+/// A settings source whose read is a change: the person chooses `then` while the step is reading what
+/// they have chosen, as a change that arrives during a save does.
+struct Racing {
+    settings: Arc<Settings>,
+    recovery: Arc<Recovery>,
+    then: Mutex<Option<ColourMode>>,
+}
+
+impl SettingsSource for Racing {
+    fn chosen(&self) -> kr_client::recovery::LocalSettings {
+        let read = self.settings.local().for_backup();
+        if let Some(mode) = self.then.lock().expect("the record").take() {
+            self.settings.local().set_colour_mode(mode).expect("kept");
+            self.recovery.settings_changed();
+        }
+        read
+    }
+}
+
+/// KR-REQ-20.17: a change made while a save is in flight leaves no "saved" line standing: the step
+/// read the settings before the change, so what it saved does not hold it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_change_made_while_a_save_is_in_flight_leaves_no_saved_line() {
+    let timing = SettingsTiming {
+        quiet: Duration::from_secs(60),
+        window: Duration::ZERO,
+    };
+    let computer = Computer::new().await;
+    let page = computer.page().await;
+    let settings = {
+        let state = page.app.state::<AppState>();
+        state.keep_under(computer.data.path());
+        state.settings().expect("the settings are open")
+    };
+    let racing = Arc::new(Racing {
+        settings: Arc::clone(&settings),
+        recovery: Arc::clone(&page.recovery),
+        then: Mutex::new(None),
+    });
+    page.recovery
+        .save_settings_from(Arc::clone(&racing) as Arc<dyn SettingsSource>, level(OPEN));
+    page.recovery.set_settings_timing(timing);
+    settings
+        .set_colour_mode(ColourMode::Dark)
+        .await
+        .expect("kept");
+    page.call("recovery_turn_on", json!({})).expect("on");
+    assert_eq!(line_of(&page), json!({ "state": "saved" }));
+
+    // The step reads dark, which the bundle holds, and the person chooses light before it ends.
+    *racing.then.lock().expect("the record") = Some(ColourMode::Light);
+    let step = page
+        .recovery
+        .save_settings(&page.account)
+        .await
+        .expect("a step");
+    assert!(
+        matches!(
+            step,
+            SettingsStep::Ended {
+                line: SettingsLine::Waiting,
+                ..
+            }
+        ),
+        "{step:?}"
+    );
+    assert_eq!(line_of(&page), Value::Null, "saved does not stand");
+}
+
 /// KR-REQ-20.17: a device turned on before the settings were saved with the bundle saves them at
 /// its next start.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4657,6 +4726,11 @@ async fn every_trigger_shares_one_deadline_and_a_change_in_the_window_stays_sche
         .set_colour_mode(ColourMode::Light)
         .await
         .expect("kept");
+    assert_eq!(
+        line_of(&page),
+        Value::Null,
+        "a change the bundle does not hold yet is no longer shown as saved"
+    );
     let host = Host::new(&computer, computer.served.origin());
     host.sets_up();
     page.recovery
@@ -4681,6 +4755,13 @@ async fn every_trigger_shares_one_deadline_and_a_change_in_the_window_stays_sche
         first.elapsed() >= window - Duration::from_millis(300),
         "{:?}",
         first.elapsed()
+    );
+    assert!(
+        until(Duration::from_secs(10), || async {
+            line_of(&page) == json!({ "state": "saved" })
+        })
+        .await,
+        "saved again once the bundle holds the change"
     );
 }
 

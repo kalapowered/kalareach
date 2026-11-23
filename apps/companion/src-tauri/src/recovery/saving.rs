@@ -16,7 +16,9 @@
 //! turned saving off; ends if the one eligibility deadline has not passed; reads the settings file
 //! now, never a value captured earlier; fetches the bundle, compares, and writes. A write of the
 //! step's own that gets no answer is ended at once. The line the page shows says "saved" only
-//! after a write the service confirmed or a read of the bundle that holds the same settings.
+//! after a write the service confirmed or a read of the bundle that holds the same settings, and a
+//! change to the settings file takes the line away until a step ends after it, even when the change
+//! came while a step was running.
 //!
 //! # The writer's level
 //!
@@ -49,7 +51,7 @@
 //! compare-and-swap is the real guard.
 
 use std::future::Future;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -196,6 +198,8 @@ pub(super) struct Saving {
     wanted: Mutex<Option<Instant>>,
     wake: Notify,
     stopped: AtomicBool,
+    /// How many changes to the settings file saving has been told of.
+    changes: AtomicU64,
     /// What the page is told when a step that ran by itself ended.
     told: Told,
 }
@@ -216,6 +220,7 @@ impl Saving {
             wanted: Mutex::new(None),
             wake: Notify::new(),
             stopped: AtomicBool::new(false),
+            changes: AtomicU64::new(0),
             told: Told::default(),
         }
     }
@@ -231,6 +236,33 @@ impl Saving {
     fn say(&self, line: SettingsLine) -> SettingsLine {
         *self.line.lock().unwrap_or_else(PoisonError::into_inner) = line;
         line
+    }
+
+    /// How many changes to the settings file saving has been told of: a step reads this before it
+    /// reads the file.
+    pub(super) fn changes(&self) -> u64 {
+        self.changes.load(Ordering::SeqCst)
+    }
+
+    /// Notes a change to the settings file. What the bundle holds is not what the file holds now,
+    /// so the line shows nothing until a step has ended after the change.
+    fn changed(&self) {
+        let mut line = self.line.lock().unwrap_or_else(PoisonError::into_inner);
+        self.changes.fetch_add(1, Ordering::SeqCst);
+        *line = SettingsLine::Waiting;
+    }
+
+    /// Says `line`, except that "saved" is not said when the settings file changed since `seen`: the
+    /// change came while the step ran, and what the step saved does not hold it.
+    fn say_after(&self, line: SettingsLine, seen: u64) -> SettingsLine {
+        let mut held = self.line.lock().unwrap_or_else(PoisonError::into_inner);
+        let said = if line == SettingsLine::Saved && self.changes.load(Ordering::SeqCst) != seen {
+            SettingsLine::Waiting
+        } else {
+            line
+        };
+        *held = said;
+        said
     }
 
     /// What this computer has chosen now, when saving has a source: the settings a first bundle
@@ -271,9 +303,9 @@ impl Saving {
 
     /// Notes that a write of the bundle carried the settings: they are saved, and the next step
     /// that reaches the service for them waits a window.
-    pub(super) fn wrote_settings(&self, step: &Step<'_>) {
+    pub(super) fn wrote_settings(&self, step: &Step<'_>, seen: u64) {
         self.window_from_now(step);
-        self.say(SettingsLine::Saved);
+        self.say_after(SettingsLine::Saved, seen);
     }
 
     /// Moves the deadline one window on from now, and says when that is.
@@ -408,9 +440,12 @@ impl Recovery {
         self.view_of(account)
     }
 
-    /// Tells saving the settings file changed. A step is wanted once the settings have been quiet.
+    /// Tells saving the settings file changed. The line shows nothing until a step has ended after
+    /// the change, the page is told so, and a step is wanted once the settings have been quiet.
     pub fn settings_changed(&self) {
+        self.saving.changed();
         self.saving.want_after_quiet();
+        self.saving.told.tell();
     }
 
     /// Wants a step now: the application started, or a recovery step has reached the service.
@@ -573,6 +608,7 @@ impl Recovery {
         {
             return Ok(SettingsStep::Deferred { until });
         }
+        let seen = self.saving.changes();
         let outcome = store
             .save_settings(&seed, saves.source.chosen(), now())
             .await;
@@ -608,7 +644,7 @@ impl Recovery {
         };
         let moved = reached.then(|| self.saving.window_from_now(step));
         Ok(SettingsStep::Ended {
-            line: self.saving.say(line),
+            line: self.saving.say_after(line, seen),
             retry_at: if retry { moved } else { None },
         })
     }

@@ -574,6 +574,7 @@ impl Recovery {
         let tokens = Arc::new(MarkedTokens::new(account));
         // The first bundle carries the settings the person has chosen, in the one write: a device
         // turned on after choosing a colour mode needs no second write for it.
+        let seen = self.saving.changes();
         let chosen = match self.saving.chosen_now() {
             Some(LocalSettings::Values(values)) if !values.is_empty() => Some(values),
             _ => None,
@@ -635,7 +636,7 @@ impl Recovery {
             self.keep_owner(&record, mark);
         }
         if with_settings {
-            self.saving.wrote_settings(&step);
+            self.saving.wrote_settings(&step, seen);
         }
         self.saving.want_now();
         self.view_of(account)

@@ -2995,8 +2995,8 @@ export interface HostPort {
   onSettings(listener: (view: SettingsView) => void): Promise<() => void>
   /**
    * Tells `listener` each time where recovery stands may have changed with no action of the
-   * person's: a step that saves the settings ended. The listener reads recovery again. Resolves,
-   * with the function that stops it, once the listener is registered.
+   * person's: a step that saves the settings ended, or the settings changed. The listener reads
+   * recovery again. Resolves, with the function that stops it, once the listener is registered.
    */
   onRecovery(listener: () => void): Promise<() => void>
 

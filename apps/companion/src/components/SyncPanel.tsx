@@ -209,8 +209,8 @@ export function SyncPanel({
     return { service, settings, devices: settings, recovery, restore: recovery }
   }, [port, readRecovery])
 
-  // A step that saves the settings ended by itself: where recovery stands may be different, and the
-  // person did nothing to ask. Recovery is read again.
+  // A step that saves the settings ended by itself, or the settings changed: where recovery stands
+  // may be different, and the person did nothing to ask. Recovery is read again.
   useEffect(() => {
     if (!desktop) return undefined
     let stop: (() => void) | null = null
