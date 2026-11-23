@@ -818,6 +818,17 @@ export interface FakeHostControls {
   setChecks(change: Partial<CapabilityChecks>): void
   /** The runs of the disclosed checks the interface asked for, in order, as it asked. */
   readonly checkRuns: readonly EnvironmentCapabilitiesParams[]
+  /**
+   * The name of the file each of those runs was sent to read, in the same order, or null for a run
+   * that was sent none. A choice serves one run, as it does in the application.
+   */
+  readonly checkFiles: readonly (string | null)[]
+  /**
+   * What the platform's file dialog answers the next time the interface opens it: the name of the
+   * file the person chose, or null for a dialog closed with no choice. It starts as a file named
+   * `notes.txt`.
+   */
+  answerFileDialog(name: string | null): void
   /** Takes one capability's permission away again. */
   revokePermission(capability: string): void
   /**
@@ -1459,6 +1470,10 @@ export function fakeHost(
     failure: null
   }
   const checkRuns: EnvironmentCapabilitiesParams[] = []
+  const checkFiles: (string | null)[] = []
+  // The file the person chose, which the next run reads and uses up, and what the dialog answers.
+  let chosenFile: string | null = null
+  let dialogAnswer: string | null = 'notes.txt'
   let identityStable = true
   const granted = new Set<string>([
     'desktop.application_launch',
@@ -2196,6 +2211,8 @@ export function fakeHost(
         refuse('INVALID_ARGUMENT', 'This host does not own that environment.')
       }
       checkRuns.push(params)
+      checkFiles.push(chosenFile)
+      chosenFile = null
       // A run already going is not started again; the answer says that it is going.
       if (checks.state !== 'running') {
         checks = {
@@ -2207,6 +2224,13 @@ export function fakeHost(
         }
       }
       return Promise.resolve({ receipt: null, action_id: nextActionId(), value: { ...checks } })
+    },
+
+    chooseAuthorisedFile: () => {
+      requireLocalSocket('the checks')
+      if (dialogAnswer === null) return Promise.resolve(null)
+      chosenFile = dialogAnswer
+      return Promise.resolve({ name: dialogAnswer })
     },
 
     setupIdentity: () => Promise.resolve(setupIdentity(identityStable, connected)),
@@ -4231,6 +4255,10 @@ export function fakeHost(
       checks = { ...checks, ...change }
     },
     checkRuns,
+    checkFiles,
+    answerFileDialog(name) {
+      dialogAnswer = name
+    },
     revokePermission(capability) {
       granted.delete(capability)
       capabilityRevision += 1

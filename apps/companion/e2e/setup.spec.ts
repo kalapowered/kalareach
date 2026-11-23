@@ -480,6 +480,64 @@ test.describe('the first-start assistant', () => {
     await expect(opener).toBeEnabled()
   })
 
+  // KR-REQ-03.29 and KR-REQ-03.02: the read check reads a file the person chose in the platform's
+  // file dialog. The sheet offers the dialog and shows the file's name and no path, a dialog closed
+  // with no choice changes nothing, and the run that reads the file uses the choice up.
+  test('offers the file dialog for the read check, and one run uses the choice up', async ({
+    page
+  }) => {
+    await openSetup(page)
+    await step(page, 'capabilities')
+    const sheet = page.getByTestId('sheet')
+    const line = page.getByTestId('setup-checks-file')
+    const none = 'No file chosen. The read check will read nothing and say so.'
+    const files = (): Promise<(string | null)[]> =>
+      page.evaluate(() => [...(window.krTestHost?.checkFiles ?? [])])
+    const answer = (name: string | null): Promise<void> =>
+      page.evaluate((chosen) => {
+        window.krTestHost?.answerFileDialog(chosen)
+      }, name)
+
+    await page.getByTestId('setup-run-checks').click()
+    await expect(sheet).toHaveAttribute('data-presentation', 'here', {
+      timeout: PRESENTATION_DEADLINE
+    })
+    await expect(line).toHaveText(none)
+
+    // A dialog closed with no choice leaves the sheet as it was.
+    await answer(null)
+    await page.getByTestId('setup-checks-choose').click()
+    await expect(line).toHaveText(none)
+
+    // A file is shown by its name, and a later dialog closed with no choice leaves it chosen.
+    await answer('notes.txt')
+    await page.getByTestId('setup-checks-choose').click()
+    await expect(line).toHaveText('File chosen: notes.txt. The next run reads it once.')
+    await answer(null)
+    await page.getByTestId('setup-checks-choose').click()
+    await expect(line).toHaveText('File chosen: notes.txt. The next run reads it once.')
+
+    // The run reads the chosen file.
+    await page.getByTestId('setup-checks-run').click()
+    await expect.poll(files).toEqual(['notes.txt'])
+    await expect(sheet).toBeHidden({ timeout: PRESENTATION_DEADLINE })
+    await page.evaluate(() => {
+      window.krTestHost?.setChecks({ state: 'current', finished_at_ms: String(Date.now()) })
+    })
+    await expect(page.getByTestId('setup-checks-state')).toHaveAttribute('data-state', 'current', {
+      timeout: PRESENTATION_DEADLINE
+    })
+
+    // The choice was used up: the next run is sent no file until one is chosen again.
+    await page.getByTestId('setup-run-checks').click()
+    await expect(sheet).toHaveAttribute('data-presentation', 'here', {
+      timeout: PRESENTATION_DEADLINE
+    })
+    await expect(line).toHaveText(none)
+    await page.getByTestId('setup-checks-run').click()
+    await expect.poll(files).toEqual(['notes.txt', null])
+  })
+
   // KR-REQ-03.29: at the largest text size, on a wide window and on a narrow one, the controls that
   // run the checks, what the page says about them and the sheet that lists them stay inside the
   // window, and every control is still a target of the token's size.

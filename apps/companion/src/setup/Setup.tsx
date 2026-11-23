@@ -77,12 +77,15 @@ const DISCLOSED_CHECKS: readonly {
   readonly name: string
   readonly performs: string
   readonly effect: string
+  /** The check reads a file the person chooses, so its entry offers the file dialog. */
+  readonly chooses?: true
 }[] = [
   {
     name: 'Read a file you authorised',
     performs: 'Opens a file you chose and reads the first few thousand bytes of it.',
     effect:
-      'Reads that file and writes nothing. With no file chosen it reads nothing and says so.'
+      'Reads that file and writes nothing. With no file chosen it reads nothing and says so.',
+    chooses: true
   },
   {
     name: 'Take a screen image',
@@ -239,6 +242,11 @@ export function Setup(): ReactNode {
   const [effectsRunnable, setEffectsRunnable] = useState(false)
   // The request to run the checks is on its way to the host, and has not been answered yet.
   const [asking, setAsking] = useState(false)
+  // The name of the file the person chose for the read check, which the next run reads and uses up.
+  // The path is never here: native code keeps it.
+  const [chosen, setChosen] = useState<string | null>(null)
+  // The platform's file dialog is open, and has not been answered yet.
+  const [choosing, setChoosing] = useState(false)
   // The environment in which the host last said a run is going, until an answer says it is not. A
   // reading that finds no host leaves the page without records, and a run goes on in the host all
   // the same, so this is what keeps the page asking until the host answers again, whether the run
@@ -318,6 +326,8 @@ export function Setup(): ReactNode {
     if (environmentId === null) return
     setEffectsOpen(false)
     setAsking(true)
+    // The run takes the choice with it, so the sheet does not offer a file that has been read.
+    setChosen(null)
     port
       .environmentCapabilitiesCheck({ environment_id: environmentId })
       .then((settled) => {
@@ -338,6 +348,22 @@ export function Setup(): ReactNode {
         setAsking(false)
       })
   }, [port, environmentId, load, apply, say])
+
+  // The platform's own dialog answers. Closing it with no choice leaves an earlier choice as it was.
+  const chooseFile = useCallback(() => {
+    setChoosing(true)
+    port
+      .chooseAuthorisedFile()
+      .then((file) => {
+        if (file !== null) setChosen(file.name)
+      })
+      .catch((error: unknown) => {
+        say(failureMessage(error), 'danger')
+      })
+      .finally(() => {
+        setChoosing(false)
+      })
+  }, [port, say])
 
   // While the host says a run is going, ask where it stands. The interval is cleared the moment
   // the answer changes or the page goes, so nothing asks after the run has ended.
@@ -551,6 +577,22 @@ export function Setup(): ReactNode {
               <strong>{check.name}</strong>
               <p>{check.performs}</p>
               <p className="faint small">{check.effect}</p>
+              {check.chooses === true && effectsRunnable ? (
+                <div className="setup-file">
+                  <Button
+                    onClick={chooseFile}
+                    disabled={choosing || asking || checking}
+                    data-testid="setup-checks-choose"
+                  >
+                    Choose a file
+                  </Button>
+                  <p className="faint small" data-testid="setup-checks-file">
+                    {chosen === null
+                      ? 'No file chosen. The read check will read nothing and say so.'
+                      : `File chosen: ${chosen}. The next run reads it once.`}
+                  </p>
+                </div>
+              ) : null}
             </li>
           ))}
         </ul>

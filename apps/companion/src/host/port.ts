@@ -1529,6 +1529,11 @@ export interface RecordedFrame {
   readonly text: string
 }
 
+/** The file a person chose for the read check, as the page is told of it: its name and no path. */
+export interface ChosenFile {
+  readonly name: string
+}
+
 /**
  * The answer of a mutation: the receipt, and the method's own result when the host returned one.
  *
@@ -2198,12 +2203,20 @@ export interface HostPort {
   /**
    * Starts the disclosed checks in a session's worker, and answers where they stand: running, or
    * why nothing was started. The page names the environment and nothing else; the file the read
-   * check reads is not the page's to name. A run takes about two minutes, so the answer to this
-   * is not its result: `environmentCapabilities` carries that.
+   * check reads is not the page's to name. It is the one `chooseAuthorisedFile` returned, which
+   * this run uses up. A run takes about two minutes, so the answer to this is not its result:
+   * `environmentCapabilities` carries that.
    */
   environmentCapabilitiesCheck(
     params: EnvironmentCapabilitiesParams
   ): Promise<Settled<CapabilityChecks>>
+  /**
+   * Asks the person, in the platform's own file dialog, which file the read check should read, and
+   * answers with the file's name, or null when the dialog was closed with no choice, which leaves
+   * an earlier choice as it was. The path stays in native code: the page is never given it and
+   * never names one.
+   */
+  chooseAuthorisedFile(): Promise<ChosenFile | null>
 
   /**
    * What the session's worker says of a launch at its root editor now, read on the link every
