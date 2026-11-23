@@ -1469,6 +1469,14 @@ mod tests {
             encoded, pinned,
             "a bundle with no settings member writes the bytes it always did"
         );
+        // The bytes a build from before the member wrote, as a literal: the vectors are generated
+        // from these types, so a change to them that is generated again would move the pinned
+        // bytes with it and leave the comparison above green.
+        assert_eq!(
+            hex::encode(kr_cbor::sha256(&pinned)),
+            "89d0e82a6e18912e9195e5c714d7e261f57d371ef9b294b13be61cbf6591d78f",
+            "the vector holds the bytes a build without the member wrote"
+        );
         let decoded: RecoveryBundle =
             kr_cbor::from_canonical_slice(&pinned, &RECOVERY_BUNDLE_LIMITS)
                 .expect("the published bytes decode");
