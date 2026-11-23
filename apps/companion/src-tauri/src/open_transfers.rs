@@ -1382,7 +1382,7 @@ impl Desk {
             let written = tauri::async_runtime::spawn_blocking(move || {
                 copied.write_copy(key, &bytes, || {
                     #[cfg(feature = "testing")]
-                    testing::copy_staged(key);
+                    testing::copy_staged(key)?;
                     let registry = locked(&desk.registry);
                     let holds = registry
                         .held
@@ -3147,6 +3147,9 @@ pub mod testing {
         PanicInWork,
         /// The freeing's task, for the wanting upload's key, panics before it frees a key, once.
         PanicInFreeing,
+        /// The write of a send's copy fails, once, after the copy is written beside its name and
+        /// before it is placed.
+        CopyFails,
     }
 
     static ARMED: LazyLock<Mutex<HashSet<(Uuid, Fault)>>> = LazyLock::new(Mutex::default);
@@ -3286,9 +3289,16 @@ pub mod testing {
     }
 
     /// Holds the thread of a send that has written its copy beside the copy's name and has not
-    /// placed it, while a hold is set for `key`.
-    pub(super) fn copy_staged(key: Uuid) {
+    /// placed it, while a hold is set for `key`, and then fails the write when `Fault::CopyFails` is
+    /// armed for it.
+    pub(super) fn copy_staged(key: Uuid) -> std::io::Result<()> {
         pause(key, Point::CopyStaged);
+        if take(key, Fault::CopyFails) {
+            return Err(std::io::Error::other(
+                "a fault injected into the copy's write",
+            ));
+        }
+        Ok(())
     }
 
     /// Holds a sender task at its first line while a hold is set for `key`, and then gives the
