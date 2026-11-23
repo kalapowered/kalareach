@@ -17,11 +17,12 @@
 //! then not told of a gateway and runs as typed. The probe binds a socket of its own in a private
 //! folder, connects to it from this process and asks the control call who connected.
 //!
-//! The sockets are the operating system's own and `uds_windows` binds and accepts them. Each is
-//! made non-blocking and registered with `async-io`'s reactor, and read and written through the
-//! tokio traits. `uds_windows` makes its sockets inheritable and clears that a moment later, so a
-//! process this worker starts in that moment could inherit one: the gap is the crate's, and it is
-//! not closed here.
+//! The sockets are the operating system's own. The listening socket and the probe's sockets are made
+//! here with `WSA_FLAG_NO_HANDLE_INHERIT`, so no process this worker starts can inherit one even in
+//! the moment after it exists, and are handed to `uds_windows` to accept and to read and write.
+//! Each is made non-blocking and registered with `async-io`'s reactor, and read and written through
+//! the tokio traits. `uds_windows` makes the sockets it accepts inheritable and clears that a moment
+//! later: the gap is the crate's, and a case measures where the flag stands afterwards.
 //!
 //! A socket's file is a reparse point of its own kind. Every read of it and every removal of it
 //! opens it without following, and acts on what the open handle is: a path that names something
@@ -39,7 +40,7 @@
 use std::io::{Read, Write};
 use std::os::windows::fs::OpenOptionsExt as _;
 use std::os::windows::io::{
-    AsHandle as _, AsRawHandle as _, AsRawSocket, AsSocket, BorrowedSocket,
+    AsHandle as _, AsRawHandle as _, AsRawSocket, AsSocket, BorrowedSocket, FromRawSocket as _,
 };
 use std::path::Path;
 use std::pin::Pin;
@@ -52,6 +53,7 @@ use kr_protocol::identity::ProcessStartIdentity;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio_util::compat::{Compat, FuturesAsyncReadCompatExt as _};
 use windows_sys::Wdk::System::SystemServices::RtlGetVersion;
+use windows_sys::Win32::Networking::WinSock as sockets;
 use windows_sys::Win32::Networking::WinSock::{SIO_AF_UNIX_GETPEERPID, WSAIoctl};
 use windows_sys::Win32::Storage::FileSystem::{
     DELETE, FILE_DISPOSITION_INFO, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
@@ -72,6 +74,107 @@ const PROBE_WAIT: Duration = Duration::from_secs(2);
 
 /// How long each wait for the probe's connection lasts.
 const PROBE_STEP: Duration = Duration::from_millis(10);
+
+/// Starts the Windows socket interface for this process, once.
+fn start_sockets() {
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    STARTED.call_once(|| {
+        let mut data = sockets::WSADATA::default();
+        // SAFETY: the version asked for is 2.2, and `data` is a live local of the size the call
+        // writes.
+        let _ = unsafe { sockets::WSAStartup(0x0202, &raw mut data) };
+    });
+}
+
+/// The failure the last socket call left, as the operating system states it.
+fn last_socket_error() -> std::io::Error {
+    // SAFETY: the call reads this thread's last socket error and has no other effect.
+    std::io::Error::from_raw_os_error(unsafe { sockets::WSAGetLastError() })
+}
+
+/// The address of a socket at `path` and the length of it that the system is told.
+fn address_of(path: &Path) -> std::io::Result<(sockets::SOCKADDR_UN, i32)> {
+    let refused =
+        |detail: &'static str| std::io::Error::new(std::io::ErrorKind::InvalidInput, detail);
+    let bytes = path
+        .to_str()
+        .ok_or_else(|| refused("the path is not text"))?
+        .as_bytes();
+    if bytes.contains(&0) {
+        return Err(refused("the path has a NUL in it"));
+    }
+    let mut address = sockets::SOCKADDR_UN {
+        sun_family: sockets::AF_UNIX,
+        ..sockets::SOCKADDR_UN::default()
+    };
+    if bytes.len() >= address.sun_path.len() {
+        return Err(refused("the path is longer than a socket's address holds"));
+    }
+    for (to, from) in address.sun_path.iter_mut().zip(bytes) {
+        *to = i8::from_ne_bytes([*from]);
+    }
+    let length = std::mem::offset_of!(sockets::SOCKADDR_UN, sun_path) + bytes.len() + 1;
+    Ok((address, i32::try_from(length).unwrap_or(i32::MAX)))
+}
+
+/// A new stream socket of the Unix family that no process this one starts can inherit, from the
+/// moment it exists, and the length of the address of `path`.
+///
+/// `uds_windows` makes its sockets inheritable and clears that after, which a process started in
+/// between could use; the flag here closes that. The socket belongs to the value returned and is
+/// closed with it, whatever happens to the calls made on it.
+fn new_socket_for(path: &Path) -> std::io::Result<(sockets::SOCKET, sockets::SOCKADDR_UN, i32)> {
+    let (address, length) = address_of(path)?;
+    start_sockets();
+    // SAFETY: the values are plain, and no protocol information is given.
+    let socket = unsafe {
+        sockets::WSASocketW(
+            i32::from(sockets::AF_UNIX),
+            sockets::SOCK_STREAM,
+            0,
+            std::ptr::null(),
+            0,
+            sockets::WSA_FLAG_OVERLAPPED | sockets::WSA_FLAG_NO_HANDLE_INHERIT,
+        )
+    };
+    if socket == sockets::INVALID_SOCKET {
+        return Err(last_socket_error());
+    }
+    Ok((socket, address, length))
+}
+
+/// Binds a listening socket at `path` that no process this one starts can inherit.
+fn bind_uninheritable(path: &Path) -> std::io::Result<uds_windows::UnixListener> {
+    let (socket, address, length) = new_socket_for(path)?;
+    let raw =
+        u64::try_from(socket).map_err(|_| std::io::Error::other("a socket that is not one"))?;
+    // SAFETY: the socket was just made and nothing else holds it, so the listener owns it and
+    // closes it when it is dropped, on every path below.
+    let listener = unsafe { uds_windows::UnixListener::from_raw_socket(raw) };
+    // SAFETY: the socket is open, and the address is a live local of the length told.
+    if unsafe { sockets::bind(socket, (&raw const address).cast(), length) } != 0 {
+        return Err(last_socket_error());
+    }
+    // SAFETY: the socket is open.
+    if unsafe { sockets::listen(socket, 128) } != 0 {
+        return Err(last_socket_error());
+    }
+    Ok(listener)
+}
+
+/// Connects a socket to the one at `path`, which no process this one starts can inherit.
+fn connect_uninheritable(path: &Path) -> std::io::Result<uds_windows::UnixStream> {
+    let (socket, address, length) = new_socket_for(path)?;
+    let raw =
+        u64::try_from(socket).map_err(|_| std::io::Error::other("a socket that is not one"))?;
+    // SAFETY: as for the listener: the socket is new, and the stream owns it from here.
+    let stream = unsafe { uds_windows::UnixStream::from_raw_socket(raw) };
+    // SAFETY: the socket is open, and the address is a live local of the length told.
+    if unsafe { sockets::connect(socket, (&raw const address).cast(), length) } != 0 {
+        return Err(last_socket_error());
+    }
+    Ok(stream)
+}
 
 /// A socket lent to the reactor: it says which socket it is and nothing else.
 #[derive(Debug)]
@@ -245,7 +348,7 @@ impl Listener {
     /// the bind fails after that; nothing else is.
     pub fn bind(path: &Path) -> Result<(Self, Object), BindFailure> {
         gateway_socket_names_its_peers().map_err(BindFailure::NoPeerProcess)?;
-        let listener = uds_windows::UnixListener::bind(path).map_err(BindFailure::Bind)?;
+        let listener = bind_uninheritable(path).map_err(BindFailure::Bind)?;
         // Until the file is proved to be the bind's own, a failure leaves the path as it is: a
         // path cannot be named by identity before that, and removing by name would remove what
         // another program put there.
@@ -318,7 +421,7 @@ fn prove_it_is_the_bound_socket(
         return Err("what stands there is not a socket's file".to_owned());
     }
     let made = file::object_of(file).map_err(|error| error.to_string())?;
-    let _client = uds_windows::UnixStream::connect(path)
+    let _client = connect_uninheritable(path)
         .map_err(|error| format!("it could not be connected to: {error}"))?;
     let _accepted = accept_within_the_wait(listener).map_err(|error| {
         format!("a connection to it did not reach the listener that bound it: {error}")
@@ -474,14 +577,14 @@ fn prove_the_build_names_a_peer(path: &Path) -> Result<(), String> {
         }
         Some(_) => {}
     }
-    let listener = uds_windows::UnixListener::bind(path).map_err(|error| {
+    let listener = bind_uninheritable(path).map_err(|error| {
         format!(
             "a Unix-domain socket could not be bound at {} on this Windows build ({build}): \
              {error}",
             path.display()
         )
     })?;
-    let _client = uds_windows::UnixStream::connect(path).map_err(|error| {
+    let _client = connect_uninheritable(path).map_err(|error| {
         format!(
             "the probe's socket at {} could not be connected to on this Windows build ({build}): \
              {error}",
@@ -776,6 +879,49 @@ mod tests {
             named.is_err(),
             "a peer that has ended is not named: {named:?}"
         );
+    }
+
+    /// The state of a socket's inherit flag, as the system reports it.
+    fn is_inheritable(socket: &impl AsRawSocket) -> bool {
+        let mut flags = 0_u32;
+        // SAFETY: a socket is a handle for this call, which reads the handle's flags into a live
+        // local and has no other effect.
+        let read = unsafe {
+            windows_sys::Win32::Foundation::GetHandleInformation(
+                socket.as_raw_socket() as windows_sys::Win32::Foundation::HANDLE,
+                &raw mut flags,
+            )
+        };
+        assert_ne!(
+            read,
+            0,
+            "the flag is read: {}",
+            std::io::Error::last_os_error()
+        );
+        flags & windows_sys::Win32::Foundation::HANDLE_FLAG_INHERIT != 0
+    }
+
+    /// KR-REQ-07.45: the listening socket and the probe's sockets are made so that no process this
+    /// worker starts inherits them, and the socket the listener accepts is measured for the same:
+    /// `uds_windows` makes it inheritable and clears the flag after, so this is the state it is
+    /// left in, which a guest reports.
+    #[tokio::test]
+    async fn the_sockets_this_module_makes_are_not_inheritable() {
+        let directory = Directory::new();
+        let path = directory.0.join("p.sock");
+        let (listener, _) = Listener::bind(&path).expect("the socket binds");
+        assert!(
+            !is_inheritable(&listener.inner.get_ref().0),
+            "the listening socket"
+        );
+        let client = connect_uninheritable(&path).expect("the socket is reached");
+        assert!(!is_inheritable(&client), "the connecting socket");
+        let accepted = listener.accept().await.expect("the connection is accepted");
+        assert!(
+            !is_inheritable(&accepted.inner.get_ref().get_ref().0),
+            "the accepted socket"
+        );
+        drop(client);
     }
 
     /// Bytes go both ways through the tokio traits.
