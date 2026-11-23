@@ -5108,6 +5108,65 @@ async fn kr_req_13_12_a_send_refused_for_a_cancelled_key_leaves_the_desk_before_
     adopted.stop().await;
 }
 
+/// KR-REQ-13.12 (FU18): a restart's sweep looks at a copy again before it removes it. A first
+/// restart reads the folder while the upload's copy has no entry, so the copy is an orphan to it, and
+/// is held before its sweep. The upload's entry is then written, and a second restart reads it and
+/// the copy's content and is held before it admits the upload. The first restart's sweep goes on: the
+/// key has an entry now, and the copy stays for the upload that the second restart resumes from it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_13_12_a_restarts_sweep_leaves_the_copy_of_a_key_whose_entry_came_after_its_scan() {
+    use testing::{Awaited, Point};
+
+    let adopted = Adopted::start(1).await;
+    let (phone, control) = phone_for(&adopted).await;
+    let companion = &phone.companion;
+    let desk = desk_of(companion);
+    let bytes = pattern(5);
+    let (key, _first, _who) = left_paused(&adopted, &phone, &control, &bytes).await;
+    // The entry is out of the folder while the first restart reads it: the copy has no entry.
+    let entry = folder(&phone).join(format!("{key}.upload"));
+    let aside = phone.data.path().join("set-aside.upload");
+    std::fs::rename(&entry, &aside).expect("the entry is set aside");
+    let sweeping = testing::hold_awaited(key, Awaited::BeforeSweep);
+    let reading = testing::hold_at(key, Point::Reading);
+    // The phone reaches the host: the first restart names the copy for its sweep and is held.
+    control.stop_holding();
+    control.release_all();
+    tokio::time::timeout(WATCHDOG, sweeping.until_arrived(1))
+        .await
+        .expect("the first restart holds its candidate");
+    // The upload's entry is there now, and a second restart reads it and the content of the copy.
+    std::fs::rename(&aside, &entry).expect("the entry is back");
+    let paired = paired_of(companion).await;
+    let second = {
+        let desk = Arc::clone(&desk);
+        tokio::spawn(async move { desk.restart(paired).await })
+    };
+    tokio::time::timeout(WATCHDOG, reading.until_passed(1))
+        .await
+        .expect("the second restart reads the content");
+    sweeping.release();
+    settled(&desk).await;
+    let left = testing::read_copy(&folder(&phone), key);
+    reading.release();
+    assert_eq!(
+        left,
+        Some(bytes.clone()),
+        "the first restart's sweep left the copy of the upload that the second restart admits"
+    );
+    tokio::time::timeout(WATCHDOG, second)
+        .await
+        .expect("the second restart ends")
+        .expect("the task ran");
+    let listed = open_where(companion, |now| {
+        now.iter().any(|view| view["state"] == "published")
+    })
+    .await;
+    assert_eq!(listed[0]["key"], key.to_string());
+    settled(&desk).await;
+    adopted.stop().await;
+}
+
 /// KR-REQ-13.12 (FU7): a panic in the desk's task of a send leaves no upload admitted with no
 /// sender. The caller is answered, the copy is gone, and the key is free for a new send.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]

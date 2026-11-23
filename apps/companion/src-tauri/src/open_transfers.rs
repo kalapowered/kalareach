@@ -251,6 +251,16 @@ impl Store {
         read_entry(&self.path(key, UPLOAD_EXTENSION), key)
     }
 
+    /// Whether the copy of `key` is no upload's to keep by the record now: the key has no entry
+    /// file of any layout, or its entry is over or cannot be resumed. An entry that cannot be read
+    /// keeps its copy, as a scan leaves it.
+    fn copy_is_spare(&self, key: Uuid) -> bool {
+        match self.entry(key) {
+            Some(file) => file.is_spent(),
+            None => matches!(self.path(key, UPLOAD_EXTENSION).try_exists(), Ok(false)),
+        }
+    }
+
     fn all(&self) -> Found {
         let mut found = Found {
             entries: Vec::new(),
@@ -306,12 +316,7 @@ impl Store {
         for key in &found.copies {
             match found.entries.iter().find(|file| file.key == *key) {
                 None if !found.unreadable.contains(key) => found.orphans.push(*key),
-                Some(file)
-                    if file.reached == Reached::Published
-                        || (file.reached == Reached::Beginning && file.transfer_id.is_none()) =>
-                {
-                    found.spent.push(*key);
-                }
+                Some(file) if file.is_spent() => found.spent.push(*key),
                 _ => {}
             }
         }
@@ -651,6 +656,12 @@ pub struct Who {
 }
 
 impl UploadFile {
+    /// Whether the entry is over or cannot be resumed: published, or never given an identifier.
+    fn is_spent(&self) -> bool {
+        self.reached == Reached::Published
+            || (self.reached == Reached::Beginning && self.transfer_id.is_none())
+    }
+
     /// Whether the entry is this device's own on `paired`'s host, kept under the sign-in in force.
     fn is_of(&self, paired: &Paired) -> bool {
         self.is_whose(&paired.who())
@@ -1938,18 +1949,23 @@ impl Desk {
         let Ok(found) = tauri::async_runtime::spawn_blocking(move || read.all()).await else {
             return;
         };
-        {
-            // Copies that no entry names, that are over, or that a stopped process left half
-            // written. A copy a send has just made is its key's in the map and is left.
+        // Copies that no entry names, that are over, or that a stopped process left half
+        // written. The scan is older than each look below: since it, an upload may have written
+        // the key's first entry and ended, and a restart that read that entry may be about to
+        // resume the upload from the copy. So the key's record is read again, and its copy goes
+        // only when no upload holds the key and the key has no entry or an entry that is over. The
+        // look and the removal are one section under the gate, so that no upload is admitted
+        // between them. A copy a send has just made is its key's in the map and is left.
+        for key in found.orphans.iter().chain(&found.spent) {
+            #[cfg(feature = "testing")]
+            testing::gate(*key, testing::Awaited::BeforeSweep).await;
             let registry = locked(&self.registry);
-            for key in found.orphans.iter().chain(&found.spent) {
-                if !registry.held.contains_key(key) {
-                    let _ = store.remove_copy(*key);
-                }
+            if !registry.held.contains_key(key) && store.copy_is_spare(*key) {
+                let _ = store.remove_copy(*key);
             }
-            for staged in &found.staged {
-                let _ = crate::drafts::remove_durably(staged);
-            }
+        }
+        for staged in &found.staged {
+            let _ = crate::drafts::remove_durably(staged);
         }
         let mut mine = Vec::new();
         for file in found.entries {
@@ -3168,6 +3184,9 @@ pub mod testing {
         Freeing,
         /// A restart, under the device's identifier, has begun and not yet read the folder.
         Scanning,
+        /// A restart has read the folder and not yet looked, under the gate, at a copy that its scan
+        /// named for removal. Held under that copy's key.
+        BeforeSweep,
         /// A barrier has the key's turn and has not yet read what the key holds under the gate.
         BeforeOwed,
         /// A draft sweep, under the device's identifier, has begun and not yet read the folder.
