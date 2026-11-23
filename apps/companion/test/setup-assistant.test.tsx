@@ -651,8 +651,12 @@ describe('what a restart is asked for, and what a record is about', () => {
     start()
     await screen.findByTestId('setup-identity')
     await goTo('permissions')
-    const about = screen.getByTestId('setup-about-desktop.authorised_file_read')
-    expect(about.textContent).toMatch(/kalareach-check\.txt/)
+    // An answer from a program is about that program. The file a person nominated is not one: the
+    // host's record of its read names no path, so nothing on this page does either.
+    expect(screen.getByTestId('setup-about-desktop.screen_capture').textContent).toMatch(
+      /\/usr\/sbin\/screencapture/
+    )
+    expect(screen.queryByTestId('setup-about-desktop.authorised_file_read')).toBeNull()
     expect(screen.getByTestId('setup-caveat-full_disk_access').textContent).toMatch(
       /a file outside the places macOS protects establishes nothing/
     )
