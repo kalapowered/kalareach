@@ -16,10 +16,10 @@ pub const NARROWER: &[Narrower] = &[
         root: "the envelope a worker checks",
         recorded: "670be1d3a4a028b44f5f5fbc5c7cb20eeed1398c6fef1ef521d2fffa69934143",
         digest: "5056aa8b73bcc549a5ee33af494310015c60b1acdc75cafbf2ca9de811358e0d",
-        refuses: "An envelope that names no application instance for agent.prompt.submit, agent.prompt.queue, agent.turn.steer, agent.turn.cancel, agent.approval.respond or plugin.action.invoke; an envelope that names another binding revision than the parameters name; and an envelope that names the instance and no binding revision.",
-        rest: "The root differs from the retained release's `WorkerService::check_envelope` by those three refusals, the binding and the comment that go with them, and its call of `params_application_target`, which replaces `params_application_instance`; nothing else. Run `git log -p -L '/    fn check_envelope(/,/^    }$/:crates/kr-worker/src/service.rs' packages/v0.78.0+e03f8dd17f5c..HEAD` to see the function's diff against the retained release.",
-        registry: "The six methods' rows in `crates/kr-protocol/src/method.rs` decide `selects_an_instance` through `ResourceSelectorKind::ApplicationInstance`; no digest holds them. When the six rows lose it, every call of the six reaches the branch that serves the session itself, and every case of `crates/kr-worker/tests/agent_service.rs` that sends one of the six fails (74 of the program's 77 at this checkout), among them the two that assert the refusals, `kr_req_23_30_an_envelope_that_names_no_instance_or_another_revision_is_refused_before_admission` and `kr_req_23_30_a_retry_of_an_uncertain_action_cannot_leave_its_subject_by_its_envelope`. The case of the third refusal, `kr_req_23_30_an_envelope_that_names_the_instance_and_no_revision_is_refused_before_admission`, stays green, because the target's own check refuses that envelope first.",
-        unreached: "Clients outside this repository; phone builds of releases that the history of tags does not hold; a later daemon that retains this level and sends what a later release builds; and the receiver crates `kr_protocol` and `kr_worker`, which decode and check what they are sent and send none of the six.",
+        refuses: "An envelope that names no application instance for agent.prompt.submit, agent.prompt.queue, agent.turn.steer, agent.turn.cancel, agent.approval.respond or plugin.action.invoke; an envelope that names another binding revision than the parameters name; and an envelope that names the instance and no binding revision, which is the retained release's own refusal by the target's own check (`ActionTarget::validate`), repeated by the comparison the entry's root makes and reached by no envelope that passes that check.",
+        rest: "The root differs from the retained release's `WorkerService::check_envelope` by the refusal of an envelope with no instance and by the comparison of the envelope's binding revision with the parameters' (which, for an envelope that names the instance and no revision, repeats the refusal that the retained release's `ActionTarget::validate` already makes), the binding and the comment that go with them, and its call of `params_application_target`, which replaces `params_application_instance`; nothing else. Run `git log -p -L '/    fn check_envelope(/,/^    }$/:crates/kr-worker/src/service.rs' packages/v0.78.0+e03f8dd17f5c..HEAD` to see the function's diff against the retained release.",
+        registry: "The six methods' rows in `crates/kr-protocol/src/method.rs` decide `selects_an_instance` through `ResourceSelectorKind::ApplicationInstance`; no digest holds them. When the six rows lose it, a bare envelope takes `None => {}` and is admitted, and an envelope that names an instance reaches the branch that serves the session itself, so every case of `crates/kr-worker/tests/agent_service.rs` that sends one of the six fails (74 of the program's 77 at this checkout), among them the two that assert the refusals, `kr_req_23_30_an_envelope_that_names_no_instance_or_another_revision_is_refused_before_admission` and `kr_req_23_30_a_retry_of_an_uncertain_action_cannot_leave_its_subject_by_its_envelope`. The case of the third refusal, `kr_req_23_30_an_envelope_that_names_the_instance_and_no_revision_is_refused_before_admission`, stays green, because the target's own check refuses that envelope first.",
+        unreached: "Clients outside this repository; phone builds of releases that the history of tags does not hold; a later daemon that retains this level and sends what a later release builds; and the receiver crates `kr_protocol` and `kr_worker`, which decode and check what they are sent and send none of the six. The compiler's reading reports the client crates only: it does not read `kr_controller`, so no check finds a new sender of the six in the daemon, and only the digests of the daemon items the rows list hold it.",
         searched: &[
             "git grep -n -w -E 'Method::(AgentPromptSubmit|AgentPromptQueue|AgentTurnSteer|AgentTurnCancel|AgentApprovalRespond|PluginActionInvoke)' -- crates apps ':!crates/kr-protocol/retained' ':!*/tests/*'",
             "git grep -n 'MutationRequest {' -- crates apps",
@@ -48,7 +48,7 @@ pub const NARROWER: &[Narrower] = &[
         senders: &[
             Sender {
                 class: "the companion",
-                sends: "Each of the six commands of the companion's host builds the envelope's target from the application instance and the binding revision its parameters carry (`WorkerLinks::mutate` calls `Link::target(Some(instance), Some(binding))`), so the envelope names both as the parameters do; a prompt that names a draft builds its target the same way (`send_draft_prompt`), and the carriers of `kr_client` pass the target on as given. The page sets `resource_id` of the plugin action in `model/agent.ts`, audited apart.",
+                sends: "Each of the six commands of the companion's host builds the envelope's target from the application instance and the binding revision its parameters carry (`WorkerLinks::mutate` calls `Link::target(Some(instance), Some(binding))`), so the envelope names both as the parameters do; a prompt that names a draft builds its target the same way (`send_draft_prompt`); the items between a command and `WorkerLinks::mutate` that choose the target passed with the parameters are listed too (`macro:agent_mutate_command`, `macro:agent_prompt_command`, `send_prompt`, `WorkerLinks::submit`), and the carriers of `kr_client` pass the target on as given. The page sets `resource_id` of the plugin action in `model/agent.ts`, audited apart.",
                 evidence: Evidence::Builds {
                     items: &[
                         Item {
@@ -77,15 +77,53 @@ pub const NARROWER: &[Narrower] = &[
                                 ),
                                 (
                                     "56049481c5610e20ba5cdcd97a3ecfdcdf4bf7582b5f696c306e34837fab18dc",
-                                    "Builds the envelope's target from the instance and the binding revision of the parameters' target (`Nullable::some` of each, directly or through `Link::target`), so the envelope names the same instance at the same revision as the parameters.",
+                                    "Builds the envelope's target with `Nullable::some` of the instance and of the binding revision its caller passes, so the envelope names what the parameters' target names.",
                                 ),
                                 (
                                     "d7f1edd9868390c0a73f29accc7f5e42b5e9ca454e16c3817fd3ea38a3da47cf",
-                                    "Builds the envelope's target from the instance and the binding revision of the parameters' target (`Nullable::some` of each, directly or through `Link::target`), so the envelope names the same instance at the same revision as the parameters.",
+                                    "Builds the envelope's target with `Nullable::some` of the instance and of the binding revision its caller passes, so the envelope names what the parameters' target names.",
                                 ),
                                 (
                                     "119b78a88b569cf4bf3ada8ff7735e3de77e81038705a42a37f1719d23c1e192",
-                                    "Builds the envelope's target from the instance and the binding revision of the parameters' target (`Nullable::some` of each, directly or through `Link::target`), so the envelope names the same instance at the same revision as the parameters.",
+                                    "Builds the envelope's target with `Nullable::some` of the instance and of the binding revision its caller passes, so the envelope names what the parameters' target names.",
+                                ),
+                            ],
+                        },
+                        Item {
+                            krate: "companion_tauri",
+                            name: "WorkerLinks::submit",
+                            now: "c80494085c258f747b439851df1c978988ebdfa0530b9c37ae4c76a74362968b",
+                            across: &[
+                                (
+                                    "absent",
+                                    "The release has no item of this name, so nothing of it builds or carries a request.",
+                                ),
+                                (
+                                    "751fef0b22a2bc9e832bd645c18b673c03ba498245a1e958dcfb8fefec61f241",
+                                    "Sends the method, the target and the parameters through the link's session as given, with no preconditions; it sets neither the instance nor the revision.",
+                                ),
+                                (
+                                    "c80494085c258f747b439851df1c978988ebdfa0530b9c37ae4c76a74362968b",
+                                    "Sends the method, the target, the preconditions and the parameters through the link's session as given; it sets neither the instance nor the revision.",
+                                ),
+                            ],
+                        },
+                        Item {
+                            krate: "companion_tauri",
+                            name: "send_prompt",
+                            now: "461099d4541b7046a4296c37ffb7182d924b335872632dd4e6e3c1f5efba2dc5",
+                            across: &[
+                                (
+                                    "absent",
+                                    "The release has no item of this name, so nothing of it builds or carries a request.",
+                                ),
+                                (
+                                    "fb71a7c64895756533e607b11252aeb087b746b78d5e2108553a6967d050366e",
+                                    "Takes the target from the prompt's own parameters (`typed.target`) and passes it to `WorkerLinks::mutate` or, for a draft, to `send_draft_prompt`; the envelope names what the parameters name.",
+                                ),
+                                (
+                                    "461099d4541b7046a4296c37ffb7182d924b335872632dd4e6e3c1f5efba2dc5",
+                                    "Takes the target from the prompt's own parameters (`typed.target`) and passes it to `WorkerLinks::mutate` or, for a draft, to `send_draft_prompt`, with the paired host's context; the envelope names what the parameters name.",
                                 ),
                             ],
                         },
@@ -119,15 +157,15 @@ pub const NARROWER: &[Narrower] = &[
                                 ),
                                 (
                                     "dca01ba7bfb13e9d7c539f202a7a362e2503197231d705abe277868982f5204f",
-                                    "Declares the module `target`, whose `Subject::target` builds the target of a command that names a subject; the declaration builds no request.",
+                                    "Holds the items named `target` in 2 files: the declaration of the module `target` in `lib.rs`; `Subject::target`'s function in `target.rs`, which builds the target of a command that names a subject and sets the instance and the binding revision only when the page names them. None of the six takes a subject or a terminal.",
                                 ),
                                 (
                                     "f0004b936ae47bbea3a7b195c7e29ba48a8b436fd94388d737d5914b1499531c",
-                                    "Declares the module `target`, whose `Subject::target` builds the target of a command that names a subject; the declaration builds no request.",
+                                    "Holds the items named `target` in 3 files: the declaration of the module `target` in `lib.rs`; `Subject::target`'s function in `target.rs`, which builds the target of a command that names a subject and sets the instance and the binding revision only when the page names them; the terminal's `target` in `terminal/view.rs`, which builds a terminal's target with the instance and the binding revision null. None of the six takes a subject or a terminal.",
                                 ),
                                 (
                                     "4dd760c8c1e6d982dcda3b5fd123ca3abb4e40afd5cd46d2d6f2e4ac3893f515",
-                                    "Declares the module `target`, whose `Subject::target` builds the target of a command that names a subject; the declaration builds no request.",
+                                    "Holds the items named `target` in 4 files: `Link::target`'s function in `agent.rs`, which builds the envelope's target from the instance and the binding revision its caller passes; the declaration of the module `target` in `lib.rs`; `Subject::target`'s function in `target.rs`, which builds the target of a command that names a subject and sets the instance and the binding revision only when the page names them; the terminal's `target` in `terminal/view.rs`, which builds a terminal's target with the instance and the binding revision null. None of the six takes a subject or a terminal.",
                                 ),
                             ],
                         },
@@ -142,127 +180,127 @@ pub const NARROWER: &[Narrower] = &[
                                 ),
                                 (
                                     "5d39a125c4cfb542b92356d7a1f086fac65551dddd9569db441a3fc382eb163f",
-                                    "Names the host's commands and the method each sends, the six among them; it builds no request, and the six commands take their target from their parameters.",
+                                    "Names the host's commands and the method each sends; none of the six is among them, so nothing of it sends one.",
                                 ),
                                 (
                                     "bbe55fa8f5ed37814f63d6f58b3695304964d0241a3cde410c448967c28c8c5e",
-                                    "Names the host's commands and the method each sends, the six among them; it builds no request, and the six commands take their target from their parameters.",
+                                    "Names the host's commands and the method each sends; none of the six is among them, so nothing of it sends one.",
                                 ),
                                 (
                                     "58deb1aa6b443e2d1678275a2ddcb0d9d5e716ae7edc35ce5d610f9830d236ea",
-                                    "Names the host's commands and the method each sends, the six among them; it builds no request, and the six commands take their target from their parameters.",
+                                    "Names the host's commands and the method each sends; none of the six is among them, so nothing of it sends one.",
                                 ),
                                 (
                                     "a3609c3bf07fc2b499ee7d3010cd5f4dc8c4c59c19bf5b099e2ce0bdf2c5a0f4",
-                                    "Names the host's commands and the method each sends, the six among them; it builds no request, and the six commands take their target from their parameters.",
+                                    "Names the host's commands and the method each sends; none of the six is among them, so nothing of it sends one.",
                                 ),
                                 (
                                     "b59219371fe19669a0249aa8b0be516c47c458d2f96ba6984460f4fc2324127b",
-                                    "Names the host's commands and the method each sends, the six among them; it builds no request, and the six commands take their target from their parameters.",
+                                    "Names the host's commands and the method each sends; none of the six is among them, so nothing of it sends one.",
                                 ),
                                 (
                                     "48727f6e15076021a3b63e729c8e64001db0c8b749e661eab329d5e81b9972b7",
-                                    "Names the host's commands and the method each sends, the six among them; it builds no request, and the six commands take their target from their parameters.",
+                                    "Names the host's commands and the method each sends; none of the six is among them, so nothing of it sends one.",
                                 ),
                                 (
                                     "f4ba4e224a8ec54b56e02c352459352fba2ccf83604fc08567b56322e7e35f4f",
-                                    "Names the host's commands and the method each sends, the six among them; it builds no request, and the six commands take their target from their parameters.",
+                                    "Names the host's commands and the method each sends; 5 of the six are among them (not `plugin_action_invoke`). It builds no request, and each of those commands takes its target from its parameters.",
                                 ),
                                 (
                                     "a70afae1c163171c368859b7c2181ba24fd39ee9cdcb4a8cc45adee55c1c8060",
-                                    "Names the host's commands and the method each sends, the six among them; it builds no request, and the six commands take their target from their parameters.",
+                                    "Names the host's commands and the method each sends; 5 of the six are among them (not `plugin_action_invoke`). It builds no request, and each of those commands takes its target from its parameters.",
                                 ),
                                 (
                                     "b310b32539b6323e686c85b7e8b4fc65e45e2895cb4dbf75927f920b4276ec44",
-                                    "Names the host's commands and the method each sends, the six among them; it builds no request, and the six commands take their target from their parameters.",
+                                    "Names the host's commands and the method each sends; 5 of the six are among them (not `plugin_action_invoke`). It builds no request, and each of those commands takes its target from its parameters.",
                                 ),
                                 (
                                     "e8f4c773b889f1c8f9dc2382531231e7986e81dc0cd01c6f1dbefa1f0c827b6d",
-                                    "Names the host's commands and the method each sends, the six among them; it builds no request, and the six commands take their target from their parameters.",
+                                    "Names the host's commands and the method each sends; 5 of the six are among them (not `plugin_action_invoke`). It builds no request, and each of those commands takes its target from its parameters.",
                                 ),
                                 (
                                     "a1ab8143a268e3a1f2e2e711c38963a5776f4508efb910f6e434775555ae9b6c",
-                                    "Names the host's commands and the method each sends, the six among them; it builds no request, and the six commands take their target from their parameters.",
+                                    "Names the host's commands and the method each sends; 5 of the six are among them (not `plugin_action_invoke`). It builds no request, and each of those commands takes its target from its parameters.",
                                 ),
                                 (
                                     "e99b16a0467274365d436ee547171685d67f62a402321f437453e490b49d23e1",
-                                    "Names the host's commands and the method each sends, the six among them; it builds no request, and the six commands take their target from their parameters.",
+                                    "Names the host's commands and the method each sends; 5 of the six are among them (not `plugin_action_invoke`). It builds no request, and each of those commands takes its target from its parameters.",
                                 ),
                                 (
                                     "3ea8857129f8a776eed627e2856920fab93f7aa349f0743579cd7a127c1582fc",
-                                    "Names the host's commands and the method each sends, the six among them; it builds no request, and the six commands take their target from their parameters.",
+                                    "Names the host's commands and the method each sends; 5 of the six are among them (not `plugin_action_invoke`). It builds no request, and each of those commands takes its target from its parameters.",
                                 ),
                                 (
                                     "eea16cafd4e534be4df64d64f9ee05ebb24990438da9e9e5421d9d96180105e4",
-                                    "Names the host's commands and the method each sends, the six among them; it builds no request, and the six commands take their target from their parameters.",
+                                    "Names the host's commands and the method each sends; 5 of the six are among them (not `plugin_action_invoke`). It builds no request, and each of those commands takes its target from its parameters.",
                                 ),
                                 (
                                     "1091f5c0a06c42cc975345dfd79538d985aca0a8fc57337beb14d0204006fa5a",
-                                    "Names the host's commands and the method each sends, the six among them; it builds no request, and the six commands take their target from their parameters.",
+                                    "Names the host's commands and the method each sends; 5 of the six are among them (not `plugin_action_invoke`). It builds no request, and each of those commands takes its target from its parameters.",
                                 ),
                                 (
                                     "d57458c22d77ace86b82966d81024e9b25f7d56e7ed0299e4fccbfafca8865c4",
-                                    "Names the host's commands and the method each sends, the six among them; it builds no request, and the six commands take their target from their parameters.",
+                                    "Names the host's commands and the method each sends; 5 of the six are among them (not `plugin_action_invoke`). It builds no request, and each of those commands takes its target from its parameters.",
                                 ),
                                 (
                                     "b8da4c496be033c31d2608f29dc226527a7f4d8ee2b805eadbf748c1a96ef865",
-                                    "Names the host's commands and the method each sends, the six among them; it builds no request, and the six commands take their target from their parameters.",
+                                    "Names the host's commands and the method each sends; 5 of the six are among them (not `plugin_action_invoke`). It builds no request, and each of those commands takes its target from its parameters.",
                                 ),
                                 (
                                     "d936da138931633c02247d05d26f58a2612dca741144d486516a83a3d536c75b",
-                                    "Names the host's commands and the method each sends, the six among them; it builds no request, and the six commands take their target from their parameters.",
+                                    "Names the host's commands and the method each sends; 5 of the six are among them (not `plugin_action_invoke`). It builds no request, and each of those commands takes its target from its parameters.",
                                 ),
                                 (
                                     "81f7e25cae76ae437be0256196bc7e1d0d442ced4c06df418eb63b8fe96f4cce",
-                                    "Names the host's commands and the method each sends, the six among them; it builds no request, and the six commands take their target from their parameters.",
+                                    "Names the host's commands and the method each sends; 5 of the six are among them (not `plugin_action_invoke`). It builds no request, and each of those commands takes its target from its parameters.",
                                 ),
                                 (
                                     "3c845fec48348bbdfe1fabc691f450b83d0ef09dda45f5b57b49c38b542a58ad",
-                                    "Names the host's commands and the method each sends, the six among them; it builds no request, and the six commands take their target from their parameters.",
+                                    "Names the host's commands and the method each sends; 5 of the six are among them (not `plugin_action_invoke`). It builds no request, and each of those commands takes its target from its parameters.",
                                 ),
                                 (
                                     "306ebc084747a1fa2e18b4abf55dd480f5c3551a6b0b6190ed178f99b6335297",
-                                    "Names the host's commands and the method each sends, the six among them; it builds no request, and the six commands take their target from their parameters.",
+                                    "Names the host's commands and the method each sends; 5 of the six are among them (not `plugin_action_invoke`). It builds no request, and each of those commands takes its target from its parameters.",
                                 ),
                                 (
                                     "10897daf9bd82a41cbbcc6b7258b29dc040eeb8d1102277a7e384d7312aeec75",
-                                    "Names the host's commands and the method each sends, the six among them; it builds no request, and the six commands take their target from their parameters.",
+                                    "Names the host's commands and the method each sends; 5 of the six are among them (not `plugin_action_invoke`). It builds no request, and each of those commands takes its target from its parameters.",
                                 ),
                                 (
                                     "cc0499df80ba06b4bd634b1048293155336b1e2bca81cbf6065c8f709f05fcaf",
-                                    "Names the host's commands and the method each sends, the six among them; it builds no request, and the six commands take their target from their parameters.",
+                                    "Names the host's commands and the method each sends; all six are among them. It builds no request, and each of those commands takes its target from its parameters.",
                                 ),
                                 (
                                     "bc8fc85526def6d4f64f2a5b835d9a283418ab00c0e84a73349e4fb5396c591d",
-                                    "Names the host's commands and the method each sends, the six among them; it builds no request, and the six commands take their target from their parameters.",
+                                    "Names the host's commands and the method each sends; all six are among them. It builds no request, and each of those commands takes its target from its parameters.",
                                 ),
                                 (
                                     "87f60005879e8639a55d60d4dd55d2a82a9d4415bec9fb527757076f3b717e5b",
-                                    "Names the host's commands and the method each sends, the six among them; it builds no request, and the six commands take their target from their parameters.",
+                                    "Names the host's commands and the method each sends; all six are among them. It builds no request, and each of those commands takes its target from its parameters.",
                                 ),
                                 (
                                     "2de24bd1fda1c22187e8643ce6965715ec777ac2cd92a1fb40b93beebc71f5f3",
-                                    "Names the host's commands and the method each sends, the six among them; it builds no request, and the six commands take their target from their parameters.",
+                                    "Names the host's commands and the method each sends; all six are among them. It builds no request, and each of those commands takes its target from its parameters.",
                                 ),
                                 (
                                     "1c7e8eb359a08f1a1242bf3af81ebdff7b19529db030c075482ce8f477dc16c2",
-                                    "Names the host's commands and the method each sends, the six among them; it builds no request, and the six commands take their target from their parameters.",
+                                    "Names the host's commands and the method each sends; all six are among them. It builds no request, and each of those commands takes its target from its parameters.",
                                 ),
                                 (
                                     "7650166cd3c3194256586bdc5c7d340264276cd885e0c7d68aa01291c1b030cb",
-                                    "Names the host's commands and the method each sends, the six among them; it builds no request, and the six commands take their target from their parameters.",
+                                    "Names the host's commands and the method each sends; all six are among them. It builds no request, and each of those commands takes its target from its parameters.",
                                 ),
                                 (
                                     "6c9e6a48430c1eb8c7ef992d5679fe1be1380c8585a9f261f8d994d71b32e95c",
-                                    "Names the host's commands and the method each sends, the six among them; it builds no request, and the six commands take their target from their parameters.",
+                                    "Names the host's commands and the method each sends; all six are among them. It builds no request, and each of those commands takes its target from its parameters.",
                                 ),
                                 (
                                     "6a3f93ca63d14ddf2715533a8532cae0c411f417e99ce6bfb988053630fdb2df",
-                                    "Names the host's commands and the method each sends, the six among them; it builds no request, and the six commands take their target from their parameters.",
+                                    "Names the host's commands and the method each sends; all six are among them. It builds no request, and each of those commands takes its target from its parameters.",
                                 ),
                                 (
                                     "5bdb9205ab3d1d7508b8debd33ed317606231681742fcef15eae45f581197c79",
-                                    "Names the host's commands and the method each sends, the six among them; it builds no request, and the six commands take their target from their parameters.",
+                                    "Names the host's commands and the method each sends; all six are among them. It builds no request, and each of those commands takes its target from its parameters.",
                                 ),
                             ],
                         },
@@ -277,19 +315,19 @@ pub const NARROWER: &[Narrower] = &[
                                 ),
                                 (
                                     "ca64c159e77e6508a22aba5006ad6e1fae00aeec297ac02894845e6c799b96bb",
-                                    "The prompt command: it sends AgentPromptSubmit with the target its parameters carry, through `WorkerLinks::mutate` or `send_draft_prompt`, so the envelope names the parameters' instance and revision.",
+                                    "Invokes `agent_mutate_command!` for `AgentPromptSubmit`; the macro's body, listed beside, passes the target its parameters carry to the link.",
                                 ),
                                 (
                                     "5f66b8a8b49d519c0e0949fb4e835fb6399595fbe6292a388b8de5f50cc426e1",
-                                    "The prompt command: it sends AgentPromptSubmit with the target its parameters carry, through `WorkerLinks::mutate` or `send_draft_prompt`, so the envelope names the parameters' instance and revision.",
+                                    "Invokes `agent_prompt_command!` for `AgentPromptSubmit`; the macro's body, listed beside, passes the target its parameters carry to the link, or sends a draft with it.",
                                 ),
                                 (
                                     "8ba36ceab556056f5004a9727ef4ec70173dd872f09f2a53523f7c66100ed7f8",
-                                    "The prompt command: it sends AgentPromptSubmit with the target its parameters carry, through `WorkerLinks::mutate` or `send_draft_prompt`, so the envelope names the parameters' instance and revision.",
+                                    "Defines the command, which hands its parameters to `send_prompt` (listed beside) with `AgentPromptSubmit`; the target is the one the parameters carry.",
                                 ),
                                 (
                                     "88d2ff596c595aa0efad292a1c92271cbc0c9a6e306bb6f29fb7a93d3cccf260",
-                                    "The prompt command: it sends AgentPromptSubmit with the target its parameters carry, through `WorkerLinks::mutate` or `send_draft_prompt`, so the envelope names the parameters' instance and revision.",
+                                    "Defines the command, which hands its parameters to `send_prompt` (listed beside) with `AgentPromptSubmit`; the target is the one the parameters carry.",
                                 ),
                             ],
                         },
@@ -304,19 +342,19 @@ pub const NARROWER: &[Narrower] = &[
                                 ),
                                 (
                                     "da96c79cfc488d1d866c99c05c5b334f6efd29916494270549d1a3b6b6a9cd15",
-                                    "The queued prompt command: it sends AgentPromptQueue with the target its parameters carry, through `WorkerLinks::mutate` or `send_draft_prompt`, so the envelope names the parameters' instance and revision.",
+                                    "Invokes `agent_mutate_command!` for `AgentPromptQueue`; the macro's body, listed beside, passes the target its parameters carry to the link.",
                                 ),
                                 (
                                     "6ce9ac86e99e8887d997e4f2671406ba37b7c039aa15e37bd0e69b8f1afb85f7",
-                                    "The queued prompt command: it sends AgentPromptQueue with the target its parameters carry, through `WorkerLinks::mutate` or `send_draft_prompt`, so the envelope names the parameters' instance and revision.",
+                                    "Invokes `agent_prompt_command!` for `AgentPromptQueue`; the macro's body, listed beside, passes the target its parameters carry to the link, or sends a draft with it.",
                                 ),
                                 (
                                     "ea8d57dea78b62e1721dec5b82e57d369b8275d72ba340e19b0d5bb37080cf13",
-                                    "The queued prompt command: it sends AgentPromptQueue with the target its parameters carry, through `WorkerLinks::mutate` or `send_draft_prompt`, so the envelope names the parameters' instance and revision.",
+                                    "Defines the command, which hands its parameters to `send_prompt` (listed beside) with `AgentPromptQueue`; the target is the one the parameters carry.",
                                 ),
                                 (
                                     "5b3e9669e09ad77a5f9e10aa89eaa38df354932481e23cc402a7638a5352300e",
-                                    "The queued prompt command: it sends AgentPromptQueue with the target its parameters carry, through `WorkerLinks::mutate` or `send_draft_prompt`, so the envelope names the parameters' instance and revision.",
+                                    "Defines the command, which hands its parameters to `send_prompt` (listed beside) with `AgentPromptQueue`; the target is the one the parameters carry.",
                                 ),
                             ],
                         },
@@ -331,15 +369,15 @@ pub const NARROWER: &[Narrower] = &[
                                 ),
                                 (
                                     "7209ceb9e0947351cd341d13fabc46d35efa80ad53b9e10643509b9a63214136",
-                                    "Defines the commands of steer, cancel, approval response and plugin action: each passes the target its parameters carry to `WorkerLinks::mutate`, so the envelope names the parameters' instance and revision.",
+                                    "Invokes `agent_mutate_command!` for `agent_prompt_submit`, `agent_prompt_queue`, `agent_turn_steer`, `agent_turn_cancel`, `agent_approval_respond`; the macro's body, listed beside, passes the target each command's parameters carry to the link.",
                                 ),
                                 (
                                     "eb060f2d9d61ca706301a107e87e86794985a788e59d2e2e3a6f786cba71bdb4",
-                                    "Defines the commands of steer, cancel, approval response and plugin action: each passes the target its parameters carry to `WorkerLinks::mutate`, so the envelope names the parameters' instance and revision.",
+                                    "Invokes `agent_mutate_command!` for `agent_turn_steer`, `agent_turn_cancel`, `agent_approval_respond`; the macro's body, listed beside, passes the target each command's parameters carry to the link.",
                                 ),
                                 (
                                     "4bed2b1531608938457b2cca742c574beedd66849e763157feaa5592fa9e4c6b",
-                                    "Defines the commands of steer, cancel, approval response and plugin action: each passes the target its parameters carry to `WorkerLinks::mutate`, so the envelope names the parameters' instance and revision.",
+                                    "Invokes `agent_mutate_command!` for `agent_turn_steer`, `agent_turn_cancel`, `agent_approval_respond`, `plugin_action_invoke`; the macro's body, listed beside, passes the target each command's parameters carry to the link.",
                                 ),
                             ],
                         },
@@ -354,7 +392,49 @@ pub const NARROWER: &[Narrower] = &[
                                 ),
                                 (
                                     "71e5ce6676b29e2945b5ad4eb0a98b59425b6fbeb1e0a4670b29939fec7586dc",
-                                    "Defines the earlier prompt commands: each passes the target its parameters carry to the link, so the envelope names the parameters' instance and revision.",
+                                    "Invokes `agent_prompt_command!` for `agent_prompt_submit`, `agent_prompt_queue`; the macro's body, listed beside, passes the target each command's parameters carry to the link.",
+                                ),
+                            ],
+                        },
+                        Item {
+                            krate: "companion_tauri",
+                            name: "macro:agent_mutate_command",
+                            now: "4e0d31574e80d231d5809d0dae94a1f0a7e2c640d6570e482ff9044db1f425c4",
+                            across: &[
+                                (
+                                    "absent",
+                                    "The release has no item of this name, so nothing of it builds or carries a request.",
+                                ),
+                                (
+                                    "3ad1e6bad0d75dae5eaab6be2adb5bf91aa13a1d760a1cd0b3a9b4eab8f93526",
+                                    "Passes the instance and the binding revision of the parameters' target (`target.subject.application_instance_id`, `target.binding_revision`) to `WorkerLinks::mutate`, with the parameters as decoded.",
+                                ),
+                                (
+                                    "983226c91a4347f2099939be4ac192dffec66b6dbe7f6b3622ccdaa53ae1830d",
+                                    "Passes the parameters' target (`typed.target`) whole to `WorkerLinks::mutate`, with the parameters as decoded.",
+                                ),
+                                (
+                                    "4e0d31574e80d231d5809d0dae94a1f0a7e2c640d6570e482ff9044db1f425c4",
+                                    "Passes the parameters' target (`typed.target`) whole to `WorkerLinks::mutate`, with the parameters as decoded.",
+                                ),
+                            ],
+                        },
+                        Item {
+                            krate: "companion_tauri",
+                            name: "macro:agent_prompt_command",
+                            now: "absent",
+                            across: &[
+                                (
+                                    "absent",
+                                    "The release has no item of this name, so nothing of it builds or carries a request.",
+                                ),
+                                (
+                                    "3c334f9ab3a45f01b1284ce4be1ee905eea4f79db2f81162cc45472eaee6d0e7",
+                                    "Defines the prompt commands: a prompt that names a draft goes to `send_draft_prompt`, and any other passes the instance and the binding revision of the parameters' target to `WorkerLinks::mutate`.",
+                                ),
+                                (
+                                    "3af18343051d40542388f3e1d2ccdf4b077bfc1ec8bf434dced5c44a07599f42",
+                                    "Defines the prompt commands: a prompt that names a draft goes to `send_draft_prompt` after a check that the host is paired, and any other passes the parameters' target (`typed.target`) to `WorkerLinks::mutate`.",
                                 ),
                             ],
                         },
@@ -702,7 +782,7 @@ pub const NARROWER: &[Narrower] = &[
                 krate: "kr_cli",
                 name: "run",
                 kinds: &[SightKind::Target],
-                now: "17bb9c8d350f72dccb87c086d13eef9149aaa8dea218baa55d540fc8fe5db17c",
+                now: "767e87eb5a5b4031c689d94c040120863ab92c8268ac7f025169e8ca5d221dbe",
                 why: "Builds or carries the request of a `kr` command for sessions, grants, shares, pairing, transfers or a bridge; no text of `kr_cli` names one of the six, and none sets an application instance.",
             },
             Account {
@@ -723,7 +803,7 @@ pub const NARROWER: &[Narrower] = &[
                 krate: "kr_cli",
                 name: "target",
                 kinds: &[SightKind::Target],
-                now: "2198aef450262daafb6bcea34158327204bf16c7ce9434e96c9f1f5da9783fe6",
+                now: "363f8ad6a761b09ff92c976b64b346325c4a5babd46e96510f394f9653c39c37",
                 why: "Builds the target of a session command with `application_instance_id` and `agent_binding_revision` null.",
             },
             Account {
@@ -821,7 +901,7 @@ pub const NARROWER: &[Narrower] = &[
                 krate: "kr_cli",
                 name: "forget",
                 kinds: &[SightKind::Target],
-                now: "1d753bba2da86cb8b9318366e9bf333ebef0a5b8578c539d0323af3672f300f3",
+                now: "015cec5c3c15bd1aa0d572af81b8760b48232dcea0b57ccee8251c3d8d32c881",
                 why: "Builds or carries the request of a `kr` command for sessions, grants, shares, pairing, transfers or a bridge; no text of `kr_cli` names one of the six, and none sets an application instance.",
             },
             Account {
@@ -989,7 +1069,7 @@ pub const NARROWER: &[Narrower] = &[
                 krate: "companion_tauri",
                 name: "answer",
                 kinds: &[SightKind::Target],
-                now: "62c5cb56a28e1d94ce7d561127d529cb96850fd8e3443fc50a4047b6391e504a",
+                now: "0b92cc06a20bac8c3afcd05eb4b32f8440b06ba233defba6b6a55fe223ba75b8",
                 why: "Builds or tags the request of a command that is none of the six (sessions, questions, pairing, sharing, transfers, the terminal); its text names none of the six and sets no application instance.",
             },
             Account {
