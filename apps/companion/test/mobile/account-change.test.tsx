@@ -7,7 +7,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { act, cleanup, render, renderHook, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
-import type { ReactNode } from 'react'
+import { useEffect, type ReactNode } from 'react'
 
 import { AppProvider, useApp } from '../../src/app/state'
 import { fakeHost } from '../../src/host/fake'
@@ -480,5 +480,114 @@ describe('a stored card, when the list of uploads cannot be read', () => {
     const row = [...uploads.snapshot().values()].find((each) => each.handle?.transfer_id === 't-stored')
     expect(row?.phase.kind).toBe('kept')
     expect(add).not.toHaveBeenCalled()
+  })
+})
+
+const SIGNED_OUT: AccountView = { state: 'signed_out', outcome: null }
+
+type App = ReturnType<typeof useApp>
+
+/** Hands a test the window's own state, which the screens share: its draft book. */
+function Keep({ onApp }: { readonly onApp: (app: App) => void }) {
+  const app = useApp()
+  useEffect(() => {
+    onApp(app)
+  })
+  return null
+}
+
+/** Waits until every read of the account's status that was asked for has answered and was taken in. */
+async function settled(status: { readonly mock: { readonly results: readonly { readonly value: unknown }[] } }) {
+  await Promise.all(status.mock.results.map((result) => result.value as Promise<unknown>))
+  await tick()
+}
+
+describe('the host the window was last connected to, as the phone follows the connection', () => {
+  /** A file of the earlier sign-in on a composer, sent to the host `environment`. */
+  const sentTo = (environment: string): DraftAttachment => ({
+    localId: 'sent',
+    transferId: 't-sent',
+    name: 't-sent.pdf',
+    byteLen: 10,
+    mediaType: 'application/pdf',
+    presentedAsImage: false,
+    upload: 'uploaded',
+    acceptedUpstream: false,
+    handle: { ...handleOf('t-sent'), environment_id: environment }
+  })
+
+  it('is the host the connection feed showed, with no session opened: an account change after a reload clears its files', async () => {
+    const { port, controls } = fakeHost()
+    controls.reachAsPhone({ rights: RIGHTS, organisation: true })
+    controls.account.set(signedIn('aa'))
+    const status = vi.spyOn(port, 'accountStatus')
+    const kept: { app: App | null } = { app: null }
+    render(
+      <AppProvider port={port} uploadPollMs={10}>
+        <MobileApp surface="ios" storage={null} />
+        <Keep
+          onApp={(app) => {
+            kept.app = app
+          }}
+        />
+      </AppProvider>
+    )
+    // The page was loaded while native code was already connected to the host: no session is opened.
+    await waitFor(() => {
+      expect(kept.app).not.toBeNull()
+      expect(port.connectionLatest()?.connected).toBe(true)
+    })
+    await waitFor(() => {
+      expect(status).toHaveBeenCalled()
+    })
+    await settled(status)
+    const environment = port.connectionLatest()?.environment_id ?? ''
+    kept.app?.drafts.update(SESSION, (draft) => ({ ...draft, attachments: [sentTo(environment)] }))
+
+    controls.account.set(signedIn('bb'))
+    expect(await screen.findByText(FILES_OF_EARLIER_SIGN_IN_REMOVED)).toBeInTheDocument()
+    expect(kept.app?.drafts.draft(SESSION).attachments).toEqual([])
+  })
+
+  it('is the host last connected to: a move to a host that answers to no organisation, with no session open, leaves a sign-out nothing to clear', async () => {
+    const { port, controls } = fakeHost()
+    controls.reachAsPhone({ rights: RIGHTS, organisation: true })
+    controls.account.set(signedIn('aa'))
+    const status = vi.spyOn(port, 'accountStatus')
+    const kept: { app: App | null } = { app: null }
+    render(
+      <AppProvider port={port} uploadPollMs={10}>
+        <MobileApp surface="ios" storage={null} />
+        <Keep
+          onApp={(app) => {
+            kept.app = app
+          }}
+        />
+      </AppProvider>
+    )
+    const person = userEvent.setup({ applyAccept: false })
+    await person.click(await screen.findByRole('button', { name: /^Sessions/ }))
+    await person.click(await screen.findByRole('button', { name: /Session 1/ }))
+    await screen.findByRole('group', { name: 'Add an attachment' })
+    await waitFor(() => {
+      expect(status).toHaveBeenCalled()
+    })
+    await settled(status)
+    const environment = port.connectionLatest()?.environment_id ?? ''
+    kept.app?.drafts.update(SESSION, (draft) => ({ ...draft, attachments: [sentTo(environment)] }))
+
+    // The person leaves the session for the Hosts tab, which has no screen of its own that listens to the
+    // connection, and the phone moves to a host that answers to no organisation.
+    await person.click(screen.getByRole('button', { name: /^Hosts/ }))
+    controls.reachAsPhone({ rights: RIGHTS, organisation: false })
+    await waitFor(() => {
+      expect(port.connectionLatest()?.organisation).toBe(false)
+    })
+    await tick()
+
+    controls.account.set(SIGNED_OUT)
+    await settled(status)
+    expect(screen.queryByText(FILES_OF_EARLIER_SIGN_IN_REMOVED)).toBeNull()
+    expect(kept.app?.drafts.draft(SESSION).attachments).toHaveLength(1)
   })
 })

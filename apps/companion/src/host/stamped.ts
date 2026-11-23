@@ -142,8 +142,8 @@ export class AccountMark {
 
 /**
  * The host the window was last connected to, when its grant answers to an organisation, by its
- * environment. It is learned from the connection states the page's own screens read and hear through
- * the stamped port: it asks for none of its own. A connection to any other host replaces it, and a
+ * environment. It is learned from the connection states the page's own screens follow, read and hear
+ * through the stamped port: it asks for none of its own. A connection to any other host replaces it, and a
  * connection that ends leaves it as it was, because a sign-out ends the connection too and the two
  * are told in either order.
  */
@@ -199,8 +199,17 @@ export function stampedPort(port: HostPort, mark: () => string | undefined, conn
   const stamped = Object.create(port) as Record<string | symbol, unknown>
   stamped[ROOT] = rootOf(port)
   if (connection !== undefined) {
-    // The states the screens read and hear are passed to `connection` as they go by: nothing more is
-    // asked. A read takes its number when it is made, so that its answer cannot undo a newer event.
+    // The states the screens follow, read and hear are passed to `connection` as they go by: nothing
+    // more is asked. A read takes its number when it is made, so that its answer cannot undo a newer
+    // event, and each state the feed shows is an event of the connection.
+    stamped.watchConnection = (
+      show: (state: ConnectionState, resynced: boolean) => void,
+      failed: (failure: unknown) => void
+    ) =>
+      port.watchConnection((state, resynced) => {
+        connection.heard(state)
+        show(state, resynced)
+      }, failed)
     stamped.connectionState = () => {
       const ticket = connection.asked()
       const read = port.connectionState()
