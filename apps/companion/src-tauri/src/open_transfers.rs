@@ -431,8 +431,9 @@ struct Live {
     reached: AtomicU64,
     /// The number of the connection its sender was started on.
     sent_link: AtomicU64,
-    /// Whether a start moved the upload out of `Admitted`: set under the gate, in the section that
-    /// makes its sender, and never cleared. An upload that a stop took before any start has none.
+    /// Whether a start has moved the upload to `Sending`: set under the gate, in the section that
+    /// makes its sender, and never cleared. An upload that a stop took before any start has not been
+    /// started.
     started: AtomicBool,
 }
 
@@ -916,13 +917,13 @@ impl Registry {
     /// Ends the admission of `live`, whose send ended before its start was decided: only its own
     /// upload, still admitted, and its own copy go, in one section under the gate. A cleanup may
     /// have stopped the upload and let the key be used again, and then neither the upload nor the
-    /// copy is this send's to remove. An upload whose start moved it out of `Admitted` has a
-    /// sender and is held until that sender ends it: its copy is what a resume reads, so it stays.
-    /// A panic between the start's change of the phase and the task it makes leaves the upload
-    /// held with no sender, and nothing here ends that. An upload that no start moved loses the
-    /// copy whatever its phase: a cleanup that stopped it (`Stopping`, or `Paused` when its cancel
-    /// could not be finished) holds it until the cleanup ends it, and the copy this send placed
-    /// after the cleanup removed the files goes.
+    /// copy is this send's to remove. An upload that a start has moved to `Sending` is held until
+    /// its sender ends it: its copy is what a resume reads, so it stays. A panic between the
+    /// start's change of the phase and the task it makes leaves the upload held with no sender,
+    /// and nothing here ends that. An upload that no start moved loses the copy in any phase, and
+    /// leaves the desk here only while it is `Admitted`. A cleanup that stopped it holds it
+    /// `Stopping` until the cleanup ends it, and a copy this send placed after the cleanup removed
+    /// the files goes.
     fn drop_admitted(&mut self, store: &Store, live: &Arc<Live>) {
         let ours = self
             .held
