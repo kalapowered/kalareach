@@ -9,6 +9,10 @@ use rustix::termios::{OptionalActions, Termios};
 
 use crate::error::{CliError, Result};
 
+/// What is said before the kit is shown.
+pub const KIT_FOLLOWS: &str = "Your recovery kit follows. It is shown once. The terminal's \
+     scrollback keeps it until you clear the scrollback.";
+
 /// Keeps this process out of a core dump, before the seed exists.
 ///
 /// The core size limit is zero. On Linux the process is also made non-dumpable, because a core

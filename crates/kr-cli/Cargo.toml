@@ -164,7 +164,8 @@ libc.workspace = true
 rustix = { workspace = true, features = ["event", "pipe", "process"] }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys.workspace = true
+# The error mode and the unhandled-exception filter that keep the recovery kit out of a crash report.
+windows-sys = { workspace = true, features = ["Win32_System_Diagnostics_Debug"] }
 # The release archive of a Windows host: parsed before any signature is checked, so it is read
 # under the bounds of `update::archive`.
 zip.workspace = true
@@ -177,8 +178,9 @@ winx = "=0.36.4"
 windows-sys = { workspace = true, features = ["Win32_Security_Authorization", "Win32_System_StationsAndDesktops", "Win32_System_SystemServices"] }
 
 # The workspace forbids unsafe code, which a crate that calls the console API cannot honour. This
-# package denies it instead. Two product modules relax the rule: `platform`, and `windows::records`,
-# which reads the console's input records on Windows. One unit-test helper,
+# package denies it instead. Three product modules relax the rule: `platform`, `windows::records`,
+# which reads the console's input records on Windows, and `backup::terminal::windows`, which sets the
+# error mode and reads the console for `kr backup`. One unit-test helper,
 # `shell::tests::question_table`, relaxes it for the process that it runs in. Nothing else in the
 # library does, and each integration program under `tests/` that does gives its own reason.
 [lints.rust]

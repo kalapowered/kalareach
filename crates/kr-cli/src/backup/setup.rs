@@ -11,7 +11,10 @@
 //! * The command runs at a terminal outside every session, whose worker keeps its output.
 //! * Before the seed exists the process is kept out of a core dump: the core size limit is zero,
 //!   and on Linux the process is made non-dumpable, because a core pattern that pipes to a handler
-//!   ignores the limit. Setup is refused if either call fails.
+//!   ignores the limit. Setup is refused if either call fails. On Windows the process declines
+//!   Windows Error Reporting and ends at once on an unhandled exception. That guard is narrower: an
+//!   administrator's dump policy, and any process of the same account that can read this process's
+//!   memory, are outside it.
 //! * The kit is written straight to the terminal from the buffer that holds it, and the buffer
 //!   clears when it is dropped. It does not pass through standard output's buffer or the line
 //!   writer.
@@ -807,10 +810,7 @@ fn show_the_kit(kit: &Zeroizing<String>, fingerprint: &Shown) -> Result<()> {
     // The controlling terminal, opened as itself and written with no buffer of ours in between;
     // the command runs only where standard output is that terminal.
     let mut terminal = terminal::open_output().map_err(|error| failed(&error))?;
-    report::say(&Shown::said(
-        "Your recovery kit follows. It is shown once. The terminal's scrollback keeps it until \
-         you clear the scrollback.",
-    ));
+    report::say(&Shown::said(terminal::KIT_FOLLOWS));
     terminal.write_all(b"\n").map_err(|error| failed(&error))?;
     terminal
         .write_all(kit.as_bytes())

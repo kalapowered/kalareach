@@ -9,6 +9,8 @@
 #![allow(dead_code)]
 
 pub mod close_plants;
+#[cfg(windows)]
+pub mod console_window;
 pub mod terminal;
 
 use std::path::{Path, PathBuf};
