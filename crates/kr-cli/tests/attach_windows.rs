@@ -2439,3 +2439,498 @@ async fn probe_reports(
         typist.watch(Duration::from_millis(100)).await;
     }
 }
+
+/// The variable that makes this test binary, started in the session's console, ask for the modes
+/// the variable `KR_ATTACH_BYTES_ASK` names and write every byte it is given to a file.
+const BYTES_READER: &str = "KR_ATTACH_BYTES_READER";
+
+/// The directory the application waits for its gate in and writes what it was given to.
+const BYTES_DIRECTORY: &str = "KR_ATTACH_BYTES_DIRECTORY";
+
+/// The private modes the application asks for once its gate exists, as numbers separated by commas.
+const BYTES_ASK: &str = "KR_ATTACH_BYTES_ASK";
+
+/// Runs the test `name` of this binary as an application in a session, which asks for the private
+/// modes `modes` (numbers separated by commas) and writes every byte it is given to a file until a
+/// `Z` ends what it has; writes each of `written` in turn to the console `kr attach` runs in, as a
+/// terminal emulator hosting it does; and says what the application was given, which is `expected`
+/// when the console hands on what it was written as the application asked for it.
+async fn what_an_application_that_asked_for_is_given(
+    name: &str,
+    modes: &str,
+    written: &[&[u8]],
+    expected: &[u8],
+) {
+    let host = WorkerHost::start().await;
+    let (session_id, dimensions) = host
+        .kr_new(&["--shell-mode", "native_compat", "--shell", &command_shell()])
+        .await
+        .session();
+    let environment = host.tree.environment();
+    let mut typist = WorkerTerminal::attach(&environment, session_id, dimensions).await;
+    let directory = tempfile::tempdir().expect("a directory on the internal disk");
+    let reader = std::env::current_exe().expect("this test binary");
+    typist
+        .type_line(&format!(
+            "set {BYTES_READER}=1&& set {BYTES_ASK}={modes}&& set \"{BYTES_DIRECTORY}={}\"&& \
+             \"{}\" --exact {name} --nocapture --test-threads=1",
+            directory.path().display(),
+            reader.display()
+        ))
+        .await;
+    typist
+        .shown(
+            "kr-bytes-waiting",
+            "the application waits to ask for its modes",
+        )
+        .await;
+
+    let mut console = Attached::start(&host, &session_id.to_string(), dimensions);
+    console.shows(
+        "the session's screen",
+        |text| text.matches("kr-bytes-waiting").count(),
+        1,
+    );
+    std::fs::write(directory.path().join("gate"), b"open")
+        .expect("the file the application waits for");
+    typist
+        .shown(
+            "kr-bytes-ready",
+            "the application asked for its modes and said so",
+        )
+        .await;
+    // The command reads the application's requests in what it shows the console, so a console that
+    // shows this has been shown them.
+    console.shows(
+        "the application's requests",
+        |text| text.matches("kr-bytes-ready").count(),
+        1,
+    );
+    for bytes in written {
+        console.press(bytes);
+    }
+
+    let given = directory.path().join("given");
+    let started = Instant::now();
+    let told = loop {
+        let told = std::fs::read(&given).unwrap_or_default();
+        if told.ends_with(b"Z") || started.elapsed() > LIVENESS_DEADLINE {
+            break told;
+        }
+        typist.watch(Duration::from_millis(200)).await;
+    };
+    assert_eq!(
+        hex(&told),
+        hex(expected),
+        "the application, which asked for modes {modes}, was given what it should have been; the \
+         end of what the outer console shows: {:?}",
+        end_of(&console.output.text())
+    );
+
+    let _ = console.child.kill();
+    drop(typist);
+    let closed = host
+        .kr(&["--json", "close", &session_id.to_string()], &[])
+        .await;
+    assert!(
+        closed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&closed.stdout)
+    );
+}
+
+/// The session half of the cases above: asks for the modes once the gate exists, and writes every
+/// byte it is given to a file, each time it is given some, until a `Z` ends what it has. The
+/// console is given virtual-terminal input as a terminal application has it.
+fn bytes_reader_in_the_session() {
+    use kr_cli::platform::ControllingTerminal;
+
+    let directory = PathBuf::from(std::env::var_os(BYTES_DIRECTORY).expect("the directory to use"));
+    let modes = std::env::var(BYTES_ASK).expect("the modes to ask for");
+    let console = ControllingTerminal::open().expect("this process has a console");
+    let _modes = console
+        .enter_raw_mode()
+        .expect("the console is given virtual-terminal input");
+    // The console the mode left on does not return the carriage at a line feed, so each line ends
+    // with both, and a word is not broken across two rows of the screen.
+    print!("kr-bytes-waiting\r\n");
+    std::io::stdout().flush().expect("flushes the first word");
+    while !directory.join("gate").exists() {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    for mode in modes.split(',') {
+        print!("\x1b[?{mode}h");
+    }
+    print!("kr-bytes-ready\r\n");
+    std::io::stdout().flush().expect("flushes the requests");
+    let mut input = console.handle();
+    let mut seen = Vec::new();
+    let mut buffer = [0_u8; 256];
+    while !seen.ends_with(b"Z") {
+        let read = input.read(&mut buffer).expect("reads the console's input");
+        assert_ne!(read, 0, "the console's input ended");
+        seen.extend_from_slice(&buffer[..read]);
+        std::fs::write(directory.join("given"), &seen).expect("writes what was given");
+    }
+    print!("kr-bytes-end\r\n");
+    std::io::stdout().flush().expect("flushes the end");
+}
+
+/// KR-REQ-08.56: an application that asked for bracketed paste and for clicks only, in the original
+/// encoding, is told of a press and a release written at the outer console as the reports a
+/// terminal sends in the SGR encoding, in the original report it asked for.
+///
+/// With bracketed paste on the console spells the mouse as it spells the keys, as text, so the
+/// command takes the reports out of that text and tells the application of them as it would of the
+/// mouse's records: a press at column 10 and row 5 is `ESC [ M` and the bytes 32, 42 and 37, and a
+/// release, which the original report cannot say of a button, is the same with the code 35.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_click_at_an_attached_console_is_told_in_the_original_report_when_bracketed_paste_is_on()
+{
+    if std::env::var_os(BYTES_READER).is_some() {
+        bytes_reader_in_the_session();
+        return;
+    }
+    what_an_application_that_asked_for_is_given(
+        "a_click_at_an_attached_console_is_told_in_the_original_report_when_bracketed_paste_is_on",
+        "2004,1000",
+        &[b"\x1b[<0;10;5M", b"\x1b[<0;10;5m", b"Z"],
+        b"\x1b[M\x20\x2a\x25\x1b[M\x23\x2a\x25Z",
+    )
+    .await;
+}
+
+/// KR-REQ-08.56: an application that asked for bracketed paste, for a button held while the pointer
+/// moves and for the SGR encoding is told of a press, a drag and a wheel notch, and of no plain
+/// movement, which it did not ask for.
+///
+/// The reports are written at the outer console as a terminal sends them, the pointer moving to
+/// column 11 with the button held, the wheel turning up, the pointer moving with no button and the
+/// button coming up.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_press_a_drag_and_the_wheel_are_told_in_the_encoding_asked_for_when_bracketed_paste_is_on()
+ {
+    if std::env::var_os(BYTES_READER).is_some() {
+        bytes_reader_in_the_session();
+        return;
+    }
+    what_an_application_that_asked_for_is_given(
+        "a_press_a_drag_and_the_wheel_are_told_in_the_encoding_asked_for_when_bracketed_paste_is_on",
+        "2004,1002,1006",
+        &[
+            b"\x1b[<0;10;5M",
+            b"\x1b[<32;11;5M",
+            b"\x1b[<64;11;5M",
+            b"\x1b[<35;12;5M",
+            b"\x1b[<0;11;5m",
+            b"Z",
+        ],
+        b"\x1b[<0;10;5M\x1b[<32;11;5M\x1b[<64;11;5M\x1b[<0;11;5mZ",
+    )
+    .await;
+}
+
+/// KR-REQ-08.56: a paste's two markers and its text reach an application that has a mouse mode on
+/// whole, with the reports written before and after them told as the application asked for them.
+///
+/// The application asked for bracketed paste and for clicks in the original encoding. The console
+/// is written a press, the paste (`ESC [ 200 ~`, `12`, `ESC [ 201 ~`), a release and a capital
+/// letter: the markers are not mouse reports, and what is pasted between them is text.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_paste_between_two_mouse_reports_reaches_an_application_with_a_mouse_mode_on_whole() {
+    if std::env::var_os(BYTES_READER).is_some() {
+        bytes_reader_in_the_session();
+        return;
+    }
+    what_an_application_that_asked_for_is_given(
+        "a_paste_between_two_mouse_reports_reaches_an_application_with_a_mouse_mode_on_whole",
+        "2004,1000",
+        &[
+            b"\x1b[<0;10;5M",
+            b"\x1b[200~12\x1b[201~",
+            b"\x1b[<0;10;5m",
+            b"Z",
+        ],
+        b"\x1b[M\x20\x2a\x25\x1b[200~12\x1b[201~\x1b[M\x23\x2a\x25Z",
+    )
+    .await;
+}
+
+/// KR-REQ-08.56: a function key, Ctrl and Alt chords and Ctrl-C pressed at an attached console
+/// reach an application that has bracketed paste on as the sequences and bytes a terminal sends for
+/// them, which is what the console spells them as when it spells its keys itself.
+///
+/// The console is written each key in the documented record sequence, going down and coming up:
+/// F1, Ctrl+A, Alt+x and Ctrl+C. A key coming up is no text, so the application is given `ESC O P`,
+/// the byte 1, `ESC x` and the byte 3, and then the capital letter that ends what it reads.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_function_key_a_chord_and_ctrl_c_reach_an_application_with_bracketed_paste_on_as_bytes() {
+    if std::env::var_os(BYTES_READER).is_some() {
+        bytes_reader_in_the_session();
+        return;
+    }
+    what_an_application_that_asked_for_is_given(
+        "a_function_key_a_chord_and_ctrl_c_reach_an_application_with_bracketed_paste_on_as_bytes",
+        "2004",
+        &[
+            b"\x1b[112;59;0;1;0;1_",
+            b"\x1b[112;59;0;0;0;1_",
+            b"\x1b[65;30;1;1;8;1_",
+            b"\x1b[65;30;1;0;8;1_",
+            b"\x1b[88;45;120;1;2;1_",
+            b"\x1b[88;45;120;0;2;1_",
+            b"\x1b[67;46;3;1;8;1_",
+            b"\x1b[67;46;3;0;8;1_",
+            b"\x1b[90;44;90;1;16;1_",
+            b"\x1b[90;44;90;0;16;1_",
+        ],
+        b"\x1bOP\x01\x1bx\x03Z",
+    )
+    .await;
+}
+
+/// The variable that makes this test binary, started in a console of its own, run the console half
+/// of the test of the console's input mode while an application's bracketed paste is on.
+const PASTE_MODE_PROBE: &str = "KR_ATTACH_PASTE_MODE_PROBE";
+
+/// The console's input mode flag that has it spell the keys itself as the sequences a terminal sends.
+const ENABLE_VIRTUAL_TERMINAL_INPUT: u32 = 0x0200;
+
+/// The console's input mode flag that has a read return a whole line.
+const ENABLE_LINE_INPUT: u32 = 0x0002;
+
+/// KR-REQ-08.56: the console an attachment runs in spells its keys while the session's application
+/// has bracketed paste on and reports its keys as records again once it turns it off, so that a key
+/// coming up is a record then; and the console is given back in the modes it had, however many
+/// times it was switched, even when the attachment ends while the keys are spelled.
+///
+/// This test binary is started in a pseudo-console of its own, as the outer console of a person's
+/// attachment, and there it reads the console's input mode, starts the real `kr attach` for a
+/// session in that console, and reads the mode each time the application in the session changes
+/// what it asks. The application is PowerShell, which turns bracketed paste on, off and on again
+/// each once a file exists, and, between the first two, reads four events with the console's own
+/// call, key releases included. The test, outside, writes Shift going down, a letter going down and
+/// coming up and Shift coming up to the console the command runs in, and closes the session while
+/// bracketed paste is on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_console_spells_its_keys_while_bracketed_paste_is_on_and_is_given_back_as_it_was() {
+    const NAME: &str =
+        "the_console_spells_its_keys_while_bracketed_paste_is_on_and_is_given_back_as_it_was";
+    if std::env::var_os(PASTE_MODE_PROBE).is_some() {
+        paste_mode_probe_in_the_console();
+        return;
+    }
+
+    let host = WorkerHost::start().await;
+    let (session_id, dimensions) = host
+        .kr_new(&["--shell-mode", "native_compat", "--shell", &command_shell()])
+        .await
+        .session();
+    let environment = host.tree.environment();
+    let mut typist = WorkerTerminal::attach(&environment, session_id, dimensions).await;
+    let gates = tempfile::tempdir().expect("a directory on the internal disk");
+    let gates_at = gates.path().display().to_string();
+    typist
+        .type_line(&format!(
+            "powershell -NoProfile -Command \"Write-Host ('kr-rea' + 'dy.'); \
+             $esc = [string][char]27; \
+             while (-not (Test-Path '{gates_at}\\on')) {{ Start-Sleep -Milliseconds 20 }}; \
+             [Console]::Out.Write($esc + '[?2004h'); Write-Host ('kr-o' + 'n.'); \
+             while (-not (Test-Path '{gates_at}\\off')) {{ Start-Sleep -Milliseconds 20 }}; \
+             [Console]::Out.Write($esc + '[?2004l'); Write-Host ('kr-o' + 'ff.'); \
+             $seen = @(); \
+             while ($seen.Count -lt 4) {{ \
+               $key = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown,IncludeKeyUp'); \
+               if ($seen.Count -gt 0 -or $key.VirtualKeyCode -eq 16) {{ \
+                 $seen += ('{{0}}{{1}}' -f $key.VirtualKeyCode, $(if ($key.KeyDown) {{ 'd' }} else {{ 'u' }})) }} }}; \
+             Write-Host (('kr-events:' + ($seen -join ',') + ':kr-') + 'end'); \
+             while (-not (Test-Path '{gates_at}\\again')) {{ Start-Sleep -Milliseconds 20 }}; \
+             [Console]::Out.Write($esc + '[?2004h'); Write-Host ('kr-a' + 'gain.'); \
+             Start-Sleep -Seconds 300\""
+        ))
+        .await;
+    typist
+        .shown(
+            "kr-ready.",
+            "the application waits to turn bracketed paste on",
+        )
+        .await;
+
+    // The probe says what it reads of the console's mode in a file: the console it runs in is
+    // repainted by the command at the same time.
+    let report = gates.path().join("probe-report");
+    let mut probe = Probe::start_in(
+        NAME,
+        PASTE_MODE_PROBE,
+        &[
+            (
+                "KR_RUNTIME_DIR",
+                host.tree.paths().runtime_root().display().to_string(),
+            ),
+            (
+                "KR_STATE_DIR",
+                host.tree.paths().state_root().display().to_string(),
+            ),
+            ("KR_PROBE_SESSION", session_id.to_string()),
+            ("KR_PROBE_KR", kr().display().to_string()),
+            ("KR_PROBE_REPORT", report.display().to_string()),
+            ("TERM", "xterm-256color".to_owned()),
+        ],
+        u16::try_from(dimensions.rows.get()).expect("a console's rows"),
+        u16::try_from(dimensions.columns.get()).expect("a console's columns"),
+    );
+    probe_reports(&report, "kr-probe:inside:", &mut typist, &mut probe).await;
+    probe.waits_for("kr-ready.");
+    std::fs::write(gates.path().join("on"), b"on").expect("the file the application waits for");
+    typist
+        .shown("kr-on.", "the application turned bracketed paste on")
+        .await;
+    probe_reports(&report, "kr-probe:spelled:", &mut typist, &mut probe).await;
+    std::fs::write(gates.path().join("off"), b"off").expect("the file the application waits for");
+    typist
+        .shown("kr-off.", "the application turned bracketed paste off")
+        .await;
+    probe_reports(&report, "kr-probe:records:", &mut typist, &mut probe).await;
+    // Shift going down, the letter going down and coming up, and Shift coming up, in separate
+    // writes, as a person's key presses reach a console.
+    probe.press(b"\x1b[16;42;0;1;16;1_");
+    probe.press(b"\x1b[65;30;65;1;16;1_");
+    probe.press(b"\x1b[65;30;65;0;16;1_");
+    probe.press(b"\x1b[16;42;0;0;0;1_");
+    let seen = typist
+        .shown(":kr-end", "the application printed the events it was given")
+        .await;
+    assert!(
+        seen.contains("kr-events:16d,65d,65u,16u:kr-end"),
+        "the application was given Shift and A going down and coming up, as records, after \
+         bracketed paste was turned off: {seen:?}"
+    );
+    std::fs::write(gates.path().join("again"), b"again")
+        .expect("the file the application waits for");
+    typist
+        .shown(
+            "kr-again.",
+            "the application turned bracketed paste on again",
+        )
+        .await;
+    probe_reports(&report, "kr-probe:spelled-again:", &mut typist, &mut probe).await;
+    let closed = host.kr(&["close", &session_id.to_string()], &[]).await;
+    assert!(
+        closed.status.success(),
+        "kr close: {}{}",
+        String::from_utf8_lossy(&closed.stdout),
+        String::from_utf8_lossy(&closed.stderr)
+    );
+    let shown = probe_reports(&report, "kr-probe:end", &mut typist, &mut probe).await;
+    println!("{shown}");
+    let before = probed_modes(&shown, "kr-probe:before:");
+    let inside = probed_modes(&shown, "kr-probe:inside:");
+    let spelled = probed_modes(&shown, "kr-probe:spelled:");
+    let records = probed_modes(&shown, "kr-probe:records:");
+    let again = probed_modes(&shown, "kr-probe:spelled-again:");
+    let after = probed_modes(&shown, "kr-probe:after:");
+    assert_eq!(
+        inside.0 & ENABLE_VIRTUAL_TERMINAL_INPUT,
+        0,
+        "the console spelled its keys before the application asked for bracketed paste: {inside:x?}"
+    );
+    assert_ne!(
+        spelled.0 & ENABLE_VIRTUAL_TERMINAL_INPUT,
+        0,
+        "the console did not spell its keys while bracketed paste was on: {spelled:x?}"
+    );
+    assert_eq!(
+        records.0 & ENABLE_VIRTUAL_TERMINAL_INPUT,
+        0,
+        "the console went on spelling its keys after bracketed paste was turned off: {records:x?}"
+    );
+    assert_ne!(
+        again.0 & ENABLE_VIRTUAL_TERMINAL_INPUT,
+        0,
+        "the console did not spell its keys when bracketed paste was turned on again: {again:x?}"
+    );
+    assert_eq!(
+        after, before,
+        "the console's modes after the attachment, which ended while its keys were spelled, are \
+         not the ones before it (before {before:x?}, after {after:x?}): {shown:?}"
+    );
+}
+
+/// The console half of the test of the console's input mode while bracketed paste is on, run in a
+/// console of its own: waits for the input mode to say whether the console spells its keys, each
+/// time the application changes its request, and says the mode it reads in the file the variable
+/// `KR_PROBE_REPORT` names.
+fn paste_mode_probe_in_the_console() {
+    use kr_cli::platform::ControllingTerminal;
+
+    let variable = |name: &str| {
+        std::env::var_os(name).unwrap_or_else(|| panic!("{name} is set for the probe"))
+    };
+    let report = PathBuf::from(variable("KR_PROBE_REPORT"));
+    let say = |line: String| {
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&report)
+            .expect("the probe's report");
+        writeln!(file, "{line}").expect("writes the probe's report");
+    };
+    let console = ControllingTerminal::open().expect("this process has a console");
+    let before = console.modes().expect("the console's modes");
+    say(format!(
+        "kr-probe:before:{:x}:{:x}",
+        before.input, before.output
+    ));
+    let mut attach = std::process::Command::new(variable("KR_PROBE_KR"))
+        .arg("attach")
+        .arg(variable("KR_PROBE_SESSION"))
+        .spawn()
+        .expect("starts kr attach");
+    // The mode that says the console does what `wanted` says, once the command has put it there.
+    let waits_for = |attach: &mut std::process::Child, what: &str, wanted: &dyn Fn(u32) -> bool| {
+        let deadline = Instant::now() + LIVENESS_DEADLINE;
+        loop {
+            let now = console.modes().expect("the console's modes");
+            if wanted(now.input) {
+                return now;
+            }
+            assert!(
+                attach.try_wait().expect("the command's state").is_none(),
+                "kr attach ended before {what}"
+            );
+            assert!(
+                Instant::now() < deadline,
+                "the console's input mode did not show {what}: {:x}",
+                now.input
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
+    // The command has taken the console over once a read of it no longer returns a line.
+    let inside = waits_for(&mut attach, "the console taken over", &|input| {
+        input & ENABLE_LINE_INPUT == 0
+    });
+    say(format!(
+        "kr-probe:inside:{:x}:{:x}",
+        inside.input, inside.output
+    ));
+    for (word, spelled) in [
+        ("spelled", true),
+        ("records", false),
+        ("spelled-again", true),
+    ] {
+        let now = waits_for(
+            &mut attach,
+            "the console's keys spelled or given back as the application asked",
+            &|input| (input & ENABLE_VIRTUAL_TERMINAL_INPUT != 0) == spelled,
+        );
+        say(format!("kr-probe:{word}:{:x}:{:x}", now.input, now.output));
+    }
+    let status = attach.wait().expect("kr attach ends");
+    let after = console.modes().expect("the console's modes");
+    say(format!(
+        "kr-probe:after:{:x}:{:x}:attach {status}",
+        after.input, after.output
+    ));
+    say("kr-probe:end".to_owned());
+}
