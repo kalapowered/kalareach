@@ -279,12 +279,32 @@ struct Running {
     /// and it was applied.
     #[cfg(windows)]
     system_limit: Option<kr_ipc::memory_limit::MemoryLimit>,
-    /// The figure that limit was last set to, which the ceiling in force is compared with.
-    #[cfg(windows)]
+    /// The figure the limit around the process was last set to, which the ceiling in force is
+    /// compared with. Where the platform holds no such limit it is the ceiling the process was
+    /// last held to.
     system_limit_bytes: u64,
 }
 
 impl Running {
+    /// Has the system hold the process to `ceiling_bytes`, where the platform holds a limit around
+    /// it. A process the system holds no limit around has nothing to change: the daemon's own
+    /// reading, which follows the ceiling in force, is the only one there is.
+    #[cfg_attr(not(windows), allow(clippy::unused_self))]
+    fn hold_to(&self, ceiling_bytes: u64) -> std::result::Result<(), String> {
+        #[cfg(feature = "testing")]
+        if crate::testing::limit_update_refused() {
+            return Err("a test asked for it to be refused".to_owned());
+        }
+        #[cfg(windows)]
+        if let Some(limit) = self.system_limit.as_ref() {
+            return limit
+                .set_limit(ceiling_bytes)
+                .map_err(|why| why.to_string());
+        }
+        let _ = ceiling_bytes;
+        Ok(())
+    }
+
     /// Whether the control thread has said it has read a request to stop the job in hand, the
     /// daemon's own at the deadline or any cancellation of the job: the process's watchdog gives the
     /// job the stop bound in either case.
@@ -452,6 +472,15 @@ impl Driver {
     #[must_use]
     pub fn pid(&self) -> Option<u32> {
         self.process.as_ref().map(|running| running.child.id())
+    }
+
+    /// Returns the ceiling the running process is held to, as the limit around it was last set:
+    /// the ceiling in force at its start, or at the last turn that found the owner had changed it.
+    #[must_use]
+    pub fn limit_held_bytes(&self) -> Option<u64> {
+        self.process
+            .as_ref()
+            .map(|running| running.system_limit_bytes)
     }
 
     /// Returns the running process's start identity, as it gave it when it said it was ready.
@@ -935,7 +964,6 @@ impl Driver {
             next_sample_ms: u64::MAX,
             #[cfg(windows)]
             system_limit,
-            #[cfg(windows)]
             system_limit_bytes: self.service.ceiling_bytes(),
         });
         let hello = Request::Hello {
@@ -1219,7 +1247,6 @@ impl Driver {
     /// when the owner changed the ceiling while the process lives. A limit the system will not
     /// change is not left standing at the old figure: the process is ended, the next one is started
     /// under the new limit, and this says so.
-    #[cfg(windows)]
     fn follow_the_ceiling(&mut self, now: Reading, reports: &mut Vec<Report>) -> Result<()> {
         let ceiling = self.service.ceiling_bytes();
         let Some(running) = self.process.as_mut() else {
@@ -1228,13 +1255,7 @@ impl Driver {
         if running.system_limit_bytes == ceiling {
             return Ok(());
         }
-        let Some(limit) = running.system_limit.as_ref() else {
-            // The system holds no limit around this process, so the daemon's own reading, which
-            // follows the ceiling in force, is the only one there is.
-            running.system_limit_bytes = ceiling;
-            return Ok(());
-        };
-        match limit.set_limit(ceiling) {
+        match running.hold_to(ceiling) {
             Ok(()) => {
                 running.system_limit_bytes = ceiling;
                 Ok(())
@@ -1245,14 +1266,13 @@ impl Driver {
                      bytes ({why}), so the description process is ended and starts again under \
                      the new limit"
                 );
-                self.kill(ProcessEnd::MemoryCeiling, now, reports)
+                self.kill(ProcessEnd::LimitNotChanged, now, reports)
             }
         }
     }
 
     /// Ends a process that broke a bound.
     fn on_timers(&mut self, now: Reading, reports: &mut Vec<Report>) -> Result<()> {
-        #[cfg(windows)]
         self.follow_the_ceiling(now, reports)?;
         let Some(running) = self.process.as_mut() else {
             return Ok(());

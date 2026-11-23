@@ -335,6 +335,10 @@ pub enum ProcessEnd {
     /// A check of a file ran past its deadline. The daemon ended the process for a check that
     /// took too long, which says nothing of inference.
     CheckOverdue,
+    /// The owner changed the ceiling while the process lived and the system would not change the
+    /// limit it holds around the process to it. The daemon ended the process so that the next one
+    /// starts under the new limit; the process did nothing wrong.
+    LimitNotChanged,
     /// It passed the ceiling: its resident set did, or, on Windows, the system refused it a commit
     /// past the limit it holds at the ceiling.
     MemoryCeiling,
@@ -356,6 +360,7 @@ impl ProcessEnd {
             Self::CancelUnanswered => "cancel_unanswered",
             Self::StopOverdue => "stop_overdue",
             Self::CheckOverdue => "check_overdue",
+            Self::LimitNotChanged => "limit_not_changed",
             Self::MemoryCeiling => "memory_ceiling",
             Self::NotReading => "not_reading",
         }
@@ -364,12 +369,16 @@ impl ProcessEnd {
     /// Returns whether this end counts as a failure of inference: toward the failures in a row
     /// that pause it, and toward the delay before the next start.
     ///
-    /// An end the daemon causes to stop work it called off, or a check of a file that took too
-    /// long, lost nothing and says nothing of the model. Every other end is the process failing
-    /// to do what it was asked, or failing to listen.
+    /// An end the daemon causes to stop work it called off, a check of a file that took too long,
+    /// or a limit it could not change to a ceiling the owner moved, lost nothing and says nothing
+    /// of the model. Every other end is the process failing to do what it was asked, or failing
+    /// to listen.
     #[must_use]
     pub const fn is_failure(self) -> bool {
-        !matches!(self, Self::StopOverdue | Self::CheckOverdue)
+        !matches!(
+            self,
+            Self::StopOverdue | Self::CheckOverdue | Self::LimitNotChanged
+        )
     }
 }
 
@@ -1636,6 +1645,9 @@ impl DescriptionService {
                 ProcessEnd::CancelUnanswered | ProcessEnd::StopOverdue if *cancel_sent => {
                     LoadEnd::Cancelled
                 }
+                // A load the daemon ended for a limit it could not change was called off by the
+                // daemon, and says nothing of the model.
+                ProcessEnd::LimitNotChanged => LoadEnd::Cancelled,
                 _ => LoadEnd::Failed,
             };
             outcomes.push(Outcome::LoadEnded {
@@ -1650,9 +1662,11 @@ impl DescriptionService {
                 now,
                 (why == ProcessEnd::MemoryCeiling).then_some(PauseReason::MemoryPressure),
             );
-        } else if load_called_off {
+        } else if load_called_off || why == ProcessEnd::LimitNotChanged {
             // Not a failure of inference, but a host that is near the reserve would otherwise admit
-            // a load, call it off and end the process in a loop with nothing between.
+            // a load, call it off and end the process in a loop with nothing between; and one
+            // whose system will not change a limit would otherwise end and start a process at
+            // every turn.
             self.restart.paced(now);
         }
         if why == ProcessEnd::MemoryCeiling {
@@ -2409,6 +2423,12 @@ impl DescriptionService {
                 }
                 self.counts.deadline_exceeded = self.counts.deadline_exceeded.saturating_add(1);
                 Outcome::DeadlineExceeded { session_id }
+            }
+            // The owner moved the ceiling and the system would not move the limit around the
+            // process, so the daemon ended it: the job lost nothing, and runs again in the process
+            // that starts under the new limit.
+            ProcessEnd::LimitNotChanged => {
+                self.ended_as_stopped_or(dispatched, |service, job| service.requeue(job, false))
             }
             // A job that was being stopped, or whose session is gone, ends as that made it when
             // the daemon ended the process for its ceiling. The job runs again after a pause, and

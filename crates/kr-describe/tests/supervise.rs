@@ -2823,6 +2823,154 @@ fn a_start_that_panics_after_creating_the_process_leaves_no_held_process() {
     }
 }
 
+/// KR-REQ-22.10: a limit the system will not change when the owner changes the ceiling ends the
+/// process as nothing the process did. The job in it goes back in the queue and is sent again to
+/// the next process, which starts under the new limit after the restart's wait; no failure of
+/// inference is counted, inference is not paused for memory, and the end is named for what it is.
+#[test]
+fn a_limit_the_system_will_not_change_ends_the_process_and_queues_its_job_again() {
+    use kr_describe::testing::the_system_refuses_the_next_limit_update;
+
+    let (catalogue, _) = tiny();
+    let fits = catalogue
+        .catalogue()
+        .default_profile()
+        .execution()
+        .resident_estimate
+        .total();
+    let before = fits + GIB;
+    let after = fits + GIB / 2;
+    let mut rig = Rig::limited(
+        &Script {
+            generate_until_cancelled: true,
+            mark_work: true,
+            ..Script::default()
+        },
+        ResourceSettings {
+            owner_ceiling_bytes: Some(before),
+            ..ResourceSettings::default()
+        },
+        Some(&catalogue),
+        true,
+    );
+    queue(rig.service(), &session(1), Priority::Ordinary, at(0));
+    rig.job_sent(at(3_000));
+    assert_eq!(rig.driver.limit_held_bytes(), Some(before));
+
+    rig.service().set_owner_budgets(Some(after), None);
+    the_system_refuses_the_next_limit_update();
+    let reports = rig.until(&roomy(), at(3_000), "the process ended", |reports, _| {
+        the_process_ended(reports)
+    });
+    let ended = outcomes(&reports);
+    assert!(
+        ended.contains(&&Outcome::ProcessEnded {
+            why: ProcessEnd::LimitNotChanged
+        }),
+        "{reports:?}"
+    );
+    assert!(
+        ended
+            .iter()
+            .any(|outcome| matches!(outcome, Outcome::Requeued { session_id } if *session_id == session(1))),
+        "the job is queued again: {reports:?}"
+    );
+    assert!(
+        !ended
+            .iter()
+            .any(|outcome| matches!(outcome, Outcome::Failed { .. })),
+        "and it did not fail: {reports:?}"
+    );
+    assert_eq!(rig.driver.pid(), None, "the process is gone");
+    let service = rig.driver.service();
+    assert_eq!(service.inference_restarts(), 0, "no failure of inference");
+    assert!(
+        !matches!(
+            service.resource_state(),
+            ResourceState::ResourcePaused {
+                reason: PauseReason::MemoryPressure,
+                ..
+            }
+        ),
+        "{:?}",
+        service.resource_state()
+    );
+    assert_eq!(
+        service.restart_not_before_ms(),
+        Some(3_000 + RESTART_FIRST_MS),
+        "the restart is paced"
+    );
+
+    // After the wait the next process starts under the new limit and is sent the job again.
+    rig.until(
+        &roomy(),
+        at(3_000 + RESTART_FIRST_MS),
+        "the job is sent again",
+        |_, driver| driver.service().in_flight() == 1,
+    );
+    assert_eq!(rig.driver.started(), 2);
+    assert_eq!(rig.driver.limit_held_bytes(), Some(after));
+}
+
+/// KR-REQ-22.10: the same end while a model is loading: the load ends cancelled, which says
+/// nothing of the model, with the cause in its detail; no failure of inference is counted and the
+/// next load waits the restart's moment.
+#[test]
+fn a_limit_the_system_will_not_change_ends_a_load_as_cancelled_and_no_failure() {
+    use kr_describe::testing::the_system_refuses_the_next_limit_update;
+
+    let (catalogue, _) = tiny();
+    let fits = catalogue
+        .catalogue()
+        .default_profile()
+        .execution()
+        .resident_estimate
+        .total();
+    let mut rig = Rig::limited(
+        &Script {
+            load_until_cancelled: true,
+            mark_work: true,
+            ..Script::default()
+        },
+        ResourceSettings {
+            owner_ceiling_bytes: Some(fits + GIB),
+            ..ResourceSettings::default()
+        },
+        Some(&catalogue),
+        true,
+    );
+    queue(rig.service(), &session(1), Priority::Ordinary, at(0));
+    rig.until(&roomy(), at(3_000), "the load is sent", |_, driver| {
+        driver.service().is_loading()
+    });
+
+    rig.service().set_owner_budgets(Some(fits + GIB / 2), None);
+    the_system_refuses_the_next_limit_update();
+    let reports = rig.until(&roomy(), at(3_000), "the process ended", |reports, _| {
+        the_process_ended(reports)
+    });
+    let ended = outcomes(&reports);
+    assert!(
+        ended.contains(&&Outcome::LoadEnded {
+            why: LoadEnd::Cancelled,
+            detail: Some("the description process ended: limit_not_changed".to_owned()),
+        }),
+        "{reports:?}"
+    );
+    assert!(
+        ended.contains(&&Outcome::ProcessEnded {
+            why: ProcessEnd::LimitNotChanged
+        }),
+        "{reports:?}"
+    );
+    let service = rig.driver.service();
+    assert_eq!(service.inference_restarts(), 0, "no failure of inference");
+    assert_eq!(
+        service.restart_not_before_ms(),
+        Some(3_000 + RESTART_FIRST_MS)
+    );
+}
+
 /// What a process that the system refused memory comes to, whatever the platform: the end is the
 /// ceiling, inference pauses with `memory_pressure`, and no second process is started for the work.
 fn the_process_ended_for_want_of_memory(rig: &Rig, reports: &[Report]) {

@@ -486,6 +486,10 @@ thread_local! {
     /// driver last asked.
     static MEMORY_REFUSED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 
+    /// Whether the system is to refuse the next change of the limit it holds around the process of
+    /// a driver on this thread.
+    static LIMIT_UPDATE_REFUSED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+
     /// What runs the next time a driver on this thread is about to put its process behind the
     /// system's memory limit.
     #[cfg(windows)]
@@ -527,6 +531,20 @@ pub fn the_system_refuses_the_process_memory() {
 /// forgets it.
 pub(crate) fn memory_refusal_taken() -> bool {
     MEMORY_REFUSED.with(|refused| refused.replace(false))
+}
+
+/// Makes the driver on this thread find, the next time it brings the limit around its process to a
+/// ceiling the owner changed, that the system will not change it, as a platform that holds such a
+/// limit can answer. It is found once. This is how the driver's answer to that refusal is shown on a
+/// platform with no such limit.
+pub fn the_system_refuses_the_next_limit_update() {
+    LIMIT_UPDATE_REFUSED.with(|refused| refused.set(true));
+}
+
+/// Returns whether the system is to refuse the next change of the limit around the process, and
+/// forgets it.
+pub(crate) fn limit_update_refused() -> bool {
+    LIMIT_UPDATE_REFUSED.with(|refused| refused.replace(false))
 }
 
 /// Makes the next time a driver on this thread lets its process run fail as a request the
