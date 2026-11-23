@@ -156,7 +156,7 @@ async fn until(host: &Host, state: CapabilityChecksState) -> EnvironmentCapabili
 /// The read check is the one every context performs, so it is the one this shows end to end: a file
 /// the owner named is read in the worker, the record is a disclosed probe naming the session whose
 /// worker read it, and it stays when the file is gone because it is what was found, not a reading
-/// of the file. A device is shown the same record with the path withheld. An exact repeat of the
+/// of the file. A device is shown the same record, which names no path. An exact repeat of the
 /// action is answered from what was kept and starts no second run.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn the_owner_asks_for_the_checks_and_the_findings_stand_in_the_records() {
@@ -244,8 +244,8 @@ async fn the_owner_asks_for_the_checks_and_the_findings_stand_in_the_records() {
         Some((record.state, record.observed_at_ms)),
     );
 
-    // A device sees the finding with the path withheld, and cannot ask for the checks: the method
-    // is the owner's socket's alone.
+    // A device sees the finding with no path, and cannot ask for the checks: the method is the
+    // owner's socket's alone.
     let (_device, device) =
         net_support::paired_device(host, &adopted.owner, &[ActionRight::SessionView]).await;
     let remote: EnvironmentCapabilitiesResult = device
@@ -262,14 +262,10 @@ async fn the_owner_asks_for_the_checks_and_the_findings_stand_in_the_records() {
         .record(capabilities::AUTHORISED_FILE_READ)
         .expect("the device is shown the finding");
     assert_eq!(remote_record.state, CapabilityState::QualifiedAvailable);
-    assert!(
-        remote_record
-            .identity
-            .binary
-            .as_ref()
-            .is_some_and(|binary| binary.starts_with("[path withheld")),
-        "{:?}",
-        remote_record.identity.binary
+    assert_eq!(
+        remote_record.identity.binary.as_ref(),
+        None,
+        "the read check runs no installed program, so its record names none"
     );
     assert_eq!(remote.checks.state, CapabilityChecksState::Current);
 
@@ -295,6 +291,103 @@ async fn the_owner_asks_for_the_checks_and_the_findings_stand_in_the_records() {
         "{refused:?}"
     );
     assert_eq!(shown(host).await.checks, done.checks, "no run was started");
+
+    device.close();
+    adopted.stop().await;
+}
+
+/// Whether any file under `root` holds `needle`, and which.
+fn a_file_under_holds(root: &std::path::Path, needle: &[u8]) -> Option<std::path::PathBuf> {
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        for entry in std::fs::read_dir(&directory).expect("reads a directory of the tree") {
+            let entry = entry.expect("an entry of the tree");
+            let kind = entry.file_type().expect("the entry's type");
+            if kind.is_dir() {
+                pending.push(entry.path());
+            } else if kind.is_file() {
+                let bytes = std::fs::read(entry.path()).expect("reads a file of the tree");
+                if bytes.windows(needle.len()).any(|window| window == needle) {
+                    return Some(entry.path());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// KR-REQ-03.29: the file the owner nominated is named in no record the daemon shows or keeps.
+///
+/// The reason says the file as its class and its length. The record's `identity.binary` names an
+/// installed program, and the read check runs none, so it is null: a person's path never travels
+/// in a field the export boundary would have to withhold a second time, with the length of the
+/// withheld text. The owner's reply, a paired device's reply and every file this host's tree holds
+/// after the run carry no part of the path, whose last component holds a marker nothing else could
+/// say.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn the_nominated_path_is_in_no_record_the_daemon_shows_or_keeps() {
+    let adopted = Adopted::start_with_document(1, &headless()).await;
+    let host = &adopted.host;
+
+    let directory = tempfile::tempdir().expect("a directory of this test's own");
+    let marker = format!("kr-nominated-{}", kr_ipc::new_uuid());
+    let file = directory.path().join(format!("{marker}.txt"));
+    std::fs::write(&file, b"the person nominated this").expect("the test's file");
+    let path_bytes = file.display().to_string().len();
+
+    ask(host, ActionId::new(kr_ipc::new_uuid()), Some(&file))
+        .await
+        .expect("asked");
+    let owner = until(host, CapabilityChecksState::Current).await;
+    let (_device, device) =
+        net_support::paired_device(host, &adopted.owner, &[ActionRight::SessionView]).await;
+    let remote: EnvironmentCapabilitiesResult = device
+        .read(
+            Method::EnvironmentCapabilities,
+            &EnvironmentCapabilitiesParams {
+                environment_id: host.environment_id,
+            },
+        )
+        .await
+        .expect("environment.capabilities is served to the device");
+
+    for (reader, shown) in [("the owner", &owner), ("a paired device", &remote)] {
+        let record = shown
+            .desktop
+            .record(capabilities::AUTHORISED_FILE_READ)
+            .unwrap_or_else(|| panic!("{reader} is shown the read check's record"));
+        assert_eq!(
+            record.state,
+            CapabilityState::QualifiedAvailable,
+            "{reader}"
+        );
+        assert_eq!(
+            record.identity.binary.as_ref(),
+            None,
+            "{reader}: the read check runs no installed program, so its record names none"
+        );
+        let text = serde_json::to_string(shown).expect("the reply as text");
+        assert!(
+            !text.contains(&marker),
+            "{reader} is shown the nominated path: {text}"
+        );
+    }
+    let withheld = format!("[path withheld, {path_bytes} bytes]");
+    let reason = owner
+        .desktop
+        .record(capabilities::AUTHORISED_FILE_READ)
+        .and_then(|record| record.disabled_reason.as_ref())
+        .expect("the owner is told what the read came to");
+    assert!(
+        reason.as_str().contains(&withheld),
+        "the reason says the file as its class and its length: {reason}"
+    );
+
+    // Nothing the host keeps holds the path either: the answer to the request, the findings and
+    // the rest of its tree.
+    if let Some(found) = a_file_under_holds(host.tree().root(), marker.as_bytes()) {
+        panic!("the host keeps the nominated path in {}", found.display());
+    }
 
     device.close();
     adopted.stop().await;

@@ -5928,7 +5928,7 @@ function capabilityRecord(
   capability: string,
   grantedNow: boolean,
   revision: number,
-  detail: { readonly permission: string; readonly binary: string; readonly probed: boolean }
+  detail: { readonly permission: string; readonly binary: string | null; readonly probed: boolean }
 ): CapabilityRecord {
   return {
     capability,
@@ -5977,7 +5977,7 @@ function capabilities(
   const record = (
     capability: string,
     permission: string,
-    binary: string,
+    binary: string | null,
     probed = true
   ): CapabilityRecord =>
     capabilityRecord(capability, granted.has(capability), revision, { permission, binary, probed })
@@ -6007,7 +6007,7 @@ function capabilities(
       records: [
         record('desktop.accessibility', 'Accessibility', '/usr/bin/osascript'),
         record('desktop.application_launch', 'nothing', '/usr/bin/open'),
-        record('desktop.authorised_file_read', 'Full Disk Access', '/Users/sam/Documents/kalareach-check.txt'),
+        record('desktop.authorised_file_read', 'Full Disk Access', null),
         record('desktop.display_server', 'nothing', 'Aqua'),
         record('desktop.input_injection', 'Accessibility', '/usr/bin/osascript', false),
         record('desktop.screen_capture', 'Screen & System Audio Recording', '/usr/sbin/screencapture')

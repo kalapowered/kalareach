@@ -101,16 +101,6 @@ impl Check {
         }
     }
 
-    /// Whether the thing this check acts through is an installed facility with an identity.
-    ///
-    /// Four of them run a program, and replacing that program invalidates what was established
-    /// about it. The read check acts on a file the person nominated, which is theirs rather than
-    /// an installed thing, and it reads only the first block of it by design.
-    #[must_use]
-    pub const fn digests_its_facility(self) -> bool {
-        !matches!(self, Self::AuthorisedFileRead)
-    }
-
     /// What this check does, declared before it is run.
     #[must_use]
     pub const fn effects(self) -> Effects {
@@ -276,6 +266,10 @@ pub struct Ran {
     /// The check.
     pub check: Check,
     /// The facility it performed the operation with, by absolute path, where it found one.
+    ///
+    /// A facility is a program the platform installs, and the record names it and digests it. A
+    /// file the person nominated is not one: the read check has none, so no record names the
+    /// person's path, and the reason says it as its class and its length.
     pub facility: Option<String>,
     /// What came of it.
     pub outcome: Outcome,
@@ -410,14 +404,7 @@ pub fn record(
     observed_at_ms: kr_protocol::scalars::TimestampMs,
 ) -> Option<CapabilityRecord> {
     let (state, evidence, reason) = judge(ran.check, &ran.outcome);
-    // Only a facility this check ran is digested. The read check's "facility" is the person's own
-    // file, and reading a document to the end to put a digest of it in a diagnostic is not
-    // something a diagnostic should do, nor is it what the check disclosed.
-    let identity = if ran.check.digests_its_facility() {
-        ran.facility.as_deref().and_then(facility_identity)
-    } else {
-        None
-    };
+    let identity = ran.facility.as_deref().and_then(facility_identity);
     Some(CapabilityRecord {
         capability: CapabilityId::new(ran.check.capability()).ok()?,
         version: U64::new(CAPABILITY_VERSION),
@@ -612,7 +599,6 @@ fn read_authorised_file_with(
             },
         };
     };
-    let facility = Some(path.display().to_string());
     // The path is opened once and everything after is asked of that handle, so a file replaced by
     // a pipe or a device between a look and a read is not read at all. The open itself does not
     // wait for the other end of a pipe, and the whole check answers inside its own bound whatever
@@ -662,7 +648,7 @@ fn read_authorised_file_with(
     };
     Ran {
         check,
-        facility,
+        facility: None,
         outcome,
     }
 }
@@ -2027,7 +2013,6 @@ mod tests {
         let elapsed = began.elapsed();
 
         assert_eq!(ran.check, Check::AuthorisedFileRead);
-        assert_eq!(ran.facility, Some(file.display().to_string()));
         let Outcome::NotAttempted { detail } = &ran.outcome else {
             panic!(
                 "the file check did not answer that it was not attempted: {:?}",
