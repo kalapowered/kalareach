@@ -435,11 +435,13 @@ struct Live {
     /// makes its sender, and never cleared. An upload that a stop took before any start has not been
     /// started.
     started: AtomicBool,
-    /// Whether the copy of this never-started upload was removed while the desk went on holding it
-    /// (a cleanup that stopped it still owned it, or it was paused): set under the gate by
-    /// [`Registry::drop_admitted`] and never cleared. Nothing is left to send or resume it from, so
-    /// no start takes an upload that carries it: the decision that would start or pause it, and
-    /// every start, end it instead.
+    /// Whether the send of this never-started upload ended before any start, and its copy, if it
+    /// had one, is gone, while the desk went on holding the upload (a cleanup that stopped it still
+    /// owned it, or it was paused): set under the gate by [`Registry::drop_admitted`] and never
+    /// cleared. Nothing is left to send or resume it from, so nothing starts an upload that
+    /// carries it. The decision ends it when no cancel is owed, and so does a start of an admitted
+    /// or paused upload. With a cancel owed a start refuses it and the decision pauses it, as for
+    /// any upload, and the cancel is finished as it is for any other.
     copy_gone: AtomicBool,
 }
 
@@ -926,13 +928,15 @@ impl Registry {
     /// the gate. A cleanup may have stopped the upload and let the key be used again, and then
     /// neither the upload nor the copy is this send's to remove. An upload that a start has moved
     /// to `Sending`, the send's own or a cleanup's resolution, is held until its sender ends it:
-    /// its copy is what a resume reads, so it stays. A panic between the
-    /// start's change of the phase and the task it makes leaves the upload held with no sender,
-    /// and nothing here ends that. An upload that no start moved loses the copy in any phase, and
-    /// leaves the desk here only while it is `Admitted`. A cleanup that stopped it holds it
-    /// `Stopping` until the cleanup ends it, and a copy this send placed after the cleanup removed
-    /// the files goes. An upload that stays held then carries `copy_gone`: it has nothing to send
-    /// or resume from, so no start takes it, and the cleanup's resolution or the next start ends it.
+    /// its copy is what a resume reads, so it stays. A panic between the start's change of the
+    /// phase and the task it makes leaves the upload held with no sender, and nothing here ends
+    /// that. An upload that no start moved loses its copy, if it had one, in any phase, and leaves
+    /// the desk here only while it is `Admitted`. A cleanup that stopped it holds it `Stopping`
+    /// until the cleanup ends it, and a copy this send placed after the cleanup removed the files
+    /// goes. An upload that stays held then carries `copy_gone`: its send ended before any start
+    /// and its copy, if it had one, is gone, so nothing is left to send or resume it from. No
+    /// start takes it; unless a cancel is owed, the cleanup's resolution or the next start of a
+    /// paused upload ends it.
     fn drop_admitted(&mut self, store: &Store, live: &Arc<Live>) {
         let ours = self
             .held
@@ -1109,8 +1113,8 @@ impl Stopped<'_> {
     }
 
     /// The one resolution of the stop: a published record ends the upload, and anything else goes
-    /// through the decision section, which ends an upload whose copy was removed meanwhile. Runs
-    /// once.
+    /// through the decision section, which ends an upload that carries `copy_gone` unless a cancel
+    /// is owed. Runs once.
     fn resolve(&mut self) {
         if self.resolved {
             return;
@@ -1492,7 +1496,7 @@ impl Desk {
             // A refused send ends its admission like one that failed before its start: a cleanup may
             // have ended this upload and let the key be used again, and then the copy is another
             // upload's and stays. An upload that a start moved to `Sending` meanwhile keeps its
-            // copy, and one that a cleanup still holds loses it and is ended, never started.
+            // copy, and one that a cleanup still holds loses it and is never started.
             if !started {
                 registry.drop_admitted(store, live);
             }
@@ -1530,9 +1534,10 @@ impl Desk {
     /// so an upload has one task, and a connection of another sign-in or of an older pairing never
     /// carries the upload. The task and its handle are made here, in one step under the gate, so a
     /// stop finds the handle. An upload just admitted that is refused for its pairing is ended, and
-    /// so is an admitted or paused one whose copy was removed, which has nothing to send or resume
-    /// from. A stopping one is refused first: the cleanup that holds it ends it, and its key is
-    /// not free before.
+    /// so is an admitted or paused one that carries `copy_gone`: its send ended before any start
+    /// and its copy, if it had one, is gone, so it has nothing to send or resume from. An upload
+    /// whose cancel is owed is refused before that check, and one that is stopping is refused
+    /// first: the cleanup that holds it ends it, and its key is not free before.
     fn start_under(
         self: &Arc<Self>,
         registry: &mut Registry,
@@ -1572,10 +1577,10 @@ impl Desk {
             if !matches!(*phase, Phase::Admitted | Phase::Paused) {
                 return false;
             }
-            // An upload whose copy was removed has nothing to send or resume from. It ends here,
+            // An upload that carries `copy_gone` has nothing to send or resume from. It ends here,
             // in the one section every start goes through, and its key is free again. A stopping
             // upload is refused above: the cleanup that holds it ends it, and the key stays
-            // unavailable until it does.
+            // unavailable until it does. A cancel owed was refused before.
             if live.copy_gone.load(Ordering::Acquire) {
                 drop(phase);
                 Self::end_under(registry, live, Outcome::Cancelled);
@@ -2675,8 +2680,9 @@ impl Desk {
     /// `failed` is the outcome a sender's command ends with when the upload stays for a later
     /// connection; it is written in the same section.
     ///
-    /// An upload whose copy `drop_admitted` removed, and whose cancel is not owed, is ended: it has
-    /// nothing to send or resume from, so it is neither started nor paused.
+    /// An upload that carries `copy_gone` (its send ended before any start, and its copy, if it had
+    /// one, is gone) and whose cancel is not owed is ended: it has nothing to send or resume from,
+    /// so it is neither started nor paused. One whose cancel is owed takes the path below.
     ///
     /// An upload that nothing owes is started on the newest connection of its account when that is
     /// newer than every connection `used` names. An upload whose cancel is owed, or one that a reach
@@ -2713,8 +2719,9 @@ impl Desk {
         let seen = live.reached.load(Ordering::Acquire);
         let owed =
             registry.cancelled.contains(&live.key) || live.cancel_asked.load(Ordering::Acquire);
-        // An upload whose copy was removed has nothing to send or resume from: with no cancel owed
-        // it ends here, and is neither paused for a later start nor started.
+        // An upload that carries `copy_gone` has nothing to send or resume from: with no cancel
+        // owed it ends here, and is neither paused for a later start nor started. With a cancel
+        // owed it takes the path below.
         if live.copy_gone.load(Ordering::Acquire) && !owed {
             Self::end_under(&mut registry, live, Outcome::Cancelled);
             return;
