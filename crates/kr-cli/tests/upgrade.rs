@@ -98,11 +98,9 @@ impl Previous {
             the_root(),
         );
         assembled.manifest.commit = CommitId::new(self.commit.clone()).expect("a commit");
-        // Its manifest is the one that build wrote, as long as the release before is one built
-        // before the manifest said what each shell package is made of, as every retained release
-        // is: a rollback to it reads that document, and the release's own `kr` reads it when it
-        // installs. A later release before this one writes the form of its own build.
-        assembled = assembled.written_by_an_earlier_build();
+        // Its manifest has the form this build writes, which is the form that release's own build
+        // wrote: every retained release states its agent builds, its pinned libraries and what each
+        // shell package is made of, and a rollback to it reads that document.
         // The stores the release declares it reads are its own, and not this build's: a store this
         // build raised or added is one the release before refuses or does not name, and a rollback
         // to it has to be decided by what the release says it reads, not left to a daemon that
@@ -619,14 +617,6 @@ fn build_previous(commit: &str) -> PathBuf {
 /// The extra levels this build retains besides its own are named in the manifest of a release
 /// assembled here, as a real release names them.
 impl Assembled {
-    /// This release as a build before this one wrote it, which the release before this one is: its
-    /// manifest has no `agents` and no `dependencies`, and each shell package it lists states its
-    /// identity and the revisions of its patches, which is all that build had to say of one.
-    fn written_by_an_earlier_build(mut self) -> Self {
-        self.earlier = true;
-        self
-    }
-
     /// This release as one that names every level this build speaks at, as its manifest does.
     fn retaining_what_this_build_does(mut self) -> Self {
         self.manifest.retained_levels = kr_protocol::retained::levels();

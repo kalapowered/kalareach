@@ -633,9 +633,6 @@ struct Assembled {
     /// Programs of the release written from these bytes in place of the workspace's own, by the name
     /// they have in `bin/`.
     written: Vec<(String, Vec<u8>)>,
-    /// Whether the manifest is written as a build before this one wrote it, which states no agent
-    /// builds and no pinned libraries, and lists a shell package by its revisions of patches alone.
-    earlier: bool,
 }
 
 impl Assembled {
@@ -725,7 +722,6 @@ impl Assembled {
             root: root.to_owned(),
             programs,
             written: Vec::new(),
-            earlier: false,
         }
     }
 
@@ -740,35 +736,9 @@ impl Assembled {
         )
     }
 
-    /// The members the manifest is signed over: what this build serialises, or with `earlier` what
-    /// the build before it wrote.
+    /// The members the manifest is signed over, as this build serialises them.
     fn members(&self) -> SignedMembers {
-        let members = SignedMembers::of(&self.manifest).expect("members");
-        if !self.earlier {
-            return members;
-        }
-        let mut document = serde_json::to_value(&members).expect("a document");
-        let object = document.as_object_mut().expect("a manifest is an object");
-        object.remove("agents");
-        object.remove("dependencies");
-        let earlier_shells: Vec<Value> = self
-            .manifest
-            .shells
-            .iter()
-            .map(|shell| {
-                serde_json::json!({
-                    "shell": shell.shell,
-                    "identity": shell.identity,
-                    "patch_revisions": shell
-                        .patches
-                        .iter()
-                        .map(|patch| patch.revision.as_str())
-                        .collect::<Vec<_>>(),
-                })
-            })
-            .collect();
-        object.insert("shells".to_owned(), Value::Array(earlier_shells));
-        serde_json::from_value(document).expect("members again")
+        SignedMembers::of(&self.manifest).expect("members")
     }
 
     /// This release as one whose table of public majors lists `majors` and no other.
