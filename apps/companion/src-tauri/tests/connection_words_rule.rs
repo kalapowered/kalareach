@@ -162,7 +162,7 @@ struct Exception {
 
 /// Every place outside `HOME` that reads a code or words or handles a refused connection, and why it
 /// does not decide what a connection that was not opened means.
-const EXCEPTIONS: [Exception; 84] = [
+const EXCEPTIONS: [Exception; 83] = [
     Exception {
         file: "account/mod.rs",
         function: "usage",
@@ -400,13 +400,6 @@ const EXCEPTIONS: [Exception; 84] = [
         needle: COMPARED,
         lines: 1,
         reason: "the end of a send on a held session whose outcome the answer left unknown, answered on a connection that is open; it decides nothing about a connection that was not opened",
-    },
-    Exception {
-        file: "paired_drafts.rs",
-        function: "at_the_bound",
-        needle: COMPARED,
-        lines: 1,
-        reason: "the host's refusal of a draft's creation for its bound on open drafts, answered on a connection that is open; it decides nothing about a connection that was not opened",
     },
     Exception {
         file: "paired_drafts.rs",
