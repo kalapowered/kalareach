@@ -60,6 +60,7 @@ impl ObservationGap {
 }
 
 /// What a drain produced.
+#[cfg(any(test, feature = "testing"))]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Drained {
     /// The gap that preceded these events, where there was one.
@@ -109,12 +110,14 @@ impl ObservationQueue {
 
     /// Returns how many bytes the queue holds.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn held_bytes(&self) -> u64 {
         self.held_bytes
     }
 
     /// Returns how many events the queue holds.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn len(&self) -> usize {
         self.events.len()
     }
@@ -127,6 +130,7 @@ impl ObservationQueue {
 
     /// Returns true when the component must take a fresh snapshot before its document is trusted.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn snapshot_required(&self) -> bool {
         self.snapshot_owed != 0
     }
@@ -253,6 +257,7 @@ impl ObservationQueue {
     }
 
     /// Takes up to `limit` events, with the gap that precedes them.
+    #[cfg(any(test, feature = "testing"))]
     pub fn drain(&mut self, limit: usize) -> Drained {
         let gap = (!self.gap.is_empty()).then(|| core::mem::take(&mut self.gap));
         let mut events = Vec::new();

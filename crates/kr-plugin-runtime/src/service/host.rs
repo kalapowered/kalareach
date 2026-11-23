@@ -385,12 +385,14 @@ impl PluginHost {
 
     /// Returns the runtime the host serves.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn runtime(&self) -> &Arc<Runtime> {
         &self.runtime
     }
 
     /// Returns what the host was started with.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn config(&self) -> &HostConfig {
         &self.config
     }
@@ -403,6 +405,7 @@ impl PluginHost {
     /// # Errors
     ///
     /// Returns [`LaunchError::Endpoint`] when the endpoint cannot be bound.
+    #[cfg(any(test, feature = "testing"))]
     pub async fn serve(
         self: Arc<Self>,
         shutdown: impl core::future::Future<Output = ()> + Send,

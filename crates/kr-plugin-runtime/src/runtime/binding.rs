@@ -254,6 +254,7 @@ impl BindingOwner {
 
     /// Returns the raw identifier, for a health report or a record.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn get(self) -> u64 {
         self.0
     }
@@ -336,6 +337,7 @@ pub enum Unbound {
 impl Unbound {
     /// Returns whether there was anything to remove.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn existed(self) -> bool {
         !matches!(self, Self::Absent)
     }
@@ -411,6 +413,7 @@ impl Runtime {
     /// An identifier another owner holds is not found, which is the point: an identifier is not a
     /// capability, and a caller that guessed one gets the same answer as a caller that invented one.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn binding(
         &self,
         owner: BindingOwner,
@@ -616,6 +619,7 @@ impl Runtime {
     /// Returns the compilation, instantiation or `bind` failure, or
     /// [`RuntimeError::CallerDeadline`] when the whole preparation does not finish inside
     /// `deadline`.
+    #[cfg(any(test, feature = "testing"))]
     pub async fn prepare(
         self: &Arc<Self>,
         owner: BindingOwner,
@@ -856,6 +860,7 @@ impl Compilation {
     /// # Errors
     ///
     /// Returns the compilation failure when it has finished and failed.
+    #[cfg(any(test, feature = "testing"))]
     pub fn poll(&mut self) -> Option<RuntimeResult<Compiled>> {
         match self.wait.try_recv() {
             Ok(outcome) => Some(outcome),
@@ -1069,6 +1074,7 @@ impl BindingHandle {
 
     /// Returns the plugin identity the binding is running.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn identity(&self) -> &PluginIdentity {
         &self.request.identity
     }
@@ -1081,6 +1087,7 @@ impl BindingHandle {
 
     /// Returns how many bytes the observation queue holds.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn queued_bytes(&self) -> u64 {
         self.queue.lock().map_or(0, |queue| queue.held_bytes())
     }
@@ -1121,6 +1128,7 @@ impl BindingHandle {
 
     /// Returns true when the component owes a fresh snapshot.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn snapshot_required(&self) -> bool {
         self.queue
             .lock()

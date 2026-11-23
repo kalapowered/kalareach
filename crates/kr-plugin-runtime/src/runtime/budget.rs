@@ -82,6 +82,7 @@ pub enum CallKind {
 
 impl CallKind {
     /// Every call kind, in the order the contract lists the exports.
+    #[cfg(any(test, feature = "testing"))]
     pub const ALL: &'static [Self] = &[
         Self::Bind,
         Self::Observe,
@@ -110,6 +111,7 @@ impl CallKind {
 
     /// Returns the call kind for an export name.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn from_wire(value: &str) -> Option<Self> {
         Self::ALL
             .iter()
@@ -139,6 +141,7 @@ impl CallKind {
     /// dispatches. Neither export has a way to reach the upstream, which is what the absence of a
     /// send function in the `upstream` import means in practice.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn returns_values_only(self) -> bool {
         matches!(self, Self::DecodeRequest | Self::EncodeResponse)
     }
@@ -158,6 +161,7 @@ pub struct CallBudget {
 impl CallBudget {
     /// Builds the budget for one export from the section 11 deadlines.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn of(kind: CallKind) -> Self {
         Self::with_fuel_rate(kind, FUEL_PER_DEADLINE_MS)
     }

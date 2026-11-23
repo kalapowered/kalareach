@@ -81,12 +81,14 @@ pub struct CallOutcome<T> {
 impl<T> CallOutcome<T> {
     /// Returns true when the component answered with a value.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn answered(&self) -> bool {
         matches!(self.result, Ok(Ok(_)))
     }
 
     /// Returns the runtime failure, where the call failed rather than answered.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn failure(&self) -> Option<&RuntimeError> {
         match &self.result {
             Err(error) => Some(error),
@@ -99,6 +101,7 @@ impl<T> CallOutcome<T> {
     /// # Errors
     ///
     /// Returns the runtime failure.
+    #[cfg(any(test, feature = "testing"))]
     pub fn answer(self) -> RuntimeResult<Result<T, Fault>> {
         self.result
     }
@@ -337,6 +340,7 @@ impl Instance {
 
     /// Returns how many times this instance has been replaced after a fault.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn replacements(&self) -> u64 {
         self.replacements
     }
@@ -404,12 +408,14 @@ impl Instance {
 
     /// Returns the facts the component is being told.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn facts(&self) -> &BindingFacts {
         &self.facts
     }
 
     /// Returns the attachments the component is being told about.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn attachments(&self) -> &[AttachmentFact] {
         &self.attachments
     }

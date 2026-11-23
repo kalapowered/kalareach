@@ -72,12 +72,14 @@ impl FaultCounter {
 
     /// Returns the number of faults that disable a binding.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn limit(&self) -> u32 {
         self.limit
     }
 
     /// Returns the disabled reason, once the binding is disabled.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn disabled_reason(&self) -> Option<&str> {
         self.disabled.as_deref()
     }
@@ -120,6 +122,7 @@ impl FaultCounter {
     ///
     /// A binding whose package was revoked, whose application exited or whose plugin host was
     /// replaced is disabled without any fault being recorded against the component.
+    #[cfg(any(test, feature = "testing"))]
     pub fn disable(&mut self, reason: impl Into<String>) {
         if self.disabled.is_none() {
             self.disabled = Some(reason.into());

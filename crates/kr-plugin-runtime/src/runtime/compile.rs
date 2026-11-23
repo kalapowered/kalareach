@@ -174,6 +174,7 @@ impl Payload {
 
     /// The digest of [`Self::bytes`].
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn digest(&self) -> &PayloadDigest {
         &self.digest
     }
@@ -221,7 +222,9 @@ pub enum BackgroundPriority {
 #[derive(Debug)]
 pub struct CompilePool {
     sender: mpsc::SyncSender<Job>,
+    #[cfg(test)]
     priority: Arc<Mutex<Option<BackgroundPriority>>>,
+    #[cfg(any(test, feature = "testing"))]
     threads: usize,
     queue: usize,
     flights: Arc<Flights>,
@@ -407,6 +410,7 @@ impl CompilePool {
         let threads = threads.max(1);
         let (sender, receiver) = mpsc::sync_channel::<Job>(queue);
         let receiver = Arc::new(Mutex::new(receiver));
+        #[cfg(test)]
         let priority = Arc::new(Mutex::new(None));
         #[cfg(feature = "testing")]
         let hold = Arc::new(HoldState::default());
@@ -414,14 +418,18 @@ impl CompilePool {
         let counts = Arc::new(Counts::default());
         for index in 0..threads {
             let receiver = Arc::clone(&receiver);
+            #[cfg(test)]
             let priority = Arc::clone(&priority);
             let spawned = std::thread::Builder::new()
                 .name(format!("kr-plugin-compile-{index}"))
                 .spawn(move || {
                     let achieved = lower_priority();
+                    #[cfg(test)]
                     if let Ok(mut slot) = priority.lock() {
                         *slot = Some(achieved);
                     }
+                    #[cfg(not(test))]
+                    let _ = achieved;
                     loop {
                         let job = {
                             let Ok(guard) = receiver.lock() else {
@@ -442,7 +450,9 @@ impl CompilePool {
         }
         Self {
             sender,
+            #[cfg(test)]
             priority,
+            #[cfg(any(test, feature = "testing"))]
             threads,
             queue,
             flights: Arc::new(Flights::default()),
@@ -499,12 +509,14 @@ impl CompilePool {
 
     /// Returns how many threads the pool was built with.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn threads(&self) -> usize {
         self.threads
     }
 
     /// Returns what priority the pool's threads achieved, once one has started.
     #[must_use]
+    #[cfg(test)]
     pub fn background_priority(&self) -> Option<BackgroundPriority> {
         self.priority.lock().ok().and_then(|slot| *slot)
     }
@@ -635,6 +647,7 @@ impl Default for CompilePool {
 
 /// Returns the cache key for one component under one engine.
 #[must_use]
+#[cfg(any(test, feature = "testing"))]
 pub fn key_for(engine: &RuntimeEngine, wasm: &[u8]) -> CacheKey {
     key_of(engine, PayloadDigest::of(wasm), wasm.len() as u64)
 }
@@ -657,6 +670,7 @@ fn key_of(engine: &RuntimeEngine, digest: PayloadDigest, bytes: u64) -> CacheKey
 /// Returns the compilation, cache or import failure. A cache entry that fails its checks is
 /// removed and the component is compiled again, because a refused entry is a reason to recompile
 /// rather than a reason to refuse the binding.
+#[cfg(any(test, feature = "testing"))]
 pub fn compile_or_load(
     engine: &RuntimeEngine,
     cache: &CompiledCache,

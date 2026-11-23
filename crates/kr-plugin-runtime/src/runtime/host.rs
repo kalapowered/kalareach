@@ -150,6 +150,7 @@ impl DocumentSink {
 
     /// Returns the nodes emitted so far.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn nodes(&self) -> &[EmittedNode] {
         &self.nodes
     }
@@ -273,6 +274,7 @@ impl HostState {
 
     /// Returns the facts a component reads about its binding.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn binding(&self) -> &BindingFacts {
         &self.binding
     }

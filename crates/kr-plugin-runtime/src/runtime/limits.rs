@@ -102,6 +102,7 @@ impl InstanceLimiter {
 
     /// Returns the linear memory bound in bytes, across every memory of the instance.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn memory_bytes(&self) -> u64 {
         self.memory_bytes
     }
@@ -114,6 +115,7 @@ impl InstanceLimiter {
 
     /// Returns the resource a refused allocation asked for, if one was refused.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn refused(&self) -> Option<RefusedResource> {
         self.refused
     }

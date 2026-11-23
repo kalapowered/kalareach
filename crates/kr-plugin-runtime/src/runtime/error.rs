@@ -13,6 +13,7 @@
 
 use std::fmt;
 
+#[cfg(any(test, feature = "testing"))]
 use kr_plugin_sdk::ids::PluginName;
 
 /// The result of a runtime operation.
@@ -242,6 +243,7 @@ impl RuntimeError {
 
     /// Renders the failure as a disabled reason a person reads.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn disabled_reason(&self, plugin: &PluginName) -> String {
         format!("{plugin} stopped responding correctly: {self}")
     }

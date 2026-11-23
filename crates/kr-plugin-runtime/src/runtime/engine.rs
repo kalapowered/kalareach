@@ -294,6 +294,7 @@ impl RuntimeEngine {
     ///
     /// For the tests that need to know the ticker is doing its job rather than assume it.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn ticks(&self) -> u64 {
         self.ticker.ticks.load(Ordering::Relaxed)
     }
@@ -301,6 +302,7 @@ impl RuntimeEngine {
     /// Advances the epoch once, without the ticker.
     ///
     /// For the tests that need a deadline to expire at a moment they choose.
+    #[cfg(any(test, feature = "testing"))]
     pub fn advance_epoch(&self) {
         self.engine.increment_epoch();
         self.ticker.ticks.fetch_add(1, Ordering::Relaxed);
