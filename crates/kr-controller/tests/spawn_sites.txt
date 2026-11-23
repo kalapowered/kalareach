@@ -396,7 +396,7 @@ crates/kr-worker/src/daemon_link.rs | Drafts::ensure_reporter | .spawn | deliver
 crates/kr-worker/src/description_facts.rs | DescriptionFacts::read_directory | .spawn | closure{.run_reads} | 1 | other_crate | - | worker program: linked; the worker runs it
 crates/kr-worker/src/desktop/probe.rs | on_a_thread | std::thread::spawn | closure{.send} | 1 | other_crate | - | worker program: linked; the worker runs it
 crates/kr-worker/src/desktop/probe.rs | read_authorised_file | read_authorised_file_with | closure{read_first_block} | 1 | other_crate | - | worker program: linked; the thread waits for a read that a stalled filesystem may never end, by design: the check stops waiting and the thread stays
-crates/kr-worker/src/desktop/probe.rs | read_authorised_file_with | on_a_thread | read | 1 | other_crate | - | worker program: linked; the thread waits for a read that a stalled filesystem may never end, by design: the check stops waiting and the thread stays
+crates/kr-worker/src/desktop/probe.rs | read_authorised_file_with | on_a_thread | closure{read} | 1 | other_crate | - | worker program: linked; the thread waits for a read that a stalled filesystem may never end, by design: the check stops waiting and the thread stays
 crates/kr-worker/src/diagnostics.rs | Writer::offer | .spawn | closure{write_lines} | 1 | other_crate | - | worker program: linked; the worker runs it
 crates/kr-worker/src/fence/bridge.rs | BridgeServer::serve | tokio::spawn | write_outbound | 1 | other_crate | - | worker program: linked; the worker runs it
 crates/kr-worker/src/local_gate.rs | LocalWrites::withdraw_soon | tokio::spawn | async{withdraw} | 1 | other_crate | - | worker program: linked; the worker runs it
