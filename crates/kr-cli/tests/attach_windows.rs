@@ -2689,6 +2689,74 @@ async fn a_function_key_a_chord_and_ctrl_c_reach_an_application_with_bracketed_p
     .await;
 }
 
+/// KR-REQ-08.56: `kr attach` writes the Windows console it runs in no auto repeat, DEC mode 8 in
+/// either spelling, and every other mode of the session's screen it writes as before.
+///
+/// A Windows console that is written `CSI ? 8 l` hands the reader of its input only the escape and
+/// the final byte of the sequences of a paste and of a mouse report, so a paste reaches an
+/// application without its markers. The session's own mode 8 stays in the session; the console is
+/// not painted it.
+///
+/// A session whose root shell is the Windows command shell is typed a line, and `kr attach` runs on
+/// a pseudo-console of its own. Once the console shows the line, which the snapshot draws after the
+/// modes of its screen, everything the console was written holds the reset of reverse video and the
+/// set of the cursor blink, the writes either side of mode 8, and neither `ESC [ ? 8 l` nor
+/// `ESC [ ? 8 h`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_console_attached_with_kr_attach_is_written_no_auto_repeat() {
+    let host = WorkerHost::start().await;
+    let (session_id, dimensions) = host
+        .kr_new(&["--shell-mode", "native_compat", "--shell", &command_shell()])
+        .await
+        .session();
+    let environment = host.tree.environment();
+    let mut typist = WorkerTerminal::attach(&environment, session_id, dimensions).await;
+    typist.type_line("echo kr-auto-repeat-left-out").await;
+    typist
+        .shown(
+            "kr-auto-repeat-left-out",
+            "the session shows the line it was typed",
+        )
+        .await;
+
+    let mut console = Attached::start(&host, &session_id.to_string(), dimensions);
+    console.shows(
+        "the session's screen",
+        |text| text.matches("kr-auto-repeat-left-out").count(),
+        1,
+    );
+    let shown = console.output.text();
+    for set in ["\x1b[?5l", "\x1b[?12h"] {
+        assert!(
+            shown.contains(set),
+            "the console was written the modes of the session's screen, which hold {:?}; the end of \
+             what it shows: {:?}",
+            set,
+            end_of(&shown)
+        );
+    }
+    for auto_repeat in ["\x1b[?8l", "\x1b[?8h"] {
+        assert!(
+            !shown.contains(auto_repeat),
+            "the console was written the session's auto repeat, {auto_repeat:?}, which a Windows \
+             console takes as the end of the sequences of a paste and of the mouse; the end of what \
+             it shows: {:?}",
+            end_of(&shown)
+        );
+    }
+
+    let _ = console.child.kill();
+    drop(typist);
+    let closed = host
+        .kr(&["--json", "close", &session_id.to_string()], &[])
+        .await;
+    assert!(
+        closed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&closed.stdout)
+    );
+}
+
 /// The variable that makes this test binary, started in a console of its own, run the console half
 /// of the test of the console's input mode while an application's bracketed paste is on.
 const PASTE_MODE_PROBE: &str = "KR_ATTACH_PASTE_MODE_PROBE";
