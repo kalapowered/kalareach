@@ -752,7 +752,8 @@ evidence does **not** cover, because a test against a deterministic runtime prov
 the model, the library or the machine. A case is never recorded as evidence on a target nothing has
 run on, and the cases that need real weights stay outstanding until a benchmark run is recorded
 against a commit and a target. `Matrix::gaps` is that list, and it is a method rather than a comment
-so a report that prints the matrix prints the gaps with it.
+so a report that prints the matrix prints the gaps with it. `kr-describe-bench --matrix` prints the
+matrix and its gaps and exits with a failure while any case has nothing run behind it.
 
 The smoke results reported on 13 September are preserved as reported. They have not been
 reproduced, the scripts and raw outputs behind them were not supplied, and they qualify no profile

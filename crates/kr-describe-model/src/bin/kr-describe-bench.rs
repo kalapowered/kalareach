@@ -10,6 +10,9 @@
 //! property of the machine, so a latency with no hardware beside it cannot be compared with the
 //! next one.
 //!
+//! `--matrix` prints the qualification matrix, which targets each case still lacks included, and
+//! fails while any case has nothing run behind it.
+//!
 //! `--run` drives the product's own description process (`--inference` names its program) the way
 //! the control daemon does, through the same driver, and keeps the terminal workload it measures
 //! that process beside in this process. The process puts itself in the background class; this one
@@ -17,6 +20,8 @@
 //! process would run in the class with the model, and the figures would be of a terminal at
 //! background priority.
 
+#[path = "kr-describe-bench/matrix.rs"]
+mod matrix;
 #[path = "kr-describe-bench/outputs.rs"]
 mod outputs;
 
@@ -81,6 +86,15 @@ const ANSI_TERMINAL_STREAM: &[u8] = b"\x1b[?25l\x1b[2J\x1b[H\x1b[32m\xe2\x9c\x93
 fn main() -> ExitCode {
     let arguments: Vec<String> = std::env::args().skip(1).collect();
     let mode = arguments.first().map(String::as_str).unwrap_or("--run");
+    if mode == "--matrix" {
+        let reading = matrix::read(&kr_describe::qualification::Matrix::builtin());
+        print!("{}", reading.text);
+        return if reading.complete {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::FAILURE
+        };
+    }
     let profile = match selected_profile(&arguments) {
         Ok(profile) => profile,
         Err(message) => {
@@ -144,7 +158,7 @@ fn main() -> ExitCode {
         }
         other => {
             eprintln!(
-                "usage: kr-describe-bench [--manifest|--run --inference <path>|--outputs [--rounds <n>]] [--profile <id>] [--cache <dir>]"
+                "usage: kr-describe-bench [--manifest|--matrix|--run --inference <path>|--outputs [--rounds <n>]] [--profile <id>] [--cache <dir>]"
             );
             eprintln!("unknown mode {other}");
             ExitCode::FAILURE
