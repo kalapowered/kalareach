@@ -1300,14 +1300,16 @@ pub struct InstanceCapabilityIdentity {
     /// A binding identifier alone names the binding, not the conversation it was bound to when the
     /// evidence was taken, and a thread selection changes what the upstream can do.
     pub binding_revision: Nullable<AgentBindingRevision>,
-    // No broker writer sets this field. It stays because it is part of level 0.78's wire form:
-    // every release of that level writes it, as null, and this type refuses a member it does not
-    // name. It is removed by the cut that stops retaining 0.78.
+    // No broker writer sets this field. It stays while a retained level writes it: every release
+    // of level 0.78 writes it as null, and so does every release of this level, because this type
+    // writes each member it names and refuses a member it does not name. A level must first stop
+    // writing it; the cut that stops retaining the last level that writes it then removes it.
     /// The desktop session generation the evidence is bound to.
     pub desktop_generation: Nullable<U64>,
-    // No broker writer sets this field. It stays because it is part of level 0.78's wire form:
-    // every release of that level writes it, as null, and this type refuses a member it does not
-    // name. It is removed by the cut that stops retaining 0.78.
+    // No broker writer sets this field. It stays while a retained level writes it: every release
+    // of level 0.78 writes it as null, and so does every release of this level, because this type
+    // writes each member it names and refuses a member it does not name. A level must first stop
+    // writing it; the cut that stops retaining the last level that writes it then removes it.
     /// Whether the operating-system permission the capability needs was held.
     pub os_permission_held: Nullable<bool>,
 }
