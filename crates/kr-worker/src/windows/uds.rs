@@ -143,6 +143,39 @@ fn new_socket_for(path: &Path) -> std::io::Result<(sockets::SOCKET, sockets::SOC
     Ok((socket, address, length))
 }
 
+/// Accepts one connection from the non-blocking listening socket `listener` and returns the socket
+/// as the system made it, before anything is done to its flags.
+///
+/// `uds_windows` accepts a connection, makes the socket inheritable, and clears that, which leaves
+/// a moment in which a process this worker starts could take it. A socket accepted from a listener
+/// made without handle inheritance can start without it, and the case that reads it here says so.
+fn accept_raw(listener: &impl AsRawSocket) -> std::io::Result<sockets::SOCKET> {
+    let raw = usize::try_from(listener.as_raw_socket())
+        .map_err(|_| std::io::Error::other("a socket handle that is not a handle"))?;
+    // SAFETY: the listening socket is open for the call, and no address is asked for.
+    let accepted = unsafe { sockets::accept(raw, std::ptr::null_mut(), std::ptr::null_mut()) };
+    if accepted == sockets::INVALID_SOCKET {
+        return Err(last_socket_error());
+    }
+    Ok(accepted)
+}
+
+/// Clears the flag that lets a process this one starts inherit `socket`.
+fn clear_inherit(socket: sockets::SOCKET) -> std::io::Result<()> {
+    // SAFETY: the socket is open and is a handle for this call, which changes one flag of it.
+    let cleared = unsafe {
+        windows_sys::Win32::Foundation::SetHandleInformation(
+            socket as windows_sys::Win32::Foundation::HANDLE,
+            windows_sys::Win32::Foundation::HANDLE_FLAG_INHERIT,
+            0,
+        )
+    };
+    if cleared == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// Binds a listening socket at `path` that no process this one starts can inherit.
 fn bind_uninheritable(path: &Path) -> std::io::Result<uds_windows::UnixListener> {
     let (socket, address, length) = new_socket_for(path)?;
@@ -397,11 +430,18 @@ impl Listener {
     ///
     /// Returns the operating system's failure.
     pub async fn accept(&self) -> std::io::Result<Stream> {
-        let (socket, _) = self
+        let accepted = self
             .inner
-            .read_with(|registered| registered.0.accept())
+            .read_with(|registered| accept_raw(&registered.0))
             .await?;
-        Stream::new(socket)
+        // A socket the listening socket hands over is made as the listening socket is. Clearing the
+        // flag again is a belt, and a case reads the socket before it.
+        clear_inherit(accepted)?;
+        let raw = u64::try_from(accepted)
+            .map_err(|_| std::io::Error::other("a socket that is not one"))?;
+        // SAFETY: the socket was just accepted and nothing else holds it, so the stream owns it
+        // and closes it when it is dropped.
+        Stream::new(unsafe { uds_windows::UnixStream::from_raw_socket(raw) })
     }
 }
 
@@ -992,9 +1032,8 @@ mod tests {
     }
 
     /// KR-REQ-07.45: the listening socket and the probe's sockets are made so that no process this
-    /// worker starts inherits them, and the socket the listener accepts is measured for the same:
-    /// `uds_windows` makes it inheritable and clears the flag after, so this is the state it is
-    /// left in, which a guest reports.
+    /// worker starts inherits them, and the socket the listener accepts is read as the system hands
+    /// it over, before anything changes its flags, and again as the stream the module returns.
     #[tokio::test]
     async fn the_sockets_this_module_makes_are_not_inheritable() {
         let directory = Directory::new();
@@ -1006,12 +1045,36 @@ mod tests {
         );
         let client = connect_uninheritable(&path).expect("the socket is reached");
         assert!(!is_inheritable(&client), "the connecting socket");
+        // The first connection is taken with the system's own call and read before anything is
+        // done to it: this is the moment `uds_windows` leaves open, and a guest reports it.
+        let first = (0..200)
+            .find_map(|_| match accept_raw(&listener.inner.get_ref().0) {
+                Ok(socket) => Some(socket),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(10));
+                    None
+                }
+                Err(error) => panic!("the connection is accepted: {error}"),
+            })
+            .expect("the connection arrived");
+        // SAFETY: the socket was just accepted and nothing else holds it.
+        let first = unsafe {
+            uds_windows::UnixStream::from_raw_socket(
+                u64::try_from(first).expect("a socket that is a socket"),
+            )
+        };
+        assert!(
+            !is_inheritable(&first),
+            "the accepted socket, as the system made it"
+        );
+        drop(first);
+        let second = connect_uninheritable(&path).expect("the socket is reached again");
         let accepted = listener.accept().await.expect("the connection is accepted");
         assert!(
             !is_inheritable(&accepted.inner.get_ref().get_ref().0),
-            "the accepted socket"
+            "the accepted stream the module returns"
         );
-        drop(client);
+        drop((client, second));
     }
 
     /// Bytes go both ways through the tokio traits.
