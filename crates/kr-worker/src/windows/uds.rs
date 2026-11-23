@@ -816,15 +816,83 @@ pub fn hold_directory(path: &Path) -> std::io::Result<HeldDirectory> {
 impl HeldDirectory {
     /// Returns true when `path` names the directory that is held, opened now as itself.
     #[must_use]
+    ///
+    /// A directory that was converted to a junction in place keeps its object, and a path through it
+    /// reaches what it points at, so the path must also name no link.
     pub fn is_still_named_by(&self, path: &Path) -> bool {
-        open_directory_without_following(
+        let Ok(other) = open_directory_without_following(
             path,
             FILE_READ_ATTRIBUTES,
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-        )
-        .and_then(|other| file::object_of(&other))
-        .is_ok_and(|object| object == self.object)
+        ) else {
+            return false;
+        };
+        matches!(file::reparse_tag_of(&other), Ok(None))
+            && file::object_of(&other).is_ok_and(|object| object == self.object)
     }
+}
+
+/// Turns an empty directory into a junction to `target` in place, as an account that may write to the
+/// directory can whatever is held on it: the conversion changes what the path reaches and not the
+/// object a handle holds.
+#[cfg(test)]
+pub(crate) fn convert_to_a_junction(directory: &Path, target: &Path) {
+    use std::os::windows::ffi::OsStrExt as _;
+    use windows_sys::Win32::Storage::FileSystem::FILE_WRITE_ATTRIBUTES;
+    use windows_sys::Win32::System::IO::DeviceIoControl;
+
+    const FSCTL_SET_REPARSE_POINT: u32 = 0x0009_00A4;
+    const IO_REPARSE_TAG_MOUNT_POINT: u32 = 0xA000_0003;
+    let opened = open_directory_without_following(
+        directory,
+        FILE_WRITE_ATTRIBUTES,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+    )
+    .expect("the directory opens for its attributes");
+    let substitute: Vec<u16> = std::ffi::OsString::from(format!(r"\??\{}", target.display()))
+        .encode_wide()
+        .collect();
+    let printed: Vec<u16> = target.as_os_str().encode_wide().collect();
+    let substitute_bytes = u16::try_from(substitute.len() * 2).expect("short");
+    let printed_bytes = u16::try_from(printed.len() * 2).expect("short");
+    let mut buffer: Vec<u8> = Vec::new();
+    buffer.extend(IO_REPARSE_TAG_MOUNT_POINT.to_le_bytes());
+    let data_length = 8 + usize::from(substitute_bytes) + 2 + usize::from(printed_bytes) + 2;
+    buffer.extend(u16::try_from(data_length).expect("short").to_le_bytes());
+    buffer.extend(0_u16.to_le_bytes());
+    buffer.extend(0_u16.to_le_bytes());
+    buffer.extend(substitute_bytes.to_le_bytes());
+    buffer.extend((substitute_bytes + 2).to_le_bytes());
+    buffer.extend(printed_bytes.to_le_bytes());
+    for unit in &substitute {
+        buffer.extend(unit.to_le_bytes());
+    }
+    buffer.extend(0_u16.to_le_bytes());
+    for unit in &printed {
+        buffer.extend(unit.to_le_bytes());
+    }
+    buffer.extend(0_u16.to_le_bytes());
+    let mut returned = 0_u32;
+    // SAFETY: the handle is open for the call, the buffer is a local laid out as the control
+    // documents, and the count is another local.
+    let set = unsafe {
+        DeviceIoControl(
+            opened.as_raw_handle().cast(),
+            FSCTL_SET_REPARSE_POINT,
+            buffer.as_ptr().cast(),
+            u32::try_from(buffer.len()).expect("short"),
+            std::ptr::null_mut(),
+            0,
+            &raw mut returned,
+            std::ptr::null_mut(),
+        )
+    };
+    assert_ne!(
+        set,
+        0,
+        "the directory becomes a junction: {}",
+        std::io::Error::last_os_error()
+    );
 }
 
 /// The identity of the socket that stands at `path` now, or none where nothing does or something

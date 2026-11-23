@@ -1006,6 +1006,43 @@ mod tests {
         let _ = std::fs::remove_dir_all(&decoy);
     }
 
+    /// KR-REQ-07.45: a private directory converted to a junction in place after it was read keeps
+    /// the object it had, and a path through it reaches what it points at: the bind is refused, the
+    /// socket it made there is removed, and nothing stands where the junction leads.
+    #[cfg(windows)]
+    #[test]
+    fn a_private_directory_converted_to_a_junction_after_it_was_read_binds_nothing() {
+        assert!(
+            std::env::var_os(kr_ipc::paths::RUNTIME_DIR_VARIABLE).is_none(),
+            "this case runs with the variable unset"
+        );
+        let name =
+            |kind: &str| std::env::temp_dir().join(format!("kr-{kind}-{}", kr_ipc::new_uuid()));
+        let (outer, decoy) = (name("e"), name("d"));
+        std::fs::create_dir_all(&outer).expect("the directory is created");
+        std::fs::create_dir_all(&decoy).expect("the directory is created");
+        let run = private_run_directory_in(&outer);
+        let (directory, leads_to) = (run.clone(), decoy.clone());
+        BEFORE_THE_BIND.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                crate::windows::uds::convert_to_a_junction(&directory, &leads_to);
+            }));
+        });
+        let bound = BoundEndpoint::bind_named(&run, "gw.sock");
+        assert!(
+            bound.is_err(),
+            "a directory converted in place binds nothing: {:?}",
+            bound.map(|_| ())
+        );
+        assert!(
+            std::fs::symlink_metadata(decoy.join("gw.sock")).is_err(),
+            "no socket stands where the junction leads"
+        );
+        std::fs::remove_dir(&run).expect("the junction is removed as itself");
+        let _ = std::fs::remove_dir_all(&outer);
+        let _ = std::fs::remove_dir_all(&decoy);
+    }
+
     /// KR-REQ-07.45: a runtime directory that is not in the default root binds nothing below a
     /// junction: the bind resolves it, and where it leads is not what was read.
     #[cfg(windows)]
