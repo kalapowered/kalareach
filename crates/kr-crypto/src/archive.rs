@@ -404,8 +404,8 @@ pub fn encrypt_recovery_bundle(key: &SymmetricKey, bundle: &RecoveryBundle) -> R
 /// A failure to open the object is [`CryptoError::Authentication`] or one of the stream's own
 /// refusals, and nothing else. An object that opened and holds what this build does not read, a
 /// member it has no name for or a schema version it does not read, is
-/// [`CryptoError::Unreadable`]: the key was right, so the bundle was written by a build that knows
-/// more than this one.
+/// [`CryptoError::Unreadable`]: the key was right, so a build that knows more than this one may
+/// have written the bundle.
 ///
 /// The settings member is carried as the bytes it is and is not decoded here.
 ///
@@ -700,7 +700,7 @@ mod tests {
 
     /// KR-REQ-20.17: an object that opened under the bundle's key and holds something this build
     /// cannot read, a member it does not know or a schema version it does not read, is told apart
-    /// from one that did not open: the first is a bundle written by a later build, the second is
+    /// from one that did not open: the first may be a bundle that a later build wrote, the second is
     /// the wrong key.
     #[test]
     fn a_bundle_that_authenticates_and_cannot_be_read_is_not_a_failure_to_authenticate() {
