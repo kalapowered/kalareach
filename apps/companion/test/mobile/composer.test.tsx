@@ -70,6 +70,17 @@ describe("the phone's slash commands (KR-REQ-13.12)", () => {
     expect(screen.getByRole('button', { name: /\/review/ })).toBeInTheDocument()
   })
 
+  it('stands above the field, where a keyboard under it and a composer that scrolls from its top leave it in view', async () => {
+    const person = userEvent.setup()
+    await open()
+    const field = screen.getByLabelText('Message this session')
+
+    await person.type(field, '/')
+
+    const list = await screen.findByTestId('slash-commands')
+    expect(list.compareDocumentPosition(field)).toBe(Node.DOCUMENT_POSITION_FOLLOWING)
+  })
+
   it('puts the chosen command in the field and closes the list', async () => {
     const person = userEvent.setup()
     await open()

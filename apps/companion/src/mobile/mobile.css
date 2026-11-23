@@ -1006,10 +1006,10 @@
   align-items: center;
 }
 
-/* The commands the agent advertises, one touch target each, under the field the person is typing in. */
+/* The commands the agent advertises, one touch target each, above the field the person is typing in. */
 .m-slash-commands {
   list-style: none;
-  margin: var(--gap-2) 0 0;
+  margin: 0;
   padding: 0;
   display: grid;
   gap: var(--gap-2);

@@ -417,6 +417,8 @@ export function MobileSession({
   const submitOffer = offers.submit
   // The commands the draft asks for while it starts with a slash.
   const offeredCommands = useMemo(() => slashCommandsFor(commands, draft.text), [commands, draft.text])
+  // Whether the list of them is shown: the person is choosing a command, not an action.
+  const listing = slashOpen && offeredCommands.length > 0
 
   /**
    * Records what the person typed on top of the draft as it is stored now.
@@ -1789,25 +1791,14 @@ export function MobileSession({
            * or the conversation's. While the view controls the program, the program's keyboard
            * takes the field's place, and Send goes with the draft until control ends.
            */}
-          {asLine && !typingToProgram && pane === 'semantic' && composerActions !== null ? (
-            // The line holds the field and Send only, so the other actions take a row above it.
+          {asLine && !typingToProgram && !listing && pane === 'semantic' && composerActions !== null ? (
+            // The line holds the field and Send only, so the other actions take a row above it,
+            // unless the commands are listed there: where the room is smallest the list has it.
             <div className="m-composer-more">{composerActions}</div>
           ) : null}
-          <div className={asLine ? 'm-composer-line' : 'm-composer-field'}>
-            {typingToProgram ? programField : field}
-            {asLine && !typingToProgram ? (
-              <>
-                {sendButton}
-                {/* Under the terminal the line has no row above it to spare: the terminal's rows are
-                    all the room there is. Interrupt, the action that is wanted at once, stands in
-                    the line, and Steer and Queue are the conversation's composer's. */}
-                {pane === 'terminal' ? interruptButton : null}
-                {lastState}
-              </>
-            ) : null}
-          </div>
-
-          {typingToProgram || !slashOpen || offeredCommands.length === 0 ? null : (
+          {/* Above the field, where a keyboard under it and a composer that scrolls from its top do not
+              take it out of view. */}
+          {typingToProgram || !listing ? null : (
             <ul className="m-slash-commands" data-testid="slash-commands">
               {offeredCommands.map((command) => (
                 <li key={command.name}>
@@ -1828,6 +1819,20 @@ export function MobileSession({
               ))}
             </ul>
           )}
+          <div className={asLine ? 'm-composer-line' : 'm-composer-field'}>
+            {typingToProgram ? programField : field}
+            {asLine && !typingToProgram ? (
+              <>
+                {sendButton}
+                {/* Under the terminal the line has no row above it to spare: the terminal's rows are
+                    all the room there is. Interrupt, the action that is wanted at once, stands in
+                    the line, and Steer and Queue are the conversation's composer's. */}
+                {pane === 'terminal' ? interruptButton : null}
+                {lastState}
+              </>
+            ) : null}
+          </div>
+
 
           {pane === 'semantic' ? (
             <>
