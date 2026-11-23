@@ -162,7 +162,7 @@ struct Exception {
 
 /// Every place outside `HOME` that reads a code or words or handles a refused connection, and why it
 /// does not decide what a connection that was not opened means.
-const EXCEPTIONS: [Exception; 71] = [
+const EXCEPTIONS: [Exception; 84] = [
     Exception {
         file: "account/mod.rs",
         function: "usage",
@@ -379,6 +379,97 @@ const EXCEPTIONS: [Exception; 71] = [
         needle: USED,
         lines: 1,
         reason: "the code of the same refusal of a request to the sync service; it decides nothing about a connection that was not opened",
+    },
+    Exception {
+        file: "open_transfers.rs",
+        function: "host_does_not_know",
+        needle: COMPARED,
+        lines: 1,
+        reason: "the host's answer to a read of an upload's status, answered on a connection that is open; it decides nothing about a connection that was not opened",
+    },
+    Exception {
+        file: "open_transfers.rs",
+        function: "is_the_count_refusal",
+        needle: COMPARED,
+        lines: 1,
+        reason: "the host's refusal of an upload's begin for the count of concurrent transfers, answered on a connection that is open; it decides nothing about a connection that was not opened",
+    },
+    Exception {
+        file: "open_transfers.rs",
+        function: "settle_as",
+        needle: COMPARED,
+        lines: 1,
+        reason: "the end of a send on a held session whose outcome the answer left unknown, answered on a connection that is open; it decides nothing about a connection that was not opened",
+    },
+    Exception {
+        file: "paired_drafts.rs",
+        function: "at_the_bound",
+        needle: COMPARED,
+        lines: 1,
+        reason: "the host's refusal of a draft's creation for its bound on open drafts, answered on a connection that is open; it decides nothing about a connection that was not opened",
+    },
+    Exception {
+        file: "paired_drafts.rs",
+        function: "bind",
+        needle: COMPARED,
+        lines: 1,
+        reason: "the host's conflict on a file added to a draft, answered on a connection that is open; it decides nothing about a connection that was not opened",
+    },
+    Exception {
+        file: "paired_drafts.rs",
+        function: "discard_once",
+        needle: COMPARED,
+        lines: 1,
+        reason: "the host's refusal of a repeated discard of a draft, answered on a connection that is open; it decides nothing about a connection that was not opened",
+    },
+    Exception {
+        file: "paired_drafts.rs",
+        function: "discard_outcome",
+        needle: COMPARED,
+        lines: 1,
+        reason: "the host's conflict on a draft's discard, answered on a connection that is open; it decides nothing about a connection that was not opened",
+    },
+    Exception {
+        file: "paired_drafts.rs",
+        function: "gone",
+        needle: COMPARED,
+        lines: 2,
+        reason: "the host's answer that a draft or its session is gone, answered on a connection that is open; it decides nothing about a connection that was not opened",
+    },
+    Exception {
+        file: "paired_drafts.rs",
+        function: "host_cannot_discard",
+        needle: WORDS,
+        lines: 1,
+        reason: "the host's words that it does not list the discard method, answered on a connection that is open; it decides nothing about a connection that was not opened",
+    },
+    Exception {
+        file: "paired_drafts.rs",
+        function: "is_the_count_refusal",
+        needle: COMPARED,
+        lines: 1,
+        reason: "the host's refusal of a draft's creation for the device's count of open drafts, answered on a connection that is open; it decides nothing about a connection that was not opened",
+    },
+    Exception {
+        file: "paired_drafts.rs",
+        function: "resolve_create",
+        needle: COMPARED,
+        lines: 1,
+        reason: "the host's refusal of a repeated creation of a draft, answered on a connection that is open; it decides nothing about a connection that was not opened",
+    },
+    Exception {
+        file: "paired_drafts.rs",
+        function: "sent_as",
+        needle: COMPARED,
+        lines: 1,
+        reason: "the end of a send or a repeat on a held session whose outcome the answer left unknown, answered on a connection that is open; it decides nothing about a connection that was not opened",
+    },
+    Exception {
+        file: "paired_drafts.rs",
+        function: "set_text",
+        needle: COMPARED,
+        lines: 1,
+        reason: "the host's conflict on a draft's text, answered on a connection that is open; it decides nothing about a connection that was not opened",
     },
     Exception {
         file: "push.rs",
