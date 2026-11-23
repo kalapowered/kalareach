@@ -729,16 +729,21 @@ fn read_first_block(path: &Path) -> std::io::Result<FirstBlock> {
 /// two more, and Full Disk Access is one more that covers them all. A path outside every one of
 /// them was refused by the filesystem's own permissions rather than by a privacy grant. Whether a
 /// path is on a removable or a network volume is what the kernel says of the volume, never how the
-/// path is spelled.
+/// path is spelled, and a protected folder is the account's own: the one in its home directory.
 #[must_use]
 pub fn permission_for_path(path: &Path) -> &'static str {
-    permission_on(path, volume::flags_of(path))
+    permission_on(
+        path,
+        volume::flags_of(path),
+        std::env::home_dir().as_deref(),
+    )
 }
 
-/// [`permission_for_path`] for a path whose volume's mount flags are `flags`, where they could be
-/// read. The flags are the one thing about a path that a case cannot make on any machine it runs
-/// on, so they are given rather than read.
-fn permission_on(path: &Path, flags: Option<u32>) -> &'static str {
+/// [`permission_for_path`] for a path whose volume's mount flags are `flags` and for an account
+/// whose home directory is `home`, where they could be read. The flags are the one thing about a
+/// path that a case cannot make on any machine it runs on, so they are given rather than read, and
+/// so is the home directory.
+fn permission_on(path: &Path, flags: Option<u32>, home: Option<&Path>) -> &'static str {
     if !cfg!(target_os = "macos") {
         return "the filesystem's own permissions on that path";
     }
@@ -750,24 +755,48 @@ fn permission_on(path: &Path, flags: Option<u32>) -> &'static str {
     if flags.is_some_and(volume::network) {
         return "Files & Folders, for network volumes";
     }
-    let text = path.to_string_lossy();
-    for (fragment, permission) in [
-        ("/Desktop/", "Files & Folders, for the Desktop folder"),
-        ("/Documents/", "Files & Folders, for the Documents folder"),
-        ("/Downloads/", "Files & Folders, for the Downloads folder"),
-        (
-            "/Library/Application Support/com.apple.TCC",
-            "Full Disk Access",
-        ),
-        ("/Library/Mail", "Full Disk Access"),
-        ("/Library/Messages", "Full Disk Access"),
-        ("/Library/Safari", "Full Disk Access"),
-    ] {
-        if text.contains(fragment) {
-            return permission;
+    let path = lexically_clean(path);
+    if let Some(home) = home.map(lexically_clean) {
+        for (folder, permission) in [
+            ("Desktop", "Files & Folders, for the Desktop folder"),
+            ("Documents", "Files & Folders, for the Documents folder"),
+            ("Downloads", "Files & Folders, for the Downloads folder"),
+            (
+                "Library/Application Support/com.apple.TCC",
+                "Full Disk Access",
+            ),
+            ("Library/Mail", "Full Disk Access"),
+            ("Library/Messages", "Full Disk Access"),
+            ("Library/Safari", "Full Disk Access"),
+        ] {
+            if path.starts_with(home.join(folder)) {
+                return permission;
+            }
         }
     }
+    // The system's own record of what has been granted is kept outside every home directory.
+    if path.starts_with("/Library/Application Support/com.apple.TCC") {
+        return "Full Disk Access";
+    }
     "the filesystem's own permissions on that path"
+}
+
+/// The path with its `.` and `..` parts resolved by their spelling, so that `Documents/../Desktop`
+/// is a place in the Desktop folder. A path that is not absolute names no folder of an account.
+fn lexically_clean(path: &Path) -> PathBuf {
+    use std::path::Component;
+
+    let mut clean = PathBuf::new();
+    for part in path.components() {
+        match part {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                clean.pop();
+            }
+            other => clean.push(other),
+        }
+    }
+    clean
 }
 
 /// What the kernel says about the volume a path is on.
@@ -2191,27 +2220,66 @@ mod tests {
 
     #[test]
     fn a_refused_read_names_the_permission_the_path_is_under() {
-        assert_eq!(
-            permission_for_path(Path::new("/Users/someone/Documents/notes.txt")),
+        let home = Path::new("/Users/someone");
+        let on = |path: &str| permission_on(Path::new(path), None, Some(home));
+        let on_macos = |permission| {
             if cfg!(target_os = "macos") {
-                "Files & Folders, for the Documents folder"
+                permission
             } else {
                 "the filesystem's own permissions on that path"
             }
+        };
+        assert_eq!(
+            on("/Users/someone/Documents/notes.txt"),
+            on_macos("Files & Folders, for the Documents folder")
         );
         assert_eq!(
-            permission_for_path(Path::new(
-                "/Users/someone/Library/Application Support/com.apple.TCC/TCC.db"
-            )),
-            if cfg!(target_os = "macos") {
-                "Full Disk Access"
-            } else {
-                "the filesystem's own permissions on that path"
-            }
+            on("/Users/someone/Library/Application Support/com.apple.TCC/TCC.db"),
+            on_macos("Full Disk Access")
         );
         assert_eq!(
-            permission_for_path(Path::new("/tmp/anything")),
+            on("/Library/Application Support/com.apple.TCC/TCC.db"),
+            on_macos("Full Disk Access")
+        );
+        // A path is read by its parts: `..` leaves the folder it follows.
+        assert_eq!(
+            on("/Users/someone/Documents/../Desktop/notes.txt"),
+            on_macos("Files & Folders, for the Desktop folder")
+        );
+        assert_eq!(
+            on("/Users/someone/Projects/../Downloads/notes.txt"),
+            on_macos("Files & Folders, for the Downloads folder")
+        );
+        assert_eq!(
+            on("/tmp/anything"),
             "the filesystem's own permissions on that path"
+        );
+    }
+
+    #[test]
+    fn a_folder_is_one_of_the_account_s_only_where_the_account_keeps_it() {
+        let fallback = "the filesystem's own permissions on that path";
+        let home = Path::new("/Users/someone");
+        // A folder that is called Documents, a folder whose name begins like a protected one, a
+        // path that leaves the folder again and another account's folder are not the account's.
+        for path in [
+            "/opt/Documents/notes.txt",
+            "/Users/someone/Projects/Documents/notes.txt",
+            "/Users/someone/Library/Mailbox/notes.txt",
+            "/Library/Mailbox/notes.txt",
+            "/Users/someone/Documents/../Projects/notes.txt",
+            "/Users/other/Documents/notes.txt",
+        ] {
+            assert_eq!(
+                permission_on(Path::new(path), None, Some(home)),
+                fallback,
+                "{path}"
+            );
+        }
+        // Without a home directory no folder is the account's.
+        assert_eq!(
+            permission_on(Path::new("/Users/someone/Documents/notes.txt"), None, None),
+            fallback
         );
     }
 
@@ -2223,7 +2291,7 @@ mod tests {
 
     #[test]
     fn a_refused_read_on_a_removable_volume_names_the_grant_for_removable_volumes() {
-        let on = |path: &str, flags| permission_on(Path::new(path), Some(flags));
+        let on = |path: &str, flags| permission_on(Path::new(path), Some(flags), None);
         let removable = if cfg!(target_os = "macos") {
             "Files & Folders, for removable volumes"
         } else {
@@ -2251,7 +2319,7 @@ mod tests {
 
     #[test]
     fn a_refused_read_on_a_network_volume_names_the_grant_for_network_volumes() {
-        let on = |path: &str, flags| permission_on(Path::new(path), Some(flags));
+        let on = |path: &str, flags| permission_on(Path::new(path), Some(flags), None);
         let network = if cfg!(target_os = "macos") {
             "Files & Folders, for network volumes"
         } else {
@@ -2281,7 +2349,7 @@ mod tests {
     fn the_sentence_for_a_removable_volume_names_its_grant() {
         let path = Path::new("/Volumes/Backup/notes.txt");
         let refused = Outcome::PermissionRefused {
-            permission: permission_on(path, Some(EXTERNAL_DISK)),
+            permission: permission_on(path, Some(EXTERNAL_DISK), None),
             detail: Sentence::new()
                 .stated("the platform refused to open ")
                 .path(path),
