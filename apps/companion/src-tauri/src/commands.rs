@@ -1437,10 +1437,13 @@ read_command!(
 /// are those of `environment.capabilities`, which refuse any other field, and the file the read
 /// check reads is not the page's to name. It is the one the person chose in the platform's file
 /// dialog (`choose_authorised_file`), which this process holds and sends with this request and no
-/// other; with none chosen the host is sent none. The checks belong to the host on this computer,
-/// not to one this device is paired with.
+/// other; with none chosen the host is sent none. While that dialog is open the request is refused:
+/// the dialog may replace the file, and the page that asks is not the one that opened it. Every
+/// screen is told when the file held changes ([`AUTHORISED_FILE_EVENT`]). The checks belong to the
+/// host on this computer, not to one this device is paired with.
 #[tauri::command]
-pub async fn environment_capabilities_check(
+pub async fn environment_capabilities_check<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     state: State<'_, AppState>,
     subject: Subject,
     params: Value,
@@ -1449,12 +1452,21 @@ pub async fn environment_capabilities_check(
     let asked: kr_protocol::desktop::EnvironmentCapabilitiesParams = decode(params)?;
     let authorised_file = state
         .take_authorised_file()
+        .map_err(|_| {
+            CommandError::refused(
+                "The file dialog is still open. Choose a file in it or close it, then run the \
+                 checks.",
+            )
+        })?
         .map(|path| {
             path.into_os_string().into_string().map_err(|_| {
                 CommandError::invalid("the chosen file's path is not text this host can be given")
             })
         })
         .transpose()?;
+    if authorised_file.is_some() {
+        authorised_file_changed(&app);
+    }
     let typed = kr_protocol::desktop::EnvironmentCapabilitiesCheckParams {
         environment_id: asked.environment_id,
         authorised_file: authorised_file.into(),
@@ -1482,59 +1494,118 @@ pub struct ChosenFile {
     pub name: String,
 }
 
+/// What the application holds for the read check, as the page is told of it.
+#[derive(Clone, Debug, Serialize)]
+pub struct HeldFile {
+    /// The platform's file dialog is open: what is held may be replaced by its answer, so nothing
+    /// is known of the file the next run reads, and none runs.
+    pub dialog_open: bool,
+    /// The file chosen that no run has taken, or none.
+    pub file: Option<ChosenFile>,
+}
+
 /// Asks the person which file the read check of the disclosed checks should read.
 ///
 /// The platform's own file dialog answers. The path is kept here, in place of any file chosen
 /// before, until the one run that reads it, and the page is told only the file's name. A person
 /// who closes the dialog without choosing changes nothing.
 ///
-/// The dialog belongs to the window the page runs in, so that on every platform the window waits
-/// while the dialog is open: the page cannot be left for another view, which would read what is
-/// held before the choice is made, and says which file is held when the choice has been.
+/// On macOS and Windows the dialog belongs to the window the page runs in and the window waits.
+/// The GTK back end that Linux uses opens it with no parent window and no modal flag, so there the
+/// window does not wait and the person can leave the screen that asked and open it again. What
+/// keeps a screen from reading the file held before the choice is made is not the window but this
+/// process: while the dialog is open `held_authorised_file` says so, the checks are refused, a
+/// second dialog is refused, and every screen is told when the dialog opens and when it closes.
 #[tauri::command]
-pub async fn choose_authorised_file(
-    app: tauri::AppHandle,
-    window: tauri::WebviewWindow,
+pub async fn choose_authorised_file<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    window: tauri::WebviewWindow<R>,
     state: State<'_, AppState>,
 ) -> Result<Option<ChosenFile>> {
     use tauri_plugin_dialog::DialogExt as _;
 
     not_on_a_paired_host(&state, "the disclosed checks")?;
-    let (sender, receiver) = tokio::sync::oneshot::channel();
-    let dialog = app.dialog().file();
-    #[cfg(desktop)]
-    let dialog = dialog.set_parent(&window);
-    // A phone's file picker takes no parent window.
-    #[cfg(not(desktop))]
-    let _ = &window;
-    dialog.pick_file(move |path| {
-        let _ = sender.send(path);
-    });
-    let chosen = receiver
-        .await
-        .map_err(|_| CommandError::local_failure("the file dialog did not answer"))?;
-    let Some(chosen) = chosen else {
-        return Ok(None);
-    };
-    let path = chosen
-        .into_path()
-        .map_err(|error| CommandError::invalid(format!("that file is not a path: {error}")))?;
-    let name = nominated_file_name(&path)?;
-    state.hold_authorised_file(path);
-    Ok(Some(ChosenFile { name }))
+    choose_file_in(&app, &state, async {
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let dialog = app.dialog().file();
+        #[cfg(desktop)]
+        let dialog = dialog.set_parent(&window);
+        // A phone's file picker takes no parent window.
+        #[cfg(not(desktop))]
+        let _ = &window;
+        dialog.pick_file(move |path| {
+            let _ = sender.send(path);
+        });
+        let chosen = receiver
+            .await
+            .map_err(|_| CommandError::local_failure("the file dialog did not answer"))?;
+        chosen
+            .map(|chosen| {
+                chosen.into_path().map_err(|error| {
+                    CommandError::invalid(format!("that file is not a path: {error}"))
+                })
+            })
+            .transpose()
+    })
+    .await
 }
 
-/// The file the person chose that no run has used, as the page is told of it: its name, or none.
+/// Keeps what a file dialog answers, for [`choose_authorised_file`], and tells every screen when
+/// the dialog opens and when it closes. `dialog` is the platform's dialog, which opens only for a
+/// person.
 ///
-/// The page asks when it opens and after every run, so that what it says of the choice is what this
-/// process holds, whatever the page did before: a page that was reloaded, or that was told a run
-/// was refused before it took the choice, says the same as one that never left. It changes nothing.
+/// The dialog is open from here until it answers, whatever the answer is: a file replaces any held
+/// and the file and the end of the dialog change together, no file leaves what was held, and a
+/// failure leaves what was held and ends the dialog too.
+pub async fn choose_file_in<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    state: &AppState,
+    dialog: impl Future<Output = Result<Option<std::path::PathBuf>>>,
+) -> Result<Option<ChosenFile>> {
+    let open = state.open_file_dialog().ok_or_else(|| {
+        CommandError::refused("A file dialog is already open. Choose a file in it or close it.")
+    })?;
+    authorised_file_changed(app);
+    let answered = dialog.await.and_then(|chosen| {
+        chosen
+            .map(|path| nominated_file_name(&path).map(|name| (path, name)))
+            .transpose()
+    });
+    let (path, name) = match &answered {
+        Ok(Some((path, name))) => (Some(path.clone()), Some(ChosenFile { name: name.clone() })),
+        _ => (None, None),
+    };
+    open.settle(path);
+    authorised_file_changed(app);
+    answered.map(|_| name)
+}
+
+/// Tells every screen that what the application holds for the read check changed, which makes each
+/// ask again.
+fn authorised_file_changed<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
+    use tauri::Emitter as _;
+
+    let _ = app.emit(crate::AUTHORISED_FILE_EVENT, ());
+}
+
+/// The file the person chose that no run has used, as the page is told of it: its name, or none,
+/// and whether the platform's file dialog that may replace it is open.
+///
+/// The page asks when it opens and when it is told that the file held changed
+/// ([`AUTHORISED_FILE_EVENT`]), so that what it says of the choice is what this process holds,
+/// whatever the page did before: a page that was reloaded, or that was told a run was refused
+/// before it took the choice, or that was left and opened again while the dialog was open, says the
+/// same as one that never left. It changes nothing.
 #[tauri::command]
-pub fn held_authorised_file(state: State<'_, AppState>) -> Result<Option<ChosenFile>> {
-    state
-        .held_authorised_file()
-        .map(|path| nominated_file_name(&path).map(|name| ChosenFile { name }))
-        .transpose()
+pub fn held_authorised_file(state: State<'_, AppState>) -> Result<HeldFile> {
+    let held = state.held_authorised_file();
+    Ok(HeldFile {
+        dialog_open: held.dialog_open,
+        file: held
+            .path
+            .map(|path| nominated_file_name(&path).map(|name| ChosenFile { name }))
+            .transpose()?,
+    })
 }
 
 /// The name of a file the host can be asked to read, or why it cannot be: the protocol carries the

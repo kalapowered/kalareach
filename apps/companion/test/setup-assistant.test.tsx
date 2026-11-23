@@ -19,7 +19,7 @@ import configuration from '../src-tauri/tauri.conf.json'
 import { App } from '../src/App'
 import { AppProvider } from '../src/app/state'
 import { fakeHost, type FakeHostControls } from '../src/host/fake'
-import type { ChosenFile, HostPort } from '../src/host/port'
+import type { ChosenFile, HeldFile, HostPort } from '../src/host/port'
 import { readableBytes } from '../src/setup/host'
 import { CHECKS_POLL_MS } from '../src/setup/Setup'
 
@@ -387,13 +387,14 @@ describe('what setup costs a person', () => {
         ].includes(name)
     )
     // Setup reads the host's checks and descriptions, this application's identity, and which file
-    // this application holds for the read check, which reaches no host either.
+    // this application holds for the read check and when that changes, which reach no host either.
     expect(new Set(own)).toEqual(
       new Set([
         'setupIdentity',
         'environmentCapabilities',
         'descriptionSetup',
-        'heldAuthorisedFile'
+        'heldAuthorisedFile',
+        'onAuthorisedFileChanged'
       ])
     )
     // Nothing on this path signs in, pairs, pays or registers for anything. The shell's read of
@@ -776,20 +777,47 @@ describe('what the page says of the file the read check reads, while the applica
   /** A read of the held file that stays out until the case answers it, and every read so far. */
   function reads(): {
     held: HostPort['heldAuthorisedFile']
-    out: { answer: (file: ChosenFile | null) => void; fail: (message: string) => void }[]
+    out: {
+      answer: (file: ChosenFile | null, dialogOpen?: boolean) => void
+      fail: (message: string) => void
+    }[]
   } {
-    const out: { answer: (file: ChosenFile | null) => void; fail: (message: string) => void }[] = []
+    const out: {
+      answer: (file: ChosenFile | null, dialogOpen?: boolean) => void
+      fail: (message: string) => void
+    }[] = []
     return {
       out,
       held: () =>
-        new Promise<ChosenFile | null>((resolve, reject) => {
+        new Promise<HeldFile>((resolve, reject) => {
           out.push({
-            answer: resolve,
+            answer: (file, dialogOpen = false) => {
+              resolve({ dialog_open: dialogOpen, file })
+            },
             fail: (message) => {
               reject(new Error(message))
             }
           })
         })
+    }
+  }
+
+  /** The application's word that what it holds changed, given when the case says so. */
+  function changes(): {
+    onAuthorisedFileChanged: HostPort['onAuthorisedFileChanged']
+    tell: () => void
+  } {
+    const listeners = new Set<() => void>()
+    return {
+      onAuthorisedFileChanged: (listener) => {
+        listeners.add(listener)
+        return Promise.resolve(() => {
+          listeners.delete(listener)
+        })
+      },
+      tell: () => {
+        for (const listener of listeners) listener()
+      }
     }
   }
 
@@ -809,6 +837,12 @@ describe('what the page says of the file the read check reads, while the applica
       finished_at_ms: null,
       session_id: null
     })
+    await openTheSheet()
+    return host.controls
+  }
+
+  /** Opens the sheet that runs the checks, from the screen of setup as it first opens. */
+  async function openTheSheet(): Promise<void> {
     await goTo('capabilities')
     await userEvent.click(screen.getByTestId('setup-recheck'))
     await waitFor(() => {
@@ -816,7 +850,6 @@ describe('what the page says of the file the read check reads, while the applica
     })
     await userEvent.click(screen.getByTestId('setup-run-checks'))
     await screen.findByTestId('setup-effects')
-    return host.controls
   }
 
   const NONE = 'No file chosen. The read check will read nothing and say so.'
@@ -930,6 +963,141 @@ describe('what the page says of the file the read check reads, while the applica
     })
     expect(line().textContent).toBe(NOTES)
     expect(screen.getByTestId('setup-checks-run')).toBeEnabled()
+  })
+
+  it('says nothing of the file, and allows no run, while the application says its dialog is open, and asks again when it is told that what it holds changed', async () => {
+    const { held, out } = reads()
+    const heard = changes()
+    await sheetWith({
+      heldAuthorisedFile: held,
+      onAuthorisedFileChanged: heard.onAuthorisedFileChanged
+    })
+    await waitFor(() => {
+      expect(out.length).toBeGreaterThan(0)
+    })
+    out.at(-1)?.answer({ name: 'notes.txt' })
+    await waitFor(() => {
+      expect(line().textContent).toBe(NOTES)
+    })
+    expect(screen.getByTestId('setup-checks-run')).toBeEnabled()
+
+    // The platform's dialog opens where the window does not wait for it, so the screen was left and
+    // opened again, or another screen opened it. The file held may be replaced by its answer.
+    const opened = out.length
+    act(() => {
+      heard.tell()
+    })
+    await waitFor(() => {
+      expect(out.length).toBeGreaterThan(opened)
+    })
+    out.at(-1)?.answer({ name: 'notes.txt' }, true)
+    await act(async () => {
+      await Promise.resolve()
+    })
+    expect(line().textContent).toBe('')
+    expect(screen.getByTestId('setup-checks-run')).toBeDisabled()
+
+    // The dialog closes with a choice, and the page is told.
+    const closed = out.length
+    act(() => {
+      heard.tell()
+    })
+    await waitFor(() => {
+      expect(out.length).toBeGreaterThan(closed)
+    })
+    out.at(-1)?.answer({ name: 'chosen.txt' })
+    await waitFor(() => {
+      expect(line().textContent).toBe('File chosen: chosen.txt. The next run reads it once.')
+    })
+    expect(screen.getByTestId('setup-checks-run')).toBeEnabled()
+  })
+
+  it('says nothing of the file, and allows no run, in a screen opened again while the platform dialog is open', async () => {
+    // The window does not wait for the dialog on every platform, so a person can leave the screen
+    // that asked and open it again while the dialog is still open.
+    let dialogOpen = false
+    let held: ChosenFile | null = null
+    let answer: (file: ChosenFile | null) => void = () => undefined
+    const heard = changes()
+    await sheetWith({
+      chooseAuthorisedFile: () =>
+        new Promise<ChosenFile | null>((resolve) => {
+          dialogOpen = true
+          answer = (file) => {
+            dialogOpen = false
+            if (file !== null) held = file
+            resolve(file)
+          }
+        }),
+      heldAuthorisedFile: () => Promise.resolve({ dialog_open: dialogOpen, file: held }),
+      onAuthorisedFileChanged: heard.onAuthorisedFileChanged
+    })
+    await waitFor(() => {
+      expect(line().textContent).toBe(NONE)
+    })
+    await userEvent.click(screen.getByTestId('setup-checks-choose'))
+
+    await userEvent.click(screen.getByRole('button', { name: 'Pair with a host' }))
+    await userEvent.click(screen.getByRole('button', { name: 'Set up this Mac' }))
+    await screen.findByTestId('setup-identity')
+    await openTheSheet()
+    // The new screen reads while the dialog is open: it is not told that none is chosen.
+    expect(line().textContent).toBe('')
+    expect(screen.getByTestId('setup-checks-run')).toBeDisabled()
+
+    // The dialog answers, the application tells every screen, and the new screen says the file.
+    await act(async () => {
+      answer({ name: 'chosen.txt' })
+      heard.tell()
+      await Promise.resolve()
+    })
+    await waitFor(() => {
+      expect(line().textContent).toBe('File chosen: chosen.txt. The next run reads it once.')
+    })
+    expect(screen.getByTestId('setup-checks-run')).toBeEnabled()
+  })
+
+  it('registers to be told that what the application holds changed before it reads, so that no change falls between', async () => {
+    const { held, out } = reads()
+    let registered: () => void = () => undefined
+    await sheetWith({
+      heldAuthorisedFile: held,
+      onAuthorisedFileChanged: () =>
+        new Promise<() => void>((resolve) => {
+          registered = () => {
+            resolve(() => undefined)
+          }
+        })
+    })
+    // Nothing is asked of the application while the page cannot yet hear it change.
+    await act(async () => {
+      await Promise.resolve()
+    })
+    expect(out.length).toBe(0)
+    expect(line().textContent).toBe('')
+    expect(screen.getByTestId('setup-checks-run')).toBeDisabled()
+    act(() => {
+      registered()
+    })
+    await waitFor(() => {
+      expect(out.length).toBeGreaterThan(0)
+    })
+    out.at(-1)?.answer(null)
+    await waitFor(() => {
+      expect(line().textContent).toBe(NONE)
+    })
+  })
+
+  it('says why it cannot know the file when it cannot be told of a change, and allows no run', async () => {
+    const { held, out } = reads()
+    await sheetWith({
+      heldAuthorisedFile: held,
+      onAuthorisedFileChanged: () => Promise.reject(new Error('the application cannot be heard'))
+    })
+    await screen.findByText(/the application cannot be heard/)
+    expect(out.length).toBe(0)
+    expect(line().textContent).toBe('')
+    expect(screen.getByTestId('setup-checks-run')).toBeDisabled()
   })
 
   it('allows no run while the platform dialog is open', async () => {

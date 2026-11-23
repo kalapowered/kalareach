@@ -26,6 +26,7 @@ import type {
   AttachmentHandle,
   CameraAccess,
   ChosenFile,
+  HeldFile,
   ConnectionSince,
   ConnectionState,
   DroppedFile,
@@ -88,6 +89,9 @@ export const CONNECTION_EVENT = 'kr://connection'
 
 /** The event the backend publishes the paths of dropped files on. */
 export const DROPPED_EVENT = 'kr://dropped'
+
+/** The event the backend publishes when what it holds for the read check changes. */
+export const AUTHORISED_FILE_EVENT = 'kr://authorised-file'
 
 /** The event the backend publishes the account's view on when it changes by itself. */
 export const ACCOUNT_EVENT = 'kr://account'
@@ -424,7 +428,8 @@ export function tauriPort(): HostPort {
     // The platform's file dialog answers, and native code keeps the path for the one run that
     // reads it. The page is told the file's name and never names a path of its own.
     chooseAuthorisedFile: () => call<ChosenFile | null>('choose_authorised_file', {}),
-    heldAuthorisedFile: () => call<ChosenFile | null>('held_authorised_file', {}),
+    heldAuthorisedFile: () => call<HeldFile>('held_authorised_file', {}),
+    onAuthorisedFileChanged: (listener) => listening<null>(AUTHORISED_FILE_EVENT, () => listener()),
 
     launchSurface: (params) => read('launch_surface', params),
     launchCommands: () => call<LaunchCommandsReading>('launch_commands_list', {}),

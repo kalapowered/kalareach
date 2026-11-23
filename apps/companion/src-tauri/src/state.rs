@@ -67,8 +67,8 @@ pub struct AppState {
     paired_links: Arc<crate::standing::PairedLinks>,
     export_destinations: Mutex<Vec<std::path::PathBuf>>,
     /// The one file the person chose in the platform's file dialog for the next run of the
-    /// disclosed checks.
-    authorised_file: Mutex<Option<std::path::PathBuf>>,
+    /// disclosed checks, and whether that dialog is open.
+    authorised_file: Mutex<AuthorisedFile>,
     dropped_files: Mutex<Vec<std::path::PathBuf>>,
     /// Where a suite has paused the state's own steps.
     #[cfg(feature = "testing")]
@@ -83,6 +83,56 @@ pub struct Started {
     /// Starts the task for the choice number it is given.
     pub spawn: Box<dyn FnOnce(u64) -> tauri::async_runtime::JoinHandle<()> + Send>,
 }
+
+/// The file chosen for the next run of the disclosed checks, and whether the dialog that may
+/// replace it is open.
+#[derive(Debug, Default)]
+struct AuthorisedFile {
+    held: Option<std::path::PathBuf>,
+    dialog_open: bool,
+}
+
+/// What the application holds for the read check.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HeldAuthorisedFile {
+    /// The platform's file dialog is open, so the file held may be replaced and no run takes it.
+    pub dialog_open: bool,
+    /// The chosen file that no run has taken.
+    pub path: Option<std::path::PathBuf>,
+}
+
+/// The platform's file dialog for the read check is open, until the answer is settled or this is
+/// dropped.
+#[derive(Debug)]
+pub struct FileDialogOpen<'a> {
+    state: &'a AppState,
+    settled: bool,
+}
+
+impl FileDialogOpen<'_> {
+    /// Ends the dialog with its answer: the file chosen, which replaces any held, or none, which
+    /// leaves what was held as it was. The file and the end of the dialog change together.
+    pub fn settle(mut self, chosen: Option<std::path::PathBuf>) {
+        let mut file = self.state.authorised_file();
+        if let Some(path) = chosen {
+            file.held = Some(path);
+        }
+        file.dialog_open = false;
+        self.settled = true;
+    }
+}
+
+impl Drop for FileDialogOpen<'_> {
+    fn drop(&mut self) {
+        if !self.settled {
+            self.state.authorised_file().dialog_open = false;
+        }
+    }
+}
+
+/// A run asked to take the chosen file while the platform's file dialog was open.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FileDialogIsOpen;
 
 impl AppState {
     /// Builds the state of an application that has not connected to anything yet.
@@ -114,7 +164,7 @@ impl AppState {
             retained: crate::retained::Deletions::default(),
             paired_links: Arc::new(crate::standing::PairedLinks::default()),
             export_destinations: Mutex::new(Vec::new()),
-            authorised_file: Mutex::new(None),
+            authorised_file: Mutex::new(AuthorisedFile::default()),
             dropped_files: Mutex::new(Vec::new()),
             #[cfg(feature = "testing")]
             pauses: Arc::default(),
@@ -816,6 +866,26 @@ impl AppState {
         }
     }
 
+    /// Marks the platform's file dialog for the disclosed checks as open until the answer is
+    /// settled, or `None` where one is open already.
+    ///
+    /// The window does not wait for the dialog on every platform: the Linux back end opens it with
+    /// no parent, so a person can leave the screen that asked and open it again. While it is open
+    /// the file held is not what the next run reads, since the dialog may replace it, so
+    /// [`held_authorised_file`](Self::held_authorised_file) says that it is open and
+    /// [`take_authorised_file`](Self::take_authorised_file) refuses.
+    pub fn open_file_dialog(&self) -> Option<FileDialogOpen<'_>> {
+        let mut file = self.authorised_file();
+        if file.dialog_open {
+            return None;
+        }
+        file.dialog_open = true;
+        Some(FileDialogOpen {
+            state: self,
+            settled: false,
+        })
+    }
+
     /// Remembers the file the person chose in the platform's file dialog for the disclosed checks,
     /// in place of any file chosen before.
     ///
@@ -823,26 +893,39 @@ impl AppState {
     /// for a choice, the platform's own dialog answers, and the answer is kept here, out of the
     /// page's reach, until the run that reads it.
     pub fn hold_authorised_file(&self, path: std::path::PathBuf) {
-        *self
-            .authorised_file
-            .lock()
-            .expect("the authorised file's lock is not poisoned") = Some(path);
+        self.authorised_file().held = Some(path);
     }
 
-    /// The chosen file that no run has taken, which the next run would read. It changes nothing.
-    pub fn held_authorised_file(&self) -> Option<std::path::PathBuf> {
+    /// The chosen file that no run has taken, which the next run would read, and whether the
+    /// dialog that may replace it is open. It changes nothing.
+    pub fn held_authorised_file(&self) -> HeldAuthorisedFile {
+        let file = self.authorised_file();
+        HeldAuthorisedFile {
+            dialog_open: file.dialog_open,
+            path: file.held.clone(),
+        }
+    }
+
+    /// Takes the chosen file for one run, so that a choice serves one run and no more. No run
+    /// takes it while the dialog is open.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FileDialogIsOpen`] where the dialog is open, and leaves the file held.
+    pub fn take_authorised_file(
+        &self,
+    ) -> std::result::Result<Option<std::path::PathBuf>, FileDialogIsOpen> {
+        let mut file = self.authorised_file();
+        if file.dialog_open {
+            return Err(FileDialogIsOpen);
+        }
+        Ok(file.held.take())
+    }
+
+    fn authorised_file(&self) -> MutexGuard<'_, AuthorisedFile> {
         self.authorised_file
             .lock()
             .expect("the authorised file's lock is not poisoned")
-            .clone()
-    }
-
-    /// Takes the chosen file for one run, so that a choice serves one run and no more.
-    pub fn take_authorised_file(&self) -> Option<std::path::PathBuf> {
-        self.authorised_file
-            .lock()
-            .expect("the authorised file's lock is not poisoned")
-            .take()
     }
 
     /// Remembers a file the platform said was dropped on this window.

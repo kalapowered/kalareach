@@ -151,6 +151,19 @@ describe('the desktop shell', () => {
       ]
     ])
   })
+
+  it('tells the page each time the application says that what it holds for the read check changed', async () => {
+    const told = vi.fn()
+    const registration = tauriPort().onAuthorisedFileChanged(told)
+    expect(shell.asked.map((asked) => asked.event)).toEqual(['kr://authorised-file'])
+    shell.asked[0].complete(() => undefined)
+    await registration
+
+    shell.asked[0].handler({ payload: null })
+    shell.asked[0].handler({ payload: null })
+    expect(told).toHaveBeenCalledTimes(2)
+    expect(told).toHaveBeenCalledWith()
+  })
 })
 
 describe('watching', () => {

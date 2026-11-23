@@ -32,7 +32,7 @@ import type { CapabilityRecord, EnvironmentCapabilitiesResult } from '@kalareach
 
 import { Badge, Banner, Button, Card, Sheet, Switch } from '../components/ui'
 import { useApp } from '../app/state'
-import { failureMessage, type SetupIdentity } from '../host/port'
+import { failureMessage, watch, type SetupIdentity } from '../host/port'
 import {
   INSTALLABLES,
   NO_ACCOUNT_NEEDED,
@@ -244,10 +244,13 @@ export function Setup(): ReactNode {
   const [asking, setAsking] = useState(false)
   // The name of the file the application holds for the read check, which the next run reads and
   // uses up, or null when it holds none. The path is never here: native code keeps it. This is what
-  // the application last said, read when the screen opens and after every dialog and every run, and
-  // the page keeps no choice of its own: it cannot say that none is chosen while one is held. It is
-  // undefined while a read is out and after one that failed, and the line says nothing and no run
-  // is allowed until a read answers.
+  // the application last said, read when the screen opens, after every dialog and every run, and
+  // whenever the application says that what it holds changed, and the page keeps no choice of its
+  // own: it cannot say that none is chosen while one is held. It is undefined while a read is out,
+  // after one that failed, and while the application says that the platform's file dialog is open,
+  // which a screen opened again meanwhile reads where the window does not wait for the dialog: its
+  // answer may replace the file. The line says nothing and no run is allowed until a read answers
+  // that no dialog is open.
   const [chosen, setChosen] = useState<string | null | undefined>(undefined)
   // Which read of the held file is the newest, so that an answer to an older one is dropped.
   const newestRead = useRef(0)
@@ -329,8 +332,10 @@ export function Setup(): ReactNode {
     const mine = newestRead.current
     port
       .heldAuthorisedFile()
-      .then((file) => {
-        if (mine === newestRead.current) setChosen(file === null ? null : file.name)
+      .then((held) => {
+        if (mine !== newestRead.current) return
+        if (held.dialog_open) setChosen(undefined)
+        else setChosen(held.file === null ? null : held.file.name)
       })
       .catch((error: unknown) => {
         if (mine === newestRead.current) say(failureMessage(error), 'danger')
@@ -344,10 +349,18 @@ export function Setup(): ReactNode {
     askChosen()
   }, [askChosen])
 
-  // When the screen opens nothing is known yet.
-  useEffect(() => {
-    askChosen()
-  }, [askChosen])
+  // The application says when what it holds changed: a dialog opened or closed, in this window or
+  // where the window did not wait for it, or a run took the file. What the page said before is not
+  // known to stand, so it asks again, and a dialog that is still open leaves nothing said. The
+  // listener is registered before the first read, so that no change falls between the two: when the
+  // screen opens nothing is known yet.
+  useEffect(
+    () =>
+      watch([port.onAuthorisedFileChanged(readChosen)], askChosen, (failure: unknown) => {
+        say(failureMessage(failure), 'danger')
+      }).stop,
+    [port, readChosen, askChosen, say]
+  )
 
   const environmentId = capabilities?.environment_id ?? null
   const watching = accepted

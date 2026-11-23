@@ -1534,6 +1534,18 @@ export interface ChosenFile {
   readonly name: string
 }
 
+/** What the application holds for the read check, as the page is told of it. */
+export interface HeldFile {
+  /**
+   * The platform's file dialog is open. Its answer may replace the file held, so nothing is known
+   * of the file the next run reads, and no run is allowed. On some platforms the window does not
+   * wait for the dialog: a screen opened again meanwhile reads this.
+   */
+  readonly dialog_open: boolean
+  /** The file chosen that no run has taken, or none. */
+  readonly file: ChosenFile | null
+}
+
 /**
  * The answer of a mutation: the receipt, and the method's own result when the host returned one.
  *
@@ -2219,11 +2231,18 @@ export interface HostPort {
   chooseAuthorisedFile(): Promise<ChosenFile | null>
   /**
    * Which file the application holds for the next run of the read check: the name of the one the
-   * person chose that no run has taken, or null. Native code is the one place that knows, so the
-   * page asks it when it opens and after every dialog and every run, and says what it answers.
+   * person chose that no run has taken, or none, and whether the dialog that may replace it is
+   * open. Native code is the one place that knows, so the page asks it when it opens and each time
+   * it is told that the file held changed (`onAuthorisedFileChanged`), and says what it answers.
    * Asking changes nothing.
    */
-  heldAuthorisedFile(): Promise<ChosenFile | null>
+  heldAuthorisedFile(): Promise<HeldFile>
+  /**
+   * Tells `listener` each time what the application holds for the read check changes: the file
+   * dialog opens or closes, or a run takes the file. The listener asks `heldAuthorisedFile` again.
+   * Resolves, with the function that stops it, once the listener is registered.
+   */
+  onAuthorisedFileChanged(listener: () => void): Promise<() => void>
 
   /**
    * What the session's worker says of a launch at its root editor now, read on the link every

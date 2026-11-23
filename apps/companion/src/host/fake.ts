@@ -2233,9 +2233,15 @@ export function fakeHost(
       return Promise.resolve({ name: dialogAnswer })
     },
 
-    // As in the application, a run that is refused before it takes the choice leaves it held.
+    // As in the application, a run that is refused before it takes the choice leaves it held. The
+    // scripted dialog answers at once, so it is never open when this is asked, and what is held
+    // changes only by the page's own actions, which ask again themselves: nothing is published.
     heldAuthorisedFile: () =>
-      Promise.resolve(chosenFile === null ? null : { name: chosenFile }),
+      Promise.resolve({
+        dialog_open: false,
+        file: chosenFile === null ? null : { name: chosenFile }
+      }),
+    onAuthorisedFileChanged: () => registering.then(() => () => undefined),
 
     setupIdentity: () => Promise.resolve(setupIdentity(identityStable, connected)),
 

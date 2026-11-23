@@ -1100,3 +1100,8 @@ pub fn start_pairing<R: tauri::Runtime>(
 
 /// The event the backend publishes the paths of dropped files on.
 pub const DROPPED_EVENT: &str = "kr://dropped";
+
+/// The event the backend publishes on when what it holds for the read check of the disclosed checks
+/// changes: a file dialog opens or closes, or a run takes the file. It carries nothing; a screen
+/// asks `held_authorised_file` again.
+pub const AUTHORISED_FILE_EVENT: &str = "kr://authorised-file";

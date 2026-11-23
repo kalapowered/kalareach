@@ -1615,7 +1615,7 @@ async fn a_file_chosen_in_the_dialog_is_read_by_one_run_of_the_checks() {
         read.disabled_reason
     );
     assert!(
-        state.take_authorised_file().is_none(),
+        state.held_authorised_file().path.is_none(),
         "the run that read the file used the choice up"
     );
 
@@ -1648,7 +1648,7 @@ async fn a_file_chosen_in_the_dialog_is_read_by_one_run_of_the_checks() {
 }
 
 /// What the page is told of the file this process holds for the next run of the checks: its name,
-/// or null.
+/// or none, and whether the dialog that may replace it is open.
 async fn held_file_as_told(host: &Host) -> Value {
     host.call("held_authorised_file", json!({}))
         .await
@@ -1663,14 +1663,18 @@ async fn held_file_as_told(host: &Host) -> Value {
 async fn the_page_reads_which_chosen_file_is_held() {
     let host = Host::start().await;
     let state = host.app.state::<companion_tauri::AppState>();
-    assert_eq!(held_file_as_told(&host).await, Value::Null, "none chosen");
+    assert_eq!(
+        held_file_as_told(&host).await,
+        json!({ "dialog_open": false, "file": null }),
+        "none chosen"
+    );
 
     let chosen = host.tree.root().join("chosen.txt");
     state.hold_authorised_file(chosen.clone());
     let told = held_file_as_told(&host).await;
     assert_eq!(
         told,
-        json!({ "name": "chosen.txt" }),
+        json!({ "dialog_open": false, "file": { "name": "chosen.txt" } }),
         "the name and no path"
     );
     assert_eq!(
@@ -1711,9 +1715,226 @@ async fn the_page_reads_which_chosen_file_is_held() {
         .expect("the checks are asked for");
     assert_eq!(
         held_file_as_told(&host).await,
-        Value::Null,
+        json!({ "dialog_open": false, "file": null }),
         "the run that took the file used the choice up"
     );
+}
+
+/// Runs `during` while the file dialog is open, as it is where a person has pressed the button and
+/// not yet answered, then has the dialog answer `answer`, and gives what the command that opened it
+/// came to and what `during` came to. The platform's dialog opens only for a person, so the dialog is
+/// a future the case answers. The host's application gives the file the dialog chose to
+/// [`companion_tauri::commands::choose_file_in`] as the command does.
+async fn while_the_file_dialog_is_open<T>(
+    host: &Host,
+    answer: Result<Option<PathBuf>, companion_tauri::error::CommandError>,
+    during: impl std::future::Future<Output = T>,
+) -> (
+    Result<Option<companion_tauri::commands::ChosenFile>, companion_tauri::error::CommandError>,
+    T,
+) {
+    let state = host.app.state::<companion_tauri::AppState>();
+    let (sender, answered) = tokio::sync::oneshot::channel();
+    let (opened, is_open) = tokio::sync::oneshot::channel();
+    let choosing =
+        companion_tauri::commands::choose_file_in(host.app.handle(), state.inner(), async {
+            // The command asks the platform's dialog once it has marked the dialog open.
+            opened.send(()).expect("the case awaits the dialog");
+            answered.await.expect("the dialog is answered")
+        });
+    let meanwhile = async {
+        is_open.await.expect("the dialog was asked");
+        let done = during.await;
+        sender.send(answer).expect("the command awaits the dialog");
+        done
+    };
+    tokio::join!(choosing, meanwhile)
+}
+
+/// KR-REQ-03.29: a screen that reads which chosen file the application holds while the platform's
+/// file dialog is open, which is a screen opened again after the person left the one that asked
+/// where the platform's dialog does not keep the window waiting, is told that the dialog is open: the
+/// answer of the dialog may replace what is held, so what is held is not what the next run reads.
+/// Once the dialog has answered, the screen is told the file.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_screen_that_reads_while_the_file_dialog_is_open_is_told_that_it_is_open() {
+    let host = Host::start().await;
+    let state = host.app.state::<companion_tauri::AppState>();
+    state.hold_authorised_file(host.tree.root().join("earlier.txt"));
+    let chosen = host.tree.root().join("chosen.txt");
+    let (choice, during) =
+        while_the_file_dialog_is_open(&host, Ok(Some(chosen)), held_file_as_told(&host)).await;
+    assert_eq!(
+        during["dialog_open"],
+        json!(true),
+        "told while the dialog is open: {during}"
+    );
+    assert_eq!(
+        choice.expect("the dialog answered").map(|file| file.name),
+        Some("chosen.txt".to_owned())
+    );
+    assert_eq!(
+        held_file_as_told(&host).await,
+        json!({ "dialog_open": false, "file": { "name": "chosen.txt" } }),
+        "the file the dialog chose replaced the earlier one and the dialog is closed"
+    );
+}
+
+/// KR-REQ-03.29: no run takes the chosen file while the platform's file dialog is open, and the
+/// request is refused with the file still held, so that a screen that was not the one that opened the
+/// dialog cannot start a run that reads a file the person is about to replace.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_checks_are_refused_while_the_file_dialog_is_open_and_the_file_stays_held() {
+    let host = Host::start().await;
+    let state = host.app.state::<companion_tauri::AppState>();
+    let earlier = host.tree.root().join("earlier.txt");
+    state.hold_authorised_file(earlier.clone());
+    let (_, refusal) =
+        while_the_file_dialog_is_open(&host, Ok(None), ask_for_the_checks(&host)).await;
+    let refusal = refusal.expect_err("a run while the dialog is open");
+    assert!(
+        refusal["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("file dialog is still open"),
+        "{refusal}"
+    );
+    assert_eq!(
+        state.held_authorised_file().path,
+        Some(earlier),
+        "the refused request left the file held"
+    );
+}
+
+/// KR-REQ-03.29: a second file dialog is refused while one is open, so that two answers never
+/// compete for the one file held.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_second_file_dialog_is_refused_while_one_is_open() {
+    let host = Host::start().await;
+    let state = host.app.state::<companion_tauri::AppState>();
+    let (_, second) = while_the_file_dialog_is_open(&host, Ok(None), async {
+        companion_tauri::commands::choose_file_in(host.app.handle(), state.inner(), async {
+            Ok(Some(host.tree.root().join("second.txt")))
+        })
+        .await
+    })
+    .await;
+    let refusal = second.expect_err("a second dialog");
+    assert!(refusal.to_string().contains("already open"), "{refusal}");
+    assert_eq!(
+        state.held_authorised_file().path,
+        None,
+        "the refused dialog held no file"
+    );
+}
+
+/// KR-REQ-03.29: a dialog that is closed with no choice, or that fails, ends: what was held stays
+/// held, and the dialog is not left open, which would refuse every run after it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_file_dialog_closed_with_no_choice_or_failing_ends_and_leaves_the_file_held() {
+    let host = Host::start().await;
+    let state = host.app.state::<companion_tauri::AppState>();
+    let earlier = host.tree.root().join("earlier.txt");
+    state.hold_authorised_file(earlier.clone());
+    for (answer, fails) in [
+        (Ok(None), false),
+        (
+            Err(companion_tauri::error::CommandError::local_failure(
+                "the file dialog did not answer",
+            )),
+            true,
+        ),
+    ] {
+        let (choice, ()) = while_the_file_dialog_is_open(&host, answer, async {}).await;
+        assert_eq!(choice.is_err(), fails);
+        let held = state.held_authorised_file();
+        assert!(!held.dialog_open, "the dialog was left open");
+        assert_eq!(held.path, Some(earlier.clone()), "what was held changed");
+    }
+}
+
+/// KR-REQ-03.29: a file dialog that is abandoned before it answers, because the command that opened
+/// it is dropped, ends: no dialog is left open to refuse every run and every dialog after it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_file_dialog_abandoned_before_it_answers_ends() {
+    let host = Host::start().await;
+    let state = host.app.state::<companion_tauri::AppState>();
+    let abandoned = tokio::time::timeout(
+        std::time::Duration::from_millis(200),
+        companion_tauri::commands::choose_file_in(
+            host.app.handle(),
+            state.inner(),
+            std::future::pending::<Result<Option<PathBuf>, companion_tauri::error::CommandError>>(),
+        ),
+    )
+    .await;
+    assert!(abandoned.is_err(), "the dialog answered by itself");
+    assert!(
+        !state.held_authorised_file().dialog_open,
+        "the dialog was left open"
+    );
+}
+
+/// KR-REQ-03.29: every screen is told when what the application holds for the read check changes:
+/// when the dialog opens, when it closes, and when a run takes the file, and told nothing when a
+/// dialog is refused or a run takes no file. A screen that is told asks again.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_screens_are_told_when_the_file_held_for_the_read_check_changes() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use tauri::Listener as _;
+
+    let host = Host::start().await;
+    let told = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&told);
+    host.app
+        .listen(companion_tauri::AUTHORISED_FILE_EVENT, move |_| {
+            counted.fetch_add(1, Ordering::SeqCst);
+        });
+    // Events reach a listener through the runtime, so each count waits for the one it expects.
+    let told_so_far = |expected: usize| {
+        let told = Arc::clone(&told);
+        async move {
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+            while told.load(Ordering::SeqCst) < expected && tokio::time::Instant::now() < deadline {
+                tokio::task::yield_now().await;
+            }
+            // Nothing more arrives for an event that was not sent.
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            told.load(Ordering::SeqCst)
+        }
+    };
+
+    let chosen = host.tree.root().join("chosen.txt");
+    let (choice, ()) = while_the_file_dialog_is_open(&host, Ok(Some(chosen)), async {}).await;
+    choice.expect("the dialog answered");
+    assert_eq!(told_so_far(2).await, 2, "the dialog opened and closed");
+
+    ask_for_the_checks(&host)
+        .await
+        .expect("the checks are asked for");
+    assert_eq!(told_so_far(3).await, 3, "a run took the file");
+
+    ask_for_the_checks(&host)
+        .await
+        .expect("the checks are asked for");
+    assert_eq!(
+        told_so_far(3).await,
+        3,
+        "a run that took no file told nobody"
+    );
+
+    let state = host.app.state::<companion_tauri::AppState>();
+    let (choice, second) = while_the_file_dialog_is_open(&host, Ok(None), async {
+        companion_tauri::commands::choose_file_in(host.app.handle(), state.inner(), async {
+            Ok(None)
+        })
+        .await
+    })
+    .await;
+    choice.expect("the dialog answered");
+    second.expect_err("a second dialog while one is open");
+    assert_eq!(told_so_far(5).await, 5, "a refused dialog told nobody");
 }
 
 /// KR-REQ-13.11: the launch commands are read, saved, replaced and removed through the three
