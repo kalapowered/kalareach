@@ -2766,29 +2766,33 @@ line = 'KR_HARNESS_DIR="$harness" KR_HARNESS_PEER="$1" KR_HARNESS_SECONDS=1500 K
 package = 'kr-transport'
 target = '--test real_proxy'
 [ignored_run.runs]
-kind = 'by_hand'
-why = 'they run only against a squid proxy that `scripts/real-proxy.sh start <run folder> basic` starts and names in the `env.sh` of its run folder, and no step of this repository installs squid or starts that script: a person starts the proxy, sources `env.sh` and runs the target with `--ignored`'
+kind = 'command'
+file = 'scripts/real-proxy-cases.sh'
+line = 'expect 4 cargo test --locked -p kr-transport --test real_proxy -- --ignored --exact a_client_with_the_right_login_reaches_an_origin_through_a_real_proxy a_wrong_login_is_refused_by_a_real_proxy_once_and_stops_every_request a_client_with_no_login_is_told_by_a_real_proxy_that_one_is_needed a_plain_http_target_is_refused_before_a_real_proxy_is_asked --nocapture --test-threads=1'
 
 [[ignored_run]]
 package = 'kr-transport'
 target = '--test real_proxy_bump'
 [ignored_run.runs]
-kind = 'by_hand'
-why = 'they run only against a squid proxy that intercepts TLS, which `scripts/real-proxy.sh start <run folder> bump` starts and names in the `env.sh` of its run folder, and no step of this repository installs squid or starts that script: a person starts the proxy, sources `env.sh` and runs the target with `--ignored`'
+kind = 'command'
+file = 'scripts/real-proxy-cases.sh'
+line = 'expect 2 cargo test --locked -p kr-transport --test real_proxy_bump -- --ignored --exact a_relay_only_attempt_through_a_real_proxy_that_refuses_the_upgrade_says_so a_real_intercepting_proxy_is_trusted_only_when_its_authority_is_named --nocapture --test-threads=1'
 
 [[ignored_run]]
 package = 'kr-controller'
 target = '--test proxy_front'
 [ignored_run.runs]
-kind = 'by_hand'
-why = 'it runs only against a squid proxy that `scripts/real-proxy.sh start <run folder> basic` starts and names in the `env.sh` of its run folder, and no step of this repository installs squid or starts that script: a person starts the proxy, sources `env.sh` and runs the target with `--ignored`'
+kind = 'command'
+file = 'scripts/real-proxy-cases.sh'
+line = 'expect 1 cargo test --locked -p kr-controller --test proxy_front -- --ignored --exact an_endpoint_reaches_its_relay_through_a_real_proxy_by_its_front --nocapture --test-threads=1'
 
 [[ignored_run]]
 package = 'kr-controller'
 target = '--test proxy_login_daemon'
 [ignored_run.runs]
-kind = 'by_hand'
-why = 'they run only against two squid proxies, one that asks for a Basic login and one that offers Digest only, which `scripts/real-proxy.sh start <run folder> basic` and `... digest` start and name in the `env.sh` of each run folder, and no step of this repository installs squid or starts that script: a person starts both proxies, sources both `env.sh` files and runs the target with `--ignored`'
+kind = 'command'
+file = 'scripts/real-proxy-cases.sh'
+line = 'expect 3 cargo test --locked -p kr-controller --test proxy_login_daemon -- --ignored --exact a_daemon_behind_a_real_proxy_starts_says_so_and_takes_the_login_at_its_next_start a_wrong_login_is_written_to_a_real_proxy_once_and_the_daemon_stops_every_request_through_it a_real_proxy_that_offers_digest_only_is_unsupported_whether_or_not_a_login_is_held --nocapture --test-threads=1'
 
 [[ignored_run]]
 package = 'kr-controller'

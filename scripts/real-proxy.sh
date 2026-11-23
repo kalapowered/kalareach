@@ -1,8 +1,13 @@
 #!/usr/bin/env bash
 # Runs a squid on the loopback for the cases that name a real proxy, and stops it.
 #
+#   scripts/real-proxy.sh check
 #   scripts/real-proxy.sh start <run folder> basic|digest|bump
 #   scripts/real-proxy.sh stop <run folder>
+#
+# `check` starts nothing. It fails unless the squid program is version 6 or newer, is built with
+# OpenSSL and with the certificate helper (`--with-openssl` and `--enable-ssl-crtd`), and has the
+# three helper programs the modes use (basic_ncsa_auth, digest_file_auth, security_file_certgen).
 #
 # The run folder is made for the run and holds everything the proxy needs: its configuration, its
 # access log, a password file and a credential file made for this run (mode 0600, one
@@ -63,6 +68,22 @@ libexec_of() {
   else
     echo /usr/lib/squid
   fi
+}
+
+check() {
+  local program libexec description version helper
+  program="$(squid_program)"
+  libexec="$(libexec_of "$program")"
+  description="$("$program" -v)"
+  version="$(printf '%s\n' "$description" | sed -n '1s/^.*Version \([0-9][0-9]*\)\..*$/\1/p')"
+  case "$version" in '' | *[!0-9]*) die "cannot read the version of $program" ;; esac
+  [ "$version" -ge 6 ] || die "$program is version $version, and the cases need 6 or newer"
+  case "$description" in *--with-openssl*) ;; *) die "$program is built without OpenSSL" ;; esac
+  case "$description" in *--enable-ssl-crtd*) ;; *) die "$program is built without the certificate helper" ;; esac
+  for helper in basic_ncsa_auth digest_file_auth security_file_certgen; do
+    [ -x "$libexec/$helper" ] || die "no $helper in $libexec: set SQUID_LIBEXEC"
+  done
+  echo "real-proxy: squid $version at $program, helpers in $libexec"
 }
 
 free_port() {
@@ -177,7 +198,8 @@ stop() {
 }
 
 case "${1:-}" in
+  check) [ $# -eq 1 ] || die "usage: real-proxy.sh check"; check ;;
   start) [ $# -eq 3 ] || die "usage: real-proxy.sh start <run folder> basic|digest|bump"; start "$2" "$3" ;;
   stop) [ $# -eq 2 ] || die "usage: real-proxy.sh stop <run folder>"; stop "$2" ;;
-  *) die "usage: real-proxy.sh start <run folder> basic|digest|bump | stop <run folder>" ;;
+  *) die "usage: real-proxy.sh check | start <run folder> basic|digest|bump | stop <run folder>" ;;
 esac
