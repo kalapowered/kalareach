@@ -78,9 +78,9 @@ export interface UploadRow {
    */
   readonly unread?: boolean
   /**
-   * How many reads of the application's list had begun when the application's answer fixed this row
-   * as a file it holds in full. A list from a read that began no later than that describes the upload
-   * as it was before the answer, and leaves the row alone.
+   * How many reads of the application's list had begun when the application's answer, the send's or a
+   * cancel's, fixed this row as a file it holds in full. A list from a read that began no later than
+   * that describes the upload as it was before the answer, and leaves the row alone.
    */
   readonly after?: number
 }
@@ -368,6 +368,7 @@ export class PairedUploads {
           handle,
           phase: { kind: 'adding' },
           awaited: false,
+          after: this.#reads,
           ...(asked ? { note: sentence(PUBLISHED_AND_KEPT) } : {})
         })
         await this.#binding(key, handle, bind, still)

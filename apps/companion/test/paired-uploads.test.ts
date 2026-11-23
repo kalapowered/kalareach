@@ -418,6 +418,55 @@ describe('the store reads the application, and the application is the one that s
     expect(row?.handle).toEqual(published)
   })
 
+  it('Z6: a list that was asked for before the send finished does not replace the words of a bind that failed', async () => {
+    // A read of the list begins while the file is sending. The send finishes, and the bind fails at
+    // once, so the file is kept with the bind's words. No call waits for the file any more, and the older
+    // list, which describes the upload as it was while it was sending, comes after.
+    const { uploads, scripted, replies, real } = held()
+    const refused = { code: 'PERMISSION_DENIED', message: words.DRAFT_GONE }
+    const sent = uploads.send({ key: 'k-13', sessionId: 's-1', subject, file }, () => Promise.reject(refused))
+    await wait(() => scripted.started.length === 1)
+    scripted.progress('k-13', 5, 10)
+    const first = uploads.restore()
+    replies[0]?.resolve(await real())
+    await first
+    expect(uploads.snapshot().get('k-13')?.phase.kind).toBe('sending')
+    const older = uploads.restore()
+    expect(replies).toHaveLength(2)
+    const listed = await real()
+    scripted.finish('k-13')
+    const handle = await sent
+    const reason = words.sentence(words.DRAFT_GONE)
+    expect(uploads.snapshot().get('k-13')?.phase).toEqual({ kind: 'kept', words: reason })
+    replies[1]?.resolve(listed)
+    await older
+    const row = uploads.snapshot().get('k-13')
+    expect(row?.phase).toEqual({ kind: 'kept', words: reason })
+    expect(row?.handle).toEqual(handle)
+    // A list asked for after the send finished is not held back: the host's later list of the published
+    // file, with a handle it has renewed, is what the row shows.
+    const later = uploads.restore()
+    expect(replies).toHaveLength(3)
+    replies[2]?.resolve([
+      {
+        key: 'k-13',
+        state: 'published',
+        sessionId: 's-1',
+        fileName: 'a.pdf',
+        byteLen: 10,
+        acknowledgedChunks: 0,
+        chunks: 0,
+        stage: null,
+        handle: { ...handle, expires_at_ms: '99' },
+        said: null
+      }
+    ])
+    await later
+    const renewed = uploads.snapshot().get('k-13')
+    expect(renewed?.handle?.expires_at_ms).toBe('99')
+    expect(renewed?.phase).toEqual({ kind: 'kept', words: reason })
+  })
+
   it('stops asking once the list is read and the application keeps nothing of the refused file', async () => {
     const { uploads, scripted, asked, mend } = unreadable()
     const sent = uploads.send({ key: 'k-6', sessionId: 's-1', subject, file }, () => Promise.resolve())
