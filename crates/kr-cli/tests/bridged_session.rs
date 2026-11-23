@@ -2304,16 +2304,15 @@ async fn a_helper_that_exits_before_the_environment_answers_is_told_with_its_pro
         enrolled_and_answering(&world, label, access, target);
         // The stand-ins end with the codes `ssh` and the runtime end with, and say why on their
         // standard error. `ssh` ends with 255 when it is the program that failed, and the runtime
-        // with 125. A code of 127 is the shell's: the helper was not found, so it never ran. Any
-        // other code is the helper's own.
+        // with 125. A code of 127 is the shell's or the runtime's: the helper was not found, so it
+        // never ran. Before the environment answers, any other code may be the helper's or the
+        // program's own, and the sentence says that the program ended with it.
         let not_run = format!(
             "{program} ran, and the helper could not be run before the environment answered"
         );
         let mut cases = vec![(
             "helper-ends",
-            format!(
-                "{program} ran, and the helper ended with exit code 3 before the environment answered"
-            ),
+            format!("{program} ended with exit code 3 before the environment answered"),
             "kr-test-nothing-printed",
         )];
         if access == "ssh" {

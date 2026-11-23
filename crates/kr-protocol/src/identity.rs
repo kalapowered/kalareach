@@ -928,10 +928,11 @@ const REFUSAL_FORMS: &[&str] = &[
     "{program} was not found",
     "{program} could not be started: {message}",
     "{program} ended with exit code {n} before the environment answered",
-    "{program} ran, and the helper ended with exit code {n} before the environment answered",
     "{program} ran, and the helper could not be run before the environment answered",
     "{program} ran, and the helper ended with exit code {n} after the environment acknowledged the bridge, \
      before it answered the read",
+    "{program} reported exit code {n} after the environment acknowledged the bridge, before it \
+     answered the read",
     "{program} ended with exit code {n} when asked whether the environment is running",
     "{program} ended with exit code {n} when asked to start the environment",
     "{program} was ended by signal {n} when asked whether the environment is running",

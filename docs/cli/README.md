@@ -1870,12 +1870,17 @@ classes are that the program was not found, that it could not be started, that i
 code, that a signal ended it, that it did not answer within a number of seconds and was ended (or that the host could not confirm that it ended, so it may
 still be running), that this host could not read what it
 printed or could not wait for it, that its answer to the look could not be read, and that the
-environment refused the bridge, in which case the line gives the refusal's code. The container
-runtime's code 125 and `ssh`'s 255 are the program's own; any other code is the helper's, and the
-line says so, except the 126 and 127 that the shell there ends with when it cannot run or find the
-helper: before the destination acknowledged the bridge, the line says that the helper could not be
-run. `wsl.exe` has no code of its own that the host can tell apart: before the acknowledgement the
-line tells a code as the launcher's, and after it, as the helper's. A failed look does not say the environment is not running, which the host does not
+environment refused the bridge, in which case the line gives the refusal's code. Before the
+destination acknowledged the bridge, the line tells every exit code as the program's own, since the
+program passes the helper's code on and the host cannot tell the two apart. The exception is the 126
+and 127 that the container runtime ends with when it cannot run or find the helper, and that the
+shell on an SSH host ends with for the same reasons: the line says that the helper could not be run.
+`wsl.exe` runs the helper with no shell, so it has no such exception. After the acknowledgement the
+helper has run: the container runtime's 125 and `ssh`'s 255 are the program's own, and any other
+code of either is the helper's. For `wsl.exe` a code above 255 is the launcher's own, and a code
+from 0 to 255 may be the helper's or the launcher's, which ends with 1 when the channel that carries
+the helper's status is lost, so the line says that the launcher reported it and not which program
+ended with it. A failed look does not say the environment is not running, which the host does not
 then know: the row reads stale. That holds for the look at a WSL distribution, whether the listing of
 registered or of running distributions failed, and for a look that fails after `--start` started the
 environment: the first line says that the refresh started it, and the second says how the look

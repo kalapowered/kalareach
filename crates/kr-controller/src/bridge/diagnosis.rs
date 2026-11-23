@@ -72,14 +72,14 @@ pub fn of(refusal: &Refusal, access: EnvironmentAccess, stage: Stage) -> Sentenc
                 }
             };
             match helper {
-                // The container runtime ends with 125, and `ssh` with 255, when they themselves fail.
-                // Any other code is the helper's own, which the program passes through.
+                // A code is told as the helper's only where this host knows it is: see `whose`.
                 Some(HelperEnd::Exited(code)) => {
                     let ended = match whose(access, *code, stage) {
                         Code::Program => program().stated(" ended with exit code "),
                         Code::Helper => {
                             program().stated(" ran, and the helper ended with exit code ")
                         }
+                        Code::Reported => program().stated(" reported exit code "),
                         // The helper was never run, so the code is not one it ended with.
                         Code::NotRun => {
                             return program()
@@ -201,44 +201,64 @@ pub fn of(refusal: &Refusal, access: EnvironmentAccess, stage: Stage) -> Sentenc
 /// Whose end an exit code of the program that carries a helper tells.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Code {
-    /// The program's own: it is the program that failed.
+    /// The program's own: the program ended with it, and this host does not know that the helper
+    /// did.
     Program,
     /// The helper's, which the program passes on.
     Helper,
     /// The helper was never run.
     NotRun,
+    /// Reported by the program, which may have passed on the helper's or ended with a code of its
+    /// own, and this host cannot tell which.
+    Reported,
 }
 
 /// Returns whose end `code` tells, for a helper that ended before the environment answered
-/// ([`Stage::Opening`]) or after it acknowledged the bridge ([`Stage::Read`]).
+/// ([`Stage::Opening`]) or after it acknowledged the bridge ([`Stage::Read`]). A code is told as the
+/// helper's only where this host knows it is.
 ///
-/// The container runtime ends with 125, and `ssh` with 255, when they themselves fail, and every
-/// other code is the helper's, which they pass on. The shell that starts a program ends with 127
-/// when it cannot find it and with 126 when it cannot run it, and the program passes those on
-/// too: before the acknowledgement they say that the helper never ran. `wsl.exe` passes on the code
-/// of what it runs, and states none that is its own that this host can tell apart: before the
-/// acknowledgement every code is told as the launcher's, and after it, when the helper has run, as
-/// the helper's.
+/// Before the acknowledgement the helper may never have run, and the program passes the code of
+/// whatever it ran on, so every code is the program's own, with two exceptions. The container
+/// runtime itself ends with 126 when it cannot invoke the command and with 127 when it cannot find
+/// it, and the login shell of an SSH host ends with the same codes for the same reasons, which
+/// `ssh` passes on: both say that the helper never ran. `wsl.exe` runs the helper with `--exec`,
+/// which starts no shell, so it has no code of that kind.
+///
+/// After the acknowledgement the helper has run. The container runtime ends with 125, and `ssh`
+/// with 255, when they themselves fail, and any other code of either is the helper's. `wsl.exe`
+/// ends its own failures with a code above 255, which no program of a distribution can end with;
+/// a code from 0 to 255 is the helper's status or the 1 that it gives for a status channel it lost,
+/// so it is told as reported and not as whose it is.
 const fn whose(access: EnvironmentAccess, code: i32, stage: Stage) -> Code {
-    if matches!(stage, Stage::Opening) && (code == 126 || code == 127) {
-        return Code::NotRun;
-    }
     match (access, stage) {
-        (EnvironmentAccess::Container, _) => {
+        (EnvironmentAccess::Container | EnvironmentAccess::SshHost, Stage::Opening) => {
+            if code == 126 || code == 127 {
+                Code::NotRun
+            } else {
+                Code::Program
+            }
+        }
+        (EnvironmentAccess::Container, Stage::Read) => {
             if code == 125 {
                 Code::Program
             } else {
                 Code::Helper
             }
         }
-        (EnvironmentAccess::SshHost, _) => {
+        (EnvironmentAccess::SshHost, Stage::Read) => {
             if code == 255 {
                 Code::Program
             } else {
                 Code::Helper
             }
         }
-        (EnvironmentAccess::WslDistribution, Stage::Read) => Code::Helper,
+        (EnvironmentAccess::WslDistribution, Stage::Read) => {
+            if code < 0 || code > 255 {
+                Code::Program
+            } else {
+                Code::Reported
+            }
+        }
         _ => Code::Program,
     }
 }
@@ -658,12 +678,15 @@ mod tests {
         }
     }
 
-    /// KR-REQ-18.11, the part about connection diagnostics: the container runtime ends with 125 and
-    /// `ssh` with 255 when they themselves fail, and any other code is the helper's, which the
-    /// program passes through, except the 126 and 127 of a shell that could not run the helper:
-    /// before the acknowledgement those say that the helper never ran. `wsl.exe` has no code of its
-    /// own: before the acknowledgement its codes are told as the launcher's, and after it as the
-    /// helper's. The sentence says whose each is, and never that a helper that never ran ended.
+    /// KR-REQ-18.11, the part about connection diagnostics: no exit code is told as the helper's
+    /// unless this host knows it is. Before the acknowledgement the helper may never have run, so
+    /// every code is the program's own, except the 126 and 127 that the container runtime and the
+    /// shell of an SSH host end with when they cannot run or find the helper. After it the helper
+    /// has run: the container runtime ends with 125, and `ssh` with 255, when they themselves fail,
+    /// and any other code is the helper's. `wsl.exe` runs the helper with no shell, so it has no
+    /// 126 or 127 of that kind; after the acknowledgement a code above 255 is its own, and a code
+    /// from 0 to 255 is the helper's status or the 1 it gives for a status channel it lost, so the
+    /// sentence says that the launcher reported it and not which program ended with it.
     #[test]
     fn an_exit_code_is_told_as_the_programs_own_or_as_the_helpers_or_as_a_helper_that_never_ran() {
         let ended = |code| Refusal::Stream {
@@ -682,14 +705,13 @@ mod tests {
             (EnvironmentAccess::SshHost, "the SSH client (ssh)", 255, 1),
         ] {
             let said = |code, stage| of(&ended(code), access, stage);
-            assert_eq!(
-                said(own, Stage::Opening).as_str(),
-                format!("{step} ended with exit code {own}{before}")
-            );
-            assert_eq!(
-                said(helpers, Stage::Opening).as_str(),
-                format!("{step} ran, and the helper ended with exit code {helpers}{before}")
-            );
+            // Before the acknowledgement the helper may never have run: any code is the program's.
+            for code in [own, helpers] {
+                assert_eq!(
+                    said(code, Stage::Opening).as_str(),
+                    format!("{step} ended with exit code {code}{before}")
+                );
+            }
             assert_eq!(
                 said(own, Stage::Read).as_str(),
                 format!("{step} ended with exit code {own}{after}")
@@ -698,8 +720,8 @@ mod tests {
                 said(helpers, Stage::Read).as_str(),
                 format!("{step} ran, and the helper ended with exit code {helpers}{after}")
             );
-            // The shell's 126 and 127 before the acknowledgement: the helper was never run. After
-            // it the helper has run, and a code is its own.
+            // The 126 and 127 of the program or its shell before the acknowledgement: the helper was
+            // never run. After it the helper has run, and a code is its own.
             for code in [126, 127] {
                 let not_run = said(code, Stage::Opening);
                 assert_eq!(
@@ -719,25 +741,36 @@ mod tests {
                 }
             }
         }
-        // `wsl.exe`: the launcher's before the acknowledgement, the helper's after it.
+        // `wsl.exe` runs the helper with no shell, so no code of its own before the acknowledgement
+        // says that the helper was not run, and none says whose it is.
         let access = EnvironmentAccess::WslDistribution;
         let step = "the WSL launcher (wsl.exe)";
-        for code in [1, 255] {
+        for code in [1, 126, 127, 255] {
+            let opening = of(&ended(code), access, Stage::Opening);
             assert_eq!(
-                of(&ended(code), access, Stage::Opening).as_str(),
+                opening.as_str(),
                 format!("{step} ended with exit code {code}{before}")
             );
+            assert!(is_composed_connection(opening.as_str()), "{opening}");
+        }
+        // After it, a code from 0 to 255 is reported by the launcher, and a code above 255, which no
+        // program of the distribution can end with, is the launcher's own.
+        for code in [0, 1, 127, 255] {
             let read = of(&ended(code), access, Stage::Read);
             assert_eq!(
                 read.as_str(),
-                format!("{step} ran, and the helper ended with exit code {code}{after}")
+                format!("{step} reported exit code {code}{after}")
             );
             assert!(is_composed_connection(read.as_str()), "{read}");
         }
-        assert_eq!(
-            of(&ended(127), access, Stage::Opening).as_str(),
-            format!("{step} ran, and the helper could not be run{before}")
-        );
+        for (code, shown) in [(256, 256_u32), (-1, 4_294_967_295)] {
+            let read = of(&ended(code), access, Stage::Read);
+            assert_eq!(
+                read.as_str(),
+                format!("{step} ended with exit code {shown}{after}")
+            );
+            assert!(is_composed_connection(read.as_str()), "{read}");
+        }
     }
 
     /// KR-REQ-18.11, the part about connection diagnostics: each step of a refresh that asks the
