@@ -23,6 +23,9 @@ const LARGEST = 53 / 17
 /** What a finger needs to hit, in points on iOS and density-independent pixels on Android. */
 const TARGET = { ios: 44, android: 48 } as const
 
+/** A box is read through floats, so a control of exactly the target can read a few hundred-thousandths short. */
+const BOX_TOLERANCE = 0.01
+
 const RIGHTS = ['session.view', 'files.upload', 'agent.prompt', 'terminal.input'] as const
 
 async function withSystemTextScale(page: Page, ratio: number): Promise<void> {
@@ -76,8 +79,8 @@ async function fits(page: Page, surface: 'ios' | 'android'): Promise<void> {
   expect(await overrunning(page, '.m-attachments')).toEqual([])
   for (const button of await page.locator('.m-upload button').all()) {
     const box = await button.boundingBox()
-    expect(box?.height ?? 0).toBeGreaterThanOrEqual(TARGET[surface])
-    expect(box?.width ?? 0).toBeGreaterThanOrEqual(TARGET[surface])
+    expect(box?.height ?? 0).toBeGreaterThanOrEqual(TARGET[surface] - BOX_TOLERANCE)
+    expect(box?.width ?? 0).toBeGreaterThanOrEqual(TARGET[surface] - BOX_TOLERANCE)
   }
 }
 
