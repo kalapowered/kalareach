@@ -64,6 +64,7 @@ use serde::Serialize;
 
 use crate::error::{ClientError, HostWord};
 use crate::recovery::bundle::read_bundle;
+use crate::recovery::capacity::{Sealed, Write, seal};
 use crate::recovery::checkpoint::Strongest;
 use crate::recovery::{
     ExportedArchive, ExportedObject, FreshRestore, MAX_EXPORT_BYTES, OfflineExport, RecoveryError,
@@ -1024,6 +1025,12 @@ pub enum CheckpointRecorded {
         /// The bundle's revision after the write.
         bundle_revision: u64,
     },
+    /// The bundle now records the verified generation, at this revision, and the settings saved in
+    /// it were left out: the checkpoint would not fit under the bound with them.
+    WrittenWithoutSettings {
+        /// The bundle's revision after the write.
+        bundle_revision: u64,
+    },
     /// The bundle already records this generation or a newer one of the archive, so it was left as
     /// it is.
     AlreadyThere,
@@ -1117,16 +1124,12 @@ impl PreparedRestore {
             };
             advanced.revision = U64::new(read.bundle.revision.get().saturating_add(1));
             advanced.written_at_ms = now;
-            let sealed = kr_crypto::archive::encrypt_recovery_bundle(&key, &advanced)
-                .map_err(|error| RestoreError::Recovery(Box::new(error.into())))?;
-            if sealed.len() as u64 > kr_protocol::sync::MAX_SEALED_RECOVERY_BUNDLE_BYTES {
-                return Err(RestoreError::Recovery(Box::new(
-                    RecoveryError::BundleTooLarge {
-                        len: sealed.len(),
-                        limit: kr_protocol::sync::MAX_SEALED_RECOVERY_BUNDLE_BYTES,
-                    },
-                )));
-            }
+            // The one policy for every write of the bundle: a checkpoint that would not fit with
+            // the settings member saved in the bundle is written without it.
+            let Sealed {
+                ciphertext: sealed,
+                dropped_settings,
+            } = seal(&key, &mut advanced, Write::Trust).map_err(from_recovery)?;
             seen = read.position;
             let request_id = kr_transport::random::fresh_uuid_v4().map_err(ClientError::from)?;
             let written = writer
@@ -1149,8 +1152,11 @@ impl PreparedRestore {
                             RecoveryError::BundleDidNotMoveOn { found: place },
                         )));
                     }
-                    return Ok(CheckpointRecorded::Written {
-                        bundle_revision: advanced.revision.get(),
+                    let bundle_revision = advanced.revision.get();
+                    return Ok(if dropped_settings {
+                        CheckpointRecorded::WrittenWithoutSettings { bundle_revision }
+                    } else {
+                        CheckpointRecorded::Written { bundle_revision }
                     });
                 }
                 Ok(BundleWritten::Conflict) => {}

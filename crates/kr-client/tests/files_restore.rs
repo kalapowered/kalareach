@@ -38,7 +38,7 @@ use kr_protocol::archive::{
 };
 use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::ids::{ArchiveId, BackupGeneration, BackupObjectId, DeviceId};
-use kr_protocol::scalars::{Digest256, TimestampMs, U64, Uuid};
+use kr_protocol::scalars::{Bytes, Digest256, TimestampMs, U64, Uuid};
 
 const ORIGIN: &str = "https://reach.kala.to";
 const OTHER_ORIGIN: &str = "https://elsewhere.example";
@@ -258,10 +258,13 @@ impl World {
         };
         let bundle = RecoveryBundle {
             schema_version: U64::new(RECOVERY_BUNDLE_SCHEMA_VERSION),
-            collections: shape
-                .collections
-                .clone()
-                .unwrap_or_else(|| vec![collection(ORIGIN, "collection-1", archive())]),
+            collections: shape.collections.clone().unwrap_or_else(|| {
+                vec![collection(
+                    ORIGIN,
+                    &format!("collection-1{}", "x".repeat(shape.padding)),
+                    archive(),
+                )]
+            }),
             trusted_writers: writers.into_iter().collect(),
             trusted_producers: producers.into_iter().collect(),
             checkpoints: shape
@@ -272,7 +275,7 @@ impl World {
                 .collect(),
             revision: U64::new(shape.revision.unwrap_or(3)),
             written_at_ms: TimestampMs::new(2_000),
-            device_settings: None,
+            device_settings: shape.device_settings.clone(),
         };
         let key = self
             .seed
@@ -302,6 +305,11 @@ struct Shape {
     revision: Option<u64>,
     sealed_for_origin: Option<&'static str>,
     sealed_at_locator: Option<String>,
+    /// The settings member saved in the bundle, when there is one.
+    device_settings: Option<Bytes>,
+    /// Characters added to the default collection's locator, to bring the sealed bundle near the
+    /// bound a service keeps.
+    padding: usize,
 }
 
 fn collection(origin: &str, locator: &str, archive_id: ArchiveId) -> CollectionLocator {
@@ -1151,6 +1159,71 @@ async fn recording_the_checkpoint_keeps_what_another_device_wrote_to_the_bundle_
     assert!(matches!(recorded, CheckpointRecorded::AlreadyThere));
     assert_eq!(*bundle.writes.lock().expect("writes"), 1);
     assert_eq!(bundle_held(&world, &source).checkpoints.len(), 1);
+}
+
+/// The shape of a bundle that leaves `room` bytes under the bound a service keeps.
+fn leaving(world: &World, settings: Option<&Bytes>, room: usize) -> Shape {
+    let target = usize::try_from(kr_protocol::sync::MAX_SEALED_RECOVERY_BUNDLE_BYTES)
+        .expect("a length")
+        - room;
+    let mut padding = 100_000_usize;
+    for _ in 0..6 {
+        let shape = Shape {
+            device_settings: settings.cloned(),
+            padding,
+            ..Shape::default()
+        };
+        let length = world.bundle(&shape).len();
+        if length == target {
+            return shape;
+        }
+        padding = (padding + target).saturating_sub(length);
+    }
+    panic!("the bundle never reached {room} bytes under the bound");
+}
+
+/// KR-REQ-20.17: the checkpoint a restore records is held to the policy every write of the bundle
+/// is. One that would not fit under the bound with the settings saved in the bundle is written
+/// without them, and the result says so; one that does not fit without them either is refused and
+/// nothing is written.
+#[tokio::test]
+async fn a_checkpoint_that_would_not_fit_with_the_settings_is_written_without_them() {
+    let world = World::new();
+    let sealed = world.seal(4, &honest_members());
+    let member = Bytes::new(vec![0x5a; 1024]);
+
+    let shape = leaving(&world, Some(&member), 20);
+    let source = Arc::new(Scripted::serving(&world, world.bundle(&shape)).publishing(&sealed));
+    let prepared = restore(&world, &source, None).await.expect("a restore");
+    let before = bundle_held(&world, &source);
+    assert_eq!(before.device_settings, Some(member.clone()));
+    let bundle = Bundle::over(&source);
+    let recorded = prepared
+        .record_checkpoint(&bundle, TimestampMs::new(9_000))
+        .await
+        .expect("recorded");
+    assert!(matches!(
+        recorded,
+        CheckpointRecorded::WrittenWithoutSettings { .. }
+    ));
+    let after = bundle_held(&world, &source);
+    assert_eq!(after.device_settings, None, "the settings were left out");
+    assert_eq!(after.checkpoints.len(), 1, "the checkpoint is in");
+    assert_eq!(after.collections, before.collections);
+
+    let shape = leaving(&world, None, 20);
+    let source = Arc::new(Scripted::serving(&world, world.bundle(&shape)).publishing(&sealed));
+    let prepared = restore(&world, &source, None).await.expect("a restore");
+    let bundle = Bundle::over(&source);
+    match prepared
+        .record_checkpoint(&bundle, TimestampMs::new(9_000))
+        .await
+    {
+        Err(RestoreError::Recovery(error))
+            if matches!(*error, RecoveryError::BundleTooLarge { .. }) => {}
+        other => panic!("too large with or without the settings: {other:?}"),
+    }
+    assert_eq!(*bundle.writes.lock().expect("writes"), 0);
 }
 
 /// KR-REQ-24.16: a checkpoint write the service refuses for now, or cannot say the outcome of, is

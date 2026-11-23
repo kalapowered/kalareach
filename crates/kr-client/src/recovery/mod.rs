@@ -37,6 +37,7 @@
 mod account_source;
 mod archive;
 mod bundle;
+mod capacity;
 mod checkpoint;
 mod export;
 mod files;
@@ -62,6 +63,7 @@ pub use crate::recovery::bundle::{
     BundleStore, LostWrite, Migrated, MigrationRecord, WriterEnabled, bundle_collection,
     fresh_locator,
 };
+pub use crate::recovery::capacity::TRUST_ROOM_BYTES;
 pub use crate::recovery::checkpoint::advance_checkpoint;
 pub use crate::recovery::export::{
     ExportSource, ExportedArchive, ExportedObject, MAX_EXPORT_BYTES, OFFLINE_EXPORT_FORMAT,

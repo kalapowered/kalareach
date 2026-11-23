@@ -10,13 +10,15 @@
 //! | `the_member_is_padded_to_a_1_kib_bucket_and_holds_only_what_it_was_given` | the member's bucket and its contents |
 //! | `a_member_that_cannot_be_written_or_read_is_unusable_settings` | the cap, a garbage member, a bad name |
 //! | `a_bundle_that_opened_and_cannot_be_read_says_what_it_needs` | the error for a bundle written by a later build |
+//! | `a_settings_write_that_would_leave_less_room_than_the_trust_entries_need_is_refused` | the room a settings write leaves |
+//! | `a_trust_write_that_would_not_fit_with_the_settings_is_written_without_them` | who wins near the bound |
 
 use std::sync::{Arc, Mutex};
 
 use kr_client::error::ClientError;
 use kr_client::recovery::{
-    BundleStore, DeviceSettings, MAX_DEVICE_SETTINGS_BYTES, RecoveryError, decode_member,
-    encode_member,
+    BundleStore, DeviceSettings, MAX_DEVICE_SETTINGS_BYTES, RecoveryError, TRUST_ROOM_BYTES,
+    decode_member, encode_member,
 };
 use kr_client::services::{
     ServiceFuture, SyncBackupService, SyncExchanged, SyncFetched, SyncPosition, SyncRequestFence,
@@ -24,9 +26,11 @@ use kr_client::services::{
 };
 use kr_client::sync::SettingValue;
 use kr_crypto::kdf::RecoverySeed;
-use kr_protocol::archive::RecoveryContext;
+use kr_protocol::archive::{CollectionLocator, RecoveryBundle, RecoveryContext};
 use kr_protocol::error::ErrorCode;
+use kr_protocol::ids::ArchiveId;
 use kr_protocol::scalars::{Bytes, TimestampMs, Uuid};
+use kr_protocol::sync::MAX_SEALED_RECOVERY_BUNDLE_BYTES;
 
 const ORIGIN: &str = "https://reach.kala.to";
 const LOCATOR: &str = "b7f1c0d2-recovery-bundle";
@@ -318,4 +322,138 @@ async fn a_bundle_that_opened_and_cannot_be_read_says_what_it_needs() {
         elsewhere.fetch(&other).await,
         Err(RecoveryError::BundleNotAuthentic)
     ));
+}
+
+/// One collection whose locator is as long as it takes for the sealed bundle to leave `room` bytes
+/// under the bound a service keeps, with the member `settings` saved in it.
+fn bundle_leaving(
+    seed: &RecoverySeed,
+    settings: Option<&DeviceSettings>,
+    room: usize,
+) -> RecoveryBundle {
+    let key = seed.bundle_key_for(&context()).expect("the bundle's key");
+    let target = usize::try_from(MAX_SEALED_RECOVERY_BUNDLE_BYTES).expect("a length") - room;
+    let mut bundle = BundleStore::empty(now());
+    bundle.device_settings = settings.map(|settings| encode_member(settings).expect("a member"));
+    let mut length = 100_000_usize;
+    for _ in 0..6 {
+        bundle.collections = vec![collection(&"x".repeat(length))];
+        let sealed = kr_crypto::archive::encrypt_recovery_bundle(&key, &bundle).expect("sealed");
+        if sealed.len() == target {
+            return bundle;
+        }
+        length = (length + target).saturating_sub(sealed.len());
+    }
+    panic!("the bundle never reached {room} bytes under the bound");
+}
+
+fn collection(locator: &str) -> CollectionLocator {
+    CollectionLocator {
+        service_origin: ORIGIN.to_owned(),
+        locator: locator.to_owned(),
+        archive_id: ArchiveId::new(Uuid::from_bytes([0x38; 16])),
+    }
+}
+
+/// KR-REQ-20.17: a settings write that would leave the sealed bundle with less room under the
+/// bound than the trust entries are kept is refused, with nothing sent; the same write with the
+/// room lands.
+#[tokio::test]
+async fn a_settings_write_that_would_leave_less_room_than_the_trust_entries_need_is_refused() {
+    let seed = RecoverySeed::generate().expect("a seed");
+    let trust_room = usize::try_from(TRUST_ROOM_BYTES).expect("a length");
+    let service = Arc::new(MemoryBundles::default());
+    let (mut store, _directory) = store_over(&service);
+
+    let mut tight = bundle_leaving(&seed, Some(&colour("dark")), trust_room - 1);
+    tight.device_settings = None;
+    let refused = store
+        .set_settings(&seed, &mut tight, Some(&colour("dark")), now())
+        .await
+        .expect_err("less room than the trust entries need");
+    assert!(matches!(refused, RecoveryError::SettingsDoNotFit { .. }));
+    assert!(
+        service.held.lock().expect("the bundle").is_none(),
+        "nothing was sent"
+    );
+    assert!(
+        tight.device_settings.is_none(),
+        "the caller's bundle is as it was"
+    );
+
+    let mut roomy = bundle_leaving(&seed, Some(&colour("dark")), trust_room);
+    roomy.device_settings = None;
+    store
+        .set_settings(&seed, &mut roomy, Some(&colour("dark")), now())
+        .await
+        .expect("the room is there");
+    assert_eq!(
+        decode_member(roomy.device_settings.as_ref().expect("the member")).expect("it reads"),
+        colour("dark")
+    );
+
+    // A member over its cap does not fit, whatever room the bundle has.
+    let big = DeviceSettings::new(
+        [(
+            "colour_mode".to_owned(),
+            SettingValue::Text("x".repeat(MAX_DEVICE_SETTINGS_BYTES)),
+        )]
+        .into_iter()
+        .collect(),
+    )
+    .expect("settings");
+    assert!(matches!(
+        store
+            .set_settings(&seed, &mut roomy, Some(&big), now())
+            .await,
+        Err(RecoveryError::SettingsDoNotFit { .. })
+    ));
+}
+
+/// KR-REQ-20.17: a write of a writer, a producer, a collection or a checkpoint that would not fit
+/// with the settings saved in the bundle is written without them, and the store says so; one that
+/// does not fit without them either is refused.
+#[tokio::test]
+async fn a_trust_write_that_would_not_fit_with_the_settings_is_written_without_them() {
+    let seed = RecoverySeed::generate().expect("a seed");
+    let service = Arc::new(MemoryBundles::default());
+    let (mut store, _directory) = store_over(&service);
+
+    // Twenty bytes of room, then a collection that takes more.
+    let mut bundle = bundle_leaving(&seed, Some(&colour("dark")), 20);
+    bundle.collections.push(collection(&"y".repeat(60)));
+    store
+        .commit(&seed, &mut bundle, now())
+        .await
+        .expect("the trust entry wins");
+    assert!(bundle.device_settings.is_none(), "the member was left out");
+    assert!(store.settings_dropped());
+    let held = store.fetch(&seed).await.expect("the bundle");
+    assert!(held.device_settings.is_none());
+    assert_eq!(
+        held.collections.len(),
+        2,
+        "the trust entry is in the bundle"
+    );
+
+    // A write that fits with the member keeps it, and the store says it dropped nothing.
+    let mut fits = held.clone();
+    fits.collections = vec![collection("short")];
+    fits.device_settings = Some(encode_member(&colour("dark")).expect("a member"));
+    store.commit(&seed, &mut fits, now()).await.expect("fits");
+    assert!(fits.device_settings.is_some());
+    assert!(!store.settings_dropped());
+
+    // Over the bound without the member as well: refused, and nothing is written.
+    let current = store.fetch(&seed).await.expect("the bundle");
+    let mut over = bundle_leaving(&seed, None, 20);
+    over.collections.push(collection(&"z".repeat(60)));
+    over.device_settings = Some(encode_member(&colour("dark")).expect("a member"));
+    over.revision = current.revision;
+    let before = service.sealed();
+    assert!(matches!(
+        store.commit(&seed, &mut over, now()).await,
+        Err(RecoveryError::BundleTooLarge { .. })
+    ));
+    assert_eq!(service.sealed(), before, "nothing was written");
 }

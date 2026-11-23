@@ -68,10 +68,12 @@ use kr_protocol::archive::{
 use kr_protocol::error::ErrorCode;
 use kr_protocol::ids::SyncConflictId;
 use kr_protocol::scalars::{Digest256, KeyId, Nullable, StoredEnvelopeKey, TimestampMs, U64};
-use kr_protocol::sync::{MAX_SEALED_RECOVERY_BUNDLE_BYTES, SyncObjectKind};
+use kr_protocol::sync::SyncObjectKind;
 
 use crate::error::ClientError;
+use crate::recovery::capacity::{self, Write};
 use crate::recovery::record::{Known, RecordFile, WriteRecord};
+use crate::recovery::{DeviceSettings, encode_member};
 use crate::recovery::{RecoveryError, Result};
 use crate::services::{
     SyncBackupService, SyncDispatch, SyncExchanged, SyncFetched, SyncPosition, SyncRequestFence,
@@ -193,6 +195,9 @@ pub struct BundleStore {
     last_write: Option<WriteRecord>,
     /// Where the record of that write is kept across a restart.
     file: RecordFile,
+    /// Whether the last write that landed was sealed without the settings member, because a
+    /// trust entry would not fit with it.
+    settings_dropped: bool,
 }
 
 impl std::fmt::Debug for BundleStore {
@@ -241,7 +246,16 @@ impl BundleStore {
             baseline: None,
             last_write,
             file,
+            settings_dropped: false,
         })
+    }
+
+    /// Whether the last write that landed left the settings member out, because a trust entry
+    /// would not fit with it. A caller that had a member in the bundle shows the person that the
+    /// settings are no longer saved there.
+    #[must_use]
+    pub const fn settings_dropped(&self) -> bool {
+        self.settings_dropped
     }
 
     /// Returns where this bundle is stored.
@@ -658,11 +672,61 @@ impl BundleStore {
     /// [`RecoveryError::BundleNotAWrite`], [`RecoveryError::BundleWentBack`],
     /// [`RecoveryError::BundleDidNotMoveOn`] or [`RecoveryError::BundleHistoryForked`] for a
     /// position this device cannot read.
+    ///
+    /// A write of a trust entry that would not fit under the bound with the settings member saved
+    /// in the bundle is sealed without the member and [`Self::settings_dropped`] says so; one that
+    /// does not fit without it either is refused ([`RecoveryError::BundleTooLarge`]).
     pub async fn commit(
         &mut self,
         seed: &RecoverySeed,
         bundle: &mut RecoveryBundle,
         now_ms: TimestampMs,
+    ) -> Result<SyncPosition> {
+        self.commit_under(seed, bundle, now_ms, Write::Trust).await
+    }
+
+    /// Sets, changes or clears the settings member by the bundle's own compare-and-swap.
+    ///
+    /// `settings` is what the person chose on this device, or nothing to clear the member. The
+    /// write is refused with [`RecoveryError::SettingsDoNotFit`] before anything is recorded when
+    /// the member is over its cap or the sealed bundle would leave less than [`TRUST_ROOM_BYTES`]
+    /// of room under the bound, so the next writer, producer or checkpoint has somewhere to go.
+    /// `bundle` is the caller's and is changed only by a write that landed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RecoveryError::SettingsDoNotFit`], the refusals of [`RecoveryError::Refused`]
+    /// that the table gives device configuration, and what [`Self::commit`] returns.
+    ///
+    /// [`TRUST_ROOM_BYTES`]: crate::recovery::TRUST_ROOM_BYTES
+    pub async fn set_settings(
+        &mut self,
+        seed: &RecoverySeed,
+        bundle: &mut RecoveryBundle,
+        settings: Option<&DeviceSettings>,
+        now_ms: TimestampMs,
+    ) -> Result<SyncPosition> {
+        let mut candidate = bundle.clone();
+        candidate.device_settings = settings.map(encode_member).transpose()?;
+        // Clearing the member only makes room, so it is a write like any other.
+        let write = if settings.is_some() {
+            Write::Settings
+        } else {
+            Write::Trust
+        };
+        let position = self
+            .commit_under(seed, &mut candidate, now_ms, write)
+            .await?;
+        *bundle = candidate;
+        Ok(position)
+    }
+
+    async fn commit_under(
+        &mut self,
+        seed: &RecoverySeed,
+        bundle: &mut RecoveryBundle,
+        now_ms: TimestampMs,
+        write: Write,
     ) -> Result<SyncPosition> {
         // A write this device never got an answer to has to be over before another goes out.
         // Writing again while it could still land would be refused where it did land, and the
@@ -692,15 +756,13 @@ impl BundleStore {
         candidate.revision = U64::new(candidate.revision.get().saturating_add(1));
         candidate.written_at_ms = now_ms;
         let key = seed.bundle_key_for(&self.context)?;
-        let ciphertext = kr_crypto::archive::encrypt_recovery_bundle(&key, &candidate)?;
         // A bundle no service keeps is refused before anything is recorded or sent, so a store
-        // never holds a record of a write that could not have been made.
-        if ciphertext.len() as u64 > MAX_SEALED_RECOVERY_BUNDLE_BYTES {
-            return Err(RecoveryError::BundleTooLarge {
-                len: ciphertext.len(),
-                limit: MAX_SEALED_RECOVERY_BUNDLE_BYTES,
-            });
-        }
+        // never holds a record of a write that could not have been made. What goes where room is
+        // short is one policy for every write of the bundle: see `capacity`.
+        let capacity::Sealed {
+            ciphertext,
+            dropped_settings,
+        } = capacity::seal(&key, &mut candidate, write)?;
         let sent = sealed_digest(&ciphertext);
         let request_id = kr_transport::random::fresh_uuid_v4().map_err(ClientError::from)?;
         // Recorded before the call and not after it, because the case this is for is the one where
@@ -753,6 +815,7 @@ impl BundleStore {
                     bundle: candidate.clone(),
                     sealed: sent,
                 });
+                self.settings_dropped = dropped_settings;
                 *bundle = candidate;
                 Ok(position)
             }

@@ -668,7 +668,10 @@ async fn record_checkpoint(
     );
     let generation = prepared.plan().generation.get();
     match prepared.record_checkpoint(bundles, now).await {
-        Ok(CheckpointRecorded::Written { bundle_revision }) => CheckpointResult::Recorded {
+        Ok(
+            CheckpointRecorded::Written { bundle_revision }
+            | CheckpointRecorded::WrittenWithoutSettings { bundle_revision },
+        ) => CheckpointResult::Recorded {
             generation,
             bundle_revision,
         },
