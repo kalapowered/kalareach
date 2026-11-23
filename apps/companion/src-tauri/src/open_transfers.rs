@@ -201,8 +201,9 @@ impl Store {
 
     /// Writes the copy of `key` beside its name, and gives it the name while the guard that
     /// `placing` answers is held, until the name is proved durable. `placing` answers none when the
-    /// copy is not to be placed: its staged file is removed, and a restart removes it if the removal
-    /// fails; the answer is still `Ok`.
+    /// copy is not to be placed: its staged file is removed, and where the removal fails the file
+    /// stays until a later process sweeps the staged files that another process wrote, which this
+    /// process's own restarts leave; the answer is still `Ok`.
     fn write_copy<G>(
         &self,
         key: Uuid,
@@ -1131,8 +1132,9 @@ impl Drop for Stopped<'_> {
 /// just made, and the removal of the copy of a send whose start was refused or whose copy failed
 /// (`Registry::remove_copy_of`), which is what stops it from removing the copy of an upload that
 /// took its key. It also covers the rename that gives a send's copy its name, with the check of the
-/// key's owner before it (`Store::write_copy`): on Windows that rename is tried again while a
-/// scanner holds the file, for up to five seconds, and the gate stays held across those tries.
+/// key's owner before it, and the flush of the directory that makes the name durable after it
+/// (`Store::write_copy`): on Windows that rename is tried again while a scanner holds the file, for
+/// up to five seconds, and the gate stays held across those tries and the flush.
 ///
 /// **Turns.** A key's turn is a `tokio` mutex, found or made under the gate and awaited outside
 /// every lock. No operation holds two turns, so two operations that want two keys cannot wait for
