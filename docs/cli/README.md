@@ -2710,8 +2710,9 @@ does not answer is a failure that says so. It prints `Disclosed desktop checks` 
 for each check, the line `kr doctor` prints for the same record. `--file` names the file the read check reads, as a full path or a path
 from the directory the command runs in; the command makes it a full path before it sends it. The
 worker reads that file in this run and in no other. With no file the read check reads nothing and
-says so. A run that is already going is not started again: the command waits for it, and the file
-that run was asked to read stands, not the one this command names.
+says so. A run that is already going is not started again. With `--file` the command then fails and
+says that the file was not read, because the findings the host holds are of a run that was asked to
+read another file; without `--file` the command follows the run that is going and reports it.
 
 The command runs outside every session: where `KR_SESSION` or `KR_ATTACHMENT` is set, where a
 session's worker says the command runs inside its session, and where a worker cannot say whether it

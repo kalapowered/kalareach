@@ -189,6 +189,9 @@ enum Followed<R> {
 /// Where the first answer already says the run ended, that answer is the command's own, and a later
 /// read only supplies the records if they are still that run's.
 ///
+/// A file named for a run that was already going is not read, and the command says so instead of
+/// reporting that run: it is not the run the person asked for.
+///
 /// `announce` is called once the host has started a run.
 async fn follow<A: Asked>(
     asked: &mut A,
@@ -196,12 +199,29 @@ async fn follow<A: Asked>(
     deadline: Instant,
     announce: impl FnOnce(),
 ) -> Result<Followed<A::Records>> {
+    let named = authorised_file.is_some();
+    let before = kr_ipc::now_ms();
     let Some(begun) = within(deadline, asked.begin(authorised_file))
         .await
         .transpose()?
     else {
         return Ok(unanswered(None));
     };
+    // A run that began before the request was going already, and the host does not start a run it
+    // is already performing: it answers with that run and the file this command named is lost.
+    if named
+        && begun.state == CapabilityChecksState::Running
+        && begun.started_at_ms.0.is_some_and(|began| began < before)
+    {
+        return Ok(Followed::Unfinished {
+            checks: Some(begun),
+            records: None,
+            words: shown!(
+                "A run of the checks was already going, so the file you named was not read. Run \
+                 the command again once it ends."
+            ),
+        });
+    }
     let accepted = Run::of(&begun);
     let running = begun.state == CapabilityChecksState::Running;
     if running {
@@ -477,10 +497,15 @@ mod tests {
     /// Follows a script from a command that began now, and says what it came to and how long the
     /// command took on the paused clock. A command that does not end by its deadline fails here.
     async fn run_script(mut script: Script) -> (Followed<()>, Duration) {
+        run_naming(&mut script, None).await
+    }
+
+    /// Follows a script as [`run_script`] does, from a command that names `file`.
+    async fn run_naming(script: &mut Script, file: Option<&str>) -> (Followed<()>, Duration) {
         let started = Instant::now();
         let followed = tokio::time::timeout(
             WAIT + Duration::from_secs(60),
-            follow(&mut script, None, started + WAIT, || {}),
+            follow(script, file.map(str::to_owned), started + WAIT, || {}),
         )
         .await
         .expect("the command ended at its deadline")
@@ -666,5 +691,52 @@ mod tests {
                 .contains("No session of the kind this host creates"),
             "{words}"
         );
+    }
+
+    /// A file named for a run the host was already performing was not read, and the command says
+    /// that instead of reporting that run's findings, and asks nothing more of the host. Without a
+    /// file, a run already going is followed, and so is a run this command began, with or without
+    /// one.
+    #[tokio::test(start_paused = true)]
+    async fn a_file_named_for_a_run_that_was_already_going_is_not_reported_as_read() {
+        let going = stands(CapabilityChecksState::Running, 1, 1, None);
+        let current = stands(CapabilityChecksState::Current, 1, 1, None);
+        let mut script = Script::new(
+            Answer::Stands(going.clone()),
+            vec![Answer::Stands(current.clone())],
+        );
+        let (followed, _) = run_naming(&mut script, Some("notes.txt")).await;
+        let Followed::Unfinished {
+            checks,
+            records,
+            words,
+        } = followed
+        else {
+            panic!("the findings of a run that did not read the file were reported");
+        };
+        assert_eq!(checks, Some(going.clone()));
+        assert!(records.is_none());
+        assert!(
+            words
+                .to_string()
+                .contains("already going, so the file you named was not read"),
+            "{words}"
+        );
+        assert_eq!(script.taken, 0, "the command read the host again");
+
+        // No file named: nothing is lost, and the run going is followed to its end.
+        let mut script = Script::new(
+            Answer::Stands(going.clone()),
+            vec![Answer::Stands(current.clone())],
+        );
+        let (followed, _) = run_naming(&mut script, None).await;
+        assert!(matches!(followed, Followed::Found { .. }));
+
+        // A run this command began, which the host dates after the request, is its own.
+        let ours = stands(CapabilityChecksState::Running, u64::MAX, 1, None);
+        let done = stands(CapabilityChecksState::Current, u64::MAX, 1, None);
+        let mut script = Script::new(Answer::Stands(ours), vec![Answer::Stands(done)]);
+        let (followed, _) = run_naming(&mut script, Some("notes.txt")).await;
+        assert!(matches!(followed, Followed::Found { .. }));
     }
 }
