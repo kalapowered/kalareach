@@ -1021,6 +1021,24 @@
   text-align: start;
 }
 
+/*
+ * In the composer's line forms the room is the field's line and the floor of what is above them, and
+ * an agent can advertise more commands than that holds: the list takes a command and a half at most
+ * and scrolls, the half telling that there is more. The ring that shows the focus is drawn inside
+ * the button, which the list's own scrolling would otherwise cut at its edges.
+ */
+.m-session[data-pane='terminal'] .m-slash-commands,
+.m-session[data-pane='semantic'][data-composer='line'] .m-slash-commands {
+  max-block-size: calc(var(--target) * 1.5 + var(--gap-2));
+  overflow-y: auto;
+  overscroll-behavior-y: contain;
+}
+
+.m-session[data-pane='terminal'] .m-slash-commands .btn:focus-visible,
+.m-session[data-pane='semantic'][data-composer='line'] .m-slash-commands .btn:focus-visible {
+  outline-offset: -2px;
+}
+
 .m-slash-summary {
   color: var(--faint);
 }

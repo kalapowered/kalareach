@@ -154,6 +154,36 @@ async function expectInView(page: Page, controls: readonly Locator[], covered = 
   })
 }
 
+/**
+ * Whether the field stands in view and every command of the list can be reached: whole in view as
+ * the screen lies, or, where the list holds more than the room it has, brought into view by scrolling
+ * the list, with the field still in view beside it.
+ */
+async function expectCommandsReachable(page: Page, phone: Phone, covered = 0): Promise<void> {
+  const field = page.getByLabel('Message this session')
+  const list = page.getByTestId('slash-commands')
+  const commands = list.getByRole('button')
+  await expect(commands).toHaveCount(THREE_COMMANDS)
+  await expectInView(page, [field], covered)
+  for (let index = 0; index < THREE_COMMANDS; index += 1) {
+    const command = commands.nth(index)
+    await expectTouchTarget(command, phone.target)
+    const [lacking] = await hiddenOf(page, [command], covered)
+    if ((lacking ?? 0) > SHORT_OF_VIEW) {
+      // The list is what scrolls, as a finger scrolls it: a deliberate scroll of it brings the command
+      // in, and the field stays in view with it.
+      expect(await list.evaluate((node) => getComputedStyle(node).overflowY), 'how the list scrolls').toMatch(
+        /^(auto|scroll)$/
+      )
+      await command.scrollIntoViewIfNeeded()
+    }
+    await expectInView(page, [field, command], covered)
+  }
+}
+
+/** What the scripted host's agent advertises for a draft that is only a slash. */
+const THREE_COMMANDS = 3
+
 /** The vertical middle of an element. */
 async function middle(element: Locator): Promise<number> {
   const box = await element.boundingBox()
@@ -220,6 +250,35 @@ for (const phone of PHONES) {
       await keyboard(page, phone.keyboard)
       await expectInView(page, [field, command.first()], phone.keyboard)
       await page.screenshot({ path: shot(`slash-terminal-${phone.surface}-${phone.width}`) })
+    })
+
+    test('keeps the field in view and every one of the three commands reachable above a keyboard', async ({ page }) => {
+      const field = page.getByLabel('Message this session')
+      await field.focus()
+      await keyboard(page, phone.keyboard)
+      await field.fill('/')
+      await expectCommandsReachable(page, phone, phone.keyboard)
+      await page.screenshot({ path: shot(`slash-all-keyboard-${phone.surface}-${phone.width}`) })
+    })
+
+    test('keeps the field in view and every one of the three commands reachable on a window too short for the whole composer', async ({
+      page
+    }) => {
+      await page.setViewportSize({ width: phone.width, height: SHORT.height })
+      await expect(page.locator('.m-session')).toHaveAttribute('data-composer', 'line')
+      await page.getByLabel('Message this session').fill('/')
+      await expectCommandsReachable(page, phone)
+      await page.screenshot({ path: shot(`slash-all-short-${phone.surface}-${phone.width}`) })
+    })
+
+    test('keeps the field in view and every one of the three commands reachable under the terminal', async ({ page }) => {
+      await page.getByRole('tab', { name: 'Terminal' }).click()
+      await expect(page.getByTestId('mobile-terminal-line').first()).toContainText('$ cargo')
+      await page.getByLabel('Message this session').fill('/')
+      await expectCommandsReachable(page, phone)
+      await keyboard(page, phone.keyboard)
+      await expectCommandsReachable(page, phone, phone.keyboard)
+      await page.screenshot({ path: shot(`slash-all-terminal-${phone.surface}-${phone.width}`) })
     })
 
     test('shows Interrupt, Steer and Queue with Send, each a touch target', async ({ page }) => {
