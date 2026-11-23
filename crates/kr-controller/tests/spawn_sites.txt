@@ -330,6 +330,7 @@ crates/kr-ipc/src/endpoint/platform/live.rs | keep_the_times_fresh | tokio::spaw
 crates/kr-ipc/src/testing.rs | Serving::spawn | tokio::spawn | task | 1 | test | - | compiled in only with the testing feature or a test module
 crates/kr-ipc/src/testing.rs | say_on_the_standard_error | say_by | closure{.write_all} | 1 | test | - | compiled in only with the testing feature or a test module
 crates/kr-ipc/src/testing.rs | say_by | .spawn | closure{.send} | 1 | test | - | compiled in only with the testing feature or a test module
+crates/kr-ipc/src/testing/volumes.rs | asked | std::thread::spawn | closure{.read_to_end} | 1 | test | - | compiled in only with the testing feature or a test module; reads one holder query's output to its end and sends it on a channel that the query's caller waits on for at most 2 seconds; the caller ends the query after 10 seconds, which closes its pipe and ends the thread unless a process the query started still holds the pipe; nothing joins the thread
 crates/kr-plugin-catalogue/src/trust.rs | verify | tokio::task::spawn_blocking | closure{check_index} | 1 | joined | - | awaited where it stands
 crates/kr-plugin-service/src/client.rs | PluginClient::over | tokio::spawn | read_frames | 1 | request | - | bound(guard at crates/kr-plugin-service/src/client.rs:1422); the client owns the task and its Drop aborts it
 crates/kr-plugin-service/src/client.rs | PluginClient::over | tokio::spawn | write_offered | 1 | request | - | bound(guard at crates/kr-plugin-service/src/client.rs:1422); the client owns the task and its Drop aborts it
