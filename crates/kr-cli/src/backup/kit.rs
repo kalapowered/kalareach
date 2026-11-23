@@ -40,6 +40,7 @@ use kr_protocol::archive::RecoveryKit;
 use zeroize::Zeroizing;
 
 use super::interrupt::{self, Interrupt};
+use super::terminal::Turn;
 use crate::error::{CliError, Result};
 
 /// The most bytes read before the document is turned away: a kit at its bound, with the byte-order
@@ -677,8 +678,8 @@ fn read_terminal(terminal: &File, document: &mut Document, cancel: &AtomicBool) 
     let mut prompt = Prompt::enter(terminal)?;
     crate::report::say(&Shown::said(PASTE_THE_KIT));
     let mut read = |chunk: &mut [u8]| match rustix::io::read(terminal, chunk) {
-        Ok(taken) => Ok(taken),
-        Err(rustix::io::Errno::INTR) => Ok(0),
+        Ok(0) | Err(rustix::io::Errno::INTR) => Ok(Turn::Quiet),
+        Ok(taken) => Ok(Turn::Text(taken)),
         Err(error) => Err(CliError::Terminal(shown!(
             "the recovery kit could not be read: {}",
             crate::shown::errno(error)
@@ -693,10 +694,11 @@ fn read_terminal(terminal: &File, document: &mut Document, cancel: &AtomicBool) 
     left
 }
 
-/// Reads and throws away what is still arriving after the document ended, until a read finds
-/// nothing more or the read is cancelled, so that a paste that comes in more than one piece does
-/// not reach the shell.
-fn discard_the_rest(read: &mut impl FnMut(&mut [u8]) -> Result<usize>, cancel: &AtomicBool) {
+/// Reads and throws away what is still arriving after the document ended, until a read finds the
+/// input quiet or the read is cancelled, so that a paste that comes in more than one piece does
+/// not reach the shell. A read that says it is busy has not found the input quiet: it counts toward
+/// the bound and the drain goes on.
+fn discard_the_rest(read: &mut impl FnMut(&mut [u8]) -> Result<Turn>, cancel: &AtomicBool) {
     let mut chunk = Zeroizing::new([0_u8; 256]);
     // Bounded, so input that never stops cannot hold the command.
     for _ in 0..64 {
@@ -704,15 +706,15 @@ fn discard_the_rest(read: &mut impl FnMut(&mut [u8]) -> Result<usize>, cancel: &
             break;
         }
         match read(&mut chunk[..]) {
-            Ok(0) | Err(_) => break,
-            Ok(_) => {}
+            Ok(Turn::Quiet) | Err(_) => break,
+            Ok(Turn::Text(_) | Turn::Busy) => {}
         }
     }
 }
 
 /// Reads what is typed until the document ends.
 fn type_document(
-    read: &mut impl FnMut(&mut [u8]) -> Result<usize>,
+    read: &mut impl FnMut(&mut [u8]) -> Result<Turn>,
     document: &mut Document,
     cancel: &AtomicBool,
 ) -> Result<()> {
@@ -723,15 +725,15 @@ fn type_document(
         if cancel.load(Ordering::SeqCst) {
             return Err(interrupt::stopped());
         }
-        let taken = read(&mut chunk[..])?;
-        if taken == 0 {
+        let Turn::Text(taken) = read(&mut chunk[..])? else {
+            // A quiet turn, or input that holds no text: neither is a kit being typed.
             if last_input.elapsed() > IDLE_LIMIT {
                 return Err(CliError::Usage(Shown::said(
                     "no recovery kit was typed, so the command stopped waiting",
                 )));
             }
             continue;
-        }
+        };
         last_input = std::time::Instant::now();
         for &byte in &chunk[..taken] {
             if typing.feed(byte, document) == Typed::Finished {
@@ -820,5 +822,57 @@ impl Typing {
             }
         }
         Typed::More
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A read that says it is busy has not found the input quiet: the drain goes on past it, and
+    /// stops at the first quiet turn.
+    #[test]
+    fn the_drain_goes_on_past_a_busy_read_and_stops_at_a_quiet_one() {
+        let mut turns = [
+            Turn::Text(3),
+            Turn::Busy,
+            Turn::Busy,
+            Turn::Text(1),
+            Turn::Quiet,
+            Turn::Text(9),
+        ]
+        .into_iter();
+        let mut reads = 0;
+        let mut read = |_: &mut [u8]| {
+            reads += 1;
+            Ok(turns.next().unwrap_or(Turn::Quiet))
+        };
+        discard_the_rest(&mut read, &AtomicBool::new(false));
+        assert_eq!(reads, 5, "the drain ended at the quiet turn and not before");
+    }
+
+    /// Reads that are always busy end the drain at its bound: input that never stops cannot hold
+    /// the command.
+    #[test]
+    fn a_drain_of_reads_that_are_always_busy_ends_at_its_bound() {
+        let mut reads = 0;
+        let mut read = |_: &mut [u8]| {
+            reads += 1;
+            Ok(Turn::Busy)
+        };
+        discard_the_rest(&mut read, &AtomicBool::new(false));
+        assert_eq!(reads, 64);
+    }
+
+    /// A drain that was cancelled reads nothing.
+    #[test]
+    fn a_drain_that_was_cancelled_reads_nothing() {
+        let mut reads = 0;
+        let mut read = |_: &mut [u8]| {
+            reads += 1;
+            Ok(Turn::Busy)
+        };
+        discard_the_rest(&mut read, &AtomicBool::new(true));
+        assert_eq!(reads, 0);
     }
 }

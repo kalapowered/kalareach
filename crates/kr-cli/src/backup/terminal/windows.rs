@@ -32,6 +32,7 @@ use windows_sys::Win32::System::Threading::{
 };
 use zeroize::{Zeroize as _, Zeroizing};
 
+use super::Turn;
 use crate::backup::interrupt;
 use crate::error::{CliError, Result};
 
@@ -340,27 +341,34 @@ impl Prompt {
         Ok(())
     }
 
-    /// Reads what the person typed into `buffer` as text, waiting one turn for it, and returns how
-    /// many bytes it holds: none when the turn passed in silence. A key's character is read as it
-    /// is typed, not as a line; Ctrl-Z reads as the end of the input.
+    /// Reads what the person typed into `buffer` as text. A key's character is read as it is
+    /// typed, not as a line; Ctrl-Z reads as the end of the input.
+    ///
+    /// A key's release, a modifier key and a change of focus arrive as records with no character,
+    /// and a paste is made of them as much as of its text. They do not say that the input stopped,
+    /// so the read goes on past them, in up to [`RECORD_READS`] reads of records, and says that the
+    /// input is quiet only after a turn of [`TURN_MILLISECONDS`] in which no record came. Past that
+    /// many reads it says that it is busy, which is not the end of the input: the caller makes its
+    /// own checks (a cancelled read, an idle limit) and reads again.
     ///
     /// # Errors
     ///
     /// Returns the error that waiting for the console or reading it gave.
-    pub fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
-        // A key's release, a modifier key and a change of focus arrive as records with no
-        // character, and a paste is made of them as much as of its text. They do not say that the
-        // input stopped, so the read goes on in the same turn, and says that nothing came only
-        // after a turn in which no record came.
-        for _ in 0..RECORD_READS {
-            if !self.pending.is_empty() || !self.fill()? {
-                break;
+    pub fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<Turn> {
+        let mut reads = 0;
+        while self.pending.is_empty() {
+            if reads == RECORD_READS {
+                return Ok(Turn::Busy);
             }
+            if !self.fill()? {
+                return Ok(Turn::Quiet);
+            }
+            reads += 1;
         }
         let taken = buffer.len().min(self.pending.len());
         buffer[..taken].copy_from_slice(&self.pending[..taken]);
         self.pending.drain(..taken);
-        Ok(taken)
+        Ok(Turn::Text(taken))
     }
 
     /// The next character the person typed, waiting one turn for it: none when the turn passed in
@@ -706,11 +714,46 @@ mod tests {
                 std::thread::sleep(std::time::Duration::from_millis(50));
                 inject(&[key(true, u16::from(b'x')), key(false, u16::from(b'x'))]);
             });
-            let taken = prompt.read(&mut buffer).expect("reads the console");
-            assert_eq!(&buffer[..taken], b"x", "the text that followed the release");
+            let turn = prompt.read(&mut buffer).expect("reads the console");
+            assert_eq!(turn, Turn::Text(1), "the text that followed the release");
+            assert_eq!(&buffer[..1], b"x");
         });
         // No record came in a whole turn: the read says so.
-        assert_eq!(prompt.read(&mut buffer).expect("reads the console"), 0);
+        assert_eq!(
+            prompt.read(&mut buffer).expect("reads the console"),
+            Turn::Quiet
+        );
+    }
+
+    /// Records with no character that fill a read up to its limit on work are not the end of the
+    /// input: the read says that it is busy, and only a turn with no record at all says that the
+    /// input is quiet.
+    #[test]
+    fn a_read_that_reached_its_limit_on_records_with_no_character_says_busy_and_not_quiet() {
+        let _alone = CONSOLE.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut prompt = Prompt::enter_on(console_input(true)).expect("a prompt on the console");
+        let writer = console_input(true);
+        // More key releases than one read takes in: `RECORD_READS` reads of `RECORDS` records.
+        let releases = [key(false, u16::from(b'a')); RECORDS];
+        for _ in 0..RECORD_READS + 4 {
+            inject_records(&writer, &releases);
+        }
+        let mut buffer = [0_u8; 16];
+        assert_eq!(
+            prompt.read(&mut buffer).expect("reads the console"),
+            Turn::Busy,
+            "the limit on work is not the end of the input"
+        );
+        // What is left is read, and then a turn passes with no record: the input is quiet.
+        let mut busy = 0;
+        loop {
+            match prompt.read(&mut buffer).expect("reads the console") {
+                Turn::Busy => busy += 1,
+                Turn::Quiet => break,
+                Turn::Text(taken) => panic!("{taken} bytes of text came from records without any"),
+            }
+            assert!(busy < 4, "the input never went quiet");
+        }
     }
 
     /// An answer that is being read when the command is told to stop ends with an interrupted

@@ -6,7 +6,21 @@
 //! | [`Terminal`] | Holds the terminal's modes as found and puts them back, with the waiting input discarded |
 //! | [`open_output`] | Opens the terminal itself for writing, so the kit reaches it through no buffer of ours |
 //! | `Prompt` (Windows only) | The console's modes while the kit or an answer is typed, and what is read from it |
+//! | [`Turn`] | What one read of the terminal found: text, a quiet turn, or input that holds no text |
 //! | [`KIT_FOLLOWS`] | What is said before the kit, including how long the screen keeps it |
+
+/// What one read of a terminal found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Turn {
+    /// Text, as many bytes as are given.
+    Text(usize),
+    /// A turn that passed with no input at all: the input has stopped, for now.
+    Quiet,
+    /// The read met input that holds no text and stopped at its own limit on work, with more
+    /// possibly still to come. The input has not stopped, so a caller that is waiting for it to
+    /// stop goes on, and one that has checks of its own makes them first.
+    Busy,
+}
 
 #[cfg(unix)]
 mod unix;
