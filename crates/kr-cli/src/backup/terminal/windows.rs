@@ -108,16 +108,26 @@ fn modes_not_changed(error: &std::io::Error) -> CliError {
     ))
 }
 
-/// Throws away the input waiting on the console, or says that it could not.
-fn discard(handle: HANDLE) -> Result<()> {
+/// Throws away the input waiting on the console.
+fn flush(handle: HANDLE) -> std::io::Result<()> {
     // SAFETY: the caller's handle is open for the length of the call.
     if unsafe { FlushConsoleInputBuffer(handle) } == 0 {
-        return Err(CliError::Terminal(shown!(
-            "the console's waiting input could not be thrown away: {}",
-            Shown::io(&std::io::Error::last_os_error())
-        )));
+        return Err(std::io::Error::last_os_error());
     }
     Ok(())
+}
+
+/// The failure to throw away the input waiting on the console.
+fn not_thrown_away(error: &std::io::Error) -> CliError {
+    CliError::Terminal(shown!(
+        "the console's waiting input could not be thrown away: {}",
+        Shown::io(error)
+    ))
+}
+
+/// Throws away the input waiting on the console, or says that it could not.
+fn discard(handle: HANDLE) -> Result<()> {
+    flush(handle).map_err(|error| not_thrown_away(&error))
 }
 
 /// Opens the console's output buffer as itself, for writing, with no buffer of ours in between. The
@@ -241,10 +251,19 @@ impl Prompt {
 
     /// As [`Self::enter`], on the console input `input`.
     fn enter_on(input: OwnedHandle) -> Result<Self> {
+        Self::enter_with(input, flush)
+    }
+
+    /// As [`Self::enter_on`], with `flush` as the way the waiting input is thrown away.
+    fn enter_with(
+        input: OwnedHandle,
+        flush: impl FnOnce(HANDLE) -> std::io::Result<()>,
+    ) -> Result<Self> {
         let prompt = Self::silent_on(input)?;
+        let handle = prompt.input.as_raw_handle().cast();
         // What was typed before this prompt was shown was echoed, and is not part of the kit. If it
         // cannot be thrown away the prompt is not entered: dropping it puts the modes back.
-        discard(prompt.input.as_raw_handle().cast())?;
+        flush(handle).map_err(|error| not_thrown_away(&error))?;
         Ok(prompt)
     }
 
@@ -296,6 +315,11 @@ impl Prompt {
     ///
     /// Returns a terminal failure when the modes cannot be put back.
     pub fn leave(&mut self) -> Result<()> {
+        self.leave_with(flush)
+    }
+
+    /// As [`Self::leave`], with `flush` as the way the waiting input is thrown away.
+    fn leave_with(&mut self, flush: impl FnOnce(HANDLE) -> std::io::Result<()>) -> Result<()> {
         if self.restored {
             return Ok(());
         }
@@ -309,7 +333,7 @@ impl Prompt {
             )));
         }
         // A prompt whose input cannot be thrown away is not left: dropping it tries once more.
-        discard(handle)?;
+        flush(handle).map_err(|error| not_thrown_away(&error))?;
         self.restored = true;
         Ok(())
     }
@@ -578,21 +602,43 @@ mod tests {
         mode
     }
 
-    /// A prompt on a console whose input cannot be thrown away is not entered, and the console's
-    /// modes are as they were found.
+    /// A prompt is not entered when the console's waiting input cannot be thrown away, and the
+    /// console's modes are as they were found. A handle cannot lack only that right, because setting
+    /// the modes needs write access too (the system says "permission denied"), so the failure comes
+    /// in through the way the input is thrown away.
     #[test]
     fn a_console_whose_waiting_input_cannot_be_thrown_away_is_not_entered() {
         let _alone = CONSOLE.lock().unwrap_or_else(PoisonError::into_inner);
-        let input = console_input(false);
+        let input = console_input(true);
         let before = mode_of(&input);
-        let refused = Prompt::enter_on(input.try_clone().expect("a copy of the handle"))
-            .err()
-            .expect("the prompt is not entered");
+        let refused = Prompt::enter_with(input.try_clone().expect("a copy of the handle"), |_| {
+            Err(std::io::Error::from_raw_os_error(5))
+        })
+        .err()
+        .expect("the prompt is not entered");
         assert!(
             refused.to_string().contains("could not be thrown away"),
             "{refused}"
         );
         assert_eq!(mode_of(&input), before, "the modes are as they were found");
+    }
+
+    /// A prompt that could not throw the waiting input away is not counted as left, so that
+    /// dropping it tries again.
+    #[test]
+    fn a_prompt_that_could_not_throw_the_waiting_input_away_is_not_counted_as_left() {
+        let _alone = CONSOLE.lock().unwrap_or_else(PoisonError::into_inner);
+        let input = console_input(true);
+        let saved = mode_of(&input);
+        let mut prompt = Prompt::holding(input, saved);
+        let error = prompt
+            .leave_with(|_| Err(std::io::Error::from_raw_os_error(5)))
+            .expect_err("leaving is refused");
+        assert!(
+            error.to_string().contains("could not be thrown away"),
+            "{error}"
+        );
+        assert!(!prompt.restored, "a prompt that kept its input is not left");
     }
 
     /// A paste after the blank line arrives as key releases and modifier keys that carry no
@@ -678,22 +724,6 @@ mod tests {
             bytes.iter().all(|byte| *byte == 0),
             "a record still held a character"
         );
-    }
-
-    /// A prompt that could not throw the waiting input away is not counted as left, so that
-    /// dropping it tries again.
-    #[test]
-    fn a_prompt_that_could_not_throw_the_waiting_input_away_is_not_counted_as_left() {
-        let _alone = CONSOLE.lock().unwrap_or_else(PoisonError::into_inner);
-        let input = console_input(false);
-        let saved = mode_of(&input);
-        let mut prompt = Prompt::holding(input, saved);
-        let error = prompt.leave().expect_err("leaving is refused");
-        assert!(
-            error.to_string().contains("could not be thrown away"),
-            "{error}"
-        );
-        assert!(!prompt.restored, "a prompt that kept its input is not left");
     }
 
     /// Setup declines Windows Error Reporting and installs the filter that ends the process at
