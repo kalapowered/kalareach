@@ -1749,7 +1749,6 @@ export function MobileSession({
               {reason}
               {earlierActions}
               {release}
-              {steerNote}
             </>
           ) : null}
           {typingToProgram && unsent !== null ? (
@@ -1767,7 +1766,7 @@ export function MobileSession({
            * or the conversation's. While the view controls the program, the program's keyboard
            * takes the field's place, and Send goes with the draft until control ends.
            */}
-          {asLine && !typingToProgram && composerActions !== null ? (
+          {asLine && !typingToProgram && pane === 'semantic' && composerActions !== null ? (
             // The line holds the field and Send only, so the other actions take a row above it.
             <div className="m-composer-more">{composerActions}</div>
           ) : null}
@@ -1776,6 +1775,10 @@ export function MobileSession({
             {asLine && !typingToProgram ? (
               <>
                 {sendButton}
+                {/* Under the terminal the line has no row above it to spare: the terminal's rows are
+                    all the room there is. Interrupt, the action that is wanted at once, stands in
+                    the line, and Steer and Queue are the conversation's composer's. */}
+                {pane === 'terminal' ? interruptButton : null}
                 {lastState}
               </>
             ) : null}

@@ -371,3 +371,53 @@ describe("the phone's Interrupt (KR-REQ-13.12)", () => {
     })
   })
 })
+
+describe("the composer under the phone's terminal (KR-REQ-13.12)", () => {
+  /** Opens the terminal view of the session, once the agent has been read. */
+  async function underTerminal(
+    through: (port: HostPort) => HostPort = (port) => port
+  ): Promise<ReturnType<typeof userEvent.setup>> {
+    const person = userEvent.setup()
+    await open(through)
+    await person.click(screen.getByRole('tab', { name: 'Terminal' }))
+    await waitFor(() => {
+      expect(screen.getAllByTestId('mobile-terminal-line').length).toBeGreaterThan(0)
+    })
+    return person
+  }
+
+  it('is the field and Send in one line, with Interrupt after them, and leaves Steer and Queue to the conversation', async () => {
+    const person = await underTerminal()
+    await person.type(screen.getByLabelText('Message this session'), 'ls')
+
+    const send = screen.getByRole('button', { name: 'Send' })
+    const interrupt = screen.getByRole('button', { name: 'Interrupt the current turn' })
+    expect(interrupt).toBeEnabled()
+    expect(screen.queryByRole('button', { name: 'Steer' })).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Queue' })).toBeNull()
+    // The line is one row: the three share a parent, in the order the keyboard reaches them.
+    const line = send.parentElement
+    expect(interrupt.parentElement).toBe(line)
+    expect(screen.getByLabelText('Message this session').parentElement).toBe(line)
+    expect(
+      [...(line?.children ?? [])].map((each) => (each.tagName === 'TEXTAREA' ? 'field' : each.textContent))
+    ).toEqual(['field', 'Send', '■'])
+  })
+
+  it('interrupts the running turn from the line', async () => {
+    const interrupted: string[] = []
+    const person = await underTerminal((port) => ({
+      ...port,
+      composerInterrupt: (params, opening) => {
+        interrupted.push(params.turn_id)
+        return port.composerInterrupt(params, opening)
+      }
+    }))
+
+    await person.click(screen.getByRole('button', { name: 'Interrupt the current turn' }))
+
+    await waitFor(() => {
+      expect(interrupted).toEqual(['turn-9'])
+    })
+  })
+})
