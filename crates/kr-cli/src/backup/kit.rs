@@ -161,7 +161,10 @@ fn read_blocking(source: &KitSource, cancel: &AtomicBool) -> Result<KitRead> {
 ///
 /// Returns a terminal failure when the answer cannot be read.
 pub async fn ask_line(question: &Shown) -> Result<Option<String>> {
+    #[cfg(unix)]
     discard_typed_ahead();
+    #[cfg(windows)]
+    discard_typed_ahead()?;
     crate::report::say(question);
     let (answer, arrives) = tokio::sync::oneshot::channel();
     std::thread::Builder::new()
@@ -259,8 +262,8 @@ fn read_answer() -> Result<Option<String>> {
 }
 
 #[cfg(windows)]
-fn discard_typed_ahead() {
-    super::terminal::discard_typed_ahead();
+fn discard_typed_ahead() -> Result<()> {
+    super::terminal::discard_typed_ahead()
 }
 
 fn answer_unreadable(error: &std::io::Error) -> CliError {

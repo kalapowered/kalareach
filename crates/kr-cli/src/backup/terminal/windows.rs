@@ -15,7 +15,7 @@ use std::os::windows::io::{AsHandle as _, AsRawHandle as _, OwnedHandle};
 
 use kr_client::shown;
 use kr_client::shown::Shown;
-use windows_sys::Win32::Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT};
+use windows_sys::Win32::Foundation::{HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows_sys::Win32::System::Console::{
     ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT, ENABLE_PROCESSED_INPUT, ENABLE_VIRTUAL_TERMINAL_INPUT,
     FlushConsoleInputBuffer, GetConsoleMode, INPUT_RECORD, KEY_EVENT, ReadConsoleInputW,
@@ -89,6 +89,26 @@ unsafe extern "system" fn end_at_once(exception: *const EXCEPTION_POINTERS) -> i
     unsafe { TerminateProcess(GetCurrentProcess(), code) };
     // The call ends the process. If it ever returned, the system ends it without a report.
     EXCEPTION_EXECUTE_HANDLER
+}
+
+/// The failure to change the console's modes.
+fn modes_not_changed(error: &std::io::Error) -> CliError {
+    CliError::Terminal(shown!(
+        "the console's modes could not be changed: {}",
+        Shown::io(error)
+    ))
+}
+
+/// Throws away the input waiting on the console, or says that it could not.
+fn discard(handle: HANDLE) -> Result<()> {
+    // SAFETY: the caller's handle is open for the length of the call.
+    if unsafe { FlushConsoleInputBuffer(handle) } == 0 {
+        return Err(CliError::Terminal(shown!(
+            "the console's waiting input could not be thrown away: {}",
+            Shown::io(&std::io::Error::last_os_error())
+        )));
+    }
+    Ok(())
 }
 
 /// Opens the console's output buffer as itself, for writing, with no buffer of ours in between. The
@@ -176,39 +196,39 @@ impl Prompt {
     /// Returns a terminal failure when the console cannot be reached or its modes cannot be
     /// changed.
     pub fn enter() -> Result<Self> {
-        let failed = |error: &std::io::Error| {
-            CliError::Terminal(shown!(
-                "the console's modes could not be changed: {}",
-                Shown::io(error)
-            ))
-        };
         let input = std::io::stdin()
             .as_handle()
             .try_clone_to_owned()
-            .map_err(|error| failed(&error))?;
+            .map_err(|error| modes_not_changed(&error))?;
+        Self::enter_on(input)
+    }
+
+    /// As [`Self::enter`], on the console input `input`.
+    fn enter_on(input: OwnedHandle) -> Result<Self> {
         let handle = input.as_raw_handle().cast();
         let mut saved = 0_u32;
         // SAFETY: the handle is open for as long as `input` is, and `saved` is a live `u32`.
         if unsafe { GetConsoleMode(handle, &raw mut saved) } == 0 {
-            return Err(failed(&std::io::Error::last_os_error()));
+            return Err(modes_not_changed(&std::io::Error::last_os_error()));
         }
         let silent = (saved
             & !(ENABLE_ECHO_INPUT | ENABLE_LINE_INPUT | ENABLE_VIRTUAL_TERMINAL_INPUT))
             | ENABLE_PROCESSED_INPUT;
         // SAFETY: the handle is open for as long as `input` is.
         if unsafe { SetConsoleMode(handle, silent) } == 0 {
-            return Err(failed(&std::io::Error::last_os_error()));
+            return Err(modes_not_changed(&std::io::Error::last_os_error()));
         }
-        // What was typed before this prompt was shown was echoed, and is not part of the kit.
-        // SAFETY: as above.
-        unsafe { FlushConsoleInputBuffer(handle) };
-        Ok(Self {
+        let prompt = Self {
             input,
             saved,
             restored: false,
             high: None,
             pending: Zeroizing::new(Vec::new()),
-        })
+        };
+        // What was typed before this prompt was shown was echoed, and is not part of the kit. If it
+        // cannot be thrown away the prompt is not entered: dropping it puts the modes back.
+        discard(handle)?;
+        Ok(prompt)
     }
 
     /// Puts the modes back, discarding the input still waiting: what was pasted past the end of the
@@ -230,8 +250,8 @@ impl Prompt {
                 Shown::io(&std::io::Error::last_os_error())
             )));
         }
-        // SAFETY: as above.
-        unsafe { FlushConsoleInputBuffer(handle) };
+        // A prompt whose input cannot be thrown away is not left: dropping it tries once more.
+        discard(handle)?;
         self.restored = true;
         Ok(())
     }
@@ -324,16 +344,20 @@ impl Drop for Prompt {
 
 /// Throws away what is waiting on the console's input, so a line typed before a question was shown
 /// cannot answer it. Standard input that is not a console is left alone.
-pub fn discard_typed_ahead() {
+///
+/// # Errors
+///
+/// Returns a terminal failure when the input is a console and what waits in it cannot be thrown
+/// away.
+pub fn discard_typed_ahead() -> Result<()> {
     let handle = std::io::stdin().as_raw_handle().cast();
     let mut mode = 0_u32;
     // SAFETY: the handle is the standard input's, open for the whole process, and `mode` is a live
     // `u32`; the call fails for a handle that is not a console.
-    unsafe {
-        if GetConsoleMode(handle, &raw mut mode) != 0 {
-            FlushConsoleInputBuffer(handle);
-        }
+    if unsafe { GetConsoleMode(handle, &raw mut mode) } == 0 {
+        return Ok(());
     }
+    discard(handle)
 }
 
 /// Reads one line from the console on standard input, with echo on: `None` at the end of the input
@@ -384,7 +408,73 @@ pub fn read_line() -> std::io::Result<Option<String>> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Mutex, PoisonError};
+
     use super::*;
+
+    /// The tests that touch the console's input share one console, so they run one at a time.
+    static CONSOLE: Mutex<()> = Mutex::new(());
+
+    /// The console's input as a new handle, with write access or without it. Throwing input away
+    /// needs write access; reading the modes and changing them needs read access.
+    fn console_input(write: bool) -> OwnedHandle {
+        File::options()
+            .read(true)
+            .write(write)
+            .open("CONIN$")
+            .expect("the test runs on a console")
+            .into()
+    }
+
+    fn mode_of(input: &OwnedHandle) -> u32 {
+        let mut mode = 0_u32;
+        // SAFETY: the handle is open for as long as `input` is, and `mode` is a live `u32`.
+        assert_ne!(
+            unsafe { GetConsoleMode(input.as_raw_handle().cast(), &raw mut mode) },
+            0,
+            "the modes are read"
+        );
+        mode
+    }
+
+    /// A prompt on a console whose input cannot be thrown away is not entered, and the console's
+    /// modes are as they were found.
+    #[test]
+    fn a_console_whose_waiting_input_cannot_be_thrown_away_is_not_entered() {
+        let _alone = CONSOLE.lock().unwrap_or_else(PoisonError::into_inner);
+        let input = console_input(false);
+        let before = mode_of(&input);
+        let refused = Prompt::enter_on(input.try_clone().expect("a copy of the handle"))
+            .err()
+            .expect("the prompt is not entered");
+        assert!(
+            refused.to_string().contains("could not be thrown away"),
+            "{refused}"
+        );
+        assert_eq!(mode_of(&input), before, "the modes are as they were found");
+    }
+
+    /// A prompt that could not throw the waiting input away is not counted as left, so that
+    /// dropping it tries again.
+    #[test]
+    fn a_prompt_that_could_not_throw_the_waiting_input_away_is_not_counted_as_left() {
+        let _alone = CONSOLE.lock().unwrap_or_else(PoisonError::into_inner);
+        let input = console_input(false);
+        let saved = mode_of(&input);
+        let mut prompt = Prompt {
+            input,
+            saved,
+            restored: false,
+            high: None,
+            pending: Zeroizing::new(Vec::new()),
+        };
+        let error = prompt.leave().expect_err("leaving is refused");
+        assert!(
+            error.to_string().contains("could not be thrown away"),
+            "{error}"
+        );
+        assert!(!prompt.restored, "a prompt that kept its input is not left");
+    }
 
     /// Setup declines Windows Error Reporting and installs the filter that ends the process at
     /// once. The test puts both back as it found them.
