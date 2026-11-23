@@ -352,45 +352,6 @@ pub fn issue_authority_revision(
     Ok(record)
 }
 
-/// Accepts an authority revision record that follows the revision a host last accepted.
-///
-/// Each host persists its latest accepted revision and rejects an older one. A record that does
-/// not follow it is out of order, whatever its signature says.
-///
-/// # Errors
-///
-/// Returns [`PairingError::ContextMismatch`] for a record from another host or out of order, and
-/// [`PairingError::AuthenticationFailed`] when the signature fails.
-pub fn accept_authority_revision(
-    record: &AuthorityRevisionRecord,
-    host_device_id: DeviceId,
-    host_key: &AuthorisationKey,
-    latest_accepted: AuthorityRevision,
-) -> Result<AuthorityRevision> {
-    if record.host_device_id != host_device_id {
-        return Err(PairingError::ContextMismatch {
-            what: "the host an authority revision names",
-        });
-    }
-    if record.previous_revision != latest_accepted
-        || record.authority_revision.get() != latest_accepted.get().saturating_add(1)
-    {
-        return Err(PairingError::ContextMismatch {
-            what: "the order of an authority revision",
-        });
-    }
-    sign::verify(
-        host_key,
-        &SigningTranscript::from_canonical_bytes(
-            kr_protocol::pairing::AUTHORITY_REVISION_DOMAIN,
-            record.signing_input()?,
-        )?,
-        &record.signature,
-    )
-    .map_err(|_| PairingError::AuthenticationFailed)?;
-    Ok(record.authority_revision)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -656,70 +617,6 @@ mod tests {
         tampered.issued_at_ms = TimestampMs::new(6_000);
         assert!(matches!(
             verify_revocation_request(&tampered, device(2), owner.authorisation.public()),
-            Err(PairingError::AuthenticationFailed)
-        ));
-    }
-
-    #[test]
-    fn only_the_host_advances_its_revision_and_only_in_order() {
-        let host = DeviceKeys::generate().expect("keys");
-        let record = issue_authority_revision(
-            &host.authorisation,
-            device(2),
-            AuthorityRevision::new(4),
-            [RevocationRequestId::new(Uuid::from_bytes([1; 16]))]
-                .into_iter()
-                .collect(),
-            TimestampMs::new(6_000),
-        )
-        .expect("a record");
-        assert_eq!(record.authority_revision.get(), 5);
-
-        assert_eq!(
-            accept_authority_revision(
-                &record,
-                device(2),
-                host.authorisation.public(),
-                AuthorityRevision::new(4),
-            )
-            .expect("the new revision")
-            .get(),
-            5
-        );
-
-        // A host that has already accepted 5 rejects it as out of order rather than replaying it.
-        assert!(matches!(
-            accept_authority_revision(
-                &record,
-                device(2),
-                host.authorisation.public(),
-                AuthorityRevision::new(5),
-            ),
-            Err(PairingError::ContextMismatch {
-                what: "the order of an authority revision"
-            })
-        ));
-
-        // A record from another host is refused whatever its order.
-        assert!(matches!(
-            accept_authority_revision(
-                &record,
-                device(9),
-                host.authorisation.public(),
-                AuthorityRevision::new(4),
-            ),
-            Err(PairingError::ContextMismatch { .. })
-        ));
-
-        // A device cannot forge one: the signature is checked against the host's key.
-        let device_keys = DeviceKeys::generate().expect("keys");
-        assert!(matches!(
-            accept_authority_revision(
-                &record,
-                device(2),
-                device_keys.authorisation.public(),
-                AuthorityRevision::new(4),
-            ),
             Err(PairingError::AuthenticationFailed)
         ));
     }

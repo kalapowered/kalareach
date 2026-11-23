@@ -64,6 +64,7 @@ const MAX_ADVANCE: u64 = 1_000;
 static LIVE_TICKERS: AtomicUsize = AtomicUsize::new(0);
 
 /// Returns how many epoch threads are running.
+#[cfg(test)]
 #[must_use]
 pub fn live_tickers() -> usize {
     LIVE_TICKERS.load(Ordering::Relaxed)
@@ -320,6 +321,7 @@ impl RuntimeEngine {
     /// A test holds it across dropping the engine, which is exactly the moment the thread has to
     /// end and nothing else can observe. Counting threads across a process would tell a test about
     /// every other engine in it as well.
+    #[cfg(test)]
     #[must_use]
     pub fn ticker_ended(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.ticker.ended)

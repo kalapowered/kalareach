@@ -3547,22 +3547,6 @@ impl Store {
         Ok(events)
     }
 
-    /// Records a consumer's position in the outbox.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`TransferError::StoreUnavailable`] when the write fails.
-    pub fn set_cursor(&self, consumer: &str, sequence: u64) -> Result<()> {
-        self.connection
-            .execute(
-                "INSERT INTO cursors (consumer, sequence) VALUES (?1, ?2)
-                 ON CONFLICT (consumer) DO UPDATE SET sequence = ?2",
-                params![consumer, as_i64(sequence)],
-            )
-            .map_err(TransferError::store)?;
-        Ok(())
-    }
-
     /// Returns a consumer's recorded position.
     ///
     /// # Errors
@@ -5260,7 +5244,11 @@ mod tests {
                 .all(|event| event.subject == transfer(1).to_string())
         );
         store
-            .set_cursor("attention", events[0].sequence)
+            .connection
+            .execute(
+                "INSERT INTO cursors (consumer, sequence) VALUES (?1, ?2)",
+                params!["attention", as_i64(events[0].sequence)],
+            )
             .expect("writes");
         assert_eq!(
             store.cursor("attention").expect("reads"),

@@ -82,12 +82,6 @@ impl<'a> MatchIndex<'a> {
         self.by_stem.len()
     }
 
-    /// Returns how many distinct distributions the catalogue recognises.
-    #[must_use]
-    pub fn distribution_count(&self) -> usize {
-        self.by_distribution.len()
-    }
-
     /// Returns every entry whose rules recognise the observation.
     ///
     /// A revoked release is not a candidate: it stops receiving new bindings, which is what a
@@ -254,7 +248,6 @@ mod tests {
         ]);
         let lookup = MatchIndex::build(&catalogue);
         assert_eq!(lookup.executable_count(), 2);
-        assert_eq!(lookup.distribution_count(), 1);
 
         let found = lookup.candidates(&Observation {
             executable_path: "/usr/local/bin/sampletool".to_owned(),

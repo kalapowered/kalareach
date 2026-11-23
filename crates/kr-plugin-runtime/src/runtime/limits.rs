@@ -20,7 +20,7 @@
 //! maximum is smaller is refused by that maximum, and saying "over its bound of 67108864" about it
 //! would be a lie.
 
-use kr_plugin_sdk::limits::{INSTANCE_MEMORY_BYTES, InstanceLimits};
+use kr_plugin_sdk::limits::INSTANCE_MEMORY_BYTES;
 
 use crate::runtime::error::RuntimeError;
 
@@ -98,14 +98,6 @@ impl InstanceLimiter {
             allocated_elements: 0,
             refused: None,
         }
-    }
-
-    /// Builds the limiter from a declared set of limits.
-    #[must_use]
-    pub const fn from_limits(limits: &InstanceLimits) -> Self {
-        let mut limiter = Self::defaults();
-        limiter.memory_bytes = limits.memory_bytes.get();
-        limiter
     }
 
     /// Returns the linear memory bound in bytes, across every memory of the instance.
@@ -233,10 +225,6 @@ mod tests {
     fn the_memory_bound_is_the_specified_sixty_four_mebibytes() {
         let limiter = InstanceLimiter::defaults();
         assert_eq!(limiter.memory_bytes(), 67_108_864);
-        assert_eq!(
-            InstanceLimiter::from_limits(&InstanceLimits::defaults()).memory_bytes(),
-            67_108_864
-        );
     }
 
     #[test]

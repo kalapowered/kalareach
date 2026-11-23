@@ -83,12 +83,6 @@ impl GrantRequirement {
             }
         }
     }
-
-    /// Returns true when the owner has to confirm this decision.
-    #[must_use]
-    pub const fn needs_confirmation(self) -> bool {
-        matches!(self, Self::ConfirmedInstallationGrant)
-    }
 }
 
 impl core::fmt::Display for GrantRequirement {
@@ -290,14 +284,10 @@ mod tests {
                 GrantRequirement::ConfirmedInstallationGrant,
                 "{capability}"
             );
-            assert!(
-                requirement_for(capability, &wide).needs_confirmation(),
-                "{capability}"
-            );
         }
         for capability in PluginCapability::ALL {
             assert_eq!(
-                requirement_for(*capability, &wide).needs_confirmation(),
+                requirement_for(*capability, &wide) == GrantRequirement::ConfirmedInstallationGrant,
                 capability.confirmed_on_every_release(),
                 "{capability}"
             );

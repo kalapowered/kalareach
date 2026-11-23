@@ -1239,6 +1239,7 @@ impl Store {
     /// # Errors
     ///
     /// Returns [`ProjectError::StoreUnavailable`] when the write fails.
+    #[cfg(test)]
     pub fn set_project_state(
         &mut self,
         id: ProjectRepositoryId,
@@ -2271,6 +2272,7 @@ impl Store {
     /// # Errors
     ///
     /// Returns [`ProjectError::StoreUnavailable`] when the write fails.
+    #[cfg(test)]
     pub fn release_retained(&mut self, workspace_id: WorkspaceId) -> Result<usize> {
         let now = kr_ipc::now_ms();
         let transaction = self.transaction()?;
@@ -2497,6 +2499,7 @@ impl Store {
     /// # Errors
     ///
     /// Returns [`ProjectError::StoreUnavailable`] when the count cannot be read.
+    #[cfg(test)]
     pub fn event_count(&self) -> Result<u64> {
         let count: i64 = self
             .connection

@@ -24,7 +24,7 @@ use kr_crypto::connect::PairedPeer;
 use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::grant::Grant;
 use kr_protocol::identity::BootIdentity;
-use kr_protocol::ids::{ActionId, ActorId, DeviceId, DeviceKeyRevision, GrantId};
+use kr_protocol::ids::{ActionId, ActorId, DeviceId, DeviceKeyRevision};
 use kr_protocol::pairing::{DeviceName, DevicePlatform, DevicePublicKeys};
 use kr_protocol::scalars::{
     AuthorisationKey, Digest256, EndpointKey, NotificationPreviewKey, StoredEnvelopeKey,
@@ -1855,12 +1855,6 @@ fn read_declaration(
     }))
 }
 
-/// Returns the grant identity a row records, for a caller that wants it without the grant.
-#[must_use]
-pub fn grant_id_of(record: &DeviceRecord) -> GrantId {
-    record.grant.grant_id
-}
-
 /// Reads one action's route on a connection the caller already holds.
 fn read_route(
     connection: &Connection,
@@ -1926,7 +1920,7 @@ fn platform_from(text: &str) -> Result<DevicePlatform> {
 mod tests {
     use super::*;
     use kr_protocol::grant::{EnvironmentSelector, GrantExpiry, HistoryScope, SessionSelector};
-    use kr_protocol::ids::AuthorityRevision;
+    use kr_protocol::ids::{AuthorityRevision, GrantId};
     use kr_protocol::rights::ActionRight;
     use kr_protocol::scalars::{CanonicalSet, Nullable};
 
@@ -2023,7 +2017,7 @@ mod tests {
             .expect("the row is still there");
         assert_eq!(stored.revoked_at_ms, Some(now));
         assert!(!stored.is_paired());
-        assert_eq!(grant_id_of(&stored), device.grant.grant_id);
+        assert_eq!(stored.grant.grant_id, device.grant.grant_id);
     }
 
     #[test]

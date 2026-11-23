@@ -223,14 +223,6 @@ impl LaunchProbe {
         (!mode.is_empty() && mode.len() <= MAX_MODE_BYTES && !mode.chars().any(char::is_control))
             .then(|| mode.to_owned())
     }
-
-    /// Returns whether a launch whose mode is `mode` is refused in a Windows service session.
-    #[must_use]
-    pub fn refuses_in_service_session(&self, mode: &str) -> bool {
-        self.refused_in_service_session
-            .iter()
-            .any(|refused| refused == mode)
-    }
 }
 
 /// Returns why one line of text is not one a probe may hold, where it is not.
@@ -456,14 +448,6 @@ mod tests {
             reads(&at(&format!("\"{}\"", "x".repeat(MAX_MODE_BYTES)))),
             Some("x".repeat(MAX_MODE_BYTES))
         );
-    }
-
-    #[test]
-    fn only_the_declared_words_are_refused_in_a_service_session() {
-        assert!(probe().refuses_in_service_session("elevated"));
-        assert!(!probe().refuses_in_service_session("disabled"));
-        assert!(!probe().refuses_in_service_session("<redacted>"));
-        assert!(!probe().refuses_in_service_session("Elevated"));
     }
 
     #[test]
