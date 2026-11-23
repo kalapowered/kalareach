@@ -4983,9 +4983,9 @@ async fn kr_req_13_12_a_cleanup_that_panicked_does_not_start_an_upload_whose_ref
 }
 
 /// KR-REQ-13.12 (FU16): a send whose start is refused because a cleanup's resolution has started
-/// its upload meanwhile leaves the copy that upload sends from. The cleanup's work panicked, its
-/// resolution started the upload while the send waited before its own start, and the sender is held
-/// at its first line, before its first journal entry names the copy.
+/// its upload meanwhile leaves the copy that a later process resumes that upload from. The
+/// cleanup's work panicked, its resolution started the upload while the send waited before its own
+/// start, and the sender is held at its first line, before its first journal entry names the copy.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn kr_req_13_12_a_refused_send_leaves_the_copy_of_an_upload_that_a_cleanup_started() {
     use testing::{Awaited, Fault, Point};
