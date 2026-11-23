@@ -1620,6 +1620,33 @@ export class ScriptedRecords {
     }
   }
 
+  /**
+   * Adds `count` requests the session's channel instance relayed and that nothing has read: they
+   * are pending and have no verified interpretation, as when the host's recovery could not read
+   * them.
+   */
+  holdUnread(sessionId: string, count: number): void {
+    const agent = this.#agentOf(sessionId)
+    const instance = agent.instances[0]?.application_instance_id
+    if (instance === undefined) throw new Error('the session has no instance')
+    for (let index = 0; index < count; index += 1) {
+      agent.resources.push({
+        resource_id: idOf('c4c4c4c4', index + 1),
+        application_instance_id: instance,
+        request: { connection: '1', upstream: JSON.stringify(`unread-${String(index + 1)}`) },
+        kind: 'reverse_rpc',
+        method: 'notifications/claude/channel/permission_request',
+        classification: { class: 'mutation', declared: false },
+        source_generation: '1',
+        state: 'pending',
+        durability: 'durable',
+        deadline_ms: null,
+        recorded_at: String(this.#ids.nowMs - 60_000),
+        interpretation_verified: false
+      })
+    }
+  }
+
   /** Whether the worker holds a receipt, reading unknown, for an answer the host could not confirm. */
   holdsUnknownReceipt(actionId: string): boolean {
     return this.#unknownReceipts.has(actionId)

@@ -330,3 +330,51 @@ describe('the notice while the host suspends rich mutations', () => {
     })
   })
 })
+
+describe('the notice while a request nothing has read is pending', () => {
+  const UNREAD =
+    'Claude Code is waiting on a request that this host could not read, so it cannot be answered from here.'
+
+  it('keeps_the_notice_and_offers_the_terminal_with_a_live_channel', async () => {
+    open((controls) => {
+      controls.records.holdUnread(SESSION_MAIN, 1)
+    })
+    const region = await notice()
+    expect(region).toHaveTextContent('Claude Code asks for approvals in its terminal. Answer them there.')
+    expect(within(region).getByTestId('approval-offer-reason')).toHaveTextContent(UNREAD)
+    await userEvent.click(within(region).getByRole('button', { name: 'Open the terminal' }))
+    await waitFor(() => {
+      expect(screen.getByRole('tab', { name: 'Terminal' })).toHaveAttribute('aria-selected', 'true')
+    })
+  })
+
+  it('says_the_same_for_more_requests_than_the_host_keeps_frames_for', async () => {
+    open((controls) => {
+      controls.records.holdUnread(SESSION_MAIN, 65)
+    })
+    const region = await notice()
+    expect(within(region).getByTestId('approval-offer-reason')).toHaveTextContent(UNREAD)
+  })
+
+  it('gives_a_records_own_reason_before_it', async () => {
+    open((controls) => {
+      controls.records.holdUnread(SESSION_MAIN, 1)
+      controls.records.withoutCapability(SESSION_MAIN, 'agent.approval')
+    })
+    const region = await notice()
+    expect(within(region).getByTestId('approval-offer-reason')).toHaveTextContent(
+      'This device cannot answer Claude Code’s approvals. Channels has not shown that it is on for this session.'
+    )
+  })
+
+  it('an_agent_that_does_not_use_channels_gets_no_notice_for_it', async () => {
+    open((controls) => {
+      controls.records.holdUnread(SESSION_MAIN, 1)
+    }, false)
+    await screen.findByTestId('approval')
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0))
+    })
+    expect(screen.queryByRole('region', { name: 'Approvals' })).toBeNull()
+  })
+})

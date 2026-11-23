@@ -1260,6 +1260,92 @@ fn kr_req_12_25_an_approval_relayed_during_the_fence_is_read_when_rich_work_retu
     );
 }
 
+/// KR-REQ-12.25: the host holds the sources of only so many unread frames, so a request a channel
+/// relayed during the fence may have lost its own by the time rich work returns. It is not read
+/// then, and stays a pending request that no approval answers: the page keeps the terminal's
+/// notice for it, which is why the host must not claim it an approval.
+#[test]
+fn kr_req_12_25_a_request_whose_source_was_forgotten_stays_unread_when_rich_work_returns() {
+    let mut worker = Worker::open();
+    let source = worker.claude_code();
+    let first = worker.admit(1, vec![testing::admitted(&source)]);
+    worker
+        .broker
+        .register_instance(
+            instance(2),
+            IntegrationMode::NativeBridge,
+            None,
+            Some(managed(2)),
+        )
+        .expect("the launched instance is registered");
+    worker
+        .bind(1, 2, source.package_digest, first)
+        .expect("binds");
+    let connector = worker
+        .sources
+        .for_command(fixture::COMMAND)
+        .expect("the admitted connector");
+
+    worker
+        .broker
+        .refuse_ledger_writes(true)
+        .expect("the store is put in query-only mode");
+    let connection = open_channel(&worker.broker, &connector);
+    // More distinct requests than the sources the host keeps, each named by five letters.
+    let letters = b"abcdefghijkmnopqrstuvwxyz";
+    let relayed: Vec<_> = (0..=kr_worker::broker::MAX_RETAINED_FRAMES)
+        .map(|index| {
+            let name: String = (0..5)
+                .rev()
+                .map(|place| {
+                    char::from(letters[(index / letters.len().pow(place)) % letters.len()])
+                })
+                .collect();
+            relay_permission_request(&worker.broker, connection, &name)
+        })
+        .collect();
+    assert_eq!(
+        worker.broker.mode(),
+        kr_protocol::gateway::GatewayMode::NativeOnlyVolatile,
+        "the failed write raised the fence"
+    );
+
+    recover(&mut worker);
+    assert_eq!(
+        worker.broker.mode(),
+        kr_protocol::gateway::GatewayMode::Normal,
+        "the recovery finished"
+    );
+    let oldest = relayed.first().expect("requests were relayed");
+    let newest = relayed.last().expect("requests were relayed");
+    assert!(
+        worker
+            .broker
+            .decoding(newest.resource_id)
+            .expect("the ledger reads")
+            .is_some(),
+        "a request whose source is held is read once rich work is back"
+    );
+    assert!(
+        worker
+            .broker
+            .decoding(oldest.resource_id)
+            .expect("the ledger reads")
+            .is_none(),
+        "the request whose source was forgotten cannot be read"
+    );
+    let left = worker
+        .broker
+        .pending(oldest.resource_id)
+        .expect("it is still recorded");
+    assert_eq!(left.state, kr_protocol::gateway::PendingState::Pending);
+    assert_eq!(left.kind, kr_protocol::gateway::PendingKind::ReverseRpc);
+    assert!(
+        !left.interpretation_verified,
+        "no approval stands for it, so only the terminal can answer it"
+    );
+}
+
 /// KR-REQ-11.13: a binding stays on its hash across an upgrade, reporting the release it holds;
 /// a new binding takes the new hash, and the old one is not admitted for new bindings any more.
 #[test]
@@ -1756,7 +1842,14 @@ fn relay_approval(
     broker: &Broker,
     connector: &InstalledConnector,
 ) -> (GatewayConnectionId, kr_protocol::gateway::PendingResource) {
-    let connection = broker
+    let connection = open_channel(broker, connector);
+    let relayed = relay_permission_request(broker, connection, "abcde");
+    (connection, relayed)
+}
+
+/// Opens instance 2's own channel for `connector`.
+fn open_channel(broker: &Broker, connector: &InstalledConnector) -> GatewayConnectionId {
+    broker
         .open_bridge_channel(
             instance(2),
             &BridgeProcess {
@@ -1772,12 +1865,21 @@ fn relay_approval(
             Some(fixture::QUALIFIED_VERSION),
             None,
         )
-        .expect("the application's own channel is opened");
+        .expect("the application's own channel is opened")
+}
+
+/// Relays one tool approval named `request_id` on `connection`. Returns the request as it was
+/// recorded.
+fn relay_permission_request(
+    broker: &Broker,
+    connection: GatewayConnectionId,
+    request_id: &str,
+) -> kr_protocol::gateway::PendingResource {
     let frame = serde_json::json!({
         "jsonrpc": "2.0",
         "method": "notifications/claude/channel/permission_request",
         "params": {
-            "request_id": "abcde",
+            "request_id": request_id,
             "tool_name": "Bash",
             "description": "List the files here",
             "input_preview": "ls -la",
@@ -1797,7 +1899,7 @@ fn relay_approval(
     else {
         panic!("the relayed approval is recorded");
     };
-    (connection, relayed)
+    relayed
 }
 
 /// Opens instance 2's channel for `connector`, relays one tool approval on it, has the channel's

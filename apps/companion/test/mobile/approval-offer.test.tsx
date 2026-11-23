@@ -164,6 +164,18 @@ describe.each(PLATFORMS)('the %s session screen of an agent that asks for approv
     expect(within(region).getByTestId('approval-offer-reason')).toHaveTextContent(SENTENCE)
   })
 
+  it('keeps_the_notice_and_offers_the_terminal_for_a_request_nothing_has_read', async () => {
+    start(surface, (controls) => controls.records.holdUnread(SESSION_MAIN, 1), { inSession: true })
+    const region = await notice()
+    expect(within(region).getByTestId('approval-offer-reason')).toHaveTextContent(
+      'Claude Code is waiting on a request that this host could not read, so it cannot be answered from here.'
+    )
+    await userEvent.click(within(region).getByRole('button', { name: 'Open the terminal' }))
+    await waitFor(() => {
+      expect(paneShown()).toBe('terminal')
+    })
+  })
+
   it('without_the_right_to_type_it_offers_no_button', async () => {
     start(
       surface,

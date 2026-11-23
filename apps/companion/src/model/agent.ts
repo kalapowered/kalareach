@@ -518,29 +518,63 @@ const NO_APPROVAL_RECORD =
   'This device cannot answer Claude Code’s approvals. Channels has not shown that it is on for this session.'
 
 /**
+ * What the notice says when a request is pending that nothing has read, and nothing else keeps the
+ * terminal's notice up.
+ */
+const UNREAD_REQUEST =
+  'Claude Code is waiting on a request that this host could not read, so it cannot be answered from here.'
+
+/**
+ * Whether `instance` has a request pending that no decoder has read into an approval.
+ *
+ * The host reads a request a channel relays as it arrives, and again when a recovery ends. One it
+ * could not read (its source no longer held, or no package that may decode it) stays pending and is
+ * not an approval a person can answer here, so only the terminal can answer it.
+ */
+export function hasUnreadRequest(
+  resources: readonly PendingResource[],
+  instance: string | null
+): boolean {
+  return (
+    instance !== null &&
+    resources.some(
+      (resource) =>
+        resource.kind !== 'upstream_action' &&
+        resource.state === 'pending' &&
+        !resource.interpretation_verified &&
+        resource.application_instance_id === instance
+    )
+  )
+}
+
+/**
  * The notice a session shows when its agent asks for approvals in its terminal, or null when there
  * is nothing to say.
  *
  * It says nothing before the records are read, before a live connection has said what it may do,
  * for an agent whose package is not in [`CHANNEL_PACKAGES`], and while the approval capability is
- * usable and the binding's rich mutations are not suspended. A record that is present and not
- * usable gives its own reason, with one sentence per state where it gave none, and an absent record
- * gives the instance's own refusal where it has one: those come first, because they stay true when
- * a suspension ends. Otherwise a suspended binding gives the host's reason for it, the one the
- * decisions show, and an absent record with no refusal says that Channels has not shown it is on.
- * Each reason is shown as a sentence ([`hostSentence`]). The terminal is offered only with a live
- * connection and the right to type in it.
+ * usable and the binding's rich mutations are not suspended, unless `unread` says a request is
+ * pending that nothing has read. A record that is present and not usable gives its own reason, with
+ * one sentence per state where it gave none, and an absent record gives the instance's own refusal
+ * where it has one: those come first, because they stay true when a suspension ends. Otherwise a
+ * suspended binding gives the host's reason for it, the one the decisions show, and an absent
+ * record with no refusal says that Channels has not shown it is on. Last, a request nothing has
+ * read says so. Each reason is shown as a sentence ([`hostSentence`]). The terminal is offered only
+ * with a live connection and the right to type in it.
  */
 export function approvalNoticeFor({
   instance,
   capabilities,
   binding,
+  unread,
   connected,
   rights
 }: {
   readonly instance: AgentInstanceSummary | null
   readonly capabilities: ReadonlyMap<string, InstanceCapabilityRecord> | null
   readonly binding: AgentBindingState | null
+  /** Whether a request of this instance is pending that nothing has read ([`hasUnreadRequest`]). */
+  readonly unread: boolean
   readonly connected: boolean
   readonly rights: ReadonlySet<string> | null
 }): ApprovalNotice | null {
@@ -565,6 +599,8 @@ export function approvalNoticeFor({
     sentence = suspensionOf(binding)
   } else if (record === undefined) {
     sentence = hostSentence(NO_APPROVAL_RECORD)
+  } else if (unread) {
+    sentence = UNREAD_REQUEST
   } else {
     return null
   }

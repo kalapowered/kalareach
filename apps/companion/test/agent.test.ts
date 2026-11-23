@@ -19,6 +19,7 @@ import type {
 
 import {
   actionableApprovals,
+  hasUnreadRequest,
   agentEntry,
   attachOffer,
   bindingStateOf,
@@ -317,6 +318,22 @@ describe('the requests a person can answer (KR-REQ-11.26)', () => {
     expect(
       actionableApprovals([resource({}), resource({ application_instance_id: 'i-2' })], 'i-2')
     ).toHaveLength(1)
+  })
+
+  it('leave a pending request nothing has read, of this instance, to the terminal', () => {
+    const unread = (over: Partial<PendingResource>) =>
+      resource({ kind: 'reverse_rpc', interpretation_verified: false, ...over })
+    expect(hasUnreadRequest([unread({})], 'i-1')).toBe(true)
+    // An approval that was verified is answered here, and a resolved one is not waiting.
+    expect(hasUnreadRequest([resource({})], 'i-1')).toBe(false)
+    expect(hasUnreadRequest([unread({ state: 'resolved' })], 'i-1')).toBe(false)
+    expect(hasUnreadRequest([unread({ state: 'uncertain' })], 'i-1')).toBe(false)
+    // One of another instance is that instance's, and an action the host prepared is not a request.
+    expect(hasUnreadRequest([unread({ application_instance_id: 'i-2' })], 'i-1')).toBe(false)
+    expect(hasUnreadRequest([unread({ kind: 'upstream_action' })], 'i-1')).toBe(false)
+    expect(hasUnreadRequest([], 'i-1')).toBe(false)
+    expect(hasUnreadRequest([unread({})], null)).toBe(false)
+    expect(hasUnreadRequest([resource({}), unread({ resource_id: 'later' })], 'i-1')).toBe(true)
   })
 
   it('make the binding one that waits on a person, and an unverified binding is unknown', () => {

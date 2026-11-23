@@ -348,6 +348,8 @@ export function ApprovalRequests({
                 instance: request.instance,
                 capabilities: capabilityRecords(facts.capabilities.records),
                 binding: facts.binding,
+                // A card is a request that was read; one nothing read has no card.
+                unread: false,
                 connected: true,
                 rights: new Set(rights)
               })

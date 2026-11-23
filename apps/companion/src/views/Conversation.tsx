@@ -59,6 +59,7 @@ import {
   bindingStateOf,
   composerOffers,
   drawnUnder,
+  hasUnreadRequest,
   invocationOf,
   subjectOf,
   targetOf,
@@ -348,10 +349,19 @@ export function Conversation({
           agent.instances?.find((each) => each.application_instance_id === agent.instance) ?? null,
         capabilities: agent.capabilities,
         binding: agent.binding,
+        unread: hasUnreadRequest(agent.resources, agent.instance),
         connected,
         rights: rights === null ? null : new Set(rights)
       }),
-    [agent.instances, agent.instance, agent.capabilities, agent.binding, connected, rights]
+    [
+      agent.instances,
+      agent.instance,
+      agent.capabilities,
+      agent.binding,
+      agent.resources,
+      connected,
+      rights
+    ]
   )
 
   // The conversation the session's agent is in now: what a draft is written for, and what it is

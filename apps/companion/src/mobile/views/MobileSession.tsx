@@ -51,6 +51,7 @@ import {
   phoneAttachOffer,
   composerInstance,
   composerOffers,
+  hasUnreadRequest,
   subjectOf,
   withheldTotal
 } from '../../model/agent'
@@ -367,10 +368,19 @@ export function MobileSession({
               ) ?? null,
             capabilities,
             binding: liveBinding,
+            unread: hasUnreadRequest(session.agent.resources, liveInstance),
             connected,
             rights: rights === null ? null : new Set(rights)
           }),
-    [session.agent.instances, liveInstance, capabilities, liveBinding, connected, rights]
+    [
+      session.agent.instances,
+      session.agent.resources,
+      liveInstance,
+      capabilities,
+      liveBinding,
+      connected,
+      rights
+    ]
   )
   const submitOffer = useMemo(
     () =>
