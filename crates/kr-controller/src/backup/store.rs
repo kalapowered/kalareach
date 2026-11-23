@@ -965,8 +965,15 @@ impl BackupStore {
 }
 
 /// The schema of version 9, as a database made from nothing holds it: this build's, with the rule
-/// of version 9 in place of its own, in the way [`BackupStore::migrate_from_version_7`] replaces one.
-fn definition_of_version_9() -> Result<Vec<(String, String)>> {
+/// of version 9 in place of its own, in the way the step from version 7 replaces one.
+///
+/// A store that records 9 is opened only when its schema is exactly this, and the build that writes
+/// version 9 must make a store hold exactly this text.
+///
+/// # Errors
+///
+/// Returns [`ControllerError::RegistryUnavailable`] when the schema cannot be made or read.
+pub fn definition_of_version_9() -> Result<Vec<(String, String)>> {
     let fresh = Database::in_memory().map_err(ControllerError::registry)?;
     fresh
         .run_script(DEFINITION)

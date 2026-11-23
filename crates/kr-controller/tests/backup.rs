@@ -21,7 +21,7 @@ use kr_controller::backup::store::{
     AttemptOutcome, AttemptStatus, BackupStore, FenceRelease, GenerationRecord, LocalState,
     MadeFrom, NewGeneration, NewObject, ObligationKind, Production, Publication,
     READS_THROUGH_SCHEMA_VERSION, Remote, SCHEMA_VERSION, SetupCommit, SetupRecord, Step,
-    UploadRecord, VERSION_9_RELEASE_RULE,
+    UploadRecord, VERSION_9_RELEASE_RULE, definition_of_version_9,
 };
 use kr_controller::backup::uploader::{
     EXECUTOR as UPLOADER, Idle, SERVICE_CHAIN_LENGTH, Stepped, Uploader, generations_kept,
@@ -6196,6 +6196,301 @@ fn an_accepted_store_in_rollback_journal_mode_goes_to_write_ahead_mode_and_is_cl
     assert!(
         closed.log.is_none() && !closed.index_is_there,
         "the closed store's log was copied into its file and removed: {closed:?}"
+    );
+}
+
+/// One object of a backup store's schema and the SHA-256 of the statement that made it, in the
+/// form the pin below is written in.
+fn pinned_form(schema: &[(String, String)]) -> Vec<(String, String)> {
+    schema
+        .iter()
+        .map(|(object, statement)| {
+            let digest = kr_cbor::sha256(statement.as_bytes());
+            let hex = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+            (object.clone(), hex)
+        })
+        .collect()
+}
+
+/// The schema of a backup store at version 9, object by object and in the order a store lists
+/// them, each with the SHA-256 of the exact statement a store holds for it.
+///
+/// This is the text the build that writes version 9 must make a new store hold, character for
+/// character: a store that records 9 is opened only when its schema is exactly this, and SQLite
+/// keeps a trigger's body as it was written, so the same rule in other spacing, a comment or
+/// another message is another schema and is refused. A change to anything here is a change to
+/// version 9, which the builds that read it ahead refuse, and takes version 10 instead.
+const VERSION_9_SCHEMA: &[(&str, &str)] = &[
+    (
+        "index one_publication_per_generation",
+        "7786eaf51c9c50f8643a277f88e201a46c79079c6d3f3ace5a487e685d61053b",
+    ),
+    (
+        "table generation_sources",
+        "0b80d275dfdff07abe49a288f93e29dc9225f6a0d5c78b4c84c907896fed6fe3",
+    ),
+    (
+        "table generations",
+        "19ed28d39ad835086a0dcd496f19ed270ef21a74e5200d1e7e3b81431701490a",
+    ),
+    (
+        "table host_backup",
+        "ab8ff36d43f82ae23c9c9a0ccd1d56f959a8420c717f79f29b9581c673b2a495",
+    ),
+    (
+        "table objects",
+        "ed6f987660f9749c095bba57b10fbe07d389c46e2129d8e1d11d5018adab3a55",
+    ),
+    (
+        "table outbox",
+        "df7f649cefce9989a576157c0bbec8273a1155046e7a0f4f2df9c1db59725862",
+    ),
+    (
+        "table privacy_fences",
+        "44ab854c0b470f806cb684761c3d85d1b45b468496266a51cea7fe9a33bcaad8",
+    ),
+    (
+        "table privacy_obligations",
+        "1e02bc105c6c321322295860594ee1524886eddde44786e2b060ac136395ddae",
+    ),
+    (
+        "table privacy_requests",
+        "58efbab3c852166da1c4a9f8c2dd4cf205f42b79ddc4718075a8209ac24185b3",
+    ),
+    (
+        "table privacy_state",
+        "a76f9f9592f154873a438e4b5372308da5887523483cfa367c71d5b461983485",
+    ),
+    (
+        "table releases",
+        "b688a13790f71fedce6be13b472e3a45ac9368d8c38fbecf931667755578faf9",
+    ),
+    (
+        "table schema_version",
+        "af5fdeeb7fc90d39ee8ae43ff26fe45eba29b8525579d2112a2c4161555c26b5",
+    ),
+    (
+        "table uploads",
+        "ef0a2409751d9f2e393ba2238ac0b45ba75dbcd497b0672589d287169d406837",
+    ),
+    (
+        "table writers",
+        "05cfb353004895a735bd00b773d3436015329ce2accc41b50d938cc1437f2d9e",
+    ),
+    (
+        "trigger a_deletion_asked_for_is_never_taken_back",
+        "472a17e66f0f5b9bf183e94a83e37fd39f7068e158e4f37749bf72ff35f5aac3",
+    ),
+    (
+        "trigger a_deletion_asked_for_keeps_what_it_is",
+        "38be1743e151744bc75162b149ac74da99dbed63678fc613774438e9fcca0b80",
+    ),
+    (
+        "trigger a_deletion_is_asked_for_once",
+        "1275935df8e51de8d1d77ef9e9b2498e965f173e40106aea60228c4a3975faec",
+    ),
+    (
+        "trigger a_fence_is_not_replaced_while_it_is_owed",
+        "52f40d29ebbf33afa237695ef24947189415b3942b470e88ec0a77ec326b24d4",
+    ),
+    (
+        "trigger a_fence_keeps_its_obligations",
+        "f4d9fb8159178a7290fefc778c92dcebb69ea5d32bc323dd4700775afe877b80",
+    ),
+    (
+        "trigger a_fence_keeps_the_generation_it_was_raised_at",
+        "2555bfc0f2f43bb57248b4b914b1da92d17ec9dc276e33d04432fdcf8f31f32e",
+    ),
+    (
+        "trigger a_fence_with_obligations_is_not_deleted",
+        "21218ceb33e7f2840ecd05a3727149c8c450bb080a676944dc0140bd4dfc3c1d",
+    ),
+    (
+        "trigger a_finished_attempt_keeps_its_outcome",
+        "e6c8362c34cc5b4de3586d5fb07765aa0bc0fc7bbcd2c7b560a1786a30e74df2",
+    ),
+    (
+        "trigger a_generation_is_never_replaced",
+        "45dc6399c10cd9df43bbe1166117375404c2ddfc9cb0abbeebc6ec3edc4e071d",
+    ),
+    (
+        "trigger a_generation_keeps_the_archive_it_is_of",
+        "48396b78d8bc83aaa65d333b9810b2afa610840267ae52c8d16ab9cbd24d8048",
+    ),
+    (
+        "trigger a_generation_keeps_what_it_was_admitted_under",
+        "20997a5e5ca170402162251c2862671f17905678799105d2b8dd2de6c5f60d95",
+    ),
+    (
+        "trigger a_publication_ends_as_accepted_only_once_it_is_held",
+        "bed568129d44b6cab6d8ed8b0701991c5dda25c643602699f845c4c65fa8ad87",
+    ),
+    (
+        "trigger a_publication_is_written_accepted_only_once_it_is_held",
+        "3c253212441edb79282cfc585c0b55c86069b3f9b290dcadaf72da1cb41da6e1",
+    ),
+    (
+        "trigger a_released_fence_takes_no_obligation",
+        "01b429811d120dd26d151ffbbf2e59d25d05a0dc1be854fcd206fcc58013623d",
+    ),
+    (
+        "trigger a_removed_staged_copy_never_returns",
+        "0d6ce14206d88dee0377f9f38fdc07a92ff224930941edecff9432c01d1efb8e",
+    ),
+    (
+        "trigger a_replacement_starts_its_count_at_nothing",
+        "9d875c1a631921500152f80ee709fe9522a592460e1278b4b22b63fe94b37af8",
+    ),
+    (
+        "trigger a_setup_is_never_deleted",
+        "3b919956363c1e58f14e1adcdf9885763e8d942b5b97d079cdd036603cafdfc0",
+    ),
+    (
+        "trigger a_setup_of_one_archive_keeps_what_it_recorded",
+        "9aa0b7a33a7c63441d3e8dd53aae79d7a518a0b79d415554c7a0bda4f0e1dbfd",
+    ),
+    (
+        "trigger an_acknowledged_part_is_never_withdrawn",
+        "07bd56bd735e6ba676b4b3a5f814ea8eef7785942c81f6693f59e3359f0d2589",
+    ),
+    (
+        "trigger an_acknowledgement_is_never_withdrawn",
+        "8f2eb5b26cd7f32a16e2190d2eba2fdc3422f1e4e96f9be32faa160a42b1f2c1",
+    ),
+    (
+        "trigger an_attempt_ends_as_stopped_only_once_that_is_written_down",
+        "0a4583e2d349eedf017bd0f06e0e246fa8ed2d747fc1fbda383a2042b960ad3a",
+    ),
+    (
+        "trigger an_attempt_ends_as_what_it_was",
+        "1f41279e53ef98549fa12aa87f14f40b5ecf4d6750ca8a2dabb22079304466db",
+    ),
+    (
+        "trigger an_attempt_is_never_replaced",
+        "57e4eb207166ef22fec69fd12db2e9218f42094eeee148c9bd4951fe4ab5a29d",
+    ),
+    (
+        "trigger an_attempt_is_written_stopped_only_once_that_is_written_down",
+        "5068ac5cf25b50179d92a9c3db3ebc175f41a7ac7d4fed00c02051bb63c16f6f",
+    ),
+    (
+        "trigger an_attempt_keeps_the_executor_it_left_with",
+        "09a1cd1c83ad9c665b21aa05a5af027cfe6e7a58562c0dacc8764c5e4f3c0383",
+    ),
+    (
+        "trigger an_attempt_keeps_what_it_is",
+        "364cecaa0b25192641ba1928956171f12dcc43af2dc265511c109fb6f52ca5e1",
+    ),
+    (
+        "trigger an_attempt_never_goes_back_in_hand",
+        "c78a7c053e40d97a1286f25dbcad96680ce780cfaaadd498c080f4fff7e554b6",
+    ),
+    (
+        "trigger an_attempt_still_owed_an_answer_is_not_deleted",
+        "da4522f8837b2023bf65224318101fd3a40242f3cd5027f5b4aa97c700eac83c",
+    ),
+    (
+        "trigger an_object_a_service_holds_takes_no_upload",
+        "62471c6686431fd2e689f4c026f7c2900ab3d93eb512ae3ef16bbea13f4c0150",
+    ),
+    (
+        "trigger an_object_another_generation_names_is_not_deleted",
+        "ce792cf5543d8017708eb842558a2b0040715bad5bb0ba1287d21c916fb4da83",
+    ),
+    (
+        "trigger an_object_is_never_replaced",
+        "ec5359d10de92bf0d822bcf57ae49414037954ff8175e82835e2d5294d8f68d5",
+    ),
+    (
+        "trigger an_object_keeps_what_it_is",
+        "7983d76228e586fed9b04aae96addad7faab780cd1bb7ec71b18363386da91e1",
+    ),
+    (
+        "trigger an_object_this_host_asked_to_delete_is_named_no_more",
+        "4a25606f8c0427109aefa7826ddd9eb7797e4ed67848992702d93803fd43757e",
+    ),
+    (
+        "trigger an_obligation_is_never_replaced",
+        "6e56874dbafa7299ae89fd4a37b043d1d4435a4d95ff5431d6d7e3288f06405b",
+    ),
+    (
+        "trigger an_obligation_keeps_the_fence_it_was_written_under",
+        "5ccf47523f7e9b9785d1662c2546accc974d4fa7064ac822c1657ebfc1fc246d",
+    ),
+    (
+        "trigger an_obligation_keeps_what_it_is_owed_for",
+        "52758528f08e49f104120a13a3a223e329f9008117fc50ede3bf1e64c06c2f6d",
+    ),
+    (
+        "trigger an_upload_ends_as_accepted_only_once_its_objects_are_held",
+        "ea48851ccfefa69b37c878d18abdb67e8e8a948cf1170e182085c81a30a4cfd2",
+    ),
+    (
+        "trigger an_upload_is_never_replaced",
+        "c7176086e7e77fca1a5605a0fb4facaed6f9219eda83779b22278449dab82d6f",
+    ),
+    (
+        "trigger an_upload_is_written_accepted_only_once_its_objects_are_held",
+        "6678336f9417e06cc27c2e93e5aea3595c527ed298d49f3aaea4c520c615175f",
+    ),
+    (
+        "trigger an_upload_keeps_what_it_is",
+        "3c024471933147b2d59c452bc866aedda251561b49a13872c51bf8eb49d63dbf",
+    ),
+    (
+        "trigger cleanup_naming_an_open_attempt_is_not_deleted",
+        "6e56b5e5bd0172e4eba60cf76a595310d104f8cbac9c2e1a04b411abe8587498",
+    ),
+    (
+        "trigger only_an_object_of_a_generation_no_publication_can_name_is_deleted",
+        "20b83f94e176daaa91f66d2d6852becf63063351262678b3b28257adb290c454",
+    ),
+    (
+        "trigger production_never_resumes",
+        "be85b1057ecf2d6f9e6499030f8aa32e7d8ef4610523f2a62d402cd299b89683",
+    ),
+    (
+        "trigger remote_evidence_is_never_withdrawn",
+        "702f6a7b6104ace3d86f202d66a25e1337bfed57fdabe573fa8b4ef2fbe53a8e",
+    ),
+    (
+        "trigger the_count_of_one_archive_never_goes_down",
+        "d981ecc100f3e0fc9449d799d3755fa0cca873497e35848d7130bc99f0fa5daa",
+    ),
+    (
+        "trigger the_privacy_generation_never_moves_backwards",
+        "269aa765fe554bb3a7ba42de9958c2eb2a43c3f78a22ee1f01669f159877933d",
+    ),
+    (
+        "trigger what_a_generation_was_made_from_is_not_rewritten",
+        "96a7e9e3e5697ed8e8e728964944879a4b5378f485fe883dd9f277afee5bf430",
+    ),
+];
+
+/// KR-REQ-24.29: what the reader accepts as a store at version 9 is pinned, so the build that
+/// writes version 9 cannot write a schema this reader refuses. The schema the reader derives and
+/// the schema a store at 9 holds on disk are both the pin.
+#[test]
+fn the_schema_of_version_9_is_the_pin_the_build_that_writes_it_is_held_to() {
+    let pin: Vec<(String, String)> = VERSION_9_SCHEMA
+        .iter()
+        .map(|(object, digest)| ((*object).to_owned(), (*digest).to_owned()))
+        .collect();
+    let derived = pinned_form(&definition_of_version_9().expect("version 9's schema"));
+    assert_eq!(
+        derived, pin,
+        "the schema the reader accepts at version 9 is not the pinned one; the pin as it is now:\n{derived:#?}"
+    );
+
+    let (_root, state) = state_directory();
+    a_store_with_an_upload_in_flight(&state);
+    as_version_9(&state);
+    let connection =
+        rusqlite::Connection::open(state.join("backup.sqlite")).expect("the backup store");
+    let held = pinned_form(&schema_text(&connection));
+    assert_eq!(
+        held, pin,
+        "a store that holds version 9 is not the pinned schema"
     );
 }
 
