@@ -132,6 +132,22 @@ fn copies_in(folder: &Path) -> usize {
         .unwrap_or(0)
 }
 
+/// The files that a copy is written to before it is given its name.
+fn staged_copies_in(folder: &Path) -> usize {
+    std::fs::read_dir(folder)
+        .map(|listing| {
+            listing
+                .flatten()
+                .filter(|item| {
+                    item.file_name()
+                        .to_string_lossy()
+                        .contains(".bytes.staged-")
+                })
+                .count()
+        })
+        .unwrap_or(0)
+}
+
 fn entries_in(folder: &Path) -> usize {
     std::fs::read_dir(folder)
         .map(|listing| {
@@ -4308,6 +4324,11 @@ async fn kr_req_13_12_a_copy_written_for_an_ended_upload_is_not_placed_over_the_
         Some(second_bytes),
         "the first send's copy was not placed over the second send's"
     );
+    assert_eq!(
+        staged_copies_in(&folder(&phone)),
+        0,
+        "the first send's copy, which was not placed, is not left beside the name"
+    );
     sender.release();
     tokio::time::timeout(WATCHDOG, second)
         .await
@@ -4393,6 +4414,60 @@ async fn kr_req_13_12_a_send_whose_copy_fails_leaves_the_copy_and_the_place_of_t
         .expect("the second send answers")
         .expect("the task ran")
         .expect("the second upload publishes");
+    adopted.stop().await;
+}
+
+/// KR-REQ-13.12 (FU8): a send whose copy cannot be written, while its own upload still holds the key,
+/// ends its admission: the caller is told, no copy, no staged file and no place is left, and the key
+/// is free for a new send.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_13_12_a_send_whose_copy_fails_leaves_no_copy_and_no_place() {
+    use testing::Fault;
+
+    let adopted = Adopted::start(1).await;
+    let (phone, _control) = phone_for(&adopted).await;
+    let desk = desk_of(&phone.companion);
+    let paired = paired_of(&phone.companion).await;
+    let key = kr_ipc::new_uuid();
+    let first_bytes = vec![5_u8; 16];
+    let second_bytes = vec![6_u8; 16];
+    let fails = testing::arm(key, Fault::CopyFails);
+    let first = request(
+        &adopted,
+        &first_bytes,
+        Arc::new(Held::new(first_bytes.clone())),
+        key,
+    );
+    let answered = tokio::time::timeout(WATCHDOG, desk.send(paired.clone(), first))
+        .await
+        .expect("the send answers");
+    assert!(answered.is_err(), "the copy could not be written");
+    drop(fails);
+    desk.sends_idle().await;
+    assert_eq!(
+        testing::read_copy(&folder(&phone), key),
+        None,
+        "the send left no copy"
+    );
+    assert_eq!(
+        staged_copies_in(&folder(&phone)),
+        0,
+        "the send left no copy beside the name"
+    );
+    assert!(
+        desk.generation_for_test(key).is_none(),
+        "the send left no upload admitted"
+    );
+    let second = request(
+        &adopted,
+        &second_bytes,
+        Arc::new(Held::new(second_bytes.clone())),
+        key,
+    );
+    tokio::time::timeout(WATCHDOG, desk.send(paired, second))
+        .await
+        .expect("the second send answers")
+        .expect("the key is free: the second upload publishes");
     adopted.stop().await;
 }
 
