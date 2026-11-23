@@ -14,7 +14,8 @@
 //!   ignores the limit. Setup is refused if either call fails. On Windows the process declines
 //!   Windows Error Reporting and ends at once on an unhandled exception. That guard is narrower: an
 //!   administrator's dump policy, and any process of the same account that can read this process's
-//!   memory, are outside it.
+//!   memory, are outside it, and so is a fast-fail abort, which skips the filter. `kr backup restore`
+//!   has no such guard on any system.
 //! * The kit is written straight to the terminal from the buffer that holds it, and the buffer
 //!   clears when it is dropped. It does not pass through standard output's buffer or the line
 //!   writer.

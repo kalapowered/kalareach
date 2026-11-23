@@ -3,7 +3,10 @@
 //! The crash-dump guard here is narrower than the Unix one. A Unix process is kept out of a core
 //! dump by the system. A Windows process can only decline Windows Error Reporting for itself: an
 //! administrator's dump policy can still take the process, and so can any process of the same
-//! account that may read this process's memory.
+//! account that may read this process's memory. A fast-fail abort does not reach the
+//! unhandled-exception filter either, so for it only the error mode applies. The console host
+//! keeps its own copy of what is written to the console, in the window's buffer, until the person
+//! clears it or closes the window; clearing this process's buffers does not clear that copy.
 
 #![expect(
     unsafe_code,
@@ -38,7 +41,7 @@ use crate::error::{CliError, Result};
 
 /// What is said before the kit is shown.
 pub const KIT_FOLLOWS: &str = "Your recovery kit follows. It is shown once. The console keeps it \
-     on screen until you run cls or close the window.";
+     in the window's buffer until you run cls or close the window.";
 
 /// The error mode setup runs under: no Windows Error Reporting, and no dialogue box that waits for
 /// a person where the kit is on the screen.
@@ -53,6 +56,8 @@ const EXCEPTION_EXECUTE_HANDLER: i32 = 1;
 /// invoking Windows Error Reporting) and ends at once on an unhandled exception, so that no
 /// handler of the system's runs while the kit is in memory. A policy an administrator set for the
 /// machine, and a process of the same account that can read this one, are outside what this does.
+/// So is a fast-fail abort (Rust's `abort` is one), which the filter never sees: for it only the
+/// error mode applies, and no run here shows what that does.
 ///
 /// # Errors
 ///
@@ -371,8 +376,8 @@ impl Prompt {
         Ok(Turn::Text(taken))
     }
 
-    /// The next character the person typed, waiting one turn for it: none when the turn passed in
-    /// silence.
+    /// The next character the person typed, waiting one turn for it: none when the turn brought no
+    /// character, whether it passed in silence or held only records with no character.
     fn next(&mut self) -> std::io::Result<Option<char>> {
         if self.pending.is_empty() {
             // Records with no character leave it empty: the caller's turn is over, and it asks again.
@@ -638,8 +643,9 @@ mod tests {
         );
     }
 
-    /// The console's input as a new handle, with write access or without it. Throwing input away
-    /// needs write access; reading the modes and changing them needs read access.
+    /// The console's input as a new handle, with write access or without it. A handle without it
+    /// cannot throw input away, and cannot change the modes either (the system says "permission
+    /// denied"), so a case needs write access for either.
     fn console_input(write: bool) -> OwnedHandle {
         File::options()
             .read(true)
@@ -965,24 +971,24 @@ mod tests {
         );
     }
 
-    /// Setup declines Windows Error Reporting and installs the filter that ends the process at
-    /// once. The test puts both back as it found them.
+    /// Setup sets the three error-mode flags and installs the filter that ends the process at
+    /// once. The test reads the error mode and the filter the process had, and puts both back.
     #[test]
     fn setup_keeps_the_process_out_of_windows_error_reporting() {
         // SAFETY: the calls read and set this test process's own error mode and filter.
-        let before = unsafe { GetErrorMode() };
+        let (before, earlier) = unsafe { (GetErrorMode(), SetUnhandledExceptionFilter(None)) };
         keep_out_of_a_dump().expect("the guard takes");
         // SAFETY: as above.
         let (during, filter) = unsafe {
             let during = GetErrorMode();
-            let filter = SetUnhandledExceptionFilter(None);
+            let filter = SetUnhandledExceptionFilter(earlier);
             SetErrorMode(before);
             (during, filter)
         };
         assert_eq!(
-            during & SEM_NOGPFAULTERRORBOX,
-            SEM_NOGPFAULTERRORBOX,
-            "Windows Error Reporting is declined"
+            during & ERROR_MODE,
+            ERROR_MODE,
+            "Windows Error Reporting and the boxes that wait for a person are declined"
         );
         assert_eq!(
             filter.map(|filter| filter as *const () as usize),
