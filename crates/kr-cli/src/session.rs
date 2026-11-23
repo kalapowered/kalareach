@@ -2064,8 +2064,13 @@ where
     // it started with. The Kitty flags go in only when this terminal reported its own, because
     // nothing else could put those back and a person left in an encoding their shell does not
     // expect is the failure they cannot work around.
+    // A Windows console is the one terminal that is not written the session's auto repeat.
     let mut display =
-        crate::render::ProjectedDisplay::with_keyboard(epoch.is_some(), keyboard.kitty.is_some());
+        crate::render::ProjectedDisplay::with_keyboard(kr_client::projection::paint::Keyboard {
+            level: epoch.is_some(),
+            flags: keyboard.kitty.is_some(),
+            skip_auto_repeat: cfg!(windows),
+        });
     // What the attachment has to say about its keys, which waits for the terminal to be the
     // person's again like everything else it says.
     let mut said_after: Vec<Shown> = Vec::new();

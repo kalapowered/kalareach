@@ -213,6 +213,15 @@ pub struct Keyboard {
     pub level: bool,
     /// Whether the session's Kitty keyboard flags may be installed.
     pub flags: bool,
+    /// Whether the session's auto repeat (DEC mode 8) is left out of what is written.
+    ///
+    /// Not a protocol, and not a choice between destinations that were asked and ones that were
+    /// not: a Windows console is written no mode 8 at all. Told `CSI ? 8 l`, it hands the reader
+    /// of its input only the escape and the final byte of a bracketed-paste marker and of a mouse
+    /// report, so a paste loses its markers and a click is lost. The session keeps its own mode 8,
+    /// and a destination that is not a Windows console is written it as before, so this is off
+    /// for every other terminal, whatever the other two fields say.
+    pub skip_auto_repeat: bool,
 }
 
 impl Keyboard {
@@ -220,12 +229,14 @@ impl Keyboard {
     pub const EVERYTHING: Self = Self {
         level: true,
         flags: true,
+        skip_auto_repeat: false,
     };
 
     /// Neither: a destination nobody was allowed to ask, whose person cannot type either.
     pub const NOTHING: Self = Self {
         level: false,
         flags: false,
+        skip_auto_repeat: false,
     };
 }
 
@@ -290,6 +301,9 @@ const ST: &[u8] = b"\x1b\\";
 
 /// DEC private mode 7, autowrap.
 const AUTOWRAP: u16 = 7;
+
+/// DEC private mode 8, auto repeat.
+const AUTO_REPEAT: u16 = 8;
 
 /// DEC private mode 25, cursor visibility.
 const CURSOR_VISIBLE: u16 = 25;
@@ -600,6 +614,13 @@ impl<'a> Writer<'a> {
                     // The keypad is installed below, in the spelling a terminal takes.
                     || number == KEYPAD_MODE)
             {
+                continue;
+            }
+            if self.keyboard.skip_auto_repeat
+                && spelling == super::ProjectedModeSpelling::Dec
+                && number == AUTO_REPEAT
+            {
+                // Left out for a destination that loses a paste's markers when it is written.
                 continue;
             }
             self.mode_of(spelling, number, enabled);
@@ -3237,6 +3258,81 @@ mod safety {
         );
     }
 
+    /// KR-REQ-08.56: a destination that loses a paste's markers when it is written auto repeat is
+    /// written none, whatever the session holds, and every other write of the frame is as it was.
+    ///
+    /// The session's mode 8 stays in the screen, so another destination of the same screen is
+    /// written it as before.
+    #[test]
+    fn a_destination_that_is_written_no_auto_repeat_is_written_the_rest_of_the_frame_as_before() {
+        let others = [
+            (super::super::ProjectedModeSpelling::Dec, 2004),
+            (super::super::ProjectedModeSpelling::Dec, 1000),
+            (super::super::ProjectedModeSpelling::Dec, 1006),
+        ];
+        for held in [false, true] {
+            let mut screen = screen("plain", "text", None);
+            screen
+                .modes
+                .insert((super::super::ProjectedModeSpelling::Dec, 8), held);
+            for other in others {
+                screen.modes.insert(other, true);
+            }
+            let spelled: &[u8] = if held { b"\x1b[?8h" } else { b"\x1b[?8l" };
+            let window = Window::of(&screen);
+            let visible = screen.visible_rows();
+            for keyboard in [Keyboard::EVERYTHING, Keyboard::NOTHING] {
+                let skipping = Keyboard {
+                    skip_auto_repeat: true,
+                    ..keyboard
+                };
+                let frames = [
+                    (
+                        "installed",
+                        install(&screen, window, keyboard),
+                        install(&screen, window, skipping),
+                    ),
+                    (
+                        "updated",
+                        update(&screen, window, &visible, true, keyboard),
+                        update(&screen, window, &visible, true, skipping),
+                    ),
+                ];
+                for (pass, written, left_out) in frames {
+                    assert!(
+                        contains(&written.bytes, spelled),
+                        "{pass}: a destination that is not asked to leave it out is written the \
+                         session's auto repeat ({:?}): {}",
+                        String::from_utf8_lossy(spelled),
+                        String::from_utf8_lossy(&written.bytes).escape_debug()
+                    );
+                    assert!(
+                        !contains(&left_out.bytes, b"\x1b[?8h")
+                            && !contains(&left_out.bytes, b"\x1b[?8l"),
+                        "{pass}: a destination that loses a paste's markers when it is written \
+                         auto repeat is written none: {}",
+                        String::from_utf8_lossy(&left_out.bytes).escape_debug()
+                    );
+                    let at = written
+                        .bytes
+                        .windows(spelled.len())
+                        .position(|window| window == spelled)
+                        .expect("the write was found above");
+                    let mut rest = written.bytes.clone();
+                    rest.drain(at..at + spelled.len());
+                    assert_eq!(
+                        left_out.bytes, rest,
+                        "{pass}: nothing but that write is left out"
+                    );
+                    assert_eq!(
+                        left_out.comparison, written.comparison,
+                        "{pass}: and it is not a loss the frame reports"
+                    );
+                }
+            }
+        }
+    }
+
     /// KR-REQ-08.40: the destination is put into the modes the session's input depends on.
     #[test]
     fn a_frame_installs_the_modes_the_session_needs_for_input() {
@@ -3290,6 +3386,7 @@ mod safety {
             Keyboard {
                 level: true,
                 flags: false,
+                skip_auto_repeat: false,
             },
         );
         assert!(

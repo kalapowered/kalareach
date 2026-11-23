@@ -78,14 +78,15 @@ impl ProjectedDisplay {
 
     /// A terminal showing nothing yet, with each keyboard protocol decided on its own terms.
     ///
-    /// `level` is whether the person at this terminal can type, because the `modifyOtherKeys` level
-    /// is the encoding the host advertises for them and `CSI > 4 m` puts any terminal back to its
-    /// own. `flags` is whether this terminal reported its Kitty flags, because nothing else could
-    /// put those back.
+    /// `keyboard.level` is whether the person at this terminal can type, because the
+    /// `modifyOtherKeys` level is the encoding the host advertises for them and `CSI > 4 m` puts any
+    /// terminal back to its own. `keyboard.flags` is whether this terminal reported its Kitty
+    /// flags, because nothing else could put those back. `keyboard.skip_auto_repeat` is whether
+    /// this terminal is one that is written no auto repeat, a Windows console.
     #[must_use]
-    pub fn with_keyboard(level: bool, flags: bool) -> Self {
+    pub fn with_keyboard(keyboard: Keyboard) -> Self {
         Self {
-            keyboard: Keyboard { level, flags },
+            keyboard,
             ..Self::default()
         }
     }
@@ -543,6 +544,177 @@ mod tests {
                 losses.complete(),
                 "{name} counts another field's loss and reports nothing alone"
             );
+        }
+    }
+
+    /// A snapshot of generation 1, 4 columns by 2 rows, that holds the given DEC modes, and the one
+    /// page that completes it.
+    fn snapshot_holding(modes: &[(u64, bool)]) -> [ProjectionEvent; 2] {
+        use kr_protocol::projection::{
+            CellRendition, CharsetState, KittyKeyboardState, MarginState, PaletteProvenance,
+            PaletteState, ProjectedBuffer, ProjectedCursor, ProjectedKeyboard, ProjectedMode,
+            ProjectedModeKind, ProjectedTitle, ProjectedViewport, ProjectionRowPage,
+            ProjectionSnapshot, Rgb,
+        };
+        use kr_protocol::scalars::{Nullable, U64};
+
+        let colour = Rgb {
+            red: 0x20,
+            green: 0x20,
+            blue: 0x20,
+        };
+        let header = ProjectionSnapshot {
+            projection_generation: U64::new(1),
+            output_cursor: U64::ZERO,
+            window_revision: U64::ZERO,
+            active_buffer: ProjectedBuffer::Primary,
+            dimensions: kr_protocol::session::Dimensions::new(4, 2),
+            viewport: ProjectedViewport {
+                top_row: U64::ZERO,
+                screen_top_row: U64::ZERO,
+                rows: U64::new(2),
+                left_column: U64::ZERO,
+                columns: U64::new(4),
+            },
+            cursor: ProjectedCursor {
+                column: U64::ZERO,
+                row: U64::ZERO,
+                visible: true,
+                style: U64::new(1),
+                pending_wrap: false,
+            },
+            saved_cursors: Vec::new(),
+            margins: MarginState {
+                top: U64::ZERO,
+                bottom: U64::new(1),
+                left: U64::ZERO,
+                right: U64::new(3),
+            },
+            rendition: CellRendition::PLAIN,
+            tab_stops: Vec::new(),
+            charsets: CharsetState {
+                g0: "Ascii".to_owned(),
+                g1: "Ascii".to_owned(),
+                shift_out: false,
+            },
+            modes: modes
+                .iter()
+                .map(|(mode, enabled)| ProjectedMode {
+                    kind: ProjectedModeKind::Dec,
+                    mode: U64::new(*mode),
+                    enabled: *enabled,
+                })
+                .collect(),
+            keypad_application: false,
+            keyboard: ProjectedKeyboard {
+                modify_other_keys: U64::ZERO,
+                primary: KittyKeyboardState {
+                    flags: Nullable::null(),
+                    stack: Vec::new(),
+                },
+                alternate: KittyKeyboardState {
+                    flags: Nullable::null(),
+                    stack: Vec::new(),
+                },
+            },
+            title: ProjectedTitle::default(),
+            title_stack: Vec::new(),
+            hyperlink: Nullable::null(),
+            palette: PaletteState {
+                source: PaletteProvenance::DarkPreset,
+                foreground: colour,
+                background: colour,
+                cursor: colour,
+                pointer_foreground: colour,
+                pointer_background: colour,
+                selection_background: colour,
+                selection_foreground: colour,
+                overrides: Vec::new(),
+            },
+            oldest_retained_row: U64::ZERO,
+            evicted: false,
+            degraded: false,
+        };
+        let page = ProjectionRowPage {
+            projection_generation: U64::new(1),
+            output_cursor: U64::ZERO,
+            buffer: ProjectedBuffer::Primary,
+            rows: Vec::new(),
+            oldest_retained_row: U64::ZERO,
+            evicted: false,
+            more: false,
+        };
+        [
+            ProjectionEvent::Snapshot(Box::new(header)),
+            ProjectionEvent::Rows(page),
+        ]
+    }
+
+    /// The bytes a terminal is drawn for the snapshot `modes` makes.
+    fn drawn_for(mut display: ProjectedDisplay, modes: &[(u64, bool)]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for event in snapshot_holding(modes) {
+            let drawn = display.apply(event);
+            bytes.extend_from_slice(&drawn.bytes);
+        }
+        bytes
+    }
+
+    fn holds(bytes: &[u8], needle: &[u8]) -> bool {
+        bytes.windows(needle.len()).any(|window| window == needle)
+    }
+
+    /// KR-REQ-08.56: the snapshot painted for a Windows console holds no write of the session's auto
+    /// repeat, and the one painted for any other terminal is as it was.
+    ///
+    /// A Windows console that is written `CSI ? 8 l` hands the reader of its input only the escape
+    /// and the final byte of a paste's markers, so the markers are lost. The session's own mode 8
+    /// stays in the screen, which the other terminal here is painted.
+    #[test]
+    fn the_snapshot_painted_for_a_windows_console_holds_no_auto_repeat_and_any_other_terminal_is_painted_it()
+     {
+        let held = [(2004, true), (1000, true)];
+        for session_has_it in [false, true] {
+            let modes = [&held[..], &[(8, session_has_it)]].concat();
+            let spelled: &[u8] = if session_has_it {
+                b"\x1b[?8h"
+            } else {
+                b"\x1b[?8l"
+            };
+            let windows = drawn_for(
+                ProjectedDisplay::with_keyboard(Keyboard {
+                    level: true,
+                    flags: true,
+                    skip_auto_repeat: true,
+                }),
+                &modes,
+            );
+            let elsewhere = drawn_for(
+                ProjectedDisplay::with_keyboard(Keyboard {
+                    level: true,
+                    flags: true,
+                    skip_auto_repeat: false,
+                }),
+                &modes,
+            );
+            assert!(
+                holds(&elsewhere, spelled),
+                "a terminal that is not a Windows console is painted the session's auto repeat: {}",
+                String::from_utf8_lossy(&elsewhere).escape_debug()
+            );
+            assert!(
+                !holds(&windows, b"\x1b[?8h") && !holds(&windows, b"\x1b[?8l"),
+                "a Windows console is painted no auto repeat: {}",
+                String::from_utf8_lossy(&windows).escape_debug()
+            );
+            for kept in [&b"\x1b[?2004h"[..], b"\x1b[?1000h"] {
+                assert!(
+                    holds(&windows, kept),
+                    "and every other mode of the session, {:?}: {}",
+                    String::from_utf8_lossy(kept),
+                    String::from_utf8_lossy(&windows).escape_debug()
+                );
+            }
         }
     }
 }
