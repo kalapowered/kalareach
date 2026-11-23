@@ -123,10 +123,13 @@ const NOTHING: AttentionCounts = {
 export function Inbox({
   surface,
   onOpenSession,
+  onOpenTerminal,
   onCounts
 }: {
   readonly surface: Surface
   readonly onOpenSession: (sessionId: string) => void
+  /** Opens a session on its terminal; given, an approval that cannot be answered here offers it. */
+  readonly onOpenTerminal?: (sessionId: string) => void
   readonly onCounts?: (actionable: number) => void
 }): ReactNode {
   const { port, say } = useApp()
@@ -561,6 +564,15 @@ export function Inbox({
             onAnswered={() => {
               again.current()
             }}
+            openTerminal={
+              onOpenTerminal === undefined
+                ? undefined
+                : () => {
+                    const sessionId = open.row.item.session_id
+                    setOpen(null)
+                    if (sessionId) onOpenTerminal(sessionId)
+                  }
+            }
           />
         ) : null}
         {open?.row.item.session_id &&

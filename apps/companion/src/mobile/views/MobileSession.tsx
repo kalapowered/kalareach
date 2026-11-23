@@ -47,6 +47,7 @@ import { UploadRowView, type UploadActions } from '../components/upload-row'
 import { usePairedFiles, type PairedFiles } from '../usePairedFiles'
 import type { UploadRow } from '../../model/paired-uploads'
 import {
+  approvalNoticeFor,
   phoneAttachOffer,
   composerInstance,
   composerOffers,
@@ -143,6 +144,7 @@ import { useChannelMessages } from '../../app/channel-messages'
 import { useBook } from '../../app/drafts'
 import type { Lifecycle } from '../useLifecycle'
 import { minimumTarget, type Surface } from '../platform'
+import { ApprovalOffer } from '../../views/Approvals'
 import { RetainedOutput } from '../../views/Output'
 
 /** Which of the three views is showing. */
@@ -352,6 +354,24 @@ export function MobileSession({
     }
     return notes
   }, [session.agent.unfinished, session.agent.gap, session.agent.withheld])
+  // An agent that asks for approvals in its terminal says so here as it does in the desktop window.
+  // Before the shell has heard from the host the screen does not say the device is not connected.
+  const approvalNotice = useMemo(
+    () =>
+      connected === null
+        ? null
+        : approvalNoticeFor({
+            instance:
+              session.agent.instances?.find(
+                (each) => each.application_instance_id === liveInstance
+              ) ?? null,
+            capabilities,
+            binding: liveBinding,
+            connected,
+            rights: rights === null ? null : new Set(rights)
+          }),
+    [session.agent.instances, liveInstance, capabilities, liveBinding, connected, rights]
+  )
   const submitOffer = useMemo(
     () =>
       over
@@ -1254,6 +1274,15 @@ export function MobileSession({
       <div className="m-pane" ref={paneRef} tabIndex={-1} onScroll={remember}>
         {pane === 'semantic' ? (
           <div className="m-stream" data-testid="mobile-conversation">
+            {approvalNotice === null ? null : (
+              <ApprovalOffer
+                notice={approvalNotice}
+                onOpenTerminal={() => {
+                  remember()
+                  setPane('terminal')
+                }}
+              />
+            )}
             {historyNotes.length > 0 ? (
               <ul className="m-notes" data-testid="history-notes">
                 {historyNotes.map((note) => (

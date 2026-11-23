@@ -242,6 +242,9 @@ export function MobileApp({
     [waiting]
   )
 
+  const openTerminal = useCallback((sessionId: string) => {
+    setPlace({ tab: 'sessions', sessionId, pane: 'terminal' })
+  }, [])
   const openSession = useCallback((sessionId: string, grantId?: string | null) => {
     setPlace(
       grantId === undefined || grantId === null
@@ -354,6 +357,7 @@ export function MobileApp({
           <Inbox
             surface={resolved}
             onOpenSession={openSession}
+            onOpenTerminal={openTerminal}
             onCounts={setActionable}
           />
         ) : null}
