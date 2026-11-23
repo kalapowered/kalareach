@@ -6,8 +6,11 @@
 //! says to such a host is a claim it reads (`HostRendezvous`), the acknowledgement it writes
 //! (`RendezvousAccepted`), the descriptor it publishes and later reads, and `Hello` and `Verify`
 //! with their answers. Only the protocol's name tells the two releases that these frames agree, so
-//! the real program of the release before is run and its frames kept. Everything else of the
-//! protocol is spoken between a worker and the host, and the daemon never sees it.
+//! the real program of the release before is run and its frames kept. One more frame reaches a
+//! launcher: the start failure frame, which a host that could not start sends in place of its
+//! claim; the launcher of the release before reads it, the recording does not hold it, and the case
+//! of a host that cannot bind, below, shows it. Everything else of the protocol is spoken between a
+//! worker and the host, and the daemon never sees it.
 //!
 //! The case runs the release before's real `kr-plugin-host` as its launcher would, keeps the
 //! payload of every frame, and checks each one decodes with this build's types and encodes back to

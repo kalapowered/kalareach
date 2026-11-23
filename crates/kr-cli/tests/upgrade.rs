@@ -99,12 +99,16 @@ impl Previous {
         );
         assembled.manifest.commit = CommitId::new(self.commit.clone()).expect("a commit");
         // Its manifest has the form this build writes, which is the form that release's own build
-        // wrote: every retained release states its agent builds, its pinned libraries and what each
-        // shell package is made of, and a rollback to it reads that document.
+        // wrote while `kr-protocol/src/update.rs` and `kr-release` stay as that release has them:
+        // every retained release states its agent builds, its pinned libraries and what each shell
+        // package is made of, and a rollback to it reads that document. A change to either makes
+        // the form posed here differ from the form that release wrote, and these cases do not
+        // compare the two.
         // The stores the release declares it reads are its own, and not this build's: a store this
-        // build raised or added is one the release before refuses or does not name, and a rollback
-        // to it has to be decided by what the release says it reads, not left to a daemon that
-        // cannot open it. They are the entries of the release's own stored-formats lock.
+        // build raised can exceed that release's read limit, and a store it added may be absent
+        // from that release's list, so a rollback to it has to be decided by what the release says
+        // it reads, not left to a daemon that cannot open it. They are the entries of the release's
+        // own stored-formats lock.
         assembled.manifest.stores = self.stores.clone();
         assembled
     }
@@ -1384,8 +1388,23 @@ async fn host_info_of(host: &Host) -> kr_protocol::hostinfo::HostInfoResult {
         .expect("this release reads the answer")
 }
 
+/// The schema version the registry file records, read while a daemon may hold the file open.
+fn registry_version_of(host: &Host) -> i64 {
+    rusqlite::Connection::open_with_flags(
+        host.tree.environment().registry_database(),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .expect("opens the registry")
+    .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
+    .expect("reads the registry's version")
+}
+
 /// KR-REQ-26.10, KR-REQ-26.08: a rollback to the release before goes on while only its session is
 /// live, and waits, exit 9, naming the session, while a session of this release is live.
+///
+/// The registry is at schema version 16 under this release's daemon, the newest version the release
+/// before reads, and it is at 16 still once that release's daemon serves: the rollback is accepted
+/// at that version, and the release before opens the registry as found.
 ///
 /// The two releases also read each other's `host.info`: the release before's own `kr` reads the
 /// answer of this release's daemon, and this release reads the answer of the release before's
@@ -1406,6 +1425,11 @@ async fn a_rollback_to_the_release_before_goes_on_beside_its_session_and_waits_f
         )),
         Some((false, 0, false)),
         "this release's daemon says where privacy mode stands"
+    );
+    assert_eq!(
+        registry_version_of(host),
+        16,
+        "this release's daemon writes the registry at schema version 16"
     );
     let output = host.run(&updated.kr_before(), &["--json", "host", "machine"]);
     assert!(
@@ -1471,6 +1495,11 @@ async fn a_rollback_to_the_release_before_goes_on_beside_its_session_and_waits_f
         )),
         Some((false, 0, false)),
         "the release before's daemon says where privacy mode stands"
+    );
+    assert_eq!(
+        registry_version_of(host),
+        16,
+        "the release before opens the registry at schema version 16 as found"
     );
     {
         let endpoint = host
@@ -4243,9 +4272,10 @@ async fn a_stored_apply_node_is_admitted_across_an_update_and_a_rollback() {
 
 /// KR-REQ-23.24: the hold a voice start leaves is a store of its own that the release before names
 /// too, and its daemon opens it at its start. A rollback to the release before is not refused: the
-/// release before opens the store, leaves it as it was, byte for byte, and serves the same device.
-/// An update again opens the store, finds the row as it was left, and the host holds the device
-/// under the same action until the same moment.
+/// release before keeps the row as it stood, leaves the file unchanged from the moment its daemon
+/// answers to the moment it serves the device, and serves the same device. An update again opens
+/// the store, finds the row as it was left, and the host holds the device under the same action
+/// until the same moment.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_voice_start_hold_is_kept_across_a_rollback_and_an_update() {
     use kr_controller::voice_start_holds::{Decision, Record, VOICE_START_HOLDS_RECORD};
@@ -4302,8 +4332,7 @@ async fn a_voice_start_hold_is_kept_across_a_rollback_and_an_update() {
     // while it starts is compared with this one, and not with what it left once it was running.
     let before = standing("before the rollback");
 
-    // The rollback is not refused, and the release before opens the store at its start, serves the
-    // device and leaves the store.
+    // The rollback is not refused, and the release before serves the device and leaves the store.
     let (output, said) = host.kr_json(&["host", "rollback", "--json"]);
     assert_eq!(
         output.status.code(),
@@ -4319,11 +4348,11 @@ async fn a_voice_start_hold_is_kept_across_a_rollback_and_an_update() {
     let left = std::fs::read(&file).expect("the store is still there");
     door.is_served_again()
         .await
-        .expect("the release before opens the store at its start, and serves the device");
+        .expect("the release before serves the device");
     assert_eq!(
         std::fs::read(&file).expect("the store is still there"),
         left,
-        "the release before leaves the store byte for byte"
+        "the release before leaves the store unchanged until it serves the device"
     );
     assert_eq!(
         standing("the release before, from its start to its service"),
@@ -5011,15 +5040,17 @@ async fn a_report_store_the_release_before_keeps_too_is_kept_across_a_rollback_a
 /// KR-REQ-12.06, KR-REQ-26.10, KR-REQ-26.08: a rollback to the release before ends no draft and keeps
 /// the binding revision of a draft written for an application, so that the update again meets a draft
 /// whose revision is still on record. The journal is at the version the release before reads, the
-/// draft and the row that holds its revision are still there, and a draft the release before wrote
-/// for an application is given no revision, so it is never sent.
+/// draft and the row that holds its revision are still there, and a draft that a release from
+/// before the store of binding revisions wrote for an application is given no revision, so it is
+/// never sent.
 ///
 /// The suite has no bound application, so the draft is made through the transfer store of this
 /// release with the daemon stopped, by the store call the daemon's create makes (the case does not go
 /// through the daemon's admission or its guard); the case asserts what the journal and the store
 /// beside it hold and what the store answers for a prompt, and no answer of a daemon about a prompt.
-/// The release before's daemon then runs on the journal and changes a draft as its own
-/// `draft.update` does: its text, its revision and its time, and nothing else. The record that
+/// The release before's daemon then starts on the journal and is stopped, and the case changes a
+/// draft by SQL in the columns a `draft.update` changes: its text, its revision and its time, and
+/// nothing else. The record that
 /// release makes for a prompt that names the draft, a row of `draft_prompts` and nothing more, is a
 /// fixture the case writes into the journal while that daemon is stopped; the daemon is not asked
 /// for a prompt. After the update again the record still names its session, and a prompt under
@@ -5082,21 +5113,21 @@ async fn a_rollback_keeps_a_draft_written_for_an_application_and_its_binding_rev
             )
             .expect("a draft that names an application is written with its revision");
     }
-    // A draft the release before wrote for the same application: the journal's own columns and no
-    // revision anywhere.
+    // A draft as a release from before the store of binding revisions wrote it, for the same
+    // application: the journal's own columns and no revision anywhere.
     rusqlite::Connection::open(&journal)
         .expect("opens the journal")
         .execute(
             "INSERT INTO drafts (draft_id, environment_id, actor_id, application_instance_id,
                                  revision, state, text, created_at_ms, updated_at_ms)
-             VALUES (?1, ?2, 'local:501', ?3, 1, 'open', 'written by the release before', 1000, 1000)",
+             VALUES (?1, ?2, 'local:501', ?3, 1, 'open', 'written before the store of binding revisions', 1000, 1000)",
             rusqlite::params![
                 before.get().as_bytes().to_vec(),
                 environment.get().as_bytes().to_vec(),
                 application.get().as_bytes().to_vec(),
             ],
         )
-        .expect("writes the draft as the release before wrote it");
+        .expect("writes the draft as a release from before the store of revisions wrote it");
 
     let (output, said) = host.kr_json(&["host", "rollback", "--json"]);
     assert_eq!(
@@ -5140,8 +5171,8 @@ async fn a_rollback_keeps_a_draft_written_for_an_application_and_its_binding_rev
         7
     );
 
-    // The release before's daemon runs on the journal, and a draft changes as its `draft.update`
-    // changes it: text, revision and time.
+    // The release before's daemon starts on the journal and is stopped; the case then changes a
+    // draft in the columns a `draft.update` changes: text, revision and time.
     let controller = updated.host.store.stable(Program::Controller);
     updated.host.start_daemon(&controller).await;
     let host = &updated.host;
@@ -5154,12 +5185,12 @@ async fn a_rollback_keeps_a_draft_written_for_an_application_and_its_binding_rev
     rusqlite::Connection::open(&journal)
         .expect("opens the journal")
         .execute(
-            "UPDATE drafts SET text = 'rewritten by the release before', revision = revision + 1,
+            "UPDATE drafts SET text = 'rewritten by the case', revision = revision + 1,
                                updated_at_ms = 2000
               WHERE draft_id = ?1",
             rusqlite::params![written.get().as_bytes().to_vec()],
         )
-        .expect("changes the draft as its own update does");
+        .expect("changes the draft's text, revision and time");
     // FIXTURE, not a write of the release before's daemon: the record that release makes for a
     // prompt that names the draft, which is a row of `draft_prompts` and nothing more, written while
     // its daemon is stopped.
@@ -5211,11 +5242,11 @@ async fn a_rollback_keeps_a_draft_written_for_an_application_and_its_binding_rev
         .draft(written)
         .expect("reads the draft")
         .expect("the draft is there");
-    assert_eq!(kept.text, "rewritten by the release before");
+    assert_eq!(kept.text, "rewritten by the case");
     assert_eq!(
         kept.agent_binding_revision.map(|revision| revision.get()),
         Some(7),
-        "the revision it was written under is still on record after the release before rewrote it"
+        "the revision it was written under is still on record after the case rewrote it"
     );
     assert_eq!(
         store
@@ -5224,7 +5255,7 @@ async fn a_rollback_keeps_a_draft_written_for_an_application_and_its_binding_rev
             .expect("the draft is there")
             .agent_binding_revision,
         None,
-        "a draft the release before wrote for an application has no revision, and is never sent"
+        "a draft written before the store of binding revisions has no revision, and is never sent"
     );
 
     // The record the release before made for a prompt is still there and still names its session.
