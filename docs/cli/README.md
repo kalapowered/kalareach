@@ -2725,8 +2725,11 @@ reports it.
 The command runs outside every session: where `KR_SESSION` or `KR_ATTACHMENT` is set, where a
 session's worker says the command runs inside its session, and where a worker cannot say whether it
 does, it refuses with `PERMISSION_DENIED` and runs no checks. This stops an accident and is no
-boundary: code that runs as your account is not stopped by it. Run it in a terminal that was not
-opened through the KalaReach profile, or an SSH login.
+boundary: code that runs as your account is not stopped by it. Where the command is inside a
+session, run it in a terminal that was not opened through the KalaReach profile, or an SSH login.
+Where a worker cannot say, another terminal gets the same refusal: the command says that it is not
+known whether the terminal is inside a session, and to run the checks again when that session
+answers or has ended.
 
 A run that ends without findings is a failure, exit 1, and the message says why in the words the
 setup page uses: no session of the kind the host creates is running, or the session's worker

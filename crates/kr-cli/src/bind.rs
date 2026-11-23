@@ -453,8 +453,12 @@ fn outside_to_run_the_checks(membership: Membership) -> Result<()> {
             "this process is inside session {}",
             session_id
         ))),
-        Membership::Unknown(why) => Err(refused_to_run_the_checks(&shown!(
-            "whether this process is inside a KalaReach session cannot be established ({})",
+        // Another terminal is no remedy: every terminal gets this refusal until the worker that could
+        // not say answers or its session has ended.
+        Membership::Unknown(why) => Err(inside(shown!(
+            "kr host desktop-checks runs outside a KalaReach session. It is not known whether this \
+             terminal is inside a KalaReach session ({}). Run the checks again when that session \
+             answers or has ended. No checks were run.",
             why
         ))),
     }
@@ -835,18 +839,26 @@ mod tests {
 
     /// A command that starts the checks goes on only where every worker said this process is not
     /// its own: a worker that could not say refuses it, as one that said it is does, where the
-    /// command that ends a daemon lets it go on.
+    /// command that ends a daemon lets it go on. Where the process is inside a session the person
+    /// is told to run the command in another terminal; where it is not known, that is not the
+    /// remedy, since every terminal gets the same refusal until the worker that could not say
+    /// answers or its session has ended.
     #[test]
     fn the_checks_are_refused_unless_every_worker_said_this_process_is_outside() {
         assert!(outside_to_run_the_checks(Membership::Outside).is_ok());
-        for (membership, said) in [
+        let other_terminal = "Run it in a terminal of this account that is not a KalaReach session";
+        for (membership, said, sends_to_another_terminal) in [
             (
                 Membership::Inside(SessionId::new(Uuid::from_bytes([2; 16]))),
                 "this process is inside session",
+                true,
             ),
             (
                 Membership::Unknown(Shown::said("it did not answer in time")),
-                "cannot be established (it did not answer in time)",
+                "It is not known whether this terminal is inside a KalaReach session (it did not \
+                 answer in time). Run the checks again when that session answers or has ended. \
+                 No checks were run.",
+                false,
             ),
         ] {
             let refused = outside_to_run_the_checks(membership.clone())
@@ -855,6 +867,11 @@ mod tests {
             let words = refused.to_string();
             assert!(words.contains(said), "{words}");
             assert!(words.ends_with("No checks were run."), "{words}");
+            assert_eq!(
+                words.contains(other_terminal),
+                sends_to_another_terminal,
+                "{words}"
+            );
         }
     }
 }
