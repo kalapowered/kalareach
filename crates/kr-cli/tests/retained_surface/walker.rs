@@ -34,6 +34,7 @@ use quote::ToTokens as _;
 use syn::ext::IdentExt as _;
 use syn::visit::Visit;
 
+use super::compiler;
 use super::condition;
 use super::crate_files;
 
@@ -47,7 +48,12 @@ pub struct Tree {
     indexes: RefCell<BTreeMap<String, Rc<CrateIndex>>>,
     /// The product files of each crate, read once.
     files: RefCell<BTreeMap<String, Rc<Vec<PathBuf>>>>,
+    /// The items of each Rust file by the names a sighting gets, read once.
+    scanned: RefCell<BTreeMap<PathBuf, Rc<ScannedItems>>>,
 }
+
+/// The items of a file by the names a sighting gets, each with its tokens.
+type ScannedItems = Vec<(String, String)>;
 
 /// What Cargo says of a crate that the file list needs.
 struct Manifest {
@@ -302,6 +308,7 @@ impl Tree {
             manifests: described,
             indexes: RefCell::new(BTreeMap::new()),
             files: RefCell::new(BTreeMap::new()),
+            scanned: RefCell::new(BTreeMap::new()),
         })
     }
 
@@ -1411,7 +1418,93 @@ impl Tree {
                 }));
             }
         }
-        Ok(None)
+        self.scan_source(krate, name)
+    }
+
+    /// The items of a Rust file by the names a sighting gets, read once.
+    fn scanned(&self, file: &Path) -> Result<Option<Rc<ScannedItems>>, String> {
+        if let Some(found) = self.scanned.borrow().get(file) {
+            return Ok(Some(Rc::clone(found)));
+        }
+        let text = match std::fs::read_to_string(file) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(format!("{}: {error}", file.display())),
+        };
+        let found = Rc::new(compiler::named_items(&text, &self.relative(file))?);
+        self.scanned
+            .borrow_mut()
+            .insert(file.to_owned(), Rc::clone(&found));
+        Ok(Some(found))
+    }
+
+    /// `file` as the sightings name a file: under the tree's root, with `/` between the parts.
+    fn relative(&self, file: &Path) -> String {
+        file.strip_prefix(&self.root)
+            .unwrap_or(file)
+            .components()
+            .map(|part| part.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/")
+    }
+
+    /// A name the compiler's reading gives a sighting and the walker does not index: `file:<path>`
+    /// (a file that is no Rust file), `use:<file>`, `<macro>! invocation @<file>`, `macro:<name>`
+    /// and the items under `#[cfg(test)]` or in a file no build reads. Its digest is over each file's
+    /// `{krate} {file} {name}`, a newline, the tokens of the items of that name in the file in file
+    /// order, and a newline, so that a file's path is part of it, as the walker's is.
+    fn scan_source(&self, krate: &str, name: &str) -> Result<Option<Source>, String> {
+        let mut found: Vec<(String, String)> = Vec::new();
+        if let Some(path) = name.strip_prefix("file:") {
+            match std::fs::read_to_string(self.root.join(path)) {
+                Ok(text) => found.push((path.to_owned(), text)),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(format!("{path}: {error}")),
+            }
+        } else {
+            let named = name
+                .strip_prefix("use:")
+                .or_else(|| name.split_once("! invocation @").map(|(_, file)| file));
+            let files = match named {
+                Some(file) => vec![self.root.join(file)],
+                None => {
+                    let source = self
+                        .crates
+                        .get(krate)
+                        .ok_or_else(|| format!("{krate} is no crate of this workspace"))?;
+                    rust_files(source)?
+                }
+            };
+            for file in files {
+                let Some(items) = self.scanned(&file)? else {
+                    continue;
+                };
+                let texts: Vec<&str> = items
+                    .iter()
+                    .filter(|(item, _)| item == name)
+                    .map(|(_, text)| text.as_str())
+                    .collect();
+                if !texts.is_empty() {
+                    found.push((self.relative(&file), texts.join("\n")));
+                }
+            }
+        }
+        if found.is_empty() {
+            return Ok(None);
+        }
+        let mut digest = Vec::new();
+        for (file, text) in &found {
+            digest.extend_from_slice(format!("{krate} {file} {name}\n{text}\n").as_bytes());
+        }
+        Ok(Some(Source {
+            digest: hex(&kr_cbor::sha256(&digest)),
+            text: found
+                .iter()
+                .map(|(_, text)| text.as_str())
+                .collect::<Vec<_>>()
+                .join("\n"),
+            files: found.into_iter().map(|(file, _)| file).collect(),
+        }))
     }
 
     pub fn item(&self, krate: &str, name: &str) -> Lookup {
@@ -1421,6 +1514,31 @@ impl Tree {
             Err(error) => Lookup::Failed(error),
         }
     }
+}
+
+/// The Rust files under `directory`, in the order of their paths.
+fn rust_files(directory: &Path) -> Result<Vec<PathBuf>, String> {
+    let mut found = Vec::new();
+    let mut pending = vec![directory.to_owned()];
+    while let Some(next) = pending.pop() {
+        let entries = match std::fs::read_dir(&next) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(format!("{}: {error}", next.display())),
+        };
+        for entry in entries {
+            let path = entry
+                .map_err(|error| format!("{}: {error}", next.display()))?
+                .path();
+            if path.is_dir() {
+                pending.push(path);
+            } else if path.extension().is_some_and(|extension| extension == "rs") {
+                found.push(path);
+            }
+        }
+    }
+    found.sort();
+    Ok(found)
 }
 
 /// `path` with its `.` components left out and each `..` taken with the normal component before

@@ -434,3 +434,108 @@ fn a_workspace_is_read_and_refused_in_words_whatever_colour_the_environment_asks
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+const SCANNED: &str = "use std::fmt;\n\
+macro_rules! make {\n    ($name:ident) => {\n        pub fn $name() {}\n    };\n}\n\
+gen!(a, b);\n\
+gen!(c);\n\
+pub struct Holder;\n\
+impl Holder {\n    pub fn held(&self) {}\n}\n\
+#[cfg(test)]\nmod tests {\n    #[test]\n    fn only_a_test_reads_this() {}\n}\n";
+
+fn digest_of(tree: &Tree, name: &str) -> String {
+    match tree.item("kr_sender", name) {
+        Lookup::Found(digest) => digest,
+        other => panic!("{name}: {other:?}"),
+    }
+}
+
+/// W5: each kind of name the compiler's reading gives a sighting resolves through `Tree::item`, with
+/// a digest that holds its file's path and the tokens of its items.
+#[test]
+fn a_name_the_compiler_gives_a_sighting_resolves_with_a_digest_that_holds_its_file_and_its_tokens()
+{
+    let folder = small_tree(SCANNED);
+    write(
+        folder.path(),
+        "crates/kr-sender/data/fixture.json",
+        "{\"a\": 1}\n",
+    );
+    write(
+        folder.path(),
+        "crates/kr-sender/src/unreached.rs",
+        "fn only_here() {}\n",
+    );
+    let tree = tree_at(folder.path()).expect("the tree");
+    let lib = "crates/kr-sender/src/lib.rs";
+    let names = [
+        format!("use:{lib}"),
+        format!("gen! invocation @{lib}"),
+        "macro:make".to_owned(),
+        "Holder::held".to_owned(),
+        "only_a_test_reads_this".to_owned(),
+        "only_here".to_owned(),
+        "file:crates/kr-sender/data/fixture.json".to_owned(),
+    ];
+    let digests: BTreeSet<String> = names.iter().map(|name| digest_of(&tree, name)).collect();
+    assert_eq!(
+        digests.len(),
+        names.len(),
+        "each name has a digest of its own"
+    );
+    // A name that nothing defines is absent, and a file that is not there is absent.
+    for name in [
+        "defined_nowhere",
+        "gen! invocation @crates/kr-sender/src/other.rs",
+        "use:crates/kr-sender/src/other.rs",
+        "file:crates/kr-sender/data/other.json",
+    ] {
+        assert_eq!(tree.item("kr_sender", name), Lookup::Absent, "{name}");
+    }
+    // The two invocations of one macro in one file are one name, and its text holds both.
+    let invocations = tree
+        .source("kr_sender", &format!("gen! invocation @{lib}"))
+        .expect("read")
+        .expect("found");
+    assert!(
+        invocations.text.contains("a , b") && invocations.text.contains("gen ! (c)"),
+        "{}",
+        invocations.text
+    );
+    assert_eq!(invocations.files, vec![lib.to_owned()]);
+    // A comment moves no digest, a token of one invocation moves that name's digest and no other,
+    // and the same text in another file is another digest.
+    let invocation = format!("gen! invocation @{lib}");
+    let before = digest_of(&tree, &invocation);
+    let used = digest_of(&tree, &format!("use:{lib}"));
+    let commented = small_tree(&format!("// a comment\n{SCANNED}"));
+    let tree_commented = tree_at(commented.path()).expect("the tree");
+    assert_eq!(digest_of(&tree_commented, &invocation), before);
+    let changed = small_tree(&SCANNED.replace("gen!(c);", "gen!(d);"));
+    let tree_changed = tree_at(changed.path()).expect("the tree");
+    assert_ne!(digest_of(&tree_changed, &invocation), before);
+    assert_eq!(digest_of(&tree_changed, &format!("use:{lib}")), used);
+    let moved = small_tree("");
+    write(moved.path(), "crates/kr-sender/src/lib.rs", "mod inner;\n");
+    write(moved.path(), "crates/kr-sender/src/inner.rs", SCANNED);
+    let tree_moved = tree_at(moved.path()).expect("the tree");
+    assert_ne!(
+        digest_of(
+            &tree_moved,
+            "gen! invocation @crates/kr-sender/src/inner.rs"
+        ),
+        before
+    );
+    // A file that does not parse is a failure with its text, never an absence.
+    let broken = small_tree("pub fn plain() {}\n");
+    write(
+        broken.path(),
+        "crates/kr-sender/src/lib.rs",
+        "pub fn plain() {}\nfn (\n",
+    );
+    let tree_broken = tree_at(broken.path()).expect("the tree");
+    let Lookup::Failed(error) = tree_broken.item("kr_sender", "only_here") else {
+        panic!("a file that does not parse");
+    };
+    assert!(error.contains("lib.rs"), "{error}");
+}

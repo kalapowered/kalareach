@@ -1241,6 +1241,8 @@ struct Range {
     start: Position,
     end: Position,
     name: String,
+    /// The tokens of the item, as the walker keeps an item's text.
+    text: String,
     /// What the range is when no sighting is to be made in it as it is: `use … as` or `type … =`.
     alias: Option<&'static str>,
     macro_rules: bool,
@@ -1275,11 +1277,13 @@ impl Collector<'_> {
         alias: Option<&'static str>,
         macro_rules: bool,
     ) {
-        if let Some((start, end)) = extent(&node.to_token_stream()) {
+        let tokens = node.to_token_stream();
+        if let Some((start, end)) = extent(&tokens) {
             self.ranges.push(Range {
                 start,
                 end,
                 name,
+                text: tokens.to_string(),
                 alias,
                 macro_rules,
             });
@@ -1451,6 +1455,17 @@ impl FileItems {
         })
     }
 
+    /// Each item of the file by the name a sighting in it gets, with its tokens, in the order of the
+    /// file.
+    fn named(&self) -> Vec<(String, String)> {
+        let mut ranges: Vec<&Range> = self.ranges.iter().collect();
+        ranges.sort_by_key(|range| range.start);
+        ranges
+            .into_iter()
+            .map(|range| (range.name.clone(), range.text.clone()))
+            .collect()
+    }
+
     /// The innermost range that holds the position.
     fn at(&self, line: usize, column: usize) -> Option<&Range> {
         self.ranges
@@ -1466,6 +1481,17 @@ impl FileItems {
             .filter(|range| range.start <= (line, column) && (line, column) < range.end)
             .find_map(|range| range.alias)
     }
+}
+
+/// The items of a Rust file by the names a sighting in it gets (`Type::method`, `macro:<name>`,
+/// `use:<file>`, `<macro>! invocation @<file>`), each with its tokens, in the order of the file. Items
+/// under `#[cfg(test)]` are among them: a sighting there is read, though no build reports it.
+///
+/// # Errors
+///
+/// When the file does not parse.
+pub(super) fn named_items(text: &str, file: &str) -> Result<Vec<(String, String)>, String> {
+    FileItems::of(text, file).map(|items| items.named())
 }
 
 // ---------------------------------------------------------------------------------------------
