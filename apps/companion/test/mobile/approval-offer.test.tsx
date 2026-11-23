@@ -20,9 +20,9 @@ const SESSION_MAIN = '8a7b6c50-22bb-4c3d-8e4f-000000000101'
 const PLATFORMS: readonly MobilePlatform[] = ['ios', 'android']
 
 const FENCE =
-  'approvals cannot be recorded while the record store has a fault, so they are answered in the terminal, which goes on working'
+  'the record store has a fault, so messages, steering, interrupts and approvals wait until it works again; the terminal goes on working'
 const SENTENCE =
-  'Approvals cannot be recorded while the record store has a fault, so they are answered in the terminal, which goes on working.'
+  'The record store has a fault, so messages, steering, interrupts and approvals wait until it works again; the terminal goes on working.'
 const NO_RECORD =
   'This device cannot answer Claude Code’s approvals. Channels has not shown that it is on for this session.'
 

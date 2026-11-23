@@ -224,9 +224,9 @@ describe('the inbox card of an approval that cannot be answered here', () => {
 
 describe('the notice while the host suspends rich mutations', () => {
   const FENCE =
-    'approvals cannot be recorded while the record store has a fault, so they are answered in the terminal, which goes on working'
+    'the record store has a fault, so messages, steering, interrupts and approvals wait until it works again; the terminal goes on working'
   const SENTENCE =
-    'Approvals cannot be recorded while the record store has a fault, so they are answered in the terminal, which goes on working.'
+    'The record store has a fault, so messages, steering, interrupts and approvals wait until it works again; the terminal goes on working.'
 
   it('gives_the_hosts_reason_as_a_sentence_and_offers_the_terminal', async () => {
     open((controls) => {

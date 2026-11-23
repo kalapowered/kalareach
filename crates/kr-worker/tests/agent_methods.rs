@@ -2286,8 +2286,9 @@ fn kr_req_11_35_a_fence_refuses_a_plan_that_arrives_after_it() {
 }
 
 /// KR-REQ-12.25: while the gateway is behind the fence, the binding says that rich mutations are
-/// suspended and gives the reason a person reads, so a client does not offer an approval that the
-/// host would refuse; when storage is back the reason says so and says when approvals return.
+/// suspended and gives the reason a person reads, so a client does not offer an approval, a
+/// message or a steer that the host would refuse; the reason says what waits, and when storage is
+/// back it says so and says what waits until the records are written.
 #[test]
 fn kr_req_12_25_a_fenced_gateway_suspends_the_binding_with_a_reason_a_person_can_read() {
     let mut store = common::SharedStore::open();
@@ -2308,8 +2309,8 @@ fn kr_req_12_25_a_fenced_gateway_suspends_the_binding_with_a_reason_a_person_can
     assert_eq!(
         fenced.suspension_reason.0.as_deref(),
         Some(
-            "approvals cannot be recorded while the record store has a fault, so they are \
-             answered in the terminal, which goes on working"
+            "the record store has a fault, so messages, steering, interrupts and approvals wait \
+             until it works again; the terminal goes on working"
         )
     );
 
@@ -2326,8 +2327,8 @@ fn kr_req_12_25_a_fenced_gateway_suspends_the_binding_with_a_reason_a_person_can
     assert_eq!(
         recovering.suspension_reason.0.as_deref(),
         Some(
-            "storage is back and the records it missed are being written; approvals return \
-             here when that is done"
+            "storage is back and the records it missed are being written; messages, steering, \
+             interrupts and approvals wait until that is done"
         )
     );
 }

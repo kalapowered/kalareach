@@ -17,14 +17,16 @@ use kr_protocol::session::Durability;
 
 use crate::broker::error::{BrokerError, Result};
 
-/// Why rich work is refused while the gateway is fenced. A device is told it as written, so a
-/// change here is a change of what a paired device reads.
-pub const GATEWAY_FENCED: &str = "approvals cannot be recorded while the record store has a fault, \
-     so they are answered in the terminal, which goes on working";
+/// Why rich work is refused while the gateway is fenced. It is the reason of every refusal of a
+/// message, a steer, an interrupt or an approval, and of every control the page disables for it, so
+/// it says what waits and not one kind of it. A device is told it as written, so a change here is
+/// a change of what a paired device reads.
+pub const GATEWAY_FENCED: &str = "the record store has a fault, so messages, steering, interrupts \
+     and approvals wait until it works again; the terminal goes on working";
 
 /// Why rich work is refused while the gateway recovers. A device is told it as written.
 pub const GATEWAY_RECOVERING: &str = "storage is back and the records it missed are being written; \
-     approvals return here when that is done";
+     messages, steering, interrupts and approvals wait until that is done";
 
 /// What one transition did.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -387,7 +389,7 @@ mod tests {
             .enter("the journal could not be written", 0, TimestampMs::new(100))
             .expect("the fence is entered");
         let refusal = state.require_rich_work().expect_err("rich work is fenced");
-        assert!(refusal.to_string().contains("answered in the terminal"));
+        assert!(refusal.to_string().contains(GATEWAY_FENCED));
         assert_eq!(
             refusal.code(),
             kr_protocol::error::ErrorCode::UpstreamUnavailable
@@ -408,7 +410,7 @@ mod tests {
             "storage returning is not the same as the gap being committed"
         );
         let refusal = state.require_rich_work().expect_err("still fenced");
-        assert!(refusal.to_string().contains("approvals return here"));
+        assert!(refusal.to_string().contains(GATEWAY_RECOVERING));
         state.finish_recovery().expect("recovery finishes");
         assert!(state.admits_rich_work());
         assert_eq!(state.durability(), Durability::Durable);
