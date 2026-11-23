@@ -1164,7 +1164,7 @@ impl Takes {
         let count = Arc::clone(&taken);
         std::thread::spawn(move || {
             let _ = armed.send(());
-            while queue.wait(&stop, &asked, false).is_ok() {
+            while queue.wait(&stop, &asked, false, None).is_ok() {
                 while queue
                     .waiting()
                     .expect("the console counts its input events")
@@ -1217,7 +1217,7 @@ fn spell_probe_in_the_console() {
                 }
             }
             TerminalInput::Bytes(bytes) => println!("kr-probe:early:{}", hex(&bytes)),
-            TerminalInput::Mouse(_) => {
+            TerminalInput::Mouse(_) | TerminalInput::MouseReport(_) => {
                 panic!("the reader handed on a mouse record, which no application asked for")
             }
         }
@@ -1238,7 +1238,7 @@ fn spell_probe_in_the_console() {
                     println!("kr-probe:key:{}:{}", key.virtual_key, key.unicode);
                 }
             }
-            TerminalInput::Mouse(_) => {
+            TerminalInput::Mouse(_) | TerminalInput::MouseReport(_) => {
                 panic!("the reader handed on a mouse record, which no application asked for")
             }
         }
@@ -1255,7 +1255,7 @@ fn spell_probe_in_the_console() {
                     println!("kr-probe:key:{}:{}", key.virtual_key, key.unicode);
                 }
             }
-            TerminalInput::Mouse(_) => {
+            TerminalInput::Mouse(_) | TerminalInput::MouseReport(_) => {
                 panic!("the reader handed on a mouse record, which no application asked for")
             }
         }
@@ -1272,7 +1272,7 @@ fn spell_probe_in_the_console() {
                     println!("kr-probe:key:{}:{}", key.virtual_key, key.unicode);
                 }
             }
-            TerminalInput::Mouse(_) => {
+            TerminalInput::Mouse(_) | TerminalInput::MouseReport(_) => {
                 panic!("the reader handed on a mouse record, which no application asked for")
             }
         }
@@ -1360,7 +1360,7 @@ fn paste_probe_in_the_console() {
                 }
             }
             TerminalInput::Bytes(bytes) => println!("kr-probe:early:{}", hex(&bytes)),
-            TerminalInput::Mouse(_) => {
+            TerminalInput::Mouse(_) | TerminalInput::MouseReport(_) => {
                 panic!("the reader handed on a mouse record, which no application asked for")
             }
         }

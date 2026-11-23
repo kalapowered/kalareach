@@ -37,7 +37,7 @@ use kr_client::shown::Shown;
 use std::os::windows::io::AsRawHandle as _;
 
 use kr_term::win32::{KeyRecord, PairHold};
-use windows_sys::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
+use windows_sys::Win32::Foundation::{HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows_sys::Win32::System::Console::{
     GetNumberOfConsoleInputEvents, INPUT_RECORD, KEY_EVENT, MOUSE_EVENT, PeekConsoleInputW,
     ReadConsoleInputW, ReadConsoleW, WINDOW_BUFFER_SIZE_EVENT,
@@ -131,7 +131,13 @@ impl RecordReader {
     /// # Errors
     ///
     /// Returns an error when the system will not wait.
-    pub fn wait(&self, stop: &WakeEvent, asked: &WakeEvent, requests_first: bool) -> Result<Woken> {
+    pub fn wait(
+        &self,
+        stop: &WakeEvent,
+        asked: &WakeEvent,
+        requests_first: bool,
+        timeout: Option<std::time::Duration>,
+    ) -> Result<Woken> {
         let stop = stop.0.as_raw_handle() as HANDLE;
         let console = self.handle.as_raw_handle() as HANDLE;
         let asked_handle = asked.0.as_raw_handle() as HANDLE;
@@ -149,7 +155,19 @@ impl RecordReader {
         };
         // SAFETY: all three handles are open for the call, two the events' and one this reader's
         // own, and the array holds exactly the three the count names.
-        let woken = unsafe { WaitForMultipleObjects(3, handles.as_ptr(), 0, INFINITE) };
+        let woken = unsafe {
+            WaitForMultipleObjects(
+                3,
+                handles.as_ptr(),
+                0,
+                timeout.map_or(INFINITE, |bound| {
+                    u32::try_from(bound.as_millis()).unwrap_or(INFINITE - 1)
+                }),
+            )
+        };
+        if woken == WAIT_TIMEOUT {
+            return Ok(Woken::TimedOut);
+        }
         let index = woken.wrapping_sub(WAIT_OBJECT_0) as usize;
         match kinds.get(index) {
             Some(Woken::Asked) => {

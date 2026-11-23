@@ -2496,6 +2496,20 @@ impl ConsoleMouse {
         self.speller
             .spell(record, &self.reporting, window(terminal))
     }
+
+    /// The bytes that tell the application of a mouse report the console spelled itself, or none
+    /// when it asked for nothing the report is. The mouse is looked after as for a record.
+    fn reported(
+        &mut self,
+        event: kr_keys::MouseEvent,
+        terminal: &ControllingTerminal,
+        may_type: bool,
+    ) -> Vec<u8> {
+        if !self.update(terminal, may_type) {
+            return Vec::new();
+        }
+        crate::mouse::MouseSpeller::report(event, &self.reporting)
+    }
 }
 
 /// Has the console spell its keys while the application has bracketed paste on, and report them as
@@ -3327,7 +3341,7 @@ async fn drive(
                         TerminalInput::Bytes(_) => true,
                         TerminalInput::Keys(keys) => presses(keys),
                         // A pointer moving over the window is not something typed.
-                        TerminalInput::Mouse(_) => false,
+                        TerminalInput::Mouse(_) | TerminalInput::MouseReport(_) => false,
                     };
                     continue;
                 }
@@ -3339,6 +3353,17 @@ async fn drive(
                     // sent the report it asked for, as bytes, and goes on from here like any other.
                     TerminalInput::Mouse(record) => {
                         let report = console_mouse.spelled(record, terminal, epoch.is_some());
+                        if report.is_empty() {
+                            continue;
+                        }
+                        mouse_report = Some(report.clone());
+                        report
+                    }
+                    // A console that spells its keys spells the mouse as well, as the reports a
+                    // terminal sends, and the reader took them out of the text: they are told as
+                    // the application asked, as a record would be.
+                    TerminalInput::MouseReport(event) => {
+                        let report = console_mouse.reported(event, terminal, epoch.is_some());
                         if report.is_empty() {
                             continue;
                         }

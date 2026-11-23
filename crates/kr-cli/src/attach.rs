@@ -876,6 +876,8 @@ pub enum Woken {
     Console,
     /// The switch asked the reader to ask the console.
     Asked,
+    /// The bound the wait was given ran out with nothing else to wake it.
+    TimedOut,
 }
 
 /// What one read of a console's records found, in the order it was reported.
@@ -893,8 +895,10 @@ pub(crate) enum ConsoleRead {
 pub(crate) trait ConsoleInput {
     /// Waits until the stop is made, the console has input or the switch asks, and says which. The
     /// stop comes first; input the console holds comes before a request unless `requests_first`
-    /// says the request has waited long enough.
-    fn wait(&mut self, requests_first: bool) -> Result<Woken>;
+    /// says the request has waited long enough. A wait that is given a bound ends when it runs
+    /// out, and says [`Woken::TimedOut`].
+    fn wait(&mut self, requests_first: bool, timeout: Option<std::time::Duration>)
+    -> Result<Woken>;
 
     /// Reads the records the console has, in the order it reported them: the key records as the
     /// runs they came in, and each mouse record on its own.
@@ -1121,23 +1125,59 @@ enum Handed {
     Ended,
 }
 
+/// Hands on the text a console spelled: what is not a mouse report as the text it is, and each
+/// report as the event it tells of, in the order they came. Bytes that may begin a report are held
+/// by `filter` until more come or the wait for them ends. Says whether the reader should go on.
+#[cfg(any(not(unix), test))]
+fn hand_on_what_was_spelled(
+    outlet: &mut Outlet<'_>,
+    filter: &mut crate::mouse::SgrMouseFilter,
+    bytes: &[u8],
+) -> bool {
+    for part in filter.push(bytes) {
+        let sent = match part {
+            crate::mouse::Part::Text(text) => outlet.send(TerminalInput::Bytes(text)),
+            crate::mouse::Part::Report(event) => outlet.send(TerminalInput::MouseReport(event)),
+        };
+        if !sent {
+            return false;
+        }
+    }
+    true
+}
+
+/// Hands on as text the bytes `filter` held for a report that did not come. Says whether the
+/// reader should go on.
+#[cfg(any(not(unix), test))]
+fn hand_on_what_was_held(
+    outlet: &mut Outlet<'_>,
+    filter: &mut crate::mouse::SgrMouseFilter,
+) -> bool {
+    let held = filter.flush();
+    held.is_empty() || outlet.send(TerminalInput::Bytes(held))
+}
+
 /// Hands on, as text, what the console holds, without waiting for more.
 #[cfg(any(not(unix), test))]
-fn hand_on_the_text(console: &mut impl ConsoleInput, outlet: &mut Outlet<'_>) -> Handed {
+fn hand_on_the_text(
+    console: &mut impl ConsoleInput,
+    outlet: &mut Outlet<'_>,
+    filter: &mut crate::mouse::SgrMouseFilter,
+) -> Handed {
     for _ in 0..DRAINS_BEFORE_THE_CHANGE_WAITS {
         if !outlet.may_touch_the_console() {
             return Handed::Ended;
         }
         match console.bytes() {
             Ok(bytes) if bytes.is_empty() => {
-                return if outlet.may_touch_the_console() {
-                    Handed::Empty
-                } else {
-                    Handed::Ended
-                };
+                // Nothing more is typed ahead, so what was held for a report is text.
+                if !hand_on_what_was_held(outlet, filter) || !outlet.may_touch_the_console() {
+                    return Handed::Ended;
+                }
+                return Handed::Empty;
             }
             Ok(bytes) => {
-                if !outlet.send(TerminalInput::Bytes(bytes)) {
+                if !hand_on_what_was_spelled(outlet, filter, &bytes) {
                     return Handed::Ended;
                 }
             }
@@ -1180,12 +1220,17 @@ fn read_console(
         left: Vec::new(),
     };
     let mut spelled = false;
+    let mut filter = crate::mouse::SgrMouseFilter::default();
     let mut in_a_row = 0_u32;
     loop {
         // A console that keeps having input is read a few times, and then a request that has been
         // waiting goes first.
         let requests_first = in_a_row >= READS_BEFORE_A_REQUEST;
-        let woken = console.wait(requests_first);
+        // Bytes that may begin a mouse report wait a short while for the rest of it.
+        let woken = console.wait(
+            requests_first,
+            filter.holds().then_some(crate::mouse::HELD_PREFIX_WAIT),
+        );
         in_a_row = if matches!(woken, Ok(Woken::Console)) && !requests_first {
             in_a_row + 1
         } else {
@@ -1200,13 +1245,18 @@ fn read_console(
             Ok(Woken::Console) if spelled => match console.bytes() {
                 Ok(bytes) if bytes.is_empty() => {}
                 Ok(bytes) => {
-                    if !outlet.send(TerminalInput::Bytes(bytes)) {
+                    if !hand_on_what_was_spelled(&mut outlet, &mut filter, &bytes) {
                         break;
                     }
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
                 Err(_) => break,
             },
+            Ok(Woken::TimedOut) => {
+                if !hand_on_what_was_held(&mut outlet, &mut filter) {
+                    break;
+                }
+            }
             Ok(Woken::Console) => {
                 let Ok(reads) = console.records() else {
                     break;
@@ -1263,7 +1313,7 @@ fn read_console(
                     // What was typed ahead is text the console already spelled: it is handed on as
                     // text before the console reports records again, since a record read after the
                     // change would be a character of a sequence the console had spelled.
-                    match hand_on_the_text(console, &mut outlet) {
+                    match hand_on_the_text(console, &mut outlet, &mut filter) {
                         Handed::Ended => break,
                         Handed::Flood => Err(CliError::Terminal(shown!(
                             "the console still has text typed ahead, so its keys are not given back yet"
@@ -1271,6 +1321,11 @@ fn read_console(
                         Handed::Empty => {
                             let answer = (switching.give_back)();
                             spelled = answer.is_err();
+                            if !spelled {
+                                // A paste that never closed does not go on into the next time the
+                                // console spells its keys.
+                                filter = crate::mouse::SgrMouseFilter::default();
+                            }
                             answer
                         }
                     }
@@ -1364,6 +1419,10 @@ pub enum TerminalInput {
     /// It is spelled as the report the session's application asked for, and is sent as bytes. Only
     /// a Windows console reports the mouse this way.
     Mouse(crate::mouse::MouseRecord),
+    /// A mouse report a console that spells its keys spelled in the text it handed on, taken out
+    /// of that text. It is spelled as the report the session's application asked for, and is sent
+    /// as bytes. Only a Windows console reports the mouse this way.
+    MouseReport(kr_keys::MouseEvent),
 }
 
 impl std::fmt::Debug for TerminalInput {
@@ -1379,6 +1438,9 @@ impl std::fmt::Debug for TerminalInput {
                 .field("count", &keys.len())
                 .finish(),
             Self::Mouse(_) => formatter.debug_struct("Mouse").finish_non_exhaustive(),
+            Self::MouseReport(_) => formatter
+                .debug_struct("MouseReport")
+                .finish_non_exhaustive(),
         }
     }
 }
@@ -1542,8 +1604,13 @@ struct WindowsConsole {
 
 #[cfg(not(unix))]
 impl ConsoleInput for WindowsConsole {
-    fn wait(&mut self, requests_first: bool) -> Result<Woken> {
-        self.reader.wait(&self.stop, &self.asked, requests_first)
+    fn wait(
+        &mut self,
+        requests_first: bool,
+        timeout: Option<std::time::Duration>,
+    ) -> Result<Woken> {
+        self.reader
+            .wait(&self.stop, &self.asked, requests_first, timeout)
     }
 
     fn records(&mut self) -> Result<Vec<ConsoleRead>> {
@@ -1884,6 +1951,9 @@ mod reader {
     /// What the thread asked of the console, in order.
     type Steps = Arc<Mutex<Vec<&'static str>>>;
 
+    /// The bound each wait of the thread was given, in order.
+    type Bounds = Arc<Mutex<Vec<Option<std::time::Duration>>>>;
+
     /// How long a stop waits for a thread that a case expects to end, a bound that no case reaches
     /// when the code is right, so that a case that fails ends with a message and not with a hang.
     /// Whether the thread ends is decided by the thread, and never by how much of this has passed.
@@ -1901,6 +1971,7 @@ mod reader {
         held: Vec<KeyRecord>,
         bytes: mpsc::Receiver<Vec<u8>>,
         steps: Steps,
+        bounds: Bounds,
         /// Holds the thread inside one of its calls, once, until the case lets it go.
         pause: Option<Pause>,
     }
@@ -1929,7 +2000,12 @@ mod reader {
     }
 
     impl ConsoleInput for Scripted {
-        fn wait(&mut self, requests_first: bool) -> Result<Woken> {
+        fn wait(
+            &mut self,
+            requests_first: bool,
+            timeout: Option<std::time::Duration>,
+        ) -> Result<Woken> {
+            self.bounds.lock().expect("bounds").push(timeout);
             if let Some(start) = self.start.take() {
                 let _ = start.recv();
             }
@@ -2005,6 +2081,7 @@ mod reader {
         /// Lets the thread go from where it is held.
         release: mpsc::Sender<()>,
         steps: Steps,
+        bounds: Bounds,
         stop: Option<ReaderStop>,
     }
 
@@ -2057,6 +2134,7 @@ mod reader {
             let (arrived, held_at) = mpsc::channel();
             let (release, released) = mpsc::channel();
             let steps: Steps = Arc::default();
+            let bounds: Bounds = Arc::default();
             let asked = Arc::clone(&steps);
             let given_back = Arc::clone(&steps);
             let switch = InputSwitch::new(
@@ -2081,6 +2159,7 @@ mod reader {
                 held,
                 bytes: spelled,
                 steps: Arc::clone(&steps),
+                bounds: Arc::clone(&bounds),
                 pause: pause_at.map(|at| Pause {
                     at,
                     arrived,
@@ -2128,6 +2207,7 @@ mod reader {
                 held: held_at,
                 release,
                 steps,
+                bounds,
                 stop: Some(stop),
             }
         }
@@ -2306,6 +2386,136 @@ mod reader {
             run.next(),
             TerminalInput::Bytes(b"b".to_vec()),
             "nothing was handed on for the input that held no byte"
+        );
+        run.ends();
+    }
+
+    /// The event a mouse report of a button's press, or a wheel notch, at a cell tells of.
+    fn told(action: kr_keys::MouseAction, column: u32, row: u32) -> TerminalInput {
+        TerminalInput::MouseReport(kr_keys::MouseEvent {
+            action,
+            column,
+            row,
+            modifiers: kr_keys::Modifiers::default(),
+        })
+    }
+
+    /// A mouse report in the text a console spelled is handed on as the event it tells of, in its
+    /// place between the text before it and the text after, and is not text.
+    #[test]
+    fn a_mouse_report_in_the_text_a_console_spells_is_handed_on_as_an_event_in_its_place() {
+        use kr_keys::{MouseAction, MouseButton, WheelDirection};
+
+        let mut run = Run::start(true, Vec::new());
+        run.switch.engage().expect("the console spells its keys");
+        run.bytes
+            .send(b"ab\x1b[<0;10;5Mcd\x1b[<65;3;4M".to_vec())
+            .expect("the reader waits");
+        run.has_input();
+        assert_eq!(run.next(), TerminalInput::Bytes(b"ab".to_vec()));
+        assert_eq!(
+            run.next(),
+            told(MouseAction::Press(MouseButton::Left), 9, 4)
+        );
+        assert_eq!(run.next(), TerminalInput::Bytes(b"cd".to_vec()));
+        assert_eq!(
+            run.next(),
+            told(MouseAction::Wheel(WheelDirection::Down), 2, 3)
+        );
+        run.ends();
+    }
+
+    /// A report whose bytes come in two reads is handed on as the one event, and the text on either
+    /// side of it as text, with no wait for more between the reads.
+    #[test]
+    fn a_report_cut_across_two_reads_of_the_console_is_handed_on_as_one_event() {
+        use kr_keys::{MouseAction, MouseButton};
+
+        let mut run = Run::start(true, Vec::new());
+        run.switch.engage().expect("the console spells its keys");
+        run.bytes
+            .send(b"ab\x1b[<0;1".to_vec())
+            .expect("the reader waits");
+        run.has_input();
+        assert_eq!(run.next(), TerminalInput::Bytes(b"ab".to_vec()));
+        run.bytes
+            .send(b"0;5Mcd".to_vec())
+            .expect("the reader waits");
+        run.has_input();
+        assert_eq!(
+            run.next(),
+            told(MouseAction::Press(MouseButton::Left), 9, 4)
+        );
+        assert_eq!(run.next(), TerminalInput::Bytes(b"cd".to_vec()));
+        run.ends();
+    }
+
+    /// Bytes that may begin a report are held, and the wait that follows has the short bound that
+    /// names how long they are held; no other wait is bounded. When that wait runs out with nothing
+    /// more read, what was held is handed on as the text it is: a lone Escape is the key.
+    #[test]
+    fn bytes_that_may_begin_a_report_are_handed_on_as_text_when_the_wait_for_the_rest_runs_out() {
+        let mut run = Run::start(true, Vec::new());
+        let bounds = Arc::clone(&run.bounds);
+        run.switch.engage().expect("the console spells its keys");
+        run.bytes.send(b"a\x1b".to_vec()).expect("the reader waits");
+        run.has_input();
+        assert_eq!(run.next(), TerminalInput::Bytes(b"a".to_vec()));
+        run.wakes.send(Woken::TimedOut).expect("the reader waits");
+        assert_eq!(
+            run.next(),
+            TerminalInput::Bytes(b"\x1b".to_vec()),
+            "the lone Escape is handed on once the wait ends"
+        );
+        run.ends();
+        let bounds = bounds.lock().expect("bounds").clone();
+        let bounded: Vec<_> = bounds.iter().filter_map(|bound| *bound).collect();
+        assert_eq!(
+            bounded,
+            [crate::mouse::HELD_PREFIX_WAIT],
+            "only the wait after the held byte is bounded: {bounds:?}"
+        );
+    }
+
+    /// What was held for a report when the console is given back as records is handed on as text,
+    /// and a paste that never closed is forgotten: the mouse reports that come once the console
+    /// spells its keys again are reports and not the text of a paste.
+    #[test]
+    fn what_is_held_and_an_open_paste_do_not_outlast_the_console_being_given_back() {
+        use kr_keys::{MouseAction, MouseButton};
+
+        let mut run = Run::start(true, Vec::new());
+        run.switch.follow_paste(true).expect("the console spells");
+        run.bytes
+            .send(b"\x1b[<0;1".to_vec())
+            .expect("the reader waits");
+        run.has_input();
+        run.switch
+            .follow_paste(false)
+            .expect("the console reports records again");
+        assert_eq!(
+            run.next(),
+            TerminalInput::Bytes(b"\x1b[<0;1".to_vec()),
+            "what was held is text once there is nothing more to wait for"
+        );
+        run.switch.follow_paste(true).expect("the console spells");
+        run.bytes
+            .send(b"\x1b[200~ab".to_vec())
+            .expect("the reader waits");
+        run.has_input();
+        assert_eq!(run.next(), TerminalInput::Bytes(b"\x1b[200~ab".to_vec()));
+        run.switch
+            .follow_paste(false)
+            .expect("the console reports records again");
+        run.switch.follow_paste(true).expect("the console spells");
+        run.bytes
+            .send(b"\x1b[<0;10;5M".to_vec())
+            .expect("the reader waits");
+        run.has_input();
+        assert_eq!(
+            run.next(),
+            told(MouseAction::Press(MouseButton::Left), 9, 4),
+            "the paste that never closed is not still open"
         );
         run.ends();
     }
