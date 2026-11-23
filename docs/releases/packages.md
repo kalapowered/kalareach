@@ -362,10 +362,15 @@ of distinct texts, and its `description` and `title` are texts. Every other diff
 a member or a variant added to a closed object, a member, a variant or a definition removed, and
 any change.
 `SessionSummary.root` is one: an earlier strict reader cannot read the summary of a command session.
-No client was released, so no shim carries it. A new section of the configuration document is one
-too, though the check of a level passes it ([A level is one surface](#a-level-is-one-surface)):
-the report names what a validator built from an earlier package would reject, and from the freeze
-it fails on it.
+No client was released, so no shim carries it. `InputWriteResult.provenance` and
+`InputLeaseResult.provenance` are the same kind: a strict reader built from an earlier package cannot
+read the answer to a write or an interrupt on a worker that sends it. The action has happened; only
+its answer is unreadable. No 0.78 product reader decodes those two results, and no client was
+released, so no shim carries them. The answer to a launch press, `ShellLaunchResult`, keeps its
+earlier shape until a client release carries the member. A new section of the configuration
+document is one too, though the check of a level passes it
+([A level is one surface](#a-level-is-one-surface)): the report names what a validator built from an
+earlier package would reject, and from the freeze it fails on it.
 
 Until `crates/kr-protocol/retained/PUBLIC_FREEZE` exists, the references are the releases at the
 commit's level, and the check reports and does not fail. That file,
