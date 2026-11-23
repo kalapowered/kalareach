@@ -248,7 +248,7 @@
           "table": "delivery_schema"
         },
         "version": 11,
-        "migrates_from": 6
+        "migrates_from": 11
       },
       "digest": "43f4a7424a4d46099716d218f15f800f6210548642af93eeb27efe6b6d4ed0e1",
       "kept": [
