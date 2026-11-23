@@ -385,6 +385,39 @@ describe('the store reads the application, and the application is the one that s
     }
   )
 
+  it('Z5: a list that was asked for before the cancel found the file published does not replace the file kept', async () => {
+    // An ordinary read of the list is under way when the person cancels. The send fails while the cancel
+    // waits, and the cancel's answer says the file was sent. No call waits for the file any more, and the
+    // older list, which describes the upload as it was before, comes after.
+    const { uploads, port, scripted, replies, real } = held()
+    const answers: ((answered: UploadCancelled) => void)[] = []
+    vi.spyOn(port, 'uploadCancel').mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          answers.push(resolve)
+        })
+    )
+    const sent = uploads.send({ key: 'k-12', sessionId: 's-1', subject, file }, () => Promise.resolve())
+    const failed = sent.catch(() => undefined)
+    await wait(() => scripted.started.length === 1)
+    const older = uploads.restore()
+    expect(replies).toHaveLength(1)
+    const cancelling = uploads.cancel('k-12')
+    await wait(() => answers.length === 1)
+    scripted.refuseRetaining('k-12', refusal)
+    await failed
+    expect(uploads.snapshot().get('k-12')?.awaited).toBe(false)
+    answers[0]?.({ key: 'k-12', state: 'published', releasedByteLen: null, handle: published, said: null })
+    await cancelling
+    expect(uploads.snapshot().get('k-12')?.phase).toEqual({ kind: 'kept', words: null })
+    // The application lists the upload as paused, in a reply to the read that began before the answer.
+    replies[0]?.resolve(await real())
+    await older
+    const row = uploads.snapshot().get('k-12')
+    expect(row?.phase).toEqual({ kind: 'kept', words: null })
+    expect(row?.handle).toEqual(published)
+  })
+
   it('stops asking once the list is read and the application keeps nothing of the refused file', async () => {
     const { uploads, scripted, asked, mend } = unreadable()
     const sent = uploads.send({ key: 'k-6', sessionId: 's-1', subject, file }, () => Promise.resolve())

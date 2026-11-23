@@ -77,6 +77,12 @@ export interface UploadRow {
    * still holds the upload is not known: the next read of the list settles it.
    */
   readonly unread?: boolean
+  /**
+   * How many reads of the application's list had begun when the application's answer fixed this row
+   * as a file it holds in full. A list from a read that began no later than that describes the upload
+   * as it was before the answer, and leaves the row alone.
+   */
+  readonly after?: number
 }
 
 /** What the read of one upload's account answers when the application's list could not be read. */
@@ -267,6 +273,8 @@ export class PairedUploads {
   #reading: { readonly cycle: number; readonly list: Promise<readonly OpenUpload[] | null> } | null = null
   /** How many times the store was reset: a call that began in an earlier cycle changes nothing. */
   #cycle = 0
+  /** How many reads of the application's list have begun. */
+  #reads = 0
   /** The end of the last turn of each session: a turn starts when the one before it has settled. */
   #turns = new Map<string, Promise<void>>()
   /** The screens that show a session's composer, and how each reads the kept draft and shows what it holds. */
@@ -626,7 +634,8 @@ export class PairedUploads {
         this.#patch(key, {
           handle,
           note: sentence(PUBLISHED_AND_KEPT),
-          phase: waiting ? { kind: 'adding' } : { kind: 'kept', words: null }
+          phase: waiting ? { kind: 'adding' } : { kind: 'kept', words: null },
+          after: this.#reads
         })
         return
       }
@@ -749,7 +758,8 @@ export class PairedUploads {
   #read(): Promise<readonly OpenUpload[] | null> {
     const cycle = this.#cycle
     if (this.#reading?.cycle === cycle) return this.#reading.list
-    const reading = { cycle, list: this.#readList(cycle) }
+    this.#reads += 1
+    const reading = { cycle, list: this.#readList(cycle, this.#reads) }
     this.#reading = reading
     void reading.list.then(() => {
       if (this.#reading === reading) this.#reading = null
@@ -757,7 +767,7 @@ export class PairedUploads {
     return reading.list
   }
 
-  async #readList(cycle: number): Promise<readonly OpenUpload[] | null> {
+  async #readList(cycle: number, number: number): Promise<readonly OpenUpload[] | null> {
     try {
       const views = await this.#port.uploadsOpen()
       // A read that was asked for before a reset describes rows that are gone: it makes none.
@@ -785,6 +795,9 @@ export class PairedUploads {
             note: null,
             awaited: false
           })
+        } else if (row.after !== undefined && number <= row.after) {
+          // The list was asked for before the answer that fixed this row: it describes the upload as it was.
+          continue
         } else if (
           DRIVEN.has(row.phase.kind) ||
           row.phase.kind === 'stuck' ||
