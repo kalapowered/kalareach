@@ -256,6 +256,7 @@ impl RelayFront {
 
     /// The address the front listens on.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn address(&self) -> SocketAddr {
         self.address
     }

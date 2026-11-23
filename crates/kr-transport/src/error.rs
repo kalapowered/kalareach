@@ -204,6 +204,7 @@ impl RelayRefusalKind {
     /// Returns the token a relay starts its reason with for this kind, or `None` for
     /// [`Self::Unknown`], which has none.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn token(self) -> Option<&'static str> {
         Self::TOKENS
             .iter()

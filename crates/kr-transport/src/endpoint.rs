@@ -89,6 +89,7 @@ pub const IDLE_TIMEOUT: Duration = Duration::from_millis(INACTIVITY_THRESHOLD.ge
 ///
 /// Returns [`TransportError::Configuration`] when a selected service cannot be constructed, and
 /// [`TransportError::Bind`] when the socket cannot be bound.
+#[cfg(any(test, feature = "testing"))]
 pub async fn bind_listener(
     config: &EndpointConfig,
     identity: &TransportIdentityKeyPair,
@@ -123,6 +124,7 @@ pub async fn bind_listener_asking(
 /// # Errors
 ///
 /// As [`bind_listener`].
+#[cfg(any(test, feature = "testing"))]
 pub async fn bind_dialer(
     config: &EndpointConfig,
     identity: &TransportIdentityKeyPair,
@@ -147,6 +149,7 @@ pub async fn bind_dialer_asking(
 
 /// Builds the endpoint. `name_server` names the one name server it asks, where a test names one;
 /// a shipped build never does, and the endpoint then asks the system's and the public ones.
+#[cfg(any(test, feature = "testing"))]
 async fn bind(
     config: &EndpointConfig,
     identity: &TransportIdentityKeyPair,
@@ -466,6 +469,7 @@ impl EndpointCloser {
 
     /// Whether the end has started.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn closing(&self) -> bool {
         self.0.started.load(std::sync::atomic::Ordering::SeqCst)
     }

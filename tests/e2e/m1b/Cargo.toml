@@ -93,7 +93,8 @@ kr-plugin-sdk = { workspace = true, optional = true }
 kr-protocol.workspace = true
 # What `kr attach` draws is read back through the product's own terminal engine.
 kr-term = { workspace = true, optional = true }
-kr-transport = { workspace = true, optional = true }
+# The device leg binds its dialling endpoint through the entry point the transport builds for tests.
+kr-transport = { workspace = true, optional = true, features = ["testing"] }
 # Where the host's configuration document lives, as the host itself works it out.
 kr-worker = { workspace = true, optional = true }
 rustls-platform-verifier = { workspace = true, optional = true }

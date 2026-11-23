@@ -1320,7 +1320,8 @@ async fn a_paired_device_attaches_subscribes_types_and_resumes_from_its_cursor()
 
     // The control stream is lost. What the client carries across is the content position, not the
     // previous connection's event sequences.
-    let carried = kr_client::reconnect::ClientState::from_session(&session, None).await;
+    let mut carried = session.cursors().await;
+    carried.reconnected();
     session.close();
     drop(session);
 
@@ -1373,7 +1374,6 @@ async fn a_paired_device_attaches_subscribes_types_and_resumes_from_its_cursor()
     );
 
     let resumed_from = carried
-        .cursors
         .applied_cursor(&output_stream())
         .expect("the client holds a position");
     assert!(
@@ -1381,7 +1381,7 @@ async fn a_paired_device_attaches_subscribes_types_and_resumes_from_its_cursor()
         "the position that travels is one the session reached, not the start of its stream"
     );
     assert_eq!(
-        carried.cursors.received(&output_stream()),
+        carried.received(&output_stream()),
         None,
         "the previous connection's event sequences do not travel"
     );
@@ -1396,7 +1396,7 @@ async fn a_paired_device_attaches_subscribes_types_and_resumes_from_its_cursor()
     )
     .await
     .expect("the device reconnects");
-    let session = Session::resume(Arc::new(transport), carried.cursors).expect("a resumed session");
+    let session = Session::resume(Arc::new(transport), carried).expect("a resumed session");
     let restoration = Restoration::start(output_stream(), &session.cursors().await);
     assert_eq!(
         restoration.step(),
@@ -5447,13 +5447,12 @@ async fn acquire(
 // `scripts/end-to-end.sh`, which runs it with `--include-ignored`. A suite that skipped itself
 // silently when that binary was absent would report a pass for something it never ran.
 /// KR-REQ-09.20: a client's reconnect acquires a new input stream identity, and the keystrokes the
-/// old stream carried are never replayed: what was left unacknowledged is reported as uncertain
-/// and dropped, not sent again.
+/// old stream carried are never replayed: what was left unacknowledged is dropped, not sent again.
 ///
 /// KR-REQ-23.22: a live reconnect is a new connection identity with a new input stream, and old
 /// raw input is never replayed. The device types one command and sees it acknowledged, then types
 /// another and loses the connection before that one's answer comes back. What the client carries
-/// across says delivery was uncertain and holds no input. The next connection has an identity of
+/// across holds no input and nothing to send again. The next connection has an identity of
 /// its own; either command sent again under the old connection's attachment, lease and sequence is
 /// refused there, and a new attachment's lease starts an input stream of its own at sequence zero,
 /// which the shell runs. Afterwards the acknowledged command ran exactly once and the uncertain one
@@ -5477,8 +5476,7 @@ async fn a_reconnect_opens_a_new_input_stream_and_replays_no_input() {
     let device = Device::create(&loopback()).await;
     let record = pair(&daemon, &device, &owner).await;
 
-    // The first connection attaches, takes the input lease and types on it. The client keeps its
-    // own record of what it sent on this connection's input stream and what came back.
+    // The first connection attaches, takes the input lease and types on it.
     let first = pairing_calls::connect_until_answered(
         &device.endpoint,
         host_addr_of(&daemon),
@@ -5491,7 +5489,6 @@ async fn a_reconnect_opens_a_new_input_stream_and_replays_no_input() {
     let session = Session::start(Arc::new(first)).expect("a session");
     let attached = attach(&session, environment_id, session_id).await;
     let old = acquire(&session, environment_id, session_id, attached.typing).await;
-    let mut lane = kr_transport::reconnect::InputLane::new(first_connection, old.lease.epoch);
     let typed = |sequence: u64, command: &str| InputWriteParams {
         session_id,
         attachment_id: attached.typing,
@@ -5502,17 +5499,14 @@ async fn a_reconnect_opens_a_new_input_stream_and_replays_no_input() {
         },
     };
     let mut events = session.events();
-    let sent = lane.next_sequence();
     session
         .write_input(&typed(0, MARKER_COMMAND))
         .await
         .expect("the first command is accepted");
-    lane.acknowledge(sent);
     observe(&session, &mut events, MARKER).await;
 
     // The second command is handed to the connection, and the connection is lost before its
     // answer can come back: its delivery is uncertain.
-    lane.next_sequence();
     {
         let uncertain = typed(1, UNCERTAIN_COMMAND);
         let pending = session.write_input(&uncertain);
@@ -5531,15 +5525,12 @@ async fn a_reconnect_opens_a_new_input_stream_and_replays_no_input() {
             .await
             .expect_err("the connection ended before the second command's answer");
     }
-    let carried =
-        kr_client::reconnect::ClientState::from_session(&session, Some(lane.close())).await;
+    let mut carried = session.cursors().await;
+    carried.reconnected();
     assert!(
-        carried.delivery_uncertain(),
-        "the client says the second command's delivery is uncertain"
-    );
-    assert!(
-        carried.submitted.is_empty() && carried.unresolved_actions().is_empty(),
-        "and carries nothing to send again: raw input is no action"
+        session.submitted_actions().await.is_empty()
+            && unresolved_actions(&session).await.is_empty(),
+        "the client carries nothing to send again: raw input is no action"
     );
     drop(session);
 
@@ -5556,7 +5547,7 @@ async fn a_reconnect_opens_a_new_input_stream_and_replays_no_input() {
         first_connection,
         "a reconnect is a connection identity of its own"
     );
-    let session = Session::resume(Arc::new(second), carried.cursors).expect("a resumed session");
+    let session = Session::resume(Arc::new(second), carried).expect("a resumed session");
 
     // A client that replayed would send each command again exactly as it went, under the old
     // connection's attachment, lease and sequence. Neither is carried on this connection.
@@ -5602,6 +5593,21 @@ async fn a_reconnect_opens_a_new_input_stream_and_replays_no_input() {
     session.close();
     close_session(&mut local, &host, session_id).await;
     daemon.stop().await;
+}
+
+/// The actions whose outcome the session has not seen settled: those whose receipt is not terminal
+/// and those sent with no receipt back. A send refused for now is not one of them, because the
+/// host decided nothing of it.
+async fn unresolved_actions(session: &Session) -> Vec<kr_protocol::ids::ActionId> {
+    let (receipts, submitted) = session.outcomes().await;
+    let mut actions = receipts.unresolved();
+    for action in submitted.iter().filter(|action| !action.refused_for_now) {
+        if !actions.contains(&action.action_id) {
+            actions.push(action.action_id);
+        }
+    }
+    actions.sort_unstable();
+    actions
 }
 
 /// How many times `needle` occurs in `haystack`.

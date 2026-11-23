@@ -4,97 +4,14 @@
 //! after a stable connection. It creates a new connection identity and input stream; old raw input
 //! is never replayed. The client restores state through cursors and receipts.
 //!
-//! The backoff itself lives in `kr-transport`. What lives here is what a client carries across a
-//! disconnect and what it does not. [`ClientState`] is the carried half: cursors, so the next
-//! subscription starts where this one stopped, and receipts, so an action whose outcome is still
-//! unresolved is reported rather than resubmitted. Everything else is dropped, including every
-//! keystroke that had not been acknowledged.
+//! The backoff itself lives in `kr-transport`. What lives here is the loop that times the delay
+//! between attempts and decides when a connection counted as stable. A client carries its cursors
+//! across a disconnect ([`crate::session::Session::resume`]), so the next subscription starts where
+//! this one stopped, and nothing else: every keystroke that had not been acknowledged is dropped.
 
 use std::time::{Duration, Instant};
 
-use kr_transport::reconnect::{Backoff, InputInterruption};
-
-use crate::cursors::{ReceiptTracker, StreamCursors};
-use crate::session::Session;
-
-/// What a client keeps when a connection ends.
-#[derive(Clone, Debug, Default)]
-pub struct ClientState {
-    /// Where each subscribed stream had reached.
-    pub cursors: StreamCursors,
-    /// What each submitted action's receipt last said.
-    pub receipts: ReceiptTracker,
-    /// Actions that were sent and whose outcome the client never saw settled.
-    ///
-    /// These are exactly the ones a receipt tracker cannot name, because no receipt arrived. Each
-    /// carries the intent it was submitted for, so a person can be told which operation is
-    /// uncertain rather than which identifier is. The next connection asks the host what became of
-    /// them; it never submits them again. Asking is a repeat of the exact request the action was
-    /// sent as ([`Session::repeat`]): the host answers it from the record it kept, never by doing
-    /// the action again, and the library makes none by itself. Those marked
-    /// [`SubmittedAction::refused_for_now`](crate::session::SubmittedAction::refused_for_now) were
-    /// refused with a transient code: the host did nothing of them. The window they carried ended
-    /// with the connection and the request is not carried, so the next connection has nothing to
-    /// ask the host about them with. A caller that still wants one sends it again under its
-    /// identifier ([`Session::mutate_continuing`]), which the next connection composes under its own
-    /// window and the host performs at most once, or as a new request ([`Session::mutate`]), which
-    /// is the way where the host kept its refusal and refuses the identifier under another window.
-    pub submitted: Vec<crate::session::SubmittedAction>,
-    /// What the ended connection left uncertain, when it had an input lane.
-    pub interruption: Option<InputInterruption>,
-}
-
-impl ClientState {
-    /// Takes what a session had reached when it ended.
-    ///
-    /// The session's connection identity and input lane are deliberately not taken: the next
-    /// connection gets its own, and an acknowledgement position belongs to the connection that
-    /// produced it. Event sequences belong to the connection as well, and go the same way: what is
-    /// carried is how far each stream's *content* had been applied, which is what the next
-    /// subscription asks the host to resume from.
-    pub async fn from_session(session: &Session, interruption: Option<InputInterruption>) -> Self {
-        let (receipts, submitted) = session.outcomes().await;
-        let mut cursors = session.cursors().await;
-        cursors.reconnected();
-        Self {
-            cursors,
-            receipts,
-            submitted,
-            interruption,
-        }
-    }
-
-    /// Returns true when some input's delivery was left uncertain.
-    ///
-    /// The client displays an interruption in that case. It never resends.
-    #[must_use]
-    pub fn delivery_uncertain(&self) -> bool {
-        self.interruption
-            .is_some_and(|interruption| interruption.delivery_uncertain())
-    }
-
-    /// Returns the actions whose outcome is still unresolved.
-    ///
-    /// Both halves count: the ones whose receipt has not reached a terminal state, and the ones
-    /// that were sent without any receipt arriving at all. The actions the host refused for now are
-    /// not among them: `submitted` marks those.
-    #[must_use]
-    pub fn unresolved_actions(&self) -> Vec<kr_protocol::ids::ActionId> {
-        let mut actions = self.receipts.unresolved();
-        // An action the host refused for now is not one whose outcome is unresolved.
-        for action in self
-            .submitted
-            .iter()
-            .filter(|action| !action.refused_for_now)
-        {
-            if !actions.contains(&action.action_id) {
-                actions.push(action.action_id);
-            }
-        }
-        actions.sort_unstable();
-        actions
-    }
-}
+use kr_transport::reconnect::Backoff;
 
 /// Drives the delay between connection attempts.
 ///
@@ -148,9 +65,7 @@ impl ReconnectLoop {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kr_protocol::ids::{ConnectionId, InputLeaseEpoch, InputSequence};
-    use kr_protocol::scalars::Uuid;
-    use kr_transport::reconnect::{BACKOFF_MAX, BACKOFF_MIN, InputLane};
+    use kr_transport::reconnect::{BACKOFF_MAX, BACKOFF_MIN};
 
     #[test]
     fn the_delay_grows_until_a_connection_lasts() {
@@ -161,45 +76,5 @@ mod tests {
             assert!(delay >= BACKOFF_MIN && delay <= BACKOFF_MAX);
         }
         assert_eq!(loop_.ceiling(), BACKOFF_MAX);
-    }
-
-    /// KR-REQ-23.22: what a client carries across a disconnect reports input the old connection left
-    /// unacknowledged as uncertain, and holds no input of its own to send again.
-    ///
-    /// KR-REQ-09.20: a reconnect discards unsent keystrokes and says delivery was uncertain.
-    #[test]
-    fn unacknowledged_input_is_reported_and_never_resent() {
-        let mut lane = InputLane::new(
-            ConnectionId::new(Uuid::from_bytes([1; 16])),
-            InputLeaseEpoch::new(1),
-        );
-        lane.next_sequence();
-        lane.next_sequence();
-        lane.acknowledge(InputSequence::new(1));
-
-        let state = ClientState {
-            interruption: Some(lane.close()),
-            ..ClientState::default()
-        };
-        assert!(state.delivery_uncertain());
-        // Nothing in the carried state can address the old connection's input lane, so there is no
-        // way to resend what it dropped.
-        assert!(state.cursors.is_empty());
-    }
-
-    /// KR-REQ-09.20: a client shows an interruption only when delivery was uncertain.
-    #[test]
-    fn a_fully_acknowledged_lane_is_not_an_interruption() {
-        let mut lane = InputLane::new(
-            ConnectionId::new(Uuid::from_bytes([1; 16])),
-            InputLeaseEpoch::new(1),
-        );
-        lane.next_sequence();
-        lane.acknowledge(InputSequence::new(1));
-        let state = ClientState {
-            interruption: Some(lane.close()),
-            ..ClientState::default()
-        };
-        assert!(!state.delivery_uncertain());
     }
 }

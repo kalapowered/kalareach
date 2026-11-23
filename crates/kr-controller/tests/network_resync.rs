@@ -28,7 +28,6 @@ use std::time::Duration;
 
 use kr_client::cursors::{Restoration, RestorationStep};
 use kr_client::projection::{Applied, Projection, Screen};
-use kr_client::reconnect::ClientState;
 use kr_client::session::Session;
 use kr_crypto::keys::DeviceKeys;
 use kr_protocol::attachment::{
@@ -394,9 +393,9 @@ async fn a_paired_device_behind_the_bounded_history_is_told_of_the_gap_and_sent_
         shown(first.projection.screen().expect("a screen")).contains(READY),
         "the first screen carries what the application printed"
     );
-    let carried = ClientState::from_session(&session, None).await;
+    let mut carried = session.cursors().await;
+    carried.reconnected();
     let held = carried
-        .cursors
         .applied_cursor(&output_stream())
         .expect("the device holds a position")
         .get();
@@ -428,8 +427,7 @@ async fn a_paired_device_behind_the_bounded_history_is_told_of_the_gap_and_sent_
     .await;
 
     // The return, with the position the ended connection carried.
-    let session =
-        Session::resume(Arc::new(dial.dial().await), carried.cursors).expect("a resumed session");
+    let session = Session::resume(Arc::new(dial.dial().await), carried).expect("a resumed session");
     let mut second = join(&session, host.environment_id, worker.session_id).await;
     assert_eq!(
         second.began,

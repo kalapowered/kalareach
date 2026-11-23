@@ -37,6 +37,7 @@
 //! where nothing iroh exposes says when they leave. So this bounds what the application offers the
 //! connection; it reserves no capacity inside the window.
 
+#[cfg(any(test, feature = "testing"))]
 use std::future::Future;
 use std::sync::{Arc, Mutex};
 
@@ -405,24 +406,28 @@ impl StreamBudget {
     /// refused again makes a new wait and waits again. A write larger than
     /// [`SendLimits::ceiling_for`] its class is refused for good: no room given back admits it, and
     /// its writer must not wait.
+    #[cfg(any(test, feature = "testing"))]
     pub fn released(&self) -> impl Future<Output = ()> + '_ {
         self.released.notified()
     }
 
     /// Returns how many bulk streams are open.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn open_bulk_streams(&self) -> usize {
         self.lock().open_bulk_streams
     }
 
     /// Returns how many bytes the application is handing the connection.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn queued_bytes(&self) -> usize {
         self.lock().queued_bytes
     }
 
     /// Returns how many of those bytes belong to bulk streams.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn bulk_queued_bytes(&self) -> usize {
         self.lock().bulk_queued_bytes
     }
@@ -458,6 +463,7 @@ pub struct QueueReservation {
 impl QueueReservation {
     /// Returns the reserved size.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn bytes(&self) -> usize {
         self.bytes
     }

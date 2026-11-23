@@ -67,6 +67,7 @@ impl DispatchLease {
 
     /// Returns how long the lease has left, or zero once it has expired.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn remaining(&self, now: ContinuousInstant) -> Duration {
         self.deadline.saturating_duration_since(now)
     }
@@ -103,6 +104,7 @@ pub struct RevocationStatus {
 impl RevocationStatus {
     /// Returns true when every affected worker has acknowledged or ended.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn is_complete(&self) -> bool {
         self.pending.is_empty()
     }
@@ -137,6 +139,7 @@ pub struct WorkerBinding(u64);
 impl WorkerBinding {
     /// Returns the raw value, for a host that records it.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn get(self) -> u64 {
         self.0
     }
@@ -304,6 +307,7 @@ impl LeaseIssuer {
 
     /// Returns whether the issuer holds a record of this worker.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn holds(&self, session_id: SessionId) -> bool {
         self.lock().workers.contains_key(&session_id)
     }

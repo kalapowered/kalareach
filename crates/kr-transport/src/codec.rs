@@ -79,6 +79,7 @@ impl FrameWriter {
 
     /// Returns the stream kind.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn kind(&self) -> StreamKind {
         self.codec.kind()
     }
@@ -98,6 +99,7 @@ impl FrameWriter {
     /// scheduler's decision observable: a stream whose priority was never applied answers the
     /// connection's default of zero.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn priority(&self) -> Option<i32> {
         self.stream.priority().ok()
     }
@@ -447,6 +449,7 @@ impl FrameReader {
 
     /// Returns the stream kind.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn kind(&self) -> StreamKind {
         self.codec.kind()
     }
@@ -513,6 +516,7 @@ impl FrameReader {
     /// # Errors
     ///
     /// As [`FrameReader::read_message`], without the deserialisation step.
+    #[cfg(any(test, feature = "testing"))]
     pub async fn read_payload(&mut self) -> Result<Option<Vec<u8>>> {
         self.read_payload_within(self.max_payload).await
     }

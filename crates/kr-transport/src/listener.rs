@@ -27,7 +27,9 @@ use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
 use crate::actor::ConnectionActor;
-use crate::clock::{ContinuousClock, ContinuousInstant, SystemContinuousClock};
+#[cfg(any(test, feature = "testing"))]
+use crate::clock::SystemContinuousClock;
+use crate::clock::{ContinuousClock, ContinuousInstant};
 use crate::codec::{FrameReader, FrameWriter};
 use crate::config::EndpointConfig;
 use crate::deadlines::{Deadlines, TimerDeadlines};
@@ -372,6 +374,7 @@ impl ReceivedFrame {
 
     /// When the host read it, on its continuous clock.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn received_at(&self) -> ContinuousInstant {
         self.received_at
     }
@@ -883,6 +886,7 @@ pub struct NetworkListener {
     /// The task that closes the endpoint once the connections have ended, when
     /// [`Self::end_connections`] started one, which [`Self::shutdown`] then waits for.
     winding_down: std::sync::Mutex<Option<JoinHandle<()>>>,
+    #[cfg(any(test, feature = "testing"))]
     windows: Arc<ActionWindowIssuer>,
 }
 
@@ -907,12 +911,14 @@ impl NetworkListener {
 
     /// Returns this host's endpoint identity.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn endpoint_id(&self) -> EndpointKey {
         EndpointKey::from_bytes(*self.endpoint.id().as_bytes())
     }
 
     /// Returns the action-window issuer, so the host can validate a window a request names.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn windows(&self) -> &Arc<ActionWindowIssuer> {
         &self.windows
     }
@@ -978,6 +984,7 @@ impl Drop for NetworkListener {
 /// # Errors
 ///
 /// Returns a configuration or bind failure. Once it returns, the listener is accepting.
+#[cfg(any(test, feature = "testing"))]
 pub async fn register<H: HostHandler>(
     config: ListenerConfig,
     identity: Arc<LocalIdentity>,
@@ -1043,6 +1050,7 @@ pub async fn register_with_clock<H: HostHandler>(
         connections,
         runtime: tokio::runtime::Handle::current(),
         winding_down: std::sync::Mutex::new(None),
+        #[cfg(any(test, feature = "testing"))]
         windows,
     })
 }

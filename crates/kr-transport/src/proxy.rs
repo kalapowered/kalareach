@@ -116,6 +116,7 @@ impl ProxyLoginFailure {
 
     /// The kind.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn kind(&self) -> ProxyLoginKind {
         self.kind
     }

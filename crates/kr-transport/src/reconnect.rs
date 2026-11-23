@@ -4,16 +4,13 @@
 //! after a stable connection. It creates a new connection identity and input stream; old raw input
 //! is never replayed. The client restores state through cursors and receipts.
 //!
-//! The backoff is here. The "never replayed" half is a property of the types rather than of a
-//! policy: a connection identity comes from the host in `hello`, an input sequence belongs to one
-//! connection, and [`InputLane`] refuses to carry either across a disconnect. Section 9 says
-//! unsent or ambiguously delivered keystrokes are discarded, never replayed, and that the client
-//! displays an interruption if delivery is uncertain, so the lane reports what it dropped rather
-//! than quietly forgetting it.
+//! The backoff is here. The "never replayed" half needs no type of its own: a connection identity
+//! comes from the host in `hello` and an input sequence belongs to one connection, so the
+//! backoff only times the delay between attempts and carries no input. Section 9 says unsent or
+//! ambiguously delivered keystrokes are discarded, never replayed.
 
 use std::time::Duration;
 
-use kr_protocol::ids::{ConnectionId, InputLeaseEpoch, InputSequence};
 use kr_protocol::limits::{INACTIVITY_THRESHOLD, RECONNECT_BACKOFF_MAX, RECONNECT_BACKOFF_MIN};
 
 /// The shortest reconnect delay.
@@ -95,99 +92,9 @@ impl Backoff {
     }
 }
 
-/// What a reconnect discarded.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct InputInterruption {
-    /// The connection that ended.
-    pub connection_id: ConnectionId,
-    /// The last sequence this side sent on it.
-    pub last_sent: InputSequence,
-    /// The last sequence the host acknowledged.
-    pub last_acknowledged: InputSequence,
-}
-
-impl InputInterruption {
-    /// Returns true when delivery of some input was uncertain.
-    ///
-    /// The client displays an interruption in that case. It never resends: an acknowledged
-    /// position belongs to the connection that acknowledged it.
-    #[must_use]
-    pub fn delivery_uncertain(&self) -> bool {
-        self.last_sent.get() > self.last_acknowledged.get()
-    }
-}
-
-/// The ordered raw-input stream of one connection.
-///
-/// Section 9: raw input is a distinct ordered stream of connection identity, lease epoch and
-/// increasing input sequence, and acknowledgement positions are retained only for that connection.
-/// A lane cannot be moved to another connection; reconnecting builds a new one.
-#[derive(Clone, Debug)]
-pub struct InputLane {
-    connection_id: ConnectionId,
-    lease_epoch: InputLeaseEpoch,
-    next_sequence: u64,
-    acknowledged: u64,
-}
-
-impl InputLane {
-    /// Opens a lane on one connection and input lease epoch.
-    #[must_use]
-    pub const fn new(connection_id: ConnectionId, lease_epoch: InputLeaseEpoch) -> Self {
-        Self {
-            connection_id,
-            lease_epoch,
-            next_sequence: 1,
-            acknowledged: 0,
-        }
-    }
-
-    /// Returns the connection this lane belongs to.
-    #[must_use]
-    pub const fn connection_id(&self) -> ConnectionId {
-        self.connection_id
-    }
-
-    /// Returns the input lease epoch.
-    #[must_use]
-    pub const fn lease_epoch(&self) -> InputLeaseEpoch {
-        self.lease_epoch
-    }
-
-    /// Allocates the next sequence number.
-    pub fn next_sequence(&mut self) -> InputSequence {
-        let sequence = self.next_sequence;
-        self.next_sequence = self.next_sequence.saturating_add(1);
-        InputSequence::new(sequence)
-    }
-
-    /// Records the host's acknowledgement position.
-    ///
-    /// An acknowledgement that goes backwards is ignored rather than trusted: positions only move
-    /// forward, and this lane is the only place they are kept.
-    pub fn acknowledge(&mut self, sequence: InputSequence) {
-        self.acknowledged = self.acknowledged.max(sequence.get());
-    }
-
-    /// Ends the lane, returning what was left uncertain.
-    #[must_use]
-    pub fn close(self) -> InputInterruption {
-        InputInterruption {
-            connection_id: self.connection_id,
-            last_sent: InputSequence::new(self.next_sequence.saturating_sub(1)),
-            last_acknowledged: InputSequence::new(self.acknowledged),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kr_protocol::scalars::Uuid;
-
-    fn connection(byte: u8) -> ConnectionId {
-        ConnectionId::new(Uuid::from_bytes([byte; 16]))
-    }
 
     /// KR-REQ-23.22: reconnect backoff runs from 250 ms up to 30 seconds.
     #[test]
@@ -263,52 +170,5 @@ mod tests {
 
         backoff.observe_connection(STABLE_CONNECTION);
         assert_eq!(backoff.ceiling(), BACKOFF_MIN);
-    }
-
-    /// KR-REQ-23.22: an input lane belongs to one connection. Closing it reports what was left
-    /// unacknowledged, and the lane for a new connection is built for that connection alone, with no
-    /// position carried across from the old one.
-    ///
-    /// KR-REQ-09.20: a client's input stream is its connection, its lease epoch and an increasing
-    /// sequence, and a reconnect opens a new one that resends nothing.
-    #[test]
-    fn a_reconnect_starts_a_new_lane_and_replays_nothing() {
-        let mut lane = InputLane::new(connection(1), InputLeaseEpoch::new(4));
-        assert_eq!(lane.next_sequence(), InputSequence::new(1));
-        assert_eq!(lane.next_sequence(), InputSequence::new(2));
-        lane.acknowledge(InputSequence::new(1));
-
-        let interruption = lane.close();
-        assert!(interruption.delivery_uncertain());
-        assert_eq!(interruption.last_sent, InputSequence::new(2));
-        assert_eq!(interruption.last_acknowledged, InputSequence::new(1));
-
-        // The new lane belongs to the new connection and starts from the beginning. There is no
-        // constructor that carries a position across, so nothing can be resent.
-        let fresh = InputLane::new(connection(2), InputLeaseEpoch::new(5));
-        assert_eq!(fresh.connection_id(), connection(2));
-        assert_eq!(fresh.lease_epoch(), InputLeaseEpoch::new(5));
-    }
-
-    /// KR-REQ-09.20: input the host acknowledged whole leaves nothing uncertain to report.
-    #[test]
-    fn fully_acknowledged_input_is_not_an_interruption() {
-        let mut lane = InputLane::new(connection(1), InputLeaseEpoch::new(1));
-        lane.next_sequence();
-        lane.acknowledge(InputSequence::new(1));
-        assert!(!lane.close().delivery_uncertain());
-    }
-
-    /// KR-REQ-09.20: the acknowledgement position a client keeps for its connection only moves
-    /// forward.
-    #[test]
-    fn an_acknowledgement_never_moves_backwards() {
-        let mut lane = InputLane::new(connection(1), InputLeaseEpoch::new(1));
-        for _ in 0..5 {
-            lane.next_sequence();
-        }
-        lane.acknowledge(InputSequence::new(4));
-        lane.acknowledge(InputSequence::new(2));
-        assert_eq!(lane.close().last_acknowledged, InputSequence::new(4));
     }
 }

@@ -108,12 +108,14 @@ impl HostServices {
 
     /// The host's endpoint identity.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn identity(&self) -> EndpointId {
         self.identity
     }
 
     /// The relays this host puts into the endpoint's relay map.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn relays(&self) -> &BTreeSet<RelayUrl> {
         &self.relays
     }

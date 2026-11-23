@@ -178,12 +178,14 @@ pub struct AuthorisedConnection {
 impl AuthorisedConnection {
     /// Returns the limits both sides negotiated.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn limits(&self) -> ReceiveLimits {
         self.selection.limits
     }
 
     /// Returns the protocol version in force.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn version(&self) -> ProtocolVersion {
         self.selection.selected_version
     }
@@ -212,6 +214,7 @@ pub struct UnpairedConnection {
 ///
 /// Returns the failure this side records. The peer has already been told, in the reply frame, the
 /// stable code it needs; the detail stays here.
+#[cfg(any(test, feature = "testing"))]
 pub async fn accept(
     connection: &Connection,
     identity: &LocalIdentity,

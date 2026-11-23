@@ -560,7 +560,6 @@ fn question_to_answer(
 #[test]
 fn a_device_uses_an_agent_in_a_managed_shell_and_reattaches_to_the_screen_kr_attach_draws() {
     use kr_client::cursors::StreamCursors;
-    use kr_client::reconnect::ClientState;
     use kr_e2e_m1b::agent::{ANSWERED, ASKED, Agent, ENDED, ERASED, WENT_ON};
     use kr_e2e_m1b::device::Device;
     use kr_e2e_m1b::host::quoted;
@@ -806,11 +805,22 @@ fn a_device_uses_an_agent_in_a_managed_shell_and_reattaches_to_the_screen_kr_att
         .unwrap_or_else(|why| panic!("{why}"));
     let before = content(&view.rows());
     let typed_before = view.acknowledged();
-    let carried = runtime.block_on(ClientState::from_session(remote.session(), None));
+    let mut carried = runtime.block_on(remote.session().cursors());
+    carried.reconnected();
+    let (receipts, submitted) = runtime.block_on(remote.session().outcomes());
+    let unresolved: Vec<_> = receipts
+        .unresolved()
+        .into_iter()
+        .chain(
+            submitted
+                .iter()
+                .filter(|action| !action.refused_for_now)
+                .map(|action| action.action_id),
+        )
+        .collect();
     assert!(
-        carried.unresolved_actions().is_empty(),
-        "every action the device submitted was settled before it detached: {:?}",
-        carried.unresolved_actions()
+        unresolved.is_empty(),
+        "every action the device submitted was settled before it detached: {unresolved:?}"
     );
     let _ = runtime
         .block_on(view.detach(&remote))
@@ -838,15 +848,10 @@ fn a_device_uses_an_agent_in_a_managed_shell_and_reattaches_to_the_screen_kr_att
     // drawn the screen as it now is: the agent's current line, not the one it erased, and no
     // clipboard write or bell replayed.
     let remote = runtime
-        .block_on(device.reconnect(&paired, carried.cursors.clone()))
+        .block_on(device.reconnect(&paired, carried.clone()))
         .unwrap_or_else(|why| panic!("the device reconnects: {why}"));
     let mut view = runtime
-        .block_on(View::attach(
-            &remote,
-            session_id,
-            dimensions,
-            &carried.cursors,
-        ))
+        .block_on(View::attach(&remote, session_id, dimensions, &carried))
         .unwrap_or_else(|why| panic!("the device reattaches: {why}"));
     let rows = runtime
         .block_on(view.wait_for(&remote, WENT_ON, LIVENESS))

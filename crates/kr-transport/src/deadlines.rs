@@ -45,6 +45,7 @@ pub enum DeadlineKind {
 
 impl DeadlineKind {
     /// Every kind, in declaration order.
+    #[cfg(any(test, feature = "testing"))]
     pub const ALL: [Self; 5] = [
         Self::Header,
         Self::Admission,

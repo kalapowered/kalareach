@@ -66,6 +66,7 @@ impl ConnectionActor {
     /// caller and a host-stamped freshness context, without pretending to be a paired network
     /// device.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn local_peer(
         actor_id: ActorId,
         controller_generation: ControllerGeneration,
@@ -107,6 +108,7 @@ impl ConnectionActor {
 
     /// Returns the connection identity.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn connection_id(&self) -> ConnectionId {
         self.connection_id
     }

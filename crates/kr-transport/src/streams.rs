@@ -153,6 +153,7 @@ impl DataStream {
 
     /// Returns the stream kind.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn kind(&self) -> StreamKind {
         self.reader.header().kind
     }
@@ -175,6 +176,7 @@ impl DataStream {
     /// so a caller can see that the scheduler's decision reached the connection rather than only
     /// that the scheduler made it.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn priority(&self) -> Option<i32> {
         self.writer.priority()
     }
@@ -227,6 +229,7 @@ impl DataStream {
     /// # Errors
     ///
     /// As [`DataStream::write_message`].
+    #[cfg(any(test, feature = "testing"))]
     pub async fn write_message_while<T: serde::Serialize + ?Sized>(
         &mut self,
         message: &T,
@@ -240,6 +243,7 @@ impl DataStream {
     /// # Errors
     ///
     /// As [`DataStream::write_message`].
+    #[cfg(any(test, feature = "testing"))]
     pub async fn write_payload(&mut self, payload: &[u8]) -> Result<()> {
         self.writer.write_payload(payload).await
     }
@@ -251,6 +255,7 @@ impl DataStream {
     /// Returns [`TransportError::ControlLost`] when the stream is revoked while the read is
     /// waiting, [`TransportError::Deadline`] when the peer stopped sending, and a framing or
     /// stream failure otherwise.
+    #[cfg(any(test, feature = "testing"))]
     pub async fn read_payload(&mut self) -> Result<Option<Vec<u8>>> {
         self.reader.read_payload().await
     }
@@ -301,6 +306,7 @@ impl DataReader {
     /// while it waits, [`TransportError::Deadline`] when the peer left the wait for a frame, or
     /// the frame itself, longer than its deadline allows, and a framing or stream failure
     /// otherwise. A read that was cut revokes the stream, so the writing half stops too.
+    #[cfg(any(test, feature = "testing"))]
     pub async fn read_payload(&mut self) -> Result<Option<Vec<u8>>> {
         if self.handle.is_revoked() {
             return Err(TransportError::ControlLost);
@@ -357,18 +363,21 @@ pub struct DataWriter {
 impl DataWriter {
     /// Returns the stream kind.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn kind(&self) -> StreamKind {
         self.kind
     }
 
     /// Returns the handle that revokes the stream, which both halves share.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn handle(&self) -> StreamHandle {
         self.handle.clone()
     }
 
     /// Returns true once the stream has been revoked.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn is_revoked(&self) -> bool {
         self.handle.is_revoked()
     }
@@ -376,6 +385,7 @@ impl DataWriter {
     /// Returns the send priority the connection is using for this stream, or `None` once the
     /// stream is closed.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn priority(&self) -> Option<i32> {
         self.writer.priority()
     }
@@ -456,6 +466,7 @@ impl DataWriter {
     /// # Errors
     ///
     /// As [`DataStream::write_message`].
+    #[cfg(any(test, feature = "testing"))]
     pub async fn write_payload(&mut self, payload: &[u8]) -> Result<()> {
         if self.handle.is_revoked() {
             return Err(TransportError::ControlLost);
@@ -865,6 +876,7 @@ impl RegistryState {
 impl StreamRegistry {
     /// Creates a registry for one connection.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn new(
         connection_id: ConnectionId,
         budget: Arc<StreamBudget>,
@@ -926,12 +938,14 @@ impl StreamRegistry {
 
     /// Returns the connection these streams belong to.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn connection_id(&self) -> ConnectionId {
         self.state.connection_id
     }
 
     /// Returns the shared send budget.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn budget(&self) -> &Arc<StreamBudget> {
         &self.state.budget
     }
@@ -1102,12 +1116,14 @@ impl StreamRegistry {
 
     /// Returns how many data streams are open.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn len(&self) -> usize {
         self.state.lock().open.len()
     }
 
     /// Returns true when no data stream is open.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }

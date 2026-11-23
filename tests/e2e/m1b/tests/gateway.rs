@@ -20,7 +20,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use kr_client::cursors::StreamCursors;
-use kr_client::reconnect::ClientState;
 use kr_e2e_m1b::device::{Device, PairedHost, Remote};
 use kr_e2e_m1b::host::{Host, HostOptions, Preparation};
 use kr_e2e_m1b::run::{Run, ended_within, groups, running};
@@ -1577,9 +1576,8 @@ fn kr_acc_006_a_daemon_killed_while_the_terminal_writes_leaves_its_agent_and_a_r
         .runtime
         .block_on(view.wait_for(&remote, "TUI: tick 3", LIVENESS))
         .unwrap_or_else(|why| panic!("{why}"));
-    let carried = ctx
-        .runtime
-        .block_on(ClientState::from_session(remote.session(), None));
+    let mut carried = ctx.runtime.block_on(remote.session().cursors());
+    carried.reconnected();
     drop(view);
 
     // The daemon is killed, and the terminal goes on writing with no daemon to read it.
@@ -1620,7 +1618,7 @@ fn kr_acc_006_a_daemon_killed_while_the_terminal_writes_leaves_its_agent_and_a_r
     }
     let remote = ctx
         .runtime
-        .block_on(device.reconnect(&paired, carried.cursors.clone()))
+        .block_on(device.reconnect(&paired, carried.clone()))
         .unwrap_or_else(|why| panic!("the device reconnects: {why}"));
     let mut view = ctx
         .runtime
@@ -1628,7 +1626,7 @@ fn kr_acc_006_a_daemon_killed_while_the_terminal_writes_leaves_its_agent_and_a_r
             &remote,
             person.session_id,
             dimensions,
-            &carried.cursors,
+            &carried,
         ))
         .unwrap_or_else(|why| panic!("the device attaches again: {why}"));
     let after = ctx.instances(&remote, person.session_id);

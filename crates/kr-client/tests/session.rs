@@ -959,15 +959,13 @@ async fn a_reconnect_subscribes_from_its_cursor_before_installing_a_snapshot() {
     session.applied(&stream_id, EventSequence::new(2)).await;
     session.applied_content(&stream_id, U64::new(4_096)).await;
 
-    let carried = kr_client::reconnect::ClientState::from_session(&session, None).await;
+    let mut carried = session.cursors().await;
+    carried.reconnected();
     // The sequences belonged to the connection that produced them and are gone; the content
     // position is what the next subscription resumes from.
-    assert_eq!(carried.cursors.received(&stream_id), None);
-    assert_eq!(
-        carried.cursors.applied_cursor(&stream_id),
-        Some(U64::new(4_096))
-    );
-    let mut second = Restoration::start(stream_id.clone(), &carried.cursors);
+    assert_eq!(carried.received(&stream_id), None);
+    assert_eq!(carried.applied_cursor(&stream_id), Some(U64::new(4_096)));
+    let mut second = Restoration::start(stream_id.clone(), &carried);
     assert_eq!(
         second.step(),
         RestorationStep::SubscribeFrom(U64::new(4_096)),
@@ -1265,8 +1263,7 @@ async fn an_unsettled_submission_carries_the_intent_it_was_made_for() {
         EnvironmentId::new(Uuid::from_bytes([9; 16]))
     );
 
-    let carried = kr_client::reconnect::ClientState::from_session(&session, None).await;
-    assert_eq!(carried.unresolved_actions(), vec![receipt.action_id]);
+    assert_eq!(unresolved_actions(&session).await, vec![receipt.action_id]);
 
     session.close();
     serving.abort();
@@ -2055,9 +2052,8 @@ async fn sends_refused_for_now_do_not_use_up_the_bound_on_unresolved_actions() {
         KEPT_FOR_NOW,
         "the sends refused for now are marked"
     );
-    let carried = kr_client::reconnect::ClientState::from_session(&session, None).await;
     assert_eq!(
-        carried.unresolved_actions().len(),
+        unresolved_actions(&session).await.len(),
         MAX_UNRESOLVED_ACTIONS,
         "a send refused for now is not one whose outcome is unresolved"
     );
@@ -5252,4 +5248,19 @@ async fn a_receipt_held_for_an_action_stops_a_changed_request_under_it() {
     );
     session.close();
     serving.abort();
+}
+
+/// The actions whose outcome the session has not seen settled: those whose receipt is not terminal
+/// and those sent with no receipt back. A send refused for now is not one of them, because the
+/// host decided nothing of it.
+async fn unresolved_actions(session: &Session) -> Vec<kr_protocol::ids::ActionId> {
+    let (receipts, submitted) = session.outcomes().await;
+    let mut actions = receipts.unresolved();
+    for action in submitted.iter().filter(|action| !action.refused_for_now) {
+        if !actions.contains(&action.action_id) {
+            actions.push(action.action_id);
+        }
+    }
+    actions.sort_unstable();
+    actions
 }

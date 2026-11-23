@@ -688,9 +688,10 @@ impl Session {
 
     /// Starts a session that carries what a previous connection had reached.
     ///
-    /// This is the client half of section 8's restoration: the cursors come from
-    /// [`crate::reconnect::ClientState`], which kept each stream's content position and dropped the
-    /// previous connection's event sequences.
+    /// This is the client half of section 8's restoration: the cursors are the ones the ended
+    /// session had reached ([`Session::cursors`]), after
+    /// [`StreamCursors::reconnected`](crate::cursors::StreamCursors::reconnected) kept each stream's
+    /// content position and dropped the previous connection's event sequences.
     ///
     /// # Errors
     ///

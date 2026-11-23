@@ -212,6 +212,7 @@ impl ProxyUrl {
 
     /// Returns this proxy with no login.
     #[must_use]
+    #[cfg(test)]
     pub fn without_login(mut self) -> Self {
         self.login = None;
         self

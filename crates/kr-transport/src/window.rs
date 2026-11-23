@@ -199,6 +199,7 @@ impl ActionWindowIssuer {
     /// # Errors
     ///
     /// Returns the window refusal when the window cannot first-admit anything.
+    #[cfg(any(test, feature = "testing"))]
     pub fn accept(
         &self,
         action_window_id: &ActionWindowId,

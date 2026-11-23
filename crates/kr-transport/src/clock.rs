@@ -22,6 +22,7 @@
 //! a clock this crate has not qualified.
 
 use std::sync::Arc;
+#[cfg(any(test, feature = "testing"))]
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -101,11 +102,13 @@ impl ContinuousClock for SystemContinuousClock {
 ///
 /// Deadline behaviour is the part of this crate that is hardest to observe from the outside, so the
 /// tests advance time rather than sleeping through it.
+#[cfg(any(test, feature = "testing"))]
 #[derive(Clone, Debug, Default)]
 pub struct ManualClock {
     nanos: Arc<AtomicU64>,
 }
 
+#[cfg(any(test, feature = "testing"))]
 impl ManualClock {
     /// Creates a clock anchored at zero.
     #[must_use]
@@ -120,6 +123,7 @@ impl ManualClock {
     }
 }
 
+#[cfg(any(test, feature = "testing"))]
 impl ContinuousClock for ManualClock {
     fn now(&self) -> ContinuousInstant {
         ContinuousInstant(Duration::from_nanos(self.nanos.load(Ordering::Acquire)))

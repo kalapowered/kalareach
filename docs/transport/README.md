@@ -772,10 +772,10 @@ through.
   fleet that lost the same relay does not return in step. The ladder resets after a connection that
   lasted at least the inactivity threshold; a connection that died immediately does not reset it.
 
-A reconnect creates a new connection identity and a new input lane. Raw input is never replayed: an
-input sequence belongs to one connection, acknowledgement positions are retained only for that
-connection, and `InputLane` has no constructor that carries a position across. What the old lane
-left unacknowledged is reported as an interruption, not resent.
+A reconnect creates a new connection identity and a new input stream. Raw input is never replayed:
+an input sequence belongs to one connection, acknowledgement positions are retained only for that
+connection, and the reconnect loop times the delay between attempts and carries no input. What the
+old stream left unacknowledged is dropped, not resent.
 
 The client restores state through cursors and receipts. `Restoration` enforces the order, and
 refuses a step taken out of it: subscribe from the cursor *first*, then install the snapshot the

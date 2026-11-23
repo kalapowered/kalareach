@@ -45,7 +45,6 @@ use std::time::{Duration, Instant};
 use kr_client::cursors::{Restoration, RestorationStep};
 use kr_client::projection::paint::{Keyboard, Window};
 use kr_client::projection::{Applied, Projection};
-use kr_client::reconnect::ClientState;
 use kr_client::session::Session;
 use kr_crypto::keys::DeviceKeys;
 use kr_protocol::attachment::{
@@ -275,7 +274,8 @@ async fn a_paired_device_that_comes_back_has_a_painted_screen_inside_the_reconne
         painted.contains(LAST_LINE),
         "the screen carries the session's text"
     );
-    let carried = ClientState::from_session(&session, None).await;
+    let mut carried = session.cursors().await;
+    carried.reconnected();
     session.close();
     until("the host to record that the connection ended", || async {
         (host.connections_of(&record) == 0).then_some(())
@@ -290,7 +290,7 @@ async fn a_paired_device_that_comes_back_has_a_painted_screen_inside_the_reconne
     // The return: the clock starts as the device dials, and nothing has been asked of the host.
     let started = Instant::now();
     let transport = dial.dial().await;
-    let session = Session::resume(Arc::new(transport), carried.cursors).expect("a resumed session");
+    let session = Session::resume(Arc::new(transport), carried).expect("a resumed session");
     let (elapsed, painted, began) =
         restored(&session, host.environment_id, worker.session_id, started).await;
     assert!(
