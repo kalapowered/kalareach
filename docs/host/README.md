@@ -1143,7 +1143,10 @@ whole when this host reads it, with "the description process's memory ceiling is
 most 4 GiB" or "the description reserve is at least 1 GiB". A document that does not use the
 ceiling has no `description_budgets` member. The member raised the document's version to 4, and a
 release that lacks it refuses a document that holds it rather than run descriptions with more
-memory than the owner allowed. Restoring a backup never sets or clears it.
+memory than the owner allowed. Restoring a backup never sets or clears it. A document that is
+absent, or that this build cannot read, decides nothing about the budgets: the ones this host last
+accepted stay in force, as the session number does, and the report says so. The daemon takes the
+budgets from the same reading the report describes.
 
 A secret is never in the document. `secrets` holds named references: what this configuration calls
 it, which secure store it lives in and its name inside that store. There is no field a value would

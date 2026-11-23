@@ -1925,6 +1925,69 @@ async fn the_owners_description_budgets_apply_to_the_next_admission_without_a_re
     environment.stop().await;
 }
 
+/// KR-REQ-22.10: a document that decides nothing leaves the description budgets this host
+/// accepted, as it leaves a session number: the owner's file removed, or one this build cannot read,
+/// does not return descriptions to section 22's defaults, and the report prints the ceiling in
+/// force. A document that is back and names no budget is the owner's choice, and is the defaults.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_document_that_decides_nothing_leaves_the_description_budgets_this_host_accepted() {
+    let environment = Environment::start(Setup::new()).await;
+    let paused = |setup: &kr_protocol::describe::DescriptionSetup| {
+        setup.paused.0 == Some(DescriptionPause::MemoryReserve)
+    };
+    let not_paused = |setup: &kr_protocol::describe::DescriptionSetup| setup.paused.0.is_none();
+    let ceiling_in_force = |report: &kr_protocol::hostinfo::EffectiveConfiguration| {
+        report
+            .ceilings
+            .iter()
+            .find(|ceiling| ceiling.key == "description_budgets.process_memory_bytes")
+            .expect("the report has the ceiling")
+            .value
+            .clone()
+            .render()
+    };
+    let path = environment
+        .controller()
+        .configuration()
+        .document()
+        .to_path_buf();
+
+    the_owner_chooses(&environment, Some(1), None).await;
+    environment.setup_until("the ceiling's pause", paused).await;
+
+    // The file goes: nothing decides, and the ceiling stays.
+    std::fs::remove_file(&path).expect("the owner removes the document");
+    let report = environment.controller().effective_configuration().await;
+    assert_eq!(
+        report.status.state,
+        kr_protocol::hostinfo::configuration::DocumentState::Absent
+    );
+    assert_eq!(
+        ceiling_in_force(&report),
+        "1",
+        "the report prints what is in force"
+    );
+    environment
+        .setup_until("the ceiling still pauses", paused)
+        .await;
+
+    // A file this build cannot read decides nothing either.
+    kr_ipc::paths::write_owner_only_file(&path, b"not json").expect("writes the file");
+    let report = environment.controller().effective_configuration().await;
+    assert_eq!(
+        report.status.state,
+        kr_protocol::hostinfo::configuration::DocumentState::Invalid
+    );
+    assert_eq!(ceiling_in_force(&report), "1");
+
+    // A document that loads and names no budget is a choice: the defaults.
+    the_owner_chooses(&environment, None, None).await;
+    environment.setup_until("no pause", not_paused).await;
+    let report = environment.controller().effective_configuration().await;
+    assert_eq!(ceiling_in_force(&report), (4 * GIB).to_string());
+    environment.stop().await;
+}
+
 /// KR-REQ-22.01: turning descriptions off while the model is loading, or while a job runs in the
 /// process, answers with the pause the change causes: the answer is the host's state after the
 /// turn that took the change, and not the state from before it. The control is the answer before

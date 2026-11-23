@@ -100,8 +100,25 @@ impl Controller {
             crate::config::InForce::of(&resolver);
         // The owner's settings for descriptions apply at once, with no fence to raise: the host
         // takes them at its next turn, and a reading that changed nothing changes nothing there.
+        // The budgets are decided by this reading when it loaded a document, and are the ones this
+        // host last accepted when it did not; the settings come from this reading and from no
+        // second one of the file.
+        let decided_budgets = crate::config::description_budgets_in_force(&resolver);
+        let description_budgets = {
+            let mut held = self
+                .description_budgets
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(decided) = decided_budgets {
+                *held = decided;
+            }
+            crate::config::EnforcedDescriptionBudgets {
+                value: *held,
+                from_document: decided_budgets.is_some(),
+            }
+        };
         self.descriptions
-            .apply_settings(self.description_settings());
+            .apply_settings(self.description_settings_of(&resolver));
         // The enrolment budgets the catalogue acts on, by the session number's rule: this reading
         // decides them when it loaded a document, and leaves them as they are when it did not.
         let mut budget_failure = None;
@@ -418,6 +435,7 @@ impl Controller {
             fence_owed,
             effects_applied,
             not_in_force: failure,
+            description_budgets,
             rights,
             push_gateways,
         }
@@ -808,5 +826,54 @@ mod tests {
             "{expired:?}"
         );
         assert!(controller.description_settings().enabled);
+    }
+
+    /// KR-REQ-22.10: the settings an acceptance gives the description host come from the reading
+    /// that acceptance took, and from no second reading of the file: a document edited between the
+    /// reading and the settings does not make the host take other budgets than the ones its report
+    /// describes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_settings_the_host_takes_are_those_of_the_reading_the_acceptance_took() {
+        use kr_protocol::hostinfo::configuration::{
+            ConfigurationCeilings, ConfigurationDocument, DescriptionBudgets, contents,
+        };
+
+        const GIB: u64 = 1 << 30;
+        let temp = kr_ipc::testing::TempHost::create();
+        let controller = daemon(&temp).await;
+        let write = |ceiling: u64| {
+            let document = ConfigurationDocument {
+                ceilings: ConfigurationCeilings {
+                    description_budgets: Some(DescriptionBudgets {
+                        process_memory_bytes: Nullable::some(ceiling),
+                        reserve_bytes: Nullable::null(),
+                    }),
+                    ..ConfigurationCeilings::default()
+                },
+                ..ConfigurationDocument::empty()
+            };
+            kr_ipc::paths::write_owner_only_file(
+                controller.configuration().document(),
+                contents(&document).as_bytes(),
+            )
+            .expect("writes the document");
+        };
+
+        write(2 * GIB);
+        let reading = controller.configuration();
+        // The owner edits the file after the reading was taken.
+        write(GIB);
+        assert_eq!(
+            controller
+                .description_settings_of(&reading)
+                .owner_ceiling_bytes,
+            Some(2 * GIB),
+            "the settings are the reading's, not the file's now"
+        );
+        assert_eq!(
+            controller.description_settings().owner_ceiling_bytes,
+            Some(GIB),
+            "a reading taken now is the file as it is now"
+        );
     }
 }

@@ -197,13 +197,31 @@ impl Controller {
     /// anything the owner could have chosen, and the owner's choice is in that document. The
     /// effective-value report reads the same resolver, so it says what the daemon does.
     pub(crate) fn description_settings(&self) -> kr_describe::resource::ResourceSettings {
-        let resolver = self.configuration();
+        self.description_settings_of(&self.configuration())
+    }
+
+    /// [`Self::description_settings`] from one reading of the configuration, which is the reading
+    /// an acceptance took and its report describes: the settings the host takes and the numbers a
+    /// person is shown cannot come from two readings of a file that may have moved between them.
+    ///
+    /// The budgets are those the reading decides, and where it decides nothing, those this host
+    /// last accepted.
+    pub(crate) fn description_settings_of(
+        &self,
+        resolver: &kr_worker::config::Resolver,
+    ) -> kr_describe::resource::ResourceSettings {
         let settings = resolver.description_settings();
+        let chosen = crate::config::description_budgets_in_force(resolver).unwrap_or_else(|| {
+            *self
+                .description_budgets
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        });
         // What the owner chose, as the intersection has it: a ceiling the host cannot honour is
         // not passed on, and a reserve below the floor is passed as written because the policy
         // keeps the larger of it and the floor it reads from this machine.
         let budgets =
-            crate::config::ceilings::description_budgets(&resolver.ceilings(), self.hard_limits());
+            crate::config::ceilings::intersect_description_budgets(chosen, self.hard_limits());
         kr_describe::resource::ResourceSettings {
             enabled: settings.enabled,
             on_battery: settings.on_battery,
@@ -425,6 +443,11 @@ impl Controller {
         let accepted_policy = accepted_document
             .as_ref()
             .map(|document| crate::config::ceilings::disable_policy(&document.ceilings).value);
+        // And the description budgets it accepted, which a startup reading that decides nothing
+        // leaves in force.
+        let accepted_description_budgets = accepted_document
+            .as_ref()
+            .and_then(|document| document.ceilings.description_budgets);
         // The gateways a credential may name, from the document this environment accepted. That is
         // the list the registry's record states, which a release that does not read the section
         // drops: so it only decides what may be used until the document on disk is read, and never
@@ -452,6 +475,10 @@ impl Controller {
         let startup_budgets = crate::config::catalogue::budgets_in_force(&startup_configuration);
         let startup_policy =
             crate::config::catalogue::disable_policy_in_force(&startup_configuration);
+        let description_budgets =
+            crate::config::description_budgets_in_force(&startup_configuration)
+                .or(accepted_description_budgets)
+                .unwrap_or_default();
         // The network and the voice broker come from this same reading, and from nothing a
         // process inherited: section 26 keeps a provider origin out of reach of an environment
         // variable. They apply for as long as this daemon runs.
@@ -1462,6 +1489,7 @@ impl Controller {
             changesets,
             automation,
             sessions_in_force: std::sync::atomic::AtomicU64::new(sessions_in_force),
+            description_budgets: std::sync::Mutex::new(description_budgets),
             attention,
             agent_tools: tokio::sync::Mutex::new(()),
             worker_program,

@@ -1239,6 +1239,9 @@ pub struct Controller {
     /// The session number admission enforces now, as the registry last took it, readable without
     /// the registry's lock. A new workflow chain's created-session ceiling does not exceed it.
     sessions_in_force: std::sync::atomic::AtomicU64,
+    /// The description budgets the owner chose in the document this host last accepted, which a
+    /// reading that decides nothing leaves in force.
+    description_budgets: std::sync::Mutex<kr_protocol::hostinfo::configuration::DescriptionBudgets>,
     /// The environment's attention store: one inbox, review state and visits across every session.
     attention: Arc<crate::attention::AttentionModule>,
     /// The serial boundary every contact-skill installation passes through.

@@ -147,6 +147,21 @@ pub struct Accepted {
     /// What is in force, which is the document's list when the reading produced one and the list
     /// before it when it did not: a document nobody can read retires nothing.
     pub push_gateways: Vec<String>,
+    /// The owner's description budgets in force.
+    pub description_budgets: EnforcedDescriptionBudgets,
+}
+
+/// The owner's description budgets in force, and where they came from.
+///
+/// The session number's rule: a reading that loaded a document decides them, whether the document
+/// names them or leaves them to section 22's defaults, and one that decided nothing - no file, or
+/// one this build cannot read - leaves the budgets this host last accepted in force.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct EnforcedDescriptionBudgets {
+    /// What the document last accepted chose, unset where it chose neither budget.
+    pub value: configuration::DescriptionBudgets,
+    /// True when the document this report describes decided them.
+    pub from_document: bool,
 }
 
 /// The rights ceiling a paired device's request is decided against, and where it came from.
@@ -227,6 +242,13 @@ impl Accepted {
             ceiling: ceilings::configured_rights(&resolver.ceilings()),
             from_document: resolver.loaded().document.is_some(),
         };
+        let description_budgets = description_budgets_in_force(&resolver).map_or(
+            EnforcedDescriptionBudgets::default(),
+            |value| EnforcedDescriptionBudgets {
+                value,
+                from_document: true,
+            },
+        );
         let budgets = catalogue::budgets_in_force(&resolver).map_or(
             EnforcedBudgets {
                 value: configuration::EnrolmentBudgets::default(),
@@ -264,6 +286,7 @@ impl Accepted {
             not_in_force: None,
             rights,
             push_gateways,
+            description_budgets,
         }
     }
 }
@@ -941,15 +964,23 @@ pub fn effective(
     } else {
         (configuration::ValueSource::Default, None)
     };
-    // The owner's description budgets: each is the owner's where the document wrote it, and the
-    // number in force is the intersection's, never the one the document wrote when it is refused.
-    let description = ceilings::description_budgets(&ceilings, limits);
-    let chosen = ceilings.description_budgets.unwrap_or_default();
+    // The owner's description budgets: each is the owner's where the budgets in force name it, and
+    // the number in force is the intersection's, never the one the owner wrote when it is refused.
+    // A reading that decided nothing leaves the budgets this host last accepted, which no document
+    // in front of this report names.
+    let chosen = accepted.description_budgets.value;
+    let description = ceilings::enforced_description_budgets(
+        ceilings::intersect_description_budgets(chosen, limits),
+        accepted.description_budgets.from_document,
+    );
     let described = |written: bool| {
         if written {
             (
                 configuration::ValueSource::HostConfiguration,
-                Some(doc_path.clone()),
+                accepted
+                    .description_budgets
+                    .from_document
+                    .then(|| doc_path.clone()),
             )
         } else {
             (configuration::ValueSource::Default, None)
@@ -1595,6 +1626,23 @@ pub fn session_limit_in_force(resolver: &Resolver, limits: HardLimits) -> Option
         return None;
     }
     Some(ceilings::session_limit(&resolver.ceilings(), limits).value)
+}
+
+/// Returns the description budgets a reading of this host's configuration puts in force, or `None`
+/// when it decides nothing.
+///
+/// The rule the session number follows ([`session_limit_in_force`]): a document this host loaded
+/// decides them, whether it names them or leaves them to section 22's defaults, and one that is
+/// absent, unreadable, of a version this build does not know or invalid decides nothing, so the
+/// budgets already in force stay. One rule for the daemon's startup and every acceptance after it.
+#[must_use]
+pub fn description_budgets_in_force(
+    resolver: &Resolver,
+) -> Option<configuration::DescriptionBudgets> {
+    if resolver.status().state != configuration::DocumentState::Loaded {
+        return None;
+    }
+    Some(resolver.ceilings().description_budgets.unwrap_or_default())
 }
 
 #[cfg(test)]

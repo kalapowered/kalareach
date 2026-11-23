@@ -260,6 +260,37 @@ async fn a_daemon_starts_over_the_document_the_release_before_it_accepted_at_ver
     );
 }
 
+/// KR-REQ-22.10: a daemon that starts with no document on disk over a copy of the one it accepted,
+/// which holds the owner's description budgets, keeps the budgets the copy holds, as it keeps the
+/// session number and the other ceilings: a file that is gone is not a document that lifts them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_daemon_with_no_document_keeps_the_description_budgets_its_accepted_copy_holds() {
+    let temp = a_stopped_environment().await;
+    let accepted = fixture("version-4-description-budgets.json");
+    as_a_later_release_left_it(&temp, recorded(&temp).0, Some(&accepted));
+    assert!(
+        !document_path(&temp).exists(),
+        "the owner's file is not there"
+    );
+
+    let controller = start(&temp)
+        .await
+        .expect("the daemon starts over a copy it can read");
+    let report = controller.effective_configuration().await;
+    assert_eq!(report.status.state, DocumentState::Absent);
+    let ceiling = report
+        .ceilings
+        .iter()
+        .find(|ceiling| ceiling.key == "description_budgets.process_memory_bytes")
+        .expect("the report has the ceiling");
+    assert_eq!(
+        ceiling.value.clone().render(),
+        (2_u64 << 30).to_string(),
+        "the ceiling the copy holds is in force, not the 4 GiB default"
+    );
+    drop(controller);
+}
+
 /// KR-REQ-26.13, KR-REQ-26.10: a daemon refuses to start over a copy of the accepted document that
 /// it cannot read, whatever the form of the ceiling it lacks, and changes nothing: not the
 /// registry's version, not the copy, not the generation, and not the document on disk, which is

@@ -994,7 +994,7 @@ impl Controller {
             ),
         ));
         checks.push(self.descriptions.doctor_check(
-            &self.description_settings(),
+            &self.description_settings_of(&accepted.resolver),
             self.in_force().unusable.as_ref(),
         ));
         checks.extend(self.device_repository_checks().await);

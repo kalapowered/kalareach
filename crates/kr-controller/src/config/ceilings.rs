@@ -155,8 +155,16 @@ pub fn description_budgets(
     ceilings: &ConfigurationCeilings,
     limits: HardLimits,
 ) -> DescriptionCeilings {
-    let configured = ceilings.description_budgets.unwrap_or_default();
+    intersect_description_budgets(ceilings.description_budgets.unwrap_or_default(), limits)
+}
 
+/// [`description_budgets`] for the budgets a document chose, as the daemon holds them between
+/// readings.
+#[must_use]
+pub fn intersect_description_budgets(
+    configured: kr_protocol::hostinfo::configuration::DescriptionBudgets,
+    limits: HardLimits,
+) -> DescriptionCeilings {
     let default_ceiling = DESCRIPTION_PROCESS_MEMORY_CEILING_BYTES;
     let asked = configured.process_memory_bytes.0;
     let process_memory = match asked {
@@ -240,14 +248,37 @@ pub fn enforced(intersected: Ceiling<u64>, sessions: crate::config::Enforced) ->
         value: sessions.value,
         // Only where there is something to explain. A host that enforces the product default
         // because nothing ever restricted it is the ordinary first run, not a retained number.
-        narrowed_by: (sessions.value != DEFAULT_MAX_SESSIONS_PER_ENVIRONMENT as u64).then(|| {
-            Sentence::new().stated(
-                "this host is still enforcing the number it last accepted, because this document \
-                 did not decide it",
-            )
-        }),
+        narrowed_by: (sessions.value != DEFAULT_MAX_SESSIONS_PER_ENVIRONMENT as u64)
+            .then(still_enforcing),
         refused: false,
     }
+}
+
+/// What a report says of a number this host last accepted and still enforces, because the reading
+/// it describes did not decide it.
+fn still_enforcing() -> Sentence {
+    Sentence::new().stated(
+        "this host is still enforcing the number it last accepted, because this document did not \
+         decide it",
+    )
+}
+
+/// Marks the description budgets the owner chose and this host still enforces, where the reading a
+/// report describes did not decide them, as [`enforced`] does for the session number. `intersected`
+/// is the intersection of the budgets this host last accepted.
+#[must_use]
+pub fn enforced_description_budgets(
+    mut intersected: DescriptionCeilings,
+    from_document: bool,
+) -> DescriptionCeilings {
+    if !from_document {
+        for budget in [&mut intersected.process_memory, &mut intersected.reserve] {
+            if budget.configured.is_some() && budget.narrowed_by.is_none() {
+                budget.narrowed_by = Some(still_enforcing());
+            }
+        }
+    }
+    intersected
 }
 
 /// Replaces the enrolment budgets a document asks for with the budgets in force, where this
