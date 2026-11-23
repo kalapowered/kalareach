@@ -81,6 +81,7 @@ import {
   invited,
   pendingWorkers,
   rechecked,
+  recordedWords,
   tookBack,
   workersHave,
   workersListed
@@ -754,7 +755,7 @@ function SharingTab({
           >
             <span>
               {line.waiting.length > 0
-                ? `The revocation for ${nameWords(line.name)} is recorded at ${momentWords(line.atMs, now)} (authority revision ${line.revision}), and not done: ${workersHave(line.waiting.length, line.cut)} not confirmed yet (${line.waiting.map(sessionIdWords).join(', ')}).${workersListed(line)}`
+                ? `${recordedWords(line.name, line.withdrawing)} at ${momentWords(line.atMs, now)} (authority revision ${line.revision}), and not done: ${workersHave(line.waiting.length, line.cut)} not confirmed yet (${line.waiting.map(sessionIdWords).join(', ')}).${workersListed(line)}`
                 : `Revoked ${nameWords(line.name)} at ${momentWords(line.atMs, now)} (authority revision ${line.revision}).${workersListed(line)}`}
             </span>{' '}
             {line.waiting.length > 0 ? (

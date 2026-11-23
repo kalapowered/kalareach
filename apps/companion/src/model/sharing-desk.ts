@@ -21,6 +21,8 @@ import { rootOf } from '../host/stamped'
 export interface Revoked {
   readonly grantId: string
   readonly name: string
+  /** Whether it withdrew an invitation nobody had accepted, which is told as a withdrawal. */
+  readonly withdrawing: boolean
   readonly atMs: number
   /** The authority revision the host issued for the revocation. */
   readonly revision: string
@@ -139,13 +141,21 @@ export class SharingDesk {
    * Keeps the line that says a revocation was made, at which authority revision, and which
    * session workers have not confirmed it.
    */
-  keepRevocation(grantId: string, name: string, atMs: number, revision: string, waiting: Waiting): void {
+  keepRevocation(
+    grantId: string,
+    name: string,
+    withdrawing: boolean,
+    atMs: number,
+    revision: string,
+    waiting: Waiting
+  ): void {
     this.#change({
       revoked: [
         ...this.#kept.revoked.filter((line) => line.grantId !== grantId),
         {
           grantId,
           name,
+          withdrawing,
           atMs,
           revision,
           waiting: waiting.sessions,

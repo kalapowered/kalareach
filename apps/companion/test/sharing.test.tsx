@@ -429,6 +429,9 @@ describe('a revocation some session worker has not confirmed', () => {
     await person.click(within(row).getByTestId('withdraw'))
     const line = await screen.findByTestId('recently-revoked')
     expect(line.textContent).not.toMatch(/^Revoked/)
+    // KR-REQ-18.14: one word for one thing. The toast below says "withdrawal", and so does the line.
+    expect(line.textContent).toMatch(/^The withdrawal of the invitation to .* is recorded at /)
+    expect(line.textContent).not.toMatch(/revocation/i)
     expect(line.textContent).toMatch(/not done/)
     expect(line.textContent).toMatch(/authority revision 6/)
     expect(line.textContent).toMatch(/1 session worker has not confirmed yet \(session 8a7b6c50\)/)
@@ -973,7 +976,10 @@ describe('what the page keeps of a result after the screen that sent it has gone
         hold.give()
       })
       const told = await screen.findByText(/is now with/)
-      expect(told.textContent).toMatch(/1 session worker has not confirmed that Sam.* lost access yet/)
+      // KR-REQ-18.14: the hand-over is told as `kr` tells it, with the giving device's revocation
+      // recorded and not done, and the count of workers still to confirm.
+      expect(told.textContent).toMatch(/The revocation for Sam.* is recorded, and not done: 1 session worker has not confirmed yet/)
+      expect(told.textContent).not.toMatch(/done\.$/)
     })
     const line = await screen.findByTestId('recently-revoked')
     expect(line.textContent).toMatch(/1 session worker has not confirmed yet/)
@@ -1048,7 +1054,7 @@ describe('what the page keeps of a result after the screen that sent it has gone
     expect(line.textContent).toMatch(/1 session worker has not confirmed yet/)
     // KR-REQ-18.14, a recovered hand-over: the hand-over is told, and the giving device's access is
     // not told as done while a worker has not confirmed that it was lost.
-    const told = screen.getByText(/1 session worker has not confirmed that .* lost access yet/)
+    const told = screen.getByText(/The revocation for .* is recorded, and not done: 1 session worker has not confirmed yet/)
     expect(told.textContent).not.toMatch(/: done\./)
     await person.click(within(line).getByTestId('check-again'))
     await waitFor(() => {

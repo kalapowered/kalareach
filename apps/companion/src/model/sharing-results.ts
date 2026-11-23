@@ -88,6 +88,22 @@ export function invited(
   }
 }
 
+/**
+ * How a revocation that is recorded begins, whichever way it is told: "The revocation for Sam is
+ * recorded" or "The withdrawal of the invitation to Sam is recorded". The toast and the line the
+ * page keeps use these words, so one thing has one word.
+ */
+export function recordedWords(name: string, withdrawing: boolean): string {
+  return withdrawing
+    ? `The withdrawal of the invitation to ${nameWords(name)} is recorded`
+    : `The revocation for ${nameWords(name)} is recorded`
+}
+
+/** "1 session worker has not confirmed yet.", and "at least 3 session workers have not confirmed yet." */
+function owedWords(waiting: Waiting): string {
+  return `${workersHave(waiting.sessions.length, waiting.cut)} not confirmed yet.`
+}
+
 /** A share was taken back, or an invitation withdrawn: says how far the session workers have got. */
 export function tookBack(
   desk: SharingDesk,
@@ -100,17 +116,14 @@ export function tookBack(
 ): void {
   const waiting = waitingOn(result)
   const done = waiting.sessions.length === 0
-  desk.keepRevocation(grantId, name, nowMs, result.authority_revision, waiting)
+  desk.keepRevocation(grantId, name, withdrawing, nowMs, result.authority_revision, waiting)
   desk.dismissNote(grantId)
-  const owed = `${workersHave(waiting.sessions.length, waiting.cut)} not confirmed yet.`
   say(
     done
       ? withdrawing
         ? `Invitation to ${nameWords(name)} withdrawn.`
         : `Revoked ${nameWords(name)}’s access.`
-      : withdrawing
-        ? `The withdrawal of the invitation to ${nameWords(name)} is recorded, and not done: ${owed}`
-        : `The revocation for ${nameWords(name)} is recorded, and not done: ${owed}`,
+      : `${recordedWords(name, withdrawing)}, and not done: ${owedWords(waiting)}`,
     done ? 'success' : 'pending'
   )
 }
@@ -139,11 +152,11 @@ export function handedOver(
   nowMs: number
 ): void {
   const waiting = waitingOn(done.revoked)
-  desk.keepRevocation(sourceGrantId, givingName, nowMs, done.revoked.authority_revision, waiting)
+  desk.keepRevocation(sourceGrantId, givingName, false, nowMs, done.revoked.authority_revision, waiting)
   say(
     waiting.sessions.length === 0
-      ? words
-      : `${words} ${workersHave(waiting.sessions.length, waiting.cut)} not confirmed that ${nameWords(givingName)} lost access yet.`,
+      ? `${words} Access for ${nameWords(givingName)} is revoked.`
+      : `${words} ${recordedWords(givingName, false)}, and not done: ${owedWords(waiting)}`,
     waiting.sessions.length === 0 ? 'success' : 'pending'
   )
 }
