@@ -681,8 +681,7 @@ final class LinkTapTests: HarnessTestCase {
     /// inside the area's own edge and one step (three points) outside it, and the words' middle. The area is
     /// what the rule gives: the words grown to the least size and to 22 points beside them, held to the link's view (the
     /// pane and the message that clips it), a cut on one side given to the other. A tap inside opens the link once. A
-    /// tap outside opens nothing by the page; where the platform's own adjustment opens the link there, or the tap lands
-    /// on the link's own button (which is taller than its words at the largest size and lights by design), the system's
+    /// tap outside opens nothing by the page; where the platform's own adjustment opens the link there, the system's
     /// click names the link's button.
     private func tapAround(_ edge: Link, named: String) {
         var edgeShift = offset(of: edge)
