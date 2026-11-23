@@ -1007,6 +1007,22 @@ fn terminal_fd(pty: &portable_pty::PtyPair) -> std::os::fd::BorrowedFd<'_> {
     }
 }
 
+/// The local-mode bits that the kernel sets by itself and the product never sets: `PENDIN`
+/// ("retype pending input", a state bit in macOS's `sys/termios.h`). A terminal the command gave
+/// back as it found it can still carry it, so a comparison that counted it would fail on a bit that
+/// is not the product's.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+const KERNEL_SET_LOCAL_MODES: libc::tcflag_t = libc::PENDIN;
+/// Where this test does not run, no bit is set aside.
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+const KERNEL_SET_LOCAL_MODES: libc::tcflag_t = 0;
+
+/// The local modes of a terminal as the product governs them: every bit but the ones the kernel
+/// sets by itself, so two terminals compare equal when the product left them alike.
+fn governed_local_modes(modes: rustix::termios::LocalModes) -> libc::tcflag_t {
+    modes.bits() & !KERNEL_SET_LOCAL_MODES
+}
+
 impl Terminal {
     /// The terminal's modes now.
     fn modes(&self) -> rustix::termios::Termios {
@@ -1435,6 +1451,32 @@ async fn a_create_that_is_not_attached(answer_the_attachment: bool) -> String {
     text
 }
 
+/// The comparison of two terminals' local modes sees a difference in a mode the product sets.
+#[test]
+fn local_modes_that_differ_in_a_mode_the_product_sets_still_differ() {
+    use rustix::termios::LocalModes;
+    assert_ne!(
+        governed_local_modes(LocalModes::ICANON | LocalModes::ECHO),
+        governed_local_modes(LocalModes::ICANON),
+        "a terminal that echoes is not as one that does not"
+    );
+}
+
+/// The comparison of two terminals' local modes sees no difference in the mode the kernel sets by
+/// itself.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn local_modes_that_differ_only_in_the_kernels_own_state_bit_do_not_differ() {
+    use rustix::termios::LocalModes;
+    assert_eq!(
+        governed_local_modes(LocalModes::ICANON | LocalModes::ECHO),
+        governed_local_modes(
+            LocalModes::ICANON | LocalModes::ECHO | LocalModes::from_bits_retain(libc::PENDIN)
+        ),
+        "the bit the kernel sets by itself is not a difference"
+    );
+}
+
 /// KR-REQ-03.14, 03.15: the helper of an attachment dying is a lost connection and not the end of
 /// the session. The attachment ends saying so, with the code a host that cannot be reached has, the
 /// terminal is the person's again as it was before, and the session is still alive where it lives.
@@ -1499,8 +1541,8 @@ async fn a_helper_that_dies_during_an_attachment_ends_it_as_a_lost_connection_an
         std::thread::sleep(Duration::from_millis(20));
     };
     assert_eq!(
-        after.local_modes.bits(),
-        terminal.before.local_modes.bits(),
+        governed_local_modes(after.local_modes),
+        governed_local_modes(terminal.before.local_modes),
         "the terminal's local modes are as they were"
     );
     assert_eq!(
