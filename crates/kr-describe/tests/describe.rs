@@ -819,7 +819,8 @@ fn a_running_job_can_be_cancelled_through_the_shared_handle() {
     assert!(!running.cancel(&session(1)));
 }
 
-/// KR-PERF-009: the paused case is driven on a host that is otherwise admitting inference.
+/// KR-REQ-22.13, KR-PERF-009: the paused case is driven on a host that is otherwise admitting
+/// inference.
 ///
 /// Section 22 is explicit that a release test must not pass its active case by keeping inference
 /// disabled throughout. So this is one service: it publishes, then memory pressure arrives and it
