@@ -725,10 +725,11 @@ fn read_first_block(path: &Path) -> std::io::Result<FirstBlock> {
 /// The permission a refused read of one path is about, in the platform's own words.
 ///
 /// Naming it is the difference between an answer a person can act on and "permission denied": on
-/// macOS the protected locations are separate grants, a removable volume is another, and Full Disk
-/// Access is one more that covers them all. A path outside every one of them was refused by the
-/// filesystem's own permissions rather than by a privacy grant. Whether a path is on a removable
-/// volume is what the kernel says of the volume, never how the path is spelled.
+/// macOS the protected locations are separate grants, a removable volume and a network volume are
+/// two more, and Full Disk Access is one more that covers them all. A path outside every one of
+/// them was refused by the filesystem's own permissions rather than by a privacy grant. Whether a
+/// path is on a removable or a network volume is what the kernel says of the volume, never how the
+/// path is spelled.
 #[must_use]
 pub fn permission_for_path(path: &Path) -> &'static str {
     permission_on(path, volume::flags_of(path))
@@ -745,6 +746,9 @@ fn permission_on(path: &Path, flags: Option<u32>) -> &'static str {
     // are called.
     if flags.is_some_and(volume::removable) {
         return "Files & Folders, for removable volumes";
+    }
+    if flags.is_some_and(volume::network) {
+        return "Files & Folders, for network volumes";
     }
     let text = path.to_string_lossy();
     for (fragment, permission) in [
@@ -791,9 +795,19 @@ mod volume {
     /// for the flag.
     const MNT_REMOVABLE: u32 = 0x0000_0200;
 
+    /// `MNT_LOCAL` of the system's `sys/mount.h`: the volume is stored on this machine. A volume
+    /// that is not is one the platform files its own grant under, and the flag is only defined
+    /// where the system header is.
+    const MNT_LOCAL: u32 = 0x0000_1000;
+
     /// Whether a volume with these mount flags is a removable one.
     pub(super) const fn removable(flags: u32) -> bool {
         flags & MNT_REMOVABLE != 0
+    }
+
+    /// Whether a volume with these mount flags is a network one: not stored on this machine.
+    pub(super) const fn network(flags: u32) -> bool {
+        flags & MNT_LOCAL == 0
     }
 }
 
@@ -2231,6 +2245,26 @@ mod tests {
         }
     }
 
+    /// The mount flags of the same Mac's automounted `/home`: a volume the kernel does not call
+    /// local.
+    const NETWORK_VOLUME: u32 = 0x0450_0000;
+
+    #[test]
+    fn a_refused_read_on_a_network_volume_names_the_grant_for_network_volumes() {
+        let on = |path: &str, flags| permission_on(Path::new(path), Some(flags));
+        let network = if cfg!(target_os = "macos") {
+            "Files & Folders, for network volumes"
+        } else {
+            "the filesystem's own permissions on that path"
+        };
+        assert_eq!(on("/Volumes/Share/notes.txt", NETWORK_VOLUME), network);
+        // The volume is asked before the folder's name here too.
+        assert_eq!(
+            on("/Volumes/Share/Documents/notes.txt", NETWORK_VOLUME),
+            network
+        );
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn the_kernel_answers_for_the_volume_of_a_path_that_is_not_there() {
@@ -2238,8 +2272,8 @@ mod tests {
         let flags = volume::flags_of(&root.path().join("nobody/wrote/this.txt"))
             .expect("the kernel answers for the volume of the nearest folder that is there");
         assert!(
-            !volume::removable(flags),
-            "this machine's temporary folder is on a removable volume: {flags:#x}"
+            !volume::removable(flags) && !volume::network(flags),
+            "this machine's temporary folder is on a removable or a network volume: {flags:#x}"
         );
     }
 
