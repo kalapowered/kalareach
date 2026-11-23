@@ -3820,6 +3820,85 @@ mod tests {
         );
     }
 
+    /// Runs a disabling, or an enabling, whose admission waits once the record's transaction is held
+    /// and until the test lets it write, as the registration lock the daemon's admission takes
+    /// can. Lets it go after the clock has moved on, and returns the moment it was let go at, or
+    /// before.
+    fn behind_the_admission_held(host: &Host, disabling: bool) -> u64 {
+        let (arrived_tx, arrived_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let release_rx = Mutex::new(release_rx);
+        let held = |write: &mut dyn FnMut() -> Result<()>| {
+            arrived_tx.send(()).expect("the test is waiting");
+            release_rx
+                .lock()
+                .expect("the release")
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .expect("the test lets the admission go");
+            write()
+        };
+        let mut let_go_at = 0;
+        std::thread::scope(|scope| {
+            let changing = scope.spawn(|| {
+                if disabling {
+                    host.privacy.disable(at(10), &held)
+                } else {
+                    host.privacy.enable(&[], at(10), &held)
+                }
+                .expect("the change is made")
+            });
+            arrived_rx
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .expect("the change reaches its admission");
+            let_go_at = after_the_clock_passes(kr_ipc::now_ms().get());
+            release_tx.send(()).expect("the admission goes on");
+            changing.join().expect("the change ends");
+        });
+        let_go_at
+    }
+
+    /// KR-REQ-15.20: a disabling whose admission waits after the record's transaction is held reads
+    /// its moment once the admission lets it write, which is the last wait it has, and stores and
+    /// publishes that moment.
+    #[test]
+    fn a_disabling_reads_its_moment_once_its_admission_has_let_it_write() {
+        let host = Host::open();
+        host.privacy
+            .enable(&[], at(0), &standing)
+            .expect("privacy mode is enabled");
+        let let_go_at = behind_the_admission_held(&host, true);
+        let published = host.privacy.state().reading().published();
+        assert!(!published.private);
+        assert!(
+            published.since_ms >= let_go_at,
+            "published as of {}, before the admission let the change write at {let_go_at}",
+            published.since_ms
+        );
+        assert_eq!(
+            stored_pair(&host),
+            (Some(published.since_ms), Some(published.generation.get()))
+        );
+    }
+
+    /// KR-REQ-15.20: an enabling whose admission waits after the record's transaction is held reads
+    /// its moment once the admission lets it write, and stores and publishes that moment.
+    #[test]
+    fn an_enabling_reads_its_moment_once_its_admission_has_let_it_write() {
+        let host = Host::open();
+        let let_go_at = behind_the_admission_held(&host, false);
+        let published = host.privacy.state().reading().published();
+        assert!(published.private);
+        assert!(
+            published.since_ms >= let_go_at,
+            "published as of {}, before the admission let the change write at {let_go_at}",
+            published.since_ms
+        );
+        assert_eq!(
+            stored_pair(&host),
+            (Some(published.since_ms), Some(published.generation.get()))
+        );
+    }
+
     /// KR-REQ-15.20: a disabling that waits for the record's own transaction reads its moment once
     /// the wait is over, and stores and publishes that moment.
     #[test]
@@ -4179,6 +4258,11 @@ mod tests {
         host.privacy
             .disable(TimestampMs::new(ahead), &standing)
             .expect("privacy mode is disabled again");
+        assert_eq!(
+            stored_pair(&host).0,
+            Some(ahead),
+            "a change asked for later than the clock stores the moment it was asked for"
+        );
         host.reopen_privacy();
         let restored = host.privacy.state().reading().published();
         assert_eq!(
