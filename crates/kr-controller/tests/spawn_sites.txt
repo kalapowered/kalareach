@@ -485,10 +485,11 @@ names | kr_describe::processor::Features::running
 names | kr_describe::processor::name_parts
 names | kr_describe::profile::catalogue::Catalogue::builtin
 names | kr_describe::profile::catalogue::MetGates::default
-names | kr_describe::resource::ResourceSettings::default
 names | kr_describe::resource::platform::free_space
+names | kr_describe::resource::platform::physical_memory_bytes
 names | kr_describe::resource::platform::power_of_supplies
 names | kr_describe::resource::platform::read_conditions
+names | kr_describe::resource::reserve_floor_bytes
 names | kr_describe::service::DescriptionService::sharing
 names | kr_describe::service::Handles::default
 names | kr_describe::store::DescriptionStore::open
