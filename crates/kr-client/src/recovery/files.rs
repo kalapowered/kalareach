@@ -1113,15 +1113,29 @@ impl PreparedRestore {
         let mut strongest = self.first_read.clone();
         let mut last_failure: Option<ClientError> = None;
         let mut pauses = Attempts::new();
+        // Whether the write of the attempt before, whose answer never came, left the settings out.
+        let mut unanswered_left_settings_out = false;
         for attempt in 0..CHECKPOINT_ATTEMPTS {
             let read = read_bundle(&reader, &self.context, Some(seen), &self.seed)
                 .await
                 .map_err(from_recovery)?;
             strongest.hold(&read.bundle).map_err(from_recovery)?;
+            let earlier_left_settings_out = std::mem::take(&mut unanswered_left_settings_out);
             let Some(mut advanced) =
                 advance_checkpoint(&read.bundle, &verified).map_err(from_recovery)?
             else {
-                return Ok(CheckpointRecorded::AlreadyThere);
+                // The checkpoint is recorded. When the write of the attempt before, whose answer
+                // never came, left the settings out and the bundle holds none, that write landed:
+                // the person is told what an answered write tells them.
+                return Ok(
+                    if earlier_left_settings_out && read.bundle.device_settings.is_none() {
+                        CheckpointRecorded::WrittenWithoutSettings {
+                            bundle_revision: read.bundle.revision.get(),
+                        }
+                    } else {
+                        CheckpointRecorded::AlreadyThere
+                    },
+                );
             };
             advanced.revision = U64::new(read.bundle.revision.get().saturating_add(1));
             advanced.written_at_ms = now;
@@ -1169,7 +1183,10 @@ impl PreparedRestore {
                     // The service says it cannot establish what became of the write: the next
                     // read finds the checkpoint recorded, or the bundle where the write compared,
                     // so it is read at once.
-                    HostWord::Unknown => last_failure = Some(error),
+                    HostWord::Unknown => {
+                        unanswered_left_settings_out = dropped_settings;
+                        last_failure = Some(error);
+                    }
                     // The service refused for now, or a connection to it ended, which the library
                     // words the same way. Either way the next read settles whether the write
                     // landed, so a pause before it loses nothing, and nothing the service said is
@@ -1187,6 +1204,7 @@ impl PreparedRestore {
                         if attempt + 1 == CHECKPOINT_ATTEMPTS {
                             return Err(RestoreError::Read(error));
                         }
+                        unanswered_left_settings_out = dropped_settings;
                         last_failure = Some(error);
                         tokio::time::sleep(delay).await;
                     }

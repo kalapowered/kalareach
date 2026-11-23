@@ -1226,6 +1226,54 @@ async fn a_checkpoint_that_would_not_fit_with_the_settings_is_written_without_th
     assert_eq!(*bundle.writes.lock().expect("writes"), 0);
 }
 
+/// KR-REQ-20.17: a checkpoint that was written without the settings, whose answer never came, is
+/// told as written without them when the next read finds it recorded: the settings are out of the
+/// bundle, and the person is told so. Where the settings are still in the bundle the next read
+/// finds, it is told as it always was.
+#[tokio::test]
+async fn a_lost_answer_on_a_checkpoint_that_left_the_settings_out_still_says_so() {
+    let world = World::new();
+    let sealed = world.seal(4, &honest_members());
+    let member = Bytes::new(vec![0x5a; 1024]);
+
+    let shape = leaving(&world, Some(&member), 20);
+    let source = Arc::new(Scripted::serving(&world, world.bundle(&shape)).publishing(&sealed));
+    let prepared = restore(&world, &source, None).await.expect("a restore");
+    let bundle = Bundle::over(&source);
+    *bundle.loses_the_answer.lock().expect("loses") = true;
+    let recorded = prepared
+        .record_checkpoint(&bundle, TimestampMs::new(9_000))
+        .await
+        .expect("settled by reading");
+    assert!(
+        matches!(recorded, CheckpointRecorded::WrittenWithoutSettings { .. }),
+        "{recorded:?}"
+    );
+    assert_eq!(*bundle.writes.lock().expect("writes"), 1, "written once");
+    let after = bundle_held(&world, &source);
+    assert_eq!(after.device_settings, None, "the settings were left out");
+    assert_eq!(after.checkpoints.len(), 1, "the checkpoint is in");
+
+    // With room for both, the lost answer leaves the settings where they were: nothing to say.
+    let shape = Shape {
+        device_settings: Some(member.clone()),
+        ..Shape::default()
+    };
+    let source = Arc::new(Scripted::serving(&world, world.bundle(&shape)).publishing(&sealed));
+    let prepared = restore(&world, &source, None).await.expect("a restore");
+    let bundle = Bundle::over(&source);
+    *bundle.loses_the_answer.lock().expect("loses") = true;
+    let recorded = prepared
+        .record_checkpoint(&bundle, TimestampMs::new(9_000))
+        .await
+        .expect("settled by reading");
+    assert!(
+        matches!(recorded, CheckpointRecorded::AlreadyThere),
+        "{recorded:?}"
+    );
+    assert_eq!(bundle_held(&world, &source).device_settings, Some(member));
+}
+
 /// KR-REQ-24.16: a checkpoint write the service refuses for now, or cannot say the outcome of, is
 /// made again after the bundle is read again, and the service's definite word ends the call. The
 /// three are told apart by the retry category of the code, every code, as every other place that
