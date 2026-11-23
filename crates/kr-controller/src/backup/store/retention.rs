@@ -157,7 +157,7 @@ pub(super) fn person_refusal(
         "objects" => {
             return Ok(Some(
                 "a service holds ciphertext of that generation and no descriptor was published, \
-                 which this host's store has no record of asking the deletion of"
+                 so this version of KalaReach cannot delete it"
                     .to_owned(),
             ));
         }

@@ -84,6 +84,14 @@ pub const OLDEST_SCHEMA_VERSION: i64 = VERSION_WITHOUT_UPLOADS;
 /// takes version 10, which a build before the one that writes it reads ahead.
 pub const READS_THROUGH_SCHEMA_VERSION: i64 = 9;
 
+// `migrate` opens a store as found only at this one version and compares it with version 9's
+// schema, so the version this build reads through must stay the one above the one it writes. The
+// build that writes version 9 does not compile until it removes that arm.
+const _: () = assert!(
+    READS_THROUGH_SCHEMA_VERSION == SCHEMA_VERSION + 1,
+    "the arm of `migrate` that opens version 9 as found is for a build that writes 8: remove it"
+);
+
 /// Whether this host may go on producing for one generation.
 ///
 /// This is permission, and nothing else. What a service holds is [`Remote`], recorded beside it:
@@ -806,7 +814,7 @@ impl BackupStore {
             if version == VERSION_WITHOUT_SETUP {
                 return self.migrate_from_version_7();
             }
-            if (SCHEMA_VERSION + 1..=READS_THROUGH_SCHEMA_VERSION).contains(&version) {
+            if version == READS_THROUGH_SCHEMA_VERSION {
                 // Written by a later build and read as it is found: nothing is brought forward and
                 // no version is written. What it enforces is still compared, against version 9's.
                 return self.expect_the_schema(&definition_of_version_9()?);

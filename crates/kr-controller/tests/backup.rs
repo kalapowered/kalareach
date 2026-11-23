@@ -6656,7 +6656,7 @@ async fn a_version_9_store_shows_a_deletion_this_build_cannot_judge_and_sends_no
 
 /// KR-REQ-24.29: the store decides again, before a request leaves, a deletion that is written
 /// down, and refuses one of a generation whose ciphertext a service holds and no descriptor was
-/// published: this build has no record of asking such a deletion and cannot judge it. This is the
+/// published: this build cannot judge it. This is the
 /// store's own hold, whatever the uploader leaves out of what it sends.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_store_refuses_to_confirm_a_deletion_a_later_build_asked_of_a_generation_it_cannot_judge()
@@ -6674,6 +6674,44 @@ async fn the_store_refuses_to_confirm_a_deletion_a_later_build_asked_of_a_genera
             "the reason is the generation's state: {detail}"
         ),
         other => panic!("the store confirmed a deletion it cannot judge: {other:?}"),
+    }
+}
+
+/// What a person is told when a deletion of a generation whose ciphertext a service holds and no
+/// descriptor was published is refused.
+const OBJECTS_REFUSAL: &str = "a service holds ciphertext of that generation and no descriptor was \
+     published, so this version of KalaReach cannot delete it";
+
+/// KR-REQ-24.29: the refusal says what this build cannot do and not what it has recorded, so it is
+/// true when no build asked the deletion and when a later build did.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_refusal_to_delete_a_generation_a_service_holds_ciphertext_of_is_true_whether_or_not_a_build_asked()
+ {
+    let mut host = a_host_a_later_build_asked_a_deletion_of_a_generation_this_build_cannot_judge();
+    let (_uploader, _) = host.restart(60_000).await;
+    // Generation 2 was never asked for; a later build asked the deletion of generation 1.
+    let not_asked = host.service.ask_deletion(
+        archive_id(),
+        BackupGeneration::new(2),
+        TimestampMs::new(63_000),
+        &|write| write(),
+    );
+    let asked = host.service.confirm_asked_deletion(
+        archive_id(),
+        BackupGeneration::new(1),
+        member_of(1, 0),
+    );
+    for (what, refusal) in [
+        ("no build asked it", not_asked.map(|_| ())),
+        ("a later build asked it", asked),
+    ] {
+        match refusal {
+            Err(ControllerError::Refused { detail, .. }) => assert!(
+                detail.contains(OBJECTS_REFUSAL),
+                "{what}: the refusal says what this build cannot do: {detail}"
+            ),
+            other => panic!("{what}: the deletion was not refused: {other:?}"),
+        }
     }
 }
 
