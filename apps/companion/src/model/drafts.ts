@@ -198,7 +198,7 @@ export function retarget(draft: Draft, target: DraftTarget, attachmentId: string
  * not accepted into its own composer, whether it is still uploading, uploaded or failed, would be
  * left behind without a word. A draft that holds one is sent only once the person removes it.
  */
-function holdsUnsentFiles(draft: Draft): boolean {
+export function holdsUnsentFiles(draft: Draft): boolean {
   return draft.attachments.some((attachment) => !attachment.acceptedUpstream)
 }
 

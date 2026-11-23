@@ -76,6 +76,7 @@ import {
   againstCurrent,
   connectionLost,
   edit,
+  holdsUnsentFiles,
   notSubmittableBecause,
   startDraft,
   submittable,
@@ -1239,9 +1240,11 @@ export function MobileSession({
       Queue
     </Button>
   ) : null
-  // A steer carries the text the person wrote and no file: on a paired host the files of the draft
-  // go only with the prompt that names it, so Steer stays off while the draft has any, and says why.
-  const steerCarriesFiles = paired && (holdsDraft || draft.attachments.length > 0)
+  // A steer carries the text the person wrote and no file. On a paired host the files of the draft
+  // go only with the prompt that names it; on any other host a file the agent has not accepted is
+  // left behind by a prompt sent from here, which is why Send is off for it. Steer stays off while
+  // the draft holds either, and says why.
+  const steerCarriesFiles = paired ? holdsDraft || draft.attachments.length > 0 : holdsUnsentFiles(draft)
   const steerNote =
     !typingToProgram && offers.steer.offered && steerCarriesFiles ? (
       <p className="m-hint" id={steerNoteId}>

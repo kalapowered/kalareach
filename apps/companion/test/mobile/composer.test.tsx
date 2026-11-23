@@ -421,3 +421,68 @@ describe("the composer under the phone's terminal (KR-REQ-13.12)", () => {
     })
   })
 })
+// The test environment's `File` does not read itself; a phone's web view does.
+if (typeof File.prototype.arrayBuffer !== 'function') {
+  File.prototype.arrayBuffer = function arrayBuffer(this: File): Promise<ArrayBuffer> {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader()
+      reader.onload = () => {
+        resolve(reader.result as ArrayBuffer)
+      }
+      reader.onerror = () => {
+        reject(new Error('the file was not read'))
+      }
+      reader.readAsArrayBuffer(this)
+    })
+  }
+}
+
+/** The input that takes any file, in the picker the composer shows. */
+function filesInput(): HTMLInputElement {
+  const group = screen.getByRole('group', { name: 'Add an attachment' })
+  const input = [...(group.parentElement?.querySelectorAll<HTMLInputElement>('input[type="file"]') ?? [])].find(
+    (each) => each.getAttribute('accept') === '*/*'
+  )
+  if (input === undefined) throw new Error('no file input')
+  return input
+}
+
+describe("the phone's Steer with a file on the draft, on a host it is not paired with (KR-REQ-13.12)", () => {
+  const SENTENCE = 'A steer carries text only. Remove the files on this draft to steer with it.'
+  const uploads: readonly [string, (port: HostPort) => HostPort][] = [
+    ['uploading', (port) => ({ ...port, attachmentUploadBytes: () => new Promise(() => undefined) })],
+    ['uploaded and not accepted by the agent', (port) => port],
+    [
+      'not uploaded',
+      (port) => ({ ...port, attachmentUploadBytes: () => Promise.reject(new Error('the upload failed')) })
+    ]
+  ]
+
+  for (const [state, through] of uploads) {
+    it(`is off while a file is ${state}, and says why, as Send is off for it`, async () => {
+      const person = userEvent.setup({ applyAccept: false })
+      const steered: string[] = []
+      await open((port) =>
+        through({
+          ...port,
+          composerSteer: (params, opening) => {
+            steered.push(params.text)
+            return port.composerSteer(params, opening)
+          }
+        })
+      )
+      await person.type(screen.getByLabelText('Message this session'), 'use the other file')
+      expect(await screen.findByRole('button', { name: 'Steer' })).toBeEnabled()
+
+      await person.upload(filesInput(), new File([new Uint8Array(12)], 'notes.pdf', { type: 'application/pdf' }))
+
+      await waitFor(() => {
+        expect(screen.getByRole('button', { name: 'Steer' })).toBeDisabled()
+      })
+      expect(screen.getByText(SENTENCE)).toBeInTheDocument()
+      expect(screen.getByRole('button', { name: 'Send' })).toBeDisabled()
+      expect(steered).toEqual([])
+    })
+  }
+})
+
