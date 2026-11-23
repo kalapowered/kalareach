@@ -75,6 +75,10 @@ aws-lc-rs = "=1.18.1"
 # authority through one, so a reader inside a poll loads it without a lock. Already in the tree
 # through the transport's dependencies.
 arc-swap = "=1.9.2"
+# A Unix-domain socket on Windows is registered with the platform's own readiness reactor through
+# this crate, which is how the worker's gateway socket there is read and written without a thread
+# per connection. Already in the lock through the D-Bus client of the Linux credential store.
+async-io = "=2.6.0"
 base64 = "=0.23.1"
 boot-time = "=0.1.3"
 cap-fs-ext = "=4.0.3"
@@ -290,6 +294,11 @@ tower-layer = "=0.3.3"
 tower-service = "=0.3.3"
 tokio = { version = "=1.53.3", features = ["macros", "rt", "rt-multi-thread", "sync", "time"] }
 tracing = "=0.1.44"
+# The Windows build of a Unix-domain socket: the worker's gateway socket on Windows is one, because
+# the agent program that connects to it speaks only to a socket of that kind. The socket is bound
+# and accepted through this crate, which has no peer-process call; that one is the worker's own.
+# Already in the lock through the D-Bus client of the Linux credential store.
+uds_windows = "=1.2.1"
 # The text of a message into a channel is decomposed, and the characters that the channel tag
 # filter names are marked, before the text is matched against the filter.
 unicode-general-category = "=1.1.0"

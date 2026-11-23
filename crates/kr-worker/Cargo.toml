@@ -67,8 +67,16 @@ unicode-normalization.workspace = true
 # be set on a pipe after it exists. `windows-sys` is what creates it; `anyhow` is only what the
 # terminal library's traits report a failure as.
 anyhow.workspace = true
-# The Windows login reader asks Terminal Services about the session its process runs in.
-windows-sys = { workspace = true, features = ["Win32_System_RemoteDesktop"] }
+# The gateway socket on Windows is a Unix-domain socket made ready for the runtime's reactor: a
+# non-blocking `uds_windows` socket registered with `async-io`, then read and written through the
+# tokio traits.
+async-io.workspace = true
+tokio-util = { workspace = true, features = ["compat"] }
+uds_windows.workspace = true
+# The login reader asks Terminal Services about the session its process runs in. The gateway socket
+# asks the kernel which process is at the other end of a connection (a socket control call), and
+# which Windows build this is when it cannot.
+windows-sys = { workspace = true, features = ["Wdk_System_SystemServices", "Win32_Networking_WinSock", "Win32_System_RemoteDesktop", "Win32_System_SystemInformation", "Win32_System_SystemServices"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # The question ledger records the executable and the parent of a calling process, which macOS
