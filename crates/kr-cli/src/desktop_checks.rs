@@ -7,6 +7,9 @@
 //! bounded time, and prints the records the way `kr doctor` does, so one renderer says what each
 //! check found wherever a person reads it.
 //!
+//! The command runs outside every session, as `kr host stop` does: an agent in a session does not
+//! start the checks or name a file for them.
+//!
 //! `--file` names the file the read check reads. A path relative to the directory the command runs
 //! in is made absolute here, because the host reads it from a worker that runs elsewhere. Without
 //! the option the read check reads nothing and says so.
@@ -44,7 +47,7 @@ const POLL: Duration = Duration::from_millis(500);
 ///
 /// # Errors
 ///
-/// Returns a usage error for a path that is not text, the daemon's refusal of the request, or a
+/// Returns the refusal inside a session, a usage error for a path that is not text, the daemon's refusal of the request, or a
 /// transport failure. A run that ends without findings is reported as a failure that has already
 /// been written.
 pub async fn run(
@@ -52,6 +55,7 @@ pub async fn run(
     arguments: &DesktopChecksArguments,
     json: bool,
 ) -> Result<Completion> {
+    crate::bind::require_outside_to_run_the_checks(&crate::build_id()).await?;
     let authorised_file = arguments.file.as_deref().map(named).transpose()?;
     let mut daemon = Daemon::open(paths, &arguments.selector).await?;
     let environment_id = daemon.environment_id();

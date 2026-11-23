@@ -156,9 +156,20 @@ impl Host {
 
     /// Runs `kr` against this host from `directory`, with nothing of this test's own environment.
     fn kr_in(&self, directory: &Path, arguments: &[&str]) -> std::process::Output {
+        self.kr_with(directory, arguments, &[])
+    }
+
+    /// Runs `kr` as `kr_in` does, with further variables in its environment.
+    fn kr_with(
+        &self,
+        directory: &Path,
+        arguments: &[&str],
+        variables: &[(&str, &str)],
+    ) -> std::process::Output {
         let mut command = std::process::Command::new(kr());
         StartedEnvironment::within(self.temp.root()).apply(&mut command);
         command
+            .envs(variables.iter().copied())
             .args(arguments)
             .env(
                 "KR_RUNTIME_DIR",
@@ -241,6 +252,18 @@ async fn the_read_check_reads_the_file_a_person_names_and_a_run_with_no_session_
         "--json",
     ]);
     let display = created["display_number"].to_string();
+
+    // Inside a session the command refuses, and no run begins: an agent does not start the checks
+    // or name a file for them.
+    let inside = host.kr_with(
+        &directory,
+        &["host", "desktop-checks", "--json"],
+        &[("KR_SESSION", display.as_str())],
+    );
+    assert!(!inside.status.success(), "refused inside a session");
+    let said: Value = serde_json::from_slice(&inside.stdout).expect("kr printed JSON");
+    assert_eq!(said["code"], "PERMISSION_DENIED", "{said}");
+    assert!(said.get("checks").is_none(), "no run began: {said}");
 
     // A file named by its full path is read in the session's worker.
     let named = directory.join("named.txt");

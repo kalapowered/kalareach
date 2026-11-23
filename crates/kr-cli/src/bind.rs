@@ -411,30 +411,58 @@ pub async fn require_outside_to_end_a_daemon(
     command: &'static str,
     what_goes_on: &'static str,
 ) -> Result<()> {
+    match found_inside(build_id).await {
+        Some(found) => Err(inside(shown!(
+            "{} runs outside a KalaReach session, and {}. {} Nothing was stopped. {}",
+            command,
+            found,
+            WHERE_TO_RUN,
+            what_goes_on
+        ))),
+        None => Ok(()),
+    }
+}
+
+/// Where a command that starts the disclosed desktop checks is run, which is outside every session,
+/// the place an agent runs: the checks are the person's to ask for, and the file they read is the
+/// person's to name.
+///
+/// The test is [`require_outside_to_end_a_daemon`]'s: `KR_SESSION` or `KR_ATTACHMENT` set here
+/// refuses at once, and otherwise every live session's worker is asked whether this process is
+/// inside its session; a worker that cannot say lets the command go on.
+///
+/// # Errors
+///
+/// Returns a refusal with `PERMISSION_DENIED`, in its own words, that says nothing was run.
+pub async fn require_outside_to_run_the_checks(build_id: &BuildId) -> Result<()> {
+    match found_inside(build_id).await {
+        Some(found) => Err(inside(shown!(
+            "kr host desktop-checks runs outside a KalaReach session, and {}. {} No checks were run.",
+            found,
+            WHERE_TO_RUN
+        ))),
+        None => Ok(()),
+    }
+}
+
+/// How this process is found to be inside a session, said as the end of a clause, or `None` where
+/// no session claims it. `KR_SESSION` or `KR_ATTACHMENT` set here is found at once; otherwise every
+/// live session's worker is asked at once ([`membership_together`]), and a worker that cannot say
+/// finds nothing.
+async fn found_inside(build_id: &BuildId) -> Option<Shown> {
     for variable in [
         crate::resolve::SESSION_VARIABLE,
         crate::resolve::ATTACHMENT_VARIABLE,
     ] {
         if std::env::var_os(variable).is_some() {
-            return Err(inside(shown!(
-                "{} runs outside a KalaReach session, and {} is set here. {} Nothing was stopped. {}",
-                command,
-                variable,
-                WHERE_TO_RUN,
-                what_goes_on
-            )));
+            return Some(shown!("{} is set here", variable));
         }
     }
     match membership_together(build_id).await {
-        Membership::Inside(session_id) => Err(inside(shown!(
-            "{} runs outside a KalaReach session, and this process is inside session {}. {} \
-             Nothing was stopped. {}",
-            command,
-            session_id,
-            WHERE_TO_RUN,
-            what_goes_on
-        ))),
-        Membership::Outside | Membership::Unknown(_) => Ok(()),
+        Membership::Inside(session_id) => {
+            Some(shown!("this process is inside session {}", session_id))
+        }
+        Membership::Outside | Membership::Unknown(_) => None,
     }
 }
 
