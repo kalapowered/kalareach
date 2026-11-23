@@ -243,7 +243,10 @@ differ only by case are one variable, so a step's `PATH` replaces the plan's `Pa
 refuses two names of one table that differ only by case, in `env` and in `[env]`, on every platform.
 The loader refuses the names the report sets for each step, in any case, in `env` and in `[env]`:
 `KR_TEST_ARTIFACTS_DIR`, `CARGO_TERM_COLOR`, `KR_CONFORMANCE_STEP`, `KR_CONFORMANCE_RECORDS`,
-`KR_CONFORMANCE_OWN_HARNESS` and `CARGO_TARGET_<triple>_RUNNER`.
+`KR_CONFORMANCE_OWN_HARNESS` and `CARGO_TARGET_<triple>_RUNNER`. A step's command inherits none of
+the variables the report sets for its own listing and run (`KR_CONFORMANCE_STEP`,
+`KR_CONFORMANCE_RECORDS` and `KR_CONFORMANCE_OWN_HARNESS`), so a report started inside a step of
+another report reads none of that report's.
 
 The placeholders are `{evidence}` (the evidence directory), `{root}` (the repository, as an absolute path), `{scratch}`
 and `{output}` (the step's own output). `{scratch}` is a directory the run makes under the directory
