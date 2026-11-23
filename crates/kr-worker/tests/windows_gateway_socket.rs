@@ -270,6 +270,16 @@ async fn the_real_codex_terminal_connects_to_a_socket_this_host_binds_and_the_ke
         facts.image.display()
     );
 
+    // What Windows does to the file of a live Unix-domain socket, recorded on each guest: the limit
+    // the bind names for a process of the same account rests on whether it can be renamed.
+    let live = directory.join("live.sock");
+    let moved = directory.join("moved.sock");
+    let listener = uds_windows::UnixListener::bind(&live).expect("a live socket binds");
+    let renamed = std::fs::rename(&live, &moved);
+    let reached = uds_windows::UnixStream::connect(&moved).is_ok();
+    eprintln!("a live socket's file renamed: {renamed:?}; reached under the new name: {reached}");
+    drop(listener);
+
     child.kill().expect("the terminal is ended");
     stop.store(true, Ordering::Relaxed);
     drop(stream);

@@ -19,16 +19,26 @@
 //!
 //! The sockets are the operating system's own. The listening socket and the probe's sockets are made
 //! here with `WSA_FLAG_NO_HANDLE_INHERIT`, so no process this worker starts can inherit one even in
-//! the moment after it exists, and are handed to `uds_windows` to accept and to read and write.
-//! Each is made non-blocking and registered with `async-io`'s reactor, and read and written through
-//! the tokio traits. `uds_windows` makes the sockets it accepts inheritable and clears that a moment
-//! later: the gap is the crate's, and a case measures where the flag stands afterwards.
+//! the moment after it exists, and are handed to `uds_windows` to read and write. Every connection
+//! is accepted here with the system's own call, and a case reads the inherit flag of the first
+//! accepted socket before anything changes it. Each socket is made non-blocking and registered with
+//! `async-io`'s reactor, and read and written through the tokio traits.
 //!
 //! A socket's file is a reparse point of its own kind. Every read of it and every removal of it
 //! opens it without following, and acts on what the open handle is: a path that names something
 //! else by then is left alone. A bind learns which file is its own by connecting to the path and
-//! finding that very connection in its own queue, the kernel naming this process as its maker, and
-//! only a file so proved is protected or removed by the bind.
+//! finding a connection in its own queue that the kernel says this process made, and only a file so
+//! proved is protected or removed by the bind. The file is held while that is shown: it is opened
+//! without the sharing of delete, so no other open may rename or remove it meanwhile where Windows
+//! lets a handle hold it.
+//!
+//! **A limit of the design, named.** A process of the same account, which can write in the account's
+//! own private folder, can race the proof by moving socket files faster than it runs, and the hold
+//! narrows that and does not close it. What the design guarantees is the peer check: the
+//! kernel names the process at the other end and its token names the account, before a byte of what
+//! it sent is read. The socket's access list is defence in depth, and a process of the same account,
+//! an elevated one included, is inside the trust boundary. Another account cannot write in the
+//! folder, which the walk and the private-directory check refuse to bind below otherwise.
 
 #![expect(
     unsafe_code,
@@ -410,8 +420,10 @@ impl Listener {
         // The file the bind made is opened once, without following, and everything done to it is
         // done through that handle.
         let rights = FILE_READ_ATTRIBUTES | READ_CONTROL | WRITE_DAC | DELETE;
-        let file = open_without_following(path, rights)
+        let file = open_holding_without_following(path, rights)
             .map_err(|error| left_as_found(format!("it could not be opened: {error}")))?;
+        #[cfg(test)]
+        run_the_hook_after_the_open(path);
         let made = prove_it_is_the_bound_socket(&listener, path, &file).map_err(left_as_found)?;
         // From here the handle holds the socket this bind made, and removing through it removes
         // that socket.
@@ -542,6 +554,22 @@ thread_local! {
     /// What a case does to the path between the bind and the first open, on its own thread, once.
     static AFTER_THE_BIND: std::cell::RefCell<Option<AfterTheBind>> =
         const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// What a case does to the path after the file is open and before the proof, on its own
+    /// thread, once.
+    static AFTER_THE_OPEN: std::cell::RefCell<Option<AfterTheBind>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Runs, once, what a case put between the open of the file and the proof.
+#[cfg(test)]
+fn run_the_hook_after_the_open(path: &Path) {
+    if let Some(hook) = AFTER_THE_OPEN.with(|hook| hook.borrow_mut().take()) {
+        hook(path);
+    }
 }
 
 /// Runs, once, what a case put between the bind and the first open of the file.
@@ -787,6 +815,16 @@ fn open_without_following(path: &Path, rights: u32) -> std::io::Result<std::fs::
     std::fs::OpenOptions::new()
         .access_mode(rights)
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+}
+
+/// As [`open_without_following`], sharing read and write only: while the handle is open, no other
+/// open may ask for the right to rename or remove the file, so it is held against replacement.
+fn open_holding_without_following(path: &Path, rights: u32) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .access_mode(rights)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
         .open(path)
 }
@@ -1400,6 +1438,33 @@ mod tests {
         drop(other);
     }
 
+    /// Puts `hook` between the next bind's open of its file on this thread and its proof.
+    fn after_the_open(hook: impl FnOnce(&Path) + 'static) {
+        AFTER_THE_OPEN.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+    }
+
+    /// KR-REQ-12.07: the socket's file is held against replacement while the bind proves it: a
+    /// rename of it is refused, so the file proved is the file the bind made.
+    #[test]
+    fn the_socket_file_cannot_be_renamed_while_the_bind_proves_it() {
+        let directory = Directory::new();
+        let path = directory.0.join("p.sock");
+        let attempt = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let (aside, slot) = (directory.0.join("aside.sock"), std::rc::Rc::clone(&attempt));
+        after_the_open(move |path| {
+            *slot.borrow_mut() = Some(std::fs::rename(path, &aside));
+        });
+        let bound = Listener::bind(&path);
+        let attempt = attempt.borrow_mut().take().expect("the hook ran");
+        assert!(
+            attempt.is_err(),
+            "a socket's file the bind holds is not renamed: {attempt:?}"
+        );
+        let (listener, made) = bound.expect("the bind goes on as it was");
+        assert_eq!(socket_object(&path), Some(made));
+        drop(listener);
+    }
+
     /// KR-REQ-12.07: a connection that another process queued before the path was replaced does not
     /// prove the replacement is the socket this bind made. The process connects to the new socket
     /// and waits, the file is removed and another socket bound at the path, and the bind's own
@@ -1447,6 +1512,7 @@ mod tests {
         match bound {
             Err(BindFailure::Unprotected(detail)) => {
                 assert!(detail.contains("left as it is"), "{detail}");
+                assert!(detail.contains("came from process"), "{detail}");
             }
             other => panic!("a refusal that leaves the path, not {other:?}"),
         }
