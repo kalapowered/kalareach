@@ -174,6 +174,25 @@ pub(crate) fn require_room_for_a_socket_path(path: &std::path::Path, limit: usiz
     Ok(())
 }
 
+#[cfg(all(windows, test))]
+type BeforeTheBind = Box<dyn FnOnce()>;
+
+#[cfg(all(windows, test))]
+thread_local! {
+    /// What a case does between the reading of the directories and the bind, on its own thread,
+    /// once.
+    static BEFORE_THE_BIND: std::cell::RefCell<Option<BeforeTheBind>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Runs, once, what a case put between the reading of the directories and the bind.
+#[cfg(all(windows, test))]
+fn run_the_hook_before_the_bind() {
+    if let Some(hook) = BEFORE_THE_BIND.with(|hook| hook.borrow_mut().take()) {
+        hook();
+    }
+}
+
 /// The endpoint a launched agent's bridge connects to.
 #[derive(Debug)]
 pub struct BoundEndpoint {
@@ -299,6 +318,15 @@ impl BoundEndpoint {
                 let parent = path.parent().ok_or_else(|| {
                     BrokerError::invalid("a private socket lives inside a directory")
                 })?;
+                // The directory the socket goes in is held from here to the end of the bind: the
+                // bind resolves every folder in its path again, so what the check read must still
+                // be what the path names when it is over.
+                let held = crate::windows::uds::hold_directory(parent).map_err(|error| {
+                    BrokerError::ledger(format!(
+                        "could not hold the runtime directory {}: {error}",
+                        parent.display()
+                    ))
+                })?;
                 crate::broker::process::check_private_directory(parent)?;
                 // The default root lies in the profile, whose folders no other account writes, and
                 // is left as it is. Any other directory can be anywhere, below a folder another
@@ -306,6 +334,8 @@ impl BoundEndpoint {
                 if !kr_ipc::paths::lies_inside_the_default_runtime_root(parent) {
                     crate::broker::process::check_the_directories_above(parent)?;
                 }
+                #[cfg(test)]
+                run_the_hook_before_the_bind();
                 // The bind proves the build names its peers, makes the socket's file, gives it
                 // the owner-only list through the handle it opened and reads that list back from
                 // the same handle, and returns the identity of the file it made.
@@ -322,6 +352,18 @@ impl BoundEndpoint {
                             BrokerError::ledger(detail)
                         }
                     })?;
+                if !held.is_still_named_by(parent) {
+                    // The folder was swapped for another while the bind ran, so the socket may
+                    // stand where nothing was read. It is the socket this bind made, by the
+                    // identity the bind proved, and is removed as such.
+                    drop(listener);
+                    remove_socket_made(path, made);
+                    return Err(BrokerError::ledger(format!(
+                        "{} names another directory than the one that was read, so the socket \
+                         was not kept",
+                        parent.display()
+                    )));
+                }
                 Ok(Self {
                     address,
                     listener: Bound::Uds { listener, made },
@@ -867,6 +909,67 @@ mod tests {
             "no socket was made"
         );
         let _ = std::fs::remove_dir_all(&outer);
+    }
+
+    /// KR-REQ-07.45: a folder above the private directory that is swapped for a junction after the
+    /// directory was read does not move the socket: the directory is held while the bind runs, so
+    /// either the swap cannot be made, and the socket is where it was read, or it is made, and the
+    /// bind is refused and nothing stands where the junction leads.
+    #[cfg(windows)]
+    #[test]
+    fn an_ancestor_swapped_after_the_private_directory_was_read_binds_nothing_where_it_leads() {
+        assert!(
+            std::env::var_os(kr_ipc::paths::RUNTIME_DIR_VARIABLE).is_none(),
+            "this case runs with the variable unset"
+        );
+        let name =
+            |kind: &str| std::env::temp_dir().join(format!("kr-{kind}-{}", kr_ipc::new_uuid()));
+        let (outer, decoy, moved) = (name("e"), name("d"), name("m"));
+        std::fs::create_dir_all(&outer).expect("the directory is created");
+        std::fs::create_dir_all(&decoy).expect("the directory is created");
+        let run = private_run_directory_in(&outer);
+        private_run_directory_in(&decoy);
+        let swapped = std::rc::Rc::new(std::cell::Cell::new(false));
+        let done = std::rc::Rc::clone(&swapped);
+        let (above, aside, leads_to) = (outer.clone(), moved.clone(), decoy.clone());
+        BEFORE_THE_BIND.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                if std::fs::rename(&above, &aside).is_err() {
+                    return;
+                }
+                let made = std::process::Command::new("cmd")
+                    .arg("/c")
+                    .arg("mklink")
+                    .arg("/J")
+                    .arg(&above)
+                    .arg(&leads_to)
+                    .output()
+                    .expect("cmd runs");
+                assert!(made.status.success(), "the junction is made: {made:?}");
+                done.set(true);
+            }));
+        });
+        let bound = BoundEndpoint::bind_named(&run, "gw.sock");
+        if swapped.get() {
+            assert!(
+                bound.is_err(),
+                "a swapped ancestor binds nothing: {:?}",
+                bound.map(|_| ())
+            );
+            assert!(
+                std::fs::symlink_metadata(decoy.join("run").join("gw.sock")).is_err(),
+                "no socket stands where the junction leads"
+            );
+            std::fs::remove_dir(&outer).expect("the junction is removed as itself");
+        } else {
+            let endpoint =
+                bound.expect("the directory was held, so the bind goes where it was read");
+            assert!(socket_identity(&run.join("gw.sock")).is_some());
+            drop(endpoint);
+        }
+        let _ = std::fs::remove_dir_all(&outer);
+        let _ = std::fs::remove_dir_all(&moved);
+        let _ = std::fs::remove_dir_all(&decoy);
     }
 
     /// KR-REQ-07.45: a runtime directory that is not in the default root binds nothing below a
