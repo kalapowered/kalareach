@@ -477,11 +477,13 @@ fn outside_to_run_the_checks(membership: Membership) -> Result<()> {
             why
         ))),
         // No session is named: the records that say which sessions there are cannot be read, and
-        // `kr doctor` says why.
+        // the remedy is the reason's own, since `kr doctor` does not see every one of them (a
+        // folder this process cannot read, another installation's environment, a descriptor that
+        // became unreadable after the daemon started, the boot identity).
         Membership::Unreadable(why) => Err(inside(shown!(
             "kr host desktop-checks runs outside a KalaReach session. It is not known whether this \
-             terminal is inside a KalaReach session ({}). `kr doctor` says why the host's records \
-             cannot be read; run the checks again when it reports no fault. No checks were run.",
+             terminal is inside a KalaReach session ({}). Repair or remove what the reason names, \
+             then run the checks again. No checks were run.",
             why
         ))),
     }
@@ -866,7 +868,8 @@ mod tests {
     /// is told to run the command in another terminal. Where it is not known, that is not the
     /// remedy, since every terminal gets the same refusal until what could not say can: a worker
     /// that did not answer is waited for, and its session named; records that cannot be read are
-    /// no session's, so `kr doctor` is named in their place, which says why they cannot be read.
+    /// no session's, so the person is told to repair or remove what the reason names, which is true
+    /// whatever the fault, where `kr doctor` does not see every one of them.
     #[test]
     fn the_checks_are_refused_unless_every_worker_said_this_process_is_outside() {
         assert!(outside_to_run_the_checks(Membership::Outside).is_ok());
@@ -875,7 +878,7 @@ mod tests {
             (
                 Membership::Inside(SessionId::new(Uuid::from_bytes([2; 16]))),
                 "this process is inside session",
-                "kr doctor",
+                "Repair or remove",
                 true,
             ),
             (
@@ -883,14 +886,14 @@ mod tests {
                 "It is not known whether this terminal is inside a KalaReach session (it did not \
                  answer in time). Run the checks again when that session answers or has ended. \
                  No checks were run.",
-                "kr doctor",
+                "Repair or remove",
                 false,
             ),
             (
                 Membership::Unreadable(Shown::said("a session descriptor cannot be read")),
                 "It is not known whether this terminal is inside a KalaReach session (a session \
-                 descriptor cannot be read). `kr doctor` says why the host's records cannot be \
-                 read; run the checks again when it reports no fault. No checks were run.",
+                 descriptor cannot be read). Repair or remove what the reason names, then run the \
+                 checks again. No checks were run.",
                 "that session",
                 false,
             ),

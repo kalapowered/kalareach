@@ -2735,9 +2735,11 @@ Where a worker cannot say, another terminal gets the same refusal: the command s
 known whether the terminal is inside a session, and to run the checks again when that session
 answers or has ended. Where the host's own records cannot be read (its directories, this boot or
 its environments, an environment's sessions, or a session's descriptor), no session is the one that
-did not say: the command says that it is not known whether the terminal is inside a session, that
-`kr doctor` says why the host's records cannot be read, and to run the checks again when it
-reports no fault.
+did not say: the command says that it is not known whether the terminal is inside a session, and
+to repair or remove what its reason names and then run the checks again. It does not send you to
+`kr doctor`, which does not see every such fault: a folder of the host's records that this program
+cannot read, another installation's environment, a descriptor that became unreadable after the
+daemon started, or the boot identity.
 
 A run that ends without findings is a failure, exit 1, and the message says why in the words the
 setup page uses: no session of the kind the host creates is running, or the session's worker
