@@ -36,5 +36,11 @@ tokio-websockets.workspace = true
 # The tests play the gateway between the two sides: it accepts the terminal's WebSocket.
 tokio-websockets = { workspace = true, features = ["server"] }
 
+[target.'cfg(windows)'.dev-dependencies]
+# A case that stands in for the gateway on Windows binds the socket the host's own code binds and
+# reads the process the kernel names at the other end of a connection.
+kr-ipc.workspace = true
+kr-worker.workspace = true
+
 [lints]
 workspace = true

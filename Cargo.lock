@@ -4603,6 +4603,8 @@ dependencies = [
  "futures-util",
  "http",
  "jsonschema",
+ "kr-ipc",
+ "kr-worker",
  "rustix",
  "serde_json",
  "tokio",
