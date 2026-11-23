@@ -131,6 +131,24 @@ fn stores_of_the_release_at(commit: &str) -> Vec<ReleaseStore> {
         .collect()
 }
 
+/// `stores` as a release of the same level built before a draft's binding revision had a store of
+/// its own lists them: no store of binding revisions, and the transfers journal at version 5 that
+/// reads no higher, so the release reads the journal below the version that keeps the revision in
+/// the journal.
+fn the_stores_before_binding_revisions_had_a_store(stores: &[ReleaseStore]) -> Vec<ReleaseStore> {
+    stores
+        .iter()
+        .filter(|store| store.store != "draft-revisions")
+        .map(|store| match store.store.as_str() {
+            "transfers" => ReleaseStore {
+                reads_through: None,
+                ..store.clone()
+            },
+            _ => store.clone(),
+        })
+        .collect()
+}
+
 /// A line `name=value` of the record of a release.
 fn recorded(record: &str, name: &str) -> String {
     record
@@ -658,6 +676,11 @@ struct Setup {
     /// the manifest of a release from before that store does not: a rollback to it is decided by
     /// the update check on that manifest, with the release's own programs behind it.
     without_the_organisation_store: bool,
+    /// The first release's manifest lists the stores of a release built before a draft's binding
+    /// revision had a store of its own, as releases of this level were: no store of binding
+    /// revisions, and the transfers journal read at version 5 and no higher. A rollback to it is
+    /// decided by that manifest, and states the limit of a draft's prompt record.
+    without_the_store_of_binding_revisions: bool,
     /// The configuration document names a test suite, `reports`, that writes a JUnit report as its
     /// output, for a workflow's `run_tests` node to run.
     suite: bool,
@@ -774,6 +797,7 @@ impl Updated {
             agent,
             states_its_own_major,
             without_the_organisation_store,
+            without_the_store_of_binding_revisions,
             suite,
         } = setup;
         let mut one = before.assembled(1);
@@ -781,6 +805,10 @@ impl Updated {
             one.manifest
                 .stores
                 .retain(|store| store.store != "organisation-policy");
+        }
+        if without_the_store_of_binding_revisions {
+            let stores = the_stores_before_binding_revisions_had_a_store(&one.manifest.stores);
+            one = one.reading(stores);
         }
         if states_its_own_major {
             one = one.whose_daemon_states(None);
@@ -5194,6 +5222,12 @@ async fn a_report_store_the_release_before_keeps_too_is_kept_across_a_rollback_a
 /// fixture the case writes into the journal while that daemon is stopped; the daemon is not asked
 /// for a prompt. After the update again the record still names its session, and a prompt under
 /// another binding revision is refused and removes nothing.
+///
+/// The release before is one of this level built before the binding revision had a store of its own:
+/// its manifest lists no such store and reads the transfers journal at version 5, no higher, which
+/// is what makes a rollback to it state the limit of a draft's prompt record (`draft_limit`). The
+/// release this suite runs as the release before lists that store, and a rollback to it states no
+/// limit, as the case after this one shows.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_rollback_keeps_a_draft_written_for_an_application_and_its_binding_revision_for_the_update_again()
  {
@@ -5203,7 +5237,11 @@ async fn a_rollback_keeps_a_draft_written_for_an_application_and_its_binding_rev
     use kr_protocol::scalars::{TimestampMs, Uuid};
     use kr_protocol::transfer::DraftState;
 
-    let mut updated = Updated::new().await;
+    let mut updated = Updated::start(Setup {
+        without_the_store_of_binding_revisions: true,
+        ..Setup::default()
+    })
+    .await;
     let host = &updated.host;
     host.close(&updated.kr_now(), &updated.display);
     host.worker_ended(&updated.worker).await;
@@ -5426,5 +5464,34 @@ async fn a_rollback_keeps_a_draft_written_for_an_application_and_its_binding_rev
         recorded(),
         Some(session.get().as_bytes().to_vec()),
         "a refused prompt removes no record"
+    );
+}
+
+/// KR-REQ-26.10: a rollback to the release before, which lists the store of binding revisions and
+/// reads the transfers journal through the version that keeps the revision in the journal, states no
+/// limit of a draft's prompt record.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rollback_to_a_release_that_lists_the_store_of_binding_revisions_states_no_draft_limit() {
+    let updated = Updated::new().await;
+    let host = &updated.host;
+    host.close(&updated.kr_now(), &updated.display);
+    host.worker_ended(&updated.worker).await;
+    assert!(
+        host.stop_the_daemon().await,
+        "the daemon of this release is stopped through its own door"
+    );
+
+    let (output, said) = host.kr_json(&["host", "rollback", "--json"]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "kr host rollback: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(said["draft_limit"], false, "{said}");
+    assert_eq!(
+        host.store.current().expect("reads"),
+        Some(updated.one.name().clone()),
+        "the host is on the release before"
     );
 }
