@@ -960,7 +960,9 @@ mod tests {
 
     #[test]
     fn the_repair_refuses_a_registry_of_another_schema_and_a_grants_table_of_an_older_shape() {
-        for version in [14_i64, 16] {
+        // The version before this build's and the one it reads through without writing: both are
+        // another schema to the repair, which works at this build's own version only.
+        for version in [SCHEMA_VERSION - 1, SCHEMA_VERSION + 1] {
             let store = damaged();
             store.sql(&format!("UPDATE schema_version SET version = {version};"));
             let before = store.rows();
