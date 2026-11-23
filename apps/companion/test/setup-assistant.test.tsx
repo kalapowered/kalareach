@@ -220,6 +220,28 @@ describe('what the machine can do, and how that is known', () => {
     expect(card.textContent).not.toMatch(/nothing installed/)
   })
 
+  it('names no file for a read that no file was nominated for', async () => {
+    const { controls } = start()
+    await screen.findByTestId('setup-identity')
+    controls.setFileNominated(false)
+    await goTo('capabilities')
+    await userEvent.click(screen.getByTestId('setup-recheck'))
+    // The setup page nominates none, so this is the record a person normally reads. Its reason
+    // says that no file was nominated; a row that said what it was about would name a file nobody
+    // gave.
+    await waitFor(() => {
+      expect(screen.getByTestId('setup-reason-desktop.authorised_file_read').textContent).toMatch(
+        /no file was nominated/
+      )
+    })
+    await userEvent.click(screen.getByTestId('setup-evidence-toggle-desktop.authorised_file_read'))
+    const card = screen.getByTestId('setup-capability-desktop.authorised_file_read')
+    expect(within(card).getByText('Established by')).toBeInTheDocument()
+    expect(within(card).queryByText('About')).toBeNull()
+    expect(card.textContent).not.toMatch(/the one file it was given/)
+    expect(card.textContent).not.toMatch(/nothing installed/)
+  })
+
   it('declares what each check does before any of them is asked for', async () => {
     const { controls } = start()
     await screen.findByTestId('setup-identity')

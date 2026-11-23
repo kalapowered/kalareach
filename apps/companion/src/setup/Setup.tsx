@@ -197,6 +197,19 @@ function refusedBy(record: CapabilityRecord): string | null {
 /** The check that reads the one file a person nominated: its record is about that file, and names no program. */
 const FILE_READ = 'desktop.authorised_file_read'
 
+/**
+ * What an answer was established about, for the row of "how this is known": the program a check
+ * ran, or, for the read of a nominated file, the one file it was given. A read that had no file,
+ * or did not get as far as one, was about nothing, and its own reason says why, so it has no row.
+ */
+function establishedAbout(record: CapabilityRecord): string | null {
+  if (record.capability !== FILE_READ) return record.identity.binary ?? 'nothing installed'
+  const opened =
+    record.evidence_source === 'disclosed_probe' &&
+    (record.state === 'qualified_available' || record.state === 'permission_required')
+  return opened ? 'the one file it was given' : null
+}
+
 /** What a record was established about, in one line, where it names something. */
 function aboutLine(record: CapabilityRecord): string | null {
   const parts = [record.subject.application, record.subject.terminal, record.identity.binary]
@@ -958,6 +971,7 @@ function CapabilityCard({
   const [showEvidence, setShowEvidence] = useState(false)
   const state = displayState(record, { grantWasOffered: offered })
   const about = aboutLine(record)
+  const establishedFor = establishedAbout(record)
   return (
     <Card data-testid={`setup-capability-${record.capability}`}>
       <header className="card-header">
@@ -1001,15 +1015,15 @@ function CapabilityCard({
                 <dt>Established by</dt>
                 <dd>{EVIDENCE_LABEL[record.evidence_source]}</dd>
               </div>
-              <div>
-                <dt>About</dt>
-                <dd className="mono small">
-                  {record.capability === FILE_READ
-                    ? 'the one file it was given'
-                    : (record.identity.binary ?? 'nothing installed')}
-                  {record.identity.version ? ` · ${record.identity.version}` : ''}
-                </dd>
-              </div>
+              {establishedFor === null ? null : (
+                <div>
+                  <dt>About</dt>
+                  <dd className="mono small">
+                    {establishedFor}
+                    {record.identity.version ? ` · ${record.identity.version}` : ''}
+                  </dd>
+                </div>
+              )}
               <div>
                 <dt>Under</dt>
                 <dd>{record.identity.profile ?? 'no profile'}</dd>

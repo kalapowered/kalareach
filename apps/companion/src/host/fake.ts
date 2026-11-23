@@ -820,6 +820,12 @@ export interface FakeHostControls {
   readonly checkRuns: readonly EnvironmentCapabilitiesParams[]
   /** Takes one capability's permission away again. */
   revokePermission(capability: string): void
+  /**
+   * Says whether a file was nominated for the read of an authorised file, as the host would find
+   * it. One that was not leaves the check unstarted, and its record says so. A file is nominated
+   * to begin with.
+   */
+  setFileNominated(nominated: boolean): void
   /** Makes this build's identity an unstable one, or a stable one again. */
   setIdentityStable(stable: boolean): void
   /** The settings panes the interface asked the platform to open, in order. */
@@ -1459,6 +1465,7 @@ export function fakeHost(
     'desktop.authorised_file_read',
     'desktop.display_server'
   ])
+  let fileNominated = true
 
   const seed = voiceSeed()
   const voice: VoiceState = {
@@ -2180,7 +2187,7 @@ export function fakeHost(
       if (asked && asked !== ENVIRONMENT) {
         refuse('NOT_FOUND', 'This host does not own that environment.')
       }
-      return Promise.resolve(capabilities(granted, capabilityRevision, checks))
+      return Promise.resolve(capabilities(granted, capabilityRevision, checks, fileNominated))
     },
 
     environmentCapabilitiesCheck: (params) => {
@@ -4228,6 +4235,10 @@ export function fakeHost(
       granted.delete(capability)
       capabilityRevision += 1
     },
+    setFileNominated(nominated) {
+      fileNominated = nominated
+      capabilityRevision += 1
+    },
     setIdentityStable(stable) {
       identityStable = stable
     },
@@ -5968,11 +5979,30 @@ function capabilityRecord(
   }
 }
 
+/**
+ * What the host answers for the read of an authorised file when no file was nominated: the check
+ * does not start, it establishes nothing, and the record names no binary and no file.
+ */
+function noFileNominated(revision: number): CapabilityRecord {
+  return {
+    ...capabilityRecord('desktop.authorised_file_read', false, revision, {
+      permission: 'Full Disk Access',
+      binary: null,
+      probed: true
+    }),
+    state: 'temporarily_unavailable',
+    disabled_reason:
+      'this check established nothing: no file was nominated for this check, and there is no ' +
+      'default: a file the person did not choose would establish something about the wrong file'
+  }
+}
+
 /** What this host answers `environment.capabilities` with. */
 function capabilities(
   granted: ReadonlySet<string>,
   revision: number,
-  checks: CapabilityChecks
+  checks: CapabilityChecks,
+  fileNominated: boolean
 ): EnvironmentCapabilitiesResult {
   const record = (
     capability: string,
@@ -6007,7 +6037,9 @@ function capabilities(
       records: [
         record('desktop.accessibility', 'Accessibility', '/usr/bin/osascript'),
         record('desktop.application_launch', 'nothing', '/usr/bin/open'),
-        record('desktop.authorised_file_read', 'Full Disk Access', null),
+        fileNominated
+          ? record('desktop.authorised_file_read', 'Full Disk Access', null)
+          : noFileNominated(revision),
         record('desktop.display_server', 'nothing', 'Aqua'),
         record('desktop.input_injection', 'Accessibility', '/usr/bin/osascript', false),
         record('desktop.screen_capture', 'Screen & System Audio Recording', '/usr/sbin/screencapture')
