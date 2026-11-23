@@ -445,6 +445,34 @@ pub fn expected_below(repository: &Path, level: CompatibilityLevel) -> Result<Ve
     Ok(expected)
 }
 
+/// The releases below `level`, first as origin lists them and then as the local tags have them,
+/// each in the order of releases once origin and the local tags agree.
+///
+/// # Errors
+///
+/// When origin and the local tags differ, or a tag cannot be read.
+pub(super) fn releases_below(
+    repository: &Path,
+    level: CompatibilityLevel,
+) -> Result<(Vec<Tagged>, Vec<Tagged>), String> {
+    let inventory = releases::inventory(repository)?;
+    let head = releases::git_in(repository, &["rev-parse", "HEAD"])?
+        .trim()
+        .to_owned();
+    releases::agree_with_origin(repository, &inventory, &head)?;
+    let expected = expected_below(repository, level)?;
+    let mut tagged = Vec::new();
+    for release in inventory.iter().filter(|release| release.level() < level) {
+        tagged.push(Tagged {
+            tag: release.tag.clone(),
+            commit: release.commit.clone(),
+            version: release.version,
+            committed: committed(repository, &release.commit)?,
+        });
+    }
+    Ok((expected, tagged))
+}
+
 /// What gives the sightings of a release: the record of the compiler's readings, or a fixture's.
 pub type SightingsOf<'a> = &'a (dyn Fn(&Tagged) -> Result<Vec<Sighting>, String> + Sync);
 
@@ -466,21 +494,7 @@ pub fn read_history(
         .level
         .parse()
         .map_err(|error| format!("the entry's level {}: {error:?}", entry.level))?;
-    let inventory = releases::inventory(repository)?;
-    let head = releases::git_in(repository, &["rev-parse", "HEAD"])?
-        .trim()
-        .to_owned();
-    releases::agree_with_origin(repository, &inventory, &head)?;
-    let expected = expected_below(repository, level)?;
-    let mut tagged = Vec::new();
-    for release in inventory.iter().filter(|release| release.level() < level) {
-        tagged.push(Tagged {
-            tag: release.tag.clone(),
-            commit: release.commit.clone(),
-            version: release.version,
-            committed: committed(repository, &release.commit)?,
-        });
-    }
+    let (expected, tagged) = releases_below(repository, level)?;
     let results = in_threads_of_their_own(tagged, READ_WIDTH, |tagged| {
         let tag = tagged.tag.clone();
         let started = std::time::Instant::now();

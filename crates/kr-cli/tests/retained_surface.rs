@@ -61,6 +61,10 @@ mod history_cases;
 mod narrower;
 #[path = "retained_surface/narrower_cases.rs"]
 mod narrower_cases;
+#[path = "retained_surface/narrower_page.rs"]
+mod narrower_page;
+#[path = "retained_surface/narrower_page_cases.rs"]
+mod narrower_page_cases;
 #[path = "retained_surface/narrower_table.rs"]
 mod narrower_table;
 #[path = "retained_surface/probes.rs"]
@@ -468,6 +472,26 @@ fn the_senders_of_each_entry_at_each_release() {
         history::print_report(&report);
         assert!(report.problems.is_empty(), "{}", report.problems.join("\n"));
     }
+}
+
+/// What the companion's page sends of the resource a plugin action names, at every release tag
+/// below this build's level, is the table's. Run by hand: it extracts the apps of every release
+/// tag, which takes minutes.
+#[test]
+#[ignore = "reads every release tag below this build's level"]
+fn the_resource_senders_at_each_release() {
+    let started = std::time::Instant::now();
+    let (expected, snapshots) =
+        narrower_page::read_page_history(&repository(), kr_protocol::update::THIS_LEVEL, &|_| {})
+            .unwrap_or_else(|error| panic!("{error}"));
+    println!(
+        "read {} releases of the page in {:?}",
+        snapshots.len(),
+        started.elapsed()
+    );
+    let report = narrower_page::audit_page(&expected, &snapshots, &narrower_page::PAGE);
+    narrower_page::print_page_report(&report);
+    assert!(report.problems.is_empty(), "{}", report.problems.join("\n"));
 }
 
 /// What the compiler finds in this checkout, by class of crate, and how long it takes.

@@ -16,7 +16,7 @@ use super::narrower::{Account, Evidence, Item, Narrower, Range, Sender};
 use super::narrower_cases::leak;
 use super::walker::{Lookup, Source};
 
-fn git(dir: &Path, args: &[&str], date: Option<i64>) -> String {
+pub(super) fn git(dir: &Path, args: &[&str], date: Option<i64>) -> String {
     let mut command = Command::new("git");
     command
         .args([
@@ -48,7 +48,7 @@ fn git(dir: &Path, args: &[&str], date: Option<i64>) -> String {
     String::from_utf8(output.stdout).expect("text")
 }
 
-fn write(root: &Path, path: &str, text: &str) {
+pub(super) fn write(root: &Path, path: &str, text: &str) {
     let full = root.join(path);
     std::fs::create_dir_all(full.parent().expect("a parent")).expect("a directory");
     std::fs::write(full, text).expect("a file");
