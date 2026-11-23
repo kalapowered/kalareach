@@ -223,7 +223,7 @@ impl Drop for Reading {
     fn drop(&mut self) {
         self.cancel.store(true, Ordering::SeqCst);
         if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
+            drop(thread);
         }
     }
 }
