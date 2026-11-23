@@ -14,6 +14,7 @@ import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } fro
 import type {
   AgentApprovalInspectResult,
   AgentCapabilitiesResult,
+  AgentInstanceSummary,
   OfferedDecision,
   PendingResource
 } from '@kalareach/protocol'
@@ -29,6 +30,7 @@ import { ask } from '../mobile/model/call'
 import {
   actionableApprovals,
   type ApprovalNotice,
+  approvalNoticeFor,
   capabilityRecords,
   composerOffers,
   isChannelPackage,
@@ -59,6 +61,8 @@ interface Waiting {
   readonly facts: AgentCapabilitiesResult
   /** Whether the request's instance takes answers over a channel that confirms nothing. */
   readonly channel: boolean
+  /** The instance the request came from, as the host lists it. */
+  readonly instance: AgentInstanceSummary | null
 }
 
 /** The request the agent sent, as text a person can read, and how much of it is not shown. */
@@ -114,11 +118,17 @@ export function ApprovalOffer({
 /** The approvals waiting in one session. */
 export function ApprovalRequests({
   sessionId,
-  onAnswered
+  onAnswered,
+  offerTerminal = false
 }: {
   readonly sessionId: string
   /** Called once an answer has been taken, so what listed the request can read again. */
   readonly onAnswered?: () => void
+  /**
+   * Whether a request that cannot be answered here is given the notice that says where to answer
+   * it, which a conversation draws once above its requests and the inbox draws on the card.
+   */
+  readonly offerTerminal?: boolean
 }): ReactNode {
   const { port, say } = useApp()
   const rights = useConnectionRights()
@@ -227,6 +237,10 @@ export function ApprovalRequests({
             resource,
             facts: instanceFacts,
             channel: channelInstances.has(resource.application_instance_id),
+            instance:
+              agents.instances.instances.find(
+                (each) => each.application_instance_id === resource.application_instance_id
+              ) ?? null,
             inspection: await port.approvalInspect({
               subject: subjectOf(sessionId, resource.application_instance_id),
               resource_id: resource.resource_id
@@ -331,6 +345,17 @@ export function ApprovalRequests({
           capabilities: capabilityRecords(facts.capabilities.records),
           rights: rights === null ? null : new Set(rights)
         }).answer
+        // Once the connection has said what it may do: before that, the card does not tell a device
+        // that it may not type.
+        const notice =
+          offerTerminal && rights !== null
+            ? approvalNoticeFor({
+                instance: request.instance,
+                capabilities: capabilityRecords(facts.capabilities.records),
+                connected: true,
+                rights: new Set(rights)
+              })
+            : null
         const source = sourceText(decoding.source_bytes)
         const busy = answering === resource.resource_id
         return (
@@ -377,7 +402,9 @@ export function ApprovalRequests({
                 </CommitButton>
               ))}
             </div>
-            {offer.reason !== null ? (
+            {notice !== null ? (
+              <ApprovalOffer sessionId={sessionId} notice={notice} />
+            ) : offer.reason !== null ? (
               <p className="small warning-text" data-testid="approval-unavailable">
                 {offer.reason}
               </p>

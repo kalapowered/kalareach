@@ -13,18 +13,23 @@ import userEvent from '@testing-library/user-event'
 import { App } from '../src/App'
 import { AppProvider } from '../src/app/state'
 import { fakeHost } from '../src/host/fake'
+import type { Place } from '../src/app/state'
 
 const SESSION_MAIN = '8a7b6c50-22bb-4c3d-8e4f-000000000101'
 
 type Controls = ReturnType<typeof fakeHost>['controls']
 
 /** Opens the session's conversation with the host as `arrange` leaves it. */
-function open(arrange: (controls: Controls) => void, channel = true): Controls {
+function open(
+  arrange: (controls: Controls) => void,
+  channel = true,
+  place: Place = { view: 'session', sessionId: SESSION_MAIN, pane: 'semantic' }
+): Controls {
   const { port, controls } = fakeHost()
   if (channel) controls.records.useChannel(SESSION_MAIN, 0)
   arrange(controls)
   render(
-    <AppProvider port={port} initialPlace={{ view: 'session', sessionId: SESSION_MAIN, pane: 'semantic' }}>
+    <AppProvider port={port} initialPlace={place}>
       <App />
     </AppProvider>
   )
@@ -150,5 +155,69 @@ describe('the notice about approvals', () => {
     const region = await notice()
     expect(region).toHaveTextContent('The launch did not keep the channel flag.')
     expect(region).not.toHaveTextContent('Channels has not shown that it is on for this session.')
+  })
+})
+
+describe('the inbox card of an approval that cannot be answered here', () => {
+  const card = () => screen.findByTestId('approval')
+
+  it('offers_the_terminal_beside_the_disabled_decisions_in_the_conversations_words', async () => {
+    open(
+      (controls) => {
+        controls.records.withoutCapability(SESSION_MAIN, 'agent.approval')
+      },
+      true,
+      { view: 'attention' }
+    )
+    const approval = await card()
+    expect(within(approval).getByRole('button', { name: 'Allow once' })).toBeDisabled()
+    const offer = await within(approval).findByTestId('approval-offer')
+    expect(offer).toHaveTextContent('Claude Code asks for approvals in its terminal. Answer them there.')
+    expect(within(offer).getByTestId('approval-offer-reason')).toHaveTextContent(
+      'This device cannot answer Claude Code’s approvals. Channels has not shown that it is on for this session.'
+    )
+    await userEvent.click(within(offer).getByRole('button', { name: 'Open the terminal' }))
+    await waitFor(() => {
+      expect(screen.getByRole('tab', { name: 'Terminal' })).toHaveAttribute('aria-selected', 'true')
+    })
+  })
+
+  it('without_the_right_to_type_the_card_says_so_and_offers_no_button', async () => {
+    open(
+      (controls) => {
+        controls.records.withoutCapability(SESSION_MAIN, 'agent.approval')
+        controls.setRights(['session.view', 'agent.prompt'])
+      },
+      true,
+      { view: 'attention' }
+    )
+    const approval = await card()
+    const offer = await within(approval).findByTestId('approval-offer')
+    expect(offer).toHaveTextContent(
+      'This device cannot type in the terminal, so it cannot answer Claude Code’s approvals.'
+    )
+    expect(within(offer).queryByRole('button')).toBeNull()
+  })
+
+  it('a_live_channel_leaves_the_card_without_an_offer', async () => {
+    open(() => undefined, true, { view: 'attention' })
+    const approval = await card()
+    await waitFor(() => {
+      expect(within(approval).getByRole('button', { name: 'Allow once' })).toBeEnabled()
+    })
+    expect(within(approval).queryByTestId('approval-offer')).toBeNull()
+  })
+
+  it('an_agent_that_does_not_use_channels_gets_no_offer_on_its_card', async () => {
+    open(
+      (controls) => {
+        controls.records.withoutCapability(SESSION_MAIN, 'agent.approval')
+      },
+      false,
+      { view: 'attention' }
+    )
+    const approval = await card()
+    await within(approval).findByTestId('approval-unavailable')
+    expect(within(approval).queryByTestId('approval-offer')).toBeNull()
   })
 })

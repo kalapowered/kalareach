@@ -395,7 +395,7 @@ export function Attention({ latest }: { readonly latest: ConnectionState | null 
                       {row.detail}
                     </p>
                     {approvals ? (
-                      <ApprovalRequests sessionId={sessionId} onAnswered={readAgain} />
+                      <ApprovalRequests sessionId={sessionId} onAnswered={readAgain} offerTerminal />
                     ) : null}
                     {questions && sessionId !== null ? (
                       <QuestionRequests sessionId={sessionId} onAnswered={readAgain} />
