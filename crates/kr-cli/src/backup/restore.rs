@@ -500,6 +500,9 @@ pub enum CheckpointResult {
         generation: u64,
         /// The bundle's revision after the write.
         bundle_revision: u64,
+        /// Whether the settings saved with the bundle were left out of this write, because the
+        /// bundle had no room for them beside the record.
+        settings_left: bool,
     },
     /// The bundle already records this generation or a newer one of the archive.
     AlreadyThere {
@@ -528,6 +531,44 @@ pub enum ConfigurationResult {
 }
 
 kr_client::debug_as_name!(CheckpointResult, ConfigurationResult);
+
+impl CheckpointResult {
+    /// What a person is told of the checkpoint, in this program's words.
+    pub fn words(&self) -> Shown {
+        match self {
+            Self::Recorded {
+                generation,
+                bundle_revision,
+                settings_left,
+            } => {
+                let recorded = shown!(
+                    "The recovery bundle now records generation {} as the newest this kit has \
+                     verified (bundle revision {}). A later restore refuses a service that offers \
+                     an older one. The first restore after a loss still has nothing to compare \
+                     with, and a service can hold the bundle back as well.",
+                    *generation,
+                    *bundle_revision
+                );
+                if *settings_left {
+                    shown!(
+                        "{} The recovery bundle had no room for this record and the saved \
+                         settings, so the settings were removed from it. A later restore does \
+                         not bring them back.",
+                        recorded
+                    )
+                } else {
+                    recorded
+                }
+            }
+            Self::AlreadyThere { generation } => shown!(
+                "The recovery bundle already records generation {} or a newer one of this \
+                 archive, so it was left as it is.",
+                *generation
+            ),
+            Self::NotRecorded(why) => why.clone(),
+        }
+    }
+}
 
 kr_client::debug_as_name!(Outcome);
 
@@ -667,14 +708,27 @@ async fn record_checkpoint(
             }),
     );
     let generation = prepared.plan().generation.get();
-    match prepared.record_checkpoint(bundles, now).await {
-        Ok(
-            CheckpointRecorded::Written { bundle_revision }
-            | CheckpointRecorded::WrittenWithoutSettings { bundle_revision },
-        ) => CheckpointResult::Recorded {
+    checkpoint_result(prepared.record_checkpoint(bundles, now).await, generation)
+}
+
+/// What recording the generation did, as the restore reports it.
+fn checkpoint_result(
+    recorded: std::result::Result<CheckpointRecorded, RestoreError>,
+    generation: u64,
+) -> CheckpointResult {
+    match recorded {
+        Ok(CheckpointRecorded::Written { bundle_revision }) => CheckpointResult::Recorded {
             generation,
             bundle_revision,
+            settings_left: false,
         },
+        Ok(CheckpointRecorded::WrittenWithoutSettings { bundle_revision }) => {
+            CheckpointResult::Recorded {
+                generation,
+                bundle_revision,
+                settings_left: true,
+            }
+        }
         Ok(CheckpointRecorded::AlreadyThere) => CheckpointResult::AlreadyThere { generation },
         Err(RestoreError::ServiceAskedToWait { seconds }) => CheckpointResult::NotRecorded(shown!(
             "the storage service asks this host to wait {} more seconds, so the bundle does not \
@@ -953,5 +1007,51 @@ async fn explain<P: Privacy>(error: RestoreError, privacy: &mut P, run: &Run<'_>
         RestoreError::Read(ClientError::Host(refusal)) => CliError::Refused(refusal),
         RestoreError::Read(ClientError::Ipc(failure)) => CliError::Ipc(failure),
         other => CliError::Other(shown!("{}", other)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// KR-REQ-20.17: a checkpoint written without the settings saved with the bundle says so after
+    /// the line that says what the bundle records, and one written with them says nothing of the
+    /// settings.
+    #[test]
+    fn a_checkpoint_written_without_the_saved_settings_says_so() {
+        let kept = checkpoint_result(Ok(CheckpointRecorded::Written { bundle_revision: 7 }), 3);
+        let left = checkpoint_result(
+            Ok(CheckpointRecorded::WrittenWithoutSettings { bundle_revision: 7 }),
+            3,
+        );
+        assert!(matches!(
+            kept,
+            CheckpointResult::Recorded {
+                generation: 3,
+                bundle_revision: 7,
+                settings_left: false
+            }
+        ));
+        assert!(matches!(
+            left,
+            CheckpointResult::Recorded {
+                generation: 3,
+                bundle_revision: 7,
+                settings_left: true
+            }
+        ));
+
+        let line = "The recovery bundle now records generation 3 as the newest this kit has \
+                    verified (bundle revision 7). A later restore refuses a service that offers \
+                    an older one. The first restore after a loss still has nothing to compare \
+                    with, and a service can hold the bundle back as well.";
+        assert_eq!(kept.words().as_str(), line);
+        assert_eq!(
+            left.words().as_str(),
+            format!(
+                "{line} The recovery bundle had no room for this record and the saved settings, \
+                 so the settings were removed from it. A later restore does not bring them back."
+            )
+        );
     }
 }

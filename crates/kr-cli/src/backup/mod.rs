@@ -303,25 +303,7 @@ fn print(outcome: &Outcome, json: bool) {
             for warning in warnings {
                 report::say(warning);
             }
-            let checkpoint_words = match checkpoint {
-                CheckpointResult::Recorded {
-                    generation,
-                    bundle_revision,
-                } => shown!(
-                    "The recovery bundle now records generation {} as the newest this kit has \
-                     verified (bundle revision {}). A later restore refuses a service that offers \
-                     an older one. The first restore after a loss still has nothing to compare \
-                     with, and a service can hold the bundle back as well.",
-                    *generation,
-                    *bundle_revision
-                ),
-                CheckpointResult::AlreadyThere { generation } => shown!(
-                    "The recovery bundle already records generation {} or a newer one of this \
-                     archive, so it was left as it is.",
-                    *generation
-                ),
-                CheckpointResult::NotRecorded(why) => why.clone(),
-            };
+            let checkpoint_words = checkpoint.words();
             let configuration_words = match configuration {
                 ConfigurationResult::NotAsked => None,
                 ConfigurationResult::NothingInTheBackup => Some(Shown::said(
