@@ -5964,6 +5964,241 @@ fn a_store_recording_9_with_another_schema_or_a_version_above_9_is_refused_and_l
     );
 }
 
+/// What one backup store leaves on disk: its main file, its write-ahead log if there is one, and
+/// whether the index that goes with the log is there.
+#[derive(Debug, PartialEq, Eq)]
+struct StoreFiles {
+    main: Vec<u8>,
+    log: Option<Vec<u8>>,
+    index_is_there: bool,
+}
+
+fn store_files(state: &std::path::Path) -> StoreFiles {
+    let main = state.join("backup.sqlite");
+    let beside = |suffix: &str| {
+        let mut name = main.clone().into_os_string();
+        name.push(suffix);
+        std::path::PathBuf::from(name)
+    };
+    let log = match std::fs::read(beside("-wal")) {
+        Ok(bytes) => Some(bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => panic!("the store's log could not be read: {error}"),
+    };
+    StoreFiles {
+        main: std::fs::read(&main).expect("the store's file"),
+        log,
+        index_is_there: beside("-shm").exists(),
+    }
+}
+
+/// Where two files first differ, for a message that does not print them.
+fn where_bytes_differ(after: &[u8], before: &[u8]) -> String {
+    match after.iter().zip(before).position(|(a, b)| a != b) {
+        Some(at) => format!(
+            "the first byte that differs is {at} (now {}, before {})",
+            after[at], before[at]
+        ),
+        None => format!(
+            "it is {} bytes long now and was {} bytes before",
+            after.len(),
+            before.len()
+        ),
+    }
+}
+
+/// How the files of a store are left when a build refuses to open it.
+#[derive(Clone, Copy, Debug)]
+enum Journal {
+    /// The store is in rollback-journal mode, as a store no build of this product wrote is.
+    Rollback,
+    /// The writer committed its last change to the write-ahead log and went away before anything
+    /// was copied from the log into the main file, as a writer does that is stopped abruptly.
+    AbruptExit,
+}
+
+/// Makes the change in a store that is in the state `journal` names, and leaves the files as the
+/// writer that made it left them.
+fn change_a_store_leaving_it(state: &std::path::Path, journal: Journal, change: &str) {
+    let connection =
+        rusqlite::Connection::open(state.join("backup.sqlite")).expect("the backup store");
+    match journal {
+        Journal::Rollback => {
+            let mode: String = connection
+                .query_row("PRAGMA journal_mode = DELETE", [], |row| row.get(0))
+                .expect("the store leaves write-ahead mode");
+            assert_eq!(mode, "delete");
+        }
+        Journal::AbruptExit => {
+            // The writer never copies the log into the main file, neither as it works nor as it
+            // goes away.
+            connection
+                .set_db_config(
+                    rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
+                    true,
+                )
+                .expect("the writer does not checkpoint as it closes");
+            connection
+                .pragma_update(None, "wal_autocheckpoint", 0)
+                .expect("the writer does not checkpoint as it works");
+        }
+    }
+    connection
+        .execute_batch(change)
+        .expect("the change is made");
+    drop(connection);
+    let files = store_files(state);
+    match journal {
+        Journal::Rollback => {
+            // Bytes 18 and 19 of the file are 1 for rollback-journal mode and 2 for write-ahead.
+            assert_eq!(
+                files.main[18..20],
+                [1, 1],
+                "the store is in rollback-journal mode"
+            );
+            assert!(
+                files.log.is_none() && !files.index_is_there,
+                "no log is kept"
+            );
+        }
+        Journal::AbruptExit => {
+            assert_eq!(
+                files.main[18..20],
+                [2, 2],
+                "the store is in write-ahead mode"
+            );
+            assert!(
+                files.log.as_ref().is_some_and(|log| !log.is_empty()),
+                "the change is committed to the log and not yet in the main file"
+            );
+            assert!(files.index_is_there, "the writer left its index behind");
+        }
+    }
+}
+
+/// A store a build refuses is left exactly as it was found, in every state its files may be in:
+/// the main file and the log byte for byte, and no index made where the writer left none. A
+/// store in rollback-journal mode stays in it, and committed pages of a writer that stopped
+/// abruptly stay in the log: opening one for refusal must neither switch its mode nor copy its
+/// log into its file.
+fn a_refused_store_keeps_its_files(journal: Journal) {
+    // What each refused store is made of: the version it starts at, the change that makes it
+    // one this build refuses, and what the refusal names.
+    let cases: [(&str, i64, &str, &str); 3] = [
+        (
+            "a store at 7 that holds a rule this build never wrote",
+            7,
+            "CREATE TRIGGER sqliteXforget AFTER INSERT ON writers
+             BEGIN
+                 DELETE FROM outbox WHERE status = 'terminal';
+             END;",
+            "sqliteXforget",
+        ),
+        (
+            "a store at 9 that holds a table version 9 does not define",
+            9,
+            "CREATE TABLE elsewhere (note TEXT);",
+            "elsewhere",
+        ),
+        (
+            "a store at 10",
+            9,
+            "UPDATE schema_version SET version = 10;",
+            "schema version 10",
+        ),
+    ];
+    for (what, version, change, named) in cases {
+        let (_root, state) = state_directory();
+        a_store_with_an_upload_in_flight(&state);
+        match version {
+            7 => as_version_7(&state),
+            _ => as_version_9(&state),
+        }
+        change_a_store_leaving_it(&state, journal, change);
+        let found = store_files(&state);
+
+        let opened = BackupStore::open(&state);
+        assert!(opened.is_err(), "{what}, {journal:?}: the store was opened");
+        let message = opened.expect_err("a refusal").to_string();
+        assert!(
+            message.contains(named),
+            "{what}, {journal:?}: the refusal names what is wrong: {message}"
+        );
+        let left = store_files(&state);
+        assert!(
+            left.main == found.main,
+            "{what}, {journal:?}: the main file is left byte for byte as it was found: {}",
+            where_bytes_differ(&left.main, &found.main)
+        );
+        assert!(
+            left.log == found.log,
+            "{what}, {journal:?}: the log is left byte for byte as it was found: {}",
+            match (&left.log, &found.log) {
+                (Some(after), Some(before)) => where_bytes_differ(after, before),
+                (after, before) => format!(
+                    "the log is there afterwards: {}, and was before: {}",
+                    after.is_some(),
+                    before.is_some()
+                ),
+            }
+        );
+        assert_eq!(
+            left.index_is_there, found.index_is_there,
+            "{what}, {journal:?}: the refusal makes no index and takes none away"
+        );
+    }
+}
+
+/// A refused store that is in rollback-journal mode stays in it, byte for byte.
+#[test]
+fn a_refused_store_in_rollback_journal_mode_is_left_byte_for_byte_as_it_was_found() {
+    a_refused_store_keeps_its_files(Journal::Rollback);
+}
+
+/// A refused store whose last committed pages are in the log of a writer that stopped abruptly
+/// keeps them there, and its main file is not changed.
+#[test]
+fn a_refused_store_with_committed_pages_in_the_log_of_a_writer_that_stopped_is_left_as_found() {
+    a_refused_store_keeps_its_files(Journal::AbruptExit);
+}
+
+/// A store this build accepts is put in write-ahead mode once it is read, and it is closed as
+/// every store of this build is: its log is copied into the main file and removed.
+#[test]
+fn an_accepted_store_in_rollback_journal_mode_goes_to_write_ahead_mode_and_is_closed_checkpointed()
+{
+    let (_root, state) = state_directory();
+    a_store_with_an_upload_in_flight(&state);
+    let connection =
+        rusqlite::Connection::open(state.join("backup.sqlite")).expect("the backup store");
+    let mode: String = connection
+        .query_row("PRAGMA journal_mode = DELETE", [], |row| row.get(0))
+        .expect("the store leaves write-ahead mode");
+    assert_eq!(mode, "delete");
+    drop(connection);
+    assert_eq!(store_files(&state).main[18..20], [1, 1]);
+
+    let store = BackupStore::open(&state).expect("a store at this build's version is accepted");
+    let held = store_files(&state);
+    assert_eq!(
+        held.main[18..20],
+        [2, 2],
+        "an accepted store is in write-ahead mode"
+    );
+    // A read opens the log, which is the file a close that does not checkpoint leaves behind.
+    store.generations().expect("a read");
+    assert!(
+        store_files(&state).log.is_some(),
+        "the open store reads through a log"
+    );
+    drop(store);
+    let closed = store_files(&state);
+    assert!(
+        closed.log.is_none() && !closed.index_is_there,
+        "the closed store's log was copied into its file and removed: {closed:?}"
+    );
+}
+
 /// KR-REQ-24.29: a store holds what a deletion of one object's ciphertext may be asked of by its
 /// generation's state. Version 8 admits a generation whose outcome is unknown and one that is
 /// published; version 9 admits one more, a generation whose production was cancelled with

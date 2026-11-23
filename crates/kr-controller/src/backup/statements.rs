@@ -13,6 +13,7 @@
 
 use std::path::Path;
 
+use rusqlite::config::DbConfig;
 use rusqlite::{Connection, Params, Row, TransactionBehavior};
 
 /// A statement the backup store may execute.
@@ -142,12 +143,26 @@ impl Database {
     /// triggers are on: SQLite runs the delete rules for a delete that conflict resolution causes
     /// only with that last one, so a statement that reached this database by any other route still
     /// meets the rules that guard a delete rather than slipping under them.
+    ///
+    /// Nothing here changes the file. Its journal mode is set by [`Database::accepted`], once the
+    /// store has been read and taken, and until then closing this connection copies no
+    /// write-ahead log into the file, so a store that is refused is left as it was found.
     fn configured(connection: Connection) -> rusqlite::Result<Self> {
-        connection.pragma_update(None, "journal_mode", "WAL")?;
+        connection.set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true)?;
         connection.pragma_update(None, "synchronous", "FULL")?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
         connection.pragma_update(None, "recursive_triggers", "ON")?;
         Ok(Self { connection })
+    }
+
+    /// Settles a store this build has read and taken: it is kept in write-ahead mode, and closing
+    /// the connection copies the log into the file again, as it does for every store of this
+    /// build.
+    pub(super) fn accepted(&self) -> rusqlite::Result<()> {
+        self.connection.pragma_update(None, "journal_mode", "WAL")?;
+        self.connection
+            .set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, false)?;
+        Ok(())
     }
 
     /// Refuses or admits writes on this connection, for a caller that is only reading.

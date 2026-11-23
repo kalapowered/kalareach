@@ -767,6 +767,12 @@ impl BackupStore {
             staging_root,
         };
         store.migrate()?;
+        // Only a store the steps above have read and taken is put in write-ahead mode. One they
+        // refused, in whatever mode its files are in, has not been changed by this build.
+        store
+            .connection
+            .accepted()
+            .map_err(ControllerError::registry)?;
         Ok(store)
     }
 
