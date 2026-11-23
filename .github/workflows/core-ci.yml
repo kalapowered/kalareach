@@ -667,6 +667,94 @@ jobs:
           primary-key: ${{ steps.cargo-cache.outputs.primary-key }}
           cache-hit: ${{ steps.cargo-cache.outputs.cache-hit }}
 
+  # The cases that run against a real squid proxy: one that asks for a login by HTTP Basic, one that
+  # offers Digest only, and one that intercepts TLS. The workspace's test run leaves them out
+  # (they are ignored, and name the proxy in the environment), so this job installs squid, starts the
+  # three proxies and runs the cases by name. It is a job of its own because the rust job's steps
+  # already add up to more than its limit, and the release gate at the end of that job is the step
+  # its limit cuts. It builds the four test programs from nothing, in parallel with the other jobs,
+  # and saves no cache: an entry of its own would take room in the repository's cache from the
+  # entries the other jobs restore.
+  real-proxy:
+    name: real-proxy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Check out
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      # rust-toolchain.toml pins the exact toolchain; rustup installs it on first use.
+      - name: Install the pinned toolchain
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustc --version
+          cargo --version
+
+      # Ubuntu 24.04 has squid in two builds, and the OpenSSL one is the one that intercepts TLS and
+      # has the certificate helper. Installing the package starts a squid service of its own, which
+      # nothing here uses, so a policy-rc.d refuses that start while the package installs and is
+      # removed afterwards. The step ends with the check that the program is squid 6 or newer, built
+      # with OpenSSL and the certificate helper, with the three helpers the proxies need: a runner
+      # image that moves to another build fails here, and no case is then skipped for want of one.
+      # The install's deadline is 8 minutes.
+      - name: Install a squid proxy that intercepts TLS
+        timeout-minutes: 10
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          set -euo pipefail
+          trap 'sudo rm -f /usr/sbin/policy-rc.d' EXIT
+          printf '#!/bin/sh\nexit 101\n' | sudo tee /usr/sbin/policy-rc.d > /dev/null
+          sudo chmod 755 /usr/sbin/policy-rc.d
+          bash scripts/apt-install.sh --deadline 480 squid-openssl
+          squid -v
+          bash scripts/real-proxy.sh check
+
+      # The two builds select the packages the cases' own lines select, so that the next step
+      # compiles nothing. From a cold target directory, on a Mac with four build jobs, they took
+      # three minutes and the cases after them half a minute; the limits below give a hosted runner
+      # several times that.
+      - name: Build the real-proxy cases' test programs
+        timeout-minutes: 30
+        run: |
+          cargo test --locked -p kr-transport --test real_proxy --test real_proxy_bump --no-run
+          cargo test --locked -p kr-controller --test proxy_front --test proxy_login_daemon --no-run
+          df -h /
+
+      # Starts the three proxies, runs the ten ignored cases of the four targets by name, holds each
+      # target to the number of cases it names, and stops the proxies whatever happened. The
+      # proxies' access logs and their own logs are kept below.
+      - name: The cases that need a real proxy
+        timeout-minutes: 10
+        run: bash scripts/real-proxy-cases.sh
+
+      # What the proxies' logs and the cases' output say, kept whether or not the cases passed.
+      - name: Keep the real-proxy evidence
+        id: keep-the-real-proxy-evidence
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: real-proxy-evidence
+          path: /tmp/kr-test-artifacts/real-proxy
+          if-no-files-found: error
+
+      # The first try failed: wait, then try once more. A second failure fails the job.
+      - name: Keep the real-proxy evidence, pause before the second try
+        if: ${{ !cancelled() && steps.keep-the-real-proxy-evidence.outcome == 'failure' }}
+        shell: bash
+        run: |
+          echo "::warning title=Evidence not kept::The first try failed. Trying once more in 60 seconds."
+          sleep 60
+
+      - name: Keep the real-proxy evidence, second try
+        if: ${{ !cancelled() && steps.keep-the-real-proxy-evidence.outcome == 'failure' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: real-proxy-evidence
+          path: /tmp/kr-test-artifacts/real-proxy
+          if-no-files-found: error
+
   windows:
     name: ${{ matrix.name }}
     runs-on: windows-2025

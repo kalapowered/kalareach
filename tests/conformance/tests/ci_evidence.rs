@@ -872,6 +872,12 @@ const FIRST_TRIES: &[(&str, &str, &str, Option<&str>)] = &[
     ),
     (
         "core-ci.yml",
+        "real-proxy",
+        "keep-the-real-proxy-evidence",
+        Some("${{ !cancelled() }}"),
+    ),
+    (
+        "core-ci.yml",
         "windows",
         "keep-the-test-evidence",
         Some("${{ !cancelled() }}"),
@@ -973,7 +979,7 @@ fn commands_of(step: &str) -> Option<Vec<&str>> {
 fn every_evidence_upload_has_a_second_try_after_a_pause_and_fails_the_job_when_both_fail() {
     let mut counted = Vec::new();
     for (file, expected) in [
-        ("core-ci.yml", 9),
+        ("core-ci.yml", 10),
         ("conformance.yml", 3),
         ("keep-evidence-test.yml", 3),
     ] {
@@ -1316,6 +1322,141 @@ fn the_linux_runs_of_the_workspace_tests_require_a_user_service_manager() {
         "the Linux job of the conformance workflow does not require a user service manager in its \
          own environment"
     );
+}
+
+/// KR-REQ-21.01, the cases that run against a real squid proxy. Ten keyed cases of four targets are
+/// left out of an ordinary run, because they name a proxy in the environment, and the landing
+/// workflow runs them in a job of its own on a hosted Linux machine. The job installs squid and
+/// fails there unless the program is the build the proxies need, by a step that has no condition
+/// and is not disabled, so a runner that cannot give one fails the job and no case is left out for
+/// want of it. It then runs `scripts/real-proxy-cases.sh` by a step that is not disabled either.
+/// The script holds each target to the number of cases its command names, which this holds to the
+/// number of names on the line, so that a command that matches no case fails and does not pass
+/// empty. What the script keeps is the directory that the job's upload takes.
+#[test]
+fn the_real_proxy_cases_run_in_a_job_that_fails_without_squid_and_without_the_cases() {
+    let landing = fs::read_to_string(repository().join(".github/workflows/core-ci.yml"))
+        .expect("the landing workflow");
+    let proxy = job(&landing, "real-proxy");
+
+    let head = header(&proxy);
+    assert_eq!(
+        value_at(&head, 4, "runs-on").as_deref(),
+        Some("ubuntu-24.04"),
+        "the real-proxy job runs on another runner"
+    );
+    assert!(
+        job_condition(&proxy).is_none(),
+        "the real-proxy job has a condition: it runs at every event of the workflow"
+    );
+    assert!(
+        !is_disabled(&head),
+        "the real-proxy job is skipped or lets its failure pass"
+    );
+    assert!(
+        value_at(&head, 4, "timeout-minutes").is_some(),
+        "the real-proxy job has no limit of its own"
+    );
+
+    let kept = |step: &str, what: &str| {
+        assert!(
+            !is_disabled(step),
+            "the {what} step is skipped or lets its failure pass"
+        );
+        assert!(
+            step_condition(step).is_none(),
+            "the {what} step has a condition: it must run whenever the job gets to it"
+        );
+        assert!(
+            value_at(step, 8, "timeout-minutes").is_some(),
+            "the {what} step has no limit"
+        );
+    };
+
+    let install = steps_running(&proxy, "scripts/apt-install.sh");
+    assert_eq!(install.len(), 1, "one step installs squid");
+    kept(&install[0], "squid install");
+    let commands = commands_of(&install[0]).expect("the install step has a run block");
+    assert_eq!(
+        commands.first().copied(),
+        Some("set -euo pipefail"),
+        "a failed install does not end the step"
+    );
+    let at = |line: &str| commands.iter().position(|command| *command == line);
+    let installed = at("bash scripts/apt-install.sh --deadline 480 squid-openssl")
+        .expect("the install step installs the OpenSSL build of squid");
+    let checked = at("bash scripts/real-proxy.sh check")
+        .expect("the install step does not check the program it installed");
+    assert!(installed < checked, "the check comes before the install");
+
+    let run = steps_running(&proxy, "scripts/real-proxy-cases.sh");
+    assert_eq!(run.len(), 1, "one step runs the real-proxy cases");
+    kept(&run[0], "real-proxy cases");
+    assert_eq!(
+        value_at(&run[0], 8, "run").as_deref(),
+        Some("bash scripts/real-proxy-cases.sh"),
+        "the step that runs the real-proxy cases runs more or less than the script"
+    );
+    let install_at = position_of_tool(&proxy, "scripts/apt-install.sh").expect("the install step");
+    let run_at = position_of_tool(&proxy, "scripts/real-proxy-cases.sh").expect("the run step");
+    let keep_at =
+        position_of_id(&proxy, "keep-the-real-proxy-evidence").expect("the evidence upload");
+    assert!(
+        install_at < run_at && run_at < keep_at,
+        "the steps are not the install, the cases and then the upload"
+    );
+
+    // The upload takes the directory the script writes to, and the directory is the one the
+    // workflow names for every job's evidence.
+    let directory = "/tmp/kr-test-artifacts";
+    assert!(
+        landing.contains(&format!("KR_TEST_ARTIFACTS_DIR: {directory}")),
+        "the workflow does not name the evidence directory"
+    );
+    assert_eq!(
+        steps_holding(&proxy, &format!("path: {directory}/real-proxy")).len(),
+        2,
+        "the first try and the second try of the upload do not both take the proxies' directory"
+    );
+    let script = fs::read_to_string(repository().join("scripts/real-proxy-cases.sh"))
+        .expect("the script that runs the real-proxy cases");
+    assert!(
+        script.contains("kr_artifacts_dir\nevidence=\"$kr_artifacts/real-proxy\"\n"),
+        "the script does not keep its evidence in the real-proxy folder of the evidence directory"
+    );
+
+    // Each target's command names as many cases as the count it is held to.
+    let commands: Vec<Vec<&str>> = script
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("expect "))
+        .map(|line| line.split_whitespace().collect())
+        .collect();
+    assert!(!commands.is_empty(), "the script runs no target's cases");
+    for words in commands {
+        let held: usize = words[1]
+            .parse()
+            .expect("the count of cases a target is held to");
+        let exact = words
+            .iter()
+            .position(|word| *word == "--exact")
+            .expect("a target is run by the names of its cases");
+        assert!(
+            words.contains(&"--ignored"),
+            "{}: the cases are ignored ones",
+            words[2..].join(" ")
+        );
+        let named = words[exact + 1..]
+            .iter()
+            .take_while(|word| !word.starts_with("--"))
+            .count();
+        assert_eq!(
+            named,
+            held,
+            "{}: the count a target is held to is not the number of cases it names",
+            words[2..].join(" ")
+        );
+    }
 }
 
 /// The names of the jobs of a workflow, in the order they are written.
