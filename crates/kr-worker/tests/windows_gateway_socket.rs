@@ -3,10 +3,13 @@
 //!
 //! Everything else the Windows gateway does rests on this. The terminal is started the way a person
 //! starts it against a remote App Server, `codex --remote unix://<path>`, with no login, on a
-//! pseudo-console, and the listener is the one the gateway binds, in a private folder. What is
+//! the product's own pseudo-console, and the listener is the one the gateway binds, in a private
+//! folder. What is
 //! shown is that the WebSocket upgrade request arrives on the socket and that the peer the broker
 //! reads from the kernel (the process, its start, and its account) is the Codex process the test
-//! started, whose image is `codex.exe`.
+//! started, whose image is `codex.exe`. A run that fails says whether the terminal had ended and
+//! what it last drew, because a login screen, a trust prompt, a connection error and an early exit
+//! all end the same way: with no connection.
 //!
 //! The case needs the real executable, so it is ignored by default. Name it and run the case:
 //!
@@ -21,10 +24,14 @@
 
 use std::io::Read as _;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use kr_worker::broker::{BoundEndpoint, ListenerAddress, Stream};
-use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+use kr_worker::pty::Room;
+use kr_worker::windows::conpty;
+use portable_pty::{Child, CommandBuilder, MasterPty as _, PtySize};
 use tokio::io::AsyncReadExt as _;
 
 /// The variable that names the Windows `codex.exe` this case runs.
@@ -35,6 +42,37 @@ const RELEASE: &str = "0.155.1";
 
 /// How long the terminal is given to connect and send its first request.
 const CONNECT_WAIT: Duration = Duration::from_secs(60);
+
+/// How much of the terminal's latest output a failure keeps.
+const TAIL_BYTES: usize = 8192;
+
+/// The end of what the terminal drew, kept for a failure's message.
+type Tail = Arc<Mutex<Vec<u8>>>;
+
+/// Appends `bytes` to the tail and drops the oldest of it beyond [`TAIL_BYTES`].
+fn keep_the_tail(tail: &Tail, bytes: &[u8]) {
+    let mut kept = tail.lock().expect("the tail is not poisoned");
+    kept.extend_from_slice(bytes);
+    if kept.len() > TAIL_BYTES {
+        let over = kept.len() - TAIL_BYTES;
+        kept.drain(..over);
+    }
+}
+
+/// What a failure says of the terminal: whether it has ended and how, and the end of what it drew.
+fn diagnosis(child: &mut (dyn Child + Send + Sync), tail: &Tail) -> String {
+    let state = match child.try_wait() {
+        Ok(Some(status)) => format!("it ended: {status:?}"),
+        Ok(None) => "it is still running".to_owned(),
+        Err(error) => format!("whether it ended could not be read: {error}"),
+    };
+    let drawn =
+        String::from_utf8_lossy(&tail.lock().expect("the tail is not poisoned")).into_owned();
+    format!(
+        "the terminal: {state}; the end of what it drew: {}",
+        drawn.escape_debug()
+    )
+}
 
 /// The real executable this run names.
 fn codex() -> PathBuf {
@@ -92,53 +130,84 @@ async fn the_real_codex_terminal_connects_to_a_socket_this_host_binds_and_the_ke
         panic!("a named bind on this platform is a socket");
     };
 
-    // The terminal runs on a pseudo-console, as it does in the managed shell.
-    let pair = native_pty_system()
-        .openpty(PtySize {
-            rows: 30,
-            cols: 100,
-            pixel_width: 0,
-            pixel_height: 0,
-        })
-        .expect("a pseudo-console is opened");
+    // The terminal runs on the product's own pseudo-console, as it does in the managed shell, which
+    // asks nothing of its reader that the case would have to answer.
+    let (console, slave) = conpty::open(PtySize {
+        rows: 30,
+        cols: 100,
+        pixel_width: 0,
+        pixel_height: 0,
+    })
+    .expect("a pseudo-console is opened");
+    let waiter = conpty::OutputWaiter::over(console.output_event().expect("the console's event"));
+    let mut output = console
+        .try_clone_reader()
+        .expect("the console's output is read");
     let mut command = CommandBuilder::new(&codex);
     command.args(["--remote", &format!("unix://{}", path.display())]);
     command.env("CODEX_HOME", &home);
     command.cwd(&directory);
-    let mut child = pair
-        .slave
-        .spawn_command(command)
+    let mut child = slave
+        .start(&command, || Ok::<(), String>(()))
         .expect("the terminal starts");
-    drop(pair.slave);
-    let mut output = pair
-        .master
-        .try_clone_reader()
-        .expect("the console's output is read");
-    // What the terminal draws is read and dropped, so the console never waits on a reader.
-    let draining = tokio::task::spawn_blocking(move || {
-        let mut sink = [0_u8; 4096];
-        while output.read(&mut sink).is_ok_and(|read| read > 0) {}
-    });
 
-    let accepted = tokio::time::timeout(CONNECT_WAIT, endpoint.accept())
-        .await
-        .expect("the terminal connected within the wait")
-        .expect("the connection is accepted and its peer named");
+    // What the terminal draws is read as it comes, so the console never waits on a reader, and the
+    // end of it is kept for a failure to show.
+    let tail = Tail::default();
+    let stop = Arc::new(AtomicBool::new(false));
+    let draining = {
+        let (tail, stop) = (Arc::clone(&tail), Arc::clone(&stop));
+        tokio::task::spawn_blocking(move || {
+            let mut chunk = [0_u8; 4096];
+            while !stop.load(Ordering::Relaxed) {
+                match output.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(read) => keep_the_tail(&tail, &chunk[..read]),
+                    // The product's reader answers "nothing yet" as would-block, and the waiter
+                    // says when there is something to read.
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if waiter.wait(Duration::from_millis(100)) == Room::Gone {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        })
+    };
+
+    let accepted = match tokio::time::timeout(CONNECT_WAIT, endpoint.accept()).await {
+        Ok(Ok(accepted)) => accepted,
+        Ok(Err(error)) => panic!(
+            "the connection is accepted and its peer named: {error}; {}",
+            diagnosis(child.as_mut(), &tail)
+        ),
+        Err(_) => panic!(
+            "the terminal connected within the wait; {}",
+            diagnosis(child.as_mut(), &tail)
+        ),
+    };
     let started = child.process_id().expect("the terminal has a process");
     assert_eq!(
         accepted.peer.process().pid.get(),
         u64::from(started),
-        "the kernel names the terminal's own process"
+        "the kernel names the terminal's own process; {}",
+        diagnosis(child.as_mut(), &tail)
     );
-    assert!(accepted.peer.is_owner(), "its account is this account");
+    assert!(
+        accepted.peer.is_owner(),
+        "its account is this account; {}",
+        diagnosis(child.as_mut(), &tail)
+    );
     let facts = kr_ipc::starter::process_facts(started).expect("the process is read");
     assert!(
         facts
             .image
             .file_name()
             .is_some_and(|name| name.eq_ignore_ascii_case("codex.exe")),
-        "the peer's image is codex.exe: {}",
-        facts.image.display()
+        "the peer's image is codex.exe: {}; {}",
+        facts.image.display(),
+        diagnosis(child.as_mut(), &tail)
     );
 
     let Stream::Uds(mut stream) = accepted.stream else {
@@ -146,23 +215,37 @@ async fn the_real_codex_terminal_connects_to_a_socket_this_host_binds_and_the_ke
     };
     let mut head = Vec::new();
     let mut chunk = [0_u8; 1024];
-    tokio::time::timeout(CONNECT_WAIT, async {
+    let sent = tokio::time::timeout(CONNECT_WAIT, async {
         while !head.windows(4).any(|window| window == b"\r\n\r\n") {
-            let read = stream.read(&mut chunk).await.expect("the request is read");
-            assert!(
-                read > 0,
-                "the terminal closed before it finished its request"
-            );
-            head.extend_from_slice(&chunk[..read]);
+            match stream.read(&mut chunk).await {
+                Ok(0) => {
+                    return Err("the terminal closed before it finished its request".to_owned());
+                }
+                Ok(read) => head.extend_from_slice(&chunk[..read]),
+                Err(error) => return Err(format!("the request could not be read: {error}")),
+            }
         }
+        Ok(())
     })
-    .await
-    .expect("the terminal sent its request within the wait");
+    .await;
+    match sent {
+        Ok(Ok(())) => {}
+        Ok(Err(why)) => panic!("{why}; {}", diagnosis(child.as_mut(), &tail)),
+        Err(_) => panic!(
+            "the terminal sent its request within the wait; {}",
+            diagnosis(child.as_mut(), &tail)
+        ),
+    }
     let request = String::from_utf8_lossy(&head).to_ascii_lowercase();
-    assert!(request.starts_with("get "), "an upgrade request: {request}");
+    assert!(
+        request.starts_with("get "),
+        "an upgrade request: {request}; {}",
+        diagnosis(child.as_mut(), &tail)
+    );
     assert!(
         request.contains("upgrade: websocket"),
-        "a WebSocket upgrade: {request}"
+        "a WebSocket upgrade: {request}; {}",
+        diagnosis(child.as_mut(), &tail)
     );
 
     eprintln!(
@@ -172,8 +255,10 @@ async fn the_real_codex_terminal_connects_to_a_socket_this_host_binds_and_the_ke
     );
 
     child.kill().expect("the terminal is ended");
+    stop.store(true, Ordering::Relaxed);
     drop(stream);
-    drop(pair.master);
+    drop(console);
+    drop(slave);
     let _ = draining.await;
     drop(endpoint);
     let _ = std::fs::remove_dir_all(&directory);
