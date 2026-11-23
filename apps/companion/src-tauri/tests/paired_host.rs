@@ -803,7 +803,6 @@ async fn a_host_chosen_or_forgotten_while_it_is_visited_is_not_reported() {
     pair(&phone, &second, &owner, &[ActionRight::SessionView]).await;
     pair(&phone, &third, &owner, &[ActionRight::SessionView]).await;
     connection(companion, true).await;
-    let device = companion.device();
     let (second_ref, third_ref) = (
         reference_for(companion, &second),
         reference_for(companion, &third),
@@ -820,7 +819,8 @@ async fn a_host_chosen_or_forgotten_while_it_is_visited_is_not_reported() {
     companion.told_host(&second_ref).await;
     until_held(&control, 3).await;
     let forgetting = companion.start_call("hosts_forget", json!({ "reference": third_ref }));
-    until_unlisted(&device, &third).await;
+    // The pairing list alone is too early: the owner's record of the host goes after it.
+    until_forgotten(companion, &third).await;
     control.stop_holding();
     control.release_all();
 
@@ -842,17 +842,27 @@ async fn a_host_chosen_or_forgotten_while_it_is_visited_is_not_reported() {
     third.stop().await;
 }
 
-/// Waits until the device no longer lists `host`.
-async fn until_unlisted(device: &companion_tauri::device::Device, host: &Host) {
+/// Waits until `host` is forgotten: the device no longer lists it, and the owner holds no record of
+/// a host that the device no longer lists. A forget removes the host from the pairing list first and
+/// the owner's record after it, so the list alone is too early: a pass that ends between the two
+/// still answers with the host.
+async fn until_forgotten(companion: &Companion, host: &Host) {
+    let device = companion.device();
+    let state = companion.app.state::<companion_tauri::AppState>();
     tokio::time::timeout(WATCHDOG, async {
-        while device
-            .pairing()
-            .hosts
-            .list()
-            .expect("the records")
-            .iter()
-            .any(|each| each.host_endpoint_id == host.network().endpoint_id())
-        {
+        loop {
+            let listed = device.pairing().hosts.list().expect("the records");
+            let unlisted = !listed
+                .iter()
+                .any(|each| each.host_endpoint_id == host.network().endpoint_id());
+            let kept = state
+                .contact_owner()
+                .paired_records()
+                .iter()
+                .any(|record| !listed.iter().any(|each| each.host_device_id == record.host));
+            if unlisted && !kept {
+                return;
+            }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
     })
@@ -913,7 +923,6 @@ async fn a_pass_leaves_out_a_host_that_is_no_longer_one_of_the_others_when_it_en
     pair(&phone, &second, &owner, &[ActionRight::SessionView]).await;
     pair(&phone, &third, &owner, &[ActionRight::SessionView]).await;
     connection(companion, true).await;
-    let device = companion.device();
     let (second_ref, third_ref) = (
         reference_for(companion, &second),
         reference_for(companion, &third),
@@ -936,7 +945,8 @@ async fn a_pass_leaves_out_a_host_that_is_no_longer_one_of_the_others_when_it_en
     companion.told_host(&second_ref).await;
     until_held(&control, 3).await;
     let forgetting = companion.start_call("hosts_forget", json!({ "reference": third_ref }));
-    until_unlisted(&device, &third).await;
+    // The pairing list alone is too early: the owner's record of the host goes after it.
+    until_forgotten(companion, &third).await;
     control.stop_holding();
     control.release_all();
 
@@ -1036,7 +1046,8 @@ async fn the_visit_hold_releases_after_the_read_and_before_the_checks() {
         "the host was asked for its inbox before the hold"
     );
     let forgetting = companion.start_call("hosts_forget", json!({ "reference": second }));
-    until_unlisted(&device, &two.second).await;
+    // The pairing list alone is too early: the owner's record of the host goes after it.
+    until_forgotten(companion, &two.second).await;
     hold.release();
     let found = tokio::time::timeout(WATCHDOG, pass)
         .await
