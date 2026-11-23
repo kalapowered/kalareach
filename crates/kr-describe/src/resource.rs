@@ -47,6 +47,7 @@ pub enum Signal<T> {
 impl<T: Copy> Signal<T> {
     /// Returns the reading, when there is one.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn value(self) -> Option<T> {
         match self {
             Self::Qualified(value) => Some(value),
@@ -56,6 +57,7 @@ impl<T: Copy> Signal<T> {
 
     /// Returns whether this host reads this signal.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn is_qualified(self) -> bool {
         matches!(self, Self::Qualified(_))
     }
@@ -97,6 +99,7 @@ pub struct HostConditions {
 impl HostConditions {
     /// Builds a reading in which every signal is qualified, which is what a test drives.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn measured(
         physical_memory_bytes: u64,
         available_memory_bytes: u64,
@@ -178,6 +181,7 @@ impl ResourceState {
     ///
     /// `resource_paused` is section 22's own word, and it is what a client sees.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Ready => "ready",
@@ -368,6 +372,7 @@ pub struct Transition {
 impl Transition {
     /// Returns whether inference resumed on this move.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn resumed(&self) -> bool {
         matches!(self.from, ResourceState::ResourcePaused { .. })
             && matches!(self.to, ResourceState::Admitted)
@@ -375,6 +380,7 @@ impl Transition {
 
     /// Returns whether inference paused on this move.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn paused(&self) -> bool {
         !matches!(self.from, ResourceState::ResourcePaused { .. })
             && matches!(self.to, ResourceState::ResourcePaused { .. })

@@ -453,6 +453,7 @@ impl Driver {
 
     /// Returns the running process's start identity, as it gave it when it said it was ready.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn identity(&self) -> Option<&ProcessStartIdentity> {
         self.process
             .as_ref()
@@ -467,6 +468,7 @@ impl Driver {
 
     /// Returns how the last process to say it was ready has its memory ceiling enforced.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn ceiling(&self) -> Option<&str> {
         self.ceiling.as_deref()
     }
@@ -483,6 +485,7 @@ impl Driver {
     /// Returns the work a cancellation has been sent for and not yet seen answered, and whether
     /// the control thread has said it has read it.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn cancelling(&self) -> Option<(u64, bool)> {
         self.process
             .as_ref()

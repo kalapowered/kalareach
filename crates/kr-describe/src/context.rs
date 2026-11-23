@@ -99,6 +99,7 @@ impl ContextBinding {
 
     /// Returns the binding's name.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -131,6 +132,7 @@ pub enum ContextSignal {
 impl ContextSignal {
     /// Returns the stable name this kind of signal is reported under.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn kind(&self) -> &'static str {
         match self {
             Self::WorkingDirectory { .. } => "working_directory",
@@ -178,6 +180,7 @@ pub enum InputClass {
 impl InputClass {
     /// Returns the stable name this class is reported under.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::DirectoryMetadata => "directory_metadata",
@@ -211,6 +214,7 @@ pub enum Admits {
 /// description, because a description is about what a session is doing rather than about what
 /// somebody typed.
 #[must_use]
+#[cfg(any(test, feature = "testing"))]
 pub const fn admits(class: InputClass) -> Admits {
     match class {
         InputClass::DirectoryMetadata
@@ -346,6 +350,7 @@ pub struct DescriptionContext {
 impl DescriptionContext {
     /// Returns the environment this context belongs to.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn environment_id(&self) -> &EnvironmentId {
         &self.environment_id
     }
@@ -376,6 +381,7 @@ impl DescriptionContext {
 
     /// Returns the semantic events this context carries.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn events(&self) -> &[SemanticEvent] {
         &self.events
     }
@@ -388,6 +394,7 @@ impl DescriptionContext {
 
     /// Returns the directory's name, when it has one.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn directory(&self) -> Option<&str> {
         self.directory.as_ref().map(ProjectText::as_str)
     }
@@ -444,6 +451,7 @@ impl DescriptionContext {
 #[derive(Clone, Debug)]
 pub struct ContextBuilder {
     context: DescriptionContext,
+    #[cfg(any(test, feature = "testing"))]
     refused: Vec<InputClass>,
 }
 
@@ -473,6 +481,7 @@ impl ContextBuilder {
                 events: Vec::new(),
                 cursor: CursorInterval::default(),
             },
+            #[cfg(any(test, feature = "testing"))]
             refused: Vec::new(),
         }
     }
@@ -534,9 +543,11 @@ impl ContextBuilder {
     /// recorded and dropped: the context is still built, because a description with less in it is
     /// better than no description, and [`Self::refused`] says what was left out.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn offer(mut self, class: InputClass, value: &str) -> Self {
         match admits(class) {
             Admits::Never => {
+                #[cfg(any(test, feature = "testing"))]
                 self.refused.push(class);
                 self
             }
@@ -559,6 +570,7 @@ impl ContextBuilder {
 
     /// Returns the classes this builder refused.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn refused(&self) -> &[InputClass] {
         &self.refused
     }
@@ -640,6 +652,7 @@ impl ContextTracker {
 
     /// Returns how many changes are waiting to be coalesced.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn pending(&self) -> usize {
         self.pending
     }

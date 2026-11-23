@@ -44,7 +44,7 @@ use kr_describe::testing::{
 use kr_describe::time::Reading;
 use kr_describe::wire::{LoadEnd, VerifyResult};
 use kr_protocol::ids::{SessionEpoch, SessionId};
-use kr_worker::privacy::{PrivacyGeneration, PrivacySubsystem};
+use kr_worker::privacy::PrivacyGeneration;
 
 use stub::Placed;
 use support::{MAC, a_pin_not_yet_committed, at, binding, built_in, native, roomy, session};
@@ -405,7 +405,6 @@ enum Change {
     NewEpoch,
     NewBinding,
     Pinned,
-    Fenced,
     NewGeneration,
     Disabled,
     Cancelled,
@@ -413,7 +412,7 @@ enum Change {
 
 /// KR-REQ-22.19: each change the host applies while a job is in the process refuses the result that
 /// comes back: a new directory that has settled, a closed session, a new epoch, a new binding, a
-/// pin, privacy mode's fence, a new privacy generation, descriptions turned off, and a
+/// pin, a new privacy generation, descriptions turned off, and a
 /// cancellation. The control is the same job with nothing changed, which is published.
 #[test]
 fn each_change_while_a_job_is_in_the_process_refuses_its_result() {
@@ -423,7 +422,6 @@ fn each_change_while_a_job_is_in_the_process_refuses_its_result() {
         Change::NewEpoch,
         Change::NewBinding,
         Change::Pinned,
-        Change::Fenced,
         Change::NewGeneration,
         Change::Disabled,
         Change::Cancelled,
@@ -461,12 +459,6 @@ fn each_change_while_a_job_is_in_the_process_refuses_its_result() {
                     1_700_000_000_000,
                 )
                 .expect("a pin"),
-            Change::Fenced => {
-                service
-                    .privacy(session(1))
-                    .fence(PrivacyGeneration::new(1))
-                    .expect("the fence");
-            }
             Change::NewGeneration => {
                 service.set_privacy_generation(session(1), PrivacyGeneration::new(1));
             }
@@ -496,7 +488,7 @@ fn each_change_while_a_job_is_in_the_process_refuses_its_result() {
             (Change::Pinned, [Outcome::Rejected { rejection, .. }]) => {
                 *rejection == Rejection::NamePinned
             }
-            (Change::Fenced | Change::NewGeneration, [Outcome::Rejected { rejection, .. }]) => {
+            (Change::NewGeneration, [Outcome::Rejected { rejection, .. }]) => {
                 matches!(rejection, Rejection::LateGeneration { .. })
             }
             (Change::Disabled, [Outcome::Requeued { .. }]) => true,

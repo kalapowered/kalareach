@@ -231,6 +231,7 @@ pub enum SummaryRefusal {
 impl SummaryRefusal {
     /// Returns the stable name this refusal is reported under.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::NoModel => "no_model",

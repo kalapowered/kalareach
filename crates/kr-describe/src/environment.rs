@@ -102,12 +102,14 @@ pub struct MachineGroup(String);
 impl MachineGroup {
     /// Names a group.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn new(name: impl Into<String>) -> Self {
         Self(name.into())
     }
 
     /// Returns the group's name.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn name(&self) -> &str {
         &self.0
     }
@@ -134,6 +136,7 @@ impl ExecutionEnvironment {
 
     /// Puts this environment in a logical group, which grants it nothing.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn in_group(mut self, group: MachineGroup) -> Self {
         self.group = Some(group);
         self
@@ -153,6 +156,7 @@ impl ExecutionEnvironment {
 
     /// Returns the logical group this environment is shown in, if any.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn group(&self) -> Option<&MachineGroup> {
         self.group.as_ref()
     }
@@ -375,6 +379,7 @@ impl ModelMapping {
 
     /// Returns every mapping this environment set has unloaded, oldest first.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn unloaded(&self) -> &[MappedModel] {
         &self.unloaded
     }

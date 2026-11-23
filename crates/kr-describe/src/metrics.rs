@@ -130,6 +130,7 @@ impl LatencyLedger {
     /// A count nothing was measured at is absent rather than zero. A published zero would say the
     /// host answered instantly at fifty sessions, when what happened is that nobody ran fifty.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn published(&self) -> Vec<Reading> {
         PUBLISHED_SESSION_COUNTS
             .iter()

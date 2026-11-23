@@ -46,14 +46,11 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use kr_protocol::ids::SessionId;
-use kr_worker::privacy::{
-    Cancelled, Exported, Fenced, KeptExplicitly, PrivacyGeneration, PrivacySubsystem, Removed,
-    Unavailable,
-};
+use kr_worker::privacy::PrivacyGeneration;
+#[cfg(any(test, feature = "testing"))]
+use kr_worker::privacy::Unavailable;
 
-use crate::context::{ContextTracker, SemanticEvent};
 use crate::priority::Cancellation;
-use crate::queue::Scheduler;
 use crate::store::DescriptionStore;
 
 /// Which sessions have description processing stopped, and at which generation.
@@ -100,6 +97,7 @@ enum NotWritten {
 impl DescriptionFence {
     /// Builds a fence that is down for every session.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn new() -> Self {
         Self::default()
     }
@@ -267,6 +265,7 @@ pub struct InFlight {
 impl InFlight {
     /// Builds a counter at nought.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn new() -> Self {
         Self::default()
     }
@@ -300,6 +299,7 @@ impl InFlight {
 
     /// Returns how many jobs are in flight for one session.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn get(&self, session_id: &SessionId) -> u64 {
         self.by_session
             .lock()
@@ -320,6 +320,7 @@ impl InFlight {
     /// # Errors
     ///
     /// Returns [`Unavailable`] when the count was left locked by a call that failed.
+    #[cfg(any(test, feature = "testing"))]
     pub fn read(&self, session_id: &SessionId) -> Result<u64, Unavailable> {
         self.by_session
             .lock()
@@ -361,6 +362,7 @@ struct Running {
 impl RunningJob {
     /// Builds a handle with nothing running.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn new() -> Self {
         Self::default()
     }
@@ -388,6 +390,7 @@ impl RunningJob {
 
     /// Returns whether this session's job is the one running.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn is_running(&self, session_id: &SessionId) -> bool {
         self.held.lock().is_ok_and(|held| {
             held.as_ref()
@@ -443,6 +446,7 @@ pub struct CleanupDebt {
 impl CleanupDebt {
     /// Builds a debt of nothing.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn new() -> Self {
         Self::default()
     }
@@ -477,6 +481,7 @@ impl CleanupDebt {
     /// # Errors
     ///
     /// Returns [`Unavailable`] when the record was left locked by a call that failed.
+    #[cfg(any(test, feature = "testing"))]
     pub fn read(&self, session_id: &SessionId) -> Result<Option<String>, Unavailable> {
         self.owed
             .lock()
@@ -490,147 +495,16 @@ impl CleanupDebt {
 
     /// Returns how many sessions have cleanup outstanding.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn len(&self) -> usize {
         self.owed.lock().map_or(0, |held| held.len())
     }
 
     /// Returns whether every session's cleanup has finished.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
-    }
-}
-
-/// Privacy mode's hook over one session's queue position, context and store row.
-#[derive(Debug)]
-pub struct DescriptionPrivacy<'a> {
-    session_id: SessionId,
-    fence: &'a DescriptionFence,
-    scheduler: &'a mut Scheduler,
-    tracker: Option<&'a mut ContextTracker>,
-    events: Option<&'a mut Vec<SemanticEvent>>,
-    store: &'a DescriptionStore,
-    in_flight: &'a InFlight,
-    running: &'a RunningJob,
-    debt: &'a CleanupDebt,
-}
-
-impl<'a> DescriptionPrivacy<'a> {
-    /// Builds the hook for one session.
-    #[allow(clippy::too_many_arguments)]
-    #[must_use]
-    pub fn over(
-        session_id: SessionId,
-        fence: &'a DescriptionFence,
-        scheduler: &'a mut Scheduler,
-        tracker: Option<&'a mut ContextTracker>,
-        events: Option<&'a mut Vec<SemanticEvent>>,
-        store: &'a DescriptionStore,
-        in_flight: &'a InFlight,
-        running: &'a RunningJob,
-        debt: &'a CleanupDebt,
-    ) -> Self {
-        Self {
-            session_id,
-            fence,
-            scheduler,
-            tracker,
-            events,
-            store,
-            in_flight,
-            running,
-            debt,
-        }
-    }
-
-    /// Returns why this session's removal could not finish, when it could not.
-    ///
-    /// It is the service's record rather than this hook's, so it outlives the hook that saw the
-    /// failure.
-    #[must_use]
-    pub fn failure(&self) -> Option<String> {
-        self.debt.owed(&self.session_id)
-    }
-}
-
-impl PrivacySubsystem for DescriptionPrivacy<'_> {
-    fn name(&self) -> &'static str {
-        "descriptions"
-    }
-
-    fn fence(&mut self, generation: PrivacyGeneration) -> Result<Fenced, Unavailable> {
-        // The fence goes up before anything is counted, so nothing is admitted between the count
-        // and the stop. The running job is then cancelled through the token its dispatcher left
-        // behind, which is the only way to reach work that is already inside the runtime.
-        self.fence.raise(self.session_id, generation);
-        let cancelled_running = self.running.cancel(&self.session_id);
-        Ok(Fenced {
-            queues: 1,
-            items: u64::from(self.scheduler.has_queued(&self.session_id))
-                + u64::from(cancelled_running),
-        })
-    }
-
-    fn cancel_undispatched(
-        &mut self,
-        _generation: PrivacyGeneration,
-    ) -> Result<Cancelled, Unavailable> {
-        Ok(Cancelled {
-            undispatched: u64::from(self.scheduler.cancel(&self.session_id)),
-            in_flight: self.in_flight.read(&self.session_id)?,
-        })
-    }
-
-    fn remove_retained(&mut self, _generation: PrivacyGeneration) -> Result<Removed, Unavailable> {
-        // The retained context goes first. It is not in a store, it is in this host's memory, and
-        // leaving it would let a change captured while private reach a job after privacy ended.
-        if let Some(tracker) = self.tracker.as_deref_mut() {
-            tracker.forget();
-        }
-        // The retained semantic events go with it. They are the other half of what this host had
-        // captured for the session, and one left behind would reach the next job after the fence
-        // came down.
-        if let Some(events) = self.events.as_deref_mut() {
-            events.clear();
-        }
-        match self.store.remove_generated_for(&self.session_id) {
-            Ok(removed) => {
-                self.debt.settle(&self.session_id);
-                Ok(Removed {
-                    bytes: removed.bytes,
-                    records: removed.records,
-                })
-            }
-            Err(error) => {
-                // Nothing is claimed. A removal this host could not make is a removal it does not
-                // report, and the debt keeps the cleanup unavailable however many times privacy
-                // mode asks again.
-                let reason = error.to_string();
-                self.debt.owe(self.session_id, reason.clone());
-                Err(Unavailable::new(reason))
-            }
-        }
-    }
-
-    fn outstanding(&self) -> Result<u64, Unavailable> {
-        if let Some(owed) = self.debt.read(&self.session_id)? {
-            return Err(Unavailable::new(owed));
-        }
-        self.in_flight.read(&self.session_id)
-    }
-
-    fn kept(&self) -> Vec<KeptExplicitly> {
-        vec![KeptExplicitly {
-            what: "a session name a person pinned",
-            why: "a name somebody chose is theirs, and section 24 keeps it until they clear it; it \
-                  is excluded from sync while privacy mode is on",
-        }]
-    }
-
-    fn exported(&self) -> Result<Vec<Exported>, Unavailable> {
-        // A description is produced on this host, stored on this host and shown on this host. It is
-        // never uploaded, so there is no copy elsewhere to offer a separate deletion of.
-        Ok(Vec::new())
     }
 }
 

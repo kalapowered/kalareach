@@ -536,12 +536,14 @@ impl ModelProfile {
 
     /// Returns the source model identity.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn model(&self) -> &ModelIdentity {
         &self.fields.model
     }
 
     /// Returns the conversion identity.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn conversion(&self) -> &ConversionIdentity {
         &self.fields.conversion
     }
@@ -575,6 +577,7 @@ impl ModelProfile {
 
     /// Returns the tokenizer identity.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn tokenizer(&self) -> &TokenizerIdentity {
         &self.fields.tokenizer
     }
@@ -587,12 +590,14 @@ impl ModelProfile {
 
     /// Returns the reasoning setting.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn reasoning(&self) -> &ReasoningSetting {
         &self.fields.reasoning
     }
 
     /// Returns which optional components the profile has, which is none of them.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn components(&self) -> &Components {
         &self.fields.components
     }
@@ -608,6 +613,7 @@ impl ModelProfile {
     /// Declared, not proved. [`crate::qualification::Matrix`] is where a target that has actually
     /// been exercised is distinguished from one a profile merely lists.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn targets(&self) -> &[String] {
         &self.fields.targets
     }
@@ -663,6 +669,7 @@ impl ProfileDocument {
 
     /// Returns the document's SHA-256.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn digest(&self) -> [u8; 32] {
         self.digest
     }
@@ -731,12 +738,14 @@ impl ProfileTrust {
 
     /// Returns how many keys this host accepts profiles from.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn len(&self) -> usize {
         self.keys.len()
     }
 
     /// Returns whether this host accepts no profile signature at all.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn is_empty(&self) -> bool {
         self.keys.is_empty()
     }
@@ -766,9 +775,11 @@ impl ProfileTrust {
 pub mod catalogue {
     use kr_protocol::scalars::{AuthorisationKey, Signature64};
 
+    #[cfg(any(test, feature = "testing"))]
+    use super::ProfileRevision;
     use super::{
-        DescribeError, Gate, ModelProfile, ProfileDocument, ProfileRevision, ProfileTrust,
-        QualificationGate, Result, SignedProfile,
+        DescribeError, Gate, ModelProfile, ProfileDocument, ProfileTrust, QualificationGate,
+        Result, SignedProfile,
     };
     use crate::processor::{Feature, Features};
 
@@ -954,6 +965,7 @@ pub mod catalogue {
     impl MetGates {
         /// Records the gates an owner has met.
         #[must_use]
+        #[cfg(any(test, feature = "testing"))]
         pub fn new(met: Vec<QualificationGate>) -> Self {
             Self(met)
         }
@@ -961,6 +973,7 @@ pub mod catalogue {
         /// Records every gate as met, which is what a host that has run the whole qualification
         /// says.
         #[must_use]
+        #[cfg(any(test, feature = "testing"))]
         pub fn all() -> Self {
             Self(QualificationGate::ALL.to_vec())
         }
@@ -987,6 +1000,7 @@ pub mod catalogue {
         /// It is the check the mapping boundary makes, so a caller that obtained a candidate
         /// profile some other way still cannot run it without the gates it declares.
         #[must_use]
+        #[cfg(any(test, feature = "testing"))]
         pub fn admits(&self, profile: &ModelProfile) -> bool {
             self.outstanding(profile).is_empty()
         }
@@ -1125,6 +1139,7 @@ pub mod catalogue {
 
         /// Returns whether a result produced under a profile revision is still current.
         #[must_use]
+        #[cfg(any(test, feature = "testing"))]
         pub fn is_current(&self, profile_id: &str, revision: ProfileRevision) -> bool {
             self.profile(profile_id)
                 .is_some_and(|profile| profile.revision() == revision)

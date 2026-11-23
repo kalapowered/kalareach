@@ -178,6 +178,7 @@ impl Prompt {
 
     /// Returns the text of the first fact labelled `label`.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn fact(&self, label: &str) -> Option<&str> {
         self.facts
             .iter()

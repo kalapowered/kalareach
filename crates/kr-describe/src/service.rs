@@ -56,9 +56,7 @@ use crate::metadata::{
 use crate::metrics::LatencyLedger;
 use crate::output::{Expectation, ProducedUnder, Rejection, validate, validate_summary};
 use crate::priority::Cancellation;
-use crate::privacy::{
-    CleanupDebt, DescriptionFence, DescriptionPrivacy, InFlight, PublishGate, RunningJob,
-};
+use crate::privacy::{CleanupDebt, DescriptionFence, InFlight, PublishGate, RunningJob};
 use crate::processor::Features;
 use crate::profile::catalogue::{Catalogue, MetGates, NothingSelected, Selection};
 use crate::profile::{DownloadPolicy, ModelProfile, ProfileRevision};
@@ -224,6 +222,7 @@ pub enum UnloadReason {
 impl UnloadReason {
     /// Returns the stable name this reason is reported under.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Idle { .. } => "idle",
@@ -658,6 +657,7 @@ pub struct DescriptionService {
     environment: ExecutionEnvironment,
     choice: Option<DataAccessChoice>,
     target: String,
+    #[cfg(any(test, feature = "testing"))]
     catalogue: Catalogue,
     met: MetGates,
     selection: Selection,
@@ -754,6 +754,7 @@ impl DescriptionService {
             environment,
             choice,
             target,
+            #[cfg(any(test, feature = "testing"))]
             catalogue,
             met,
             selection,
@@ -794,12 +795,14 @@ impl DescriptionService {
 
     /// Returns the environment.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn environment(&self) -> &ExecutionEnvironment {
         &self.environment
     }
 
     /// Returns the environment's identifier.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn environment_id(&self) -> &EnvironmentId {
         self.environment.id()
     }
@@ -812,6 +815,7 @@ impl DescriptionService {
 
     /// Returns the catalogue.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn catalogue(&self) -> &Catalogue {
         &self.catalogue
     }
@@ -833,6 +837,7 @@ impl DescriptionService {
 
     /// Returns the records of work in flight, which another thread may hold clones of.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn handles(&self) -> Handles {
         Handles {
             fence: self.fence.clone(),
@@ -928,6 +933,7 @@ impl DescriptionService {
 
     /// Returns the published latency figures.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn latency(&self) -> &LatencyLedger {
         &self.latency
     }
@@ -940,6 +946,7 @@ impl DescriptionService {
 
     /// Returns the store.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn store(&self) -> &DescriptionStore {
         &self.store
     }
@@ -974,25 +981,6 @@ impl DescriptionService {
         } else {
             None
         }
-    }
-
-    /// Returns privacy mode's hook over one session's queue position, context and store row.
-    ///
-    /// One session, because that is the scope privacy mode has in this product: a private session
-    /// sits beside one that is not, and a hook that emptied the whole queue would cancel work for
-    /// sessions nobody asked about.
-    pub fn privacy(&mut self, session_id: SessionId) -> DescriptionPrivacy<'_> {
-        DescriptionPrivacy::over(
-            session_id,
-            &self.fence,
-            &mut self.scheduler,
-            self.trackers.get_mut(&session_id),
-            self.events.get_mut(&session_id),
-            &self.store,
-            &self.in_flight,
-            &self.running,
-            &self.debt,
-        )
     }
 
     /// Records the privacy generation now in force for one session.

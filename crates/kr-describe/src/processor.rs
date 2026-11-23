@@ -196,6 +196,7 @@ impl Features {
 
     /// Says what a processor has.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn of(features: impl IntoIterator<Item = Feature>) -> Self {
         Self(features.into_iter().collect())
     }

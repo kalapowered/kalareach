@@ -84,6 +84,7 @@ impl Title {
 
     /// Returns the title's length in Unicode codepoints.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn codepoints(&self) -> usize {
         self.0.chars().count()
     }
@@ -115,6 +116,7 @@ impl ActivityText {
 
     /// Returns the text's length in Unicode codepoints.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn codepoints(&self) -> usize {
         self.0.chars().count()
     }
@@ -146,6 +148,7 @@ impl SummaryText {
 
     /// Returns the text's length in Unicode codepoints.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn codepoints(&self) -> usize {
         self.0.chars().count()
     }
@@ -252,6 +255,7 @@ pub enum VerifiedStatus {
 impl VerifiedStatus {
     /// Returns the stable name this status is reported under.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Starting => "starting",
@@ -271,6 +275,7 @@ impl VerifiedStatus {
     /// unreachable whatever it was doing, and something waiting for a person comes before
     /// something that finished, because the waiting is what they can act on.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn of(facts: &LifecycleFacts) -> Self {
         if facts.closed {
             Self::Closed

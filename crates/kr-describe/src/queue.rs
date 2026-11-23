@@ -69,6 +69,7 @@ impl Work {
 
     /// Returns the context to describe, when this is a description.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn description(&self) -> Option<&DescriptionContext> {
         match self {
             Self::Description(context) => Some(context),
@@ -78,6 +79,7 @@ impl Work {
 
     /// Returns the request to summarise, when this is a summary.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn summary(&self) -> Option<&SummaryAsk> {
         match self {
             Self::Summary(ask) => Some(ask),
@@ -166,6 +168,7 @@ pub enum Freshness {
 impl Freshness {
     /// Returns the stable name this is reported under.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Current => "current",
@@ -239,6 +242,7 @@ impl ServiceTime {
 
     /// Returns how many jobs have been measured.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn samples(&self) -> u64 {
         self.samples
     }
@@ -425,6 +429,7 @@ impl Scheduler {
     /// A session whose queued job is ordinary waits for the cadence since its last job; any other
     /// session waits for the cooldown. A session that has never been described waits for nothing.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn is_eligible(&self, session_id: &SessionId, now: Reading) -> bool {
         self.eligible_under(session_id, now, self.cadence_ms(now))
     }
@@ -622,6 +627,7 @@ impl Scheduler {
 
     /// Returns the queued jobs of both kinds, oldest position first.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn jobs(&self) -> Vec<&QueuedJob> {
         let mut jobs: Vec<&QueuedJob> = self
             .queued

@@ -19,7 +19,7 @@ use kr_describe::prompt::{Prompt, PromptKind};
 use kr_describe::queue::{Enqueued, Priority, Scheduler};
 use kr_describe::resource::ResourceSettings;
 use kr_describe::service::{
-    Answered, DescriptionService, Instruction, Outcome, ProcessEnd, RESTART_FIRST_MS, Work,
+    Answered, DescriptionService, Instruction, Outcome, ProcessEnd, RESTART_FIRST_MS,
 };
 use kr_describe::store::DescriptionStore;
 use kr_describe::summary::{
@@ -30,7 +30,7 @@ use kr_describe::testing::{Output, answer_of};
 use kr_describe::time::Reading;
 use kr_describe::wire::Phases;
 use kr_protocol::ids::{SessionEpoch, SessionId};
-use kr_worker::privacy::{PrivacyGeneration, PrivacySubsystem};
+use kr_worker::privacy::PrivacyGeneration;
 
 use support::{MAC, at, binding, built_in, default_profile, native, roomy, session};
 
@@ -423,129 +423,6 @@ fn a_summary_that_is_running_is_not_stopped_by_the_session_changing() {
             .expect("the answer"),
         Outcome::SummaryPublished { .. }
     ));
-}
-
-/// KR-REQ-18.02 and KR-REQ-22.19: a summary is never sent for a session privacy mode has stopped,
-/// is cancelled while it runs, is refused when it arrives under another generation than the one in
-/// force, and is removed with the session's other generated text, so none is left after it.
-#[test]
-fn privacy_mode_stops_removes_and_refuses_summaries() {
-    let on = PrivacyGeneration::new(1);
-
-    // A request for a session that is fenced is refused, and so is one whose text was read under
-    // another generation than the one in force.
-    let mut service = service();
-    service.fence().raise(session(1), on);
-    assert_eq!(
-        service.summarise(ask(session(1), 10, 14), at(0)),
-        SummaryAsked::Refused(SummaryRefusal::Fenced)
-    );
-    service.fence().lower(&session(1));
-    let mut old = ask(session(1), 10, 14);
-    old.generation = Some(on);
-    assert_eq!(
-        service.summarise(old, at(0)),
-        SummaryAsked::Refused(SummaryRefusal::Generation)
-    );
-
-    // One that was dequeued as the fence went up is not sent.
-    assert!(matches!(
-        service.summarise(ask(session(1), 10, 14), at(0)),
-        SummaryAsked::Queued(_)
-    ));
-    let Instruction::Load { id, .. } = service.next(&roomy(), at(0)).expect("an instruction")
-    else {
-        panic!("a load comes first");
-    };
-    service
-        .finished(
-            id,
-            Answered::Loaded {
-                load_ms: 0,
-                rss_bytes: 0,
-            },
-            at(0),
-        )
-        .expect("an answer");
-    service.fence().raise(session(1), on);
-    assert!(matches!(
-        service.next(&roomy(), at(0)).expect("an instruction"),
-        Instruction::Wait { .. }
-    ));
-    assert_eq!(service.counts().cancelled, 1);
-    let mut service = self::service();
-    service.summarise(ask(session(1), 10, 14), at(0));
-    let Instruction::Generate { id, request, .. } = loaded(&mut service, at(0)) else {
-        panic!("the summary is sent");
-    };
-    // Cancelled while it runs, so what it produced is not published.
-    let fenced = service.privacy(session(1)).fence(on).expect("a fence");
-    assert_eq!(fenced.queues, 1);
-    assert!(matches!(
-        service.next(&roomy(), at(10)).expect("an instruction"),
-        Instruction::Cancel {
-            work: Work::Job,
-            ..
-        }
-    ));
-    assert!(
-        matches!(
-            service
-                .finished(id, produced(&request.prompt), at(20))
-                .expect("the answer"),
-            Outcome::Rejected {
-                rejection: Rejection::LateGeneration { .. },
-                ..
-            }
-        ),
-        "what it produced is refused under the generation the fence stands at"
-    );
-    assert_eq!(service.store().summary_count().expect("a count"), 0);
-
-    // A result that arrives after the generation moved is refused, and one that was published is
-    // removed with the rest of the session's generated text.
-    let mut service = self::service();
-    service.summarise(ask(session(1), 10, 14), at(0));
-    let Instruction::Generate { id, request, .. } = loaded(&mut service, at(0)) else {
-        panic!("the summary is sent");
-    };
-    service.set_privacy_generation(session(1), on);
-    assert_eq!(
-        service
-            .finished(id, produced(&request.prompt), at(10))
-            .expect("the answer"),
-        Outcome::Rejected {
-            session_id: session(1),
-            rejection: Rejection::LateGeneration {
-                expected: on,
-                found: PrivacyGeneration::INITIAL
-            }
-        }
-    );
-    assert_eq!(service.store().summary_count().expect("a count"), 0);
-
-    let mut service = self::service();
-    service.summarise(ask(session(1), 10, 14), at(0));
-    let Instruction::Generate { id, request, .. } = loaded(&mut service, at(0)) else {
-        panic!("the summary is sent");
-    };
-    service
-        .finished(id, produced(&request.prompt), at(10))
-        .expect("the answer");
-    assert_eq!(service.store().summary_count().expect("a count"), 1);
-    let removed = service
-        .privacy(session(1))
-        .remove_retained(on)
-        .expect("a removal");
-    assert!(removed.records >= 1, "{removed:?}");
-    assert_eq!(service.store().summary_count().expect("a count"), 0);
-    assert!(
-        service
-            .store()
-            .summaries(&session(1))
-            .expect("a read")
-            .is_empty()
-    );
 }
 
 /// KR-REQ-18.02: a summary is judged against what is in force when it arrives: a session that was

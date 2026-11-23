@@ -127,6 +127,7 @@ pub struct Applied {
 impl Applied {
     /// Returns whether this host qualified a background mechanism.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn is_qualified(&self) -> bool {
         self.cpu
     }

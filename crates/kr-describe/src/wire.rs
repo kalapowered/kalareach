@@ -372,6 +372,7 @@ pub enum VerifyResult {
 impl VerifyResult {
     /// Returns the stable name this result is reported under.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Verified => "verified",
