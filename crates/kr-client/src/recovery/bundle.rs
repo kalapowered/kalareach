@@ -73,7 +73,9 @@ use kr_protocol::sync::SyncObjectKind;
 use crate::error::ClientError;
 use crate::recovery::capacity::{self, Write};
 use crate::recovery::record::{Known, RecordFile, WriteRecord};
-use crate::recovery::{DeviceSettings, encode_member};
+use crate::recovery::{
+    DeviceSettings, LocalSettings, SettingsRemoval, SettingsSaved, decode_member, encode_member,
+};
 use crate::recovery::{RecoveryError, Result};
 use crate::services::{
     SyncBackupService, SyncDispatch, SyncExchanged, SyncFetched, SyncPosition, SyncRequestFence,
@@ -719,6 +721,88 @@ impl BundleStore {
             .await?;
         *bundle = candidate;
         Ok(position)
+    }
+
+    /// How many times a save of the settings reads the bundle again after it moved.
+    const SAVE_ATTEMPTS: usize = 3;
+
+    /// Saves what this device has chosen as the settings member, when the bundle does not already
+    /// hold it.
+    ///
+    /// The bundle is read first and the member compared with `local`, the values as the settings
+    /// file holds them now and never a value captured earlier: the same settings are not written
+    /// again. A bundle that moved between the read and the write is read again, up to three times,
+    /// and the last conflict is returned after that. A member the bundle holds that cannot be read
+    /// is replaced, since it is no choice of anyone's.
+    ///
+    /// A device with nothing chosen clears the member; a settings file that cannot be read keeps
+    /// it and is [`RecoveryError::SettingsUnusable`], because an unreadable file says nothing about
+    /// what the person chose.
+    ///
+    /// A write whose answer never came back is [`RecoveryError::BundleOutcomeUnknown`] and stays
+    /// outstanding until [`Self::end_lost_write`] ends it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RecoveryError::SettingsUnusable`] for an unreadable settings file, and what
+    /// [`Self::fetch`] and [`Self::set_settings`] return.
+    pub async fn save_settings(
+        &mut self,
+        seed: &RecoverySeed,
+        local: LocalSettings,
+        now_ms: TimestampMs,
+    ) -> Result<SettingsSaved> {
+        let LocalSettings::Values(values) = local else {
+            return Err(RecoveryError::SettingsUnusable {
+                what: "this device's settings file cannot be read, so what is saved is kept",
+            });
+        };
+        let wanted = (!values.is_empty()).then_some(&values);
+        let mut last = None;
+        for _ in 0..Self::SAVE_ATTEMPTS {
+            let mut bundle = self.fetch(seed).await?;
+            let held = bundle
+                .device_settings
+                .as_ref()
+                .and_then(|member| decode_member(member).ok());
+            if held.as_ref() == wanted && bundle.device_settings.is_some() == wanted.is_some() {
+                return Ok(SettingsSaved::AlreadySaved);
+            }
+            match self.set_settings(seed, &mut bundle, wanted, now_ms).await {
+                Ok(position) => return Ok(SettingsSaved::Saved { position }),
+                Err(conflict @ RecoveryError::BundleConflict { .. }) => last = Some(conflict),
+                Err(other) => return Err(other),
+            }
+        }
+        Err(last.unwrap_or(RecoveryError::BundleConflict {
+            expected: self.position(),
+            retained: None,
+        }))
+    }
+
+    /// Takes the settings member out of the bundle by the bundle's own compare-and-swap.
+    ///
+    /// An outstanding write is ended first, so the write that follows compares against what is
+    /// there. The bundle is read and written typed, so the collections, the writers, the producers
+    /// and the checkpoints leave as they came. A bundle that holds no member is not written.
+    ///
+    /// # Errors
+    ///
+    /// Returns what [`Self::end_lost_write`], [`Self::fetch`] and [`Self::commit`] return. A
+    /// removal whose answer never came back is [`RecoveryError::BundleOutcomeUnknown`], and the
+    /// member is not reported removed.
+    pub async fn remove_settings(
+        &mut self,
+        seed: &RecoverySeed,
+        now_ms: TimestampMs,
+    ) -> Result<SettingsRemoval> {
+        self.end_lost_write(seed).await?;
+        let mut bundle = self.fetch(seed).await?;
+        if bundle.device_settings.is_none() {
+            return Ok(SettingsRemoval::NothingSaved);
+        }
+        let position = self.set_settings(seed, &mut bundle, None, now_ms).await?;
+        Ok(SettingsRemoval::Removed { position })
     }
 
     async fn commit_under(

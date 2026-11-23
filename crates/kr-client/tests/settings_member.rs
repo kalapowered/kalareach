@@ -12,13 +12,17 @@
 //! | `a_bundle_that_opened_and_cannot_be_read_says_what_it_needs` | the error for a bundle written by a later build |
 //! | `a_settings_write_that_would_leave_less_room_than_the_trust_entries_need_is_refused` | the room a settings write leaves |
 //! | `a_trust_write_that_would_not_fit_with_the_settings_is_written_without_them` | who wins near the bound |
+//! | `a_changed_setting_is_written_once_and_an_unchanged_one_is_not_written` | the comparison before a write |
+//! | `an_unreadable_settings_file_keeps_the_member_the_bundle_holds` | an absent choice and an unreadable file |
+//! | `removing_the_member_leaves_collections_keys_and_checkpoints_byte_for_byte` | the removal by its own compare-and-swap |
+//! | `a_removal_whose_answer_is_lost_stays_unconfirmed_until_it_is_ended` | an unconfirmed removal stays visible |
 
 use std::sync::{Arc, Mutex};
 
 use kr_client::error::ClientError;
 use kr_client::recovery::{
-    BundleStore, DeviceSettings, MAX_DEVICE_SETTINGS_BYTES, RecoveryError, TRUST_ROOM_BYTES,
-    decode_member, encode_member,
+    BundleStore, DeviceSettings, LocalSettings, LostWrite, MAX_DEVICE_SETTINGS_BYTES,
+    RecoveryError, SettingsRemoval, SettingsSaved, TRUST_ROOM_BYTES, decode_member, encode_member,
 };
 use kr_client::services::{
     ServiceFuture, SyncBackupService, SyncExchanged, SyncFetched, SyncPosition, SyncRequestFence,
@@ -48,6 +52,12 @@ fn at(write_sequence: u64) -> SyncPosition {
 #[derive(Debug, Default)]
 struct MemoryBundles {
     held: Mutex<Option<(u64, Vec<u8>)>>,
+    /// Whether the next write applies and its answer never comes back.
+    loses_the_next_answer: Mutex<bool>,
+    /// Whether the next write never reaches the service.
+    drops_the_next_request: Mutex<bool>,
+    /// Where each applied request landed, as a receipt.
+    receipts: Mutex<std::collections::BTreeMap<Uuid, SyncPosition>>,
 }
 
 impl MemoryBundles {
@@ -79,12 +89,15 @@ impl SyncBackupService for MemoryBundles {
     fn compare_exchange<'a>(
         &'a self,
         _collection: &'a str,
-        _request_id: Uuid,
+        request_id: Uuid,
         _signed_at_ms: u64,
         expected: Option<SyncPosition>,
         ciphertext: &'a [u8],
     ) -> ServiceFuture<'a, SyncExchanged> {
         Box::pin(async move {
+            if std::mem::take(&mut *self.drops_the_next_request.lock().expect("a flag")) {
+                return Err(unsupported());
+            }
             let mut held = self.held.lock().expect("the bundle");
             let current = held.as_ref().map(|(place, _)| at(*place));
             if current != expected {
@@ -96,6 +109,13 @@ impl SyncBackupService for MemoryBundles {
             }
             let next = held.as_ref().map_or(1, |(place, _)| place + 1);
             *held = Some((next, ciphertext.to_vec()));
+            self.receipts
+                .lock()
+                .expect("the receipts")
+                .insert(request_id, at(next));
+            if std::mem::take(&mut *self.loses_the_next_answer.lock().expect("a flag")) {
+                return Err(unsupported());
+            }
             Ok(SyncExchanged::Applied { position: at(next) })
         })
     }
@@ -111,11 +131,23 @@ impl SyncBackupService for MemoryBundles {
     fn fence_request<'a>(
         &'a self,
         _collection: &'a str,
-        _request_id: Uuid,
+        request_id: Uuid,
         _first_signed_at_ms: u64,
         _last_signed_at_ms: u64,
     ) -> ServiceFuture<'a, SyncRequestFence> {
-        Box::pin(async { Err(unsupported()) })
+        Box::pin(async move {
+            Ok(
+                match self.receipts.lock().expect("the receipts").get(&request_id) {
+                    Some(position) => SyncRequestFence::Applied {
+                        position: *position,
+                    },
+                    None => SyncRequestFence::Fenced {
+                        never_ran: true,
+                        recovery: None,
+                    },
+                },
+            )
+        })
     }
 
     fn fetch<'a>(&'a self, _collection: &'a str) -> ServiceFuture<'a, SyncFetched> {
@@ -456,4 +488,293 @@ async fn a_trust_write_that_would_not_fit_with_the_settings_is_written_without_t
         Err(RecoveryError::BundleTooLarge { .. })
     ));
     assert_eq!(service.sealed(), before, "nothing was written");
+}
+
+fn local(mode: &str) -> LocalSettings {
+    LocalSettings::Values(colour(mode))
+}
+
+/// KR-REQ-20.17: a write is made when what the bundle holds differs from what the device has
+/// chosen, and not otherwise; the choice of nothing clears the member.
+#[tokio::test]
+async fn a_changed_setting_is_written_once_and_an_unchanged_one_is_not_written() {
+    let seed = RecoverySeed::generate().expect("a seed");
+    let service = Arc::new(MemoryBundles::default());
+    let (mut store, _directory) = store_over(&service);
+    let place = || {
+        service
+            .held
+            .lock()
+            .expect("the bundle")
+            .as_ref()
+            .map(|held| held.0)
+    };
+
+    // The first bundle is the one a turn-on writes, and a choice not yet made leaves no member.
+    let mut first = BundleStore::empty(now());
+    store
+        .commit(&seed, &mut first, now())
+        .await
+        .expect("the first bundle");
+    assert_eq!(place(), Some(1));
+    assert_eq!(
+        store
+            .save_settings(
+                &seed,
+                LocalSettings::Values(DeviceSettings::default()),
+                now()
+            )
+            .await
+            .expect("nothing to save"),
+        SettingsSaved::AlreadySaved
+    );
+    assert_eq!(place(), Some(1), "no write for no choice");
+
+    assert!(matches!(
+        store
+            .save_settings(&seed, local("dark"), now())
+            .await
+            .expect("saved"),
+        SettingsSaved::Saved { .. }
+    ));
+    assert_eq!(place(), Some(2));
+    assert_eq!(
+        store
+            .save_settings(&seed, local("dark"), now())
+            .await
+            .expect("settled"),
+        SettingsSaved::AlreadySaved
+    );
+    assert_eq!(place(), Some(2), "the same choice is not written again");
+
+    assert!(matches!(
+        store
+            .save_settings(&seed, local("light"), now())
+            .await
+            .expect("saved"),
+        SettingsSaved::Saved { .. }
+    ));
+    assert_eq!(place(), Some(3));
+    let held = store.fetch(&seed).await.expect("the bundle");
+    assert_eq!(
+        decode_member(held.device_settings.as_ref().expect("the member")).expect("it reads"),
+        colour("light")
+    );
+
+    // A choice taken back, which is a readable file with nothing chosen in it, clears the member.
+    assert!(matches!(
+        store
+            .save_settings(
+                &seed,
+                LocalSettings::Values(DeviceSettings::default()),
+                now()
+            )
+            .await
+            .expect("cleared"),
+        SettingsSaved::Saved { .. }
+    ));
+    assert!(
+        store
+            .fetch(&seed)
+            .await
+            .expect("the bundle")
+            .device_settings
+            .is_none()
+    );
+}
+
+/// KR-REQ-20.17: a settings file that cannot be read is not a choice of nothing. The member the
+/// bundle holds stays, and nothing is written.
+#[tokio::test]
+async fn an_unreadable_settings_file_keeps_the_member_the_bundle_holds() {
+    let seed = RecoverySeed::generate().expect("a seed");
+    let service = Arc::new(MemoryBundles::default());
+    let (mut store, _directory) = store_over(&service);
+    let mut first = BundleStore::empty(now());
+    store
+        .commit(&seed, &mut first, now())
+        .await
+        .expect("the first bundle");
+    store
+        .save_settings(&seed, local("dark"), now())
+        .await
+        .expect("saved");
+    let before = service.sealed();
+
+    assert!(matches!(
+        store
+            .save_settings(&seed, LocalSettings::Unreadable, now())
+            .await,
+        Err(RecoveryError::SettingsUnusable { .. })
+    ));
+    assert_eq!(service.sealed(), before, "nothing was written");
+    let held = store.fetch(&seed).await.expect("the bundle");
+    assert_eq!(
+        decode_member(held.device_settings.as_ref().expect("the member kept")).expect("it reads"),
+        colour("dark")
+    );
+}
+
+/// KR-REQ-20.17: removing the member writes the bundle by its own compare-and-swap and changes
+/// nothing else in it: the collections, the writers, the producers and the checkpoints are the
+/// same bytes. A bundle with no member is left alone.
+#[tokio::test]
+async fn removing_the_member_leaves_collections_keys_and_checkpoints_byte_for_byte() {
+    let seed = RecoverySeed::generate().expect("a seed");
+    let service = Arc::new(MemoryBundles::default());
+    let (mut store, _directory) = store_over(&service);
+    let mut bundle = BundleStore::empty(now());
+    bundle.collections.push(collection("collection-1"));
+    bundle.trusted_writers = [kr_protocol::archive::TrustedWriter {
+        writer_key_id: kr_protocol::scalars::KeyId::from_bytes([0x73; 32]),
+        signing_key: kr_protocol::scalars::AuthorisationKey::from_bytes([0x74; 32]),
+        enrolled_at_ms: now(),
+    }]
+    .into_iter()
+    .collect();
+    bundle.trusted_producers = [kr_protocol::archive::TrustedProducer {
+        sender_key_id: kr_protocol::scalars::KeyId::from_bytes([0x78; 32]),
+        stored_envelope_key: kr_protocol::scalars::StoredEnvelopeKey::from_bytes([0x79; 32]),
+        enrolled_at_ms: now(),
+    }]
+    .into_iter()
+    .collect();
+    bundle.checkpoints = [kr_protocol::archive::ArchiveCheckpoint {
+        archive_id: ArchiveId::new(Uuid::from_bytes([0x38; 16])),
+        backup_generation: kr_protocol::ids::BackupGeneration::new(7),
+        encrypted_manifest_hash: kr_protocol::scalars::Digest256::from_bytes([0x7a; 32]),
+        verified_at_ms: now(),
+    }]
+    .into_iter()
+    .collect();
+    store
+        .commit(&seed, &mut bundle, now())
+        .await
+        .expect("the bundle");
+    store
+        .save_settings(&seed, local("dark"), now())
+        .await
+        .expect("saved");
+    let with_member = store.fetch(&seed).await.expect("the bundle");
+    assert!(with_member.device_settings.is_some());
+
+    assert!(matches!(
+        store.remove_settings(&seed, now()).await.expect("removed"),
+        SettingsRemoval::Removed { .. }
+    ));
+    let without = store.fetch(&seed).await.expect("the bundle");
+    assert!(without.device_settings.is_none());
+    assert_eq!(without.revision.get(), with_member.revision.get() + 1);
+    // Everything else is the same bytes: the two bundles agree once the member, the revision and
+    // the instant are put aside.
+    let rest = |bundle: &RecoveryBundle| {
+        kr_cbor::to_canonical_vec(&RecoveryBundle {
+            device_settings: None,
+            revision: kr_protocol::scalars::U64::new(0),
+            written_at_ms: TimestampMs::new(0),
+            ..bundle.clone()
+        })
+        .expect("canonical bytes")
+    };
+    assert_eq!(rest(&without), rest(&with_member));
+    assert_eq!(rest(&without), rest(&bundle));
+
+    // Nothing to remove: nothing is written.
+    let place = service
+        .held
+        .lock()
+        .expect("the bundle")
+        .as_ref()
+        .map(|held| held.0);
+    assert!(matches!(
+        store
+            .remove_settings(&seed, now())
+            .await
+            .expect("nothing saved"),
+        SettingsRemoval::NothingSaved
+    ));
+    assert_eq!(
+        service
+            .held
+            .lock()
+            .expect("the bundle")
+            .as_ref()
+            .map(|held| held.0),
+        place
+    );
+}
+
+/// KR-REQ-20.15, KR-REQ-20.17: a removal whose answer never came back is not reported as done. The
+/// store still says the write is unsettled, and a second removal ends it first, then reads the
+/// bundle and finds the member gone.
+#[tokio::test]
+async fn a_removal_whose_answer_is_lost_stays_unconfirmed_until_it_is_ended() {
+    let seed = RecoverySeed::generate().expect("a seed");
+    let service = Arc::new(MemoryBundles::default());
+    let (mut store, _directory) = store_over(&service);
+    let mut first = BundleStore::empty(now());
+    store
+        .commit(&seed, &mut first, now())
+        .await
+        .expect("the first bundle");
+    store
+        .save_settings(&seed, local("dark"), now())
+        .await
+        .expect("saved");
+
+    *service.loses_the_next_answer.lock().expect("a flag") = true;
+    let lost = store
+        .remove_settings(&seed, now())
+        .await
+        .expect_err("the answer never came back");
+    assert!(matches!(lost, RecoveryError::BundleOutcomeUnknown { .. }));
+    assert!(matches!(
+        store.lost_write(),
+        Some(LostWrite::Unsettled { .. })
+    ));
+
+    assert_eq!(
+        store
+            .remove_settings(&seed, now())
+            .await
+            .expect("ended, then read"),
+        SettingsRemoval::NothingSaved,
+        "the first removal applied, and the second finds nothing to remove"
+    );
+    assert!(matches!(store.lost_write(), Some(LostWrite::Applied)));
+
+    // A removal that never reached the service leaves the member where it was, and the next one
+    // ends the lost write first and then goes out.
+    store
+        .save_settings(&seed, local("dark"), now())
+        .await
+        .expect("saved again");
+    *service.drops_the_next_request.lock().expect("a flag") = true;
+    assert!(matches!(
+        store.remove_settings(&seed, now()).await,
+        Err(RecoveryError::BundleOutcomeUnknown { .. })
+    ));
+    assert!(
+        store
+            .fetch(&seed)
+            .await
+            .expect("the bundle")
+            .device_settings
+            .is_some()
+    );
+    assert!(matches!(
+        store
+            .remove_settings(&seed, now())
+            .await
+            .expect("ended, then removed"),
+        SettingsRemoval::Removed { .. }
+    ));
+    assert!(
+        store
+            .fetch(&seed)
+            .await
+            .expect("the bundle")
+            .device_settings
+            .is_none()
+    );
 }

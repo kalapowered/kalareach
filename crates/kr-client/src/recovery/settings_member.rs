@@ -27,6 +27,7 @@ use kr_protocol::scalars::Bytes;
 use serde::{Deserialize, Serialize};
 
 use crate::recovery::{MaterialName, RecoveryError, Result};
+use crate::services::SyncPosition;
 use crate::sync::SettingValue;
 
 /// The most one encoded, padded settings member may be.
@@ -204,4 +205,40 @@ pub fn decode_member(member: &Bytes) -> Result<DeviceSettings> {
         what: "the saved settings are not a settings member this build reads",
     })?;
     DeviceSettings::new(decoded.values)
+}
+
+/// What this device has chosen, as its settings file says.
+///
+/// A file that cannot be read is not a choice of nothing: [`Self::Unreadable`] keeps the member
+/// the bundle holds, where [`Self::Values`] with no value in it clears it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LocalSettings {
+    /// The file was read and these are the values it holds, none when the person chose nothing.
+    Values(DeviceSettings),
+    /// The file exists and could not be read.
+    Unreadable,
+}
+
+/// What saving the settings did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SettingsSaved {
+    /// The bundle already held these settings, so nothing was written.
+    AlreadySaved,
+    /// The bundle was written, and is now at this place.
+    Saved {
+        /// Where the service put the write.
+        position: SyncPosition,
+    },
+}
+
+/// What removing the settings from the bundle did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SettingsRemoval {
+    /// The member was taken out of the bundle, which is now at this place.
+    Removed {
+        /// Where the service put the write.
+        position: SyncPosition,
+    },
+    /// The bundle held no settings, so nothing was written.
+    NothingSaved,
 }

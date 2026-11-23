@@ -88,8 +88,8 @@ pub use crate::recovery::settings::{
     ExportedSettings, ImportedSettings, SETTINGS_FILENAME, export_settings, import_settings,
 };
 pub use crate::recovery::settings_member::{
-    DEVICE_SETTINGS_BUCKET_BYTES, DeviceSettings, MAX_DEVICE_SETTINGS_BYTES, decode_member,
-    encode_member,
+    DEVICE_SETTINGS_BUCKET_BYTES, DeviceSettings, LocalSettings, MAX_DEVICE_SETTINGS_BYTES,
+    SettingsRemoval, SettingsSaved, decode_member, encode_member,
 };
 pub use crate::recovery::setup::{PreparedSetup, SetupInputs, kit_fingerprint, prepare_setup};
 // One definition of what a backup carries, in the crate that owns the backup layer. A device and a
