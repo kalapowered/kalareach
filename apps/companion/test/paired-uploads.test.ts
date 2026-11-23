@@ -209,6 +209,21 @@ describe('the store reads the application, and the application is the one that s
     code: 'RESOURCE_UNAVAILABLE',
     message: 'this device could not keep a record of the upload: disk full'
   }
+  /** The handle of a file the host holds in full, as a cancel's answer names it. */
+  const published = {
+    transfer_id: 't-11',
+    environment_id: 'e-1',
+    byte_len: '9',
+    content_digest: 'b'.repeat(64),
+    declared_media_type: 'application/octet-stream',
+    original_file_name: 'sent.bin',
+    presented_as_image: false,
+    session_id: null,
+    preview: null,
+    published_at_ms: '1',
+    expires_at_ms: '2',
+    submitted: false
+  }
 
   it('does not take a refused file for one the application keeps nothing of when its list cannot be read', async () => {
     const { uploads, scripted, mend } = unreadable()
@@ -322,24 +337,12 @@ describe('the store reads the application, and the application is the one that s
     await run('asked', { kind: 'cancelAsked', said: null })
   })
 
-  it('Z4: a failure after a cancel that found the file published keeps the file', async () => {
-    // The cancel's answer says the file was sent while the failed send is still awaited. No bind follows a send that
-    // failed, so the row is kept, and neither the failure nor the older list reply replaces it.
-    const handle = {
-      transfer_id: 't-11',
-      environment_id: 'e-1',
-      byte_len: '9',
-      content_digest: 'b'.repeat(64),
-      declared_media_type: 'application/octet-stream',
-      original_file_name: 'sent.bin',
-      presented_as_image: false,
-      session_id: null,
-      preview: null,
-      published_at_ms: '1',
-      expires_at_ms: '2',
-      submitted: false
-    }
-    const run = async (order: 'during the read' | 'before the failure') => {
+  // The cancel's answer says the file was sent while the failed send is still awaited. No bind follows a send that
+  // failed, so the row is kept, and neither the failure nor the older list reply replaces it. Each order of the
+  // cancel's answer and the failure is a case of its own.
+  it.each(['during the read', 'before the failure'] as const)(
+    'Z4: a failure after a cancel that found the file published keeps the file, %s',
+    async (order) => {
       const { uploads, port, scripted, replies, real } = held()
       const answers: ((answered: UploadCancelled) => void)[] = []
       vi.spyOn(port, 'uploadCancel').mockImplementation(
@@ -357,7 +360,7 @@ describe('the store reads the application, and the application is the one that s
       const cancelWithPublished = async () => {
         const cancelling = uploads.cancel('k-11')
         await wait(() => answers.length === 1)
-        answers[0]?.({ key: 'k-11', state: 'published', releasedByteLen: null, handle, said: null })
+        answers[0]?.({ key: 'k-11', state: 'published', releasedByteLen: null, handle: published, said: null })
         await cancelling
         expect(uploads.snapshot().get('k-11')?.phase).toEqual({ kind: 'adding' })
       }
@@ -376,13 +379,11 @@ describe('the store reads the application, and the application is the one that s
       await failed
       const row = uploads.snapshot().get('k-11')
       expect(row?.phase).toEqual({ kind: 'kept', words: null })
-      expect(row?.handle).toEqual(handle)
+      expect(row?.handle).toEqual(published)
       expect(row?.awaited).toBe(false)
       expect(row?.note).toBe(words.sentence(words.PUBLISHED_AND_KEPT))
     }
-    await run('during the read')
-    await run('before the failure')
-  })
+  )
 
   it('stops asking once the list is read and the application keeps nothing of the refused file', async () => {
     const { uploads, scripted, asked, mend } = unreadable()
