@@ -2367,15 +2367,15 @@ mod tests {
     #[test]
     fn the_permission_for_a_protected_folder_of_the_home_directory_is_read_from_the_account() {
         let home = std::env::home_dir().expect("this account has a home directory");
-        let expected = match volume::flags_of(&home) {
+        // A folder of the home directory can be a link to another volume, so it is the path's own
+        // volume that decides here, as it does in the lookup.
+        let path = home.join("Library/Mail/notes.txt");
+        let expected = match volume::flags_of(&path) {
             Some(flags) if volume::removable(flags) => "Files & Folders, for removable volumes",
             Some(flags) if volume::network(flags) => "Files & Folders, for network volumes",
             _ => "Full Disk Access",
         };
-        assert_eq!(
-            permission_for_path(&home.join("Library/Mail/notes.txt")),
-            Some(expected)
-        );
+        assert_eq!(permission_for_path(&path), Some(expected));
     }
 
     /// KR-REQ-11.16, the bounded clause, for the lookup that follows a refused open: the question of
