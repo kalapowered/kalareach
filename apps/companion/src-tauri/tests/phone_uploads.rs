@@ -5017,17 +5017,21 @@ async fn kr_req_13_12_a_refused_send_leaves_the_copy_of_an_upload_that_a_cleanup
         "the cleanup's resolution started the upload"
     );
     gate.add_permits(1);
-    let answered = tokio::time::timeout(WATCHDOG, send)
-        .await
-        .expect("the send answers")
-        .expect("the task ran");
-    assert!(answered.is_err(), "the start of the send was refused");
+    // The send's own start is refused, and the desk's task of the send ends; the send waits for the
+    // outcome of the upload that the desk sends.
+    desk.sends_idle().await;
+    let left = testing::read_copy(&folder(&phone), key);
+    sender.release();
     assert_eq!(
-        testing::read_copy(&folder(&phone), key),
+        left,
         Some(bytes),
         "the refused send left the copy of the upload that is sending"
     );
-    sender.release();
+    tokio::time::timeout(WATCHDOG, send)
+        .await
+        .expect("the send answers")
+        .expect("the task ran")
+        .expect("the upload that the cleanup started published");
     until("the upload ends after its sender ran", || {
         desk.generation_for_test(key).is_none()
     })
@@ -5280,6 +5284,60 @@ async fn kr_req_13_12_a_stopped_sender_removes_no_file_of_the_upload_a_cleanup_h
         0,
         "the cleanup removed the copy"
     );
+    adopted.stop().await;
+}
+
+/// KR-REQ-13.12 (FU21): a send whose own start finds the upload started already by a cleanup's
+/// resolution answers the upload's outcome, not a cancel. The cleanup's work panicked, its resolution
+/// started the upload while the send waited before its own start, and the sender is held at its first
+/// line. The send waits while the desk sends, and answers the handle once the upload publishes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_13_12_a_send_whose_upload_a_cleanup_started_answers_the_uploads_outcome() {
+    use testing::{Awaited, Fault, Point};
+
+    let adopted = Adopted::start(1).await;
+    let (phone, _control) = phone_for(&adopted).await;
+    let desk = desk_of(&phone.companion);
+    let paired = paired_of(&phone.companion).await;
+    let key = kr_ipc::new_uuid();
+    let bytes = vec![5_u8; 16];
+    let gate = desk.hold_after_copy_for_test();
+    let after = testing::hold_at(key, Point::AfterCopy);
+    let tail = testing::hold_awaited(key, Awaited::BeforeTail);
+    let sender = testing::hold_at(key, Point::SenderStarting);
+    let _panics = testing::arm(key, Fault::PanicInWork);
+    let send = {
+        let sent = request(&adopted, &bytes, Arc::new(Held::new(bytes.clone())), key);
+        let (desk, paired) = (Arc::clone(&desk), paired.clone());
+        tokio::spawn(async move { desk.send(paired, sent).await })
+    };
+    after.until_passed(1).await;
+    desk.forgotten(paired.device_id);
+    tail.until_arrived(1).await;
+    tail.release();
+    sender.until_passed(1).await;
+    assert_eq!(
+        desk.phase_for_test(key),
+        Some("sending"),
+        "the cleanup's resolution started the upload"
+    );
+    // The send's own start is refused, and the desk's task of the send ends.
+    gate.add_permits(1);
+    desk.sends_idle().await;
+    // A send that answers a cancel answers within a moment of the refusal.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let finished = send.is_finished();
+    sender.release();
+    let answered = tokio::time::timeout(WATCHDOG, send)
+        .await
+        .expect("the send answers")
+        .expect("the task ran");
+    assert!(
+        !finished,
+        "the send waits for the upload that the desk sends"
+    );
+    answered.expect("the upload that the cleanup started published");
+    settled(&desk).await;
     adopted.stop().await;
 }
 

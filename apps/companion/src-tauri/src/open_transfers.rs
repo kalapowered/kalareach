@@ -1529,7 +1529,9 @@ impl Desk {
             if !started {
                 registry.drop_admitted(store, live);
             }
-            started
+            // An upload that another start moved to `Sending` first, a cleanup's resolution, is the
+            // desk's to send and publish, and this send answers its outcome.
+            started || live.started.load(Ordering::Acquire)
         };
         if started {
             Ok(())
