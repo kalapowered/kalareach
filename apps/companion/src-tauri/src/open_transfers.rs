@@ -452,6 +452,12 @@ struct Live {
     /// refuses it and the decision pauses it, as for any upload, and the cancel is finished as it
     /// is for any other.
     copy_gone: AtomicBool,
+    /// Whether the send of this upload is still writing the copy it keeps: set before the upload is
+    /// admitted when the send keeps a copy, and cleared by the send once the copy is placed. No
+    /// start takes an upload that carries it, so that nothing sends from memory and writes a
+    /// journal entry that names a copy that may never come; the send's own start follows the copy.
+    /// A send whose copy fails leaves it set, and that upload is never started (`copy_gone`).
+    copy_pending: AtomicBool,
 }
 
 fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -468,6 +474,7 @@ impl Live {
             sent_link: AtomicU64::new(0),
             started: AtomicBool::new(false),
             copy_gone: AtomicBool::new(false),
+            copy_pending: AtomicBool::new(false),
             published: AtomicBool::new(file.reached == Reached::Published),
             generation: AtomicU64::new(0),
             file: Mutex::new(file),
@@ -1404,6 +1411,10 @@ impl Desk {
             cancel_asked: false,
         };
         let live = Live::new(file, request.content, false);
+        live.copy_pending.store(
+            matches!(request.keeping, Keeping::Copy(_)),
+            Ordering::Release,
+        );
         // The place and the key are taken together, here and before any await: a key the person
         // cancelled, a key in use and a third open upload are refused under the gate, so no copy is
         // written and no reservation is asked for.
@@ -1484,6 +1495,8 @@ impl Desk {
                 locked(&self.registry).drop_admitted(store, live);
                 return Err(error);
             }
+            // The copy is placed: a start may take the upload now.
+            live.copy_pending.store(false, Ordering::Release);
         }
         #[cfg(feature = "testing")]
         {
@@ -1555,7 +1568,9 @@ impl Desk {
     /// mark does not say that no content remains). A start on another connection refuses it and
     /// leaves it held, for the pairing in force or the next decision to end. An upload whose cancel
     /// is owed is refused before that check, and one that is stopping is refused first: the cleanup
-    /// that holds it ends it, and its key is not free before.
+    /// that holds it ends it, and its key is not free before. An upload whose send is still writing
+    /// its copy (`copy_pending`) is refused after the check, and left as it is for that send's own
+    /// start.
     fn start_under(
         self: &Arc<Self>,
         registry: &mut Registry,
@@ -1603,6 +1618,13 @@ impl Desk {
             if live.copy_gone.load(Ordering::Acquire) {
                 drop(phase);
                 Self::end_under(registry, live, Outcome::Cancelled);
+                return false;
+            }
+            // An upload whose send is still writing its copy is started by that send, after the
+            // copy is placed, and by nothing else: a start before it would send from memory and
+            // write a journal entry that names a copy that may never come. A cleanup's resolution
+            // leaves the upload paused, and the send's own start takes it.
+            if live.copy_pending.load(Ordering::Acquire) {
                 return false;
             }
             *phase = Phase::Sending;

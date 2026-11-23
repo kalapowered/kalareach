@@ -5167,6 +5167,66 @@ async fn kr_req_13_12_a_restarts_sweep_leaves_the_copy_of_a_key_whose_entry_came
     adopted.stop().await;
 }
 
+/// KR-REQ-13.12 (FU19): a cleanup's resolution does not start an upload whose send is still writing
+/// its copy, so that no journal entry names a copy that never came. The cleanup stops the upload
+/// while its copy is staged, and its work panics; its resolution runs before the copy is placed. The
+/// copy's write then fails, and the send ends its admission. No sender starts, and no entry is
+/// written for a copy that does not exist.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_13_12_a_resolution_does_not_start_an_upload_whose_copy_is_not_placed_yet() {
+    use testing::{Awaited, Fault, Point};
+
+    let adopted = Adopted::start(1).await;
+    let (phone, _control) = phone_for(&adopted).await;
+    let desk = desk_of(&phone.companion);
+    let paired = paired_of(&phone.companion).await;
+    let key = kr_ipc::new_uuid();
+    let bytes = vec![5_u8; 16];
+    let staged = testing::hold_at(key, Point::CopyStaged);
+    let tail = testing::hold_awaited(key, Awaited::BeforeTail);
+    let decided = testing::hold_at(key, Point::DecisionDone);
+    let sender = testing::hold_at(key, Point::SenderStarting);
+    let _panics = testing::arm(key, Fault::PanicInWork);
+    let _fails = testing::arm(key, Fault::CopyFails);
+    let send = {
+        let sent = request(&adopted, &bytes, Arc::new(Held::new(bytes.clone())), key);
+        let (desk, paired) = (Arc::clone(&desk), paired.clone());
+        tokio::spawn(async move { desk.send(paired, sent).await })
+    };
+    staged.until_passed(1).await;
+    // The cleanup has stopped the upload and its work has panicked; its resolution runs while the
+    // copy is still being written.
+    desk.forgotten(paired.device_id);
+    tail.until_arrived(1).await;
+    tail.release();
+    decided.until_passed(1).await;
+    staged.release();
+    let answered = tokio::time::timeout(WATCHDOG, send)
+        .await
+        .expect("the send answers")
+        .expect("the task ran");
+    sender.release();
+    settled(&desk).await;
+    desk.sends_idle().await;
+    assert!(answered.is_err(), "the write of the copy failed");
+    assert_eq!(
+        entries_in(&folder(&phone)),
+        0,
+        "no journal entry names the copy that never came"
+    );
+    assert_eq!(
+        sender.passed(),
+        0,
+        "no sender started for an upload with no copy"
+    );
+    assert_eq!(
+        testing::read_copy(&folder(&phone), key),
+        None,
+        "no copy is left for the upload"
+    );
+    adopted.stop().await;
+}
+
 /// KR-REQ-13.12 (FU7): a panic in the desk's task of a send leaves no upload admitted with no
 /// sender. The caller is answered, the copy is gone, and the key is free for a new send.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
