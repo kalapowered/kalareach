@@ -1411,6 +1411,10 @@ async fn a_settings_member_that_no_build_can_read_fails_only_the_settings_restor
 /// alphabet and as a list of numbers. The controls are the scan finding a key where one is put: in
 /// a setting's value, in each form. The sealed bundle the service holds is ciphertext and is
 /// read only as that.
+///
+/// What it shows is that the format adds no key: the keys are made here and no code under test
+/// gets them, so it does not show that a producer keeps keys out of what it saves. The settings
+/// the companion saves are scanned for the device's keys where the companion makes them.
 #[tokio::test]
 async fn the_member_and_the_settings_a_restore_returns_hold_none_of_the_private_keys_the_device_keeps()
  {

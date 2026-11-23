@@ -3,15 +3,16 @@
 //!
 //! A leg that holds the managed service to its retention rules needs thirty-one generations in a
 //! real deployment's storage and manifest services, and this is the smallest producer that makes
-//! them. The writer's enrolment goes in the recovery bundle first and the manifest service second;
-//! each generation stages one member for the recovery recipient, seals the archive, uploads the
-//! member and the encrypted manifest through the storage service and publishes the descriptor,
-//! signed by the writer. It is test support: it holds no record of what it sent and no privacy
-//! gate, and a refusal is a panic with the service's own words.
+//! them. The writer's enrolment goes in the recovery bundle first and the manifest service second,
+//! and a bundle that does not land enrols nothing; each generation stages one member for the
+//! recovery recipient, seals the archive, uploads the member and the encrypted manifest through the
+//! storage service and publishes the descriptor, signed by the writer. It is test support: it holds
+//! no record of what it sent and no privacy gate, and a refusal after the bundle is a panic with
+//! the service's own words.
 
 use std::sync::Arc;
 
-use kr_client::recovery::{ArchiveEntries, BundleStore};
+use kr_client::recovery::{ArchiveEntries, BundleStore, RecoveryError};
 use kr_client::services::account::AccountTokenSource;
 use kr_client::services::backup::{ManagedBackupManifestService, Published};
 use kr_client::services::storage::{ArchiveAnswer, ManagedStorageService, NewUpload, upload_parts};
@@ -75,10 +76,13 @@ pub struct Generations {
 impl Generations {
     /// Enables the writer: the recovery bundle first, the manifest service second.
     ///
+    /// # Errors
+    ///
+    /// Returns the bundle's refusal when it does not land, and enrols nothing.
+    ///
     /// # Panics
     ///
-    /// Panics with the service's refusal when the bundle does not land or the enrolment is not
-    /// answered.
+    /// Panics with the service's refusal when the enrolment is not answered.
     pub async fn enable(
         collection: Collection,
         bundles: &mut BundleStore,
@@ -87,7 +91,7 @@ impl Generations {
         owner: &AuthorisationKeyPair,
         manifest: &dyn BackupManifestService,
         now: TimestampMs,
-    ) -> Self {
+    ) -> Result<Self, RecoveryError> {
         let entries = ArchiveEntries {
             collection: CollectionLocator {
                 service_origin: collection.service_origin.clone(),
@@ -105,10 +109,7 @@ impl Generations {
                 enrolled_at_ms: now,
             },
         };
-        entries
-            .commit(bundles, seed, bundle, now)
-            .await
-            .expect("the bundle landed");
+        entries.commit(bundles, seed, bundle, now).await?;
         let payload = BackupWriterRecordPayload {
             archive_id: collection.archive_id,
             writer: entries.writer,
@@ -130,7 +131,7 @@ impl Generations {
             })
             .await
             .expect("the writer is enrolled");
-        Self { collection }
+        Ok(Self { collection })
     }
 
     /// Backs `member` up as generation `generation`: sealed for the recovery recipient under

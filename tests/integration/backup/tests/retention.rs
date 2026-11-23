@@ -284,7 +284,8 @@ async fn thirty_daily_snapshots_are_kept_and_a_deleted_generation_is_a_tombstone
         &services.manifest(),
         now(),
     )
-    .await;
+    .await
+    .expect("the bundle landed");
 
     // What each generation carries: the settings member a device that chose a colour mode saves,
     // as bytes.
