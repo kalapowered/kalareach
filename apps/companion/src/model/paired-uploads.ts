@@ -382,7 +382,10 @@ export class PairedUploads {
             const kept = await this.#kept(key)
             still()
             const now = this.#rows.get(key)?.phase.kind
-            if (now === 'cancelling' || now === 'cancelAsked' || now === 'cancelled') {
+            if (now === 'adding') {
+              // The cancel found the file published while the status was read.
+              this.#keepPublished(key)
+            } else if (now === 'cancelling' || now === 'cancelAsked' || now === 'cancelled') {
               // The person cancelled while the status was read: the cancel has the row, and the
               // status, read before it, does not replace it.
               this.#patch(key, { awaited: false })
@@ -649,6 +652,15 @@ export class PairedUploads {
         this.#asked(key, refusalOf(failure).words)
       }
     }
+  }
+
+  /**
+   * The person's cancel found the file published while a send that then failed was still awaited. No
+   * bind follows a send that failed, so the file is kept, as it is when no call waits; the handle and
+   * the note the cancel's answer set stay.
+   */
+  #keepPublished(key: string): void {
+    this.#patch(key, { phase: { kind: 'kept', words: null }, awaited: false })
   }
 
   /** A cancel the application keeps and has not finished: nothing more is sent, and it is read again. */

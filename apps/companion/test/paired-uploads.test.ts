@@ -322,6 +322,68 @@ describe('the store reads the application, and the application is the one that s
     await run('asked', { kind: 'cancelAsked', said: null })
   })
 
+  it('Z4: a failure after a cancel that found the file published keeps the file', async () => {
+    // The cancel's answer says the file was sent while the failed send is still awaited. No bind follows a send that
+    // failed, so the row is kept, and neither the failure nor the older list reply replaces it.
+    const handle = {
+      transfer_id: 't-11',
+      environment_id: 'e-1',
+      byte_len: '9',
+      content_digest: 'b'.repeat(64),
+      declared_media_type: 'application/octet-stream',
+      original_file_name: 'sent.bin',
+      presented_as_image: false,
+      session_id: null,
+      preview: null,
+      published_at_ms: '1',
+      expires_at_ms: '2',
+      submitted: false
+    }
+    const run = async (order: 'during the read' | 'before the failure') => {
+      const { uploads, port, scripted, replies, real } = held()
+      const answers: ((answered: UploadCancelled) => void)[] = []
+      vi.spyOn(port, 'uploadCancel').mockImplementation(
+        () =>
+          new Promise((resolve) => {
+            answers.push(resolve)
+          })
+      )
+      const sent = uploads.send({ key: 'k-11', sessionId: 's-1', subject, file }, () => Promise.resolve())
+      let over = false
+      const failed = sent.catch(() => undefined).then(() => {
+        over = true
+      })
+      await wait(() => scripted.started.length === 1)
+      const cancelWithPublished = async () => {
+        const cancelling = uploads.cancel('k-11')
+        await wait(() => answers.length === 1)
+        answers[0]?.({ key: 'k-11', state: 'published', releasedByteLen: null, handle, said: null })
+        await cancelling
+        expect(uploads.snapshot().get('k-11')?.phase).toEqual({ kind: 'adding' })
+      }
+      if (order === 'before the failure') {
+        await cancelWithPublished()
+        scripted.refuseRetaining('k-11', refusal)
+      } else {
+        scripted.refuseRetaining('k-11', refusal)
+        // The failure reads what the application keeps, and the read is held.
+        await wait(() => replies.length === 1)
+        await cancelWithPublished()
+      }
+      // The application lists the upload as paused, in a reply to a read that began before the cancel's answer.
+      await wait(() => over || replies.length === 1)
+      replies[0]?.resolve(await real())
+      await failed
+      const row = uploads.snapshot().get('k-11')
+      expect(row?.phase).toEqual({ kind: 'kept', words: null })
+      expect(row?.handle).toEqual(handle)
+      expect(row?.awaited).toBe(false)
+      expect(row?.note).toBe(words.sentence(words.PUBLISHED_AND_KEPT))
+    }
+    await run('during the read')
+    await run('before the failure')
+  })
+
   it('stops asking once the list is read and the application keeps nothing of the refused file', async () => {
     const { uploads, scripted, asked, mend } = unreadable()
     const sent = uploads.send({ key: 'k-6', sessionId: 's-1', subject, file }, () => Promise.resolve())
