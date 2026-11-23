@@ -536,10 +536,10 @@
           "kind": "sqlite_table",
           "table": "privacy_schema"
         },
-        "version": 1,
+        "version": 2,
         "migrates_from": 1
       },
-      "digest": "2b9f5c9d66960d0b002be60e3b827b08311d36127dd999e4fff42efa8fb0fd9d",
+      "digest": "2ba2102f7719bfb30caedea9d49489dabf6a3bcd13be36b8505b1b191d2f0edc",
       "kept": []
     },
     {

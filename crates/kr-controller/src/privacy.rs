@@ -82,10 +82,13 @@ use crate::push::DeliveryModule;
 pub const PRIVACY_RECORD: &str = "privacy.sqlite3";
 
 /// The schema version this build reads and writes.
-pub const SCHEMA_VERSION: i64 = 1;
+///
+/// Version 2 adds the moment a change took effect and the generation it took effect at to the
+/// record, and a record at version 1 is brought to it when it is opened.
+pub const SCHEMA_VERSION: i64 = 2;
 
 /// The oldest schema version this build opens: it reads no other.
-pub const OLDEST_SCHEMA_VERSION: i64 = SCHEMA_VERSION;
+pub const OLDEST_SCHEMA_VERSION: i64 = 1;
 
 /// The first wait before a refused step is tried again.
 const FIRST_RETRY_MS: u64 = 1_000;
@@ -2453,8 +2456,9 @@ struct Record {
 impl Record {
     fn open(state_dir: &Path) -> Result<Self> {
         std::fs::create_dir_all(state_dir).map_err(ControllerError::registry)?;
-        let connection = kr_flush::release::open_connection(&state_dir.join(PRIVACY_RECORD), None)
-            .map_err(|error| ControllerError::registry(kr_flush::release::describe(&error)))?;
+        let mut connection =
+            kr_flush::release::open_connection(&state_dir.join(PRIVACY_RECORD), None)
+                .map_err(|error| ControllerError::registry(kr_flush::release::describe(&error)))?;
         // A write that finds the record held by another connection waits for it, up to five
         // seconds, rather than refusing the change at once.
         connection
@@ -2463,15 +2467,24 @@ impl Record {
         // Every change is one transaction, and it is on the disk before the change is reported:
         // a boundary lost to a power failure would be one no restart could see.
         connection
+            .execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL;")
+            .map_err(ControllerError::registry)?;
+        // The tables, the migration and the version are one transaction, so a record is never
+        // left between two versions: a failure leaves the record as it was found and the daemon
+        // does not start.
+        let transaction = connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(ControllerError::registry)?;
+        transaction
             .execute_batch(
-                "PRAGMA journal_mode = WAL;
-                 PRAGMA synchronous = FULL;
-                 CREATE TABLE IF NOT EXISTS privacy_schema (version INTEGER NOT NULL);
+                "CREATE TABLE IF NOT EXISTS privacy_schema (version INTEGER NOT NULL);
                  CREATE TABLE IF NOT EXISTS privacy_record (
                      id            INTEGER PRIMARY KEY CHECK (id = 0),
                      generation    INTEGER NOT NULL CHECK (generation >= 0),
                      enabled       INTEGER NOT NULL CHECK (enabled IN (0, 1)),
-                     changed_at_ms INTEGER NOT NULL
+                     changed_at_ms INTEGER NOT NULL,
+                     effective_at_ms INTEGER,
+                     effective_generation INTEGER
                  );
                  CREATE TABLE IF NOT EXISTS privacy_obligations (
                      session_id     TEXT PRIMARY KEY,
@@ -2486,27 +2499,57 @@ impl Record {
                  VALUES (0, 0, 0, 0);",
             )
             .map_err(ControllerError::registry)?;
-        let version: Option<i64> = connection
+        let version: Option<i64> = transaction
             .query_row("SELECT version FROM privacy_schema", [], |row| row.get(0))
             .optional()
             .map_err(ControllerError::registry)?;
         match version {
-            None => {
-                connection
-                    .execute(
-                        "INSERT INTO privacy_schema (version) VALUES (?1)",
-                        params![SCHEMA_VERSION],
-                    )
-                    .map_err(ControllerError::registry)?;
-            }
             Some(SCHEMA_VERSION) => {}
+            // A file with no version is a new one, or the tables of a first open that stopped
+            // before it wrote the version: the same migration takes both to the current version.
+            None | Some(OLDEST_SCHEMA_VERSION) => {
+                for column in ["effective_at_ms", "effective_generation"] {
+                    let present: i64 = transaction
+                        .query_row(
+                            "SELECT COUNT(*) FROM pragma_table_info('privacy_record')
+                              WHERE name = ?1",
+                            params![column],
+                            |row| row.get(0),
+                        )
+                        .map_err(ControllerError::registry)?;
+                    if present == 0 {
+                        transaction
+                            .execute_batch(&format!(
+                                "ALTER TABLE privacy_record ADD COLUMN {column} INTEGER"
+                            ))
+                            .map_err(ControllerError::registry)?;
+                    }
+                }
+                // Last, so that a migration that stops before it leaves the version it found.
+                if version.is_none() {
+                    transaction
+                        .execute(
+                            "INSERT INTO privacy_schema (version) VALUES (?1)",
+                            params![SCHEMA_VERSION],
+                        )
+                        .map_err(ControllerError::registry)?;
+                } else {
+                    transaction
+                        .execute(
+                            "UPDATE privacy_schema SET version = ?1",
+                            params![SCHEMA_VERSION],
+                        )
+                        .map_err(ControllerError::registry)?;
+                }
+            }
             Some(found) => {
                 return Err(ControllerError::registry(format!(
                     "the privacy record is at schema {found} and this build reads \
-                     {SCHEMA_VERSION}"
+                     {OLDEST_SCHEMA_VERSION} to {SCHEMA_VERSION}"
                 )));
             }
         }
+        transaction.commit().map_err(ControllerError::registry)?;
         Ok(Self { connection })
     }
 
@@ -5214,6 +5257,229 @@ mod tests {
             0,
             "the removal ran once the read was done"
         );
+    }
+}
+
+/// The record's schema as a build that wrote version 1 left it, and what opening it does.
+#[cfg(test)]
+mod the_record_at_open {
+    use super::*;
+
+    /// The tables, the trigger and the row a build at schema version 1 made, exactly as it wrote
+    /// them.
+    const VERSION_ONE: &str = "CREATE TABLE privacy_schema (version INTEGER NOT NULL);
+         CREATE TABLE privacy_record (
+             id            INTEGER PRIMARY KEY CHECK (id = 0),
+             generation    INTEGER NOT NULL CHECK (generation >= 0),
+             enabled       INTEGER NOT NULL CHECK (enabled IN (0, 1)),
+             changed_at_ms INTEGER NOT NULL
+         );
+         CREATE TABLE privacy_obligations (
+             session_id     TEXT PRIMARY KEY,
+             generation     INTEGER NOT NULL CHECK (generation > 0),
+             recorded_at_ms INTEGER NOT NULL
+         );
+         CREATE TRIGGER privacy_generation_moves_forward
+         BEFORE UPDATE OF generation ON privacy_record
+         WHEN NEW.generation < OLD.generation
+         BEGIN SELECT RAISE(ABORT, 'a privacy generation never moves backwards'); END;
+         INSERT INTO privacy_record (id, generation, enabled, changed_at_ms)
+         VALUES (0, 3, 0, 1234);";
+
+    /// Writes the file a build at schema version 1 left in `directory`, with `version` recorded.
+    fn version_one(directory: &Path, version: Option<i64>) -> Connection {
+        let connection = Connection::open(directory.join(PRIVACY_RECORD)).expect("the file");
+        connection.execute_batch(VERSION_ONE).expect("version 1");
+        let session = SessionId::new(kr_protocol::scalars::Uuid::from_bytes([1; 16]));
+        connection
+            .execute(
+                "INSERT INTO privacy_obligations (session_id, generation, recorded_at_ms)
+                 VALUES (?1, 2, 99)",
+                [session.to_string()],
+            )
+            .expect("an obligation");
+        if let Some(version) = version {
+            connection
+                .execute(
+                    "INSERT INTO privacy_schema (version) VALUES (?1)",
+                    [version],
+                )
+                .expect("the version");
+        }
+        connection
+    }
+
+    fn version_of(connection: &Connection) -> Option<i64> {
+        connection
+            .query_row("SELECT version FROM privacy_schema", [], |row| row.get(0))
+            .optional()
+            .expect("the version")
+    }
+
+    fn columns_of(connection: &Connection) -> Vec<String> {
+        let mut statement = connection
+            .prepare("SELECT name FROM pragma_table_info('privacy_record') ORDER BY cid")
+            .expect("the columns");
+        statement
+            .query_map([], |row| row.get(0))
+            .expect("the columns")
+            .collect::<std::result::Result<_, _>>()
+            .expect("the columns")
+    }
+
+    /// Every definition the file holds, with its white space gone: what a store's tables are,
+    /// whichever way they were made.
+    fn definitions_of(connection: &Connection) -> Vec<String> {
+        let mut statement = connection
+            .prepare(
+                "SELECT type, name, tbl_name, sql FROM sqlite_master
+                  WHERE sql IS NOT NULL ORDER BY type, name",
+            )
+            .expect("the definitions");
+        statement
+            .query_map([], |row| {
+                let sql: String = row.get(3)?;
+                Ok(format!(
+                    "{} {} {} {}",
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    sql.split_whitespace().collect::<String>()
+                ))
+            })
+            .expect("the definitions")
+            .collect::<std::result::Result<_, _>>()
+            .expect("the definitions")
+    }
+
+    const PAIR: [&str; 2] = ["effective_at_ms", "effective_generation"];
+
+    /// KR-REQ-15.20: a record at version 1 is brought to version 2 when it is opened, in one
+    /// step: the moment and the generation it took effect at are added empty, what the record held
+    /// is as it was, and the version is the last thing written.
+    #[test]
+    fn a_version_one_record_is_migrated_when_it_is_opened() {
+        let directory = tempfile::tempdir().expect("a directory");
+        drop(version_one(directory.path(), Some(1)));
+
+        let record = Record::open(directory.path()).expect("version 1 is opened");
+
+        let stored = record.read().expect("the record");
+        assert_eq!(
+            (
+                stored.generation.get(),
+                stored.enabled,
+                stored.changed_at_ms.get()
+            ),
+            (3, false, 1234),
+            "what the record held is as it was"
+        );
+        assert_eq!(record.obligations().expect("the obligations").len(), 1);
+        let connection = Connection::open(directory.path().join(PRIVACY_RECORD)).expect("the file");
+        assert_eq!(version_of(&connection), Some(2));
+        let columns = columns_of(&connection);
+        assert_eq!(
+            columns[columns.len() - 2..],
+            PAIR,
+            "the pair is added last: {columns:?}"
+        );
+        let pair: (Option<i64>, Option<i64>) = connection
+            .query_row(
+                "SELECT effective_at_ms, effective_generation FROM privacy_record WHERE id = 0",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("the pair");
+        assert_eq!(pair, (None, None), "a migrated record has no evidence yet");
+    }
+
+    /// KR-REQ-15.20: a file a first open of version 1 left before it wrote its version has the
+    /// tables and no version row, and gets the pair before version 2 is written.
+    #[test]
+    fn a_record_with_the_version_one_tables_and_no_version_is_migrated_when_it_is_opened() {
+        let directory = tempfile::tempdir().expect("a directory");
+        drop(version_one(directory.path(), None));
+
+        drop(Record::open(directory.path()).expect("the tables are opened"));
+
+        let connection = Connection::open(directory.path().join(PRIVACY_RECORD)).expect("the file");
+        assert_eq!(version_of(&connection), Some(2));
+        assert_eq!(columns_of(&connection)[4..], PAIR);
+    }
+
+    /// KR-REQ-15.20: a migration that cannot finish changes nothing: the record is at version 1 as
+    /// it was, with no column added, and the daemon does not start.
+    #[test]
+    fn a_migration_that_fails_leaves_the_version_one_record_whole() {
+        let directory = tempfile::tempdir().expect("a directory");
+        let connection = version_one(directory.path(), Some(1));
+        let before = definitions_of(&connection);
+        // The version is the last thing the migration writes, so refusing it fails the migration
+        // after both columns have been added.
+        connection
+            .execute_batch(
+                "CREATE TRIGGER refuse_the_version BEFORE UPDATE ON privacy_schema
+                 BEGIN SELECT RAISE(ABORT, 'this store refused the version'); END;",
+            )
+            .expect("the version will be refused");
+        let before_with_trigger = definitions_of(&connection);
+
+        let refused = Record::open(directory.path()).expect_err("a record that cannot be migrated");
+
+        assert!(
+            refused.to_string().contains("refused the version"),
+            "{refused}"
+        );
+        assert_eq!(version_of(&connection), Some(1));
+        assert_eq!(
+            columns_of(&connection),
+            ["id", "generation", "enabled", "changed_at_ms"],
+            "no column was added"
+        );
+        assert_eq!(
+            definitions_of(&connection),
+            before_with_trigger,
+            "nothing the migration did stays, from the {} definitions it began with",
+            before.len()
+        );
+    }
+
+    /// KR-REQ-15.20: a record that was migrated is, to the definition, the one a new store has.
+    #[test]
+    fn a_migrated_record_is_the_one_a_fresh_store_has() {
+        let fresh = tempfile::tempdir().expect("a directory");
+        drop(Record::open(fresh.path()).expect("a new store"));
+        let migrated = tempfile::tempdir().expect("a directory");
+        drop(version_one(migrated.path(), Some(1)));
+        drop(Record::open(migrated.path()).expect("version 1 is migrated"));
+
+        let fresh = Connection::open(fresh.path().join(PRIVACY_RECORD)).expect("the file");
+        let migrated = Connection::open(migrated.path().join(PRIVACY_RECORD)).expect("the file");
+
+        assert_eq!(version_of(&fresh), Some(2));
+        assert_eq!(version_of(&migrated), Some(2));
+        assert_eq!(definitions_of(&migrated), definitions_of(&fresh));
+        assert_eq!(columns_of(&migrated), columns_of(&fresh));
+    }
+
+    /// KR-REQ-15.20: version 2 is opened as it is, and a version this build does not read is
+    /// refused with nothing written.
+    #[test]
+    fn version_two_is_opened_as_it_is_and_a_later_one_is_refused() {
+        let directory = tempfile::tempdir().expect("a directory");
+        drop(Record::open(directory.path()).expect("a new store"));
+        drop(Record::open(directory.path()).expect("version 2 is opened again"));
+
+        let connection = Connection::open(directory.path().join(PRIVACY_RECORD)).expect("the file");
+        connection
+            .execute("UPDATE privacy_schema SET version = 3", [])
+            .expect("a later version");
+        let refused = Record::open(directory.path()).expect_err("a later version");
+        assert!(
+            refused.to_string().contains("schema 3"),
+            "the refusal names the version: {refused}"
+        );
+        assert_eq!(version_of(&connection), Some(3), "nothing was written");
     }
 }
 
