@@ -30,8 +30,9 @@ use kr_protocol::desktop::{
     EnvironmentCapabilitiesResult,
 };
 use kr_protocol::error::ErrorCode;
+use kr_protocol::ids::SessionId;
 use kr_protocol::method::Method;
-use kr_protocol::scalars::Nullable;
+use kr_protocol::scalars::{Nullable, TimestampMs};
 
 use crate::cli::DesktopChecksArguments;
 use crate::daemon::Daemon;
@@ -182,6 +183,12 @@ enum Followed<R> {
 /// between reads: a daemon that holds its connection open and never answers ends the command at the
 /// deadline with nothing to show but the words that say so.
 ///
+/// The run is the one the host named in its first answer ([`Run`]), and the command reports no
+/// other: a read that finds another run, which a second caller began once this one ended, ends the
+/// command with the words that say so, and the findings of that run are not shown as this one's.
+/// Where the first answer already says the run ended, that answer is the command's own, and a later
+/// read only supplies the records if they are still that run's.
+///
 /// `announce` is called once the host has started a run.
 async fn follow<A: Asked>(
     asked: &mut A,
@@ -195,7 +202,9 @@ async fn follow<A: Asked>(
     else {
         return Ok(unanswered(None));
     };
-    if begun.state == CapabilityChecksState::Running {
+    let accepted = Run::of(&begun);
+    let running = begun.state == CapabilityChecksState::Running;
+    if running {
         announce();
     }
     let mut seen = begun;
@@ -203,11 +212,36 @@ async fn follow<A: Asked>(
         let Some((checks, records)) = within(deadline, asked.read()).await.transpose()? else {
             return Ok(unanswered(Some(seen)));
         };
+        let ours = Run::of(&checks) == accepted;
+        if !running {
+            return Ok(kept(seen, ours.then_some(records)));
+        }
+        if !ours {
+            return Ok(replaced(seen));
+        }
         if checks.state != CapabilityChecksState::Running || Instant::now() >= deadline {
             return Ok(ended(checks, records));
         }
         seen = checks;
         tokio::time::sleep_until(deadline.min(Instant::now() + POLL)).await;
+    }
+}
+
+/// A run of the checks as the host names it: when it began and the session whose worker performs
+/// it. Another run has another pair, so a command that reads the host again can tell that the run
+/// it asked for is no longer the one the host holds.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Run {
+    started_at_ms: Option<TimestampMs>,
+    session_id: Option<SessionId>,
+}
+
+impl Run {
+    fn of(checks: &CapabilityChecks) -> Self {
+        Self {
+            started_at_ms: checks.started_at_ms.0,
+            session_id: checks.session_id.0,
+        }
     }
 }
 
@@ -226,6 +260,39 @@ fn ended<R>(checks: CapabilityChecks, records: R) -> Followed<R> {
             words,
         },
     }
+}
+
+/// What a run comes to that the host's first answer already ended: that answer says how, and the
+/// records come with it where a later read found them still that run's.
+fn kept<R>(first: CapabilityChecks, records: Option<R>) -> Followed<R> {
+    match (unfinished(&first), records) {
+        (None, Some(records)) => Followed::Found {
+            checks: first,
+            records,
+        },
+        (words, records) => Followed::Unfinished {
+            words: words.unwrap_or_else(replaced_words),
+            checks: Some(first),
+            records,
+        },
+    }
+}
+
+/// What the command comes to where the host holds another run than the one it asked for.
+fn replaced<R>(seen: CapabilityChecks) -> Followed<R> {
+    Followed::Unfinished {
+        checks: Some(seen),
+        records: None,
+        words: replaced_words(),
+    }
+}
+
+/// What a person is told where another run took the place of the one the command started.
+fn replaced_words() -> Shown {
+    shown!(
+        "Another run of the checks replaced the one this command started, so what the host holds \
+         now is not this run's findings. Run the command again."
+    )
 }
 
 /// What the command comes to where the host did not answer a call in time.
@@ -338,8 +405,7 @@ fn unfinished(checks: &CapabilityChecks) -> Option<Shown> {
 
 #[cfg(test)]
 mod tests {
-    use kr_protocol::ids::SessionId;
-    use kr_protocol::scalars::{TimestampMs, Uuid};
+    use kr_protocol::scalars::Uuid;
 
     use super::*;
 
@@ -410,7 +476,7 @@ mod tests {
 
     /// Follows a script from a command that began now, and says what it came to and how long the
     /// command took on the paused clock. A command that does not end by its deadline fails here.
-    async fn followed(mut script: Script) -> (Followed<()>, Duration) {
+    async fn run_script(mut script: Script) -> (Followed<()>, Duration) {
         let started = Instant::now();
         let followed = tokio::time::timeout(
             WAIT + Duration::from_secs(60),
@@ -434,7 +500,7 @@ mod tests {
     /// command: it ends at its deadline and says that the host did not answer.
     #[tokio::test(start_paused = true)]
     async fn a_host_that_never_answers_the_request_ends_the_command_at_its_deadline() {
-        let (followed, _) = followed(Script::new(Answer::Silent, vec![Answer::Silent])).await;
+        let (followed, _) = run_script(Script::new(Answer::Silent, vec![Answer::Silent])).await;
         let (seen, words) = unfinished_with(followed);
         assert!(seen.is_none(), "{seen:?}");
         assert!(
@@ -448,7 +514,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_host_that_stops_answering_reads_ends_the_command_at_its_deadline() {
         let running = stands(CapabilityChecksState::Running, 10, 1, None);
-        let (followed, _) = followed(Script::new(
+        let (followed, _) = run_script(Script::new(
             Answer::Stands(running.clone()),
             vec![Answer::Silent],
         ))
@@ -471,7 +537,7 @@ mod tests {
             vec![Answer::Stands(running)],
         );
         script.read_takes = Duration::from_millis(400);
-        let (followed, took) = followed(script).await;
+        let (followed, took) = run_script(script).await;
         assert!(matches!(followed, Followed::Unfinished { .. }));
         assert!(took <= WAIT, "the command took {took:?}");
     }
@@ -481,7 +547,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_run_still_going_at_the_deadline_is_said_to_be_still_going() {
         let running = stands(CapabilityChecksState::Running, 10, 1, None);
-        let (followed, _) = followed(Script::new(
+        let (followed, _) = run_script(Script::new(
             Answer::Stands(running.clone()),
             vec![Answer::Stands(running)],
         ))
@@ -489,6 +555,115 @@ mod tests {
         let (_, words) = unfinished_with(followed);
         assert!(
             words.contains("still running after five minutes"),
+            "{words}"
+        );
+    }
+
+    /// A run another caller began once this one had ended, or another session's worker took over,
+    /// is not this command's run, whether it is going or has ended: the command says that its own
+    /// was replaced, and shows no findings.
+    #[tokio::test(start_paused = true)]
+    async fn a_run_that_another_caller_replaced_between_two_reads_is_not_reported_as_this_ones() {
+        let ours = stands(CapabilityChecksState::Running, 10, 1, None);
+        for replacement in [
+            stands(CapabilityChecksState::Current, 20, 1, None),
+            stands(CapabilityChecksState::Running, 20, 1, None),
+            stands(CapabilityChecksState::Current, 10, 2, None),
+        ] {
+            let (followed, _) = run_script(Script::new(
+                Answer::Stands(ours.clone()),
+                vec![
+                    Answer::Stands(ours.clone()),
+                    Answer::Stands(replacement.clone()),
+                ],
+            ))
+            .await;
+            let Followed::Unfinished {
+                checks,
+                records,
+                words,
+            } = followed
+            else {
+                panic!("the command reported the findings of {replacement:?} as its own");
+            };
+            assert_eq!(checks, Some(ours.clone()), "{replacement:?}");
+            assert!(records.is_none(), "{replacement:?}");
+            assert!(
+                words
+                    .to_string()
+                    .contains("Another run of the checks replaced"),
+                "{words}"
+            );
+        }
+    }
+
+    /// The control of the case above: the run this command started is reported when it ends.
+    #[tokio::test(start_paused = true)]
+    async fn the_run_this_command_started_is_reported_when_it_ends() {
+        let running = stands(CapabilityChecksState::Running, 10, 1, None);
+        let current = stands(CapabilityChecksState::Current, 10, 1, None);
+        let (followed, _) = run_script(Script::new(
+            Answer::Stands(running.clone()),
+            vec![Answer::Stands(running), Answer::Stands(current.clone())],
+        ))
+        .await;
+        let Followed::Found { checks, .. } = followed else {
+            panic!("the run that ended was not reported");
+        };
+        assert_eq!(checks, current);
+    }
+
+    /// A run the host refused to begin ended in its first answer, and that failure is what the
+    /// command reports: a run another caller begins after it is not this command's, and its
+    /// records are not shown with this failure.
+    #[tokio::test(start_paused = true)]
+    async fn a_failure_in_the_first_answer_is_kept_over_a_run_another_caller_began_after() {
+        let refused = CapabilityChecks {
+            session_id: Nullable::null(),
+            ..stands(
+                CapabilityChecksState::Failed,
+                10,
+                1,
+                Some(CapabilityChecksFailure::NoSession),
+            )
+        };
+        let theirs = stands(CapabilityChecksState::Running, 20, 2, None);
+        let (followed, _) = run_script(Script::new(
+            Answer::Stands(refused.clone()),
+            vec![Answer::Stands(theirs)],
+        ))
+        .await;
+        let Followed::Unfinished {
+            checks,
+            records,
+            words,
+        } = followed
+        else {
+            panic!("the command reported findings");
+        };
+        assert_eq!(checks, Some(refused.clone()));
+        assert!(records.is_none());
+        assert!(
+            words
+                .to_string()
+                .contains("No session of the kind this host creates"),
+            "{words}"
+        );
+
+        // With nothing in its way, the same failure comes with the records the host holds.
+        let (followed, _) = run_script(Script::new(
+            Answer::Stands(refused.clone()),
+            vec![Answer::Stands(refused)],
+        ))
+        .await;
+        let Followed::Unfinished { records, words, .. } = followed else {
+            panic!("the command reported findings");
+        };
+        assert!(records.is_some());
+        assert!(
+            words
+                .to_string()
+                .contains("No session of the kind this host creates"),
             "{words}"
         );
     }

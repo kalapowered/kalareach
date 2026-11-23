@@ -2722,8 +2722,10 @@ opened through the KalaReach profile, or an SSH login.
 A run that ends without findings is a failure, exit 1, and the message says why in the words the
 setup page uses: no session of the kind the host creates is running, or the session's worker
 answered with an error, did not answer in time, or answered with something the host cannot use.
-A run that is still going when the wait ends, a result the host holds as stale, and a host with no
-run to report are failures too. With `--json` the document has `checks`, which holds `state`,
+A run that is still going when the wait ends, a result the host holds as stale, a host with no run
+to report, and a run that another caller replaced while the command waited are failures too: the
+command reports the run it asked for and no other, and a refusal that the host's first answer gave
+stays the command's answer. With `--json` the document has `checks`, which holds `state`,
 `failure`, `started_at_ms`, `finished_at_ms` and `session_id` as `environment.capabilities` states
 them, and `desktop`, the desktop and its capability records as `kr doctor --json` states them under
 `environment`. A failure carries `ok` false, `code`, `message` and `exit_code` beside them.
