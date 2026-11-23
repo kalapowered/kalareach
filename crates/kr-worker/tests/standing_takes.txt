@@ -384,6 +384,7 @@ calls crates/kr-worker/src/broker/methods.rs checks package crates/kr-worker/src
 calls crates/kr-worker/src/broker/methods.rs checks recheck crates/kr-worker/src/broker/capability.rs
 calls crates/kr-worker/src/broker/methods.rs checks require_rich_work crates/kr-worker/src/broker/volatile.rs
 calls crates/kr-worker/src/broker/methods.rs checks resource_id crates/kr-worker/src/broker/methods.rs
+calls crates/kr-worker/src/broker/mod.rs binding_state require_rich_work crates/kr-worker/src/broker/volatile.rs
 calls crates/kr-worker/src/broker/mod.rs recheck_answer_trust get crates/kr-worker/src/broker/arbitration.rs
 calls crates/kr-worker/src/broker/mod.rs recheck_answer_trust unknown crates/kr-worker/src/broker/error.rs
 calls crates/kr-worker/src/broker/mod.rs resource get crates/kr-worker/src/broker/arbitration.rs
