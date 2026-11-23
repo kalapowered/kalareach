@@ -147,10 +147,11 @@ export interface FakeSharing {
    */
   passTheBound(): void
   /**
-   * The next revocation's barrier has a worker that has not fenced it, beside one that has, until
-   * told otherwise.
+   * The next revocation's barrier has workers that have not fenced it, beside one that has, until
+   * told otherwise. `pending` of them are listed (one by default), and the host counts `total` in
+   * all (the listed ones by default): a total above the list is a list the host cut.
    */
-  holdBarrier(held: boolean): void
+  holdBarrier(held: boolean, shape?: { readonly pending: number; readonly total?: number }): void
   /**
    * The host's answer to the next hand-over that is sent is held until the test lets it go: the
    * hand-over is sent at once, and the page is told how it went only then.
@@ -231,6 +232,7 @@ export class ScriptedSharing implements FakeSharing {
   #previewFailure: string | null = null
   #lose: 'none' | 'answer' | 'request' = 'none'
   #barrierHeld = false
+  #barrierShape: { readonly pending: number; readonly total?: number } = { pending: 1 }
   #finishHold: { release: () => void; fail: (failure: unknown) => void; held: Promise<void> } | null = null
   #unreadable = 0
   #phone = false
@@ -304,8 +306,9 @@ export class ScriptedSharing implements FakeSharing {
     }
   }
 
-  holdBarrier(held: boolean): void {
+  holdBarrier(held: boolean, shape: { readonly pending: number; readonly total?: number } = { pending: 1 }): void {
     this.#barrierHeld = held
+    this.#barrierShape = shape
   }
 
   holdNextFinish(): FinishHold {
@@ -1035,7 +1038,9 @@ export class ScriptedSharing implements FakeSharing {
    */
   #revocation(summary: GrantSummary, alsoRevoked: readonly string[] = []): RevocationResult {
     const pending = this.#barrierHeld
+    const shape = this.#barrierShape
     this.#barrierHeld = false
+    this.#barrierShape = { pending: 1 }
     // The host lists the workers that have not confirmed first, then the ones that have. A worker
     // whose execution has ended is listed as ended, and it did not confirm anything.
     const worker = (
@@ -1053,16 +1058,21 @@ export class ScriptedSharing implements FakeSharing {
       session_id: sessionId,
       state
     })
+    const workers = pending
+      ? [
+          worker(sessionOf(summary), 'pending'),
+          ...Array.from({ length: shape.pending - 1 }, (_, at) => worker(idOf('6a6a6a6a', at + 1), 'pending')),
+          worker(idOf('5d5d5d5d', 1), 'acknowledged')
+        ]
+      : [worker(sessionOf(summary), 'acknowledged'), worker(idOf('5d5d5d5d', 1), 'ended')]
     return {
       authority_revision: '6',
       revoked_grants: [...alsoRevoked, summary.grant.grant_id],
       revoked_grants_total: String(alsoRevoked.length + 1),
       barrier: {
         authority_revision: '6',
-        workers: pending
-          ? [worker(sessionOf(summary), 'pending'), worker(idOf('5d5d5d5d', 1), 'acknowledged')]
-          : [worker(sessionOf(summary), 'acknowledged'), worker(idOf('5d5d5d5d', 1), 'ended')],
-        workers_total: '2'
+        workers,
+        workers_total: String(pending ? (shape.total ?? workers.length) : workers.length)
       }
     }
   }

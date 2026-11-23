@@ -1539,3 +1539,61 @@ describe('what is left of the sharing page when a control goes', () => {
     expect(document.body).not.toHaveFocus()
   })
 })
+
+describe('what a person reads when several session workers have not confirmed a revocation', () => {
+  /** Shares with the phone, has it accepted, and takes it back while the host lists `shape`. */
+  async function revokedWhile(shape: { readonly pending: number; readonly total?: number }) {
+    const { controls, person } = await openSharing()
+    await person.click(screen.getByRole('radio', { name: PHONE }))
+    await person.click(screen.getByTestId('invite'))
+    await waitFor(() => {
+      expect(controls.sharing.grants()).toHaveLength(1)
+    })
+    controls.sharing.deviceAccepts(controls.sharing.grants()[0]?.grant.grant_id ?? '')
+    await reread()
+    const row = await waitFor(() => {
+      const found = screen.getByTestId('access').querySelector('[data-state="active"]')
+      expect(found).not.toBeNull()
+      return found as HTMLElement
+    })
+    controls.sharing.holdBarrier(true, shape)
+    await person.click(within(row).getByTestId('revoke'))
+    const line = await screen.findByTestId('recently-revoked')
+    return { controls, person, line }
+  }
+
+  // KR-REQ-18.14: two sessions are each named and counted in the plural, in the line the page keeps
+  // and in the toast, and the session that has confirmed is named apart from them.
+  it('names two sessions and counts them in the plural, in the line and in the toast', async () => {
+    const { line } = await revokedWhile({ pending: 2 })
+    expect(line.textContent).toMatch(
+      /2 session workers have not confirmed yet \(session 8a7b6c50, session 6a6a6a6a\)\./
+    )
+    expect(line.textContent).toMatch(/Confirmed: session 5d5d5d5d\./)
+    expect(line.textContent).not.toMatch(/at least/)
+    expect(
+      screen.getByText(/The revocation for .* is recorded, and not done: 2 session workers have not confirmed yet\./)
+    ).toBeInTheDocument()
+  })
+
+  // KR-REQ-18.14: a list the host cut is a floor, so the words say "at least" in the line and in the
+  // toast, the workers named are only the ones the host listed, and a check that still finds a cut
+  // list says it again.
+  it('says "at least" for a list the host cut, and keeps saying it when it is checked again', async () => {
+    const { controls, person, line } = await revokedWhile({ pending: 2, total: 5 })
+    expect(line.textContent).toMatch(/at least 2 session workers have not confirmed yet \(session 8a7b6c50, session 6a6a6a6a\)\./)
+    expect(line.textContent).toMatch(/Confirmed among those the host listed: session 5d5d5d5d\./)
+    expect(
+      screen.getByText(/The revocation for .* is recorded, and not done: at least 2 session workers have not confirmed yet\./)
+    ).toBeInTheDocument()
+
+    controls.sharing.holdBarrier(true, { pending: 1, total: 4 })
+    await person.click(within(line).getByTestId('check-again'))
+    await waitFor(() => {
+      expect(screen.getByTestId('recently-revoked').textContent).toMatch(
+        /at least 1 session worker has not confirmed yet \(session 8a7b6c50\)\./
+      )
+    })
+    expect(screen.getByTestId('recently-revoked').textContent).not.toMatch(/session 6a6a6a6a/)
+  })
+})

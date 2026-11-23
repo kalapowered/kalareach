@@ -210,9 +210,10 @@ fn invitation_for(scene: &Scene, selection: RoleSelection) -> Value {
 /// it; the grant in the host's answer, the preview the issuer saw and the host's own list of the
 /// session's shares each carry the actions and the history that choice compiles to and no others,
 /// and the notices the person accepted are the ones those actions carry. The third option, the live
-/// screen, is read from the offer the device receives, in the cases that follow.
+/// screen, is read in the case that follows this one, and from the offer the device receives.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn the_grant_the_host_writes_carries_the_role_the_person_chose_and_each_option() {
+async fn the_grant_the_host_writes_carries_the_role_the_person_chose_and_the_history_and_answer_options()
+ {
     let scene = Scene::start().await;
     let viewer_who_answers = RoleSelection {
         include_question_respond: true,
@@ -316,6 +317,86 @@ async fn the_grant_the_host_writes_carries_the_role_the_person_chose_and_each_op
             .expect("the invitation is withdrawn");
     }
     scene.stop().await;
+}
+
+/// KR-REQ-18.12, the live-screen option: the person takes it with the role, and the grant the host
+/// writes carries it (`history.include_live_screen`) only when they did. The invitation is issued
+/// against a real worker, as the Sharing tab sends it, once without the option and once with it;
+/// the grant in the host's answer carries it only the second time, and the history the issuer's
+/// preview showed is the grant's own, each time. The offer the device receives is read in the case
+/// that follows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn the_grant_the_host_writes_carries_the_live_screen_option_only_when_the_person_took_it() {
+    let adopted = Adopted::start(1).await;
+    let host = &adopted.host;
+    let session_id = adopted.workers[0].session_id;
+    let issuer = Page::start(
+        local_connection(host, None).await,
+        Arc::new(tempfile::tempdir().expect("a data directory")),
+        WorkerLinks::at(host.tree().environment()),
+    );
+    let guest = Device::create().await;
+    let record = net_support::pair_with(
+        host,
+        &guest,
+        &adopted.owner,
+        kr_pairing::grants::guest_grant(
+            kr_ipc::now_ms().get(),
+            24 * 60 * 60 * 1000,
+            host.environment_id,
+        )
+        .expect("a guest grant"),
+    )
+    .await;
+    for taken in [false, true] {
+        let selection = RoleSelection {
+            include_live_screen: taken,
+            ..RoleSelection::plain(SessionRole::Viewer)
+        };
+        let invited = issuer
+            .call(
+                "grant_create",
+                json!({
+                    "params": serde_json::to_value(&GrantCreateParams {
+                        session_id,
+                        recipient_device_id: record.device_id,
+                        parent_grant_id: Nullable::null(),
+                        accepted_notices: AuthorityNotice::for_actions(&selection.actions()),
+                        selection,
+                        lifetime_ms: Nullable::null(),
+                        owner_confirmation: Nullable::null(),
+                    }).expect("encodes"),
+                    "subject": { "sessionId": session_id.to_string(), "sessionEpoch": "1" },
+                }),
+            )
+            .await
+            .unwrap_or_else(|why| panic!("an invitation (live screen: {taken}) is issued: {why}"));
+        let created: GrantCreateResult = typed(&invited["value"]);
+        assert_eq!(
+            created.grant.history.include_live_screen, taken,
+            "the grant carries the live screen only when it was taken: {invited}"
+        );
+        assert_eq!(
+            created.preview.history, created.grant.history,
+            "the preview shows it"
+        );
+        issuer
+            .call(
+                "grant_revoke",
+                json!({ "params": serde_json::to_value(&GrantRevokeParams {
+                    grant_id: created.grant.grant_id,
+                }).expect("encodes") }),
+            )
+            .await
+            .expect("the invitation is withdrawn");
+    }
+    issuer
+        .state()
+        .connection()
+        .expect("connected")
+        .session()
+        .close();
+    adopted.stop().await;
 }
 
 /// KR-REQ-18.14: the issuer withdraws an invitation nobody has accepted, from the page. The result
