@@ -109,7 +109,13 @@ fn observe_enrolment(
                 LISTING_LIMIT,
                 look,
             )?;
+            if !strict {
+                listing_that_ended_well(enrolment.access, &registered)?;
+            }
             let running = run_within_as(&running.program, &running.arguments, LISTING_LIMIT, look)?;
+            if !strict {
+                listing_that_ended_well(enrolment.access, &running)?;
+            }
             Ok(wsl_state(&registered, &running, &enrolment.target))
         }
         Observation::Inspection(command) => {
@@ -127,6 +133,24 @@ fn observe_enrolment(
             }
         }
     }
+}
+
+/// Returns the failure of the look when a listing of a refresh did not end well: the launcher has
+/// then shown nothing of the distribution, which is not the same as showing that it is not running.
+fn listing_that_ended_well(
+    access: kr_protocol::identity::EnvironmentAccess,
+    listing: &CommandOutput,
+) -> Result<()> {
+    if listing.code == Some(0) {
+        return Ok(());
+    }
+    Err(ControllerError::Platform {
+        access,
+        step: Step::Look,
+        failure: listing
+            .code
+            .map_or(StepFailure::Unreadable, StepFailure::Exited),
+    })
 }
 
 /// What an inspection that is acted on shows: a container the runtime says it does not know is

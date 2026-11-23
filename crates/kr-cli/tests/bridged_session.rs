@@ -135,6 +135,16 @@ printf '%s\n' "$*" >>'{tools}/invocations'
 # Asking runs nothing in the distribution, as the real command does not. Like the real command it
 # writes UTF-16LE, and the listings of names print nothing else.
 if [ "$1" = "--list" ]; then
+  # A test that wants a listing to fail says so with a file named for the listing: the launcher then
+  # ends with a code, and says why on its standard error.
+  if [ "$*" = "--list --all --quiet" ] && [ -f '{tools}/registered-listing-fails' ]; then
+    echo 'kr-test-the-launcher-said-this' >&2
+    exit 1
+  fi
+  if [ "$*" = "--list --running --quiet" ] && [ -f '{tools}/running-listing-fails' ]; then
+    echo 'kr-test-the-launcher-said-this' >&2
+    exit 1
+  fi
   state="$(cat '{tools}/distribution-state' 2>/dev/null || echo Running)"
   case "$*" in
     "--list --all --quiet")
@@ -2435,6 +2445,40 @@ async fn a_look_that_fails_after_a_start_is_told_as_a_failed_look_and_keeps_the_
             printed(&said)
         );
     });
+}
+
+/// KR-REQ-18.11, the part about connection diagnostics, for a distribution whose listing fails: the
+/// WSL launcher ends with a code when asked for the registered distributions, and when asked for
+/// the running ones. The refresh says that the look ended with it, in `--json` and in the lines,
+/// and the row reads stale. It does not say the environment is not running, which the host does not
+/// know, and what the launcher printed is in neither output.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_listing_of_distributions_that_fails_is_told_as_a_failed_look_and_not_as_a_stopped_environment()
+ {
+    let world = World::start().await;
+    world.enrol_destination();
+    let expected = "the WSL launcher (wsl.exe) ended with exit code 1 when asked whether the \
+                    environment is running";
+    for switch in ["registered-listing-fails", "running-listing-fails"] {
+        with_the_switch_on(&world, switch, "dest", || {
+            let told = refreshed_both_ways(&world, "dest");
+            assert_eq!(told.document["connection"], expected, "{switch}: {told:?}");
+            assert_eq!(
+                told.document["row"]["status"], "stale",
+                "{switch}: {told:?}"
+            );
+            assert_eq!(told.lines.len(), 2, "{switch}: {told:?}");
+            assert_eq!(told.lines[1].trim_start(), expected, "{switch}: {told:?}");
+            assert!(
+                !told.everything.contains("not running"),
+                "{switch}: {told:?}"
+            );
+            assert!(
+                !told.everything.contains("kr-test-the-launcher-said-this"),
+                "{switch}: {told:?}"
+            );
+        });
+    }
 }
 
 /// KR-REQ-18.11, the part about connection diagnostics, for a refresh that finds nothing wrong:
