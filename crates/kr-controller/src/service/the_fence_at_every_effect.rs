@@ -3698,8 +3698,9 @@ async fn a_fence_that_lands_after_an_ssh_hosts_helper_answered_stops_what_the_an
         .expect("a result");
     let said = result.connection.as_str();
     assert!(
-        said.contains("answered, and this host did not record that, because [message withheld, ")
-            && said.ends_with(" bytes]"),
+        said.starts_with(
+            "the helper on the SSH host answered, and this host did not record that, because [message withheld, "
+        ) && said.ends_with(" bytes]"),
         "{said}"
     );
     assert!(

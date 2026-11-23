@@ -368,11 +368,16 @@ pub fn record_changed(over_ssh: bool) -> Sentence {
     })
 }
 
-/// Returns the sentence for a bridge that answered and whose answer could not be recorded.
+/// Returns the sentence for a bridge that answered and whose answer could not be recorded,
+/// `over_ssh` for the helper on an SSH host, which is asked once and has no bridge.
 #[must_use]
-pub fn answered_not_recorded(reason: &str) -> Sentence {
+pub fn answered_not_recorded(reason: &str, over_ssh: bool) -> Sentence {
     Sentence::new()
-        .stated("the bridge answered, and this host did not record that, because ")
+        .stated(if over_ssh {
+            "the helper on the SSH host answered, and this host did not record that, because "
+        } else {
+            "the bridge answered, and this host did not record that, because "
+        })
         .withheld(ContentClass::Message, reason)
 }
 
@@ -924,7 +929,8 @@ mod tests {
             answered(&environment(3), ARRIVED, true),
             record_changed(false),
             record_changed(true),
-            answered_not_recorded(ARRIVED),
+            answered_not_recorded(ARRIVED, false),
+            answered_not_recorded(ARRIVED, true),
             and_not_recorded(
                 of(&ended, EnvironmentAccess::Container, Stage::Read),
                 ARRIVED,

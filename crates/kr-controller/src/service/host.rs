@@ -669,6 +669,7 @@ impl Controller {
                                     Nullable::null(),
                                     crate::bridge::diagnosis::answered_not_recorded(
                                         &refusal.to_string(),
+                                        false,
                                     ),
                                 ),
                             }
@@ -782,7 +783,7 @@ impl Controller {
                 // is not refused with the host's own sentence.
                 Err(error) => (
                     Nullable::some(verification),
-                    crate::bridge::diagnosis::answered_not_recorded(&error.to_string()),
+                    crate::bridge::diagnosis::answered_not_recorded(&error.to_string(), true),
                 ),
             },
             Err(refusal) => {

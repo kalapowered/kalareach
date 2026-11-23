@@ -1006,6 +1006,7 @@ const OTHER_FORMS: &[&str] = &[
     "this environment's record changed while its helper was asked, so what answered says nothing \
      about what is recorded now",
     "the bridge answered, and this host did not record that, because {message}",
+    "the helper on the SSH host answered, and this host did not record that, because {message}",
 ];
 
 /// What the host appends to a refusal when it could not record it either.

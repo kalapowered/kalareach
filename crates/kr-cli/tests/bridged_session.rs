@@ -2699,9 +2699,10 @@ async fn a_container_runtime_that_cannot_be_started_is_told_by_its_step_and_the_
 
 /// KR-REQ-18.11, the part about connection diagnostics, for an SSH host whose refresh cannot be
 /// recorded: this host's record of its environments cannot be read once the helper is asked. The
-/// refresh is answered and not refused. A helper that answered is said to have answered, with its
-/// verification, and this host's failure to record it is told as its class and length. A helper
-/// that failed keeps its own sentence, followed by the same words.
+/// refresh is answered and not refused. A helper that answered is said to have answered, as the
+/// helper on the SSH host and not as a bridge, with its verification, and this host's failure to
+/// record it is told as its class and length. A helper that failed keeps its own sentence,
+/// followed by the same words.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_ssh_refresh_that_cannot_be_recorded_keeps_what_the_helper_said() {
     let _turn = CONTAINER_RUNTIME_TURN.lock().await;
@@ -2734,9 +2735,11 @@ async fn an_ssh_refresh_that_cannot_be_recorded_keeps_what_the_helper_said() {
         let document: Value = serde_json::from_slice(&json.stdout).expect("kr printed JSON");
         let said = document["connection"].as_str().expect("a sentence");
         assert!(
-            said.starts_with("the bridge answered, and ") && said.contains(not_recorded),
+            said.starts_with("the helper on the SSH host answered, and ")
+                && said.contains(not_recorded),
             "{document}"
         );
+        assert!(!said.contains("bridge"), "{document}");
         assert!(!document["verification"].is_null(), "{document}");
     });
     // The helper fails, and the record cannot be written.
