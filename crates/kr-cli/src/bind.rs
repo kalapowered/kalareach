@@ -431,7 +431,7 @@ pub async fn require_outside_to_end_a_daemon(
 /// is not isolation from other code running as the same user. `KR_SESSION` or `KR_ATTACHMENT` set
 /// here refuses at once. Otherwise every live session's worker is asked at once
 /// ([`membership_together`]) whether this process is inside its session, and the command goes on
-/// only where every one says it is not ([`outside_to_run_the_checks`]): a worker that cannot say
+/// only where every one says it is not (`outside_to_run_the_checks`): a worker that cannot say
 /// refuses it, as [`require_outside`] does, since nothing here needs a host that cannot answer.
 ///
 /// # Errors
