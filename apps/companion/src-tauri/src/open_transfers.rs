@@ -1124,7 +1124,9 @@ impl Drop for Stopped<'_> {
 /// `restart` makes (each a flush), which is what stops `restart` from removing the copy a send has
 /// just made, and the removal of the copy of a send whose start was refused or whose copy failed
 /// (`Registry::remove_copy_of`), which is what stops it from removing the copy of an upload that
-/// took its key.
+/// took its key. It also covers the rename that gives a send's copy its name, with the check of the
+/// key's owner before it (`Store::write_copy`): on Windows that rename is tried again while a
+/// scanner holds the file, for up to five seconds, and the gate stays held across those tries.
 ///
 /// **Turns.** A key's turn is a `tokio` mutex, found or made under the gate and awaited outside
 /// every lock. No operation holds two turns, so two operations that want two keys cannot wait for
