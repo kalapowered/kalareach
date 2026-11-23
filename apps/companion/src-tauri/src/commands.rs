@@ -302,6 +302,11 @@ pub const NAMED_COMMANDS: &[(&str, Option<Method>)] = &[
     // Turning the saving of this computer's settings with the recovery bundle on again, after the
     // person removed them. The page supplies nothing.
     ("recovery_resume_settings", None),
+    // Restoring this device's settings from the recovery bundle with a recovery kit. The page
+    // names only whether the bundle is an exported file: this process raises the open panels, reads
+    // the kit and the file from the paths they return, and the page is told what the restore came
+    // to and nothing the kit holds.
+    ("recovery_restore_settings", None),
     // The person's settings: the colour mode now, and keeping it in step with their other devices.
     // None is a host method. The page names a mode from a closed set and is told where things
     // stand; it holds no copy of its own and is given no key, identity or token.
@@ -831,6 +836,7 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'static
         recovery_export_offline,
         recovery_cover_host,
         recovery_resume_settings,
+        recovery_restore_settings,
         settings_view,
         settings_colour_mode_set,
         settings_sync_turn_on,
@@ -4929,6 +4935,7 @@ mod tests {
         "recovery_export_offline",
         "recovery_cover_host",
         "recovery_resume_settings",
+        "recovery_restore_settings",
         "settings_view",
         "settings_colour_mode_set",
         "settings_sync_turn_on",
@@ -5106,6 +5113,7 @@ mod tests {
                 "recovery_archives",
                 "recovery_cover_host",
                 "recovery_export_offline",
+                "recovery_restore_settings",
                 "recovery_resume_settings",
                 "recovery_save_kit",
                 "recovery_save_kit_qr",
@@ -6199,6 +6207,27 @@ pub async fn recovery_resume_settings(
     state
         .recovery()?
         .resume_saving_settings(account.get().await?)
+        .await
+}
+
+/// Restores this device's settings from the recovery bundle, where it has chosen none of its own.
+///
+/// The page says only whether the bundle is an exported file. This process asks the person for the
+/// recovery kit, and for the exported file when there is one, in open panels of its own, reads what
+/// they return, and clears the kit when it is done. The page is told what the restore came to and
+/// no path, locator or key.
+#[tauri::command]
+pub async fn recovery_restore_settings<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    state: State<'_, AppState>,
+    account: State<'_, crate::account::AccountSlot>,
+    from_file: bool,
+) -> Result<crate::recovery::SettingsRestored> {
+    let settings = state.settings()?;
+    let panels = crate::recovery::NativePanels::new(app);
+    state
+        .recovery()?
+        .restore_settings_with(&panels, account.get().await?, settings.local(), from_file)
         .await
 }
 

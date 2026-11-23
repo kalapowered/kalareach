@@ -22,13 +22,14 @@ use companion_tauri::account::carrier::{Boxed, Carrier, Ending, Plan, Unavailabl
 use companion_tauri::account::{Account, AccountSlot};
 use companion_tauri::device::DeviceIdentity;
 use companion_tauri::recovery::{
-    HostCoverView, LeftView, NotSavedWhy, Recovery, SEED_SCOPE, SettingsLine, SettingsRemoved,
-    SettingsSource, SettingsStep, SettingsTiming,
+    EXPORT_PANEL, HostCoverView, KIT_PANEL, LeftView, NotSavedWhy, OpenPanels, Recovery,
+    SEED_SCOPE, SettingsLine, SettingsRemoved, SettingsRestored, SettingsSource, SettingsStep,
+    SettingsTiming, settings_restored,
 };
 use companion_tauri::retained::{Confirm, Deletions, Question, SavedSettings};
 use companion_tauri::settings::{ColourMode, Settings};
 use kr_client::pairing::BoxFuture;
-use kr_client::recovery::{BundleStore, HostBackups, parse_kit};
+use kr_client::recovery::{BundleStore, HostBackups, RecoveryError, RestoreError, parse_kit};
 use kr_client::services::account::{
     ACCOUNT_ORIGIN, AccountMark, AccountToken, AccountTokenSource, BACKUP_RESTORE_SCOPE,
     BACKUP_WRITE_SCOPE, Client, IssuedGrant, RECOVERY_BACKUP_SCOPES, REQUESTED_SCOPES,
@@ -293,6 +294,7 @@ impl Computer {
                 companion_tauri::commands::recovery_export_offline,
                 companion_tauri::commands::recovery_cover_host,
                 companion_tauri::commands::recovery_resume_settings,
+                companion_tauri::commands::recovery_restore_settings,
                 companion_tauri::commands::retained_saved_settings,
                 cover_the_host_double,
             ])
@@ -4875,4 +4877,430 @@ async fn a_closed_gate_still_lists_and_removes_a_member_a_later_build_wrote_and_
         refused.message,
         "Your recovery bundle holds no saved settings."
     );
+}
+
+/* -------------------------------------------------------------------------- */
+/* Restoring the saved settings with the kit                                   */
+/* -------------------------------------------------------------------------- */
+
+/// A device that has chosen nothing, as a restore finds it: its own settings directory.
+fn fresh_device() -> (tempfile::TempDir, Arc<Settings>) {
+    let directory = tempfile::tempdir().expect("a directory");
+    let settings = Arc::new(Settings::open(directory.path()));
+    (directory, settings)
+}
+
+/// The open panels, answered for the person: each panel is answered by the next answer, and the
+/// titles asked are kept. A case that is asked a panel it did not expect fails.
+struct Chooses {
+    answers: Mutex<Vec<Option<std::path::PathBuf>>>,
+    asked: Mutex<Vec<&'static str>>,
+}
+
+impl Chooses {
+    fn answering(answers: Vec<Option<std::path::PathBuf>>) -> Self {
+        Self {
+            answers: Mutex::new(answers),
+            asked: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn titles(&self) -> Vec<&'static str> {
+        self.asked.lock().expect("the record").clone()
+    }
+}
+
+impl OpenPanels for Chooses {
+    fn choose(
+        &self,
+        title: &'static str,
+    ) -> BoxFuture<'_, companion_tauri::error::Result<Option<std::path::PathBuf>>> {
+        self.asked.lock().expect("the record").push(title);
+        let mut answers = self.answers.lock().expect("the answers");
+        assert!(!answers.is_empty(), "the panel {title:?} was not expected");
+        let answer = answers.remove(0);
+        Box::pin(async move { Ok(answer) })
+    }
+}
+
+/// A computer whose first bundle carries the colour mode `mode`, written by a build whose writer's
+/// level is open, with its kit saved to a file.
+async fn computer_with_saved_mode(
+    mode: ColourMode,
+) -> (Computer, tempfile::TempDir, std::path::PathBuf, RecoveryKit) {
+    let computer = Computer::new().await;
+    let out = tempfile::tempdir().expect("a directory");
+    let (path, kit) = {
+        let (later, settings) = computer.saving_page(NO_WAIT).await;
+        settings.set_colour_mode(mode).await.expect("kept");
+        later.call("recovery_turn_on", json!({})).expect("on");
+        later.kit(out.path())
+    };
+    (computer, out, path, kit)
+}
+
+/// KR-REQ-20.17: a restore with only the kit puts the colour mode back on a device that has chosen
+/// nothing, replaces nothing on one that has chosen or whose file cannot be read, and tells the
+/// page nothing of the kit; it needs no writer's level (this build's is closed), because it reads
+/// what a later build wrote.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_restore_puts_the_colour_mode_back_on_a_fresh_device_and_replaces_nothing_on_one_that_chose_a_mode()
+ {
+    let (computer, out, kit_path, kit) = computer_with_saved_mode(ColourMode::Dark).await;
+    let (page, _) = computer.saving_page_at(NO_WAIT, level(CLOSED)).await;
+
+    let (_directory, fresh) = fresh_device();
+    let chooses = Chooses::answering(vec![Some(kit_path.clone())]);
+    let restored = page
+        .recovery
+        .restore_settings_with(&chooses, &page.account, fresh.local(), false)
+        .await
+        .expect("a restore");
+    assert!(
+        matches!(restored, SettingsRestored::Restored { .. }),
+        "{restored:?}"
+    );
+    assert_eq!(fresh.local().chosen_colour_mode(), Some(ColourMode::Dark));
+    assert_eq!(chooses.titles(), vec![KIT_PANEL], "one panel, for the kit");
+    let told = serde_json::to_string(&restored).expect("the answer");
+    assert!(
+        !told.contains(&kit.bundle_locator),
+        "the page is told no locator"
+    );
+    assert!(
+        !told.contains(kit_path.to_string_lossy().as_ref()),
+        "the page is told no path"
+    );
+
+    // A device that chose already keeps its choice, and the answer says so.
+    let (_directory, chose) = fresh_device();
+    chose
+        .local()
+        .set_colour_mode(ColourMode::Light)
+        .expect("kept");
+    assert_eq!(
+        page.recovery
+            .restore_settings_with(
+                &Chooses::answering(vec![Some(kit_path.clone())]),
+                &page.account,
+                chose.local(),
+                false
+            )
+            .await
+            .expect("a restore"),
+        SettingsRestored::AlreadyChosen
+    );
+    assert_eq!(chose.local().chosen_colour_mode(), Some(ColourMode::Light));
+
+    // A device whose settings file cannot be read is left as it is, and the answer says so.
+    let (directory, unreadable) = fresh_device();
+    let file = directory.path().join(companion_tauri::settings::FILE);
+    std::fs::write(&file, b"this is not settings").expect("a file");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).expect("private");
+    }
+    assert_eq!(
+        page.recovery
+            .restore_settings_with(
+                &Chooses::answering(vec![Some(kit_path.clone())]),
+                &page.account,
+                unreadable.local(),
+                false
+            )
+            .await
+            .expect("a restore"),
+        SettingsRestored::FileUnreadable
+    );
+    assert_eq!(
+        std::fs::read(&file).expect("the file"),
+        b"this is not settings"
+    );
+
+    // Another kit does not open the bundle: that is a failure of the restore, not an answer.
+    let other = RecoverySeed::generate()
+        .expect("a seed")
+        .to_kit(kit.service_origins.clone(), kit.bundle_locator.clone());
+    let other_path = out.path().join("another-kit.txt");
+    std::fs::write(
+        &other_path,
+        kr_client::recovery::render_kit(&other)
+            .expect("a kit")
+            .as_bytes(),
+    )
+    .expect("a kit file");
+    let (_directory, untouched) = fresh_device();
+    page.recovery
+        .restore_settings_with(
+            &Chooses::answering(vec![Some(other_path)]),
+            &page.account,
+            untouched.local(),
+            false,
+        )
+        .await
+        .expect_err("the kit does not open the bundle");
+    assert_eq!(untouched.local().chosen_colour_mode(), None);
+}
+
+/// KR-REQ-20.17: a restore from an export file needs no account and sends no request, and asks for
+/// the kit first and the file second.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_restore_from_an_export_file_needs_no_account_and_no_network() {
+    let (computer, out, kit_path, _) = computer_with_saved_mode(ColourMode::System).await;
+    let page = computer.page().await;
+    let export = out.path().join("bundle.krexport");
+    page.dialog_returns(&export);
+    page.call(
+        "recovery_export_offline",
+        json!({ "path": export.to_string_lossy(), "archive": null }),
+    )
+    .expect("exported");
+
+    let requests = computer.served.web().arrived().len();
+    let (_directory, fresh) = fresh_device();
+    let chooses = Chooses::answering(vec![Some(kit_path), Some(export)]);
+    let signed_out = account(&computer.origin(), None).await;
+    let restored = page
+        .recovery
+        .restore_settings_with(&chooses, &signed_out, fresh.local(), true)
+        .await
+        .expect("a restore");
+    assert!(
+        matches!(restored, SettingsRestored::Restored { .. }),
+        "{restored:?}"
+    );
+    assert_eq!(fresh.local().chosen_colour_mode(), Some(ColourMode::System));
+    assert_eq!(chooses.titles(), vec![KIT_PANEL, EXPORT_PANEL]);
+    assert_eq!(
+        computer.served.web().arrived().len(),
+        requests,
+        "nothing was sent"
+    );
+}
+
+/// KR-REQ-20.17: a panel the person closes reads nothing and shows nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn closing_either_panel_reads_nothing_and_changes_nothing() {
+    let (computer, _out, kit_path, _) = computer_with_saved_mode(ColourMode::Dark).await;
+    let page = computer.page().await;
+    let (_directory, fresh) = fresh_device();
+    let requests = computer.served.web().arrived().len();
+    for (answers, from_file, titles) in [
+        (vec![None], false, vec![KIT_PANEL]),
+        (vec![None], true, vec![KIT_PANEL]),
+        (
+            vec![Some(kit_path.clone()), None],
+            true,
+            vec![KIT_PANEL, EXPORT_PANEL],
+        ),
+    ] {
+        let chooses = Chooses::answering(answers);
+        assert_eq!(
+            page.recovery
+                .restore_settings_with(&chooses, &page.account, fresh.local(), from_file)
+                .await
+                .expect("an answer"),
+            SettingsRestored::Cancelled
+        );
+        assert_eq!(chooses.titles(), titles);
+    }
+    assert_eq!(fresh.local().chosen_colour_mode(), None);
+    assert_eq!(
+        computer.served.web().arrived().len(),
+        requests,
+        "nothing was sent"
+    );
+}
+
+/// KR-REQ-20.17: a file that is not what it is said to be is refused with the words the person
+/// reads, and nothing is read past what a kit or an export is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_kit_or_export_file_that_is_not_one_is_refused_in_words() {
+    let (computer, out, kit_path, _) = computer_with_saved_mode(ColourMode::Dark).await;
+    let page = computer.page().await;
+    let (_directory, fresh) = fresh_device();
+    let refused = |answers: Vec<Option<std::path::PathBuf>>, from_file: bool| {
+        let (page, fresh) = (&page, &fresh);
+        async move {
+            page.recovery
+                .restore_settings_with(
+                    &Chooses::answering(answers),
+                    &page.account,
+                    fresh.local(),
+                    from_file,
+                )
+                .await
+                .expect_err("refused")
+                .message
+        }
+    };
+    let join = |name: &str| out.path().join(name);
+
+    // A kit that is a folder, is missing, is not text, or is a link to a kit is unreadable.
+    let folder = join("a-folder");
+    std::fs::create_dir(&folder).expect("a folder");
+    let binary = join("binary.txt");
+    std::fs::write(&binary, [0xff_u8, 0xfe, 0x00]).expect("a file");
+    #[cfg(unix)]
+    let link = {
+        let link = join("link.txt");
+        std::os::unix::fs::symlink(&kit_path, &link).expect("a link");
+        Some(link)
+    };
+    #[cfg(not(unix))]
+    let link: Option<std::path::PathBuf> = None;
+    let unreadable = [folder.clone(), join("missing.txt"), binary]
+        .into_iter()
+        .chain(link);
+    for path in unreadable {
+        assert_eq!(
+            refused(vec![Some(path.clone())], false).await,
+            "the kit file could not be read",
+            "{path:?}"
+        );
+    }
+    // A kit that is not a kit, or too long, shows the library's words.
+    let long = join("long.txt");
+    std::fs::write(&long, vec![b'a'; 4096]).expect("a file");
+    assert!(
+        !refused(vec![Some(long)], false).await.is_empty(),
+        "a file over a kit's size is refused"
+    );
+
+    // An export that is a folder or missing is unreadable, one over the cap is too large, and
+    // one that is no export is none.
+    for path in [folder, join("missing.krexport")] {
+        assert_eq!(
+            refused(vec![Some(kit_path.clone()), Some(path.clone())], true).await,
+            "the export file could not be read",
+            "{path:?}"
+        );
+    }
+    let huge = join("huge.krexport");
+    std::fs::File::create(&huge)
+        .and_then(|file| file.set_len(kr_client::recovery::MAX_EXPORT_BYTES + 2 * 1024 * 1024))
+        .expect("a sparse file");
+    assert_eq!(
+        refused(vec![Some(kit_path.clone()), Some(huge)], true).await,
+        "the export file is larger than an export is"
+    );
+    let garbage = join("garbage.krexport");
+    std::fs::write(&garbage, b"this is not an export").expect("a file");
+    assert_eq!(
+        refused(vec![Some(kit_path), Some(garbage)], true).await,
+        "that file is not an offline export"
+    );
+    assert_eq!(fresh.local().chosen_colour_mode(), None);
+}
+
+/// KR-REQ-20.17: a kit whose service this device is not signed in to is refused before anything is
+/// sent, naming both services; an export file needs no sign-in.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_kit_for_another_service_than_the_one_signed_in_is_refused_before_anything_is_sent() {
+    let (computer, _out, kit_path, _) = computer_with_saved_mode(ColourMode::Dark).await;
+    let other = serve().await;
+    let page = computer.page().await;
+    let elsewhere = account(
+        &GatewayOrigin::new(other.origin()).expect("an origin"),
+        Some(&RECOVERY_BACKUP_SCOPES),
+    )
+    .await;
+    let (_directory, fresh) = fresh_device();
+    let (ours, theirs) = (host_of(computer.served.origin()), host_of(other.origin()));
+    let requests = computer.served.web().arrived().len() + other.web().arrived().len();
+    let refused = page
+        .recovery
+        .restore_settings_with(
+            &Chooses::answering(vec![Some(kit_path)]),
+            &elsewhere,
+            fresh.local(),
+            false,
+        )
+        .await
+        .expect_err("another service");
+    assert_eq!(
+        refused.message,
+        format!(
+            "the kit's bundle is at {ours}, but this device is signed in to {theirs}, and a \
+             sign-in is never sent to another service. Sign in to {ours}, then restore again"
+        )
+    );
+    assert_eq!(fresh.local().chosen_colour_mode(), None);
+    assert_eq!(
+        computer.served.web().arrived().len() + other.web().arrived().len(),
+        requests,
+        "nothing was sent"
+    );
+}
+
+/// KR-REQ-20.17: what a restore finds in a bundle that holds no usable settings is an answer of its
+/// own, and a settings member that holds only values this build does not read is one the page says
+/// cannot be used, not an empty bundle.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_bundle_with_no_saved_settings_restores_none_and_an_unusable_one_says_so() {
+    let computer = Computer::new().await;
+    let page = computer.page().await;
+    page.call("recovery_turn_on", json!({})).expect("on");
+    let out = tempfile::tempdir().expect("a directory");
+    let (kit_path, kit) = page.kit(out.path());
+    let (_directory, fresh) = fresh_device();
+    assert_eq!(
+        page.recovery
+            .restore_settings_with(
+                &Chooses::answering(vec![Some(kit_path)]),
+                &page.account,
+                fresh.local(),
+                false
+            )
+            .await
+            .expect("a restore"),
+        SettingsRestored::NoneSaved
+    );
+    drop(kit);
+
+    let unread = kr_client::recovery::DeviceSettings::new(
+        [(
+            "font_size".to_owned(),
+            SettingValue::Number(kr_protocol::scalars::U64::new(14)),
+        )]
+        .into(),
+    )
+    .expect("a setting");
+    for (found, expected) in [
+        (
+            Err(RestoreError::Recovery(Box::new(
+                RecoveryError::SettingsUnusable {
+                    what: "a member this build cannot read",
+                },
+            ))),
+            SettingsRestored::Unusable,
+        ),
+        (
+            Err(RestoreError::Recovery(Box::new(
+                RecoveryError::BundleNeedsANewerKr,
+            ))),
+            SettingsRestored::NeedsNewer,
+        ),
+        (
+            Ok(kr_client::recovery::SavedSettings::Found {
+                settings: unread,
+                bundle_written_at_ms: TimestampMs::new(1),
+            }),
+            SettingsRestored::Unusable,
+        ),
+        (
+            Ok(kr_client::recovery::SavedSettings::Found {
+                settings: kr_client::recovery::DeviceSettings::default(),
+                bundle_written_at_ms: TimestampMs::new(1),
+            }),
+            SettingsRestored::NoneSaved,
+        ),
+    ] {
+        assert_eq!(
+            settings_restored(fresh.local(), found).expect("an answer"),
+            expected
+        );
+    }
+    assert_eq!(fresh.local().chosen_colour_mode(), None);
 }

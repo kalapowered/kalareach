@@ -73,8 +73,13 @@ use crate::error::{CommandError, Result};
 use crate::services::SyncServices;
 use crate::sync_service::{SyncService, SyncServiceView, host_of};
 
+mod restoring;
 mod saving;
 
+pub use restoring::{
+    EXPORT_PANEL, KIT_PANEL, NativePanels, OpenPanels, SettingsRestored, restore_settings,
+    settings_restored,
+};
 pub use saving::{
     NotSavedWhy, SETTINGS_READ_FROM, SettingsLine, SettingsRemoved, SettingsSource, SettingsStep,
     SettingsTiming, oldest_retained_level,
@@ -1136,6 +1141,7 @@ fn blocker(account: &Account, used: &GatewayOrigin) -> Option<Blocker> {
 
 /// What names the service an account is checked against.
 #[derive(Clone, Copy)]
+#[allow(clippy::enum_variant_names)] // Each variant says what names the service: by the setting, by the record, by the kit.
 enum Named {
     /// The sync service setting, for a record that is not made yet. Choosing another service
     /// changes where the record is made.
@@ -1143,6 +1149,9 @@ enum Named {
     /// The record, which names the service for the bundle from before the first write leaves.
     /// Choosing another sync service does not move the bundle.
     ByRecord,
+    /// The recovery kit the person chose, which names the service its bundle is at. Nothing the
+    /// person can change on this device moves the bundle, so the refusal says to sign in there.
+    ByKit,
 }
 
 /// Refuses, before anything is made or sent, when the account cannot be used at `used`.
@@ -1173,6 +1182,11 @@ fn refuse_if_blocked(account: &Account, used: &GatewayOrigin, named: Named) -> R
                  bundle, but this device is signed in to {account}, and the account's sign-in is \
                  not sent to another service. Recovery waits until this device is signed in to \
                  {sync_service}; choosing another sync service does not move the bundle"
+            ),
+            Named::ByKit => format!(
+                "the kit's bundle is at {sync_service}, but this device is signed in to \
+                 {account}, and a sign-in is never sent to another service. Sign in to \
+                 {sync_service}, then restore again"
             ),
         })),
     }
