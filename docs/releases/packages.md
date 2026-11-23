@@ -159,9 +159,11 @@ surface moves the level, in the train that makes it, with its cut
 ([support-window.md](support-window.md#cutting-a-release)). It is never made at the same level under
 a new tag.
 
-Every landing on main is tagged and published, so the branches that change the surface of a new
-level land in one train. Three branches that land in three trains make three releases, and the
-first of them is the level.
+Every landing on main is tagged and published, except the landings of a level that has no tag yet.
+Those go on untagged, so the branches that change the surface of a new level may land in several
+trains, and the level's first tag is made on purpose, once the whole surface is on main. After that
+tag, three branches that land in three trains make three releases, and the first of them is the
+level.
 
 The first tag of a level freezes its surface. A release from that tag cannot be replaced. After
 that tag, each landing on the level is compared to the newest release of the level, and any
