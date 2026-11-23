@@ -297,6 +297,7 @@ describe('the desktop port and the published methods', () => {
     await port.catalogueList({ environment_id: environment })
     await port.changesetRead({ change_set_id: 'change-1', version: null })
     await port.retainedSyncCopies()
+    await port.retainedSavedSettings()
     await port.retainedDeleteAsk('copy-1')
     await port.retainedDeleteFinish('token-1')
     await port.retainedDeleteCancel('token-1')
@@ -326,6 +327,7 @@ describe('the desktop port and the published methods', () => {
       'catalogue_list',
       'changeset_read',
       'retained_sync_copies',
+      'retained_saved_settings',
       'retained_delete_ask',
       'retained_delete_finish',
       'retained_delete_cancel'
@@ -354,6 +356,9 @@ describe('the desktop port and the published methods', () => {
     // Deleting a copy that left the host names the copy by the reference it is listed under and the
     // confirmation by the token the person's yes returned: never a method, never a parameter of one.
     expect(named('retained_sync_copies')).toEqual({})
+    // The settings saved with the recovery bundle are listed by a command of their own, and the
+    // page names nothing to it.
+    expect(named('retained_saved_settings')).toEqual({})
     expect(named('retained_delete_ask')).toEqual({ reference: 'copy-1' })
     expect(named('retained_delete_finish')).toEqual({ token: 'token-1' })
     expect(named('retained_delete_cancel')).toEqual({ token: 'token-1' })
@@ -1143,6 +1148,9 @@ describe('the desktop port and recovery', () => {
     await port.recoveryView()
     await port.recoveryTurnOn()
     await port.recoverySettle()
+    await port.recoveryResumeSettings()
+    await port.recoveryRestoreSettings(false)
+    await port.recoveryRestoreSettings(true)
     await port.recoverySaveKit('/tmp/kit.txt')
     await port.recoveryCoverHost(false)
     await port.recoveryCoverHost(true)
@@ -1157,6 +1165,11 @@ describe('the desktop port and recovery', () => {
       { command: 'recovery_view', args: {} },
       { command: 'recovery_turn_on', args: {} },
       { command: 'recovery_settle', args: {} },
+      { command: 'recovery_resume_settings', args: {} },
+      // The page says only whether the bundle is an exported file: the kit and the file are chosen
+      // in panels the application raises, so no path and no key goes through this call.
+      { command: 'recovery_restore_settings', args: { fromFile: false } },
+      { command: 'recovery_restore_settings', args: { fromFile: true } },
       { command: 'recovery_save_kit', args: { path: '/tmp/kit.txt' } },
       { command: 'recovery_cover_host', args: { replace: false } },
       { command: 'recovery_cover_host', args: { replace: true } },
