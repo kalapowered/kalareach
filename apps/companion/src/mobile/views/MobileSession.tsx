@@ -277,6 +277,9 @@ export function MobileSession({
   const modeButtonId = useId()
   const noControlId = useId()
   const sendId = useId()
+  const interruptId = useId()
+  const steerId = useId()
+  const queueId = useId()
   const steerNoteId = useId()
   const attachAgainId = useId()
   const keysHelpId = useId()
@@ -1150,19 +1153,24 @@ export function MobileSession({
         {SEND_ANYWAY_WORDS}
       </Button>
     ) : null
-  // Send changes place when the composer changes form, and focus that was on it goes with it: a
-  // control taken away from under the focus would leave a keyboard nowhere.
+  // Send and the other actions change place when the composer changes form, and focus that was on
+  // one goes with it: a control taken away from under the focus would leave a keyboard nowhere.
   const lastFocused = useRef<Element | null>(null)
   const wasLine = useRef(asLine)
   useLayoutEffect(() => {
     if (wasLine.current !== asLine) {
       const active = document.activeElement
-      if ((active === null || active === document.body) && lastFocused.current?.id === sendId) {
-        document.getElementById(sendId)?.focus()
+      const was = lastFocused.current?.id
+      if (
+        (active === null || active === document.body) &&
+        was !== undefined &&
+        [sendId, interruptId, steerId, queueId].includes(was)
+      ) {
+        document.getElementById(was)?.focus()
       }
     }
     wasLine.current = asLine
-  }, [asLine, sendId])
+  }, [asLine, sendId, interruptId, steerId, queueId])
   const terminalWarnings = frame === null ? [] : warningsOf(frame, leftBlankOnPhone(frame))
 
   const field = draftsStatus === 'opening' ? (
@@ -1239,6 +1247,7 @@ export function MobileSession({
   // only where the agent and the host allow it.
   const queueButton = offers.queue.offered ? (
     <Button
+      id={queueId}
       data-testid="composer-queue"
       disabled={!submittable(draft, carriesFiles) || busy || waiting.length > 0 || heldForFiles}
       style={{ minBlockSize: target }}
@@ -1263,6 +1272,7 @@ export function MobileSession({
   // Steering the turn that is running with what was written. The text stays where it was written.
   const steerButton = offers.steer.offered ? (
     <Button
+      id={steerId}
       data-testid="composer-steer"
       aria-describedby={steerNote === null ? undefined : steerNoteId}
       disabled={
@@ -1285,6 +1295,7 @@ export function MobileSession({
   // it is most wanted. Pressed while one is on its way it is not sent again.
   const interruptButton = offers.interrupt.offered ? (
     <Button
+      id={interruptId}
       aria-label="Interrupt the current turn"
       title="Interrupt the current turn"
       data-testid="composer-interrupt"

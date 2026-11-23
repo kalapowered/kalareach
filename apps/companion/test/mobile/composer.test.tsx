@@ -4,7 +4,7 @@
  */
 
 import type { ReactNode } from 'react'
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 
@@ -529,3 +529,51 @@ describe('the phone refuses text longer than one prompt carries before it sends 
   }
 })
 
+
+describe("the phone's composer on a window too short for the whole composer (KR-REQ-13.12)", () => {
+  /** Lays the session out `lines` lines high, as jsdom lays nothing out. */
+  function sessionOf(lines: { height: number }): () => void {
+    document.documentElement.style.fontSize = '16px'
+    const heights = vi.spyOn(Element.prototype, 'clientHeight', 'get').mockImplementation(function (this: Element) {
+      return this.classList.contains('m-session') ? lines.height : 0
+    })
+    return () => {
+      heights.mockRestore()
+      document.documentElement.style.removeProperty('font-size')
+    }
+  }
+
+  it('keeps the focus on an action when the window changes between the two forms', async () => {
+    const person = userEvent.setup()
+    const size = { height: 40 * 16 }
+    const end = sessionOf(size)
+    try {
+      await open()
+      await waitFor(() => {
+        expect(document.querySelector('.m-session')).toHaveAttribute('data-composer', 'whole')
+      })
+      await person.type(screen.getByLabelText('Message this session'), 'use the other file')
+      for (const name of ['Interrupt the current turn', 'Steer', 'Queue']) {
+        screen.getByRole('button', { name }).focus()
+        size.height = 20 * 16
+        act(() => {
+          window.dispatchEvent(new Event('resize'))
+        })
+        await waitFor(() => {
+          expect(document.querySelector('.m-session')).toHaveAttribute('data-composer', 'line')
+        })
+        expect(screen.getByRole('button', { name }), `${name} in the line's form`).toHaveFocus()
+        size.height = 40 * 16
+        act(() => {
+          window.dispatchEvent(new Event('resize'))
+        })
+        await waitFor(() => {
+          expect(document.querySelector('.m-session')).toHaveAttribute('data-composer', 'whole')
+        })
+        expect(screen.getByRole('button', { name }), `${name} in the whole form`).toHaveFocus()
+      }
+    } finally {
+      end()
+    }
+  })
+})
