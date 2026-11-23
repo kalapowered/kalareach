@@ -692,3 +692,43 @@ describe("the phone's Interrupt, in the cases that hold its rules (KR-REQ-13.12)
   })
 })
 
+describe("the phone's actions made in one tick of the clock (KR-REQ-13.12)", () => {
+  it('keeps a queued prompt nobody knows the end of apart from an interrupt made at the same instant', async () => {
+    const person = userEvent.setup()
+    // The clock does not move between the two presses, as it need not between two events.
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(1_800_000_000_000)
+    try {
+      const host = await open()
+      const field = screen.getByLabelText('Message this session')
+      host.controls.leaveNextSendUnconfirmed()
+      const held = host.controls.holdMutation()
+
+      // The queued prompt is on its way to the host, which has it and has not answered yet.
+      await person.type(field, 'run the migration')
+      await person.click(screen.getByRole('button', { name: 'Queue' }))
+      await waitFor(() => {
+        expect(held.count).toBe(1)
+      })
+      expect(screen.getByRole('button', { name: 'Send' })).toBeDisabled()
+
+      // An interrupt is not held back by a prompt on its way, and is answered while that is.
+      const interrupt = screen.getByRole('button', { name: 'Interrupt the current turn' })
+      expect(interrupt).toBeEnabled()
+      await person.click(interrupt)
+      await screen.findByText('Applied')
+
+      // The host's answer to the queued prompt then names no outcome: nobody knows its end.
+      held.release()
+      await screen.findByTestId('composer-send-anyway')
+
+      // Each answer settled its own record. The interrupt is applied, the queued prompt is still one
+      // nobody knows the end of, and it still holds the session though an interrupt is applied.
+      expect(screen.getAllByText('Applied')).toHaveLength(1)
+      expect(screen.getByText(/One action has no confirmed outcome yet/)).toBeInTheDocument()
+      expect(screen.getByRole('button', { name: 'Queue' })).toBeDisabled()
+      expect(screen.getByRole('button', { name: 'Interrupt the current turn' })).toBeEnabled()
+    } finally {
+      clock.mockRestore()
+    }
+  })
+})

@@ -188,15 +188,25 @@ const NO_IMAGES: ReadonlyMap<string, string> = new Map()
 /** What a submission of an interrupt is called where it is listed: it carries no text of its own. */
 const INTERRUPT_LABEL = 'Interrupt the turn'
 
+/** Actions made so far by this window, which keeps two apart even if the random source repeats itself. */
+let actionsMade = 0
+
 /**
  * This device's identity for one submission.
  *
  * The session is in it because the submissions are held for the whole device: an outcome from one
  * session shown under another is a person told their message was applied when it was somebody
- * else's that was.
+ * else's that was. The rest is a UUID and not the time: two actions made in one tick of the clock,
+ * a queued prompt and an interrupt, are two records, and an answer settles only its own.
  */
-function localId(sessionId: string, now: number): string {
-  return `local:${sessionId}:${now}`
+function localId(sessionId: string): string {
+  const random = globalThis.crypto as Crypto | undefined
+  actionsMade += 1
+  const key =
+    typeof random?.randomUUID === 'function'
+      ? random.randomUUID()
+      : `${actionsMade.toString(36)}-${Math.random().toString(36).slice(2, 12)}`
+  return `local:${sessionId}:${key}`
 }
 
 /** Whether a submission belongs to one session. */
@@ -797,7 +807,6 @@ export function MobileSession({
         if (interrupting.current) return
         interrupting.current = true
       }
-      const now = Date.now()
       // The opening this send is made under. Its answer may come after the screen has opened the
       // session again, and then it settles its own record and nothing the new opening shows.
       const opening = openings.tokenOf(sessionId)
@@ -816,7 +825,7 @@ export function MobileSession({
       // The session is in the identity, so one session's outcome is never shown under another.
       const submission: Submission = {
         ...queued(
-          localId(sessionId, now),
+          localId(sessionId),
           action === 'interrupt' ? INTERRUPT_LABEL : text.slice(0, 60),
           receiptReads.stamp(),
           action === 'interrupt' ? '' : text
