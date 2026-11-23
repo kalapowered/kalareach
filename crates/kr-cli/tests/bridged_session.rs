@@ -270,6 +270,18 @@ case "$1" in
           echo 'Error: cannot connect to the store' >&2
           exit 125
         fi
+        # A test that wants the runtime to be ended by a signal, to say nothing until it is ended, or
+        # to answer with something that is neither true nor false says so with a file.
+        if [ -f '{tools}/running-signalled' ]; then
+          kill -9 $$
+        fi
+        if [ -f '{tools}/running-stalls' ]; then
+          exec sleep 60
+        fi
+        if [ -f '{tools}/running-unreadable' ]; then
+          echo 'kr-test-neither-true-nor-false'
+          exit 0
+        fi
         # A test that wants the question to fail only once the container has been started says so
         # with a file.
         if [ -f '{tools}/running-fails-after-start' ] \
@@ -287,6 +299,18 @@ case "$1" in
     if [ "$3" != '{id}' ]; then
       echo "Error: no container with name or ID \"$3\" found: no such container" >&2
       exit 125
+    fi
+    # A test that wants the start to fail, to be ended by a signal, or to say nothing until it is
+    # ended says so with a file.
+    if [ -f '{tools}/start-fails' ]; then
+      echo 'kr-test-printed-by-the-start' >&2
+      exit 125
+    fi
+    if [ -f '{tools}/start-signalled' ]; then
+      kill -9 $$
+    fi
+    if [ -f '{tools}/start-stalls' ]; then
+      exec sleep 60
     fi
     echo true >'{tools}/container-running'
     echo '{id}'
@@ -384,6 +408,16 @@ impl World {
     }
 
     async fn start_with(login: Login) -> Self {
+        Self::start_bounding(login, None).await
+    }
+
+    /// A world whose daemon holds its platform commands to `limit`, for a case whose subject is a
+    /// command that outlasts it.
+    async fn start_with_platform_commands_bounded_at(limit: Duration) -> Self {
+        Self::start_bounding(Login::Home, Some(limit)).await
+    }
+
+    async fn start_bounding(login: Login, platform_limit: Option<Duration>) -> Self {
         let source = teardown::Tree::create();
         let destination = teardown::Tree::create();
         let home = destination.root().join("home");
@@ -409,7 +443,8 @@ impl World {
         // Started in its turn, so that no pipe another case has just made is handed to a daemon
         // that outlives it.
         let child = user_manager::spawning(|| {
-            std::process::Command::new(installation().join("kr-controller"))
+            let mut command = std::process::Command::new(installation().join("kr-controller"));
+            command
                 .current_dir(source.root())
                 .arg("--runtime-dir")
                 .arg(source.root().join("r"))
@@ -429,8 +464,11 @@ impl World {
                 )
                 .stdin(std::process::Stdio::null())
                 .stdout(log.try_clone().expect("duplicates the log"))
-                .stderr(log)
-                .spawn()
+                .stderr(log);
+            if let Some(limit) = platform_limit {
+                command.env("KR_TEST_PLATFORM_LIMIT_MS", limit.as_millis().to_string());
+            }
+            command.spawn()
         })
         .expect("the source daemon starts");
         let world = Self {
@@ -2145,10 +2183,22 @@ fn a_failed_run_is_reported_with_what_it_printed_on_both_streams() {
 
 /// Refreshes `label` as `--json` and as lines of text.
 fn refreshed_both_ways(world: &World, label: &str) -> Told {
-    let json = world.run(&["--json", "bridge", "refresh", label]);
+    refreshed_both_ways_with(world, label, &[])
+}
+
+/// [`refreshed_both_ways`], with the options of the refresh (`--start`) given before the label.
+fn refreshed_both_ways_with(world: &World, label: &str, options: &[&str]) -> Told {
+    let call = |json: bool| {
+        let mut arguments: Vec<&str> = if json { vec!["--json"] } else { vec![] };
+        arguments.extend(["bridge", "refresh"]);
+        arguments.extend(options);
+        arguments.push(label);
+        arguments
+    };
+    let json = world.run(&call(true));
     assert_ran(&json, &format!("{label}: kr --json bridge refresh"));
     let document: Value = serde_json::from_slice(&json.stdout).expect("kr printed JSON");
-    let said = world.run(&["bridge", "refresh", label]);
+    let said = world.run(&call(false));
     assert_ran(&said, &format!("{label}: kr bridge refresh"));
     let stdout = String::from_utf8_lossy(&said.stdout).into_owned();
     Told {
@@ -2479,6 +2529,136 @@ async fn a_listing_of_distributions_that_fails_is_told_as_a_failed_look_and_not_
             );
         });
     }
+}
+
+/// A source host whose daemon holds its platform commands to `limit`, a stand-in for the container
+/// runtime, and a destination whose helper answers.
+async fn world_whose_platform_commands_end_within(limit: Duration) -> World {
+    let world = World::start_with_platform_commands_bounded_at(limit).await;
+    world.stand_in_for_the_container_runtime();
+    world.enrol_destination();
+    let _ = world.create_in_destination();
+    world
+}
+
+/// KR-REQ-18.11, the part about connection diagnostics, for each way a step that asks the container
+/// runtime can fail: the look at whether the environment runs, and its start with `--start`. A signal
+/// ends the program, an answer that is neither `true` nor `false`, a program that does not answer
+/// within its bound and is ended, and an exit code are each told by their class, in `--json` and in
+/// the lines, with the row stale. What the program printed is in neither.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_step_of_the_platform_that_fails_is_told_by_the_class_of_its_failure() {
+    let _turn = CONTAINER_RUNTIME_TURN.lock().await;
+    let world = world_whose_platform_commands_end_within(Duration::from_secs(2)).await;
+    enrolled_and_answering(&world, "box", "container", STAND_IN_CONTAINER_NAME);
+    let step = "the container runtime (podman)";
+    let look = "when asked whether the environment is running";
+    let start = "when asked to start the environment";
+    let cases = [
+        (
+            "running-signalled",
+            false,
+            format!("{step} was ended by signal 9 {look}"),
+        ),
+        (
+            "running-stalls",
+            false,
+            format!("{step} did not answer within 2 seconds {look}, so it was ended"),
+        ),
+        (
+            "running-unreadable",
+            false,
+            format!("{step} gave an answer that could not be read {look}"),
+        ),
+        (
+            "start-fails",
+            true,
+            format!("{step} ended with exit code 125 {start}"),
+        ),
+        (
+            "start-signalled",
+            true,
+            format!("{step} was ended by signal 9 {start}"),
+        ),
+        (
+            "start-stalls",
+            true,
+            format!("{step} did not answer within 2 seconds {start}, so it was ended"),
+        ),
+    ];
+    // Every class is tried before the case fails, so that one run says which of them are told wrongly.
+    let mut told_wrongly = Vec::new();
+    for (switch, starting, expected) in cases {
+        // A start is asked for when the container is stopped, and a look when it runs.
+        std::fs::write(
+            world.tools.join("container-running"),
+            if starting { "false\n" } else { "true\n" },
+        )
+        .expect("the container's state");
+        with_the_switch_on(&world, switch, "box", || {
+            let options: &[&str] = if starting { &["--start"] } else { &[] };
+            let told = refreshed_both_ways_with(&world, "box", options);
+            if told.document["connection"] != expected {
+                told_wrongly.push(format!(
+                    "{switch}: {} (expected {expected})",
+                    told.document["connection"]
+                ));
+                return;
+            }
+            assert_eq!(
+                told.document["row"]["status"], "stale",
+                "{switch}: {told:?}"
+            );
+            assert_eq!(told.document["started"], false, "{switch}: {told:?}");
+            assert_eq!(told.lines.len(), 2, "{switch}: {told:?}");
+            assert_eq!(told.lines[1].trim_start(), expected, "{switch}: {told:?}");
+            for printed in [
+                "kr-test-printed-by-the-start",
+                "kr-test-neither-true-nor-false",
+            ] {
+                assert!(!told.everything.contains(printed), "{switch}: {told:?}");
+            }
+            assert!(
+                !told.everything.contains("not running"),
+                "{switch}: {told:?}"
+            );
+        });
+    }
+    assert!(
+        told_wrongly.is_empty(),
+        "a step of the platform that failed was told in the wrong words: {told_wrongly:#?}"
+    );
+}
+
+/// KR-REQ-18.11, the part about connection diagnostics, for a container runtime that is on the path
+/// and cannot be run: the refresh says that the step could not be started, with what the operating
+/// system said as its class and length, in `--json` and in the lines.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_container_runtime_that_cannot_be_started_is_told_by_its_step_and_the_length_of_the_reason()
+ {
+    use std::os::unix::fs::PermissionsExt;
+    let _turn = CONTAINER_RUNTIME_TURN.lock().await;
+    let world = world_whose_destination_answers().await;
+    enrolled_and_answering(&world, "box", "container", STAND_IN_CONTAINER_NAME);
+    let runtime = world.tools.join("podman");
+    let mode = std::fs::metadata(&runtime)
+        .expect("the runtime")
+        .permissions()
+        .mode();
+    std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o644))
+        .expect("the runtime is made unrunnable");
+    let told = refreshed_both_ways(&world, "box");
+    std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(mode))
+        .expect("the runtime is made runnable");
+    let said = told.document["connection"].as_str().expect("a sentence");
+    let prefix = "the container runtime (podman) could not be started: [message withheld, ";
+    assert!(
+        said.starts_with(prefix) && said.ends_with(" bytes]"),
+        "{told:?}"
+    );
+    assert_eq!(told.lines[1].trim_start(), said, "{told:?}");
+    assert_eq!(told.document["row"]["status"], "stale", "{told:?}");
+    assert!(!told.everything.contains("ermission denied"), "{told:?}");
 }
 
 /// KR-REQ-18.11, the part about connection diagnostics, for a refresh that finds nothing wrong:

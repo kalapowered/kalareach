@@ -205,7 +205,7 @@ fn resolve_container_target_through(
         ["container", "inspect", "--format", "{{.Id}}", "--", target].map(str::to_owned);
     let output = platform::run_bounded(runtime, &arguments, limit).map_err(|failure| {
         CliError::Other(match failure {
-            CallFailure::NotRun { error, .. } => shown!(
+            CallFailure::NotRun { error, .. } | CallFailure::Unread { error, .. } => shown!(
                 "{} could not be run to resolve the target to a container identifier ({})",
                 runtime,
                 Shown::io(&error)

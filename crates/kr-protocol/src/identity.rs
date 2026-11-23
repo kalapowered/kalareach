@@ -933,11 +933,23 @@ const REFUSAL_FORMS: &[&str] = &[
      before it answered the read",
     "{program} ended with exit code {n} when asked whether the environment is running",
     "{program} ended with exit code {n} when asked to start the environment",
-    "{program} said nothing for {n} seconds when asked whether the environment is running, so it was \
+    "{program} was ended by signal {n} when asked whether the environment is running",
+    "{program} was ended by signal {n} when asked to start the environment",
+    "{program} did not answer within {n} seconds when asked whether the environment is running, so it \
+     was ended",
+    "{program} did not answer within {n} seconds when asked to start the environment, so it was \
      ended",
-    "{program} said nothing for {n} seconds when asked to start the environment, so it was ended",
+    "{program} did not answer within {n} seconds when asked whether the environment is running, and it \
+     could not be ended",
+    "{program} did not answer within {n} seconds when asked to start the environment, and it could \
+     not be ended",
+    "{program} ran, and this host could not read what it printed when asked whether the environment \
+     is running: {message}",
+    "{program} ran, and this host could not read what it printed when asked to start the \
+     environment: {message}",
+    "{program} could not be waited for when asked whether the environment is running: {message}",
+    "{program} could not be waited for when asked to start the environment: {message}",
     "{program} gave an answer that could not be read when asked whether the environment is running",
-    "{program} gave an answer that could not be read when asked to start the environment",
     "{program} was ended by signal {n} before the environment answered",
     "{program} ended the connection before the environment answered",
     "{program} ended with exit code {n} after the environment acknowledged the bridge, before it \

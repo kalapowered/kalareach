@@ -75,11 +75,7 @@ impl Observer for PlatformObserver {
             return Ok(());
         }
         // What the program printed is not told: the person reads that the step ended, and how.
-        Err(step(
-            output
-                .code
-                .map_or(StepFailure::Unreadable, StepFailure::Exited),
-        ))
+        Err(step(ended_badly(&output)))
     }
 }
 
@@ -147,9 +143,7 @@ fn listing_that_ended_well(
     Err(ControllerError::Platform {
         access,
         step: Step::Look,
-        failure: listing
-            .code
-            .map_or(StepFailure::Unreadable, StepFailure::Exited),
+        failure: ended_badly(listing),
     })
 }
 
@@ -180,6 +174,8 @@ fn presence_after_inspection(call: &str, output: &CommandOutput) -> Result<Envir
 pub struct CommandOutput {
     /// The exit code, where the platform reported one.
     pub code: Option<i32>,
+    /// The signal that ended it, where one did.
+    pub signal: Option<i32>,
     /// Standard output and standard error together, as text.
     pub text: String,
     /// Standard output alone, as text: what a command answers, apart from what it says of itself
@@ -356,9 +352,16 @@ enum Ending {
 /// `named` says, and none repeats a value after them.
 #[derive(Debug)]
 pub enum CallFailure {
-    /// The program could not be started, or could not be given a thread to read what it prints,
-    /// in which case it was ended.
+    /// The program could not be started.
     NotRun {
+        /// The call.
+        call: String,
+        /// What the operating system said.
+        error: std::io::Error,
+    },
+    /// The program was started and could not be given a thread to read what it prints, so it was
+    /// ended.
+    Unread {
         /// The call.
         call: String,
         /// What the operating system said.
@@ -386,6 +389,10 @@ impl std::fmt::Display for CallFailure {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NotRun { call, error } => write!(formatter, "{call} could not be run: {error}"),
+            Self::Unread { call, error } => write!(
+                formatter,
+                "{call} ran, and what it prints could not be read: {error}"
+            ),
             Self::Deadline { call, limit, ended } => write!(
                 formatter,
                 "{call} did not end within {} seconds and {}",
@@ -465,10 +472,10 @@ pub fn run_bounded(
     let (reading_out, reading_err) = match (reading_out, reading_err) {
         (Ok(out), Ok(err)) => (out, err),
         // The program is running, and nothing can read what it prints: it is ended, and the call
-        // is told as one that could not be run.
+        // is told as one that ran and was not read.
         (Err(error), _) | (_, Err(error)) => {
             end_and_reap(child);
-            return Err(CallFailure::NotRun { call, error });
+            return Err(CallFailure::Unread { call, error });
         }
     };
 
@@ -559,12 +566,26 @@ pub enum StepFailure {
     },
     /// The program ended with a code.
     Exited(i32),
-    /// The program did not end within its bound, in seconds.
+    /// A signal ended the program.
+    Signalled(i32),
+    /// The program did not end within its bound, which is given in seconds, and was ended.
     NoAnswer {
         /// The bound.
         seconds: u64,
+        /// Whether the ending was seen.
+        ended: bool,
     },
-    /// The program ended without a code, or answered with something that is not an answer.
+    /// The program ran and this host could not start a reader for what it printed.
+    Unread {
+        /// What the operating system said.
+        message: String,
+    },
+    /// This host could not tell how the program ended.
+    NotWaited {
+        /// What the operating system said.
+        message: String,
+    },
+    /// The program ended well, and what it answered is not an answer to the question.
     Unreadable,
 }
 
@@ -577,10 +598,28 @@ fn failure_of(failure: CallFailure) -> StepFailure {
         CallFailure::NotRun { error, .. } => StepFailure::NotStarted {
             message: error.to_string(),
         },
-        CallFailure::Deadline { limit, .. } => StepFailure::NoAnswer {
+        CallFailure::Deadline { limit, ended, .. } => StepFailure::NoAnswer {
             seconds: limit.as_secs(),
+            ended,
         },
-        CallFailure::Unknown { .. } => StepFailure::Unreadable,
+        CallFailure::Unread { error, .. } => StepFailure::Unread {
+            message: error.to_string(),
+        },
+        CallFailure::Unknown { error, .. } => StepFailure::NotWaited {
+            message: error.to_string(),
+        },
+    }
+}
+
+/// How a program that did not end well ended: with a code, by a signal, or in a way this host
+/// could not tell.
+fn ended_badly(output: &CommandOutput) -> StepFailure {
+    match (output.code, output.signal) {
+        (Some(code), _) => StepFailure::Exited(code),
+        (None, Some(signal)) => StepFailure::Signalled(signal),
+        (None, None) => StepFailure::NotWaited {
+            message: "it ended with no code and no signal".to_owned(),
+        },
     }
 }
 
@@ -597,11 +636,7 @@ fn presence_after_look(
         failure,
     };
     if output.code != Some(0) && !says_there_is_no_such_container(&output.text) {
-        return Err(failed(
-            output
-                .code
-                .map_or(StepFailure::Unreadable, StepFailure::Exited),
-        ));
+        return Err(failed(ended_badly(output)));
     }
     if output.code == Some(0) && !matches!(output.stdout.trim(), "true" | "false") {
         return Err(failed(StepFailure::Unreadable));
@@ -631,9 +666,22 @@ fn run_within_as(
     text.retain(|character| character != '\0');
     Ok(CommandOutput {
         code: output.status.code(),
+        signal: signal_of(&output.status),
         text,
         stdout,
     })
+}
+
+/// The signal that ended a program, where one did.
+#[cfg(unix)]
+fn signal_of(status: &std::process::ExitStatus) -> Option<i32> {
+    std::os::unix::process::ExitStatusExt::signal(status)
+}
+
+/// The signal that ended a program, where one did: no program here is ended by one.
+#[cfg(not(unix))]
+fn signal_of(_: &std::process::ExitStatus) -> Option<i32> {
+    None
 }
 
 /// Whether what a container runtime printed says that it knows no such container, in the form the
@@ -722,6 +770,7 @@ mod tests {
         use kr_protocol::identity::EnvironmentAccess::Container;
         let output = |code, text: &str, stdout: &str| CommandOutput {
             code,
+            signal: None,
             text: text.to_owned(),
             stdout: stdout.to_owned(),
         };
@@ -733,9 +782,22 @@ mod tests {
             failure(output(Some(125), "Error: cannot connect to the store", "")),
             (Step::Look, StepFailure::Exited(125))
         );
+        // A signal ends the runtime: it is told as one, and not as an answer that could not be read.
+        assert_eq!(
+            failure(CommandOutput {
+                signal: Some(9),
+                ..output(None, "", "")
+            }),
+            (Step::Look, StepFailure::Signalled(9))
+        );
         assert_eq!(
             failure(output(None, "", "")),
-            (Step::Look, StepFailure::Unreadable)
+            (
+                Step::Look,
+                StepFailure::NotWaited {
+                    message: "it ended with no code and no signal".to_owned()
+                }
+            )
         );
         assert_eq!(
             failure(output(Some(0), "maybe", "maybe")),
@@ -838,11 +900,13 @@ mod tests {
     fn an_inspection_that_failed_for_another_reason_is_the_calls_failure() {
         let ended = |code: Option<i32>, said: &str| super::CommandOutput {
             code,
+            signal: None,
             text: said.to_owned(),
             stdout: String::new(),
         };
         let answered = |stdout: &str| super::CommandOutput {
             code: Some(0),
+            signal: None,
             text: stdout.to_owned(),
             stdout: stdout.to_owned(),
         };
@@ -923,6 +987,91 @@ mod tests {
         drop(sender);
     }
 
+    /// KR-REQ-18.11, the part about connection diagnostics: each way a call of the platform can
+    /// fail is told as what the runner knows of it, through the conversions a person's sentence
+    /// comes from. A program that a signal ends is a signal, and not an answer that could not be
+    /// read. One that printed and then outlasted its bound did not answer within it, and is said to
+    /// be ended only where the ending was seen. One that nothing could read was started and not
+    /// read. One whose state could not be read could not be waited for.
+    #[cfg(unix)]
+    #[test]
+    fn each_way_a_call_can_fail_is_told_as_what_the_runner_knows_of_it() {
+        use kr_protocol::identity::EnvironmentAccess::Container;
+        let told = |failure: super::StepFailure| {
+            crate::bridge::diagnosis::platform(Container, super::Step::Look, &failure)
+                .as_str()
+                .to_owned()
+        };
+        let step = "the container runtime (podman)";
+        let look = "when asked whether the environment is running";
+
+        let killed = super::run_within_as(
+            "/bin/sh",
+            &["-c".to_owned(), "kill -9 $$".to_owned()],
+            std::time::Duration::from_secs(10),
+            ControllerError::from,
+        )
+        .expect("the program ran");
+        assert_eq!((killed.code, killed.signal), (None, Some(9)));
+        assert_eq!(
+            told(super::ended_badly(&killed)),
+            format!("{step} was ended by signal 9 {look}")
+        );
+
+        // It printed before the bound passed, so nothing is said of what it printed.
+        let stalled = super::run_bounded(
+            "/bin/sh",
+            &[
+                "-c".to_owned(),
+                "echo kr-test-printed; exec sleep 60".to_owned(),
+            ],
+            std::time::Duration::from_millis(1500),
+        )
+        .expect_err("the program outlasts its bound");
+        assert_eq!(
+            told(super::failure_of(stalled)),
+            format!("{step} did not answer within 1 seconds {look}, so it was ended")
+        );
+
+        let unended = super::CallFailure::Deadline {
+            call: "podman container inspect".to_owned(),
+            limit: std::time::Duration::from_secs(60),
+            ended: false,
+        };
+        assert_eq!(
+            told(super::failure_of(unended)),
+            format!("{step} did not answer within 60 seconds {look}, and it could not be ended")
+        );
+
+        let unknown = super::CallFailure::Unknown {
+            call: "podman container inspect".to_owned(),
+            error: std::io::Error::other("kr-test-os-text"),
+        };
+        assert_eq!(
+            told(super::failure_of(unknown)),
+            format!("{step} could not be waited for {look}: [message withheld, 15 bytes]")
+        );
+
+        // The program is started and nothing can read it: it is not told as one that was not run.
+        let marker = format!("sleep 119.{}", std::process::id());
+        THREADS_REFUSED.with(|refused| refused.set(true));
+        let unread = super::run_bounded(
+            "/bin/sh",
+            &["-c".to_owned(), format!("exec {marker}")],
+            std::time::Duration::from_secs(60),
+        );
+        THREADS_REFUSED.with(|refused| refused.set(false));
+        let said = told(super::failure_of(
+            unread.expect_err("nothing can read what the program prints"),
+        ));
+        assert!(
+            said.starts_with(&format!(
+                "{step} ran, and this host could not read what it printed {look}: [message withheld, "
+            )),
+            "{said}"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn a_program_that_is_not_there_is_not_run_and_the_failure_says_so() {
@@ -955,11 +1104,13 @@ mod tests {
         THREADS_REFUSED.with(|refused| refused.set(false));
         let error = result.expect_err("nothing can read what the program prints");
         assert!(
-            matches!(error, super::CallFailure::NotRun { .. }),
+            matches!(error, super::CallFailure::Unread { .. }),
             "{error}"
         );
         assert!(
-            error.to_string().contains("/bin/sh -c could not be run"),
+            error
+                .to_string()
+                .contains("/bin/sh -c ran, and what it prints could not be read"),
             "{error}"
         );
         let listing = std::process::Command::new("ps")
@@ -1066,6 +1217,7 @@ mod tests {
     fn printed(text: &str) -> CommandOutput {
         CommandOutput {
             code: Some(0),
+            signal: None,
             text: text.to_owned(),
             stdout: text.to_owned(),
         }
@@ -1161,6 +1313,7 @@ mod tests {
         let (registered, running) = the_host();
         let failed = |text: &str| CommandOutput {
             code: Some(1),
+            signal: None,
             text: text.to_owned(),
             stdout: text.to_owned(),
         };
@@ -1244,16 +1397,19 @@ mod tests {
     fn a_container_answers_running_stopped_or_nothing_at_all() {
         let running = CommandOutput {
             code: Some(0),
+            signal: None,
             text: "true\n".to_owned(),
             stdout: "true\n".to_owned(),
         };
         let stopped = CommandOutput {
             code: Some(0),
+            signal: None,
             text: "false\n".to_owned(),
             stdout: "false\n".to_owned(),
         };
         let absent = CommandOutput {
             code: Some(125),
+            signal: None,
             text: "no such container\n".to_owned(),
             stdout: String::new(),
         };

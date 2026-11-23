@@ -1867,11 +1867,16 @@ program (the container runtime (`podman`) for a container, the SSH client (`ssh`
 the WSL launcher (`wsl.exe`) for a WSL distribution) and how it failed, whichever step it was: the
 look at whether the environment runs, its start with `--start`, or the opening of the bridge. The
 classes are that the program was not found, that it could not be started, that it ended with an exit
-code, that a signal ended it, that it said nothing for a number of seconds and was ended, that its
-answer could not be read, and that the environment refused the bridge, in which case the line gives
-the refusal's code. The container runtime's code 125 and `ssh`'s 255 are the program's own; any other
-code is the helper's, and the line says so. A failed look does not say the environment is not
-running, which the host does not then know: the row reads stale. What the operating system or the
+code, that a signal ended it, that it did not answer within a number of seconds and was ended (or
+could not be ended, where the host did not see the end), that this host could not read what it
+printed or could not wait for it, that its answer to the look could not be read, and that the
+environment refused the bridge, in which case the line gives the refusal's code. The container
+runtime's code 125 and `ssh`'s 255 are the program's own; any other code is the helper's, and the
+line says so. A failed look does not say the environment is not running, which the host does not
+then know: the row reads stale. That holds for the look at a WSL distribution, whether the listing of
+registered or of running distributions failed, and for a look that fails after `--start` started the
+environment: the first line says that the refresh started it, and the second says how the look
+failed. What the operating system or the
 destination wrote in its own words, and what a program printed, show only as a class and length, as
 every message from the host does. `--json` carries the same sentence in `connection`.
 

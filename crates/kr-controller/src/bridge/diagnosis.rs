@@ -221,12 +221,31 @@ pub fn platform(access: EnvironmentAccess, step: Step, failure: &StepFailure) ->
             .number(u64::from(u32::from_ne_bytes(code.to_ne_bytes())))
             .stated(" ")
             .stated(asked),
-        StepFailure::NoAnswer { seconds } => program
-            .stated(" said nothing for ")
+        StepFailure::Signalled(signal) => program
+            .stated(" was ended by signal ")
+            .number(u64::from(u32::from_ne_bytes(signal.to_ne_bytes())))
+            .stated(" ")
+            .stated(asked),
+        StepFailure::NoAnswer { seconds, ended } => program
+            .stated(" did not answer within ")
             .number(*seconds)
             .stated(" seconds ")
             .stated(asked)
-            .stated(", so it was ended"),
+            .stated(if *ended {
+                ", so it was ended"
+            } else {
+                ", and it could not be ended"
+            }),
+        StepFailure::Unread { message } => program
+            .stated(" ran, and this host could not read what it printed ")
+            .stated(asked)
+            .stated(": ")
+            .withheld(ContentClass::Message, message),
+        StepFailure::NotWaited { message } => program
+            .stated(" could not be waited for ")
+            .stated(asked)
+            .stated(": ")
+            .withheld(ContentClass::Message, message),
         StepFailure::Unreadable => program
             .stated(" gave an answer that could not be read ")
             .stated(asked),
@@ -660,12 +679,43 @@ mod tests {
                     format!("{step} ended with exit code 125 {asked}"),
                 ),
                 (
-                    StepFailure::NoAnswer { seconds: 60 },
-                    format!("{step} said nothing for 60 seconds {asked}, so it was ended"),
+                    StepFailure::Signalled(9),
+                    format!("{step} was ended by signal 9 {asked}"),
                 ),
                 (
-                    StepFailure::Unreadable,
-                    format!("{step} gave an answer that could not be read {asked}"),
+                    StepFailure::NoAnswer {
+                        seconds: 60,
+                        ended: true,
+                    },
+                    format!("{step} did not answer within 60 seconds {asked}, so it was ended"),
+                ),
+                (
+                    StepFailure::NoAnswer {
+                        seconds: 60,
+                        ended: false,
+                    },
+                    format!(
+                        "{step} did not answer within 60 seconds {asked}, and it could not be ended"
+                    ),
+                ),
+                (
+                    StepFailure::Unread {
+                        message: ARRIVED.to_owned(),
+                    },
+                    format!(
+                        "{step} ran, and this host could not read what it printed {asked}: \
+                         [message withheld, {} bytes]",
+                        ARRIVED.len()
+                    ),
+                ),
+                (
+                    StepFailure::NotWaited {
+                        message: ARRIVED.to_owned(),
+                    },
+                    format!(
+                        "{step} could not be waited for {asked}: [message withheld, {} bytes]",
+                        ARRIVED.len()
+                    ),
                 ),
             ] {
                 let said = platform(access, look, &failure);
@@ -674,6 +724,15 @@ mod tests {
                 assert!(!said.as_str().contains(ARRIVED), "{said}");
             }
         }
+        // A start reads no answer, so only the look has an answer that cannot be read.
+        let said = platform(access, Step::Look, &StepFailure::Unreadable);
+        assert_eq!(
+            said.as_str(),
+            format!(
+                "{step} gave an answer that could not be read when asked whether the environment is running"
+            )
+        );
+        assert!(is_composed_connection(said.as_str()), "{said}");
     }
 
     /// KR-REQ-18.11, the part about connection diagnostics: once the destination has acknowledged
