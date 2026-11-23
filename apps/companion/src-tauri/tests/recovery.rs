@@ -1721,6 +1721,79 @@ fn x25519_secret_of(seed: &[u8]) -> Vec<u8> {
     sha2::Sha512::digest(seed)[..32].to_vec()
 }
 
+/// The private keys this computer keeps, each with the name the scans give it.
+fn kept_keys(computer: &Computer) -> Vec<(String, Vec<u8>)> {
+    use kr_crypto::store::{SecretName, SecretStore as _};
+    use kr_protocol::pairing::KeyPurpose;
+
+    // The private keys this computer keeps, read from the store the recovery seed is in. The
+    // private keys of the two X25519 pairs are made from their seeds by a hash, so each is checked
+    // against the public key its pair has.
+    let identity = computer.identity();
+    let mut kept = Vec::new();
+    for (purpose, public) in [
+        (KeyPurpose::Transport, None),
+        (KeyPurpose::Authorisation, None),
+        (
+            KeyPurpose::StoredEnvelope,
+            Some(*identity.keys.stored_envelope.public().as_bytes()),
+        ),
+        (
+            KeyPurpose::NotificationPreview,
+            Some(*identity.keys.notification_preview.public().as_bytes()),
+        ),
+    ] {
+        let name = SecretName::device_key(companion_tauri::device::identity::SCOPE, purpose)
+            .expect("a name");
+        let seed = computer
+            .secrets
+            .get(&name)
+            .expect("the store reads")
+            .unwrap_or_else(|| panic!("this computer kept a {purpose:?} key"));
+        kept.push((format!("{purpose:?} seed"), seed.expose().to_vec()));
+        if let Some(public) = public {
+            let secret = x25519_secret_of(seed.expose());
+            let derived = aws_lc_rs::agreement::PrivateKey::from_private_key(
+                &aws_lc_rs::agreement::X25519,
+                &secret,
+            )
+            .expect("an X25519 private key")
+            .compute_public_key()
+            .expect("its public key");
+            assert_eq!(
+                derived.as_ref(),
+                public.as_slice(),
+                "the {purpose:?} private key is the first half of its seed's hash"
+            );
+            kept.push((format!("{purpose:?} private key (derived)"), secret));
+        }
+    }
+    assert_eq!(kept.len(), 6, "four seeds and two keys made from them");
+    for (name, key) in &kept {
+        assert!(key.len() >= 32, "the {name} is a key, not a stub");
+    }
+    kept
+}
+
+/// Every request the service was sent: the document, the content beside it, the token.
+fn sent_to_the_service(computer: &Computer) -> Vec<(String, Vec<u8>)> {
+    let mut sent = Vec::new();
+    for (at, arrived) in computer.served.web().arrived().iter().enumerate() {
+        let to = format!("request {at} to {}", arrived.path);
+        sent.push((
+            format!("the body of {to}"),
+            serde_json::to_vec(&arrived.body).expect("a body encodes"),
+        ));
+        if let Some(content) = &arrived.content {
+            sent.push((format!("the content of {to}"), content.clone()));
+        }
+        if let Some(token) = &arrived.token {
+            sent.push((format!("the token of {to}"), token.clone().into_bytes()));
+        }
+    }
+    sent
+}
+
 /// A generation of an archive as the host's producer makes one, put at the service: sealed for the
 /// recovery recipient `seed` derives and signed by the host's writer, which this computer's own key
 /// enrols; its objects stored under the account; the publication sent by the writer.
@@ -1907,60 +1980,12 @@ async fn publish_generation(
 /// none of.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_kit_the_qr_code_and_the_bundle_export_hold_none_of_the_keys_this_computer_keeps() {
-    use kr_crypto::store::{SecretName, SecretStore as _};
-    use kr_protocol::pairing::KeyPurpose;
-
     let computer = Computer::new().await;
     let page = computer.page().await;
     page.call("recovery_turn_on", json!({})).expect("on");
     let out = tempfile::tempdir().expect("a directory");
 
-    // The private keys this computer keeps, read from the store the recovery seed is in. The
-    // private keys of the two X25519 pairs are made from their seeds by a hash, so each is checked
-    // against the public key its pair has.
-    let identity = computer.identity();
-    let mut kept = Vec::new();
-    for (purpose, public) in [
-        (KeyPurpose::Transport, None),
-        (KeyPurpose::Authorisation, None),
-        (
-            KeyPurpose::StoredEnvelope,
-            Some(*identity.keys.stored_envelope.public().as_bytes()),
-        ),
-        (
-            KeyPurpose::NotificationPreview,
-            Some(*identity.keys.notification_preview.public().as_bytes()),
-        ),
-    ] {
-        let name = SecretName::device_key(companion_tauri::device::identity::SCOPE, purpose)
-            .expect("a name");
-        let seed = computer
-            .secrets
-            .get(&name)
-            .expect("the store reads")
-            .unwrap_or_else(|| panic!("this computer kept a {purpose:?} key"));
-        kept.push((format!("{purpose:?} seed"), seed.expose().to_vec()));
-        if let Some(public) = public {
-            let secret = x25519_secret_of(seed.expose());
-            let derived = aws_lc_rs::agreement::PrivateKey::from_private_key(
-                &aws_lc_rs::agreement::X25519,
-                &secret,
-            )
-            .expect("an X25519 private key")
-            .compute_public_key()
-            .expect("its public key");
-            assert_eq!(
-                derived.as_ref(),
-                public.as_slice(),
-                "the {purpose:?} private key is the first half of its seed's hash"
-            );
-            kept.push((format!("{purpose:?} private key (derived)"), secret));
-        }
-    }
-    assert_eq!(kept.len(), 6, "four seeds and two keys made from them");
-    for (name, key) in &kept {
-        assert!(key.len() >= 32, "the {name} is a key, not a stub");
-    }
+    let kept = kept_keys(&computer);
     let stored_seed = load_recovery_seed(&*computer.secrets, SEED_SCOPE)
         .expect("the store reads")
         .expect("the recovery seed is in the same store");
@@ -2130,21 +2155,7 @@ async fn the_kit_the_qr_code_and_the_bundle_export_hold_none_of_the_keys_this_co
     }
 
     let told = page.told().into_bytes();
-    // Every request the service was sent: the document, the content beside it, the token.
-    let mut sent = Vec::new();
-    for (at, arrived) in computer.served.web().arrived().iter().enumerate() {
-        let to = format!("request {at} to {}", arrived.path);
-        sent.push((
-            format!("the body of {to}"),
-            serde_json::to_vec(&arrived.body).expect("a body encodes"),
-        ));
-        if let Some(content) = &arrived.content {
-            sent.push((format!("the content of {to}"), content.clone()));
-        }
-        if let Some(token) = &arrived.token {
-            sent.push((format!("the token of {to}"), token.clone().into_bytes()));
-        }
-    }
+    let sent = sent_to_the_service(&computer);
     let mut outputs: Vec<(String, Vec<u8>)> = [
         ("the kit file", kit_file.clone()),
         ("the QR code file", qr_file),
@@ -5303,4 +5314,219 @@ async fn a_bundle_with_no_saved_settings_restores_none_and_an_unusable_one_says_
         );
     }
     assert_eq!(fresh.local().chosen_colour_mode(), None);
+}
+
+/* -------------------------------------------------------------------------- */
+/* The settings member and the keys this computer keeps                        */
+/* -------------------------------------------------------------------------- */
+
+/// KR-REQ-20.17, KR-REQ-18.05: the settings member the step writes, and everything that carries it
+/// (the bundle opened with the kit, the sealed bundle at the service, the offline export, the
+/// settings file a restore writes, the restore's answer, what the page was told and every request),
+/// hold none of the private keys this computer keeps, in any form [`forms_of`] names or as a list of
+/// numbers.
+///
+/// The member is the one the application's own step encodes: it is written by turning recovery on
+/// and again by a step after the person changes the colour mode, and read back with the kit alone.
+/// The controls put each key in a setting's value in each text form through the library's own
+/// encoder and find it in the member, find the colour in the member and in the settings file, and
+/// find the sealed bundle in the export and in the requests.
+///
+/// Not shown here: a member of a later build that carries a value this build does not know, which
+/// is only checked for its size and its form, and the other data paths of backup and recovery
+/// material.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_saved_settings_and_everything_that_carries_them_hold_none_of_the_keys_this_computer_keeps()
+ {
+    let computer = Computer::new().await;
+    let kept = kept_keys(&computer);
+    let (page, settings) = computer.saving_page(NO_WAIT).await;
+    settings
+        .set_colour_mode(ColourMode::Dark)
+        .await
+        .expect("kept");
+    page.call("recovery_turn_on", json!({})).expect("on");
+    settings
+        .set_colour_mode(ColourMode::Light)
+        .await
+        .expect("kept");
+    page.recovery
+        .save_settings(&page.account)
+        .await
+        .expect("a step");
+    let out = tempfile::tempdir().expect("a directory");
+    let (kit_path, kit) = page.kit(out.path());
+
+    // The member the step wrote, as the service holds it, and what carries it.
+    let opened = read_with_only_the_kit(&computer.served, &kit).await;
+    let member = opened
+        .device_settings
+        .clone()
+        .expect("the step wrote a member");
+    assert_eq!(colour_in(&opened).as_deref(), Some("light"));
+    let held_bundle = computer
+        .served
+        .web()
+        .bundle(&kit.bundle_locator)
+        .expect("the service holds the bundle");
+    let export = out.path().join("bundle.krexport");
+    page.dialog_returns(&export);
+    page.call(
+        "recovery_export_offline",
+        json!({ "path": export.to_string_lossy(), "archive": null }),
+    )
+    .expect("the bundle is exported");
+    let export_file = std::fs::read(&export).expect("the export file");
+
+    // A restore from the account and one from the export file, each onto a device that chose
+    // nothing: the settings file it writes and what it answers.
+    let (from_account_directory, from_account) = fresh_device();
+    let restored = page
+        .recovery
+        .restore_settings_with(
+            &Chooses::answering(vec![Some(kit_path.clone())]),
+            &page.account,
+            from_account.local(),
+            false,
+        )
+        .await
+        .expect("a restore from the account");
+    assert!(
+        matches!(restored, SettingsRestored::Restored { .. }),
+        "{restored:?}"
+    );
+    let (from_file_directory, from_file) = fresh_device();
+    let restored_from_file = page
+        .recovery
+        .restore_settings_with(
+            &Chooses::answering(vec![Some(kit_path), Some(export)]),
+            &page.account,
+            from_file.local(),
+            true,
+        )
+        .await
+        .expect("a restore from the file");
+    assert!(
+        matches!(restored_from_file, SettingsRestored::Restored { .. }),
+        "{restored_from_file:?}"
+    );
+    let settings_file = |directory: &tempfile::TempDir| {
+        std::fs::read(directory.path().join(companion_tauri::settings::FILE))
+            .expect("the settings file a restore wrote")
+    };
+    let (account_file, file_file) = (
+        settings_file(&from_account_directory),
+        settings_file(&from_file_directory),
+    );
+
+    let mut outputs: Vec<(String, Vec<u8>)> = vec![
+        ("the settings member".to_owned(), member.as_slice().to_vec()),
+        (
+            "the bundle opened with the kit".to_owned(),
+            serde_json::to_vec(&opened).expect("the bundle encodes"),
+        ),
+        (
+            "the sealed bundle at the service".to_owned(),
+            held_bundle.clone(),
+        ),
+        ("the offline export".to_owned(), export_file.clone()),
+        (
+            "the settings file a restore from the account wrote".to_owned(),
+            account_file.clone(),
+        ),
+        (
+            "the settings file a restore from the file wrote".to_owned(),
+            file_file,
+        ),
+        (
+            "the answer of a restore from the account".to_owned(),
+            serde_json::to_vec(&restored).expect("the answer"),
+        ),
+        (
+            "the answer of a restore from the file".to_owned(),
+            serde_json::to_vec(&restored_from_file).expect("the answer"),
+        ),
+        (
+            "what the page was told".to_owned(),
+            page.told().into_bytes(),
+        ),
+    ];
+    let sent = sent_to_the_service(&computer);
+    assert!(
+        sent.len() > 2,
+        "the service was sent the writes and the reads of the bundle"
+    );
+    outputs.extend(sent.iter().cloned());
+
+    // The controls. The scan reads the colour in the member and in the file a restore writes, and
+    // the sealed bundle in the export and in the requests.
+    let contains =
+        |bytes: &[u8], word: &[u8]| bytes.windows(word.len()).any(|window| window == word);
+    assert!(
+        contains(member.as_slice(), b"light"),
+        "the scan does not read the colour in the member"
+    );
+    assert!(
+        contains(&account_file, b"light"),
+        "the scan does not read the colour in the settings file"
+    );
+    assert!(
+        carried_in(&export_file, &held_bundle).is_some(),
+        "the scan does not read the sealed bundle in the export"
+    );
+    assert!(
+        sent.iter()
+            .any(|(_, bytes)| carried_in(bytes, &held_bundle).is_some()),
+        "the scan does not read the sealed bundle in the requests"
+    );
+    // Each key, put in a setting's value in each form and through the library's own encoder, is
+    // found in the member; and as bytes and as a list of numbers in a raw document.
+    for (name, private) in &kept {
+        let lower: String = private.iter().map(|byte| format!("{byte:02x}")).collect();
+        let url = kr_protocol::scalars::to_base64url(private);
+        let numbers = private
+            .iter()
+            .map(u8::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        for (form, text) in [
+            ("in lower-case hexadecimal", lower.clone()),
+            ("in upper-case hexadecimal", lower.to_uppercase()),
+            ("in base64url", url.clone()),
+            ("in base64", url.replace('-', "+").replace('_', "/")),
+            ("as a list of numbers", format!("[{numbers}]")),
+        ] {
+            let planted = kr_client::recovery::DeviceSettings::new(
+                [("colour_mode".to_owned(), SettingValue::Text(text))].into(),
+            )
+            .expect("settings");
+            let encoded = kr_client::recovery::encode_member(&planted).expect("a member");
+            assert!(
+                carried_in(encoded.as_slice(), private).is_some(),
+                "the scan misses the {name} {form} in a member"
+            );
+        }
+        let raw = [b"colour_mode".as_slice(), private.as_slice()].concat();
+        assert_eq!(
+            carried_in(&raw, private).as_deref(),
+            Some("as bytes"),
+            "the scan misses the {name} as bytes"
+        );
+        let listed = serde_json::to_vec(&json!({ "colour_mode": private })).expect("json");
+        assert_eq!(
+            carried_in(&listed, private).as_deref(),
+            Some("as a list of numbers"),
+            "the scan misses the {name} as a list of numbers"
+        );
+    }
+
+    for (output, bytes) in &outputs {
+        for (name, key) in &kept {
+            assert_eq!(
+                carried_in(bytes, key),
+                None,
+                "{output} holds the {name} this computer keeps"
+            );
+        }
+    }
 }
