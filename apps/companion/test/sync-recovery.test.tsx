@@ -279,6 +279,9 @@ describe('recovery', () => {
     })
     expect(controls.recovery.settled).toBe(1)
     expect(within(sheet).queryByRole('alert')).toBeNull()
+    // A settle that found nothing outstanding is no failure: the card says nothing went wrong, in
+    // the line where it shows a failure.
+    expect(within(recovery).queryByTestId('recovery-said')).toBeNull()
   })
 
   it('shows what a step that ended by itself left, with no action of the person', async () => {
