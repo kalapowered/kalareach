@@ -1026,6 +1026,9 @@ async fn run(cli: Cli) -> Result<Completion> {
             HostCommand::Descriptions(descriptions) => {
                 kr_cli::descriptions::run(&paths, descriptions, cli.json).await
             }
+            HostCommand::DesktopChecks(checks) => {
+                kr_cli::desktop_checks::run(&paths, &checks, cli.json).await
+            }
             HostCommand::Power(power) => {
                 let environment = kr_cli::resolve::select(&paths, None)?;
                 // Changing the setting is one validated edit of this user's own host

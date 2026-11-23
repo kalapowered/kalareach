@@ -1417,6 +1417,10 @@ pub struct HostArguments {
 pub enum HostCommand {
     /// Show or change whether this host keeps itself awake for work it has admitted.
     Power(PowerArguments),
+    /// Run the disclosed desktop checks now, in a session's own worker, and show what each found.
+    /// With --file the read check reads that file; without it the read check reads nothing and
+    /// says so.
+    DesktopChecks(DesktopChecksArguments),
     /// Show or choose the shell mode a new session is created in when none is named.
     ShellMode(ShellModeArguments),
     /// Show or choose the push gateways, besides the official one, that a paired device's
@@ -1901,6 +1905,17 @@ pub struct PowerArguments {
     /// and what it is doing are shown and nothing changes.
     #[arg(long)]
     pub set: Option<String>,
+}
+
+/// `kr host desktop-checks`.
+#[derive(Args)]
+pub struct DesktopChecksArguments {
+    /// The file the read check reads.
+    #[arg(long, value_name = "PATH")]
+    pub file: Option<PathBuf>,
+    /// The environment.
+    #[command(flatten)]
+    pub selector: EnvironmentSelector,
 }
 
 /// `kr host shell-mode`.

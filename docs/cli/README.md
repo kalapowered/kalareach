@@ -21,6 +21,7 @@ worker directly for what a session owns.
 | `kr agent-tools --stdio` | — | Run the contact tools for the agent that launched this process |
 | `kr doctor` | — | Read-only diagnostics, this host's effective configuration, and support bundles |
 | `kr host power` | — | Show or change whether this host stays awake for work it has admitted |
+| `kr host desktop-checks` | — | Run the disclosed desktop checks now, in a session's own worker, and show what each found |
 | `kr host shell-mode` | — | Show or choose the shell mode a new session is created in when none is named |
 | `kr host push-gateways` | — | Show or choose the push gateways, besides the official one, that a paired device's notification credential may name |
 | `kr host terminal` | — | Show the terminal applications this host has, and which one a new window opens in |
@@ -2690,6 +2691,35 @@ carries what the platform's own listing said of it, and what the platform said a
 can carry what its facility said, so the line says each as its class and its length;
 `pmset -g assertions` on macOS lists the assertion itself. `docs/host/platforms.md` has the
 facility each platform uses and what an assertion does not promise.
+
+## `kr host desktop-checks`
+
+The desktop checks take a screen image, read the accessibility tree and start an application, so
+the host never performs them when its capabilities are read: you ask, and the worker of one of its
+sessions performs them. `docs/host/platforms.md` says what each check does and why it runs there.
+
+```sh
+kr host desktop-checks                       # the read check reads nothing, and says so
+kr host desktop-checks --file ./notes.txt    # the read check reads this file
+kr host desktop-checks --json                # the same, as one document
+```
+
+The command asks the control daemon to run the checks, waits up to five minutes for the run to
+end, and prints `Disclosed desktop checks` and then one line for each check, the line `kr doctor`
+prints for the same record. `--file` names the file the read check reads, as a full path or a path
+from the directory the command runs in; the command makes it a full path before it sends it. The
+worker reads that file in this run and in no other. With no file the read check reads nothing and
+says so. A run that is already going is not started again: the command waits for it, and the file
+that run was asked to read stands, not the one this command names.
+
+A run that ends without findings is a failure, exit 1, and the message says why in the words the
+setup page uses: no session of the kind the host creates is running, or the session's worker
+answered with an error, did not answer in time, or answered with something the host cannot use.
+A run that is still going when the wait ends, a result the host holds as stale, and a host with no
+run to report are failures too. With `--json` the document has `checks`, which holds `state`,
+`failure`, `started_at_ms`, `finished_at_ms` and `session_id` as `environment.capabilities` states
+them, and `desktop`, the desktop and its capability records as `kr doctor --json` states them under
+`environment`. A failure carries `ok` false, `code`, `message` and `exit_code` beside them.
 
 ## `kr host shell-mode`
 

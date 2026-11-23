@@ -636,6 +636,8 @@ impl claim::Claimed for kr_protocol::sharing::GrantState {}
 impl claim::Claimed for kr_protocol::sharing::SessionRole {}
 impl claim::Claimed for kr_protocol::ids::SessionId {}
 impl claim::Claimed for kr_protocol::privacy::PrivacyDisabled {}
+impl claim::Claimed for kr_protocol::desktop::CapabilityChecksState {}
+impl claim::Claimed for kr_protocol::desktop::CapabilityChecksFailure {}
 impl claim::Claimed for kr_protocol::describe::DescriptionDownload {}
 impl claim::Claimed for kr_protocol::describe::DescriptionPause {}
 impl claim::Claimed for kr_protocol::describe::DescriptionState {}
@@ -1498,6 +1500,8 @@ mod tests {
         assert_closed::<kr_protocol::error::RetryCategory>();
         assert_closed::<kr_protocol::identity::ProcessStartSource>();
         assert_closed::<kr_protocol::privacy::PrivacyDisabled>();
+        assert_closed::<kr_protocol::desktop::CapabilityChecksState>();
+        assert_closed::<kr_protocol::desktop::CapabilityChecksFailure>();
         assert_closed::<kr_protocol::describe::DescriptionDownload>();
         assert_closed::<kr_protocol::describe::DescriptionPause>();
         assert_closed::<kr_protocol::describe::DescriptionState>();

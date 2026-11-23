@@ -301,8 +301,9 @@ the answer says so. Only one run may happen at a time.
 
 The worker will read the owner's nominated file in each context. The setup page nominates it through
 the platform's own file dialog: the application keeps the chosen path, sends it with the next
-request and no other, and tells the page only the file's name. With no file nominated, the read
-check reads nothing and says so. The worker takes an image of the screen,
+request and no other, and tells the page only the file's name. `kr host desktop-checks --file`
+nominates a file too, by a path the person types, and runs the checks from the command line. With no
+file nominated, the read check reads nothing and says so. The worker takes an image of the screen,
 reads the accessibility tree and starts an application only on macOS, and only where the platform
 doesn't refuse the capability. The platform refuses in a container, in contexts without a graphical
 login, when the desktop is locked and when it has ended. The worker will never perform synthetic
