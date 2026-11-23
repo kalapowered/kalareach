@@ -267,13 +267,17 @@ the later of the change and its own start, and counts what that keeps out as "pr
 privacy mode last changed or this daemon last started, whichever is later". The moment is read
 inside the record's transaction, after every wait the change has, and published as it was stored.
 It is never before the moment the change was asked for, which `kr privacy status` shows, and a
-wait for a reader or for the store can put it later. Two windows follow from where it is read. The
-commit window lies between the moment and the publication of the change: a decision made in it, and
-the history a worker of an earlier release records through privacy mode in it, are stamped after
-the moment and are carried. The crash window opens when a daemon stops after the record has
-committed and before the change was published: the stored moment stays in force while the daemon is
-down, the workers are told of nothing and stay private, and what they decide in that time is
-carried after the restart. A report a hook made over a connection admitted in privacy mode, or before
+wait for a reader or for the store can put it later. The daemon carries what is stamped after the
+moment and withholds what is stamped at it or before it, so an item stamped in the same
+millisecond as the moment is withheld with the rest. Two windows follow from where the moment is
+read. The commit window lies between the moment and the publication of the change: a decision
+made in it, and the history a worker of an earlier release records through privacy mode in it,
+can be stamped after the moment, and are carried when they are. The crash window opens when a
+daemon stops after the record has committed and before the change was published: the stored moment
+stays in force while the daemon is down, the workers are told of nothing and stay private, and what
+they decide in that time is carried after the restart, unless it is stamped in the millisecond of
+the moment. The moment is the daemon's wall clock: after a step of the clock back it can be the
+moment the change was asked for, which withholds what is stamped before the clock reaches it. A report a hook made over a connection admitted in privacy mode, or before
 privacy mode last changed, is not kept by the worker; a hook that started in privacy mode and
 connected after it ended is kept, because the platform's record of when a hook started is on a
 clock that has no reading of now to compare it with. If the privacy mode is turned on whilst the

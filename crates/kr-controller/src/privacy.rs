@@ -179,17 +179,21 @@ pub struct Published {
     /// reader of the state it replaces produced is at or before it. It is read with the state and
     /// in the same step. Nought for a host that has never changed it.
     ///
-    /// What is produced after it is carried, and two windows put what was produced under privacy
-    /// mode there. In the commit window, between the moment being read and the change being
-    /// published, a decision that is made, and the history a worker of an earlier release records
-    /// through privacy mode, are stamped after it. In the crash window, a daemon stops after the
-    /// record committed and before the change was published: the stored moment stays in force for
-    /// the whole time it is down, the workers are told of nothing and stay private, and what they
-    /// decide in that time is stamped after it and is carried when the daemon starts again. Both
-    /// are after the change, by the rule that the record comes first. A worker also learns of a
-    /// change a little after the daemon does, and what it produces in between is stamped after it
-    /// and is carried. It is the wall clock's, so a step of the clock back across it can put an
-    /// earlier stamp after it.
+    /// What is stamped after it is carried, and what is stamped at it or before it is not: an item
+    /// stamped in the same millisecond as the moment (`produced_at_ms == since_ms`) is withheld
+    /// with the rest. Two windows put what was produced under privacy mode after the moment, so
+    /// that it is carried when its stamp is later. In the commit window, between the moment being
+    /// read and the change being published, a decision that is made, and the history a worker of
+    /// an earlier release records through privacy mode, can be stamped after it. In the crash
+    /// window, a daemon stops after the record committed and before the change was published: the
+    /// stored moment stays in force for the whole time it is down, the workers are told of nothing
+    /// and stay private, and what they decide in that time is carried when the daemon starts
+    /// again, unless it is stamped in the millisecond of the moment. Both are after the change, by
+    /// the rule that the record comes first. A worker also learns of a change a little after the
+    /// daemon does, and what it produces in between is carried when its stamp is later than the
+    /// moment. The moment is the wall clock's, so a step of the clock back can put an earlier
+    /// stamp after it, and it can leave the stored moment at the asked one, which withholds what
+    /// is stamped before the clock reaches it.
     ///
     /// A state restored when the daemon starts carries the moment the record stored for the
     /// change in force, and [`Self::since_source`] says so, when the record holds one that is
@@ -3903,7 +3907,8 @@ mod tests {
     /// KR-REQ-24.27: a disabling that is refused, or whose store refuses the write, leaves the row
     /// it found: privacy mode on at its generation, nothing published and nothing left raised. One
     /// that stops after the record committed and before it published leaves the new row whole, and
-    /// the next start serves privacy mode off at the new generation, from its own start.
+    /// the next start serves privacy mode off at the new generation, from the moment that row took
+    /// effect.
     #[test]
     fn a_disabling_that_is_refused_or_stopped_leaves_one_whole_row() {
         let mut host = Host::open();
