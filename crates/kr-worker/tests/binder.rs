@@ -1191,6 +1191,75 @@ fn kr_req_11_24_a_grant_change_the_store_cannot_record_is_owed_and_never_widens_
         .expect("the confirmed grant is in force once recorded");
 }
 
+/// KR-REQ-12.25: an approval a channel relays while the gateway is fenced is recorded and sent on,
+/// and cannot be read into something a person answers then. When rich work returns it is read, so
+/// the request is not left in the terminal for good.
+#[test]
+fn kr_req_12_25_an_approval_relayed_during_the_fence_is_read_when_rich_work_returns() {
+    let mut worker = Worker::open();
+    let source = worker.claude_code();
+    let first = worker.admit(1, vec![testing::admitted(&source)]);
+    worker
+        .broker
+        .register_instance(
+            instance(2),
+            IntegrationMode::NativeBridge,
+            None,
+            Some(managed(2)),
+        )
+        .expect("the launched instance is registered");
+    worker
+        .bind(1, 2, source.package_digest, first)
+        .expect("binds");
+    let connector = worker
+        .sources
+        .for_command(fixture::COMMAND)
+        .expect("the admitted connector");
+
+    worker
+        .broker
+        .refuse_ledger_writes(true)
+        .expect("the store is put in query-only mode");
+    let (_connection, relayed) = relay_approval(&worker.broker, &connector);
+    assert_eq!(
+        worker.broker.mode(),
+        kr_protocol::gateway::GatewayMode::NativeOnlyVolatile,
+        "the failed write raised the fence"
+    );
+    // The channel's reader asks for the request's meaning as it arrives, and is refused.
+    let refused = worker
+        .broker
+        .interpret_request(relayed.resource_id, kr_ipc::now_ms())
+        .expect_err("rich work is fenced");
+    assert!(
+        matches!(refused, BrokerError::RichWorkFenced { .. }),
+        "{refused}"
+    );
+    assert!(
+        worker
+            .broker
+            .decoding(relayed.resource_id)
+            .expect("the ledger reads")
+            .is_none(),
+        "nothing has read it"
+    );
+
+    recover(&mut worker);
+    assert_eq!(
+        worker.broker.mode(),
+        kr_protocol::gateway::GatewayMode::Normal,
+        "the recovery finished"
+    );
+    assert!(
+        worker
+            .broker
+            .decoding(relayed.resource_id)
+            .expect("the ledger reads")
+            .is_some(),
+        "the request is read once rich work is back"
+    );
+}
+
 /// KR-REQ-11.13: a binding stays on its hash across an upgrade, reporting the release it holds;
 /// a new binding takes the new hash, and the old one is not admitted for new bindings any more.
 #[test]

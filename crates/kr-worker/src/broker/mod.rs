@@ -3617,11 +3617,32 @@ impl Broker {
             .promptly(|state| Ok(state.reconcile_owed_in(now)))
             .ok()
             .flatten();
+        // A request a channel relayed while rich work was fenced was recorded and sent on, and could
+        // not be read into an approval a person answers: the reader that asked was refused and does
+        // not ask again. Rich work is back, so each request that nothing has read is read now.
+        let unread: Vec<PendingResourceId> = if finished.is_some() {
+            state
+                .arbitration
+                .iter()
+                .filter(|pending| {
+                    pending.resource.kind == kr_protocol::gateway::PendingKind::ReverseRpc
+                        && pending.resource.state == PendingState::Pending
+                        && !pending.resource.interpretation_verified
+                })
+                .map(|pending| pending.resource.resource_id)
+                .collect()
+        } else {
+            Vec::new()
+        };
         drop(state);
         // The recovery's end brought every binding to the admissions held, which can queue a
         // notice for the session's journal.
         if finished.is_some() {
             self.notices_ready.notify_one();
+        }
+        for resource_id in unread {
+            // A request no binding may decode stays recorded and unanswerable here.
+            let _ = self.interpret_request(resource_id, now);
         }
         finished
     }
