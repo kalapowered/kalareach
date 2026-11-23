@@ -543,6 +543,33 @@ describe("the phone's composer on a window too short for the whole composer (KR-
     }
   }
 
+  it('puts the three actions in a row above the line that holds the field and Send', async () => {
+    const person = userEvent.setup()
+    const end = sessionOf({ height: 20 * 16 })
+    try {
+      await open()
+      await waitFor(() => {
+        expect(document.querySelector('.m-session')).toHaveAttribute('data-composer', 'line')
+      })
+      await person.type(screen.getByLabelText('Message this session'), 'use the other file')
+
+      const row = document.querySelector('.m-composer-more')
+      const line = document.querySelector('.m-composer-line')
+      expect(row).not.toBeNull()
+      expect(
+        [...(row?.querySelectorAll('button') ?? [])].map((each) => each.getAttribute('data-testid'))
+      ).toEqual(['composer-interrupt', 'composer-steer', 'composer-queue'])
+      expect([...(line?.children ?? [])].map((each) => (each.tagName === 'TEXTAREA' ? 'field' : each.textContent))).toEqual([
+        'field',
+        'Send'
+      ])
+      // The row comes first, so it is also what the keyboard reaches first.
+      expect(row?.compareDocumentPosition(line as Node)).toBe(Node.DOCUMENT_POSITION_FOLLOWING)
+    } finally {
+      end()
+    }
+  })
+
   it('keeps the focus on an action when the window changes between the two forms', async () => {
     const person = userEvent.setup()
     const size = { height: 40 * 16 }
@@ -577,3 +604,80 @@ describe("the phone's composer on a window too short for the whole composer (KR-
     }
   })
 })
+
+describe("the phone's Interrupt, in the cases that hold its rules (KR-REQ-13.12)", () => {
+  it('names the conversation as it is now, not the one the draft was written for', async () => {
+    const person = userEvent.setup()
+    const interrupted: { turn: string; revision: string }[] = []
+    const host = await open((port) => ({
+      ...port,
+      composerInterrupt: (params, opening) => {
+        interrupted.push({ turn: params.turn_id, revision: params.target.binding_revision })
+        return port.composerInterrupt(params, opening)
+      }
+    }))
+    await person.type(screen.getByLabelText('Message this session'), 'Keep the timer')
+
+    // The agent moves to another conversation and begins a turn there; the view reads it again.
+    host.controls.records.moveBinding(SESSION_MAIN)
+    host.controls.records.startTurn(SESSION_MAIN)
+    act(() => {
+      host.controls.setConnected(true)
+    })
+    expect(await screen.findByText(/The conversation changed since this was written/)).toBeInTheDocument()
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'Interrupt the current turn' })).toBeEnabled()
+    })
+
+    await person.click(screen.getByRole('button', { name: 'Interrupt the current turn' }))
+
+    await waitFor(() => {
+      expect(interrupted).toHaveLength(1)
+    })
+    // The draft was written for revision 4; the conversation is at 5, and so is the interrupt.
+    expect(interrupted[0]).toEqual({ turn: 'turn-10', revision: '5' })
+    expect(screen.getByLabelText('Message this session')).toHaveValue('Keep the timer')
+  })
+
+  it('can be sent again once the first has ended', async () => {
+    const person = userEvent.setup()
+    const answers: (() => void)[] = []
+    let calls = 0
+    await open((port) => ({
+      ...port,
+      composerInterrupt: () => {
+        calls += 1
+        return new Promise((resolve) => {
+          answers.push(() => {
+            resolve({
+              receipt: null,
+              value: {
+                binding_revision: '4',
+                provenance: 'upstream_typed_rpc',
+                upstream_request_id: `"req-${calls}"`,
+                turn_id: 'turn-9'
+              },
+              action_id: null
+            })
+          })
+        })
+      }
+    }))
+    const interrupt = await screen.findByRole('button', { name: 'Interrupt the current turn' })
+
+    await person.click(interrupt)
+    await person.click(interrupt)
+    expect(calls).toBe(1)
+    act(() => {
+      answers[0]?.()
+    })
+    await screen.findByText('Applied')
+
+    await person.click(interrupt)
+    expect(calls).toBe(2)
+    act(() => {
+      answers[1]?.()
+    })
+  })
+})
+

@@ -13,6 +13,7 @@ import type { ActionRight } from '@kalareach/protocol'
 
 import { AppProvider } from '../../src/app/state'
 import { fakeHost, type FakeHostControls } from '../../src/host/fake'
+import { receivedFailure } from '../../src/host/tauri'
 import { MobileApp } from '../../src/mobile/MobileApp'
 import { HANDED_FILE_LIMIT } from '../../src/mobile/model/media'
 import * as words from '../../src/model/transfer-words'
@@ -38,7 +39,7 @@ if (typeof File.prototype.arrayBuffer !== 'function') {
   }
 }
 
-async function open(rights: readonly ActionRight[] = RIGHTS): Promise<{ controls: FakeHostControls; person: ReturnType<typeof userEvent.setup> }> {
+async function open(rights: readonly ActionRight[] = RIGHTS): Promise<{ controls: FakeHostControls; person: ReturnType<typeof userEvent.setup>; port: ReturnType<typeof fakeHost>['port'] }> {
   const { port, controls } = fakeHost()
   controls.reachAsPhone({ rights })
   render(
@@ -50,7 +51,7 @@ async function open(rights: readonly ActionRight[] = RIGHTS): Promise<{ controls
   await person.click(await screen.findByRole('button', { name: /^Sessions/ }))
   await person.click(await screen.findByRole('button', { name: /Session 1/ }))
   await screen.findByRole('group', { name: 'Add an attachment' })
-  return { controls, person }
+  return { controls, person, port }
 }
 
 function filesInput(): HTMLInputElement {
@@ -704,5 +705,72 @@ describe('the phone steering the running turn on a paired host (KR-REQ-13.12)', 
     expect(screen.getByRole('button', { name: 'Steer' })).toHaveAccessibleDescription(
       /A steer carries text only/
     )
+  })
+})
+
+describe('the phone queueing a prompt with files on a paired host (KR-REQ-13.12)', () => {
+  /** Binds one file to the draft and writes the text a prompt would carry. */
+  async function withFileAndText(): Promise<Awaited<ReturnType<typeof open>>> {
+    const opened = await open()
+    await pick(opened.person)
+    const key = await started(opened.controls)
+    act(() => {
+      opened.controls.pairedUploads.finish(key)
+    })
+    await waitFor(() => {
+      expect(line()).toBe('Added to this draft')
+    })
+    await opened.person.type(screen.getByRole('textbox', { name: 'Message this session' }), 'then read the file')
+    return opened
+  }
+
+  it('names the draft the application keeps, with no text of its own, and the files go with it', async () => {
+    const { controls, person, port } = await withFileAndText()
+    const queued = vi.spyOn(port, 'composerQueue')
+
+    await person.click(screen.getByRole('button', { name: 'Queue' }))
+
+    await waitFor(() => {
+      expect(controls.queuedParams).toHaveLength(1)
+    })
+    // The text is set on the draft first; the queued prompt names that draft and carries no text.
+    expect(controls.pairedUploads.texts).toEqual([{ sessionId: SESSION, text: 'then read the file' }])
+    expect(controls.queuedParams[0]).toMatchObject({ text: null })
+    expect(controls.queuedParams[0]?.draft_id).toEqual(expect.any(String))
+    expect(controls.promptParams).toHaveLength(0)
+    // It is made under the opening of the session, so the host knows which one it is made under.
+    expect(queued.mock.calls[0]?.[1]).toEqual(expect.any(String))
+    // The host took it as applied: the files are the session's now, and the composer is clear.
+    await waitFor(() => {
+      expect(screen.queryByTestId('m-upload')).toBeNull()
+    })
+    expect(controls.pairedUploads.textOf(SESSION)).toBeNull()
+    expect(screen.getByRole('textbox', { name: 'Message this session' })).toHaveValue('')
+  })
+
+  it('leaves the files bound to the draft and the text where it is when the host refuses it', async () => {
+    const { controls, person, port } = await withFileAndText()
+    vi.spyOn(port, 'composerQueue').mockRejectedValue(
+      receivedFailure({ code: 'DRAFT_CONFLICT', message: 'The conversation moved on.', user_action: 'none', retry: 'no_retry' })
+    )
+
+    await person.click(screen.getByRole('button', { name: 'Queue' }))
+
+    expect(await screen.findByText('Refused by the host')).toBeInTheDocument()
+    expect(screen.getByRole('textbox', { name: 'Message this session' })).toHaveValue('then read the file')
+    expect(screen.getAllByTestId('m-upload')).toHaveLength(1)
+    expect(controls.pairedUploads.ended).toEqual([])
+  })
+
+  it('leaves the files bound to the draft when nobody knows what became of it', async () => {
+    const { controls, person } = await withFileAndText()
+    controls.leaveNextSendUnconfirmed()
+
+    await person.click(screen.getByRole('button', { name: 'Queue' }))
+
+    expect(await screen.findByText('Outcome unknown')).toBeInTheDocument()
+    // The application still holds the draft with its text, and the file is still bound to it.
+    expect(screen.getAllByTestId('m-upload')).toHaveLength(1)
+    expect(controls.pairedUploads.ended).toEqual([])
   })
 })

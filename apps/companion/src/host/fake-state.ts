@@ -1542,6 +1542,14 @@ export class ScriptedRecords {
     }
   }
 
+  /** Starts a turn on a session's agent that is running none, as a prompt it took does. */
+  startTurn(sessionId: string): void {
+    const agent = this.#agentOf(sessionId)
+    if (agent.binding.turn_id !== null) return
+    agent.turns += 1
+    agent.binding = { ...agent.binding, turn_id: `turn-${agent.turns}` }
+  }
+
   /** Ends the running turn of a session's agent. */
   endTurn(sessionId: string): void {
     const agent = this.#agentOf(sessionId)

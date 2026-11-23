@@ -798,6 +798,8 @@ export interface FakeHostControls {
   readonly pairedUploads: FakeUploads
   /** The prompts the interface sent, in order, as it sent them. */
   readonly promptParams: readonly AgentPromptParams[]
+  /** The prompts the interface queued behind a turn, in order, as it queued them. */
+  readonly queuedParams: readonly AgentPromptParams[]
   /** The drafts the host holds for files, and what the interface bound to them. */
   readonly hostDrafts: FakeHostDrafts
   /** The action identifiers this host has issued, in order. */
@@ -1774,6 +1776,7 @@ export function fakeHost(
     others: namedHost === undefined ? otherHosts : otherHosts.filter((each) => listedAsOther(each.reference))
   })
   const promptParams: AgentPromptParams[] = []
+  const queuedParams: AgentPromptParams[] = []
   const pairedUploads = new FakeUploads(
     (file) => {
       const name = file.name.split(/[\\/]/).pop()?.trim() || 'attachment'
@@ -2486,7 +2489,15 @@ export function fakeHost(
       requireConnection()
       checkOpening('composerQueue', params.target.subject.session_id, opening)
       submissions += 1
-      return answeredWhenReleased(records.prompt(params, true))
+      queuedParams.push(params)
+      const answer = records.prompt(params, true)
+      // A queued prompt that names the draft a paired device keeps takes it as a sent one does.
+      if (pairedDevice && params.draft_id !== null) pairedUploads.sent(params.target.subject.session_id)
+      if (nextSendUnconfirmed) {
+        nextSendUnconfirmed = false
+        return answeredWhenReleased({ ...answer, receipt: null, value: null })
+      }
+      return answeredWhenReleased(answer)
     },
     composerSteer: (params, opening) => {
       requireConnection()
@@ -4255,6 +4266,7 @@ export function fakeHost(
     uploaded,
     pairedUploads,
     promptParams,
+    queuedParams,
     hostDrafts: hostDrafts.controls,
     actions: issuedActions,
     grantPermission(capability) {
