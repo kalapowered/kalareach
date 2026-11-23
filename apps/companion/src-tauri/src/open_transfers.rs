@@ -921,11 +921,12 @@ impl Registry {
         }
     }
 
-    /// Ends the admission of `live`, whose send ended before its start was decided: only its own
-    /// upload, still admitted, and its own copy go, in one section under the gate. A cleanup may
-    /// have stopped the upload and let the key be used again, and then neither the upload nor the
-    /// copy is this send's to remove. An upload that a start has moved to `Sending` is held until
-    /// its sender ends it: its copy is what a resume reads, so it stays. A panic between the
+    /// Ends the admission of `live`, whose send ended before its start was decided or whose start
+    /// was refused: only its own upload, still admitted, and its own copy go, in one section under
+    /// the gate. A cleanup may have stopped the upload and let the key be used again, and then
+    /// neither the upload nor the copy is this send's to remove. An upload that a start has moved
+    /// to `Sending`, the send's own or a cleanup's resolution, is held until its sender ends it:
+    /// its copy is what a resume reads, so it stays. A panic between the
     /// start's change of the phase and the task it makes leaves the upload held with no sender,
     /// and nothing here ends that. An upload that no start moved loses the copy in any phase, and
     /// leaves the desk here only while it is `Admitted`. A cleanup that stopped it holds it
@@ -1488,10 +1489,12 @@ impl Desk {
                 .or_default()
                 .observe(Connection::of(paired));
             let started = self.start_under(&mut registry, live, Connection::of(paired), false);
-            // A refused send leaves the copy that is another upload's: a cleanup may have ended
-            // this upload and let the key be used again.
+            // A refused send ends its admission like one that failed before its start: a cleanup may
+            // have ended this upload and let the key be used again, and then the copy is another
+            // upload's and stays. An upload that a start moved to `Sending` meanwhile keeps its
+            // copy, and one that a cleanup still holds loses it and is ended, never started.
             if !started {
-                registry.remove_copy_of(store, live);
+                registry.drop_admitted(store, live);
             }
             started
         };

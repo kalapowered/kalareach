@@ -4898,6 +4898,145 @@ async fn kr_req_13_12_a_reach_does_not_start_a_paused_upload_whose_copy_was_remo
     adopted.stop().await;
 }
 
+/// KR-REQ-13.12 (FU15): a cleanup whose work panicked does not start a never-started upload whose
+/// copy a refused start removed. The send has placed its copy and waits before its start; the
+/// cleanup stops the upload and its work panics, so the upload is held `Stopping`; the send's start
+/// is refused for that and the send removes its copy. The cleanup's resolution then ends the upload:
+/// a start would send from memory and write a journal entry that names a copy that is gone, which a
+/// later process cannot resume.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_13_12_a_cleanup_that_panicked_does_not_start_an_upload_whose_refused_send_removed_the_copy()
+ {
+    use testing::{Awaited, Fault, Point};
+
+    let adopted = Adopted::start(1).await;
+    let (phone, _control) = phone_for(&adopted).await;
+    let desk = desk_of(&phone.companion);
+    let paired = paired_of(&phone.companion).await;
+    let key = kr_ipc::new_uuid();
+    let bytes = vec![5_u8; 16];
+    let gate = desk.hold_after_copy_for_test();
+    let after = testing::hold_at(key, Point::AfterCopy);
+    let tail = testing::hold_awaited(key, Awaited::BeforeTail);
+    let sender = testing::hold_at(key, Point::SenderStarting);
+    let _panics = testing::arm(key, Fault::PanicInWork);
+    let send = {
+        let sent = request(&adopted, &bytes, Arc::new(Held::new(bytes.clone())), key);
+        let (desk, paired) = (Arc::clone(&desk), paired.clone());
+        tokio::spawn(async move { desk.send(paired, sent).await })
+    };
+    after.until_passed(1).await;
+    assert_eq!(
+        testing::read_copy(&folder(&phone), key),
+        Some(bytes.clone()),
+        "the send placed its copy"
+    );
+    // The cleanup has stopped the upload, its work has panicked before it ended it, and its
+    // resolution has not run.
+    desk.forgotten(paired.device_id);
+    tail.until_arrived(1).await;
+    assert_eq!(
+        desk.phase_for_test(key),
+        Some("stopping"),
+        "the cleanup holds the upload"
+    );
+    gate.add_permits(1);
+    let answered = tokio::time::timeout(WATCHDOG, send)
+        .await
+        .expect("the send answers")
+        .expect("the task ran");
+    assert!(answered.is_err(), "the start of the send was refused");
+    assert_eq!(
+        testing::read_copy(&folder(&phone), key),
+        None,
+        "the refused send removed the copy it placed"
+    );
+    assert_eq!(
+        desk.phase_for_test(key),
+        Some("stopping"),
+        "the send left the upload to the cleanup that holds it"
+    );
+    tail.release();
+    settled(&desk).await;
+    desk.sends_idle().await;
+    assert_ne!(
+        desk.phase_for_test(key),
+        Some("sending"),
+        "no start took an upload whose copy was removed"
+    );
+    assert!(
+        desk.generation_for_test(key).is_none(),
+        "the cleanup's resolution ended the upload"
+    );
+    assert_eq!(sender.passed(), 0, "no sender reached its first line");
+    assert_eq!(
+        entries_in(&folder(&phone)),
+        0,
+        "no journal entry names the copy that was removed"
+    );
+    assert_eq!(
+        testing::read_copy(&folder(&phone), key),
+        None,
+        "no copy is left for the upload"
+    );
+    adopted.stop().await;
+}
+
+/// KR-REQ-13.12 (FU16): a send whose start is refused because a cleanup's resolution has started
+/// its upload meanwhile leaves the copy that upload sends from. The cleanup's work panicked, its
+/// resolution started the upload while the send waited before its own start, and the sender is held
+/// at its first line, before its first journal entry names the copy.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_13_12_a_refused_send_leaves_the_copy_of_an_upload_that_a_cleanup_started() {
+    use testing::{Awaited, Fault, Point};
+
+    let adopted = Adopted::start(1).await;
+    let (phone, _control) = phone_for(&adopted).await;
+    let desk = desk_of(&phone.companion);
+    let paired = paired_of(&phone.companion).await;
+    let key = kr_ipc::new_uuid();
+    let bytes = vec![5_u8; 16];
+    let gate = desk.hold_after_copy_for_test();
+    let after = testing::hold_at(key, Point::AfterCopy);
+    let tail = testing::hold_awaited(key, Awaited::BeforeTail);
+    let sender = testing::hold_at(key, Point::SenderStarting);
+    let _panics = testing::arm(key, Fault::PanicInWork);
+    let send = {
+        let sent = request(&adopted, &bytes, Arc::new(Held::new(bytes.clone())), key);
+        let (desk, paired) = (Arc::clone(&desk), paired.clone());
+        tokio::spawn(async move { desk.send(paired, sent).await })
+    };
+    after.until_passed(1).await;
+    desk.forgotten(paired.device_id);
+    tail.until_arrived(1).await;
+    tail.release();
+    sender.until_passed(1).await;
+    assert_eq!(
+        desk.phase_for_test(key),
+        Some("sending"),
+        "the cleanup's resolution started the upload"
+    );
+    gate.add_permits(1);
+    let answered = tokio::time::timeout(WATCHDOG, send)
+        .await
+        .expect("the send answers")
+        .expect("the task ran");
+    assert!(answered.is_err(), "the start of the send was refused");
+    assert_eq!(
+        testing::read_copy(&folder(&phone), key),
+        Some(bytes),
+        "the refused send left the copy of the upload that is sending"
+    );
+    sender.release();
+    until("the upload ends after its sender ran", || {
+        desk.generation_for_test(key).is_none()
+    })
+    .await;
+    settled(&desk).await;
+    desk.sends_idle().await;
+    adopted.stop().await;
+}
+
 /// KR-REQ-13.12 (FU7): a panic in the desk's task of a send leaves no upload admitted with no
 /// sender. The caller is answered, the copy is gone, and the key is free for a new send.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
