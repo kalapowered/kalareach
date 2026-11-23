@@ -355,7 +355,16 @@ signal. A closed terminal (HUP) and every other signal still reach the report on
 reaches the report outside a step's wait ends it at once, as before. The step's error is
 `stopped by signal INT` (or `TERM`), the log's last line says the same, and each later step is not
 run, with the error `not run because the run was interrupted by signal INT`; the result is written as
-for a failed run. An interactive command in the step's group that reads the
+for a failed run. A report that starts with INT ignored (for example as a background job of a
+non-interactive shell) loses that ignore on macOS and Linux from the first command of a step with a
+limit, because the report then sets its own handlers for INT and TERM. From then on it takes INT as
+described above. A signal that reaches the report while it ends the group of a step that ran out of
+its time leaves that step's error, and the last line of its log, as the time limit. Each later step
+is not run, with the error `not run because the run was interrupted by signal INT` (or `TERM`), and
+the report ends by the signal after it writes its result. A signal that the report finds only after
+a command has ended and been reaped stops the step as one that it sends on does: the step's error is
+`stopped by signal INT` and no later step runs. The report sends that signal to no process, so a
+process that the command left in its group and that holds no pipe stays. An interactive command in the step's group that reads the
 controlling terminal, for example to ask for a password, can stop the group, because the group is
 not the terminal's foreground group, and the group can stay stopped until the deadline if no signal
 resumes it. The read fails at once instead when the group is orphaned (no process of the group has a
