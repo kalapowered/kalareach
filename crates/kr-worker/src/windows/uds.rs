@@ -27,8 +27,8 @@
 //! A socket's file is a reparse point of its own kind. Every read of it and every removal of it
 //! opens it without following, and acts on what the open handle is: a path that names something
 //! else by then is left alone. A bind learns which file is its own by connecting to the path and
-//! finding the connection in its own queue, and only a file so proved is protected or removed by
-//! the bind.
+//! finding that very connection in its own queue, the kernel naming this process as its maker, and
+//! only a file so proved is protected or removed by the bind.
 
 #![expect(
     unsafe_code,
@@ -407,8 +407,9 @@ impl Listener {
 
 /// Shows that the open file at `path` is the socket `listener` bound, and returns its identity.
 ///
-/// The file must be a socket's file, a connection to the path must reach `listener`'s own queue, and
-/// the path must still name the file's object afterwards. A path that names a file, or another
+/// The file must be a socket's file, a connection to the path made here must reach `listener`'s own
+/// queue, as the kernel's naming of the connection's maker shows, and the path must still name the
+/// file's object afterwards. A path that names a file, or another
 /// socket, or that was swapped again meanwhile, is none of those and is refused.
 fn prove_it_is_the_bound_socket(
     listener: &uds_windows::UnixListener,
@@ -423,9 +424,26 @@ fn prove_it_is_the_bound_socket(
     let made = file::object_of(file).map_err(|error| error.to_string())?;
     let _client = connect_uninheritable(path)
         .map_err(|error| format!("it could not be connected to: {error}"))?;
-    let _accepted = accept_within_the_wait(listener).map_err(|error| {
+    let accepted = accept_within_the_wait(listener).map_err(|error| {
         format!("a connection to it did not reach the listener that bound it: {error}")
     })?;
+    // The connection this listener takes first is not necessarily the one made above: another
+    // process may have queued one before it replaced the path. The kernel names who made it, and
+    // only this process's own connection proves the path led here.
+    match peer_process_of(&accepted) {
+        Ok(pid) if pid == std::process::id() => {}
+        Ok(pid) => {
+            return Err(format!(
+                "the connection this listener accepted came from process {pid} and not from this \
+                 one, so it does not show that the path leads to this socket"
+            ));
+        }
+        Err(error) => {
+            return Err(format!(
+                "the process that made the accepted connection could not be named: {error}"
+            ));
+        }
+    }
     if socket_object(path) != Some(made) {
         return Err("the path names another object than the one that was opened".to_owned());
     }
@@ -840,12 +858,26 @@ mod tests {
     /// The variable that tells the process a case starts which socket to connect to.
     const CONNECT_VARIABLE: &str = "KR_UDS_CASE_CONNECT";
 
-    /// What the process an ended-peer case starts runs, and only when that case names a socket: it
-    /// connects, and ends with the test program.
+    /// The variable that makes that process say it connected and wait to be ended, where it would
+    /// end.
+    const HOLD_VARIABLE: &str = "KR_UDS_CASE_HOLD";
+
+    /// What the line the waiting process prints to say it connected holds.
+    const CONNECTED_MARKER: &str = "KR-UDS-CASE-CONNECTED";
+
+    /// What the process a case starts runs, and only when that case names a socket: it connects,
+    /// and ends with the test program, or, where told to hold, says it connected and waits for its
+    /// input to close.
     #[test]
     fn a_process_that_connects_to_the_socket_it_is_told_and_ends() {
         if let Some(path) = std::env::var_os(CONNECT_VARIABLE) {
             let _stream = uds_windows::UnixStream::connect(Path::new(&path)).expect("it connects");
+            if std::env::var_os(HOLD_VARIABLE).is_some() {
+                let mut out = std::io::stdout();
+                writeln!(out, "{CONNECTED_MARKER}").expect("it says so");
+                out.flush().expect("it says so");
+                let _ = std::io::stdin().read_to_end(&mut Vec::new());
+            }
         }
     }
 
@@ -1044,6 +1076,66 @@ mod tests {
             check_access_list(&path, true).is_err(),
             "the other program's socket kept the list it was made with"
         );
+        drop(other);
+    }
+
+    /// KR-REQ-12.07: a connection that another process queued before the path was replaced does not
+    /// prove the replacement is the socket this bind made. The process connects to the new socket
+    /// and waits, the file is removed and another socket bound at the path, and the bind's own
+    /// connection goes to the other socket while its listener accepts the first one: the kernel
+    /// names a process that is not this one, and the bind leaves the other socket as it found it.
+    #[test]
+    fn a_connection_queued_before_the_path_was_replaced_does_not_prove_the_replacement() {
+        use std::io::BufRead as _;
+        let directory = Directory::new();
+        let path = directory.0.join("p.sock");
+        let kept = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let keeps = std::rc::Rc::clone(&kept);
+        after_the_bind(move |path| {
+            let mut peer = std::process::Command::new(
+                std::env::current_exe().expect("this program"),
+            )
+            .args([
+                "--exact",
+                "windows::uds::tests::a_process_that_connects_to_the_socket_it_is_told_and_ends",
+                "--nocapture",
+            ])
+            .env(CONNECT_VARIABLE, path)
+            .env(HOLD_VARIABLE, "1")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("the process starts");
+            let mut lines = std::io::BufReader::new(peer.stdout.take().expect("its output"));
+            let mut line = String::new();
+            loop {
+                line.clear();
+                let read = lines.read_line(&mut line).expect("its output is read");
+                assert!(read > 0, "the process ended before it connected");
+                if line.contains(CONNECTED_MARKER) {
+                    break;
+                }
+            }
+            std::fs::remove_file(path).expect("the socket's file is taken away");
+            let other = uds_windows::UnixListener::bind(path).expect("another socket binds");
+            *keeps.borrow_mut() = Some((peer, other, lines));
+        });
+        let bound = Listener::bind(&path);
+        let (mut peer, other, _lines) = kept.borrow_mut().take().expect("the hook ran");
+        match bound {
+            Err(BindFailure::Unprotected(detail)) => {
+                assert!(detail.contains("left as it is"), "{detail}");
+            }
+            other => panic!("a refusal that leaves the path, not {other:?}"),
+        }
+        assert!(socket_object(&path).is_some(), "the other socket stands");
+        assert!(
+            check_access_list(&path, true).is_err(),
+            "the other socket kept the list it was made with"
+        );
+        peer.kill().expect("the process is ended");
+        let _ = peer.wait();
         drop(other);
     }
 
