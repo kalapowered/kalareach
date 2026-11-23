@@ -2789,3 +2789,11 @@ target = '--test proxy_login_daemon'
 [ignored_run.runs]
 kind = 'by_hand'
 why = 'they run only against two squid proxies, one that asks for a Basic login and one that offers Digest only, which `scripts/real-proxy.sh start <run folder> basic` and `... digest` start and name in the `env.sh` of each run folder, and no step of this repository installs squid or starts that script: a person starts both proxies, sources both `env.sh` files and runs the target with `--ignored`'
+
+[[ignored_run]]
+package = 'kr-controller'
+target = '--test desktop_file_access'
+cases = ['the_read_check_of_a_running_host_names_what_the_platform_decided']
+[ignored_run.runs]
+kind = 'by_hand'
+why = 'it asks a host that is already running on a Mac for the read check on a file in a place the platform guards, and the platform then asks the person at the machine whether to allow it, so a person has to be there to answer, and no step of this repository is'
