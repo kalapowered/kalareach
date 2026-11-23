@@ -2272,6 +2272,39 @@ async fn kr_req_12_06_a_transport_that_cannot_carry_an_answer_gives_the_resource
     assert_eq!(upstream.submitted().len(), 1);
 }
 
+/// KR-REQ-12.25: the fence does not take away a reason an instance holds for itself, such as a
+/// request its connector's table does not classify. The binding keeps that reason while the
+/// gateway is fenced and while it recovers, and the fence's own words are for instances that have
+/// none.
+#[test]
+fn kr_req_12_25_a_fenced_binding_keeps_the_reason_the_instance_holds_for_itself() {
+    const OWN: &str = "thread/x is not a request this connector classifies";
+    let mut store = common::SharedStore::open();
+    let upstream = std::sync::Arc::new(RecordingUpstream::default());
+    let broker = agent_broker_sharing(upstream, store.health());
+    broker
+        .suspend_rich_mutations(instance(), OWN)
+        .expect("the instance is suspended for its own reason");
+
+    store.fault_acceptance();
+    let fenced = broker
+        .binding_state(instance())
+        .expect("the binding is read");
+    assert!(fenced.rich_mutations_suspended);
+    assert_eq!(fenced.suspension_reason.0.as_deref(), Some(OWN));
+
+    store.recover_journal(4);
+    broker
+        .recover(TimestampMs::new(4))
+        .expect("the gap is committed");
+    assert_eq!(broker.mode(), kr_protocol::gateway::GatewayMode::Recovering);
+    let recovering = broker
+        .binding_state(instance())
+        .expect("the binding is read");
+    assert!(recovering.rich_mutations_suspended);
+    assert_eq!(recovering.suspension_reason.0.as_deref(), Some(OWN));
+}
+
 /// KR-REQ-11.35 and KR-REQ-11.28: a plan that arrives while rich work is fenced is refused, and
 /// nothing carries it.
 ///
