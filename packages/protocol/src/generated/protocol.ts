@@ -12796,6 +12796,17 @@ export interface TestSuite {
  */
 export interface ConfigurationCeilings {
   /**
+   * The memory the description process may use and the memory the host keeps free while
+   * it runs, as section 22 lets the owner configure them.
+   *
+   * Absent leaves the defaults section 22 fixes. Present narrows them: a ceiling of 0 or
+   * above 4 GiB, and a reserve below 1 GiB, are values the host cannot honour, and the
+   * document that holds one is refused. A document that does not use the ceiling writes no
+   * member for it. A release that lacks the member refuses the document whole, which is
+   * why the document's version rose with it.
+   */
+  description_budgets?: DescriptionBudgets | null
+  /**
    * What happens to a live binding whose release its repository revokes: section 25's
    * administrator's explicit disable policy.
    *
@@ -12823,6 +12834,23 @@ export interface ConfigurationCeilings {
    * with what this machine's own resources allow, not with the default.
    */
   session_limit?: number | null
+}
+/**
+ * The description process's budgets that the owner chooses, each present only where the
+ * owner wrote one.
+ *
+ * Both are ordinary file numbers, in bytes, as `session_limit` is. A budget left out is the
+ * default section 22 fixes, and one written as `null` is left out.
+ */
+export interface DescriptionBudgets {
+  /**
+   * The most memory the description process may use, in bytes.
+   */
+  process_memory_bytes?: number | null
+  /**
+   * The memory this host keeps free while descriptions run, in bytes.
+   */
+  reserve_bytes?: number | null
 }
 /**
  * The enrolment budgets a document chooses, each present only where its owner wrote one.
