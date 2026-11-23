@@ -12,7 +12,7 @@
  */
 
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { act, render, screen, waitFor, within } from '@testing-library/react'
+import { act, cleanup, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 
 import configuration from '../src-tauri/tauri.conf.json'
@@ -1098,6 +1098,33 @@ describe('what the page says of the file the read check reads, while the applica
     expect(out.length).toBe(0)
     expect(line().textContent).toBe('')
     expect(screen.getByTestId('setup-checks-run')).toBeDisabled()
+  })
+
+  it('allows no run after a dialog answers while the page cannot be told of a change', async () => {
+    // A registration that failed, and one that has not answered: the page cannot know that what it
+    // reads stays what the application holds, so no answer it reads, a dialog's included, is believed.
+    for (const registering of [
+      () => Promise.reject(new Error('the application cannot be heard')),
+      () => new Promise<() => void>(() => undefined)
+    ]) {
+      const { held, out } = reads()
+      const controls = await sheetWith({
+        heldAuthorisedFile: held,
+        onAuthorisedFileChanged: registering
+      })
+      controls.answerFileDialog('notes.txt')
+      await userEvent.click(screen.getByTestId('setup-checks-choose'))
+      await waitFor(() => {
+        expect(out.length).toBeGreaterThan(0)
+      })
+      out.at(-1)?.answer({ name: 'notes.txt' })
+      await act(async () => {
+        await Promise.resolve()
+      })
+      expect(line().textContent).toBe('')
+      expect(screen.getByTestId('setup-checks-run')).toBeDisabled()
+      cleanup()
+    }
   })
 
   it('allows no run while the platform dialog is open', async () => {

@@ -251,7 +251,12 @@ export function Setup(): ReactNode {
   // which a screen opened again meanwhile reads where the window does not wait for the dialog: its
   // answer may replace the file. The line says nothing and no run is allowed until a read answers
   // that no dialog is open.
-  const [chosen, setChosen] = useState<string | null | undefined>(undefined)
+  const [read, setRead] = useState<string | null | undefined>(undefined)
+  // The page is registered to be told when what the application holds changes. Until it is, and
+  // after a registration that failed, no answer the page reads is believed, a dialog's included: a
+  // change could come that it would miss.
+  const [listening, setListening] = useState(false)
+  const chosen = listening ? read : undefined
   // Which read of the held file is the newest, so that an answer to an older one is dropped.
   const newestRead = useRef(0)
   // The platform's file dialog is open, and has not been answered yet.
@@ -334,8 +339,8 @@ export function Setup(): ReactNode {
       .heldAuthorisedFile()
       .then((held) => {
         if (mine !== newestRead.current) return
-        if (held.dialog_open) setChosen(undefined)
-        else setChosen(held.file === null ? null : held.file.name)
+        if (held.dialog_open) setRead(undefined)
+        else setRead(held.file === null ? null : held.file.name)
       })
       .catch((error: unknown) => {
         if (mine === newestRead.current) say(failureMessage(error), 'danger')
@@ -345,7 +350,7 @@ export function Setup(): ReactNode {
   // Asks again after the application may have changed what it holds. What the page said before is
   // not known to stand while it is asked, and not after a failure to ask, so it is cleared at once.
   const readChosen = useCallback(() => {
-    setChosen(undefined)
+    setRead(undefined)
     askChosen()
   }, [askChosen])
 
@@ -354,13 +359,22 @@ export function Setup(): ReactNode {
   // known to stand, so it asks again, and a dialog that is still open leaves nothing said. The
   // listener is registered before the first read, so that no change falls between the two: when the
   // screen opens nothing is known yet.
-  useEffect(
-    () =>
-      watch([port.onAuthorisedFileChanged(readChosen)], askChosen, (failure: unknown) => {
+  useEffect(() => {
+    const watched = watch(
+      [port.onAuthorisedFileChanged(readChosen)],
+      () => {
+        setListening(true)
+        askChosen()
+      },
+      (failure: unknown) => {
         say(failureMessage(failure), 'danger')
-      }).stop,
-    [port, readChosen, askChosen, say]
-  )
+      }
+    )
+    return () => {
+      watched.stop()
+      setListening(false)
+    }
+  }, [port, readChosen, askChosen, say])
 
   const environmentId = capabilities?.environment_id ?? null
   const watching = accepted
