@@ -42,11 +42,13 @@ pub const NAMED_COMMANDS: &[(&str, Option<Method>)] = &[
         Some(Method::EnvironmentCapabilities),
     ),
     // The disclosed checks, asked for once the interface has shown what each one does. The page
-    // names the environment and no file.
+    // names the environment and no file: the file the read check reads is the one the person chose
+    // in the platform's file dialog, which this process holds.
     (
         "environment_capabilities_check",
         Some(Method::EnvironmentCapabilitiesCheck),
     ),
+    ("choose_authorised_file", None),
     ("setup_identity", None),
     ("setup_open_settings", None),
     // Sessions.
@@ -661,6 +663,7 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'static
         environment_list,
         environment_capabilities,
         environment_capabilities_check,
+        choose_authorised_file,
         setup_identity,
         setup_open_settings,
         session_list,
@@ -1430,8 +1433,10 @@ read_command!(
 /// The checks take a screen image and start an application, so the interface asks only after it
 /// has shown what each one does. The page names the environment and nothing else: the parameters
 /// are those of `environment.capabilities`, which refuse any other field, and the file the read
-/// check reads is not the page's to name, so none is sent. The checks belong to the host on this
-/// computer, not to one this device is paired with.
+/// check reads is not the page's to name. It is the one the person chose in the platform's file
+/// dialog (`choose_authorised_file`), which this process holds and sends with this request and no
+/// other; with none chosen the host is sent none. The checks belong to the host on this computer,
+/// not to one this device is paired with.
 #[tauri::command]
 pub async fn environment_capabilities_check(
     state: State<'_, AppState>,
@@ -1440,9 +1445,17 @@ pub async fn environment_capabilities_check(
 ) -> Result<Settled> {
     not_on_a_paired_host(&state, "the disclosed checks")?;
     let asked: kr_protocol::desktop::EnvironmentCapabilitiesParams = decode(params)?;
+    let authorised_file = state
+        .take_authorised_file()
+        .map(|path| {
+            path.into_os_string().into_string().map_err(|_| {
+                CommandError::invalid("the chosen file's path is not text this host can be given")
+            })
+        })
+        .transpose()?;
     let typed = kr_protocol::desktop::EnvironmentCapabilitiesCheckParams {
         environment_id: asked.environment_id,
-        authorised_file: kr_protocol::scalars::Nullable::null(),
+        authorised_file: authorised_file.into(),
     };
     let target = subject.target(state.environment_id()?)?;
     let session = state.session()?;
@@ -1458,6 +1471,59 @@ pub async fn environment_capabilities_check(
             )
             .await,
     )
+}
+
+/// The file the person chose for the read check, as the page is told of it.
+#[derive(Clone, Debug, Serialize)]
+pub struct ChosenFile {
+    /// The file's own name, which is all the page learns of it: the path stays in this process.
+    pub name: String,
+}
+
+/// Asks the person which file the read check of the disclosed checks should read.
+///
+/// The platform's own file dialog answers. The path is kept here, in place of any file chosen
+/// before, until the one run that reads it, and the page is told only the file's name. A person
+/// who closes the dialog without choosing changes nothing.
+#[tauri::command]
+pub async fn choose_authorised_file(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<Option<ChosenFile>> {
+    use tauri_plugin_dialog::DialogExt as _;
+
+    not_on_a_paired_host(&state, "the disclosed checks")?;
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    app.dialog().file().pick_file(move |path| {
+        let _ = sender.send(path);
+    });
+    let chosen = receiver
+        .await
+        .map_err(|_| CommandError::local_failure("the file dialog did not answer"))?;
+    let Some(chosen) = chosen else {
+        return Ok(None);
+    };
+    let path = chosen
+        .into_path()
+        .map_err(|error| CommandError::invalid(format!("that file is not a path: {error}")))?;
+    let name = nominated_file_name(&path)?;
+    state.hold_authorised_file(path);
+    Ok(Some(ChosenFile { name }))
+}
+
+/// The name of a file the host can be asked to read, or why it cannot be: the protocol carries the
+/// path as text of a bounded length.
+fn nominated_file_name(path: &std::path::Path) -> Result<String> {
+    let text = path.to_str().ok_or_else(|| {
+        CommandError::invalid("that file's path is not text this host can be given")
+    })?;
+    if text.len() > kr_protocol::desktop::MAX_AUTHORISED_FILE_BYTES {
+        return Err(CommandError::invalid("that file's path is too long"));
+    }
+    path.file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .map(str::to_owned)
+        .ok_or_else(|| CommandError::invalid("that is not a file"))
 }
 
 read_command!(
@@ -4548,6 +4614,7 @@ mod tests {
         "environment_list",
         "environment_capabilities",
         "environment_capabilities_check",
+        "choose_authorised_file",
         "setup_identity",
         "setup_open_settings",
         "session_list",
@@ -4769,6 +4836,7 @@ mod tests {
             local,
             BTreeSet::from([
                 "agent_action_settle",
+                "choose_authorised_file",
                 "choose_export_destination",
                 "connection_state",
                 "connection_since",

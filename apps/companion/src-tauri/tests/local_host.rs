@@ -182,6 +182,27 @@ impl Host {
                 false,
             )
         });
+        if workers == Workers::Live {
+            // This host creates its sessions headless, whatever machine the test runs on, so the
+            // worker of a session a case creates is the one the disclosed checks are performed in.
+            let mut document = kr_protocol::hostinfo::configuration::ConfigurationDocument::empty();
+            document.revision = 1;
+            document.preferences.worker_profile = kr_protocol::scalars::Nullable::some(
+                kr_protocol::identity::WorkerProfile::HeadlessUser,
+            );
+            let path = kr_protocol::hostinfo::configuration::document_path(
+                environment.state_dir(),
+                environment.state_root(),
+                environment.environment_id(),
+            );
+            std::fs::create_dir_all(path.parent().expect("the document's directory"))
+                .expect("the state directory");
+            kr_ipc::paths::write_owner_only_file(
+                &path,
+                kr_protocol::hostinfo::configuration::contents(&document).as_bytes(),
+            )
+            .expect("the configuration document");
+        }
         let secrets = environment.secrets_dir();
         let build_id = companion_tauri::connection::build_id().expect("a build identity");
         let (supervisor, worker_program): (Box<dyn WorkerSupervisor>, PathBuf) = match workers {
@@ -1494,6 +1515,135 @@ async fn the_disclosed_checks_are_asked_for_by_environment_alone() {
         .expect("the capabilities"),
     );
     assert_eq!(shown.checks.state, CapabilityChecksState::Failed);
+}
+
+/// Asks for the disclosed checks as the page does: the environment and nothing else.
+async fn ask_for_the_checks(host: &Host) -> Result<Value, Value> {
+    host.call(
+        "environment_capabilities_check",
+        json!({ "params": { "environment_id": host.environment_id() }, "subject": {} }),
+    )
+    .await
+}
+
+/// Reads the capabilities as the page does until the disclosed checks have finished a run that
+/// began after `after`, and returns what the host then held.
+async fn capabilities_after_a_run_began_after(
+    host: &Host,
+    after: Option<kr_protocol::scalars::TimestampMs>,
+) -> kr_protocol::desktop::EnvironmentCapabilitiesResult {
+    use kr_protocol::desktop::{CapabilityChecksState, EnvironmentCapabilitiesResult};
+
+    let deadline = tokio::time::Instant::now() + WORKER_START;
+    loop {
+        let shown: EnvironmentCapabilitiesResult = typed(
+            host.call(
+                "environment_capabilities",
+                json!({ "params": { "environment_id": host.environment_id() } }),
+            )
+            .await
+            .expect("the capabilities"),
+        );
+        let began = shown.checks.started_at_ms.as_ref().copied();
+        if shown.checks.state == CapabilityChecksState::Current && began > after {
+            return shown;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no run began after {after:?} and finished: {:?}",
+            shown.checks
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+/// KR-REQ-03.29 and KR-REQ-03.02: the file the person chose in the platform's file dialog is the
+/// file the read check reads, in the worker of a real session, and one choice serves one run. The
+/// page names the environment and nothing else, as it always did; the chosen path is held in the
+/// application and travels to the host with that one request. A run asked for with no choice held
+/// reads nothing and says so, which is the host's own answer for no nominated file.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_file_chosen_in_the_dialog_is_read_by_one_run_of_the_checks() {
+    use kr_protocol::desktop::{CapabilityState, EnvironmentCapabilitiesResult, capabilities};
+
+    let host = Host::start_creating_sessions().await;
+    let work = host.tree.root().join("w");
+    std::fs::create_dir(&work).expect("a directory on the internal disk");
+    let created = host
+        .call_within(
+            "session_create",
+            creation(
+                &host,
+                "native_compat",
+                json!("/bin/sh"),
+                &work.display().to_string(),
+            ),
+            WORKER_START,
+        )
+        .await
+        .expect("the host creates the session a run of the checks needs");
+    let session_id = created["value"]["session"]["session_id"]
+        .as_str()
+        .expect("the new session's identifier")
+        .to_owned();
+
+    let chosen = host.tree.root().join("chosen.txt");
+    std::fs::write(&chosen, b"the person chose this file").expect("the file the person chose");
+    let state = host.app.state::<companion_tauri::AppState>();
+    state.hold_authorised_file(chosen.clone());
+
+    ask_for_the_checks(&host)
+        .await
+        .expect("the checks are asked for");
+    let first: EnvironmentCapabilitiesResult =
+        capabilities_after_a_run_began_after(&host, None).await;
+    let read = first
+        .desktop
+        .record(capabilities::AUTHORISED_FILE_READ)
+        .expect("the read check has a record");
+    assert_eq!(
+        read.state,
+        CapabilityState::QualifiedAvailable,
+        "the worker read the chosen file: {read:?}"
+    );
+    assert!(
+        read.disabled_reason
+            .as_ref()
+            .is_some_and(|reason| reason.as_str().contains("26 bytes")),
+        "the worker read what the chosen file held: {:?}",
+        read.disabled_reason
+    );
+    assert!(
+        state.take_authorised_file().is_none(),
+        "the run that read the file used the choice up"
+    );
+
+    // The same file is still there, and nothing is held: the next run reads nothing.
+    ask_for_the_checks(&host)
+        .await
+        .expect("the checks are asked for again");
+    let second =
+        capabilities_after_a_run_began_after(&host, first.checks.started_at_ms.as_ref().copied())
+            .await;
+    let read = second
+        .desktop
+        .record(capabilities::AUTHORISED_FILE_READ)
+        .expect("the read check has a record");
+    assert_ne!(
+        read.state,
+        CapabilityState::QualifiedAvailable,
+        "a file nobody chose this time was not read: {read:?}"
+    );
+
+    host.call(
+        "session_close",
+        json!({
+            "params": { "session_id": session_id },
+            "subject": { "sessionId": session_id, "sessionEpoch": "1" }
+        }),
+    )
+    .await
+    .expect("the host closes the session");
 }
 
 /// KR-REQ-13.11: the launch commands are read, saved, replaced and removed through the three

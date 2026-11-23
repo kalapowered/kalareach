@@ -66,6 +66,9 @@ pub struct AppState {
     retained: crate::retained::Deletions,
     paired_links: Arc<crate::standing::PairedLinks>,
     export_destinations: Mutex<Vec<std::path::PathBuf>>,
+    /// The one file the person chose in the platform's file dialog for the next run of the
+    /// disclosed checks.
+    authorised_file: Mutex<Option<std::path::PathBuf>>,
     dropped_files: Mutex<Vec<std::path::PathBuf>>,
     /// Where a suite has paused the state's own steps.
     #[cfg(feature = "testing")]
@@ -111,6 +114,7 @@ impl AppState {
             retained: crate::retained::Deletions::default(),
             paired_links: Arc::new(crate::standing::PairedLinks::default()),
             export_destinations: Mutex::new(Vec::new()),
+            authorised_file: Mutex::new(None),
             dropped_files: Mutex::new(Vec::new()),
             #[cfg(feature = "testing")]
             pauses: Arc::default(),
@@ -810,6 +814,27 @@ impl AppState {
                 "an export is written only to a destination the save dialog returned",
             )),
         }
+    }
+
+    /// Remembers the file the person chose in the platform's file dialog for the disclosed checks,
+    /// in place of any file chosen before.
+    ///
+    /// The read check reads only a file the person chose. The WebView never names a path: it asks
+    /// for a choice, the platform's own dialog answers, and the answer is kept here, out of the
+    /// page's reach, until the run that reads it.
+    pub fn hold_authorised_file(&self, path: std::path::PathBuf) {
+        *self
+            .authorised_file
+            .lock()
+            .expect("the authorised file's lock is not poisoned") = Some(path);
+    }
+
+    /// Takes the chosen file for one run, so that a choice serves one run and no more.
+    pub fn take_authorised_file(&self) -> Option<std::path::PathBuf> {
+        self.authorised_file
+            .lock()
+            .expect("the authorised file's lock is not poisoned")
+            .take()
     }
 
     /// Remembers a file the platform said was dropped on this window.
