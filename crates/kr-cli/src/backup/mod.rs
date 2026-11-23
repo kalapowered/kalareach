@@ -8,6 +8,7 @@
 //! | [`kit`] | Reading the recovery kit from a file, a pipe or the terminal, and clearing it |
 //! | [`directory`] | The folder the files go into, held open for the run |
 //! | [`source`] | The control daemon's relay as the place ciphertext is read from |
+//! | [`terminal`] | The terminal calls the setup dialogue makes |
 //! | [`interrupt`] | What ends a run early |
 
 pub mod directory;
@@ -17,6 +18,7 @@ pub mod restore;
 #[cfg(unix)]
 pub mod setup;
 pub mod source;
+pub mod terminal;
 
 use std::sync::Arc;
 

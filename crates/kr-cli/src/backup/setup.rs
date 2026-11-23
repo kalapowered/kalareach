@@ -36,9 +36,7 @@
 //! membership lease ended while it was being written, and a decline of a repeat cannot rule out
 //! that an earlier try, whose answer was lost, recorded it.
 
-use std::fs::File;
 use std::io::{IsTerminal as _, Write as _};
-use std::os::fd::AsFd as _;
 use std::time::Duration;
 
 use kr_client::recovery::{SetupInputs, prepare_setup};
@@ -54,11 +52,11 @@ use kr_protocol::backup_setup::{
 use kr_protocol::error::ErrorCode;
 use kr_protocol::ids::ArchiveId;
 use kr_protocol::method::Method;
-use rustix::termios::{OptionalActions, Termios};
 use zeroize::Zeroizing;
 
 use super::interrupt::{self, Interrupt};
 use super::kit::ask_line;
+use super::terminal::{self, Terminal};
 use crate::cli::{BackupSetupArguments, EnvironmentSelector};
 use crate::daemon::Daemon;
 use crate::error::{CliError, Result};
@@ -109,7 +107,7 @@ pub async fn run(
          agent in it can read",
     )
     .await?;
-    keep_out_of_a_core_dump()?;
+    terminal::keep_out_of_a_dump()?;
 
     let interrupt = Interrupt::install()?;
     // Held from here to the end, so that every exit puts the terminal back and drops what is
@@ -808,10 +806,7 @@ fn show_the_kit(kit: &Zeroizing<String>, fingerprint: &Shown) -> Result<()> {
     };
     // The controlling terminal, opened as itself and written with no buffer of ours in between;
     // the command runs only where standard output is that terminal.
-    let mut terminal = File::options()
-        .write(true)
-        .open("/dev/tty")
-        .map_err(|error| failed(&error))?;
+    let mut terminal = terminal::open_output().map_err(|error| failed(&error))?;
     report::say(&Shown::said(
         "Your recovery kit follows. It is shown once. The terminal's scrollback keeps it until \
          you clear the scrollback.",
@@ -857,71 +852,6 @@ fn matches_the_end(typed: &str, end: &[u8]) -> bool {
 /// Whether the person's line is the word yes.
 fn is_yes(answer: Option<&Zeroizing<String>>) -> bool {
     answer.is_some_and(|typed| typed.trim().eq_ignore_ascii_case("yes"))
-}
-
-/// Keeps this process out of a core dump, before the seed exists.
-///
-/// The core size limit is zero. On Linux the process is also made non-dumpable, because a core
-/// pattern that pipes to a handler ignores the limit. A failure of either refuses the setup.
-fn keep_out_of_a_core_dump() -> Result<()> {
-    let refused = |error: rustix::io::Errno| {
-        CliError::Other(shown!(
-            "the recovery kit is not made because this process could not be kept out of a core \
-             dump: {}",
-            crate::shown::errno(error)
-        ))
-    };
-    rustix::process::setrlimit(
-        rustix::process::Resource::Core,
-        rustix::process::Rlimit {
-            current: Some(0),
-            maximum: Some(0),
-        },
-    )
-    .map_err(refused)?;
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    rustix::process::set_dumpable_behavior(rustix::process::DumpableBehavior::NotDumpable)
-        .map_err(refused)?;
-    Ok(())
-}
-
-/// The terminal's modes as they were found. They are put back when this is dropped, and the input
-/// still waiting is discarded with them: what was pasted past a line the dialogue read is not for
-/// the shell.
-struct Terminal {
-    input: File,
-    saved: Termios,
-}
-
-impl Terminal {
-    fn hold() -> Result<Self> {
-        let input = std::io::stdin()
-            .as_fd()
-            .try_clone_to_owned()
-            .map(File::from)
-            .map_err(|error| {
-                CliError::Terminal(shown!(
-                    "the terminal could not be reached: {}",
-                    Shown::io(&error)
-                ))
-            })?;
-        let saved = rustix::termios::tcgetattr(&input).map_err(|error| {
-            CliError::Terminal(shown!(
-                "the terminal's modes could not be read: {}",
-                crate::shown::errno(error)
-            ))
-        })?;
-        Ok(Self { input, saved })
-    }
-}
-
-impl Drop for Terminal {
-    fn drop(&mut self) {
-        // The call waits for output to drain, so a signal can end it early; it is asked again.
-        while let Err(rustix::io::Errno::INTR) =
-            rustix::termios::tcsetattr(&self.input, OptionalActions::Flush, &self.saved)
-        {}
-    }
 }
 
 #[cfg(test)]
