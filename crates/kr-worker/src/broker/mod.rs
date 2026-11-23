@@ -1403,9 +1403,9 @@ impl Broker {
             .map(Instance::state)
             .ok_or_else(|| unknown_instance(application_instance_id))?;
         // The fence is the gateway's, not any one instance's: while it is up the host refuses every
-        // rich mutation, so a client that reads the binding is told the same, with the words the
-        // refusal would give, and offers nothing the host will refuse. A reason the instance holds
-        // for itself is the more particular one and is kept.
+        // rich mutation, so a client that reads the binding is told the same, in the fence's own
+        // words, and offers nothing the host will refuse. A reason the instance holds for itself is
+        // the more particular one and is kept here, though a refusal names the fence first.
         if binding.suspension_reason.0.is_none()
             && let Err(BrokerError::RichWorkFenced { detail }) = state.volatile.require_rich_work()
         {

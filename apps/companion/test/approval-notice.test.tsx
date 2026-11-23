@@ -182,6 +182,20 @@ describe('the inbox card of an approval that cannot be answered here', () => {
     })
   })
 
+  it('the_decisions_title_is_the_notices_reason', async () => {
+    open(
+      (controls) => {
+        controls.records.withoutCapability(SESSION_MAIN, 'agent.approval')
+      },
+      true,
+      { view: 'attention' }
+    )
+    const approval = await card()
+    const offer = await within(approval).findByTestId('approval-offer')
+    const reason = within(offer).getByTestId('approval-offer-reason').textContent
+    expect(within(approval).getByRole('button', { name: 'Allow once' })).toHaveAttribute('title', reason)
+  })
+
   it('without_the_right_to_type_the_card_says_so_and_offers_no_button', async () => {
     open(
       (controls) => {

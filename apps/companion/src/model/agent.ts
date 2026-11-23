@@ -120,12 +120,14 @@ export function unboundBecause(instance: AgentInstanceSummary): string {
  * The host words some of its reasons as clauses for its own log, in lower case and with no full
  * stop. Every reason this page shows on its own line goes through here: a first letter that is
  * lower case is raised, and a reason that does not end in a full stop, a question mark or an
- * exclamation mark gets a full stop. A reason that is a sentence already is not changed.
+ * exclamation mark gets a full stop. A reason that is a sentence already is not changed. A reason
+ * that starts with a method name, which is the upstream's and keeps its case, is not raised.
  */
 export function hostSentence(reason: string): string {
   const text = reason.trim()
   if (text === '') return ''
-  const raised = text.charAt(0).toUpperCase() + text.slice(1)
+  const first = text.split(/\s/, 1)[0] ?? ''
+  const raised = /^\p{Ll}+[,;:]?$/u.test(first) ? text.charAt(0).toUpperCase() + text.slice(1) : text
   return /[.!?]$/.test(raised) ? raised : `${raised}.`
 }
 
@@ -595,8 +597,9 @@ export function actionableApprovals(
 /**
  * The binding's state, as a control's visibility predicate names it, or null while it is not known.
  *
- * A binding whose rich mutations are suspended is one the host could not verify, so its state is
- * unknown here rather than any of the named ones: a control that turns on it stays hidden.
+ * A binding whose rich mutations are suspended is one the host holds back, for a native selection
+ * it could not observe or because its record store has a fault, so its state is unknown here
+ * rather than any of the named ones: a control that turns on it stays hidden.
  */
 export function bindingStateOf(
   binding: AgentBindingState | null,

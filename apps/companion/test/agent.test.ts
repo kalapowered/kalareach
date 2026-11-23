@@ -648,6 +648,15 @@ describe('a reason the host gives, shown as a sentence', () => {
     expect(hostSentence('  ')).toBe('')
   })
 
+  it('keeps the case of a method name that starts the reason', () => {
+    expect(hostSentence('thread/x is not a request this host classifies')).toBe(
+      'thread/x is not a request this host classifies.'
+    )
+    expect(hostSentence('item/commandExecution/requestApproval is not classified')).toBe(
+      'item/commandExecution/requestApproval is not classified.'
+    )
+  })
+
   it('is what an offer gives for a suspension the host worded as a clause', () => {
     const offers = composerOffers({
       known: true,

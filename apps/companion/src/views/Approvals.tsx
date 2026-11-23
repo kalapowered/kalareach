@@ -389,7 +389,7 @@ export function ApprovalRequests({
                   key={decision.option_id}
                   data-option={decision.option_id}
                   disabled={!offer.offered || busy}
-                  title={offer.reason ?? undefined}
+                  title={notice?.sentence ?? offer.reason ?? undefined}
                   onCommit={() => {
                     answer(request, decision)
                   }}
