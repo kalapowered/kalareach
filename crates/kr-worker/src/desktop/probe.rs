@@ -2339,7 +2339,7 @@ mod tests {
         let bound = Check::AuthorisedFileRead.effects().bound;
         let stays = (bound + SLACK) * 2;
         let plan = Plan {
-            authorised_file: Some(PathBuf::from("/Volumes/Share/notes.txt")),
+            authorised_file: Some(below_volumes(&["Share", "notes.txt"])),
             ..Plan::in_directory("/nonexistent/scratch")
         };
         let (release, released) = std::sync::mpsc::channel::<()>();
@@ -2501,20 +2501,28 @@ mod tests {
     const DATA_VOLUME: u32 = 0x0490_9080;
     const EXTERNAL_DISK: u32 = 0x04a0_9218;
 
+    /// A path below the folder the volumes are mounted in, built here rather than written out: a
+    /// mount path in a source line names a machine.
+    fn below_volumes(parts: &[&str]) -> PathBuf {
+        parts
+            .iter()
+            .fold(PathBuf::from("/Volumes"), |path, part| path.join(part))
+    }
+
     #[test]
     fn a_refused_read_on_a_removable_volume_names_the_grant_for_removable_volumes() {
-        let on = |path: &str, flags| permission_on(Path::new(path), Some(flags), None);
+        let on = |parts: &[&str], flags| permission_on(&below_volumes(parts), Some(flags), None);
         let removable = on_macos("Files & Folders, for removable volumes");
-        assert_eq!(on("/Volumes/Backup/notes.txt", EXTERNAL_DISK), removable);
+        assert_eq!(on(&["Backup", "notes.txt"], EXTERNAL_DISK), removable);
         // The volume is asked before the folder's name: a folder called Documents on an external
         // disk is not the Documents folder of the account.
         assert_eq!(
-            on("/Volumes/Backup/Documents/notes.txt", EXTERNAL_DISK),
+            on(&["Backup", "Documents", "notes.txt"], EXTERNAL_DISK),
             removable
         );
         // A path on an internal volume, whatever it is spelled like, is not one.
         for flags in [SYSTEM_VOLUME, DATA_VOLUME] {
-            assert_eq!(on("/Volumes/Internal/notes.txt", flags), None);
+            assert_eq!(on(&["Internal", "notes.txt"], flags), None);
         }
     }
 
@@ -2524,12 +2532,12 @@ mod tests {
 
     #[test]
     fn a_refused_read_on_a_network_volume_names_the_grant_for_network_volumes() {
-        let on = |path: &str, flags| permission_on(Path::new(path), Some(flags), None);
+        let on = |parts: &[&str], flags| permission_on(&below_volumes(parts), Some(flags), None);
         let network = on_macos("Files & Folders, for network volumes");
-        assert_eq!(on("/Volumes/Share/notes.txt", NETWORK_VOLUME), network);
+        assert_eq!(on(&["Share", "notes.txt"], NETWORK_VOLUME), network);
         // The volume is asked before the folder's name here too.
         assert_eq!(
-            on("/Volumes/Share/Documents/notes.txt", NETWORK_VOLUME),
+            on(&["Share", "Documents", "notes.txt"], NETWORK_VOLUME),
             network
         );
     }
@@ -2549,13 +2557,13 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn the_sentence_for_a_removable_volume_names_its_grant() {
-        let path = Path::new("/Volumes/Backup/notes.txt");
+        let path = below_volumes(&["Backup", "notes.txt"]);
         let refused = Outcome::PermissionRefused {
-            permission: permission_on(path, Some(EXTERNAL_DISK), None)
+            permission: permission_on(&path, Some(EXTERNAL_DISK), None)
                 .expect("a removable volume has a grant to name"),
             detail: Sentence::new()
                 .stated("the platform refused to open ")
-                .path(path),
+                .path(&path),
         };
         let (state, _, reason) = judge(Check::AuthorisedFileRead, &refused);
         assert_eq!(state, CapabilityState::PermissionRequired);
