@@ -191,13 +191,13 @@ impl VolatileState {
         Err(BrokerError::RichWorkFenced {
             detail: match self.mode {
                 GatewayMode::NativeOnlyVolatile => {
-                    "the receipt journal faulted: rich mutations and rich approvals are fenced, \
-                     and the native terminal continues"
+                    "approvals cannot be recorded while the record store has a fault, so they \
+                     are answered in the terminal, which goes on working"
                         .to_owned()
                 }
                 GatewayMode::Recovering => {
-                    "storage has returned and the evidence gap is being committed: rich work \
-                     resumes once the pending identifiers are reconciled"
+                    "storage is back and the records it missed are being written; approvals \
+                     return here when that is done"
                         .to_owned()
                 }
                 GatewayMode::Normal => unreachable!("normal admits rich work"),
@@ -386,7 +386,7 @@ mod tests {
             .enter("the journal could not be written", 0, TimestampMs::new(100))
             .expect("the fence is entered");
         let refusal = state.require_rich_work().expect_err("rich work is fenced");
-        assert!(refusal.to_string().contains("native terminal continues"));
+        assert!(refusal.to_string().contains("answered in the terminal"));
         assert_eq!(
             refusal.code(),
             kr_protocol::error::ErrorCode::UpstreamUnavailable
@@ -407,7 +407,7 @@ mod tests {
             "storage returning is not the same as the gap being committed"
         );
         let refusal = state.require_rich_work().expect_err("still fenced");
-        assert!(refusal.to_string().contains("reconciled"));
+        assert!(refusal.to_string().contains("approvals return here"));
         state.finish_recovery().expect("recovery finishes");
         assert!(state.admits_rich_work());
         assert_eq!(state.durability(), Durability::Durable);

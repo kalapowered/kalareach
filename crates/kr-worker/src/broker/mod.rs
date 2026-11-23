@@ -1397,11 +1397,22 @@ impl Broker {
         application_instance_id: ApplicationInstanceId,
     ) -> Result<AgentBindingState> {
         let state = self.state();
-        state
+        let mut binding = state
             .instances
             .get(&application_instance_id)
             .map(Instance::state)
-            .ok_or_else(|| unknown_instance(application_instance_id))
+            .ok_or_else(|| unknown_instance(application_instance_id))?;
+        // The fence is the gateway's, not any one instance's: while it is up the host refuses every
+        // rich mutation, so a client that reads the binding is told the same, with the words the
+        // refusal would give, and offers nothing the host will refuse. A reason the instance holds
+        // for itself is the more particular one and is kept.
+        if binding.suspension_reason.0.is_none()
+            && let Err(BrokerError::RichWorkFenced { detail }) = state.volatile.require_rich_work()
+        {
+            binding.rich_mutations_suspended = true;
+            binding.suspension_reason = Nullable::some(detail);
+        }
+        Ok(binding)
     }
 
     /// Advances the binding revision, because the upstream owner or selected thread changed.

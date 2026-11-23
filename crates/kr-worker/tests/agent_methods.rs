@@ -2285,6 +2285,53 @@ fn kr_req_11_35_a_fence_refuses_a_plan_that_arrives_after_it() {
     }
 }
 
+/// KR-REQ-12.25: while the gateway is behind the fence, the binding says that rich mutations are
+/// suspended and gives the reason a person reads, so a client does not offer an approval that the
+/// host would refuse; when storage is back the reason says so and says when approvals return.
+#[test]
+fn kr_req_12_25_a_fenced_gateway_suspends_the_binding_with_a_reason_a_person_can_read() {
+    let mut store = common::SharedStore::open();
+    let upstream = std::sync::Arc::new(RecordingUpstream::default());
+    let broker = agent_broker_sharing(upstream, store.health());
+    let open = broker
+        .binding_state(instance())
+        .expect("the binding is read");
+    assert!(!open.rich_mutations_suspended, "nothing is fenced yet");
+    assert_eq!(open.suspension_reason.0, None);
+
+    // The receipt journal faults: approvals cannot be recorded, and the native terminal goes on.
+    store.fault_acceptance();
+    let fenced = broker
+        .binding_state(instance())
+        .expect("the binding is read");
+    assert!(fenced.rich_mutations_suspended);
+    assert_eq!(
+        fenced.suspension_reason.0.as_deref(),
+        Some(
+            "approvals cannot be recorded while the record store has a fault, so they are \
+             answered in the terminal, which goes on working"
+        )
+    );
+
+    // Storage is back and the gap is committed, and rich work waits for the reconciliation.
+    store.recover_journal(4);
+    broker
+        .recover(TimestampMs::new(4))
+        .expect("the gap is committed");
+    assert_eq!(broker.mode(), kr_protocol::gateway::GatewayMode::Recovering);
+    let recovering = broker
+        .binding_state(instance())
+        .expect("the binding is read");
+    assert!(recovering.rich_mutations_suspended);
+    assert_eq!(
+        recovering.suspension_reason.0.as_deref(),
+        Some(
+            "storage is back and the records it missed are being written; approvals return \
+             here when that is done"
+        )
+    );
+}
+
 fn a_fence_refuses_a_plan_that_arrives_after_it(recovered: bool) {
     let mut store = common::SharedStore::open();
     let upstream = std::sync::Arc::new(RecordingUpstream::default());
