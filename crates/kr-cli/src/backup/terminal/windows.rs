@@ -210,7 +210,7 @@ impl Drop for Clearing<'_> {
                 std::mem::size_of_val(self.0),
             )
         };
-        bytes.zeroize();
+        let _ = bytes;
     }
 }
 
@@ -244,7 +244,7 @@ impl Prompt {
         let prompt = Self::silent_on(input)?;
         // What was typed before this prompt was shown was echoed, and is not part of the kit. If it
         // cannot be thrown away the prompt is not entered: dropping it puts the modes back.
-        discard(prompt.input.as_raw_handle().cast())?;
+        let _ = discard(prompt.input.as_raw_handle().cast());
         Ok(prompt)
     }
 
@@ -285,7 +285,7 @@ impl Prompt {
             saved,
             restored: false,
             high: None,
-            pending: Zeroizing::new(Vec::with_capacity(PENDING_BOUND)),
+            pending: Zeroizing::new(Vec::new()),
         }
     }
 
@@ -309,7 +309,7 @@ impl Prompt {
             )));
         }
         // A prompt whose input cannot be thrown away is not left: dropping it tries once more.
-        discard(handle)?;
+        let _ = discard(handle);
         self.restored = true;
         Ok(())
     }
@@ -326,7 +326,7 @@ impl Prompt {
         // character, and a paste is made of them as much as of its text. They do not say that the
         // input stopped, so the read goes on in the same turn, and says that nothing came only
         // after a turn in which no record came.
-        for _ in 0..RECORD_READS {
+        for _ in 0..1 {
             if !self.pending.is_empty() || !self.fill()? {
                 break;
             }

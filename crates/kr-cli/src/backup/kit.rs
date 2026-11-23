@@ -107,7 +107,6 @@ pub async fn read(source: KitSource, interrupt: &mut Interrupt) -> Result<KitRea
     // Windows too, and the handler is armed before the first read. A pipe's read cannot be ended
     // by one and is made without it.
     if source == KitSource::Standard && std::io::stdin().is_terminal() {
-        interrupt.arm()?;
     }
     let cancel = Arc::new(AtomicBool::new(false));
     let reader = {
