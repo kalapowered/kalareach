@@ -4,8 +4,9 @@
 //! A service keeps a sealed bundle up to [`MAX_SEALED_RECOVERY_BUNDLE_BYTES`]. What a restore
 //! verifies an archive with (the collections, the writers, the producers and the checkpoints) is
 //! worth more than a person's saved settings, so the two are held to one policy, and every write of
-//! the bundle seals through [`seal`]: [`BundleStore::commit`](super::BundleStore::commit) and
-//! [`PreparedRestore::record_checkpoint`](super::PreparedRestore::record_checkpoint) alike.
+//! the bundle seals through [`seal`]: [`BundleStore::commit`](super::BundleStore::commit),
+//! [`PreparedRestore::record_checkpoint`](super::PreparedRestore::record_checkpoint) and the first
+//! bundle of [`prepare_setup`](super::prepare_setup) alike.
 //!
 //! * **A settings write** ([`Write::Settings`]) is refused with [`RecoveryError::SettingsDoNotFit`]
 //!   when the sealed bundle would leave less than [`TRUST_ROOM_BYTES`] of room under the bound, so

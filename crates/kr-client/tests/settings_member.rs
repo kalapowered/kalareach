@@ -19,6 +19,7 @@
 //! | `a_valid_member_over_the_cap_is_refused_at_the_read_and_one_at_the_cap_is_read` | the cap at the read |
 //! | `clearing_the_member_from_a_bundle_with_little_room_is_written_as_a_trust_write` | a clear makes room |
 //! | `a_removal_that_meets_a_bundle_which_moved_is_a_conflict_and_removes_nothing` | a removal that meets another write |
+//! | `a_save_is_unsettled_while_a_write_of_the_bundle_is_open` | a save waits for an open write to end |
 //! | `removing_the_member_leaves_collections_keys_and_checkpoints_byte_for_byte` | the removal by its own compare-and-swap |
 //! | `a_removal_whose_answer_is_lost_stays_unconfirmed_until_it_is_ended` | an unconfirmed removal stays visible |
 //! | `a_restore_with_only_the_kit_returns_the_settings_member_and_nothing_that_grants` | the restore from a service |
@@ -697,6 +698,54 @@ async fn a_migration_whose_destination_left_the_settings_out_for_want_of_room_is
 /// write does between a read and the write that follows it.
 fn the_bundle_moves_after_the_next(service: &MemoryBundles, times: u32) {
     *service.moves_after_a_fetch.lock().expect("a count") = times;
+}
+
+/// KR-REQ-20.17: a save is not answered "already saved" while a write of the bundle is open. The
+/// open write may be the one that put the settings there, or one that changed them, and the bundle
+/// is compared once it is ended.
+#[tokio::test]
+async fn a_save_is_unsettled_while_a_write_of_the_bundle_is_open() {
+    let seed = RecoverySeed::generate().expect("a seed");
+    let service = Arc::new(MemoryBundles::default());
+    let (mut store, _directory) = store_over(&service);
+    let mut first = BundleStore::empty(now());
+    store
+        .commit(&seed, &mut first, now())
+        .await
+        .expect("the first bundle");
+
+    // The write lands and its answer never comes back: the bundle holds the settings and the write
+    // is still open.
+    *service.loses_the_next_answer.lock().expect("a flag") = true;
+    let lost = store.save_settings(&seed, local("dark"), now()).await;
+    assert!(
+        matches!(lost, Err(RecoveryError::BundleOutcomeUnknown { .. })),
+        "{:?}",
+        lost.ok()
+    );
+    assert!(matches!(
+        store.lost_write(),
+        Some(LostWrite::Unsettled { .. })
+    ));
+
+    let again = store.save_settings(&seed, local("dark"), now()).await;
+    assert!(
+        matches!(again, Err(RecoveryError::BundleWriteUnsettled { .. })),
+        "{:?}",
+        again.ok()
+    );
+
+    // Once it is ended, the bundle holds what the device chose and there is nothing to write.
+    store
+        .end_lost_write(&seed)
+        .await
+        .expect("the write is ended");
+    let settled = store.save_settings(&seed, local("dark"), now()).await;
+    assert!(
+        matches!(settled, Ok(SettingsSaved::AlreadySaved)),
+        "{:?}",
+        settled.err()
+    );
 }
 
 /// KR-REQ-20.17: a removal that meets a bundle that moved since it was read is a conflict, and the

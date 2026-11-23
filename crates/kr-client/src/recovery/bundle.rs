@@ -734,11 +734,15 @@ impl BundleStore {
     /// Saves what this device has chosen as the settings member, when the bundle does not already
     /// hold it.
     ///
-    /// The bundle is read first and the member compared with `local`, the values as the settings
-    /// file holds them now and never a value captured earlier: the same settings are not written
-    /// again. A bundle that moved between the read and the write is read again, up to three times,
-    /// and the last conflict is returned after that. A member the bundle holds that cannot be read
-    /// is replaced, since it is no choice of anyone's.
+    /// `local` is what the caller read from the settings file for this call, and it is kept across
+    /// the reads below. The bundle is read first and the member compared with it: the same
+    /// settings are not written again. A bundle that moved between the read and the write is read
+    /// again, up to three times, and the last conflict is returned after that. A member the bundle
+    /// holds that cannot be read is replaced, since it is no choice of anyone's.
+    ///
+    /// A write of the bundle that is still open is [`RecoveryError::BundleWriteUnsettled`], before
+    /// anything is read: the open write may have changed what the bundle holds, so the bundle is
+    /// compared once [`Self::end_lost_write`] has ended it.
     ///
     /// A device with nothing chosen clears the member; a settings file that cannot be read keeps
     /// it and is [`RecoveryError::SettingsUnusable`], because an unreadable file says nothing about
@@ -749,7 +753,8 @@ impl BundleStore {
     ///
     /// # Errors
     ///
-    /// Returns [`RecoveryError::SettingsUnusable`] for an unreadable settings file, and what
+    /// Returns [`RecoveryError::BundleWriteUnsettled`] while a write is open,
+    /// [`RecoveryError::SettingsUnusable`] for an unreadable settings file, and what
     /// [`Self::fetch`] and [`Self::set_settings`] return.
     pub async fn save_settings(
         &mut self,
@@ -757,6 +762,9 @@ impl BundleStore {
         local: LocalSettings,
         now_ms: TimestampMs,
     ) -> Result<SettingsSaved> {
+        if let Some(record) = self.unsettled() {
+            return Err(RecoveryError::BundleWriteUnsettled { sent: record.sent });
+        }
         let LocalSettings::Values(values) = local else {
             return Err(RecoveryError::SettingsUnusable {
                 what: "this device's settings file cannot be read, so what is saved is kept",

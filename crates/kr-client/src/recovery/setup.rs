@@ -30,6 +30,7 @@ use kr_protocol::scalars::{
 use zeroize::Zeroizing;
 
 use crate::recovery::bundle::fresh_locator;
+use crate::recovery::capacity::{self, Write};
 use crate::recovery::kit::{ALPHABET, render_kit};
 use crate::recovery::{RecoveryError, Result};
 
@@ -122,7 +123,7 @@ pub fn prepare_setup(inputs: &SetupInputs<'_>) -> Result<PreparedSetup> {
         service_origin: inputs.origin.to_owned(),
         bundle_locator: locator.clone(),
     };
-    let bundle = RecoveryBundle {
+    let mut bundle = RecoveryBundle {
         schema_version: U64::new(RECOVERY_BUNDLE_SCHEMA_VERSION),
         collections: vec![CollectionLocator {
             service_origin: inputs.origin.to_owned(),
@@ -147,7 +148,8 @@ pub fn prepare_setup(inputs: &SetupInputs<'_>) -> Result<PreparedSetup> {
         device_settings: None,
     };
     let key = seed.bundle_key_for(&context)?;
-    let sealed = kr_crypto::archive::encrypt_recovery_bundle(&key, &bundle)?;
+    // The first bundle goes through the same policy as every other write, and holds no settings.
+    let sealed = capacity::seal(&key, &mut bundle, Write::Trust)?.ciphertext;
 
     let recipient = *seed.recipient()?.public();
     let fingerprint = kit_fingerprint(&recipient);
