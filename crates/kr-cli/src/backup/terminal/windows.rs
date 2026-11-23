@@ -589,16 +589,54 @@ pub fn read_line(cancel: &AtomicBool) -> Result<Option<Zeroizing<String>>> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Mutex, PoisonError};
-
     use windows_sys::Win32::System::Console::{
         INPUT_RECORD_0, KEY_EVENT_RECORD, KEY_EVENT_RECORD_0, WriteConsoleInputW,
     };
 
     use super::*;
 
-    /// The tests that touch the console's input share one console, so they run one at a time.
-    static CONSOLE: Mutex<()> = Mutex::new(());
+    /// The variable that tells a process of the test program that it was started to run one case on
+    /// a console of its own.
+    const OWN_CONSOLE: &str = "KR_CASE_ON_ITS_OWN_CONSOLE";
+
+    /// Runs `body` on a console made for it. A case that opens `CONIN$` reads the console of the
+    /// process it runs in, and a runner can start the test program with no console at all (a
+    /// service, a detached process), so the case makes the console it reads. The first run of the
+    /// case starts the test program again, for this case alone, with a new console of its own; that
+    /// run does the work. The case passes when it did, and shows what the other run said when it did
+    /// not. Each case has a console to itself, so none shares the runner's or another case's.
+    fn on_a_console_of_its_own(case: &str, body: impl FnOnce()) {
+        use std::os::windows::process::CommandExt as _;
+
+        use windows_sys::Win32::System::Threading::CREATE_NEW_CONSOLE;
+
+        if std::env::var_os(OWN_CONSOLE).is_some() {
+            body();
+            return;
+        }
+        let output =
+            std::process::Command::new(std::env::current_exe().expect("this program's path"))
+                .args([
+                    "--exact",
+                    &format!("backup::terminal::windows::tests::{case}"),
+                    "--test-threads=1",
+                ])
+                .env(OWN_CONSOLE, "1")
+                .creation_flags(CREATE_NEW_CONSOLE)
+                .stdin(std::process::Stdio::null())
+                .output()
+                .expect("starts the case in a process of its own");
+        let said = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        // A case name that matches nothing runs no case and passes, so the run must have run one.
+        assert!(
+            output.status.success() && said.contains("1 passed"),
+            "the case did not pass on a console of its own: {said}"
+        );
+    }
 
     /// The console's input as a new handle, with write access or without it. Throwing input away
     /// needs write access; reading the modes and changing them needs read access.
@@ -662,37 +700,46 @@ mod tests {
     /// in through the way the input is thrown away.
     #[test]
     fn a_console_whose_waiting_input_cannot_be_thrown_away_is_not_entered() {
-        let _alone = CONSOLE.lock().unwrap_or_else(PoisonError::into_inner);
-        let input = console_input(true);
-        let before = mode_of(&input);
-        let refused = Prompt::enter_with(input.try_clone().expect("a copy of the handle"), |_| {
-            Err(std::io::Error::from_raw_os_error(5))
-        })
-        .err()
-        .expect("the prompt is not entered");
-        assert!(
-            refused.to_string().contains("could not be thrown away"),
-            "{refused}"
+        on_a_console_of_its_own(
+            "a_console_whose_waiting_input_cannot_be_thrown_away_is_not_entered",
+            || {
+                let input = console_input(true);
+                let before = mode_of(&input);
+                let refused =
+                    Prompt::enter_with(input.try_clone().expect("a copy of the handle"), |_| {
+                        Err(std::io::Error::from_raw_os_error(5))
+                    })
+                    .err()
+                    .expect("the prompt is not entered");
+                assert!(
+                    refused.to_string().contains("could not be thrown away"),
+                    "{refused}"
+                );
+                assert_eq!(mode_of(&input), before, "the modes are as they were found");
+            },
         );
-        assert_eq!(mode_of(&input), before, "the modes are as they were found");
     }
 
     /// A prompt that could not throw the waiting input away is not counted as left, so that
     /// dropping it tries again.
     #[test]
     fn a_prompt_that_could_not_throw_the_waiting_input_away_is_not_counted_as_left() {
-        let _alone = CONSOLE.lock().unwrap_or_else(PoisonError::into_inner);
-        let input = console_input(true);
-        let saved = mode_of(&input);
-        let mut prompt = Prompt::holding(input, saved);
-        let error = prompt
-            .leave_with(|_| Err(std::io::Error::from_raw_os_error(5)))
-            .expect_err("leaving is refused");
-        assert!(
-            error.to_string().contains("could not be thrown away"),
-            "{error}"
+        on_a_console_of_its_own(
+            "a_prompt_that_could_not_throw_the_waiting_input_away_is_not_counted_as_left",
+            || {
+                let input = console_input(true);
+                let saved = mode_of(&input);
+                let mut prompt = Prompt::holding(input, saved);
+                let error = prompt
+                    .leave_with(|_| Err(std::io::Error::from_raw_os_error(5)))
+                    .expect_err("leaving is refused");
+                assert!(
+                    error.to_string().contains("could not be thrown away"),
+                    "{error}"
+                );
+                assert!(!prompt.restored, "a prompt that kept its input is not left");
+            },
         );
-        assert!(!prompt.restored, "a prompt that kept its input is not left");
     }
 
     /// A paste after the blank line arrives as key releases and modifier keys that carry no
@@ -700,41 +747,46 @@ mod tests {
     /// stop: it reads on, and says that nothing came only after a turn with no record at all.
     #[test]
     fn a_read_goes_on_past_records_with_no_character_until_the_input_is_quiet() {
-        let _alone = CONSOLE.lock().unwrap_or_else(PoisonError::into_inner);
-        let mut prompt = Prompt::enter_on(console_input(true)).expect("a prompt on the console");
-        let writer = console_input(true);
-        let inject = |records: &[INPUT_RECORD]| {
-            let mut written = 0_u32;
-            // SAFETY: the handle is open for as long as `writer` is, the records are as many as
-            // the call is told, and `written` is a live `u32`.
-            let done = unsafe {
-                WriteConsoleInputW(
-                    writer.as_raw_handle().cast(),
-                    records.as_ptr(),
-                    records.len() as u32,
-                    &raw mut written,
-                )
-            };
-            assert_ne!(done, 0, "the records are written");
-            assert_eq!(written as usize, records.len());
-        };
+        on_a_console_of_its_own(
+            "a_read_goes_on_past_records_with_no_character_until_the_input_is_quiet",
+            || {
+                let mut prompt =
+                    Prompt::enter_on(console_input(true)).expect("a prompt on the console");
+                let writer = console_input(true);
+                let inject = |records: &[INPUT_RECORD]| {
+                    let mut written = 0_u32;
+                    // SAFETY: the handle is open for as long as `writer` is, the records are as many as
+                    // the call is told, and `written` is a live `u32`.
+                    let done = unsafe {
+                        WriteConsoleInputW(
+                            writer.as_raw_handle().cast(),
+                            records.as_ptr(),
+                            records.len() as u32,
+                            &raw mut written,
+                        )
+                    };
+                    assert_ne!(done, 0, "the records are written");
+                    assert_eq!(written as usize, records.len());
+                };
 
-        // A key release first, which holds no character, and the text a little later.
-        inject(&[key(false, u16::from(b'a'))]);
-        let mut buffer = [0_u8; 16];
-        std::thread::scope(|scope| {
-            scope.spawn(|| {
-                std::thread::sleep(std::time::Duration::from_millis(50));
-                inject(&[key(true, u16::from(b'x')), key(false, u16::from(b'x'))]);
-            });
-            let turn = prompt.read(&mut buffer).expect("reads the console");
-            assert_eq!(turn, Turn::Text(1), "the text that followed the release");
-            assert_eq!(&buffer[..1], b"x");
-        });
-        // No record came in a whole turn: the read says so.
-        assert_eq!(
-            prompt.read(&mut buffer).expect("reads the console"),
-            Turn::Quiet
+                // A key release first, which holds no character, and the text a little later.
+                inject(&[key(false, u16::from(b'a'))]);
+                let mut buffer = [0_u8; 16];
+                std::thread::scope(|scope| {
+                    scope.spawn(|| {
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                        inject(&[key(true, u16::from(b'x')), key(false, u16::from(b'x'))]);
+                    });
+                    let turn = prompt.read(&mut buffer).expect("reads the console");
+                    assert_eq!(turn, Turn::Text(1), "the text that followed the release");
+                    assert_eq!(&buffer[..1], b"x");
+                });
+                // No record came in a whole turn: the read says so.
+                assert_eq!(
+                    prompt.read(&mut buffer).expect("reads the console"),
+                    Turn::Quiet
+                );
+            },
         );
     }
 
@@ -743,30 +795,37 @@ mod tests {
     /// input is quiet.
     #[test]
     fn a_read_that_reached_its_limit_on_records_with_no_character_says_busy_and_not_quiet() {
-        let _alone = CONSOLE.lock().unwrap_or_else(PoisonError::into_inner);
-        let mut prompt = Prompt::enter_on(console_input(true)).expect("a prompt on the console");
-        let writer = console_input(true);
-        // More key releases than one read takes in: `RECORD_READS` reads of `RECORDS` records.
-        let releases = [key(false, u16::from(b'a')); RECORDS];
-        for _ in 0..RECORD_READS + 4 {
-            inject_records(&writer, &releases);
-        }
-        let mut buffer = [0_u8; 16];
-        assert_eq!(
-            prompt.read(&mut buffer).expect("reads the console"),
-            Turn::Busy,
-            "the limit on work is not the end of the input"
+        on_a_console_of_its_own(
+            "a_read_that_reached_its_limit_on_records_with_no_character_says_busy_and_not_quiet",
+            || {
+                let mut prompt =
+                    Prompt::enter_on(console_input(true)).expect("a prompt on the console");
+                let writer = console_input(true);
+                // More key releases than one read takes in: `RECORD_READS` reads of `RECORDS` records.
+                let releases = [key(false, u16::from(b'a')); RECORDS];
+                for _ in 0..RECORD_READS + 4 {
+                    inject_records(&writer, &releases);
+                }
+                let mut buffer = [0_u8; 16];
+                assert_eq!(
+                    prompt.read(&mut buffer).expect("reads the console"),
+                    Turn::Busy,
+                    "the limit on work is not the end of the input"
+                );
+                // What is left is read, and then a turn passes with no record: the input is quiet.
+                let mut busy = 0;
+                loop {
+                    match prompt.read(&mut buffer).expect("reads the console") {
+                        Turn::Busy => busy += 1,
+                        Turn::Quiet => break,
+                        Turn::Text(taken) => {
+                            panic!("{taken} bytes of text came from records without any")
+                        }
+                    }
+                    assert!(busy < 4, "the input never went quiet");
+                }
+            },
         );
-        // What is left is read, and then a turn passes with no record: the input is quiet.
-        let mut busy = 0;
-        loop {
-            match prompt.read(&mut buffer).expect("reads the console") {
-                Turn::Busy => busy += 1,
-                Turn::Quiet => break,
-                Turn::Text(taken) => panic!("{taken} bytes of text came from records without any"),
-            }
-            assert!(busy < 4, "the input never went quiet");
-        }
     }
 
     /// An answer that is being read when the command is told to stop ends with an interrupted
@@ -774,38 +833,42 @@ mod tests {
     /// gone: the thread that reads the answer is waited for, and what it changed is back.
     #[test]
     fn an_answer_read_that_is_told_to_stop_ends_and_puts_the_console_back() {
-        let _alone = CONSOLE.lock().unwrap_or_else(PoisonError::into_inner);
-        let input = console_input(true);
-        let before = mode_of(&input);
-        let prompt = Prompt::enter_on(input.try_clone().expect("a copy of the handle"))
-            .expect("a prompt on the console");
-        let cancel = std::sync::Arc::new(AtomicBool::new(false));
-        let (done, ended) = std::sync::mpsc::channel();
-        let reader = {
-            let cancel = std::sync::Arc::clone(&cancel);
-            std::thread::spawn(move || {
-                let mut prompt = prompt;
-                let result = prompt.line(&cancel);
-                drop(prompt);
-                let _ = done.send(result);
-            })
-        };
-        // Nothing is typed, so the read waits, in turns, until it is told to stop.
-        std::thread::sleep(std::time::Duration::from_millis(300));
-        assert!(
-            ended.try_recv().is_err(),
-            "the read ended before it was told to"
+        on_a_console_of_its_own(
+            "an_answer_read_that_is_told_to_stop_ends_and_puts_the_console_back",
+            || {
+                let input = console_input(true);
+                let before = mode_of(&input);
+                let prompt = Prompt::enter_on(input.try_clone().expect("a copy of the handle"))
+                    .expect("a prompt on the console");
+                let cancel = std::sync::Arc::new(AtomicBool::new(false));
+                let (done, ended) = std::sync::mpsc::channel();
+                let reader = {
+                    let cancel = std::sync::Arc::clone(&cancel);
+                    std::thread::spawn(move || {
+                        let mut prompt = prompt;
+                        let result = prompt.line(&cancel);
+                        drop(prompt);
+                        let _ = done.send(result);
+                    })
+                };
+                // Nothing is typed, so the read waits, in turns, until it is told to stop.
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                assert!(
+                    ended.try_recv().is_err(),
+                    "the read ended before it was told to"
+                );
+                cancel.store(true, Ordering::SeqCst);
+                let result = ended
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .expect("the read stops when it is told to");
+                reader.join().expect("the reader ends");
+                assert_eq!(
+                    result.expect_err("a read that was stopped").kind(),
+                    std::io::ErrorKind::Interrupted
+                );
+                assert_eq!(mode_of(&input), before, "the modes are as they were found");
+            },
         );
-        cancel.store(true, Ordering::SeqCst);
-        let result = ended
-            .recv_timeout(std::time::Duration::from_secs(5))
-            .expect("the read stops when it is told to");
-        reader.join().expect("the reader ends");
-        assert_eq!(
-            result.expect_err("a read that was stopped").kind(),
-            std::io::ErrorKind::Interrupted
-        );
-        assert_eq!(mode_of(&input), before, "the modes are as they were found");
     }
 
     /// The answer comes back in the wrapper that clears it, as it was read and without being copied
@@ -813,14 +876,17 @@ mod tests {
     /// it, clears what was typed.
     #[test]
     fn an_answer_comes_back_in_the_wrapper_that_clears_it() {
-        let _alone = CONSOLE.lock().unwrap_or_else(PoisonError::into_inner);
-        let mut prompt = Prompt::enter_on(console_input(true)).expect("a prompt on the console");
-        let keys: Vec<INPUT_RECORD> = "yes\r".encode_utf16().map(|unit| key(true, unit)).collect();
-        inject_records(&console_input(true), &keys);
-        let answer: Option<Zeroizing<String>> = prompt
-            .line(&AtomicBool::new(false))
-            .expect("reads the answer");
-        assert_eq!(answer.as_deref().map(String::as_str), Some("yes"));
+        on_a_console_of_its_own("an_answer_comes_back_in_the_wrapper_that_clears_it", || {
+            let mut prompt =
+                Prompt::enter_on(console_input(true)).expect("a prompt on the console");
+            let keys: Vec<INPUT_RECORD> =
+                "yes\r".encode_utf16().map(|unit| key(true, unit)).collect();
+            inject_records(&console_input(true), &keys);
+            let answer: Option<Zeroizing<String>> = prompt
+                .line(&AtomicBool::new(false))
+                .expect("reads the answer");
+            assert_eq!(answer.as_deref().map(String::as_str), Some("yes"));
+        });
     }
 
     /// A prompt that reads nothing: its input is the null device, so there is no console to put
