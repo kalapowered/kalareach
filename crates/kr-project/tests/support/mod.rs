@@ -371,6 +371,66 @@ pub fn ordinary_repository(parent: &Path, name: &str) -> PathBuf {
     path
 }
 
+/// What a filesystem does with two names that differ only by letter case.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CaseRule {
+    /// The two names are two entries, so two distinct trees may hold them.
+    Sensitive,
+    /// The two names are one entry, so the second resolves to whatever the first names.
+    Insensitive,
+}
+
+impl CaseRule {
+    /// Says which clause of the case-alias requirement a leg on this volume runs.
+    #[must_use]
+    pub const fn clause(self) -> &'static str {
+        match self {
+            Self::Sensitive => {
+                "case-sensitive volume: two trees, a grant to one is refused for the other"
+            }
+            Self::Insensitive => "case-insensitive volume: the alias resolves to the granted tree",
+        }
+    }
+}
+
+/// Reads what the volume under `directory` does with names that differ only by letter case, and
+/// names the clause the leg then runs.
+///
+/// `KR_TEST_VOLUME_CASE` is how a run names the kind of volume it means to be on (`sensitive` or
+/// `insensitive`): a volume of the other kind fails the leg rather than letting it run the clause
+/// it was not sent to show. Left unset, the leg runs the clause the volume allows.
+///
+/// # Panics
+///
+/// Panics when the volume cannot be probed, and when the run named the other kind of volume.
+#[must_use]
+pub fn case_rule_of(directory: &Path) -> CaseRule {
+    let probe = directory.join("KrCaseProbe");
+    std::fs::create_dir(&probe).expect("a probe directory");
+    let rule = match std::fs::symlink_metadata(directory.join("krcaseprobe")) {
+        Ok(_) => CaseRule::Insensitive,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => CaseRule::Sensitive,
+        Err(error) => panic!("the volume could not be probed: {error}"),
+    };
+    std::fs::remove_dir(&probe).expect("the probe directory goes");
+    let named = match std::env::var("KR_TEST_VOLUME_CASE").as_deref() {
+        Ok("sensitive") => Some(CaseRule::Sensitive),
+        Ok("insensitive") => Some(CaseRule::Insensitive),
+        Ok(other) => panic!("KR_TEST_VOLUME_CASE is sensitive or insensitive, not {other:?}"),
+        Err(_) => None,
+    };
+    if let Some(named) = named {
+        assert_eq!(
+            rule,
+            named,
+            "this run named a {named:?} volume and {} is on a {rule:?} one",
+            directory.display()
+        );
+    }
+    eprintln!("case-alias leg: {}", rule.clause());
+    rule
+}
+
 /// Creates a named pipe nothing ever writes to, and returns its path.
 ///
 /// Opening one for reading blocks until a writer arrives, so a child pointed at one cannot finish

@@ -27,6 +27,7 @@ use kr_ipc::testing::volumes;
 use kr_project::ProjectService;
 use kr_project::discovery::{Discovered, MAX_ALTERNATE_DEPTH, discover, discover_through};
 use kr_project::git::{Interposition, ReadAdmission};
+use kr_project::identity::OpenedRepository;
 use kr_project::policy::{Admitting, LocationUse};
 use kr_protocol::error::ErrorCode;
 use kr_protocol::ids::{
@@ -135,6 +136,16 @@ fn authorised(
 
 fn adopt(fixture: &Fixture, parent: &Path, name: &str, seed: u8) -> ProjectRepositoryId {
     ordinary_repository(parent, name);
+    adopt_checkout(fixture, parent, name, seed).expect("the checkout is adopted")
+}
+
+/// Registers the checkout at `name` in `parent` as it is, which another name may already have done.
+fn adopt_checkout(
+    fixture: &Fixture,
+    parent: &Path,
+    name: &str,
+    seed: u8,
+) -> kr_project::Result<ProjectRepositoryId> {
     fixture
         .service()
         .project_adopt(
@@ -146,9 +157,7 @@ fn adopt(fixture: &Fixture, parent: &Path, name: &str, seed: u8) -> ProjectRepos
             },
             Some(&action("project.adopt", seed)),
         )
-        .expect("the checkout is adopted")
-        .project
-        .project_repository_id
+        .map(|adopted| adopted.project.project_repository_id)
 }
 
 fn attach_params(
@@ -4103,6 +4112,228 @@ fn source_parent_rename_cannot_fabricate_containment() {
     let refusal = attach(fixture.service(), &owner, moved_in, source, 206)
         .expect_err("the record says it is outside");
     assert_eq!(refusal.code(), ErrorCode::PermissionDenied, "{refusal}");
+}
+
+/// KR-REQ-14.06, the part about case aliases: a location the owner granted at one name is not a
+/// grant for a name that differs from it only by letter case. On a case-sensitive volume the other
+/// name holds an unrelated tree, and a repository recorded there is not bound through the location.
+/// On a case-insensitive volume the other name is the granted directory itself, so what is reached
+/// through it is the granted tree and no other. The leg names the clause it ran. Not shown here: a
+/// rename, a worktree or another environment.
+#[test]
+fn a_name_that_differs_by_case_from_a_granted_location_is_the_granted_tree_and_no_other() {
+    let fixture = Fixture::create();
+    let rule = support::case_rule_of(fixture.work());
+    let owner = TestOwner::default();
+    let environment = fixture.environment_id();
+    let granted = fixture.work().join("Sources");
+    let alias = fixture.work().join("sources");
+    let location = owner_location(&fixture, &owner, &granted, LocationPurpose::Source, 210);
+    let inside = adopt(&fixture, &granted, "repo", 211);
+    attach(fixture.service(), &owner, inside, location, 212)
+        .expect("a repository in the granted tree is bound through the location");
+    let held = fixture
+        .service()
+        .locations()
+        .admit(location, &source_use(environment, Admitting::Caller(None)))
+        .expect("the grant admits the owner");
+    let granted_identity = held.handle().identity();
+    match rule {
+        support::CaseRule::Sensitive => {
+            std::fs::create_dir(&alias).expect("an unrelated tree whose name differs by case");
+            let unrelated = adopt(&fixture, &alias, "repo", 213);
+            let other = AuthorisedDirectory::open_root(environment, &alias)
+                .expect("the unrelated tree opens");
+            assert_ne!(
+                other.identity(),
+                granted_identity,
+                "the two names are two objects on this volume"
+            );
+            let refusal = attach(fixture.service(), &owner, unrelated, location, 214)
+                .expect_err("a grant to one name is not a grant to the other");
+            assert_eq!(refusal.code(), ErrorCode::PermissionDenied, "{refusal}");
+            // What the grant reaches is unchanged: the repository in the granted tree is still
+            // bound, and the held handle is still the granted object.
+            attach(fixture.service(), &owner, inside, location, 215)
+                .expect("the granted tree is still reached");
+            assert_eq!(held.handle().identity(), granted_identity);
+        }
+        support::CaseRule::Insensitive => {
+            let through_alias =
+                AuthorisedDirectory::open_root(environment, &alias).expect("the alias opens");
+            assert_eq!(
+                through_alias.identity(),
+                granted_identity,
+                "the alias is the granted directory, not another"
+            );
+            // The repository found through the alias is the one in the granted tree.
+            let profile = fixture.service().profile();
+            let in_granted = OpenedRepository::open(profile, environment, &granted.join("repo"))
+                .expect("the granted repository opens");
+            let in_alias = OpenedRepository::open(profile, environment, &alias.join("repo"))
+                .expect("the repository opens through the alias");
+            assert_eq!(in_alias.identity(), in_granted.identity());
+            // Registered through the alias, it is the same repository under a spelling the grant
+            // does not carry: the name the owner authorised is what a binding is proved by, so it
+            // is refused and bound as nothing.
+            let registered = adopt_checkout(&fixture, &alias, "repo", 213)
+                .expect("the same checkout is registered through its alias");
+            let refusal = attach(fixture.service(), &owner, registered, location, 214)
+                .expect_err("the alias is not the name that was granted");
+            assert_eq!(refusal.code(), ErrorCode::PermissionDenied, "{refusal}");
+            attach(fixture.service(), &owner, inside, location, 215)
+                .expect("the granted tree is still reached");
+            assert_eq!(
+                names_in(fixture.work()),
+                ["Sources"],
+                "one tree on this volume"
+            );
+        }
+    }
+}
+
+/// KR-REQ-14.06, the part about environments: a location the owner granted in one environment, the
+/// handle held for it and the identity read through that handle are refused when another
+/// environment presents them, whatever object they name. The location is not listed, authorised,
+/// admitted or reached through a destination in the other environment, and a second handle on the
+/// very same directory opened for that environment is a different authority: nothing moves between
+/// the two. Not shown here: a rename, a worktree or a case alias.
+#[test]
+fn a_handle_made_in_one_environment_is_refused_in_another() {
+    let fixture = Fixture::create();
+    let owner = TestOwner::default();
+    let environment = fixture.environment_id();
+    let elsewhere = EnvironmentId::new(Uuid::from_bytes([0x64; 16]));
+    let root = fixture.work().join("granted");
+    let location = owner_location(&fixture, &owner, &root, LocationPurpose::Destination, 220);
+    let held = fixture
+        .service()
+        .locations()
+        .admit(
+            location,
+            &LocationUse {
+                purpose: LocationPurpose::Destination,
+                environment_id: environment,
+                admitting: Admitting::Caller(None),
+            },
+        )
+        .expect("the grant admits the owner in its own environment");
+
+    // The grant's row names its environment, and the other one is refused at the policy.
+    let refusal = fixture
+        .service()
+        .locations()
+        .admit(
+            location,
+            &LocationUse {
+                purpose: LocationPurpose::Destination,
+                environment_id: elsewhere,
+                admitting: Admitting::Caller(None),
+            },
+        )
+        .expect_err("another environment is not admitted");
+    assert_eq!(refusal.code(), ErrorCode::PermissionDenied, "{refusal}");
+    assert!(
+        refusal.to_string().contains("belongs to environment"),
+        "the refusal says why: {refusal}"
+    );
+
+    // The service answers for one environment: a request that names another is refused before a
+    // name is resolved, and nothing is made in the granted directory.
+    let origin = ordinary_repository(fixture.work(), "origin");
+    let refusal = clone_into(
+        fixture.service(),
+        through(elsewhere, location, "copy"),
+        local_remote(&origin),
+        221,
+    )
+    .expect_err("a destination in another environment is refused");
+    assert_eq!(
+        refusal.code(),
+        ErrorCode::EnvironmentUnavailable,
+        "{refusal}"
+    );
+    assert!(names_in(&root).is_empty());
+    // The resolution of the destination refuses it again on its own, whoever asks it.
+    let refusal = kr_project::operation::Destination::resolve(
+        &through(elsewhere, location, "copy"),
+        environment,
+        fixture.service().locations(),
+        Admitting::Caller(None),
+    )
+    .expect_err("a destination named for another environment resolves to no handle");
+    assert_eq!(
+        refusal.code(),
+        ErrorCode::EnvironmentUnavailable,
+        "{refusal}"
+    );
+    clone_into(
+        fixture.service(),
+        through(environment, location, "copy"),
+        local_remote(&origin),
+        222,
+    )
+    .expect("the same request in the granting environment is served");
+    assert_eq!(names_in(&root), ["copy"]);
+
+    // Another environment lists none of it and authorises nothing of its own.
+    let refusal = fixture
+        .service()
+        .project_location_list(&ProjectLocationListParams {
+            environment_id: elsewhere,
+            grant_id: Nullable(None),
+        })
+        .expect_err("another environment's locations are not read here");
+    assert_eq!(
+        refusal.code(),
+        ErrorCode::EnvironmentUnavailable,
+        "{refusal}"
+    );
+    let beyond = fixture.work().join("beyond");
+    std::fs::create_dir(&beyond).expect("a directory another environment would authorise");
+    let refusal = fixture
+        .service()
+        .project_location_authorise(
+            &actor(),
+            &authorise_params(elsewhere, &beyond, LocationPurpose::Destination, None),
+            Some(&submission(AUTHORISE, 223, false)),
+            Some(&owner),
+        )
+        .expect_err("another environment's authorisation is refused");
+    assert_eq!(
+        refusal.code(),
+        ErrorCode::EnvironmentUnavailable,
+        "{refusal}"
+    );
+
+    // The handle the policy holds is the granting environment's. A second handle on the very
+    // same directory opened for another environment reads the same object and is still another
+    // authority: the first refuses the other's name and no operation joins the two.
+    let held_handle = held.handle();
+    assert_eq!(held_handle.environment_id(), environment);
+    let foreign = AuthorisedDirectory::open_root(elsewhere, &root)
+        .expect("the same directory opens for another environment");
+    assert_eq!(foreign.identity(), held_handle.identity());
+    assert!(matches!(
+        held_handle.check_environment(elsewhere),
+        Err(kr_transfer::Escape::WrongEnvironment { .. })
+    ));
+    assert!(matches!(
+        foreign.check_environment(environment),
+        Err(kr_transfer::Escape::WrongEnvironment { .. })
+    ));
+    let name = RelativeName::parse("copy").expect("a relative name");
+    let moved = RelativeName::parse("moved").expect("a relative name");
+    let refusal = held_handle
+        .rename_into(&name, &foreign, &moved, || {
+            std::ops::ControlFlow::<std::convert::Infallible>::Continue(())
+        })
+        .expect_err("the two environments are never one authority");
+    assert!(
+        matches!(refusal, kr_transfer::Escape::WrongEnvironment { .. }),
+        "{refusal:?}"
+    );
+    assert_eq!(names_in(&root), ["copy"], "and nothing moved");
 }
 
 // ----- metadata discovery through a location's handle -----------------------------------------

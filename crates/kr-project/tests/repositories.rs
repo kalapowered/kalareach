@@ -674,6 +674,96 @@ fn an_added_worktree_is_its_own_object_and_a_record_of_one_tree_never_covers_ano
     );
 }
 
+/// KR-REQ-14.06, the part about case aliases: a name that differs from a checkout's only by letter
+/// case never carries that checkout's record to an unrelated tree. On a case-sensitive volume the
+/// two names hold two distinct trees, and a record of one is refused at the other as a source that
+/// changed; on a case-insensitive volume the alias is the same directory, so it opens as exactly
+/// the recorded object and never as another. The leg names the clause it ran. Not shown here: a
+/// rename, a worktree or another environment.
+#[test]
+fn a_case_alias_of_a_checkout_is_the_recorded_object_or_refused_and_never_another_tree() {
+    let fixture = Fixture::create();
+    let rule = support::case_rule_of(fixture.work());
+    let granted = ordinary_repository(fixture.work(), "Repo");
+    let adopted = fixture
+        .service()
+        .project_adopt(
+            &actor(),
+            &ProjectAdoptParams {
+                destination: destination(fixture.environment_id(), fixture.work(), "Repo"),
+                label: "Repo".to_owned(),
+                flow: AdoptionFlow::ExistingCheckout,
+            },
+            Some(&action("project.adopt", 15)),
+        )
+        .expect("the checkout is adopted");
+    let alias = fixture.work().join("repo");
+    let recorded = OpenedRepository::open(
+        fixture.service().profile(),
+        fixture.environment_id(),
+        &granted,
+    )
+    .expect("it opens")
+    .recorded()
+    .expect("it reads its identity");
+    match rule {
+        support::CaseRule::Sensitive => {
+            // Another tree of its own holds the other name.
+            let unrelated = ordinary_repository(fixture.work(), "repo");
+            assert_eq!(unrelated, alias);
+            let other = OpenedRepository::open(
+                fixture.service().profile(),
+                fixture.environment_id(),
+                &alias,
+            )
+            .expect("the unrelated tree opens");
+            assert_ne!(other.identity().git_dir, recorded.git_dir.object);
+            assert_ne!(other.identity().work_tree, recorded.work_tree.object);
+            // A record of the first does not cover the second, whatever the names share.
+            let refusal = open_recorded(&fixture, &alias, recorded).expect_err(
+                "a record of one tree does not cover the tree whose name differs by case",
+            );
+            assert_eq!(refusal.code(), ErrorCode::SourceChanged);
+            assert!(
+                refusal
+                    .to_string()
+                    .contains("the object rather than the path"),
+                "the refusal says why: {refusal}"
+            );
+            // The record still names the first, which is still the object it recorded.
+            open_recorded(&fixture, &granted, recorded).expect("the recorded tree still opens");
+        }
+        support::CaseRule::Insensitive => {
+            // The alias is the directory itself, so it opens as the recorded object.
+            let opened = open_recorded(&fixture, &alias, recorded)
+                .expect("the alias is the recorded tree and opens as it");
+            assert_eq!(opened.identity().git_dir, recorded.git_dir.object);
+            assert_eq!(opened.identity().work_tree, recorded.work_tree.object);
+            // There is one tree on this volume: no second one came of the second name.
+            assert_eq!(support::names_in(fixture.work()), ["Repo"]);
+        }
+    }
+    // The project's own record still reaches exactly the tree it recorded.
+    fixture
+        .service()
+        .workspace_create(
+            &actor(),
+            &kr_protocol::project::WorkspaceCreateParams {
+                project_repository_id: adopted.project.project_repository_id,
+                label: "review".to_owned(),
+                kind: kr_protocol::project::WorkspaceKind::SharedExisting,
+                isolation: Nullable(None),
+                policy: support::include_everything(),
+                base_revision: Nullable(None),
+                base_change_set_id: Nullable(None),
+                destination: Nullable(None),
+                preview_only: true,
+            },
+            Some(&action("workspace.create", 16)),
+        )
+        .expect("the record still names the object it recorded");
+}
+
 /// KR-REQ-14.18, the part about a crash or ambiguous publish: a replacement daemon settles the
 /// publication as unknown under its create token without looking at the staging directory, names
 /// that directory and why, leaves what was published untouched, and answers a repeat of the action
