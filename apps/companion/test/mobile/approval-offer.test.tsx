@@ -90,6 +90,24 @@ describe.each(PLATFORMS)('the %s inbox sheet of an approval that cannot be answe
     })
   })
 
+  it('keeps_the_offer_and_shows_the_failure_apart_when_the_request_cannot_be_read', async () => {
+    start(surface, (controls) => {
+      controls.records.suspend(SESSION_MAIN, FENCE)
+      controls.records.refuseInspection(SESSION_MAIN, 'The record store cannot be read.')
+    })
+    const approval = await openCard()
+    const offer = await within(approval).findByTestId('approval-offer')
+    expect(within(offer).getByTestId('approval-offer-reason')).toHaveTextContent(SENTENCE)
+    expect(within(approval).getByTestId('approval-inspection-failed')).toHaveTextContent(
+      'The record store cannot be read.'
+    )
+    expect(within(approval).queryByRole('button', { name: 'Allow once' })).toBeNull()
+    await userEvent.click(within(offer).getByRole('button', { name: 'Open the terminal' }))
+    await waitFor(() => {
+      expect(paneShown()).toBe('terminal')
+    })
+  })
+
   it('without_the_right_to_type_the_sheet_says_so_and_offers_no_button', async () => {
     start(surface, (controls) => {
       controls.records.withoutCapability(SESSION_MAIN, 'agent.approval')

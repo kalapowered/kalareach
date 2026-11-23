@@ -136,6 +136,8 @@ interface ScriptedAgent {
    * for them and the page is still told the host's own word: a paired route's lost answer.
    */
   channel?: { lost: number; unrecorded: number }
+  /** Why the host refuses to read the requests it holds, as a store that refuses reads does. */
+  inspectionRefusal?: string
 }
 
 /** How many entries one part of a snapshot carries here, so a longer history continues. */
@@ -863,6 +865,7 @@ export class ScriptedRecords {
   inspect(params: unknown): AgentApprovalInspectResult {
     const read = decodeParams<AgentApprovalInspectParams>(params, AGENT_INSPECT_PARAMS)
     const agent = this.#subjectAgent(read.subject)
+    if (agent.inspectionRefusal !== undefined) refuse('RESOURCE_UNAVAILABLE', agent.inspectionRefusal)
     const resource = agent.resources.find((each) => each.resource_id === read.resource_id)
     const decoding = agent.ledger.get(read.resource_id)
     if (
@@ -1504,6 +1507,16 @@ export class ScriptedRecords {
     agent.instances = agent.instances.map((each, index) =>
       index === 0 ? { ...each, refusal: reason } : each
     )
+  }
+
+  /**
+   * Has the host refuse to read what a request holds, for `reason`, or read it again with null:
+   * a store that refuses reads, which the session's other reads do not meet.
+   */
+  refuseInspection(sessionId: string, reason: string | null): void {
+    const agent = this.#agentOf(sessionId)
+    if (reason === null) delete agent.inspectionRefusal
+    else agent.inspectionRefusal = reason
   }
 
   /** Suspends a session's rich mutations for `reason`, or lifts the suspension with null. */

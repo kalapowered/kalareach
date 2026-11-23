@@ -378,3 +378,67 @@ describe('the notice while a request nothing has read is pending', () => {
     expect(screen.queryByRole('region', { name: 'Approvals' })).toBeNull()
   })
 })
+
+describe('the inbox card of a request the host could not read', () => {
+  const REFUSED = 'The record store cannot be read.'
+  const FENCE =
+    'the record store has a fault, so messages, steering, interrupts and approvals wait until it works again; the terminal goes on working'
+  const SENTENCE =
+    'The record store has a fault, so messages, steering, interrupts and approvals wait until it works again; the terminal goes on working.'
+  const card = () => screen.findByTestId('approval')
+
+  it('keeps_the_notice_and_the_offer_from_the_facts_it_read_and_shows_the_failure_apart', async () => {
+    open(
+      (controls) => {
+        controls.records.suspend(SESSION_MAIN, FENCE)
+        controls.records.refuseInspection(SESSION_MAIN, REFUSED)
+      },
+      true,
+      { view: 'attention' }
+    )
+    const approval = await card()
+    const offer = await within(approval).findByTestId('approval-offer')
+    expect(within(offer).getByTestId('approval-offer-reason')).toHaveTextContent(SENTENCE)
+    expect(within(approval).getByTestId('approval-inspection-failed')).toHaveTextContent(REFUSED)
+    expect(within(approval).queryByRole('button', { name: 'Allow once' })).toBeNull()
+    expect(screen.queryByText('The requests waiting here could not be read')).toBeNull()
+    await userEvent.click(within(offer).getByRole('button', { name: 'Open the terminal' }))
+    await waitFor(() => {
+      expect(screen.getByRole('tab', { name: 'Terminal' })).toHaveAttribute('aria-selected', 'true')
+    })
+  })
+
+  it('without_a_reason_of_the_hosts_the_card_shows_the_failure_and_offers_a_new_read', async () => {
+    open(
+      (controls) => {
+        controls.records.refuseInspection(SESSION_MAIN, REFUSED)
+      },
+      true,
+      { view: 'attention' }
+    )
+    const approval = await card()
+    expect(await within(approval).findByTestId('approval-inspection-failed')).toHaveTextContent(REFUSED)
+    expect(within(approval).queryByTestId('approval-offer')).toBeNull()
+    expect(within(approval).getByRole('button', { name: 'Try again' })).toBeEnabled()
+  })
+
+  it('reads_the_request_when_the_store_reads_again', async () => {
+    const controls = open(
+      (each) => {
+        each.records.refuseInspection(SESSION_MAIN, REFUSED)
+      },
+      true,
+      { view: 'attention' }
+    )
+    const approval = await card()
+    await within(approval).findByTestId('approval-inspection-failed')
+    act(() => {
+      controls.records.refuseInspection(SESSION_MAIN, null)
+    })
+    await userEvent.click(within(approval).getByRole('button', { name: 'Try again' }))
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'Allow once' })).toBeEnabled()
+    })
+    expect(screen.queryByTestId('approval-inspection-failed')).toBeNull()
+  })
+})

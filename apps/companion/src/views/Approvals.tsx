@@ -57,7 +57,10 @@ const SHOWN_UNCONFIRMED = 5
 /** One request, with what its decoder read and what the instance can do now. */
 interface Waiting {
   readonly resource: PendingResource
-  readonly inspection: AgentApprovalInspectResult
+  /** What the host read of the request, or null when that read failed ([`failure`]). */
+  readonly inspection: AgentApprovalInspectResult | null
+  /** Why the host could not be asked what the request holds, shown apart from the facts it did give. */
+  readonly failure: string | null
   readonly facts: AgentCapabilitiesResult
   /** Whether the request's instance takes answers over a channel that confirms nothing. */
   readonly channel: boolean
@@ -228,18 +231,27 @@ export function ApprovalRequests({
         open.map(async (resource): Promise<Waiting> => {
           const instanceFacts = facts.get(resource.application_instance_id)
           if (instanceFacts === undefined) throw new Error('an instance was not read')
-          return {
+          const known = {
             resource,
             facts: instanceFacts,
             channel: channelInstances.has(resource.application_instance_id),
             instance:
               agents.instances.instances.find(
                 (each) => each.application_instance_id === resource.application_instance_id
-              ) ?? null,
-            inspection: await port.approvalInspect({
+              ) ?? null
+          }
+          // The instance, capability and binding facts are the host's own and are read already. A
+          // request the host cannot read to the end (its store refuses reads, say) keeps what they
+          // say, and its failure is shown beside them: it does not take the other requests, or the
+          // terminal's notice, with it.
+          try {
+            const inspection = await port.approvalInspect({
               subject: subjectOf(sessionId, resource.application_instance_id),
               resource_id: resource.resource_id
             })
+            return { ...known, inspection, failure: null }
+          } catch (error: unknown) {
+            return { ...known, inspection: null, failure: failureMessage(error) }
           }
         })
       )
@@ -332,7 +344,6 @@ export function ApprovalRequests({
     >
       {requests.map((request) => {
         const { resource, inspection, facts } = request
-        const decoding = inspection.decoding
         const offer = composerOffers({
           known: true,
           instance: null,
@@ -354,6 +365,32 @@ export function ApprovalRequests({
                 rights: new Set(rights)
               })
             : null
+        if (inspection === null) {
+          return (
+            <article
+              className="approval"
+              key={resource.resource_id}
+              data-resource={resource.resource_id}
+              data-testid="approval"
+            >
+              <p className="eyebrow">Waiting for you</p>
+              <h3>Request {requestLabel(resource)}</h3>
+              <p className="small muted">
+                Asked {describeElapsed(now - Number(resource.recorded_at))} ago
+              </p>
+              <p className="small warning-text" data-testid="approval-inspection-failed">
+                What this request asks could not be read here. {request.failure}
+              </p>
+              {notice !== null && openTerminal !== undefined ? (
+                <ApprovalOffer notice={notice} onOpenTerminal={openTerminal} />
+              ) : null}
+              <div className="row wrap">
+                <Button onClick={readAgain}>Try again</Button>
+              </div>
+            </article>
+          )
+        }
+        const decoding = inspection.decoding
         const source = sourceText(decoding.source_bytes)
         const busy = answering === resource.resource_id
         return (
