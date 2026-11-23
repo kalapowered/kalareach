@@ -664,17 +664,24 @@ pub async fn subscribe(
 pub struct InputSwitch {
     /// Asks the console to spell its keys.
     ask: std::sync::Arc<dyn Fn() -> Result<()> + Send + Sync>,
+    /// Asks the console to report its keys as records again.
+    give_back: std::sync::Arc<dyn Fn() -> Result<()> + Send + Sync>,
     /// The reader, once one that can make the change is running.
     #[cfg(any(not(unix), test))]
     reader: std::sync::Mutex<Option<ReaderLine>>,
 }
 
 impl InputSwitch {
-    /// A switch that asks the console with `ask`.
+    /// A switch that asks the console to spell its keys with `ask`, and to report them as records
+    /// again with `give_back`.
     #[must_use]
-    pub fn new(ask: impl Fn() -> Result<()> + Send + Sync + 'static) -> Self {
+    pub fn new(
+        ask: impl Fn() -> Result<()> + Send + Sync + 'static,
+        give_back: impl Fn() -> Result<()> + Send + Sync + 'static,
+    ) -> Self {
         Self {
             ask: std::sync::Arc::new(ask),
+            give_back: std::sync::Arc::new(give_back),
             #[cfg(any(not(unix), test))]
             reader: std::sync::Mutex::new(None),
         }
@@ -700,6 +707,19 @@ impl InputSwitch {
     }
 }
 
+impl InputSwitch {
+    /// Has the console spell its keys while the application has bracketed paste on, and report
+    /// them as records again when it has not.
+    ///
+    /// # Errors
+    ///
+    /// Returns why the console would not.
+    pub fn follow_paste(&self, wanted: bool) -> Result<()> {
+        let _ = (wanted, &self.give_back);
+        Ok(())
+    }
+}
+
 /// How long a switch waits for the reader to make it. The reader answers between two of its reads,
 /// so a wait that long means the reader is gone.
 #[cfg(all(not(unix), not(test)))]
@@ -714,6 +734,12 @@ const READER_ANSWER_WAIT: std::time::Duration = std::time::Duration::from_millis
 /// being heard.
 #[cfg(any(not(unix), test))]
 const READS_BEFORE_A_REQUEST: u32 = 4;
+
+/// How many reads of text the reader makes to take what the console holds before it gives the
+/// console's keys back as records. A console that has more than that is not given them back yet,
+/// so that the answer does not wait on a flood.
+#[cfg(any(not(unix), test))]
+const DRAINS_BEFORE_THE_CHANGE_WAITS: u32 = 16;
 
 /// Where a request of the switch is, shared by the switch and the reader.
 #[cfg(any(not(unix), test))]
@@ -1729,8 +1755,9 @@ mod reader {
     use tokio::sync::mpsc::UnboundedReceiver;
 
     use super::{
-        ConsoleInput, ConsoleRead, InputSwitch, READS_BEFORE_A_REQUEST, ReaderStop, Stopped,
-        TerminalInput, Wakes, Woken, key_can_make_text, start_reader, utf8_of_console_text,
+        ConsoleInput, ConsoleRead, DRAINS_BEFORE_THE_CHANGE_WAITS, InputSwitch,
+        READS_BEFORE_A_REQUEST, ReaderStop, Stopped, TerminalInput, Wakes, Woken,
+        key_can_make_text, start_reader, utf8_of_console_text,
     };
     use crate::error::{CliError, Result};
 
@@ -1911,14 +1938,21 @@ mod reader {
             let (release, released) = mpsc::channel();
             let steps: Steps = Arc::default();
             let asked = Arc::clone(&steps);
-            let switch = InputSwitch::new(move || {
-                asked.lock().expect("steps").push("ask");
-                if will_spell {
+            let given_back = Arc::clone(&steps);
+            let switch = InputSwitch::new(
+                move || {
+                    asked.lock().expect("steps").push("ask");
+                    if will_spell {
+                        Ok(())
+                    } else {
+                        Err(CliError::Terminal(Shown::said("the console refused")))
+                    }
+                },
+                move || {
+                    given_back.lock().expect("steps").push("give back");
                     Ok(())
-                } else {
-                    Err(CliError::Terminal(Shown::said("the console refused")))
-                }
-            });
+                },
+            );
             let console = Scripted {
                 wakes: heard,
                 pending: VecDeque::new(),
@@ -2154,6 +2188,150 @@ mod reader {
             "nothing was handed on for the input that held no byte"
         );
         run.ends();
+    }
+
+    /// How often a thread of `steps` is at `step`.
+    fn times(steps: &[&'static str], step: &str) -> usize {
+        steps.iter().filter(|done| **done == step).count()
+    }
+
+    /// While the application has bracketed paste on, the console spells its keys and the reader
+    /// hands its text on; when the application turns it off, the console reports records again and
+    /// the reader reads records. What was typed ahead and not yet read when it turned off is handed
+    /// on as the text it is, before the console is given the records back: a record read after the
+    /// change would be a character of a sequence the console had spelled.
+    #[test]
+    fn the_console_spells_its_keys_while_bracketed_paste_is_on_and_reports_records_after() {
+        let down = key(u16::from(b'A'), u16::from(b'a'), true);
+        let up = key(u16::from(b'A'), u16::from(b'a'), false);
+        let mut run = Run::start(true, vec![vec![vec![down]], vec![vec![up]]]);
+        run.has_input();
+        assert_eq!(run.next(), TerminalInput::Keys(vec![down]));
+
+        run.switch
+            .follow_paste(true)
+            .expect("the console spells its keys");
+        run.bytes.send(b"x".to_vec()).expect("the reader waits");
+        run.has_input();
+        assert_eq!(run.next(), TerminalInput::Bytes(b"x".to_vec()));
+
+        run.bytes.send(b"yz".to_vec()).expect("the reader waits");
+        run.switch
+            .follow_paste(false)
+            .expect("the console reports records again");
+        assert_eq!(
+            run.next(),
+            TerminalInput::Bytes(b"yz".to_vec()),
+            "what was typed ahead is handed on as text"
+        );
+        run.has_input();
+        assert_eq!(run.next(), TerminalInput::Keys(vec![up]));
+
+        let steps = run.ends();
+        let asked = steps.iter().position(|step| *step == "ask").expect("asked");
+        let given = steps
+            .iter()
+            .position(|step| *step == "give back")
+            .expect("given back");
+        assert!(steps[..asked].iter().all(|step| *step == "records"));
+        assert!(
+            steps[asked + 1..given].iter().all(|step| *step == "bytes"),
+            "only text is read while the console spells: {steps:?}"
+        );
+        assert!(
+            steps[given + 1..].iter().all(|step| *step == "records"),
+            "only records are read after: {steps:?}"
+        );
+    }
+
+    /// The console is asked once for each change of what the application asked for, and nothing is
+    /// asked of it when the state is the one it is in.
+    #[test]
+    fn a_console_is_asked_once_for_each_change_of_bracketed_paste() {
+        let mut run = Run::start(true, Vec::new());
+        run.switch
+            .follow_paste(false)
+            .expect("nothing to give back");
+        run.switch.follow_paste(true).expect("spelled");
+        run.switch.follow_paste(true).expect("already spelled");
+        run.switch.follow_paste(false).expect("given back");
+        run.switch.follow_paste(false).expect("already given back");
+        run.switch.follow_paste(true).expect("spelled again");
+        assert_eq!(run.ends(), ["ask", "give back", "ask"]);
+    }
+
+    /// A console the session refused the records of is asked to spell its keys for good: the end of
+    /// bracketed paste does not give it records the session cannot take, and it is asked to spell
+    /// once, whichever of the two reasons came first.
+    #[test]
+    fn a_console_asked_to_spell_for_the_sessions_refusal_stays_spelled_when_paste_ends() {
+        for refusal_first in [false, true] {
+            let mut run = Run::start(true, Vec::new());
+            if refusal_first {
+                run.switch.engage().expect("spelled for the refusal");
+            }
+            run.switch
+                .follow_paste(true)
+                .expect("a paste's start asks nothing more");
+            if !refusal_first {
+                run.switch.engage().expect("spelled for the refusal");
+            }
+            run.switch
+                .follow_paste(false)
+                .expect("a paste's end gives nothing back");
+            run.bytes.send(b"x".to_vec()).expect("the reader waits");
+            run.has_input();
+            assert_eq!(run.next(), TerminalInput::Bytes(b"x".to_vec()));
+            let steps = run.ends();
+            assert_eq!(times(&steps, "give back"), 0, "{steps:?}");
+            assert_eq!(times(&steps, "ask"), 1, "{steps:?}");
+        }
+    }
+
+    /// A console that will not spell its keys goes on being read as records while the application
+    /// has bracketed paste on, and the refusal is said.
+    #[test]
+    fn a_console_that_will_not_spell_goes_on_being_read_as_records_while_paste_is_on() {
+        let down = key(u16::from(b'A'), u16::from(b'a'), true);
+        let mut run = Run::start(false, vec![vec![vec![down]]]);
+        assert!(run.switch.follow_paste(true).is_err());
+        run.has_input();
+        assert_eq!(run.next(), TerminalInput::Keys(vec![down]));
+        run.switch
+            .follow_paste(false)
+            .expect("a console that was never spelled has nothing to give back");
+        let steps = run.ends();
+        assert_eq!(times(&steps, "give back"), 0, "{steps:?}");
+    }
+
+    /// A console that keeps having text when the application turns bracketed paste off is not given
+    /// the records back while it does: the change is refused, so the answer does not wait on a
+    /// flood, and the text goes on being read and handed on, none of it lost. The change is made on
+    /// the next ask, once the console has no more.
+    #[test]
+    fn a_flood_of_typed_ahead_text_puts_the_change_off_without_losing_any() {
+        let flood = usize::try_from(DRAINS_BEFORE_THE_CHANGE_WAITS).expect("a small number") + 1;
+        let mut run = Run::start(true, Vec::new());
+        run.switch.follow_paste(true).expect("spelled");
+        for _ in 0..flood {
+            run.bytes.send(b"t".to_vec()).expect("the reader waits");
+        }
+        assert!(
+            run.switch.follow_paste(false).is_err(),
+            "the console kept having text"
+        );
+        let mut text = Vec::new();
+        while text.len() < flood {
+            run.has_input();
+            if let TerminalInput::Bytes(bytes) = run.next() {
+                text.extend(bytes);
+            }
+        }
+        assert_eq!(text, vec![b't'; flood], "none of it is lost");
+        run.switch
+            .follow_paste(false)
+            .expect("the console has no more");
+        assert_eq!(times(&run.ends(), "give back"), 1);
     }
 
     /// A console that would not spell its keys goes on being read as records.
@@ -2676,7 +2854,7 @@ mod unix_stop {
         let terminal = std::fs::File::from(terminal);
         let mut next_reader = terminal.try_clone().expect("a duplicate");
         let mut typed = std::fs::File::from(typed);
-        let switch = super::InputSwitch::new(|| Ok(()));
+        let switch = super::InputSwitch::new(|| Ok(()), || Ok(()));
         let (mut input, stop) = super::spawn_input_reader(terminal, &switch).expect("a reader");
 
         // It is reading: a key typed before the stop is handed on.
@@ -2914,7 +3092,7 @@ mod unix_stop {
         };
         let controlling = ControllingTerminal::over(terminal.try_clone().expect("a duplicate"));
         let saved = controlling.enter_raw_mode().expect("raw mode");
-        let switch = super::InputSwitch::new(|| Ok(()));
+        let switch = super::InputSwitch::new(|| Ok(()), || Ok(()));
         let typed = std::path::PathBuf::from(
             std::env::var_os(STOP_PROBE_TYPED).expect("the case names the file"),
         );

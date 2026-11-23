@@ -4380,6 +4380,10 @@ mod tests {
             pub said: Vec<kr_client::shown::Shown>,
             pub sent: Vec<ControlFrame>,
             pub written: Vec<u8>,
+            /// How many times the loop asked the console to spell its keys.
+            pub asked: usize,
+            /// How many times it asked the console to report them as records again.
+            pub given_back: usize,
         }
 
         /// Runs the loop with a lease held and a console that will spell its keys, and `case` for
@@ -4550,16 +4554,25 @@ mod tests {
             let mut display = crate::render::ProjectedDisplay::new();
             let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let counted = Arc::clone(&asked);
-            let switch = crate::attach::InputSwitch::new(move || {
-                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                if console_will_spell {
+            let asks = Arc::clone(&asked);
+            let given_back = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let given = Arc::clone(&given_back);
+            let switch = crate::attach::InputSwitch::new(
+                move || {
+                    counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if console_will_spell {
+                        Ok(())
+                    } else {
+                        Err(CliError::Terminal(kr_client::shown::Shown::said(
+                            "the console refused",
+                        )))
+                    }
+                },
+                move || {
+                    given.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     Ok(())
-                } else {
-                    Err(CliError::Terminal(kr_client::shown::Shown::said(
-                        "the console refused",
-                    )))
-                }
-            });
+                },
+            );
             let mut fallback = super::super::Fallback::default();
             // Held until the loop has ended: a wire the case let go of reads as a connection lost,
             // and the loop looks at the worker's side first.
@@ -4611,6 +4624,8 @@ mod tests {
                 ),
                 sent,
                 written,
+                asked: asks.load(std::sync::atomic::Ordering::SeqCst),
+                given_back: given_back.load(std::sync::atomic::Ordering::SeqCst),
             }
         }
     }
@@ -6163,6 +6178,53 @@ mod tests {
         assert_eq!(ran.said.len(), 1);
         assert!(ran.said[0].as_str().contains("would not spell its keys"));
         assert!(ran.said[0].as_str().contains("--no-probe"));
+    }
+
+    /// The console is asked to spell its keys while the application has bracketed paste on, which
+    /// the session's screen at the attachment states as live output does afterwards, and to report
+    /// records again when it turns it off.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_console_spells_its_keys_while_the_application_has_bracketed_paste_on() {
+        let ran = wire::run_switched(true, true, |case| async move {
+            // The screen the session drew for this terminal, then what the application wrote.
+            case.says_output_bytes(0, b"$ \x1b[?2004h");
+            case.says_output_bytes(1, b"text\x1b[?2004h");
+            case.says_output_bytes(2, b"\x1b[?2004l");
+            case.says_output_bytes(3, b"\x1b[?2004h");
+            case.closes();
+        })
+        .await;
+        assert_eq!(
+            (ran.asked, ran.given_back),
+            (2, 1),
+            "spelled when it came on, given back when it went off, spelled again"
+        );
+    }
+
+    /// A console the session refused the records of keeps spelling its keys when the application's
+    /// bracketed paste ends: the records it would be given are the ones the session cannot take.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_console_whose_records_were_refused_is_not_given_them_back_with_the_paste() {
+        let ran = wire::run_switched(true, true, |mut case| async move {
+            case.says_output_bytes(0, b"\x1b[?2004h");
+            let first = case.types(key_down(b'A')).await;
+            case.refuses(&first, ErrorCode::InputIncompatible);
+            let typed = case
+                .types(crate::attach::TerminalInput::Bytes(b"c".to_vec()))
+                .await;
+            case.takes(&typed);
+            case.says_output_bytes(1, b"\x1b[?2004l");
+            case.says_output_bytes(2, b"\x1b[?2004h");
+            case.closes();
+        })
+        .await;
+        assert_eq!(
+            (ran.asked, ran.given_back),
+            (1, 0),
+            "asked once, and never given back"
+        );
     }
 
     /// What the line after a refusal of console keys says, for a case that ends once the console has

@@ -303,6 +303,13 @@ impl MouseReporting {
             .map(u32::from)
     }
 
+    /// Whether the application asked for bracketed paste.
+    #[must_use]
+    pub fn bracketed_paste(&self) -> bool {
+        let _ = &self.modes;
+        false
+    }
+
     /// Acts on one event of the lexer, and says whether it set or reset an encoding.
     ///
     /// Only what the worker forwards is acted on: a full reset of the terminal, and the setting and
@@ -647,6 +654,15 @@ pub const fn mouse_input_mode(current: u32, attached: u32, asked: bool) -> u32 {
     }
 }
 
+/// The console input mode `current` becomes when the console is asked to spell the keys itself
+/// (`spelled`), or to report them as records again. Only the one flag changes: the mouse's flags and
+/// the private flags stay as `current` holds them.
+#[must_use]
+pub const fn keys_spelled_mode(current: u32, spelled: bool) -> u32 {
+    let _ = spelled;
+    current
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -654,7 +670,7 @@ mod tests {
         ENABLE_PROCESSED_INPUT, ENABLE_QUICK_EDIT_MODE, ENABLE_VIRTUAL_TERMINAL_INPUT,
         ENABLE_WINDOW_INPUT, Follow, LEFT, MIDDLE, MOUSE_MOVED, MOUSE_WHEELED, MouseRecord,
         MouseReporting, MouseSpeller, RESTORATION_CHUNK, RIGHT, Reading, Restoration, Tracking,
-        Window, mouse_input_mode, record_input_mode,
+        Window, keys_spelled_mode, mouse_input_mode, record_input_mode,
     };
 
     /// A record at `column` and `row` with the buttons and flags the console reported it with.
@@ -1445,5 +1461,70 @@ mod tests {
         let asked = mouse_input_mode(held, attached, true);
         assert_eq!(asked, held | ENABLE_MOUSE_INPUT);
         assert_eq!(mouse_input_mode(asked, attached, false), held);
+    }
+
+    /// The application's bracketed paste is read from its output as its mouse is: set and reset,
+    /// among the other modes of one sequence, in a sequence that arrives in two writes, and off
+    /// after a full reset of the terminal.
+    #[test]
+    fn the_applications_bracketed_paste_is_read_from_its_output() {
+        let mut reporting = MouseReporting::default();
+        assert!(!reporting.bracketed_paste(), "a terminal begins with none");
+        reporting.observe(b"text\x1b[?2004h");
+        assert!(reporting.bracketed_paste());
+        reporting.observe(b"\x1b[?2004l");
+        assert!(!reporting.bracketed_paste());
+        reporting.observe(b"\x1b[?25l\x1b[?1000;2004h");
+        assert!(
+            reporting.bracketed_paste(),
+            "among the modes of one sequence"
+        );
+        reporting.observe(b"\x1b[?20");
+        reporting.observe(b"04l");
+        assert!(
+            !reporting.bracketed_paste(),
+            "a sequence that arrives in two writes"
+        );
+        reporting.observe(b"\x1b[?2004h\x1bc");
+        assert!(!reporting.bracketed_paste(), "a full reset turns it off");
+    }
+
+    /// A screen drawn for this terminal states the application's bracketed paste as live output
+    /// does, and reading it writes nothing after it.
+    #[test]
+    fn a_screen_the_session_drew_states_bracketed_paste_as_live_output_does() {
+        for reading in [Reading::Live, Reading::Restoration, Reading::Painted] {
+            let mut reporting = MouseReporting::default();
+            assert!(reporting.read(b"\x1b[?2004h", reading).is_empty());
+            assert!(reporting.bracketed_paste(), "set, read as {reading:?}");
+            assert!(reporting.read(b"\x1b[?2004l", reading).is_empty());
+            assert!(!reporting.bracketed_paste(), "reset, read as {reading:?}");
+        }
+    }
+
+    /// Asking the console to spell the keys itself changes its virtual-terminal flag and no other,
+    /// the mouse's among them, and giving the keys back as records restores exactly what the mode
+    /// was.
+    #[test]
+    fn spelling_the_keys_changes_the_one_flag_and_giving_them_back_restores_the_mode() {
+        for attached in [
+            0x1f7_u32,
+            0x1a7,
+            0x7,
+            ENABLE_QUICK_EDIT_MODE | ENABLE_EXTENDED_FLAGS,
+        ] {
+            let records = record_input_mode(attached);
+            let mouse = mouse_input_mode(records, attached, true);
+            for current in [records, mouse] {
+                let spelled = keys_spelled_mode(current, true);
+                assert_eq!(
+                    spelled,
+                    current | ENABLE_VIRTUAL_TERMINAL_INPUT,
+                    "attached {attached:#x}, current {current:#x}"
+                );
+                assert_eq!(keys_spelled_mode(spelled, false), current);
+                assert_eq!(keys_spelled_mode(current, false), current);
+            }
+        }
     }
 }

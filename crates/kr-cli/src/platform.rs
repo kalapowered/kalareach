@@ -353,10 +353,19 @@ mod console {
                 .input
                 .try_clone()
                 .map_err(|error| CliError::Terminal(Shown::io(&error)))?;
-            Ok(crate::attach::InputSwitch::new(move || {
-                let mode = console_mode(&input)?;
-                set_console_mode(&input, mode | ENABLE_VIRTUAL_TERMINAL_INPUT)
-            }))
+            let spelled = input
+                .try_clone()
+                .map_err(|error| CliError::Terminal(Shown::io(&error)))?;
+            Ok(crate::attach::InputSwitch::new(
+                move || {
+                    let mode = console_mode(&input)?;
+                    set_console_mode(&input, mode | ENABLE_VIRTUAL_TERMINAL_INPUT)
+                },
+                move || {
+                    let mode = console_mode(&spelled)?;
+                    set_console_mode(&spelled, mode & !ENABLE_VIRTUAL_TERMINAL_INPUT)
+                },
+            ))
         }
 
         /// Puts the console into the mode an attachment needs, and returns what it replaced.
