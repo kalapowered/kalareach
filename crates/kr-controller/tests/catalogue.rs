@@ -5197,10 +5197,12 @@ mod native_bridges {
         );
     }
 
-    /// KR-REQ-12.25: a confirmation the owner gave to other words installs nothing, and the
-    /// confirmation of the words the manifest makes installs the release and records the package
-    /// hash the owner confirmed with the grant it holds. Nothing is written in Claude Code's
-    /// directory by either: the recipe applies when the installation is enabled.
+    /// KR-REQ-12.25: a confirmation the owner gave to other words installs nothing. The
+    /// confirmation of what the host shows for the installation, which is the digest it resolved
+    /// from the repository, installs the release: the result names the bridge capability as one
+    /// the owner's confirmation permits, and the installation record holds it. The same
+    /// confirmation spent again installs nothing. Nothing is written in Claude Code's directory by
+    /// either: the recipe applies when the installation is enabled.
     ///
     /// Windows applies no native bridge (`refused_on_windows`), so this runs on the other
     /// platforms.
@@ -5243,23 +5245,93 @@ mod native_bridges {
         );
         assert_eq!(site.tree(), before, "nothing was written");
 
-        // Control: the confirmation of the words the manifest makes installs it, and the result
-        // names the hash and the bridge capability the owner confirmed.
-        let installed: wire::PluginInstallResult = ok(install(&host, &digest, true).await);
+        // Control: the owner confirms what the host shows for this installation, which is the
+        // digest the host resolved from the repository, and that confirmation installs it.
+        let params = wire::PluginInstallParams {
+            environment_id: host.environment_id,
+            catalogue_id: "development".to_owned(),
+            plugin_id: claude_code(),
+            version: "0.3.0".to_owned(),
+            package_digest: digest.clone(),
+            grant: GRANT.iter().map(|name| (*name).to_owned()).collect(),
+            owner_confirmation: Nullable::null(),
+        };
+        let resolved = host
+            .module
+            .resolve_confirmation(
+                &kr_protocol::confirmation::ConfirmationSubject::PluginInstall(Box::new(
+                    params.clone(),
+                )),
+            )
+            .await
+            .expect("the host describes the installation");
+        let confirmed = wire::PluginInstallParams {
+            owner_confirmation: Nullable::some(
+                host.ceremony
+                    .approve(SensitiveAction::GrantExecutableCapability, resolved.digest),
+            ),
+            ..params
+        };
+        let attempt = |params: wire::PluginInstallParams| {
+            let host = &host;
+            async move {
+                host.module
+                    .write_frame_admitted(
+                        &mutation(Method::PluginInstall, host.environment_id, &params),
+                        Method::PluginInstall,
+                        Some(host.confirmations()),
+                    )
+                    .await
+            }
+        };
+        let installed: wire::PluginInstallResult = ok(attempt(confirmed.clone()).await);
         assert_eq!(installed.plugin.package_digest, digest);
-        assert!(
-            installed.capabilities.iter().any(|grant| grant
-                .capability
-                .as_str()
-                .contains("native_bridge.install")
-                && grant.permitted),
-            "the bridge capability is held: {:?}",
-            installed.capabilities
+        let bridge = installed
+            .capabilities
+            .iter()
+            .find(|grant| grant.capability.as_str() == "plugin.native_bridge.install/1")
+            .expect("the bridge capability is among those asked for");
+        assert_eq!(
+            bridge.requirement,
+            wire::PluginGrantRequirement::ConfirmedInstallationGrant
         );
+        assert!(bridge.permitted, "the owner's confirmation permits it");
+        {
+            let catalogue = host.module.catalogue().lock().await;
+            let installation = catalogue
+                .installation(host.environment_id, &claude_code())
+                .expect("readable")
+                .expect("installed");
+            assert!(
+                installation
+                    .grant
+                    .holds(kr_plugin_sdk::capability::PluginCapability::NativeBridgeInstall),
+                "the installation record holds what the owner confirmed"
+            );
+        }
         assert_eq!(
             site.tree(),
             before,
             "installing places nothing until enabled"
+        );
+
+        // The same confirmation, spent again once the installation is removed, installs nothing.
+        let _: wire::PluginRemoveResult = ok(plugin_change(&host, Method::PluginRemove).await);
+        let refused = refusal(attempt(confirmed).await);
+        assert_eq!(
+            refused.code,
+            ErrorCode::PermissionDenied,
+            "a confirmation spent once is not spent again: {refused:?}"
+        );
+        assert!(
+            host.module
+                .catalogue()
+                .lock()
+                .await
+                .installation(host.environment_id, &claude_code())
+                .expect("readable")
+                .is_none(),
+            "nothing was installed by the spent confirmation"
         );
     }
 
