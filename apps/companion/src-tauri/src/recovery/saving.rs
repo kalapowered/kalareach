@@ -377,7 +377,7 @@ impl Recovery {
         let Some(mut record) = self.record()?.filter(|record| record.kept) else {
             return Err(CommandError::invalid(NO_SAVED_SETTINGS));
         };
-        refuse_if_blocked(account, &record.origin()?, Named::ByRecord)?;
+        refuse_if_blocked(account, &record.origin()?, Named::ByRemoval)?;
         let seed = self.seed(false)?;
         if !record.settings_stopped {
             record.settings_stopped = true;

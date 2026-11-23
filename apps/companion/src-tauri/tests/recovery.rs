@@ -4476,6 +4476,98 @@ async fn a_step_that_ends_by_itself_tells_the_page_to_read_recovery_again() {
     );
 }
 
+/// KR-REQ-20.18: a device that is signed out is told to sign in to the service the record names
+/// wherever a record exists (the continuation of a turn-on, a settle, a cover, a read of the
+/// bundle, and the removal of the saved settings, which says what it was for), and told to sign in
+/// before turning recovery on only where it has no record.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_signed_out_device_is_told_to_sign_in_where_a_record_exists_and_before_turning_on_where_none_does()
+ {
+    let computer = Computer::new().await;
+    let origin = computer.origin();
+    let ours = host_of(computer.served.origin());
+    let first = "sign in before turning recovery on: it keeps its bundle with the account";
+    let reach = format!(
+        "this device is signed out, so recovery cannot reach the bundle it keeps with your \
+         account. Sign in to {ours}, then try again"
+    );
+    let removal = format!(
+        "this device is signed out, so the settings saved with your recovery bundle cannot be \
+         removed. Sign in to {ours}, then try again"
+    );
+
+    // A first turn-on has no record, and is told to sign in before it turns recovery on.
+    let page = computer.start(account(&origin, None).await);
+    assert_eq!(
+        page.call("recovery_turn_on", json!({}))
+            .expect_err("signed out")["message"],
+        first
+    );
+    drop(page);
+
+    // A turn-on whose first write got no answer leaves a record that is not kept. Turning it on
+    // again and settling the write are asked of a device that is signed out.
+    let page = computer.page().await;
+    computer.served.web().fail(SYNC_PATH, 1, Moment::After);
+    page.call("recovery_turn_on", json!({}))
+        .expect_err("the answer was lost");
+    drop(page);
+    let page = computer.start(account(&origin, None).await);
+    for command in ["recovery_turn_on", "recovery_settle"] {
+        assert_eq!(
+            page.call(command, json!({})).expect_err("signed out")["message"],
+            reach.as_str(),
+            "{command}"
+        );
+    }
+    drop(page);
+    let page = computer.page().await;
+    page.call("recovery_settle", json!({})).expect("settled");
+    drop(page);
+
+    // The bundle is kept now: a cover, a read of it and the removal of the settings in it.
+    let page = computer.start(account(&origin, None).await);
+    let host = Host::new(&computer, computer.served.origin());
+    host.sets_up();
+    let out = tempfile::tempdir().expect("a directory");
+    assert_eq!(
+        page.recovery
+            .cover_host(&page.account, &host, false)
+            .await
+            .err()
+            .expect("signed out")
+            .message,
+        reach
+    );
+    assert_eq!(
+        page.recovery
+            .archives(&page.account)
+            .await
+            .err()
+            .expect("signed out")
+            .message,
+        reach
+    );
+    assert_eq!(
+        page.recovery
+            .export_offline(&page.account, &out.path().join("bundle.krexport"), None)
+            .await
+            .err()
+            .expect("signed out")
+            .message,
+        reach
+    );
+    assert_eq!(
+        page.recovery
+            .remove_saved_settings(&page.account)
+            .await
+            .err()
+            .expect("signed out")
+            .message,
+        removal
+    );
+}
+
 /// KR-REQ-20.17: a device turned on before the settings were saved with the bundle saves them at
 /// its next start.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

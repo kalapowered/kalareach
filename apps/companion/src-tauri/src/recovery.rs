@@ -1163,7 +1163,8 @@ enum Named {
     /// changes where the record is made.
     BySetting,
     /// The record, which names the service for the bundle from before the first write leaves.
-    /// Choosing another sync service does not move the bundle.
+    /// Choosing another sync service does not move the bundle. The person has turned recovery on,
+    /// or a first write of it is waiting to be settled, so the refusal does not tell them to.
     ByRecord,
     /// The recovery kit the person chose, which names the service its bundle is at. Nothing the
     /// person can change on this device moves the bundle, so the refusal says to sign in there.
@@ -1171,6 +1172,9 @@ enum Named {
     /// The record, to read what the bundle holds. The person has turned recovery on, so the
     /// refusal does not tell them to.
     ByListing,
+    /// The record, to take the saved settings out of the bundle. The person has turned recovery on,
+    /// so the refusal does not tell them to.
+    ByRemoval,
 }
 
 /// Refuses, before anything is made or sent, when the account cannot be used at `used`.
@@ -1188,7 +1192,17 @@ fn refuse_if_blocked(account: &Account, used: &GatewayOrigin, named: Named) -> R
                 host_of(used)
             ),
             Named::ByKit => format!("sign in to {}, then restore again", host_of(used)),
-            Named::BySetting | Named::ByRecord => {
+            Named::ByRemoval => format!(
+                "this device is signed out, so the settings saved with your recovery bundle \
+                 cannot be removed. Sign in to {}, then try again",
+                host_of(used)
+            ),
+            Named::ByRecord => format!(
+                "this device is signed out, so recovery cannot reach the bundle it keeps with \
+                 your account. Sign in to {}, then try again",
+                host_of(used)
+            ),
+            Named::BySetting => {
                 "sign in before turning recovery on: it keeps its bundle with the account"
                     .to_owned()
             }
@@ -1198,7 +1212,7 @@ fn refuse_if_blocked(account: &Account, used: &GatewayOrigin, named: Named) -> R
                 "this sign-in does not let KalaReach read your recovery bundle. Sign in again to \
                  allow it, then restore again"
             }
-            Named::BySetting | Named::ByRecord | Named::ByListing => {
+            Named::BySetting | Named::ByRecord | Named::ByListing | Named::ByRemoval => {
                 "this sign-in does not let KalaReach keep recovery data. Sign in again to allow it"
             }
         })),
@@ -1211,7 +1225,7 @@ fn refuse_if_blocked(account: &Account, used: &GatewayOrigin, named: Named) -> R
                  device is signed in to ({account}), so the account's sign-in is not sent there. \
                  Choose {account} as the sync service to keep recovery data"
             ),
-            Named::ByRecord | Named::ByListing => format!(
+            Named::ByRecord | Named::ByListing | Named::ByRemoval => format!(
                 "this computer's recovery record names {sync_service} as the service for its \
                  bundle, but this device is signed in to {account}, and the account's sign-in is \
                  not sent to another service. Recovery waits until this device is signed in to \
