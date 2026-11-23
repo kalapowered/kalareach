@@ -178,11 +178,11 @@
           "member": "version",
           "absent": 1
         },
-        "version": 3,
+        "version": 4,
         "migrates_from": 1,
-        "reads_through": 4
+        "reads_through": 5
       },
-      "digest": "c342cb3cc4391e4029491a3f300190ea752edc941bf351d199d400da21c8865d",
+      "digest": "d72751e3dafa181c1f452d9002368d7911901157cb36db97a5f2f383cb8b9daa",
       "kept": [
         "ConfigurationDocument"
       ],

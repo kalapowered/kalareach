@@ -4890,6 +4890,45 @@ mod tests {
         assert_eq!(document.revision, 4);
     }
 
+    /// KR-REQ-22.10: a registry at the version before the raise, and at the one before that, comes
+    /// forward to this version by the one statement that writes it, and holds the tables a new
+    /// registry has: the raise changes the version and the document the registry may copy, and no
+    /// table.
+    #[test]
+    fn a_registry_at_the_two_versions_before_comes_forward_with_the_tables_a_new_one_has() {
+        let shape = |path: &std::path::Path| -> Vec<(String, Option<String>)> {
+            let connection = Connection::open(path).expect("opens");
+            let mut statement = connection
+                .prepare("SELECT name, sql FROM sqlite_master ORDER BY name")
+                .expect("prepares");
+            statement
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .expect("reads")
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .expect("rows")
+        };
+        let fresh = tempfile::tempdir().expect("a directory");
+        let fresh_path = fresh.path().join("registry.sqlite3");
+        drop(Registry::open(&fresh_path, environment()).expect("a registry"));
+        assert_eq!(
+            version(&Registry::open(&fresh_path, environment()).expect("opens")),
+            SCHEMA_VERSION
+        );
+        for from in [SCHEMA_VERSION - 2, SCHEMA_VERSION - 1] {
+            let directory = tempfile::tempdir().expect("a directory");
+            let path = directory.path().join("registry.sqlite3");
+            drop(Registry::open(&path, environment()).expect("a registry"));
+            Connection::open(&path)
+                .expect("opens")
+                .execute("UPDATE schema_version SET version = ?1", [from])
+                .expect("sets the file back");
+            let registry = Registry::open(&path, environment()).expect("is brought forward");
+            assert_eq!(version(&registry), SCHEMA_VERSION, "from {from}");
+            drop(registry);
+            assert_eq!(shape(&path), shape(&fresh_path), "from {from}");
+        }
+    }
+
     /// A release that reads version 9 kept no answer to a redemption or to a transfer of control.
     /// A registry it left, and one at each later version, come forward to this version with as many
     /// rows in the answer and grant tables as they held: the registry's own steps from 9 write only
