@@ -756,7 +756,7 @@ function SharingTab({
             <span>
               {line.waiting.length > 0
                 ? `${recordedWords(line.name, line.withdrawing)} at ${momentWords(line.atMs, now)} (authority revision ${line.revision}), and not done: ${workersHave(line.waiting.length, line.cut)} not confirmed yet (${line.waiting.map(sessionIdWords).join(', ')}).${workersListed(line)}`
-                : `Revoked ${nameWords(line.name)} at ${momentWords(line.atMs, now)} (authority revision ${line.revision}).${workersListed(line)}`}
+                : `${line.withdrawing ? `Withdrew the invitation to ${nameWords(line.name)}` : `Revoked ${nameWords(line.name)}`} at ${momentWords(line.atMs, now)} (authority revision ${line.revision}).${workersListed(line)}`}
             </span>{' '}
             {line.waiting.length > 0 ? (
               <Button

@@ -440,7 +440,7 @@ describe('a revocation some session worker has not confirmed', () => {
 
     await person.click(within(line).getByTestId('check-again'))
     await waitFor(() => {
-      expect(screen.getByTestId('recently-revoked').textContent).toMatch(/^Revoked /)
+      expect(screen.getByTestId('recently-revoked').textContent).toMatch(/^Withdrew the invitation to /)
     })
     expect(screen.getByTestId('recently-revoked').textContent).toMatch(/authority revision 6/)
   })
