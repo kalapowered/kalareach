@@ -16,9 +16,21 @@ import { fakeHost, type FakeHostControls } from '../../src/host/fake'
 import { receivedFailure } from '../../src/host/tauri'
 import { MobileApp } from '../../src/mobile/MobileApp'
 import { HANDED_FILE_LIMIT } from '../../src/mobile/model/media'
+import type { AccountView } from '../../src/model/account'
 import * as words from '../../src/model/transfer-words'
 
 const SESSION = '8a7b6c50-22bb-4c3d-8e4f-000000000101'
+
+/** An account signed in, which the page reads and whose mark every command of its own carries. */
+const signedIn = (mark: string): AccountView => ({
+  state: 'signed_in',
+  email: null,
+  name: null,
+  usage_readable: false,
+  generation: 'g',
+  mark,
+  outcome: null
+})
 const RIGHTS = ['session.view', 'files.upload', 'agent.prompt', 'terminal.input'] as const
 
 afterEach(cleanup)
@@ -727,6 +739,13 @@ describe('the phone queueing a prompt with files on a paired host (KR-REQ-13.12)
   it('names the draft the application keeps, with no text of its own, and the files go with it', async () => {
     const { controls, person, port } = await withFileAndText()
     const queued = vi.spyOn(port, 'composerQueue')
+    // An account signs in and the page has read it: what the page asks for an account carries its mark.
+    const status = vi.spyOn(port, 'accountStatus')
+    controls.account.set(signedIn('aa'))
+    await waitFor(() => {
+      expect(status).toHaveBeenCalled()
+    })
+    await Promise.all(status.mock.results.map((result) => result.value as Promise<unknown>))
 
     await person.click(screen.getByRole('button', { name: 'Queue' }))
 
@@ -738,8 +757,10 @@ describe('the phone queueing a prompt with files on a paired host (KR-REQ-13.12)
     expect(controls.queuedParams[0]).toMatchObject({ text: null })
     expect(controls.queuedParams[0]?.draft_id).toEqual(expect.any(String))
     expect(controls.promptParams).toHaveLength(0)
-    // It is made under the opening of the session, so the host knows which one it is made under.
+    // It is made under the opening of the session, so the host knows which one it is made under, and
+    // under the mark of the account the person pressed it as.
     expect(queued.mock.calls[0]?.[1]).toEqual(expect.any(String))
+    expect(queued.mock.calls[0]?.[2]).toBe('aa')
     // The host took it as applied: the files are the session's now, and the composer is clear.
     await waitFor(() => {
       expect(screen.queryByTestId('m-upload')).toBeNull()

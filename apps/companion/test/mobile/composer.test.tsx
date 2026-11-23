@@ -8,7 +8,7 @@ import { describe, expect, it, vi } from 'vitest'
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 
-import { AppProvider } from '../../src/app/state'
+import { AppProvider, useApp } from '../../src/app/state'
 import { fakeHost } from '../../src/host/fake'
 import { EVERY_RIGHT } from '../../src/host/fake-state'
 import type { HostPort } from '../../src/host/port'
@@ -32,6 +32,12 @@ function OnSession({ sessionId }: { readonly sessionId: string }): ReactNode {
   )
 }
 
+/** What the passing message says, which the shell draws in the app and these cases do without. */
+function Said(): ReactNode {
+  const { toast } = useApp()
+  return <p data-testid="said">{toast?.text ?? ''}</p>
+}
+
 /**
  * Opens the session the fake host's agent is in, once its conversation has been read. `through`
  * wraps the host's port, to see what the screen asks of it or to answer it otherwise.
@@ -45,6 +51,7 @@ async function open(
   render(
     <AppProvider port={through(host.port)}>
       <OnSession sessionId={SESSION_MAIN} />
+      <Said />
     </AppProvider>
   )
   await screen.findByText('Find why the reconnect test is flaky.')
@@ -557,6 +564,10 @@ describe('the phone refuses text longer than one prompt carries before it sends 
       await screen.findByRole('button', { name: 'Steer' })
 
       await person.click(await screen.findByRole('button', { name: action }))
+      // The person is told, in the desktop's words, that it was too long and that it is kept.
+      await waitFor(() => {
+        expect(screen.getByTestId('said')).toHaveTextContent('That is longer than one prompt carries. It is kept here.')
+      })
       await new Promise((resolve) => setTimeout(resolve, 50))
 
       expect(calls).toEqual([])
