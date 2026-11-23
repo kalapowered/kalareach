@@ -133,6 +133,12 @@ impl Place<'_> {
         command
             .args(&words[1..])
             .current_dir(self.directory)
+            // The variables the report sets for its own listing and run are its own: a report
+            // started inside a step of another report must not read that report's, so the step
+            // inherits none of them. The listing and the run set theirs after this.
+            .env_remove(STEP_VARIABLE)
+            .env_remove(RECORDS_VARIABLE)
+            .env_remove(OWN_HARNESS_VARIABLE)
             .env("KR_TEST_ARTIFACTS_DIR", self.evidence)
             .env("CARGO_TERM_COLOR", "never")
             .envs(self.environment.iter().map(|(name, value)| (name, value)));
@@ -1745,10 +1751,10 @@ mod tests {
     use std::time::{Duration, SystemTime};
 
     use super::{
-        Binary, Compiled, ERROR_BYTES, LISTING_BEGIN, LISTING_END, Stop, Unit, artifact_key,
-        date_before, dependency_file, ends_of, ends_of_root_resolved, file_name, is_count,
-        is_named_by_digest, libtest, listed, may_have_been_read_while_written, read_listing,
-        reconcile, targets_by_artifact, unrecorded,
+        Binary, Compiled, ERROR_BYTES, LISTING_BEGIN, LISTING_END, OWN_HARNESS_VARIABLE, Place,
+        RECORDS_VARIABLE, STEP_VARIABLE, Stop, Unit, artifact_key, date_before, dependency_file,
+        ends_of, ends_of_root_resolved, file_name, is_count, is_named_by_digest, libtest, listed,
+        may_have_been_read_while_written, read_listing, reconcile, targets_by_artifact, unrecorded,
     };
     use crate::tree::{Captured, Waited};
     use crate::workspace::{Package, Target, TargetId, TargetKind};
@@ -1846,6 +1852,38 @@ mod tests {
             std::fs::read_to_string(&log).expect("the log"),
             "== the listing failed: `cargo test -- --list` (time limit reached)\n\
              == its standard output\nlisted\n\n== its standard error\nwarned\n\n"
+        );
+    }
+
+    /// KR-REQ-29.01, the part about reproducible commands: a step's command is given none of the
+    /// variables the report sets for its own listing and run, so a report started inside a step of
+    /// another report does not read that report's step number, records or list of programs with a
+    /// harness of their own; what the step is given stays.
+    #[test]
+    fn a_steps_command_is_not_given_the_variables_the_report_sets_for_its_own_listing_and_run() {
+        let directory = tempfile::tempdir().expect("a directory");
+        let given = [("KR_GIVEN_TO_THE_STEP".to_owned(), "1".to_owned())];
+        let place = Place {
+            root: directory.path(),
+            directory: directory.path(),
+            evidence: directory.path(),
+            environment: &given,
+            lister: Path::new("kr-conformance"),
+            deadline: None,
+        };
+        let command = place.command(&["cargo".to_owned(), "test".to_owned()]);
+        let variables: BTreeMap<&std::ffi::OsStr, Option<&std::ffi::OsStr>> =
+            command.get_envs().collect();
+        for name in [STEP_VARIABLE, RECORDS_VARIABLE, OWN_HARNESS_VARIABLE] {
+            assert_eq!(
+                variables.get(std::ffi::OsStr::new(name)),
+                Some(&None),
+                "{name} is removed from what the step inherits"
+            );
+        }
+        assert_eq!(
+            variables.get(std::ffi::OsStr::new("KR_GIVEN_TO_THE_STEP")),
+            Some(&Some(std::ffi::OsStr::new("1")))
         );
     }
 
