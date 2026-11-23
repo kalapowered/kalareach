@@ -1757,6 +1757,15 @@ export type InputAck =
       kind: 'epoch_ended'
     }
 /**
+ * How one action actually reached the upstream application.
+ *
+ * Section 12 requires every action to record this, and forbids reporting an authoritative typed
+ * approval or an accepted media upload from screen text alone. The app may offer a terminal
+ * action as a convenience; it says so.
+ */
+export type ActionProvenance =
+  'upstream_typed_rpc' | 'authenticated_hook_response' | 'terminal_input'
+/**
  * What wrote an environment's current group record.
  */
 export type MachineChange = 'created' | 'joined' | 'merged' | 'split'
@@ -18965,6 +18974,14 @@ export interface InputLeaseResult {
    */
   fenced_bytes?: U64 | null
   lease: InputLeaseState2
+  /**
+   * How the action reached the application. An interrupt names terminal input; a release acts
+   * on the lease alone and names nothing.
+   *
+   * Absent from the wire when a worker does not name it, so an answer built before the member
+   * existed is byte for byte what it was.
+   */
+  provenance?: ActionProvenance | null
 }
 /**
  * The lease after the operation.
@@ -19159,6 +19176,14 @@ export interface InputWriteResult {
    * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   held_prefix_bytes: string
+  /**
+   * How the action reached the application: terminal input, which proves the bytes were
+   * written and never that the application took them as a typed answer.
+   *
+   * Absent from the wire when a worker does not name it, so an answer built before the member
+   * existed is byte for byte what it was.
+   */
+  provenance?: ActionProvenance | null
   /**
    * An increasing sequence number inside one raw input stream.
    */
@@ -28125,7 +28150,11 @@ export interface RichMethodEntry {
    */
   operation: RichOperation | null
   /**
-   * How a successful invocation's provenance is recorded.
+   * How one action actually reached the upstream application.
+   *
+   * Section 12 requires every action to record this, and forbids reporting an authoritative typed
+   * approval or an accepted media upload from screen text alone. The app may offer a terminal
+   * action as a convenience; it says so.
    */
   provenance: 'upstream_typed_rpc' | 'authenticated_hook_response' | 'terminal_input'
   /**

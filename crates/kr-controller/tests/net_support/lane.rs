@@ -386,6 +386,7 @@ async fn play(
                             sequence: kr_protocol::ids::InputSequence::new(written.sequence + 1),
                             forwarded_bytes: U64::new(written.bytes.len() as u64),
                             held_prefix_bytes: U64::new(0),
+                            provenance: None,
                         })
                         .expect("a result encodes"),
                     )

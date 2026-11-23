@@ -646,6 +646,7 @@ fn the_ended_notice_follows_a_late_answer_of_the_same_epoch() {
                     sequence: kr_protocol::ids::InputSequence::new(0),
                     forwarded_bytes: U64::new(1),
                     held_prefix_bytes: U64::new(0),
+                    provenance: None,
                 })
                 .expect("encodes"),
             ),

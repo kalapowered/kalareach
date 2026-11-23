@@ -2691,6 +2691,7 @@ fn answer_to(request: u64) -> ControlFrame {
                 sequence: kr_protocol::ids::InputSequence::new(request - 1),
                 forwarded_bytes: kr_protocol::scalars::U64::new(1),
                 held_prefix_bytes: kr_protocol::scalars::U64::new(0),
+                provenance: Some(kr_protocol::broker::ActionProvenance::TerminalInput),
             })
             .expect("the answer encodes"),
         ),

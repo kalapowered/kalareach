@@ -12516,6 +12516,7 @@ impl WorkerService {
                 sequence: params.sequence,
                 forwarded_bytes: U64::new(accepted.forwarded_bytes),
                 held_prefix_bytes: U64::new(accepted.held_prefix_bytes),
+                provenance: None,
             });
             // The answer to a lane's frame is queued in this hold, in the order the ledger changed,
             // so that the notice that an epoch ended, which a later hold queues, comes after it.
@@ -12745,6 +12746,7 @@ impl WorkerService {
                     encode(&InputLeaseResult {
                         lease,
                         fenced_bytes: params.fenced_report.then(|| U64::new(fenced)),
+                        provenance: None,
                     })?,
                     AfterEffect::None,
                 ))
@@ -12769,6 +12771,7 @@ impl WorkerService {
                     encode(&InputLeaseResult {
                         lease: session.lease(),
                         fenced_bytes: None,
+                        provenance: None,
                     })?,
                     AfterEffect::None,
                 ))

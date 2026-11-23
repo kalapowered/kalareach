@@ -1643,6 +1643,7 @@ impl WorkerLease {
             let answer = kr_protocol::input::InputLeaseResult {
                 lease: self.state(),
                 fenced_bytes: None,
+                provenance: None,
             };
             link.answer(call, &answer).await;
         } else if call.method == Method::InputWrite.to_string() {
@@ -1677,6 +1678,7 @@ impl WorkerLease {
                 sequence: asked.sequence,
                 forwarded_bytes: U64::new(forwarded),
                 held_prefix_bytes: U64::ZERO,
+                provenance: Some(kr_protocol::broker::ActionProvenance::TerminalInput),
             };
             link.answer(call, &answer).await;
         } else {

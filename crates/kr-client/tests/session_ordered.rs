@@ -850,6 +850,7 @@ async fn a_lane_on_an_ordered_session_sends_and_its_event_is_seen() {
             sequence: InputSequence::new(0),
             forwarded_bytes: U64::new(1),
             held_prefix_bytes: U64::new(0),
+            provenance: None,
         })),
     ));
     assert_eq!(

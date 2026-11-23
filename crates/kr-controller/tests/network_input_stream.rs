@@ -3808,6 +3808,7 @@ fn took() -> SerialAnswer {
             sequence: InputSequence::new(0),
             forwarded_bytes: U64::new(1),
             held_prefix_bytes: U64::new(0),
+            provenance: None,
         })
         .expect("a result"),
     ))
@@ -4785,6 +4786,7 @@ fn script_dependents(rig: &Rig, count: Option<u64>) -> Dependents {
                             next_sequence: InputSequence::new(3),
                         },
                         fenced_bytes: count.map(U64::new),
+                        provenance: None,
                     })
                     .expect("a result"),
                 ),

@@ -3170,6 +3170,7 @@ mod local {
                 sequence: sequence(0),
                 forwarded_bytes: U64::new(0),
                 held_prefix_bytes: U64::new(0),
+                provenance: None,
             };
             self.words
                 .send(answer(request_id, typed(&result)))

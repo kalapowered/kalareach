@@ -9,6 +9,7 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::broker::ActionProvenance;
 use crate::error::ProtocolError;
 use crate::frame::FRAME_LENGTH_PREFIX_LEN;
 use crate::ids::{AttachmentId, ConnectionId, InputLeaseEpoch, InputSequence, SessionId};
@@ -192,6 +193,13 @@ pub struct InputWriteResult {
     pub forwarded_bytes: U64,
     /// Bytes held as an incomplete paste delimiter prefix, pending the recogniser deadline.
     pub held_prefix_bytes: U64,
+    /// How the action reached the application: terminal input, which proves the bytes were
+    /// written and never that the application took them as a typed answer.
+    ///
+    /// Absent from the wire when a worker does not name it, so an answer built before the member
+    /// existed is byte for byte what it was.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<ActionProvenance>,
 }
 
 /// What an interrupt may do.
@@ -234,6 +242,13 @@ pub struct InputLeaseResult {
     /// `input.interrupt`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fenced_bytes: Option<U64>,
+    /// How the action reached the application. An interrupt names terminal input; a release acts
+    /// on the lease alone and names nothing.
+    ///
+    /// Absent from the wire when a worker does not name it, so an answer built before the member
+    /// existed is byte for byte what it was.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<ActionProvenance>,
 }
 
 /// The typing that must have arrived at the worker before a request is applied.

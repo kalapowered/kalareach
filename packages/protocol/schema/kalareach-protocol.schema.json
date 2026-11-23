@@ -20115,6 +20115,17 @@
         "lease": {
           "$ref": "#/$defs/InputLeaseState",
           "description": "The lease after the operation."
+        },
+        "provenance": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ActionProvenance"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "How the action reached the application. An interrupt names terminal input; a release acts\non the lease alone and names nothing.\n\nAbsent from the wire when a worker does not name it, so an answer built before the member\nexisted is byte for byte what it was."
         }
       },
       "required": [
@@ -20275,6 +20286,17 @@
         "held_prefix_bytes": {
           "$ref": "#/$defs/U64",
           "description": "Bytes held as an incomplete paste delimiter prefix, pending the recogniser deadline."
+        },
+        "provenance": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ActionProvenance"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "How the action reached the application: terminal input, which proves the bytes were\nwritten and never that the application took them as a typed answer.\n\nAbsent from the wire when a worker does not name it, so an answer built before the member\nexisted is byte for byte what it was."
         },
         "sequence": {
           "$ref": "#/$defs/InputSequence",
