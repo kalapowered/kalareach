@@ -12,14 +12,14 @@
  */
 
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { render, screen, waitFor, within } from '@testing-library/react'
+import { act, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 
 import configuration from '../src-tauri/tauri.conf.json'
 import { App } from '../src/App'
 import { AppProvider } from '../src/app/state'
 import { fakeHost, type FakeHostControls } from '../src/host/fake'
-import type { HostPort } from '../src/host/port'
+import type { ChosenFile, HostPort } from '../src/host/port'
 import { readableBytes } from '../src/setup/host'
 import { CHECKS_POLL_MS } from '../src/setup/Setup'
 
@@ -769,5 +769,190 @@ describe('what a restart is asked for, and what a record is about', () => {
     expect(screen.queryByTestId('setup-nothing-chosen')).toBeNull()
     expect(screen.getByTestId('setup-chosen-descriptions').textContent).toMatch(/Downloading/)
     expect(screen.getByTestId('setup-descriptions-asked').textContent).toMatch(/you asked it to/)
+  })
+})
+
+describe('what the page says of the file the read check reads, while the application is asked', () => {
+  /** A read of the held file that stays out until the case answers it, and every read so far. */
+  function reads(): {
+    held: HostPort['heldAuthorisedFile']
+    out: { answer: (file: ChosenFile | null) => void; fail: (message: string) => void }[]
+  } {
+    const out: { answer: (file: ChosenFile | null) => void; fail: (message: string) => void }[] = []
+    return {
+      out,
+      held: () =>
+        new Promise<ChosenFile | null>((resolve, reject) => {
+          out.push({
+            answer: resolve,
+            fail: (message) => {
+              reject(new Error(message))
+            }
+          })
+        })
+    }
+  }
+
+  /** The sheet that runs the checks, open on a host that has run none, `answering` in place of the host's own. */
+  async function sheetWith(answering: Partial<HostPort>): Promise<FakeHostControls> {
+    const host = fakeHost()
+    const port: HostPort = { ...host.port, ...answering }
+    render(
+      <AppProvider port={port} initialPlace={{ view: 'setup' }}>
+        <App />
+      </AppProvider>
+    )
+    await screen.findByTestId('setup-identity')
+    host.controls.setChecks({
+      state: 'not_run',
+      started_at_ms: null,
+      finished_at_ms: null,
+      session_id: null
+    })
+    await goTo('capabilities')
+    await userEvent.click(screen.getByTestId('setup-recheck'))
+    await waitFor(() => {
+      expect(screen.getByTestId('setup-checks-state').dataset.state).toBe('not_run')
+    })
+    await userEvent.click(screen.getByTestId('setup-run-checks'))
+    await screen.findByTestId('setup-effects')
+    return host.controls
+  }
+
+  const NONE = 'No file chosen. The read check will read nothing and say so.'
+  const NOTES = 'File chosen: notes.txt. The next run reads it once.'
+  const line = (): HTMLElement => screen.getByTestId('setup-checks-file')
+
+  it('says nothing of the file, and allows no run, while the application has not answered', async () => {
+    const { held, out } = reads()
+    const controls = await sheetWith({ heldAuthorisedFile: held })
+    await waitFor(() => {
+      expect(out.length).toBeGreaterThan(0)
+    })
+    // The first read is out: nothing is known, so nothing is said and no run is allowed.
+    expect(line().textContent).toBe('')
+    expect(screen.getByTestId('setup-checks-run')).toBeDisabled()
+    out.at(-1)?.answer(null)
+    await waitFor(() => {
+      expect(line().textContent).toBe(NONE)
+    })
+    expect(screen.getByTestId('setup-checks-run')).toBeEnabled()
+
+    // A file is chosen, and the page reads again: the earlier answer, none, does not stand while
+    // the application is asked, when the application may already hold the file.
+    controls.answerFileDialog('notes.txt')
+    const before = out.length
+    await userEvent.click(screen.getByTestId('setup-checks-choose'))
+    await waitFor(() => {
+      expect(out.length).toBeGreaterThan(before)
+    })
+    expect(line().textContent).toBe('')
+    expect(screen.getByTestId('setup-checks-run')).toBeDisabled()
+    out.at(-1)?.answer({ name: 'notes.txt' })
+    await waitFor(() => {
+      expect(line().textContent).toBe(NOTES)
+    })
+    expect(screen.getByTestId('setup-checks-run')).toBeEnabled()
+  })
+
+  it('does not know the file after a read that fails, and allows no run until a read answers', async () => {
+    const { held, out } = reads()
+    const controls = await sheetWith({ heldAuthorisedFile: held })
+    await waitFor(() => {
+      expect(out.length).toBeGreaterThan(0)
+    })
+    out.at(-1)?.answer({ name: 'notes.txt' })
+    await waitFor(() => {
+      expect(line().textContent).toBe(NOTES)
+    })
+
+    // The application is asked again and does not answer: the earlier name is not the page's to
+    // say, and the run that would read it is not offered.
+    controls.answerFileDialog(null)
+    const before = out.length
+    await userEvent.click(screen.getByTestId('setup-checks-choose'))
+    await waitFor(() => {
+      expect(out.length).toBeGreaterThan(before)
+    })
+    out.at(-1)?.fail('the application did not answer')
+    await screen.findByText(/the application did not answer/)
+    expect(line().textContent).toBe('')
+    expect(screen.getByTestId('setup-checks-run')).toBeDisabled()
+
+    // A read that answers is the one the page believes.
+    const again = out.length
+    await userEvent.click(screen.getByTestId('setup-checks-choose'))
+    await waitFor(() => {
+      expect(out.length).toBeGreaterThan(again)
+    })
+    out.at(-1)?.answer(null)
+    await waitFor(() => {
+      expect(line().textContent).toBe(NONE)
+    })
+    expect(screen.getByTestId('setup-checks-run')).toBeEnabled()
+  })
+
+  it('drops an answer that is older than the newest read', async () => {
+    const { held, out } = reads()
+    const controls = await sheetWith({ heldAuthorisedFile: held })
+    await waitFor(() => {
+      expect(out.length).toBeGreaterThan(0)
+    })
+    out.at(-1)?.answer(null)
+    await waitFor(() => {
+      expect(line().textContent).toBe(NONE)
+    })
+
+    // Two reads are out at once: a dialog that closed, and then another.
+    controls.answerFileDialog('notes.txt')
+    const first = out.length
+    await userEvent.click(screen.getByTestId('setup-checks-choose'))
+    await waitFor(() => {
+      expect(out.length).toBeGreaterThan(first)
+    })
+    const older = out.at(-1)
+    const second = out.length
+    await userEvent.click(screen.getByTestId('setup-checks-choose'))
+    await waitFor(() => {
+      expect(out.length).toBeGreaterThan(second)
+    })
+    const newest = out.at(-1)
+
+    // The newest answers, and the older answer, which the application gave before the file was
+    // held, comes after it and is not believed.
+    newest?.answer({ name: 'notes.txt' })
+    await waitFor(() => {
+      expect(line().textContent).toBe(NOTES)
+    })
+    await act(async () => {
+      older?.answer(null)
+      await Promise.resolve()
+    })
+    expect(line().textContent).toBe(NOTES)
+    expect(screen.getByTestId('setup-checks-run')).toBeEnabled()
+  })
+
+  it('allows no run while the platform dialog is open', async () => {
+    let close: (file: ChosenFile | null) => void = () => undefined
+    await sheetWith({
+      chooseAuthorisedFile: () =>
+        new Promise<ChosenFile | null>((resolve) => {
+          close = resolve
+        })
+    })
+    await waitFor(() => {
+      expect(line().textContent).toBe(NONE)
+    })
+    expect(screen.getByTestId('setup-checks-run')).toBeEnabled()
+    await userEvent.click(screen.getByTestId('setup-checks-choose'))
+    // The dialog answers nothing yet: a file may be held by the time it does.
+    expect(screen.getByTestId('setup-checks-run')).toBeDisabled()
+    await act(async () => {
+      close(null)
+      await Promise.resolve()
+    })
+    await waitFor(() => {
+      expect(screen.getByTestId('setup-checks-run')).toBeEnabled()
+    })
   })
 })

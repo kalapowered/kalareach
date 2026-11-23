@@ -246,8 +246,11 @@ export function Setup(): ReactNode {
   // uses up, or null when it holds none. The path is never here: native code keeps it. This is what
   // the application last said, read when the screen opens and after every dialog and every run, and
   // the page keeps no choice of its own: it cannot say that none is chosen while one is held. It is
-  // undefined until the first answer, and the line says nothing until then.
+  // undefined while a read is out and after one that failed, and the line says nothing and no run
+  // is allowed until a read answers.
   const [chosen, setChosen] = useState<string | null | undefined>(undefined)
+  // Which read of the held file is the newest, so that an answer to an older one is dropped.
+  const newestRead = useRef(0)
   // The platform's file dialog is open, and has not been answered yet.
   const [choosing, setChoosing] = useState(false)
   // The environment in which the host last said a run is going, until an answer says it is not. A
@@ -319,20 +322,32 @@ export function Setup(): ReactNode {
       })
   }, [load, apply, refuse])
 
-  const readChosen = useCallback(() => {
+  // Asks the application which file it holds. Only the newest read's answer is believed, since an
+  // older one can arrive after the choice it did not see.
+  const askChosen = useCallback(() => {
+    newestRead.current += 1
+    const mine = newestRead.current
     port
       .heldAuthorisedFile()
       .then((file) => {
-        setChosen(file === null ? null : file.name)
+        if (mine === newestRead.current) setChosen(file === null ? null : file.name)
       })
       .catch((error: unknown) => {
-        say(failureMessage(error), 'danger')
+        if (mine === newestRead.current) say(failureMessage(error), 'danger')
       })
   }, [port, say])
 
+  // Asks again after the application may have changed what it holds. What the page said before is
+  // not known to stand while it is asked, and not after a failure to ask, so it is cleared at once.
+  const readChosen = useCallback(() => {
+    setChosen(undefined)
+    askChosen()
+  }, [askChosen])
+
+  // When the screen opens nothing is known yet.
   useEffect(() => {
-    readChosen()
-  }, [readChosen])
+    askChosen()
+  }, [askChosen])
 
   const environmentId = capabilities?.environment_id ?? null
   const watching = accepted
@@ -341,7 +356,7 @@ export function Setup(): ReactNode {
   // Asking starts the run and answers at once. The sheet closes on the press, so the card behind it
   // is the one that says the checks are running.
   const runChecks = useCallback(() => {
-    if (environmentId === null) return
+    if (environmentId === null || chosen === undefined || choosing) return
     setEffectsOpen(false)
     setAsking(true)
     port
@@ -366,7 +381,7 @@ export function Setup(): ReactNode {
         // it took the file leaves the file held.
         readChosen()
       })
-  }, [port, environmentId, load, apply, say, readChosen])
+  }, [port, environmentId, chosen, choosing, load, apply, say, readChosen])
 
   // The platform's own dialog answers. Closing it with no choice leaves an earlier choice as it was,
   // and either way the line says what the application holds afterwards.
@@ -580,7 +595,9 @@ export function Setup(): ReactNode {
               <Button
                 tone="primary"
                 onClick={runChecks}
-                disabled={asking || checking || environmentId === null}
+                disabled={
+                  asking || checking || environmentId === null || chosen === undefined || choosing
+                }
                 data-testid="setup-checks-run"
               >
                 {asking || checking ? 'Running…' : 'Run the checks'}

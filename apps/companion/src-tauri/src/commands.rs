@@ -1487,16 +1487,27 @@ pub struct ChosenFile {
 /// The platform's own file dialog answers. The path is kept here, in place of any file chosen
 /// before, until the one run that reads it, and the page is told only the file's name. A person
 /// who closes the dialog without choosing changes nothing.
+///
+/// The dialog belongs to the window the page runs in, so that on every platform the window waits
+/// while the dialog is open: the page cannot be left for another view, which would read what is
+/// held before the choice is made, and says which file is held when the choice has been.
 #[tauri::command]
 pub async fn choose_authorised_file(
     app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
     state: State<'_, AppState>,
 ) -> Result<Option<ChosenFile>> {
     use tauri_plugin_dialog::DialogExt as _;
 
     not_on_a_paired_host(&state, "the disclosed checks")?;
     let (sender, receiver) = tokio::sync::oneshot::channel();
-    app.dialog().file().pick_file(move |path| {
+    let dialog = app.dialog().file();
+    #[cfg(desktop)]
+    let dialog = dialog.set_parent(&window);
+    // A phone's file picker takes no parent window.
+    #[cfg(not(desktop))]
+    let _ = &window;
+    dialog.pick_file(move |path| {
         let _ = sender.send(path);
     });
     let chosen = receiver
