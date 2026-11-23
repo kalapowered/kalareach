@@ -4431,6 +4431,7 @@ dependencies = [
  "kr-client",
  "kr-crypto",
  "kr-protocol",
+ "kr-service-stand-in",
  "kr-sync-integration",
  "serde_json",
  "tempfile",

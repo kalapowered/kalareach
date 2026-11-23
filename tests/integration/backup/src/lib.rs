@@ -9,6 +9,9 @@
 //!   kit, the origin and the same account's `backup.restore` token, moved on by compare and swap and
 //!   read again with the same kit, and refused wherever its origin or its locator is substituted or
 //!   the kit belongs to another seed.
+//! * **Retention** (`tests/retention.rs`): the managed storage service's retention rules, held by
+//!   thirty-one generations of one archive that [`generations`] makes the way a device's backup
+//!   writer does.
 //! * **A restored deployment** (`tests/restore.rs`): a device's settings, drafts and membership,
 //!   made against one local deployment, meeting a second deployment restored from the first one's
 //!   export. That leg runs in phases, between which the deployments are exported, stopped, prepared
@@ -27,6 +30,8 @@
 //! and one that was never put back names none. [`Watched`] carries a leg's requests and reads each
 //! answer as it came back, before any client parses it, so the rule is checked on every answer
 //! rather than on the ones a leg thought to look at, and a missing name is told from a null one.
+
+pub mod generations;
 
 use std::fmt;
 use std::path::{Path, PathBuf};

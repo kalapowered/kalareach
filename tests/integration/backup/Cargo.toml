@@ -22,5 +22,10 @@ serde_json.workspace = true
 tempfile.workspace = true
 tokio.workspace = true
 
+[dev-dependencies]
+# The managed storage and backup manifest services the generation producer is exercised against
+# without a deployment.
+kr-service-stand-in = { path = "../../support/service-stand-in" }
+
 [lints]
 workspace = true

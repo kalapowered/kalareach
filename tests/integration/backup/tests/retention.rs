@@ -39,10 +39,9 @@
 
 use std::sync::Arc;
 
+use kr_backup_integration::generations::{ArchiveServices, Collection, Generations};
 use kr_backup_integration::{DeviceSigner, RunDirectory, TOKENS_VARIABLE, account_tokens, skipped};
-use kr_client::recovery::{
-    ArchiveServices, BundleStore, SETTINGS_FILENAME, SettingsArchive, SettingsCollection,
-};
+use kr_client::recovery::{BundleStore, DeviceSettings, encode_member};
 use kr_client::services::account::{AccountTokenSource, BACKUP_WRITE_SCOPE};
 use kr_client::services::backup::ManagedBackupManifestService;
 use kr_client::services::relay::ServiceSigner;
@@ -51,13 +50,13 @@ use kr_client::services::sync::ManagedSyncService;
 use kr_client::services::{
     BackupManifestService, BackupState, RetentionChange, StorageService, SyncBackupService,
 };
-use kr_client::sync::{SettingValue, SyncBody, SyncObject, SyncSettings, SyncStore};
+use kr_client::sync::SettingValue;
 use kr_crypto::backup::{ArchiveExpectation, ArchiveReader, GenerationExpectation, open_archive};
 use kr_crypto::kdf::RecoverySeed;
 use kr_crypto::keys::StoredEnvelopeKeyPair;
 use kr_protocol::archive::{RecoveryContext, TrustedWriter};
 use kr_protocol::ids::{
-    ArchiveId, BackupGeneration, BackupObjectId, BackupWriterRevision, DeviceId, SyncObjectId,
+    ArchiveId, BackupGeneration, BackupObjectId, BackupWriterRevision, DeviceId,
 };
 use kr_protocol::scalars::{TimestampMs, Uuid};
 use kr_sync_integration::{Deployment, fresh_uuid, now_ms, proved};
@@ -70,6 +69,9 @@ const PLAN: &str = "retention.json";
 
 /// How many generations the service keeps, and so how many the host may.
 const KEPT: u64 = 30;
+
+/// The name every generation's one member is carried under.
+const MEMBER_NAME: &str = "retention/member.bin";
 
 /// A day in milliseconds.
 const DAY_MS: u64 = 24 * 60 * 60 * 1000;
@@ -244,8 +246,7 @@ async fn thirty_daily_snapshots_are_kept_and_a_deleted_generation_is_a_tombstone
         other => panic!("the change was made against the revision it read: {other:?}"),
     }
 
-    // The device: a recovery seed, a writer that is also the owner, a producer, one settings
-    // object, and the bundle first.
+    // The device: a recovery seed, a writer that is also the owner, a producer and the bundle first.
     let disk = tempfile::tempdir().expect("a directory on the internal disk");
     let seed = RecoverySeed::generate().expect("a seed");
     let producer = StoredEnvelopeKeyPair::generate().expect("a producer key");
@@ -253,8 +254,6 @@ async fn thirty_daily_snapshots_are_kept_and_a_deleted_generation_is_a_tombstone
     let archive_id = ArchiveId::new(fresh_uuid());
     let locator = kr_client::recovery::fresh_locator().expect("a locator");
     let origin = deployment.origin().as_str().to_owned();
-    let records = disk.path().join("records");
-    std::fs::create_dir_all(&records).expect("a directory");
     let bundle_dir = disk.path().join("bundle");
     std::fs::create_dir_all(&bundle_dir).expect("a directory");
     let mut bundles = BundleStore::open(
@@ -268,8 +267,8 @@ async fn thirty_daily_snapshots_are_kept_and_a_deleted_generation_is_a_tombstone
     .expect("the bundle store");
     let mut bundle = BundleStore::empty(now());
     let recovery = seed.recipient().expect("the recovery recipient");
-    let archive = SettingsArchive::enable(
-        SettingsCollection {
+    let archive = Generations::enable(
+        Collection {
             archive_id,
             service_origin: origin,
             owner_device_id: DeviceId::new(fresh_uuid()),
@@ -277,7 +276,6 @@ async fn thirty_daily_snapshots_are_kept_and_a_deleted_generation_is_a_tombstone
             writer_revision: BackupWriterRevision::new(1),
             producer: producer.clone(),
             recovery: *recovery.public(),
-            records,
         },
         &mut bundles,
         &seed,
@@ -286,43 +284,37 @@ async fn thirty_daily_snapshots_are_kept_and_a_deleted_generation_is_a_tombstone
         &services.manifest(),
         now(),
     )
-    .await
-    .expect("the bundle landed and the writer is enrolled");
+    .await;
 
-    let store = SyncStore::open(disk.path().join("sync")).expect("a sync store");
-    let object_id = SyncObjectId::new(fresh_uuid());
-    store
-        .put_object(&SyncObject {
-            object_id,
-            revision: kr_client::sync::fresh_revision().expect("a revision"),
-            device_id: DeviceId::new(fresh_uuid()),
-            updated_at_ms: now(),
-            body: SyncBody::Settings(SyncSettings {
-                values: [("theme".to_owned(), SettingValue::Text("dusk".to_owned()))]
-                    .into_iter()
-                    .collect(),
-                pinned_labels: std::collections::BTreeSet::new(),
-            }),
-            went_over: Vec::new(),
-        })
-        .expect("the settings");
+    // What each generation carries: the settings member a device that chose a colour mode saves,
+    // as bytes.
+    let member = encode_member(
+        &DeviceSettings::new(
+            [(
+                "colour_mode".to_owned(),
+                SettingValue::Text("dusk".to_owned()),
+            )]
+            .into_iter()
+            .collect(),
+        )
+        .expect("settings"),
+    )
+    .expect("a member");
 
     // Thirty-one generations. The first is opened as it lands, for the identity of its objects;
     // the thirty-first is the one that pushes it out of the chain.
     let archive_services = services.archive_services();
     let mut first_objects: Vec<BackupObjectId> = Vec::new();
     for generation in 1..=KEPT + 1 {
-        let backed_up = archive
+        let published = archive
             .back_up(
-                &store,
-                object_id,
+                MEMBER_NAME,
+                member.as_slice(),
                 BackupGeneration::new(generation),
                 &archive_services,
                 now(),
             )
-            .await
-            .unwrap_or_else(|error| panic!("generation {generation} was backed up: {error}"));
-        let published = backed_up.published;
+            .await;
         assert!(!published.duplicate);
         assert_eq!(published.collection.checkpoint_generation, generation);
         assert_eq!(
@@ -436,7 +428,7 @@ async fn thirty_daily_snapshots_are_kept_and_a_deleted_generation_is_a_tombstone
     );
 }
 
-/// The objects one generation of the settings archive holds: its member and its encrypted manifest.
+/// The objects one generation holds: its member and its encrypted manifest.
 async fn objects_of(
     services: &Services,
     archive_id: ArchiveId,
@@ -489,7 +481,7 @@ async fn objects_of(
         .objects()
         .iter()
         .map(|member| {
-            assert_eq!(member.filename, SETTINGS_FILENAME);
+            assert_eq!(member.filename, MEMBER_NAME);
             member.object.object_id
         })
         .collect();
