@@ -23,10 +23,11 @@ use crate::account::{
     OrganisationPolicy, OrganisationPolicyPayload, OrganisationRecoveryRecipient,
 };
 use crate::archive::{
-    ARCHIVE_DESCRIPTOR_VERSION, ArchiveDescriptor, BACKUP_PUBLICATION_DOMAIN, BACKUP_WRITER_DOMAIN,
-    BackupGenerationPublication, BackupGenerationPublicationPayload, BackupWriterRecord,
-    BackupWriterRecordPayload, EncryptedObjectRef, KeyWrapContext, KeyWrapFormat, KeyWrapPurpose,
-    SealedKeyWrap, TrustedWriter,
+    ARCHIVE_DESCRIPTOR_VERSION, ArchiveCheckpoint, ArchiveDescriptor, BACKUP_PUBLICATION_DOMAIN,
+    BACKUP_WRITER_DOMAIN, BackupGenerationPublication, BackupGenerationPublicationPayload,
+    BackupWriterRecord, BackupWriterRecordPayload, CollectionLocator, EncryptedObjectRef,
+    KeyWrapContext, KeyWrapFormat, KeyWrapPurpose, RECOVERY_BUNDLE_LIMITS,
+    RECOVERY_BUNDLE_SCHEMA_VERSION, RecoveryBundle, SealedKeyWrap, TrustedProducer, TrustedWriter,
 };
 use crate::collection_keys::{
     COLLECTION_KEY_LEN, CollectionKeyRecord, CollectionKeyRecordPayload, CollectionKeyWrapContext,
@@ -1097,7 +1098,68 @@ fn services() -> Value {
                 &policy,
                 &policy_payload.signing_input().expect("a policy signing input"),
             ),
+            recovery_bundle_case(
+                "recovery_bundle",
+                "The recovery bundle's plaintext before it is sealed under the key the recovery seed derives, as a device that saves no settings writes it: where the owner's collections live, the writers and producers a restore may trust, the checkpoints, the revision and the instant. These canonical bytes are fixed: a build that adds a member to the bundle writes the same bytes for a bundle that has none.",
+                &recovery_bundle(),
+            ),
         ],
+    })
+}
+
+/// The fixed recovery bundle the published vectors encode: one collection, one writer, one
+/// producer and one checkpoint, as a device that saves no settings holds them.
+fn recovery_bundle() -> RecoveryBundle {
+    let archive_id = ArchiveId::new(Uuid::from_bytes([0x38; 16]));
+    RecoveryBundle {
+        schema_version: U64::new(RECOVERY_BUNDLE_SCHEMA_VERSION),
+        collections: vec![CollectionLocator {
+            service_origin: "https://reach.kala.to".to_owned(),
+            locator: "kr-collection-vector-locator".to_owned(),
+            archive_id,
+        }],
+        trusted_writers: [TrustedWriter {
+            writer_key_id: KeyId::from_bytes([0x73; 32]),
+            signing_key: AuthorisationKey::from_bytes([0x74; 32]),
+            enrolled_at_ms: TimestampMs::new(NOW_MS),
+        }]
+        .into_iter()
+        .collect(),
+        trusted_producers: [TrustedProducer {
+            sender_key_id: KeyId::from_bytes([0x78; 32]),
+            stored_envelope_key: StoredEnvelopeKey::from_bytes([0x79; 32]),
+            enrolled_at_ms: TimestampMs::new(NOW_MS),
+        }]
+        .into_iter()
+        .collect(),
+        checkpoints: [ArchiveCheckpoint {
+            archive_id,
+            backup_generation: BackupGeneration::new(7),
+            encrypted_manifest_hash: Digest256::from_bytes([0x7a; 32]),
+            verified_at_ms: TimestampMs::new(NOW_MS + 120_000),
+        }]
+        .into_iter()
+        .collect(),
+        revision: U64::new(3),
+        written_at_ms: TimestampMs::new(NOW_MS + 180_000),
+    }
+}
+
+/// One recovery bundle case: the record, its canonical bytes under the bounds a bundle is encoded
+/// and decoded with, and their digest.
+fn recovery_bundle_case(id: &str, description: &str, bundle: &RecoveryBundle) -> Value {
+    let encoded = kr_cbor::to_canonical_vec_within(bundle, &RECOVERY_BUNDLE_LIMITS)
+        .expect("the published bundle is within its bounds");
+    json!({
+        "id": id,
+        "description": description,
+        "domain": Value::Null,
+        "cbor_hex": hex(&encoded),
+        "sha256": hex(&kr_cbor::sha256(&encoded)),
+        "json": serde_json::to_value(bundle).expect("a bundle"),
+        "value": describe(
+            &kr_cbor::decode(&encoded, &kr_cbor::Limits::default()).expect("valid KR-CBOR-1")
+        ),
     })
 }
 
