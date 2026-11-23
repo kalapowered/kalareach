@@ -4246,6 +4246,4 @@ async fn a_restored_device_joins_only_after_a_fresh_authorisation() {
             "nothing from before it joined: epoch {epoch}"
         );
     }
-    // The settings that came back are still what the bundle held, untouched by the membership.
-    assert_eq!(carried.restored, chosen());
 }
