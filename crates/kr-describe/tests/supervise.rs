@@ -2823,6 +2823,68 @@ fn a_start_that_panics_after_creating_the_process_leaves_no_held_process() {
     }
 }
 
+/// KR-REQ-22.10: a ceiling the owner changes while the process lives reaches the limit it is held
+/// to, through the driver and with no restart: a lower one, a higher one, and one cleared back to
+/// the default. The process is the same process and its job goes on. Where the platform holds a
+/// limit around the process (Windows, when this case runs there) the
+/// limit is the system's own, set and read back by the system; elsewhere it is the figure the
+/// daemon holds the process to.
+#[test]
+fn a_ceiling_the_owner_changes_while_the_process_lives_is_the_one_it_is_held_to() {
+    let (catalogue, _) = tiny();
+    let fits = catalogue
+        .catalogue()
+        .default_profile()
+        .execution()
+        .resident_estimate
+        .total();
+    assert!(fits + 2 * GIB < Budgets::DEFAULTS.process_memory_ceiling_bytes);
+    let mut rig = Rig::limited(
+        &Script {
+            generate_until_cancelled: true,
+            mark_work: true,
+            ..Script::default()
+        },
+        ResourceSettings {
+            owner_ceiling_bytes: Some(fits + GIB),
+            ..ResourceSettings::default()
+        },
+        Some(&catalogue),
+        true,
+    );
+    queue(rig.service(), &session(1), Priority::Ordinary, at(0));
+    rig.job_sent(at(3_000));
+    let process = rig.driver.pid().expect("the process");
+    assert_eq!(rig.driver.limit_held_bytes(), Some(fits + GIB));
+
+    for (change, owner, held) in [
+        ("a lower ceiling", Some(fits + GIB / 2), fits + GIB / 2),
+        ("a higher ceiling", Some(fits + 2 * GIB), fits + 2 * GIB),
+        (
+            "a cleared ceiling",
+            None,
+            Budgets::DEFAULTS.process_memory_ceiling_bytes,
+        ),
+    ] {
+        rig.service().set_owner_budgets(owner, None);
+        let reports = rig.until(&roomy(), at(3_000), change, |_, driver| {
+            driver.limit_held_bytes() == Some(held)
+        });
+        assert!(!the_process_ended(&reports), "{change}: {reports:?}");
+        assert_eq!(
+            rig.driver.pid(),
+            Some(process),
+            "{change}: the same process"
+        );
+        assert_eq!(
+            rig.driver.service().in_flight(),
+            1,
+            "{change}: the job goes on"
+        );
+        assert_eq!(rig.driver.started(), 1, "{change}: no other is started");
+    }
+}
+
 /// KR-REQ-22.10: a limit the system will not change when the owner changes the ceiling ends the
 /// process as nothing the process did. The job in it goes back in the queue and is sent again to
 /// the next process, which starts under the new limit after the restart's wait; no failure of
