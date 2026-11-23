@@ -488,28 +488,37 @@ impl MouseSpeller {
         };
         let mut report = Vec::new();
         for action in actions {
-            let asked = match action {
-                MouseAction::Press(_) | MouseAction::Release(_) | MouseAction::Wheel(_) => {
-                    Tracking::Clicks
-                }
-                MouseAction::Drag(_) => Tracking::Drag,
-                MouseAction::Motion => Tracking::Motion,
-            };
-            if reporting.tracking() < asked {
-                continue;
-            }
-            let event = MouseEvent {
-                action,
-                column,
-                row,
-                modifiers,
-            };
-            // A position the encoding has no room for is not told to the application as another.
-            if let Ok(bytes) = kr_keys::mouse(event, reporting.encoding()) {
-                report.extend_from_slice(&bytes);
-            }
+            report.extend(Self::report(
+                MouseEvent {
+                    action,
+                    column,
+                    row,
+                    modifiers,
+                },
+                reporting,
+            ));
         }
         report
+    }
+
+    /// The bytes that tell the application of `event`, or none when it asked for nothing the event
+    /// is. The event is one a console already reports as a cell of its window, such as a report the
+    /// console spelled itself ([`SgrMouseFilter`]), so no buffer position is mapped and no button
+    /// is remembered.
+    #[must_use]
+    pub fn report(event: MouseEvent, reporting: &MouseReporting) -> Vec<u8> {
+        let asked = match event.action {
+            MouseAction::Press(_) | MouseAction::Release(_) | MouseAction::Wheel(_) => {
+                Tracking::Clicks
+            }
+            MouseAction::Drag(_) => Tracking::Drag,
+            MouseAction::Motion => Tracking::Motion,
+        };
+        if reporting.tracking() < asked {
+            return Vec::new();
+        }
+        // A position the encoding has no room for is not told to the application as another.
+        kr_keys::mouse(event, reporting.encoding()).unwrap_or_default()
     }
 
     /// What the pointer did, as a report names it, in the order it happened.
@@ -574,6 +583,218 @@ const fn first_of(state: u32) -> Option<MouseButton> {
     } else {
         None
     }
+}
+
+/// How long bytes that begin a mouse report wait for the rest of it. A lone escape is the Escape
+/// key, and a console writes a report it spells in one piece, so what has not become a report by
+/// then is text.
+pub const HELD_PREFIX_WAIT: std::time::Duration = std::time::Duration::from_millis(25);
+
+/// What [`SgrMouseFilter`] makes of the text a console spelled.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Part {
+    /// Text to hand on to the application as it is.
+    Text(Vec<u8>),
+    /// A mouse report the console spelled, as the event it tells of.
+    Report(MouseEvent),
+}
+
+/// What the bytes held so far are.
+enum Held {
+    /// A whole mouse report: its button code, column and row (counted from one) and whether it
+    /// says a button came up.
+    Report {
+        code: u32,
+        column: u32,
+        row: u32,
+        up: bool,
+    },
+    /// The opening or the closing marker of a bracketed paste.
+    Marker { opening: bool },
+    /// The beginning of one of those, which more bytes may complete.
+    Prefix,
+    /// Not the beginning of either.
+    Neither,
+}
+
+const REPORT_START: &[u8] = b"\x1b[<";
+const PASTE_OPENING: &[u8] = b"\x1b[200~";
+const PASTE_CLOSING: &[u8] = b"\x1b[201~";
+/// The digits a report's button code, column and row may have.
+const REPORT_DIGITS: [u32; 3] = [3, 5, 5];
+
+/// Takes the mouse reports out of the text a console spelled.
+///
+/// A console that spells its keys also spells the mouse, as the reports a terminal sends: `ESC [ <`,
+/// the button code, the column and the row, each after a semicolon, and `M`, or `m` when a button
+/// came up. Everything else is text. Bytes that begin a report are held until the next byte shows
+/// whether they are one, and go on as text when it does not, or when [`flush`](Self::flush) is
+/// called because nothing more came. A report is at most 19 bytes, so that is all that is ever
+/// held. Between the opening and the closing marker of a bracketed paste nothing is a report, so
+/// that a pasted text that holds one reaches the application as the text it is.
+#[derive(Debug, Default)]
+pub struct SgrMouseFilter {
+    held: Vec<u8>,
+    pasting: bool,
+}
+
+impl SgrMouseFilter {
+    /// Whether bytes that may begin a report are held.
+    #[must_use]
+    pub fn holds(&self) -> bool {
+        !self.held.is_empty()
+    }
+
+    /// Takes `bytes`, which follow those given before, and returns what they are, in order.
+    pub fn push(&mut self, bytes: &[u8]) -> Vec<Part> {
+        let mut parts = Vec::new();
+        let mut text = Vec::new();
+        for &byte in bytes {
+            if self.held.is_empty() && byte != 0x1b {
+                text.push(byte);
+                continue;
+            }
+            self.held.push(byte);
+            loop {
+                match self.classify() {
+                    Held::Prefix => break,
+                    Held::Report {
+                        code,
+                        column,
+                        row,
+                        up,
+                    } => {
+                        self.held.clear();
+                        if let Some(event) = event_of(code, column, row, up) {
+                            if !text.is_empty() {
+                                parts.push(Part::Text(std::mem::take(&mut text)));
+                            }
+                            parts.push(Part::Report(event));
+                        }
+                        break;
+                    }
+                    Held::Marker { opening } => {
+                        text.append(&mut self.held);
+                        self.pasting = opening;
+                        break;
+                    }
+                    Held::Neither => {
+                        // The first byte is text; the ones after it may begin something.
+                        text.push(self.held.remove(0));
+                        if self.held.first() != Some(&0x1b) {
+                            text.append(&mut self.held);
+                        }
+                        if self.held.is_empty() {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        if !text.is_empty() {
+            parts.push(Part::Text(text));
+        }
+        parts
+    }
+
+    /// The bytes held, as the text they are, when no more are coming.
+    pub fn flush(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.held)
+    }
+
+    /// What the bytes held are.
+    fn classify(&self) -> Held {
+        let held = self.held.as_slice();
+        let prefix_of = |whole: &[u8]| held.len() <= whole.len() && whole.starts_with(held);
+        if self.pasting {
+            return if held == PASTE_CLOSING {
+                Held::Marker { opening: false }
+            } else if prefix_of(PASTE_CLOSING) {
+                Held::Prefix
+            } else {
+                Held::Neither
+            };
+        }
+        if held == PASTE_OPENING {
+            return Held::Marker { opening: true };
+        }
+        if prefix_of(PASTE_OPENING) {
+            return Held::Prefix;
+        }
+        if !held.starts_with(REPORT_START) {
+            return if prefix_of(REPORT_START) {
+                Held::Prefix
+            } else {
+                Held::Neither
+            };
+        }
+        let mut fields = [0_u32; 3];
+        let mut field = 0;
+        let mut digits = 0;
+        for &byte in &held[REPORT_START.len()..] {
+            match byte {
+                b'0'..=b'9' => {
+                    digits += 1;
+                    if digits > REPORT_DIGITS[field] {
+                        return Held::Neither;
+                    }
+                    fields[field] = fields[field] * 10 + u32::from(byte - b'0');
+                }
+                b';' if field < 2 && digits > 0 => {
+                    field += 1;
+                    digits = 0;
+                }
+                b'M' | b'm' if field == 2 && digits > 0 => {
+                    return Held::Report {
+                        code: fields[0],
+                        column: fields[1],
+                        row: fields[2],
+                        up: byte == b'm',
+                    };
+                }
+                _ => return Held::Neither,
+            }
+        }
+        Held::Prefix
+    }
+}
+
+/// The event a report tells of, or none when it tells of nothing an application can be told: a
+/// position that is not one, a button or a sideways wheel this crate's encoder has no report for.
+fn event_of(code: u32, column: u32, row: u32, up: bool) -> Option<MouseEvent> {
+    if column == 0 || row == 0 || code >= 128 {
+        return None;
+    }
+    let button = match code & 0b11 {
+        0 => Some(MouseButton::Left),
+        1 => Some(MouseButton::Middle),
+        2 => Some(MouseButton::Right),
+        _ => None,
+    };
+    let action = if code & 64 != 0 {
+        match (code & 0b11, up) {
+            (0, false) => MouseAction::Wheel(WheelDirection::Up),
+            (1, false) => MouseAction::Wheel(WheelDirection::Down),
+            _ => return None,
+        }
+    } else if code & 32 != 0 {
+        button.map_or(MouseAction::Motion, MouseAction::Drag)
+    } else if up {
+        MouseAction::Release(button?)
+    } else {
+        MouseAction::Press(button?)
+    };
+    Some(MouseEvent {
+        action,
+        column: column - 1,
+        row: row - 1,
+        modifiers: Modifiers {
+            shift: code & 4 != 0,
+            alt: code & 8 != 0,
+            control: code & 16 != 0,
+            superkey: false,
+        },
+    })
 }
 
 /// The console handles Ctrl-C itself, and does not hand it on as a key.
@@ -688,6 +909,7 @@ mod tests {
         MouseReporting, MouseSpeller, RESTORATION_CHUNK, RIGHT, Reading, Restoration, Tracking,
         Window, keys_spelled_mode, mouse_input_mode, record_input_mode,
     };
+    use super::{Part, SgrMouseFilter};
 
     /// A record at `column` and `row` with the buttons and flags the console reported it with.
     fn record(column: i16, row: i16, buttons: u32, flags: u32) -> MouseRecord {
@@ -1542,5 +1764,217 @@ mod tests {
                 assert_eq!(keys_spelled_mode(current, false), current);
             }
         }
+    }
+
+    /// What an application that wrote `asked` is told of the text `input`, which a console spelled:
+    /// the reports in it as the application asked for them, and the rest as it is.
+    fn told_of_text(asked: &[u8], input: &[u8]) -> Vec<u8> {
+        let mut reporting = MouseReporting::default();
+        reporting.observe(asked);
+        let mut filter = SgrMouseFilter::default();
+        let mut told = Vec::new();
+        for part in filter.push(input) {
+            match part {
+                Part::Text(text) => told.extend(text),
+                Part::Report(event) => told.extend(MouseSpeller::report(event, &reporting)),
+            }
+        }
+        told.extend(filter.flush());
+        told
+    }
+
+    /// The original report of `code` at `column` and `row`, counted from one.
+    fn original(code: u8, column: u8, row: u8) -> Vec<u8> {
+        vec![0x1b, b'[', b'M', 32 + code, 32 + column, 32 + row]
+    }
+
+    /// Each report the console spells is told as the application asked for it: the events of its
+    /// tracking level, in its encoding, and nothing the level has no place for.
+    #[test]
+    fn a_report_the_console_spelled_is_told_in_the_tracking_and_encoding_the_application_asked_for()
+    {
+        let press = b"\x1b[<0;2;2M".as_slice();
+        let release = b"\x1b[<0;2;2m".as_slice();
+        let drag = b"\x1b[<32;2;2M".as_slice();
+        let motion = b"\x1b[<35;2;2M".as_slice();
+        let up = b"\x1b[<64;2;2M".as_slice();
+        let down = b"\x1b[<65;2;2M".as_slice();
+        let all = [press, release, drag, motion, up, down].concat();
+        assert_eq!(
+            told_of_text(b"", &all),
+            Vec::<u8>::new(),
+            "nothing was asked"
+        );
+        assert_eq!(
+            told_of_text(b"\x1b[?1000h\x1b[?1006h", &all),
+            [press, release, up, down].concat(),
+            "1000 and SGR: clicks and the wheel"
+        );
+        assert_eq!(
+            told_of_text(b"\x1b[?1002h\x1b[?1006h", &all),
+            [press, release, drag, up, down].concat(),
+            "1002 and SGR: and a move with a button held"
+        );
+        assert_eq!(
+            told_of_text(b"\x1b[?1003h\x1b[?1006h", &all),
+            all,
+            "1003 and SGR: and every move"
+        );
+        let original_encoding = [
+            original(0, 2, 2),
+            original(3, 2, 2),
+            original(64, 2, 2),
+            original(65, 2, 2),
+        ]
+        .concat();
+        assert_eq!(
+            told_of_text(b"\x1b[?1000h", &all),
+            original_encoding,
+            "1000 alone: the original report, which has no release of a button"
+        );
+        assert_eq!(
+            told_of_text(b"\x1b[?1000h\x1b[?1005h", &all),
+            original_encoding,
+            "1005 asks for the original report's bytes"
+        );
+        assert_eq!(
+            told_of_text(b"\x1b[?1000h\x1b[?1006h", b"\x1b[<20;2;2M"),
+            b"\x1b[<20;2;2M".to_vec(),
+            "Shift and Control held are told"
+        );
+        let record_told = told(
+            b"\x1b[?1000h\x1b[?1006h",
+            &[record(1, 1, LEFT, 0), record(1, 1, 0, 0)],
+        );
+        assert_eq!(
+            told_of_text(b"\x1b[?1000h\x1b[?1006h", &[press, release].concat()),
+            record_told,
+            "a report and a record of the same events are told the same"
+        );
+    }
+
+    /// A report whose bytes come in two reads, cut anywhere, is the one report, and the text on
+    /// either side of it is the text.
+    #[test]
+    fn a_report_cut_across_two_reads_is_one_report() {
+        let whole = b"ab\x1b[<0;10;5Mcd".as_slice();
+        let mut once = SgrMouseFilter::default();
+        let expected: Vec<Part> = once.push(whole);
+        assert_eq!(expected.len(), 3, "text, report, text: {expected:?}");
+        for cut in 0..=whole.len() {
+            let mut filter = SgrMouseFilter::default();
+            let mut parts = filter.push(&whole[..cut]);
+            parts.extend(filter.push(&whole[cut..]));
+            let mut text = Vec::new();
+            let mut reports = Vec::new();
+            for part in parts {
+                match part {
+                    Part::Text(bytes) => text.extend(bytes),
+                    Part::Report(event) => reports.push(event),
+                }
+            }
+            assert_eq!(text, b"abcd".to_vec(), "cut at {cut}");
+            assert_eq!(reports.len(), 1, "cut at {cut}");
+            assert!(!filter.holds(), "cut at {cut}");
+        }
+    }
+
+    /// Bytes that begin a report and are not one are text, in their place, and a lone escape is
+    /// text once nothing more comes.
+    #[test]
+    fn bytes_that_begin_a_report_and_are_not_one_are_text_in_their_place() {
+        let text = |input: &[u8]| {
+            let mut filter = SgrMouseFilter::default();
+            let mut parts = filter.push(input);
+            let held = filter.flush();
+            if !held.is_empty() {
+                parts.push(Part::Text(held));
+            }
+            parts
+                .into_iter()
+                .map(|part| match part {
+                    Part::Text(bytes) => bytes,
+                    Part::Report(event) => panic!("{input:?} was read as {event:?}"),
+                })
+                .collect::<Vec<_>>()
+                .concat()
+        };
+        for input in [
+            b"\x1b[A".as_slice(),
+            b"\x1bx",
+            b"\x1b",
+            b"\x1b[",
+            b"\x1b[<",
+            b"\x1b[<0;1",
+            b"\x1b[<0;x;1M",
+            b"\x1b[<0;1;1X",
+            b"\x1b[<1234;1;1M",
+            b"\x1b[<0;123456;1M",
+            b"\x1b[<;1;1M",
+            b"\x1b[<0;;1M",
+            b"\x1b\x1b[A",
+        ] {
+            assert_eq!(text(input), input.to_vec(), "{input:?}");
+        }
+        let mut filter = SgrMouseFilter::default();
+        assert!(filter.push(b"\x1b").is_empty());
+        assert!(filter.holds(), "a lone escape is held");
+        assert_eq!(filter.flush(), b"\x1b".to_vec());
+        assert!(!filter.holds());
+        let mut filter = SgrMouseFilter::default();
+        let parts = filter.push(b"\x1b\x1b[<0;1;1M");
+        assert_eq!(parts.len(), 2, "{parts:?}");
+        assert_eq!(parts[0], Part::Text(b"\x1b".to_vec()));
+        assert!(matches!(parts[1], Part::Report(_)), "{parts:?}");
+    }
+
+    /// A report that tells of nothing an application can be told is taken out and told to nobody.
+    #[test]
+    fn a_report_that_tells_of_nothing_is_taken_out_and_told_to_nobody() {
+        for input in [
+            b"\x1b[<0;0;5M".as_slice(),
+            b"\x1b[<0;5;0M",
+            b"\x1b[<66;1;1M",
+            b"\x1b[<64;1;1m",
+            b"\x1b[<3;1;1M",
+            b"\x1b[<128;1;1M",
+        ] {
+            let mut filter = SgrMouseFilter::default();
+            assert!(filter.push(input).is_empty(), "{input:?}");
+            assert!(!filter.holds(), "{input:?}");
+        }
+    }
+
+    /// Between the markers of a bracketed paste nothing is a report, so a pasted text that holds
+    /// one is given to the application as text, and the markers, cut anywhere, are text.
+    #[test]
+    fn a_paste_is_text_whatever_it_holds_and_its_markers_are_not_reports() {
+        let asked = b"\x1b[?1000h\x1b[?1006h";
+        let pasted = b"\x1b[200~12\x1b[<0;1;1M\x1b[A\x1b[201~".as_slice();
+        assert_eq!(told_of_text(asked, pasted), pasted.to_vec());
+        for cut in 0..=pasted.len() {
+            let mut filter = SgrMouseFilter::default();
+            let mut parts = filter.push(&pasted[..cut]);
+            parts.extend(filter.push(&pasted[cut..]));
+            parts.push(Part::Text(filter.flush()));
+            let told: Vec<u8> = parts
+                .into_iter()
+                .flat_map(|part| match part {
+                    Part::Text(bytes) => bytes,
+                    Part::Report(event) => panic!("cut at {cut}: {event:?}"),
+                })
+                .collect();
+            assert_eq!(told, pasted.to_vec(), "cut at {cut}");
+        }
+        assert_eq!(
+            told_of_text(asked, b"\x1b[<0;1;1M\x1b[200~12\x1b[201~\x1b[<0;1;1mZ"),
+            b"\x1b[<0;1;1M\x1b[200~12\x1b[201~\x1b[<0;1;1mZ".to_vec(),
+            "a report before, a paste, a report after and a letter, with the mouse asked for"
+        );
+        assert_eq!(
+            told_of_text(b"", b"\x1b[<0;1;1M\x1b[200~12\x1b[201~\x1b[<0;1;1mZ"),
+            b"\x1b[200~12\x1b[201~Z".to_vec(),
+            "the reports are told to nobody when nothing was asked, and the paste is whole"
+        );
     }
 }
