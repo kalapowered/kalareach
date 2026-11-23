@@ -4472,8 +4472,8 @@ async fn kr_req_13_12_a_send_whose_copy_fails_leaves_no_copy_and_no_place() {
 }
 
 /// KR-REQ-13.12 (FU9): a panic in the desk's task of a send after its upload started leaves that
-/// upload its copy. The caller is answered, and the upload goes on: its sender runs and its copy is
-/// what a resume reads.
+/// upload its copy. The caller is answered with an error, the upload's sender starts, and the upload
+/// stays held with its copy.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn kr_req_13_12_a_panic_after_the_upload_started_leaves_its_copy() {
     use testing::{Fault, Point};
