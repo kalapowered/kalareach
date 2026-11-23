@@ -6511,9 +6511,9 @@ async fn a_rollback_to_a_release_without_the_store_of_binding_revisions_states_t
 }
 
 /// KR-REQ-26.10: a rollback is refused, naming the document, when the configuration document is at a
-/// version the older release does not read: the document this build writes is at version 3, and a release
-/// that reads versions 1 to 2 cannot take it. Nothing is switched, and the document is left as it was; a
-/// document at the older release's own version is no obstacle.
+/// version the older release does not read: the document this build writes is at the configuration
+/// version, and a release that reads versions 1 to 2 cannot take it. Nothing is switched, and the document
+/// is left as it was; a document at the older release's own version is no obstacle.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_rollback_is_refused_naming_a_configuration_document_the_older_release_cannot_read() {
@@ -6569,7 +6569,10 @@ async fn a_rollback_is_refused_naming_a_configuration_document_the_older_release
     let message = said["message"].as_str().unwrap_or_default().to_owned();
     assert!(
         message.contains(&document.display().to_string())
-            && message.contains("records version 3")
+            && message.contains(&format!(
+                "records version {}",
+                kr_protocol::hostinfo::configuration::VERSION
+            ))
             && message.contains("reads versions 1 to 2"),
         "{said}"
     );
