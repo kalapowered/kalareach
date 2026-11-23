@@ -4508,6 +4508,70 @@ async fn kr_req_13_12_a_panic_after_the_upload_started_leaves_its_copy() {
     adopted.stop().await;
 }
 
+/// KR-REQ-13.12 (FU10): a send whose copy is placed, and whose directory flush then fails, leaves no
+/// copy when a cleanup stopped its upload before it started. The cleanup stops the admitted upload,
+/// which has no sender, and removes its files; the send places its copy under the key the upload
+/// still holds; the flush fails and the send ends its admission before the cleanup ends the upload.
+/// The upload never started, so the copy is the send's own to remove, and the cleanup then ends the
+/// upload.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_13_12_a_send_whose_copy_flush_fails_after_a_cleanup_stopped_its_upload_leaves_no_copy()
+ {
+    use testing::{Fault, Point};
+
+    let adopted = Adopted::start(1).await;
+    let (phone, _control) = phone_for(&adopted).await;
+    let desk = desk_of(&phone.companion);
+    let paired = paired_of(&phone.companion).await;
+    let key = kr_ipc::new_uuid();
+    let bytes = vec![5_u8; 16];
+    let staged = testing::hold_at(key, Point::CopyStaged);
+    let removed = testing::hold_at(key, Point::ForgetRemoved);
+    let flush = testing::arm(key, Fault::CopyFlushFails);
+    let send = {
+        let sent = request(&adopted, &bytes, Arc::new(Held::new(bytes.clone())), key);
+        let (desk, paired) = (Arc::clone(&desk), paired.clone());
+        tokio::spawn(async move { desk.send(paired, sent).await })
+    };
+    staged.until_passed(1).await;
+    // The cleanup has stopped the upload and removed its files, and has not ended it.
+    desk.forgotten(paired.device_id);
+    removed.until_passed(1).await;
+    assert_eq!(
+        testing::read_copy(&folder(&phone), key),
+        None,
+        "the cleanup removed the files before the send placed its copy"
+    );
+    staged.release();
+    let answered = tokio::time::timeout(WATCHDOG, send)
+        .await
+        .expect("the send answers")
+        .expect("the task ran");
+    assert!(
+        answered.is_err(),
+        "the flush of the copy's directory failed"
+    );
+    drop(flush);
+    removed.release();
+    settled(&desk).await;
+    desk.sends_idle().await;
+    assert_eq!(
+        testing::read_copy(&folder(&phone), key),
+        None,
+        "the send left the copy it placed for an upload that never started"
+    );
+    assert_eq!(
+        staged_copies_in(&folder(&phone)),
+        0,
+        "no copy is left beside the name"
+    );
+    assert!(
+        desk.generation_for_test(key).is_none(),
+        "the cleanup ended the upload"
+    );
+    adopted.stop().await;
+}
+
 /// KR-REQ-13.12 (FU7): a panic in the desk's task of a send leaves no upload admitted with no
 /// sender. The caller is answered, the copy is gone, and the key is free for a new send.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]

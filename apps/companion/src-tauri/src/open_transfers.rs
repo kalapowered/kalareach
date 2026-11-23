@@ -225,6 +225,8 @@ impl Store {
             }
         };
         let placed = crate::drafts::place(&staged, &to).map_err(|fault| fault.error);
+        #[cfg(feature = "testing")]
+        let placed = placed.and_then(|()| testing::copy_flush(key));
         drop(held);
         placed
     }
@@ -429,6 +431,9 @@ struct Live {
     reached: AtomicU64,
     /// The number of the connection its sender was started on.
     sent_link: AtomicU64,
+    /// Whether a start moved the upload out of `Admitted`: set under the gate, in the section that
+    /// makes its sender, and never cleared. An upload that a stop took before any start has none.
+    started: AtomicBool,
 }
 
 fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -443,6 +448,7 @@ impl Live {
             cancel_asked: AtomicBool::new(file.cancel_asked),
             reached: AtomicU64::new(0),
             sent_link: AtomicU64::new(0),
+            started: AtomicBool::new(false),
             published: AtomicBool::new(file.reached == Reached::Published),
             generation: AtomicU64::new(0),
             file: Mutex::new(file),
@@ -910,20 +916,23 @@ impl Registry {
     /// Ends the admission of `live`, whose send ended before its start was decided: only its own
     /// upload, still admitted, and its own copy go, in one section under the gate. A cleanup may
     /// have stopped the upload and let the key be used again, and then neither the upload nor the
-    /// copy is this send's to remove. An upload that has started has a sender and is held until
-    /// that sender ends it: its copy is what a resume reads, so it stays. A panic between the
-    /// start's change of the phase and the task it makes leaves the upload held with no sender,
-    /// and nothing here ends that.
+    /// copy is this send's to remove. An upload whose start moved it out of `Admitted` has a
+    /// sender and is held until that sender ends it: its copy is what a resume reads, so it stays.
+    /// A panic between the start's change of the phase and the task it makes leaves the upload
+    /// held with no sender, and nothing here ends that. An upload that no start moved loses the
+    /// copy whatever its phase: a cleanup that stopped it (`Stopping`, or `Paused` when its cancel
+    /// could not be finished) holds it until the cleanup ends it, and the copy this send placed
+    /// after the cleanup removed the files goes.
     fn drop_admitted(&mut self, store: &Store, live: &Arc<Live>) {
         let ours = self
             .held
             .get(&live.key)
             .is_some_and(|held| Arc::ptr_eq(held, live));
-        if ours && *locked(&live.phase) != Phase::Admitted {
+        if ours && live.started.load(Ordering::Acquire) {
             return;
         }
         self.remove_copy_of(store, live);
-        if ours {
+        if ours && *locked(&live.phase) == Phase::Admitted {
             self.held.remove(&live.key);
         }
     }
@@ -1544,6 +1553,7 @@ impl Desk {
                 return false;
             }
             *phase = Phase::Sending;
+            live.started.store(true, Ordering::Release);
         }
         live.sent_link.store(link, Ordering::Release);
         #[cfg(feature = "testing")]
@@ -2814,6 +2824,8 @@ impl Desk {
         locked(&self.verdicts).remove(&key);
         // The files go first: whoever is told it was cancelled finds nothing kept.
         let _ = store.remove(key);
+        #[cfg(feature = "testing")]
+        testing::pause(key, testing::Point::ForgetRemoved);
         if let Some(live) = held {
             self.end(live, Outcome::Cancelled);
         }
@@ -3077,6 +3089,9 @@ pub mod testing {
         /// A send has written the copy of its content beside the copy's name and has not placed it
         /// there. Held, the blocking thread that writes it goes no further until released.
         CopyStaged,
+        /// A barrier has removed the files of a key it forgets and has not yet ended the upload held
+        /// for it. Held, the barrier goes no further until released.
+        ForgetRemoved,
         /// A send has written the copy of its content and holds the gate that
         /// `hold_after_copy_for_test` opens, before it waits for it. Noted, never held.
         AfterCopy,
@@ -3180,6 +3195,9 @@ pub mod testing {
         /// The write of a send's copy fails, once, after the copy is written beside its name and
         /// before it is placed.
         CopyFails,
+        /// The flush of the directory that follows the copy's rename fails, once: the copy is in
+        /// place under its name and the write reports the failure.
+        CopyFlushFails,
         /// The desk's task of a send panics, once, after the copy is placed and before the start.
         PanicInSend,
         /// The desk's task of a send panics, once, in the section that starts the upload, after its
@@ -3331,6 +3349,17 @@ pub mod testing {
         if take(key, Fault::CopyFails) {
             return Err(std::io::Error::other(
                 "a fault injected into the copy's write",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Fails the flush that follows a copy's rename when `Fault::CopyFlushFails` is armed for `key`:
+    /// the copy is placed, and the write reports an error all the same.
+    pub(super) fn copy_flush(key: Uuid) -> std::io::Result<()> {
+        if take(key, Fault::CopyFlushFails) {
+            return Err(std::io::Error::other(
+                "a fault injected into the flush of the copy's directory",
             ));
         }
         Ok(())
