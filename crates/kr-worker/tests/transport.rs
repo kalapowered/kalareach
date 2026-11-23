@@ -2585,7 +2585,11 @@ impl LaunchedForwarder {
             program: std::path::Path::new(program),
             arguments,
             directory: &std::env::temp_dir(),
-            environment: &[("KR_REGISTRATION", registration.as_os_str())],
+            environment: &kr_worker::windows::launch::Environment::of_this_process_with(&[(
+                "KR_REGISTRATION",
+                registration.as_os_str(),
+            )])
+            .expect("an environment"),
             session: Some(&session),
             agent: &job,
             pipe_input: true,

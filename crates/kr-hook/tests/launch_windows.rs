@@ -424,7 +424,8 @@ impl Shell {
             program: &self.placed.forwarder,
             arguments: &arguments,
             directory: cwd,
-            environment: &variables,
+            environment: &kr_worker::windows::launch::Environment::of_this_process_with(&variables)
+                .expect("an environment"),
             session: Some(&self.job),
             agent,
             pipe_input: false,
@@ -908,7 +909,8 @@ impl Scripted {
             program: &program,
             arguments: &arguments,
             directory: shell.placed.host.root(),
-            environment: &[],
+            environment: &kr_worker::windows::launch::Environment::of_this_process_with(&[])
+                .expect("an environment"),
             session: Some(&shell.job),
             agent: &agent,
             pipe_input: true,

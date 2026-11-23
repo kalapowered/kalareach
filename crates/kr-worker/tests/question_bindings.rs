@@ -856,7 +856,8 @@ impl Started {
                     "ping -n 600 127.0.0.1 > NUL".to_owned(),
                 ],
                 directory: &std::env::temp_dir(),
-                environment: &[],
+                environment: &kr_worker::windows::launch::Environment::of_this_process_with(&[])
+                    .expect("an environment"),
                 session: None,
                 agent: &job,
                 pipe_input: false,

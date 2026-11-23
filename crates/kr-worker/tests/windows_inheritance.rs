@@ -172,7 +172,8 @@ impl Jobs {
             program: &system_program("ping.exe"),
             arguments: &["-n".to_owned(), "600".to_owned(), "127.0.0.1".to_owned()],
             directory: &std::env::temp_dir(),
-            environment: &[],
+            environment: &kr_worker::windows::launch::Environment::of_this_process_with(&[])
+                .expect("an environment"),
             session: Some(&*self.session),
             agent: &self.agent,
             pipe_input: true,

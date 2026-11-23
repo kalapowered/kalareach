@@ -16,6 +16,7 @@
 //! is not a failure: an application's diagnostic exits nonzero for a problem it reports in the
 //! output the host reads, and the output is the answer.
 
+use std::ffi::OsString;
 use std::io::Read as _;
 use std::path::Path;
 use std::sync::mpsc;
@@ -74,14 +75,17 @@ impl Probed {
 /// host's own tests give a longer deadline, so that they decide by what a program prints and not by
 /// how soon a machine starts it, or a smaller cap.
 ///
-/// The probe runs in this process's environment, which is the environment the launch it precedes
-/// runs in, and in the launch's own directory. It belongs on a thread that may block.
+/// The probe runs in `environment` and in no other: the whole set of variables, which the caller
+/// gives and nothing of this process's own is added to. A caller that probes for a launch gives the
+/// environment that launch runs in, and the doctor gives its own process's variables. It runs in the
+/// launch's own directory, and belongs on a thread that may block.
 #[must_use]
 pub fn run_within(
     executable: &Path,
     probe: &LaunchProbe,
     launch: &[String],
     directory: &Path,
+    environment: &[(OsString, OsString)],
     deadline: Duration,
     cap: usize,
 ) -> Probed {
@@ -90,7 +94,7 @@ pub fn run_within(
         Err(why) => return Probed::unread(why),
     };
     let started = Instant::now();
-    let mut process = match Process::start(executable, &arguments, directory) {
+    let mut process = match Process::start(executable, &arguments, directory, environment) {
         Ok(process) => process,
         Err(error) => {
             return Probed::unread(format!(
@@ -168,13 +172,20 @@ struct Process {
 
 #[cfg(unix)]
 impl Process {
-    fn start(executable: &Path, arguments: &[String], directory: &Path) -> std::io::Result<Self> {
+    fn start(
+        executable: &Path,
+        arguments: &[String],
+        directory: &Path,
+        environment: &[(OsString, OsString)],
+    ) -> std::io::Result<Self> {
         use std::os::unix::process::CommandExt as _;
 
         let mut command = std::process::Command::new(executable);
         command
             .args(arguments)
             .current_dir(directory)
+            .env_clear()
+            .envs(environment.iter().map(|(name, value)| (name, value)))
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
@@ -214,7 +225,14 @@ struct Process {
 
 #[cfg(windows)]
 impl Process {
-    fn start(executable: &Path, arguments: &[String], directory: &Path) -> std::io::Result<Self> {
+    fn start(
+        executable: &Path,
+        arguments: &[String],
+        directory: &Path,
+        environment: &[(OsString, OsString)],
+    ) -> std::io::Result<Self> {
+        let environment = crate::windows::launch::Environment::from_pairs(environment)
+            .map_err(std::io::Error::other)?;
         let job = crate::windows::job::AgentJob::create_owning()?;
         #[cfg(feature = "testing")]
         kr_ipc::testing::created::note_words_here(
@@ -226,7 +244,7 @@ impl Process {
             program: executable,
             arguments,
             directory,
-            environment: &[],
+            environment: &environment,
             session: None,
             agent: &job,
             pipe_input: false,

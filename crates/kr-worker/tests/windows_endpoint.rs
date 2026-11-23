@@ -236,7 +236,11 @@ impl Launch {
             program: Path::new(&reservation.profile().binary.resolved_path),
             arguments: &reservation.profile().arguments,
             directory: &std::env::temp_dir(),
-            environment: &[("KR_REGISTRATION", own_registration.as_os_str())],
+            environment: &kr_worker::windows::launch::Environment::of_this_process_with(&[(
+                "KR_REGISTRATION",
+                own_registration.as_os_str(),
+            )])
+            .expect("an environment"),
             session: Some(session.as_ref()),
             agent: &job,
             pipe_input: true,

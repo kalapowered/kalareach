@@ -106,6 +106,7 @@ impl Standin {
             &self.probe(&[]),
             &[],
             directory,
+            &given(&[]),
             GENEROUS,
             probe::MAX_OUTPUT_BYTES,
         )
@@ -128,6 +129,45 @@ fn kr_req_07_64_the_mode_is_read_from_what_the_program_prints_whatever_it_exits_
     let probed = standin.run(directory().path());
     assert_eq!(probed.mode.as_deref(), Some("elevated"), "{probed:?}");
     assert_eq!(probed.unread, None);
+}
+
+/// The variables a stand-in needs to start at all, and `extra` beside them: the whole environment a
+/// probe is given, since it is given no other.
+fn given(extra: &[(&str, &str)]) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+    ["PATH", "SystemRoot", "windir"]
+        .iter()
+        .filter_map(|name| std::env::var_os(name).map(|value| ((*name).into(), value)))
+        .chain(
+            extra
+                .iter()
+                .map(|(name, value)| ((*name).into(), (*value).into())),
+        )
+        .collect()
+}
+
+/// KR-REQ-07.64: the probe runs in the environment it is given and in no other: a variable of this
+/// process that is not in the set is absent, and one that is in it is present.
+#[test]
+fn kr_req_07_64_the_probe_runs_in_the_environment_it_is_given() {
+    // `CARGO_MANIFEST_DIR` is a variable of this test program, which the set does not hold.
+    let standin = Standin::running(
+        r#"printf '{"mode":"%s|%s"}' "${KR_PROBE_GIVEN:-none}" "${CARGO_MANIFEST_DIR:-none}""#,
+        r#"[Console]::Out.Write('{"mode":"' + $(if ($env:KR_PROBE_GIVEN) { $env:KR_PROBE_GIVEN } else { 'none' }) + '|' + $(if ($env:CARGO_MANIFEST_DIR) { $env:CARGO_MANIFEST_DIR } else { 'none' }) + '"}')"#,
+    );
+    assert!(
+        std::env::var_os("CARGO_MANIFEST_DIR").is_some(),
+        "this program has a variable that the set below does not"
+    );
+    let probed = probe::run_within(
+        &standin.program,
+        &standin.probe(&[]),
+        &[],
+        directory().path(),
+        &given(&[("KR_PROBE_GIVEN", "yes")]),
+        GENEROUS,
+        probe::MAX_OUTPUT_BYTES,
+    );
+    assert_eq!(probed.mode.as_deref(), Some("yes|none"), "{probed:?}");
 }
 
 /// KR-REQ-07.64: the program runs in the directory the launch runs in and is given no input, so a
@@ -180,6 +220,7 @@ fn kr_req_07_64_a_program_that_prints_more_than_the_cap_records_no_mode() {
         &standin.probe(&[]),
         &[],
         directory().path(),
+        &given(&[]),
         GENEROUS,
         1000,
     );
@@ -228,6 +269,7 @@ fn kr_req_07_64_a_program_that_never_finishes_is_ended_with_everything_it_starte
             &standin.probe(&[]),
             &[],
             here.path(),
+            &given(&[]),
             deadline,
             probe::MAX_OUTPUT_BYTES,
         );
@@ -275,6 +317,7 @@ fn kr_req_07_64_a_program_that_cannot_start_records_no_mode_and_says_so() {
         &standin.probe(&[]),
         &[],
         directory().path(),
+        &given(&[]),
         GENEROUS,
         probe::MAX_OUTPUT_BYTES,
     );
@@ -348,6 +391,7 @@ fn kr_req_07_64_a_probe_is_held_to_the_deadline_it_is_given_and_a_late_answer_is
             &slow.probe(&[]),
             &[],
             root,
+            &given(&[]),
             deadline,
             probe::MAX_OUTPUT_BYTES,
         )

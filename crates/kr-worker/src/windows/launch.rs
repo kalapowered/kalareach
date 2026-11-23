@@ -106,38 +106,169 @@ pub fn command_line(program: &Path, arguments: &[String]) -> Result<Vec<u16>, St
 /// One environment variable: its name and its value, as UTF-16.
 pub type Variable = (Vec<u16>, Vec<u16>);
 
-/// Builds an environment block: the variables of `base` with those of `additions` set over them
-/// and sorted by name, which is how the operating system wants them, ending with an empty one.
+/// A complete environment: every variable a process is started with, and no other.
 ///
-/// Names are compared without regard to case, as the operating system compares them, so an
-/// addition replaces the variable it names however that was spelled. The first of the additions
-/// that names a variable wins.
-#[must_use]
-pub fn environment_block(base: Vec<Variable>, additions: Vec<Variable>) -> Vec<u16> {
-    fn key(name: &[u16]) -> String {
-        String::from_utf16_lossy(name).to_uppercase()
+/// Starting a process adds nothing to it and reads no variable of this worker's own, so the
+/// process sees exactly these variables. A caller that wants this worker's variables builds them in
+/// with [`Environment::of_this_process_with`]; one that presents a set gives that set.
+///
+/// Names are compared as the operating system compares them, without regard to case, so a set holds
+/// one variable for each name however it is spelled, and the variables are kept in the order the
+/// system wants them in a block.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct Environment {
+    /// The variables, by the upper-cased text of their names.
+    variables: std::collections::BTreeMap<String, Variable>,
+}
+
+/// The key a name is compared and sorted by: its text, upper-cased.
+fn name_key(name: &[u16]) -> String {
+    String::from_utf16_lossy(name).to_uppercase()
+}
+
+/// Refuses a variable the operating system could not read back as it was given, by its name.
+///
+/// A name holds no `=` but a first one, which cmd.exe's per-drive folders (`=C:`) begin with, and
+/// has something after it; a NUL ends the text the system reads, in a name and in a value alike.
+/// The refusal names the variable and never says its value.
+fn refuse_variable((name, value): &Variable) -> Result<(), String> {
+    let shown = String::from_utf16_lossy(name);
+    if name.is_empty() {
+        return Err("an environment variable has an empty name".to_owned());
     }
-    let mut variables: std::collections::BTreeMap<String, Variable> =
-        std::collections::BTreeMap::new();
-    for variable in base {
-        variables.insert(key(&variable.0), variable);
+    if name.contains(&0) {
+        return Err(format!(
+            "the environment variable {shown:?} has a NUL in its name"
+        ));
     }
-    let mut added = std::collections::BTreeSet::new();
-    for variable in additions {
-        let name = key(&variable.0);
-        if added.insert(name.clone()) {
-            variables.insert(name, variable);
+    let equals = u16::from(b'=');
+    let plain = name.strip_prefix(&[equals]).unwrap_or(name);
+    if plain.is_empty() {
+        return Err(format!(
+            "the environment variable {shown:?} has no name after its first ="
+        ));
+    }
+    if plain.contains(&equals) {
+        return Err(format!(
+            "the environment variable {shown:?} has a = in its name, which only its first \
+             character may be"
+        ));
+    }
+    if value.contains(&0) {
+        return Err(format!(
+            "the environment variable {shown:?} has a NUL in its value"
+        ));
+    }
+    Ok(())
+}
+
+impl Environment {
+    /// Builds the environment `variables` are, refusing a set that cannot be one: a name that is
+    /// empty, holds a NUL or a `=` other than its first character, a NUL in a value, or one
+    /// variable named twice however the spellings differ in case.
+    ///
+    /// # Errors
+    ///
+    /// Returns the refusal, which names the variable and never its value.
+    pub fn from_variables(variables: Vec<Variable>) -> Result<Self, String> {
+        let mut set = Self::default();
+        for variable in variables {
+            refuse_variable(&variable)?;
+            let name = String::from_utf16_lossy(&variable.0);
+            if let Some(first) = set.variables.insert(name_key(&variable.0), variable) {
+                return Err(format!(
+                    "the environment names one variable twice, as {:?} and as {name:?}",
+                    String::from_utf16_lossy(&first.0),
+                ));
+            }
         }
+        Ok(set)
     }
-    let mut block = Vec::new();
-    for (name, value) in variables.into_values() {
-        block.extend(name);
-        block.push(u16::from(b'='));
-        block.extend(value);
+
+    /// Builds the environment of `base` with `additions` set over it: an addition replaces the
+    /// variable it names however that was spelled, and the first of the additions to name a
+    /// variable wins.
+    ///
+    /// # Errors
+    ///
+    /// Returns the refusal of the first variable, in `base` or in `additions`, that cannot be one.
+    pub fn merged(base: Vec<Variable>, additions: Vec<Variable>) -> Result<Self, String> {
+        let mut set = Self::default();
+        for variable in base {
+            refuse_variable(&variable)?;
+            set.variables.insert(name_key(&variable.0), variable);
+        }
+        let mut added = std::collections::BTreeSet::new();
+        for variable in additions {
+            refuse_variable(&variable)?;
+            let key = name_key(&variable.0);
+            if added.insert(key.clone()) {
+                set.variables.insert(key, variable);
+            }
+        }
+        Ok(set)
+    }
+
+    /// This environment less the variables `names` name, compared without regard to case.
+    #[must_use]
+    pub fn without(&self, names: &[&str]) -> Self {
+        let mut set = self.clone();
+        for name in names {
+            let units: Vec<u16> = name.encode_utf16().collect();
+            set.variables.remove(&name_key(&units));
+        }
+        set
+    }
+
+    /// How many variables it holds.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.variables.len()
+    }
+
+    /// Whether it holds no variable.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.variables.is_empty()
+    }
+
+    /// The value of the variable `name` names, compared without regard to case.
+    #[must_use]
+    pub fn value_of(&self, name: &str) -> Option<&[u16]> {
+        let units: Vec<u16> = name.encode_utf16().collect();
+        self.variables
+            .get(&name_key(&units))
+            .map(|(_, value)| value.as_slice())
+    }
+
+    /// The block `CreateProcessW` takes: each variable as `name=value` ending in a NUL, sorted by
+    /// name, and one NUL more to end the block.
+    ///
+    /// An empty environment has no entry for that last NUL to follow, and the system reads a block
+    /// that holds none as two NULs, so it is written as two.
+    #[must_use]
+    pub fn block(&self) -> Vec<u16> {
+        let mut block = Vec::new();
+        for (name, value) in self.variables.values() {
+            block.extend(name);
+            block.push(u16::from(b'='));
+            block.extend(value);
+            block.push(0);
+        }
+        if block.is_empty() {
+            block.push(0);
+        }
         block.push(0);
+        block
     }
-    block.push(0);
-    block
+}
+
+impl std::fmt::Debug for Environment {
+    /// How many variables it holds and no more: what a person keeps in their environment is shown
+    /// to nothing.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "Environment({} variables)", self.variables.len())
+    }
 }
 
 /// Returns the handles a process is to inherit, each once, in the order given.
@@ -193,7 +324,7 @@ mod platform {
         UpdateProcThreadAttribute, WaitForSingleObject,
     };
 
-    use super::{Variable, command_line, distinct, environment_block, inheriting, refuse_program};
+    use super::{Environment, Variable, command_line, distinct, inheriting, refuse_program};
     use crate::windows::job::{AgentJob, SessionJob};
 
     /// How much a pipe holds before a write waits.
@@ -218,8 +349,9 @@ mod platform {
         pub arguments: &'a [String],
         /// The directory it starts in.
         pub directory: &'a Path,
-        /// Variables set beside this process's own environment, in addition to it.
-        pub environment: &'a [(&'a str, &'a std::ffi::OsStr)],
+        /// The whole environment the process starts with. Nothing of this worker's own is added to
+        /// it: a caller that wants this worker's variables builds them in.
+        pub environment: &'a Environment,
         /// The session's job, which ends everything in it when it closes. Absent only for a launch
         /// whose profile has been explicitly selected not to be held by one.
         pub session: Option<&'a SessionJob>,
@@ -597,6 +729,45 @@ mod platform {
         (name.encode_wide().collect(), value.encode_wide().collect())
     }
 
+    impl Environment {
+        /// Builds the environment `pairs` are, as [`Environment::from_variables`] does.
+        ///
+        /// # Errors
+        ///
+        /// Returns the refusal of a set that cannot be an environment, by the name of the variable.
+        pub fn from_pairs(
+            pairs: &[(std::ffi::OsString, std::ffi::OsString)],
+        ) -> Result<Self, String> {
+            Self::from_variables(
+                pairs
+                    .iter()
+                    .map(|(name, value)| variable(name, value))
+                    .collect(),
+            )
+        }
+
+        /// Builds this process's own environment with `additions` set over it: an addition replaces
+        /// the variable it names however that was spelled, and the first of them to name a variable
+        /// wins.
+        ///
+        /// # Errors
+        ///
+        /// Returns the refusal of a variable that cannot be one, by its name.
+        pub fn of_this_process_with(
+            additions: &[(&str, &std::ffi::OsStr)],
+        ) -> Result<Self, String> {
+            Self::merged(
+                std::env::vars_os()
+                    .map(|(name, value)| variable(&name, &value))
+                    .collect(),
+                additions
+                    .iter()
+                    .map(|(name, value)| variable(std::ffi::OsStr::new(name), value))
+                    .collect(),
+            )
+        }
+    }
+
     /// Ends a process that was created and never resumed, and says why, and if it cannot be ended,
     /// that too: a suspended process nothing can reach is worse than a launch that failed.
     fn end_unstarted(process: &OwnedHandle, because: &str) -> std::io::Error {
@@ -623,15 +794,7 @@ mod platform {
     pub fn start(spec: &Spec<'_>) -> std::io::Result<Child> {
         refuse_program(spec.program).map_err(std::io::Error::other)?;
         let mut line = command_line(spec.program, spec.arguments).map_err(std::io::Error::other)?;
-        let base: Vec<Variable> = std::env::vars_os()
-            .map(|(name, value)| variable(&name, &value))
-            .collect();
-        let additions: Vec<Variable> = spec
-            .environment
-            .iter()
-            .map(|(name, value)| variable(std::ffi::OsStr::new(name), value))
-            .collect();
-        let environment = environment_block(base, additions);
+        let environment = spec.environment.block();
         let program = wide(spec.program);
         let directory = wide(spec.directory);
 
@@ -1024,9 +1187,13 @@ mod tests {
         assert!(command_line(Path::new("C:\\a.exe"), &[fits]).is_ok());
     }
 
+    fn text(block: &[u16]) -> String {
+        String::from_utf16(block).expect("text")
+    }
+
     #[test]
     fn an_environment_block_is_sorted_by_name_and_additions_replace_without_regard_to_case() {
-        let block = environment_block(
+        let environment = Environment::merged(
             vec![
                 variable("Path", "C:\\Windows"),
                 variable("ZED", "z"),
@@ -1036,8 +1203,10 @@ mod tests {
                 variable("PATH", "C:\\bin"),
                 variable("KR_REGISTRATION", "r"),
             ],
-        );
-        let text = String::from_utf16(&block).expect("text");
+        )
+        .expect("an environment");
+        let block = environment.block();
+        let text = text(&block);
         let entries: Vec<&str> = text.split('\0').collect();
         assert_eq!(
             entries,
@@ -1056,13 +1225,126 @@ mod tests {
 
     #[test]
     fn the_first_addition_to_name_a_variable_wins() {
-        let block = environment_block(
+        let environment = Environment::merged(
             Vec::new(),
             vec![variable("A", "first"), variable("a", "second")],
-        );
-        let text = String::from_utf16(&block).expect("text");
+        )
+        .expect("an environment");
+        let text = text(&environment.block());
         assert!(text.starts_with("A=first\0"), "{text:?}");
         assert!(!text.contains("second"), "{text:?}");
+    }
+
+    #[test]
+    fn an_empty_environment_block_ends_with_the_two_terminators_the_create_reads() {
+        assert_eq!(
+            Environment::default().block(),
+            [0, 0],
+            "an empty set is two terminators, not one"
+        );
+        let one = Environment::from_variables(vec![variable("A", "b")]).expect("an environment");
+        assert_eq!(
+            text(&one.block()),
+            "A=b\0\0",
+            "a set that holds one ends with one more"
+        );
+    }
+
+    #[test]
+    fn a_given_value_wins_over_a_workers_own_of_the_same_name_in_any_case() {
+        for spelling in ["PATH", "path", "pAtH"] {
+            let environment = Environment::merged(
+                vec![variable("Path", "worker"), variable("OTHER", "kept")],
+                vec![variable(spelling, "given")],
+            )
+            .expect("an environment");
+            assert_eq!(environment.len(), 2, "{spelling}");
+            let value = environment.value_of("PATH").expect("the variable");
+            assert_eq!(String::from_utf16_lossy(value), "given", "{spelling}");
+            assert_eq!(
+                text(&environment.block()),
+                format!("OTHER=kept\0{spelling}=given\0\0"),
+                "the name is spelled as the addition spelled it"
+            );
+        }
+    }
+
+    #[test]
+    fn a_withheld_name_in_four_case_variants_is_absent() {
+        for held in ["KR_GATEWAY", "kr_gateway", "Kr_Gateway", "kR_gAtEwAy"] {
+            let environment =
+                Environment::from_variables(vec![variable(held, "x"), variable("KEPT", "y")])
+                    .expect("an environment");
+            for withheld in ["KR_GATEWAY", "kr_gateway", "Kr_Gateway", "kR_gAtEwAy"] {
+                let without = environment.without(&[withheld]);
+                assert_eq!(without.len(), 1, "{held} withheld as {withheld}");
+                assert!(
+                    without.value_of("KR_GATEWAY").is_none(),
+                    "{held} as {withheld}"
+                );
+                assert_eq!(text(&without.block()), "KEPT=y\0\0");
+            }
+        }
+    }
+
+    #[test]
+    fn a_name_may_begin_with_one_equals_and_holds_no_other() {
+        let environment = Environment::from_variables(vec![
+            variable("=C:", "C:\\work"),
+            variable("=D:", "D:\\"),
+            variable("PATH", "p"),
+        ])
+        .expect("cmd.exe's per-drive folders are variables");
+        let block = environment.block();
+        let text = text(&block);
+        assert!(
+            text.starts_with("=C:=C:\\work\0=D:=D:\\\0PATH=p\0"),
+            "presented unchanged and first, as the system sorts them: {text:?}"
+        );
+        for refused in ["A=B", "==", "=", "=A=B", ""] {
+            let why = Environment::from_variables(vec![variable(refused, "v")]).expect_err(refused);
+            assert!(why.contains("environment"), "{refused:?}: {why}");
+        }
+    }
+
+    #[test]
+    fn a_nul_is_refused_in_a_value_as_it_is_in_a_name() {
+        let in_name = Environment::from_variables(vec![(wide("A\0B"), wide("v"))])
+            .expect_err("a NUL in a name");
+        assert!(in_name.contains("NUL in its name"), "{in_name}");
+        let in_value = Environment::from_variables(vec![(wide("A"), wide("secret\0more"))])
+            .expect_err("a NUL in a value");
+        assert!(in_value.contains("NUL in its value"), "{in_value}");
+        assert!(
+            in_value.contains("\"A\""),
+            "it names the variable: {in_value}"
+        );
+        assert!(
+            !in_value.contains("secret") && !in_value.contains("more"),
+            "it never says the value: {in_value}"
+        );
+        let merged = Environment::merged(Vec::new(), vec![(wide("A"), wide("x\0"))])
+            .expect_err("a NUL in an addition's value");
+        assert!(merged.contains("NUL in its value"), "{merged}");
+    }
+
+    #[test]
+    fn a_set_that_names_one_variable_twice_by_case_is_refused_by_name() {
+        let why = Environment::from_variables(vec![variable("Path", "1"), variable("PATH", "2")])
+            .expect_err("two spellings of one name");
+        assert!(why.contains("Path") && why.contains("PATH"), "{why}");
+        assert!(
+            !why.contains('1') && !why.contains('2'),
+            "never the values: {why}"
+        );
+    }
+
+    #[test]
+    fn an_environment_shows_how_many_variables_it_holds_and_no_more() {
+        let environment = Environment::from_variables(vec![variable("TOKEN", "hunter2")])
+            .expect("an environment");
+        let shown = format!("{environment:?}");
+        assert_eq!(shown, "Environment(1 variables)");
     }
 
     #[test]

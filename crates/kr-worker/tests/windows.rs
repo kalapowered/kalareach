@@ -684,7 +684,8 @@ fn start_in(
         program: &system_program(name),
         arguments: &arguments,
         directory: &std::env::temp_dir(),
-        environment: &[],
+        environment: &kr_worker::windows::launch::Environment::of_this_process_with(&[])
+            .expect("an environment"),
         session: None,
         agent: job,
         pipe_input: false,

@@ -99,12 +99,15 @@ fn one(
             )),
         );
     }
-    // The doctor holds no launch, so no options of one are carried.
+    // The doctor holds no launch, so no options of one are carried, and it runs the probe in the
+    // environment of its own process, which it names here.
+    let environment: Vec<_> = std::env::vars_os().collect();
     let probed = kr_worker::broker::probe::run_within(
         &executable,
         probe,
         &[],
         directory,
+        &environment,
         deadline,
         kr_worker::broker::probe::MAX_OUTPUT_BYTES,
     );

@@ -468,7 +468,11 @@ impl Started {
             program: Path::new(program),
             arguments,
             directory,
-            environment: &[("KR_REGISTRATION", registration.as_os_str())],
+            environment: &kr_worker::windows::launch::Environment::of_this_process_with(&[(
+                "KR_REGISTRATION",
+                registration.as_os_str(),
+            )])
+            .expect("an environment"),
             session: Some(session.as_ref()),
             agent: &job,
             pipe_input: true,
