@@ -5949,7 +5949,7 @@ function capabilityRecord(
     evidence_source: detail.probed ? 'disclosed_probe' : 'not_probed',
     identity: {
       binary: detail.binary,
-      version: '1502942 bytes, digest 8a1f2c3d4e5f6071',
+      version: detail.binary === null ? null : '1502942 bytes, digest 8a1f2c3d4e5f6071',
       package: null,
       schema: null,
       profile: 'desktop_bound'

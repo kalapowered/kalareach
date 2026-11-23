@@ -63,8 +63,7 @@ export const PERMISSION_CATEGORIES: readonly PermissionCategory[] = [
     caveat:
       'This does not stand in for the others. An application with Full Disk Access still cannot ' +
       'take a screen image or send a keystroke. And the check below is about the one file it was ' +
-      'given, named beside it: a file outside the places macOS protects establishes nothing ' +
-      'about this grant.'
+      'given: a file outside the places macOS protects establishes nothing about this grant.'
   },
   {
     name: 'Automation',

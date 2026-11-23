@@ -210,6 +210,16 @@ describe('what the machine can do, and how that is known', () => {
     expect(card.textContent).toMatch(/you log in again/)
   })
 
+  it('says the read of a nominated file is about that file, not about an installed program', async () => {
+    start()
+    await screen.findByTestId('setup-identity')
+    await goTo('capabilities')
+    await userEvent.click(screen.getByTestId('setup-evidence-toggle-desktop.authorised_file_read'))
+    const card = screen.getByTestId('setup-capability-desktop.authorised_file_read')
+    expect(card.textContent).toMatch(/the one file it was given/)
+    expect(card.textContent).not.toMatch(/nothing installed/)
+  })
+
   it('declares what each check does before any of them is asked for', async () => {
     const { controls } = start()
     await screen.findByTestId('setup-identity')
@@ -660,6 +670,7 @@ describe('what a restart is asked for, and what a record is about', () => {
     expect(screen.getByTestId('setup-caveat-full_disk_access').textContent).toMatch(
       /a file outside the places macOS protects establishes nothing/
     )
+    expect(screen.getByTestId('setup-caveat-full_disk_access').textContent).not.toMatch(/named beside/)
   })
 
   it('says it installs nothing itself, and names the command where there is one', async () => {

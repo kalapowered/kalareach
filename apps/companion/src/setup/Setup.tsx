@@ -194,6 +194,9 @@ function refusedBy(record: CapabilityRecord): string | null {
   )
 }
 
+/** The check that reads the one file a person nominated: its record is about that file, and names no program. */
+const FILE_READ = 'desktop.authorised_file_read'
+
 /** What a record was established about, in one line, where it names something. */
 function aboutLine(record: CapabilityRecord): string | null {
   const parts = [record.subject.application, record.subject.terminal, record.identity.binary]
@@ -1001,7 +1004,9 @@ function CapabilityCard({
               <div>
                 <dt>About</dt>
                 <dd className="mono small">
-                  {record.identity.binary ?? 'nothing installed'}
+                  {record.capability === FILE_READ
+                    ? 'the one file it was given'
+                    : (record.identity.binary ?? 'nothing installed')}
                   {record.identity.version ? ` · ${record.identity.version}` : ''}
                 </dd>
               </div>
