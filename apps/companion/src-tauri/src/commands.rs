@@ -1556,7 +1556,9 @@ pub async fn choose_authorised_file<R: tauri::Runtime>(
 ///
 /// The dialog is open from here until it answers, whatever the answer is: a file replaces any held
 /// and the file and the end of the dialog change together, no file leaves what was held, and a
-/// failure leaves what was held and ends the dialog too.
+/// failure leaves what was held and ends the dialog too. A dialog whose command is dropped before
+/// it answers, or panics, ends with nothing chosen and tells the screens as well, so that a screen
+/// that saw it open reads again.
 pub async fn choose_file_in<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     state: &AppState,
@@ -1565,6 +1567,10 @@ pub async fn choose_file_in<R: tauri::Runtime>(
     let open = state.open_file_dialog().ok_or_else(|| {
         CommandError::refused("A file dialog is already open. Choose a file in it or close it.")
     })?;
+    let open = OpenDialog {
+        open: Some(open),
+        app,
+    };
     authorised_file_changed(app);
     let answered = dialog.await.and_then(|chosen| {
         chosen
@@ -1576,8 +1582,34 @@ pub async fn choose_file_in<R: tauri::Runtime>(
         _ => (None, None),
     };
     open.settle(path);
-    authorised_file_changed(app);
     answered.map(|_| name)
+}
+
+/// The platform's file dialog while it is open, which tells every screen that it ended however it
+/// ends: settled with its answer, or dropped before it answers.
+struct OpenDialog<'a, R: tauri::Runtime> {
+    /// Taken when the dialog is settled, which leaves nothing to clear when this is dropped.
+    open: Option<crate::state::FileDialogOpen<'a>>,
+    app: &'a tauri::AppHandle<R>,
+}
+
+impl<R: tauri::Runtime> OpenDialog<'_, R> {
+    /// Ends the dialog with its answer, as [`crate::state::FileDialogOpen::settle`] does, and tells
+    /// the screens.
+    fn settle(mut self, chosen: Option<std::path::PathBuf>) {
+        if let Some(open) = self.open.take() {
+            open.settle(chosen);
+        }
+    }
+}
+
+impl<R: tauri::Runtime> Drop for OpenDialog<'_, R> {
+    fn drop(&mut self) {
+        // A dialog that was not settled ends with nothing chosen, and only then are the screens
+        // told, so that what they read is the dialog closed.
+        self.open = None;
+        authorised_file_changed(self.app);
+    }
 }
 
 /// Tells every screen that what the application holds for the read check changed, which makes each

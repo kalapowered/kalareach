@@ -1875,51 +1875,93 @@ async fn a_file_dialog_abandoned_before_it_answers_ends() {
     );
 }
 
-/// KR-REQ-03.29: every screen is told when what the application holds for the read check changes:
-/// when the dialog opens, when it closes, and when a run takes the file, and told nothing when a
-/// dialog is refused or a run takes no file. A screen that is told asks again.
-#[tokio::test(flavor = "multi_thread")]
-async fn the_screens_are_told_when_the_file_held_for_the_read_check_changes() {
+/// Counts the times every screen is told that what the application holds for the read check
+/// changed.
+fn count_the_screens_told(host: &Host) -> Arc<std::sync::atomic::AtomicUsize> {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use tauri::Listener as _;
 
-    let host = Host::start().await;
     let told = Arc::new(AtomicUsize::new(0));
     let counted = Arc::clone(&told);
     host.app
         .listen(companion_tauri::AUTHORISED_FILE_EVENT, move |_| {
             counted.fetch_add(1, Ordering::SeqCst);
         });
-    // Events reach a listener through the runtime, so each count waits for the one it expects.
-    let told_so_far = |expected: usize| {
-        let told = Arc::clone(&told);
-        async move {
-            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-            while told.load(Ordering::SeqCst) < expected && tokio::time::Instant::now() < deadline {
-                tokio::task::yield_now().await;
-            }
-            // Nothing more arrives for an event that was not sent.
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            told.load(Ordering::SeqCst)
-        }
-    };
+    told
+}
+
+/// How many times the screens have been told once the count has reached `expected`, or after the
+/// wait for it. Events reach a listener through the runtime, so each count waits for the one it
+/// expects, and a moment more shows that nothing arrives for an event that was not sent.
+async fn told_so_far(told: &Arc<std::sync::atomic::AtomicUsize>, expected: usize) -> usize {
+    use std::sync::atomic::Ordering;
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    while told.load(Ordering::SeqCst) < expected && tokio::time::Instant::now() < deadline {
+        tokio::task::yield_now().await;
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    told.load(Ordering::SeqCst)
+}
+
+/// KR-REQ-03.29: a file dialog that is abandoned before it answers tells every screen that it ended,
+/// as one that answers does: a screen that saw the dialog open stays blank and allows no run until
+/// it reads again, and it reads again when it is told, and finds the dialog closed.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_file_dialog_abandoned_before_it_answers_tells_the_screens() {
+    let host = Host::start().await;
+    let told = count_the_screens_told(&host);
+    let state = host.app.state::<companion_tauri::AppState>();
+    let abandoned = tokio::time::timeout(
+        std::time::Duration::from_millis(200),
+        companion_tauri::commands::choose_file_in(
+            host.app.handle(),
+            state.inner(),
+            std::future::pending::<Result<Option<PathBuf>, companion_tauri::error::CommandError>>(),
+        ),
+    )
+    .await;
+    assert!(abandoned.is_err(), "the dialog answered by itself");
+    assert_eq!(
+        told_so_far(&told, 2).await,
+        2,
+        "the screens were told that the dialog opened and not that it ended"
+    );
+    assert_eq!(
+        held_file_as_told(&host).await,
+        json!({ "dialog_open": false, "file": null }),
+        "a screen that reads when it is told finds the dialog closed"
+    );
+}
+
+/// KR-REQ-03.29: every screen is told when what the application holds for the read check changes:
+/// when the dialog opens, when it closes, and when a run takes the file, and told nothing when a
+/// dialog is refused or a run takes no file. A screen that is told asks again.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_screens_are_told_when_the_file_held_for_the_read_check_changes() {
+    let host = Host::start().await;
+    let told = count_the_screens_told(&host);
 
     let chosen = host.tree.root().join("chosen.txt");
     let (choice, ()) = while_the_file_dialog_is_open(&host, Ok(Some(chosen)), async {}).await;
     choice.expect("the dialog answered");
-    assert_eq!(told_so_far(2).await, 2, "the dialog opened and closed");
+    assert_eq!(
+        told_so_far(&told, 2).await,
+        2,
+        "the dialog opened and closed"
+    );
 
     ask_for_the_checks(&host)
         .await
         .expect("the checks are asked for");
-    assert_eq!(told_so_far(3).await, 3, "a run took the file");
+    assert_eq!(told_so_far(&told, 3).await, 3, "a run took the file");
 
     ask_for_the_checks(&host)
         .await
         .expect("the checks are asked for");
     assert_eq!(
-        told_so_far(3).await,
+        told_so_far(&told, 3).await,
         3,
         "a run that took no file told nobody"
     );
@@ -1934,7 +1976,11 @@ async fn the_screens_are_told_when_the_file_held_for_the_read_check_changes() {
     .await;
     choice.expect("the dialog answered");
     second.expect_err("a second dialog while one is open");
-    assert_eq!(told_so_far(5).await, 5, "a refused dialog told nobody");
+    assert_eq!(
+        told_so_far(&told, 5).await,
+        5,
+        "a refused dialog told nobody"
+    );
 }
 
 /// KR-REQ-13.11: the launch commands are read, saved, replaced and removed through the three
