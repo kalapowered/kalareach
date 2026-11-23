@@ -530,15 +530,19 @@ fn a_reserve_below_this_machines_floor_does_not_block_an_edit_of_another_setting
     drop(apply(&environment, &reserve(2 * GIB), machine_with(8 * GIB)).expect("honoured here"));
 
     let bigger = machine_with(32 * GIB);
-    let turned_off = apply(
+    let turned_off = match apply(
         &environment,
         &Change::Descriptions {
             enabled: Some(false),
             on_battery: None,
         },
         bigger,
-    )
-    .expect("an edit that leaves the budgets as they are is written");
+    ) {
+        Ok(written) => written,
+        Err(refused) => {
+            panic!("an edit that leaves the budgets as they are was refused: {refused}")
+        }
+    };
     assert_eq!(turned_off.revision, 2);
     drop(turned_off);
     let held = open(&environment).ceilings().description_budgets;
