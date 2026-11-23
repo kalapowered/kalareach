@@ -3627,6 +3627,30 @@ fn on_that_mount(_directory: &Path, _mount: &Path) -> bool {
     false
 }
 
+/// Whether `path` lies inside `root` by its own name, with nothing in it that leads out again.
+#[cfg(any(windows, test))]
+fn lies_inside_by_name(root: &Path, path: &Path) -> bool {
+    path.starts_with(root)
+        && !path.components().any(|part| {
+            matches!(
+                part,
+                std::path::Component::ParentDir | std::path::Component::CurDir
+            )
+        })
+}
+
+/// Whether `path` lies inside the default runtime root, `%LOCALAPPDATA%\KalaReach\run`, by its own
+/// name.
+///
+/// A runtime directory is given to a worker as an argument, whatever chose it, so this reads the
+/// directory and not the worker's environment: where it is not inside the default root, someone
+/// chose it, and nothing is known of who can write the folders above it.
+#[cfg(windows)]
+#[must_use]
+pub fn lies_inside_the_default_runtime_root(path: &Path) -> bool {
+    default_runtime_root().is_ok_and(|root| lies_inside_by_name(&root, path))
+}
+
 #[cfg(windows)]
 fn default_runtime_root() -> Result<PathBuf> {
     let base = std::env::var_os("LOCALAPPDATA").ok_or_else(|| IpcError::IdentityUnavailable {
@@ -3677,6 +3701,20 @@ fn home_directory() -> Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    /// KR-REQ-12.07: a runtime directory is in the default root by its name only when nothing in
+    /// it leads out of the root again.
+    #[test]
+    fn a_path_lies_inside_a_root_by_its_name_only_when_nothing_leads_out() {
+        use super::lies_inside_by_name;
+        use std::path::Path;
+        let root = Path::new("/a/b/run");
+        assert!(lies_inside_by_name(root, Path::new("/a/b/run")));
+        assert!(lies_inside_by_name(root, Path::new("/a/b/run/env/x")));
+        assert!(!lies_inside_by_name(root, Path::new("/a/b/run/../../x")));
+        assert!(!lies_inside_by_name(root, Path::new("/a/b/run2")));
+        assert!(!lies_inside_by_name(root, Path::new("/a/b")));
+    }
+
     use super::*;
 
     /// What a test does with a new file's temporary name before the file is published.
