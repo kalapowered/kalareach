@@ -629,9 +629,12 @@ fn probe_in(base: &Path) -> Result<(), String> {
         )
     })?;
     let socket = directory.join("p.sock");
-    let outcome = prove_the_build_names_a_peer(&socket);
-    if let Some(made) = socket_object(&socket) {
-        remove_socket_made(&socket, made);
+    let mut kept = None;
+    let outcome = prove_the_build_names_a_peer(&socket, &mut kept);
+    // Only the socket the probe made is removed, through the handle it opened right after its
+    // bind: what stands at the path by now is not asked.
+    if let Some(file) = kept.take() {
+        let _ = delete_through(&file);
     }
     let _ = delete_through(&held);
     outcome
@@ -639,7 +642,10 @@ fn probe_in(base: &Path) -> Result<(), String> {
 
 /// Binds a socket at `path`, connects to it from this process and reads the peer of the accepted
 /// end.
-fn prove_the_build_names_a_peer(path: &Path) -> Result<(), String> {
+fn prove_the_build_names_a_peer(
+    path: &Path,
+    kept: &mut Option<std::fs::File>,
+) -> Result<(), String> {
     let build = windows_build();
     let own = std::process::id();
     match path.to_str() {
@@ -666,6 +672,11 @@ fn prove_the_build_names_a_peer(path: &Path) -> Result<(), String> {
             path.display()
         )
     })?;
+    // The file the bind made is opened at once and kept, so that what the probe removes is the
+    // object that handle names and never what another process puts at the path afterwards.
+    *kept = open_without_following(path, FILE_READ_ATTRIBUTES | DELETE)
+        .ok()
+        .filter(|file| file::reparse_tag_of(file).ok() == Some(Some(IO_REPARSE_TAG_AF_UNIX)));
     let _client = connect_uninheritable(path).map_err(|error| {
         format!(
             "the probe's socket at {} could not be connected to on this Windows build ({build}): \
