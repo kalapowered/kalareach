@@ -271,7 +271,7 @@ impl Dialogue {
             () = self.interrupt.arrived() => return Err(self.stopped()),
             answer = ask_line(question) => answer.map_err(|error| self.failed(error))?,
         };
-        Ok(answer.map(Zeroizing::new))
+        Ok(answer)
     }
 
     /// Opens a connection to the daemon, which the person can interrupt. The outer error is the

@@ -163,7 +163,10 @@ fn read_blocking(source: &KitSource, cancel: &AtomicBool) -> Result<KitRead> {
 /// # Errors
 ///
 /// Returns a terminal failure when the answer cannot be read.
-pub async fn ask_line(question: &Shown) -> Result<Option<String>> {
+///
+/// The answer can be a typed seed suffix, so it is handed on in the wrapper that clears it, through
+/// the thread's end and the channel it is sent over, which clears what nobody was waiting for.
+pub async fn ask_line(question: &Shown) -> Result<Option<Zeroizing<String>>> {
     #[cfg(unix)]
     discard_typed_ahead();
     #[cfg(windows)]
@@ -238,7 +241,7 @@ fn discard_typed_ahead() {
 }
 
 #[cfg(unix)]
-fn read_answer() -> Result<Option<String>> {
+fn read_answer() -> Result<Option<Zeroizing<String>>> {
     use rustix::event::{PollFd, PollFlags, poll};
     use std::os::fd::AsFd as _;
 
@@ -293,11 +296,13 @@ fn read_answer() -> Result<Option<String>> {
         .next()
         .unwrap_or_default();
     // Text that is not UTF-8 is not yes: a decline, said as one.
-    Ok(Some(String::from_utf8_lossy(line).into_owned()))
+    Ok(Some(Zeroizing::new(
+        String::from_utf8_lossy(line).into_owned(),
+    )))
 }
 
 #[cfg(windows)]
-fn read_answer(cancel: &AtomicBool) -> Result<Option<String>> {
+fn read_answer(cancel: &AtomicBool) -> Result<Option<Zeroizing<String>>> {
     super::terminal::read_line(cancel)
 }
 

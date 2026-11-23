@@ -395,8 +395,9 @@ impl Prompt {
     /// taken, Backspace taking the last one back, Enter ending the line and Ctrl-Z, on an empty
     /// line, ending the input. They are read as input records, as the kit is, so that the console
     /// keeps no history of the line. The read looks at `cancel` once in each turn of
-    /// [`TURN_MILLISECONDS`] and ends with an interrupted error when it is set.
-    fn line(&mut self, cancel: &AtomicBool) -> std::io::Result<Option<String>> {
+    /// [`TURN_MILLISECONDS`] and ends with an interrupted error when it is set. The answer is
+    /// handed on in the wrapper that clears it, never as a plain string.
+    fn line(&mut self, cancel: &AtomicBool) -> std::io::Result<Option<Zeroizing<String>>> {
         /// An answer is a word; this is more than any answer needs.
         const LONGEST_ANSWER: usize = 4096;
 
@@ -413,7 +414,7 @@ impl Prompt {
             match character {
                 '\r' | '\n' => {
                     shown.write_all(b"\r\n")?;
-                    return Ok(Some(std::mem::take(&mut *answer)));
+                    return Ok(Some(answer));
                 }
                 // Ctrl-Z, as `take` makes it.
                 '\u{4}' if answer.is_empty() => {
@@ -429,7 +430,7 @@ impl Prompt {
                 other => {
                     if answer.len() + other.len_utf8() > LONGEST_ANSWER {
                         shown.write_all(b"\r\n")?;
-                        return Ok(Some(std::mem::take(&mut *answer)));
+                        return Ok(Some(answer));
                     }
                     answer.push(other);
                     shown.write_all(other.encode_utf8(&mut [0_u8; 4]).as_bytes())?;
@@ -538,13 +539,14 @@ pub fn discard_typed_ahead() -> Result<()> {
 /// The answer is read as input records, as the kit is, and never as a line by the console, which
 /// would keep each line in the command history of the window, where a later question could bring
 /// it back. The read looks at `cancel` in each turn and, once it is set, puts the console's modes
-/// back before it returns the command's own interrupt.
+/// back before it returns the command's own interrupt. The answer stays in the wrapper that clears
+/// it, through the console's cleanup and until the caller has it.
 ///
 /// # Errors
 ///
 /// Returns a terminal failure when the console cannot be reached, read or put back, and the
 /// interrupt's failure when `cancel` was set.
-pub fn read_line(cancel: &AtomicBool) -> Result<Option<String>> {
+pub fn read_line(cancel: &AtomicBool) -> Result<Option<Zeroizing<String>>> {
     if cancel.load(Ordering::SeqCst) {
         return Err(interrupt::stopped());
     }
@@ -603,6 +605,23 @@ mod tests {
                 },
             },
         }
+    }
+
+    /// Types `records` into the console that `writer` is a handle to.
+    fn inject_records(writer: &OwnedHandle, records: &[INPUT_RECORD]) {
+        let mut written = 0_u32;
+        // SAFETY: the handle is open for as long as `writer` is, the records are as many as the
+        // call is told, and `written` is a live `u32`.
+        let done = unsafe {
+            WriteConsoleInputW(
+                writer.as_raw_handle().cast(),
+                records.as_ptr(),
+                records.len() as u32,
+                &raw mut written,
+            )
+        };
+        assert_ne!(done, 0, "the records are written");
+        assert_eq!(written as usize, records.len());
     }
 
     fn mode_of(input: &OwnedHandle) -> u32 {
@@ -731,6 +750,21 @@ mod tests {
             std::io::ErrorKind::Interrupted
         );
         assert_eq!(mode_of(&input), before, "the modes are as they were found");
+    }
+
+    /// The answer comes back in the wrapper that clears it, as it was read and without being copied
+    /// into a plain string on the way, so that the failure of the console's cleanup, which drops
+    /// it, clears what was typed.
+    #[test]
+    fn an_answer_comes_back_in_the_wrapper_that_clears_it() {
+        let _alone = CONSOLE.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut prompt = Prompt::enter_on(console_input(true)).expect("a prompt on the console");
+        let keys: Vec<INPUT_RECORD> = "yes\r".encode_utf16().map(|unit| key(true, unit)).collect();
+        inject_records(&console_input(true), &keys);
+        let answer: Option<Zeroizing<String>> = prompt
+            .line(&AtomicBool::new(false))
+            .expect("reads the answer");
+        assert_eq!(answer.as_deref().map(String::as_str), Some("yes"));
     }
 
     /// The most one read can bring into a prompt fits the room it was given before any secret was

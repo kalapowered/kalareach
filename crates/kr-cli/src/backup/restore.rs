@@ -111,7 +111,9 @@ impl Conversation for AtTheTerminal {
     }
 
     async fn ask(&mut self, question: &Shown) -> Result<Option<String>> {
-        super::kit::ask_line(question).await
+        // What a restore asks for is `yes`, which is not secret.
+        let answer = super::kit::ask_line(question).await?;
+        Ok(answer.map(|typed| typed.as_str().to_owned()))
     }
 }
 
