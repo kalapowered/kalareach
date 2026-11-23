@@ -62,9 +62,11 @@ async fn shown(
 }
 
 /// KR-REQ-03.02: asks the running host for the read check on a nominated file and writes what the
-/// host then holds. It fails if the host's default profile is not headless, or if any check other
-/// than the read was performed. It passes for every state the read check can end in, so a person
-/// reads the written findings for what the platform decided.
+/// host then holds. It fails if the host's default profile is not headless, if a run of the checks
+/// was already going, if any check other than the read was performed, or if the record it reads
+/// is not this request's: taken before the request, in another session, for another file or not a
+/// disclosed probe. It passes for every state the read check can end in, so a person reads the
+/// written findings for what the platform decided.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "raises the platform's file-access prompt; run by hand against a running host with KR_FILE_ACCESS_FILE and KR_FILE_ACCESS_OUT"]
 async fn the_read_check_of_a_running_host_names_what_the_platform_decided() {
@@ -94,6 +96,14 @@ async fn the_read_check_of_a_running_host_names_what_the_platform_decided() {
         WorkerProfile::HeadlessUser,
         "set the host's default worker profile to headless_user before asking for the read check"
     );
+    // A run that is already going would be joined by this request, and its record is not an
+    // answer to the file nominated here.
+    assert_ne!(
+        before.checks.state,
+        CapabilityChecksState::Running,
+        "a run of the checks is already going on this host; ask again when it has ended"
+    );
+    let asked_at = kr_ipc::now_ms();
 
     let request = client
         .compose(
@@ -102,7 +112,7 @@ async fn the_read_check_of_a_running_host_names_what_the_platform_decided() {
             ActionTarget::environment(environment_id),
             &EnvironmentCapabilitiesCheckParams {
                 environment_id,
-                authorised_file: Nullable::some(file),
+                authorised_file: Nullable::some(file.clone()),
             },
         )
         .await
@@ -134,26 +144,73 @@ async fn the_read_check_of_a_running_host_names_what_the_platform_decided() {
     )
     .unwrap_or_else(|error| panic!("{out} could not be written: {error}"));
 
-    let read = found
-        .desktop
-        .record(capabilities::AUTHORISED_FILE_READ)
-        .expect("the read check has a record");
+    // The findings are written above whatever they say. What is accepted is the record of this
+    // request: a run that began after it was asked, that ended current, in the session whose
+    // worker read the file nominated here, as a disclosed probe.
+    let mut problems = Vec::new();
+    if found.checks.state != CapabilityChecksState::Current {
+        problems.push(format!(
+            "the checks ended as {:?}, failure {:?}",
+            found.checks.state, found.checks.failure
+        ));
+    }
+    match found.checks.started_at_ms.as_ref() {
+        Some(started) if started.get() >= asked_at.get() => {}
+        other => problems.push(format!(
+            "the run began at {other:?}, which is not at or after this request at {asked_at:?}"
+        )),
+    }
+    if found.checks.session_id.as_ref().is_none() {
+        problems.push("no session is named as having performed the checks".to_owned());
+    }
+    match found.desktop.record(capabilities::AUTHORISED_FILE_READ) {
+        None => problems.push("the read check has no record".to_owned()),
+        Some(read) => {
+            if read.subject.session_id.as_ref() != found.checks.session_id.as_ref() {
+                problems.push(format!(
+                    "the read record is about session {:?}, not the run's session {:?}",
+                    read.subject.session_id, found.checks.session_id
+                ));
+            }
+            if read.identity.binary.as_ref() != Some(&file) {
+                problems.push(format!(
+                    "the read record is for {:?}, not the nominated file",
+                    read.identity.binary
+                ));
+            }
+            if read.evidence_source != CapabilityEvidenceSource::DisclosedProbe {
+                problems.push(format!(
+                    "the read record comes from {:?}, not a disclosed probe",
+                    read.evidence_source
+                ));
+            }
+            if read.observed_at_ms.get() < asked_at.get() {
+                problems.push(format!(
+                    "the read record was observed at {:?}, before this request at {asked_at:?}",
+                    read.observed_at_ms
+                ));
+            }
+            if read.state == CapabilityState::PermissionRequired
+                && read.disabled_reason.as_ref().is_none()
+            {
+                problems.push("a refusal says why, and this one does not".to_owned());
+            }
+        }
+    }
     // Only the read ran. A host whose sessions run in a desktop profile performs the screen,
     // accessibility and application checks as well, and each of those raises a prompt of its own.
     for record in &found.desktop.records {
-        if record.capability.as_str() != capabilities::AUTHORISED_FILE_READ {
-            assert_ne!(
-                record.evidence_source,
-                CapabilityEvidenceSource::DisclosedProbe,
+        if record.capability.as_str() != capabilities::AUTHORISED_FILE_READ
+            && record.evidence_source == CapabilityEvidenceSource::DisclosedProbe
+        {
+            problems.push(format!(
                 "{} was performed, and this case asks for the read check alone",
                 record.capability.as_str()
-            );
+            ));
         }
     }
-    if read.state == CapabilityState::PermissionRequired {
-        assert!(
-            read.disabled_reason.as_ref().is_some(),
-            "a refusal says why"
-        );
-    }
+    assert!(
+        problems.is_empty(),
+        "the findings written to {out} are not the answer to this request: {problems:#?}"
+    );
 }
