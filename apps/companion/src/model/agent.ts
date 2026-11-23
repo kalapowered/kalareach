@@ -311,6 +311,9 @@ export const COMPOSER_CAPABILITIES = {
   answer: 'agent.approval'
 } as const
 
+/** The composer's own actions, which the specification names. */
+export type ComposerAction = Exclude<keyof typeof COMPOSER_CAPABILITIES, 'answer'>
+
 /** The right each composer action needs, as section 23 maps methods to rights. */
 const COMPOSER_RIGHTS: Readonly<Record<keyof typeof COMPOSER_CAPABILITIES, readonly string[]>> = {
   submit: ['agent.prompt'],

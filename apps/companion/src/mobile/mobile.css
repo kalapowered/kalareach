@@ -998,7 +998,8 @@
   pointer-events: none;
 }
 
-.m-composer-actions {
+.m-composer-actions,
+.m-composer-more {
   display: flex;
   flex-wrap: wrap;
   gap: var(--gap-2);

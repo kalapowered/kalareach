@@ -54,7 +54,9 @@ import {
   hasUnreadRequest,
   slashCommandsFor,
   subjectOf,
-  withheldTotal
+  withheldTotal,
+  type ComposerAction,
+  type ComposerOffers
 } from '../../model/agent'
 import type { ConversationItem } from '../../model/conversation'
 import { claimWasLost, keptEntry } from '../../model/draft-book'
@@ -180,6 +182,9 @@ interface ReadNode {
 /** No image has been imported: a renderer never fetches one on a person's behalf. */
 const NO_IMAGES: ReadonlyMap<string, string> = new Map()
 
+/** What a submission of an interrupt is called where it is listed: it carries no text of its own. */
+const INTERRUPT_LABEL = 'Interrupt the turn'
+
 /**
  * This device's identity for one submission.
  *
@@ -258,6 +263,8 @@ export function MobileSession({
   // Send free, and what the earlier one left unsettled still holds it.
   const [busyUnder, setBusyUnder] = useState<string | null>(null)
   const busy = busyUnder === (token ?? '')
+  // Whether an interrupt is on its way: a second press while it is names the turn it is ending.
+  const interrupting = useRef(false)
   // Whether the terminal's status shows all it says, rather than its first two lines.
   const [statusOpen, setStatusOpen] = useState(false)
   // Whether the commands the agent advertises are listed under the field: while the person types a
@@ -386,19 +393,21 @@ export function MobileSession({
       rights
     ]
   )
-  const submitOffer = useMemo(
-    () =>
-      over
-        ? { offered: false, reason: 'Nothing more can be sent to this session from here.' }
-        : composerOffers({
-            known: session.agent.instances !== null,
-            instance: composerInstance(session.agent.instances, liveInstance),
-            binding: liveBinding,
-            capabilities,
-            rights: rights === null ? null : new Set(rights)
-          }).submit,
-    [over, session.agent.instances, liveInstance, liveBinding, capabilities, rights]
-  )
+  // What the agent and the host allow of each composer action now. An opening that is over allows
+  // none of them.
+  const offers = useMemo((): ComposerOffers => {
+    const asked = composerOffers({
+      known: session.agent.instances !== null,
+      instance: composerInstance(session.agent.instances, liveInstance),
+      binding: liveBinding,
+      capabilities,
+      rights: rights === null ? null : new Set(rights)
+    })
+    if (!over) return asked
+    const closed = { offered: false, reason: 'Nothing more can be sent to this session from here.' }
+    return { ...asked, submit: closed, queue: closed, steer: closed, interrupt: closed }
+  }, [over, session.agent.instances, liveInstance, liveBinding, capabilities, rights])
+  const submitOffer = offers.submit
   // The commands the draft asks for while it starts with a slash.
   const offeredCommands = useMemo(() => slashCommandsFor(commands, draft.text), [commands, draft.text])
 
@@ -756,34 +765,58 @@ export function MobileSession({
   }
 
   const send = useCallback(
-    (text: string, anyway = false, quoting: Supersession | null = null) => {
-      // A prompt that names the draft the device keeps waits until that draft's files are shown: it
-      // would carry files the person has not seen. A text-only prompt carries none and does not wait.
+    (action: ComposerAction, text: string, anyway = false, quoting: Supersession | null = null) => {
+      // A prompt, sent or queued, names the draft the device keeps when that draft holds files, so it
+      // waits until the draft's files are shown: it would carry files the person has not seen. A
+      // text-only prompt carries none and does not wait. A steer and an interrupt carry no files.
+      const prompts = action === 'submit' || action === 'queue'
       const pairedDraft =
+        prompts &&
         paired &&
         [...uploads.snapshot().values()].some((row) => row.sessionId === sessionId && row.phase.kind === 'bound')
       if (pairedDraft && !uploads.ready(sessionId)) return
+      // An interrupt is the one action nothing else on this screen holds back, and it sends only once
+      // at a time: its second press names the turn the first has already ended.
+      if (action === 'interrupt') {
+        if (interrupting.current) return
+        interrupting.current = true
+      }
       const now = Date.now()
       // The opening this send is made under. Its answer may come after the screen has opened the
       // session again, and then it settles its own record and nothing the new opening shows.
       const opening = openings.tokenOf(sessionId)
       const stillHere = () => openings.isCurrent(sessionId, opening)
+      // What the action is made against. A prompt and a steer go to the conversation the person
+      // wrote them for, at the binding revision they wrote them at: the host refuses them if that
+      // conversation has moved on since. An interrupt carries no text, and names the conversation as
+      // it is now.
+      const { applicationInstanceId: instance, agentBindingRevision: revision } =
+        action === 'interrupt'
+          ? {
+              applicationInstanceId: liveInstance,
+              agentBindingRevision: liveBinding?.binding_revision ?? null
+            }
+          : draft.target
       // The session is in the identity, so one session's outcome is never shown under another.
       const submission: Submission = {
-        ...queued(localId(sessionId, now), text.slice(0, 60), receiptReads.stamp(), text),
-        sentTo: {
-          applicationInstanceId: draft.target.applicationInstanceId,
-          agentBindingRevision: draft.target.agentBindingRevision
-        },
+        ...queued(
+          localId(sessionId, now),
+          action === 'interrupt' ? INTERRUPT_LABEL : text.slice(0, 60),
+          receiptReads.stamp(),
+          action === 'interrupt' ? '' : text
+        ),
+        sentTo: { applicationInstanceId: instance, agentBindingRevision: revision },
         opening,
         grantId: openings.get(sessionId)?.grantId ?? null
       }
       // The revision the person submitted. Anything typed after it is a newer draft, and a late
       // answer about the older one must not take it away.
       const submittedRevision = draft.revision
-      // The stored draft is brought up to what is being sent and held as it is until the prompt
-      // ends, so a refusal or an outcome nobody knows leaves it kept.
-      const sending = book.beginSend(sessionId)
+      // A prompt is taken off the composer once the host has it; a steer leaves what was written
+      // where it is, and an interrupt has nothing written. The stored draft of a prompt is brought up
+      // to what is being sent and held as it is until the prompt ends, so a refusal or an outcome
+      // nobody knows leaves it kept.
+      const sending = prompts ? book.beginSend(sessionId) : null
       const ended = { done: false }
       // The draft the text is kept in is named again whenever it changes, however the prompt ends and
       // after it has: it is what a restart finds the text by.
@@ -794,29 +827,27 @@ export function MobileSession({
         )
       }
       const end = (outcome: 'taken' | 'refused' | 'unknown') => {
-        if (ended.done) return
+        if (sending === null || ended.done) return
         ended.done = true
         book.endSend(sending, outcome, submission.localId, named)
       }
       // Local feedback first, and it says queued rather than sent, because it has not left yet.
       lifecycle.setSubmissions((current) => [...current, submission])
-      setBusyUnder(opening ?? '')
-      // What the person wrote goes to the conversation they wrote it for, at the binding revision
-      // they wrote it at: the host refuses it if that conversation has moved on since.
-      const { applicationInstanceId: instance, agentBindingRevision: revision } = draft.target
+      if (action !== 'interrupt') setBusyUnder(opening ?? '')
       // A person who checked sends a prompt past an outcome nobody could establish as an explicit
       // later request: it names the earlier action and the revision of its record they were shown,
       // which is the one `sendAnyway` has just read. With nothing of that kind to name it names
-      // nothing, and the host decides.
-      const quote = anyway ? quoting : null
+      // nothing, and the host decides. Only a submitted prompt is quoted.
+      const quote = anyway && action === 'submit' ? quoting : null
+      const turn = liveBinding?.turn_id ?? ''
       const wentWith = new Set(draft.attachments.map((file) => file.localId))
       // The account the person pressed Send under: both commands of the submission carry its mark,
       // whatever the account is by the time each is made.
       const marked = portUnderMark(port, account.current)
       ask(async () => {
-        // The prompt is sent only once the stored draft is this window's to send: another window
+        // A prompt is sent only once the stored draft is this window's to send: another window
         // that holds the same draft claims it first, and the other one sends nothing.
-        const storedDraftId = await sending.claimed
+        const storedDraftId = sending === null ? null : await sending.claimed
         // What this submission is kept with across a restart names the draft its text is in.
         if (storedDraftId !== null) {
           lifecycle.setSubmissions((current) =>
@@ -828,17 +859,15 @@ export function MobileSession({
           throw { code: 'UNSUPPORTED_CAPABILITY', message: 'No agent is running in this session.' }
         }
         const target = { subject: subjectOf(sessionId, instance), binding_revision: revision }
+        if (action === 'interrupt') return await marked.composerInterrupt({ target, turn_id: turn }, opening)
+        if (action === 'steer') return await marked.composerSteer({ target, turn_id: turn, text }, opening)
         // Files bound to the draft the device keeps on a paired host are sent with the prompt that
         // names the draft, which carries no text of its own: the text is set on the draft first.
-        if (pairedDraft) {
-          const kept = await marked.draftSetText(await nameSession(), sessionId, text)
-          return await marked.composerSubmit(
-            { target, draft_id: kept.draftId, text: null },
-            opening,
-            quote ?? undefined
-          )
-        }
-        return await marked.composerSubmit({ target, draft_id: null, text }, opening, quote ?? undefined)
+        const body = pairedDraft
+          ? { draft_id: (await marked.draftSetText(await nameSession(), sessionId, text)).draftId, text: null }
+          : { draft_id: null, text }
+        if (action === 'queue') return await marked.composerQueue({ target, ...body }, opening)
+        return await marked.composerSubmit({ target, ...body }, opening, quote ?? undefined)
       })
         .then((answer) => {
           const state = answeredState(answer)
@@ -856,6 +885,7 @@ export function MobileSession({
             end('refused')
             return
           }
+          if (sending === null) return
           // The files that went with the prompt are the session's now, and no longer this composer's,
           // once the host performed it: the application ends its draft only then, so a prompt it
           // has only accepted, or whose outcome nobody knows, leaves the files bound to the draft.
@@ -913,10 +943,26 @@ export function MobileSession({
           end(leavesOutcomeUnknown(reason) ? 'unknown' : 'refused')
         })
         .finally(() => {
-          if (stillHere()) setBusyUnder(null)
+          if (action === 'interrupt') interrupting.current = false
+          else if (stillHere()) setBusyUnder(null)
         })
     },
-    [draft, lifecycle, book, port, account, say, sessionId, openings, receiptReads, paired, uploads, nameSession]
+    [
+      draft,
+      lifecycle,
+      book,
+      port,
+      account,
+      say,
+      sessionId,
+      openings,
+      receiptReads,
+      paired,
+      uploads,
+      nameSession,
+      liveInstance,
+      liveBinding
+    ]
   )
 
 
@@ -1030,7 +1076,7 @@ export function MobileSession({
           say('The message changed while the earlier prompt was read. Nothing was sent.', 'danger')
           return
         }
-        send(text, true, outcome.quote)
+        send('submit', text, true, outcome.quote)
       })
       .finally(() => {
         reading.current = false
@@ -1172,12 +1218,26 @@ export function MobileSession({
       disabled={!submittable(draft, carriesFiles) || !submitOffer.offered || busy || waiting.length > 0 || heldForFiles}
       style={{ minBlockSize: target }}
       onClick={() => {
-        send(draft.text)
+        send('submit', draft.text)
       }}
     >
       Send
     </Button>
   )
+  // Queueing a prompt behind the turn that is running is held back as sending one is. It is shown
+  // only where the agent and the host allow it.
+  const queueButton = offers.queue.offered ? (
+    <Button
+      data-testid="composer-queue"
+      disabled={!submittable(draft, carriesFiles) || busy || waiting.length > 0 || heldForFiles}
+      style={{ minBlockSize: target }}
+      onClick={() => {
+        send('queue', draft.text)
+      }}
+    >
+      Queue
+    </Button>
+  ) : null
   // The actions that are not finished, other than the newest, which the badge beside Send shows: an
   // action sent past one nobody knows the end of leaves that one listed, with its own status.
   const earlier = unresolved(mine).filter((submission) => submission !== mine.at(-1))
@@ -1651,6 +1711,10 @@ export function MobileSession({
            * or the conversation's. While the view controls the program, the program's keyboard
            * takes the field's place, and Send goes with the draft until control ends.
            */}
+          {asLine && !typingToProgram && queueButton !== null ? (
+            // The line holds the field and Send only, so the other actions take a row above it.
+            <div className="m-composer-more">{queueButton}</div>
+          ) : null}
           <div className={asLine ? 'm-composer-line' : 'm-composer-field'}>
             {typingToProgram ? programField : field}
             {asLine && !typingToProgram ? (
@@ -1723,6 +1787,7 @@ export function MobileSession({
 
               {asLine ? null : (
                 <div className="m-composer-actions">
+                  {queueButton}
                   {sendButton}
                   {lastState}
                 </div>

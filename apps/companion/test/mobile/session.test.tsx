@@ -1946,8 +1946,9 @@ describe("the phone's raw terminal view (KR-REQ-08.02, 13.18)", () => {
         fireEvent.keyDown(field, { key: 'Tab', code: 'Tab', ctrlKey: true, shiftKey: true }),
         state
       ).toBe(false)
-      // Back past the terminal keys, which wait for control, to the status's More.
-      expect(screen.getByRole('button', { name: 'More' }), state).toHaveFocus()
+      // Back past the terminal keys, which wait for control, to the composer's own actions that
+      // stand before the field.
+      expect(screen.getByRole('button', { name: 'Queue' }), state).toHaveFocus()
       // Tab and Shift-Tab are the platform's.
       field.focus()
       expect(fireEvent.keyDown(field, { key: 'Tab', code: 'Tab' }), state).toBe(true)
@@ -2183,14 +2184,15 @@ describe("the phone's raw terminal view (KR-REQ-08.02, 13.18)", () => {
       }
       return reached
     }
-    // Watching: the mode, the moves, the status and the field, and Tab goes on from the field to
-    // Send. The keys wait for control, out of the way.
+    // Watching: the mode, the moves, the status, the composer's actions and the field, and Tab goes
+    // on from the field to Send. The keys wait for control, out of the way.
     const watching = await tabbing(screen.getByRole('button', { name: 'Take control' }))
     const at = (reached: string[], name: string) => reached.indexOf(name)
     expect(at(watching, 'Move the window up')).toBe(0)
     expect(at(watching, 'More')).toBeGreaterThan(at(watching, 'Move the window up'))
     expect(at(watching, 'Escape')).toBe(-1)
-    expect(at(watching, 'the field')).toBe(at(watching, 'More') + 1)
+    expect(at(watching, 'Queue')).toBeGreaterThan(at(watching, 'More'))
+    expect(at(watching, 'the field')).toBe(at(watching, 'Queue') + 1)
     expect(at(watching, 'Send')).toBe(at(watching, 'the field') + 1)
 
     // Controlling: the mode, the status, the keys and the program's keyboard in the field's place,

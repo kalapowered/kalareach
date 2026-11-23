@@ -65,6 +65,7 @@ import {
   subjectOf,
   targetOf,
   withheldTotal,
+  type ComposerAction,
   type ComposerOffers,
   type DrawnUnder
 } from '../model/agent'
@@ -135,9 +136,6 @@ const NEAR_TOP = 64
 
 /** How much of the document one move brings in. */
 const WINDOW_STEP = Math.floor(WINDOW_SIZE / 2)
-
-/** The composer's own actions, which the specification names. */
-type ComposerAction = 'submit' | 'queue' | 'steer' | 'interrupt'
 
 /**
  * One field of a node body, as text.
