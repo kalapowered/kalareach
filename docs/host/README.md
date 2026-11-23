@@ -9090,9 +9090,9 @@ one at a time: the one an unclassified request placed, else a native bridge's, e
 (see [What the gateway reads from the stream](#what-the-gateway-reads-from-the-stream)), else the
 unread thread. While the gateway is fenced or recovering (see *Volatile-native mode*) the binding
 also reads as suspended, and keeps the reason the instance holds where it has one; where it has
-none, the reason is the fence's. The unread thread is set before the launch commits and holds until a reply from the
-server has named the conversation the terminal selected: until then the binding names no thread and
-nothing vouches for one. A table that says where its messages name a thread lifts it with the first
+none, the reason is the fence's. The unread thread is set before the launch commits and holds until
+a reply from the server has named the conversation the terminal selected: until then the binding
+names no thread and nothing vouches for one. A table that says where its messages name a thread lifts it with the first
 such reply. A table that says nothing never lifts it, and rich mutations stay suspended for the
 instance's life. While a reason holds, the binding reads `rich_mutations_suspended`. Once the
 instance has an upstream transport, and while rich work is not fenced (see *Volatile-native mode*),
@@ -9507,12 +9507,15 @@ still a rich client and still cannot forward.
 The fence is one fact about the gateway, and an agent instance's binding reports it: while the
 gateway is fenced or recovering, `rich_mutations_suspended` is set and `suspension_reason` is the
 sentence the refused operation gives (`GATEWAY_FENCED` or `GATEWAY_RECOVERING` in
-`broker/volatile.rs`), unless the instance holds a reason of its own, which is kept. The sentence
+`broker/volatile.rs`), unless the instance holds a reason of its own, which is kept. Each sentence
 says what waits (messages, steering, interrupts and approvals) and that the terminal goes on working,
 so a client that disables a control for it gives the host's own words. A device is told that
 sentence as the host wrote it. A request a channel relayed while the fence was up is recorded and
-forwarded like any native request and is not read into an approval then; when the recovery ends the
-broker reads each such request that nothing has read, so it can be answered here from then on.
+forwarded like any native request and is not read into an approval then. When the recovery ends,
+the broker reads again every open reverse request that nothing has read, whenever it arrived. A
+request that a binding may decode is then an approval and can be answered here. One that no binding
+may decode, or whose source the host no longer holds, stays unread and can be answered only in the
+terminal, and the page keeps the terminal's notice for it.
 
 The gap is exposed while it is open, with when it started, why, how many native requests and
 responses passed through it, how many rich operations it refused, and how many claimed identifiers

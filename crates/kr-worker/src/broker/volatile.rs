@@ -24,9 +24,11 @@ use crate::broker::error::{BrokerError, Result};
 pub const GATEWAY_FENCED: &str = "the record store has a fault, so messages, steering, interrupts \
      and approvals wait until it works again; the terminal goes on working";
 
-/// Why rich work is refused while the gateway recovers. A device is told it as written.
+/// Why rich work is refused while the gateway recovers. It says what waits and that the terminal
+/// goes on working, as [`GATEWAY_FENCED`] does. A device is told it as written.
 pub const GATEWAY_RECOVERING: &str = "storage is back and the records it missed are being written; \
-     messages, steering, interrupts and approvals wait until that is done";
+     messages, steering, interrupts and approvals wait until that is done; the terminal goes on \
+     working";
 
 /// What one transition did.
 #[derive(Clone, Debug, PartialEq, Eq)]

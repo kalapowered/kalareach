@@ -2361,7 +2361,7 @@ fn kr_req_12_25_a_fenced_gateway_suspends_the_binding_with_a_reason_a_person_can
         recovering.suspension_reason.0.as_deref(),
         Some(
             "storage is back and the records it missed are being written; messages, steering, \
-             interrupts and approvals wait until that is done"
+             interrupts and approvals wait until that is done; the terminal goes on working"
         )
     );
 }
