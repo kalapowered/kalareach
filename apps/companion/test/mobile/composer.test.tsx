@@ -4,6 +4,7 @@
  */
 
 import type { ReactNode } from 'react'
+import type { Receipt } from '@kalareach/protocol'
 import { describe, expect, it, vi } from 'vitest'
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
@@ -30,6 +31,23 @@ function OnSession({ sessionId }: { readonly sessionId: string }): ReactNode {
       onBack={() => undefined}
     />
   )
+}
+
+/** A receipt in which the host says it refused the action. */
+function refusedReceipt(method: string): Receipt {
+  return {
+    action_id: '00000000-0000-4000-8000-00000000abcd',
+    actor_id: 'owner:local',
+    error: null,
+    method,
+    method_version: 1,
+    payload_digest: '0'.repeat(64),
+    reason: null,
+    revision: '1',
+    state: 'refused',
+    updated_at_ms: '0',
+    accepted_deadline_ms: null
+  }
 }
 
 /** What the passing message says, which the shell draws in the app and these cases do without. */
@@ -691,6 +709,40 @@ describe("the phone's Interrupt, in the cases that hold its rules (KR-REQ-13.12)
     // The draft was written for revision 4; the conversation is at 5, and so is the interrupt.
     expect(interrupted[0]).toEqual({ turn: 'turn-10', revision: '5' })
     expect(screen.getByLabelText('Message this session')).toHaveValue('Keep the timer')
+  })
+
+  it('says that it was the interrupt the host refused, with nothing of what was written', async () => {
+    const person = userEvent.setup()
+    await open((port) => ({
+      ...port,
+      composerInterrupt: () =>
+        Promise.resolve({ receipt: refusedReceipt('agent.cancel'), value: null, action_id: refusedReceipt('agent.cancel').action_id })
+    }))
+    await person.type(screen.getByLabelText('Message this session'), 'Keep the timer')
+
+    await person.click(await screen.findByRole('button', { name: 'Interrupt the current turn' }))
+
+    await waitFor(() => {
+      expect(screen.getByTestId('said')).toHaveTextContent(/^The host refused the interrupt\.$/)
+    })
+    // The interrupt carries nothing the person wrote, and what they wrote is where it was.
+    expect(screen.getByLabelText('Message this session')).toHaveValue('Keep the timer')
+  })
+
+  it('still says that what was written is kept when the host refuses a steer', async () => {
+    const person = userEvent.setup()
+    await open((port) => ({
+      ...port,
+      composerSteer: () =>
+        Promise.resolve({ receipt: refusedReceipt('agent.steer'), value: null, action_id: refusedReceipt('agent.steer').action_id })
+    }))
+    await person.type(screen.getByLabelText('Message this session'), 'use the other file')
+
+    await person.click(await screen.findByRole('button', { name: 'Steer' }))
+
+    await waitFor(() => {
+      expect(screen.getByTestId('said')).toHaveTextContent('The host refused it. What you wrote is still here.')
+    })
   })
 
   it('can be sent again once the first has ended', async () => {

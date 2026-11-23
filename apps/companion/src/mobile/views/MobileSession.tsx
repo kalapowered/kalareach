@@ -907,7 +907,15 @@ export function MobileSession({
           if (wasRefused(state)) {
             // The submission did not happen. The text stays exactly where it was. The toast is the
             // current opening's to show: an answer to a replaced one settles its record only.
-            if (stillHere()) say(`The host refused it. What you wrote is still here.`, 'danger')
+            // An interrupt carries nothing the person wrote, so its refusal names the interrupt.
+            if (stillHere()) {
+              say(
+                action === 'interrupt'
+                  ? 'The host refused the interrupt.'
+                  : 'The host refused it. What you wrote is still here.',
+                'danger'
+              )
+            }
             end('refused')
             return
           }
