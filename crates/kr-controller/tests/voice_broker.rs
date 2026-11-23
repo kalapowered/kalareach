@@ -1343,6 +1343,99 @@ async fn a_sign_in_request_sent_again_is_answered_from_the_first() {
     host.stop().await;
 }
 
+/// KR-REQ-26.42: a person adds an account to a host and needs no Cloudflare, Stripe, Firebase or
+/// Apple account to do it. The host is signed out; the sign-in sends the person's browser to the
+/// account service the host names and asks it for nothing but the service's own authorisation
+/// code flow; the browser comes back with a code, and the daemon redeems it at that service with
+/// the five fields of that flow and no other credential; the host then holds the account. Nothing
+/// is asked of any other service: every request the service saw is for the account system's own
+/// paths.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_26_42_a_person_adds_an_account_with_no_account_at_any_other_provider() {
+    let broker = Broker::start().await;
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host =
+        net_support::Host::start_with_document(&owner, &document_naming(&broker.origin)).await;
+    listen_for_sign_ins(&host);
+    assert_eq!(
+        account_report(&host).await.state,
+        AccountState::SignedOut,
+        "the host holds no account"
+    );
+
+    let (authorise_url, redirect_address) = start_sign_in(&host).await;
+    broker.expect_sign_in(&authorise_url);
+    let url = url::Url::parse(&authorise_url).expect("an address");
+    let asked: std::collections::BTreeSet<String> = url
+        .query_pairs()
+        .map(|(name, _)| name.into_owned())
+        .collect();
+    assert_eq!(
+        asked,
+        [
+            "client_id",
+            "code_challenge",
+            "code_challenge_method",
+            "nonce",
+            "prompt",
+            "redirect_uri",
+            "response_type",
+            "scope",
+            "state",
+        ]
+        .map(str::to_owned)
+        .into_iter()
+        .collect(),
+        "the browser is sent to the account service with the authorisation code flow's own fields \
+         and no hint of another provider: {authorise_url}"
+    );
+
+    let page = browser_answers(&redirect_address, &authorise_url, "the-code").await;
+    assert!(
+        page.starts_with("HTTP/1.1 200"),
+        "the browser's answer: {page}"
+    );
+    let report = settled(&host).await;
+    assert!(
+        matches!(
+            &report.state,
+            AccountState::SignedIn { origin, .. } if *origin == broker.origin
+        ),
+        "the person's host holds the account: {report:?}"
+    );
+
+    let seen = broker.seen();
+    assert!(
+        seen.iter()
+            .all(|request| request.path.starts_with("/auth/")),
+        "the daemon asked the account service and nothing else: {:?}",
+        seen.iter().map(|request| &request.path).collect::<Vec<_>>()
+    );
+    let exchange = seen
+        .iter()
+        .find(|request| request.path == "/auth/oauth2/token")
+        .expect("the code is redeemed at the account service");
+    let fields: std::collections::BTreeSet<&str> = exchange
+        .body
+        .as_object()
+        .expect("a form")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        fields,
+        std::collections::BTreeSet::from([
+            "client_id",
+            "code",
+            "code_verifier",
+            "grant_type",
+            "redirect_uri",
+        ]),
+        "the code is redeemed with the flow's fields and no other credential: {exchange:?}"
+    );
+    host.stop().await;
+}
+
 /// KR-REQ-17.23 and 15.17: a call closes under the account it started under, so a sign-in is refused
 /// while a call is open, and one that is waiting when a call opens ends without spending its code.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
