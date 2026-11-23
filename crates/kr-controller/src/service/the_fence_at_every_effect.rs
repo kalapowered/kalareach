@@ -2422,6 +2422,73 @@ impl crate::bridge::store::Observer for LosesTheLook {
     }
 }
 
+/// KR-REQ-09.09 and 18.11: a look that fails after a start that succeeded, and that fails as a step
+/// of the platform (the runtime ended with a code), is answered like any failed look: the row is
+/// stale and recorded, the answer says that this refresh started the environment, and its sentence
+/// names the look and how it failed. It is not an outcome this host does not know.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refresh_whose_look_fails_after_its_start_as_a_step_is_answered_and_says_it_started() {
+    use kr_protocol::identity::{EnvironmentPresence, EnvironmentRefreshResult};
+    let rig = Refreshing::start().await;
+
+    let platform = LosesTheLookAsAStep::after_the_start();
+    rig.controller.ask_instead(platform.clone());
+    let answered = rig
+        .refresh(1, true)
+        .await
+        .expect("a look that failed as a step of the platform is answered");
+    assert!(platform.was_started());
+    let result: EnvironmentRefreshResult = answered.to_typed().expect("a result");
+    assert!(result.started, "{result:?}");
+    assert_eq!(result.row.status, EnvironmentPresence::Stale);
+    assert!(result.verification.0.is_none());
+    assert_eq!(
+        result.connection.as_str(),
+        "the container runtime (podman) ended with exit code 125 when asked whether the \
+         environment is running"
+    );
+    assert_eq!(rig.recorded_status(1), EnvironmentPresence::Stale);
+}
+
+/// A platform whose look fails as a step of it, once it has been told to start the environment.
+struct LosesTheLookAsAStep {
+    started: std::sync::atomic::AtomicBool,
+}
+
+impl LosesTheLookAsAStep {
+    fn after_the_start() -> Arc<Self> {
+        Arc::new(Self {
+            started: std::sync::atomic::AtomicBool::new(false),
+        })
+    }
+
+    fn was_started(&self) -> bool {
+        self.started.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl crate::bridge::store::Observer for LosesTheLookAsAStep {
+    fn observe(
+        &self,
+        _: &kr_protocol::identity::EnvironmentEnrolment,
+    ) -> crate::error::Result<kr_protocol::identity::EnvironmentPresence> {
+        if self.was_started() {
+            return Err(crate::error::ControllerError::Platform {
+                access: kr_protocol::identity::EnvironmentAccess::Container,
+                step: crate::bridge::platform::Step::Look,
+                failure: crate::bridge::platform::StepFailure::Exited(125),
+            });
+        }
+        Ok(kr_protocol::identity::EnvironmentPresence::EnvironmentStopped)
+    }
+
+    fn start(&self, _: &kr_protocol::identity::EnvironmentEnrolment) -> crate::error::Result<()> {
+        self.started
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+}
+
 /// KR-REQ-09.09: a fence that lands after a refresh has recorded what the platform said leaves the
 /// refresh answered, with the observation recorded, and says that no bridge was opened.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

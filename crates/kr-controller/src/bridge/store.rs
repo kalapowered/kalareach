@@ -21,6 +21,7 @@ use kr_protocol::identity::{
 use kr_protocol::ids::EnvironmentId;
 use kr_protocol::scalars::TimestampMs;
 
+use crate::bridge::platform::{Step, StepFailure};
 use crate::error::{ControllerError, Result};
 
 /// How long an observation describes the present.
@@ -131,6 +132,8 @@ pub struct Observed {
     status: EnvironmentPresence,
     /// Whether the platform was told to start the environment.
     started: bool,
+    /// The step that asked the platform and failed, when one did. The status is then stale.
+    failed: Option<PlatformFailure>,
 }
 
 impl Observed {
@@ -139,6 +142,40 @@ impl Observed {
     #[must_use]
     pub const fn started(&self) -> bool {
         self.started
+    }
+
+    /// The step that asked the platform and failed, which is what the person is told.
+    #[must_use]
+    pub const fn failed(&self) -> Option<&PlatformFailure> {
+        self.failed.as_ref()
+    }
+}
+
+/// A step of a refresh that asks the platform, and how it failed.
+#[derive(Clone, Debug)]
+pub struct PlatformFailure {
+    /// The access class of the environment.
+    pub access: EnvironmentAccess,
+    /// The step.
+    pub step: Step,
+    /// How it failed.
+    pub failure: StepFailure,
+}
+
+/// Sets a failure of a step that asks the platform apart from every other failure.
+fn asked<T>(result: Result<T>) -> Result<std::result::Result<T, PlatformFailure>> {
+    match result {
+        Ok(value) => Ok(Ok(value)),
+        Err(ControllerError::Platform {
+            access,
+            step,
+            failure,
+        }) => Ok(Err(PlatformFailure {
+            access,
+            step,
+            failure,
+        })),
+        Err(other) => Err(other),
     }
 }
 
@@ -375,11 +412,16 @@ impl Store {
     /// thing here that changes the environment, and what the platform said is not recorded here:
     /// [`Self::record`] takes it in, under the admission asked again.
     ///
+    /// A step that asks the platform and fails ends the asking: what is seen is stale, the failure
+    /// is [`Observed::failed`], and [`Observed::started`] says whether the start had been made by
+    /// then, which a look that fails after it does not undo.
+    ///
     /// # Errors
     ///
     /// Returns a not-found failure when nothing is enrolled under that identity, `admitted`'s
     /// refusal when it no longer stands at the start, whatever the observer reported otherwise,
-    /// and [`ControllerError::Uncertain`] when the look after a start failed: the start was made.
+    /// and [`ControllerError::Uncertain`] when the look after a start failed for a reason that is
+    /// not a step of the platform: the start was made.
     pub fn observe(
         &self,
         environment_id: EnvironmentId,
@@ -401,55 +443,46 @@ impl Store {
             ))
         })?;
         let mut started = false;
-        if start && observer.observe(&enrolment)? != EnvironmentPresence::Running {
-            admitted()?;
-            observer.start(&enrolment)?;
-            started = true;
-        }
-        let status = observer.observe(&enrolment).map_err(|error| {
-            if started {
-                ControllerError::Uncertain {
-                    detail: format!(
-                        "the environment was started and the look at it afterwards failed: {error}"
-                    ),
+        let mut failed = None;
+        if start {
+            match asked(observer.observe(&enrolment))? {
+                Ok(EnvironmentPresence::Running) => {}
+                Ok(_) => {
+                    admitted()?;
+                    match asked(observer.start(&enrolment))? {
+                        Ok(()) => started = true,
+                        Err(failure) => failed = Some(failure),
+                    }
                 }
-            } else {
-                error
+                Err(failure) => failed = Some(failure),
             }
-        })?;
+        }
+        let status = if failed.is_some() {
+            EnvironmentPresence::Stale
+        } else {
+            let looked = asked(observer.observe(&enrolment)).map_err(|error| {
+                if started {
+                    ControllerError::Uncertain {
+                        detail: format!(
+                            "the environment was started and the look at it afterwards failed: \
+                             {error}"
+                        ),
+                    }
+                } else {
+                    error
+                }
+            })?;
+            looked.unwrap_or_else(|failure| {
+                failed = Some(failure);
+                EnvironmentPresence::Stale
+            })
+        };
         Ok(Observed {
             enrolment,
             instance,
             status,
             started,
-        })
-    }
-
-    /// What a refresh takes in when the platform could not be asked: the environment as stale, which
-    /// is what a daemon records of an environment it could observe nothing about, and not started.
-    ///
-    /// # Errors
-    ///
-    /// Returns a failure when this host has no enrolled environment `environment_id`.
-    pub fn unobserved(&self, environment_id: EnvironmentId) -> Result<Observed> {
-        let enrolment = self
-            .enrolment(environment_id)
-            .ok_or_else(|| {
-                ControllerError::InvalidArgument(format!(
-                    "this host has no enrolled environment {environment_id}"
-                ))
-            })?
-            .clone();
-        let instance = self.instance_of(environment_id).ok_or_else(|| {
-            ControllerError::supervision(format!(
-                "this host has no approved record for environment {environment_id}"
-            ))
-        })?;
-        Ok(Observed {
-            enrolment,
-            instance,
-            status: EnvironmentPresence::Stale,
-            started: false,
+            failed,
         })
     }
 
@@ -464,6 +497,7 @@ impl Store {
             instance,
             status,
             started,
+            ..
         } = observed;
         self.record.observations.insert(
             enrolment.environment_id.to_string(),

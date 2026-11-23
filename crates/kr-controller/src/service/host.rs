@@ -559,24 +559,20 @@ impl Controller {
                         asking.check_registration(&carried)?;
                         // A step that asks the platform and fails is a failed look or start, which the
                         // refresh answers with its row as stale and a sentence that names the step:
-                        // not a refusal of the refresh.
-                        let (observed, failed) = match store.observe(
+                        // not a refusal of the refresh, also when the start had been made.
+                        let observed = store.observe(
                             params.environment_id,
                             params.start,
                             platform.as_ref(),
                             &|| asking.check_registration(&carried),
-                        ) {
-                            Ok(observed) => (observed, None),
-                            Err(ControllerError::Platform {
-                                access,
-                                step,
-                                failure,
-                            }) => (
-                                store.unobserved(params.environment_id)?,
-                                Some(crate::bridge::diagnosis::platform(access, step, &failure)),
-                            ),
-                            Err(other) => return Err(other),
-                        };
+                        )?;
+                        let failed = observed.failed().map(|step| {
+                            crate::bridge::diagnosis::platform(
+                                step.access,
+                                step.step,
+                                &step.failure,
+                            )
+                        });
                         let started = observed.started();
                         asking
                             .under_registration(&carried, || store.record(observed, now_ms))

@@ -260,6 +260,13 @@ case "$1" in
           echo 'Error: cannot connect to the store' >&2
           exit 125
         fi
+        # A test that wants the question to fail only once the container has been started says so
+        # with a file.
+        if [ -f '{tools}/running-fails-after-start' ] \
+          && [ "$(cat '{tools}/container-running' 2>/dev/null || echo true)" = true ]; then
+          echo 'Error: cannot connect to the store' >&2
+          exit 125
+        fi
         cat '{tools}/container-running' 2>/dev/null || echo true ;;
       *) echo "the stand-in for podman has no answer for: $*" >&2; exit 2 ;;
     esac
@@ -2381,6 +2388,51 @@ async fn a_look_at_the_container_that_fails_is_told_as_its_step_and_not_as_a_sto
         assert!(
             !told.everything.contains("cannot connect to the store"),
             "{told:?}"
+        );
+    });
+}
+
+/// KR-REQ-18.11, the part about connection diagnostics, for a look at the container that fails
+/// after a start that succeeded: the refresh is answered like any failed look, in `--json` and in
+/// the lines. The row reads stale, it says that this refresh started the environment, and the line
+/// names the look and its class. It is not refused as an outcome the host does not know.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_look_that_fails_after_a_start_is_told_as_a_failed_look_and_keeps_the_start() {
+    let _turn = CONTAINER_RUNTIME_TURN.lock().await;
+    let world = world_whose_destination_answers().await;
+    enrolled_and_answering(&world, "box", "container", STAND_IN_CONTAINER_NAME);
+    let stopped = || {
+        std::fs::write(world.tools.join("container-running"), "false\n")
+            .expect("the container is stopped");
+    };
+    let expected = "the container runtime (podman) ended with exit code 125 when asked whether \
+                    the environment is running";
+    with_the_switch_on(&world, "running-fails-after-start", "box", || {
+        stopped();
+        let json = world.run(&["--json", "bridge", "refresh", "--start", "box"]);
+        assert_ran(&json, "box: kr --json bridge refresh --start");
+        let document: Value = serde_json::from_slice(&json.stdout).expect("kr printed JSON");
+        assert_eq!(document["connection"], expected, "{document}");
+        assert_eq!(document["started"], true, "{document}");
+        assert_eq!(document["row"]["status"], "stale", "{document}");
+        stopped();
+        let said = world.run(&["bridge", "refresh", "--start", "box"]);
+        assert_ran(&said, "box: kr bridge refresh --start");
+        let stdout = String::from_utf8_lossy(&said.stdout).into_owned();
+        let lines: Vec<&str> = stdout.lines().collect();
+        assert_eq!(
+            lines,
+            [
+                "box is not seen recently, started by this refresh",
+                &format!("    {expected}")
+            ],
+            "{}",
+            printed(&said)
+        );
+        assert!(
+            !printed(&said).contains("cannot connect to the store"),
+            "{}",
+            printed(&said)
         );
     });
 }
