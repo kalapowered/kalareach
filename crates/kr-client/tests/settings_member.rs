@@ -12,6 +12,7 @@
 //! | `a_bundle_that_opened_and_cannot_be_read_says_what_it_needs` | the error for a bundle written by a later build |
 //! | `a_settings_write_that_would_leave_less_room_than_the_trust_entries_need_is_refused` | the room a settings write leaves |
 //! | `a_trust_write_that_would_not_fit_with_the_settings_is_written_without_them` | who wins near the bound |
+//! | `a_migration_whose_destination_left_the_settings_out_for_want_of_room_is_completed` | a move that lost the member to the bound still completes |
 //! | `a_changed_setting_is_written_once_and_an_unchanged_one_is_not_written` | the comparison before a write |
 //! | `an_unreadable_settings_file_keeps_the_member_the_bundle_holds` | an absent choice and an unreadable file |
 //! | `removing_the_member_leaves_collections_keys_and_checkpoints_byte_for_byte` | the removal by its own compare-and-swap |
@@ -42,7 +43,7 @@ use kr_crypto::keys::DeviceKeys;
 use kr_protocol::archive::{CollectionLocator, RecoveryBundle, RecoveryContext};
 use kr_protocol::error::ErrorCode;
 use kr_protocol::ids::ArchiveId;
-use kr_protocol::scalars::{Bytes, TimestampMs, Uuid};
+use kr_protocol::scalars::{Bytes, TimestampMs, U64, Uuid};
 use kr_protocol::sync::MAX_SEALED_RECOVERY_BUNDLE_BYTES;
 
 const ORIGIN: &str = "https://reach.kala.to";
@@ -499,6 +500,181 @@ async fn a_trust_write_that_would_not_fit_with_the_settings_is_written_without_t
         Err(RecoveryError::BundleTooLarge { .. })
     ));
     assert_eq!(service.sealed(), before, "nothing was written");
+}
+
+/// Where the migrations in these cases move the bundle to.
+fn moved_context() -> RecoveryContext {
+    RecoveryContext {
+        service_origin: "https://self-hosted.example".to_owned(),
+        bundle_locator: "moved-bundle-locator".to_owned(),
+    }
+}
+
+/// Saved settings that take two buckets of the bundle.
+fn two_buckets() -> DeviceSettings {
+    DeviceSettings::new(
+        [(
+            "colour_mode".to_owned(),
+            SettingValue::Text("x".repeat(1500)),
+        )]
+        .into_iter()
+        .collect(),
+    )
+    .expect("settings")
+}
+
+/// A migration that went out and whose answer was lost.
+struct LostMigration {
+    seed: RecoverySeed,
+    kit: kr_protocol::archive::RecoveryKit,
+    /// The old location, which still holds the bundle that was moved.
+    source: Arc<MemoryBundles>,
+    store: BundleStore,
+    destination: BundleStore,
+    /// What the caller holds: the bundle it was moving.
+    bundle: RecoveryBundle,
+    _directories: [tempfile::TempDir; 2],
+}
+
+/// The old location holds a bundle at `revision`, sealed at exactly the bound with its settings. A
+/// migration moves it to the destination, which takes the write at the next revision, and the
+/// answer never comes back.
+async fn a_migration_with_its_answer_lost(revision: u64) -> LostMigration {
+    let seed = RecoverySeed::generate().expect("a seed");
+    let source_key = seed.bundle_key_for(&context()).expect("the bundle's key");
+    let source = Arc::new(MemoryBundles::default());
+    let mut held = bundle_leaving(&seed, Some(&two_buckets()), 0);
+    held.revision = U64::new(revision);
+    source.put(kr_crypto::archive::encrypt_recovery_bundle(&source_key, &held).expect("sealed"));
+    assert_eq!(
+        source.sealed().len() as u64,
+        MAX_SEALED_RECOVERY_BUNDLE_BYTES,
+        "the bundle is at the bound with its settings"
+    );
+
+    let (mut store, first) = store_over(&source);
+    let mut bundle = store.fetch(&seed).await.expect("the bundle");
+    assert_eq!(bundle, held);
+    let destination_service = Arc::new(MemoryBundles::default());
+    let second = tempfile::tempdir().expect("a directory on the internal disk");
+    let mut destination = BundleStore::open(
+        Arc::clone(&destination_service) as Arc<dyn SyncBackupService>,
+        moved_context(),
+        second.path(),
+    )
+    .expect("the destination store");
+    *destination_service
+        .loses_the_next_answer
+        .lock()
+        .expect("a flag") = true;
+    let kit = seed.to_kit(vec![ORIGIN.to_owned()], LOCATOR.to_owned());
+    let migrating = store
+        .migrate(&seed, &mut bundle, &kit, &mut destination, now())
+        .await;
+    assert!(
+        matches!(migrating, Err(RecoveryError::BundleOutcomeUnknown { .. })),
+        "the destination took the write and its answer was lost"
+    );
+    assert_eq!(bundle, held, "the caller still holds what it was moving");
+    LostMigration {
+        seed,
+        kit,
+        source,
+        store,
+        destination,
+        bundle,
+        _directories: [first, second],
+    }
+}
+
+/// KR-REQ-20.17: a migration whose destination left the settings out for want of room is completed
+/// by the one step that finishes a migration, and the old location is still held to what was moved.
+///
+/// The bundle at the old location is sealed at the bound with its settings. A revision of 22 moves
+/// to 23 and a revision of 23 to 24, which takes one more byte, so the destination write is the
+/// one that leaves the settings out.
+#[tokio::test]
+async fn a_migration_whose_destination_left_the_settings_out_for_want_of_room_is_completed() {
+    // One byte under: the move still fits with the settings, and completes as it always did.
+    let mut fits = a_migration_with_its_answer_lost(22).await;
+    let completed = fits
+        .store
+        .complete_migration(
+            &fits.seed,
+            &mut fits.bundle,
+            &fits.kit,
+            &mut fits.destination,
+            now(),
+        )
+        .await;
+    assert!(completed.is_ok(), "{:?}", completed.err());
+    assert!(fits.bundle.device_settings.is_some(), "the settings stay");
+    assert_eq!(fits.bundle.revision.get(), 23);
+
+    // At the bound: the destination wrote the bundle without the settings, and that is the write
+    // this migration made.
+    let mut over = a_migration_with_its_answer_lost(23).await;
+    let moving = over.bundle.clone();
+    let completed = over
+        .store
+        .complete_migration(
+            &over.seed,
+            &mut over.bundle,
+            &over.kit,
+            &mut over.destination,
+            now(),
+        )
+        .await;
+    assert!(completed.is_ok(), "{:?}", completed.err());
+    assert_eq!(over.bundle.revision.get(), 24);
+    assert!(
+        over.bundle.device_settings.is_none(),
+        "the caller holds the bundle at the destination, which lacks the settings"
+    );
+    let at_destination = over
+        .destination
+        .fetch(&over.seed)
+        .await
+        .expect("the bundle");
+    assert_eq!(at_destination, over.bundle);
+    let source_key = over
+        .seed
+        .bundle_key_for(&context())
+        .expect("the bundle's key");
+    assert_eq!(
+        kr_crypto::archive::decrypt_recovery_bundle(&source_key, &over.source.sealed())
+            .expect("the old location's bundle"),
+        moving,
+        "the old location still holds the bundle that was moved, settings included"
+    );
+
+    // The old location is held to what was moved: the same bundle with settings that would have
+    // fitted is not the bundle whose move this was, because nothing then left them out.
+    let mut changed = a_migration_with_its_answer_lost(23).await;
+    let changed_key = changed
+        .seed
+        .bundle_key_for(&context())
+        .expect("the bundle's key");
+    let mut smaller = changed.bundle.clone();
+    smaller.device_settings = Some(encode_member(&colour("dark")).expect("a member"));
+    changed
+        .source
+        .put(kr_crypto::archive::encrypt_recovery_bundle(&changed_key, &smaller).expect("sealed"));
+    let refused = changed
+        .store
+        .complete_migration(
+            &changed.seed,
+            &mut changed.bundle,
+            &changed.kit,
+            &mut changed.destination,
+            now(),
+        )
+        .await;
+    assert!(
+        matches!(refused, Err(RecoveryError::BundleConflict { .. })),
+        "{:?}",
+        refused.err()
+    );
 }
 
 fn local(mode: &str) -> LocalSettings {

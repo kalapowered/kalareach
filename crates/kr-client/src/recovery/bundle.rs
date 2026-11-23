@@ -65,6 +65,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use kr_crypto::kdf::RecoverySeed;
+use kr_crypto::secret::SymmetricKey;
 use kr_protocol::archive::{
     RECOVERY_BUNDLE_SCHEMA_VERSION, RecoveryBundle, RecoveryContext, RecoveryKit, TrustedProducer,
     TrustedWriter,
@@ -1111,6 +1112,10 @@ impl BundleStore {
     /// location, and whatever [`Self::commit`] returns for the write itself: among it
     /// [`RecoveryError::BundleNotSent`] for a destination write refused before anything left,
     /// which leaves both locations and both stores as they were, so the move can be made again.
+    ///
+    /// The write at the destination is a trust write: where the bundle with its saved settings
+    /// would not fit under the bound there, they are left out, and the caller holds what was
+    /// written. The old location keeps them.
     pub async fn migrate(
         &mut self,
         seed: &RecoverySeed,
@@ -1196,8 +1201,12 @@ impl BundleStore {
     /// **Then everything [`Self::migrate`] checks is checked.** The kit is this bundle's and this
     /// seed's, the bundle at the destination is the caller's bundle moved on by the one revision a
     /// write adds, and the old location still holds the bundle that was moved: a write made there
-    /// since would leave the updated kit pointing at a bundle without it. The caller may hold the
-    /// bundle that was moved or, where an earlier completion already returned, the one it became.
+    /// since would leave the updated kit pointing at a bundle without it. The write may also have
+    /// left the saved settings out, as every trust write does where the bundle with them would not
+    /// fit under the bound, and that is the only other change a move makes: the caller then holds
+    /// the bundle at the destination, without them, and the old location still holds them. The
+    /// caller may hold the bundle that was moved or, where an earlier completion already returned,
+    /// the one it became.
     ///
     /// It can be asked again, and it answers the same way: the fence repeats its answer, the read
     /// finds the same bundle, and nothing is written. The destination store keeps its record of the
@@ -1221,17 +1230,18 @@ impl BundleStore {
         now_ms: TimestampMs,
     ) -> Result<Migrated> {
         let updated_kit = self.kit_for_the_move(seed, kit, &moved.context)?;
+        let destination_key = seed.bundle_key_for(&moved.context)?;
         // The destination comes first, as it does for a migration: a destination whose bundle is
         // not this migration's is refused whatever the old location holds.
         let landed = moved.recognise_its_own_write(seed).await?;
         // The destination's bundle has to be a move of the one the caller is completing. A write
         // the destination store made for any other reason is its own, and still not this
         // migration's.
-        if &landed.bundle != bundle && !is_a_move_of(&landed.bundle, bundle) {
+        if &landed.bundle != bundle && !is_a_move_of(&landed.bundle, bundle, &destination_key)? {
             return Err(RecoveryError::DestinationHoldsABundle);
         }
         let current = self.read_the_source(seed).await?;
-        if !is_a_move_of(&landed.bundle, &current) {
+        if !is_a_move_of(&landed.bundle, &current, &destination_key)? {
             return Err(self.source_moved_on());
         }
         *bundle = landed.bundle;
@@ -1623,14 +1633,34 @@ fn sealed_digest(ciphertext: &[u8]) -> Digest256 {
 /// Returns true when `moved` is `source` as a migration writes it: the same bundle, one revision on.
 ///
 /// A migration writes the caller's bundle at the destination and the write adds one revision and
-/// stamps the instant it was made, so those two are what may differ and nothing else may.
-fn is_a_move_of(moved: &RecoveryBundle, source: &RecoveryBundle) -> bool {
-    moved.revision.get() == source.revision.get().saturating_add(1)
-        && RecoveryBundle {
-            revision: source.revision,
-            written_at_ms: source.written_at_ms,
-            ..moved.clone()
-        } == *source
+/// stamps the instant it was made, so those two are what may differ. One more change is permitted,
+/// the one the capacity policy makes: the settings member left out, when the bundle with it would
+/// not have fitted under the bound under `destination_key`. Nothing else may differ.
+///
+/// # Errors
+///
+/// Returns the encoding errors of sealing the bundle, which the question about the bound asks.
+fn is_a_move_of(
+    moved: &RecoveryBundle,
+    source: &RecoveryBundle,
+    destination_key: &SymmetricKey,
+) -> Result<bool> {
+    let written = RecoveryBundle {
+        revision: U64::new(source.revision.get().saturating_add(1)),
+        written_at_ms: moved.written_at_ms,
+        ..source.clone()
+    };
+    if *moved == written {
+        return Ok(true);
+    }
+    if moved.device_settings.is_some() {
+        return Ok(false);
+    }
+    let without_settings = RecoveryBundle {
+        device_settings: None,
+        ..written.clone()
+    };
+    Ok(*moved == without_settings && capacity::leaves_settings_out(destination_key, &written)?)
 }
 
 /// Checks that what this store holds at one place is the write a receipt names at that same place.

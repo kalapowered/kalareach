@@ -23,6 +23,11 @@ use crate::recovery::{RecoveryError, Result};
 /// The room a settings write leaves under the sealed bound, for the trust entries that follow it.
 pub const TRUST_ROOM_BYTES: u64 = 8 * 1024;
 
+/// Whether a sealed bundle of `len` bytes is over the bound a service keeps.
+const fn over_the_bound(len: u64) -> bool {
+    len > MAX_SEALED_RECOVERY_BUNDLE_BYTES
+}
+
 /// What a write of the bundle is for, which decides who wins when the bundle is near its bound.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Write {
@@ -71,7 +76,7 @@ pub(super) fn seal(
             })
         }
         Write::Trust => {
-            if len <= MAX_SEALED_RECOVERY_BUNDLE_BYTES {
+            if !over_the_bound(len) {
                 return Ok(Sealed {
                     ciphertext,
                     dropped_settings: false,
@@ -83,7 +88,7 @@ pub(super) fn seal(
             } else {
                 ciphertext
             };
-            if ciphertext.len() as u64 > MAX_SEALED_RECOVERY_BUNDLE_BYTES {
+            if over_the_bound(ciphertext.len() as u64) {
                 return Err(RecoveryError::BundleTooLarge {
                     len: ciphertext.len(),
                     limit: MAX_SEALED_RECOVERY_BUNDLE_BYTES,
@@ -95,4 +100,21 @@ pub(super) fn seal(
             })
         }
     }
+}
+
+/// Whether a trust write of `bundle` is sealed without its settings member under `key`.
+///
+/// It is the question [`seal`] answers for a trust write, asked without writing anything: a
+/// migration whose answer was lost uses it to tell a destination that left the member out because
+/// the bundle would not have fitted from one that lost it for another reason.
+///
+/// # Errors
+///
+/// Returns the encoding errors of [`kr_crypto::archive::encrypt_recovery_bundle`].
+pub(super) fn leaves_settings_out(key: &SymmetricKey, bundle: &RecoveryBundle) -> Result<bool> {
+    if bundle.device_settings.is_none() {
+        return Ok(false);
+    }
+    let ciphertext = kr_crypto::archive::encrypt_recovery_bundle(key, bundle)?;
+    Ok(over_the_bound(ciphertext.len() as u64))
 }
