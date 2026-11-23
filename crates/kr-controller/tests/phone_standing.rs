@@ -1016,11 +1016,11 @@ async fn kept_result_through_the_daemon(
     read.result.0.expect("the launch's result is kept")
 }
 
-/// KR-REQ-12.09: the answer to a paired device's launch press, forwarded by the daemon from a
-/// worker that names provenance on its input answers, keeps the shape a reader built from the 0.78
-/// package reads, and `action.read` through the daemon returns the same kept result.
-#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn kr_req_12_09_a_devices_launch_answer_through_the_daemon_keeps_the_earlier_shape() {
+/// A paired device presses a launch through the daemon, and the managed reader installs it inside
+/// the worker's hold, or, with `late`, after the worker has revoked the hold: the caller is then
+/// told what happened, later than the hold. The answer and the kept result `action.read` returns
+/// through the daemon are read as a reader built from the 0.78 package reads them.
+async fn a_devices_launch_answer_keeps_the_earlier_shape(late: bool) {
     let adopted = Adopted::start_managed().await;
     let worker = &adopted.workers[0];
     let session_id = worker.session_id;
@@ -1040,6 +1040,13 @@ async fn kr_req_12_09_a_devices_launch_answer_through_the_daemon_keeps_the_earli
                 .await
                 .expect("the reader is asked")
                 .expect("a request");
+            if late {
+                // Past the worker's hold on the launch, which it revokes at its own deadline.
+                tokio::time::sleep(Duration::from_millis(
+                    kr_protocol::root::FENCE_EXCHANGE_TIMEOUT.get() * 3,
+                ))
+                .await;
+            }
             reader.installs(&asked).await.expect("the reader installs");
         }
     );
@@ -1052,12 +1059,28 @@ async fn kr_req_12_09_a_devices_launch_answer_through_the_daemon_keeps_the_earli
         )
     );
     let kept = kept_result_through_the_daemon(&connection, session_id, action_id).await;
+    read_as_the_earlier_package(&kept);
     assert_eq!(
         kr_cbor::encode(kept.as_value()),
         kr_cbor::encode(answer.as_value())
     );
     connection.close();
     adopted.stop().await;
+}
+
+/// KR-REQ-12.09: the answer to a paired device's launch press, forwarded by the daemon from a
+/// worker that names provenance on its input answers, keeps the shape a reader built from the 0.78
+/// package reads, and `action.read` through the daemon returns the same kept result.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_12_09_a_devices_launch_answer_through_the_daemon_keeps_the_earlier_shape() {
+    a_devices_launch_answer_keeps_the_earlier_shape(false).await;
+}
+
+/// KR-REQ-12.09: the same when the reader installs after the worker revoked its hold, so the answer
+/// reaches the device later than the hold and the daemon waits for it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_12_09_a_devices_launch_installed_after_the_hold_is_answered_in_the_earlier_shape() {
+    a_devices_launch_answer_keeps_the_earlier_shape(true).await;
 }
 
 /// A share's end ends its own connection and no other: two shares of one session on two
