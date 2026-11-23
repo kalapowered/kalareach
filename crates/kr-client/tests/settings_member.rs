@@ -15,6 +15,10 @@
 //! | `a_migration_whose_destination_left_the_settings_out_for_want_of_room_is_completed` | a move that lost the member to the bound still completes |
 //! | `a_changed_setting_is_written_once_and_an_unchanged_one_is_not_written` | the comparison before a write |
 //! | `an_unreadable_settings_file_keeps_the_member_the_bundle_holds` | an absent choice and an unreadable file |
+//! | `a_save_reads_the_bundle_again_after_it_moved_three_times_in_all` | the save's three reads and the conflict after them |
+//! | `a_valid_member_over_the_cap_is_refused_at_the_read_and_one_at_the_cap_is_read` | the cap at the read |
+//! | `clearing_the_member_from_a_bundle_with_little_room_is_written_as_a_trust_write` | a clear makes room |
+//! | `a_removal_that_meets_a_bundle_which_moved_is_a_conflict_and_removes_nothing` | a removal that meets another write |
 //! | `removing_the_member_leaves_collections_keys_and_checkpoints_byte_for_byte` | the removal by its own compare-and-swap |
 //! | `a_removal_whose_answer_is_lost_stays_unconfirmed_until_it_is_ended` | an unconfirmed removal stays visible |
 //! | `a_restore_with_only_the_kit_returns_the_settings_member_and_nothing_that_grants` | the restore from a service |
@@ -68,6 +72,9 @@ struct MemoryBundles {
     drops_the_next_request: Mutex<bool>,
     /// Where each applied request landed, as a receipt.
     receipts: Mutex<std::collections::BTreeMap<Uuid, SyncPosition>>,
+    /// How many more fetches another writer's write follows at once, which moves the bundle on to
+    /// the next place before the fetcher writes.
+    moves_after_a_fetch: Mutex<u32>,
 }
 
 impl MemoryBundles {
@@ -162,13 +169,22 @@ impl SyncBackupService for MemoryBundles {
 
     fn fetch<'a>(&'a self, _collection: &'a str) -> ServiceFuture<'a, SyncFetched> {
         Box::pin(async move {
-            Ok(match self.held.lock().expect("the bundle").as_ref() {
+            let mut held = self.held.lock().expect("the bundle");
+            let answer = match held.as_ref() {
                 Some((place, ciphertext)) => SyncFetched::Held {
                     position: at(*place),
                     ciphertext: ciphertext.clone(),
                 },
                 None => SyncFetched::Absent { recovery: None },
-            })
+            };
+            let mut moves = self.moves_after_a_fetch.lock().expect("a count");
+            if *moves > 0 {
+                *moves -= 1;
+                if let Some((place, _)) = held.as_mut() {
+                    *place += 1;
+                }
+            }
+            Ok(answer)
         })
     }
 
@@ -675,6 +691,186 @@ async fn a_migration_whose_destination_left_the_settings_out_for_want_of_room_is
         "{:?}",
         refused.err()
     );
+}
+
+/// Makes the bundle move once more after each of the next `times` fetches, as another device's
+/// write does between a read and the write that follows it.
+fn the_bundle_moves_after_the_next(service: &MemoryBundles, times: u32) {
+    *service.moves_after_a_fetch.lock().expect("a count") = times;
+}
+
+/// KR-REQ-20.17: a removal that meets a bundle that moved since it was read is a conflict, and the
+/// member stays where it was; read again, the same removal goes through.
+#[tokio::test]
+async fn a_removal_that_meets_a_bundle_which_moved_is_a_conflict_and_removes_nothing() {
+    let seed = RecoverySeed::generate().expect("a seed");
+    let key = seed.bundle_key_for(&context()).expect("the bundle's key");
+    let service = Arc::new(MemoryBundles::default());
+    let mut held = BundleStore::empty(now());
+    held.device_settings = Some(encode_member(&colour("dark")).expect("a member"));
+    service.put(kr_crypto::archive::encrypt_recovery_bundle(&key, &held).expect("sealed"));
+    let (mut store, _directory) = store_over(&service);
+
+    the_bundle_moves_after_the_next(&service, 1);
+    let removal = store.remove_settings(&seed, now()).await;
+    assert!(
+        matches!(removal, Err(RecoveryError::BundleConflict { .. })),
+        "{:?}",
+        removal.ok()
+    );
+    assert_eq!(
+        kr_crypto::archive::decrypt_recovery_bundle(&key, &service.sealed()).expect("the bundle"),
+        held,
+        "the member is where it was"
+    );
+
+    let removal = store.remove_settings(&seed, now()).await;
+    assert!(
+        matches!(removal, Ok(SettingsRemoval::Removed { .. })),
+        "{:?}",
+        removal.err()
+    );
+}
+
+/// KR-REQ-20.17: a save reads the bundle again after it moved, three reads in all, and returns the
+/// last conflict after that.
+#[tokio::test]
+async fn a_save_reads_the_bundle_again_after_it_moved_three_times_in_all() {
+    let seed = RecoverySeed::generate().expect("a seed");
+    let key = seed.bundle_key_for(&context()).expect("the bundle's key");
+    let service = Arc::new(MemoryBundles::default());
+    service.put(
+        kr_crypto::archive::encrypt_recovery_bundle(&key, &BundleStore::empty(now()))
+            .expect("sealed"),
+    );
+    let (mut store, _directory) = store_over(&service);
+
+    // The bundle moves after the first two reads and the third attempt writes.
+    the_bundle_moves_after_the_next(&service, 2);
+    let saved = store.save_settings(&seed, local("dark"), now()).await;
+    assert!(
+        matches!(saved, Ok(SettingsSaved::Saved { .. })),
+        "{:?}",
+        saved.err()
+    );
+
+    // It moves after all three reads: the conflict of the last is what the caller gets, and
+    // nothing of this save was written.
+    the_bundle_moves_after_the_next(&service, 3);
+    let refused = store.save_settings(&seed, local("light"), now()).await;
+    assert!(
+        matches!(refused, Err(RecoveryError::BundleConflict { .. })),
+        "{:?}",
+        refused.ok()
+    );
+    assert_eq!(
+        *service.moves_after_a_fetch.lock().expect("a count"),
+        0,
+        "three reads were made, and no fourth"
+    );
+    let held =
+        kr_crypto::archive::decrypt_recovery_bundle(&key, &service.sealed()).expect("the bundle");
+    assert_eq!(
+        decode_member(held.device_settings.as_ref().expect("the member")).expect("it reads"),
+        colour("dark")
+    );
+}
+
+/// A member as `encode_member` makes it, except that its pad brings it to `len` bytes, whatever
+/// the cap says.
+fn a_member_of_length(len: usize) -> Bytes {
+    let sample = encode_member(&colour("dark")).expect("a member");
+    let kr_cbor::CanonicalValue::Map(map) =
+        kr_cbor::decode(sample.as_slice(), &kr_cbor::Limits::DEFAULT).expect("canonical")
+    else {
+        panic!("the member is a map");
+    };
+    let padded = |pad: usize| -> Vec<u8> {
+        let entries = map
+            .entries()
+            .iter()
+            .map(|(name, value)| {
+                if name == "pad" {
+                    (name.clone(), kr_cbor::CanonicalValue::bytes(vec![0; pad]))
+                } else {
+                    (name.clone(), value.clone())
+                }
+            })
+            .collect::<Vec<_>>();
+        kr_cbor::encode(&kr_cbor::CanonicalValue::Map(
+            kr_cbor::CanonicalMap::from_entries(entries).expect("a map"),
+        ))
+    };
+    // A pad of 256 bytes or more has a three-byte header, so the member grows byte for byte.
+    let encoded = padded(1024 + len - padded(1024).len());
+    assert_eq!(encoded.len(), len);
+    Bytes::new(encoded)
+}
+
+/// KR-REQ-20.17: the read holds a member to the cap as the write does. A member that is the right
+/// shape and canonical, and over the cap, is refused for its size; one at the cap is read.
+#[test]
+fn a_valid_member_over_the_cap_is_refused_at_the_read_and_one_at_the_cap_is_read() {
+    let at_the_cap = a_member_of_length(MAX_DEVICE_SETTINGS_BYTES);
+    assert_eq!(
+        decode_member(&at_the_cap).expect("a member at the cap reads"),
+        colour("dark")
+    );
+    let over = a_member_of_length(MAX_DEVICE_SETTINGS_BYTES + 1);
+    let refused = decode_member(&over);
+    assert!(
+        matches!(&refused, Err(RecoveryError::SettingsUnusable { what }) if what.contains("larger")),
+        "{:?}",
+        refused.ok()
+    );
+}
+
+/// KR-REQ-20.17: taking the member out is a trust write, which makes room, so a bundle with less
+/// room than a settings write needs still has it cleared: by the removal, and by the choice of
+/// nothing.
+#[tokio::test]
+async fn clearing_the_member_from_a_bundle_with_little_room_is_written_as_a_trust_write() {
+    for removal in [true, false] {
+        let seed = RecoverySeed::generate().expect("a seed");
+        let key = seed.bundle_key_for(&context()).expect("the bundle's key");
+        let service = Arc::new(MemoryBundles::default());
+        // One bucket of room with the member in, two without it: under what a settings write
+        // leaves for the trust entries.
+        let full = bundle_leaving(&seed, Some(&colour("dark")), 1024);
+        service.put(kr_crypto::archive::encrypt_recovery_bundle(&key, &full).expect("sealed"));
+        let (mut store, _directory) = store_over(&service);
+
+        let mut held = store.fetch(&seed).await.expect("the bundle");
+        assert!(
+            matches!(
+                store
+                    .set_settings(&seed, &mut held, Some(&colour("light")), now())
+                    .await,
+                Err(RecoveryError::SettingsDoNotFit { .. })
+            ),
+            "a settings write does not fit here"
+        );
+
+        if removal {
+            let cleared = store.remove_settings(&seed, now()).await;
+            assert!(
+                matches!(cleared, Ok(SettingsRemoval::Removed { .. })),
+                "{:?}",
+                cleared.err()
+            );
+        } else {
+            let nothing = LocalSettings::Values(DeviceSettings::default());
+            let cleared = store.save_settings(&seed, nothing, now()).await;
+            assert!(
+                matches!(cleared, Ok(SettingsSaved::Saved { .. })),
+                "{:?}",
+                cleared.err()
+            );
+        }
+        let after = kr_crypto::archive::decrypt_recovery_bundle(&key, &service.sealed())
+            .expect("the bundle");
+        assert!(after.device_settings.is_none(), "the member is out");
+    }
 }
 
 fn local(mode: &str) -> LocalSettings {
