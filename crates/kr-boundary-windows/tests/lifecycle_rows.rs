@@ -8,6 +8,7 @@ use kr_boundary_windows::filekey::FileKey;
 use kr_boundary_windows::frame::invocation::{
     Cleanup, ConfigurationState, EndedBy, InvocationReply, LeftoverClass as ReplyClass, RefusedKind,
 };
+use kr_boundary_windows::journal::limits;
 use kr_boundary_windows::journal::replay::{Standing, Tracker};
 use kr_boundary_windows::journal::rows::{
     DigestedFile, LeftoverClass, RootName, Row, SnapshotKind,
@@ -264,6 +265,104 @@ fn an_object_of_the_private_root_is_named_by_the_root_and_the_root_itself_by_its
         r"C:\ProgramData\Boundary\run\0a1b\x\file.lock"
     );
     assert_eq!(root_object(root, ""), root);
+}
+
+/// The name of an object that a child made deep in its private root: `levels` directories of
+/// `width` characters each, joined by backslashes.
+fn deep_name(levels: usize, width: usize, letter: &str) -> String {
+    vec![letter.repeat(width); levels].join("\\")
+}
+
+#[test]
+fn a_name_of_the_private_root_longer_than_a_row_takes_is_cut_at_a_directory_and_its_rows_are_taken()
+{
+    let root = r"C:\ProgramData\Boundary\run\0a1b";
+    // 64 levels of 48 characters: the removal's depth, with names that a child can make.
+    let below = deep_name(64, 48, "n");
+    let full = root_object_whole(root, &below);
+    assert!(
+        limits::json_bytes(&full) > limits::PATH_JSON_BYTES,
+        "the case needs a name that no row takes: {}",
+        limits::json_bytes(&full)
+    );
+    let name = root_object(root, &below);
+    assert!(
+        limits::json_bytes(&name) <= limits::PATH_JSON_BYTES,
+        "the name takes {} bytes in a row, over the {} that a row takes",
+        limits::json_bytes(&name),
+        limits::PATH_JSON_BYTES
+    );
+    // The cut name is a directory that holds the object, and the longest one that a row takes.
+    assert!(name.starts_with(root), "{name}");
+    assert!(
+        full.starts_with(&name) && full[name.len()..].starts_with('\\'),
+        "{name}"
+    );
+    let next = full[name.len() + 1..].split('\\').next().unwrap();
+    assert!(limits::json_bytes(&format!("{name}\\{next}")) > limits::PATH_JSON_BYTES);
+
+    // The closing rows are taken by the writer's tracker, and the end counts the leftover.
+    let closing = Closing {
+        root: vec![left(&name)],
+        ..closing()
+    };
+    let rows = closing_rows(&closing);
+    assert!(
+        rows.iter()
+            .any(|row| matches!(row, Row::End { root_leftovers: 1 })),
+        "{rows:?}"
+    );
+    let mut tracker = ended_invocation();
+    apply_all(&mut tracker, &rows);
+    assert_eq!(tracker.standing(), Standing::Finished);
+    assert_eq!(tracker.leftovers().len(), 1);
+    // The reply names the cut object too, within its own limit.
+    assert!(matches!(
+        cleanup_of(&closing),
+        Cleanup::Failed {
+            class: ReplyClass::Root,
+            ..
+        }
+    ));
+
+    // An earlier end journalled the same cut name; the removal finds it again, so it is kept and
+    // not journalled a second time.
+    let again = Closing {
+        root: vec![left(&name)],
+        root_recorded: vec![name.clone()],
+        ..closing.clone()
+    };
+    let rows = closing_rows(&again);
+    assert!(
+        !rows.iter().any(|row| matches!(row, Row::Leftover { .. })),
+        "{rows:?}"
+    );
+    let mut tracker = ended_with_root_leftovers(&[&name]);
+    apply_all(&mut tracker, &rows);
+    assert_eq!(tracker.standing(), Standing::Finished);
+    assert_eq!(tracker.leftovers().len(), 1);
+}
+
+#[test]
+fn a_long_name_is_cut_by_the_bytes_a_row_takes_and_a_name_that_fits_is_kept_whole() {
+    let root = r"C:\ProgramData\Boundary\run\0a1b";
+    // Three bytes a character: five directories of 255 characters take 3,825 bytes in a row.
+    let below = deep_name(5, 255, "\u{3042}");
+    let name = root_object(root, &below);
+    assert!(limits::json_bytes(&name) <= limits::PATH_JSON_BYTES);
+    let kept = name[root.len()..].split('\\').count() - 1;
+    assert_eq!(kept, 3, "{name}");
+    // The next directory would not fit: it takes a backslash (two bytes) and 765.
+    assert!(limits::json_bytes(&name) + 2 + 3 * 255 > limits::PATH_JSON_BYTES);
+    // A name that fits, by the bytes a row takes, is kept: 63 backslashes count twice.
+    let fits = deep_name(40, 48, "n");
+    assert!(limits::json_bytes(&root_object_whole(root, &fits)) <= limits::PATH_JSON_BYTES);
+    assert_eq!(root_object(root, &fits), root_object_whole(root, &fits));
+}
+
+/// The name of an object of the private root without any cut.
+fn root_object_whole(root: &str, below: &str) -> String {
+    format!("{root}\\{below}")
 }
 
 #[test]
