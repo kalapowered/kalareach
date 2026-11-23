@@ -818,7 +818,7 @@ fn open_recovery(app: &tauri::AppHandle) {
             tracing::warn!(%error, "this computer cannot take part in settings sync");
         }
     }
-    if let Err(error) = start_settings_saving(app, recovery::oldest_retained_level()) {
+    if let Err(error) = start_settings_saving(app) {
         tracing::warn!(%error, "this computer cannot save its settings with its recovery bundle");
     }
 }
@@ -964,13 +964,31 @@ pub fn start_recovery<R: tauri::Runtime>(
 /// to the settings once they have been quiet, after a recovery step that reached the service, and
 /// at the end of the window after a step that failed. The settings and recovery are opened first.
 /// The settings the bundle holds are listed and removed through the retained flow from here on.
-/// `oldest_retained` is the oldest level this release retains: while it is below the first level
-/// that reads a settings member, nothing is written (see [`recovery::SETTINGS_READ_FROM`]).
+/// The oldest level this release retains decides whether a member is written: while it is below the
+/// first level that reads one, nothing is (see [`recovery::SETTINGS_READ_FROM`]).
 ///
 /// # Errors
 ///
 /// Returns a local failure when the settings or recovery were not opened.
-pub fn start_settings_saving<R: tauri::Runtime>(
+pub fn start_settings_saving<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> Result<()> {
+    start_saving(app, recovery::oldest_retained_level())
+}
+
+/// As [`start_settings_saving`], for a release whose oldest retained level is `oldest_retained`:
+/// a case runs both sides of the writer's level.
+///
+/// # Errors
+///
+/// Returns a local failure when the settings or recovery were not opened.
+#[cfg(feature = "testing")]
+pub fn start_settings_saving_at<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    oldest_retained: kr_protocol::update::CompatibilityLevel,
+) -> Result<()> {
+    start_saving(app, oldest_retained)
+}
+
+fn start_saving<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     oldest_retained: kr_protocol::update::CompatibilityLevel,
 ) -> Result<()> {

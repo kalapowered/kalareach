@@ -23,8 +23,8 @@ use companion_tauri::account::{Account, AccountSlot};
 use companion_tauri::device::DeviceIdentity;
 use companion_tauri::recovery::{
     EXPORT_PANEL, HostCoverView, KIT_PANEL, LeftView, NotSavedWhy, OpenPanels, Recovery,
-    SEED_SCOPE, SettingsLine, SettingsRemoved, SettingsRestored, SettingsSource, SettingsStep,
-    SettingsTiming, settings_restored,
+    SEED_SCOPE, SETTINGS_READ_FROM, SettingsLine, SettingsRemoved, SettingsRestored,
+    SettingsSource, SettingsStep, SettingsTiming, settings_restored,
 };
 use companion_tauri::retained::{Confirm, Deletions, Question, SavedSettings};
 use companion_tauri::settings::{ColourMode, Settings};
@@ -62,6 +62,7 @@ use kr_protocol::backup_setup::{
 };
 use kr_protocol::error::ErrorCode;
 use kr_protocol::hello::PackageVersion;
+use kr_protocol::retained::RETAINED_WORKER_LEVELS;
 use kr_protocol::scalars::{AuthorisationKey, Signature64, TimestampMs};
 use kr_protocol::service::{GatewayOrigin, ServiceRequestSigner};
 use kr_protocol::update::CompatibilityLevel;
@@ -4309,7 +4310,8 @@ impl Computer {
             state.settings().expect("the settings are open")
         };
         page.recovery.set_settings_timing(timing);
-        companion_tauri::start_settings_saving(page.app.handle(), oldest).expect("saving starts");
+        companion_tauri::start_settings_saving_at(page.app.handle(), oldest)
+            .expect("saving starts");
         (page, settings)
     }
 }
@@ -4657,6 +4659,36 @@ async fn the_loop_writes_no_settings_while_the_oldest_retained_level_cannot_read
     assert_eq!(writes_sent(&computer), before, "no write follows a change");
     assert_eq!(colour_in(&bundle_of(&computer, &page).await), None);
     assert_eq!(line_of(&page), Value::Null);
+}
+
+/// KR-REQ-20.17, writer's level: saving started as the application starts it, with the levels this
+/// release retains and no level of its own, writes a member in the first bundle only when every
+/// retained level reads the member. Today the oldest retained level is below the first that reads
+/// it, so the bundle carries none; the case needs no edit when the cut moves the retained levels.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn saving_started_as_the_product_starts_it_writes_a_member_only_when_every_retained_level_reads_it()
+ {
+    let computer = Computer::new().await;
+    let page = computer.page().await;
+    let settings = {
+        let state = page.app.state::<AppState>();
+        state.keep_under(computer.data.path());
+        state.settings().expect("the settings are open")
+    };
+    companion_tauri::start_settings_saving(page.app.handle()).expect("saving starts");
+    settings
+        .set_colour_mode(ColourMode::Dark)
+        .await
+        .expect("kept");
+    page.call("recovery_turn_on", json!({})).expect("on");
+    let every_level_reads = RETAINED_WORKER_LEVELS
+        .iter()
+        .all(|retained| *retained >= SETTINGS_READ_FROM);
+    assert_eq!(
+        colour_in(&bundle_of(&computer, &page).await).is_some(),
+        every_level_reads,
+        "the levels this release retains: {RETAINED_WORKER_LEVELS:?}"
+    );
 }
 
 /// KR-REQ-20.17, writer's level: the gate is the level that reads the member and every level above it.
