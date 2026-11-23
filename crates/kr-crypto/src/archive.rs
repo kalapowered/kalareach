@@ -401,23 +401,35 @@ pub fn encrypt_recovery_bundle(key: &SymmetricKey, bundle: &RecoveryBundle) -> R
 /// origin and locator being read. Origin or locator substitution therefore fails authentication
 /// here rather than causing trust in archive-supplied writer keys.
 ///
+/// A failure to open the object is [`CryptoError::Authentication`] or one of the stream's own
+/// refusals, and nothing else. An object that opened and holds what this build does not read, a
+/// member it has no name for or a schema version it does not read, is
+/// [`CryptoError::Unreadable`]: the key was right, so the bundle was written by a build that knows
+/// more than this one.
+///
+/// The settings member is carried as the bytes it is and is not decoded here.
+///
 /// # Errors
 ///
-/// Returns an authentication error when the object does not open, and an encoding error when the
-/// plaintext is not a valid bundle.
+/// Returns an authentication error when the object does not open, and
+/// [`CryptoError::Unreadable`] when it opened and the plaintext is not a bundle this build reads.
 pub fn decrypt_recovery_bundle(key: &SymmetricKey, object: &[u8]) -> Result<RecoveryBundle> {
     let plaintext = stream::decrypt_object(key, object)?;
+    let unreadable = |_| CryptoError::Unreadable {
+        what: "a recovery bundle",
+    };
     let bundle: RecoveryBundle = kr_cbor::from_canonical_slice(
         plaintext.expose(),
         &kr_protocol::archive::RECOVERY_BUNDLE_LIMITS,
-    )?;
+    )
+    .map_err(unreadable)?;
     // The `secretstream` object authenticates the schema version; it does not establish that this
     // build knows what that version means. A bundle written under a later schema is refused rather
     // than read under this one's rules, because reading it wrongly would mean trusting the wrong
     // writers.
     if bundle.schema_version.get() != kr_protocol::archive::RECOVERY_BUNDLE_SCHEMA_VERSION {
-        return Err(CryptoError::BindingMismatch {
-            what: "a recovery bundle schema version this build does not read",
+        return Err(CryptoError::Unreadable {
+            what: "a recovery bundle under a schema version this build does not read",
         });
     }
     Ok(bundle)
@@ -635,6 +647,106 @@ mod tests {
         ] {
             let wrong = seed.bundle_key_for(&substituted).expect("a bundle key");
             assert!(decrypt_recovery_bundle(&wrong, &object).is_err());
+        }
+    }
+
+    /// A change to the entries of a bundle's map, made before it is sealed.
+    type Edit<'a> = dyn Fn(&mut Vec<(String, kr_cbor::CanonicalValue)>) + 'a;
+
+    fn bundle_with_a_member() -> RecoveryBundle {
+        RecoveryBundle {
+            schema_version: U64::new(1),
+            collections: Vec::new(),
+            trusted_writers: CanonicalSet::new(),
+            trusted_producers: CanonicalSet::new(),
+            checkpoints: CanonicalSet::new(),
+            revision: U64::new(3),
+            written_at_ms: TimestampMs::new(2),
+            device_settings: Some(kr_protocol::scalars::Bytes::new(vec![0x5a; 1024])),
+        }
+    }
+
+    fn bundle_key() -> SymmetricKey {
+        let seed = crate::kdf::RecoverySeed::generate().expect("a seed");
+        seed.bundle_key_for(&kr_protocol::archive::RecoveryContext {
+            service_origin: "https://reach.kala.to".to_owned(),
+            bundle_locator: "opaque-locator".to_owned(),
+        })
+        .expect("a bundle key")
+    }
+
+    /// KR-REQ-20.17: the settings member is carried as the bytes it is, in both directions, and a
+    /// key that is not the bundle's key does not open it: a failure to authenticate is that and
+    /// nothing else.
+    #[test]
+    fn a_bundle_with_a_settings_member_round_trips_and_another_key_does_not_authenticate() {
+        let key = bundle_key();
+        let bundle = bundle_with_a_member();
+        let object = encrypt_recovery_bundle(&key, &bundle).expect("an encrypted bundle");
+        let opened = decrypt_recovery_bundle(&key, &object).expect("the bundle");
+        assert_eq!(opened, bundle);
+        assert_eq!(
+            opened
+                .device_settings
+                .as_ref()
+                .map(|member| member.as_slice().len()),
+            Some(1024)
+        );
+        assert!(matches!(
+            decrypt_recovery_bundle(&bundle_key(), &object),
+            Err(CryptoError::Authentication { .. })
+        ));
+    }
+
+    /// KR-REQ-20.17: an object that opened under the bundle's key and holds something this build
+    /// cannot read, a member it does not know or a schema version it does not read, is told apart
+    /// from one that did not open: the first is a bundle written by a later build, the second is
+    /// the wrong key.
+    #[test]
+    fn a_bundle_that_authenticates_and_cannot_be_read_is_not_a_failure_to_authenticate() {
+        let key = bundle_key();
+        let sealed_as = |edit: &Edit<'_>| -> Vec<u8> {
+            let kr_cbor::CanonicalValue::Map(map) =
+                kr_cbor::to_canonical_value(&bundle_with_a_member()).expect("a bundle's value")
+            else {
+                panic!("a bundle is a map");
+            };
+            let mut entries = map.entries().to_vec();
+            edit(&mut entries);
+            let value = kr_cbor::CanonicalValue::Map(
+                kr_cbor::CanonicalMap::from_entries(entries).expect("a map"),
+            );
+            stream::encrypt_object(&key, &kr_cbor::encode(&value)).expect("a sealed object")
+        };
+        let number = |value: i128| kr_cbor::CanonicalValue::integer(value).expect("an integer");
+        let with_a_later_member = sealed_as(&|entries| {
+            entries.push(("a_later_member".to_owned(), number(1)));
+        });
+        let at_a_later_version = sealed_as(&|entries| {
+            entries.retain(|(name, _)| name != "schema_version");
+            entries.push(("schema_version".to_owned(), number(2)));
+        });
+        let without_a_member_it_needs = sealed_as(&|entries| {
+            entries.retain(|(name, _)| name != "collections");
+        });
+        for (what, object) in [
+            ("a member this build does not know", with_a_later_member),
+            (
+                "a schema version this build does not read",
+                at_a_later_version,
+            ),
+            (
+                "a member this build requires missing",
+                without_a_member_it_needs,
+            ),
+        ] {
+            assert!(
+                matches!(
+                    decrypt_recovery_bundle(&key, &object),
+                    Err(CryptoError::Unreadable { .. })
+                ),
+                "{what} authenticates and is unreadable"
+            );
         }
     }
 

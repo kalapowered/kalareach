@@ -53,6 +53,18 @@ pub enum CryptoError {
         what: &'static str,
     },
 
+    /// An object opened under its key and holds what this build cannot read.
+    ///
+    /// It authenticated, so it is what its owner wrote. What it holds is a shape this build does
+    /// not know: a member it has no name for, a schema version it does not read, or a member it
+    /// needs that is missing. That is a different fact from [`Self::Authentication`], which says
+    /// the key was wrong or the bytes were changed, and a caller words the two differently.
+    #[error("{what} opened and holds what this build does not read")]
+    Unreadable {
+        /// What opened and could not be read.
+        what: &'static str,
+    },
+
     /// An input was shorter than the minimum its format requires.
     #[error("{what} is {actual} bytes, under the {minimum}-byte minimum")]
     Truncated {
