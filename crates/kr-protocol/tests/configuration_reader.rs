@@ -95,7 +95,8 @@ fn a_document_one_version_ahead_with_no_new_ceiling_is_read_as_the_version_this_
 #[test]
 fn a_ceiling_this_build_lacks_makes_the_document_unusable_in_every_form() {
     let empty = Value::Object(serde_json::Map::new());
-    for (name, member) in [("version-4-limits.json", "limits")] {
+    {
+        let (name, member) = ("version-4-limits.json", "limits");
         let set = fixture(name);
         let forms = [
             ("set", set.clone()),

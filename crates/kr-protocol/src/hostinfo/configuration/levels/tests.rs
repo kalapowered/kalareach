@@ -312,7 +312,7 @@ fn an_edit_of_a_document_above_the_level_is_refused() {
     let refused = edit_in(&loaded, &change, &R1_LISTING).expect_err("refused");
     assert!(matches!(refused, EditRefused::NotOurs(_)), "{refused:?}");
 
-    let only_known = br#"{"version": 3, "level": 2, "ceilings": {"session_limit": 4}}"#;
+    let only_known = br#"{"version": 4, "level": 2, "ceilings": {"session_limit": 4}}"#;
     let loaded = load_in(Some(only_known), &R1);
     assert_eq!(loaded.status.state, DocumentState::Loaded);
     assert_eq!(loaded.newer.as_ref().map(|newer| newer.count), Some(0));
@@ -327,11 +327,11 @@ fn an_edit_of_a_document_above_the_level_is_refused() {
 /// though the reader keeps only the members it knows and so sees an unchanged document.
 #[test]
 fn a_file_changed_to_a_higher_level_since_the_edit_was_prepared_is_not_overwritten() {
-    let before = load_in(Some(br#"{"version": 3, "revision": 1}"#), &R1);
+    let before = load_in(Some(br#"{"version": 4, "revision": 1}"#), &R1);
     assert_eq!(before.status.state, DocumentState::Loaded);
     let edited = edit_in(&before, &Change::SessionLimit(Some(2)), &R1).expect("an edit");
     let after = load_in(
-        Some(br#"{"version": 3, "level": 2, "revision": 1, "telemetry_events": {}}"#),
+        Some(br#"{"version": 4, "level": 2, "revision": 1, "telemetry_events": {}}"#),
         &R1,
     );
     assert_eq!(
@@ -349,22 +349,22 @@ fn a_file_changed_to_a_higher_level_since_the_edit_was_prepared_is_not_overwritt
 /// and a document of an earlier version states no level.
 #[test]
 fn the_level_a_document_states_is_checked() {
-    let plain = load_in(Some(br#"{"version": 3}"#), &R1);
+    let plain = load_in(Some(br#"{"version": 4}"#), &R1);
     assert_eq!(plain.status.state, DocumentState::Loaded);
     assert_eq!(plain.document.expect("used").level, BASE_LEVEL);
     assert!(plain.newer.is_none());
 
     for refused in [
-        r#"{"version": 3, "level": 0}"#,
-        r#"{"version": 3, "level": "2"}"#,
-        r#"{"version": 3, "level": -1}"#,
+        r#"{"version": 4, "level": 0}"#,
+        r#"{"version": 4, "level": "2"}"#,
+        r#"{"version": 4, "level": -1}"#,
     ] {
         let loaded = load_in(Some(refused.as_bytes()), &R1);
         assert_eq!(loaded.status.state, DocumentState::Invalid, "{refused}");
     }
 
     let too_low =
-        format!(r#"{{"version": 3, "level": 1, "voice": {{"broker_origin": "{BROKER}"}}}}"#);
+        format!(r#"{{"version": 4, "level": 1, "voice": {{"broker_origin": "{BROKER}"}}}}"#);
     let loaded = load_in(Some(too_low.as_bytes()), &R2);
     assert_eq!(
         loaded.status.state,
@@ -397,16 +397,16 @@ fn the_level_a_document_states_is_checked() {
 fn a_document_above_the_level_stays_strict_about_what_it_knows() {
     for refused in [
         // An unknown field inside a known section.
-        r#"{"version": 3, "level": 2, "ceilings": {"session_limt": 4}}"#,
-        r#"{"version": 3, "level": 2, "voice": {"broker_origin": null, "x": 1}}"#,
+        r#"{"version": 4, "level": 2, "ceilings": {"session_limt": 4}}"#,
+        r#"{"version": 4, "level": 2, "voice": {"broker_origin": null, "x": 1}}"#,
         // A misspelling, a different case, a different separator, a transposition.
-        r#"{"version": 3, "level": 2, "ceilngs": {"session_limit": 4}}"#,
-        r#"{"version": 3, "level": 2, "Ceilings": {"session_limit": 4}}"#,
-        r#"{"version": 3, "level": 2, "default-profile": "review"}"#,
-        r#"{"version": 3, "level": 2, "descriptoins": {}}"#,
+        r#"{"version": 4, "level": 2, "ceilngs": {"session_limit": 4}}"#,
+        r#"{"version": 4, "level": 2, "Ceilings": {"session_limit": 4}}"#,
+        r#"{"version": 4, "level": 2, "default-profile": "review"}"#,
+        r#"{"version": 4, "level": 2, "descriptoins": {}}"#,
         // A field written at the top level instead of inside its section.
-        r#"{"version": 3, "level": 2, "session_limit": 4}"#,
-        r#"{"version": 3, "level": 2, "package_bytes": 1}"#,
+        r#"{"version": 4, "level": 2, "session_limit": 4}"#,
+        r#"{"version": 4, "level": 2, "package_bytes": 1}"#,
     ] {
         let loaded = load_in(Some(refused.as_bytes()), &R1);
         assert_eq!(loaded.status.state, DocumentState::Invalid, "{refused}");
@@ -415,7 +415,7 @@ fn a_document_above_the_level_stays_strict_about_what_it_knows() {
 
     // The detail names the known name in this build's own word and the member only by its length.
     let loaded = load_in(
-        Some(br#"{"version": 3, "level": 2, "ceilngs": {"session_limit": 4}}"#),
+        Some(br#"{"version": 4, "level": 2, "ceilngs": {"session_limit": 4}}"#),
         &R1,
     );
     let said = loaded.status.detail.as_str();
@@ -424,7 +424,7 @@ fn a_document_above_the_level_stays_strict_about_what_it_knows() {
 
     // A member that is not near any name is a section of a newer release.
     let newer = load_in(
-        Some(br#"{"version": 3, "level": 2, "telemetry_events": {"enabled": true}}"#),
+        Some(br#"{"version": 4, "level": 2, "telemetry_events": {"enabled": true}}"#),
         &R1,
     );
     assert_eq!(
@@ -439,7 +439,7 @@ fn a_document_above_the_level_stays_strict_about_what_it_knows() {
     );
 
     // A near miss is found among many members, though it sorts after the sixteen names kept.
-    let mut crowded = serde_json::json!({"version": 3, "level": 2});
+    let mut crowded = serde_json::json!({"version": 4, "level": 2});
     for index in 0..20 {
         crowded[format!("aa_telemetry_{index:02}")] = serde_json::json!({});
     }
@@ -449,14 +449,14 @@ fn a_document_above_the_level_stays_strict_about_what_it_knows() {
 
     // A guard: below the level, a misspelt member is refused as it always was.
     let loaded = load_in(
-        Some(br#"{"version": 3, "ceilngs": {"session_limit": 4}}"#),
+        Some(br#"{"version": 4, "ceilngs": {"session_limit": 4}}"#),
         &R1,
     );
     assert_eq!(loaded.status.state, DocumentState::Invalid);
 
     // A section the release lists above its level is refused whenever it is present, held or not.
     let loaded = load_in(
-        Some(br#"{"version": 3, "voice": {"broker_origin": null}}"#),
+        Some(br#"{"version": 4, "voice": {"broker_origin": null}}"#),
         &R1_LISTING,
     );
     assert_eq!(
@@ -473,7 +473,7 @@ fn a_document_above_the_level_stays_strict_about_what_it_knows() {
 fn the_names_a_report_keeps_are_bounded_and_printable() {
     // The names that cannot be kept sort first, so a rule that kept them would put them among the
     // sixteen; the others sort after.
-    let mut value = serde_json::json!({"version": 3, "level": 2});
+    let mut value = serde_json::json!({"version": 4, "level": 2});
     for index in 0..18 {
         value[format!("zq_telemetry_{index:02}")] = serde_json::json!({});
     }
@@ -685,7 +685,7 @@ fn a_selected_feed_survives_the_file_and_the_registrys_copy() {
     );
 
     // The section is as strict as any other: a field it does not declare refuses the document.
-    let stray = br#"{"version": 3, "level": 2, "authority": {"origin": "https://reach.example.com", "relay": 1}}"#;
+    let stray = br#"{"version": 4, "level": 2, "authority": {"origin": "https://reach.example.com", "relay": 1}}"#;
     assert_eq!(
         load_in(Some(stray), &THIS_RELEASE).status.state,
         DocumentState::Invalid
@@ -826,7 +826,7 @@ fn a_selected_mailbox_survives_the_file_and_the_registrys_copy() {
     );
 
     // The section is as strict as any other: a field it does not declare refuses the document.
-    let stray = br#"{"version": 3, "level": 3, "mailbox": {"origin": "https://reach.example.com", "relay": 1}}"#;
+    let stray = br#"{"version": 4, "level": 3, "mailbox": {"origin": "https://reach.example.com", "relay": 1}}"#;
     assert_eq!(
         load_in(Some(stray), &THIS_RELEASE).status.state,
         DocumentState::Invalid
@@ -962,12 +962,12 @@ fn a_selected_relay_survives_the_file_and_the_registrys_copy() {
     );
 
     // The section is as strict as any other: a field it does not declare refuses the document.
-    let stray = br#"{"version": 3, "level": 4, "relay": {"origin": "https://reach.example.com", "region": "eu"}}"#;
+    let stray = br#"{"version": 4, "level": 4, "relay": {"origin": "https://reach.example.com", "region": "eu"}}"#;
     assert_eq!(
         load_in(Some(stray), &THIS_RELEASE).status.state,
         DocumentState::Invalid
     );
-    let stray = br#"{"version": 3, "level": 4, "relay": {"origin": "https://reach.example.com", "payer": {"account_id": "0b0c4a1e-2f6a-4a7c-9b7e-5d1f3c2a8e41", "authorisation_id": "7c1d9e52-3b4f-4d86-a0c2-91e5f6b73d08", "ceiling": 1}}}"#;
+    let stray = br#"{"version": 4, "level": 4, "relay": {"origin": "https://reach.example.com", "payer": {"account_id": "0b0c4a1e-2f6a-4a7c-9b7e-5d1f3c2a8e41", "authorisation_id": "7c1d9e52-3b4f-4d86-a0c2-91e5f6b73d08", "ceiling": 1}}}"#;
     assert_eq!(
         load_in(Some(stray), &THIS_RELEASE).status.state,
         DocumentState::Invalid
@@ -1107,8 +1107,8 @@ fn a_named_suite_survives_the_file_and_the_registrys_copy() {
 
     // The section is as strict as any other: a member it does not declare refuses the document.
     for stray in [
-        r#"{"version": 3, "level": 5, "automation": {"test_suites": {}, "region": "eu"}}"#,
-        r#"{"version": 3, "level": 5, "automation": {"test_suites": {"unit": {"command": "true", "shell": "zsh"}}}}"#,
+        r#"{"version": 4, "level": 5, "automation": {"test_suites": {}, "region": "eu"}}"#,
+        r#"{"version": 4, "level": 5, "automation": {"test_suites": {"unit": {"command": "true", "shell": "zsh"}}}}"#,
     ] {
         assert_eq!(
             load_in(Some(stray.as_bytes()), &THIS_RELEASE).status.state,
@@ -1240,8 +1240,8 @@ fn a_chosen_shell_mode_survives_the_file_and_the_registrys_copy() {
 
     // The section is as strict as any other: a member it does not declare refuses the document.
     for stray in [
-        r#"{"version": 3, "level": 6, "shell": {"mode": "managed", "fallback": true}}"#,
-        r#"{"version": 3, "level": 6, "shell": {"mode": "stock"}}"#,
+        r#"{"version": 4, "level": 6, "shell": {"mode": "managed", "fallback": true}}"#,
+        r#"{"version": 4, "level": 6, "shell": {"mode": "stock"}}"#,
     ] {
         assert_eq!(
             load_in(Some(stray.as_bytes()), &THIS_RELEASE).status.state,
@@ -1391,8 +1391,8 @@ fn a_listed_gateway_survives_the_file_and_the_registrys_copy() {
 
     // The section is as strict as any other.
     for stray in [
-        r#"{"version": 3, "level": 7, "push": {"gateways": [], "fallback": true}}"#,
-        r#"{"version": 3, "level": 7, "push": {"gateways": "https://push.builder.example"}}"#,
+        r#"{"version": 4, "level": 7, "push": {"gateways": [], "fallback": true}}"#,
+        r#"{"version": 4, "level": 7, "push": {"gateways": "https://push.builder.example"}}"#,
     ] {
         assert_eq!(
             load_in(Some(stray.as_bytes()), &THIS_RELEASE).status.state,
@@ -1486,7 +1486,7 @@ fn the_list_of_gateways_is_refused_by_name_when_an_entry_is_not_an_allowed_origi
     }
 
     // The control: the same document with allowed origins is read.
-    let accepted = r#"{"version": 3, "level": 7, "push": {"gateways": ["https://push.builder.example", "http://127.0.0.1:8788"]}}"#;
+    let accepted = r#"{"version": 4, "level": 7, "push": {"gateways": ["https://push.builder.example", "http://127.0.0.1:8788"]}}"#;
     assert_eq!(
         load_in(Some(accepted.as_bytes()), &THIS_RELEASE)
             .status
@@ -1495,8 +1495,8 @@ fn the_list_of_gateways_is_refused_by_name_when_an_entry_is_not_an_allowed_origi
     );
     // A level below the section's is refused by name, an empty list included.
     for low in [
-        r#"{"version": 3, "level": 6, "push": {"gateways": ["https://push.builder.example"]}}"#,
-        r#"{"version": 3, "push": {"gateways": []}}"#,
+        r#"{"version": 4, "level": 6, "push": {"gateways": ["https://push.builder.example"]}}"#,
+        r#"{"version": 4, "push": {"gateways": []}}"#,
     ] {
         let loaded = load_in(Some(low.as_bytes()), &THIS_RELEASE);
         assert_eq!(loaded.status.state, DocumentState::Invalid, "{low}");

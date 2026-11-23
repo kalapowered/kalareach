@@ -220,7 +220,8 @@ async fn a_daemon_refuses_to_start_over_an_accepted_copy_it_cannot_read() {
     let readable = fixture("version-5.json");
     let empty = Value::Object(serde_json::Map::new());
     let mut copies: Vec<(String, String)> = Vec::new();
-    for (name, member) in [("version-4-limits.json", "limits")] {
+    {
+        let (name, member) = ("version-4-limits.json", "limits");
         copies.push((format!("{member} set"), fixture(name)));
         copies.push((
             format!("{member} null"),
