@@ -2067,11 +2067,13 @@ fn provenance_on_the_wire(answer: &kr_protocol::envelope::ParamsValue) -> Option
 }
 
 /// KR-REQ-12.09: the answer to a write and to an interrupt records that the action reached the
-/// application as terminal input, which proves bytes were written and never that the application
-/// took them as a typed answer. A release acts on the lease alone and records no provenance.
+/// application as terminal input, the route the action took and never a typed answer. A release
+/// acts on the lease alone and records no provenance.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_answers_to_a_write_and_an_interrupt_say_terminal_input_and_a_release_says_nothing() {
-    let wired = wired("stty raw -echo; printf 'kr-ready.'; exec cat").await;
+    // The root program ignores the interrupt, which `exec` keeps for `cat`: an interrupt that ended
+    // the program would end the session, and the release below would race that end.
+    let wired = wired("stty raw -echo; trap '' INT; printf 'kr-ready.'; exec cat").await;
     retained_within(&wired.runtime, b"kr-ready.", LIVENESS_DEADLINE).await;
     let mut client = LocalClient::connect(&wired.endpoint, LocalClientKind::Cli, build())
         .await
@@ -2141,13 +2143,6 @@ async fn the_answers_to_a_write_and_an_interrupt_say_terminal_input_and_a_releas
         "the interrupt keeps the lease"
     );
 
-    // The lease is taken again after the interrupt, and the release is made at that epoch: a release
-    // at the epoch from before the interrupt is refused as `LEASE_LOST`.
-    let epoch = acquire_over(&mut client, &wired, attachment_id)
-        .await
-        .expect("acquires again")
-        .lease
-        .epoch;
     let released = client
         .mutate(
             Method::InputRelease,
