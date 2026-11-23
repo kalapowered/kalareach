@@ -1351,7 +1351,9 @@ async fn a_host_that_cannot_be_covered_as_it_stands_is_left_alone_and_nothing_is
 /// from being asked, and holds back every other write until it is ended. Where the service cannot
 /// be asked when the application starts, the write stays lost across the restart and the person
 /// settles it; where it can be asked, the start of the application ends it with no action by the
-/// person. A host that does not say how its setup ended is no evidence either.
+/// person, whether or not the oldest retained level can read the settings member: ending a lost
+/// write fences a request and reads a bundle, and writes no member. A host that does not say how
+/// its setup ended is no evidence either.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_write_whose_answer_was_lost_blocks_the_next_until_it_is_settled() {
     // A window that outlasts the case: a step that fails is not tried again inside it.
@@ -1360,8 +1362,11 @@ async fn a_write_whose_answer_was_lost_blocks_the_next_until_it_is_settled() {
         window: Duration::from_secs(60),
     };
     for (moment, landed) in [(Moment::After, true), (Moment::Before, false)] {
-        for available in [false, true] {
-            let label = format!("{moment:?}, the service can be asked at start: {available}");
+        for (available, gate) in [(false, OPEN), (true, OPEN), (false, CLOSED), (true, CLOSED)] {
+            let label = format!(
+                "{moment:?}, the service can be asked at start: {available}, the oldest retained \
+                 level 0.{gate}"
+            );
             let computer = Computer::new().await;
             let page = computer.page().await;
             page.call("recovery_turn_on", json!({})).expect("on");
@@ -1391,7 +1396,7 @@ async fn a_write_whose_answer_was_lost_blocks_the_next_until_it_is_settled() {
                 // The first request of the start step fails before the service sees it.
                 computer.served.web().fail(SYNC_PATH, 1, Moment::Before);
             }
-            let (page, _) = computer.running_page(timing).await;
+            let (page, _) = computer.running_page_at(timing, level(gate)).await;
             if available {
                 assert!(
                     until(Duration::from_secs(10), || async {
@@ -1465,6 +1470,54 @@ async fn a_write_whose_answer_was_lost_blocks_the_next_until_it_is_settled() {
         .expect_err("no answer from the host");
     assert_eq!(unknown.code, ErrorCode::OutcomeUnknown);
     assert_eq!(silent.setups_sent().len(), 1, "the host was asked once");
+}
+
+/// KR-REQ-20.15: the first write of all, whose answer was lost, is ended by the application's start
+/// with no action by the person, like any other write that was lost: recovery is then on if the write
+/// landed, and ready to be turned on if it did not, and the step wrote nothing of its own. The oldest
+/// retained level does not change this.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_lost_first_write_is_ended_by_the_start_with_no_action_by_the_person() {
+    let timing = SettingsTiming {
+        quiet: Duration::ZERO,
+        window: Duration::from_secs(60),
+    };
+    for (moment, landed) in [(Moment::After, true), (Moment::Before, false)] {
+        for gate in [OPEN, CLOSED] {
+            let label = format!("{moment:?}, the oldest retained level 0.{gate}");
+            let computer = Computer::new().await;
+            let page = computer.page().await;
+            computer.served.web().fail(SYNC_PATH, 1, moment);
+            let lost = page
+                .call("recovery_turn_on", json!({}))
+                .expect_err("no answer");
+            assert_eq!(lost["code"], "OUTCOME_UNKNOWN", "{label}");
+            assert_eq!(page.view()["state"], "unsettled", "{label}");
+
+            drop(page);
+            let sent = writes_sent(&computer);
+            let (page, _) = computer.running_page_at(timing, level(gate)).await;
+            let expected = if landed { "on" } else { "unfinished" };
+            assert!(
+                until(Duration::from_secs(10), || async {
+                    page.view()["state"] == expected
+                })
+                .await,
+                "{label}: the start ended the first write with no action by the person, and the \
+                 card says {}",
+                page.view()["state"]
+            );
+            assert_eq!(
+                writes_sent(&computer),
+                sent,
+                "{label}: the step wrote nothing of its own"
+            );
+            if !landed {
+                let on = page.call("recovery_turn_on", json!({})).expect("on");
+                assert_eq!(on["state"], "on", "{label}");
+            }
+        }
+    }
 }
 
 /// The QR code a saved kit draws, as a viewer shows it and a scanner reads it: the whole file is

@@ -11,12 +11,12 @@
 //! # The order of a step
 //!
 //! A step takes the recovery lock and then, in this order: ends any write of the bundle whose
-//! answer never came back (a cover's too, so a person is never asked to settle what a step can
-//! end); ends if the person turned saving off; ends if the one eligibility deadline has not
-//! passed; reads the settings file now, never a value captured earlier; fetches the bundle,
-//! compares, and writes. A write of the step's own that gets no answer is ended at once. The line
-//! the page shows says "saved" only after a write the service confirmed or a read of the bundle
-//! that holds the same settings.
+//! answer never came back (a cover's too, and the first write of all, so a person is never asked
+//! to settle what a step can end); ends if the writer's level is closed; ends if the person
+//! turned saving off; ends if the one eligibility deadline has not passed; reads the settings file
+//! now, never a value captured earlier; fetches the bundle, compares, and writes. A write of the
+//! step's own that gets no answer is ended at once. The line the page shows says "saved" only
+//! after a write the service confirmed or a read of the bundle that holds the same settings.
 //!
 //! # The writer's level
 //!
@@ -25,10 +25,11 @@
 //! step writes the member while the oldest level its release retains is below
 //! [`SETTINGS_READ_FROM`], the first level whose builds read it. [`Recovery::save_settings_from`]
 //! takes that level as an input, and while it is below, the first bundle carries no member, a step
-//! does nothing and the page is told nothing of saving. The gate binds the saving step and nothing
-//! the person does: restoring a member that a later build wrote, listing the member the bundle
-//! holds and removing it do not depend on it. The gate opens by itself when a release retains a
-//! level that reads the member.
+//! writes nothing and the page is told nothing of saving. The gate binds the writing of the member
+//! and nothing the person does: restoring a member that a later build wrote, listing the member
+//! the bundle holds and removing it do not depend on it. Nor does it bind the end of a lost write,
+//! which fences a request and reads a bundle and writes no member, so a step ends one whatever the
+//! level. The gate opens by itself when a release retains a level that reads the member.
 //!
 //! # When a step runs
 //!
@@ -163,11 +164,12 @@ pub enum SettingsRemoved {
 /// What one step came to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SettingsStep {
-    /// Nothing to do, and nothing was asked of the service: saving has no source or the writer's
-    /// level is closed, recovery is not on, or the account cannot be used now.
+    /// Nothing more to do, and no settings were asked of the service: saving has no source,
+    /// recovery is not on, or the account cannot be used now; or a write whose answer was lost was
+    /// ended and the writer's level is closed, or the first write of all did not land.
     Idle,
-    /// The eligibility deadline is ahead, so nothing was asked of the service. The step is wanted
-    /// again at `until`.
+    /// The eligibility deadline is ahead, so the settings were not asked of the service (a lost
+    /// write may have been ended before it was found). The step is wanted again at `until`.
     Deferred {
         /// When the deadline passes.
         until: Instant,
@@ -240,6 +242,11 @@ impl Saving {
             .get()
             .filter(|saves| saves.open)
             .map(|saves| &saves.source)
+    }
+
+    /// What saving is given, whether or not the writer's level is open.
+    fn given(&self) -> Option<&Saves> {
+        self.source.get()
     }
 
     /// Whether the writer's level lets saving write or remove the member.
@@ -495,32 +502,50 @@ impl Recovery {
         step: &Step<'_>,
         account: &Account,
     ) -> std::result::Result<SettingsStep, NotSavedWhy> {
-        let Some(source) = self.saving.writer() else {
+        let Some(saves) = self.saving.given() else {
             return Ok(SettingsStep::Idle);
         };
-        let record = match self.record() {
-            Ok(Some(record)) if record.kept => record,
-            Ok(_) => return Ok(SettingsStep::Idle),
+        let mut record = match self.record() {
+            Ok(Some(record)) => record,
+            Ok(None) => return Ok(SettingsStep::Idle),
             Err(_) => return Err(NotSavedWhy::Records),
         };
         let origin = record.origin().map_err(|_| NotSavedWhy::Records)?;
         if blocker(account, &origin).is_some() {
             return Ok(SettingsStep::Idle);
         }
-        let seed = self.seed(false).map_err(|_| NotSavedWhy::Seed)?;
         let mut store = self
             .store(&record, account)
             .map_err(|_| NotSavedWhy::Records)?;
-        // Any write whose answer never came back is ended first, whoever sent it: nothing else
-        // can be written until it is, and a step that can end it should not leave it to a person.
-        // A service that cannot be asked leaves it outstanding, which the card says.
-        if matches!(store.lost_write(), Some(LostWrite::Unsettled { .. }))
-            && store.end_lost_write(&seed).await.is_err()
-        {
-            return Err(NotSavedWhy::Service);
+        // Any write whose answer never came back is ended first, whoever sent it and the first
+        // write of all too: nothing else can be written until it is, and a step that can end it
+        // should not leave it to a person. Ending it fences a request and reads a bundle and writes
+        // no member, so the writer's level does not bind it, and the seed is read only when there
+        // is a write to end or a member to write. A service that cannot be asked leaves it
+        // outstanding, which the card says.
+        let outstanding = matches!(store.lost_write(), Some(LostWrite::Unsettled { .. }));
+        if !outstanding && !(saves.open && record.kept) {
+            return Ok(SettingsStep::Idle);
         }
-        // Only then: a person who turned saving off has the member taken out and nothing written
-        // back, by a step of whichever trigger had already begun.
+        let seed = self.seed(false).map_err(|_| NotSavedWhy::Seed)?;
+        if outstanding {
+            match store.end_lost_write(&seed).await {
+                // The first write of all landed: recovery is on, as when the person settles it.
+                Ok(Some(LostWrite::Applied)) if !record.kept => {
+                    record.kept = true;
+                    self.keep(&record).map_err(|_| NotSavedWhy::Records)?;
+                }
+                Ok(_) => {}
+                Err(_) => return Err(NotSavedWhy::Service),
+            }
+        }
+        // Only then the writer's level, and the first write of all that did not land: a step has
+        // nothing to write for either.
+        if !saves.open || !record.kept {
+            return Ok(SettingsStep::Idle);
+        }
+        // Then: a person who turned saving off has the member taken out and nothing written back,
+        // by a step of whichever trigger had already begun.
         if record.settings_stopped {
             return Ok(SettingsStep::Ended {
                 line: self.saving.say(SettingsLine::Stopped),
@@ -534,7 +559,9 @@ impl Recovery {
         {
             return Ok(SettingsStep::Deferred { until });
         }
-        let outcome = store.save_settings(&seed, source.chosen(), now()).await;
+        let outcome = store
+            .save_settings(&seed, saves.source.chosen(), now())
+            .await;
         let (line, reached, retry) = match outcome {
             Ok(SettingsSaved::AlreadySaved) => (SettingsLine::Saved, false, false),
             Ok(SettingsSaved::Saved { .. }) => (SettingsLine::Saved, true, false),
