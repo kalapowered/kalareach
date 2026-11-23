@@ -278,12 +278,15 @@ async fn the_read_check_reads_the_file_a_person_names_and_a_run_with_no_session_
     assert_eq!(found["checks"]["state"], "current", "{found}");
     let (state, reason) = record_of(&found, READ);
     assert_eq!(state, "qualified_available", "{found}");
-    assert!(reason.contains("23 bytes"), "{reason}");
+    assert!(reason.contains("it read 23 bytes"), "{reason}");
 
-    // A path relative to the directory the person runs the command in is the file they meant.
-    std::fs::write(directory.join("relative.txt"), b"seven b").expect("the file");
+    // A path relative to the directory the person runs the command in is the file they meant, which
+    // is not the directory the session works in.
+    let nearby = directory.join("nearby");
+    std::fs::create_dir(&nearby).expect("the directory the person runs the command in");
+    std::fs::write(nearby.join("relative.txt"), b"seven b").expect("the file");
     let output = host.kr_in(
-        &directory,
+        &nearby,
         &["host", "desktop-checks", "--file", "relative.txt", "--json"],
     );
     assert!(
@@ -294,23 +297,31 @@ async fn the_read_check_reads_the_file_a_person_names_and_a_run_with_no_session_
     let found: Value = serde_json::from_slice(&output.stdout).expect("kr printed JSON");
     let (state, reason) = record_of(&found, READ);
     assert_eq!(state, "qualified_available", "{found}");
-    assert!(reason.contains("7 bytes"), "{reason}");
+    assert!(reason.contains("it read 7 bytes"), "{reason}");
 
     // With no file the read check reads nothing.
     let none = host.kr_json(&["host", "desktop-checks", "--json"]);
     assert_eq!(none["checks"]["state"], "current", "{none}");
-    let (state, _) = record_of(&none, READ);
+    let (state, reason) = record_of(&none, READ);
     assert_ne!(state, "qualified_available", "{none}");
+    assert!(reason.contains("no file was nominated"), "{reason}");
 
     // Said to a person, the findings follow a heading, a line to each check.
     let output = host.kr_in(
-        &directory,
+        &nearby,
         &["host", "desktop-checks", "--file", "relative.txt"],
     );
     assert!(
         output.status.success(),
         "{}",
         String::from_utf8_lossy(&output.stderr)
+    );
+    // While the run goes, standard error says so.
+    let progress = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        progress.contains("The checks are running in a session's worker")
+            && progress.contains("they can take about two minutes"),
+        "{progress}"
     );
     let said = String::from_utf8_lossy(&output.stdout);
     assert!(said.starts_with("Disclosed desktop checks"), "{said}");
