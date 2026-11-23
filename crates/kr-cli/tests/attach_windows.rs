@@ -2699,6 +2699,9 @@ const ENABLE_VIRTUAL_TERMINAL_INPUT: u32 = 0x0200;
 /// The console's input mode flag that has a read return a whole line.
 const ENABLE_LINE_INPUT: u32 = 0x0002;
 
+/// The console's input mode flag that has it report a change of its window's size as a record.
+const ENABLE_WINDOW_INPUT: u32 = 0x0008;
+
 /// KR-REQ-08.56: the console an attachment runs in spells its keys while the session's application
 /// has bracketed paste on and reports its keys as records again once it turns it off, so that a key
 /// coming up is a record then; and the console is given back in the modes it had, however many
@@ -2711,7 +2714,8 @@ const ENABLE_LINE_INPUT: u32 = 0x0002;
 /// each once a file exists, and, between the first two, reads four events with the console's own
 /// call, key releases included. The test, outside, writes Shift going down, a letter going down and
 /// coming up and Shift coming up to the console the command runs in, and closes the session while
-/// bracketed paste is on.
+/// bracketed paste is on. The mode the probe reads back while the keys are spelled has the mouse and
+/// window flags as the console had them, and has neither of them once the keys are records again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_console_spells_its_keys_while_bracketed_paste_is_on_and_is_given_back_as_it_was() {
     const NAME: &str =
@@ -2848,6 +2852,25 @@ async fn the_console_spells_its_keys_while_bracketed_paste_is_on_and_is_given_ba
         again.0 & ENABLE_VIRTUAL_TERMINAL_INPUT,
         0,
         "the console did not spell its keys when bracketed paste was turned on again: {again:x?}"
+    );
+    let kept = ENABLE_MOUSE_INPUT | ENABLE_WINDOW_INPUT;
+    assert_eq!(
+        spelled.0 & kept,
+        before.0 & kept,
+        "the mouse and window flags the console spells its keys with are not the ones it had \
+         (before {before:x?}, spelled {spelled:x?})"
+    );
+    assert_eq!(
+        again.0 & kept,
+        before.0 & kept,
+        "the mouse and window flags the console spells its keys with the second time are not the \
+         ones it had (before {before:x?}, again {again:x?})"
+    );
+    assert_eq!(
+        records.0 & kept,
+        0,
+        "the console reports its keys as records with the mouse or window flag on, which asks for \
+         records nobody reads: {records:x?}"
     );
     assert_eq!(
         after, before,
