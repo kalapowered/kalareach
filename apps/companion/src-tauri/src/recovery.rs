@@ -1183,14 +1183,21 @@ fn refuse_if_blocked(account: &Account, used: &GatewayOrigin, named: Named) -> R
                  cannot be read. Sign in to {}, then try again",
                 host_of(used)
             ),
-            Named::BySetting | Named::ByRecord | Named::ByKit => {
+            Named::ByKit => format!("sign in to {}, then restore again", host_of(used)),
+            Named::BySetting | Named::ByRecord => {
                 "sign in before turning recovery on: it keeps its bundle with the account"
                     .to_owned()
             }
         })),
-        Some(Blocker::NeedsSignIn) => Err(CommandError::refused(
-            "this sign-in does not let KalaReach keep recovery data. Sign in again to allow it",
-        )),
+        Some(Blocker::NeedsSignIn) => Err(CommandError::refused(match named {
+            Named::ByKit => {
+                "this sign-in does not let KalaReach read your recovery bundle. Sign in again to \
+                 allow it, then restore again"
+            }
+            Named::BySetting | Named::ByRecord | Named::ByListing => {
+                "this sign-in does not let KalaReach keep recovery data. Sign in again to allow it"
+            }
+        })),
         Some(Blocker::WrongService {
             sync_service,
             account,

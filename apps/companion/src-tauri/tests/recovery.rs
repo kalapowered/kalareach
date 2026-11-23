@@ -5436,6 +5436,55 @@ async fn a_kit_for_another_service_than_the_one_signed_in_is_refused_before_anyt
     );
 }
 
+/// KR-REQ-20.17: a restore from the account that cannot use the account says what to do for a
+/// restore: sign in at the kit's service, or sign in again to allow the read. It never tells the
+/// person to turn recovery on, which would take the restore card away from the device, and nothing
+/// is sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_restore_that_cannot_use_the_account_says_what_a_restore_needs() {
+    let (computer, _out, kit_path, _) = computer_with_saved_mode(ColourMode::Dark).await;
+    let page = computer.page().await;
+    let (_directory, fresh) = fresh_device();
+    let ours = host_of(computer.served.origin());
+    let origin = computer.origin();
+    let requests = computer.served.web().arrived().len();
+    for (signed, words) in [
+        (
+            account(&origin, None).await,
+            format!("sign in to {ours}, then restore again"),
+        ),
+        (
+            account(&origin, Some(&[])).await,
+            "this sign-in does not let KalaReach read your recovery bundle. Sign in again to \
+             allow it, then restore again"
+                .to_owned(),
+        ),
+    ] {
+        let refused = page
+            .recovery
+            .restore_settings_with(
+                &Chooses::answering(vec![Some(kit_path.clone())]),
+                &signed,
+                &fresh,
+                false,
+            )
+            .await
+            .expect_err("the account cannot be used");
+        assert_eq!(refused.message, words);
+        assert!(
+            !refused.message.contains("turning recovery on"),
+            "{}",
+            refused.message
+        );
+    }
+    assert_eq!(fresh.local().chosen_colour_mode(), None);
+    assert_eq!(
+        computer.served.web().arrived().len(),
+        requests,
+        "nothing was sent"
+    );
+}
+
 /// KR-REQ-20.17: what a restore finds in a bundle that holds no usable settings is an answer of its
 /// own, and a settings member that holds only values this build does not read is one the page says
 /// cannot be used, not an empty bundle.
