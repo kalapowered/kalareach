@@ -979,9 +979,10 @@ impl Prepared {
 }
 
 /// KR-REQ-26.03: the first command of a package manager's `kr` brings a host that
-/// runs the release before to this release. The release before knows nothing of package managers,
-/// so what is offered it is what it takes of any update, a release archive; it checks the release
-/// and switches as it does for one a person names, and the manager is recorded.
+/// runs the release before to this release. This release's `kr` offers its release to the `kr` of
+/// the release before as what every release takes of an update, a release archive
+/// (`kr host update --archive`); that `kr` checks the release and switches as it does for one a
+/// person names, and the manager is recorded.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_package_managers_first_command_updates_a_host_on_the_release_before() {
     struct Writable(PathBuf);
@@ -2192,11 +2193,10 @@ async fn a_device_at_the_door_of_the_updated_host_meets_the_worker_of_the_releas
 /// this release takes a remote dispatch lease for, is performed by the worker of the release
 /// before.
 ///
-/// That worker reads no lease and holds the daemon's deadline and the revision its grant was
-/// checked at, so the daemon sends it the frame it read before this release and not the lease: a
-/// frame that carried one is refused by name at that level and nothing is sent. The device attaches
-/// to the session through the updated daemon, and the worker, which is the process it was
-/// throughout, admits the attachment.
+/// That worker reads the lease: the frame the daemon sends it carries the lease and the daemon's
+/// deadline, and the worker anchors both on its own clock. The device attaches to the session
+/// through the updated daemon, and the worker, which is the process it was throughout, admits the
+/// attachment.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_mutation_of_a_paired_device_is_performed_by_the_worker_of_the_release_before_through_the_daemon_of_this_release()
  {
@@ -4038,9 +4038,9 @@ async fn the_release_before_reads_the_journal_of_a_command_session_this_release_
 }
 
 /// KR-REQ-26.10, KR-REQ-26.08, KR-REQ-25.25: a session of this release keeps when its output was
-/// produced in a store of its own beside the spool, which the release before does not name. A
+/// produced in a store of its own beside the spool, which the release before names too. A
 /// rollback leaves that store where it is, and the release before reads the session's output from
-/// its spool by its own rules: the bytes and the file its `kr export` writes are all there.
+/// its spool: the bytes and the file its `kr export` writes are all there.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_rollback_leaves_the_record_of_when_output_was_produced_and_the_release_before_exports_the_output()
  {
@@ -4431,12 +4431,13 @@ async fn a_stored_apply_node_is_admitted_across_an_update_and_a_rollback() {
     drop(owner);
 }
 
-/// KR-REQ-23.24: the hold a voice start leaves is a store of its own that the release before does
-/// not name. A rollback to the release before is not refused, and it leaves the store as it was,
-/// unread: the release before serves the same device. An update again opens the store, finds the
-/// row as it was left, and the host holds the device under the same action until the same moment.
+/// KR-REQ-23.24: the hold a voice start leaves is a store of its own that the release before names
+/// too, and its daemon opens it at its start. A rollback to the release before is not refused: the
+/// release before opens the store, leaves it as it was, byte for byte, and serves the same device.
+/// An update again opens the store, finds the row as it was left, and the host holds the device
+/// under the same action until the same moment.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_voice_start_hold_the_release_before_ignores_is_kept_across_a_rollback_and_an_update() {
+async fn a_voice_start_hold_is_kept_across_a_rollback_and_an_update() {
     use kr_controller::voice_start_holds::{Decision, Record, VOICE_START_HOLDS_RECORD};
 
     let mut updated = Updated::on_the_network().await;
@@ -4491,7 +4492,8 @@ async fn a_voice_start_hold_the_release_before_ignores_is_kept_across_a_rollback
     // while it starts is compared with this one, and not with what it left once it was running.
     let before = standing("before the rollback");
 
-    // The rollback is not refused, and the release before serves the device and leaves the store.
+    // The rollback is not refused, and the release before opens the store at its start, serves the
+    // device and leaves the store.
     let (output, said) = host.kr_json(&["host", "rollback", "--json"]);
     assert_eq!(
         output.status.code(),
@@ -4507,7 +4509,7 @@ async fn a_voice_start_hold_the_release_before_ignores_is_kept_across_a_rollback
     let left = std::fs::read(&file).expect("the store is still there");
     door.is_served_again()
         .await
-        .expect("the release before does not read the store, and serves the device");
+        .expect("the release before opens the store at its start, and serves the device");
     assert_eq!(
         std::fs::read(&file).expect("the store is still there"),
         left,
@@ -4575,8 +4577,8 @@ async fn a_rollback_leaves_the_record_of_a_restored_policy_and_an_update_again_w
     door.is_served_again()
         .await
         .expect("the control: with no wait standing the owner device is served");
-    // A device the wait will owe: the record lists it, and the release before knows nothing of the
-    // list.
+    // A device the wait will owe: the record lists it, and the release before reads and keeps the
+    // list too.
     let guest = door
         .pair_a_guest(&endpoint, updated.host.tree.environment_id(), "A guest")
         .await;
@@ -5213,11 +5215,12 @@ async fn a_report_store_the_release_before_keeps_too_is_kept_across_a_rollback_a
 /// for a prompt. After the update again the record still names its session, and a prompt under
 /// another binding revision is refused and removes nothing.
 ///
-/// The release before is one of this level built before the binding revision had a store of its own:
-/// its manifest lists no such store and reads the transfers journal at version 5, no higher, which
-/// is what makes a rollback to it state the limit of a draft's prompt record (`draft_limit`). The
-/// release this suite runs as the release before lists that store, and a rollback to it states no
-/// limit, as the case after this one shows.
+/// The release before is made as one of this level built before the binding revision had a store of
+/// its own: its programs are the predecessor's, and its manifest, which is all the update check
+/// reads, lists no such store and reads the transfers journal at version 5, no higher. That is what
+/// makes a rollback to it state the limit of a draft's prompt record (`draft_limit`). The release
+/// this suite runs as the release before lists that store, and a rollback to it states no limit, as
+/// the case after this one shows.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_rollback_keeps_a_draft_written_for_an_application_and_its_binding_revision_for_the_update_again()
  {

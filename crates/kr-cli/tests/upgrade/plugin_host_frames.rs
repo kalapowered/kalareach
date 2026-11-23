@@ -309,9 +309,9 @@ fn a_host_said_why_it_could_not_start(jobs: &std::path::Path, socket_name: &str)
 
 /// A plugin host of this build, started by the daemon of the release before in a layout that has no
 /// store, whose endpoint has a file on it, does not hang the daemon: the host sends the frame that
-/// says why it could not start, the launcher of the release before keeps a frame it does not know
-/// as a refusal, and the pair ends as it did before the frame existed. No host is published, the
-/// daemon goes on serving, and the session's worker is the one it was.
+/// says why it could not start, the launcher of the release before reads it as the host's reason
+/// and ends its wait, and the host ends with the connection. No host is published, the daemon goes
+/// on serving, and the session's worker is the one it was.
 ///
 /// The case shows that the scenario happened: the plugin host of this build is seen to have been
 /// started by the release before's launcher (it leaves its reason in a job's diagnostics), and is
@@ -374,9 +374,9 @@ async fn a_host_that_cannot_bind_beside_the_daemon_of_the_release_before_leaves_
     arguments.push(programs.join("kr-worker").display().to_string());
     let arguments: Vec<&str> = arguments.iter().map(String::as_str).collect();
     // The daemon is given the home and working folder of this tree and nothing of this test's
-    // environment, and a folder of its own for its `PATH` that holds Git alone (the release before
-    // starts only with Git found), so it finds no other program of the system by name: every
-    // program it runs but Git is named by its whole path.
+    // environment, and a folder of its own for its `PATH` that holds Git alone, so it finds no
+    // other program of the system by name: every program it runs but Git is named by its whole
+    // path.
     let tools = host.scratch("only-git");
     let git = std::env::var_os("PATH")
         .and_then(|search| {
@@ -410,8 +410,8 @@ async fn a_host_that_cannot_bind_beside_the_daemon_of_the_release_before_leaves_
     let program = start_agent(&host, &terminal, &agent).await;
 
     // The worker asks for the plugin runtime, and the release before's launcher starts this
-    // build's host. The release before's launcher closes the connection when it cannot read the
-    // frame, so the host ends at once and lives for milliseconds: it is seen by what it leaves, the
+    // build's host. The release before's launcher reads the frame and drops the connection, so the
+    // host ends at once and lives for milliseconds: it is seen by what it leaves, the
     // job's diagnostics file, where it writes why it could not start (the service manager's own
     // record of a job's standard error stays after the job). The daemon is watched from the first
     // sight, for longer than the launcher's whole wait.
