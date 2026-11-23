@@ -304,7 +304,8 @@ describe('the store reads the application, and the application is the one that s
         reply(state)
         await cancelling
       }
-      // The application lists the upload as failed, in a reply to a read that began before the cancel.
+      // The application lists the upload as paused (the state the fake keeps after a retained
+      // refusal), in a reply to a read that began before the cancel.
       replies[0]?.resolve(await real())
       await failed
       expect(uploads.snapshot().get('k-10')?.phase).toEqual(expected)
