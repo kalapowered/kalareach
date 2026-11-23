@@ -1252,6 +1252,11 @@ impl BundleStore {
         if !is_a_move_of(&landed.bundle, &current, &destination_key)? {
             return Err(self.source_moved_on());
         }
+        // A migration whose answer came says whether the write left the settings out for want of
+        // room, and a completed one says the same: the member the caller held and the bundle that
+        // landed show it.
+        moved.settings_dropped =
+            bundle.device_settings.is_some() && landed.bundle.device_settings.is_none();
         *bundle = landed.bundle;
         Ok(self.migrated(moved, bundle, landed.position, updated_kit, now_ms))
     }

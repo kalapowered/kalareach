@@ -627,6 +627,10 @@ async fn a_migration_whose_destination_left_the_settings_out_for_want_of_room_is
     assert!(completed.is_ok(), "{:?}", completed.err());
     assert!(fits.bundle.device_settings.is_some(), "the settings stay");
     assert_eq!(fits.bundle.revision.get(), 23);
+    assert!(
+        !fits.destination.settings_dropped(),
+        "nothing was left out, so nothing is said to be"
+    );
 
     // At the bound: the destination wrote the bundle without the settings, and that is the write
     // this migration made.
@@ -647,6 +651,10 @@ async fn a_migration_whose_destination_left_the_settings_out_for_want_of_room_is
     assert!(
         over.bundle.device_settings.is_none(),
         "the caller holds the bundle at the destination, which lacks the settings"
+    );
+    assert!(
+        over.destination.settings_dropped(),
+        "a completed migration says the settings were left out, as a migration that was answered does"
     );
     let at_destination = over
         .destination
