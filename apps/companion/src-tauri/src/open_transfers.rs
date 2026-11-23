@@ -201,7 +201,8 @@ impl Store {
 
     /// Writes the copy of `key` beside its name, and gives it the name while the guard that
     /// `placing` answers is held, until the name is proved durable. `placing` answers none when the
-    /// copy is not to be placed: nothing is left then, and the answer is still `Ok`.
+    /// copy is not to be placed: its staged file is removed, and a restart removes it if the removal
+    /// fails; the answer is still `Ok`.
     fn write_copy<G>(
         &self,
         key: Uuid,
@@ -1477,7 +1478,7 @@ impl Desk {
         let told = outcome
             .wait_for(Option::is_some)
             .await
-            .map_err(|_| CommandError::local_failure("the upload ended without an outcome"))?
+            .map_err(|_| CommandError::local_failure(ENDED_WITHOUT_OUTCOME))?
             .clone();
         match told {
             Some(Outcome::Published(handle)) => Ok(*handle),

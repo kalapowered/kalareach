@@ -391,7 +391,7 @@ export class PairedUploads {
             still()
             const now = this.#rows.get(key)?.phase.kind
             if (now === 'adding') {
-              // The cancel found the file published while the status was read.
+              // The cancel found the file published before the failure, or while the status was read.
               this.#keepPublished(key)
             } else if (now === 'cancelling' || now === 'cancelAsked' || now === 'cancelled') {
               // The person cancelled while the status was read: the cancel has the row, and the
