@@ -1340,7 +1340,7 @@ mod tests {
 
     fn descriptor_of(identity: &HostIdentity, endpoint: &str) -> HostDescriptor {
         HostDescriptor {
-            protocol: kr_protocol::retained::PLUGIN_HOST_PROTOCOL.to_owned(),
+            protocol: HostProtocol::THIS.name.to_owned(),
             environment_id: identity.environment_id(),
             reservation_id: ReservationId::new(kr_protocol::scalars::Uuid::from_bytes([2; 16])),
             endpoint: endpoint.to_owned(),
@@ -1450,7 +1450,7 @@ mod tests {
         let identity = HostIdentity::generate(host.environment_id()).expect("an identity");
         let endpoint = host_endpoint(&environment, &HostProtocol::THIS).expect("an endpoint");
         let descriptor = HostDescriptor {
-            protocol: kr_protocol::retained::PLUGIN_HOST_PROTOCOL.to_owned(),
+            protocol: HostProtocol::THIS.name.to_owned(),
             environment_id: host.environment_id(),
             reservation_id: ReservationId::new(kr_protocol::scalars::Uuid::from_bytes([2; 16])),
             endpoint: endpoint.as_text(),

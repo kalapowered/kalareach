@@ -134,6 +134,22 @@ pub fn record_without_a_table(source: &str) -> Result<String, String> {
 /// reader does not read, more than once, or with an entry that is not a plain string literal.
 #[allow(dead_code)]
 pub fn string_list(source: &str, name: &str) -> Result<Option<Vec<String>>, String> {
+    list_of(source, name, |byte| byte.is_ascii_alphanumeric())
+}
+
+/// As [`string_list`], for a list of protocol names: each entry holds letters, digits, `-` and `/`.
+///
+/// # Errors
+///
+/// As [`string_list`].
+#[allow(dead_code)]
+pub fn name_list(source: &str, name: &str) -> Result<Option<Vec<String>>, String> {
+    list_of(source, name, |byte| {
+        byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'/')
+    })
+}
+
+fn list_of(source: &str, name: &str, plain: fn(u8) -> bool) -> Result<Option<Vec<String>>, String> {
     let code = without_comments(source)?;
     let outside = masked(&code);
     let Some(start) = declaration(&outside, name, &format!("pub const {name}: &[&str] = &["))?
@@ -150,9 +166,7 @@ pub fn string_list(source: &str, name: &str) -> Result<Option<Vec<String>>, Stri
         let text = entry
             .strip_prefix('"')
             .and_then(|rest| rest.strip_suffix('"'))
-            .filter(|text| {
-                !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_alphanumeric())
-            })
+            .filter(|text| !text.is_empty() && text.bytes().all(plain))
             .ok_or_else(|| format!("an entry that is not a plain string literal: {entry}"))?;
         entries.push(text.to_owned());
     }

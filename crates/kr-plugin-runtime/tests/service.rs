@@ -4580,7 +4580,7 @@ async fn kr_req_11_38_an_event_handed_over_is_counted_until_it_is_written_and_a_
             {
                 let body = match request.body {
                     RequestBody::Hello { .. } => ResponseBody::Hello {
-                        protocol: kr_protocol::retained::PLUGIN_HOST_PROTOCOL.to_owned(),
+                        protocol: HostProtocol::THIS.name.to_owned(),
                         descriptor: Box::new(descriptor.clone()),
                     },
                     RequestBody::Verify { nonce } => ResponseBody::Verified(Box::new(

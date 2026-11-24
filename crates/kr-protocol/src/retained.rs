@@ -137,15 +137,16 @@ pub const FROZEN_VARIANTS: &[&str] = &[
     "PluginRuntimeWanted.session_id",
 ];
 
-/// The protocol the plugin host speaks to the workers that register with it.
+/// The protocols the plugin host serves to the workers that register with it, each by its name.
 ///
 /// A worker connects to its environment's plugin host directly, so a daemon of one release can meet
-/// a host of another and a worker of one release a host of another. A host process speaks one
-/// protocol, and the retained levels record this one (`PLUGIN_HOST`): one host serves the workers
-/// of every level, and the control daemon adopts it when it runs and otherwise starts it. A host
-/// and a worker of another protocol refuse each other at the handshake. The third protocol adds
-/// the requests that decode a native request, encode a response and revise a binding's facts and
-/// attachments.
+/// a host of another and a worker of one release a host of another. The retained levels record the
+/// names their builds use (`PLUGIN_HOST`, one name on each line): one host serves the workers of
+/// every level, and the control daemon adopts it when it runs and otherwise starts it. This list
+/// holds every name that a retained level records. A name joins it when a protocol is released and
+/// leaves it only after no retained level records it. A host and a worker that share no name refuse
+/// each other at the handshake. The third protocol adds the requests that decode a native request,
+/// encode a response and revise a binding's facts and attachments.
 ///
 /// Every frame of a released protocol is closed: a request, a response or notice variant, or a
 /// member added to a record after a release exists would meet a host or a worker of the release
@@ -158,7 +159,50 @@ pub const FROZEN_VARIANTS: &[&str] = &[
 /// store, and there a launcher of release `0.78.0+66f10e25ea2d` or later, the release before among
 /// them, reads a frame for its own reservation as the host's reason and ends its wait; a launcher
 /// of an earlier release keeps it as a refusal and waits to its own deadline.
-pub const PLUGIN_HOST_PROTOCOL: &str = "kr-plugin-host/3";
+///
+/// Every entry is a string literal, because the generator reads the list from the source of each
+/// release (`kr-protocol-gen`).
+pub const PLUGIN_HOST_PROTOCOLS: &[&str] = &["kr-plugin-host/3"];
+
+/// The names a `PLUGIN_HOST` record lists: one on each line that holds one.
+#[must_use]
+pub fn host_names(document: &str) -> Vec<&str> {
+    document
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect()
+}
+
+/// The names of `names` that `list` does not hold, in the order of `names`.
+#[must_use]
+pub fn host_names_outside<'a>(names: &[&'a str], list: &[&str]) -> Vec<&'a str> {
+    names
+        .iter()
+        .copied()
+        .filter(|name| !list.contains(name))
+        .collect()
+}
+
+/// What is wrong with the plugin host protocol names a level `recorded`, held against the names
+/// `served` by a build: a level that records none, and each name it records that the build does not
+/// serve. The build may serve more than the level recorded and never fewer.
+#[must_use]
+pub fn host_problems(level: CompatibilityLevel, recorded: &[&str], served: &[&str]) -> Vec<String> {
+    if recorded.is_empty() {
+        return vec![format!("level {level} records no plugin host protocol")];
+    }
+    host_names_outside(recorded, served)
+        .into_iter()
+        .map(|name| {
+            format!(
+                "level {level} kept the plugin host protocol {name}, which this build does not \
+                 serve (it serves {})",
+                served.join(", ")
+            )
+        })
+        .collect()
+}
 
 /// The definition that names the parameters of a read the control daemon makes of a worker itself,
 /// by the method it makes it with.
@@ -220,7 +264,7 @@ pub struct RetainedLevel {
     pub surface: &'static str,
     /// The release record (`RELEASE`).
     pub release: &'static str,
-    /// The protocol name the plugin host spoke at that release (`PLUGIN_HOST`).
+    /// The protocol names the plugin host spoke at that release, one on each line (`PLUGIN_HOST`).
     pub plugin_host: &'static str,
     /// The differences that need a rewrite.
     pub declared: &'static [Declared],
@@ -252,6 +296,12 @@ impl RetainedLevel {
             public_majors: None,
             parsed: OnceLock::new(),
         }
+    }
+
+    /// The plugin host protocol names this level recorded.
+    #[must_use]
+    pub fn plugin_host_names(&self) -> Vec<&'static str> {
+        host_names(self.plugin_host)
     }
 
     /// This level with the table of public majors its release recorded.
@@ -692,14 +742,11 @@ pub fn check() -> Result<(), Vec<String>> {
                 retained.level
             ));
         }
-        let host = retained.plugin_host.trim();
-        if host != PLUGIN_HOST_PROTOCOL {
-            problems.push(format!(
-                "level {} kept the plugin host protocol {host}, and this build speaks \
-                 {PLUGIN_HOST_PROTOCOL}",
-                retained.level
-            ));
-        }
+        problems.extend(host_problems(
+            retained.level,
+            &retained.plugin_host_names(),
+            PLUGIN_HOST_PROTOCOLS,
+        ));
         if THIS_LEVEL <= retained.level {
             problems.push(format!(
                 "level {} is not below this build's level {THIS_LEVEL}",

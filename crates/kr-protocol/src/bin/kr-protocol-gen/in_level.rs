@@ -81,7 +81,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use kr_protocol::hello::PACKAGE_VERSION;
-use kr_protocol::retained::{PLUGIN_HOST_PROTOCOL, Surface, SurfaceError};
+use kr_protocol::retained::{PLUGIN_HOST_PROTOCOLS, Surface, SurfaceError, host_names_outside};
 use kr_protocol::update::CompatibilityLevel;
 use kr_protocol::worker_surface;
 use serde_json::Value;
@@ -203,8 +203,8 @@ pub struct Head {
     pub sdk_contract: SdkContract,
     /// What it serves.
     pub worker: WorkerSurface,
-    /// The protocol its plugin host speaks.
-    pub plugin_host: String,
+    /// The protocols its plugin host serves.
+    pub plugin_host: Vec<String>,
     /// The record of its table of public majors.
     pub public_majors: String,
     /// The sections of the host configuration document that arrived with a level, each with the
@@ -242,7 +242,10 @@ impl Head {
             sdk_schema,
             sdk_contract,
             worker: WorkerSurface::parse(&worker_surface::document())?,
-            plugin_host: PLUGIN_HOST_PROTOCOL.to_owned(),
+            plugin_host: PLUGIN_HOST_PROTOCOLS
+                .iter()
+                .map(|name| (*name).to_owned())
+                .collect(),
             public_majors: expected_public_majors_in(repository, commit)?,
             sections: kr_protocol::hostinfo::configuration::LEVELLED
                 .iter()
@@ -609,13 +612,11 @@ fn compare(
         .map(|line| format!("the plugin SDK schema: {line}")),
     );
     arrivals_passed.extend(passed.into_iter().map(|member| (tag.clone(), member)));
-    let host = plugin_host_in(repository, &release.commit)?;
-    if host != head.plugin_host {
-        found.push(format!(
-            "the plugin host protocol is {host} there and {} here",
-            head.plugin_host
-        ));
-    }
+    found.extend(plugin_host_differences(
+        tag,
+        &plugin_host_in(repository, &release.commit)?,
+        &head.plugin_host,
+    ));
     let majors = expected_public_majors_in(repository, &release.commit)?;
     if majors != head.public_majors {
         found.push("the table of public majors is not the same".to_owned());
@@ -628,6 +629,22 @@ fn compare(
         )),
     }
     Ok(found)
+}
+
+/// What the plugin host protocol names of the release `tag` have that the head's do not. A head may
+/// serve a name a release of its level did not list, since a name joins the list inside a level,
+/// and it may not lack one that a release listed.
+fn plugin_host_differences(tag: &str, release: &[String], head: &[String]) -> Vec<String> {
+    let listed: Vec<&str> = release.iter().map(String::as_str).collect();
+    let served: Vec<&str> = head.iter().map(String::as_str).collect();
+    host_names_outside(&listed, &served)
+        .into_iter()
+        .map(|name| {
+            format!(
+                "the plugin host protocol {name} is listed by {tag} and this build does not serve it"
+            )
+        })
+        .collect()
 }
 
 /// What differs between two releases' tables of what a worker serves.
