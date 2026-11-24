@@ -1209,8 +1209,8 @@ jobs:
       #   - the forwarder: all of `kr-hook`.
       # The second leg runs:
       #   - the worker over its own pipe and the launch endpoint: `windows_endpoint`, `listener`,
-      #     `transport`, `broker`, `gateway`, `agent_service`, `windows_inheritance`, `connectors`,
-      #     `launch_probe`, `command_backends`, `windows` (a real pseudo-console, a real PowerShell
+      #     `transport`, `broker`, `gateway`, `agent_service`, `windows_inheritance`,
+      #     `windows_environment`, `windows_pipes`, `connectors`, `launch_probe`, `command_backends`, `windows` (a real pseudo-console, a real PowerShell
       #     and a real job object), `question_bindings`, `questions_answer`, `authority`,
       #     `persistence`, `snapshot`, `terminal`, `session`, `local_owner`, `input_lease`, `fence`,
       #     `desktop`, `performance` and `host`, whose daemons start each worker as the shipping
@@ -1479,10 +1479,12 @@ jobs:
       # What a process the worker starts holds of the worker's own handles. A launch's agent holds
       # the handles it lists and no other; a launch and every other start the worker makes (the
       # desktop reading, the time reading) take one lock, so none starts in the window in which a
-      # launch's pipe ends are inheritable and holds one open after the agent has let go.
+      # launch's pipe ends are inheritable and holds one open after the agent has let go. The same
+      # step runs what a launch is given beside those handles: its whole environment and nothing of
+      # the worker's own (`windows_environment`), and its private overlapped pipes (`windows_pipes`).
       - name: Test which handles a started process holds
         if: ${{ !cancelled() && matrix.part == 'second' }}
-        run: cargo test --locked -p kr-worker --test windows_inheritance
+        run: cargo test --locked -p kr-worker --test windows_inheritance --test windows_environment --test windows_pipes
 
       # What the worker reads of an installed package: its connector, its command integration, its
       # launch probe and its bridge, each from the verified manifest, with an installation's grants

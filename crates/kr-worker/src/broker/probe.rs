@@ -8,6 +8,10 @@
 //! deadline, a cap on what it may print, and a job of its own (a process group on Unix) that ends
 //! with it, so nothing it started outlives the answer.
 //!
+//! On Unix the group holds what the probe started and leaves a descendant that makes a group or a
+//! session of its own, which the kill does not reach. A probe that the kernel does not release
+//! within [`CLEANUP_BOUND`] is collected later by its thread.
+//!
 //! One absolute deadline covers the whole operation, from the caller's first instant: creating the
 //! process, reading its output, ending it and collecting it. The operation runs on one thread of its
 //! own, which owns the process until it has ended it, so a process created after the deadline has

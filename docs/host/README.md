@@ -2443,7 +2443,7 @@ Every command in that list needs the developer environment for the target loaded
 
 The runner runs the worker's suites one at a time (its library, and the `windows`,
 `windows_endpoint`, `listener`, `transport`, `broker`, `gateway`, `agent_service`,
-`windows_inheritance`, `command_backends`, `launch_probe`, `question_bindings`,
+`windows_inheritance`, `windows_environment`, `windows_pipes`, `command_backends`, `launch_probe`, `question_bindings`,
 `questions_answer`, `authority`, `persistence`, `snapshot`, `terminal`, `session`, `local_owner`,
 `input_lease`, `fence`, `desktop`, `performance`, `host`, `binder`, `channels`, `connectors` and
 `attention_source` suites) and does not run `cargo test -p kr-worker` with every suite, because the

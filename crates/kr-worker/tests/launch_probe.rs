@@ -632,8 +632,8 @@ fn kr_req_07_64_the_total_time_is_bounded_by_the_deadline_plus_the_cleanup_bound
     assert!(probed.late, "{probed:?}");
     std::thread::sleep(Duration::from_secs(if cfg!(windows) { 6 } else { 2 }));
     assert!(
-        !queued.path().join("ran.txt").exists(),
-        "a call whose deadline passed in the queue started a probe"
+        probed.thread.get().is_none(),
+        "a call whose deadline passed in the queue started a thread, and so a process"
     );
 }
 

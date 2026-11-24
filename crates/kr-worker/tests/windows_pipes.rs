@@ -171,9 +171,9 @@ fn a_competing_client_in_the_window_refuses_the_start() {
         "{why}"
     );
     assert_eq!(
-        job.process_ids().expect("the job's members"),
-        Vec::<u32>::new(),
-        "no process was created"
+        job.total_processes().expect("the job's count"),
+        0,
+        "no process was created, not even one that has ended"
     );
     let reader = competitor
         .lock()
@@ -222,7 +222,11 @@ fn a_taken_name_refuses_the_start() {
         why.contains("the server's pipe name was already taken"),
         "{why}"
     );
-    assert_eq!(job.process_ids().expect("members"), Vec::<u32>::new());
+    assert_eq!(
+        job.total_processes().expect("the job's count"),
+        0,
+        "no process was created, not even one that has ended"
+    );
     drop(held);
 }
 
@@ -396,5 +400,9 @@ fn an_overlapped_start_without_a_runtime_is_refused_before_a_process_exists() {
     );
     let why = refused.expect_err("refused").to_string();
     assert!(why.contains("runtime"), "{why}");
-    assert_eq!(job.process_ids().expect("members"), Vec::<u32>::new());
+    assert_eq!(
+        job.total_processes().expect("the job's count"),
+        0,
+        "no process was created, not even one that has ended"
+    );
 }

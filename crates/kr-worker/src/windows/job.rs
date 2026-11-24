@@ -56,7 +56,8 @@ use windows_sys::Win32::Foundation::{
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, IsProcessInJob, JOB_OBJECT_LIMIT_BREAKAWAY_OK,
     JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK,
-    JOBOBJECT_BASIC_PROCESS_ID_LIST, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+    JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JOBOBJECT_BASIC_PROCESS_ID_LIST,
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectBasicAccountingInformation,
     JobObjectBasicProcessIdList, JobObjectExtendedLimitInformation, QueryInformationJobObject,
     SetInformationJobObject, TerminateJobObject,
 };
@@ -352,6 +353,15 @@ impl AgentJob {
         self.job.process_ids()
     }
 
+    /// Returns how many processes the job has held in all, those that have ended included.
+    ///
+    /// # Errors
+    ///
+    /// Returns the operating system's failure when the job will not say.
+    pub fn total_processes(&self) -> std::io::Result<u32> {
+        self.job.total_processes()
+    }
+
     /// Ends every process the job holds, at once.
     ///
     /// # Errors
@@ -548,6 +558,28 @@ impl Job {
                 MemberReading::Unreadable(error.to_string())
             }
         }
+    }
+
+    /// Returns how many processes the job has held in all, those that have ended included.
+    fn total_processes(&self) -> std::io::Result<u32> {
+        // SAFETY: all zeroes is a structure of integers that the call fills in.
+        let mut accounting: JOBOBJECT_BASIC_ACCOUNTING_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: the handle is this object's own and open for the call, and the buffer is a local
+        // this thread owns, with its own size declared.
+        let read = unsafe {
+            QueryInformationJobObject(
+                self.raw(),
+                JobObjectBasicAccountingInformation,
+                (&raw mut accounting).cast(),
+                u32::try_from(std::mem::size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>())
+                    .unwrap_or(u32::MAX),
+                std::ptr::null_mut(),
+            )
+        };
+        if read == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(accounting.TotalProcesses)
     }
 
     /// Returns the identifiers of every process the job currently holds, asking again with more
