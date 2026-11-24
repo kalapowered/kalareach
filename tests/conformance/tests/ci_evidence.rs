@@ -1464,40 +1464,65 @@ fn the_real_proxy_cases_run_in_a_job_that_fails_without_squid_and_without_the_ca
 /// application's looks for `x86_64-w64-mingw32-windres`; no hosted runner image has them, so
 /// without them the suite's Windows build fails. Each job that runs the suite installs them before
 /// its test step, by one step that is not disabled and runs on every leg that runs the suite: in
-/// the landing workflow, the rust job and the macOS job's `tests-2` leg, which holds `kr-cli`.
+/// the landing workflow, the rust job and the macOS job's `tests-2` leg, which holds `kr-cli`; in
+/// the conformance workflow, the linux and macos jobs, whose plan runs the workspace's tests; in
+/// the package-release workflow, the release job, whose cut's check runs the suite.
 #[test]
 fn the_jobs_that_run_the_retained_surface_suite_install_the_windows_cross_compiler_first() {
-    let landing = fs::read_to_string(repository().join(".github/workflows/core-ci.yml"))
-        .expect("the landing workflow");
-    for (name, tests, package, when) in [
+    for (file, name, tests, package, when) in [
         (
+            "core-ci.yml",
             "rust",
             "cargo test --locked --workspace",
             "gcc-mingw-w64-x86-64",
             None,
         ),
         (
+            "core-ci.yml",
             "macos",
             "cargo test --locked ${{ matrix.packages }} --no-fail-fast --",
             "brew install mingw-w64",
             Some("${{ matrix.part == 'tests-2' }}"),
         ),
+        (
+            "conformance.yml",
+            "linux",
+            "scripts/run-conformance.sh",
+            "gcc-mingw-w64-x86-64",
+            None,
+        ),
+        (
+            "conformance.yml",
+            "macos",
+            "scripts/run-conformance.sh",
+            "brew install mingw-w64",
+            None,
+        ),
+        (
+            "package-release.yml",
+            "release",
+            "target/debug/kr-protocol-gen --in-level",
+            "gcc-mingw-w64-x86-64",
+            None,
+        ),
     ] {
-        let text = job(&landing, name);
+        let workflow = fs::read_to_string(repository().join(".github/workflows").join(file))
+            .unwrap_or_else(|error| panic!("{file}: {error}"));
+        let text = job(&workflow, name);
         let installs = steps_holding(&text, package);
         assert_eq!(
             installs.len(),
             1,
-            "the {name} job has not one step that installs the cross compiler"
+            "{file}: the {name} job has not one step that installs the cross compiler"
         );
         assert!(
             !is_disabled(&installs[0]),
-            "the {name} job's step that installs the cross compiler is disabled or lets its failure pass"
+            "{file}: the {name} job's step that installs the cross compiler is disabled or lets its failure pass"
         );
         assert_eq!(
             step_condition(&installs[0]),
             when.map(compact),
-            "the {name} job's step that installs the cross compiler runs under a condition other than {when:?}"
+            "{file}: the {name} job's step that installs the cross compiler runs under a condition other than {when:?}"
         );
         let installed = steps_of(&text)
             .iter()
@@ -1506,7 +1531,7 @@ fn the_jobs_that_run_the_retained_surface_suite_install_the_windows_cross_compil
         let tested = position_of_tool(&text, tests).expect("the step that runs the tests");
         assert!(
             installed < tested,
-            "the {name} job runs its tests before it installs the cross compiler"
+            "{file}: the {name} job runs its tests before it installs the cross compiler"
         );
     }
 }
