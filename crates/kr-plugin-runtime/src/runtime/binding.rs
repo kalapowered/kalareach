@@ -974,6 +974,16 @@ impl Compilation {
     }
 }
 
+/// What a restore did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Restored {
+    /// The component took the state, or declined it: the answer of the call says which.
+    Done,
+    /// The restore carried a position and the binding had been offered an event by the time it ran,
+    /// so the instance may have consumed past the state. Nothing was restored.
+    Skipped,
+}
+
 /// What a call into a component produced.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CallResult<T> {
@@ -1010,7 +1020,9 @@ enum Command {
     Restore {
         state: Vec<u8>,
         through: Option<Through>,
-        answer: Answer<()>,
+        /// Whether the restore is only for a binding that was never offered an event.
+        unoffered_only: bool,
+        answer: Answer<Restored>,
     },
     Stop,
 }
@@ -1273,13 +1285,6 @@ impl BindingHandle {
         self.restores.load(Ordering::Acquire)
     }
 
-    /// Returns true when the binding has been offered an event since it was registered, whether the
-    /// queue took it or it was refused on the way.
-    #[must_use]
-    pub fn offered_events(&self) -> bool {
-        !self.queue.lock().is_ok_and(|queue| queue.offered() == 0)
-    }
-
     /// Records that an event offered to the binding was refused before it reached the queue.
     ///
     /// What the instance consumes after it is not a prefix of what was offered, and the queue
@@ -1433,7 +1438,8 @@ impl BindingHandle {
     /// With `through`, what the instance has consumed becomes what the state was taken at, and is
     /// clean, once the restore has answered. Without it the position stays and is no longer clean:
     /// the state covers events the position cannot name. A restore the component declines changes
-    /// nothing.
+    /// nothing. It restores whether or not the binding has been offered an event: a caller that
+    /// sets a position from the state calls [`Self::restore_if_unoffered`] instead.
     ///
     /// # Errors
     ///
@@ -1443,10 +1449,41 @@ impl BindingHandle {
         state: Vec<u8>,
         through: Option<Through>,
         deadline: core::time::Duration,
-    ) -> RuntimeResult<CallResult<()>> {
+    ) -> RuntimeResult<CallResult<Restored>> {
+        self.restore_as(state, through, false, deadline).await
+    }
+
+    /// Restores state and sets the position it was taken at, if the binding was never offered an
+    /// event.
+    ///
+    /// A position is only for a binding that was never offered an event, and the binding's thread
+    /// decides that when the restore runs: an event offered after the restore was asked for and
+    /// before it runs has been offered by then. Such a restore replaces nothing and answers
+    /// [`Restored::Skipped`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the component's failure, or [`RuntimeError::CallerDeadline`].
+    pub async fn restore_if_unoffered(
+        &self,
+        state: Vec<u8>,
+        through: Through,
+        deadline: core::time::Duration,
+    ) -> RuntimeResult<CallResult<Restored>> {
+        self.restore_as(state, Some(through), true, deadline).await
+    }
+
+    async fn restore_as(
+        &self,
+        state: Vec<u8>,
+        through: Option<Through>,
+        unoffered_only: bool,
+        deadline: core::time::Duration,
+    ) -> RuntimeResult<CallResult<Restored>> {
         self.dispatch(deadline, |answer| Command::Restore {
             state,
             through,
+            unoffered_only,
             answer,
         })
         .await
@@ -1786,9 +1823,21 @@ impl BindingWorker {
                 Command::Restore {
                     state,
                     through,
+                    unoffered_only,
                     answer,
                 } => {
                     if self.abandoned(&answer) {
+                        continue;
+                    }
+                    if unoffered_only && self.queue.lock().is_ok_and(|queue| queue.offered() != 0) {
+                        // Decided here, on the thread that takes the events: an event offered
+                        // since the restore was asked for is counted, and one this thread has
+                        // already taken was counted before it.
+                        let _ = answer.send(Ok(CallResult {
+                            answer: Ok(Restored::Skipped),
+                            nodes: Vec::new(),
+                            document: None,
+                        }));
                         continue;
                     }
                     let outcome =
@@ -1812,7 +1861,11 @@ impl BindingWorker {
                             None => self.consumed.clean = false,
                         }
                     }
-                    let _ = answer.send(outcome);
+                    let _ = answer.send(outcome.map(|result| CallResult {
+                        answer: result.answer.map(|()| Restored::Done),
+                        nodes: result.nodes,
+                        document: result.document,
+                    }));
                 }
                 Command::Stop => return,
             }
