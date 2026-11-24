@@ -147,23 +147,27 @@ impl Controller {
         // ended it. The directory is read before the desktop's lock is taken, so a wait for one is
         // never made under the other.
         let checks = loop {
-            // What the desktop, the tools and the worker are now is read before the checks' lock
-            // is taken, because reading the tools opens their files, and only where findings are
-            // held to be compared with it. A run that ended in between has replaced the findings
-            // this was read against, and the reading is made again.
+            // What the desktop, the tools and the worker are now is read outside the checks' lock,
+            // because reading the tools opens their files, and only where findings are held to be
+            // compared with it: the lock is taken twice, once to see which findings and files are
+            // held and once to compare. A run that ended in between has replaced the findings this
+            // was read against, and the reading is made again.
             let workers = self.directory_workers().await;
-            let (held, generation) = self
-                .checks
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .held_stamp();
+            let (held, generation, records) = {
+                let checks = self.checks.lock().unwrap_or_else(PoisonError::into_inner);
+                let (held, generation) = checks.held_stamp();
+                (held, generation, checks.held_records())
+            };
             let now = held.map(|session| {
                 let worker = workers.iter().find(|w| w.descriptor.session_id == session);
                 // The build is that of the worker a run asked for now would be performed in, as
                 // the start of a run takes it.
                 let target =
                     super::capability_checks::worker_for(workers.clone(), context.worker_profile);
-                super::capability_checks::fingerprint_of(&context, worker, target.as_ref())
+                kr_worker::desktop::probe::Fingerprint {
+                    facility: Some(super::capability_checks::identities_now(&records)),
+                    ..super::capability_checks::fingerprint_of(&context, worker, target.as_ref())
+                }
             });
             let mut checks = self.checks.lock().unwrap_or_else(PoisonError::into_inner);
             if checks.held_stamp() != (held, generation) {

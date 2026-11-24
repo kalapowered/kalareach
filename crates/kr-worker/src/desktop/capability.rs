@@ -819,10 +819,17 @@ pub(super) fn facility_identity_within(tool: &str, deadline: &Deadline) -> Optio
 }
 
 /// Digests a file a block at a time, and gives up where `over` says so between two blocks.
+///
+/// The file is opened without waiting and refused if it is not a regular file: a pipe opened for
+/// reading waits for whoever is on its other end, and a path that names one has no identity to
+/// give.
 fn identified_until(tool: &str, over: impl Fn() -> bool) -> Option<Sentence> {
     use std::io::Read as _;
 
-    let mut file = std::fs::File::open(tool).ok()?;
+    let mut file = super::probe::open_without_waiting(std::path::Path::new(tool)).ok()?;
+    if !file.metadata().ok()?.is_file() {
+        return None;
+    }
     let mut hasher = std::hash::DefaultHasher::new();
     let mut block = [0_u8; DIGEST_BLOCK];
     let mut digested: u64 = 0;
@@ -1179,6 +1186,38 @@ mod tests {
         let _ = std::fs::remove_file(&large);
         assert_eq!(answer.state, CapabilityState::TemporarilyUnavailable);
         assert!(identity.is_none(), "{identity:?}");
+    }
+
+    /// KR-REQ-03.29, R9: a path that names a pipe has no identity, and asking for it does not wait
+    /// for somebody to write to the pipe.
+    #[cfg(unix)]
+    #[test]
+    fn a_pipe_at_a_named_path_has_no_identity_and_is_not_waited_for() {
+        let root = kr_ipc::testing::PrivateTempDir::create();
+        let pipe = root.path().join("a-pipe");
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&pipe)
+                .status()
+                .expect("mkfifo runs")
+                .success(),
+            "a pipe"
+        );
+        let named = pipe.display().to_string();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(facility_identity(&named));
+        });
+        let answered = receiver.recv_timeout(std::time::Duration::from_secs(5));
+        if answered.is_err() {
+            // The case's own cleanup: a writer lets the reader that waited for one go.
+            drop(std::fs::OpenOptions::new().write(true).open(&pipe));
+        }
+        assert_eq!(
+            answered,
+            Ok(None),
+            "the digest waited for the other end of a pipe"
+        );
     }
 
     /// KR-REQ-03.29, S-8: a program is digested inside the check's time, and one not digested by the

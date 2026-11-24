@@ -1239,7 +1239,7 @@ const FIRST_BLOCK: usize = 4_096;
 /// A pipe opened for reading waits for a writer, and a device can wait for a person. Opening
 /// without waiting returns at once for both, and what was opened is then asked what it is. A
 /// terminal device named here is not made this process's controlling terminal by being opened.
-fn open_without_waiting(path: &Path) -> std::io::Result<std::fs::File> {
+pub(super) fn open_without_waiting(path: &Path) -> std::io::Result<std::fs::File> {
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
     #[cfg(unix)]

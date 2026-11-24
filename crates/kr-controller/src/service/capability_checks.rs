@@ -27,7 +27,7 @@ use kr_protocol::ids::{ActorId, EnvironmentId, RequestId, SessionId};
 use kr_protocol::local::ControllerConnectionRole;
 use kr_protocol::retained::Level;
 use kr_protocol::scalars::{Nullable, TimestampMs};
-use kr_worker::desktop::capability::{context_refuses, facility_identity, tools_of};
+use kr_worker::desktop::capability::{context_refuses, facility_identity};
 use kr_worker::desktop::probe::{Fingerprint, stale};
 
 use crate::authority::AdmittedMutation;
@@ -222,16 +222,13 @@ impl Checks {
     /// record lists ends the record. The triggers are the same for every record of one run, so one
     /// ended is all ended, and they are not kept to be served again if a reading recovers.
     ///
-    /// `now` is the desktop and the worker as they are at this reading. The tools are the ones the
-    /// worker ran, read again at the paths its answer named, so that a tool replaced under the
-    /// worker ends the findings and one it never ran does not.
+    /// `now` is the desktop and the worker as they are at this reading, with the tools the worker
+    /// ran as [`identities_now`] reads them. The caller reads them before it takes the lock this
+    /// is called under, because reading a file can wait, and a lock held across that wait stops
+    /// every other read and every new run.
     pub(super) fn standing(&mut self, now: &Fingerprint) -> Vec<CapabilityRecord> {
         let Some(held) = self.held.as_ref() else {
             return Vec::new();
-        };
-        let now = Fingerprint {
-            facility: Some(identities_now(&held.records)),
-            ..now.clone()
         };
         let ended = held
             .records
@@ -244,6 +241,15 @@ impl Checks {
             return Vec::new();
         }
         held.records.clone()
+    }
+
+    /// The findings that are held, for a caller that reads what they name before it takes the lock
+    /// again.
+    pub(super) fn held_records(&self) -> Vec<CapabilityRecord> {
+        self.held
+            .as_ref()
+            .map(|held| held.records.clone())
+            .unwrap_or_default()
     }
 
     /// The worker whose findings are held, where findings are, and which findings they are: a
@@ -294,7 +300,11 @@ fn identities_held(records: &[CapabilityRecord]) -> String {
 }
 
 /// The identities of the same programs at the same paths as they are now.
-fn identities_now(records: &[CapabilityRecord]) -> String {
+///
+/// Each file is opened without waiting and refused if it is not a regular file, so a path that
+/// something else has made a pipe of does not hold the caller. It still takes the time of reading
+/// a file, which is why a caller reads it outside every lock.
+pub(super) fn identities_now(records: &[CapabilityRecord]) -> String {
     identities(records, |record| {
         record
             .identity
@@ -321,7 +331,9 @@ pub(super) fn fingerprint_of(
     target: Option<&KnownWorker>,
 ) -> Fingerprint {
     Fingerprint {
-        facility: Some(tools_of(context)),
+        // The tools are the ones the worker ran, which its answer names: the daemon's own search
+        // would find what the worker never ran.
+        facility: None,
         host_agent: worker.map(|worker| format!("{:?}", worker.descriptor.process_start_identity)),
         agent_build: target
             .and_then(|target| target.release.as_ref())
@@ -991,6 +1003,16 @@ mod tests {
         );
     }
 
+    /// What the daemon's reading of the held findings does: the tools the worker ran are read at the
+    /// paths its answer named, outside the lock, and given to the comparison.
+    fn standing_now(checks: &mut Checks, now: &Fingerprint) -> Vec<CapabilityRecord> {
+        let now = Fingerprint {
+            facility: Some(identities_now(&checks.held_records())),
+            ..now.clone()
+        };
+        checks.standing(&now)
+    }
+
     fn screen_finding() -> CapabilityRecord {
         record(
             capabilities::SCREEN_CAPTURE,
@@ -1015,7 +1037,7 @@ mod tests {
         assert_eq!(checks.view().state, CapabilityChecksState::Running);
         checks.succeeded(TimestampMs::new(20), vec![screen_finding()]);
         assert_eq!(checks.view().state, CapabilityChecksState::Current);
-        assert_eq!(checks.standing(&taken).len(), 1, "nothing moved");
+        assert_eq!(standing_now(&mut checks, &taken).len(), 1, "nothing moved");
         // The worker gone, a new login and another profile each end them. A tool the worker ran
         // replaced ends them too, which the cases of the worker's tools below show.
         for moved in [
@@ -1043,10 +1065,10 @@ mod tests {
             let mut checks = Checks::new();
             checks.begin(TimestampMs::new(10), session(), taken.clone());
             checks.succeeded(TimestampMs::new(20), vec![screen_finding()]);
-            assert!(checks.standing(&moved).is_empty(), "{moved:?}");
+            assert!(standing_now(&mut checks, &moved).is_empty(), "{moved:?}");
             assert_eq!(checks.view().state, CapabilityChecksState::Stale);
             // And they are gone: a reading that recovers does not bring them back.
-            assert!(checks.standing(&taken).is_empty());
+            assert!(standing_now(&mut checks, &taken).is_empty());
         }
     }
 
@@ -1085,11 +1107,11 @@ mod tests {
             checks.succeeded(TimestampMs::new(20), vec![finding_naming(&worker_tool)]);
             checks
         };
-        assert_eq!(held().standing(&taken).len(), 1, "nothing moved");
+        assert_eq!(standing_now(&mut held(), &taken).len(), 1, "nothing moved");
 
         std::fs::write(&controller_candidate, b"the second build").expect("the replacement");
         assert_eq!(
-            held().standing(&taken).len(),
+            standing_now(&mut held(), &taken).len(),
             1,
             "a tool the worker never ran is not what the findings are about"
         );
@@ -1097,7 +1119,7 @@ mod tests {
         let mut checks = held();
         std::fs::write(&worker_tool, b"the second build").expect("the replacement");
         assert!(
-            checks.standing(&taken).is_empty(),
+            standing_now(&mut checks, &taken).is_empty(),
             "the worker's own tool was replaced"
         );
         assert_eq!(checks.view().state, CapabilityChecksState::Stale);
@@ -1120,7 +1142,7 @@ mod tests {
         checks.succeeded(TimestampMs::new(20), vec![screen_finding()]);
         let read = |checks: &mut Checks| {
             let mut records = platform();
-            merge(&mut records, &checks.standing(&taken), &context());
+            merge(&mut records, &standing_now(checks, &taken), &context());
             records
                 .into_iter()
                 .find(|record| record.capability.as_str() == capabilities::SCREEN_CAPTURE)
@@ -1163,23 +1185,96 @@ mod tests {
         let mut checks = Checks::new();
         checks.begin(TimestampMs::new(10), session(), read());
         checks.succeeded(TimestampMs::new(20), vec![screen_finding()]);
-        assert_eq!(checks.standing(&read()).len(), 1, "the same login");
+        assert_eq!(
+            standing_now(&mut checks, &read()).len(),
+            1,
+            "the same login"
+        );
         assert_eq!(checks.view().state, CapabilityChecksState::Current);
         source.0.store(3, std::sync::atomic::Ordering::SeqCst);
         assert!(
-            checks.standing(&read()).is_empty(),
+            standing_now(&mut checks, &read()).is_empty(),
             "a login that changed ends them"
         );
         assert_eq!(checks.view().state, CapabilityChecksState::Stale);
     }
 
+    /// KR-REQ-03.29, R9: a fingerprint holds no tool of the daemon's own. What the findings are
+    /// about is what the worker ran, which its answer names.
     #[test]
-    fn a_fingerprint_holds_the_tools_the_machine_has() {
+    fn a_fingerprint_holds_no_tool_of_the_daemons_own() {
+        assert_eq!(fingerprint_of(&context(), None).facility, None);
+    }
+
+    /// KR-REQ-03.29, R9: the tools are compared as the caller read them, which is outside the
+    /// lock: findings held against a file that has not changed end when the reading says it has.
+    #[cfg(unix)]
+    #[test]
+    fn the_comparison_is_made_with_the_tools_the_caller_read() {
+        let directory = std::env::temp_dir().join(format!("kr-read-{}", kr_ipc::new_uuid()));
+        std::fs::create_dir_all(&directory).expect("a directory of this test's own");
+        let tool = directory.join("the-workers-tool");
+        std::fs::write(&tool, b"a build").expect("the tool");
+        let taken = fingerprint_of(&context(), None);
+        let mut checks = Checks::new();
+        checks.begin(TimestampMs::new(10), session(), taken.clone());
+        checks.succeeded(TimestampMs::new(20), vec![finding_naming(&tool)]);
+        let read = identities_now(&checks.held_records());
         assert_eq!(
-            fingerprint_of(&context(), None, None).facility,
-            Some(tools_of(&context())),
-            "the tools in a fingerprint are read from the machine, so one installed since is a change"
+            checks
+                .standing(&Fingerprint {
+                    facility: Some(read),
+                    ..taken.clone()
+                })
+                .len(),
+            1,
+            "the reading the caller took says nothing changed"
         );
+        let mut checks = Checks::new();
+        checks.begin(TimestampMs::new(10), session(), taken.clone());
+        checks.succeeded(TimestampMs::new(20), vec![finding_naming(&tool)]);
+        assert!(
+            checks
+                .standing(&Fingerprint {
+                    facility: Some("what the caller read, which is another file".to_owned()),
+                    ..taken
+                })
+                .is_empty(),
+            "the comparison read the files itself and not the caller's reading"
+        );
+        std::fs::remove_dir_all(&directory).expect("removes the test's directory");
+    }
+
+    /// KR-REQ-03.29, R9: a path a finding names that has become a pipe is not waited for.
+    #[cfg(unix)]
+    #[test]
+    fn a_path_a_finding_names_that_became_a_pipe_is_not_waited_for() {
+        let directory = std::env::temp_dir().join(format!("kr-pipe-{}", kr_ipc::new_uuid()));
+        std::fs::create_dir_all(&directory).expect("a directory of this test's own");
+        let pipe = directory.join("a-pipe");
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&pipe)
+                .status()
+                .expect("mkfifo runs")
+                .success(),
+            "a pipe"
+        );
+        let records = vec![finding_naming(&pipe)];
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(identities_now(&records));
+        });
+        let answered = receiver.recv_timeout(Duration::from_secs(5));
+        if answered.is_err() {
+            // The case's own cleanup: a writer lets the reader that waited for one go.
+            drop(std::fs::OpenOptions::new().write(true).open(&pipe));
+        }
+        assert!(
+            answered.is_ok(),
+            "reading the finding's file waited for a pipe"
+        );
+        std::fs::remove_dir_all(&directory).expect("removes the test's directory");
     }
 
     #[test]
@@ -1192,11 +1287,7 @@ mod tests {
         let mut checks = Checks::new();
         checks.begin(TimestampMs::new(10), session(), began);
         checks.succeeded(TimestampMs::new(20), vec![screen_finding()]);
-        assert!(
-            checks
-                .standing(&fingerprint_of(&other, None, None))
-                .is_empty()
-        );
+        assert!(standing_now(&mut checks, &fingerprint_of(&other, None, None)).is_empty());
         assert_eq!(checks.view().state, CapabilityChecksState::Stale);
     }
 
@@ -1220,7 +1311,7 @@ mod tests {
             let mut desktop = context();
             desktop.availability = availability;
             assert_eq!(
-                checks.standing(&fingerprint_of(&desktop, None, None)).len(),
+                standing_now(&mut checks, &fingerprint_of(&desktop, None, None)).len(),
                 1,
                 "{availability:?}"
             );
@@ -1320,7 +1411,7 @@ mod tests {
             view.failure.as_ref(),
             Some(&CapabilityChecksFailure::WorkerUnreachable)
         );
-        assert_eq!(checks.standing(&taken).len(), 1);
+        assert_eq!(standing_now(&mut checks, &taken).len(), 1);
         assert_eq!(checks.held_stamp().0, Some(session()));
     }
 
