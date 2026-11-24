@@ -83,19 +83,27 @@ const REACHED: [&str; 18] = [
     "notice:disabled",
 ];
 
-/// The members of a frame that differ from one run to the next or one machine to the next: the
-/// challenge and its signature, a path in a folder made for the run, the identity of the host's
-/// process and the machine, the number a worker gave a registration, how long something took, the
-/// component a registration carries (built with paths of the machine that built it), and what the
-/// engine says of the target it compiles for.
-const OF_THE_RUN: [&str; 18] = [
+/// The kinds of frame that hold something of the run they were written in.
+const OF_A_RUN: [&str; 6] = [
+    "request:verify",
+    "request:register_binding",
+    "response:hello",
+    "response:verified",
+    "response:registered",
+    "response:health",
+];
+
+/// The members of those frames that differ from one run to the next or one machine to the next: the
+/// challenge and its signature, the endpoint and identity of the host and of the machine it runs on,
+/// how long something took, the component a registration carries (built with paths of the machine
+/// that built it), and what the engine says of the target it compiles for and how much it compiled.
+const OF_THE_RUN: [&str; 16] = [
     "component",
     "target",
     "engine_compatibility",
     "resident_bytes",
     "reservation_id",
     "nonce",
-    "path",
     "endpoint",
     "environment_id",
     "host_public_key",
@@ -106,7 +114,6 @@ const OF_THE_RUN: [&str; 18] = [
     "signature",
     "elapsed_ms",
     "uptime_ms",
-    "registration",
 ];
 
 fn hex(bytes: &[u8]) -> String {
@@ -121,60 +128,96 @@ fn unhex(text: &str) -> Vec<u8> {
         .collect()
 }
 
-/// What a frame reads as, with each member of the run replaced by what kind of value it is.
-fn of_the_run(value: serde_json::Value) -> serde_json::Value {
-    use serde_json::Value;
-    match value {
-        Value::Object(members) => Value::Object(
-            members
-                .into_iter()
-                .map(|(name, member)| {
-                    let member = if OF_THE_RUN.contains(&name.as_str()) {
-                        match member {
-                            Value::Array(items) => Value::from(format!("{} members", items.len())),
-                            Value::String(_) => Value::from("text"),
-                            Value::Number(_) => Value::from("number"),
-                            Value::Object(_) => Value::from("object"),
-                            other => Value::from(other.to_string()),
-                        }
-                    } else {
-                        of_the_run(member)
-                    };
-                    (name, member)
-                })
-                .collect(),
-        ),
-        Value::Array(items) => Value::Array(items.into_iter().map(of_the_run).collect()),
-        other => other,
-    }
+/// Holds the frames of one session to what they read as. A registration is held as its place among
+/// the registrations the session has named so far, so a request, an answer and a notice that name
+/// one registration are held to the same place, and one that names another registration is a
+/// difference.
+#[derive(Default)]
+struct Held {
+    registrations: Vec<u64>,
 }
 
-/// A frame as data, with what is of the run masked.
-fn masked(kind: &str, bytes: &[u8]) -> String {
-    let limits = StreamKind::Control.cbor_limits();
-    let read = if kind.starts_with("request:") {
-        serde_json::to_value(
-            kr_cbor::from_canonical_slice::<Request4>(bytes, &limits).expect("a request"),
-        )
-    } else {
-        serde_json::to_value(
-            kr_cbor::from_canonical_slice::<Frame4>(bytes, &limits).expect("a frame"),
-        )
-    };
-    of_the_run(read.expect("it reads as data")).to_string()
-}
+impl Held {
+    /// The place of a registration among those named so far, counted from one.
+    fn place(&mut self, registration: u64) -> usize {
+        let at = self
+            .registrations
+            .iter()
+            .position(|named| *named == registration)
+            .unwrap_or_else(|| {
+                self.registrations.push(registration);
+                self.registrations.len() - 1
+            });
+        at + 1
+    }
 
-/// What a frame is held to: what it reads as, or, for a long frame, its length and digest (of its
-/// bytes for a request, which holds nothing of its run, and of what it reads as for the rest).
-fn held_to(kind: &str, bytes: &[u8]) -> String {
-    if bytes.len() <= LARGE_FRAME {
-        return masked(kind, bytes);
+    /// What a value reads as, with each registration replaced by its place and, when `of_a_run`,
+    /// each member of the run replaced by what kind of value it is.
+    fn read(&mut self, value: serde_json::Value, of_a_run: bool) -> serde_json::Value {
+        use serde_json::Value;
+        match value {
+            Value::Object(members) => Value::Object(
+                members
+                    .into_iter()
+                    .map(|(name, member)| {
+                        let member = match member {
+                            Value::Number(number) if name == "registration" => {
+                                let named = number.as_u64().expect("a registration number");
+                                Value::from(format!("registration {}", self.place(named)))
+                            }
+                            member if of_a_run && OF_THE_RUN.contains(&name.as_str()) => {
+                                match member {
+                                    Value::Array(items) => {
+                                        Value::from(format!("{} members", items.len()))
+                                    }
+                                    Value::String(_) => Value::from("text"),
+                                    Value::Number(_) => Value::from("number"),
+                                    Value::Object(_) => Value::from("object"),
+                                    other => Value::from(other.to_string()),
+                                }
+                            }
+                            member => self.read(member, of_a_run),
+                        };
+                        (name, member)
+                    })
+                    .collect(),
+            ),
+            Value::Array(items) => Value::Array(
+                items
+                    .into_iter()
+                    .map(|item| self.read(item, of_a_run))
+                    .collect(),
+            ),
+            other => other,
+        }
     }
-    if kind.starts_with("request:") {
-        return format!("{}:{}", bytes.len(), PayloadDigest::of(bytes));
+
+    /// What a frame is held to: what it reads as, with each registration replaced by its place and,
+    /// in a frame of a kind that holds something of its run, each member of the run replaced by
+    /// what kind of value it is; a long frame is held to its length and digest.
+    fn frame(&mut self, kind: &str, bytes: &[u8]) -> String {
+        let is_request = kind.starts_with("request:");
+        if is_request && bytes.len() > LARGE_FRAME {
+            return format!("{}:{}", bytes.len(), PayloadDigest::of(bytes));
+        }
+        let limits = StreamKind::Control.cbor_limits();
+        let read = if is_request {
+            serde_json::to_value(
+                kr_cbor::from_canonical_slice::<Request4>(bytes, &limits).expect("a request"),
+            )
+        } else {
+            serde_json::to_value(
+                kr_cbor::from_canonical_slice::<Frame4>(bytes, &limits).expect("a frame"),
+            )
+        };
+        let text = self
+            .read(read.expect("it reads as data"), OF_A_RUN.contains(&kind))
+            .to_string();
+        if bytes.len() > LARGE_FRAME {
+            return format!("{}:{}", text.len(), PayloadDigest::of(text.as_bytes()));
+        }
+        text
     }
-    let text = masked(kind, bytes);
-    format!("{}:{}", text.len(), PayloadDigest::of(text.as_bytes()))
 }
 
 fn kind_of_response(body: &ResponseBody4) -> String {
@@ -649,11 +692,12 @@ async fn session(served: &Served, open: bool) -> Option<Session> {
 }
 
 fn entries(frames: &[(String, Vec<u8>)]) -> Vec<serde_json::Value> {
+    let mut held_to = Held::default();
     frames
         .iter()
         .map(|(kind, bytes)| {
+            let held = held_to.frame(kind, bytes);
             if bytes.len() > LARGE_FRAME {
-                let held = held_to(kind, bytes);
                 let (length, digest) = held.split_once(':').expect("a length and a digest");
                 serde_json::json!({
                     "kind": kind,
@@ -669,6 +713,7 @@ fn entries(frames: &[(String, Vec<u8>)]) -> Vec<serde_json::Value> {
 
 /// The frames of a recorded session, each held to what it reads as.
 fn recorded_frames(session: &serde_json::Value) -> Vec<(String, String)> {
+    let mut held_to = Held::default();
     session["frames"]
         .as_array()
         .expect("the frames")
@@ -676,7 +721,7 @@ fn recorded_frames(session: &serde_json::Value) -> Vec<(String, String)> {
         .map(|entry| {
             let kind = entry["kind"].as_str().expect("a kind").to_owned();
             let held = match entry["hex"].as_str() {
-                Some(hexed) => held_to(&kind, &unhex(hexed)),
+                Some(hexed) => held_to.frame(&kind, &unhex(hexed)),
                 None => format!(
                     "{}:{}",
                     entry["length"].as_u64().expect("a length"),
@@ -855,10 +900,11 @@ async fn kr_req_24_24_the_fourth_protocol_host_answers_its_sessions_the_way_the_
             session.shape, shape,
             "{which}: each request is answered with the kind of answer it was recorded with"
         );
+        let mut held_to = Held::default();
         let live: Vec<(String, String)> = session
             .frames
             .iter()
-            .map(|(kind, bytes)| (kind.clone(), held_to(kind, bytes)))
+            .map(|(kind, bytes)| (kind.clone(), held_to.frame(kind, bytes)))
             .collect();
         let recorded = recorded_frames(recorded);
         let requests = |frames: &[(String, String)]| {
@@ -927,7 +973,7 @@ async fn kr_req_24_24_the_fourth_protocol_host_answers_its_sessions_the_way_the_
         );
     }
     // The descriptors this host publishes are the ones that were recorded, but for what is of the run.
-    let held = |value: &serde_json::Value| of_the_run(value.clone());
+    let held = |value: &serde_json::Value| Held::default().read(value.clone(), true);
     assert_eq!(
         held(&hellos[0]),
         held(&record["descriptors"]["plugin-host-4.json"]),
