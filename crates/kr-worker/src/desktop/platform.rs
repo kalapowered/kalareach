@@ -272,6 +272,9 @@ fn run(program: &str, arguments: &[&str]) -> Printed {
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::from(to_out))
             .stderr(std::process::Stdio::from(to_err));
+        // A group of its own, ended with the command: a descendant that outlived it would hold the
+        // capture files and run on after the reading was made.
+        super::children::in_a_group_of_its_own(&mut command);
         #[cfg(feature = "testing")]
         kr_ipc::testing::created::note_here("question", &command);
         command.spawn()
@@ -286,7 +289,7 @@ fn run(program: &str, arguments: &[&str]) -> Printed {
     let started = std::time::Instant::now();
     let mut ended = false;
     let status = loop {
-        match child.try_wait() {
+        match super::children::poll(&mut child) {
             Ok(Some(status)) => {
                 ended = true;
                 break Some(status);
@@ -303,7 +306,8 @@ fn run(program: &str, arguments: &[&str]) -> Printed {
     };
     if !ended {
         // Terminated and reaped: a child left running would outlive every probe after it, and one
-        // left unreaped would outlive the process.
+        // left unreaped would outlive the process. The group goes with it.
+        super::children::end_group(&child);
         let _ = child.kill();
         let _ = child.wait();
     }
@@ -1499,5 +1503,43 @@ mod tests {
             "the reader of the stand-in's answer for a domain that is not there:\n{}",
             run.log
         );
+    }
+
+    /// KR-REQ-03.29, S-6: a platform command that succeeds or fails is ended with the descendants it
+    /// started, before the reading goes on.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn a_platform_command_leaves_no_descendant_running() {
+        for (what, code) in [("a success", "0"), ("a failure", "3")] {
+            let root = kr_ipc::testing::PrivateTempDir::create();
+            let file = root.path().join("descendant.pid");
+            let script = format!("/bin/sleep 120 & echo $! > \"$1\"; exit {code}");
+            let printed = super::run(
+                "/bin/sh",
+                &["-c", &script, "sh", file.to_str().expect("text")],
+            );
+            assert_eq!(
+                matches!(printed, super::Printed::Output(_)),
+                code == "0",
+                "{what}: the stand-in exited on its own"
+            );
+            let number = std::fs::read_to_string(&file)
+                .expect("the stand-in wrote the number of what it started")
+                .trim()
+                .parse::<i32>()
+                .expect("a process number");
+            let gone =
+                super::super::children::gone_within(number, std::time::Duration::from_secs(5));
+            if !gone {
+                // The case's own cleanup: a failure of it leaves nothing running.
+                if let Some(pid) = rustix::process::Pid::from_raw(number) {
+                    let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
+                }
+            }
+            assert!(
+                gone,
+                "{what}: process {number} is still there after the reading"
+            );
+        }
     }
 }

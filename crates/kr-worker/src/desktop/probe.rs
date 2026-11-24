@@ -1807,8 +1807,9 @@ fn failed(said: &str) -> Sentence {
 /// prints more than a pipe holds cannot stop halfway through waiting for somebody to read it. The
 /// allowance is what is left of the check's one deadline: a facility still running at the end of it
 /// is ended with everything it started, and the check answers [`Outcome::NotAnswered`], which is
-/// what a permission prompt the person has not answered looks like from here. A call made after
-/// the deadline has passed starts nothing and answers the same.
+/// what a permission prompt the person has not answered looks like from here. A facility that
+/// finished, whether it succeeded or failed, is ended with everything it started too, before it is
+/// collected. A call made after the deadline has passed starts nothing and answers the same.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn bounded(
     check: Check,
@@ -1876,11 +1877,7 @@ fn bounded(
             .stderr(err);
         // A group of its own, so that ending the facility ends what it started as well: a
         // descendant that outlived its parent would go on running after the check answered.
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::CommandExt as _;
-            command.process_group(0);
-        }
+        super::children::in_a_group_of_its_own(&mut command);
         #[cfg(feature = "testing")]
         kr_ipc::testing::created::note_here("check", &command);
         command.spawn()
@@ -1895,8 +1892,10 @@ fn bounded(
             }),
         };
     };
+    // A facility that finished has its group ended before it is collected, so that what it left
+    // running does not outlive it, and one that failed is no different.
     let status = loop {
-        match child.try_wait() {
+        match super::children::poll(&mut child) {
             Ok(Some(status)) => break Some(status),
             Ok(None) => {
                 if deadline.expired() {
@@ -1922,15 +1921,7 @@ fn bounded(
             // Only this check's own child and its own group, by the handle and the group it holds:
             // nothing here looks a process up by name. Collecting it is bounded as well, because a
             // child that will not go is not a reason for a diagnostic to stop answering.
-            #[cfg(unix)]
-            if let Some(group) = i32::try_from(child.id())
-                .ok()
-                .and_then(rustix::process::Pid::from_raw)
-            {
-                // Best effort: a group that has ended already cannot be signalled, which is the
-                // outcome wanted.
-                let _ = rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
-            }
+            super::children::end_group(&child);
             let _ = child.kill();
             let collected = std::time::Instant::now();
             let stopped = loop {
@@ -2686,12 +2677,56 @@ mod tests {
                 .trim()
                 .parse::<i32>()
                 .expect("a process number");
-            let pid = rustix::process::Pid::from_raw(number).expect("a process number");
-            assert_eq!(
-                rustix::process::test_kill_process(pid),
-                Err(rustix::io::Errno::SRCH),
+            // Gone, or a zombie that only waits to be collected: where nothing collects an orphan
+            // at once, a process that was ended still answers a signal for a moment.
+            assert!(
+                super::super::children::gone_within(number, Duration::from_secs(5)),
                 "process {number} of {} is still there after the check answered",
                 file.display()
+            );
+        }
+    }
+
+    /// KR-REQ-03.29, S-6: a facility that exits on its own, and one that fails, leave nothing they
+    /// started running when the call returns.
+    #[cfg(unix)]
+    #[test]
+    fn a_facility_that_finished_leaves_no_descendant_running() {
+        for (what, code) in [("a success", "0"), ("a failure", "3")] {
+            let root = kr_ipc::testing::PrivateTempDir::create();
+            let scratch = root.path().join("finished");
+            std::fs::create_dir_all(&scratch).expect("a directory for this check");
+            let file = scratch.join("descendant.pid");
+            let script = format!("/bin/sleep 120 & echo $! > \"$1\"; exit {code}");
+            let run = bounded(
+                Check::ScreenImage,
+                "/bin/sh",
+                &["-c", &script, "sh", file.to_str().expect("text")],
+                &Plan::in_directory(&scratch),
+                &Deadline::after(Duration::from_secs(10)),
+            );
+            assert!(
+                matches!(
+                    (&run.exit, code),
+                    (Exit::Succeeded(_), "0") | (Exit::Failed(_), "3")
+                ),
+                "{what}: the stand-in exited on its own"
+            );
+            let number = std::fs::read_to_string(&file)
+                .expect("the stand-in wrote the number of what it started")
+                .trim()
+                .parse::<i32>()
+                .expect("a process number");
+            let gone = super::super::children::gone_within(number, Duration::from_secs(5));
+            if !gone {
+                // The case's own cleanup: a failure of it leaves nothing running.
+                if let Some(pid) = rustix::process::Pid::from_raw(number) {
+                    let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
+                }
+            }
+            assert!(
+                gone,
+                "{what}: process {number} is still there after the call returned"
             );
         }
     }

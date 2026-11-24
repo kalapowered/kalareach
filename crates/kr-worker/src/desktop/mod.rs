@@ -51,6 +51,7 @@
 
 pub mod capability;
 pub mod checks;
+mod children;
 pub mod platform;
 pub mod probe;
 pub mod routes;
