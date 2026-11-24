@@ -776,6 +776,103 @@ jobs:
           path: /tmp/kr-test-artifacts/real-proxy
           if-no-files-found: error
 
+  # Contract tests for installed apps, live workers and plugins. An installed app, a running worker, a
+  # plugin host and a published plugin can each be a build of another release than the one under
+  # test, and what each reads of the other is held by the cases this job runs together: the surfaces
+  # and frames of the releases a build retains, a client against a daemon or a worker of another
+  # release, a plugin host of the release before, a plugin whose SDK range does not take this host,
+  # and the upgrade suite, which builds the release before from its commit and runs a session of it
+  # beside this build. The workspace's test step runs most of the first cases too, and cannot run the
+  # upgrade suite, which builds only with its feature. The job is a job of its own because the rust
+  # job's steps already add up to more than its limit, and it has no `needs` so that it runs beside
+  # that job. The service side of the contract is the web repository's. The macOS upgrade suite is
+  # not in this workflow: hosted macOS runners are the gate's scarcest, so no job here takes one.
+  #
+  # The limits are estimates and not measurements of a hosted run. On the box, whose build was warm,
+  # the retained surface's cases took 7 minutes and the upgrade suite's 51 cases 8.5 minutes; a
+  # hosted runner has a quarter of the threads and builds everything from nothing, twice for the
+  # upgrade suite, which builds the release before in a tree of its own. The fast step has 90
+  # minutes and the upgrade suite 180, each about twice what it is expected to take.
+  contract-tests:
+    name: contract tests for installed apps, live workers and plugins
+    runs-on: ubuntu-24.04
+    timeout-minutes: 330
+    env:
+      # A runner with no user service manager fails the cases that start a daemon through one, where
+      # they would otherwise stand down and pass.
+      KR_REQUIRE_SERVICE_MANAGER: "1"
+    steps:
+      - name: Free the disk the build needs
+        run: |
+          df -h /
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force
+          df -h /
+
+      # The history and the release tags: the upgrade suite builds the release before from its
+      # commit, which a shallow checkout does not have.
+      - name: Check out
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          fetch-depth: 0
+
+      - name: Install the pinned toolchain
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustc --version
+          cargo --version
+
+      # The retained surface's cases build their fixture trees for x86_64-pc-windows-gnu, and a cross
+      # check needs the standard library of its target.
+      - name: Install the component target
+        run: rustup target add x86_64-pc-windows-gnu
+
+      # The retained surface's narrower reading resolves every target's packages offline.
+      - name: Fetch the crates of every target
+        timeout-minutes: 10
+        run: cargo fetch --locked
+
+      - name: The contract cases that need this tree alone
+        timeout-minutes: 90
+        run: bash scripts/contract-cases.sh fast
+
+      - name: The upgrade suite
+        if: ${{ !cancelled() }}
+        timeout-minutes: 180
+        run: bash scripts/contract-cases.sh upgrade
+
+      - name: What the disk has left
+        if: ${{ !cancelled() }}
+        run: df -h /
+
+  # The Windows case of the upgrade suite: a host that ran the release before in place is moved to
+  # this release's store beside a live session of the release before. The limit is an estimate and
+  # not a measurement of a hosted run: the case builds this tree's programs and the release before's
+  # from nothing, and a Windows build is slower than a Linux one.
+  contract-tests-windows:
+    name: contract tests for installed apps, live workers and plugins (windows)
+    runs-on: windows-2025
+    timeout-minutes: 240
+    steps:
+      - name: Check out
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          fetch-depth: 0
+
+      - name: Install the pinned toolchain
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustc --version
+          cargo --version
+
+      - name: Place libsodium's archives
+        uses: ./.github/actions/libsodium-archive
+
+      - name: The upgrade suite's Windows case
+        timeout-minutes: 200
+        shell: bash
+        run: bash scripts/contract-cases.sh windows
+
   windows:
     name: ${{ matrix.name }}
     runs-on: windows-2025

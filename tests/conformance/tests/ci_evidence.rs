@@ -1536,6 +1536,394 @@ fn the_jobs_that_run_the_retained_surface_suite_install_the_windows_cross_compil
     }
 }
 
+/// The commands `scripts/contract-cases.sh` runs through `expect`, each as its words, by the
+/// function that runs them. A line that ends in a backslash goes on in the next.
+fn contract_commands(script: &str) -> Vec<(String, Vec<String>)> {
+    let mut joined: Vec<String> = Vec::new();
+    let mut pending = String::new();
+    for line in script.lines() {
+        let line = line.trim();
+        match line.strip_suffix('\\') {
+            Some(part) => {
+                pending.push_str(part);
+                pending.push(' ');
+            }
+            None => {
+                pending.push_str(line);
+                joined.push(std::mem::take(&mut pending));
+            }
+        }
+    }
+    let mut function = String::new();
+    let mut commands = Vec::new();
+    for line in joined {
+        if let Some(name) = line.strip_suffix("() {") {
+            function = name.to_owned();
+        } else if let Some(command) = line.strip_prefix("expect ") {
+            commands.push((
+                function.clone(),
+                command.split_whitespace().map(str::to_owned).collect(),
+            ));
+        }
+    }
+    commands
+}
+
+/// Whether a command of the contract script runs the test target `target` of `package`, or its
+/// library for `--lib`.
+fn runs_target(words: &[String], package: &str, target: &str) -> bool {
+    let has = |wanted: &[&str]| {
+        words
+            .windows(wanted.len())
+            .any(|window| window.iter().map(String::as_str).eq(wanted.iter().copied()))
+    };
+    has(&["-p", package])
+        && if target == "--lib" {
+            has(&["--lib"])
+        } else {
+            has(&["--test", target])
+        }
+}
+
+/// The files that can hold the case `name` of a command that runs `package`'s `target`: for a
+/// library case `module::tests::name`, the module's source file; for a test target, its file and
+/// the files of the folder it has beside it.
+fn files_of_cases(package: &str, target: &str, name: &str) -> Vec<PathBuf> {
+    let root = repository().join("crates").join(package);
+    if target == "--lib" {
+        let module = name.split("::").next().expect("a module");
+        return vec![root.join("src").join(format!("{module}.rs"))];
+    }
+    let tests = root.join("tests");
+    let mut files = vec![tests.join(format!("{target}.rs"))];
+    if let Ok(entries) = fs::read_dir(tests.join(target)) {
+        files.extend(entries.flatten().map(|entry| entry.path()));
+    }
+    files
+}
+
+/// A boundary of the contract cases: what it is, the function of the script that holds it and the
+/// packages and test targets that hold it there.
+type Boundary<'a> = (&'a str, &'a str, &'a [(&'a str, &'a str)]);
+
+/// KR-REQ-04.21, contract tests for installed apps, live workers and plugins. A build of one release
+/// meets builds of other releases at four boundaries: an installed app and the host, a client and a
+/// daemon or a worker, a worker and a plugin host, and a published plugin and the host. The landing
+/// workflow runs the cases for each in a job of its own on a hosted Linux machine, and the upgrade
+/// suite's Windows case in another on a hosted Windows machine. A job has no `needs`, so it runs
+/// beside the rust job. Each step that runs the script is not disabled, has a limit and has no
+/// condition, except that the upgrade suite also runs after the cases before it failed. The steps'
+/// limits, with 30 minutes for the steps that have none, fit inside the job's limit, which is under
+/// the 360 minutes GitHub allows. The script runs a command for each boundary in the function that
+/// holds it, each command names a test target or library that exists, and each case it names with
+/// `--exact` exists in that target and is named once.
+#[test]
+fn the_contract_cases_for_installed_apps_live_workers_and_plugins_run_in_jobs_of_their_own() {
+    let workflow = fs::read_to_string(repository().join(".github/workflows/core-ci.yml"))
+        .expect("the landing workflow");
+    let script = fs::read_to_string(repository().join("scripts/contract-cases.sh"))
+        .expect("the script that runs the contract cases");
+
+    let minutes = |text: &str, indent: usize| {
+        value_at(text, indent, "timeout-minutes").and_then(|value| value.parse::<u32>().ok())
+    };
+    for (name, runner, modes) in [
+        ("contract-tests", "ubuntu-24.04", vec!["fast", "upgrade"]),
+        ("contract-tests-windows", "windows-2025", vec!["windows"]),
+    ] {
+        let text = job(&workflow, name);
+        let head = header(&text);
+        assert_eq!(
+            value_at(&head, 4, "runs-on").as_deref(),
+            Some(runner),
+            "{name} runs on another runner"
+        );
+        assert!(job_condition(&text).is_none(), "{name} has a condition");
+        assert!(
+            !is_disabled(&head),
+            "{name} is skipped or lets its failure pass"
+        );
+        assert!(
+            value_at(&head, 4, "needs").is_none() && !head.contains("\n    needs:"),
+            "{name} waits for another job"
+        );
+        let job_limit = minutes(&head, 4).unwrap_or_else(|| panic!("{name} has no limit"));
+        assert!(
+            job_limit < 360,
+            "{name}: {job_limit} is not under GitHub's 360 minutes"
+        );
+
+        let mut total = 0;
+        for mode in &modes {
+            let command = format!("bash scripts/contract-cases.sh {mode}");
+            let steps: Vec<String> = steps_of(&text)
+                .into_iter()
+                .filter(|step| value_at(step, 8, "run").as_deref() == Some(command.as_str()))
+                .collect();
+            assert_eq!(steps.len(), 1, "{name}: one step runs `{command}`");
+            let step = &steps[0];
+            assert!(
+                !is_disabled(step),
+                "{name}: the {mode} step is skipped or lets its failure pass"
+            );
+            let condition = step_condition(step);
+            if *mode == "upgrade" {
+                assert_eq!(
+                    condition.as_deref(),
+                    Some("${{!cancelled()}}"),
+                    "the upgrade suite does not run after the cases before it failed"
+                );
+            } else {
+                assert!(
+                    condition.is_none(),
+                    "{name}: the {mode} step has a condition"
+                );
+            }
+            total +=
+                minutes(step, 8).unwrap_or_else(|| panic!("{name}: the {mode} step has no limit"));
+        }
+        // The steps without a limit of their own (the checkout, the toolchain and the disk) and
+        // the other steps' limits leave the job a margin.
+        let others: u32 = steps_of(&text)
+            .iter()
+            .filter(|step| {
+                !modes.iter().any(|mode| {
+                    value_at(step, 8, "run").as_deref()
+                        == Some(format!("bash scripts/contract-cases.sh {mode}").as_str())
+                })
+            })
+            .filter_map(|step| minutes(step, 8))
+            .sum();
+        assert!(
+            total + others + 30 <= job_limit,
+            "{name}: the steps' limits ({total} and {others}) and 30 minutes for the steps with none do not fit in {job_limit}"
+        );
+    }
+    assert!(
+        job(&workflow, "contract-tests").contains("KR_REQUIRE_SERVICE_MANAGER: \"1\""),
+        "a runner with no service manager passes the cases that start a daemon without running them"
+    );
+
+    // Each boundary has a command in the function that runs it.
+    let commands = contract_commands(&script);
+    let boundaries: [Boundary; 6] = [
+        (
+            "an installed app and the surfaces, frames and majors of the releases a build retains",
+            "fast",
+            &[
+                ("kr-protocol", "retained"),
+                ("kr-protocol", "public_majors"),
+                ("kr-cli", "retained_surface"),
+                ("kr-client", "release_check"),
+                ("kr-client", "network_chunks"),
+            ],
+        ),
+        (
+            "a client and a daemon or a worker of another release or another major",
+            "fast",
+            &[("kr-cli", "bridge"), ("kr-cli", "startup")],
+        ),
+        (
+            "a worker and a plugin host of the release before or of another protocol",
+            "fast",
+            &[
+                ("kr-plugin-service", "retained_host_frames"),
+                ("kr-plugin-service", "--lib"),
+            ],
+        ),
+        (
+            "a published plugin whose SDK range does not take this host",
+            "fast",
+            &[
+                ("kr-plugin-sdk", "sdk_range_first"),
+                ("kr-plugin-catalogue", "catalogue"),
+            ],
+        ),
+        (
+            "an installed app, a client, a worker and a plugin host beside the release before",
+            "upgrade",
+            &[("kr-cli", "upgrade")],
+        ),
+        (
+            "a Windows host that ran the release before in place",
+            "windows",
+            &[("kr-cli", "upgrade_windows")],
+        ),
+    ];
+    for (boundary, function, targets) in boundaries {
+        for (package, target) in targets {
+            assert!(
+                commands
+                    .iter()
+                    .any(|(at, words)| at == function && runs_target(words, package, target)),
+                "no command of `{function}` holds {boundary}: {package} {target}"
+            );
+        }
+    }
+    for function in ["upgrade", "windows"] {
+        let suites: Vec<String> = commands
+            .iter()
+            .filter(|(at, _)| at == function)
+            .map(|(_, words)| words.join(" "))
+            .collect();
+        assert!(!suites.is_empty(), "`{function}` runs no suite");
+        for suite in suites {
+            assert!(
+                suite.contains("--features upgrade-suite"),
+                "`{function}` runs a suite that builds only with its feature without it: {suite}"
+            );
+        }
+    }
+
+    // Every target and every named case exists, and no case is named twice.
+    assert!(!commands.is_empty(), "the script runs no cases");
+    for (function, words) in &commands {
+        let package = words
+            .windows(2)
+            .find(|window| window[0] == "-p")
+            .map(|window| window[1].as_str())
+            .unwrap_or_else(|| panic!("`{function}`: a command names no package"));
+        let tests: Vec<&str> = words
+            .windows(2)
+            .filter(|window| window[0] == "--test")
+            .map(|window| window[1].as_str())
+            .collect();
+        let target = if words.iter().any(|word| word == "--lib") {
+            "--lib"
+        } else {
+            assert!(!tests.is_empty(), "`{function}`: {package} has no target");
+            tests[0]
+        };
+        for test in &tests {
+            let file = repository()
+                .join("crates")
+                .join(package)
+                .join("tests")
+                .join(format!("{test}.rs"));
+            assert!(
+                file.is_file(),
+                "`{function}`: {package} has no test target {test}"
+            );
+        }
+        if let Some(exact) = words.iter().position(|word| word == "--exact") {
+            assert_eq!(
+                tests.len().max(1),
+                1,
+                "`{function}`: named cases of more than one target"
+            );
+            let named: Vec<&str> = words[exact + 1..]
+                .iter()
+                .take_while(|word| !word.starts_with("--"))
+                .map(String::as_str)
+                .collect();
+            assert!(!named.is_empty(), "`{function}`: --exact names no case");
+            for (at, name) in named.iter().enumerate() {
+                assert!(
+                    !named[..at].contains(name),
+                    "`{function}`: {name} is named twice"
+                );
+                let function_name = name.rsplit("::").next().expect("a name");
+                let held = files_of_cases(package, target, name).iter().any(|file| {
+                    fs::read_to_string(file)
+                        .is_ok_and(|text| text.contains(&format!("fn {function_name}(")))
+                });
+                assert!(held, "`{function}`: {package} has no case {name}");
+            }
+        }
+    }
+}
+
+/// KR-REQ-04.21: the contract script holds each command to what its test programs report. A command
+/// passes only when every test program reports passed cases and no failed one, and a command that
+/// names several cases with `--exact` passes only when as many passed as it names, because cargo
+/// exits 0 for a name that matches nothing. A failed command does not stop the commands after it,
+/// and the script then exits 1. This runs the script against a `cargo` that reports what each case
+/// asks of it.
+#[test]
+fn the_contract_script_fails_a_command_whose_cases_did_not_all_run_and_pass() {
+    let tools = TempDir::new().expect("a directory");
+    let cargo = tools.path().join("cargo");
+    fs::write(
+        &cargo,
+        r#"#!/bin/sh
+# A build builds, whatever the cases do.
+if [ "$1" = build ]; then exit 0; fi
+named=0
+seen=0
+for word in "$@"; do
+  if [ "$seen" = 1 ]; then
+    case "$word" in
+      --*) seen=2 ;;
+      *) named=$((named + 1)) ;;
+    esac
+  elif [ "$word" = --exact ]; then
+    seen=1
+  fi
+done
+if [ "$named" -gt 0 ]; then count=$named; else count=7; fi
+case "$FAKE_CARGO" in
+  right) echo "test result: ok. $count passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.1s" ;;
+  none) echo "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.0s" ;;
+  short)
+    if [ "$named" -gt 1 ]; then count=$((named - 1)); fi
+    echo "test result: ok. $count passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.1s" ;;
+  failed) echo "test result: FAILED. 3 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.1s"; exit 101 ;;
+  silent) ;;
+esac
+"#,
+    )
+    .expect("a cargo");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&cargo, fs::Permissions::from_mode(0o755)).expect("executable");
+    }
+    let path = format!(
+        "{}:{}",
+        tools.path().display(),
+        std::env::var("PATH").expect("a PATH")
+    );
+    let run = |mode: &str, fake: &str| {
+        let output = Command::new("bash")
+            .arg(repository().join("scripts/contract-cases.sh"))
+            .arg(mode)
+            .env("PATH", &path)
+            .env("FAKE_CARGO", fake)
+            .current_dir(repository())
+            .output()
+            .expect("bash runs");
+        (
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+        )
+    };
+
+    for mode in ["fast", "upgrade", "windows"] {
+        assert_eq!(run(mode, "right").0, Some(0), "{mode}: every case passed");
+        for fake in ["none", "failed", "silent"] {
+            assert_eq!(run(mode, fake).0, Some(1), "{mode}: {fake} passed");
+        }
+    }
+    assert_eq!(
+        run("fast", "short").0,
+        Some(1),
+        "a command that names its cases passed with one of them not run"
+    );
+    let (_, output) = run("fast", "failed");
+    let commands = contract_commands(
+        &fs::read_to_string(repository().join("scripts/contract-cases.sh")).expect("the script"),
+    )
+    .into_iter()
+    .filter(|(function, _)| function == "fast")
+    .count();
+    assert_eq!(
+        output.matches("\n== cargo test ").count()
+            + usize::from(output.starts_with("== cargo test ")),
+        commands,
+        "a command that fails stops the commands after it"
+    );
+    assert_eq!(run("neither", "right").0, Some(2), "an unknown mode ran");
+}
+
 /// The names of the jobs of a workflow, in the order they are written.
 fn job_names(workflow: &str) -> Vec<String> {
     let mut in_jobs = false;
