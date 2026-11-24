@@ -1292,7 +1292,7 @@ async fn kr_req_24_24_a_request_claimed_for_an_answer_is_given_to_a_component_th
         ["1", "2", "3"],
         "the claimed request was left out, or another was: {account:?}"
     );
-    let reason = world.reason(2);
+    let reason = world.until_reason(2, "started again").await;
     assert!(
         reason.contains("the worker gave it 3 pending requests from its own records"),
         "{reason}"
@@ -1387,7 +1387,7 @@ async fn kr_req_24_24_a_request_answered_while_an_earlier_hand_over_waits_is_not
         1,
         "the upstream was written one answer"
     );
-    let reason = world.reason(1);
+    let reason = world.until_reason(1, "started again").await;
     assert!(
         reason.contains("the worker gave it 2 pending requests from its own records"),
         "{reason}"
@@ -1497,7 +1497,7 @@ async fn kr_req_24_24_a_second_loss_between_two_hand_overs_leaves_the_replacemen
          request: {account:?}"
     );
     assert_eq!(account.observes, 3, "{account:?}");
-    let reason = world.reason(1);
+    let reason = world.until_reason(1, "started again").await;
     assert!(
         reason.contains("the worker gave it 3 pending requests from its own records"),
         "{reason}"

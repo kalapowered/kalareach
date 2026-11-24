@@ -655,13 +655,13 @@ Whatever a ready component does not get is a numbered loss: an entry the lane pu
 one the pump passed over, one the host's queue refused. A request frame is the exception: the pump
 asks the broker again before it offers one, and skips it, with no loss, when the request was
 answered, taken by the native client, marked as sent, or left behind by its source while it waited.
-What was pushed before a binding first
-became ready predates the binding's view and is not a loss. What was pushed while the runtime was
-lost is counted for a binding that had been ready, and its component is told when it starts again
-(see below); the worker owes the component no snapshot of it. The pump offers a binding nothing
-while it owes the binding a snapshot, so a component is asked for a fresh snapshot before anything later is handed to it. The snapshot waits, for up to a
-second, until the client has written every event it was handed, an event being counted until its
-write is over; if it has not, the binding is passed over and asked again after a wait that grows.
+What was pushed before a binding first became ready predates the binding's view and is not a loss.
+What was pushed while the runtime was lost is counted for a binding that had been ready, and its
+component is told when it starts again (see below); the worker owes the component no snapshot of
+it. The pump offers a binding nothing while it owes the binding a snapshot, so a component is asked
+for a fresh snapshot before anything later is handed to it. The snapshot waits, for up to a second,
+until the client has written every event it was handed, an event being counted until its write is
+over; if it has not, the binding is passed over and asked again after a wait that grows.
 The snapshot request is then written after those events, and the runtime reads them in that order.
 Whether the component has observed them when it answers is not claimed: the runtime queues an event
 when it reads it, takes the queue in batches of sixteen and may answer a snapshot request between
@@ -679,8 +679,9 @@ after a wait that doubles from one second to thirty.
 The link keeps two more things. When a binding is registered again, after the runtime was replaced
 for example, its component is a new instance with no state, and the worker takes no state from a
 component and restores nothing into one: the state is opaque to the worker, and a state of unknown
-coverage cannot be made to hold exactly the requests the broker holds unresolved. The pump gives the component, before anything else, each request the
-broker still holds as pending, once each, in the order the broker recorded them. An approval's bytes
+coverage cannot be made to hold exactly the requests the broker holds unresolved. The pump gives
+the component, before anything else, each request the broker still holds as unanswered, once each,
+in the order the broker recorded them. An approval's bytes
 come from its decoder entry, which keeps the original whole, and any other request's from the frame
 the broker retained; nothing is read from the terminal, the semantic log or a screen. A request is given
 while it is pending, and while a rich answer holds it under a claim that nothing marks as sent,
@@ -706,7 +707,8 @@ could not be given, how many upstream frames and spans of terminal output the wo
 while the runtime was away (and how many bytes they held), how many observations the worker's queue dropped for
 want of room, and how many requests were queued to be decoded again. A request the worker's queue
 refused while the runtime was away is counted among the observations dropped, and is given from
-the broker's records only if it is still unanswered and within the limits on what is given.
+the broker's records only if it is still unanswered and the baseline has room for it. The baseline
+gives at most 64 requests and 4 MiB, and none too large for one event.
 
 Privacy mode does not stop observation for live use. The runtime's words in a fault, and in the reason a component is disabled for, are withheld from the
 report once privacy mode has been on at any time since the worker made the connection to the runtime
