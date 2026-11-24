@@ -473,8 +473,6 @@ impl PluginHost {
     /// that listener through the report, so there is no moment between proving which process owns
     /// the endpoint and answering on it during which another process could take it.
     ///
-    /// # Errors
-    ///
     /// Every connection it accepts speaks `protocol`: each endpoint speaks one protocol, and a
     /// host that serves two does so on two listeners, one call each. What `Verify` signs is the
     /// endpoint of the listener, which is the one the connection arrived on.
