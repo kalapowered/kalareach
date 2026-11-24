@@ -310,6 +310,9 @@ impl Computer {
                 companion_tauri::commands::recovery_resume_settings,
                 companion_tauri::commands::recovery_restore_settings,
                 companion_tauri::commands::retained_saved_settings,
+                companion_tauri::commands::settings_sync_turn_on,
+                companion_tauri::commands::settings_sync_now,
+                companion_tauri::commands::settings_drafts_set,
                 cover_the_host_double,
             ])
             .build(mock_context(noop_assets()))
@@ -4825,6 +4828,16 @@ async fn a_change_to_the_settings_tells_the_page_and_takes_the_saved_line_away_a
     );
 }
 
+/// The one host this computer is connected to, which is in privacy mode.
+fn privacy_host() -> companion_tauri::drafts::DraftHost {
+    companion_tauri::drafts::DraftHost {
+        environment: kr_protocol::ids::EnvironmentId::new(kr_protocol::scalars::Uuid::from_bytes(
+            [1; 16],
+        )),
+        name: Some("studio".to_owned()),
+    }
+}
+
 /// What this computer can read of a host's privacy mode, scripted: every host is in privacy mode,
 /// and the reads are counted.
 struct HostsInPrivacyMode {
@@ -4848,9 +4861,10 @@ impl companion_tauri::settings::Hosts for HostsInPrivacyMode {
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = companion_tauri::settings::Holds> + Send + '_>,
     > {
-        Box::pin(std::future::ready(
-            companion_tauri::settings::Holds::Unknown,
-        ))
+        // Every session belongs to the one host this computer is connected to.
+        Box::pin(std::future::ready(companion_tauri::settings::Holds::Here(
+            privacy_host(),
+        )))
     }
 
     fn privacy(
@@ -4886,9 +4900,10 @@ impl kr_client::pairing::owner::Ceremony for Confirms {
 }
 
 /// KR-REQ-20.17, KR-REQ-18.05: privacy mode does not stop the settings from being saved with the
-/// bundle, as it does not stop the colour mode's sync: with settings sync taking part beside hosts
-/// that are all in privacy mode and the writer's level open, a change to the colour mode reaches the
-/// bundle, and the step never reads a host's privacy mode.
+/// bundle, as it does not stop the colour mode's sync: with settings sync on, drafts syncing, and a
+/// draft for a host in privacy mode kept on this device, a change to the colour mode reaches the
+/// bundle. The step has no input for privacy mode; what the case shows is that privacy mode in
+/// force beside it does not stop the colour mode from reaching the bundle.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_colour_change_beside_hosts_in_privacy_mode_is_saved_with_the_bundle() {
     let timing = SettingsTiming {
@@ -4908,6 +4923,65 @@ async fn a_colour_change_beside_hosts_in_privacy_mode_is_saved_with_the_bundle()
     )
     .expect("settings sync opens");
     page.call("recovery_turn_on", json!({})).expect("on");
+
+    // Privacy mode is in force: settings sync is on and drafts sync with it, and a draft written
+    // for a session of a host that reports privacy mode on is read as private and stays here.
+    settings
+        .set_colour_mode(ColourMode::Light)
+        .await
+        .expect("kept");
+    let synced = page
+        .call("settings_sync_turn_on", json!({}))
+        .expect("settings sync is on");
+    assert_eq!(synced["sync"]["state"], "on");
+    page.call("settings_drafts_set", json!({ "enabled": true }))
+        .expect("drafts sync is on");
+    let session =
+        kr_protocol::ids::SessionId::new(kr_protocol::scalars::Uuid::from_bytes([0x81; 16]));
+    page.app
+        .state::<AppState>()
+        .drafts()
+        .save(
+            serde_json::from_value(json!({
+                "id": null,
+                "expectedRevision": null,
+                "sessionId": session,
+                "applicationInstanceId": null,
+                "agentBindingRevision": null,
+                "state": "open",
+                "text": "written for the studio",
+                "attachments": []
+            }))
+            .expect("parameters"),
+            TimestampMs::new(now_ms()),
+        )
+        .expect("the draft is saved");
+    let view = page
+        .call("settings_sync_now", json!({}))
+        .expect("settings sync runs");
+    assert!(
+        *hosts.reads.lock().expect("the record") > 0,
+        "the host's privacy mode was read by the path that reads it"
+    );
+    let kept: Vec<(String, String, u64)> = view["sync"]["drafts"]["kept_here"]
+        .as_array()
+        .expect("a list")
+        .iter()
+        .map(|kept| {
+            (
+                kept["host"].as_str().unwrap_or("").to_owned(),
+                kept["why"].as_str().expect("a reason").to_owned(),
+                kept["drafts"].as_u64().expect("a count"),
+            )
+        })
+        .collect();
+    assert_eq!(
+        kept,
+        vec![("studio".to_owned(), "private".to_owned(), 1)],
+        "the draft of the host in privacy mode stays on this device: {view}"
+    );
+
+    // In the same run, the colour mode reaches the bundle.
     settings
         .set_colour_mode(ColourMode::Dark)
         .await
@@ -4921,11 +4995,6 @@ async fn a_colour_change_beside_hosts_in_privacy_mode_is_saved_with_the_bundle()
         line_of(&page)
     );
     assert_eq!(line_of(&page), json!({ "state": "saved" }));
-    assert_eq!(
-        *hosts.reads.lock().expect("the record"),
-        0,
-        "the step asked no host about privacy mode"
-    );
 }
 
 /// KR-REQ-20.17: a device turned on before the settings were saved with the bundle saves them at
