@@ -206,12 +206,18 @@ impl ShellPackage {
     /// [`PackageFault::MissingExecutable`] when the executable it names is not installed.
     pub fn read(directory: &Path) -> Result<Self, PackageFault> {
         let candidate = directory.join(MANIFEST_BASENAME);
-        let package = read_manifest(&candidate, None, directory)?.ok_or_else(|| {
-            PackageFault::Unreadable {
-                path: candidate.display().to_string(),
-                detail: "this directory holds no identity record".to_owned(),
-            }
-        })?;
+        // An identity directory is two levels under the root a build wrote it in.
+        let root = directory
+            .parent()
+            .and_then(Path::parent)
+            .unwrap_or(directory);
+        let package =
+            read_manifest(&candidate, None, directory, Home::Built(root))?.ok_or_else(|| {
+                PackageFault::Unreadable {
+                    path: candidate.display().to_string(),
+                    detail: "this directory holds no identity record".to_owned(),
+                }
+            })?;
         if !package.executable().is_file() {
             return Err(PackageFault::MissingExecutable {
                 path: package.directory.display().to_string(),
@@ -344,20 +350,30 @@ impl ShellPackage {
 
     /// Returns what is wrong with the flags, when something is.
     ///
-    /// A flag is one argument of the shell's command line, so it is held to what an argument can
-    /// be: not empty, and with no NUL in it. What the flags make the shell do is the build's to
-    /// declare and the release check's to read.
+    /// A flag is one argument of the shell's command line. A command line cannot carry a NUL in
+    /// an argument. It can carry an empty one, and this host refuses it as a rule of its own: a
+    /// flag that says nothing is a fault in the record, not something a package declares. What the
+    /// flags make the shell do is the build's to declare and the release check's to read.
     fn flags_fault(&self) -> Option<String> {
         let flags = &self.manifest.flags;
         [("interactive", &flags.interactive), ("login", &flags.login)]
             .into_iter()
-            .find(|(_, arguments)| {
-                arguments
-                    .iter()
-                    .any(|argument| argument.is_empty() || argument.contains('\0'))
-            })
-            .map(|(mode, _)| {
-                format!("the {mode} flags hold an argument that is empty or has a NUL in it")
+            .find_map(|(mode, arguments)| {
+                arguments.iter().find_map(|argument| {
+                    if argument.is_empty() {
+                        Some(format!(
+                            "the {mode} flags hold an empty argument, and this host refuses a \
+                             package that declares one"
+                        ))
+                    } else if argument.contains('\0') {
+                        Some(format!(
+                            "the {mode} flags hold an argument with a NUL in it, which a command \
+                             line cannot carry"
+                        ))
+                    } else {
+                        None
+                    }
+                })
             })
     }
 
@@ -678,13 +694,34 @@ fn unqualified(requested: &str) -> String {
     }
 }
 
-/// The words for a record that declares no flags, which say what writes a new one.
-fn flags_missing(kind: ShellKind) -> String {
-    let said = "the record declares no flags: it was written before packages declared them";
-    if kind == ShellKind::PowerShell {
-        format!("{said}; run {PUBLISH_COMMAND} in PowerShell to qualify the one this account runs")
-    } else {
-        format!("{said}; build the package again with scripts/build-shells.sh")
+/// Where a set of packages was read from, which decides what writes a record that can be read.
+#[derive(Clone, Copy, Debug)]
+enum Home<'a> {
+    /// The `shells` folder of an installed release, which holds the packages the release came with.
+    Release,
+    /// Any other root: the one a build wrote to, which is the platform's package directory or the
+    /// one [`PACKAGE_ROOT_VARIABLE`] names.
+    Built(&'a Path),
+}
+
+/// The words for a record that declares no flags, which say what writes a new one for the
+/// package's own shell and home.
+fn flags_missing(kind: ShellKind, home: Home<'_>) -> String {
+    let said = "the record declares no flags";
+    match (kind, home) {
+        // A PowerShell package is only ever published by the person it is for, wherever it is.
+        (ShellKind::PowerShell, _) => format!(
+            "{said}; import the current KalaReach.ShellBridge module from a package that has its \
+             manifest.json beside the module folder, and run {PUBLISH_COMMAND} in PowerShell"
+        ),
+        (_, Home::Release) => {
+            format!("{said}; it is in an installed release, so replace the installed release")
+        }
+        (_, Home::Built(root)) => format!(
+            "{said}; build the package again from current sources with scripts/build-shells.sh \
+             --prefix {}",
+            root.display()
+        ),
     }
 }
 
@@ -750,7 +787,8 @@ pub fn default_package_root() -> PathBuf {
 ///
 /// `expected` is the shell the enclosing directory installs it as, where there is one: a record
 /// that says it is a different shell describes some other package and is refused rather than
-/// launched. `fallback` is the directory a record with no parent belongs to.
+/// launched. `fallback` is the directory a record with no parent belongs to. `home` is where the
+/// record was found, which decides what a refusal for a missing field says writes a new one.
 ///
 /// Returns `None` when the record is not there, which is what makes a directory holding no
 /// manifest an installation without that package rather than a failure.
@@ -758,6 +796,7 @@ fn read_manifest(
     candidate: &Path,
     expected: Option<ShellKind>,
     fallback: &Path,
+    home: Home<'_>,
 ) -> Result<Option<ShellPackage>, PackageFault> {
     let text = match std::fs::read_to_string(candidate) {
         Ok(text) => text,
@@ -773,19 +812,25 @@ fn read_manifest(
         path: candidate.display().to_string(),
         detail,
     };
+    // The record is read as a value only to see which fields it has. It is then read as a manifest
+    // from its text, so a field it names twice and the position of a fault are the parser's own.
     let record: serde_json::Value =
         serde_json::from_str(&text).map_err(|error| unreadable(error.to_string()))?;
-    // A record from before packages declared their flags is refused by name, with the step that
-    // writes a new one, rather than by the parser's word for a field it has never heard of.
-    if record.get("flags").is_none()
-        && let Some(kind) = record
+    // A record with no flags is refused by name, with the step that writes a new one, rather than
+    // by the parser's word for a missing field. The step is the one for the shell the folder it is
+    // in installs, where there is one: that folder is what the step has to repair.
+    let kind = expected.or_else(|| {
+        record
             .pointer("/shell/kind")
             .and_then(|kind| serde_json::from_value::<ShellKind>(kind.clone()).ok())
+    });
+    if record.get("flags").is_none()
+        && let Some(kind) = kind
     {
-        return Err(unreadable(flags_missing(kind)));
+        return Err(unreadable(flags_missing(kind, home)));
     }
     let manifest: PackageManifest =
-        serde_json::from_value(record).map_err(|error| unreadable(error.to_string()))?;
+        serde_json::from_str(&text).map_err(|error| unreadable(error.to_string()))?;
     if let Some(expected) = expected
         && manifest.shell.kind != expected
     {
@@ -854,6 +899,22 @@ impl PackageSet {
     /// Returns [`PackageFault::Unreadable`] when a manifest exists and cannot be parsed, because a
     /// package that cannot say what it is must not be launched as though it could.
     pub fn discover(root: &Path) -> Result<Self, PackageFault> {
+        Self::read_in(root, Home::Built(root))
+    }
+
+    /// Reads every package in the `shells` folder of an installed release.
+    ///
+    /// As [`Self::discover`], for the one root whose packages the release came with: a record in it
+    /// that cannot be used is mended by replacing the release, and not by a build or a publish.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PackageFault::Unreadable`] when a manifest cannot be parsed.
+    pub fn discover_release(root: &Path) -> Result<Self, PackageFault> {
+        Self::read_in(root, Home::Release)
+    }
+
+    fn read_in(root: &Path, home: Home<'_>) -> Result<Self, PackageFault> {
         let mut packages = Vec::new();
         let mut faults = std::collections::BTreeMap::new();
         for kind in ShellKind::ALL {
@@ -866,7 +927,7 @@ impl PackageSet {
                 }
             };
             for candidate in candidates {
-                match read_manifest(&candidate, Some(*kind), &directory) {
+                match read_manifest(&candidate, Some(*kind), &directory, home) {
                     Ok(Some(package)) => packages.push(package),
                     Ok(None) => continue,
                     // A record that cannot say what it is must not be launched as though it
@@ -1555,13 +1616,10 @@ mod tests {
         }
     }
 
-    /// KR-REQ-07.16: a record that declares no flags is refused, by name, with the step that
-    /// writes a new one; the host has no flags of its own to launch it with instead.
-    #[test]
-    fn a_record_that_declares_no_flags_is_refused_and_names_the_step_that_writes_a_new_one() {
-        let root = tempfile::tempdir().expect("a directory");
-        for kind in [ShellKind::Zsh, ShellKind::PowerShell] {
-            install_edited(root.path(), kind, |record| {
+    /// Writes a record that declares no `flags` for each of `kinds`.
+    fn install_without_flags(root: &Path, kinds: &[ShellKind]) {
+        for kind in kinds {
+            install_edited(root, *kind, |record| {
                 record
                     .as_object_mut()
                     .expect("an object")
@@ -1569,39 +1627,149 @@ mod tests {
                     .expect("the record had flags");
             });
         }
-        let set = PackageSet::discover(root.path()).expect("reads what it can");
-        assert!(set.packages().is_empty(), "neither record is a package");
-        for kind in [ShellKind::Zsh, ShellKind::PowerShell] {
-            let fault = set.fault(kind).expect("the record is refused");
-            assert!(matches!(fault, PackageFault::Unreadable { .. }), "{fault}");
+    }
+
+    /// The refusal of `kind`'s record in `set`, which must be one that this host cannot read.
+    fn refusal(set: &PackageSet, kind: ShellKind) -> String {
+        assert!(set.packages().is_empty(), "no record is a package");
+        let fault = set.fault(kind).expect("the record is refused");
+        assert!(matches!(fault, PackageFault::Unreadable { .. }), "{fault}");
+        assert!(
+            fault.to_string().contains("the record declares no flags"),
+            "{kind:?}: {fault}"
+        );
+        assert!(
+            !fault.to_string().contains("written before"),
+            "the record's age is not something this host knows: {fault}"
+        );
+        fault.to_string()
+    }
+
+    /// KR-REQ-07.16: the package of an installed release that declares no flags is refused, and
+    /// what writes a new one is a replaced release: a build or a publish writes elsewhere, and
+    /// leaves the release's own `shells` folder as it is.
+    #[test]
+    fn a_release_package_that_declares_no_flags_is_refused_and_the_release_is_to_be_replaced() {
+        let root = tempfile::tempdir().expect("a directory");
+        install_without_flags(root.path(), &[ShellKind::Zsh, ShellKind::Fish]);
+        let set = PackageSet::discover_release(root.path()).expect("reads what it can");
+        for kind in [ShellKind::Zsh, ShellKind::Fish] {
+            let said = refusal(&set, kind);
             assert!(
-                fault.to_string().contains("the record declares no flags"),
-                "{kind:?}: {fault}"
+                said.contains("replace the installed release"),
+                "{kind:?}: {said}"
             );
+            assert!(!said.contains("build-shells.sh"), "{kind:?}: {said}");
+            assert!(!said.contains(PUBLISH_COMMAND), "{kind:?}: {said}");
         }
-        let powershell = set
-            .fault(ShellKind::PowerShell)
-            .expect("refused")
-            .to_string();
-        assert!(powershell.contains(PUBLISH_COMMAND), "{powershell}");
-        let zsh = set.fault(ShellKind::Zsh).expect("refused").to_string();
-        assert!(zsh.contains("scripts/build-shells.sh"), "{zsh}");
-        assert!(!zsh.contains(PUBLISH_COMMAND), "{zsh}");
         assert!(
             set.select(Some("zsh")).is_err(),
             "and so is a request for it"
         );
     }
 
-    /// KR-REQ-07.16: a flag is one argument of the command line, so a record whose flags hold an
-    /// empty argument, or one with a NUL in it, is refused in whichever mode it is.
+    /// KR-REQ-07.16: the package a build wrote that declares no flags is refused, and what writes a
+    /// new one is the build again from current sources, into the root this host read it from.
     #[test]
-    fn a_flag_that_cannot_be_an_argument_is_refused() {
-        for (mode, bad) in [
-            ("interactive", ""),
-            ("login", ""),
-            ("interactive", "-i\u{0}x"),
-            ("login", "-l\u{0}x"),
+    fn a_built_package_that_declares_no_flags_is_refused_and_the_build_at_its_root_is_named() {
+        let root = tempfile::tempdir().expect("a directory");
+        install_without_flags(root.path(), &[ShellKind::Zsh, ShellKind::Bash]);
+        let set = PackageSet::discover(root.path()).expect("reads what it can");
+        for kind in [ShellKind::Zsh, ShellKind::Bash] {
+            let said = refusal(&set, kind);
+            assert!(
+                said.contains(&format!(
+                    "build the package again from current sources with scripts/build-shells.sh \
+                     --prefix {}",
+                    root.path().display()
+                )),
+                "{kind:?}: {said}"
+            );
+            assert!(
+                !said.contains("replace the installed release"),
+                "{kind:?}: {said}"
+            );
+            assert!(!said.contains(PUBLISH_COMMAND), "{kind:?}: {said}");
+        }
+        assert!(
+            set.select(Some("bash")).is_err(),
+            "and so is a request for it"
+        );
+    }
+
+    /// KR-REQ-07.16: the PowerShell package a person published that declares no flags is refused,
+    /// wherever this host reads it, and what writes a new one is a publish from the current module
+    /// with its manifest beside it: the publisher of an older module cannot add the field.
+    #[test]
+    fn a_published_powershell_package_that_declares_no_flags_is_refused_and_a_new_publish_is_named()
+    {
+        let root = tempfile::tempdir().expect("a directory");
+        install_without_flags(root.path(), &[ShellKind::PowerShell]);
+        for set in [
+            PackageSet::discover(root.path()).expect("reads what it can"),
+            PackageSet::discover_release(root.path()).expect("reads what it can"),
+        ] {
+            let said = refusal(&set, ShellKind::PowerShell);
+            assert!(
+                said.contains(
+                    "import the current KalaReach.ShellBridge module from a package that has its \
+                     manifest.json beside the module folder"
+                ),
+                "{said}"
+            );
+            assert!(
+                said.contains(&format!("run {PUBLISH_COMMAND} in PowerShell")),
+                "{said}"
+            );
+            assert!(!said.contains("build-shells.sh"), "{said}");
+            assert!(!said.contains("replace the installed release"), "{said}");
+        }
+    }
+
+    /// KR-REQ-07.16: the step a refusal names is the one for the folder the record is in, as that
+    /// is what the step has to repair, when the record says it is another shell.
+    #[test]
+    fn a_record_of_another_shell_that_declares_no_flags_is_refused_with_its_folders_step() {
+        let root = tempfile::tempdir().expect("a directory");
+        install_edited(root.path(), ShellKind::Zsh, |record| {
+            record["shell"]["kind"] = serde_json::json!("powershell");
+            record.as_object_mut().expect("an object").remove("flags");
+        });
+        install_edited(root.path(), ShellKind::PowerShell, |record| {
+            record["shell"]["kind"] = serde_json::json!("zsh");
+            record.as_object_mut().expect("an object").remove("flags");
+        });
+        let set = PackageSet::discover(root.path()).expect("reads what it can");
+        let zsh = refusal(&set, ShellKind::Zsh);
+        assert!(zsh.contains("scripts/build-shells.sh"), "{zsh}");
+        assert!(!zsh.contains(PUBLISH_COMMAND), "{zsh}");
+        let powershell = refusal(&set, ShellKind::PowerShell);
+        assert!(powershell.contains(PUBLISH_COMMAND), "{powershell}");
+        assert!(!powershell.contains("build-shells.sh"), "{powershell}");
+    }
+
+    /// KR-REQ-07.16: a package's flags hold no empty argument and none with a NUL in it. A NUL
+    /// cannot be in an argument of a command line. An empty argument can, and this host refuses it
+    /// as a rule of its own, in whichever mode it is.
+    #[test]
+    fn an_empty_flag_and_a_flag_with_a_nul_are_refused() {
+        for (mode, bad, said) in [
+            (
+                "interactive",
+                "",
+                "the interactive flags hold an empty argument",
+            ),
+            ("login", "", "the login flags hold an empty argument"),
+            (
+                "interactive",
+                "-i\u{0}x",
+                "the interactive flags hold an argument with a NUL in it",
+            ),
+            (
+                "login",
+                "-l\u{0}x",
+                "the login flags hold an argument with a NUL in it",
+            ),
         ] {
             let root = tempfile::tempdir().expect("a directory");
             install_edited(root.path(), ShellKind::Zsh, |record| {
@@ -1609,12 +1777,7 @@ mod tests {
             });
             let set = PackageSet::discover(root.path()).expect("reads what it can");
             let fault = set.fault(ShellKind::Zsh).expect("the record is refused");
-            assert!(
-                fault
-                    .to_string()
-                    .contains(&format!("the {mode} flags hold an argument")),
-                "{mode} {bad:?}: {fault}"
-            );
+            assert!(fault.to_string().contains(said), "{mode} {bad:?}: {fault}");
         }
         // And what an argument can be is accepted: a value with a space or a dash in it.
         let root = tempfile::tempdir().expect("a directory");
@@ -1623,6 +1786,34 @@ mod tests {
         });
         let set = PackageSet::discover(root.path()).expect("reads the package");
         assert!(set.fault(ShellKind::Zsh).is_none());
+    }
+
+    /// KR-REQ-07.16: a record that names a field twice, or holds a value of the wrong kind, is
+    /// refused by the parser's own words, with the position of the fault in the record.
+    #[test]
+    fn a_record_that_names_a_field_twice_or_holds_the_wrong_kind_of_value_is_refused_where_it_is() {
+        let root = tempfile::tempdir().expect("a directory");
+        install_edited(root.path(), ShellKind::Zsh, |_| {});
+        let file = root.path().join("zsh/identity-1").join(MANIFEST_BASENAME);
+        let text = std::fs::read_to_string(&file).expect("the record");
+
+        std::fs::write(
+            &file,
+            text.replacen('{', "{\"identity\":\"identity-2\",", 1),
+        )
+        .expect("writes the record");
+        let set = PackageSet::discover(root.path()).expect("reads what it can");
+        let said = set.fault(ShellKind::Zsh).expect("refused").to_string();
+        assert!(said.contains("duplicate field `identity`"), "{said}");
+        assert!(said.contains("at line 1 column"), "{said}");
+
+        let mut record: serde_json::Value = serde_json::from_str(&text).expect("a record");
+        record["flags"]["interactive"] = serde_json::json!(5);
+        std::fs::write(&file, record.to_string()).expect("writes the record");
+        let set = PackageSet::discover(root.path()).expect("reads what it can");
+        let said = set.fault(ShellKind::Zsh).expect("refused").to_string();
+        assert!(said.contains("expected a sequence"), "{said}");
+        assert!(said.contains("at line 1 column"), "{said}");
     }
 
     /// KR-REQ-07.16: what a session with no profile is launched with is the platform's own default

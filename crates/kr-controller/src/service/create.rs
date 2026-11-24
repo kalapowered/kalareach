@@ -1587,7 +1587,7 @@ pub(super) fn qualified_package(root: Option<&Path>, requested: Option<&str>) ->
     use kr_shell_integration::host::package::{PackageSet, default_package_root};
 
     let installed = match root {
-        Some(root) => PackageSet::discover(root),
+        Some(root) => PackageSet::discover_release(root),
         None => PackageSet::installed(&default_package_root()),
     }
     .map_err(|fault| ControllerError::ShellIntegrationUnsupported(fault.to_string()))?;

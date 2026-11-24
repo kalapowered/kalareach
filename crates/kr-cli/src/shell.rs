@@ -138,7 +138,7 @@ pub fn packages() -> Result<Packages> {
             }
         };
         let root = current.shells();
-        return PackageSet::discover(&root)
+        return PackageSet::discover_release(&root)
             .map(|set| Packages {
                 set,
                 _held: Some(current),

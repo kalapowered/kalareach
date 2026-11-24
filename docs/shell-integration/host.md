@@ -315,9 +315,14 @@ holds one list for the interactive startup and one for the login startup, which 
 from the package's pinned manifest, and the worker passes on exactly the list for the session's
 mode, in its order. The session decides the mode: login on macOS and interactive elsewhere, unless
 its profile says otherwise. A record with no `flags` is refused for that shell alone, and the
-refusal names the step that writes a new one: `Publish-KalaReachQualification` for the PowerShell
-package, a new build for the others. A hello does not carry the flags, because they say how a host
-starts the shell and not what the shell is, so nothing compares them with the shell that started.
+refusal names the step that writes a new one, which depends on where the record came from. A
+release's own package is replaced by replacing the installed release. A build is made again from
+current sources into the root the host read. A PowerShell package that a person published is
+published again with `Publish-KalaReachQualification`, from the current `KalaReach.ShellBridge`
+module with its `manifest.json` beside the module folder; the publisher of an older module cannot
+add the field. When a record says it is another shell than the folder it is in, the step is the
+folder's. A hello does not carry the flags, because they say how a host starts the shell and not
+what the shell is, so nothing compares them with the shell that started.
 A package whose recorded executable is no longer where the build put it is still read from its own
 directory, so a package that was copied somewhere else is the package that is there.
 
