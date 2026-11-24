@@ -5654,10 +5654,18 @@ mod recorded_session {
         "response:health",
     ];
 
-    /// The members of those frames that differ from one run to the next: the challenge and its
-    /// signature, a path in a folder made for the run, the identity of the host's process and how
-    /// long something took.
-    const OF_THE_RUN: [&str; 10] = [
+    /// The members of those frames that differ from one run to the next or one machine to the next:
+    /// the challenge and its signature, a path in a folder made for the run, the identity of the
+    /// host's process and of the machine it runs on, how long something took, the component a
+    /// registration carries (built with paths of the machine that built it) and what the engine says
+    /// of the target it compiles for and how much it compiled.
+    const OF_THE_RUN: [&str; 16] = [
+        "component",
+        "process_start_identity",
+        "target",
+        "engine_compatibility",
+        "resident_bytes",
+        "boot_identity",
         "nonce",
         "path",
         "endpoint",
@@ -5688,6 +5696,7 @@ mod recorded_session {
                                     }
                                     Value::String(_) => Value::from("text"),
                                     Value::Number(_) => Value::from("number"),
+                                    Value::Object(_) => Value::from("object"),
                                     other => Value::from(other.to_string()),
                                 }
                             } else {
