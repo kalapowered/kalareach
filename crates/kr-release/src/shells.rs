@@ -247,7 +247,10 @@ fn package(tree: &Path, checkout: &Path, shell: &str) -> Result<ReleaseShell> {
     if !pins["flags"].is_object() {
         refuse!("{}", at("the pins declare no flags"));
     }
-    if !record["flags"].is_object() {
+    // A record that has no flags field is refused here by that word. A field of another shape is
+    // left to the comparison below, which says that the record records other flags than the pins
+    // declare.
+    if record.get("flags").is_none() {
         refuse!("{}", at("its record declares no flags"));
     }
     if record["flags"] != pins["flags"] {

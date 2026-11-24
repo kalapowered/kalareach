@@ -970,4 +970,18 @@ fn a_record_whose_flags_differ_from_the_pins_is_refused_before_it_is_signed() {
         refused.to_string().contains("its record declares no flags"),
         "{refused}"
     );
+
+    // A record whose flags are not an object is a record of other flags: the comparison says so,
+    // and the word for no flags is for a record with no field.
+    let release = tree_of();
+    edit_record(&release, &|record| {
+        record["flags"] = serde_json::json!("-l");
+    });
+    let refused = assemble(&inputs(&release.tree())).expect_err("flags of another shape");
+    assert!(
+        refused
+            .to_string()
+            .contains("it records other flags than the pins declare"),
+        "{refused}"
+    );
 }
