@@ -187,7 +187,7 @@ describe('an inbox that holds an item whose upstream result is unknown', () => {
   })
 })
 
-describe('an inbox that holds an item for action results that were not read in time', () => {
+describe('an inbox that holds an item for action results that cannot be read', () => {
   const GAP_KEY = 'attention.receipts_gap|~0123456789abcdef0123456789abcdef'
 
   it('shows the item as results nobody read and still reads the whole page', async () => {
@@ -237,7 +237,7 @@ describe('an inbox that holds an item for action results that were not read in t
       'results_not_read'
     )
     expect(row.textContent).toContain('Results not read')
-    expect(row.textContent).toContain('Some action results were not read in time')
+    expect(row.textContent).toContain('Some action results cannot be read')
     expect(screen.queryByText('The inbox could not be read')).toBeNull()
     expect(
       document.querySelector('[data-kind="pending_decision"]'),

@@ -114,8 +114,8 @@ use crate::visit::{Change, Omitted, SessionLog, Visit};
 /// `record_source` holds, which a build that does not know it reads as a row it cannot read.
 /// Version 12 adds the authority source and the rule that tells the owner an authority feed
 /// removed the host, which a build that does not know them reads the same way. Version 13 adds the
-/// rules for an action whose upstream result is unknown and for action results that were not read
-/// in time; its tables are those of version 12.
+/// rules for an action whose upstream result is unknown and for action results the host cannot
+/// read; its tables are those of version 12.
 pub const SCHEMA_VERSION: i64 = 13;
 
 /// The oldest schema this build brings forward rather than refusing: see `migrate_forward`.
@@ -571,8 +571,8 @@ fn file_control<T>(connection: &Connection, question: i32, answer: *mut T) -> Re
 /// until then.
 ///
 /// From schema 12, nothing in the tables changes: no row names the rule for an action whose
-/// upstream result is unknown, or the rule for results not read in time, until a later release
-/// raises an item of one.
+/// upstream result is unknown, or the rule for action results the host cannot read, until a later
+/// release raises an item of one.
 ///
 /// Remove the step from schema 9, with its column check, once no supported upgrade starts from a
 /// store written under schema 9; `OLDEST_SCHEMA_VERSION` then moves up to 10.

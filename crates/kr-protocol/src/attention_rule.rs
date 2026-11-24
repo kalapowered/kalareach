@@ -4,7 +4,7 @@
 //! at sixty seconds; its automation paragraph, with section 17's workflow limits, adds a ninth for
 //! a workflow or a causal chain its own limits paused, a tenth tells the owner that the
 //! authority feed a host reads removed it, an eleventh is for an action whose upstream result
-//! is unknown, and a twelfth for action results the host did not read in time. [`RULES`] is that
+//! is unknown, and a twelfth for action results the host cannot read. [`RULES`] is that
 //! table, one entry per
 //! identifier, and [`rule`] is the only way to reach an entry, so a rule's policy cannot be decided
 //! twice in two places.
@@ -197,10 +197,11 @@ pub static RULES: &[Rule] = &[
         trusted: true,
         droppable: false,
     },
-    // Action results the host did not read in time: it cannot say whether any of them is unknown.
-    // The person is told once and has nothing to answer here, so it is notable and does not climb.
-    // It is the host's own record, so it is trusted. It is never dropped to keep the inbox within its
-    // bound: it stands until the owner acknowledges it. No code of this release raises it.
+    // Action results the host cannot read: it cannot say whether any of them is unknown. The person
+    // is told once and has nothing to answer here, so it is notable and does not climb. It is the
+    // host's own record, so it is trusted. Nothing resolves it, so the inbox bound may drop it when
+    // the inbox is full; the gap itself stays recorded in the store. No code of this release raises
+    // it.
     Rule {
         id: AttentionRule::ReceiptsGap,
         initial: AttentionLevel::Notable,
@@ -208,7 +209,7 @@ pub static RULES: &[Rule] = &[
         repeat_ms: None,
         dedup_window_ms: DEDUPLICATION_WINDOW_MS,
         trusted: true,
-        droppable: false,
+        droppable: true,
     },
 ];
 
@@ -287,7 +288,6 @@ mod tests {
                     | AttentionRule::AutomationPaused
                     | AttentionRule::AuthorityFeedRemoved
                     | AttentionRule::ReceiptUncertain
-                    | AttentionRule::ReceiptsGap
             );
             assert_eq!(
                 rule.droppable, !waiting,
@@ -326,7 +326,7 @@ mod tests {
     }
 
     #[test]
-    fn results_not_read_in_time_are_a_notable_item_that_the_bound_never_drops() {
+    fn results_that_cannot_be_read_are_a_notable_item_the_bound_may_drop() {
         let entry = RULES
             .iter()
             .find(|rule| rule.id.as_str() == "attention.receipts_gap")
@@ -346,10 +346,10 @@ mod tests {
                 None,
                 DEDUPLICATION_WINDOW_MS,
                 true,
-                false
+                true
             )),
-            "results that were not read start notable, climb no ladder, are announced once, are the \
-             host's own record, and are never dropped to keep the inbox within its bound"
+            "results that cannot be read start notable, climb no ladder, are announced once, are the \
+             host's own record, and may be dropped to keep the inbox within its bound"
         );
     }
 

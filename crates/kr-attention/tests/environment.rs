@@ -2499,8 +2499,8 @@ fn a_store_that_holds_an_item_of_the_receipt_rule_is_read_listed_and_kept() {
     );
 }
 
-/// A store of schema 13 that holds an item of the rule for action results that were not read in
-/// time, which a later release raises, is read by this build in the same way.
+/// A store of schema 13 that holds an item of the rule for action results the host cannot read,
+/// which a later release raises, is read by this build in the same way.
 #[test]
 fn a_store_that_holds_an_item_of_the_results_gap_rule_is_read_listed_and_kept() {
     an_item_of_a_later_rule_is_read_listed_and_kept(

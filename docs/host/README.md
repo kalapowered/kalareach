@@ -7007,7 +7007,7 @@ raised, and a client of this release shows them.
 | `attention.automation_paused` | One of its own limits paused a workflow revision or a causal chain | notable | announced once |
 | `attention.authority_feed_removed` | The authority feed this host reads answered that it was removed from it | urgent | announced once; stands until the host reads another feed or none |
 | `attention.receipt_uncertain` | An action's upstream result is unknown, so the host cannot say whether it took effect; nothing raises it in this release | notable | announced once |
-| `attention.receipts_gap` | The host did not read some of a session's action results in time, so it cannot say whether any of them is unknown; nothing raises it in this release | notable | announced once |
+| `attention.receipts_gap` | The host cannot read some of a session's action results, so it cannot say whether any of them is unknown; nothing raises it in this release | notable | announced once |
 
 The idle reminder counts from the moment the request became pending, not from the last output: a
 session printing continuously while a question waits still owes the reminder, and a silent session

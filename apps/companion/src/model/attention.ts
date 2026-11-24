@@ -126,7 +126,7 @@ const RULE_WORDS: Readonly<Record<AttentionItem['rule'], string>> = {
   'attention.automation_paused': 'An automation stopped at one of its own limits',
   'attention.authority_feed_removed': 'This host no longer learns revocations from its feed',
   'attention.receipt_uncertain': 'An action’s result is unknown',
-  'attention.receipts_gap': 'Some action results were not read in time'
+  'attention.receipts_gap': 'Some action results cannot be read'
 }
 
 /** The word each kind shows, which is the row's own label rather than a colour alone. */

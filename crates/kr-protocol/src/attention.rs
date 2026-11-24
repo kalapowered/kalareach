@@ -190,7 +190,7 @@ wire_enum! {
         ReceiptUncertain => "attention.receipt_uncertain",
             "An action's upstream result is unknown, so the host cannot say whether it took effect.";
         ReceiptsGap => "attention.receipts_gap",
-            "The host did not read some of a session's action results in time, so it cannot say whether any of them is unknown.";
+            "The host cannot read some of a session's action results, so it cannot say whether any of them is unknown.";
     }
 }
 
@@ -1262,7 +1262,7 @@ mod tests {
         // Section 25's eight, the one its automation paragraph and section 17's workflow limits
         // add, the one that tells the owner a host's authority feed was removed, the one a later
         // release raises for an action whose upstream result is unknown, and the one it raises when
-        // it did not read some of a session's action results in time.
+        // it cannot read some of a session's action results.
         assert_eq!(AttentionRule::ALL.len(), 12);
     }
 

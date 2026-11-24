@@ -4287,7 +4287,7 @@
         },
         {
           "const": "attention.receipts_gap",
-          "description": "The host did not read some of a session's action results in time, so it cannot say whether any of them is unknown.",
+          "description": "The host cannot read some of a session's action results, so it cannot say whether any of them is unknown.",
           "type": "string"
         }
       ]

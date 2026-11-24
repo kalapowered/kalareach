@@ -323,13 +323,13 @@ describe('the attention inbox (KR-REQ-13.01, 13.02)', () => {
     expect(emptyMessage('unknown_result')).toBe('No action has an unknown result.')
   })
 
-  it('shows an item for action results that were not read in time as results nobody read, and never as a failure', () => {
+  it('shows an item for action results that cannot be read as results nobody read, and never as a failure', () => {
     const gap = inbox([item({ rule: 'attention.receipts_gap', summary: null })])
     const [row] = order(gap, NOW)
     expect(row?.kind, 'a gap in the results read has a kind of its own').toBe('results_not_read')
     expect(row?.label, 'its label claims no outcome').toBe('Results not read')
     expect(row?.tone, 'and it asks to be looked at').toBe('warning')
-    expect(row?.title).toBe('Some action results were not read in time')
+    expect(row?.title).toBe('Some action results cannot be read')
     expect(row?.announcement.startsWith('Results not read.'), 'the kind is read aloud').toBe(true)
     expect(row?.actionable, 'a decision is not taken on this screen').toBe(false)
     expect(count(gap).results_not_read, 'it is counted by its kind').toBe(1)
