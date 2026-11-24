@@ -156,12 +156,15 @@ JavaScript packages of its interface, as the packages themselves state them. It 
 native libraries that the Android and iOS builds link.
 
 The list covers every platform the application is built for, so the list for one platform is a subset
-of it. A crate that is offered under several licences is recorded under the one this project takes it
-under. Each text appears once, followed by the packages it applies to. An entry gives the package, its
-version, whether it is a Rust crate (rust) or a JavaScript package (javascript), and the authors its
-package names. The entry of a crate under the Mozilla Public License 2.0, or taken from a Git
-repository, names where its source is. Where a package ships no licence text, the entry names the
-upstream file that the text comes from.
+of it. A package that is offered under several licences is recorded under the one this project takes
+it under. Each block lists the packages that use a text and then gives the text, under the licence it
+is. A file that holds the texts of several licences is one block under a heading that names all of
+them, and a file that holds no licence's text, only a statement that names a licence or the header of
+one, has a heading that says so. An entry gives the package, its version, whether it is a Rust crate
+(rust) or a JavaScript package (javascript), and the authors its package names. The entry of a crate
+under the Mozilla Public License 2.0, or taken from a Git repository, names where its source is.
+Where a package ships no text of a licence it is recorded under, the notice carries the upstream text
+beside the package's own files, and the entry names the upstream file.
 """
 
 COMPANION_UNUSED = """\
@@ -195,7 +198,8 @@ REPAIR = (
 )
 COMPANION_REPAIR = (
     "install the production packages with `pnpm install --frozen-lockfile --prod --filter "
-    "\"@kalareach/companion...\"`, build kr-release with `cargo build -p kr-release`, run "
+    "\"@kalareach/companion...\"`, build kr-release with `cargo build -p kr-release`, fetch the crates "
+    "with `cargo fetch --locked`, put cargo-about 0.9.3 and askalono 0.5.0 on the PATH, run "
     "`python3 scripts/generate-notices.py write --product companion --kr-release target/debug/kr-release`, "
     "and commit the result"
 )
