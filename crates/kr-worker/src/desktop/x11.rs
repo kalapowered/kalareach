@@ -1906,15 +1906,51 @@ mod tests {
         authority: PathBuf,
     }
 
+    /// Asks the child to stop, unless it has ended and been collected, and says whether it asked.
+    #[cfg(target_os = "linux")]
+    fn ask_to_stop(child: &mut std::process::Child) -> bool {
+        // A server that has ended was collected by this call, and a process that holds its number
+        // now is not ours to signal.
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            return false;
+        }
+        if let Some(pid) =
+            rustix::process::Pid::from_raw(i32::try_from(child.id()).expect("a process number"))
+        {
+            let _ = rustix::process::kill_process(pid, rustix::process::Signal::TERM);
+        }
+        true
+    }
+
+    /// A server that has ended is not asked to stop again, because its process number may be
+    /// another process's by then.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_server_that_has_ended_is_not_asked_to_stop_again() {
+        let mut ended = std::process::Command::new("true")
+            .spawn()
+            .expect("a program that ends");
+        ended.wait().expect("its end");
+        assert!(
+            !ask_to_stop(&mut ended),
+            "a child that was collected was signalled"
+        );
+        let mut running = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("a program that runs");
+        assert!(
+            ask_to_stop(&mut running),
+            "a child that runs was not asked to stop"
+        );
+        let _ = running.wait();
+    }
+
     #[cfg(target_os = "linux")]
     impl Drop for Server {
         fn drop(&mut self) {
             // Asked to stop first, so that it takes its socket and its lock file with it.
-            if let Some(pid) = rustix::process::Pid::from_raw(
-                i32::try_from(self.child.id()).expect("a process number"),
-            ) {
-                let _ = rustix::process::kill_process(pid, rustix::process::Signal::TERM);
-            }
+            ask_to_stop(&mut self.child);
             let asked = std::time::Instant::now();
             while asked.elapsed() < Duration::from_secs(5) {
                 if matches!(self.child.try_wait(), Ok(Some(_))) {
