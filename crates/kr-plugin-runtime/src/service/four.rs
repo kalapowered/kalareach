@@ -302,8 +302,8 @@ pub(super) fn notice4_of(notice: Notice, beyond: Beyond, registration: u64) -> N
             events,
             bytes,
             documents,
-            first: beyond.first,
-            last: beyond.last,
+            first: beyond.first.map(|bound| bound.handle),
+            last: beyond.last.map(|bound| bound.handle),
         },
         Notice::Fault {
             binding_id,

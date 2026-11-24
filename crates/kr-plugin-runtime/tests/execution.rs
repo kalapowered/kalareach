@@ -3474,7 +3474,10 @@ mod consumed {
                     last,
                 }) => {
                     assert!(documents >= 2, "the two gaps went: {documents}");
-                    dropped = Some((first, last));
+                    dropped = Some((
+                        first.map(|bound| bound.handle),
+                        last.map(|bound| bound.handle),
+                    ));
                 }
                 Some(BindingEvent::Consumed(_)) => break,
                 Some(BindingEvent::Disabled { reason }) => panic!("disabled: {reason}"),
