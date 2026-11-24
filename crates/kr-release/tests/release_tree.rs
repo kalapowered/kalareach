@@ -1077,7 +1077,8 @@ fn a_notice_that_lacks_a_crate_of_the_programs_is_refused() {
 }
 
 /// A line of a licence text that starts as an entry does is not an entry: a crate whose entries are
-/// cut out and whose name and version stand in such a line is still named as missing.
+/// cut out and whose name and version stand in such a line, before the first block and inside the
+/// text of a block, is still named as missing.
 #[test]
 fn a_line_of_a_licence_text_does_not_stand_for_an_entry() {
     let committed =
@@ -1101,6 +1102,20 @@ fn a_line_of_a_licence_text_does_not_stand_for_an_entry() {
     let stray = format!("THIRD-PARTY NOTICES\n  - {} | programs\n", cut[0]);
     let text = text.replacen("THIRD-PARTY NOTICES\n", &stray, 1);
     assert!(text.contains(&stray), "the stray line is in the text");
+    // The same line again as the first line of the first block's licence text, after its entries.
+    let mut lines: Vec<String> = text.lines().map(str::to_owned).collect();
+    let used = lines
+        .iter()
+        .position(|line| line == "Used by:")
+        .expect("a block of entries");
+    let ends = used
+        + 2
+        + lines[used + 2..]
+            .iter()
+            .position(|line| line.is_empty())
+            .expect("the end of the entries");
+    lines.insert(ends + 1, format!("  - {} | programs", cut[0]));
+    let text: String = lines.iter().map(|line| format!("{line}\n")).collect();
     let lacking = kr_release::notices::gaps(&checkout(), &text).expect("the lock is read");
     assert_eq!(lacking, cut);
 }

@@ -63,6 +63,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import textwrap
 
 ABOUT_VERSION = "0.9.3"
 # The licence reader: askalono, run over the SPDX licence list at this revision (list version 3.29.0).
@@ -888,8 +889,18 @@ def fish_member(blocks, name, member):
     if unknown:
         fail(f"{name} of the fish workspace declares {', '.join(unknown)}, a licence this notice has no text for")
     crate = (name, member["version"], None)
+    shipped = []
     for file_name in licence_files(member["root"]):
-        blocks.add_licence(read_text(os.path.join(member["root"], file_name)), crate, member["authors"], "fish", None, file_name)
+        shipped.append(read_text(os.path.join(member["root"], file_name)))
+        blocks.add_licence(shipped[-1], crate, member["authors"], "fish", None, file_name)
+    # A member under fish's own licences, as fish and most of its crates are, has them carried by COPYING and
+    # doc_src/license.rst. Any other member needs the text of its licence in its package, but for the
+    # CC0-1.0 dedication, which asks for no notice.
+    declared = declared_tokens(member["licence"])
+    needed = [] if declared & set(FISH_OWN_LICENCES) else sorted(declared - {"CC0-1.0"})
+    missing = lacking(needed, shipped, blocks.reader)
+    if missing:
+        fail(f"{name} of the fish workspace is under {' and '.join(missing)}, and its package ships no licence text")
     if name == "fish":
         path = os.path.join(member["root"], FISH_LICENCES)
         if not os.path.isfile(path):
@@ -1057,10 +1068,12 @@ def self_checks(scratch, reader):
     expect("the GPL's own paragraph and Apache's appendix are not placeholders",
            placeholder(gpl) is None and placeholder(apache) is None)
 
-    reader.prepare([mit, isc, apache, bsd, mit + bsd, statement, isc.replace("for any purpose", "for any\npurpose"),
+    wrapped = textwrap.fill(" ".join(isc.split()), 24)
+    reader.prepare([mit, isc, apache, bsd, mit + bsd, statement, isc.replace("for any purpose", "for any\npurpose"), wrapped,
                     isc + "\n\n" + apache, "UNICODE LICENSE V3\n"])
     expect("a text names the licence it is", reader.of(mit) == {"MIT"} and reader.of(bsd) == {"BSD-3-Clause"} and reader.of(apache) == {"Apache-2.0"})
-    expect("a line break inside a phrase does not hide a licence", reader.of(isc.replace("for any purpose", "for any\npurpose")) == {"ISC"})
+    expect("a line break inside a phrase does not hide a licence",
+           reader.of(isc.replace("for any purpose", "for any\npurpose")) == {"ISC"} and reader.of(wrapped) == {"ISC"})
     expect("a file that holds two licences names both", reader.of(mit + bsd) == {"MIT", "BSD-3-Clause"} and reader.of(isc + "\n\n" + apache) == {"ISC", "Apache-2.0"})
     expect("a statement of a licence is none of the licences", reader.of(statement) == frozenset())
     expect("the Unicode licence's third version is told from its second",
@@ -1241,6 +1254,26 @@ for path in paths:
     expect("a text that a notice file and a licence answer share is carried once",
            text.count("Permission is hereby granted") == 1 and "Licence: MIT (MIT License)\n" in text and "Notice file" not in text)
 
+    # A kept text listed as a statement may not be a licence's text, and the kept texts of a crate have to be
+    # the texts of every licence it is recorded under.
+    refuses("a kept text listed as a statement that is a licence's text is refused",
+            lambda: gather([made_up([both])], *keep([{**item, "statement": True}], [pinned], []), reader),
+            "lists n0-MIT as a statement, and its text is MIT")
+    answer = [("MIT", "MIT License", "", False), ("BSD-3-Clause", "BSD 3-Clause", "", False)]
+    refuses("kept texts that are not the text of the crate's recorded licence are refused",
+            lambda: gather([made_up([synthetic("bare", "1.0.0", licences=answer, folder=empty, declared="MIT AND BSD-3-Clause")])],
+                           *keep([item], [pinned], []), reader),
+            "keeps texts for bare 1.0.0 that are not the text of BSD-3-Clause")
+    unicode_folder = os.path.join(scratch, "unicoded-1.0.0")
+    write(unicode_folder, "LICENSE", licence_text("Unicode-3.0"))
+    nfa_folder = os.path.join(scratch, "nfa-1.0.0")
+    write(nfa_folder, "LICENSE-MIT", licence_text("MITNFA"))
+    unicoded = synthetic("unicoded", "1.0.0", licences=[("Unicode-DFS-2016", "Unicode License Agreement", "", False)],
+                         folder=unicode_folder, declared="Unicode-DFS-2016")
+    nfa = synthetic("nfa", "1.0.0", licences=licences(template, False), folder=nfa_folder)
+    expect("a text of Unicode-3.0 is the text of a crate recorded under Unicode-DFS-2016, and MITNFA of MIT",
+           "Licence: Unicode-3.0" in rendered([made_up([unicoded])], nothing, {}) and "Licence: MITNFA" in rendered([made_up([nfa])], nothing, {}))
+
     # No licence of an AND is dropped, a file with two licences stays whole, and a file for an
     # alternative that is not taken goes.
     anded = os.path.join(scratch, "anded-1.0.0")
@@ -1338,6 +1371,22 @@ for path in paths:
     text = render(fish_blocks)
     expect("a crate of fish's own workspace under CC0-1.0 is carried with its licence file under the licence it is",
            "Licence: CC0-1.0 (Creative Commons Zero v1.0 Universal)" in text and "CC0 1.0 Universal" in text)
+    printf_folder = os.path.join(scratch, "fish-printf")
+    write(printf_folder, "COPYING", statement)
+    printf_entry = {"root": printf_folder, "version": "0.2.1", "authors": [], "licence": "MIT"}
+    refuses("a crate of fish's workspace under MIT whose only file is a statement is refused",
+            lambda: fish_member(Blocks(reader), "printf", printf_entry), "printf of the fish workspace is under MIT, and its package ships no licence text")
+    dedication = os.path.join(scratch, "fish-widecharwidth-dedication")
+    write(dedication, "LICENSE",
+          "widecharwidth - wcwidth implementation\nWritten in 2018 by ridiculous_fish\n"
+          "To the extent possible under law, the author(s) have dedicated all copyright and related and neighboring "
+          "rights to this software to the public domain worldwide. This software is distributed without any warranty.\n"
+          "You should have received a copy of the CC0 Public Domain Dedication along with this software. If not, see "
+          "<http://creativecommons.org/publicdomain/zero/1.0/>.\n")
+    dedication_blocks = Blocks(reader)
+    made(lambda: fish_member(dedication_blocks, "widecharwidth", {"root": dedication, "version": "0.0.0", "authors": [], "licence": "CC0-1.0"}))
+    expect("fish-widecharwidth's four-line file is carried as a statement",
+           "Licence statement: LICENSE (" + STATEMENT + ")" in render(dedication_blocks))
     fish_root = os.path.join(scratch, "fish-root")
     write(fish_root, "COPYING", statement)
     fish_member_entry = {"root": fish_root, "version": "4.0.0", "authors": [], "licence": "GPL-2.0-only"}
