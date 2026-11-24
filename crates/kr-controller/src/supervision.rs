@@ -2389,7 +2389,7 @@ mod tests {
     /// none it fails and says so.
     #[cfg(target_os = "linux")]
     #[test]
-    #[ignore = "needs a user service manager for this account (`systemctl --user`), which a hosted CI runner's account does not have; it runs with --ignored on a Linux host whose account has one"]
+    #[ignore = "starts transient units in this account's own service manager (`systemctl --user`), so an ordinary run on a person's machine does not run it"]
     fn a_transient_unit_whose_process_failed_is_collected() {
         assert!(
             SystemdSupervisor::available(),

@@ -4369,9 +4369,9 @@ async fn a_crashed_workers_tree_is_stopped_by_the_daemon_that_starts_after_it() 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[cfg_attr(
     target_os = "linux",
-    ignore = "needs a user service manager for this account (`systemctl --user`), which a hosted CI \
-              runner's account does not have; it runs with --ignored on a Linux host whose account \
-              has one"
+    ignore = "starts transient units in this account's own service manager (`systemctl --user`), so \
+              an ordinary run on a person's machine does not run it; \
+              `scripts/service-manager-cases.sh` runs it"
 )]
 async fn a_crashed_workers_tree_is_stopped_under_the_platforms_service_manager() {
     if kr_ipc::testing::account_launchd::stands_down("a launchd job") {
@@ -5040,9 +5040,9 @@ perl -e 'use POSIX qw(setsid); $SIG{HUP} = "IGNORE"; $SIG{TERM} = "IGNORE"; exit
 /// it, and the worker's record says the session rests on it.
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "needs a user service manager for this account (`systemctl --user`), which a hosted CI \
-            runner's account does not have; it runs with --ignored on a Linux host whose account \
-            has one"]
+#[ignore = "starts transient units in this account's own service manager (`systemctl --user`), so \
+            an ordinary run on a person's machine does not run it; \
+            `scripts/service-manager-cases.sh` runs it"]
 async fn a_session_in_a_service_rests_on_a_control_group_and_a_close_ends_what_left_its_tree() {
     let host = Host::create().through_the_platform().recording_launches();
     let script = host.temp.root().join("leaver.sh");
