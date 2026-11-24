@@ -5481,3 +5481,569 @@ async fn a_revision_or_a_call_beyond_its_bounds_is_refused_and_the_binding_goes_
         .await
         .expect("the binding goes on");
 }
+
+/// The frames of the plugin host protocol `kr-plugin-host/3`, kept as bytes and held to them.
+///
+/// `tests/recorded/host-3-session-frames.json` (in `kr-plugin-service`) holds one frame of every
+/// kind a session can carry: those a real session with this host produced, and, for the kinds a
+/// session of these components does not reach, the frames the types encode. A frame that no longer
+/// reads, or that reads and writes back to other bytes, is a change to a protocol whose frames are
+/// closed. The same record holds the shape of the session (each request and the kind of its answer),
+/// which the host is held to as well, so a host that serves a second protocol is still the host the
+/// first protocol's workers were built against.
+///
+/// `KR_RECORD_PLUGIN_HOST_SESSION_FRAMES=1` prints the record from a session instead of checking it.
+mod recorded_session {
+    use std::collections::BTreeSet;
+    use std::sync::{Arc, Mutex};
+
+    use kr_ipc::endpoint::{Connection, Listener};
+    use kr_ipc::framed::split;
+    use kr_plugin_sdk::effect::EffectClass;
+    use kr_plugin_service::client::PluginClient;
+    use kr_plugin_service::protocol::{
+        CallValue, ComponentSource, EncodeCall, Frame, Notice, PrepareActionCall, Request,
+        RequestBody, ResponseBody, WireArgument, WireDecoded, WireEncoded, WireMethodClass,
+        WireNamedArgument, WireNode, WireOperation, WirePlan, WireRequestSnapshot, WireToken,
+    };
+    use kr_protocol::frame::StreamKind;
+
+    use super::{HANG_GUARD, REGISTRATION_PATIENCE, Served, components, documents_until};
+
+    const RECORD: &str =
+        include_str!("../../kr-plugin-service/tests/recorded/host-3-session-frames.json");
+
+    /// Every request kind, every answer kind and every notice kind of the closed protocol.
+    const KINDS: [&str; 36] = [
+        "request:hello",
+        "request:verify",
+        "request:register_binding",
+        "request:event",
+        "request:snapshot",
+        "request:prepare_action",
+        "request:checkpoint",
+        "request:restore",
+        "request:unbind",
+        "request:health",
+        "request:decode",
+        "request:encode",
+        "request:revise_facts",
+        "request:revise_attachments",
+        "request:privacy",
+        "response:hello",
+        "response:verified",
+        "response:registered",
+        "response:admitted",
+        "response:called:document",
+        "response:called:plan",
+        "response:called:state",
+        "response:called:decoded",
+        "response:called:encoded",
+        "response:called:fault",
+        "response:called:none",
+        "response:unbound",
+        "response:revised",
+        "response:privacy_set",
+        "response:health",
+        "response:refused",
+        "notice:document",
+        "notice:gap",
+        "notice:fault",
+        "notice:disabled",
+        "response:called:plan:with_arguments",
+    ];
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    fn unhex(text: &str) -> Vec<u8> {
+        assert_eq!(text.len() % 2, 0, "{text}");
+        (0..text.len())
+            .step_by(2)
+            .map(|at| u8::from_str_radix(&text[at..at + 2], 16).expect("hexadecimal"))
+            .collect()
+    }
+
+    /// The name of what a frame is: a request, an answer (a call's by what it carries) or a notice.
+    fn kind_of_response(body: &ResponseBody) -> String {
+        let name = match body {
+            ResponseBody::Hello { .. } => "hello",
+            ResponseBody::Verified(_) => "verified",
+            ResponseBody::Registered { .. } => "registered",
+            ResponseBody::Admitted { .. } => "admitted",
+            ResponseBody::Called { value, fault, .. } => {
+                return match (fault, value) {
+                    (Some(_), _) => "response:called:fault".to_owned(),
+                    (None, None) => "response:called:none".to_owned(),
+                    (None, Some(CallValue::Document)) => "response:called:document".to_owned(),
+                    (None, Some(CallValue::Plan(plan))) if plan.arguments.is_empty() => {
+                        "response:called:plan".to_owned()
+                    }
+                    (None, Some(CallValue::Plan(_))) => {
+                        "response:called:plan:with_arguments".to_owned()
+                    }
+                    (None, Some(CallValue::State(_))) => "response:called:state".to_owned(),
+                    (None, Some(CallValue::Decoded(_))) => "response:called:decoded".to_owned(),
+                    (None, Some(CallValue::Encoded(_))) => "response:called:encoded".to_owned(),
+                };
+            }
+            ResponseBody::Unbound { .. } => "unbound",
+            ResponseBody::Revised => "revised",
+            ResponseBody::PrivacySet { .. } => "privacy_set",
+            ResponseBody::Health(_) => "health",
+            ResponseBody::Refused { .. } => "refused",
+        };
+        format!("response:{name}")
+    }
+
+    fn kind_of_notice(notice: &Notice) -> &'static str {
+        match notice {
+            Notice::Document { .. } => "notice:document",
+            Notice::Gap { .. } => "notice:gap",
+            Notice::Fault { .. } => "notice:fault",
+            Notice::Disabled { .. } => "notice:disabled",
+        }
+    }
+
+    fn kind_of_frame(frame: &Frame) -> String {
+        match frame {
+            Frame::Response { body, .. } => kind_of_response(body),
+            Frame::Notice(notice) => kind_of_notice(notice).to_owned(),
+        }
+    }
+
+    /// Each frame that passed, in the order it was read, with whether the client wrote it.
+    type Kept = Arc<Mutex<Vec<(bool, Vec<u8>)>>>;
+
+    /// Puts a tee between a client and the host: every frame is kept as it passed, and written on
+    /// as the same message, which has to encode to the bytes it came from.
+    async fn tee(served: &Served) -> (Connection, Kept, tokio::task::JoinHandle<()>) {
+        let environment = served._temp.environment();
+        let endpoint = kr_plugin_service::launcher::rendezvous_endpoint(
+            &environment,
+            kr_protocol::worker::ReservationId::new(kr_ipc::new_uuid()),
+        )
+        .expect("an endpoint");
+        let listener = Listener::bind(&endpoint).expect("the tee's endpoint");
+        let host =
+            kr_ipc::paths::Endpoint::from_path(&served.descriptor.endpoint).expect("an endpoint");
+        let kept: Kept = Arc::default();
+        let task = tokio::spawn({
+            let kept = Arc::clone(&kept);
+            async move {
+                let (inbound, _peer) = listener.accept().await.expect("the client connects");
+                let outbound = Connection::connect(&host).await.expect("the host answers");
+                let limits = StreamKind::Control.cbor_limits();
+                let (mut from_client, mut to_client) = split(inbound, StreamKind::Control);
+                let (mut from_host, mut to_host) = split(outbound, StreamKind::Control);
+                let up = {
+                    let kept = Arc::clone(&kept);
+                    async move {
+                        while let Ok(payload) = from_client.read_payload().await {
+                            kept.lock().expect("the tee").push((true, payload.clone()));
+                            let request: Request = kr_cbor::from_canonical_slice(&payload, &limits)
+                                .expect("a request of the protocol");
+                            if to_host.write_message(&request).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                };
+                let down = {
+                    let kept = Arc::clone(&kept);
+                    async move {
+                        while let Ok(payload) = from_host.read_payload().await {
+                            kept.lock().expect("the tee").push((false, payload.clone()));
+                            let frame: Frame = kr_cbor::from_canonical_slice(&payload, &limits)
+                                .expect("a frame of the protocol");
+                            if to_client.write_message(&frame).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                };
+                // The client's end is the session's end. A half of the tee that stays open would
+                // keep the host's connection open, so the tee leaves with the client.
+                tokio::select! {
+                    () = up => {}
+                    () = down => {}
+                }
+            }
+        });
+        let connection = Connection::connect(&endpoint)
+            .await
+            .expect("connects to the tee");
+        (connection, kept, task)
+    }
+
+    /// What a session said: the frames, and the kind of each request's answer.
+    struct Session {
+        frames: Vec<(String, Vec<u8>)>,
+        shape: Vec<(String, String)>,
+        notices: BTreeSet<String>,
+    }
+
+    /// A session with this host through a tee: a worker registers two components, delivers an event,
+    /// takes a snapshot, a checkpoint and a restore, revises facts and attachments, sets privacy mode,
+    /// decodes (once to a component that traps), and unbinds.
+    async fn session(served: &Served) -> Option<Session> {
+        let behaved = components::well_behaved()?;
+        let hostile = components::component("hostile-decoder")?;
+        let (connection, kept, tee_task) = tee(served).await;
+        let mut client = PluginClient::over(connection, served.descriptor.clone())
+            .await
+            .expect("the handshake and the challenge")
+            .registering_within(REGISTRATION_PATIENCE + core::time::Duration::from_secs(5));
+        let deadline = core::time::Duration::from_secs(20);
+
+        let (path, digest, bytes) = served.install("well-behaved", &behaved);
+        let first = components::request("well-behaved", 1);
+        client
+            .register(
+                first.binding_id,
+                &first.identity,
+                &first.facts,
+                &first.executable,
+                &ComponentSource {
+                    path,
+                    digest,
+                    bytes,
+                },
+            )
+            .await
+            .expect("the binding registers");
+        client.health().await.expect("a health report");
+        client
+            .deliver(first.binding_id, &components::scrape("se-1", "building"))
+            .await
+            .expect("the event is offered");
+        documents_until(&mut client, first.binding_id, "bind").await;
+        documents_until(&mut client, first.binding_id, "observe").await;
+        client
+            .snapshot(first.binding_id, deadline)
+            .await
+            .expect("the snapshot runs");
+        documents_until(&mut client, first.binding_id, "snapshot").await;
+        let state = client
+            .checkpoint(first.binding_id, deadline)
+            .await
+            .expect("the checkpoint runs")
+            .state
+            .expect("the component has state");
+        client
+            .restore(first.binding_id, state, deadline)
+            .await
+            .expect("the restore runs");
+        client
+            .revise_facts(first.binding_id, &components::facts("well-behaved"))
+            .await
+            .expect("the facts are revised");
+        client
+            .revise_attachments(first.binding_id, &[])
+            .await
+            .expect("the attachments are revised");
+        client.privacy(true).await.expect("privacy mode is set");
+        client.privacy(false).await.expect("privacy mode ends");
+
+        let (path, digest, bytes) = served.install("hostile-decoder", &hostile);
+        let second = components::request("hostile-decoder", 14);
+        client
+            .register(
+                second.binding_id,
+                &second.identity,
+                &second.facts,
+                &second.executable,
+                &ComponentSource {
+                    path,
+                    digest,
+                    bytes,
+                },
+            )
+            .await
+            .expect("the second binding registers");
+        let _ = client
+            .decode(
+                second.binding_id,
+                &components::native_request("se-2", "8", "a request"),
+                deadline,
+            )
+            .await;
+        client
+            .decode(
+                second.binding_id,
+                &components::native_request("se-3", "9", "!trap"),
+                deadline,
+            )
+            .await
+            .expect_err("a decode that traps is refused");
+        tokio::time::timeout(HANG_GUARD, async {
+            loop {
+                if let Notice::Fault { .. } = client.notice().await.expect("the connection is open")
+                {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("the fault was never written");
+        assert!(client.unbind(first.binding_id).await.expect("an unbind"));
+        assert!(!client.unbind(first.binding_id).await.expect("an unbind"));
+        assert!(client.unbind(second.binding_id).await.expect("an unbind"));
+        drop(client);
+        tokio::time::timeout(HANG_GUARD, tee_task)
+            .await
+            .expect("the tee ends with the client")
+            .expect("the tee runs");
+
+        let limits = StreamKind::Control.cbor_limits();
+        let mut frames = Vec::new();
+        let mut asked: Vec<(u64, String)> = Vec::new();
+        let mut answered: std::collections::BTreeMap<u64, String> = Default::default();
+        let mut notices = BTreeSet::new();
+        for (written, payload) in kept.lock().expect("the tee").iter() {
+            if *written {
+                let request: Request =
+                    kr_cbor::from_canonical_slice(payload, &limits).expect("a request");
+                let kind = format!("request:{}", request.body.name());
+                asked.push((request.request_id, kind.clone()));
+                frames.push((kind, payload.clone()));
+            } else {
+                let frame: Frame =
+                    kr_cbor::from_canonical_slice(payload, &limits).expect("a frame");
+                let kind = kind_of_frame(&frame);
+                match &frame {
+                    Frame::Response { reply_to, .. } => {
+                        answered.insert(*reply_to, kind.clone());
+                    }
+                    Frame::Notice(_) => {
+                        notices.insert(kind.clone());
+                    }
+                }
+                frames.push((kind, payload.clone()));
+            }
+        }
+        let shape = asked
+            .into_iter()
+            .map(|(id, kind)| {
+                let answer = answered.get(&id).cloned().unwrap_or_default();
+                (kind, answer)
+            })
+            .collect();
+        Some(Session {
+            frames,
+            shape,
+            notices,
+        })
+    }
+
+    /// The frames of the kinds a session of these components does not reach, from the types.
+    fn built() -> Vec<(String, Vec<u8>)> {
+        let binding_id = kr_protocol::scalars::Uuid::from_bytes([3; 16]);
+        let handle = kr_protocol::ids::SourceEventHandle::new("se-1").expect("a bounded handle");
+        let request = |body| Request {
+            request_id: 11,
+            body,
+        };
+        let called = |value, fault| Frame::Response {
+            reply_to: 11,
+            body: ResponseBody::Called {
+                value,
+                fault,
+                document: Some(2),
+            },
+        };
+        let plan = |arguments| {
+            CallValue::Plan(Box::new(WirePlan {
+                action_id: "turn.cancel".to_owned(),
+                class: EffectClass::UpstreamCancel,
+                operation: WireOperation::UpstreamCancel,
+                arguments,
+            }))
+        };
+        let mut out: Vec<(String, Vec<u8>)> = Vec::new();
+        let mut push_request = |body: RequestBody| {
+            let request = request(body);
+            let kind = format!("request:{}", request.body.name());
+            out.push((
+                kind,
+                kr_cbor::to_canonical_vec(&request).expect("a request encodes"),
+            ));
+        };
+        push_request(RequestBody::PrepareAction(Box::new(PrepareActionCall {
+            binding_id,
+            token: WireToken {
+                actor_id: "local:501".to_owned(),
+                grant_id: String::new(),
+                binding_revision: 3,
+                thread_revision: None,
+                action_id: "turn.cancel".to_owned(),
+                parameter_hash: vec![7; 32],
+                expires_at_ms: 1_700_000_005_000,
+            },
+            arguments: vec![WireNamedArgument {
+                name: "reason".to_owned(),
+                value: WireArgument::Text("because".to_owned()),
+            }],
+            deadline_ms: 500,
+        })));
+        push_request(RequestBody::Encode(Box::new(EncodeCall {
+            binding_id,
+            request: WireRequestSnapshot {
+                request_id: "r-1".to_owned(),
+                handle,
+                method: "approve".to_owned(),
+                class: WireMethodClass::Mutation,
+                received_at_ms: 7,
+                deadline_at_ms: Some(9),
+                offered_decisions: vec!["accept".to_owned()],
+                binding_revision: 3,
+            },
+            decision: "accept".to_owned(),
+            event: None,
+            deadline_ms: 500,
+        })));
+        let mut push_frame = |frame: Frame| {
+            out.push((
+                kind_of_frame(&frame),
+                kr_cbor::to_canonical_vec(&frame).expect("a frame encodes"),
+            ));
+        };
+        push_frame(called(Some(CallValue::Document), None));
+        push_frame(called(Some(plan(vec![])), None));
+        push_frame(called(
+            Some(plan(vec![WireNamedArgument {
+                name: "reason".to_owned(),
+                value: WireArgument::Text("because".to_owned()),
+            }])),
+            None,
+        ));
+        push_frame(called(Some(CallValue::State(b"state".to_vec())), None));
+        push_frame(called(
+            Some(CallValue::Decoded(Box::new(WireDecoded {
+                request_id: "r-1".to_owned(),
+                class: WireMethodClass::Mutation,
+                summary: "approve a change".to_owned(),
+                decisions: vec!["accept".to_owned()],
+                presentation: vec!["{}".to_owned()],
+            }))),
+            None,
+        ));
+        push_frame(called(
+            Some(CallValue::Encoded(Box::new(WireEncoded {
+                request_id: "r-1".to_owned(),
+                bytes: b"{}".to_vec(),
+            }))),
+            None,
+        ));
+        push_frame(called(None, Some("the component declined".to_owned())));
+        push_frame(called(None, None));
+        push_frame(Frame::Notice(Notice::Document {
+            binding_id,
+            call: "observe".to_owned(),
+            document: 4,
+            last: true,
+            nodes: vec![WireNode {
+                node_id: "n-1".to_owned(),
+                node_revision: 1,
+                body_json: "{}".to_owned(),
+            }],
+        }));
+        push_frame(Frame::Notice(Notice::Gap {
+            binding_id,
+            events: 3,
+            bytes: 300,
+            documents: 1,
+        }));
+        push_frame(Frame::Notice(Notice::Fault {
+            binding_id,
+            call: "observe".to_owned(),
+            detail: "trapped".to_owned(),
+            faults_in_window: 1,
+        }));
+        push_frame(Frame::Notice(Notice::Disabled {
+            binding_id,
+            reason: "disabled".to_owned(),
+        }));
+        out
+    }
+
+    #[test]
+    fn kr_req_24_24_every_recorded_frame_of_the_plugin_host_protocol_reads_and_writes_back() {
+        let record: serde_json::Value = serde_json::from_str(RECORD).expect("the record");
+        let limits = StreamKind::Control.cbor_limits();
+        let mut kinds = BTreeSet::new();
+        for entry in record["frames"].as_array().expect("the frames") {
+            let kind = entry["kind"].as_str().expect("a kind");
+            let bytes = unhex(entry["hex"].as_str().expect("the bytes"));
+            let read = if kind.starts_with("request:") {
+                let request: Request =
+                    kr_cbor::from_canonical_slice(&bytes, &limits).expect("this build reads it");
+                assert_eq!(
+                    kr_cbor::to_canonical_vec(&request).expect("it encodes"),
+                    bytes,
+                    "{kind} writes back to the bytes it was recorded as"
+                );
+                format!("request:{}", request.body.name())
+            } else {
+                let frame: Frame =
+                    kr_cbor::from_canonical_slice(&bytes, &limits).expect("this build reads it");
+                assert_eq!(
+                    kr_cbor::to_canonical_vec(&frame).expect("it encodes"),
+                    bytes,
+                    "{kind} writes back to the bytes it was recorded as"
+                );
+                kind_of_frame(&frame)
+            };
+            assert_eq!(read, kind, "the frame is the kind it was recorded as");
+            kinds.insert(read);
+        }
+        for kind in KINDS {
+            assert!(kinds.contains(kind), "the record holds no frame of {kind}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn kr_req_24_24_the_host_answers_a_session_the_way_the_record_says() {
+        let served = Served::start_held().await;
+        let Some(session) = session(&served).await else {
+            return;
+        };
+        if std::env::var_os("KR_RECORD_PLUGIN_HOST_SESSION_FRAMES").is_some() {
+            let entries = |frames: &[(String, Vec<u8>)], source: &'static str| {
+                frames
+                    .iter()
+                    .map(|(kind, bytes)| {
+                        serde_json::json!({ "source": source, "kind": kind, "hex": hex(bytes) })
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let mut frames = entries(&session.frames, "session");
+            frames.extend(entries(&built(), "built"));
+            let record = serde_json::json!({
+                "frames": frames,
+                "shape": session.shape,
+                "notices": session.notices,
+            });
+            println!(
+                "RECORD-BEGIN\n{}\nRECORD-END",
+                serde_json::to_string_pretty(&record).expect("the record")
+            );
+            return;
+        }
+        let record: serde_json::Value = serde_json::from_str(RECORD).expect("the record");
+        let shape: Vec<(String, String)> =
+            serde_json::from_value(record["shape"].clone()).expect("the recorded shape");
+        assert_eq!(
+            session.shape, shape,
+            "each request is answered with the kind of answer it was recorded with"
+        );
+        let notices: BTreeSet<String> =
+            serde_json::from_value(record["notices"].clone()).expect("the recorded notices");
+        assert!(
+            notices.is_subset(&session.notices),
+            "{notices:?} is not within {:?}",
+            session.notices
+        );
+    }
+}
