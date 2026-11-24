@@ -1408,7 +1408,7 @@
     ]
   },
   "descriptors": {
-    "plugin-host-3.json": {
+    "descriptor-3-served-by-the-test": {
       "boot_identity": {
         "source": "macos_boot_session_uuid",
         "value": "NjkwQ0JFREQtMjJGNy00MEE1LUFENDQtM0U5NTNFMkVDMUI0"
@@ -1424,7 +1424,7 @@
       "protocol": "kr-plugin-host/3",
       "reservation_id": "014cd774-6e8b-4bf8-85eb-1989c2f0d6dc"
     },
-    "plugin-host-4.json": {
+    "descriptor-4-stated-by-the-hello": {
       "boot_identity": {
         "source": "macos_boot_session_uuid",
         "value": "NjkwQ0JFREQtMjJGNy00MEE1LUFENDQtM0U5NTNFMkVDMUI0"
