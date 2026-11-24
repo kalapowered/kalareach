@@ -36,9 +36,6 @@
 //! A view says whether the binding may be offered anything yet, and what its component has missed:
 //! each loss is numbered, a snapshot is requested for the number current when it is asked for and
 //! discharges that number only, so a loss that arrives while a snapshot runs asks for another.
-//!
-//! The checkpoints the link holds for a binding are kept here too, so that privacy mode has one place
-//! to remove them from.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -70,16 +67,6 @@ pub const SNAPSHOT_RETRY: Duration = Duration::from_secs(1);
 
 /// The longest a snapshot is left for.
 pub const LONGEST_SNAPSHOT_RETRY: Duration = Duration::from_secs(30);
-
-/// How long a binding is quiet for before its state is taken.
-pub const QUIET_BEFORE_CHECKPOINT: Duration = Duration::from_secs(2);
-
-/// The longest a binding that is still being offered events goes between attempts to take its
-/// state.
-pub const CHECKPOINT_EVERY: Duration = Duration::from_secs(60);
-
-/// The most checkpoint bytes the worker holds for all its bindings together.
-pub const CHECKPOINT_BYTES: u64 = 8 * 1024 * 1024;
 
 /// One upstream frame, offered as a native request or as news.
 #[derive(Clone, Debug)]
@@ -306,9 +293,9 @@ pub struct Account {
 /// What one binding's component has missed, and where the worker stands with it.
 #[derive(Clone, Debug, Default)]
 pub struct View {
-    /// Whether the binding may be offered anything: registered, and its checkpoint restored where
-    /// there was one. A restore is a loss, so the binding may be ready while it owes a snapshot, and
-    /// is offered nothing until the snapshot has been taken.
+    /// Whether the binding may be offered anything: registered, and made ready by the link. A
+    /// binding may be ready while it owes a snapshot, and is offered nothing until the snapshot has
+    /// been taken.
     pub ready: bool,
     /// The number of the latest loss.
     pub lost_seq: u64,
@@ -320,12 +307,6 @@ pub struct View {
     pub silence: Option<Duration>,
     /// How long the next failed snapshot is left.
     pub snapshot_retry: Option<Duration>,
-    /// How many events have been offered since the last attempt to take the binding's state.
-    pub offered_since_checkpoint: u64,
-    /// When an event was last offered.
-    pub last_offer: Option<Instant>,
-    /// When the binding's state was last asked for, answered or not.
-    pub last_checkpoint_attempt: Option<Instant>,
     /// What the component last missed, in the words a person is told.
     pub loss_note: Option<String>,
     /// The first entry the binding may be offered: those pushed before it was made ready are older
@@ -364,18 +345,6 @@ impl View {
     }
 }
 
-/// A binding's component state, held to be restored after the plugin runtime is lost.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Held {
-    /// The package digest it was taken under.
-    pub package_digest: kr_protocol::scalars::Digest256,
-    /// The source generation of the instance the component was registered in when the state was
-    /// taken: state is never restored into another generation.
-    pub generation: u64,
-    /// The state, as the component returned it.
-    pub state: Vec<u8>,
-}
-
 #[derive(Debug, Default)]
 struct Inner {
     ordinary: VecDeque<Entry>,
@@ -388,17 +357,13 @@ struct Inner {
     tail_loss: LaneLoss,
     account: Account,
     views: BTreeMap<BrokerBindingId, View>,
-    checkpoints: BTreeMap<BrokerBindingId, Held>,
-    checkpoint_order: VecDeque<BrokerBindingId>,
-    checkpoint_bytes: u64,
     /// Whether privacy mode has been on since the link made the connection it now holds.
     words_tainted: bool,
     /// How many connections to the plugin runtime the link has made: the one it holds now is this
     /// one. A component is registered on a connection and holds only what it was handed on it.
     connection: u64,
     /// The bindings whose component was handed something made in privacy mode, or while it stood,
-    /// and the connection it was handed on. None is taken from such a component until it starts
-    /// again. A mark belongs to the binding and the connection and not to a view: a binding that is
+    /// and the connection it was handed on. A mark belongs to the binding and the connection and not to a view: a binding that is
     /// unbound and registered again on the same connection can be reached by a call that was
     /// started before it was unbound, and that call finds the mark.
     marks: BTreeMap<BrokerBindingId, u64>,
@@ -457,8 +422,7 @@ pub struct PrivacyMark {
     epoch: u64,
 }
 
-/// The queue of what the worker has to offer, the views of what each binding has missed, and the
-/// state the link holds for each binding.
+/// The queue of what the worker has to offer, and the views of what each binding has missed.
 #[derive(Debug)]
 pub struct ObservationLane {
     inner: Mutex<Inner>,
@@ -467,14 +431,11 @@ pub struct ObservationLane {
     native_wanted: AtomicBool,
     /// Whether any binding takes terminal output.
     terminal_wanted: AtomicBool,
-    /// Whether privacy mode is on: no component's state is taken or held.
+    /// Whether privacy mode is on.
     private: AtomicBool,
-    /// Advances each time privacy mode is turned on or off, so that a state asked for before the
-    /// change is not held after it.
+    /// Advances each time privacy mode is turned on or off, so that what was taken in before a
+    /// change can be told from what was taken in after it ([`Self::privacy_mark`]).
     privacy_epoch: AtomicU64,
-    /// Wakes the link when a binding that was owed nothing is offered something, so that the time
-    /// its state falls due is worked out again.
-    checkpoint_wake: tokio::sync::Notify,
     /// Wakes the task that tells the plugin runtime whether privacy mode is on when that changes.
     privacy_wake: tokio::sync::Notify,
     /// What the plugin runtime was last told and acknowledged on the connection the link holds:
@@ -541,7 +502,6 @@ impl ObservationLane {
             terminal_wanted: AtomicBool::new(false),
             private: AtomicBool::new(false),
             privacy_epoch: AtomicU64::new(0),
-            checkpoint_wake: tokio::sync::Notify::new(),
             privacy_wake: tokio::sync::Notify::new(),
             #[cfg(feature = "testing")]
             runtime_told: std::sync::atomic::AtomicU8::new(0),
@@ -747,7 +707,7 @@ impl ObservationLane {
     /// before the registration has ended or after. So a mark made on an earlier connection goes,
     /// since the component it described went with that connection, and a mark made on this one
     /// stays, whenever in the registration it was made: the component may already hold what it was
-    /// handed, and it is asked for no state until it starts again.
+    /// handed.
     pub fn set_ready(&self, binding: BrokerBindingId, connection: u64) {
         let mut inner = self.inner();
         let next = inner.next_seq;
@@ -815,7 +775,6 @@ impl ObservationLane {
         view.ready_from = next;
         view.snapshot_through = view.lost_seq;
         view.loss_note = None;
-        view.offered_since_checkpoint = 0;
         view.outage.decode_queued = decode_queued;
         view.outage.decode_full = decode_full;
         drop(inner);
@@ -912,16 +871,12 @@ impl ObservationLane {
         }
     }
 
-    /// Forgets a binding: its view, and the state held for it. Its mark stays: see
-    /// [`Self::forget_unwanted`].
+    /// Forgets a binding's view. Its mark stays: see [`Self::forget_unwanted`].
     pub fn forget(&self, binding: BrokerBindingId) {
-        let mut inner = self.inner();
-        inner.views.remove(&binding);
-        drop_checkpoint(&mut inner, binding);
+        self.inner().views.remove(&binding);
     }
 
-    /// Forgets the view and the held state of every binding that is not in `wanted`: a binding that
-    /// ended while the plugin runtime was lost is not unbound by anything else.
+    /// Forgets the view of every binding that is not in `wanted`: a binding that ended while the plugin runtime was lost is not unbound by anything else.
     ///
     /// A mark made on an earlier connection of a binding that is not wanted goes with it. One made
     /// on this connection stays, for the binding may be registered again on it.
@@ -931,17 +886,7 @@ impl ObservationLane {
         inner
             .marks
             .retain(|binding, made| wanted.contains(binding) || *made >= connection);
-        let gone: Vec<BrokerBindingId> = inner
-            .views
-            .keys()
-            .chain(inner.checkpoints.keys())
-            .filter(|binding| !wanted.contains(binding))
-            .copied()
-            .collect();
-        for binding in gone {
-            inner.views.remove(&binding);
-            drop_checkpoint(&mut inner, binding);
-        }
+        inner.views.retain(|binding, _| wanted.contains(binding));
     }
 
     /// Returns a copy of a binding's view.
@@ -993,29 +938,6 @@ impl ObservationLane {
             view.silent_until = Some(now + wait);
             view.silence = Some(wait.saturating_mul(2).min(LONGEST_SILENCE));
         }
-    }
-
-    /// Records that something was offered to the binding, which is one more thing its state holds
-    /// that has not been taken. Whether it was made in privacy mode is marked before the hand-over
-    /// ([`Self::expose`]), not here.
-    pub fn offered(&self, binding: BrokerBindingId, now: Instant) {
-        let mut inner = self.inner();
-        let Some(view) = inner.views.get_mut(&binding) else {
-            return;
-        };
-        let first = view.offered_since_checkpoint == 0;
-        view.offered_since_checkpoint = view.offered_since_checkpoint.saturating_add(1);
-        view.last_offer = Some(now);
-        drop(inner);
-        if first {
-            self.checkpoint_wake.notify_one();
-        }
-    }
-
-    /// Waits until a binding that had been offered nothing since its state was last asked for is
-    /// offered something, which is when the time its state falls due changes.
-    pub async fn until_state_is_owed(&self) {
-        self.checkpoint_wake.notified().await;
     }
 
     /// Records that a call to the binding was answered, which ends a silence.
@@ -1080,72 +1002,7 @@ impl ObservationLane {
         self.inner().marks.contains_key(&binding)
     }
 
-    // -- checkpoints --------------------------------------------------------------------------
-
-    /// Returns the ready bindings whose state is due to be taken: events have been offered since the
-    /// last attempt, and the binding has been quiet for [`QUIET_BEFORE_CHECKPOINT`] or the last
-    /// attempt is [`CHECKPOINT_EVERY`] old.
-    #[must_use]
-    pub fn checkpoint_due(&self, now: Instant) -> Vec<BrokerBindingId> {
-        if self.is_private() {
-            return Vec::new();
-        }
-        let inner = self.inner();
-        inner
-            .views
-            .iter()
-            .filter(|(_, view)| view.ready && view.offered_since_checkpoint > 0)
-            .filter(|(binding, _)| !inner.marks.contains_key(binding))
-            .filter(|(_, view)| {
-                let quiet = view
-                    .last_offer
-                    .is_none_or(|at| now.saturating_duration_since(at) >= QUIET_BEFORE_CHECKPOINT);
-                let old = view
-                    .last_checkpoint_attempt
-                    .is_none_or(|at| now.saturating_duration_since(at) >= CHECKPOINT_EVERY);
-                quiet || old
-            })
-            .map(|(binding, _)| *binding)
-            .collect()
-    }
-
-    /// Returns how long until some ready binding that has been offered events is due a checkpoint,
-    /// where one is.
-    #[must_use]
-    pub fn next_checkpoint(&self, now: Instant) -> Option<Duration> {
-        if self.is_private() {
-            return None;
-        }
-        let inner = self.inner();
-        inner
-            .views
-            .iter()
-            .filter(|(_, view)| view.ready && view.offered_since_checkpoint > 0)
-            .filter(|(binding, _)| !inner.marks.contains_key(binding))
-            .map(|(_, view)| {
-                let quiet_at = view.last_offer.map(|at| at + QUIET_BEFORE_CHECKPOINT);
-                let old_at = view.last_checkpoint_attempt.map(|at| at + CHECKPOINT_EVERY);
-                let due = match (quiet_at, old_at) {
-                    (Some(quiet), Some(old)) => quiet.min(old),
-                    (Some(at), None) | (None, Some(at)) => at,
-                    (None, None) => now,
-                };
-                due.saturating_duration_since(now)
-            })
-            .min()
-    }
-
-    /// Records that this binding's state was asked for, whatever came of it.
-    pub fn checkpoint_attempted(&self, binding: BrokerBindingId, now: Instant) {
-        let mut inner = self.inner();
-        if let Some(view) = inner.views.get_mut(&binding) {
-            view.offered_since_checkpoint = 0;
-            view.last_checkpoint_attempt = Some(now);
-        }
-    }
-
-    /// Returns the number privacy mode's changes have reached: a state asked for under one number is
-    /// held only under the same one.
+    /// Returns the number privacy mode's changes have reached.
     #[must_use]
     pub fn privacy_epoch(&self) -> u64 {
         self.privacy_epoch.load(Ordering::Acquire)
@@ -1172,85 +1029,12 @@ impl ObservationLane {
         !mark.private && self.privacy_epoch() == mark.epoch && !self.is_private()
     }
 
-    /// Holds a binding's state, asked for when privacy mode stood at `epoch`. Nothing is held under
-    /// privacy mode, nothing asked for before a change of it, and nothing from a component that was
-    /// offered something made in it; the oldest is dropped rather than the total passing
-    /// [`CHECKPOINT_BYTES`].
-    pub fn hold(&self, binding: BrokerBindingId, held: Held, epoch: u64) {
-        let size = held.state.len() as u64;
-        if size > CHECKPOINT_BYTES {
-            return;
-        }
-        let mut inner = self.inner();
-        // Read under the lock the fence takes, so that a fence is either before this or after it.
-        if self.is_private()
-            || self.privacy_epoch() != epoch
-            || inner.marks.contains_key(&binding)
-            || !inner.views.contains_key(&binding)
-        {
-            return;
-        }
-        drop_checkpoint(&mut inner, binding);
-        while inner.checkpoint_bytes.saturating_add(size) > CHECKPOINT_BYTES {
-            let Some(oldest) = inner.checkpoint_order.front().copied() else {
-                break;
-            };
-            drop_checkpoint(&mut inner, oldest);
-        }
-        inner.checkpoint_bytes = inner.checkpoint_bytes.saturating_add(size);
-        inner.checkpoint_order.push_back(binding);
-        inner.checkpoints.insert(binding, held);
-    }
-
-    /// Takes the state held for a binding, if it was taken under this package and this
-    /// generation.
-    pub fn take_held(
-        &self,
-        binding: BrokerBindingId,
-        package_digest: kr_protocol::scalars::Digest256,
-        generation: u64,
-    ) -> Option<Held> {
-        let mut inner = self.inner();
-        let matches = inner.checkpoints.get(&binding).is_some_and(|held| {
-            held.package_digest == package_digest && held.generation == generation
-        });
-        if !matches {
-            // Held under another package or another execution: it is not this binding's to
-            // restore, and keeping it would only keep content nothing will use.
-            drop_checkpoint(&mut inner, binding);
-            return None;
-        }
-        let held = inner.checkpoints.get(&binding).cloned();
-        drop_checkpoint(&mut inner, binding);
-        held
-    }
-
-    /// Returns how many checkpoints are held, and their bytes.
-    #[must_use]
-    pub fn held_checkpoints(&self) -> (usize, u64) {
-        let inner = self.inner();
-        (inner.checkpoints.len(), inner.checkpoint_bytes)
-    }
-
-    /// Returns the state held for a binding, without taking it. For this host's own tests.
-    #[cfg(feature = "testing")]
-    #[must_use]
-    pub fn held_state(&self, binding: BrokerBindingId) -> Option<Vec<u8>> {
-        self.inner()
-            .checkpoints
-            .get(&binding)
-            .map(|held| held.state.clone())
-    }
-
     // -- privacy mode -------------------------------------------------------------------------
 
-    /// Says whether privacy mode is on. Observation for live use goes on under it; what does not is
-    /// anything derived from it that would outlive it: while it is on no checkpoint is taken or
-    /// held, the ones held are dropped when it is turned on ([`Self::fence`]), and a component that
-    /// was offered something while it was on is not asked for its state again, since the state may
-    /// hold what it was offered, until it starts again.
+    /// Says whether privacy mode is on. Observation for live use goes on under it, and the lane
+    /// keeps nothing derived from it beyond the entries waiting, which the pump takes off in bounded
+    /// time.
     pub fn set_private(&self, private: bool) {
-        // Under the lock a fence and a hold take, so that neither sees half of the change.
         let mut inner = self.inner();
         if self.private.swap(private, Ordering::AcqRel) != private {
             self.privacy_epoch.fetch_add(1, Ordering::AcqRel);
@@ -1258,9 +1042,6 @@ impl ObservationLane {
         }
         if private {
             inner.words_tainted = true;
-        }
-        if !private {
-            self.checkpoint_wake.notify_one();
         }
     }
 
@@ -1343,30 +1124,13 @@ impl ObservationLane {
     /// them was made, or a component on it has been handed something made in privacy mode
     /// ([`Self::expose`]), and until the link makes another. What decides it is the connection and
     /// not the notice: any component on it may have been handed something while privacy mode stood, by
-    /// an observation, a restore or an action, and the words can be made of what a component was
+    /// an observation or an action, and the words can be made of what a component was
     /// handed. Every notice about every component on the connection is withheld, however many wait
     /// and however late each is read, and a notice of an earlier connection cannot be read from a
     /// later one.
     #[must_use]
     pub fn words_withheld(&self) -> bool {
         self.inner().words_tainted
-    }
-
-    /// Drops every checkpoint held, which is everything this lane holds that is derived from what a
-    /// component was offered: the entries waiting are live observation, bounded in time by the
-    /// pump and in size by the lane. Returns the checkpoints dropped and their bytes.
-    pub fn fence(&self) -> Fenced {
-        let mut inner = self.inner();
-        self.privacy_epoch.fetch_add(1, Ordering::AcqRel);
-        let records = inner.checkpoints.len();
-        let bytes = inner.checkpoint_bytes;
-        inner.checkpoints.clear();
-        inner.checkpoint_order.clear();
-        inner.checkpoint_bytes = 0;
-        Fenced {
-            checkpoints: records as u64,
-            checkpoint_bytes: bytes,
-        }
     }
 
     /// Returns how many entries the pump has taken and not finished with.
@@ -1415,13 +1179,9 @@ impl ObservationLane {
 
 /// The observation lane's part in privacy mode.
 ///
-/// Observation for live use goes on under privacy mode, and nothing derived from it outlives it.
-/// Turning privacy mode on stops any more of a component's state being taken and drops the state
-/// held for each binding, so a component restored after that starts again from the live point; while
-/// it is on, a component is never asked for its state ([`ObservationLane::checkpoint_due`]) and
-/// nothing is held ([`ObservationLane::hold`]). A component that was offered something while it was
-/// on keeps no state afterwards either, until it starts again, since what it holds may be what it
-/// was offered.
+/// Observation for live use goes on under privacy mode, and the lane keeps nothing derived from it
+/// beyond the entries waiting, which the pump takes off in bounded time. There is nothing to remove
+/// when privacy mode is turned on, so the subsystem only records that it is on.
 #[derive(Clone, Debug)]
 pub struct ObservationPrivacy {
     lane: Arc<ObservationLane>,
@@ -1462,36 +1222,13 @@ impl crate::privacy::PrivacySubsystem for ObservationPrivacy {
         &mut self,
         _generation: crate::privacy::PrivacyGeneration,
     ) -> Result<crate::privacy::Removed, crate::privacy::Unavailable> {
-        let dropped = self.lane.fence();
-        Ok(crate::privacy::Removed {
-            bytes: dropped.checkpoint_bytes,
-            records: dropped.checkpoints,
-        })
+        Ok(crate::privacy::Removed::default())
     }
 
     fn outstanding(&self) -> Result<u64, crate::privacy::Unavailable> {
-        // A checkpoint being taken when privacy mode is turned on is refused when it comes back:
-        // nothing is held while it is on. So there is nothing in flight to wait for.
+        // The lane takes nothing from a component, so there is nothing in flight to wait for.
         Ok(0)
     }
-}
-
-/// What turning privacy mode on dropped from the lane.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Fenced {
-    /// Checkpoints that were held.
-    pub checkpoints: u64,
-    /// The bytes those checkpoints held.
-    pub checkpoint_bytes: u64,
-}
-
-fn drop_checkpoint(inner: &mut Inner, binding: BrokerBindingId) {
-    if let Some(held) = inner.checkpoints.remove(&binding) {
-        inner.checkpoint_bytes = inner
-            .checkpoint_bytes
-            .saturating_sub(held.state.len() as u64);
-    }
-    inner.checkpoint_order.retain(|queued| *queued != binding);
 }
 
 /// What is known of an upstream frame under the broker's lock, which is all the lock is needed

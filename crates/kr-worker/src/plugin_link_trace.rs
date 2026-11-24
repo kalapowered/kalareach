@@ -65,10 +65,6 @@ pub enum Call {
     Register,
     /// Removing one binding's registration.
     Unbind,
-    /// Giving a component its held state back.
-    Restore,
-    /// Taking a component's state.
-    Checkpoint,
     /// Asking the runtime what it is doing.
     Health,
     /// Telling a component what its binding is bound to now.
@@ -83,8 +79,6 @@ impl Call {
             Self::Privacy => "privacy",
             Self::Register => "register",
             Self::Unbind => "unbind",
-            Self::Restore => "restore",
-            Self::Checkpoint => "checkpoint",
             Self::Health => "health",
             Self::ReviseFacts => "revise",
         }

@@ -67,6 +67,7 @@ struct State {
     observes: u64,
     snapshots: u64,
     restores: u64,
+    checkpoints: u64,
     spin_snapshot: bool,
     seen: Vec<String>,
     requests: Vec<String>,
@@ -90,6 +91,7 @@ fn state() -> &'static mut State {
                 observes: 0,
                 snapshots: 0,
                 restores: 0,
+                checkpoints: 0,
                 spin_snapshot: false,
                 seen: Vec::new(),
                 requests: Vec::new(),
@@ -209,6 +211,7 @@ impl Guest for Component {
 
     fn checkpoint() -> Result<Vec<u8>, Fault> {
         let state = state();
+        state.checkpoints += 1;
         let facts = upstream::state();
         let activity = match facts.activity {
             Activity::Idle => "idle",
@@ -226,11 +229,12 @@ impl Guest for Component {
             })
             .collect();
         Ok(format!(
-            "bind={};observe={};snapshot={};restore={};seen={};requests={};facts={}/{}/{}/{}/{};attachments={}",
+            "bind={};observe={};snapshot={};restore={};checkpoint={};seen={};requests={};facts={}/{}/{}/{}/{};attachments={}",
             state.binds,
             state.observes,
             state.snapshots,
             state.restores,
+            state.checkpoints,
             state.seen.join("|"),
             state.requests.join("|"),
             facts.binding_revision,

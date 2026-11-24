@@ -29,15 +29,11 @@
 //! # What the link does once a component is registered
 //!
 //! A binding is reported `Registered` as soon as the runtime has its component, and is offered
-//! observations (`crate::plugin_observation`) only once the link has made it ready: its held
-//! checkpoint restored where there was one. What was observed between the checkpoint and the
-//! registration is not replayed, so a restore is a loss, and the pump takes the snapshot it owes
-//! before it offers the binding anything. The link takes a checkpoint of a ready binding when it
-//! has been offered events and has been quiet for two seconds (or its last attempt is a minute old,
-//! or it has never been asked), holds it in memory under the source generation the component was
-//! registered in, and restores it when the binding is registered again after the runtime was lost.
-//! Held checkpoints are never persisted, and privacy mode drops them. Every thirty seconds it asks
-//! the runtime what it is doing; a runtime that does not answer twice running is treated as lost.
+//! observations (`crate::plugin_observation`) only once the link has made it ready. A component
+//! registered again after the runtime was lost is a new instance and holds nothing: the link takes
+//! no state from a component and restores none, and the pump gives the component the requests the
+//! broker holds for it before anything else. Every thirty seconds the link asks the runtime what it
+//! is doing; a runtime that does not answer twice running is treated as lost.
 //!
 //! # When the runtime is lost
 //!
@@ -73,10 +69,10 @@ use kr_protocol::ids::{BrokerBindingId, SessionId};
 
 use crate::broker::Broker;
 use crate::broker::component::{ComponentNote, ComponentWant, Execution, FaultNote};
-use crate::broker::observation::{Held, ObservationLane};
+use crate::broker::observation::ObservationLane;
 #[cfg(feature = "testing")]
 use crate::plugin_link_trace as link_trace;
-use crate::plugin_observation::{CALL_WAIT, service_id};
+use crate::plugin_observation::service_id;
 
 /// How long a request to the control daemon is given.
 ///
@@ -145,7 +141,7 @@ pub async fn link(request: RuntimeRequest, broker: Weak<Broker>) {
     let mut link = Link {
         request,
         client: None,
-        registered: BTreeMap::new(),
+        registered: BTreeSet::new(),
         abandoned: BTreeMap::new(),
         refused: BTreeMap::new(),
         told_facts: BTreeMap::new(),
@@ -265,10 +261,8 @@ impl Drop for AbortOnDrop {
 struct Link {
     request: RuntimeRequest,
     client: Option<Arc<PluginClient>>,
-    /// The bindings registered on `client`, each with the source generation of its instance when it
-    /// was registered: the component holds what it was offered since, whichever generation the
-    /// instance has reached.
-    registered: BTreeMap<BrokerBindingId, u64>,
+    /// The bindings registered on `client`.
+    registered: BTreeSet<BrokerBindingId>,
     /// How many registration calls on `client` were given up for each binding because the binding
     /// went while the runtime held the call: the runtime may register any of them all the same, and
     /// each is removed, one for each call, when the runtime next answers a registration or the
@@ -401,7 +395,7 @@ impl Link {
                 .any(|want| want.observing && want.streams.terminal),
         );
         let registering = self.register_wanted(broker, changes, &wants).await;
-        let keeping = self.keep_up(broker, &wants).await;
+        let keeping = self.keep_up(broker).await;
         self.revise_facts(broker, &wants).await;
         match (registering, keeping) {
             (Some(first), Some(second)) => Some(first.min(second)),
@@ -422,7 +416,7 @@ impl Link {
         // lost its rich capabilities, and the instance it holds in the runtime goes with it.
         let gone: Vec<BrokerBindingId> = self
             .registered
-            .keys()
+            .iter()
             .filter(|binding| !wanted.contains(binding))
             .copied()
             .collect();
@@ -477,7 +471,7 @@ impl Link {
         let pending: Vec<&ComponentWant> = wants
             .iter()
             .filter(|want| {
-                !self.registered.contains_key(&want.binding_id)
+                !self.registered.contains(&want.binding_id)
                     && self
                         .refused
                         .get(&want.binding_id)
@@ -608,7 +602,7 @@ impl Link {
                     // accepted means it held nothing of a call given up for the same binding, and
                     // there is nothing of that call to remove: removing it would remove this one.
                     self.abandoned.remove(&want.binding_id);
-                    self.registered.insert(want.binding_id, want.generation);
+                    self.registered.insert(want.binding_id);
                     self.told_facts
                         .insert(want.binding_id, want.execution.clone());
                     self.refused.remove(&want.binding_id);
@@ -879,7 +873,6 @@ impl Link {
             };
             tokio::select! {
                 () = changes.notified() => Event::Changed,
-                () = self.lane.until_state_is_owed() => Event::Changed,
                 () = timer => Event::Timer,
                 notice = notice => Event::Notice(notice),
             }
@@ -987,7 +980,7 @@ impl Link {
             return;
         };
         for want in wants {
-            if !self.registered.contains_key(&want.binding_id)
+            if !self.registered.contains(&want.binding_id)
                 || self.told_facts.get(&want.binding_id) == Some(&want.execution)
             {
                 continue;
@@ -1025,13 +1018,9 @@ impl Link {
         }
     }
 
-    /// Takes the state of the bindings that are due it, and asks the runtime what it is doing when
-    /// it is time. Says how long to leave before either is due again.
-    async fn keep_up(
-        &mut self,
-        broker: &Weak<Broker>,
-        wants: &[ComponentWant],
-    ) -> Option<Duration> {
+    /// Asks the runtime what it is doing when it is time. Says how long to leave before it is due
+    /// again.
+    async fn keep_up(&mut self, broker: &Weak<Broker>) -> Option<Duration> {
         let client = self.client.clone()?;
         if self.registered.is_empty() {
             self.health_due = None;
@@ -1074,77 +1063,21 @@ impl Link {
                 }
             }
         }
-        // One binding's state at a time; the next is taken on the next pass.
         let now = tokio::time::Instant::now();
-        let epoch = self.lane.privacy_epoch();
-        let due = self.lane.checkpoint_due(now).into_iter().next();
-        // Privacy mode may have come on between the choice and the call, and then nothing is asked.
-        if let Some(binding) =
-            due.filter(|_| !self.lane.is_private() && self.lane.privacy_epoch() == epoch)
-        {
-            self.lane.checkpoint_attempted(binding, now);
-            let want = wants.iter().find(|want| want.binding_id == binding);
-            let generation = self.registered.get(&binding).copied();
-            #[cfg(feature = "testing")]
-            let began = link_trace::began(
-                link_trace::Call::Checkpoint,
-                Some(binding),
-                CALL_WAIT + kr_plugin_service::client::ROUND_TRIP_ALLOWANCE,
-            );
-            let checkpointed = client.checkpoint(service_id(binding), CALL_WAIT).await;
-            #[cfg(feature = "testing")]
-            link_trace::ended(
-                began,
-                match &checkpointed {
-                    Ok(called) if !called.answered() => link_trace::Outcome::Faulted,
-                    _ => link_trace::Outcome::of(&checkpointed),
-                },
-            );
-            match checkpointed {
-                Ok(called) => {
-                    if let (Some(state), Some(want), Some(generation)) =
-                        (called.state, want, generation)
-                    {
-                        self.lane.hold(
-                            binding,
-                            Held {
-                                package_digest: want.package_digest,
-                                generation,
-                                state,
-                            },
-                            epoch,
-                        );
-                    }
-                }
-                Err(ServiceError::Unavailable { detail }) => {
-                    #[cfg(feature = "testing")]
-                    link_trace::lost(link_trace::Why::Unavailable);
-                    self.lose(broker, &detail);
-                    return Some(self.pace.remaining(tokio::time::Instant::now()));
-                }
-                Err(_) => {}
-            }
-        }
-        let now = tokio::time::Instant::now();
-        let health = self
-            .health_due
-            .map_or(HEALTH_EVERY, |due| due.saturating_duration_since(now));
         Some(
-            self.lane
-                .next_checkpoint(now)
-                .map_or(health, |checkpoint| checkpoint.min(health)),
+            self.health_due
+                .map_or(HEALTH_EVERY, |due| due.saturating_duration_since(now)),
         )
     }
 
     /// Records that the runtime is gone: every registration on it with it.
     fn lose(&mut self, broker: &Weak<Broker>, reason: &str) {
-        // Nothing is offered to a binding the runtime no longer holds, and what it held of the
-        // component's state stays, for the registration that follows.
+        // Nothing is offered to a binding the runtime no longer holds.
         self.lane.all_not_ready();
         self.told_facts.clear();
         self.health_due = None;
         self.health_failures = 0;
-        for binding_id in std::mem::take(&mut self.registered).into_keys() {
+        for binding_id in std::mem::take(&mut self.registered) {
             report(
                 broker,
                 binding_id,

@@ -1,24 +1,22 @@
 //! The worker's observation lane keeps promises that no timing of a running worker can show
-//! deterministically: what it lost comes with the entry it hands over, older than that entry; a
-//! state asked for before a change of privacy mode is not held after it; and the runtime's words are
-//! withheld once privacy mode has stood on the connection that carries them.
+//! deterministically: what it lost comes with the entry it hands over, older than that entry; the
+//! runtime's words are withheld once privacy mode has stood on the connection that carries them; and
+//! a component that was handed something made in privacy mode is marked as having been.
 //!
 //! The first is what keeps a component from being offered an entry newer than a loss before the
 //! fresh snapshot the loss owes it, and an entry older than a loss from being offered after the
-//! snapshot the loss owes. The second is what keeps a state taken before privacy mode was turned on
-//! from being kept through it. The third is what keeps words a component made from what it was
-//! handed in privacy mode from reaching a report, however late they are read. A fourth keeps a
-//! component that was handed something made in privacy mode while it was registering from being
-//! asked for its state, whichever task handed it. All are decided at the
-//! lane's own interface, and the cases in kr-controller's `plugin_observation` show the same lane at
-//! work in a running worker.
+//! snapshot the loss owes. The second is what keeps words a component made from what it was handed
+//! in privacy mode from reaching a report, however late they are read. The third keeps the mark of a
+//! component that was handed such content while it was registering, whichever task handed it. All
+//! are decided at the lane's own interface, and the cases in kr-controller's `plugin_observation`
+//! show the same lane at work in a running worker.
 
 use std::sync::Arc;
 
 use kr_protocol::ids::{ApplicationInstanceId, BrokerBindingId, PluginId, PublisherId};
 use kr_protocol::scalars::{Digest256, Uuid};
 use kr_worker::broker::PackageIdentity;
-use kr_worker::broker::observation::{Held, NativeFrame, ObservationLane, Outage, Tally};
+use kr_worker::broker::observation::{NativeFrame, ObservationLane, Outage, Tally};
 
 /// A span of terminal output of `bytes` bytes.
 fn span(bytes: usize) -> Arc<Vec<u8>> {
@@ -174,64 +172,6 @@ fn kr_req_11_38_a_loss_goes_with_the_first_entry_newer_than_it() {
     assert!(seventh.loss.is_none() && seventh.entry.is_none());
 }
 
-/// KR-REQ-24.27: a state a component was asked for while privacy mode stood one way is not held
-/// once it has stood another, and one asked for under the present standing is.
-#[test]
-fn kr_req_24_27_a_state_asked_for_before_a_change_of_privacy_mode_is_not_held_after_it() {
-    let lane = ObservationLane::new();
-    let binding = BrokerBindingId::new(Uuid::from_bytes([7; 16]));
-    // A view for the binding, as the link makes one when it registers the component.
-    lane.began_connection();
-    lane.set_ready(binding, lane.connection());
-    let held = |state: &[u8]| Held {
-        package_digest: Digest256::from_bytes([1; 32]),
-        generation: 1,
-        state: state.to_vec(),
-    };
-
-    // Asked for under the present standing: held.
-    let epoch = lane.privacy_epoch();
-    lane.hold(binding, held(b"before"), epoch);
-    assert_eq!(lane.held_checkpoints().0, 1);
-
-    // Asked for, then privacy mode turned on and off before the answer came back: not held.
-    let stale = lane.privacy_epoch();
-    lane.set_private(true);
-    let _fenced = lane.fence();
-    lane.set_private(false);
-    assert_eq!(
-        lane.held_checkpoints(),
-        (0, 0),
-        "the fence dropped the state"
-    );
-    lane.hold(binding, held(b"asked before"), stale);
-    assert_eq!(
-        lane.held_checkpoints(),
-        (0, 0),
-        "a state asked for before the change was held after it"
-    );
-
-    // Asked for after the change: held. A component marked as handed something made in privacy mode
-    // is held no state of, however the state was asked for. And never while privacy mode is on.
-    lane.hold(binding, held(b"asked after"), lane.privacy_epoch());
-    assert_eq!(lane.held_checkpoints().0, 1);
-    lane.expose(binding, true);
-    lane.hold(binding, held(b"exposed"), lane.privacy_epoch());
-    assert!(lane.is_marked(binding));
-    assert_eq!(
-        lane.held_checkpoints().0,
-        1,
-        "the earlier state is the one held"
-    );
-    lane.set_private(true);
-    lane.hold(binding, held(b"private"), lane.privacy_epoch());
-    assert_eq!(
-        lane.held_checkpoints().0,
-        1,
-        "the earlier state stays until the fence"
-    );
-}
-
 /// KR-REQ-24.27: the runtime's words are withheld once privacy mode has been on since the link made
 /// the connection, however privacy mode stands later, and until the link makes another; a connection
 /// made while privacy mode is on is withheld from its start.
@@ -325,52 +265,21 @@ fn kr_req_24_27_a_component_handed_private_content_on_the_connection_it_register
         Some(true),
         "becoming ready cleared a mark made on the connection before the registration began"
     );
-    let held = Held {
-        package_digest: Digest256::from_bytes([1; 32]),
-        generation: 1,
-        state: b"state".to_vec(),
-    };
-    lane.hold(binding, held, lane.privacy_epoch());
-    assert_eq!(
-        lane.held_checkpoints().0,
-        0,
-        "the state of a component that was handed private content was held"
-    );
 }
 
 /// KR-REQ-24.27: the same hand-over, to a binding the lane has no view of yet: the first
 /// connection, and an action accepted in privacy mode that reaches its component's call before the
-/// component is registered. The mark is kept, so the component is asked for no state, and none is
-/// held for it while one is held for a component that was handed nothing.
+/// component is registered. The mark is kept.
 #[test]
 fn kr_req_24_27_a_first_hand_over_before_the_component_is_registered_is_marked() {
     let lane = ObservationLane::new();
     let binding = BrokerBindingId::new(Uuid::from_bytes([12; 16]));
-    let unmarked = BrokerBindingId::new(Uuid::from_bytes([15; 16]));
-    let held = || Held {
-        package_digest: Digest256::from_bytes([1; 32]),
-        generation: 1,
-        state: b"state".to_vec(),
-    };
     lane.began_connection();
     lane.expose(binding, true);
     lane.set_ready(binding, lane.connection());
-    lane.set_ready(unmarked, lane.connection());
     assert!(
         lane.is_marked(binding),
         "a component handed private content before it was registered was not marked"
-    );
-    lane.hold(binding, held(), lane.privacy_epoch());
-    assert_eq!(
-        lane.held_checkpoints().0,
-        0,
-        "the state of a component that was handed private content before it was registered was held"
-    );
-    lane.hold(unmarked, held(), lane.privacy_epoch());
-    assert_eq!(
-        lane.held_checkpoints().0,
-        1,
-        "the state of a component that was handed nothing was not held"
     );
 }
 
@@ -399,30 +308,12 @@ fn kr_req_24_27_a_mark_outlasts_an_unbinding_on_the_connection_it_was_made_on() 
         lane.is_marked(binding),
         "an unbinding dropped the mark of a call that had not yet reached its component"
     );
-    let held = || Held {
-        package_digest: Digest256::from_bytes([1; 32]),
-        generation: 1,
-        state: b"state".to_vec(),
-    };
-    lane.hold(binding, held(), lane.privacy_epoch());
-    assert_eq!(
-        lane.held_checkpoints().0,
-        0,
-        "the state of a component that was handed private content was held after an unbinding"
-    );
 
-    // A later connection's registration holds nothing the earlier one was handed, so its state is
-    // held again.
+    // A later connection's registration holds nothing the earlier one was handed.
     lane.all_not_ready();
     lane.began_connection();
     lane.set_ready(binding, lane.connection());
     assert!(!lane.is_marked(binding));
-    lane.hold(binding, held(), lane.privacy_epoch());
-    assert_eq!(
-        lane.held_checkpoints().0,
-        1,
-        "the state of a component registered afresh was not held"
-    );
 
     // The cleanup of bindings no longer wanted drops the marks of an earlier connection.
     lane.expose(other, true);

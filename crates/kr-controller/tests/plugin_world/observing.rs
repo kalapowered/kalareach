@@ -224,6 +224,8 @@ pub struct Account {
     pub snapshots: u64,
     /// Restores.
     pub restores: u64,
+    /// Checkpoints taken, this read of the account among them.
+    pub checkpoints: u64,
     /// The last eight events, oldest first.
     pub seen: Vec<Seen>,
     /// The identifiers of the last thirty-two requests offered, oldest first.
@@ -256,6 +258,7 @@ impl Account {
                 "observe" => account.observes = count(),
                 "snapshot" => account.snapshots = count(),
                 "restore" => account.restores = count(),
+                "checkpoint" => account.checkpoints = count(),
                 "seen" => {
                     account.seen = value
                         .split('|')
@@ -755,35 +758,6 @@ impl Observing {
                 self.diagnostics(number)
             ),
         }
-    }
-
-    /// Waits until the worker has recorded that the binding's component was offered something since
-    /// its state was last asked for.
-    pub async fn until_offered(&self, number: u8) {
-        let lane = self.broker().observation();
-        until(
-            "the worker to have recorded what the component was offered",
-            || async {
-                lane.view(binding(number))
-                    .is_some_and(|view| view.offered_since_checkpoint > 0)
-                    .then_some(())
-            },
-        )
-        .await;
-    }
-
-    /// Waits until the lane holds a state for a binding that says `part`, and returns it.
-    pub async fn until_held(&self, number: u8, part: &str) -> String {
-        let lane = self.broker().observation();
-        until(
-            &format!("the state held for the component to say {part:?}"),
-            || async {
-                let state =
-                    String::from_utf8_lossy(&lane.held_state(binding(number))?).into_owned();
-                state.contains(part).then_some(state)
-            },
-        )
-        .await
     }
 
     /// What a failing case needs to see of the lane, the client and the terminal.

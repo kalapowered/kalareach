@@ -1660,139 +1660,37 @@ async fn kr_req_24_24_a_first_registration_is_given_nothing_and_terminal_text_is
     );
 }
 
-/// KR-REQ-24.27: turning privacy mode on drops the state the worker holds for a component, and while
-/// it is on no state is taken or held; observation for live use goes on; a component that was offered
-/// something while it was on is not asked for its state again, since what it holds may be what it
-/// was offered; and a component that starts again has its state taken from then on.
+/// KR-REQ-24.27: the worker takes no state of a component, however long the component has been quiet
+/// since it was offered something: what a component holds is opaque to the worker, and nothing the
+/// worker could keep of it is derived from what it was offered.
 ///
-/// The state is what a component returns when it is asked for a checkpoint: a record of what it was
-/// offered, held in the worker so that a component started again after its runtime ended can be
-/// restored. Privacy mode removes the caches derived from what a session produced, so a component
-/// that is started again after it starts from the live point and not from a restored state.
+/// A component observes a frame. Its account is read until it says so, and once more after a wait
+/// longer than the time a component was once left quiet before its state was asked for. Each read of
+/// the account is a checkpoint, and the case counts its own: the component has taken no others.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn kr_req_24_27_privacy_mode_drops_the_state_held_for_a_component_and_none_is_taken_of_what_it_was_offered_in_it()
- {
+async fn kr_req_24_27_a_component_is_asked_for_no_state_however_long_it_has_been_quiet() {
     let Some(world) = Observing::start(Options::with(vec![Spec::semantic_only(1)])).await else {
         return;
     };
     world.until_ready(1).await;
-    let lane = world.broker().observation();
-    // Far enough on that every time rule has passed, so that what the lane would ask for is decided
-    // by what it is owed and not by how long it has been since.
-    let later = tokio::time::Instant::now() + std::time::Duration::from_secs(3600);
-
     world.send(&notification("one"));
-    world.until_held(1, "observe=1;").await;
-    assert_eq!(lane.held_checkpoints().0, 1);
-    // Another frame, offered after the state was taken and before the component has been quiet long
-    // enough to be asked for it again.
-    world.send(&notification("one more"));
-    world.until_offered(1).await;
-
-    // Privacy mode on: what is held is dropped, and the state the component is owed is not asked
-    // for.
-    let mut authority = world
-        .hosted
-        .daemon_connection(ControllerConnectionRole::Authority)
-        .await;
-    world.tell_privacy(&mut authority, 1, true).await;
-    assert!(lane.is_private());
+    let mut reads = 0_u64;
+    loop {
+        if let Some(account) = world.account(1).await {
+            reads += 1;
+            if account.observes >= 1 {
+                break;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+    let account = world.account(1).await.expect("the component answers");
+    reads += 1;
     assert_eq!(
-        lane.held_checkpoints(),
-        (0, 0),
-        "the state held was dropped"
+        account.checkpoints, reads,
+        "the link took the component's state while it was quiet: {account:?}"
     );
-    assert!(lane.checkpoint_due(later).is_empty());
-
-    // Observation for live use goes on. The component is owed a checkpoint it is not asked for.
-    world.send(&notification("two"));
-    world
-        .until_account(
-            1,
-            "the component to observe a frame sent while private",
-            |account| account.observes >= 3,
-        )
-        .await;
-    world.until_offered(1).await;
-    assert!(lane.checkpoint_due(later).is_empty());
-    assert_eq!(lane.held_checkpoints(), (0, 0));
-
-    // Privacy mode off: what the component was offered while it was on is still in it, so it is
-    // still not asked.
-    world.tell_privacy(&mut authority, 2, false).await;
-    assert!(!lane.is_private());
-    assert!(lane.checkpoint_due(later).is_empty());
-    assert_eq!(lane.held_checkpoints(), (0, 0));
-
-    // A runtime that ends is replaced, and the component in it starts from the live point: nothing
-    // is restored. Its state is taken from then on.
-    let host = world.hosted.published().expect("the runtime is published");
-    plugin_world::kill(&host);
-    until("a replacement runtime to be published", || async {
-        world
-            .hosted
-            .published()
-            .filter(|published| *published != host)
-    })
-    .await;
-    let account = world
-        .until_account(1, "the component to be registered again", |account| {
-            account.binds >= 1
-        })
-        .await;
-    assert_eq!(account.restores, 0, "{account:?}");
-    assert_eq!(account.observes, 0, "{account:?}");
-    world.until_ready(1).await;
-    world.send(&notification("three"));
-    world.until_held(1, "observe=1;").await;
-}
-
-/// KR-REQ-24.27: what the worker had while privacy mode was on is made in it however long it waits
-/// to be offered. A frame that reached the worker in privacy mode and is offered to the component
-/// after privacy mode ended leaves the component holding something made in privacy mode, so no
-/// state is taken from it afterwards.
-///
-/// The worker's pump is held while privacy mode is turned on, a frame arrives, and privacy mode is
-/// turned off again; then the pump goes on.
-#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn kr_req_24_27_an_observation_made_in_privacy_mode_and_offered_after_it_leaves_no_state_taken()
- {
-    let Some(world) = Observing::start(Options::with(vec![Spec::semantic_only(1)])).await else {
-        return;
-    };
-    world.until_ready(1).await;
-    let lane = world.broker().observation();
-    let later = tokio::time::Instant::now() + std::time::Duration::from_secs(3600);
-    let hold = lane.hold_pump();
-    until("the pump to stop at the hold", || async {
-        hold.parked().then_some(())
-    })
-    .await;
-
-    let mut authority = world
-        .hosted
-        .daemon_connection(ControllerConnectionRole::Authority)
-        .await;
-    world.tell_privacy(&mut authority, 1, true).await;
-    world.send(&notification("made in privacy mode"));
-    until("the lane to hold the frame", || async {
-        (lane.waiting() == 1).then_some(())
-    })
-    .await;
-    world.tell_privacy(&mut authority, 2, false).await;
-    assert!(!lane.is_private());
-
-    hold.release();
-    world
-        .until_account(
-            1,
-            "the component to be offered the frame after privacy mode ended",
-            |account| account.observes >= 1,
-        )
-        .await;
-    world.until_offered(1).await;
-    assert!(lane.checkpoint_due(later).is_empty());
-    assert_eq!(lane.held_checkpoints(), (0, 0));
 }
 
 /// KR-REQ-24.27: what the runtime says about a fault of a component is made in part of what the

@@ -673,15 +673,10 @@ arrives while a snapshot runs has a number of its own and asks for another. A sn
 answers or declines discharges its number. One that does not reach the component is asked for again
 after a wait that doubles from one second to thirty.
 
-The link keeps three more things. When a component has been offered something since its state was
-last asked for and has then been left alone for two seconds, or its last request is a minute old or
-there has been none, the link asks it for a checkpoint. The worker keeps checkpoints in memory only,
-at most 8 MiB in all, under the package's digest and the source generation the component was
-registered in, so state taken in one generation of the instance's source is never restored into
-another. When a binding is registered again, after the runtime was replaced for example, its
-component is a new instance with no state, and the worker restores nothing into it: the state is
-opaque to the worker, and a state of unknown coverage cannot be made to hold exactly the requests
-the broker holds unresolved. The pump gives the component, before anything else, each request the
+The link keeps two more things. When a binding is registered again, after the runtime was replaced
+for example, its component is a new instance with no state, and the worker takes no state from a
+component and restores nothing into one: the state is opaque to the worker, and a state of unknown
+coverage cannot be made to hold exactly the requests the broker holds unresolved. The pump gives the component, before anything else, each request the
 broker still holds as pending, once each, in the order the broker recorded them. An approval's bytes
 come from its decoder entry, which keeps the original whole, and any other request's from the frame
 the broker retained; nothing is read from the terminal, the semantic log or a screen. A request that
@@ -706,12 +701,9 @@ could not be given, how many upstream frames and spans of terminal output the wo
 while the runtime was away (and how many bytes they held), how many observations the worker's queue dropped for
 want of room, and how many requests were queued to be decoded again.
 
-Privacy mode does not stop observation for live use. While it is on, the worker asks for no
-component state, and it holds none that was asked for before privacy mode was turned on or off.
-Turning it on drops the state held. A component that was handed anything the worker had while
-privacy mode was on, including something that waited in the lane and was handed over after it ended,
-or whose hand-over was not answered, is marked before the hand-over and is not asked for its state
-again until it starts again, since what it holds may be what it was handed. An observation, the
+Privacy mode does not stop observation for live use. A component is marked before a hand-over of anything the worker had while privacy mode was on,
+including something that waited in the lane and was handed over after privacy mode ended, and
+including a hand-over the component did not answer, since what it holds may be what it was handed. An observation, the
 arguments of an action and a request to decode all mark it. A component holds only what it was
 handed on the connection it is registered on. A mark made on the connection a component is
 registered on stays when the component becomes ready, whichever of them made it and whether it was
@@ -723,8 +715,7 @@ nothing its predecessor was handed.
 The runtime's words in a fault, and in the reason a component is disabled for, are withheld from the
 report once privacy mode has been on at any time since the worker made the connection to the runtime
 that carries them, and until it makes another. The connection decides it, not the notice: any
-component on it may have been handed something while privacy mode stood, by an observation, a
-restore or an action, and its words can be made of what it was handed. So every notice about every
+component on it may have been handed something while privacy mode stood, by an observation or an action, and its words can be made of what it was handed. So every notice about every
 component on the connection is withheld, however many wait and however late each is read. A
 connection made while privacy mode is on is withheld from its start, and so is one that a component
 is handed something made in privacy mode on. The documents a component draws are read and dropped
@@ -755,8 +746,8 @@ loss of documents for each binding that had one withheld is reported as a gap, w
 that holds the start of a document that it lost the rest, and makes the host ask the component to
 draw again. The component's drawing is then fresh and not a continuation.
 
-What the host withholds is documents and presentation. A fault's detail, a disabling's reason, a
-decoded request's summary and decisions, a declared fault's text and a checkpoint's state still cross,
+What the host withholds is documents and presentation. A fault's detail, a disabling's reason, a decoded request's summary and decisions and a declared
+fault's text still cross,
 and the worker keeps none of them beyond what it uses: a summary is what a person is shown beside an
 approval and is kept in the approvals ledger; the rest it withholds by the rules above, because it
 has to for whatever was said before the host was told. The worker's state and the host's agree

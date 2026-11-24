@@ -387,7 +387,6 @@ async fn rebuild(broker: &Broker, lane: &ObservationLane, binding: BrokerBinding
                 Ok(Admission::Queued | Admission::QueuedWithGap { .. }) => {
                     recovery.given += 1;
                     recovery.approvals += u64::from(given.approval);
-                    lane.offered(binding, Instant::now());
                     lane.answered(binding);
                 }
                 Ok(Admission::Refused { .. }) => {
@@ -473,7 +472,6 @@ async fn deliver_frame(
     }
     match answer {
         Ok(Admission::Queued | Admission::QueuedWithGap { .. }) => {
-            lane.offered(binding, Instant::now());
             lane.answered(binding);
         }
         Ok(Admission::Refused { .. }) => lost(
@@ -522,9 +520,7 @@ fn offer_terminal(
             piece.to_vec(),
         );
         match client.offer(service_id(binding), &event) {
-            Handoff::Accepted => {
-                lane.offered(binding, Instant::now());
-            }
+            Handoff::Accepted => {}
             Handoff::Refused { .. } => {
                 lost(
                     broker,
