@@ -106,3 +106,10 @@ test-group = 'network-project'
 [[profile.default.overrides]]
 filter = 'package(kr-cli) & (binary(update) | binary(admit))'
 test-group = 'host-cases'
+
+# The update harness writes `update-harness: a copy of the packed archive read wrong and was made again` to
+# standard error, so that a log can be searched for it and every incident counted. nextest keeps the output of a
+# passing case only where it is asked to, so the binaries that use the harness ask.
+[[profile.default.overrides]]
+filter = 'package(kr-cli) & (binary(update) | binary(admit))'
+success-output = "final"
