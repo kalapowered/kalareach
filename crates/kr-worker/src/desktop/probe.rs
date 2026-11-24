@@ -587,7 +587,7 @@ pub fn invalidation() -> Vec<CapabilityInvalidation> {
 /// Turns one run into the record a caller reads.
 ///
 /// The identity names what the run was about: the program it ran, by path, with the digest of that
-/// file, and the route it took as the schema. A route that ran this worker's own helper names no
+/// file as it was before the run, which the caller takes, and the route it took as the schema. A route that ran this worker's own helper names no
 /// program, because the helper is the worker program and the host agent's identity covers it.
 #[must_use]
 pub fn record(
@@ -597,15 +597,9 @@ pub fn record(
     profile: WorkerProfile,
     revision: CapabilityRevision,
     observed_at_ms: kr_protocol::scalars::TimestampMs,
-    deadline: &Deadline,
+    identity: Option<Sentence>,
 ) -> Option<CapabilityRecord> {
     let (state, evidence, reason) = judge(ran.check, &ran.outcome, route.asking);
-    // Digesting a program takes the check's time like everything else in it: one that cannot be
-    // digested before the deadline has no identity, which a later reading finds changed.
-    let identity = ran
-        .facility
-        .as_deref()
-        .and_then(|program| facility_identity_within(program, deadline));
     Some(CapabilityRecord {
         capability: CapabilityId::new(ran.check.capability()).ok()?,
         version: U64::new(CAPABILITY_VERSION),
@@ -726,8 +720,24 @@ pub fn report(
     facilities: &dyn Facilities,
 ) -> Vec<CapabilityRecord> {
     report_timed(
-        checks, subject, source, revision, plan, facilities, &time_of,
+        checks,
+        subject,
+        source,
+        revision,
+        plan,
+        facilities,
+        &Seams {
+            time_of: &time_of,
+            routes: &resolve,
+        },
     )
+}
+
+/// What a report takes from outside itself, so that a case can give it its own: the time each
+/// check has, and how a check is turned into an operation on a desktop.
+struct Seams<'a> {
+    time_of: &'a dyn Fn(Check) -> Time,
+    routes: &'a dyn Fn(Check, &DesktopContext, Option<&std::ffi::OsStr>) -> Option<Operation>,
 }
 
 /// How the time of one check is shared out.
@@ -757,7 +767,7 @@ const AFTER_OPERATION: Duration = Duration::from_secs(5);
 /// The time the first reading has, which comes before every check and belongs to none.
 pub const FIRST_READING: Duration = Duration::from_secs(10);
 
-/// [`report`], with the time each check has given by the caller.
+/// [`report`], with the time each check has and the routes it takes given by the caller.
 fn report_timed(
     checks: &[Check],
     subject: &CapabilitySubject,
@@ -765,7 +775,7 @@ fn report_timed(
     revision: CapabilityRevision,
     plan: &Plan,
     facilities: &dyn Facilities,
-    time_of: &dyn Fn(Check) -> Time,
+    seams: &Seams<'_>,
 ) -> Vec<CapabilityRecord> {
     let observed_at_ms = kr_ipc::now_ms();
     let first = source.read(&Deadline::after(FIRST_READING));
@@ -774,7 +784,7 @@ fn report_timed(
     let mut records = Vec::new();
     for check in checks {
         let record = if check.acts_on_a_desktop() {
-            let time = time_of(*check);
+            let time = (seams.time_of)(*check);
             let deadline = Deadline::after(time.bound);
             let before = if stopped {
                 first.clone()
@@ -782,7 +792,7 @@ fn report_timed(
                 source.read(&deadline)
             };
             let Some(operation) =
-                resolve(*check, &before.desktop, before.variables.search.as_deref())
+                (seams.routes)(*check, &before.desktop, before.variables.search.as_deref())
             else {
                 continue;
             };
@@ -790,6 +800,14 @@ fn report_timed(
             // check act on.
             let ready =
                 !stopped && may_start(*check, &before.desktop) && unchanged(&first, &before);
+            // The program as it is before the operation, which is what the answer is about: it is
+            // digested before the operation starts and again after it ends, and an answer about a
+            // program that changed in between is about neither.
+            let program = match &operation.program {
+                Program::Tool(path) if ready && !deadline.expired() => Some(path.as_str()),
+                _ => None,
+            };
+            let identity = program.and_then(|path| facility_identity_within(path, &deadline));
             let ran = if deadline.expired() {
                 // What the readings and the lookup took was all the time there was: nothing starts.
                 timed_out(*check, None)
@@ -811,15 +829,19 @@ fn report_timed(
                     },
                 );
                 let after = source.read(&deadline);
+                let replaced = program
+                    .is_some_and(|path| facility_identity_within(path, &deadline) != identity);
                 if deadline.expired() {
                     // A success whose desktop could not be read again in time is not one that
                     // stands.
                     timed_out(*check, ran.facility)
-                } else if unchanged(&before, &after) {
-                    ran
-                } else {
+                } else if !unchanged(&before, &after) {
                     stopped = true;
                     not_in_the_state_it_needs(*check, ran.facility)
+                } else if replaced {
+                    replaced_while_running(*check, ran.facility)
+                } else {
+                    ran
                 }
             };
             record(
@@ -829,7 +851,7 @@ fn report_timed(
                 profile,
                 revision,
                 observed_at_ms,
-                &deadline,
+                identity,
             )
         } else {
             let route = match check {
@@ -857,7 +879,7 @@ fn report_timed(
                 profile,
                 revision,
                 observed_at_ms,
-                &deadline,
+                None,
             )
         };
         records.extend(record);
@@ -886,6 +908,17 @@ fn unchanged(before: &Surroundings, after: &Surroundings) -> bool {
     before.desktop.availability == after.desktop.availability
         && before.desktop.login_generation == after.desktop.login_generation
         && before.desktop.is_same_desktop(&after.desktop)
+}
+
+/// What a check came to when the program it ran was replaced while it ran.
+fn replaced_while_running(check: Check, facility: Option<String>) -> Ran {
+    Ran {
+        check,
+        facility,
+        outcome: Outcome::NotAttempted {
+            detail: Sentence::new().stated("the program it ran was replaced while it ran"),
+        },
+    }
 }
 
 /// What a check came to when its time ran out where nothing of it was running.
@@ -2108,6 +2141,8 @@ mod tests {
     use kr_protocol::ids::{DesktopSessionId, EnvironmentId, SessionId};
     use kr_protocol::scalars::{Bytes, Uuid};
 
+    use super::super::capability::facility_identity;
+
     /// A desktop of this test's own, so nothing here depends on the machine it runs on.
     fn desktop() -> DesktopContext {
         DesktopContext {
@@ -2180,7 +2215,7 @@ mod tests {
             profile,
             revision,
             observed_at_ms,
-            &Deadline::after(Duration::from_secs(60)),
+            ran.facility.as_deref().and_then(facility_identity),
         )
     }
 
@@ -2634,7 +2669,7 @@ mod tests {
             WorkerProfile::DesktopBound,
             revision(),
             kr_ipc::now_ms(),
-            &Deadline::after(Duration::from_secs(60)),
+            None,
         )
         .expect("a record");
         assert_eq!(record.state, CapabilityState::NotTested);
@@ -2666,7 +2701,7 @@ mod tests {
             WorkerProfile::DesktopBound,
             revision(),
             kr_ipc::now_ms(),
-            &Deadline::after(Duration::from_secs(60)),
+            None,
         )
         .expect("a record");
         assert!(!helper.identity.binary.is_present());
@@ -2688,7 +2723,7 @@ mod tests {
             WorkerProfile::DesktopBound,
             revision(),
             kr_ipc::now_ms(),
-            &Deadline::after(Duration::from_secs(60)),
+            facility_identity(&file.display().to_string()),
         )
         .expect("a record");
         let _ = std::fs::remove_file(&file);
@@ -2940,9 +2975,12 @@ mod tests {
             revision(),
             &Plan::in_directory("."),
             &facility,
-            &|_| Time {
-                bound,
-                after: Duration::from_millis(800),
+            &Seams {
+                time_of: &|_| Time {
+                    bound,
+                    after: Duration::from_millis(800),
+                },
+                routes: &resolve,
             },
         );
         // The first reading comes before every check and takes its 500 ms outside the bound.
@@ -2983,9 +3021,12 @@ mod tests {
             revision(),
             &Plan::in_directory("."),
             &seeing,
-            &|_| Time {
-                bound: Duration::from_millis(600),
-                after: Duration::from_millis(100),
+            &Seams {
+                time_of: &|_| Time {
+                    bound: Duration::from_millis(600),
+                    after: Duration::from_millis(100),
+                },
+                routes: &resolve,
             },
         );
         assert!(
@@ -3034,15 +3075,107 @@ mod tests {
             revision(),
             &Plan::in_directory("."),
             &Seeing::default(),
-            &|_| Time {
-                bound: Duration::from_millis(600),
-                after: Duration::from_millis(100),
+            &Seams {
+                time_of: &|_| Time {
+                    bound: Duration::from_millis(600),
+                    after: Duration::from_millis(100),
+                },
+                routes: &resolve,
             },
         );
         assert_eq!(
             state_of(&records, Check::AccessibleElement),
             CapabilityState::TemporarilyUnavailable,
             "a success nothing could confirm stands"
+        );
+    }
+
+    /// A stand-in that runs a program of this test's own and, where asked, replaces its file while
+    /// the operation is running.
+    struct Running {
+        program: std::path::PathBuf,
+        replace: bool,
+    }
+
+    impl Facilities for Running {
+        fn perform(&self, check: Check, _plan: &Plan, _setting: &Setting<'_>) -> Ran {
+            if self.replace {
+                std::fs::write(&self.program, b"the second build").expect("the replacement");
+            }
+            Ran {
+                check,
+                facility: Some(self.program.display().to_string()),
+                outcome: Outcome::Performed {
+                    detail: Sentence::new().stated("it ran"),
+                },
+            }
+        }
+    }
+
+    /// KR-REQ-03.29, R9: the digest an answer carries is the program's before the operation, and an
+    /// answer about a program that was replaced while it ran establishes nothing.
+    #[test]
+    fn a_program_replaced_during_its_operation_establishes_nothing() {
+        let root = kr_ipc::testing::PrivateTempDir::create();
+        let program = root.path().join("the-tool");
+        let named = program.display().to_string();
+        let route = |check: Check, _: &DesktopContext, _: Option<&std::ffi::OsStr>| {
+            Some(Operation {
+                check,
+                route: MACOS,
+                program: Program::Tool(named.clone()),
+                target: None,
+            })
+        };
+        let run = |replace: bool| {
+            std::fs::write(&program, b"the first build").expect("the program");
+            let before = facility_identity(&named);
+            let source = Readings::of(vec![surroundings(desktop())]);
+            let records = report_timed(
+                &[Check::AccessibleElement],
+                &subject(),
+                &source,
+                revision(),
+                &Plan::in_directory("."),
+                &Running {
+                    program: program.clone(),
+                    replace,
+                },
+                &Seams {
+                    time_of: &time_of,
+                    routes: &route,
+                },
+            );
+            (before, records)
+        };
+        let (before, records) = run(false);
+        assert_eq!(
+            state_of(&records, Check::AccessibleElement),
+            CapabilityState::QualifiedAvailable,
+            "a program that stayed as it was"
+        );
+        assert_eq!(
+            records[0].identity.version.as_ref().cloned(),
+            before,
+            "the digest of the program as it was"
+        );
+        let (before, records) = run(true);
+        assert_eq!(
+            state_of(&records, Check::AccessibleElement),
+            CapabilityState::TemporarilyUnavailable,
+            "the answer stood about a program that was replaced while it ran"
+        );
+        assert_eq!(
+            records[0]
+                .disabled_reason
+                .as_ref()
+                .map(|sentence| sentence.as_str()),
+            Some("this check established nothing: the program it ran was replaced while it ran")
+        );
+        assert_eq!(
+            records[0].identity.version.as_ref().cloned(),
+            before,
+            "the record names the program as it was before the operation"
         );
     }
 
