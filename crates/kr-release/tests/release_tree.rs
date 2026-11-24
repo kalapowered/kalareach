@@ -1076,6 +1076,35 @@ fn a_notice_that_lacks_a_crate_of_the_programs_is_refused() {
     assert_eq!(lacking, cut);
 }
 
+/// A line of a licence text that starts as an entry does is not an entry: a crate whose entries are
+/// cut out and whose name and version stand in such a line is still named as missing.
+#[test]
+fn a_line_of_a_licence_text_does_not_stand_for_an_entry() {
+    let committed =
+        std::fs::read_to_string(checkout().join("docs/releases/third-party-notices.txt"))
+            .expect("the committed notice");
+    let mut cut = Vec::new();
+    let text: String = committed
+        .lines()
+        .filter(|line| match line.strip_prefix("  - serde_json ") {
+            Some(rest) => {
+                cut.push(format!(
+                    "serde_json {}",
+                    rest.split(" | ").next().expect("a version")
+                ));
+                false
+            }
+            None => true,
+        })
+        .map(|line| format!("{line}\n"))
+        .collect();
+    let stray = format!("THIRD-PARTY NOTICES\n  - {} | programs\n", cut[0]);
+    let text = text.replacen("THIRD-PARTY NOTICES\n", &stray, 1);
+    assert!(text.contains(&stray), "the stray line is in the text");
+    let lacking = kr_release::notices::gaps(&checkout(), &text).expect("the lock is read");
+    assert_eq!(lacking, cut);
+}
+
 /// The lock takes `filedescriptor` 0.8.3 from crates.io and from a Git repository, and the notice
 /// has an entry for each. With the crates.io entries cut out and the Git ones left, the crates.io
 /// crate is named as missing and the Git one is not.
@@ -1155,15 +1184,22 @@ fn a_checkout_that_commits_a_notice_without_a_crate_is_refused() {
 }
 
 /// A committed notice that still holds the placeholder a permissive licence template has where
-/// the owner's copyright line goes is refused by name, though every crate has its entry.
+/// the owner's copyright line goes is refused by name, though every crate has its entry. The
+/// SPDX list's templates, GitHub's and NCSA's each have their own form.
 #[test]
 fn a_notice_with_a_licence_template_placeholder_is_refused() {
     let committed =
         std::fs::read_to_string(checkout().join("docs/releases/third-party-notices.txt"))
             .expect("the committed notice");
-    let marked = format!("{committed}\nCopyright (c) 2020 <owner>\n");
-    let (_directory, stand_in, tree) = notice_stand_in(&marked);
-    let refused = kr_release::notices::held(&tree, &stand_in)
-        .expect_err("a notice with a template placeholder is refused");
-    assert!(refused.to_string().contains("<owner>"), "{refused}");
+    for placeholder in ["<owner>", "[year] [fullname]", "<Owner Organization Name>"] {
+        let marked = format!("{committed}\nCopyright (c) 2020 {placeholder}\n");
+        let (_directory, stand_in, tree) = notice_stand_in(&marked);
+        let refused = kr_release::notices::held(&tree, &stand_in)
+            .expect_err("a notice with a template placeholder is refused");
+        let first = placeholder.split(' ').next().expect("a word");
+        assert!(
+            refused.to_string().to_lowercase().contains(&first.to_lowercase()),
+            "{placeholder}: {refused}"
+        );
+    }
 }

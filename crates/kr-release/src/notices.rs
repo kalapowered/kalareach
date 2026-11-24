@@ -32,16 +32,21 @@ pub const COMMITTED: &str = "docs/releases/third-party-notices.txt";
 /// What the permissive licence templates of the SPDX list hold where the owner's copyright line
 /// belongs, in lower case. The GPL's own text has `<year>` and `<name of author>` in the paragraph
 /// that tells a program how to apply it, so those two are not in the list.
-const PLACEHOLDERS: [&str; 5] = [
+const PLACEHOLDERS: [&str; 9] = [
     "<owner>",
     "<copyright holder>",
     "<copyright holders>",
     "<organization>",
     "<organisation>",
+    "<owner organization name>",
+    "<owner organisation name>",
+    "[year]",
+    "[fullname]",
 ];
 
 /// What a person does when the committed text is not the one the lock makes.
-const REPAIR: &str = "build kr-release with `cargo build -p kr-release`, run \
+const REPAIR: &str = "build kr-release with `cargo build -p kr-release`, fetch the crates with \
+     `cargo fetch --locked`, put cargo-about 0.9.3 and askalono 0.5.0 on the PATH, run \
      `python3 scripts/generate-notices.py write --kr-release target/debug/kr-release`, and commit \
      the result";
 
@@ -96,9 +101,8 @@ pub fn held(tree: &Path, checkout: &Path) -> Result<()> {
 ///
 /// Returns a refusal when a file it reads is missing or is not what it expects.
 pub fn gaps(checkout: &Path, notice: &str) -> Result<Vec<String>> {
-    let named: BTreeSet<Identity> = notice
-        .lines()
-        .filter_map(|line| line.strip_prefix("  - "))
+    let named: BTreeSet<Identity> = entries(notice)
+        .into_iter()
         .filter_map(|entry| {
             let mut fields = entry.split(" | ");
             let mut words = fields.next()?.split_whitespace();
@@ -118,6 +122,44 @@ pub fn gaps(checkout: &Path, notice: &str) -> Result<Vec<String>> {
             None => format!("{name} {version}"),
         })
         .collect())
+}
+
+/// Where a line of the notice stands: in a licence text or a heading, under a heading `Used by:`
+/// before its entries, among a block's entries, or among the closing list of crates.
+#[derive(Clone, Copy)]
+enum Part {
+    Text,
+    Heading,
+    Entries,
+    Closing,
+}
+
+/// The title of the closing list of crates that no release build compiles.
+const CLOSING: &str = "Crates the lock reaches that no release build compiles";
+
+/// The entries of the notice, without their leading marker: the lines under a `Used by:` heading, up
+/// to the blank line that ends them, and the lines of the closing list. A line of a licence text that
+/// starts with the same marker is not an entry.
+fn entries(notice: &str) -> Vec<&str> {
+    let mut part = Part::Text;
+    let mut found = Vec::new();
+    for line in notice.lines() {
+        part = match (part, line) {
+            (Part::Text, "Used by:") => Part::Heading,
+            (Part::Text, CLOSING) => Part::Closing,
+            (Part::Heading, _) => Part::Entries,
+            (Part::Entries, "") => Part::Text,
+            (same, entry) => {
+                if let (Part::Entries | Part::Closing, Some(rest)) =
+                    (same, entry.strip_prefix("  - "))
+                {
+                    found.push(rest);
+                }
+                same
+            }
+        };
+    }
+    found
 }
 
 /// What a package of the workspace depends on, by the name of the package each dependency is.
