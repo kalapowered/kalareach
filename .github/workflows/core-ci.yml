@@ -90,7 +90,7 @@ jobs:
 
       # The image's apt sources name a mirror that it picks by the runner's region, and one such
       # mirror served a download at 79 kB/s on a day when the Ubuntu archive hosts served 12 to
-      # 36 MB/s. Every apt step of this job, and of the four jobs that install packages below, goes
+      # 36 MB/s. Every apt step of this job, and of the five jobs that install packages below, goes
       # to the archive and security hosts by name. The script changes only the sources file, once
       # (a second call changes nothing). An image that does not hold the file, or whose file names
       # other suites or components, gets a warning in the run's annotations and no red step: the
@@ -902,12 +902,15 @@ jobs:
   # and which gave each run 4 to 12 build jobs, the retained surface's cases took 7 minutes and the
   # upgrade suite's 51 cases up to 11; a hosted runner has 4 processors and builds everything from
   # nothing: this tree, the release before in a tree of its own, and a third tree once a release of
-  # this build's own level is tagged. The fast step has 90 minutes and the upgrade suite 190, which
-  # the first hosted run replaces with measured limits.
+  # this build's own level is tagged. The fast step has 80 minutes and the upgrade suite 165, which
+  # the first hosted run replaces with measured limits. The steps' limits add up to 320 of the job's
+  # 350 minutes: 245 for the two steps that run the cases and 75 for the others. The other 30 are
+  # for the steps that have no limit of their own: the disk, the checkout, the toolchain, the
+  # target and the last reading of the disk.
   contract-tests:
     name: contract tests for installed apps, live workers and plugins
     runs-on: ubuntu-24.04
-    timeout-minutes: 330
+    timeout-minutes: 350
     steps:
       - name: Free the disk the build needs
         run: |
@@ -929,10 +932,79 @@ jobs:
           rustc --version
           cargo --version
 
+      # The retained surface's cases check the workspace, for this machine and for
+      # x86_64-pc-windows-gnu. The check needs the desktop build dependencies that the workspace's
+      # companion application links and, for the Windows build, the cross compiler, as in the rust
+      # job. The steps that install them, their deadlines and their Actions cache entries are that
+      # job's, and an install step's limit is its deadline and 5 minutes for the install that
+      # follows the download.
+      - name: Use the Ubuntu archive hosts
+        timeout-minutes: 2
+        run: bash scripts/ubuntu-archive-hosts.sh
+
+      - name: Restore the desktop packages' archives
+        id: desktop-archives
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.cache/kalareach/apt/desktop
+          key: apt-v1-desktop-ubuntu-24.04-${{ runner.arch }}-${{ github.run_id }}
+          restore-keys: apt-v1-desktop-ubuntu-24.04-${{ runner.arch }}-
+
+      - name: Install the desktop build dependencies
+        id: desktop-install
+        timeout-minutes: 35
+        run: |
+          bash scripts/apt-install.sh --deadline 1800 --archive ~/.cache/kalareach/apt/desktop \
+            libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev \
+            libsoup-3.0-dev libjavascriptcoregtk-4.1-dev desktop-file-utils python3-gi
+
+      - name: Save the desktop packages' archives
+        if: github.ref == 'refs/heads/main' && steps.desktop-install.outputs.save == 'true'
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.cache/kalareach/apt/desktop
+          key: apt-v1-desktop-ubuntu-24.04-${{ runner.arch }}-${{ steps.desktop-install.outputs.entry }}
+
       # The retained surface's cases build their fixture trees for x86_64-pc-windows-gnu, and a cross
       # check needs the standard library of its target.
       - name: Install the Windows cross-check target
         run: rustup target add x86_64-pc-windows-gnu
+
+      - name: Restore the Windows cross compiler's archives
+        id: mingw-archives
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.cache/kalareach/apt/mingw
+          key: apt-v1-mingw-ubuntu-24.04-${{ runner.arch }}-${{ github.run_id }}
+          restore-keys: apt-v1-mingw-ubuntu-24.04-${{ runner.arch }}-
+
+      - name: Install the Windows cross compiler
+        id: mingw-install
+        timeout-minutes: 20
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          if ! command -v x86_64-w64-mingw32-gcc > /dev/null; then
+            bash scripts/apt-install.sh --deadline 900 --archive ~/.cache/kalareach/apt/mingw \
+              gcc-mingw-w64-x86-64
+          fi
+          x86_64-w64-mingw32-gcc --version
+          x86_64-w64-mingw32-windres --version
+
+      - name: Save the Windows cross compiler's archives
+        if: github.ref == 'refs/heads/main' && steps.mingw-install.outputs.save == 'true'
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.cache/kalareach/apt/mingw
+          key: apt-v1-mingw-ubuntu-24.04-${{ runner.arch }}-${{ steps.mingw-install.outputs.entry }}
 
       # The retained surface's narrower reading resolves every target's packages offline.
       - name: Fetch the crates of every target
@@ -940,13 +1012,13 @@ jobs:
         run: cargo fetch --locked
 
       - name: The contract cases that need this tree alone
-        timeout-minutes: 90
+        timeout-minutes: 80
         run: bash scripts/contract-cases.sh fast
 
       # The limit includes 10 minutes for the build of the test components.
       - name: The upgrade suite
         if: ${{ !cancelled() }}
-        timeout-minutes: 190
+        timeout-minutes: 165
         run: bash scripts/contract-cases.sh upgrade
 
       - name: What the disk has left
