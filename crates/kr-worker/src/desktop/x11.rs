@@ -12,6 +12,11 @@
 //! two independent facts tell them apart: whether this worker can connect to the display's socket
 //! itself, and whether the tool's error output holds the line the client library prints when the
 //! server refuses the connection.
+//!
+//! The tool is looked for by its bare name, so a finding that it is not installed has no file to
+//! digest and nothing that changes it by itself. That finding is as old as the run of the checks
+//! that made it: installing one of the four tools is seen at the next run of the checks, and not
+//! before.
 
 use std::ffi::OsStr;
 use std::path::Path;
@@ -173,7 +178,8 @@ fn perform_in(plan: &Plan, setting: &Setting<'_>, operation: &Operation, sockets
         TOOLS.iter().find(|tool| tool.route == operation.route),
         &operation.program,
     ) else {
-        // No row's tool is installed: the record names none, and the platform's own words stand.
+        // No row's tool is installed: the record names none and says the installation is
+        // missing, and it replaces the platform's record when the findings are merged.
         return Ran {
             check,
             facility: operation.program.named_path().map(str::to_owned),
