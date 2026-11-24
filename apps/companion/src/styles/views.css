@@ -58,6 +58,10 @@
   border-color: var(--danger-line);
 }
 
+.card[data-kind='unknown_result'] {
+  border-color: var(--warning-line);
+}
+
 /* What the inbox as a whole says beyond its items: what it let go, and quiet hours. */
 .inbox-notes {
   list-style: none;

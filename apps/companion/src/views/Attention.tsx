@@ -53,6 +53,7 @@ const FILTERS: readonly { readonly value: AttentionFilter; readonly label: strin
   { value: 'all', label: 'Everything' },
   { value: 'pending_decision', label: 'Decisions' },
   { value: 'failed_action', label: 'Failures' },
+  { value: 'unknown_result', label: 'Result unknown' },
   { value: 'awaiting_review', label: 'To review' },
   { value: 'disconnected', label: 'Out of contact' },
   { value: 'notice', label: 'Notices' }

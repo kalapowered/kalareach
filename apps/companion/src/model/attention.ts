@@ -82,6 +82,7 @@ export const THIS_COMPUTER = 'This computer'
 export type AttentionKind =
   | 'pending_decision'
   | 'failed_action'
+  | 'unknown_result'
   | 'awaiting_review'
   | 'disconnected'
   | 'notice'
@@ -98,6 +99,8 @@ export function kindOf(item: AttentionItem): AttentionKind {
     case 'attention.automation_paused':
     case 'attention.authority_feed_removed':
       return 'failed_action'
+    case 'attention.receipt_uncertain':
+      return 'unknown_result'
     case 'attention.review_ready':
       return 'awaiting_review'
     case 'attention.host_contact_lost':
@@ -118,13 +121,15 @@ const RULE_WORDS: Readonly<Record<AttentionItem['rule'], string>> = {
   'attention.host_contact_lost': 'This host is out of contact',
   'attention.application_notice': 'An application asked for your attention',
   'attention.automation_paused': 'An automation stopped at one of its own limits',
-  'attention.authority_feed_removed': 'This host no longer learns revocations from its feed'
+  'attention.authority_feed_removed': 'This host no longer learns revocations from its feed',
+  'attention.receipt_uncertain': 'An action’s result is unknown'
 }
 
 /** The word each kind shows, which is the row's own label rather than a colour alone. */
 export const KIND_LABEL: Readonly<Record<AttentionKind, string>> = {
   pending_decision: 'Waiting for you',
   failed_action: 'Did not finish',
+  unknown_result: 'Result unknown',
   awaiting_review: 'Ready to review',
   disconnected: 'Out of contact',
   notice: 'Application notice'
@@ -135,6 +140,7 @@ export const KIND_TONE: Readonly<Record<AttentionKind, 'warning' | 'danger' | 's
   {
     pending_decision: 'warning',
     failed_action: 'danger',
+    unknown_result: 'warning',
     awaiting_review: 'success',
     disconnected: 'muted',
     notice: 'muted'
@@ -144,9 +150,10 @@ export const KIND_TONE: Readonly<Record<AttentionKind, 'warning' | 'danger' | 's
 const KIND_ORDER: Readonly<Record<AttentionKind, number>> = {
   pending_decision: 0,
   failed_action: 1,
-  awaiting_review: 2,
-  disconnected: 3,
-  notice: 4
+  unknown_result: 2,
+  awaiting_review: 3,
+  disconnected: 4,
+  notice: 5
 }
 
 /**
@@ -315,6 +322,7 @@ export function addCounts(left: AttentionCounts, right: AttentionCounts): Attent
   return {
     pending_decision: left.pending_decision + right.pending_decision,
     failed_action: left.failed_action + right.failed_action,
+    unknown_result: left.unknown_result + right.unknown_result,
     awaiting_review: left.awaiting_review + right.awaiting_review,
     disconnected: left.disconnected + right.disconnected,
     notice: left.notice + right.notice,
@@ -326,6 +334,7 @@ export function addCounts(left: AttentionCounts, right: AttentionCounts): Attent
 export interface AttentionCounts {
   readonly pending_decision: number
   readonly failed_action: number
+  readonly unknown_result: number
   readonly awaiting_review: number
   readonly disconnected: number
   readonly notice: number
@@ -338,6 +347,7 @@ export function count(inbox: AttentionReadResult): AttentionCounts {
   const counts = {
     pending_decision: 0,
     failed_action: 0,
+    unknown_result: 0,
     awaiting_review: 0,
     disconnected: 0,
     notice: 0
@@ -364,6 +374,8 @@ export function emptyMessage(chosen: AttentionFilter): string {
       return 'No item here says that something is waiting for you.'
     case 'failed_action':
       return 'No item here says that something did not finish.'
+    case 'unknown_result':
+      return 'No action has an unknown result.'
     case 'awaiting_review':
       return 'No item here says that finished work is ready to review.'
     case 'disconnected':

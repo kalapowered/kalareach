@@ -927,6 +927,54 @@ mod tests {
         }
     }
 
+    /// A host of a later release lists an item that the receipt rule raised. The page is decoded as
+    /// every page is, and the item keeps the rule's word, so the read is not refused over one item
+    /// this release cannot say why it was raised.
+    #[test]
+    fn a_page_that_holds_an_item_of_the_receipt_rule_is_decoded() {
+        let page = serde_json::json!({
+            "items": [{
+                "key": "attention.receipt_uncertain|~0123456789abcdef0123456789abcdef",
+                "rule": "attention.receipt_uncertain",
+                "source": "receipts",
+                "level": "notable",
+                "session_id": "8a7b6c50-22bb-4c3d-8e4f-000000000101",
+                "summary": null,
+                "trusted": true,
+                "routing": "owner_policy",
+                "occurrences": "1",
+                "first_seen_ms": "1763000000000",
+                "last_seen_ms": "1763000000000",
+                "notification": "delivered",
+                "awaiting_delivery": false,
+                "acknowledged": false,
+                "uncertain": false,
+                "revision": "1",
+                "automation": null
+            }],
+            "more": false,
+            "dropped": "0",
+            "gaps": [],
+            "quiet_hours": null,
+            "quiet_now": false,
+            "quiet_hours_provable": true
+        });
+        let bytes = kr_cbor::to_canonical_vec(&page).expect("the page encodes");
+        let decoded =
+            kr_protocol::wire::decode::<AttentionReadResult>(&bytes, &kr_cbor::Limits::DEFAULT);
+        let words: Vec<&str> = decoded
+            .iter()
+            .flat_map(|page| page.items.iter())
+            .map(|item| item.rule.as_str())
+            .collect();
+        assert_eq!(
+            words,
+            ["attention.receipt_uncertain"],
+            "a page with an item of the receipt rule is decoded: {:?}",
+            decoded.as_ref().err()
+        );
+    }
+
     /// A visit to A that found a whole inbox over a connection of an account that has left, and
     /// committed it: the flag says when the account leaves.
     fn read_over(owner: &ContactOwner, byte: u8) -> Arc<std::sync::atomic::AtomicBool> {

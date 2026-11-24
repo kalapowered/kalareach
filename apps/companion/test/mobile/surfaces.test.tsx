@@ -128,6 +128,65 @@ describe('the inbox is the primary mobile surface (KR-REQ-13.01, 13.02)', () => 
   })
 })
 
+describe('an inbox that holds an item whose upstream result is unknown', () => {
+  const UNKNOWN_KEY = 'attention.receipt_uncertain|~0123456789abcdef0123456789abcdef'
+
+  it('shows the item as a result nobody knows and still reads the whole page', async () => {
+    const { port } = fakeHost()
+    const read = port.attentionRead.bind(port)
+    const unknown: AttentionItem = {
+      key: UNKNOWN_KEY,
+      rule: 'attention.receipt_uncertain',
+      source: 'receipts',
+      level: 'notable',
+      session_id: MAIN_SESSION,
+      summary: null,
+      trusted: true,
+      routing: 'owner_policy',
+      occurrences: '1',
+      first_seen_ms: '1763000000000',
+      last_seen_ms: '1763000000000',
+      notification: 'delivered',
+      awaiting_delivery: false,
+      acknowledged: false,
+      uncertain: false,
+      revision: '1',
+      automation: null
+    }
+    render(
+      <AppProvider
+        port={{
+          ...port,
+          attentionRead: async (params) => {
+            const answered = await read(params)
+            return {
+              key: answered.key,
+              value: { ...answered.value, items: [...answered.value.items, unknown] }
+            }
+          }
+        }}
+      >
+        <Inbox surface="ios" onOpenSession={() => undefined} />
+      </AppProvider>
+    )
+    const row = await waitFor(() => {
+      const found = document.querySelector(`[data-attention="${UNKNOWN_KEY}"]`)
+      if (!found) throw new Error('no row yet')
+      return found as HTMLElement
+    })
+    expect(row.getAttribute('data-kind'), 'the row has the kind of an unknown result').toBe(
+      'unknown_result'
+    )
+    expect(row.textContent).toContain('Result unknown')
+    expect(row.textContent).toContain('An action’s result is unknown')
+    expect(screen.queryByText('The inbox could not be read')).toBeNull()
+    expect(
+      document.querySelector('[data-kind="pending_decision"]'),
+      'the other items of the page are shown too'
+    ).not.toBeNull()
+  })
+})
+
 describe('touch targets and accessible names (KR-REQ-13.06, 13.19, KR-ACC-020)', () => {
   for (const surface of ['ios', 'android'] as const) {
     it(`meets the ${surface} minimum in both dimensions`, async () => {

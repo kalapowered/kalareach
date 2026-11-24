@@ -78,6 +78,7 @@ const FILTERS: readonly { readonly id: AttentionFilter; readonly label: string }
   { id: 'all', label: 'Everything' },
   { id: 'pending_decision', label: 'Waiting for you' },
   { id: 'failed_action', label: 'Failed' },
+  { id: 'unknown_result', label: 'Result unknown' },
   { id: 'awaiting_review', label: 'To review' },
   { id: 'disconnected', label: 'Out of contact' },
   { id: 'notice', label: 'Notices' }
@@ -113,6 +114,7 @@ const NO_NUMBERS: ReadonlyMap<string, string> = new Map()
 const NOTHING: AttentionCounts = {
   pending_decision: 0,
   failed_action: 0,
+  unknown_result: 0,
   awaiting_review: 0,
   disconnected: 0,
   notice: 0,

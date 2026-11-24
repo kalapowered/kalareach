@@ -308,6 +308,21 @@ describe('the attention inbox (KR-REQ-13.01, 13.02)', () => {
     expect(withheld?.detail).toContain('did not share this item’s text')
   })
 
+  it('shows an item whose upstream result is unknown as a result nobody knows, and never as a failure', () => {
+    const unknown = inbox([item({ rule: 'attention.receipt_uncertain', summary: null })])
+    const [row] = order(unknown, NOW)
+    expect(row?.kind, 'an uncertain receipt has a kind of its own').toBe('unknown_result')
+    expect(row?.label, 'its label claims no outcome').toBe('Result unknown')
+    expect(row?.tone, 'and it asks to be looked at').toBe('warning')
+    expect(row?.title).toBe('An action’s result is unknown')
+    expect(row?.announcement.startsWith('Result unknown.'), 'the kind is read aloud').toBe(true)
+    expect(row?.actionable, 'a decision is not taken on this screen').toBe(false)
+    expect(count(unknown).unknown_result, 'it is counted by its kind').toBe(1)
+    expect(filter(order(unknown, NOW), 'unknown_result')).toHaveLength(1)
+    expect(filter(order(INBOX, NOW), 'unknown_result')).toHaveLength(0)
+    expect(emptyMessage('unknown_result')).toBe('No action has an unknown result.')
+  })
+
   it('says what the inbox let go, what it can no longer read, and why it is not holding sounds', () => {
     expect(inboxNotes(INBOX)).toEqual([])
     const notes = inboxNotes(
