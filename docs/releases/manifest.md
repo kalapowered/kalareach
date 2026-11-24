@@ -221,8 +221,9 @@ breaks.
 several is recorded under the first of them that `about.toml` lists, and a crate under a licence it
 does not list stops the run until a person has read that licence and added it.
 
-The text of a crate is the licence files of its own package, without a file that is only an
-alternative of a dual licence, and every notice file the package ships. A crate under several
+The text of a crate is the licence files of its own package, without a file that is the text of an
+alternative of a dual licence (a file that holds only the header of one stays, as a statement), and
+every notice file the package ships. A crate under several
 licences that all apply has the text of each. Where a package holds no text of a licence it is
 recorded under (a file that only names the licence is not a text of it), `scripts/notice-texts.json`
 names the upstream file kept in `docs/releases/notice-texts/`, with its address, its commit and its

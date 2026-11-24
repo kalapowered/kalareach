@@ -19,9 +19,10 @@ an answer for a crate that is not listed is left out. A path package that is not
 workspace it belongs to stops the run too.
 
 What the notice says for each crate. The licence files of the crate's own package (a name that starts
-`LICENSE`, `LICENCE`, `COPYING` or `UNLICENSE`), without a file that is only an alternative of a dual
-licence, and every notice file of the package (a name that starts `COPYRIGHT`, `NOTICE`, `NOTICES` or
-`PATENTS`, or holds `THIRD-PARTY`). askalono reads each file, offline, over the SPDX licence list at one
+`LICENSE`, `LICENCE`, `COPYING` or `UNLICENSE`), without a file that is the text of an alternative of
+a dual licence (a file that holds only the header of that alternative stays, as a statement), and every
+notice file of the package (a name that starts `COPYRIGHT`, `NOTICE`, `NOTICES` or `PATENTS`, or holds
+`THIRD-PARTY`). askalono reads each file, offline, over the SPDX licence list at one
 pinned revision, without regard to case, punctuation and line breaks, and names every licence the file
 holds; the file is carried under the licence it is, or under a heading that says it names a licence and
 holds none of its text. A crate under several licences that all apply has the text of each. Where a
@@ -733,9 +734,10 @@ def declared_tokens(expression):
 def alone(files, required, declared, reader):
     """The licence files of a package without the ones that are only an alternative the package
     offers: a crate under `MIT OR Apache-2.0` is taken under MIT, and its Apache file is the alternative
-    that this project does not take it under. A file is dropped only when the reader names its licence
-    or licences and every one of them is declared and not required; a file that is none of them, or that
-    holds a required licence beside another, stays."""
+    that this project does not take it under. A file is dropped only when the reader names at least one
+    licence in it and every licence it names is declared and not required. A file in which the reader
+    names no licence, such as one that holds only the header of the alternative, stays and is carried as
+    a statement; so does a file that holds a required licence beside another."""
     alternatives = declared - set(required)
     kept = []
     for file_name, text in files:
