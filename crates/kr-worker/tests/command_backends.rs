@@ -1854,7 +1854,27 @@ async fn a_program_the_fixture_created_ends_with_the_launcher_when_the_backend_n
         );
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
+    // The backend goes on and finishes with the program, which has ended, so that it holds nothing
+    // of the case's folder when the case ends.
     let _ = release.send(());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while setup
+        .backends
+        .launch_failure_of(PromptGeneration::new(1))
+        .is_none()
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the backend recorded why the launch of a program that had ended did not go"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let directory = setup.directory.clone();
+    drop(setup);
+    assert!(
+        !directory.exists(),
+        "the case removed what it made in the temporary folder"
+    );
 }
 
 /// A program that was created held and has no job yet is ended and collected when what holds it is
