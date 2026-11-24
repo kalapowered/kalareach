@@ -70,22 +70,6 @@ jobs:
           rustc --version
           cargo --version
 
-      # The cut's check, which runs when a tag moves its level, runs `kr-cli`'s retained_surface
-      # suite, which checks the workspace for x86_64-pc-windows-gnu. The build scripts of `ring`,
-      # `aws-lc-sys`, `libsqlite3-sys` and the companion application need
-      # `x86_64-w64-mingw32-gcc` and `x86_64-w64-mingw32-windres`, which the runner image lacks, so
-      # the check's build fails without them. The packages come to 90 MB; the install's deadline is
-      # 15 minutes.
-      - name: Install the Windows cross compiler
-        env:
-          DEBIAN_FRONTEND: noninteractive
-        run: |
-          if ! command -v x86_64-w64-mingw32-gcc > /dev/null; then
-            bash scripts/apt-install.sh --deadline 900 gcc-mingw-w64-x86-64
-          fi
-          x86_64-w64-mingw32-gcc --version
-          x86_64-w64-mingw32-windres --version
-
       # A level is one surface, so a release is made only of a commit that has the surface of every
       # release at its level. The generator is built first, so that no tag can land between
       # fetching the tags and comparing them with origin's while it compiles. A commit at a level

@@ -1465,8 +1465,9 @@ fn the_real_proxy_cases_run_in_a_job_that_fails_without_squid_and_without_the_ca
 /// without them the suite's Windows build fails. Each job that runs the suite installs them before
 /// its test step, by one step that is not disabled and runs on every leg that runs the suite: in
 /// the landing workflow, the rust job and the macOS job's `tests-2` leg, which holds `kr-cli`; in
-/// the conformance workflow, the linux and macos jobs, whose plan runs the workspace's tests; in
-/// the package-release workflow, the release job, whose cut's check runs the suite.
+/// the conformance workflow, the linux and macos jobs, whose plan runs the workspace's tests. The
+/// package-release workflow's release job needs none: its cut's check sets `KR_RELEASE_TREE`, so
+/// the suite reads the release's source and builds nothing for Windows.
 #[test]
 fn the_jobs_that_run_the_retained_surface_suite_install_the_windows_cross_compiler_first() {
     for (file, name, tests, package, when) in [
@@ -1496,13 +1497,6 @@ fn the_jobs_that_run_the_retained_surface_suite_install_the_windows_cross_compil
             "macos",
             "scripts/run-conformance.sh",
             "brew install mingw-w64",
-            None,
-        ),
-        (
-            "package-release.yml",
-            "release",
-            "target/debug/kr-protocol-gen --in-level",
-            "gcc-mingw-w64-x86-64",
             None,
         ),
     ] {
