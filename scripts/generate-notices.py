@@ -1003,7 +1003,7 @@ def self_checks(scratch, reader):
     refuses("a path package that is not a member is refused",
             lambda: record("programs", set(), {"stranger"}, {}, {}, {}), "stranger")
     refuses("a crate cargo tree lists and cargo-about does not answer for is refused",
-            lambda: record("programs", {("lost", "1.0.0", None)}, set(), {}, {}, {}), "lost 1.0.0")
+            lambda: record("programs", {("lost", "1.0.0", None)}, set(), {}, {}, {}), "gives no licence for, the first lost 1.0.0")
 
     empty = os.path.join(scratch, "empty-1.0.0")
     os.makedirs(empty)
