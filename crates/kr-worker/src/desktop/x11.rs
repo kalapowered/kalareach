@@ -1922,15 +1922,33 @@ mod tests {
         path
     }
 
+    /// The process number a display's lock file holds, if there is one.
+    #[cfg(target_os = "linux")]
+    fn lock_holder(number: u32) -> Option<u32> {
+        let text = std::fs::read_to_string(format!("/tmp/.X{number}-lock")).ok()?;
+        text.trim().parse().ok()
+    }
+
+    /// Whether a server holds the display number: its socket accepts, or its lock file names a
+    /// process that runs. A socket file or lock file that nothing stands behind is what a server
+    /// that was killed leaves behind, and a new server takes it over.
+    #[cfg(target_os = "linux")]
+    fn held(number: u32) -> bool {
+        lock_holder(number).is_some_and(|pid| Path::new(&format!("/proc/{pid}")).exists())
+            || reach(
+                number,
+                Path::new(SOCKETS),
+                &Deadline::after(Duration::from_secs(2)),
+            ) != Some(Reach::Silent)
+    }
+
     /// Starts an `Xvfb` that holds one cookie, on a display number nobody on this machine holds.
     #[cfg(target_os = "linux")]
     fn start_server(folder: &Path) -> Server {
         for attempt in 0..8 {
             let number = 300 + std::process::id() % 500 + attempt;
             let display = format!(":{number}");
-            if Path::new(&format!("/tmp/.X11-unix/X{number}")).exists()
-                || Path::new(&format!("/tmp/.X{number}-lock")).exists()
-            {
+            if held(number) {
                 continue;
             }
             let cookie = kr_ipc::new_uuid().to_string().replace('-', "");
@@ -1950,10 +1968,12 @@ mod tests {
             };
             let started = std::time::Instant::now();
             while started.elapsed() < Duration::from_secs(10) {
-                if Path::new(&format!("/tmp/.X11-unix/X{number}")).exists()
+                // Its own lock file says that the server that accepts is this one and not a
+                // server another test started on the same number a moment before.
+                if lock_holder(number) == Some(server.child.id())
                     && reach(
                         number,
-                        Path::new("/tmp/.X11-unix"),
+                        Path::new(SOCKETS),
                         &Deadline::after(Duration::from_secs(2)),
                     ) == Some(Reach::Connects)
                 {
@@ -2082,13 +2102,9 @@ mod tests {
                     said(&ran)
                 );
             }
-            // The first number above the server's with no socket that accepts and no lock file.
+            // The first number above the server's that no server holds.
             let free = (number + 1..number + 100)
-                .find(|n| {
-                    !Path::new(&format!("/tmp/.X{n}-lock")).exists()
-                        && reach(*n, sockets, &Deadline::after(Duration::from_secs(2)))
-                            == Some(Reach::Silent)
-                })
+                .find(|n| !held(*n))
                 .expect("a display number nobody holds");
             let ran = run(&with(&format!(":{free}"), &server.authority));
             assert!(
