@@ -182,10 +182,11 @@ pub enum BindingEvent {
         detail: String,
         /// How many faults are inside the window now.
         faults_in_window: u32,
-        /// The event whose `observe` trapped, where the call was one.
+        /// The event whose `observe` failed, where the call was one: a trap, an output over its
+        /// budget and a replacement that could not be made all name it.
         event: Option<SourceEventHandle>,
-        /// The generation the next call runs under: the replacements so far, and one for the
-        /// replacement that call makes first.
+        /// The generation the next call runs under: the replacements so far, and one more when
+        /// the instance has trapped, for the replacement the next call makes first.
         generation: u32,
     },
     /// The binding is disabled and will run nothing more.
@@ -1023,6 +1024,9 @@ pub struct BindingHandle {
     pump_pending: Arc<AtomicBool>,
     #[cfg(feature = "testing")]
     pump_stop: Arc<Mutex<Option<PumpStopSide>>>,
+    /// Whether the worker owed the caller a report the last time it came to wait.
+    #[cfg(feature = "testing")]
+    report_owed: Arc<AtomicBool>,
     pending: Arc<PendingUpdates>,
     outstanding: Arc<AtomicUsize>,
     calls: Arc<AtomicU64>,
@@ -1059,6 +1063,8 @@ impl BindingHandle {
         let pump_pending = Arc::new(AtomicBool::new(false));
         #[cfg(feature = "testing")]
         let pump_stop = Arc::new(Mutex::new(None));
+        #[cfg(feature = "testing")]
+        let report_owed = Arc::new(AtomicBool::new(false));
         let pending = Arc::new(PendingUpdates::default());
         let outstanding = Arc::new(AtomicUsize::new(0));
         let calls = Arc::new(AtomicU64::new(0));
@@ -1088,6 +1094,8 @@ impl BindingHandle {
             pump_pending: Arc::clone(&pump_pending),
             #[cfg(feature = "testing")]
             pump_stop: Arc::clone(&pump_stop),
+            #[cfg(feature = "testing")]
+            report_owed: Arc::clone(&report_owed),
             pending: Arc::clone(&pending),
             outstanding: Arc::clone(&outstanding),
             commands: commands.clone(),
@@ -1118,6 +1126,8 @@ impl BindingHandle {
             pump_pending,
             #[cfg(feature = "testing")]
             pump_stop,
+            #[cfg(feature = "testing")]
+            report_owed,
             pending,
             outstanding,
             calls,
@@ -1216,6 +1226,14 @@ impl BindingHandle {
             acknowledged,
             _release: release,
         }
+    }
+
+    /// Whether the binding still owes its caller a report of what the instance has consumed, as of
+    /// the last time its thread came to wait for a command.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn report_owed(&self) -> bool {
+        self.report_owed.load(Ordering::Acquire)
     }
 
     /// Says the component's view is stale and a fresh snapshot is owed.
@@ -1552,6 +1570,8 @@ struct BindingWorker {
     pump_pending: Arc<AtomicBool>,
     #[cfg(feature = "testing")]
     pump_stop: Arc<Mutex<Option<PumpStopSide>>>,
+    #[cfg(feature = "testing")]
+    report_owed: Arc<AtomicBool>,
     pending: Arc<PendingUpdates>,
     outstanding: Arc<AtomicUsize>,
     commands: mpsc::Sender<Command>,
@@ -1625,6 +1645,9 @@ impl BindingWorker {
             if self.consumed_owed.is_some() && std::time::Instant::now() >= self.owed_due {
                 self.flush_consumed();
             }
+            #[cfg(feature = "testing")]
+            self.report_owed
+                .store(self.consumed_owed.is_some(), Ordering::Release);
             let received = match self.owed_wait() {
                 Some(wait) => inbox.recv_timeout(wait),
                 None => inbox
@@ -1742,6 +1765,13 @@ impl BindingWorker {
     fn pump(&mut self) {
         self.returned_in_pass = false;
         self.pump_pass();
+        if self.is_disabled() {
+            // A disabled binding runs no pass that would report a gap, so nothing it owes is ever
+            // read: its caller has the notice that says why.
+            self.consumed_owed = None;
+            self.consumed_held = false;
+            return;
+        }
         // After the gap and the fault the pass raised, so the caller reads them first. A gap the pass
         // left in the queue, which a trap or a loss during the pass does, is reported by the next
         // pass, and what is owed waits for it.
@@ -1798,6 +1828,10 @@ impl BindingWorker {
         let Some(owed) = self.consumed_owed.take() else {
             return;
         };
+        if self.events.is_closed() {
+            // Nobody reads the channel any more, so nobody is owed anything.
+            return;
+        }
         if self.events.capacity() > FAULT_RESERVE
             && self
                 .events

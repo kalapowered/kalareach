@@ -2856,7 +2856,8 @@ mod consumed {
         assert!(!cursor.clean);
         assert_eq!(cursor.terminal, Some(handle("se-1")));
 
-        // A plain restore leaves the cursor as it was.
+        // A plain restore sets no position and claims no prefix. The trap had cleared `clean`
+        // already, so the cursor is as it was.
         let state = binding
             .checkpoint(ANSWER)
             .await
@@ -3061,12 +3062,7 @@ mod consumed {
         }
         // Nothing has been read yet. What fitted is read now, and the cursors among it are the first
         // passes'.
-        let mut seen = Vec::new();
-        while let Ok(event) = received.try_recv() {
-            if let BindingEvent::Consumed(cursor) = event {
-                seen.push(cursor.terminal);
-            }
-        }
+        let seen = reports_held(&mut received);
         assert!(
             !seen.is_empty() && !seen.contains(&Some(handle("se-6"))),
             "the newest cursor found room: {seen:?}"
@@ -3263,24 +3259,13 @@ mod consumed {
         Some((host, binding, received))
     }
 
-    /// The terminal handles of the reports a channel holds now.
-    fn reports_in(received: &mut Received) -> Vec<Option<SourceEventHandle>> {
-        let mut seen = Vec::new();
-        while let Ok(event) = received.try_recv() {
-            if let BindingEvent::Consumed(consumed) = event {
-                seen.push(consumed.terminal);
-            }
-        }
-        seen
-    }
-
     /// KR-REQ-24.24: what is owed is sent once the caller has made room, with no other call or event.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn kr_req_24_24_an_owed_report_is_sent_when_the_channel_has_room_again() {
         let Some((_host, _binding, mut received)) = with_an_owed_report(32).await else {
             return;
         };
-        let held = reports_in(&mut received);
+        let held = reports_held(&mut received);
         assert!(
             !held.contains(&Some(handle("se-6"))),
             "the newest report found room: {held:?}"
@@ -3313,6 +3298,83 @@ mod consumed {
             }
         }
         seen
+    }
+
+    /// Polls `probe` until it holds, for at most ten seconds.
+    async fn eventually(probe: impl Fn() -> bool) -> bool {
+        let started = std::time::Instant::now();
+        while started.elapsed() < core::time::Duration::from_secs(10) {
+            if probe() {
+                return true;
+            }
+            tokio::time::sleep(core::time::Duration::from_millis(10)).await;
+        }
+        probe()
+    }
+
+    /// KR-REQ-24.24: a report owed to a caller that has stopped reading is dropped: nobody is left
+    /// to read it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn kr_req_24_24_a_report_owed_to_a_caller_that_has_stopped_reading_is_dropped() {
+        let Some((_host, binding, received)) = with_an_owed_report(35).await else {
+            return;
+        };
+        assert!(
+            eventually(|| binding.report_owed()).await,
+            "no report was owed"
+        );
+        drop(received);
+        assert!(
+            eventually(|| !binding.report_owed()).await,
+            "the report is still owed to a caller that has gone"
+        );
+    }
+
+    /// KR-REQ-24.24: a binding that is disabled drops the report it owed. No pass of it will report
+    /// the gap the report waits for, and its caller has the notice that says why.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn kr_req_24_24_a_disabled_binding_drops_the_report_it_owed() {
+        let Some((_host, binding, mut received)) =
+            bound("recording", 36, DEFAULT_EVENT_QUEUE).await
+        else {
+            return;
+        };
+        // Two faults, each in a pass of its own, and then one pass that returns an event and
+        // traps on the next: the third fault disables the binding while the report of the first
+        // event waits for the gap the trap left.
+        for index in 1..=2 {
+            binding.enqueue_observation(components::scrape(&format!("se-{index}"), "!trap"));
+        }
+        let mut faults = 0;
+        while faults < 2 {
+            match next_event(&mut received, LIVENESS).await {
+                Some(BindingEvent::Fault { .. }) => faults += 1,
+                Some(BindingEvent::Disabled { reason }) => panic!("disabled early: {reason}"),
+                Some(_) => {}
+                None => panic!("the faults did not come"),
+            }
+        }
+        let mut stop = binding.stop_next_pump();
+        binding.enqueue_observation(components::scrape("se-3", "x"));
+        assert!(
+            tokio::time::timeout(core::time::Duration::from_secs(60), stop.reached())
+                .await
+                .expect("the pass stands at the stop"),
+            "the stop was replaced before a pass reached it"
+        );
+        binding.enqueue_observation(components::scrape("se-4", "!trap"));
+        stop.release();
+        loop {
+            match next_event(&mut received, LIVENESS).await {
+                Some(BindingEvent::Disabled { .. }) => break,
+                Some(_) => {}
+                None => panic!("the third trap did not disable the binding"),
+            }
+        }
+        assert!(
+            eventually(|| !binding.report_owed()).await,
+            "the disabled binding still owes a report"
+        );
     }
 
     /// KR-REQ-24.24: calls that follow one another closer than the retry and draw no document do
@@ -3379,7 +3441,7 @@ mod consumed {
             .expect("the restore runs")
             .answer
             .expect("the component answers");
-        let mut later = reports_in(&mut received);
+        let mut later = reports_held(&mut received);
         while let Some(event) = next_event(&mut received, core::time::Duration::from_secs(2)).await
         {
             if let BindingEvent::Consumed(consumed) = event {

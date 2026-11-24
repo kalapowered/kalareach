@@ -242,7 +242,8 @@ pub enum Frame4 {
 /// An event is consumed when its `observe` call returned, whether the component accepted it or
 /// declined it. An event that trapped, that the queue dropped or that was refused before it ran is
 /// not consumed, and the cursor is then not a prefix of what was observed: `clean` says so for the
-/// rest of the instance's life, or until a restore the host accepted.
+/// rest of the instance's life, or until an answered `Set` restore, which carries the position of
+/// the state it puts in.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Consumed {
@@ -423,10 +424,11 @@ pub enum Notice4 {
         detail: String,
         /// How many faults are inside the window now.
         faults_in_window: u32,
-        /// The event whose `observe` trapped, where the call was one and the host's writer is open.
+        /// The event whose `observe` failed, where the call was one and the host's writer is open.
+        /// A trap, an output over its budget and a replacement that could not be made all name it.
         event: Option<SourceEventHandle>,
-        /// The generation the next call runs under: the replacements so far, and one for the
-        /// replacement that call makes first.
+        /// The generation the next call runs under: the replacements so far, and one more when
+        /// the instance has trapped, for the replacement the next call makes first.
         generation: u32,
     },
     /// The binding is disabled and will run nothing more.
