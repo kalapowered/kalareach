@@ -144,10 +144,11 @@ jobs:
 
   # The third-party notice that every release archive carries is made from the lock by
   # `scripts/generate-notices.py`: it lists the crates the programs and fish are built from with
-  # `cargo tree`, takes each crate's licence files from its package, and asks cargo-about, run
-  # offline, which licence each crate is recorded under. The committed text has to be the one that
-  # makes. cargo-about is one pinned release, and its archive has to match the digest below before
-  # it runs.
+  # `cargo tree`, reads each crate's licence files from its package with askalono, and asks
+  # cargo-about, run offline, which licence each crate is recorded under. The fish preparation fetches
+  # the pinned fish archive, and the SPDX licence list is fetched at its pinned revision; the rest runs
+  # offline. The committed text has to be the one that makes. cargo-about and askalono are each one
+  # pinned release, and each archive has to match the digest below before it runs.
   third-party-notice:
     name: the third-party notice is the one the lock makes
     runs-on: ubuntu-24.04
@@ -175,6 +176,19 @@ jobs:
           echo "$CARGO_ABOUT_SHA256  $RUNNER_TEMP/$release.tar.gz" | sha256sum --check --strict
           tar --extract --gzip --file "$RUNNER_TEMP/$release.tar.gz" --directory "$RUNNER_TEMP"
           echo "$RUNNER_TEMP/$release" >> "$GITHUB_PATH"
+
+      - name: Install askalono
+        env:
+          ASKALONO_VERSION: "0.5.0"
+          ASKALONO_SHA256: "8a007355b700137b48e7e39aab5d083acb9a0926f20c064ab4476b1624390e52"
+        run: |
+          set -euo pipefail
+          curl --fail --silent --show-error --location --retry 3 --output "$RUNNER_TEMP/askalono.zip" \
+            "https://github.com/amzn/askalono/releases/download/$ASKALONO_VERSION/askalono-Linux.zip"
+          echo "$ASKALONO_SHA256  $RUNNER_TEMP/askalono.zip" | sha256sum --check --strict
+          mkdir "$RUNNER_TEMP/askalono"
+          unzip -q "$RUNNER_TEMP/askalono.zip" -d "$RUNNER_TEMP/askalono"
+          echo "$RUNNER_TEMP/askalono" >> "$GITHUB_PATH"
 
       - name: Test the generator
         run: python3 scripts/generate-notices.py self-test

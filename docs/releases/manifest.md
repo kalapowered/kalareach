@@ -203,8 +203,9 @@ built and not on a release being installed.
 
 A release for every target carries `share/THIRD-PARTY-NOTICES.txt`: the licence texts and notices of
 the third-party crates that its programs and its fish package are built from, as each crate's
-package states them, the licence texts of the libraries that some of those crates bundle, and the
-whole of fish's own `COPYING`. The manifest lists it like any other file, so the signature covers
+package states them, the licence texts of the libraries that some of those crates bundle, and fish's own
+licence file `COPYING` and `doc_src/license.rst`, the file that `COPYING` names for the licences of
+the rest of fish's code. The manifest lists it like any other file, so the signature covers
 it. The checkout commits the text as `docs/releases/third-party-notices.txt`, and
 `scripts/build-release.sh` copies it into the tree.
 
@@ -213,18 +214,25 @@ takes the crates that a release compiles from `cargo tree`, over normal and buil
 packages in `scripts/release-programs.json` on every platform a release is built for, and for the
 fish source that `shells/fish/manifest.json` pins with the features its build selects. cargo-about,
 pinned to one version and run offline, says which licence each crate is recorded under.
+askalono, pinned to one version and run offline over the SPDX licence list at one pinned revision, says
+which licences each licence file holds: it reads a text without regard to case, punctuation and line
+breaks.
 `about.toml` names the licences a dependency may be used under. A crate that is offered under
 several is recorded under the first of them that `about.toml` lists, and a crate under a licence it
 does not list stops the run until a person has read that licence and added it.
 
-The text of a crate is the licence files of its own package, without the alternative of a dual
-licence, and every notice file the package ships. Where a package ships no licence file, or none for
-the licence it is recorded under, `scripts/notice-texts.json` names the upstream file kept in
-`docs/releases/notice-texts/`, with its address, its commit and its digest, and the entry names that
-file. A text that holds a template's placeholder in place of a copyright line stops the run. Each
-licence text appears once, with the crates that use it. The entry of a crate under the Mozilla
-Public License 2.0, or taken from a Git repository, names where its source is. The text covers
-every platform a release is built for, so the list for one archive is a subset of it.
+The text of a crate is the licence files of its own package, without a file that is only an
+alternative of a dual licence, and every notice file the package ships. A crate under several
+licences that all apply has the text of each. Where a package holds no text of a licence it is
+recorded under (a file that only names the licence is not a text of it), `scripts/notice-texts.json`
+names the upstream file kept in `docs/releases/notice-texts/`, with its address, its commit and its
+digest, beside the package's own files, and the entry names that file. A kept text for a crate from a
+Git repository names the package's source and revision, so a crate that moves to another revision
+stops the run until a person has read its licence file again. A text that holds a template's
+placeholder in place of a copyright line stops the run. Each block lists the crates that use a text
+and then gives it, under the licence it is. The entry of a crate under the Mozilla Public License
+2.0, or taken from a Git repository, names where its source is. The text covers every platform a
+release is built for, so the list for one archive is a subset of it.
 
 The lock also names crates that no release build compiles. They are listed last, each with the
 reason, so that `kr-release manifest`, `check` and `sign` can hold the committed text to the lock:
