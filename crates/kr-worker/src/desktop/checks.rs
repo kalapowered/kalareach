@@ -386,4 +386,38 @@ mod tests {
         }
         assert!(facilities.0.lock().expect("the record").is_empty());
     }
+
+    /// KR-REQ-03.29, R4: the desktop is read once for the checks to be chosen from and reported
+    /// against, and the report does not take that reading again. A context asked for the file
+    /// read alone acts on no desktop, so nothing after the first reading takes another.
+    #[test]
+    fn the_first_reading_is_taken_once_to_choose_the_checks_and_to_report_them() {
+        let reads = std::sync::atomic::AtomicUsize::new(0);
+        let desktop = context(false);
+        let source = |_: &probe::Deadline| {
+            reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Surroundings {
+                desktop: desktop.clone(),
+                variables: Variables::default(),
+            }
+        };
+        let facilities = Recording::default();
+        perform(
+            &request(None),
+            session(),
+            &source,
+            &std::env::temp_dir(),
+            &facilities,
+        )
+        .expect("the checks are performed");
+        assert_eq!(
+            *facilities.0.lock().expect("the record"),
+            vec![Check::AuthorisedFileRead]
+        );
+        assert_eq!(
+            reads.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the desktop was read again for the report"
+        );
+    }
 }
