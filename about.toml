@@ -1,0 +1,51 @@
+# What `scripts/generate-notices.py` asks cargo-about for when it makes the third-party notice that
+# every release archive carries (`docs/releases/third-party-notices.txt`). Two things here decide
+# what the notice says.
+#
+# `accepted` names every licence a dependency of a release program, or of the fish package, may be
+# used under, and the order is the choice. A crate licensed as an `OR` of several is recorded under
+# the first of them that is listed here, so each crate is recorded under exactly the licence this
+# project takes it under, and the order puts the shortest permissive terms first. A crate whose
+# expression names no licence listed here stops the notice until a person adds the licence, after
+# reading its terms. MPL-2.0 is listed because some dependencies carry it; the notice names where
+# the source of each is.
+#
+# `targets` is every platform a release is built for, so the notice covers the crates each of them
+# compiles in. `ignore-dev-dependencies` keeps out the crates only the tests of a dependency use.
+# A crate that the workspace does not publish is the project's own and has no entry.
+
+accepted = [
+    "MIT",
+    "MIT-0",
+    "ISC",
+    "0BSD",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSD-1-Clause",
+    "Zlib",
+    "Unlicense",
+    "CC0-1.0",
+    "WTFPL",
+    "BSL-1.0",
+    "NCSA",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "CDLA-Permissive-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "Apache-2.0",
+    "MPL-2.0",
+]
+
+targets = [
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-unknown-linux-gnu",
+    "x86_64-pc-windows-msvc",
+    "aarch64-pc-windows-msvc",
+]
+
+ignore-dev-dependencies = true
+ignore-build-dependencies = false
+ignore-transitive-dependencies = false
+private = { ignore = true }

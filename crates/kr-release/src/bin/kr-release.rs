@@ -4,6 +4,7 @@
 //! kr-release manifest --tree T --checkout C --release R --sequence N --commit SHA --target TRIPLE --floor macos=14.0
 //! kr-release record   --tree T --checkout C --target TRIPLE [--plugins DIR] [--web DIR]
 //! kr-release terminal --tree T --checkout C
+//! kr-release notice-gaps --checkout C --notice FILE
 //! kr-release check    --tree T --checkout C [--plugins DIR] [--web DIR]
 //! kr-release sign     --tree T --checkout C --key KEY... [--plugins DIR] [--web DIR]
 //! kr-release verify   --tree T --root ROOT
@@ -79,6 +80,14 @@ enum Command {
         tree: PathBuf,
         #[arg(long)]
         checkout: PathBuf,
+    },
+    /// Lists the crates the lock takes into the release programs that a notice has no entry for.
+    NoticeGaps {
+        #[arg(long)]
+        checkout: PathBuf,
+        /// The notice text to read.
+        #[arg(long)]
+        notice: PathBuf,
     },
     /// Refuses a tree whose `release.json` is not what the tree now makes.
     Check {
@@ -191,6 +200,15 @@ fn run(command: Command) -> Result<()> {
             &record::build(&checkout, &target, &elsewhere.at_hand(), development)?,
         ),
         Command::Terminal { tree, checkout } => kr_release::terminal::write(&tree, &checkout),
+        Command::NoticeGaps { checkout, notice } => {
+            let text = std::fs::read_to_string(&notice).map_err(|error| {
+                Refusal(format!("{} cannot be read: {error}", notice.display()))
+            })?;
+            for gap in kr_release::notices::gaps(&checkout, &text)? {
+                println!("{gap}");
+            }
+            Ok(())
+        }
         Command::Check {
             tree,
             checkout,

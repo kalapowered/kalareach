@@ -2,7 +2,7 @@
 
 A release is a tree of regular files: `bin/` with the host's programs, `shells/` with the qualified
 shell packages, `share/` with the update channel's root, the release record, the terminal's
-capability manifest and its terminfo database, and `release.json`.
+capability manifest and its terminfo database, the third-party notice, and `release.json`.
 `release.json` is the release's manifest in the signed envelope of
 [the update documents](../host/updates.md#what-a-release-is-and-how-it-is-checked). This page says
 what each member of the manifest states, where its value is read from, and what stops a release
@@ -198,6 +198,30 @@ database is compiled by the engine in the build. They also refuse a checkout who
 `capabilities.json` is not what its fixtures make, or in which a fixture belongs to no category.
 Releases published before these files existed do not carry them, so the check is on a tree being
 built and not on a release being installed.
+
+## The third-party notice
+
+A release for every target carries `share/THIRD-PARTY-NOTICES.txt`, the licences of the third-party
+crates that its programs and its fish package are built from. The manifest lists it like any other
+file, so the signature covers it. The checkout commits the text as
+`docs/releases/third-party-notices.txt`, and `scripts/build-release.sh` copies it into the tree.
+
+`python3 scripts/generate-notices.py write` makes the text with cargo-about, pinned to one version
+and run offline, over the crates of each program in `scripts/release-programs.json` and over the
+crates of the fish source that `shells/fish/manifest.json` pins. `about.toml` names the licences a
+dependency may be used under. A crate that is offered under several is recorded under the first of
+them that `about.toml` lists, and a crate under a licence it does not list stops the run until a
+person has read that licence and added it. Each licence text appears once, with the crates that use
+it. The entry of a crate under the Mozilla Public License 2.0, or taken from a Git repository, names
+where its source is. The text covers every platform a release is built for, so the list for one
+archive is a subset of it.
+
+The lock also names crates that no release platform builds. They are listed last, so that
+`kr-release manifest`, `check` and `sign` can hold the committed text to the lock: they refuse a tree
+that carries no notice or a copy that is not the committed text, and a committed text that has no
+entry for a crate the lock takes into the release programs. The release-checks workflow makes the
+text again and refuses a committed one that differs. The crates of the fish source are covered by
+that comparison alone, since their lock is inside the pinned archive and not in this checkout.
 
 ## Building and signing a release
 

@@ -141,3 +141,49 @@ jobs:
           paths: |
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
+
+  # The third-party notice that every release archive carries is made from the lock by
+  # `scripts/generate-notices.py`, which runs cargo-about over the programs a release builds and over
+  # fish's own crates. The committed text has to be the one that makes. The checker is one release,
+  # and its archive has to match the digest below before it runs.
+  third-party-notice:
+    name: the third-party notice is the one the lock makes
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - name: Check out
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      # rust-toolchain.toml pins the exact toolchain.
+      - name: Install the pinned toolchain
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustc --version
+          cargo --version
+
+      - name: Install cargo-about
+        env:
+          CARGO_ABOUT_VERSION: "0.9.3"
+          CARGO_ABOUT_SHA256: "3ad1e94ea1e63d69d1961f4fb15ccbbe9575d906111f96d2cb4dce6df48f71b4"
+        run: |
+          set -euo pipefail
+          release="cargo-about-$CARGO_ABOUT_VERSION-x86_64-unknown-linux-musl"
+          curl --fail --silent --show-error --location --retry 3 --output "$RUNNER_TEMP/$release.tar.gz" \
+            "https://github.com/EmbarkStudios/cargo-about/releases/download/$CARGO_ABOUT_VERSION/$release.tar.gz"
+          echo "$CARGO_ABOUT_SHA256  $RUNNER_TEMP/$release.tar.gz" | sha256sum --check --strict
+          tar --extract --gzip --file "$RUNNER_TEMP/$release.tar.gz" --directory "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/$release" >> "$GITHUB_PATH"
+
+      - name: Test the generator
+        run: python3 scripts/generate-notices.py self-test
+
+      - name: Build kr-release
+        run: cargo build --locked -p kr-release
+
+      # cargo-about reads the licence files from the sources cargo has fetched, for every platform
+      # the lock names, and runs offline.
+      - name: Fetch the lock's crates
+        run: cargo fetch --locked
+
+      - name: Make the notice again and compare it with the committed one
+        run: python3 scripts/generate-notices.py check --kr-release target/debug/kr-release

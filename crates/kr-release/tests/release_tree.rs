@@ -211,6 +211,49 @@ fn inputs(tree: &Path) -> Inputs {
     }
 }
 
+const WINDOWS: &str = "x86_64-pc-windows-msvc";
+
+/// A tree for Windows, made by the script a release is built with from stand-in programs, with no
+/// shell package built, and the directory that holds it.
+fn windows_tree() -> (tempfile::TempDir, PathBuf) {
+    let directory = tempfile::Builder::new()
+        .prefix("kr-release-windows-")
+        .tempdir()
+        .expect("a directory");
+    let programs = directory.path().join("programs");
+    std::fs::create_dir_all(&programs).expect("programs");
+    for program in kr_protocol::update::required_programs(WINDOWS) {
+        std::fs::write(programs.join(format!("{program}.exe")), "MZ").expect("a program");
+    }
+    let keys = directory.path().join("keys");
+    let made = kr_release_binary(&["dev-keys", "--out", keys.to_str().expect("utf-8")]);
+    assert!(made.status.success(), "{}", why(&made));
+    let tree = directory.path().join("release");
+    let built = Command::new("bash")
+        .arg(checkout().join("scripts/build-release.sh"))
+        .args(["--target", WINDOWS, "--release", "0.1.0+4254aa6e62e5"])
+        .args([
+            "--sequence",
+            "3",
+            "--commit",
+            COMMIT,
+            "--floor",
+            "windows=10.0",
+        ])
+        .arg("--programs")
+        .arg(&programs)
+        .arg("--root")
+        .arg(keys.join("root.json"))
+        .arg("--out")
+        .arg(&tree)
+        .arg("--kr-release")
+        .arg(env!("CARGO_BIN_EXE_kr-release"))
+        .output()
+        .expect("the script runs");
+    assert!(built.status.success(), "{}", why(&built));
+    (directory, tree)
+}
+
 /// KR-REQ-07.38: the manifest of a tree names, for each shell package, the pins of
 /// the shell and the identity the build recorded; the unedited tree passes, which is the control
 /// of the refusals below.
@@ -700,42 +743,7 @@ fn a_signed_tree_verifies_and_a_changed_or_short_signed_one_does_not() {
 /// Windows.
 #[test]
 fn a_windows_tree_carries_the_powershell_package_as_files() {
-    const WINDOWS: &str = "x86_64-pc-windows-msvc";
-    let directory = tempfile::Builder::new()
-        .prefix("kr-release-windows-")
-        .tempdir()
-        .expect("a directory");
-    let programs = directory.path().join("programs");
-    std::fs::create_dir_all(&programs).expect("programs");
-    for program in kr_protocol::update::required_programs(WINDOWS) {
-        std::fs::write(programs.join(format!("{program}.exe")), "MZ").expect("a program");
-    }
-    let keys = directory.path().join("keys");
-    let made = kr_release_binary(&["dev-keys", "--out", keys.to_str().expect("utf-8")]);
-    assert!(made.status.success(), "{}", why(&made));
-    let tree = directory.path().join("release");
-    let built = Command::new("bash")
-        .arg(checkout().join("scripts/build-release.sh"))
-        .args(["--target", WINDOWS, "--release", "0.1.0+4254aa6e62e5"])
-        .args([
-            "--sequence",
-            "3",
-            "--commit",
-            COMMIT,
-            "--floor",
-            "windows=10.0",
-        ])
-        .arg("--programs")
-        .arg(&programs)
-        .arg("--root")
-        .arg(keys.join("root.json"))
-        .arg("--out")
-        .arg(&tree)
-        .arg("--kr-release")
-        .arg(env!("CARGO_BIN_EXE_kr-release"))
-        .output()
-        .expect("the script runs");
-    assert!(built.status.success(), "{}", why(&built));
+    let (_directory, tree) = windows_tree();
 
     let manifest = manifest_of(&tree);
     assert!(manifest.shells.is_empty(), "no shell build is stated");
@@ -984,4 +992,86 @@ fn a_record_whose_flags_differ_from_the_pins_is_refused_before_it_is_signed() {
             .contains("it records other flags than the pins declare"),
         "{refused}"
     );
+}
+
+/// A release carries the third-party notice its checkout commits, and the manifest lists
+/// it, so its signature covers it. A tree without it is refused by name; the unedited tree passes,
+/// which is the control.
+#[test]
+fn a_tree_without_the_third_party_notice_is_refused() {
+    let (_directory, tree) = windows_tree();
+    let notice = tree.join("share/THIRD-PARTY-NOTICES.txt");
+    assert!(
+        manifest_of(&tree)
+            .files
+            .iter()
+            .any(|file| file.path.as_str() == "share/THIRD-PARTY-NOTICES.txt"),
+        "the manifest lists the notice"
+    );
+    let passed = run(&manifest_arguments_for(&tree, WINDOWS, "windows=10.0"));
+    assert!(passed.status.success(), "{}", why(&passed));
+    std::fs::remove_file(&notice).expect("removed");
+    let refused = run(&manifest_arguments_for(&tree, WINDOWS, "windows=10.0"));
+    assert!(!refused.status.success(), "the notice is gone");
+    assert!(
+        why(&refused).contains("the tree carries no share/THIRD-PARTY-NOTICES.txt"),
+        "{}",
+        why(&refused)
+    );
+}
+
+/// The notice a tree carries is the one its checkout commits. A copy that is changed by
+/// one byte is refused by name.
+#[test]
+fn a_tree_whose_third_party_notice_is_not_the_committed_one_is_refused() {
+    let (_directory, tree) = windows_tree();
+    let notice = tree.join("share/THIRD-PARTY-NOTICES.txt");
+    assert_eq!(
+        std::fs::read(&notice).expect("the notice"),
+        std::fs::read(checkout().join("docs/releases/third-party-notices.txt"))
+            .expect("the committed notice"),
+        "the tree carries the notice this checkout commits"
+    );
+    let mut edited = std::fs::read(&notice).expect("the notice");
+    edited.push(b'\n');
+    std::fs::write(&notice, edited).expect("edited");
+    let refused = run(&manifest_arguments_for(&tree, WINDOWS, "windows=10.0"));
+    assert!(!refused.status.success(), "the notice differs");
+    assert!(
+        why(&refused)
+            .contains("share/THIRD-PARTY-NOTICES.txt is not the notice this checkout commits"),
+        "{}",
+        why(&refused)
+    );
+}
+
+/// Every crate the lock takes into the release programs has an entry in the notice. The
+/// committed text has none missing, which is the control; the same text with every entry of one
+/// crate cut out names that crate and its version.
+#[test]
+fn a_notice_that_lacks_a_crate_of_the_programs_is_refused() {
+    let committed =
+        std::fs::read_to_string(checkout().join("docs/releases/third-party-notices.txt"))
+            .expect("the committed notice");
+    let none = kr_release::notices::gaps(&checkout(), &committed).expect("the lock is read");
+    assert!(none.is_empty(), "the committed notice lacks {none:?}");
+
+    let mut cut = Vec::new();
+    let text: String = committed
+        .lines()
+        .filter(|line| match line.strip_prefix("  - serde_json ") {
+            Some(rest) => {
+                cut.push(format!(
+                    "serde_json {}",
+                    rest.split(" | ").next().expect("a version")
+                ));
+                false
+            }
+            None => true,
+        })
+        .map(|line| format!("{line}\n"))
+        .collect();
+    assert!(!cut.is_empty(), "the notice has entries of serde_json");
+    let lacking = kr_release::notices::gaps(&checkout(), &text).expect("the lock is read");
+    assert_eq!(lacking, cut);
 }

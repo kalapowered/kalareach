@@ -18,7 +18,7 @@ use kr_protocol::update::{
 };
 
 use crate::refusal::{Refusal, Result, read_json, refuse, scalar};
-use crate::{agents, pins, shells, terminal, tree};
+use crate::{agents, notices, pins, shells, terminal, tree};
 
 /// Where a release keeps the update channel's root.
 pub const CHANNEL_ROOT: &str = "share/update-root.json";
@@ -87,6 +87,7 @@ pub fn assemble(inputs: &Inputs) -> Result<ReleaseManifest> {
         }
     }
     terminal::held(&inputs.tree, &inputs.checkout)?;
+    notices::held(&inputs.tree, &inputs.checkout)?;
 
     let manifest = ReleaseManifest {
         kind: ManifestKind::Release,

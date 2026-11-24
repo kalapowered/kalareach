@@ -23,6 +23,7 @@
 mod agents;
 pub mod assemble;
 pub mod dev;
+pub mod notices;
 pub mod pins;
 mod profile;
 pub mod record;

@@ -31,11 +31,13 @@ pub const PINNED: [&str; 8] = [
 ];
 
 /// One package of the lock.
-struct Package {
-    name: String,
-    version: String,
+pub(crate) struct Package {
+    pub(crate) name: String,
+    pub(crate) version: String,
+    /// The registry or repository the lock takes it from; a package of the workspace has none.
+    pub(crate) source: Option<String>,
     checksum: Option<String>,
-    dependencies: Vec<String>,
+    pub(crate) dependencies: Vec<String>,
 }
 
 /// The pins, their resolved graphs and the vectors, held to the documents that name them, and for a
@@ -210,7 +212,7 @@ fn documented_versions(checkout: &Path) -> Result<BTreeMap<String, Vec<String>>>
     Ok(stated)
 }
 
-fn packages(lock: &DocumentMut) -> Result<Vec<Package>> {
+pub(crate) fn packages(lock: &DocumentMut) -> Result<Vec<Package>> {
     let Some(array) = lock.get("package").and_then(Item::as_array_of_tables) else {
         refuse!("Cargo.lock lists no packages");
     };
@@ -225,6 +227,7 @@ fn packages(lock: &DocumentMut) -> Result<Vec<Package>> {
         found.push(Package {
             name,
             version,
+            source: text(table, "source"),
             checksum: text(table, "checksum"),
             dependencies: table
                 .get("dependencies")
