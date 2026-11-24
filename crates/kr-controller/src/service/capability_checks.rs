@@ -237,7 +237,7 @@ impl Checks {
         let ended = held
             .records
             .iter()
-            .any(|record| !stale(record, &held.fingerprint, &now).is_empty());
+            .any(|record| !stale(record, &held.fingerprint, now).is_empty());
         if ended {
             self.held = None;
             self.ended = true;

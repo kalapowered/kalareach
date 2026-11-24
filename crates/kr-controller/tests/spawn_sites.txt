@@ -418,7 +418,7 @@ crates/kr-worker/src/runtime.rs | SessionRuntime::start_and_say_if_the_shell_end
 crates/kr-worker/src/runtime.rs | SessionRuntime::start_and_say_if_the_shell_ended | tokio::task::spawn_blocking | closure{.in_observation} | 1 | joined | - | awaited where it stands
 crates/kr-worker/src/runtime.rs | SessionRuntime::start_and_say_if_the_shell_ended | tokio::task::spawn_blocking | closure{Instant::now} | 1 | other_crate | - | worker program: linked; the worker runs it
 crates/kr-worker/src/service.rs | UpstreamHandoff::carry_with | submit_within | .rechecked_before_submit | 2 | joined | - | awaited where it stands
-crates/kr-worker/src/service.rs | WorkerService::desktop_checks | tokio::task::spawn_blocking | closure{crate::desktop::context} | 1 | joined | - | awaited where it stands
+crates/kr-worker/src/service.rs | WorkerService::desktop_checks | tokio::task::spawn_blocking | closure{crate::desktop::platform::within} | 1 | joined | - | awaited where it stands
 crates/kr-worker/src/service.rs | WorkerService::install_command_backends | tokio::spawn | crate::broker::adoption::watch | 1 | other_crate | - | worker program: linked; the worker runs it
 crates/kr-worker/src/service.rs | WorkerService::new | .spawn | crate::application::follow_evidence | 1 | other_crate | - | worker program: linked; the worker runs it
 crates/kr-worker/src/service.rs | WorkerService::plugin_admissions_part | tokio::task::spawn_blocking | closure{.prepare} | 1 | joined | - | awaited where it stands
@@ -491,7 +491,6 @@ names | kr_worker::config::lock
 names | kr_worker::desktop::capability::context_refuses
 names | kr_worker::desktop::capability::facility_identity
 names | kr_worker::desktop::capability::report
-names | kr_worker::desktop::capability::tools_of
 names | kr_worker::desktop::context
 names | kr_worker::desktop::probe::stale
 names | kr_worker::desktop::recorded_presence
