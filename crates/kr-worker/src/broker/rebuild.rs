@@ -824,8 +824,8 @@ mod tests {
         for clause in [
             "the worker gave it 64 pending requests from its own records, oldest first, 64 of them \
              already read as approvals",
-            "pending requests left out: 99999 whose bytes could not be used, 64 too large for one \
-             event, 99999 over the limit of 64 requests or 4 MiB, 64 refused by the runtime and \
+            "pending requests left out: 99999 whose bytes could not be used, 99999 too large for \
+             one event, 99999 over the limit of 64 requests or 4 MiB, 64 refused by the runtime and \
              64 not offered after an earlier one failed; 64 not confirmed as given because the \
              runtime did not answer",
             away.as_str(),
