@@ -3508,6 +3508,12 @@ async fn a_rollback_leaves_the_plugin_host_of_this_release_for_the_release_befor
     let second_program = start_agent(host, &second, &agent).await;
     let this_host = host.plugin_host_published().await;
     let (three, four) = host.descriptors_of(&this_host).await;
+    assert_eq!(
+        endpoint_name(&three.endpoint),
+        Some("p3.sock"),
+        "the descriptor of the third protocol names p3.sock, the endpoint the release before connects to: {}",
+        three.endpoint
+    );
     assert_a_host_of_both_protocols(&three, &four);
     host.plugin_holding(1).await;
     assert_runs_the_host_of(&this_host, updated.two.name());
@@ -3967,7 +3973,11 @@ async fn a_plugin_host_of_both_protocols_is_adopted_by_the_next_daemon_as_the_pr
 
     // A session that binds after the adoption is served by the same process.
     let second = BoundSession::start(host, &updated.kr_now(), &agent).await;
-    host.plugin_holding(2).await;
+    let held = tokio::time::timeout(Duration::from_secs(60), host.plugin_holding(2)).await;
+    assert!(
+        held.is_ok(),
+        "the second session is served by the host the daemon adopted"
+    );
     assert_eq!(
         host.plugin_host(),
         Some(process.clone()),
