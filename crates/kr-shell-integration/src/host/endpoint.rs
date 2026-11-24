@@ -17,7 +17,7 @@ use kr_ipc::paths::Endpoint;
 use kr_protocol::ids::SessionId;
 use kr_protocol::scalars::Bytes;
 
-#[cfg(any(test, feature = "testing"))]
+#[cfg(any(test, feature = "testing", not(unix)))]
 use crate::contract::transport::ENDPOINT_BASENAME;
 #[cfg(not(unix))]
 use crate::contract::transport::WINDOWS_PIPE_PREFIX;
