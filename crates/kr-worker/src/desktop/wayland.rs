@@ -235,7 +235,6 @@ mod tests {
 
         /// A runtime folder for a compositor, whose socket names a path of a hundred bytes cannot
         /// hold: a short name directly under `/tmp`.
-        #[cfg(target_os = "linux")]
         fn runtime() -> Self {
             let unique = kr_ipc::new_uuid().to_string();
             Self::under(&Path::new("/tmp").join(format!("kr-wl-{}", &unique[..8])))
@@ -958,9 +957,12 @@ mod tests {
     fn a_worker_that_names_no_display_starts_nothing() {
         let tools = Folder::new();
         let scratch = Folder::new();
-        let runtime = Folder::new();
-        // The default socket of another login, in the folder this worker's variables name.
-        runtime.file("wayland-0", b"");
+        let runtime = Folder::runtime();
+        // The default socket of another login, listening in the folder this worker's variables
+        // name.
+        let _default_socket =
+            std::os::unix::net::UnixListener::bind(runtime.path().join("wayland-0"))
+                .expect("the default socket of another login");
         let ran = tools.path().join("ran");
         let image = tools.file("image.png", &whole(1280, 720));
         let grim = tools.program(
