@@ -355,7 +355,8 @@ pub const fn alert_for(rule: AttentionRule) -> PushAlert {
         | AttentionRule::ApplicationNotice
         | AttentionRule::AutomationPaused
         | AttentionRule::AuthorityFeedRemoved
-        | AttentionRule::ReceiptUncertain => PushAlert::SessionNeedsAttention,
+        | AttentionRule::ReceiptUncertain
+        | AttentionRule::ReceiptsGap => PushAlert::SessionNeedsAttention,
     }
 }
 
@@ -661,6 +662,7 @@ fn host_lines(rule: AttentionRule, notice: &Notice) -> Vec<ContentLine> {
         AttentionRule::AutomationPaused => "Automation was paused by a limit.".to_owned(),
         AttentionRule::AuthorityFeedRemoved => "This host's authority feed was removed.".to_owned(),
         AttentionRule::ReceiptUncertain => format!("An action's result is unknown{place}."),
+        AttentionRule::ReceiptsGap => format!("Some action results were not read in time{place}."),
     };
     let line = |text: String| ContentLine {
         session_id: notice.session_id,
@@ -4684,6 +4686,7 @@ mod tests {
             AttentionRule::HostContactLost,
             AttentionRule::ApplicationNotice,
             AttentionRule::ReceiptUncertain,
+            AttentionRule::ReceiptsGap,
         ] {
             assert!(PushAlert::ALL.contains(&alert_for(rule)));
         }

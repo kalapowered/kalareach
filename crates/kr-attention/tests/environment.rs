@@ -2493,6 +2493,25 @@ fn a_bringing_forward_that_cannot_record_its_schema_is_rolled_back_whole() {
 /// rule's word, and every opening writes the whole state again without losing it.
 #[test]
 fn a_store_that_holds_an_item_of_the_receipt_rule_is_read_listed_and_kept() {
+    an_item_of_a_later_rule_is_read_listed_and_kept(
+        "attention.receipt_uncertain",
+        "the receipt rule",
+    );
+}
+
+/// A store of schema 13 that holds an item of the rule for action results that were not read in
+/// time, which a later release raises, is read by this build in the same way.
+#[test]
+fn a_store_that_holds_an_item_of_the_results_gap_rule_is_read_listed_and_kept() {
+    an_item_of_a_later_rule_is_read_listed_and_kept(
+        "attention.receipts_gap",
+        "the results gap rule",
+    );
+}
+
+/// Writes the item of a rule a later release raises, named `rule` in the messages, into a store of
+/// schema 13 and opens it twice.
+fn an_item_of_a_later_rule_is_read_listed_and_kept(word: &str, rule: &str) {
     let directory = tempfile::tempdir().expect("a temporary directory");
     let path = directory.path().join("attention.db");
     let mut attention =
@@ -2503,12 +2522,11 @@ fn a_store_that_holds_an_item_of_the_receipt_rule_is_read_listed_and_kept() {
     drop(attention);
     // What a later release writes: the item of the rule it raises, in a store at schema 13.
     let raw = rusqlite::Connection::open(&path).expect("the file opens");
-    raw.execute_batch(
+    raw.execute_batch(&format!(
         "UPDATE attention_items SET
-             rule = 'attention.receipt_uncertain',
-             key = 'attention.receipt_uncertain|'
-                 || substr(key, length('attention.command_failed|') + 1);",
-    )
+             rule = '{word}',
+             key = '{word}|' || substr(key, length('attention.command_failed|') + 1);"
+    ))
     .expect("the item of the later rule");
     drop(raw);
 
@@ -2516,7 +2534,7 @@ fn a_store_that_holds_an_item_of_the_receipt_rule_is_read_listed_and_kept() {
         let opened = Attention::open(&path, reading(1_000 * (opening + 1)), &opener());
         assert!(
             opened.is_ok(),
-            "opening {opening} of a store that holds an item of the receipt rule: {:?}",
+            "opening {opening} of a store that holds an item of {rule}: {:?}",
             opened.as_ref().err()
         );
         let attention = opened.expect("the store opens");
@@ -2526,8 +2544,8 @@ fn a_store_that_holds_an_item_of_the_receipt_rule_is_read_listed_and_kept() {
             .collect();
         assert_eq!(
             listed,
-            ["attention.receipt_uncertain"],
-            "opening {opening} lists the item with the receipt rule's word"
+            [word],
+            "opening {opening} lists the item with {rule}'s word"
         );
         drop(attention);
         let stored: Vec<String> = {
@@ -2543,7 +2561,7 @@ fn a_store_that_holds_an_item_of_the_receipt_rule_is_read_listed_and_kept() {
         };
         assert_eq!(
             stored,
-            ["attention.receipt_uncertain"],
+            [word],
             "the write of opening {opening} keeps the item and its word"
         );
     }

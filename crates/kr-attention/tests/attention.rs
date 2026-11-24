@@ -534,12 +534,14 @@ fn every_rule_in_the_set_is_raised_by_the_typed_event_it_covers() {
         .expect("the store records the decision");
     seen.extend(raised(&outcomes));
 
-    // The one rule no event of this release covers: a later release raises it, and this one only
+    // The two rules no event of this release covers: a later release raises them, and this one only
     // reads and lists what it raised.
     let expected: BTreeSet<_> = RULES
         .iter()
         .map(|rule| rule.id)
-        .filter(|id| *id != AttentionRule::ReceiptUncertain)
+        .filter(|id| {
+            !["attention.receipt_uncertain", "attention.receipts_gap"].contains(&id.as_str())
+        })
         .collect();
     assert_eq!(seen, expected, "every rule in the set was exercised");
 }

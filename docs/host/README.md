@@ -6988,11 +6988,11 @@ only when its grant selects that session.
 
 ### The rule set
 
-Eleven rules, each with a stable identifier that outlives any change to the wording it produces.
+Twelve rules, each with a stable identifier that outlives any change to the wording it produces.
 The engine raises nine of them: nothing in the daemon sends the event that raises
-`attention.host_contact_lost`, and nothing in this release raises `attention.receipt_uncertain`.
-This release reads and lists an `attention.receipt_uncertain` item that a later release raised, and
-a client of this release shows it.
+`attention.host_contact_lost`, and nothing in this release raises `attention.receipt_uncertain` or
+`attention.receipts_gap`. This release reads and lists items of those two rules that a later release
+raised, and a client of this release shows them.
 
 | Rule | What raises it | Starts at | While it stands |
 | --- | --- | --- | --- |
@@ -7007,6 +7007,7 @@ a client of this release shows it.
 | `attention.automation_paused` | One of its own limits paused a workflow revision or a causal chain | notable | announced once |
 | `attention.authority_feed_removed` | The authority feed this host reads answered that it was removed from it | urgent | announced once; stands until the host reads another feed or none |
 | `attention.receipt_uncertain` | An action's upstream result is unknown, so the host cannot say whether it took effect; nothing raises it in this release | notable | announced once |
+| `attention.receipts_gap` | The host did not read some of a session's action results in time, so it cannot say whether any of them is unknown; nothing raises it in this release | notable | announced once |
 
 The idle reminder counts from the moment the request became pending, not from the last output: a
 session printing continuously while a question waits still owes the reminder, and a silent session

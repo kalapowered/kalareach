@@ -189,6 +189,8 @@ wire_enum! {
             "The authority feed this host reads removed it, so it learns no revocation from it.";
         ReceiptUncertain => "attention.receipt_uncertain",
             "An action's upstream result is unknown, so the host cannot say whether it took effect.";
+        ReceiptsGap => "attention.receipts_gap",
+            "The host did not read some of a session's action results in time, so it cannot say whether any of them is unknown.";
     }
 }
 
@@ -1258,21 +1260,34 @@ mod tests {
             assert!(rule.as_str().starts_with("attention."));
         }
         // Section 25's eight, the one its automation paragraph and section 17's workflow limits
-        // add, the one that tells the owner a host's authority feed was removed, and the one a
-        // later release raises for an action whose upstream result is unknown.
-        assert_eq!(AttentionRule::ALL.len(), 11);
+        // add, the one that tells the owner a host's authority feed was removed, the one a later
+        // release raises for an action whose upstream result is unknown, and the one it raises when
+        // it did not read some of a session's action results in time.
+        assert_eq!(AttentionRule::ALL.len(), 12);
     }
 
     #[test]
-    fn the_rule_for_an_unknown_upstream_result_is_the_last_word_of_the_set() {
+    fn the_rules_for_an_unknown_upstream_result_and_for_results_not_read_are_the_last_words_of_the_set()
+     {
         assert!(
             AttentionRule::from_wire("attention.receipt_uncertain").is_some(),
             "attention.receipt_uncertain is a rule word"
         );
+        assert!(
+            AttentionRule::from_wire("attention.receipts_gap").is_some(),
+            "attention.receipts_gap is a rule word"
+        );
+        let last_two: Vec<&str> = AttentionRule::ALL
+            .iter()
+            .rev()
+            .take(2)
+            .rev()
+            .map(|rule| rule.as_str())
+            .collect();
         assert_eq!(
-            AttentionRule::ALL.last().map(|rule| rule.as_str()),
-            Some("attention.receipt_uncertain"),
-            "attention.receipt_uncertain comes after the words an earlier release wrote"
+            last_two,
+            ["attention.receipt_uncertain", "attention.receipts_gap"],
+            "attention.receipt_uncertain and attention.receipts_gap come after the words an earlier release wrote, in that order"
         );
     }
 

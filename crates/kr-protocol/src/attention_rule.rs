@@ -3,8 +3,9 @@
 //! Section 25 names eight rules, gives them stable identifiers and fixes the de-duplication window
 //! at sixty seconds; its automation paragraph, with section 17's workflow limits, adds a ninth for
 //! a workflow or a causal chain its own limits paused, a tenth tells the owner that the
-//! authority feed a host reads removed it, and an eleventh is for an action whose upstream result
-//! is unknown. [`RULES`] is that table, one entry per
+//! authority feed a host reads removed it, an eleventh is for an action whose upstream result
+//! is unknown, and a twelfth for action results the host did not read in time. [`RULES`] is that
+//! table, one entry per
 //! identifier, and [`rule`] is the only way to reach an entry, so a rule's policy cannot be decided
 //! twice in two places.
 //!
@@ -196,6 +197,19 @@ pub static RULES: &[Rule] = &[
         trusted: true,
         droppable: false,
     },
+    // Action results the host did not read in time: it cannot say whether any of them is unknown.
+    // The person is told once and has nothing to answer here, so it is notable and does not climb.
+    // It is the host's own record, so it is trusted. It is never dropped to keep the inbox within its
+    // bound: it stands until the owner acknowledges it. No code of this release raises it.
+    Rule {
+        id: AttentionRule::ReceiptsGap,
+        initial: AttentionLevel::Notable,
+        steps: &[],
+        repeat_ms: None,
+        dedup_window_ms: DEDUPLICATION_WINDOW_MS,
+        trusted: true,
+        droppable: false,
+    },
 ];
 
 /// Returns the rule with this identifier.
@@ -273,6 +287,7 @@ mod tests {
                     | AttentionRule::AutomationPaused
                     | AttentionRule::AuthorityFeedRemoved
                     | AttentionRule::ReceiptUncertain
+                    | AttentionRule::ReceiptsGap
             );
             assert_eq!(
                 rule.droppable, !waiting,
@@ -307,6 +322,34 @@ mod tests {
             )),
             "an uncertain receipt starts notable, climbs no ladder, is announced once, is the \
              host's own record, and is never dropped to keep the inbox within its bound"
+        );
+    }
+
+    #[test]
+    fn results_not_read_in_time_are_a_notable_item_that_the_bound_never_drops() {
+        let entry = RULES
+            .iter()
+            .find(|rule| rule.id.as_str() == "attention.receipts_gap")
+            .copied();
+        assert_eq!(
+            entry.map(|rule| (
+                rule.initial,
+                rule.steps.len(),
+                rule.repeat_ms,
+                rule.dedup_window_ms,
+                rule.trusted,
+                rule.droppable
+            )),
+            Some((
+                AttentionLevel::Notable,
+                0,
+                None,
+                DEDUPLICATION_WINDOW_MS,
+                true,
+                false
+            )),
+            "results that were not read start notable, climb no ladder, are announced once, are the \
+             host's own record, and are never dropped to keep the inbox within its bound"
         );
     }
 
