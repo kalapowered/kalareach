@@ -66,6 +66,24 @@ pub struct Pending {
     pub recorded: u64,
 }
 
+impl Pending {
+    /// Returns true while nobody's answer to the request may have gone, so that a component that
+    /// starts again is still to be given it: the request is pending, or a rich answer holds it under
+    /// a claim and nothing marks the answer as sent. Such a claim can still go back, and the request
+    /// is then pending. A request the native client or this host answers, one whose marker is
+    /// written, and one claimed by nobody are not.
+    #[must_use]
+    pub fn is_unanswered(&self) -> bool {
+        match self.resource.state {
+            PendingState::Pending => true,
+            // Only a rich answer holds a claim: the native client's answer and this host's own are
+            // admitted with none, so a claim here is a rich one (admitted or not yet).
+            PendingState::Claimed => self.claim.is_some() && !self.dispatched,
+            _ => false,
+        }
+    }
+}
+
 /// Which writer holds the one admission to transmit an answer for a pending resource.
 ///
 /// Section 11 gives every pending resource one resolution, and a resolution is bytes reaching the
@@ -1417,6 +1435,87 @@ mod tests {
         arbitration.record(resource, None, None).expect("recorded");
         assert!(claim(&mut arbitration, resource_id, "device-1", 200).is_err());
         claim(&mut arbitration, resource_id, "device-1", 50).expect("inside the deadline");
+    }
+
+    #[test]
+    fn a_request_is_unanswered_while_pending_or_held_by_a_rich_claim_with_no_marker() {
+        let mut arbitration = Arbitration::new();
+        let record = |arbitration: &mut Arbitration, byte: u8| {
+            let resource = resource(byte, &byte.to_string());
+            let id = resource.resource_id;
+            arbitration.record(resource, None, None).expect("recorded");
+            id
+        };
+        let unanswered = |arbitration: &Arbitration, id: PendingResourceId| {
+            arbitration.get(id).expect("recorded").is_unanswered()
+        };
+
+        let rich = record(&mut arbitration, 1);
+        assert!(unanswered(&arbitration, rich), "pending");
+        let held = claim(&mut arbitration, rich, "device-1", 2).expect("claimed");
+        assert!(
+            unanswered(&arbitration, rich),
+            "a claim is taken and its answer not yet admitted"
+        );
+        let admitted = arbitration.plan_dispatch(&held).expect("planned");
+        arbitration.commit(admitted).expect("committed");
+        assert!(
+            unanswered(&arbitration, rich),
+            "a rich answer is admitted and not marked"
+        );
+        let marked = arbitration.plan_dispatched(&held).expect("planned");
+        arbitration.commit(marked).expect("committed");
+        assert!(
+            !unanswered(&arbitration, rich),
+            "an answer that may have gone"
+        );
+        let unsent = arbitration.plan_unsent(&held, |_| true).expect("planned");
+        arbitration.commit(unsent).expect("committed");
+        assert!(
+            unanswered(&arbitration, rich),
+            "the answer proved unsent: the request is pending again"
+        );
+
+        for (byte, writer) in [(2, Transmitter::Native), (3, Transmitter::Host)] {
+            let id = record(&mut arbitration, byte);
+            let request = arbitration
+                .get(id)
+                .expect("recorded")
+                .resource
+                .request
+                .clone();
+            let admitted = arbitration
+                .plan_writer_dispatch(&request, writer)
+                .expect("planned");
+            arbitration.commit(admitted).expect("committed");
+            assert_eq!(state_of(&arbitration, id), PendingState::Claimed);
+            assert!(
+                !unanswered(&arbitration, id),
+                "{writer:?} answers the request"
+            );
+        }
+
+        let mut orphan = resource(4, "4");
+        orphan.state = PendingState::Claimed;
+        let orphan_id = orphan.resource_id;
+        arbitration.restore(orphan, false, None);
+        assert!(
+            !unanswered(&arbitration, orphan_id),
+            "a claim nobody holds cannot go back"
+        );
+
+        let settled = record(&mut arbitration, 5);
+        let request = arbitration
+            .get(settled)
+            .expect("recorded")
+            .resource
+            .request
+            .clone();
+        let resolved = arbitration
+            .plan_upstream_resolved(&request)
+            .expect("planned");
+        arbitration.commit(resolved).expect("committed");
+        assert!(!unanswered(&arbitration, settled), "resolved");
     }
 
     #[test]

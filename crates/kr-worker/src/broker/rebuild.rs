@@ -16,7 +16,6 @@
 //! what the component was given and what it was not: counts, never content.
 
 use kr_plugin_service::vocabulary::{ScopedSourceEvent, SourceProvenance};
-use kr_protocol::gateway::PendingState;
 use kr_protocol::ids::{
     ApplicationInstanceId, BrokerBindingId, PendingResourceId, SourceEventHandle, SourceGeneration,
 };
@@ -64,7 +63,8 @@ impl Broker {
     /// Reads the requests the broker holds for a binding's component that starts again.
     ///
     /// Returns nothing for a binding that is not offered the connector's upstream frames: it has no
-    /// requests to be given. A request is read only when it is still pending, was recorded under the
+    /// requests to be given. A request is read only when it is still unanswered ([`super::arbitration::Pending::is_unanswered`]:
+    /// pending, or claimed for a rich answer that is not marked as sent), was recorded under the
     /// instance's current source generation, is of a kind a component may be offered, belongs to the
     /// binding's package, and is held by handle. Requests are read in the order the broker recorded
     /// them. At most [`MAX_RETAINED_FRAMES`] are read and [`MAX_RETAINED_FRAME_BYTES`] of event
@@ -94,10 +94,11 @@ impl Broker {
         let mut bytes = 0usize;
         for pending in state.arbitration.in_recorded_order() {
             let resource = &pending.resource;
-            // Pending only: a request that is claimed is being answered, and one the host performs
-            // itself is claimed when it is recorded and was never offered to a component.
+            // Unanswered only: pending, or claimed for a rich answer that is not marked as sent,
+            // since that claim can go back after this read. One the host performs itself is claimed
+            // when it is recorded and was never offered to a component.
             if resource.application_instance_id != instance_id
-                || resource.state != PendingState::Pending
+                || !pending.is_unanswered()
                 || resource.source_generation != instance.source_generation
                 || !resource.classification.declared
                 || resource.classification.carries_credentials()
@@ -146,9 +147,10 @@ impl Broker {
         Some(rebuild)
     }
 
-    /// Returns true while a request is still pending and the instance is still at the source
-    /// generation it was recorded under: asked before each request is given, since a request can be
-    /// answered, or its frames can be left behind, while an earlier one is being delivered.
+    /// Returns true while a request is still unanswered (pending, or claimed for a rich answer that
+    /// is not marked as sent) and the instance is still at the source generation it was recorded
+    /// under: asked before each request is given, since a request can be answered, or its frames can
+    /// be left behind, while an earlier one is being delivered.
     #[must_use]
     pub fn still_pending(
         &self,
@@ -157,7 +159,8 @@ impl Broker {
     ) -> bool {
         let state = self.state();
         state.arbitration.get(resource_id).is_some_and(|pending| {
-            pending.resource.state == PendingState::Pending
+            let unanswered = pending.is_unanswered();
+            unanswered
                 && state
                     .instances
                     .get(&pending.resource.application_instance_id)

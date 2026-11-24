@@ -1072,29 +1072,19 @@ async fn kr_req_24_24_a_component_that_starts_again_is_given_the_pending_request
     );
 }
 
-/// KR-REQ-24.24: a request whose answer is being written is not given to a component that starts
-/// again: the request is claimed, and is no longer one the broker holds as pending.
-///
-/// Three requests are read into approvals. The runtime is lost and an answer to the second is
-/// admitted, which claims it; the answer is not written. The component that starts again is given
-/// the other two, and its report says two.
+/// Starts a world whose binding 1 reads requests into approvals and whose binding 2 observes, and
+/// sends three requests that binding 1 reads and binding 2 has observed.
 ///
 /// The binding that reads the requests is the first of its package, since that is the one the
 /// worker asks whether the package may answer.
-#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn kr_req_24_24_a_request_whose_answer_is_being_written_is_not_given_to_a_component_that_starts_again()
- {
-    let Some(world) = Observing::start(Options::with(vec![
+async fn three_approvals_read_by_the_first_binding() -> Option<Observing> {
+    let world = Observing::start(Options::with(vec![
         Spec::interpreter(1),
         Spec::semantic_only(2),
     ]))
-    .await
-    else {
-        return;
-    };
+    .await?;
     world.until_ready(2).await;
-    let sent = [1_u64, 2, 3];
-    for id in sent {
+    for id in 1..=3_u64 {
         world.send(&request(id));
     }
     until("every request to be read into an approval", || async {
@@ -1106,18 +1096,22 @@ async fn kr_req_24_24_a_request_whose_answer_is_being_written_is_not_given_to_a_
                 resource.kind == PendingKind::Approval && resource.interpretation_verified
             })
             .count()
-            == sent.len())
-        .then_some(())
+            == 3)
+            .then_some(())
     })
     .await;
     world
         .until_account(2, "the component to have observed them all", |account| {
-            account.requests.len() == sent.len()
+            account.requests.len() == 3
         })
         .await;
+    Some(world)
+}
 
-    lose_the_runtime(&world).await;
-    let second = until_recorded(&world, 2).await;
+/// Admits an answer to the request the upstream gave `id`, which claims it and leaves the answer
+/// unwritten until [`Broker::abandon`] gives the claim back.
+async fn admit_an_answer_to(world: &Observing, id: u64) -> kr_worker::broker::MutationAdmission {
+    let request = until_recorded(world, id).await;
     let revision = world
         .broker()
         .binding_state(instance())
@@ -1129,9 +1123,7 @@ async fn kr_req_24_24_a_request_whose_answer_is_being_written_is_not_given_to_a_
         ingress: kr_protocol::actor::ActorIngress::LocalIpc,
         device_id: None,
     };
-    // Held until the end of the case: the answer is admitted and never written, so the request
-    // stays claimed.
-    let _answer = world
+    let admitted = world
         .broker()
         .admit_approval(
             &caller,
@@ -1140,32 +1132,103 @@ async fn kr_req_24_24_a_request_whose_answer_is_being_written_is_not_given_to_a_
                     subject: kr_worker::broker::subject(world.hosted.session_id, instance()),
                     binding_revision: revision,
                 },
-                resource_id: second.resource_id,
+                resource_id: request.resource_id,
                 option_id: "allow".to_owned(),
             },
             kr_ipc::now_ms(),
         )
         .expect("the answer is admitted");
     assert_eq!(
-        until_recorded(&world, 2).await.state,
+        until_recorded(world, id).await.state,
         PendingState::Claimed,
         "the admitted answer claims the request"
     );
+    admitted
+}
+
+/// KR-REQ-24.24: a request claimed for a rich answer that is not yet marked as sent is given to a
+/// component that starts again, and is not given a second time when the claim goes back.
+///
+/// Three requests are read into approvals. The runtime is lost and an answer to the second is
+/// admitted, which claims it; the answer is not written. The component that starts again is given
+/// all three, in the order they were recorded. The answer is then given up, which makes the second
+/// request pending again, and a notification that the component observes after it shows that the
+/// pump has gone past: the component was not given the request again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_24_24_a_request_claimed_for_an_answer_is_given_to_a_component_that_starts_again_and_once_when_the_claim_goes_back()
+ {
+    let Some(world) = three_approvals_read_by_the_first_binding().await else {
+        return;
+    };
+    lose_the_runtime(&world).await;
+    let answer = admit_an_answer_to(&world, 2).await;
     world.let_the_compiles_go();
     until_started_again(&world, 2).await;
 
     let account = world.account(2).await.expect("the component answers");
     assert_eq!(
         account.requests,
-        ["1", "3"],
-        "the claimed request was given, or another was left out: {account:?}"
+        ["1", "2", "3"],
+        "the claimed request was left out, or another was: {account:?}"
     );
-    assert_eq!(account.observes, 2, "{account:?}");
     let reason = world.reason(2);
     assert!(
-        reason.contains("the worker gave it 2 pending requests from its own records"),
+        reason.contains("the worker gave it 3 pending requests from its own records"),
         "{reason}"
     );
+
+    world.broker().abandon(&answer);
+    assert_eq!(
+        until_recorded(&world, 2).await.state,
+        PendingState::Pending,
+        "the claim went back"
+    );
+    world.send(&notification("after"));
+    let account = world
+        .until_account(
+            2,
+            "the component to have observed the notification",
+            |account| account.observes >= 4,
+        )
+        .await;
+    assert_eq!(
+        account.requests,
+        ["1", "2", "3"],
+        "the request whose claim went back was given again: {account:?}"
+    );
+}
+
+/// KR-REQ-24.24: a request that is claimed for a rich answer while an earlier request is handed over
+/// is still given: the claim can go back, and the request is then pending.
+///
+/// Three requests are read into approvals, and the baseline is held once it has given the first.
+/// An answer to the second is admitted, and the baseline goes on: the component is given the second
+/// and the third.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_24_24_a_request_claimed_while_an_earlier_hand_over_waits_is_still_given() {
+    let Some(world) = three_approvals_read_by_the_first_binding().await else {
+        return;
+    };
+    let lane = world.broker().observation();
+    let hold = lane.pause_at(Pause::BaselineGiven(1));
+    lose_the_runtime(&world).await;
+    world.let_the_compiles_go();
+    until(
+        "the baseline to be held after its first request",
+        || async { hold.parked().then_some(()) },
+    )
+    .await;
+    let answer = admit_an_answer_to(&world, 2).await;
+    hold.release();
+    until_started_again(&world, 2).await;
+
+    let account = world.account(2).await.expect("the component answers");
+    assert_eq!(
+        account.requests,
+        ["1", "2", "3"],
+        "the request claimed while the first was handed over was left out: {account:?}"
+    );
+    world.broker().abandon(&answer);
 }
 
 /// Starts a world whose binding 1 observes and whose binding 2 reads requests, and sends three
