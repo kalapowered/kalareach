@@ -26,6 +26,10 @@ on:
         description: "Run the Windows job."
         type: boolean
         default: true
+      desktop_probe:
+        description: "Run the desktop probe job: it installs the screen-capture, accessibility and portal tools on a hosted Linux runner and records what they do. Set the three platform inputs to false to run it alone."
+        type: boolean
+        default: false
   schedule:
     - cron: "37 2 * * *"
 
@@ -761,4 +765,118 @@ jobs:
         with:
           name: conformance-windows-part-${{ matrix.part }}
           path: ${{ env.KR_TEST_ARTIFACTS_DIR }}
+          if-no-files-found: error
+
+  # A probe of the screen-capture, accessibility, launch and portal tools on a hosted Linux runner.
+  # It runs only in a run started by hand with desktop_probe set; with the three platform inputs
+  # false it is the only job. Each probe step records its exit code, a failed probe does not stop
+  # the next one, and the results folder is kept for 7 days.
+  desktop-probe:
+    name: desktop probe
+    if: github.event_name == 'workflow_dispatch' && inputs.desktop_probe
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    defaults:
+      run:
+        shell: bash
+    env:
+      # The results folder, which the first step makes with mode 0700. Each probe script writes to a
+      # folder of its own inside it, because three of them write a file of the same name.
+      PROBE_RESULTS: /tmp/desktop-probe-results
+    steps:
+      - name: Check out
+        timeout-minutes: 3
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      - name: Make the results folder
+        timeout-minutes: 1
+        run: install -d -m 700 "$PROBE_RESULTS"
+
+      - name: Record the packages before the install
+        timeout-minutes: 2
+        run: |
+          rc=0
+          bash scripts/probe-desktop/dl2-packages.sh before "$PROBE_RESULTS/packages" || rc=$?
+          echo "dl2-packages.sh before $rc" >> "$PROBE_RESULTS/exit-codes.txt"
+          exit "$rc"
+
+      # The packages are the list in dl2-packages.sh. The script retries the update and the download,
+      # each under a bound, for 25 minutes at most; the step's 30 are those 25 and the install.
+      - name: Install the packages
+        timeout-minutes: 30
+        run: |
+          rc=0
+          read -r -a packages <<< "$(awk -F'"' '/^PACKAGES=/ { print $2 }' scripts/probe-desktop/dl2-packages.sh)"
+          if [ "${#packages[@]}" -eq 0 ]; then
+            echo "dl2-packages.sh has no package list" >&2
+            rc=2
+          else
+            echo "installing ${#packages[@]} packages: ${packages[*]}"
+            bash scripts/apt-install.sh --deadline 1500 "${packages[@]}" 2>&1 | tee "$PROBE_RESULTS/apt-install.log" || rc=$?
+          fi
+          echo "apt-install.sh $rc" >> "$PROBE_RESULTS/exit-codes.txt"
+          exit "$rc"
+
+      - name: Record the packages after the install
+        if: ${{ !cancelled() }}
+        timeout-minutes: 2
+        run: |
+          rc=0
+          bash scripts/probe-desktop/dl2-packages.sh after "$PROBE_RESULTS/packages" || rc=$?
+          echo "dl2-packages.sh after $rc" >> "$PROBE_RESULTS/exit-codes.txt"
+          exit "$rc"
+
+      - name: Probe the X11 capture tools
+        if: ${{ !cancelled() }}
+        timeout-minutes: 6
+        run: |
+          rc=0
+          timeout --kill-after=15 300 bash scripts/probe-desktop/dl2-x11.sh "$PROBE_RESULTS/x11" || rc=$?
+          echo "dl2-x11.sh $rc" >> "$PROBE_RESULTS/exit-codes.txt"
+          exit "$rc"
+
+      - name: Probe the accessibility bus
+        if: ${{ !cancelled() }}
+        timeout-minutes: 6
+        run: |
+          rc=0
+          timeout --kill-after=15 300 bash scripts/probe-desktop/dl2-atspi.sh "$PROBE_RESULTS/atspi" || rc=$?
+          echo "dl2-atspi.sh $rc" >> "$PROBE_RESULTS/exit-codes.txt"
+          exit "$rc"
+
+      - name: Probe the launch targets
+        if: ${{ !cancelled() }}
+        timeout-minutes: 6
+        run: |
+          rc=0
+          timeout --kill-after=15 300 bash scripts/probe-desktop/dl2-launch.sh "$PROBE_RESULTS/launch" || rc=$?
+          echo "dl2-launch.sh $rc" >> "$PROBE_RESULTS/exit-codes.txt"
+          exit "$rc"
+
+      - name: Probe the Wayland compositors
+        if: ${{ !cancelled() }}
+        timeout-minutes: 6
+        run: |
+          rc=0
+          timeout --kill-after=15 300 bash scripts/probe-desktop/dl2-wayland.sh "$PROBE_RESULTS/wayland" || rc=$?
+          echo "dl2-wayland.sh $rc" >> "$PROBE_RESULTS/exit-codes.txt"
+          exit "$rc"
+
+      - name: Probe the screenshot portal
+        if: ${{ !cancelled() }}
+        timeout-minutes: 6
+        run: |
+          rc=0
+          timeout --kill-after=15 300 bash scripts/probe-desktop/dl2-portal-headless.sh "$PROBE_RESULTS/portal" || rc=$?
+          echo "dl2-portal-headless.sh $rc" >> "$PROBE_RESULTS/exit-codes.txt"
+          exit "$rc"
+
+      - name: Keep the results
+        if: ${{ !cancelled() }}
+        timeout-minutes: 5
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: desktop-probe-results
+          path: ${{ env.PROBE_RESULTS }}
+          retention-days: 7
           if-no-files-found: error
