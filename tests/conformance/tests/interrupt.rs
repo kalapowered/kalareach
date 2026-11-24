@@ -52,6 +52,10 @@ const WAITS: &str = "printf '%s\\n' \"$$\" >> \"$1\"\nsleep 20\n";
 /// Ends at once.
 const QUICK: &str = "exit 0\n";
 
+/// Records two lines in its file, as [`GROUP`] records two pids, and ends at once: the report's
+/// program ends after it, with every line a case waits for already in the file.
+const RECORDS_AND_ENDS: &str = "printf '%s\\n' \"$$\" \"$$\" >> \"$1\"\n";
+
 /// Sends `INT` to its parent, the report's program, and ends with status 0 at once: the signal is
 /// recorded while the step ends.
 const SIGNALS_AND_ENDS: &str = "kill -INT \"$PPID\"\nexit 0\n";
@@ -209,23 +213,26 @@ impl Run {
     }
 
     /// The pids a script recorded in `file`, once it has recorded `count` of them. A report's
-    /// program that ends before that stops the wait, and the failure shows what it said.
+    /// program that has ended fails the wait, whatever the file holds, and the failure shows what
+    /// it said: the case signals the report's program next, and one that was waited for is no
+    /// longer there to be signalled, so its pid could be another process's.
     fn recorded_pids(&mut self, file: &Path, count: usize) -> Vec<String> {
         let until = Instant::now() + Duration::from_secs(60);
         loop {
-            // Asked before the file is read, so that a program that ended is read after its end.
+            // Asked before the file is read: the call reaps a program that has ended.
             let ended = self.child.try_wait().expect("a wait");
             let text = std::fs::read_to_string(file).unwrap_or_default();
             let pids: Vec<String> = text.lines().map(str::to_owned).collect();
-            if pids.len() >= count {
-                return pids;
-            }
             if let Some(status) = ended {
                 panic!(
-                    "the report's program ended {status:?} before the script recorded {count} pids \
-                     ({text:?}); it said: {}",
+                    "the report's program ended {status:?} before the case signalled it, with {} \
+                     of {count} pids recorded ({text:?}); it said: {}",
+                    pids.len(),
                     std::fs::read_to_string(&self.output).unwrap_or_default()
                 );
+            }
+            if pids.len() >= count {
+                return pids;
             }
             assert!(
                 Instant::now() < until,
@@ -434,4 +441,33 @@ fn a_second_signal_in_the_grace_does_not_change_the_signal_of_the_run() {
         result["steps"][1]["error"],
         "not run because the run was interrupted by signal TERM"
     );
+}
+
+/// A report's program that has ended is not waited for as one that has not, though the file already
+/// holds the pids the case asks for: the case would signal a program that is no longer there. The
+/// wait fails and says what the report said.
+#[test]
+fn a_report_that_has_ended_fails_the_wait_for_pids_the_file_already_holds() {
+    let place = tempfile::tempdir().expect("a directory for the pids");
+    let pids = place.path().join("pids.txt");
+    let mut run = Run::start(
+        &[step("ends", "timeout = 600", "ends", &pids)],
+        &[("ends", RECORDS_AND_ENDS)],
+    );
+    run.ended_within(BOUND);
+    let recorded = std::fs::read_to_string(&pids).unwrap_or_default();
+    assert_eq!(
+        recorded.lines().count(),
+        2,
+        "the script recorded {recorded:?}"
+    );
+    let caught =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run.recorded_pids(&pids, 2)));
+    let panic = match caught {
+        Ok(pids) => panic!("a report that had ended was waited for as one that had not: {pids:?}"),
+        Err(panic) => panic,
+    };
+    let message = panic.downcast_ref::<String>().cloned().unwrap_or_default();
+    assert!(message.contains("the report's program ended"), "{message}");
+    assert!(message.contains("it said:"), "{message}");
 }
