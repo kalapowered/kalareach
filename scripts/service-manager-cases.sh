@@ -12,13 +12,13 @@
 # removed is filtered out, and cargo then exits 0 having run nothing. The script exits non-zero
 # when any command fails or runs less than it names; each command runs even when an earlier one
 # failed, so one run shows every case that does not hold. Each command's output goes through `tee`
-# to the file service-manager-cases.out in the target directory as the command writes it, so that a
-# command that hangs shows what it did before. The script starts no unit of its own and removes
-# nothing: the units a case leaves behind when it dies are the caller's to end.
+# to a temporary file as the command writes it, so that a command that hangs shows what it did
+# before and the script can count the cases that passed; the script removes that file when it ends.
+# The script starts no unit of its own and removes nothing else: the units a case leaves behind when
+# it dies are the caller's to end.
 set -u
 
 cd "$(dirname "${BASH_SOURCE[0]}")/.." || exit 2
-out="${CARGO_TARGET_DIR:-target}/service-manager-cases.out"
 
 if [ "$(uname -s)" != Linux ]; then
   echo "service-manager-cases: these cases run only on Linux" >&2
@@ -29,11 +29,13 @@ if ! systemctl --user show --property=Version --value > /dev/null 2>&1; then
   exit 2
 fi
 
+out="$(mktemp "${TMPDIR:-/tmp}/service-manager-cases.XXXXXX")" || exit 2
+trap 'rm -f "$out"' EXIT
+
 failed=0
 step() {
   echo "== $*"
   local status=0 exact=0 named=0 word
-  mkdir -p "$(dirname "$out")"
   "$@" 2>&1 | tee "$out"
   status=${PIPESTATUS[0]}
   for word in "$@"; do

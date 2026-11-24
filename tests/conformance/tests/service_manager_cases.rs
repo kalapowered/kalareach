@@ -56,8 +56,8 @@ fn place(dir: &Path, name: &str, body: &str) {
 /// Runs the script on `host` and returns what it printed, its exit code and the commands the
 /// stand-ins were given, one a line.
 ///
-/// The script writes each command's output to a file in its target directory and reads it back,
-/// and the cases of this file run side by side, so each run has a target directory of its own.
+/// The script writes each command's output to a temporary file and reads it back. Each run is given
+/// a target directory of its own, and the script makes nothing in it.
 fn run(host: &Host) -> (String, Option<i32>, Vec<String>) {
     let dir = tempfile::tempdir().expect("a folder for the stand-ins");
     let calls = dir.path().join("calls");
@@ -157,4 +157,61 @@ fn a_failed_case_fails_the_step_and_the_next_command_still_runs() {
     let (text, code, calls) = run(&host);
     assert_eq!(code, Some(1), "{text}");
     assert_eq!(calls.len(), 3, "each command ran: {calls:?}");
+}
+
+/// The script keeps what each command printed in a file `mktemp` makes in the temporary directory,
+/// which is there while each command runs and gone when the script ends, and it makes nothing in
+/// the target directory.
+#[test]
+fn the_script_keeps_its_count_in_a_temporary_file_and_removes_it_when_it_ends() {
+    let dir = tempfile::tempdir().expect("a folder for the stand-ins");
+    let temporary = dir.path().join("temporary");
+    std::fs::create_dir(&temporary).expect("a temporary directory");
+    let during = dir.path().join("during");
+    let says = dir.path().join("cargo-says");
+    std::fs::write(&says, result(1)).expect("what cargo prints");
+    place(dir.path(), "uname", "echo Linux");
+    place(dir.path(), "systemctl", "exit 0");
+    place(
+        dir.path(),
+        "cargo",
+        &format!(
+            "ls '{}' >> '{}'\ncat '{}'",
+            temporary.display(),
+            during.display(),
+            says.display()
+        ),
+    );
+    let output = Command::new("/bin/bash")
+        .arg(script())
+        .env("PATH", format!("{}:/usr/bin:/bin", dir.path().display()))
+        .env("TMPDIR", &temporary)
+        .env("CARGO_TARGET_DIR", dir.path().join("target"))
+        .output()
+        .expect("bash runs the script");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.status.code(), Some(0), "{text}");
+    let seen = std::fs::read_to_string(&during).unwrap_or_default();
+    assert_eq!(
+        seen.lines().count(),
+        2,
+        "one file in the temporary directory while each of the two commands ran: {seen:?}"
+    );
+    assert!(
+        seen.lines()
+            .all(|name| name.starts_with("service-manager-cases.")),
+        "{seen:?}"
+    );
+    let left: Vec<_> = std::fs::read_dir(&temporary)
+        .expect("the temporary directory")
+        .collect();
+    assert!(left.is_empty(), "the script removes its file: {left:?}");
+    assert!(
+        !dir.path().join("target").exists(),
+        "the script makes nothing in the target directory"
+    );
 }
