@@ -415,19 +415,27 @@ pub fn judge(
     asking: Asking,
 ) -> (CapabilityState, CapabilityEvidenceSource, Option<Sentence>) {
     match outcome {
-        Outcome::Performed { detail } => (
-            CapabilityState::QualifiedAvailable,
-            CapabilityEvidenceSource::DisclosedProbe,
-            Some(
-                Sentence::new()
+        Outcome::Performed { detail } => {
+            (
+                CapabilityState::QualifiedAvailable,
+                CapabilityEvidenceSource::DisclosedProbe,
+                Some({
+                    let said = Sentence::new()
                     .stated("this context performed the operation: ")
                     .sentence(detail)
                     .stated(
                         ". That is what establishes it, and it establishes it for this binary and \
                          this permission state only",
-                    ),
-            ),
-        ),
+                    );
+                    // Where a grant exists and nothing can see it withdrawn, the person is told so.
+                    if asking == Asking::ForAGrant && check != Check::ApplicationLaunch {
+                        said.stated(". A permission you withdraw later shows only when the checks run again")
+                    } else {
+                        said
+                    }
+                }),
+            )
+        }
         Outcome::PermissionRefused { permission, detail } => (
             CapabilityState::PermissionRequired,
             CapabilityEvidenceSource::DisclosedProbe,
@@ -695,6 +703,9 @@ const fn has_a_desktop_of(os: HostOs, display_server: DisplayServer) -> bool {
 
 /// Runs the checks given and returns one record each, in the order given.
 ///
+/// `first` is the reading the checks were chosen from, which the report holds every later reading
+/// against and does not take again.
+///
 /// A tool-specific permission stays its own record here. There is no aggregate answer to collapse
 /// into, and a caller reading this list reads separate states: an accessibility grant that this
 /// context holds says nothing about a screen image, and the report never says otherwise.
@@ -712,6 +723,7 @@ const fn has_a_desktop_of(os: HostOs, display_server: DisplayServer) -> bool {
 /// program all draw on it. A check whose time ran out before its operation started starts nothing.
 #[must_use]
 pub fn report(
+    first: &Surroundings,
     checks: &[Check],
     subject: &CapabilitySubject,
     source: &dyn ContextSource,
@@ -727,6 +739,7 @@ pub fn report(
         plan,
         facilities,
         &Seams {
+            first,
             time_of: &time_of,
             routes: &resolve,
         },
@@ -736,6 +749,8 @@ pub fn report(
 /// What a report takes from outside itself, so that a case can give it its own: the time each
 /// check has, and how a check is turned into an operation on a desktop.
 struct Seams<'a> {
+    /// The reading that selected the desktop, which the caller took to choose the checks.
+    first: &'a Surroundings,
     time_of: &'a dyn Fn(Check) -> Time,
     routes: &'a dyn Fn(Check, &DesktopContext, Option<&std::ffi::OsStr>) -> Option<Operation>,
 }
@@ -767,6 +782,12 @@ const AFTER_OPERATION: Duration = Duration::from_secs(5);
 /// The time the first reading has, which comes before every check and belongs to none.
 pub const FIRST_READING: Duration = Duration::from_secs(10);
 
+/// Reads the desktop once for the checks to be chosen from and reported against.
+#[must_use]
+pub fn first_reading(source: &dyn ContextSource) -> Surroundings {
+    source.read(&Deadline::after(FIRST_READING))
+}
+
 /// [`report`], with the time each check has and the routes it takes given by the caller.
 fn report_timed(
     checks: &[Check],
@@ -778,7 +799,7 @@ fn report_timed(
     seams: &Seams<'_>,
 ) -> Vec<CapabilityRecord> {
     let observed_at_ms = kr_ipc::now_ms();
-    let first = source.read(&Deadline::after(FIRST_READING));
+    let first = seams.first.clone();
     let profile = first.desktop.worker_profile;
     let mut stopped = false;
     let mut records = Vec::new();
@@ -1959,10 +1980,7 @@ fn bounded(
     if deadline.expired() {
         return Run {
             facility,
-            exit: Exit::Unfinished(Outcome::NotAnswered {
-                waited: Duration::ZERO,
-                stopped: true,
-            }),
+            exit: Exit::Unfinished(Outcome::TimedOut),
         };
     }
     if let Err(error) = std::fs::create_dir_all(&plan.scratch) {
@@ -2230,6 +2248,11 @@ mod tests {
         }
     }
 
+    /// The first reading a caller takes from a source, as `checks::perform` does.
+    fn first_of(source: &dyn ContextSource) -> Surroundings {
+        super::first_reading(source)
+    }
+
     /// [`super::report`] against a desktop that does not change.
     fn report(
         checks: &[Check],
@@ -2239,7 +2262,16 @@ mod tests {
         plan: &Plan,
         facilities: &dyn Facilities,
     ) -> Vec<CapabilityRecord> {
-        super::report(checks, subject, &fixed(desktop), revision, plan, facilities)
+        let source = fixed(desktop);
+        super::report(
+            &first_of(&source),
+            checks,
+            subject,
+            &source,
+            revision,
+            plan,
+            facilities,
+        )
     }
 
     /// Performs one check through the platform's facilities, on this test's own macOS desktop.
@@ -2358,6 +2390,7 @@ mod tests {
         let source = Readings::of(vec![first, before.clone(), before]);
         let seeing = Seeing::default();
         let records = super::report(
+            &first_of(&source),
             &[Check::ScreenImage],
             &subject(),
             &source,
@@ -2407,6 +2440,7 @@ mod tests {
                 surroundings(after),
             ]);
             let records = super::report(
+                &first_of(&source),
                 &[Check::ScreenImage],
                 &subject(),
                 &source,
@@ -2432,6 +2466,7 @@ mod tests {
         }
         let same = Readings::of(vec![surroundings(desktop())]);
         let records = super::report(
+            &first_of(&same),
             &[Check::ScreenImage],
             &subject(),
             &same,
@@ -2499,6 +2534,7 @@ mod tests {
             let source = Readings::of(vec![surroundings(context)]);
             let seeing = Seeing::default();
             let records = super::report(
+                &first_of(&source),
                 &[Check::ScreenImage],
                 &subject(),
                 &source,
@@ -2534,6 +2570,7 @@ mod tests {
         ]);
         let seeing = Seeing::default();
         let records = super::report(
+            &first_of(&source),
             &[Check::AccessibleElement, Check::ScreenImage],
             &subject(),
             &source,
@@ -2576,6 +2613,7 @@ mod tests {
         ]);
         let seeing = Seeing::default();
         let records = super::report(
+            &first_of(&source),
             &[
                 Check::ScreenImage,
                 Check::AccessibleElement,
@@ -2978,6 +3016,7 @@ mod tests {
             &Plan::in_directory("."),
             &facility,
             &Seams {
+                first: &first_of(&source),
                 time_of: &|_| Time {
                     bound,
                     after: Duration::from_millis(800),
@@ -3024,6 +3063,7 @@ mod tests {
             &Plan::in_directory("."),
             &seeing,
             &Seams {
+                first: &first_of(&source),
                 time_of: &|_| Time {
                     bound: Duration::from_millis(600),
                     after: Duration::from_millis(100),
@@ -3068,16 +3108,18 @@ mod tests {
                 surroundings(desktop())
             }
         }
+        let source = SlowAfter {
+            reads: std::sync::atomic::AtomicUsize::new(0),
+        };
         let records = report_timed(
             &[Check::AccessibleElement],
             &subject(),
-            &SlowAfter {
-                reads: std::sync::atomic::AtomicUsize::new(0),
-            },
+            &source,
             revision(),
             &Plan::in_directory("."),
             &Seeing::default(),
             &Seams {
+                first: &first_of(&source),
                 time_of: &|_| Time {
                     bound: Duration::from_millis(600),
                     after: Duration::from_millis(100),
@@ -3144,6 +3186,7 @@ mod tests {
                     replace,
                 },
                 &Seams {
+                    first: &first_of(&source),
                     time_of: &time_of,
                     routes: &route,
                 },
@@ -3204,6 +3247,7 @@ mod tests {
             &Plan::in_directory("."),
             &Platform,
             &Seams {
+                first: &first_of(&source),
                 time_of: &time_of,
                 routes: &route,
             },
@@ -3218,6 +3262,42 @@ mod tests {
             "the record names the path the tool would be installed at"
         );
         assert!(!records[0].identity.version.is_present(), "and no digest");
+    }
+
+    /// KR-REQ-03.29, R11: where a grant exists, a finding says that a permission withdrawn later
+    /// shows only when the checks run again; the launch needs no grant and a route with none says
+    /// nothing of it.
+    #[test]
+    fn a_finding_says_a_permission_withdrawn_later_shows_only_on_a_new_run() {
+        let said = |check, asking| {
+            super::judge(
+                check,
+                &Outcome::Performed {
+                    detail: Sentence::new().stated("it ran"),
+                },
+                asking,
+            )
+            .2
+            .expect("a reason")
+            .as_str()
+            .to_owned()
+        };
+        let words = ". A permission you withdraw later shows only when the checks run again";
+        for check in [
+            Check::ScreenImage,
+            Check::AccessibleElement,
+            Check::AuthorisedFileRead,
+        ] {
+            assert!(said(check, Asking::ForAGrant).ends_with(words), "{check:?}");
+            assert!(
+                !said(check, Asking::Never).contains("withdraw"),
+                "{check:?}"
+            );
+        }
+        assert!(
+            !said(Check::ApplicationLaunch, Asking::ForAGrant).contains("withdraw"),
+            "the launch needs no grant"
+        );
     }
 
     /// KR-REQ-03.29, S-8: what a check reads of its own files, an image and what a facility printed,
@@ -3273,8 +3353,8 @@ mod tests {
         };
         assert!(*waited < Duration::from_millis(650), "waited {waited:?}");
         assert!(
-            matches!(calls[2].0, Exit::Unfinished(Outcome::NotAnswered { .. })),
-            "a call after the deadline starts nothing"
+            matches!(calls[2].0, Exit::Unfinished(Outcome::TimedOut)),
+            "a call after the deadline starts nothing, and does not say that it was started"
         );
         assert!(
             started.elapsed() < Duration::from_millis(1_200) + Duration::from_secs(1),
@@ -4639,6 +4719,7 @@ fn the_disclosed_checks_on_this_desktop() {
         variables: crate::desktop::routes::Variables::of_this_process(),
     };
     let records = report(
+        &first_reading(&reading),
         &Check::all(),
         &subject,
         &reading,

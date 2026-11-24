@@ -84,9 +84,8 @@ pub fn perform(
     };
     // The first reading names the desktop the records are about and which checks it is asked for.
     // Each operation that acts on the desktop reads it again before it starts and after it ends.
-    let desktop = source
-        .read(&probe::Deadline::after(probe::FIRST_READING))
-        .desktop;
+    let first = probe::first_reading(source);
+    let desktop = first.desktop.clone();
     let subject = CapabilitySubject {
         environment_id: request.environment_id,
         desktop_session_id: desktop.desktop_session_id.clone(),
@@ -95,6 +94,7 @@ pub fn perform(
         terminal: Nullable::null(),
     };
     let records = probe::report(
+        &first,
         &probe::performable(&desktop),
         &subject,
         source,
