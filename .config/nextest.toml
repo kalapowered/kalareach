@@ -18,6 +18,11 @@ default-filter = "not (binary_id(companion-tauri::navigation) | binary_id(compan
 # A rerun is not a fix: a case that fails once fails.
 retries = 0
 fail-fast = false
+# Test threads for a run: 32, the count the shadow runs measured on the box's 64 processors, which the checklist's
+# other steps share; cases with a time bound fail when a run asks more of the processors than the box has. The
+# variable NEXTEST_TEST_THREADS, which a box job sets from its share, overrides this value (the order, measured: the
+# command line, then the variable, then the profile), so the shadow script unsets it.
+test-threads = 32
 # One line for every case, so that the log names each one the way a libtest run does.
 status-level = "pass"
 final-status-level = "fail"
