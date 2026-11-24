@@ -1780,8 +1780,8 @@ impl ClaimRefusal {
         self.into_error_until(None)
     }
 
-    /// As [`Self::into_error`], naming the moment a pairing's invitation stays open until when the
-    /// refusal is that pairing's.
+    /// The refusal as the controller gives it, with the words a person reads, naming the moment a
+    /// pairing's invitation stays open until when the refusal is that pairing's.
     pub(crate) fn into_error_until(self, open_until: Option<&str>) -> ControllerError {
         match self {
             Self::Live => ControllerError::PermissionDenied {
