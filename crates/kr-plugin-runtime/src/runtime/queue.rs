@@ -112,6 +112,9 @@ pub struct ObservationQueue {
     offered: u64,
     /// The place of the event `take_one` took last.
     taken: u64,
+    /// The place of the first request that was offered and refused, which no gap accounts for,
+    /// until `take_loss_before_taken` reports it. Zero means none.
+    refused: u64,
     /// Which snapshot obligation is outstanding, counted from one. Zero means none.
     snapshot_owed: u64,
     /// How many obligations have ever been raised, so a new one is always a new number.
@@ -142,6 +145,7 @@ impl ObservationQueue {
             },
             offered: 0,
             taken: 0,
+            refused: 0,
             snapshot_owed: 0,
             obligations: 0,
         }
@@ -222,6 +226,7 @@ impl ObservationQueue {
             // ordinary observation of that size is a gap of one; an authoritative request of that
             // size is refused so the broker keeps it rather than losing it here.
             if event.is_authoritative() {
+                self.note_refusal(order);
                 return Admission::Refused {
                     held_bytes: self.held_bytes,
                 };
@@ -244,7 +249,9 @@ impl ObservationQueue {
                 // evicted on the way here is a gap, and so is this event if it is an ordinary
                 // observation: nobody else is holding one of those, so losing it without recording
                 // it would be a hole in the stream that nothing ever accounts for.
-                if !event.is_authoritative() {
+                if event.is_authoritative() {
+                    self.note_refusal(order);
+                } else {
                     evicted_events = evicted_events.saturating_add(1);
                     evicted_bytes = evicted_bytes.saturating_add(bytes);
                     self.gap.note(order, &event.handle);
@@ -280,6 +287,38 @@ impl ObservationQueue {
                 bytes: evicted_bytes,
             }
         }
+    }
+
+    /// Records that the request offered `order`th was refused, which is a loss no gap reports.
+    ///
+    /// A refused request stays with the broker, so the gap and the snapshot of `/3` do not change; the
+    /// binding is told through [`Self::take_loss_before_taken`] so that what it consumed after the
+    /// request is not claimed to follow it.
+    const fn note_refusal(&mut self, order: u64) {
+        if self.refused == 0 {
+            self.refused = order;
+        }
+    }
+
+    /// Returns true when the gap holds a lost event, or a request was refused, that was offered
+    /// before the event `take_one` took last, and forgets the refusal.
+    ///
+    /// Called with the queue still held after `take_one`, so that what is reported is what stood
+    /// before that event. A loss offered after it, which the queue records while the component
+    /// works on it, comes before no event this pass has taken.
+    pub const fn take_loss_before_taken(&mut self) -> bool {
+        let gap = self.gap.first.is_some() && self.gap.first_order < self.taken;
+        let refused = self.refused != 0 && self.refused < self.taken;
+        if refused {
+            self.refused = 0;
+        }
+        gap || refused
+    }
+
+    /// Returns true when a gap is waiting to be taken.
+    #[must_use]
+    pub const fn gap_pending(&self) -> bool {
+        !self.gap.is_empty()
     }
 
     /// Takes the gap, if there is one.
@@ -620,6 +659,99 @@ mod tests {
         let gap = drained.gap.expect("a gap");
         assert!(gap.events >= 5, "only {} events reported lost", gap.events);
         assert!(gap.bytes >= gap.u64_events() * 240);
+    }
+
+    /// A loss is reported against the events offered after it, and not against those before it.
+    #[test]
+    fn a_loss_is_reported_before_the_events_offered_after_it() {
+        let mut queue = ObservationQueue::with_capacity(500);
+        queue.push(scrape("se-0", 100));
+        queue.push(scrape("se-1", 100));
+        assert_eq!(
+            queue.take_one().map(|event| event.handle),
+            SourceEventHandle::new("se-0").ok()
+        );
+        assert!(!queue.take_loss_before_taken(), "nothing was lost yet");
+        // Three more fill the queue, and the one after them takes the place of the oldest.
+        for index in 2..=5 {
+            queue.push(scrape(&format!("se-{index}"), 100));
+        }
+        assert_eq!(queue.take_gap().map(|gap| gap.events), Some(1));
+        queue.push(scrape("se-6", 100));
+        queue.push(scrape("se-7", 100));
+        queue.push(scrape("se-8", 100));
+        // What was lost was offered before the event taken now.
+        assert!(queue.take_one().is_some());
+        assert!(
+            queue.take_loss_before_taken(),
+            "a loss stands before this event"
+        );
+    }
+
+    /// A loss offered after the event taken is not one that stands before it.
+    #[test]
+    fn a_loss_offered_after_the_event_taken_is_not_reported_against_it() {
+        let mut queue = ObservationQueue::with_capacity(500);
+        for index in 0..4 {
+            queue.push(request(&format!("se-{index}"), &format!("rq-{index}"), 100));
+        }
+        // Nothing but requests to evict: this scrape is the loss, and it is the newest.
+        assert!(matches!(
+            queue.push(scrape("se-lost", 100)),
+            Admission::Refused { .. }
+        ));
+        assert!(queue.take_one().is_some());
+        assert!(!queue.take_loss_before_taken());
+    }
+
+    /// A request the queue refuses is a loss that no gap reports, and the events offered after it
+    /// are told of it once.
+    #[test]
+    fn a_refused_request_is_reported_before_the_events_offered_after_it() {
+        let mut queue = ObservationQueue::with_capacity(500);
+        for index in 0..4 {
+            queue.push(request(&format!("se-{index}"), &format!("rq-{index}"), 100));
+        }
+        assert!(matches!(
+            queue.push(request("se-refused", "rq-refused", 100)),
+            Admission::Refused { .. }
+        ));
+        assert!(queue.take_gap().is_none(), "the gap of /3 does not change");
+        for _ in 0..4 {
+            assert!(queue.take_one().is_some());
+            assert!(!queue.take_loss_before_taken(), "these came before it");
+        }
+        queue.push(request("se-after", "rq-after", 100));
+        assert!(queue.take_one().is_some());
+        assert!(queue.take_loss_before_taken(), "this one came after it");
+        queue.push(request("se-last", "rq-last", 100));
+        assert!(queue.take_one().is_some());
+        assert!(!queue.take_loss_before_taken(), "it is reported once");
+    }
+
+    /// A gap names the first and the last event it lost in the order they were offered, and a request
+    /// the queue kept can stand between them.
+    #[test]
+    fn a_gap_names_the_first_and_last_lost_event_in_the_order_they_were_offered() {
+        let mut queue = ObservationQueue::with_capacity(500);
+        queue.push(scrape("se-0", 100));
+        queue.push(request("se-1", "rq-1", 100));
+        queue.push(scrape("se-2", 100));
+        queue.push(scrape("se-3", 100));
+        for index in 4..=6 {
+            queue.push(scrape(&format!("se-{index}"), 100));
+        }
+        let gap = queue.take_gap().expect("a gap");
+        assert_eq!(gap.events, 3);
+        assert_eq!(gap.first, SourceEventHandle::new("se-0").ok());
+        assert_eq!(gap.last, SourceEventHandle::new("se-3").ok());
+        let kept: Vec<_> = queue
+            .drain(16)
+            .events
+            .into_iter()
+            .map(|e| e.handle)
+            .collect();
+        assert!(kept.contains(&SourceEventHandle::new("se-1").expect("a handle")));
     }
 
     impl ObservationGap {
