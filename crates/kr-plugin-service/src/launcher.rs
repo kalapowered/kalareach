@@ -70,21 +70,24 @@ use crate::protocol4::{Frame4, HostDescriptor4, Request4, RequestBody4, Response
 /// The largest descriptor this host writes or reads.
 const MAX_DESCRIPTOR_BYTES: u64 = 8 * 1024;
 
-/// One environment's publication turn.
+/// One environment's publication turn, for the descriptors of both protocols.
 ///
 /// Writing a descriptor is a file write, a flush and a rename, and a timer cannot interrupt any of
 /// it: a publication this launcher stopped waiting for still finishes. What must not happen is that
 /// it finishes *after* a later launch published its own, and replaces it.
 ///
 /// So a publication is not merely checked before it starts: it holds this environment's turn from
-/// the check to the rename. Each attempt takes a number, and a publication that finds a newer
-/// number when its turn comes writes nothing and says so. Two launches for one environment
-/// therefore publish in order, and the older one never wins.
+/// the check to the rename. Each launch takes a number once, when its acceptance reaches
+/// publication, and everything the launch does to the environment's descriptors holds the turn
+/// under that number: the removal of an earlier host's `/4` descriptor, the publication of `/3` and
+/// the publication of `/4`. An action that finds a newer number when its turn comes does nothing and
+/// says so. Two launches for one environment therefore act in order, and the older one never wins,
+/// whichever of its descriptors it was still to write or remove.
 static PUBLICATIONS: std::sync::LazyLock<std::sync::Mutex<Turns>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(Turns::new()));
 
-/// The publication turns, by environment and descriptor file.
-type Turns = std::collections::HashMap<(EnvironmentId, &'static str), Arc<std::sync::Mutex<u64>>>;
+/// The publication turns, by environment.
+type Turns = std::collections::HashMap<EnvironmentId, Arc<std::sync::Mutex<u64>>>;
 
 /// The source of publication numbers, which are never reused inside a process.
 static NEXT_PUBLICATION: AtomicU64 = AtomicU64::new(1);
@@ -113,63 +116,74 @@ impl Drop for Waiting {
     }
 }
 
-/// Returns the publication turn of one environment's descriptor of one protocol.
+/// Returns the publication turn of one environment's descriptors.
 ///
-/// The turn belongs to the file the protocol names, so a publication of another file never makes
-/// this one stale.
-fn publication_turn(
-    environment_id: EnvironmentId,
-    protocol: &HostProtocol,
-) -> Arc<std::sync::Mutex<u64>> {
+/// One turn covers the descriptor of every protocol: a launch that replaces the host replaces both,
+/// so a later launch's `/3` must fence an earlier launch's `/4` as it fences its `/3`.
+fn publication_turn(environment_id: EnvironmentId) -> Arc<std::sync::Mutex<u64>> {
     PUBLICATIONS.lock().map_or_else(
         |_poisoned| Arc::new(std::sync::Mutex::new(0)),
         |mut turns| {
             Arc::clone(
                 turns
-                    .entry((environment_id, protocol.descriptor))
+                    .entry(environment_id)
                     .or_insert_with(|| Arc::new(std::sync::Mutex::new(0))),
             )
         },
     )
 }
 
-/// Publishes a descriptor in this environment's publication order.
+/// Takes the number of one launch, which it keeps for everything it does to the environment's
+/// descriptors.
+fn take_attempt() -> u64 {
+    NEXT_PUBLICATION.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Publishes a descriptor in this environment's publication order, for the launch that took
+/// `attempt`.
 ///
 /// Called on a blocking thread, and it waits there: the turn is held by whoever is publishing, and
-/// waiting for it is waiting for a file write rather than for anything on an executor. Taking the
-/// number after the turn is what puts two launches in the order they reached publication, and the
-/// turn is held from that point to the rename, so no later launch's descriptor can be replaced by
-/// an earlier launch that was slow.
+/// waiting for it is waiting for a file write rather than for anything on an executor. The turn is
+/// held from the check to the rename, so no later launch's descriptor can be replaced by an earlier
+/// launch that was slow.
+///
+/// The descriptor of `/4` that is still there when a launch publishes `/3` belongs to an earlier
+/// host. It is taken away inside the turn, after the checks, so that no reader finds the old one
+/// beside the new `/3`, and a launch that is out of turn takes away nothing.
 ///
 /// A launch whose acceptance has already given up publishes nothing: `abandoned` is what its
 /// acceptance sets on its way out.
 fn publish_in_turn(
     turn: &std::sync::Mutex<u64>,
+    attempt: u64,
     abandoned: &core::sync::atomic::AtomicBool,
     environment: &EnvironmentPaths,
     protocol: &HostProtocol,
     descriptor: &HostDescriptor,
 ) -> LaunchResult<()> {
-    let attempt = NEXT_PUBLICATION.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     publish_numbered(turn, attempt, abandoned, || {
+        if *protocol == HostProtocol::V3 {
+            let _ = retire_descriptor(environment, &HostProtocol::V4);
+        }
         publish_descriptor(environment, protocol, descriptor)
     })
 }
 
-/// [`publish_in_turn`] for the descriptor of `/4`.
+/// [`publish_in_turn`] for the descriptor of `/4`, under the number of the launch that published
+/// the `/3` beside it.
 fn publish_in_turn4(
     turn: &std::sync::Mutex<u64>,
+    attempt: u64,
     abandoned: &core::sync::atomic::AtomicBool,
     environment: &EnvironmentPaths,
     descriptor: &HostDescriptor4,
 ) -> LaunchResult<()> {
-    let attempt = NEXT_PUBLICATION.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     publish_numbered(turn, attempt, abandoned, || {
         publish_descriptor4(environment, descriptor)
     })
 }
 
-/// [`publish_in_turn`] for the attempt that took `attempt`, writing with `publish`.
+/// [`publish_in_turn`] for the launch that took `attempt`, acting with `publish`.
 fn publish_numbered(
     turn: &std::sync::Mutex<u64>,
     attempt: u64,
@@ -1262,7 +1276,8 @@ impl HostReservation {
                     // finishes. So it is fenced rather than merely bounded -- it writes nothing once
                     // a later launch has taken the environment's publication -- and the wait for it
                     // is inside the deadline like every other stage.
-                    let turn = publication_turn(self.environment_id, &self.protocol);
+                    let turn = publication_turn(self.environment_id);
+                    let attempt = take_attempt();
                     // Set when this acceptance stops waiting, however it stops: its own deadline,
                     // or a caller that dropped it. A publication still queued behind somebody
                     // else's then publishes nothing, because a descriptor for a startup nobody is
@@ -1279,13 +1294,14 @@ impl HostReservation {
                         let descriptor = descriptor.clone();
                         let abandoned = Arc::clone(&abandoned);
                         tokio::task::spawn_blocking(move || {
-                            // A descriptor of `/4` that is still there belongs to a host that
-                            // has ended, and is taken away before the new host's is published,
-                            // so that no reader finds the old one beside the new `/3`.
-                            if protocol == HostProtocol::V3 {
-                                let _ = retire_descriptor(&paths, &HostProtocol::V4);
-                            }
-                            publish_in_turn(&turn, &abandoned, &paths, &protocol, &descriptor)
+                            publish_in_turn(
+                                &turn,
+                                attempt,
+                                &abandoned,
+                                &paths,
+                                &protocol,
+                                &descriptor,
+                            )
                         })
                     };
                     match tokio::time::timeout(left, publishing).await {
@@ -1321,7 +1337,8 @@ impl HostReservation {
                     }
                     // The host serves now, so the endpoint of `/4` can be asked who answers it.
                     if self.protocol == HostProtocol::V3 {
-                        self.publish_four(environment, &descriptor, deadline).await;
+                        self.publish_four(environment, &descriptor, deadline, attempt)
+                            .await;
                     }
                     // One reservation, one host: the endpoint stays this launcher's, and every
                     // later claim on it is refused and counted.
@@ -1352,6 +1369,7 @@ impl HostReservation {
         environment: &EnvironmentPaths,
         claimed: &HostDescriptor,
         deadline: tokio::time::Instant,
+        attempt: u64,
     ) {
         let left = deadline
             .saturating_duration_since(tokio::time::Instant::now())
@@ -1360,7 +1378,7 @@ impl HostReservation {
         else {
             return;
         };
-        let turn = publication_turn(self.environment_id, &HostProtocol::V4);
+        let turn = publication_turn(self.environment_id);
         let abandoned = Arc::new(core::sync::atomic::AtomicBool::new(false));
         let waiting = Waiting {
             abandoned: Arc::clone(&abandoned),
@@ -1369,7 +1387,7 @@ impl HostReservation {
         let left = deadline.saturating_duration_since(tokio::time::Instant::now());
         let paths = environment.clone();
         let publishing = tokio::task::spawn_blocking(move || {
-            publish_in_turn4(&turn, &abandoned, &paths, &descriptor)
+            publish_in_turn4(&turn, attempt, &abandoned, &paths, &descriptor)
         });
         if matches!(tokio::time::timeout(left, publishing).await, Ok(Ok(Ok(())))) {
             waiting.finished();
@@ -2261,6 +2279,19 @@ mod tests {
         silent.abort();
     }
 
+    fn descriptor4_for(identity: &HostIdentity, endpoint: &str) -> HostDescriptor4 {
+        HostDescriptor4 {
+            protocol: HostProtocol::V4.name.to_owned(),
+            environment_id: identity.environment_id(),
+            reservation_id: ReservationId::new(kr_protocol::scalars::Uuid::from_bytes([0; 16])),
+            endpoint: endpoint.to_owned(),
+            boot_identity: identity.boot_identity().clone(),
+            process_start_identity: identity.process_start_identity().clone(),
+            host_public_key: *identity.public_key(),
+            build: honest_build(),
+        }
+    }
+
     #[test]
     fn a_publication_a_later_launch_superseded_writes_nothing() {
         let host = kr_ipc::testing::TempHost::create();
@@ -2269,18 +2300,34 @@ mod tests {
             HostIdentity::generate(host.environment_id()).expect("this host can describe itself");
         let descriptor = descriptor_of(&identity, "/run/kr/first.sock");
 
-        let turn = publication_turn(host.environment_id(), &HostProtocol::V3);
+        let turn = publication_turn(host.environment_id());
         let waiting = core::sync::atomic::AtomicBool::new(false);
 
         // The launch that reaches publication first publishes first.
+        let earlier = take_attempt();
         let later = descriptor_of(&identity, "/run/kr/second.sock");
-        publish_in_turn(&turn, &waiting, &environment, &HostProtocol::V3, &later)
-            .expect("the first publication wins");
+        publish_in_turn(
+            &turn,
+            earlier,
+            &waiting,
+            &environment,
+            &HostProtocol::V3,
+            &later,
+        )
+        .expect("the first publication wins");
 
         // A launch that reached publication later, with a number of its own, publishes after it.
         let third = descriptor_of(&identity, "/run/kr/third.sock");
-        publish_in_turn(&turn, &waiting, &environment, &HostProtocol::V3, &third)
-            .expect("a later launch publishes");
+        let newest = take_attempt();
+        publish_in_turn(
+            &turn,
+            newest,
+            &waiting,
+            &environment,
+            &HostProtocol::V3,
+            &third,
+        )
+        .expect("a later launch publishes");
         let published = read_descriptor(&environment, &HostProtocol::V3)
             .expect("a read")
             .expect("a descriptor");
@@ -2291,6 +2338,7 @@ mod tests {
         let abandoned = core::sync::atomic::AtomicBool::new(true);
         let refused = publish_in_turn(
             &turn,
+            take_attempt(),
             &abandoned,
             &environment,
             &HostProtocol::V3,
@@ -2305,18 +2353,165 @@ mod tests {
 
         // Another environment's publications are its own.
         let elsewhere = kr_ipc::testing::TempHost::create();
-        let their_turn = publication_turn(elsewhere.environment_id(), &HostProtocol::V3);
+        let their_turn = publication_turn(elsewhere.environment_id());
         let their_identity =
             HostIdentity::generate(elsewhere.environment_id()).expect("an identity");
         let theirs = descriptor_of(&their_identity, "/run/kr/fourth.sock");
         publish_in_turn(
             &their_turn,
+            take_attempt(),
             &waiting,
             &elsewhere.environment(),
             &HostProtocol::V3,
             &theirs,
         )
         .expect("another environment is unaffected");
+    }
+
+    #[test]
+    fn a_launch_publishes_both_descriptors_under_the_one_number_it_took() {
+        let host = kr_ipc::testing::TempHost::create();
+        let environment = host.environment();
+        let identity =
+            HostIdentity::generate(host.environment_id()).expect("this host can describe itself");
+        let turn = publication_turn(host.environment_id());
+        let waiting = core::sync::atomic::AtomicBool::new(false);
+
+        let launch = take_attempt();
+        publish_in_turn(
+            &turn,
+            launch,
+            &waiting,
+            &environment,
+            &HostProtocol::V3,
+            &descriptor_of(&identity, "/run/kr/own-3.sock"),
+        )
+        .expect("the launch publishes the third protocol's descriptor");
+        publish_in_turn4(
+            &turn,
+            launch,
+            &waiting,
+            &environment,
+            &descriptor4_for(&identity, "/run/kr/own-4.sock"),
+        )
+        .expect("the launch publishes the fourth protocol's descriptor under the same number");
+        let fourth = read_descriptor4(&environment)
+            .expect("a read")
+            .expect("a descriptor");
+        assert_eq!(fourth.endpoint, "/run/kr/own-4.sock");
+    }
+
+    #[test]
+    fn a_delayed_publication_of_the_fourth_protocol_across_a_replacement_writes_nothing() {
+        let host = kr_ipc::testing::TempHost::create();
+        let environment = host.environment();
+        let identity =
+            HostIdentity::generate(host.environment_id()).expect("this host can describe itself");
+        let turn = publication_turn(host.environment_id());
+        let waiting = core::sync::atomic::AtomicBool::new(false);
+
+        // An earlier launch took its number and published the third protocol's descriptor, and its
+        // write of the fourth's is still to come.
+        let earlier = take_attempt();
+        publish_in_turn(
+            &turn,
+            earlier,
+            &waiting,
+            &environment,
+            &HostProtocol::V3,
+            &descriptor_of(&identity, "/run/kr/old-3.sock"),
+        )
+        .expect("the earlier launch publishes the third protocol's descriptor");
+
+        // A later launch replaces the host and publishes both.
+        let later = take_attempt();
+        publish_in_turn(
+            &turn,
+            later,
+            &waiting,
+            &environment,
+            &HostProtocol::V3,
+            &descriptor_of(&identity, "/run/kr/new-3.sock"),
+        )
+        .expect("the later launch publishes the third protocol's descriptor");
+        publish_in_turn4(
+            &turn,
+            later,
+            &waiting,
+            &environment,
+            &descriptor4_for(&identity, "/run/kr/new-4.sock"),
+        )
+        .expect("the later launch publishes the fourth protocol's descriptor");
+
+        // The earlier launch's write comes now.
+        let refused = publish_in_turn4(
+            &turn,
+            earlier,
+            &waiting,
+            &environment,
+            &descriptor4_for(&identity, "/run/kr/old-4.sock"),
+        )
+        .expect_err("a delayed publication of the earlier launch is refused");
+        assert!(matches!(refused, LaunchError::Refused { .. }), "{refused}");
+        let fourth = read_descriptor4(&environment)
+            .expect("a read")
+            .expect("a descriptor");
+        assert_eq!(
+            fourth.endpoint, "/run/kr/new-4.sock",
+            "the delayed publication replaced the later launch's descriptor"
+        );
+    }
+
+    #[test]
+    fn an_acceptance_that_stopped_waiting_takes_away_no_descriptor_after_a_later_launch() {
+        let host = kr_ipc::testing::TempHost::create();
+        let environment = host.environment();
+        let identity =
+            HostIdentity::generate(host.environment_id()).expect("this host can describe itself");
+        let turn = publication_turn(host.environment_id());
+        let waiting = core::sync::atomic::AtomicBool::new(false);
+
+        // An earlier launch took its number, and its acceptance then stopped waiting.
+        let earlier = take_attempt();
+        let abandoned = core::sync::atomic::AtomicBool::new(true);
+
+        // A later launch published both descriptors.
+        let later = take_attempt();
+        publish_in_turn(
+            &turn,
+            later,
+            &waiting,
+            &environment,
+            &HostProtocol::V3,
+            &descriptor_of(&identity, "/run/kr/new-3.sock"),
+        )
+        .expect("the later launch publishes the third protocol's descriptor");
+        publish_in_turn4(
+            &turn,
+            later,
+            &waiting,
+            &environment,
+            &descriptor4_for(&identity, "/run/kr/new-4.sock"),
+        )
+        .expect("the later launch publishes the fourth protocol's descriptor");
+
+        // The earlier launch's blocking task runs now.
+        let refused = publish_in_turn(
+            &turn,
+            earlier,
+            &abandoned,
+            &environment,
+            &HostProtocol::V3,
+            &descriptor_of(&identity, "/run/kr/old-3.sock"),
+        )
+        .expect_err("an abandoned publication is refused");
+        assert!(matches!(refused, LaunchError::Refused { .. }), "{refused}");
+        let fourth = read_descriptor4(&environment).expect("a read");
+        assert_eq!(
+            fourth.map(|descriptor| descriptor.endpoint),
+            Some("/run/kr/new-4.sock".to_owned()),
+            "an abandoned launch took away the later launch's descriptor of the fourth protocol"
+        );
     }
 
     #[tokio::test]
