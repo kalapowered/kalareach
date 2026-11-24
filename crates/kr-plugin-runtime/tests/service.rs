@@ -5658,12 +5658,14 @@ mod recorded_session {
     /// the challenge and its signature, a path in a folder made for the run, the identity of the
     /// host's process and of the machine it runs on, how long something took, the component a
     /// registration carries (built with paths of the machine that built it) and what the engine says
-    /// of the target it compiles for and how much it compiled.
-    const OF_THE_RUN: [&str; 16] = [
+    /// of the target it compiles for and how much it compiled, and the version of the engine, which
+    /// changes with the release.
+    const OF_THE_RUN: [&str; 17] = [
         "component",
         "process_start_identity",
         "target",
         "engine_compatibility",
+        "engine_version",
         "resident_bytes",
         "boot_identity",
         "nonce",
