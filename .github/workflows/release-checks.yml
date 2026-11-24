@@ -145,10 +145,11 @@ jobs:
   # The third-party notice that every release archive carries is made from the lock by
   # `scripts/generate-notices.py`: it lists the crates the programs and fish are built from with
   # `cargo tree`, reads each crate's licence files from its package with askalono, and asks
-  # cargo-about, run offline, which licence each crate is recorded under. The fish preparation fetches
-  # the pinned fish archive, and the SPDX licence list is fetched at its pinned revision; the rest runs
-  # offline. The committed text has to be the one that makes. cargo-about and askalono are each one
-  # pinned release, and each archive has to match the digest below before it runs.
+  # cargo-about, run offline, which licence each crate is recorded under. The preparation fetches the
+  # pinned fish archive, fish's own crates and the SPDX licence list at its pinned revision; the
+  # licence files are then identified offline. The committed text has to be the one that makes.
+  # cargo-about and askalono are each one pinned release, and each archive has to match the digest
+  # below before it runs.
   third-party-notice:
     name: the third-party notice is the one the lock makes
     runs-on: ubuntu-24.04
@@ -196,8 +197,9 @@ jobs:
       - name: Build kr-release
         run: cargo build --locked -p kr-release
 
-      # The generator and cargo-about read the sources cargo has fetched, for every platform the
-      # lock names, and run offline.
+      # `cargo fetch --locked` brings in the crates the lock names for every platform. The generator
+      # then fetches the pinned fish archive, fish's own crates and the SPDX licence list; after that,
+      # cargo-about and askalono read only what is on disk.
       - name: Fetch the lock's crates
         run: cargo fetch --locked
 
