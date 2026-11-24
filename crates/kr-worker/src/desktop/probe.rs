@@ -2206,7 +2206,7 @@ pub(super) fn bounded_with(
 ///
 /// A file that cannot be read is an empty one, which is what every caller does with it. `None` is
 /// the time running out, which is a different thing.
-pub(super) fn read_within(path: &Path, deadline: &Deadline) -> Option<Vec<u8>> {
+fn read_within(path: &Path, deadline: &Deadline) -> Option<Vec<u8>> {
     use std::io::Read as _;
 
     if deadline.expired() {

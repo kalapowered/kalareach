@@ -21,9 +21,7 @@ use kr_protocol::hostinfo::export::{ContentClass, Sentence};
 
 use super::capability::{installed_in, wlroots};
 use super::payload;
-use super::probe::{
-    Check, Exit, Outcome, Plan, Ran, Setting, bounded_with, failed, judge, read_within,
-};
+use super::probe::{Check, Exit, Outcome, Plan, Ran, Setting, bounded_with, failed, judge};
 use super::routes::{Asking, Operation, Program, Route};
 
 /// The screen-copy protocol route.
@@ -142,14 +140,14 @@ fn screen_copy(check: Check, plan: &Plan, setting: &Setting<'_>, tool: &str) -> 
         setting.deadline,
     );
     let outcome = match ran.exit {
-        Exit::Succeeded(_) => match read_within(&image, setting.deadline) {
+        Exit::Succeeded(_) => match payload::read_image(&image, setting.deadline) {
             // The image could not be read before the check's time ran out.
             None => Outcome::TimedOut,
-            Some(bytes) => match payload::png(&bytes) {
-                Ok(_) => Outcome::Performed {
+            Some(read) => match read.and_then(|bytes| payload::png(&bytes).map(|_| bytes.len())) {
+                Ok(length) => Outcome::Performed {
                     detail: Sentence::new()
                         .stated("it read a ")
-                        .number(u64::try_from(bytes.len()).unwrap_or(u64::MAX))
+                        .number(u64::try_from(length).unwrap_or(u64::MAX))
                         .stated("-byte image of every output into memory and kept none of it"),
                 },
                 Err(fault) => Outcome::NotAttempted {
@@ -243,7 +241,7 @@ mod tests {
     use kr_protocol::ids::{CapabilityRevision, DesktopSessionId, EnvironmentId, SessionId};
     use kr_protocol::scalars::{Bytes, Nullable, U64, Uuid};
 
-    use super::super::payload::{self, tests::whole};
+    use super::super::payload::tests::whole;
     use super::super::probe::{self, Deadline, Facilities as _, Platform};
     use super::super::routes::{Surroundings, Variables};
     use super::*;
@@ -581,33 +579,33 @@ mod tests {
         let whole_png = whole(1280, 720);
         let header_only = whole_png[..8 + 25].to_vec();
         let cut_short = whole_png[..whole_png.len() - 20].to_vec();
-        let wanted = |fault: payload::Fault| format!("left no usable image: {}", fault.words());
+        let wanted = |ending: &str| format!("left no usable image: {ending}");
         let cases: [(&str, Vec<u8>, Option<String>); 6] = [
             ("a whole image", whole_png.clone(), None),
             (
                 "a header alone",
                 header_only,
-                Some(wanted(payload::Fault::CutShort)),
+                Some(wanted("a PNG image that is cut short")),
             ),
             (
                 "a payload that stops short",
                 cut_short,
-                Some(wanted(payload::Fault::CutShort)),
+                Some(wanted("a PNG image that is cut short")),
             ),
             (
                 "another format",
                 b"%!PS-Adobe-3.0\n%%Creator: (ImageMagick)\n".to_vec(),
-                Some(wanted(payload::Fault::NotThisFormat)),
+                Some(wanted("a file that is not a PNG image")),
             ),
             (
                 "an empty file",
                 Vec::new(),
-                Some(wanted(payload::Fault::Empty)),
+                Some(wanted("no file, or an empty one")),
             ),
             (
                 "a signature and nothing else",
                 whole_png[..8].to_vec(),
-                Some(wanted(payload::Fault::CutShort)),
+                Some(wanted("a PNG image that is cut short")),
             ),
         ];
         for (name, image, failure) in cases {
@@ -654,7 +652,7 @@ mod tests {
             scratch.path(),
         ));
         assert_eq!(record.state, CapabilityState::TemporarilyUnavailable);
-        assert!(reason(&record).contains(&wanted(payload::Fault::Empty)));
+        assert!(reason(&record).contains(&wanted("no file, or an empty one")));
 
         // A removal that fails is said, whether or not the image was whole: the tool makes the
         // directory unwritable after it writes.
@@ -679,6 +677,94 @@ mod tests {
             "{}",
             reason(&record)
         );
+    }
+
+    /// Whether this process is held to the permissions of a file it owns: a privileged one is not.
+    fn permissions_are_enforced() -> bool {
+        let folder = Folder::new();
+        let file = folder.file("closed", b"a file");
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o000)).expect("closes it");
+        std::fs::File::open(&file).is_err()
+    }
+
+    /// KR-REQ-03.29, KR-REQ-03.30, LP-9: what the tool leaves at the image path is read only if it
+    /// is a regular file. A link is not followed, so the image it names is neither read nor
+    /// removed; a pipe is not waited for; a file that cannot be read is said in the system's words
+    /// and not called absent. Whatever the tool left is removed.
+    #[test]
+    fn what_is_not_a_regular_file_is_not_read_and_what_cannot_be_read_is_said() {
+        let refused = |ending: &str| format!("left no usable image: {ending}");
+
+        // A link to a whole image.
+        let tools = Folder::new();
+        let scratch = Folder::new();
+        let target = tools.file("target.png", &whole(1280, 720));
+        tools.program("grim", &format!("ln -s '{}' \"$1\"", target.display()));
+        let record = only(asked(
+            &desktop(Some("sway")),
+            variables(tools.path()),
+            scratch.path(),
+        ));
+        assert_eq!(
+            record.state,
+            CapabilityState::TemporarilyUnavailable,
+            "a link: {}",
+            reason(&record)
+        );
+        assert!(
+            reason(&record).contains(&refused("something that is not a regular file")),
+            "{}",
+            reason(&record)
+        );
+        assert!(target.exists(), "the image the link names is not removed");
+        assert_eq!(left_in(scratch.path()), Vec::<String>::new());
+
+        // A pipe with no writer, which a read that waited would never leave.
+        let tools = Folder::new();
+        let scratch = Folder::new();
+        tools.program("grim", "mkfifo \"$1\"");
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let (held, path) = (variables(tools.path()), scratch.path().to_path_buf());
+        std::thread::spawn(move || {
+            let _ = sender.send(only(asked(&desktop(Some("sway")), held, &path)));
+        });
+        let record = receiver
+            .recv_timeout(Duration::from_secs(20))
+            .expect("the check waited for a writer to a pipe");
+        assert!(
+            reason(&record).contains(&refused("something that is not a regular file")),
+            "{}",
+            reason(&record)
+        );
+        assert_eq!(left_in(scratch.path()), Vec::<String>::new());
+
+        // A file closed to the process that reads it.
+        if permissions_are_enforced() {
+            let tools = Folder::new();
+            let scratch = Folder::new();
+            let image = tools.file("image.png", &whole(1280, 720));
+            tools.program(
+                "grim",
+                &format!("cp '{}' \"$1\"\nchmod 000 \"$1\"", image.display()),
+            );
+            let record = only(asked(
+                &desktop(Some("sway")),
+                variables(tools.path()),
+                scratch.path(),
+            ));
+            assert_eq!(record.state, CapabilityState::TemporarilyUnavailable);
+            assert!(
+                reason(&record).contains(&refused("a file that could not be read: ")),
+                "{}",
+                reason(&record)
+            );
+            assert!(
+                !reason(&record).contains("no file, or an empty one"),
+                "{}",
+                reason(&record)
+            );
+            assert_eq!(left_in(scratch.path()), Vec::<String>::new());
+        }
     }
 
     /// KR-REQ-03.29, LP-4: a route on which a compositor may ask the person says that, claims no
