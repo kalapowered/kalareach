@@ -170,9 +170,16 @@ pub enum BindingEvent {
     /// The observation stream has a gap, and a fresh snapshot follows.
     Gap(ObservationGap),
     /// Documents were dropped because the caller was too far behind, and a fresh snapshot follows.
+    ///
+    /// A gap is one of the presentations that go, and what it said of the loss is kept here, so the
+    /// loss is still bounded when the caller learns of it.
     PresentationDropped {
-        /// How many documents went.
+        /// How many documents went, the gaps among them included.
         documents: u32,
+        /// The first event lost, as the oldest gap that went named it.
+        first: Option<SourceEventHandle>,
+        /// The last event lost, as the newest gap that went named it.
+        last: Option<SourceEventHandle>,
     },
     /// A call failed, and the binding survived it.
     Fault {
@@ -1086,6 +1093,8 @@ impl BindingHandle {
             faults,
             events,
             dropped_documents: 0,
+            dropped_first: None,
+            dropped_last: None,
             documents: 0,
             calls: Arc::clone(&calls),
             queue: Arc::clone(&queue),
@@ -1559,6 +1568,9 @@ struct BindingWorker {
     faults: FaultCounter,
     events: tokio::sync::mpsc::Sender<BindingEvent>,
     dropped_documents: u32,
+    /// The first and the last event lost, as the gaps among the dropped presentations named them.
+    dropped_first: Option<SourceEventHandle>,
+    dropped_last: Option<SourceEventHandle>,
     /// How many documents this binding has drawn, which is what numbers the next one.
     documents: u64,
     /// How many calls into the component have finished, for a caller that wants to know whether
@@ -1832,7 +1844,11 @@ impl BindingWorker {
             // Nobody reads the channel any more, so nobody is owed anything.
             return;
         }
-        if self.events.capacity() > FAULT_RESERVE
+        // What the binding said before the report is told first: a loss that a full channel kept
+        // from the caller comes with the positions it bounds.
+        self.flush_dropped();
+        if self.dropped_documents == 0
+            && self.events.capacity() > FAULT_RESERVE
             && self
                 .events
                 .try_send(BindingEvent::Consumed(owed.clone()))
@@ -2136,15 +2152,8 @@ impl BindingWorker {
     /// anything else, so the send waits for room by blocking this thread, which is the binding's
     /// own and nothing else's.
     fn send(&mut self, event: BindingEvent) {
+        self.flush_dropped();
         self.flush_consumed();
-        if self.dropped_documents > 0 {
-            let dropped = BindingEvent::PresentationDropped {
-                documents: self.dropped_documents,
-            };
-            if self.events.capacity() > FAULT_RESERVE && self.events.try_send(dropped).is_ok() {
-                self.dropped_documents = 0;
-            }
-        }
         let must_arrive = matches!(
             event,
             BindingEvent::Fault { .. } | BindingEvent::Disabled { .. }
@@ -2152,11 +2161,16 @@ impl BindingWorker {
         if !must_arrive {
             // The reserve is not presentation's to take: a document that filled the last places
             // would be a document that left no room for the fault that followed it.
-            if self.events.capacity() <= FAULT_RESERVE || self.events.try_send(event).is_err() {
-                self.dropped_documents = self.dropped_documents.saturating_add(1);
-                if let Ok(mut queue) = self.queue.lock() {
-                    queue.require_snapshot();
-                }
+            let refused = if self.events.capacity() <= FAULT_RESERVE {
+                Some(event)
+            } else {
+                self.events
+                    .try_send(event)
+                    .err()
+                    .map(tokio::sync::mpsc::error::TrySendError::into_inner)
+            };
+            if let Some(refused) = refused {
+                self.drop_presentation(&refused);
             }
             return;
         }
@@ -2188,6 +2202,42 @@ impl BindingWorker {
                 return;
             }
             std::thread::sleep(core::time::Duration::from_millis(5));
+        }
+    }
+
+    /// Tells the caller what presentation went for want of room, once the channel has room.
+    fn flush_dropped(&mut self) {
+        if self.dropped_documents == 0 || self.events.capacity() <= FAULT_RESERVE {
+            return;
+        }
+        let dropped = BindingEvent::PresentationDropped {
+            documents: self.dropped_documents,
+            first: self.dropped_first.clone(),
+            last: self.dropped_last.clone(),
+        };
+        if self.events.try_send(dropped).is_ok() {
+            self.dropped_documents = 0;
+            self.dropped_first = None;
+            self.dropped_last = None;
+        }
+    }
+
+    /// Records that a presentation went for want of room, and that the component owes a snapshot.
+    ///
+    /// A gap that goes leaves its positions in the record, which the caller is told of with the
+    /// documents that went.
+    fn drop_presentation(&mut self, event: &BindingEvent) {
+        self.dropped_documents = self.dropped_documents.saturating_add(1);
+        if let BindingEvent::Gap(gap) = event {
+            if self.dropped_first.is_none() {
+                self.dropped_first.clone_from(&gap.first);
+            }
+            if gap.last.is_some() {
+                self.dropped_last.clone_from(&gap.last);
+            }
+        }
+        if let Ok(mut queue) = self.queue.lock() {
+            queue.require_snapshot();
         }
     }
 
