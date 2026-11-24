@@ -143,7 +143,7 @@ fn stand_in_named(value: &OsStr, marker: &Marker) -> Option<PathBuf> {
 /// 1. A program that is not `launchctl` or `systemctl` is left as it is.
 /// 2. With no variable and no marker, nothing changes.
 /// 3. A marker that cannot be read, and a marked installation with no variable, refuse.
-/// 4. A variable must name a stand-in as [`stand_in_named`] says; any other value, empty or relative
+/// 4. A variable must name a stand-in as `stand_in_named` says; any other value, empty or relative
 ///    or a link to another program, refuses. It never falls back to the real program.
 /// 5. A `launchctl` command then runs as the stand-in; a `systemctl` command is refused, since the
 ///    stand-in speaks launchd's dialect only.
