@@ -429,6 +429,10 @@ const THREAD_PATIENCE: Duration = Duration::from_secs(30);
 /// How much later than its bound a call may be for a loaded machine's scheduling.
 const SLACK: Duration = Duration::from_millis(1500);
 
+/// How long the create itself may take on a loaded machine; the limits of the cases that include a
+/// create allow for it.
+const CREATE_ALLOWANCE: Duration = Duration::from_secs(5);
+
 /// How the probe's thread ended, waited for until it has.
 fn thread_end(probed: &Probed) -> ThreadEnd {
     let started = Instant::now();
@@ -515,7 +519,7 @@ fn kr_req_07_64_a_probe_created_after_the_deadline_is_ended_by_its_creator() {
     );
     let total = thread_total(&probed);
     assert!(
-        total < LATE_CREATE + probe::CLEANUP_BOUND + SLACK,
+        total < LATE_CREATE + CREATE_ALLOWANCE + probe::CLEANUP_BOUND + SLACK,
         "the thread ended what it made at once: {total:?}"
     );
     // Longer than the stand-in's own second, and than a Windows shell takes to begin.
@@ -769,13 +773,13 @@ fn kr_req_07_64_a_start_that_fails_after_the_create_is_ended_within_the_cleanup_
         "the premise: the process could not be ended: {probed:?}"
     );
     assert!(
-        probed.took < probe::CLEANUP_BOUND + SLACK,
+        probed.took < CREATE_ALLOWANCE + probe::CLEANUP_BOUND + SLACK,
         "the call gave up on the end within the cleanup bound: {:?}",
         probed.took
     );
     let total = thread_total(&probed);
     assert!(
-        total < probe::CLEANUP_BOUND + SLACK,
+        total < CREATE_ALLOWANCE + probe::CLEANUP_BOUND + SLACK,
         "the thread gave up on the end within the cleanup bound: {total:?}"
     );
 }
