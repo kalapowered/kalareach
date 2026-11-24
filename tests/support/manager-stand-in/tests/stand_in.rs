@@ -205,11 +205,16 @@ impl Fixture {
             .parse()
             .expect("a process number");
         let identity = started_process_identity(pid).expect("the process is there");
+        self.track(&identity);
+        identity
+    }
+
+    /// Has the fixture end the process `identity` when the case ends.
+    fn track(&self, identity: &ProcessStartIdentity) {
         self.started
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .push(identity.clone());
-        identity
     }
 }
 
@@ -592,6 +597,48 @@ fn a_start_that_was_never_recorded_is_not_confused_with_processes_that_only_hold
             "{what} was taken for the job's and ended"
         );
     }
+}
+
+/// `bootout` ends the daemon and the group it leads: a process the daemon started and left running
+/// ends with it, and the job is unloaded.
+#[test]
+fn bootout_ends_the_processes_the_daemon_started_with_it() {
+    let fixture = Fixture::new();
+    let child_file = fixture.tree.path().join("child.pid");
+    let script = format!(
+        "#!/bin/sh\nsleep 60 &\necho $! > {}\nwait\n",
+        child_file.display()
+    );
+    let (_, loaded) = fixture.load("kr-controller-r", &script, "");
+    assert_eq!(loaded.status.code(), Some(0), "{}", text(&loaded.stderr));
+    let target = format!("{}/kr-controller-r", fixture.domain());
+    let started = fixture.call(&["kickstart", "-p", &target]);
+    assert_eq!(started.status.code(), Some(0), "{}", text(&started.stderr));
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let child = loop {
+        if let Some(pid) = std::fs::read_to_string(&child_file)
+            .ok()
+            .and_then(|written| written.trim().parse::<u32>().ok())
+        {
+            break pid;
+        }
+        assert!(Instant::now() < deadline, "the daemon started no process");
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let child = started_process_identity(child).expect("the process the daemon started");
+    fixture.track(&child);
+    assert_eq!(process_state(&child), ProcessState::Running);
+    let ended_job = fixture.call(&["bootout", &target]);
+    assert_eq!(
+        ended_job.status.code(),
+        Some(0),
+        "{}",
+        text(&ended_job.stderr)
+    );
+    assert!(
+        ended(&child),
+        "the process the daemon started ended with the daemon"
+    );
 }
 
 /// Ends the processes it holds when it is dropped, by their identities, independently of the fixture.

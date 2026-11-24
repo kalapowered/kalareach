@@ -24,6 +24,7 @@ use std::time::{Duration, Instant};
 
 use kr_ipc::identity::{ProcessState, Stop, process_state, started_process_identity, stop_process};
 use kr_protocol::identity::ProcessStartIdentity;
+use rustix::process::{Pid, Signal};
 use serde::{Deserialize, Serialize};
 
 use plist::Definition;
@@ -648,19 +649,101 @@ fn start(
     Ok((identity, keys))
 }
 
-/// Waits for the process `identity` to end, for at most [`END_BOUND`].
-fn ended_within(identity: &ProcessStartIdentity) -> bool {
+/// Whether the process `identity` and every process of the group `group` are shown to have ended
+/// within [`END_BOUND`]. A state that is not known is not an end.
+fn ended_within(
+    identity: &ProcessStartIdentity,
+    group: Option<Pid>,
+    state: &dyn Fn(&ProcessStartIdentity) -> ProcessState,
+) -> bool {
+    let over = || state(identity) == ProcessState::Ended && group.is_none_or(group_is_gone);
     let deadline = Instant::now() + END_BOUND;
     while Instant::now() < deadline {
-        if process_state(identity) == ProcessState::Ended {
+        if over() {
             return true;
         }
         std::thread::sleep(Duration::from_millis(50));
     }
-    process_state(identity) == ProcessState::Ended
+    over()
 }
 
-/// The processes of a start that was never recorded.
+/// The process group `identity` leads, which a daemon the stand-in started does: its descendants
+/// are in it. A process that does not lead its group has no group of its own to end.
+fn group_led_by(identity: &ProcessStartIdentity) -> Option<Pid> {
+    let pid = Pid::from_raw(i32::try_from(identity.pid.get()).ok()?)?;
+    (rustix::process::getpgid(Some(pid)).ok()? == pid).then_some(pid)
+}
+
+/// Whether no process is left in the group `group`. A group number is not given to another
+/// process while any process is in the group, so the number names this group until it is gone.
+fn group_is_gone(group: Pid) -> bool {
+    matches!(
+        rustix::process::test_kill_process_group(group),
+        Err(rustix::io::Errno::SRCH)
+    )
+}
+
+/// What a process whose state is not known is said to be.
+fn unknown(identity: &ProcessStartIdentity, detail: &str) -> String {
+    format!(
+        "whether the process {} still runs is not known ({detail})",
+        identity.pid.get()
+    )
+}
+
+/// Ends every process of `identities` and of the groups they lead, asking first and then making
+/// sure. A process whose state is not known, and a process or group that is not shown to have ended
+/// within [`END_BOUND`] after it was made to, is an error: nothing is called ended that was not seen
+/// to end.
+fn end_all(
+    identities: &[ProcessStartIdentity],
+    state: &dyn Fn(&ProcessStartIdentity) -> ProcessState,
+) -> Result<(), String> {
+    for identity in identities {
+        match state(identity) {
+            ProcessState::Ended => continue,
+            ProcessState::Unknown { detail } => return Err(unknown(identity, &detail)),
+            ProcessState::Running => {}
+        }
+        let group = group_led_by(identity);
+        let _ = stop_process(identity, Stop::Terminate);
+        if let Some(group) = group {
+            let _ = rustix::process::kill_process_group(group, Signal::TERM);
+            let _ = rustix::process::kill_process_group(group, Signal::CONT);
+        }
+        if !ended_within(identity, group, state) {
+            let _ = stop_process(identity, Stop::Kill);
+            if let Some(group) = group {
+                let _ = rustix::process::kill_process_group(group, Signal::KILL);
+            }
+            if !ended_within(identity, group, state) {
+                return Err(format!("the process {} did not end", identity.pid.get()));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// What a process whose identity cannot be read is said to be.
+fn unreadable(pid: u32, why: &str) -> String {
+    format!("the process {pid} cannot be identified: {why}")
+}
+
+/// The identities of the processes `pids`, read by `read`. A process whose identity cannot be read
+/// is an error: it would be left out of what is ended.
+fn identities_of(
+    pids: &[u32],
+    read: &dyn Fn(u32) -> Result<ProcessStartIdentity, String>,
+) -> Result<Vec<ProcessStartIdentity>, String> {
+    let mut identities = Vec::new();
+    for pid in pids {
+        let identity = read(*pid).map_err(|why| unreadable(*pid, &why))?;
+        identities.push(identity);
+    }
+    Ok(identities)
+}
+
+/// The processes of a start that was never recorded, found in the listing that the program `ps` prints.
 ///
 /// `ps` prints a process's arguments as one line, so a line that holds the same text proves nothing.
 /// A process is the job's only on proof, each part read apart from the text around it: its
@@ -668,49 +751,97 @@ fn ended_within(identity: &ProcessStartIdentity) -> bool {
 /// the program it runs is a file inside the test's folders; and its working directory is the
 /// definition's. A process that fails any of the three is not the job's, whatever else its line or
 /// its environment holds.
-fn found_unrecorded(context: &Context, job: &Job) -> Vec<u32> {
-    let Ok(working) = context.bounded(Path::new(&job.working_directory)) else {
-        return Vec::new();
-    };
-    let Ok(output) = Command::new("/bin/ps")
+///
+/// A search that cannot be made is an error and not an empty answer: an argument that holds a space
+/// cannot be told from two words in the listing, and a list or a directory that cannot be read
+/// leaves a process unproved.
+fn found_unrecorded(context: &Context, job: &Job, ps: &Path) -> Result<Vec<u32>, String> {
+    if let Some(argument) = job
+        .arguments
+        .iter()
+        .find(|argument| argument.split_whitespace().count() != 1)
+    {
+        return Err(format!(
+            "the argument {argument:?} holds a space or nothing, so a process list cannot show \
+             where it ends"
+        ));
+    }
+    let working = context.bounded(Path::new(&job.working_directory))?;
+    let output = match Command::new(ps)
         // Twice `w`, so that a line is not cut at a width. No `E`: the environment is no proof.
         .args(["-axww", "-o", "pid=,args="])
         .stdin(Stdio::null())
         .output()
-    else {
-        return Vec::new();
+    {
+        Ok(output) if output.status.success() => output,
+        Ok(output) => {
+            return Err(format!(
+                "the process list cannot be read: ps said {}",
+                output.status
+            ));
+        }
+        Err(error) => return Err(format!("the process list cannot be read: {error}")),
     };
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter_map(|line| {
-            let (pid, arguments) = line.trim_start().split_once(char::is_whitespace)?;
-            let words: Vec<&str> = arguments.split_whitespace().collect();
-            let pid: u32 = pid.parse().ok()?;
-            (pid != std::process::id()
-                && context.runs_the_program_of(job, &words)
-                && working_directory_of(pid).as_deref() == Some(working.as_path()))
-            .then_some(pid)
-        })
-        .collect()
+    let mut found = Vec::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let Some((pid, arguments)) = line.trim_start().split_once(char::is_whitespace) else {
+            continue;
+        };
+        let Ok(pid) = pid.parse::<u32>() else {
+            continue;
+        };
+        let words: Vec<&str> = arguments.split_whitespace().collect();
+        if pid != std::process::id()
+            && context.runs_the_program_of(job, &words)
+            && working_directory_of(pid)?.as_deref() == Some(working.as_path())
+        {
+            found.push(pid);
+        }
+    }
+    Ok(found)
 }
 
-/// The working directory of the process `pid`, as `lsof` reads it, or `None` where it reads none.
-fn working_directory_of(pid: u32) -> Option<PathBuf> {
+/// The working directory of the process `pid`, as `lsof` reads it, or `None` where it has none to
+/// read: `lsof` lists nothing for a process that has ended since it was found. Any other failure is
+/// an error.
+fn working_directory_of(pid: u32) -> Result<Option<PathBuf>, String> {
     let output = Command::new("/usr/sbin/lsof")
         .args(["-a", "-d", "cwd", "-Fn", "-p", &pid.to_string()])
         .stdin(Stdio::null())
         .output()
-        .ok()?;
-    String::from_utf8_lossy(&output.stdout)
+        .map_err(|error| format!("the directory of the process {pid} cannot be read: {error}"))?;
+    let listed = String::from_utf8_lossy(&output.stdout)
         .lines()
         .find_map(|line| line.strip_prefix('n'))
-        .map(PathBuf::from)
+        .map(PathBuf::from);
+    match (listed, output.status.code()) {
+        (Some(path), _) => Ok(Some(path)),
+        (None, Some(1)) => Ok(None),
+        (None, _) => Err(format!(
+            "the directory of the process {pid} cannot be read: lsof said {}",
+            output.status
+        )),
+    }
 }
 
-/// `bootout`: ends the daemon by the identity recorded for it, asking first and then making sure,
-/// and unloads the job. A start that was not recorded is found by what proves a process the job's.
-/// The identity is checked by the signalling itself, so a number that belongs to another process now
-/// is left alone.
+/// Ends every process of `job`, the recorded one and, for a start that was never recorded, those
+/// found for it, with the groups they lead.
+fn end_job(context: &Context, job: &Job) -> Result<(), String> {
+    let mut identities: Vec<ProcessStartIdentity> = job.identity.clone().into_iter().collect();
+    if job.pending {
+        let found = found_unrecorded(context, job, Path::new("/bin/ps"))?;
+        identities.extend(identities_of(&found, &|pid| {
+            started_process_identity(pid).map_err(|error| error.to_string())
+        })?);
+    }
+    end_all(&identities, &process_state)
+}
+
+/// `bootout`: ends the daemon by the identity recorded for it and the group it leads, asking first
+/// and then making sure, and unloads the job. A start that was not recorded is found by what proves
+/// a process the job's. The identity is checked by the signalling itself, so a number that belongs
+/// to another process now is left alone. A process that is not shown to have ended keeps the job
+/// loaded and is reported as a failure.
 fn bootout(context: &Context, target: &str) -> Answer {
     let Some((_, label)) = split_target(target) else {
         return Answer::failed(
@@ -728,31 +859,8 @@ fn bootout(context: &Context, target: &str) -> Answer {
         }
         Ok(Some(job)) => job,
     };
-    let mut identities: Vec<ProcessStartIdentity> = job.identity.clone().into_iter().collect();
-    if job.pending {
-        for pid in found_unrecorded(context, &job) {
-            if let Ok(identity) = started_process_identity(pid) {
-                identities.push(identity);
-            }
-        }
-    }
-    for identity in &identities {
-        if process_state(identity) != ProcessState::Running {
-            continue;
-        }
-        let _ = stop_process(identity, Stop::Terminate);
-        if !ended_within(identity) {
-            let _ = stop_process(identity, Stop::Kill);
-            if !ended_within(identity) {
-                return Answer::failed(
-                    REFUSED,
-                    format!(
-                        "the process {} did not end, and the job is kept\n",
-                        identity.pid.get()
-                    ),
-                );
-            }
-        }
+    if let Err(why) = end_job(context, &job) {
+        return Answer::failed(REFUSED, format!("{why}, and the job is kept\n"));
     }
     match std::fs::remove_file(context.job_path(label)) {
         Ok(()) => Answer::said(String::new()),
@@ -764,6 +872,101 @@ fn bootout(context: &Context, target: &str) -> Answer {
 mod tests {
     use super::*;
     use kr_ipc::testing::PrivateTempDir;
+
+    /// Ends the child it holds when it is dropped.
+    struct Held(std::process::Child);
+
+    impl Drop for Held {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    /// A process whose state is not known is not an end: ending it is an error, and nothing was
+    /// signalled to the process that runs.
+    #[test]
+    fn a_process_whose_state_is_not_known_is_not_an_end() {
+        let mut held = Held(
+            Command::new("/bin/sleep")
+                .arg("30")
+                .spawn()
+                .expect("a process that runs"),
+        );
+        let identity = started_process_identity(held.0.id()).expect("its identity");
+        let not_known = |_: &ProcessStartIdentity| ProcessState::Unknown {
+            detail: "the system did not answer".to_owned(),
+        };
+        let ended = end_all(std::slice::from_ref(&identity), &not_known);
+        assert!(
+            ended.as_ref().is_err_and(|why| why.contains("not known")),
+            "{ended:?}"
+        );
+        assert_eq!(
+            held.0.try_wait().expect("its state"),
+            None,
+            "nothing was signalled to the process"
+        );
+    }
+
+    /// A process list that cannot be read is an error and not an empty answer: `ps` that cannot be
+    /// started, `ps` that fails, and an argument of the job that a listing cannot show the end of.
+    #[test]
+    fn a_process_list_that_cannot_be_read_is_an_error_and_not_an_empty_answer() {
+        let folder = PrivateTempDir::create();
+        let root = folder.path().canonicalize().expect("a folder");
+        let context = Context {
+            own: root.clone(),
+            roots: vec![root.clone()],
+            store: root.join("store"),
+            uid: 0,
+        };
+        let job = |arguments: [&str; 2]| Job {
+            arguments: arguments.map(str::to_owned).to_vec(),
+            working_directory: root.display().to_string(),
+            ..Job::default()
+        };
+        let plain = job(["/x/program", "argument"]);
+        assert!(found_unrecorded(&context, &plain, Path::new("/bin/ps")).is_ok());
+        assert!(
+            found_unrecorded(&context, &plain, &root.join("no-such-ps")).is_err(),
+            "ps that cannot be started"
+        );
+        assert!(
+            found_unrecorded(&context, &plain, Path::new("/usr/bin/false")).is_err(),
+            "ps that fails"
+        );
+        assert!(
+            found_unrecorded(
+                &context,
+                &job(["/x/program", "two words"]),
+                Path::new("/bin/ps")
+            )
+            .is_err(),
+            "an argument that holds a space"
+        );
+    }
+
+    /// A process whose identity cannot be read is an error and is not left out of what is ended.
+    #[test]
+    fn an_identity_that_cannot_be_read_is_an_error() {
+        let own = kr_ipc::identity::current_process_start_identity().expect("an identity");
+        let read = |pid: u32| {
+            if pid == 7 {
+                Err("the system refused".to_owned())
+            } else {
+                Ok(own.clone())
+            }
+        };
+        assert_eq!(identities_of(&[1, 2], &read).expect("both read").len(), 2);
+        let refused = identities_of(&[1, 7], &read);
+        assert!(
+            refused
+                .as_ref()
+                .is_err_and(|why| why.contains("process 7") && why.contains("refused")),
+            "{refused:?}"
+        );
+    }
 
     /// The arguments of a process are the job's only as whole words after a program inside the
     /// roots: the program run as it is, run by its interpreter, or handed over to with arguments of
