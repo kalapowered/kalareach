@@ -752,8 +752,11 @@ struct Seams<'a> {
     /// The reading that selected the desktop, which the caller took to choose the checks.
     first: &'a Surroundings,
     time_of: &'a dyn Fn(Check) -> Time,
-    routes: &'a dyn Fn(Check, &DesktopContext, Option<&std::ffi::OsStr>) -> Option<Operation>,
+    routes: Routes<'a>,
 }
+
+/// How a check is turned into an operation on a desktop: [`resolve`] in the product.
+type Routes<'a> = &'a dyn Fn(Check, &DesktopContext, Option<&std::ffi::OsStr>) -> Option<Operation>;
 
 /// How the time of one check is shared out.
 #[derive(Clone, Copy, Debug)]
