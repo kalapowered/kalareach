@@ -253,9 +253,9 @@ Xcode resolves.
 
 Every installer and store bundle carries the text. The interface's bundle holds it, and the account
 panel opens it under "Third-party notices" on every platform. The desktop installers also place it as
-`THIRD-PARTY-NOTICES.txt` beside the application: `tauri.macos.conf.json`, `tauri.linux.conf.json` and
-`tauri.windows.conf.json` in `apps/companion/src-tauri` name it as a bundle resource, and the shared
-`tauri.conf.json`, which the mobile builds read, names none.
+`THIRD-PARTY-NOTICES.txt` among the application's resource files: `tauri.macos.conf.json`,
+`tauri.linux.conf.json` and `tauri.windows.conf.json` in `apps/companion/src-tauri` name it as a bundle
+resource, and the shared `tauri.conf.json`, which the mobile builds read, names none.
 
 `pnpm install --frozen-lockfile --prod --filter "@kalareach/companion..."` and then
 `python3 scripts/generate-notices.py write --product companion --kr-release <a built kr-release>` make
@@ -263,10 +263,12 @@ the text. `scripts/companion-notice.json` names the package, its features and it
 desktop targets and the mobile targets that `scripts/check-mobile-graph.py` reads. The crates are made
 as the release archives' are (`cargo tree`, cargo-about, `about.toml`), and an entry of
 `scripts/notice-texts.json` says which notice it is for. The JavaScript packages are the ones
-`pnpm licenses list --prod` gives, which is the dependency closure and not only the part that the
-bundler keeps. Each is recorded under the first of its licences that `about.toml` lists, and its texts
-are chosen as a crate's are: the licence files of its installed package, or, where the package holds no
-text of that licence, the text that `scripts/notice-texts.json` keeps for it, with `npm` as its package.
+`pnpm licenses list --prod` gives, which is the production dependency closure of the interface and not
+only the part that the bundler keeps; the generator refuses a package that `apps/companion/src` imports
+and `apps/companion/package.json` does not list under `dependencies`. Each is recorded under the first
+of its licences that `about.toml` lists, and its texts are chosen as a crate's are: the licence files of
+its installed package, or, where the package holds no text of that licence, the text that
+`scripts/notice-texts.json` keeps for it, with `npm` as its package.
 
 `kr-release companion-notice` holds the committed text to the lock: it refuses a text that has no entry
 for a crate the lock takes into the companion application, or that holds a template's placeholder. The

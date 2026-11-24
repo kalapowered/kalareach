@@ -150,22 +150,23 @@ the entry names the upstream file.
 COMPANION_HEADER = """\
 THIRD-PARTY NOTICES
 
-KalaReach is distributed under the BSD-3-Clause licence in the file LICENSE. This file carries the
-licence texts and notices of the third-party software that the KalaReach companion application is
-built from: the Rust crates of its native program, for every platform it is built for, and the
-JavaScript packages of its interface, as the packages themselves state them. It does not yet list the
-native libraries that the Android and iOS builds link.
+KalaReach is distributed under the BSD-3-Clause licence. This file carries the licence texts and
+notices of the third-party software that the KalaReach companion application is built from: the Rust
+crates of its native program, for every platform it is built for, and the JavaScript packages in the
+production dependency closure of its interface, as the packages themselves state them, and the licence
+texts of the libraries that some of those crates bundle. It does not yet list the native libraries that
+the Android and iOS builds link.
 
 The list covers every platform the application is built for, so the list for one platform is a subset
 of it. A package that is offered under several licences is recorded under the one this project takes
 it under. Each block lists the packages that use a text and then gives the text, under the licence it
 is. A file that holds the texts of several licences is one block under a heading that names all of
 them, and a file that holds no licence's text, only a statement that names a licence or the header of
-one, has a heading that says so. An entry gives the package, its version, whether it is a Rust crate
-(rust) or a JavaScript package (javascript), and the authors its package names. The entry of a crate
-under the Mozilla Public License 2.0, or taken from a Git repository, names where its source is.
-Where a package ships no text of a licence it is recorded under, the notice carries the upstream text
-beside the package's own files, and the entry names the upstream file.
+one, has a heading that says so. An entry gives the package, its version, whether the Rust crates
+(rust) or the JavaScript packages (javascript) are built from it, and the authors its package names.
+The entry of a crate under the Mozilla Public License 2.0, or taken from a Git repository, names where
+its source is. Where a package ships no text of a licence it is recorded under, the notice carries the
+upstream text beside the package's own files, and the entry names the upstream file.
 """
 
 COMPANION_UNUSED = """\
