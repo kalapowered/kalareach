@@ -351,5 +351,6 @@ threads each records its figures and none of them is a release figure. The macOS
 `macos-15`, with three processors, below the reference host's four, so its figures are recorded and
 none of them is a release figure, and `macos-reference`'s `macos-15-intel`, which the workflow treats
 as a four-processor host and whose topology no step reads either. Its job runs
-`scripts/performance.sh` and not a `--reference-host` run of `scripts/bench-all.sh`, so its figures
-are recorded and none of them is a release figure either.
+`scripts/performance.sh` and the whole reconnect in a release build, and not a `--reference-host`
+run of `scripts/bench-all.sh`, so its figures are recorded and none of them is a release figure
+either.
