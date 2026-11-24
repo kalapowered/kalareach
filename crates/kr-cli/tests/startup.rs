@@ -3781,6 +3781,8 @@ fn service_installation() -> &'static Path {
 /// every process of a case that started from it.
 ///
 /// A build that has not built the stand-in yet fails here and says why: the case never stands down.
+/// So does a worker built without the `testing` feature: it does not read the marker, and in a
+/// marked installation it would run the account's own service manager.
 #[cfg(target_os = "macos")]
 fn stand_in_installation() -> &'static Path {
     static PLACED: OnceLock<PathBuf> = OnceLock::new();
@@ -3793,6 +3795,13 @@ fn stand_in_installation() -> &'static Path {
             );
         };
         let directory = place_service_installation("service-stand-in");
+        let worker = directory.join("daemon").join("kr-worker");
+        assert!(
+            holds_the_marker_name(&worker),
+            "the kr-worker placed in the stand-in installation was built without the `testing` \
+             feature, so it does not read the marker; build it with \
+             `cargo build -p kr-worker --features testing`"
+        );
         let program = kr_ipc::testing::manager_stand_in::place_installation(&directory);
         kr_ipc::testing::place_program(&stand_in, &program);
         // The operating system checks a program the first time it is started from a new file; here
@@ -3813,6 +3822,15 @@ fn stand_in_installation() -> &'static Path {
     })
 }
 
+/// Whether a program holds the name of the marker file. Only a build with the `testing` feature
+/// does, because only its seam looks for the marker.
+#[cfg(target_os = "macos")]
+fn holds_the_marker_name(program: &Path) -> bool {
+    let name = kr_ipc::testing::manager_stand_in::MARKER_NAME.as_bytes();
+    let bytes = std::fs::read(program).expect("reads the program to search it");
+    bytes.windows(name.len()).any(|window| window == name)
+}
+
 /// Places the service installation's programs in the folder `name` of this run's binaries.
 fn place_service_installation(name: &str) -> PathBuf {
     let (Some(controller), Some(worker)) = (
@@ -3823,7 +3841,7 @@ fn place_service_installation(name: &str) -> PathBuf {
             "the kr-controller-held and kr-worker executables are not built beside this test, \
              so this check cannot run; a workspace test run builds them, and so do \
              `cargo build -p kr-controller --features testing --bin kr-controller-held` \
-             and `cargo build -p kr-worker`"
+             and `cargo build -p kr-worker --features testing`"
         );
     };
     let directory = support::command_binaries().join(name);
