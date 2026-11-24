@@ -6620,6 +6620,7 @@ export interface AttentionItem {
     | 'attention.application_notice'
     | 'attention.automation_paused'
     | 'attention.authority_feed_removed'
+    | 'attention.receipt_uncertain'
   /**
    * The session it belongs to, when it belongs to one.
    */

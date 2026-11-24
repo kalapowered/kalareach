@@ -4279,6 +4279,11 @@
           "const": "attention.authority_feed_removed",
           "description": "The authority feed this host reads removed it, so it learns no revocation from it.",
           "type": "string"
+        },
+        {
+          "const": "attention.receipt_uncertain",
+          "description": "An action's upstream result is unknown, so the host cannot say whether it took effect.",
+          "type": "string"
         }
       ]
     },
