@@ -560,32 +560,40 @@ async fn kr_req_24_24_a_third_protocol_connection_on_a_host_with_its_writer_open
     let Some(component) = recording(&served) else {
         return;
     };
+    // Every frame this connection is written is read here, as a frame of the third protocol, and
+    // not through a helper that unwraps a read: a frame that protocol does not have fails this case.
+    macro_rules! next_frame_of_three {
+        ($three:expr) => {{
+            let frame: Result<Frame, _> = $three.reader.read_message_without_schema().await;
+            let Ok(frame) = frame else {
+                panic!("the host wrote a frame the third protocol does not have: {frame:?}");
+            };
+            frame
+        }};
+    }
     let mut three = Raw::connect(&served).await;
     let request = components::request("recording", 37);
-    let registered = three.register(&request, &component).await;
-    assert!(
-        matches!(registered, ResponseBody::Registered { .. }),
-        "the registration was answered with {registered:?}"
-    );
-    for (name, text) in [("se-1", "x"), ("se-2", "!trap")] {
-        three
-            .ask(RequestBody::Event {
-                binding_id: request.binding_id.get(),
-                event: wire_event(&components::scrape(name, text)),
-            })
-            .await;
-    }
-    // Every frame this connection is written is a frame of the third protocol: it is read until
-    // the trap is told, and then until the answer to an unbind, which follows everything the
-    // binding produced.
+    let registering = three.send_register(&request, &component).await;
+    // Read until the trap is told, and then until the answer to an unbind, which follows everything
+    // the binding produced.
     let mut notices = Vec::new();
     let mut asked = None;
     loop {
-        let frame: Result<Frame, _> = three.reader.read_message_without_schema().await;
-        let Ok(frame) = frame else {
-            panic!("the host wrote a frame the third protocol does not have: {frame:?}");
-        };
-        match frame {
+        match next_frame_of_three!(three) {
+            Frame::Response { reply_to, body } if reply_to == registering => {
+                assert!(
+                    matches!(body, ResponseBody::Registered { .. }),
+                    "the registration was answered with {body:?}"
+                );
+                for (name, text) in [("se-1", "x"), ("se-2", "!trap")] {
+                    three
+                        .send(RequestBody::Event {
+                            binding_id: request.binding_id.get(),
+                            event: wire_event(&components::scrape(name, text)),
+                        })
+                        .await;
+                }
+            }
             Frame::Response { reply_to, .. } if Some(reply_to) == asked => break,
             Frame::Response { .. } => {}
             Frame::Notice(notice) => {
