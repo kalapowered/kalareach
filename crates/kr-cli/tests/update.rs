@@ -5920,15 +5920,17 @@ async fn a_rollback_is_refused_naming_a_store_the_older_release_cannot_read() {
 }
 
 /// KR-REQ-26.10, KR-REQ-26.13: a rollback over a host whose daemon, of this build, wrote the attention
-/// store is refused by a release that lists that store at version 12, naming the store and the version
-/// it is at, and nothing is switched; a release that lists version 13 goes back. The release lists
-/// every other store as this build does, so the attention store is all either answer can be about, and
-/// the store stays at version 13 either way.
+/// store is refused by a release that lists that store at the version before this build's version,
+/// naming the store and the version it is at, and nothing is switched; a release that lists this
+/// build's version goes back. The release lists every other store as this build does, so the
+/// attention store is all either answer can be about, and the store stays at this build's version
+/// either way.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
-async fn a_rollback_over_the_attention_store_at_version_13_is_refused_by_a_release_that_lists_version_12()
+async fn a_rollback_over_the_attention_store_at_this_builds_version_is_refused_by_a_release_that_lists_the_version_before_it()
  {
-    for listed_at in [12, 13] {
+    let this_build = u32::try_from(kr_attention::store::SCHEMA_VERSION).expect("a small number");
+    for listed_at in [this_build - 1, this_build] {
         let mut host = Host::bare();
         let two = Assembled::at_this_level("0.2.0+bbbbbbbbbbbb", 2);
         host.install(&two);
@@ -5967,10 +5969,10 @@ async fn a_rollback_over_the_attention_store_at_version_13_is_refused_by_a_relea
         host.put(&one);
 
         let (output, said) = host.roll_back_to(&one);
-        if listed_at == 13 {
+        if listed_at == this_build {
             assert!(
                 output.status.success(),
-                "a release that lists version 13 goes back: {said} {}",
+                "a release that lists this build's version goes back: {said} {}",
                 String::from_utf8_lossy(&output.stderr)
             );
             assert_eq!(
@@ -5983,8 +5985,8 @@ async fn a_rollback_over_the_attention_store_at_version_13_is_refused_by_a_relea
             assert!(
                 message.contains("attention")
                     && message.contains(&host.tree.environment_id().to_string())
-                    && message.contains("schema version 13")
-                    && message.contains(&format!("versions {lowest} to 12"))
+                    && message.contains(&format!("schema version {this_build}"))
+                    && message.contains(&format!("versions {lowest} to {}", this_build - 1))
                     && !message.contains("registry"),
                 "the refusal names the attention store and the version it is at, and no other store: {said}"
             );
@@ -5994,7 +5996,11 @@ async fn a_rollback_over_the_attention_store_at_version_13_is_refused_by_a_relea
                 "nothing was switched"
             );
         }
-        assert_eq!(version(), 13, "the store is as it was found");
+        assert_eq!(
+            version(),
+            kr_attention::store::SCHEMA_VERSION,
+            "the store is as it was found"
+        );
     }
 }
 
