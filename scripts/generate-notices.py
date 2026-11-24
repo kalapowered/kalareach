@@ -627,9 +627,14 @@ def is_text(match):
 
 def refine(found, text):
     """askalono's cache has no text of Unicode-3.0 and reads it as Unicode-DFS-2016, whose text is the
-    same but for a few words; the title of the text tells them apart."""
+    same but for a few words; the title of the text tells them apart. askalono reads the Markdown licence
+    of John Gruber, the three-clause BSD text with "Markdown" where BSD-3-Clause names the holder, as
+    BSD-3-Clause-Clear, which adds a limit on the grant and a sentence on patent rights that Gruber's
+    text does not have; his name tells them apart."""
     if "Unicode-DFS-2016" in found and re.search(r"UNICODE\s+LICENSE\s+V3", text, re.IGNORECASE):
         return (found - {"Unicode-DFS-2016"}) | {"Unicode-3.0"}
+    if "BSD-3-Clause-Clear" in found and "John Gruber" in text:
+        return (found - {"BSD-3-Clause-Clear"}) | {"BSD-3-Clause"}
     return found
 
 
@@ -1304,6 +1309,11 @@ def self_checks(scratch, reader):
     expect("the Unicode licence's third version is told from its second",
            refine(frozenset({"Unicode-DFS-2016"}), "UNICODE LICENSE V3\n") == {"Unicode-3.0"}
            and refine(frozenset({"Unicode-DFS-2016"}), "UNICODE, INC. LICENSE AGREEMENT\n") == {"Unicode-DFS-2016"})
+    gruber = "Copyright \u00a9 2004, John Gruber\nhttp://daringfireball.net/\nAll rights reserved.\n"
+    expect("the Markdown licence of John Gruber is read as BSD-3-Clause",
+           refine(frozenset({"BSD-3-Clause-Clear", "MIT"}), "MIT text\n\n" + gruber) == {"BSD-3-Clause", "MIT"})
+    expect("a text read as BSD-3-Clause-Clear without his name stays so",
+           refine(frozenset({"BSD-3-Clause-Clear"}), "BSD 3-Clause Clear License\n") == {"BSD-3-Clause-Clear"})
 
     # How askalono's answers are read: a range blanks the lines it names, an answer is for the file it names,
     # and the two readings of a text may not call one region two licences.
