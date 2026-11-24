@@ -880,13 +880,7 @@ fn start(
     let identity = match started_process_identity(child.id()) {
         Ok(identity) => identity,
         Err(error) => {
-            // The process is this program's own child, so ending it needs no identity.
-            let _ = child.kill();
-            let seen = if reap_within(&mut child, END_BOUND) {
-                "and was ended"
-            } else {
-                "and was killed, but not seen to end"
-            };
+            let seen = ended_after_failure(&mut child);
             return Err(format!(
                 "the process {} cannot be identified, {seen}: {error}",
                 child.id()
@@ -894,13 +888,7 @@ fn start(
         }
     };
     if let Err(why) = write_down_start(context, label, &identity) {
-        // The process is this program's own child, so ending it needs no identity.
-        let _ = child.kill();
-        let seen = if reap_within(&mut child, END_BOUND) {
-            "and was ended"
-        } else {
-            "and was killed, but not seen to end"
-        };
+        let seen = ended_after_failure(&mut child);
         return Err(format!(
             "the start of the process {} cannot be written down, {seen}: {why}",
             child.id()
@@ -909,6 +897,15 @@ fn start(
     let mut keys: Vec<String> = environment.into_iter().map(|(name, _)| name).collect();
     keys.sort();
     Ok((identity, keys))
+}
+
+/// What is said of a start that failed after the process began, once it and its group are ended.
+fn ended_after_failure(child: &mut Child) -> &'static str {
+    if end_started(child, &Tools::system()) {
+        "and it and its group were ended"
+    } else {
+        "and it and its group were killed, but not all seen to end"
+    }
 }
 
 /// How a process's identity is read: by the kernel, or, in a case, by a reader that gives another
@@ -1007,6 +1004,21 @@ fn members_of(
     if !number_is_the_groups()? {
         return Ok(Vec::new());
     }
+    let members = members_listed(group, tools)?;
+    Ok(if number_is_the_groups()? {
+        members
+    } else {
+        Vec::new()
+    })
+}
+
+/// The processes the kernel lists in the group `group`, each held by identity as a member of it:
+/// its identity is read, its group is read, and its identity is read again, and a process that does
+/// not give the same identity both times, is not in the group, or has ended, is left out. A group
+/// that cannot be listed or read is an error. The number of the group is not judged here: whoever
+/// calls this holds it.
+fn members_listed(group: Pid, tools: &Tools<'_>) -> Result<Vec<ProcessStartIdentity>, String> {
+    let number = group.as_raw_pid().unsigned_abs();
     let mut members = Vec::new();
     for pid in (tools.group)(number)? {
         if pid == std::process::id() {
@@ -1030,11 +1042,35 @@ fn members_of(
                 .filter(|member| process_state(member) != ProcessState::Ended),
         );
     }
-    Ok(if number_is_the_groups()? {
-        members
-    } else {
-        Vec::new()
-    })
+    Ok(members)
+}
+
+/// Ends the process `child`, which this program has just started, and every process of the group it
+/// leads, and collects it. The child is this program's own and is not collected yet, so its number
+/// is still its and the number of its group is held until it is collected: the members are listed
+/// and ended, each by identity, before the child is collected. Says whether the group was shown
+/// to have ended and the child to be collected, each within [`END_BOUND`].
+fn end_started(child: &mut Child, tools: &Tools<'_>) -> bool {
+    let _ = child.kill();
+    let mut ended = false;
+    if let Some(group) = i32::try_from(child.id()).ok().and_then(Pid::from_raw) {
+        let deadline = Instant::now() + END_BOUND;
+        while !ended && Instant::now() < deadline {
+            match members_listed(group, tools) {
+                Ok(members) if members.is_empty() => ended = true,
+                Ok(members) => {
+                    for member in &members {
+                        let _ = stop_process(member, Stop::Kill);
+                    }
+                }
+                Err(_) => {}
+            }
+            if !ended {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+    }
+    reap_within(child, END_BOUND) && ended
 }
 
 /// The processes in the group the process `leader` leads, now, each held by identity as a member of
@@ -1550,6 +1586,28 @@ mod tests {
             process_state(&member.0),
             ProcessState::Ended,
             "the member the leader left was not ended"
+        );
+    }
+
+    /// A start that fails after the process began ends the process and the members of the group it
+    /// leads, and collects the process: the members are ended while the process is not yet collected
+    /// and its number is still its.
+    #[test]
+    fn a_start_that_failed_ends_the_process_and_the_members_of_its_group() {
+        let (mut leader, identity, member) = a_leader_with_a_member();
+        assert!(
+            end_started(&mut leader.0, &Tools::system()),
+            "the process and its group were not shown to have ended"
+        );
+        assert_eq!(
+            process_state(&member.0),
+            ProcessState::Ended,
+            "the member of the group was not ended"
+        );
+        assert_eq!(process_state(&identity), ProcessState::Ended);
+        assert!(
+            leader.0.try_wait().expect("the process").is_some(),
+            "the process was not collected"
         );
     }
 

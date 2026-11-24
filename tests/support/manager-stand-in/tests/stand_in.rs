@@ -1304,6 +1304,42 @@ fn a_bootout_that_fails_keeps_the_job_loaded() {
     std::fs::remove_file(&file).expect("the file is removed");
 }
 
+/// A start that cannot be written down fails the call and ends the process it began and the group
+/// that process leads: with a folder in the place of the file of starts, no process of the daemon is
+/// left in the group it led.
+#[test]
+fn a_start_that_cannot_be_written_down_ends_the_process_and_its_group() {
+    let fixture = Fixture::new();
+    let (_, loaded) = fixture.load("kr-controller-w", "#!/bin/sh\nsleep 5 &\nwait\n", "");
+    assert_eq!(loaded.status.code(), Some(0), "{}", text(&loaded.stderr));
+    let file = fixture.started_file();
+    std::fs::create_dir_all(&file).expect("a folder in the place of the file of starts");
+    let target = format!("{}/kr-controller-w", fixture.domain());
+    let failed = fixture.call(&["kickstart", "-p", &target]);
+    let said = text(&failed.stderr);
+    assert_eq!(
+        failed.status.code(),
+        Some(64),
+        "a start that cannot be written down fails: {said}"
+    );
+    assert!(
+        said.contains("cannot be written down") && said.contains("it and its group were ended"),
+        "the start does not say that the process and its group were ended: {said}"
+    );
+    let pid: u32 = said
+        .split("the start of the process ")
+        .nth(1)
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|number| number.parse().ok())
+        .expect("the number of the process in the answer");
+    assert!(
+        processes_in_group(pid).expect("the group").is_empty(),
+        "a process of the group the daemon led is still there"
+    );
+    // The fixture reads the file of starts when the case ends, so the folder goes first.
+    std::fs::remove_dir(&file).expect("the folder is removed");
+}
+
 /// What a definition may name is bounded after every link is resolved: a plist, a log or a working
 /// directory behind a link that leads outside the test's folders, or a link that leads nowhere, is
 /// refused.
