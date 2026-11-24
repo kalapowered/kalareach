@@ -3452,6 +3452,41 @@ mod tests {
         assert!(!said.contains(".,"), "a comma after a full stop: {said}");
     }
 
+    /// KR-REQ-03.29, S-8: a file that is being read is given up at the next block once the time has
+    /// run out in the middle of the read, and what was read so far is not an answer.
+    #[cfg(unix)]
+    #[test]
+    fn a_read_gives_up_at_the_next_block_where_the_time_runs_out_in_the_middle() {
+        use std::io::Write as _;
+
+        let root = kr_ipc::testing::PrivateTempDir::create();
+        let pipe = root.path().join("slow.pipe");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&pipe)
+            .status()
+            .expect("mkfifo runs");
+        assert!(made.success(), "a pipe for this test");
+        // One block at once, and the next one after the time of the read is gone.
+        let writer = {
+            let pipe = pipe.clone();
+            std::thread::spawn(move || {
+                let mut end = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(pipe)
+                    .expect("the writer opens");
+                end.write_all(&[b'a'; 1024]).expect("the first block");
+                std::thread::sleep(Duration::from_millis(600));
+                end.write_all(&[b'b'; 1024]).expect("the second block");
+            })
+        };
+        let read = read_within(&pipe, &Deadline::after(Duration::from_millis(250)));
+        writer.join().expect("the writer ended");
+        assert_eq!(
+            read, None,
+            "what was read before the time ran out was given as an answer"
+        );
+    }
+
     /// KR-REQ-03.29, S-8: a file is not opened once the time is gone, so what the open would have
     /// said is not an answer: not an empty file and not a missing one.
     #[test]
