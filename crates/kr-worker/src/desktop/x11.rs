@@ -287,7 +287,8 @@ fn not_started(program: &str, words: &'static str) -> Ran {
 /// What a display name names.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Named {
-    /// A display on this machine, by its number: `:0`, `:0.0` and `unix:0` name display 0.
+    /// A display on this machine, by its number: `:0`, `:0.0`, `unix:0` and `unix/:0` name
+    /// display 0.
     Here(u32),
     /// A display on another machine: a host comes before the colon.
     Network,
@@ -299,6 +300,9 @@ enum Named {
 /// machine, and no tool is started for any other.
 fn named(display: &str) -> Named {
     let digits = |text: &str| !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit());
+    // A protocol of `unix` names a local socket, as it does in xcb, so `unix/:0` is a display on
+    // this machine.
+    let display = display.strip_prefix("unix/").unwrap_or(display);
     if let Some(rest) = display
         .strip_prefix(':')
         .or_else(|| display.strip_prefix("unix:"))
@@ -1631,6 +1635,8 @@ mod tests {
             (":7.1", Named::Here(7)),
             ("unix:7", Named::Here(7)),
             ("unix:7.0", Named::Here(7)),
+            ("unix/:0", Named::Here(0)),
+            ("unix/:7.1", Named::Here(7)),
             ("host:0", Named::Network),
             ("host:0.0", Named::Network),
             ("tcp/host:0", Named::Network),
@@ -1651,12 +1657,15 @@ mod tests {
         let seen = tools.path().join("seen");
         let scratch = folder();
         let plan = Plan::in_directory(scratch.path());
-        let ran = perform_with(&plan, tools.path(), &variables(":7"), tools.path());
-        assert!(
-            matches!(ran.outcome, Outcome::Performed { .. }),
-            "a display on this machine: {ran:?}"
-        );
-        assert!(seen.exists(), "a display on this machine starts the tool");
+        for display in [":7", "unix/:7"] {
+            let _ = std::fs::remove_file(&seen);
+            let ran = perform_with(&plan, tools.path(), &variables(display), tools.path());
+            assert!(
+                matches!(ran.outcome, Outcome::Performed { .. }),
+                "a display on this machine: {ran:?}"
+            );
+            assert!(seen.exists(), "a display on this machine starts the tool");
+        }
         for (display, words) in [
             ("host:0", "reached over the network"),
             ("tcp/host:0", "reached over the network"),
