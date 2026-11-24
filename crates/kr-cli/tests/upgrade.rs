@@ -700,8 +700,12 @@ impl Updated {
     /// asks about: it holds a registry as the earlier release's own tables name it, which is how
     /// the registry's own cases leave a file at an earlier version. The daemon of this build stays
     /// as it is until the rollback stops it, and the release before opens the file at the version
-    /// it writes.
-    fn puts_the_registry_back_for_the_release_before(&self) {
+    /// it writes. Returns the version it wrote.
+    ///
+    /// Remove it when the release before reads the registry at the version this release writes,
+    /// which is when a kept release of this level is the release before: a rollback to it is then
+    /// no longer refused for the registry.
+    fn puts_the_registry_back_for_the_release_before(&self) -> i64 {
         let registry = self
             .one
             .manifest
@@ -715,12 +719,11 @@ impl Updated {
         connection
             .busy_timeout(Duration::from_secs(30))
             .expect("waits for the daemon's writes");
+        let version = i64::from(registry.version);
         connection
-            .execute(
-                "UPDATE schema_version SET version = ?1",
-                [i64::from(registry.version)],
-            )
+            .execute("UPDATE schema_version SET version = ?1", [version])
             .expect("the registry takes the version the release before writes");
+        version
     }
 
     async fn new() -> Self {
@@ -1443,9 +1446,12 @@ fn registry_version_of(host: &Host) -> i64 {
 /// KR-REQ-26.10, KR-REQ-26.08: a rollback to the release before goes on while only its session is
 /// live, and waits, exit 9, naming the session, while a session of this release is live.
 ///
-/// The registry is at schema version 16 under this release's daemon, the newest version the release
-/// before reads, and it is at 16 still once that release's daemon serves: the rollback is accepted
-/// at that version, and the release before opens the registry as found.
+/// The registry is at schema version 18 under this release's daemon, which the release before does
+/// not read, so a rollback to it is refused
+/// (`a_rollback_to_the_release_before_is_refused_for_the_registry_it_cannot_read`). This case asks
+/// about sessions and `host.info`, not about the registry, so it puts the registry back to the
+/// version the release before writes before the first rollback, as the cases of the other stores
+/// do; the rollback that waits leaves it there.
 ///
 /// The two releases also read each other's `host.info`: the release before's own `kr` reads the
 /// answer of this release's daemon, and this release reads the answer of the release before's
@@ -1469,8 +1475,8 @@ async fn a_rollback_to_the_release_before_goes_on_beside_its_session_and_waits_f
     );
     assert_eq!(
         registry_version_of(host),
-        16,
-        "this release's daemon writes the registry at schema version 16"
+        kr_controller::registry::SCHEMA_VERSION,
+        "the update brought the registry to the version this release writes"
     );
     let output = host.run(&updated.kr_before(), &["--json", "host", "machine"]);
     assert!(
@@ -1482,7 +1488,7 @@ async fn a_rollback_to_the_release_before_goes_on_beside_its_session_and_waits_f
     // A session of this release: the older release's daemon does not retain its level.
     let (display, session_now) = host.new_session(&updated.kr_now());
     let worker_now = host.worker_process(session_now);
-    updated.puts_the_registry_back_for_the_release_before();
+    let written = updated.puts_the_registry_back_for_the_release_before();
     let (output, said) = host.kr_json(&["host", "rollback", "--json"]);
     assert_eq!(
         output.status.code(),
@@ -1540,8 +1546,8 @@ async fn a_rollback_to_the_release_before_goes_on_beside_its_session_and_waits_f
     );
     assert_eq!(
         registry_version_of(host),
-        16,
-        "the release before opens the registry at schema version 16 as found"
+        written,
+        "the release before opens the registry as found, at the version it writes"
     );
     {
         let endpoint = host
