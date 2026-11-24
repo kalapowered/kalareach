@@ -905,8 +905,10 @@ jobs:
   # host, the released plugin packages the repository keeps, and the upgrade suite, which builds the
   # release before from its commit and runs a session of it beside this build. The workspace's test
   # step runs most of the first cases too, and cannot run the upgrade suite, which builds only with
-  # its feature. The job is a job of its own because the rust job's steps already add up to more than
-  # its limit, and it has no `needs` so that it runs beside that job. The service side of the
+  # its feature. The job is a job of its own because the rust job has no room for it: that job's
+  # step limits add up to 305 of its 360 minutes, and to 375 with the deadlines of its package
+  # installs, and the two steps that run these cases have 245 minutes between them. It has no
+  # `needs`, so that it runs beside that job. The service side of the
   # contract is the web repository's. The macOS upgrade suite is
   # not in this workflow: hosted macOS runners are the gate's scarcest, so no contract job takes one.
   # No job runs an installed app of the release before: the app side of these cases is the frames
@@ -3370,10 +3372,10 @@ jobs:
       # companion-tauri 20 and kr-worker 18, and the other 43 packages 28 between them. `tests-1`
       # has kr-controller, the four packages that hold the cases that need another filesystem
       # (kr-changeset, kr-ipc, kr-project and kr-transfer) and five more, 85 minutes of those
-      # programs; `tests-2` has the other 37 packages, 72 minutes, and kr-boundary-windows, which
-      # that run did not have: its 455 cases ran in 29 seconds on a Mac, half a minute more for
-      # `tests-2`. Move a package between the lists by its minutes, and keep those four packages in
-      # `tests-1`.
+      # programs; `tests-2` has 39 packages: the other 37 of that run, 72 minutes, and
+      # kr-boundary-windows and kr-manager-stand-in, which that run did not have. The 455 cases of
+      # kr-boundary-windows ran in 29 seconds on a Mac, half a minute more for `tests-2`. Move a
+      # package between the lists by its minutes, and keep those four packages in `tests-1`.
       matrix:
         include:
           - name: macos-tests-1
