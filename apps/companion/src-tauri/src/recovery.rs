@@ -605,8 +605,9 @@ impl Recovery {
                 None => store.commit(&seed, &mut first, now).await,
             };
             // A write that carries the settings uses the window once it has left this device,
-            // whatever came back: one whose answer was lost or refused may have landed, and the step
-            // that follows must not write them again at once.
+            // whatever came back, so the step that follows does not write them again at once. One
+            // whose answer was lost, or whose applied answer the store refuses, may also have
+            // landed.
             if settings_sent {
                 self.saving.window_from_now(&step);
             }
@@ -1244,10 +1245,11 @@ fn refuse_if_blocked(account: &Account, used: &GatewayOrigin, named: Named) -> R
     }
 }
 
-/// Whether a write of the bundle left this device, whatever came back: an answer of any kind, an
-/// applied answer the store refuses for the place it names (which leaves the write outstanding),
-/// or none at all. A write stopped before anything was sent, or by a bundle that does not fit,
-/// did not.
+/// Whether a write of the bundle left this device, whatever came back: an answer, an applied
+/// answer the store refuses for the place it names (which leaves the write outstanding), or none
+/// at all. A conflict counts because the one caller makes the first write of all: the store holds
+/// no baseline then, so a conflict can only be the service's answer. A write stopped before
+/// anything was sent, or by a bundle that does not fit, did not.
 fn left_this_device<T>(written: &std::result::Result<T, RecoveryError>) -> bool {
     matches!(
         written,

@@ -35,10 +35,11 @@
 //!
 //! # When a step runs
 //!
-//! Five things want a step: the application's start, a change to the settings file (after
+//! Seven things want a step: the application's start, a change to the settings file (after
 //! [`SettingsTiming::quiet`] with no further change), a recovery step that reached the service,
-//! the person turning saving on again, and the end of the window after a step that failed. None of
-//! them waits inside the lock: each only records that a step is wanted. One loop runs the steps.
+//! a turn-on that left a write outstanding, a removal whose answer was lost, the person turning
+//! saving on again, and the end of the window after a step that failed. None of them waits inside
+//! the lock: each only records that a step is wanted. One loop runs the steps.
 //!
 //!
 //! There is one eligibility deadline for the process. It is read and moved only while a step holds

@@ -961,8 +961,9 @@ pub fn start_recovery<R: tauri::Runtime>(
 }
 
 /// Starts saving this computer's settings with the recovery bundle: a step runs now, after a change
-/// to the settings once they have been quiet, after a recovery step that reached the service, and
-/// at the end of the window after a step that failed. The settings and recovery are opened first.
+/// to the settings once they have been quiet, after a recovery step that reached the service,
+/// after a turn-on that left a write outstanding or a removal whose answer was lost, and at the
+/// end of the window after a step that failed. The settings and recovery are opened first.
 /// The settings the bundle holds are listed and removed through the retained flow from here on.
 /// The oldest level this release retains decides whether a member is written: while it is below the
 /// first level that reads one, nothing is (see [`recovery::SETTINGS_READ_FROM`]).
