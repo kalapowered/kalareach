@@ -1463,7 +1463,8 @@ impl Host {
     }
 }
 
-/// Writes version 12 into the attention store at `store`, as `Host::roll_back_json` says.
+/// Writes version 12 into the attention store at `store`, as `Host::roll_back_json` says. Remove it
+/// when the release before lists the attention store at version 13.
 fn write_the_attention_version_back(store: &Path) {
     let connection = rusqlite::Connection::open(store).expect("the attention store");
     connection
