@@ -16,10 +16,12 @@
 # features of every crate's tests into one graph. It also builds the two test programs that carry
 # the refusal (`kr-controller-held` and `kr` with `--features testing`). The case
 # `a_shipped_program_holds_none_of_the_launchd_refusal` of `kr-ipc` then reads the files: the test
-# programs have to hold the bytes of the refusal sentence and of the variable's name, which proves
-# that a search which finds nothing is not a search that cannot find, and no program of either
-# release build may hold either. The profile is the release one throughout: it is what a person
-# installs.
+# programs have to hold the bytes of the refusal sentence and of the variable's name and, on macOS,
+# the three strings of the stand-in service manager's seam (the variable `KR_MANAGER_STAND_IN`, the
+# sentence of its refusal and the marker's file name `kr-manager-stand-in.installation`), which
+# proves that a search which finds nothing is not a search that cannot find, and no program of
+# either release build may hold any of them. The profile is the release one throughout: it is what
+# a person installs.
 #
 # The three release builds do not stand on the disk together. The case is compiled first, so the
 # last step compiles nothing. Each build's programs are copied into a folder of their own, and the

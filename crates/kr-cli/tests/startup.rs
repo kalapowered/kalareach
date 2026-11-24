@@ -3778,7 +3778,8 @@ fn service_installation() -> &'static Path {
 /// `kr`, and the marker that makes every program of the installation refuse a service manager
 /// unless the run names the stand-in. It is not the shared installation, so no other case's
 /// processes are held to a stand-in, and it stays until this test program ends, which is after
-/// every process of a case that started from it.
+/// every process of a case that started from it, except those of a tree that is kept because their
+/// end could not be established: they can outlive the installation.
 ///
 /// A build that has not built the stand-in yet fails here and says why: the case never stands down.
 /// So does a worker built without the `testing` feature: it does not read the marker, and in a
@@ -5085,10 +5086,11 @@ fn the_headless_host_case(host: &ServiceHost) {
     host.close(&created);
 }
 
-/// KR-REQ-26.42: the headless host is installed and started under the user's service manager with
-/// no account and no managed service: on Linux the user's systemd, and on macOS the account's own
-/// launchd where the run asked for it. Where the host has no such manager the case says so and
-/// stands down; the case on the stand-in service manager is the one that runs everywhere on macOS.
+/// KR-REQ-26.42: the headless host is installed and started under a user service manager with no
+/// account and no managed service: on Linux a `systemd --user` that this test starts for itself,
+/// and on macOS the account's own launchd where the run asked for it. Where the host has no such
+/// manager the case says so and stands down; the case on the stand-in service manager is the one
+/// that runs everywhere on macOS.
 #[test]
 fn kr_req_26_42_the_headless_host_is_installed_and_started_under_the_user_service_manager_with_no_account_and_no_managed_service()
  {

@@ -12,7 +12,9 @@
 //! first: a runner whose substitution is missing, skipped or ignored reaches it with the real
 //! program, and it refuses. In a run that names a stand-in, or in a marked installation, every
 //! command of a program whose file name is `launchctl` or `systemctl` is refused for every verb,
-//! reads included; nothing falls back to the real program.
+//! reads included; nothing falls back to the real program. On Linux the control daemon's desktop
+//! agent also runs `systemctl --user show-environment`, a read, with a runner of its own that this
+//! seam does not cover.
 //!
 //! A run that names no stand-in, in an installation that is not marked, is not changed by anything
 //! here. The module compiles only with the `testing` feature, which no shipped build enables.

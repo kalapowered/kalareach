@@ -780,15 +780,17 @@ fn kickstart(context: &Context, target: &str) -> Answer {
 }
 
 /// Starts the daemon as `definition` says: its arguments, its directory, its mask, its log as both
-/// outputs, no input, a session and a process group of its own, and exactly launchd's defaults for
-/// the environment (the test's home and temporary directory, the system path), the definition's
-/// own entries and the name of this program.
+/// outputs, no input, a process group of its own, a session of its own where this program can start
+/// one, and an environment of a system path, the home, temporary, state and runtime directories of
+/// the caller, the definition's own entries and the name of this program. launchd's defaults also
+/// hold `USER`, `LOGNAME` and `SHELL`, which this program does not set.
 fn start(
     context: &Context,
     definition: &Definition,
 ) -> Result<(ProcessStartIdentity, Vec<String>), String> {
-    // A session of its own, so that the daemon has no controlling terminal whatever started the
-    // test; where this process already leads one, it already has none to give.
+    // A session of its own, so that the daemon has no controlling terminal from the test that
+    // started it. The call fails when this process leads a process group, and the daemon then keeps
+    // the session it was started in, controlling terminal included.
     let _ = rustix::process::setsid();
     bound_arguments(context, definition)?;
     // The paths are resolved again here, so that a link made after the definition was loaded is

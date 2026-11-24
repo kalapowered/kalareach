@@ -1,6 +1,6 @@
 //! The rule that a test run's stand-in service manager has no way round it, read from the sources.
 //!
-//! Product code starts a service manager through three runners only: the command line's
+//! Product code starts `launchctl` through three runners only: the command line's
 //! (`run_within`), the desktop reader's (`run`) and the control daemon's (`command_within`). Two
 //! readings, each by tokens, so that a name inside a comment is not a use:
 //!
@@ -11,7 +11,9 @@
 //!    until it is listed, and a listed one that names none is refused too.
 //!
 //! What the readings cannot see: a program named by a string a macro builds, a path made at run
-//! time, and a command inside shell text. The behaviour of each runner is shown by its own cases,
+//! time, a command inside shell text, and a call of `systemctl`: on Linux the control daemon's
+//! desktop agent runs `systemctl --user show-environment`, a read, outside the three runners. The
+//! behaviour of each runner is shown by its own cases,
 //! each in a child of its own with the variable and the marker in the state the case names.
 
 use std::collections::BTreeMap;
