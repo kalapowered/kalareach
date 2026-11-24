@@ -294,7 +294,15 @@ async fn offer(broker: &Broker, lane: &ObservationLane, entry: &Entry) {
         if let Source::Native(frame) = &entry.source
             && frame
                 .recorded
-                .is_some_and(|place| place < view.recorded_from)
+                .is_some_and(|recorded| recorded.place < view.recorded_from)
+        {
+            continue;
+        }
+        // A request recorded after the baseline was read is asked about again here: it can be
+        // answered, or left behind by its source, between its recording and this hand-over.
+        if let Source::Native(frame) = &entry.source
+            && let Some(recorded) = &frame.recorded
+            && !broker.still_pending(recorded.resource_id, recorded.generation)
         {
             continue;
         }

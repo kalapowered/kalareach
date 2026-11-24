@@ -43,7 +43,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use kr_plugin_sdk::limits::OBSERVATION_QUEUE_BYTES;
-use kr_protocol::ids::{ApplicationInstanceId, BrokerBindingId, SourceEventHandle};
+use kr_protocol::ids::{
+    ApplicationInstanceId, BrokerBindingId, PendingResourceId, SourceEventHandle, SourceGeneration,
+};
 use tokio::time::Instant;
 
 use super::{Broker, PackageIdentity};
@@ -81,12 +83,24 @@ pub struct NativeFrame {
     /// The upstream's identifier for the request, where the frame is one the upstream is waiting
     /// on. Such an entry is authoritative.
     pub request_id: Option<String>,
-    /// The place the broker recorded the request in ([`super::arbitration::Pending::recorded`]),
-    /// where the frame is a request it recorded. A producer pushes the frame after the broker's lock
-    /// is dropped, so the order of pushes is not the order of records: this is.
-    pub recorded: Option<u64>,
+    /// What the broker recorded the request as, where the frame is a request it recorded.
+    pub recorded: Option<Recorded>,
     /// The frame's bytes, shared and never changed.
     pub bytes: Arc<[u8]>,
+}
+
+/// What the broker recorded a request as: where, under which identifier, and at which source
+/// generation.
+#[derive(Clone, Copy, Debug)]
+pub struct Recorded {
+    /// The place the broker recorded the request in ([`super::arbitration::Pending::recorded`]). A
+    /// producer pushes the frame after the broker's lock is dropped, so the order of pushes is not
+    /// the order of records: this is.
+    pub place: u64,
+    /// The request, which the broker is asked about again before the frame is offered.
+    pub resource_id: PendingResourceId,
+    /// The source generation the request was recorded under.
+    pub generation: SourceGeneration,
 }
 
 /// Where an entry came from.
@@ -1338,7 +1352,7 @@ pub(super) struct NativeTap {
     package: PackageIdentity,
     handle: Option<SourceEventHandle>,
     request_id: Option<String>,
-    recorded: Option<u64>,
+    recorded: Option<Recorded>,
 }
 
 impl super::BrokerState {
@@ -1370,7 +1384,11 @@ impl super::BrokerState {
                 Some(request.upstream.as_str().to_owned()),
                 resource
                     .and_then(|resource| self.arbitration.get(resource.resource_id))
-                    .map(|pending| pending.recorded),
+                    .map(|pending| Recorded {
+                        place: pending.recorded,
+                        resource_id: pending.resource.resource_id,
+                        generation: pending.resource.source_generation,
+                    }),
             ),
             _ => (None, None, None),
         };

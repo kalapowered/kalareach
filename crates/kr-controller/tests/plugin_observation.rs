@@ -677,7 +677,10 @@ async fn kr_req_24_24_a_request_frame_in_the_lane_carries_the_place_the_broker_r
         let Source::Native(frame) = &entry.source else {
             panic!("an upstream frame: {entry:?}");
         };
-        taken.push((frame.request_id.clone(), frame.recorded));
+        taken.push((
+            frame.request_id.clone(),
+            frame.recorded.map(|recorded| recorded.place),
+        ));
         lane.finish(&entry);
     }
     hold.release();
@@ -1070,6 +1073,54 @@ async fn kr_req_24_24_a_component_that_starts_again_is_given_the_pending_request
         world.report(2).is_none(),
         "the binding that ships no component has no report"
     );
+}
+
+/// KR-REQ-24.24: a request recorded after the baseline was read and answered before the pump takes
+/// its frame is not given to the component.
+///
+/// The component starts again with nothing pending. The pump is held, a request arrives and is
+/// answered through the native terminal, and a notification arrives after it. When the pump goes on,
+/// the component observes the notification, which the lane holds after the request, and was never
+/// given the request.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_24_24_a_request_answered_after_the_baseline_was_read_is_not_given_to_the_component()
+{
+    let Some(world) = Observing::start(Options::with(vec![Spec::semantic_only(1)])).await else {
+        return;
+    };
+    world.until_ready(1).await;
+    let lane = world.broker().observation();
+    lose_the_runtime(&world).await;
+    world.let_the_compiles_go();
+    until_started_again(&world, 1).await;
+
+    let hold = lane.hold_pump();
+    until("the pump to stop at the hold", || async {
+        hold.parked().then_some(())
+    })
+    .await;
+    world.send(&request(5));
+    until_recorded(&world, 5).await;
+    answer_natively(&world, 5).await;
+    world.send(&notification("after"));
+    until(
+        "the lane to hold the request and the notification",
+        || async { (lane.waiting() == 2).then_some(()) },
+    )
+    .await;
+    hold.release();
+    let account = world
+        .until_account(
+            1,
+            "the component to have observed the notification",
+            |account| account.observes >= 1,
+        )
+        .await;
+    assert!(
+        account.requests.is_empty(),
+        "the component was given a request answered before it was offered: {account:?}"
+    );
+    assert_eq!(account.observes, 1, "{account:?}");
 }
 
 /// Starts a world whose binding 1 reads requests into approvals and whose binding 2 observes, and
