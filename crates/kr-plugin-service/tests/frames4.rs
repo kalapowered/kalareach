@@ -43,7 +43,11 @@ fn recorded() -> (Vec<Request>, Vec<Frame>) {
     let (mut requests, mut frames) = (Vec::new(), Vec::new());
     for entry in record["frames"].as_array().expect("the frames") {
         let kind = entry["kind"].as_str().expect("a kind");
-        let bytes = unhex(entry["hex"].as_str().expect("the bytes"));
+        // A frame too long to keep is held as its length and digest.
+        let Some(hexed) = entry["hex"].as_str() else {
+            continue;
+        };
+        let bytes = unhex(hexed);
         if kind.starts_with("request:") {
             requests.push(kr_cbor::from_canonical_slice(&bytes, &limits).expect("a request"));
         } else {
