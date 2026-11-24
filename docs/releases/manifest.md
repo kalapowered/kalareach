@@ -265,7 +265,8 @@ as the release archives' are (`cargo tree`, cargo-about, `about.toml`), and an e
 `scripts/notice-texts.json` says which notice it is for. The JavaScript packages are the ones
 `pnpm licenses list --prod` gives, which is the dependency closure and not only the part that the
 bundler keeps. Each is recorded under the first of its licences that `about.toml` lists, and its texts
-are the licence files of its installed package.
+are chosen as a crate's are: the licence files of its installed package, or, where the package holds no
+text of that licence, the text that `scripts/notice-texts.json` keeps for it, with `npm` as its package.
 
 `kr-release companion-notice` holds the committed text to the lock: it refuses a text that has no entry
 for a crate the lock takes into the companion application, or that holds a template's placeholder. The
