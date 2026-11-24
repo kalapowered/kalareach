@@ -1151,34 +1151,48 @@ fn ended_within(
 /// a group only as members found and held by identity just before: never to a number, which can name
 /// another process or group by the time a signal arrives. A process whose state is not known, and a
 /// process or group that is not shown to have ended after it was made to, is an error: nothing is
-/// called ended that was not seen to end.
+/// called ended that was not seen to end. Every process is tried, whichever of the others cannot be
+/// ended, and the error names each one that could not be.
 fn end_all(
     identities: &[ProcessStartIdentity],
     state: &dyn Fn(&ProcessStartIdentity) -> ProcessState,
     tools: &Tools<'_>,
     bound: Duration,
 ) -> Result<(), String> {
+    let mut failures = Vec::new();
     for identity in identities {
-        if let ProcessState::Unknown { detail } = state(identity) {
-            return Err(unknown(identity, &detail));
-        }
-        let group = group_of(identity)?;
-        let mut ended = false;
-        for stop in [Stop::Terminate, Stop::Kill] {
-            let _ = stop_process(identity, stop);
-            for member in members_of(identity, group, tools)? {
-                let _ = stop_process(&member, stop);
-            }
-            if ended_within(identity, group, state, tools, bound)? {
-                ended = true;
-                break;
-            }
-        }
-        if !ended {
-            return Err(format!("the process {} did not end", identity.pid.get()));
+        if let Err(why) = end_one(identity, state, tools, bound) {
+            failures.push(why);
         }
     }
-    Ok(())
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures.join("; "))
+    }
+}
+
+/// Ends the process `identity` and the members of the group it leads, as [`end_all`] does for each.
+fn end_one(
+    identity: &ProcessStartIdentity,
+    state: &dyn Fn(&ProcessStartIdentity) -> ProcessState,
+    tools: &Tools<'_>,
+    bound: Duration,
+) -> Result<(), String> {
+    if let ProcessState::Unknown { detail } = state(identity) {
+        return Err(unknown(identity, &detail));
+    }
+    let group = group_of(identity)?;
+    for stop in [Stop::Terminate, Stop::Kill] {
+        let _ = stop_process(identity, stop);
+        for member in members_of(identity, group, tools)? {
+            let _ = stop_process(&member, stop);
+        }
+        if ended_within(identity, group, state, tools, bound)? {
+            return Ok(());
+        }
+    }
+    Err(format!("the process {} did not end", identity.pid.get()))
 }
 
 /// The processes written down for the job `label`.
@@ -1435,6 +1449,58 @@ mod tests {
             held.0.try_wait().expect("its state"),
             None,
             "nothing was signalled to the process"
+        );
+    }
+
+    /// A process that cannot be ended does not stop the ones after it: the second of two is still
+    /// ended, and the error names the first.
+    #[test]
+    fn a_process_that_cannot_be_ended_does_not_stop_the_ones_after_it() {
+        let mut first = Held(
+            Command::new("/bin/sleep")
+                .arg("30")
+                .process_group(0)
+                .spawn()
+                .expect("a process that runs"),
+        );
+        let mut second = Held(
+            Command::new("/bin/sleep")
+                .arg("30")
+                .process_group(0)
+                .spawn()
+                .expect("a process that runs"),
+        );
+        let first_identity = started_process_identity(first.0.id()).expect("its identity");
+        let second_identity = started_process_identity(second.0.id()).expect("its identity");
+        let state = |identity: &ProcessStartIdentity| {
+            if *identity == first_identity {
+                ProcessState::Unknown {
+                    detail: "the system did not answer".to_owned(),
+                }
+            } else {
+                process_state(identity)
+            }
+        };
+        let ended = end_all(
+            &[first_identity.clone(), second_identity.clone()],
+            &state,
+            &Tools::system(),
+            Duration::from_secs(5),
+        );
+        assert!(
+            ended.as_ref().is_err_and(|why| {
+                why.contains("not known") && why.contains(&first.0.id().to_string())
+            }),
+            "{ended:?}"
+        );
+        assert_eq!(
+            first.0.try_wait().expect("its state"),
+            None,
+            "the first was signalled"
+        );
+        assert!(
+            reap_within(&mut second.0, Duration::from_secs(5)),
+            "the second was not ended"
         );
     }
 
