@@ -27,11 +27,14 @@ use kr_protocol::identity::ProcessStartIdentity;
 /// show to have ended, a group or a record it cannot read, and a line of the file of starts that is
 /// not a start fail the case.
 ///
-/// Two readings are single, with no second reading to show that the process is the same one: the
-/// identity [`Fixture::detached`] reads of the process its shell started, and the identity of each
-/// `sleep` that `idle` starts, which the one case that tracks them reads once. The first runs for as
-/// long as the case lets it and the others end within a second. A number that passes to another
-/// process between the start of a process and its one reading is not guarded against.
+/// Six readings are single, with no second reading to show that the process is the same one: the
+/// identity [`Fixture::detached`] reads of the process its shell started; the identity of each
+/// `sleep` that `idle` starts, which the one case that tracks them reads once; the identity of the
+/// process a daemon's script started, which three cases read once from the number the script wrote;
+/// and the identity of the `sleep` that the case of an unreadable group starts through a shell.
+/// Each is read just after its process starts, and all but the `sleep`s of `idle`, which end within
+/// a second, run for as long as their case lets them. A number that passes to another process
+/// between the start of a process and its one reading is not guarded against.
 struct Fixture {
     tree: PrivateTempDir,
     installation: PrivateTempDir,

@@ -7,14 +7,21 @@
 //! record of each job, and writes down every call with its status. A command it does not know, a key
 //! of the definition it does not apply (it accepts `ProcessType` as `Interactive` and applies none),
 //! and a path outside the test's own folders are refused with status 64. A call is not written down
-//! when the caller names no state directory, when the store cannot be made, when the lock on it is
-//! not taken within a minute, or when the path of its record lies outside the test's own folders.
+//! when the caller names no state directory, when the store cannot be made, when the file of its
+//! lock cannot be opened, when the lock on it is not taken within a minute, when the path of its
+//! record lies outside the test's own folders, or when the call log cannot be opened or written
+//! (the call does not report that one).
 //!
 //! Each process it starts is written down with the label of its job, as soon as it is started and
 //! before the record that names it is kept. `bootout` ends every process written down for the job,
 //! each with the members of the group it leads. One gap remains: a stand-in that is ended after it
 //! starts a process and before it writes the process down leaves that process running, and
-//! `bootout` does not find it. A write that fails ends the process it was for.
+//! `bootout` does not find it. A limit remains too: the number of a group can pass to another
+//! process once the group has ended, and members that a leader of the new group leaves after it
+//! ends are then taken for the job's. It takes a wrap of the counter of process numbers, within the
+//! time from the end of a start's leader to the reading that finds it, which can be as long as the
+//! test has run. A write that fails ends the process it was for with the members of its group, and
+//! the answer says so when it could not confirm that every one of them ended.
 //!
 //! What it cannot show: that real launchd accepts the file, that these answers are the real tool's
 //! (they are copied from what `kr` reads), the session and the keychain a real job runs in, the
@@ -105,10 +112,10 @@ const END_BOUND: Duration = Duration::from_secs(15);
 /// [`END_BOUND`]s to end a daemon, so this is longer than both.
 const LOCK_BOUND: Duration = Duration::from_secs(60);
 
-/// How long a command this program runs (`ps`, `lsof`) is given to end.
+/// How long a command this program runs (`ps`) is given to end.
 const COMMAND_BOUND: Duration = Duration::from_secs(20);
 
-/// How much a command is read for on each stream. A listing of every process is far below it.
+/// How much a command is read for on each stream. What `ps` prints for one process is far below it.
 const OUTPUT_LIMIT: usize = 8 * 1024 * 1024;
 
 /// The variables the definition may not set: the harness's own.
@@ -905,7 +912,7 @@ fn ended_after_failure(child: &mut Child) -> &'static str {
     if end_started(child, &Tools::system()) {
         "and it and its group were ended"
     } else {
-        "and it and its group were killed, but not all seen to end"
+        "but the end of every process of it and its group could not be confirmed"
     }
 }
 
@@ -995,7 +1002,10 @@ fn group_of(identity: &ProcessStartIdentity) -> Result<Pid, String> {
 ///
 /// A limit: a number that another process took, whose leader then ended and left members, passes
 /// both readings, and those members are read as the group's. It takes a wrap of the counter of
-/// process numbers, a new group leader and its end, all inside one reading.
+/// process numbers, a new group leader and its end. If the old leader was still there at the first
+/// reading, all three must come between the two readings. If it had ended before the first reading,
+/// they can come at any time from its end to the first reading, which can be as long as the test
+/// has run.
 fn members_of(
     leader: &ProcessStartIdentity,
     group: Pid,

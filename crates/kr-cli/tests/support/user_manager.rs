@@ -58,8 +58,9 @@ pub fn spawning<T>(start: impl FnOnce() -> T) -> T {
     spawning_before(Instant::now() + TURN_BOUND, start).unwrap_or_else(|why| panic!("{why}"))
 }
 
-/// [`spawning`], for a caller that has a deadline: it gives up the turn it is waiting for at
-/// `deadline`, and says so, where [`spawning`] waits for as long as another thread's start takes.
+/// Takes the turn and runs `start`, as [`spawning`] does, but gives up the turn it is waiting for at
+/// `deadline` and says so. [`spawning`] calls it with [`TURN_BOUND`] and [`bounded`] with the bound
+/// it was given.
 fn spawning_before<T>(deadline: Instant, start: impl FnOnce() -> T) -> Result<T, String> {
     loop {
         match SPAWNING.try_lock() {
