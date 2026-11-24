@@ -282,6 +282,12 @@ fn split_target(target: &str) -> Option<(String, &str)> {
     Some((format!("{kind}/{uid}"), label))
 }
 
+/// The job `label` loaded in `domain`: a job that is loaded in the other domain is not there, as
+/// launchd answers.
+fn job_in(context: &Context, domain: &str, label: &str) -> Result<Option<Job>, String> {
+    Ok(context.job(label)?.filter(|job| job.domain == domain))
+}
+
 /// Runs the stand-in's own command line and returns the status it exits with.
 #[must_use]
 pub fn run(arguments: &[String]) -> i32 {
@@ -534,7 +540,7 @@ fn print(context: &Context, target: &str) -> Answer {
             format!("Could not find domain for {domain}\n"),
         );
     }
-    match context.job(label) {
+    match job_in(context, &domain, label) {
         Err(why) => Answer::refused(why),
         Ok(None) => Answer::failed(
             NOT_LOADED,
@@ -733,7 +739,7 @@ fn kickstart(context: &Context, target: &str) -> Answer {
             format!("Could not find domain for {target}\n"),
         );
     };
-    let mut job = match context.job(label) {
+    let mut job = match job_in(context, &domain, label) {
         Err(why) => return Answer::refused(why),
         Ok(None) => {
             return Answer::failed(
@@ -1048,13 +1054,13 @@ fn end_job(context: &Context, job: &Job) -> Result<(), String> {
 /// to another process now is left alone. A process that is not shown to have ended keeps the job
 /// loaded and is reported as a failure.
 fn bootout(context: &Context, target: &str) -> Answer {
-    let Some((_, label)) = split_target(target) else {
+    let Some((domain, label)) = split_target(target) else {
         return Answer::failed(
             NO_SUCH_DOMAIN,
             format!("Could not find domain for {target}\n"),
         );
     };
-    let job = match context.job(label) {
+    let job = match job_in(context, &domain, label) {
         Err(why) => return Answer::refused(why),
         Ok(None) => {
             return Answer::failed(

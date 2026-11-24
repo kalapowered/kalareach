@@ -282,6 +282,37 @@ fn the_stand_in_answers_the_reads_of_kr_as_launchd_does() {
     );
 }
 
+/// A job loaded in the background domain is not there for the graphical domain: `print`,
+/// `kickstart` and `bootout` answer 113, as launchd does for a job that a domain does not have,
+/// and the job stays loaded in its own domain.
+#[test]
+fn a_job_loaded_in_the_background_domain_is_not_found_in_the_graphical_domain() {
+    let fixture = Fixture::new();
+    let (_, loaded) = fixture.load("kr-controller-x", "#!/bin/sh\nexit 0\n", "");
+    assert_eq!(loaded.status.code(), Some(0), "{}", text(&loaded.stderr));
+    let graphical = format!("gui/{}/kr-controller-x", fixture.uid);
+    for arguments in [
+        vec!["print", &graphical],
+        vec!["kickstart", "-p", &graphical],
+        vec!["bootout", &graphical],
+    ] {
+        let answered = fixture.call(&arguments);
+        assert_eq!(
+            answered.status.code(),
+            Some(113),
+            "{arguments:?}: {}",
+            text(&answered.stderr)
+        );
+    }
+    let background = format!("{}/kr-controller-x", fixture.domain());
+    let described = fixture.call(&["print", &background]);
+    assert_eq!(
+        described.status.code(),
+        Some(0),
+        "the job is still loaded in its own domain"
+    );
+}
+
 /// A definition is loaded as written, once; what the description says is what `kr` reads; and
 /// everything the stand-in does not apply is refused and never loaded.
 #[test]
