@@ -444,6 +444,43 @@ fn decide_windows(capability: &str, tool: Option<String>) -> Answer {
     }
 }
 
+/// The answer on X11, from the tool found and whether this process holds a display.
+///
+/// This process is the control daemon, which is a service with no display of its own, and the
+/// record is read in it. A display it does not hold is therefore not a permission a person grants
+/// and not a finding about the desktop: what a worker's own context holds is what a check reads.
+fn decide_x11(tool: Option<String>, holds_display: bool) -> Answer {
+    match tool {
+        Some(tool) if holds_display => Answer {
+            state: CapabilityState::NotTested,
+            evidence: CapabilityEvidenceSource::NotProbed,
+            reason: Some(
+                Sentence::new()
+                    .stated(
+                        "X11 grants this to a client that holds the display and its authority, \
+                         and this process holds both. Nothing here has opened the display with ",
+                    )
+                    .path(Path::new(&tool))
+                    .stated(", so whether it opens is not established"),
+            ),
+            tool: Some(tool),
+        },
+        Some(tool) => Answer {
+            state: CapabilityState::NotTested,
+            evidence: CapabilityEvidenceSource::NotProbed,
+            reason: Some(Sentence::new().stated(
+                "this process holds no X11 display; a worker's own context is what a check reads",
+            )),
+            tool: Some(tool),
+        },
+        None => Answer::refused(
+            CapabilityState::MissingInstallation,
+            CapabilityEvidenceSource::PlatformQuery,
+            "no installed tool on this host serves this capability on X11",
+        ),
+    }
+}
+
 /// The answer on a Unix desktop, which depends on the display server and the tool together.
 ///
 /// X11 hands a client that holds the display and its authority everything, so what is left
@@ -470,36 +507,7 @@ pub fn decide_unix(capability: &str, desktop: &DesktopContext, tool: Option<Stri
         Sentence::new().withheld(ContentClass::Name, &compositor)
     };
     match desktop.display_server {
-        DisplayServer::X11 => match tool {
-            Some(tool) if display_reachable() => Answer {
-                state: CapabilityState::NotTested,
-                evidence: CapabilityEvidenceSource::NotProbed,
-                reason: Some(
-                    Sentence::new()
-                        .stated(
-                            "X11 grants this to a client that holds the display and its authority, \
-                             and this context holds both. Nothing here has opened the display with ",
-                        )
-                        .path(Path::new(&tool))
-                        .stated(", so whether it opens is not established"),
-                ),
-                tool: Some(tool),
-            },
-            Some(tool) => Answer {
-                state: CapabilityState::PermissionRequired,
-                evidence: CapabilityEvidenceSource::PlatformQuery,
-                reason: Some(Sentence::new().stated(
-                    "this context has no X11 display and authority, so it cannot reach the X \
-                     server",
-                )),
-                tool: Some(tool),
-            },
-            None => Answer::refused(
-                CapabilityState::MissingInstallation,
-                CapabilityEvidenceSource::PlatformQuery,
-                "no installed tool on this host serves this capability on X11",
-            ),
-        },
+        DisplayServer::X11 => decide_x11(tool, display_reachable()),
         DisplayServer::Wayland => match tool {
             Some(tool) => {
                 let route = wayland_route(capability);
@@ -680,9 +688,7 @@ fn facility_in(
 fn candidates(capability: &str, display_server: DisplayServer) -> &'static [&'static str] {
     match (capability, display_server) {
         (capabilities::SCREEN_CAPTURE, DisplayServer::Quartz) => &["/usr/sbin/screencapture"],
-        (capabilities::SCREEN_CAPTURE, DisplayServer::X11) => {
-            &["maim", "import", "scrot", "xwd", "spectacle"]
-        }
+        (capabilities::SCREEN_CAPTURE, DisplayServer::X11) => super::x11::PROGRAMS,
         (capabilities::SCREEN_CAPTURE, DisplayServer::Wayland) => {
             &["grim", "grimblast", "spectacle", "gnome-screenshot"]
         }
@@ -920,7 +926,6 @@ mod tests {
         }
         let search = std::ffi::OsString::from(&directory);
         for (server, compositor) in [
-            (DisplayServer::X11, "x"),
             (DisplayServer::Wayland, "gnome"),
             (DisplayServer::WindowsDesktop, "dwm"),
         ] {
@@ -953,6 +958,22 @@ mod tests {
         for check in [Check::AccessibleElement, Check::ApplicationLaunch] {
             assert_eq!(
                 resolve(check, &sway, Some(search.as_os_str())),
+                None,
+                "no route for {check:?}"
+            );
+        }
+        // X11 names the first of its screen image tools that is installed, and no other check's.
+        let x11 = desktop(DisplayServer::X11, Some("x"));
+        let operation = resolve(Check::ScreenImage, &x11, Some(search.as_os_str()))
+            .expect("X11 has a route for the screen image");
+        assert_eq!(
+            operation.program.named_path(),
+            Some(format!("{}/maim", directory.display()).as_str()),
+            "names maim, the first row, and no other tool"
+        );
+        for check in [Check::AccessibleElement, Check::ApplicationLaunch] {
+            assert_eq!(
+                resolve(check, &x11, Some(search.as_os_str())),
                 None,
                 "no route for {check:?}"
             );
@@ -1372,6 +1393,46 @@ mod tests {
                 .record(capabilities::DISPLAY_SERVER)
                 .is_some_and(|record| record.state.is_available()),
             "the display server is still nameable while the screen is locked"
+        );
+    }
+
+    /// KR-REQ-03.29, LX-5: the daemon builds the platform's records in its own process, which holds
+    /// no display. An X11 context with a tool installed and no display in this process is not a
+    /// permission a person grants and not a finding about the desktop: the record says this
+    /// process holds none and that a worker's own context is what a check reads.
+    #[test]
+    fn kr_req_03_29_the_daemons_x11_record_without_a_display_is_not_a_permission() {
+        let tool = Some("/usr/bin/maim".to_owned());
+        let without = decide_x11(tool.clone(), false);
+        assert_eq!(without.state, CapabilityState::NotTested);
+        assert_eq!(without.evidence, CapabilityEvidenceSource::NotProbed);
+        let reason = without.reason.expect("a reason").as_str().to_owned();
+        assert!(
+            reason.contains("this process holds no X11 display"),
+            "{reason}"
+        );
+        assert!(
+            reason.contains("a worker's own context is what a check reads"),
+            "{reason}"
+        );
+        assert!(!reason.contains("permission"), "{reason}");
+        assert_eq!(without.tool, tool);
+        // With a display the words say this process too, and no tool is no installation.
+        let with = decide_x11(tool, true);
+        assert_eq!(with.state, CapabilityState::NotTested);
+        let reason = with.reason.expect("a reason").as_str().to_owned();
+        assert!(reason.contains("this process holds both"), "{reason}");
+        assert!(!reason.contains("this context"), "{reason}");
+        let none = decide_x11(None, true);
+        assert_eq!(none.state, CapabilityState::MissingInstallation);
+    }
+
+    /// KR-REQ-03.29, LX-1: the platform's own record looks for the tools the check runs.
+    #[test]
+    fn kr_req_03_29_the_platform_record_looks_for_the_x11_tools_the_check_runs() {
+        assert_eq!(
+            candidates(capabilities::SCREEN_CAPTURE, DisplayServer::X11),
+            ["maim", "import", "scrot", "xwd"]
         );
     }
 

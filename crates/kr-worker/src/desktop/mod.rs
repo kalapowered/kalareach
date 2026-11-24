@@ -57,6 +57,7 @@ pub mod platform;
 pub mod probe;
 pub mod routes;
 mod wayland;
+mod x11;
 
 use std::time::{Duration, Instant};
 

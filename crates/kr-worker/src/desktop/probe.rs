@@ -152,9 +152,9 @@ impl Check {
                 bound: Duration::from_secs(5),
             },
             Self::ScreenImage => Effects {
-                performs: "takes one image of the main display, reads it into memory to measure \
-                           it, and keeps nothing",
-                reads: "whatever is on the main display at that instant",
+                performs: "takes one image of the screen, reads it into memory to measure it, \
+                           and keeps nothing",
+                reads: "whatever is on the screen at that instant",
                 writes: "one image into this check's own directory, read back and removed before \
                          the check answers; a removal that fails is reported rather than passed \
                          over",
@@ -1183,6 +1183,10 @@ impl Facilities for Platform {
                 Some(operation) if wayland::performs(operation) => {
                     wayland::perform(check, plan, setting, operation)
                 }
+                // The X11 routes are the same program on every platform that has an X server.
+                Some(operation) if super::x11::performs(operation) => {
+                    super::x11::perform(plan, setting, operation)
+                }
                 Some(operation) => platform::perform(check, plan, setting, operation),
             },
         }
@@ -1358,7 +1362,7 @@ enum FirstBlock {
 }
 
 /// Runs one filesystem question on a thread and waits for it with a clock.
-fn on_a_thread<T: Send + 'static>(
+pub(super) fn on_a_thread<T: Send + 'static>(
     path: &Path,
     bound: Duration,
     ask: impl FnOnce(std::path::PathBuf) -> std::io::Result<T> + Send + 'static,
@@ -2030,6 +2034,21 @@ pub(super) struct Run {
     pub(super) facility: Option<String>,
     /// What came of it.
     pub(super) exit: Exit,
+    /// What it printed on its error output alone, without the space around it, where it exited with
+    /// a failure. [`Exit::Failed`] falls back to the output when the error output is empty, and a
+    /// reader that needs to know which stream spoke reads this.
+    pub(super) error_output: Option<String>,
+}
+
+impl Run {
+    /// A run that ended without a failure exit to read, or before the facility could be started.
+    fn ended(facility: Option<String>, exit: Exit) -> Self {
+        Self {
+            facility,
+            exit,
+            error_output: None,
+        }
+    }
 }
 
 /// What a facility that exited with a failure said, as an answer carries it.
@@ -2079,28 +2098,22 @@ pub(super) fn bounded_with(
 ) -> Run {
     let facility = installed(program);
     if facility.is_none() {
-        return Run {
-            facility,
-            exit: Exit::Unfinished(Outcome::FacilityMissing),
-        };
+        return Run::ended(facility, Exit::Unfinished(Outcome::FacilityMissing));
     }
     if deadline.expired() {
-        return Run {
-            facility,
-            exit: Exit::Unfinished(Outcome::TimedOut),
-        };
+        return Run::ended(facility, Exit::Unfinished(Outcome::TimedOut));
     }
     if let Err(error) = std::fs::create_dir_all(&plan.scratch) {
-        return Run {
+        return Run::ended(
             facility,
-            exit: Exit::Unfinished(Outcome::NotAttempted {
+            Exit::Unfinished(Outcome::NotAttempted {
                 detail: Sentence::new()
                     .stated("this check's own directory ")
                     .path(&plan.scratch)
                     .stated(" could not be made: ")
                     .withheld(ContentClass::Message, &error.to_string()),
             }),
-        };
+        );
     }
     let out_path = plan.scratch.join(format!("{}-out.txt", name(check)));
     let err_path = plan.scratch.join(format!("{}-err.txt", name(check)));
@@ -2108,15 +2121,15 @@ pub(super) fn bounded_with(
         std::fs::File::create(&out_path),
         std::fs::File::create(&err_path),
     ) else {
-        return Run {
+        return Run::ended(
             facility,
-            exit: Exit::Unfinished(Outcome::NotAttempted {
+            Exit::Unfinished(Outcome::NotAttempted {
                 detail: Sentence::new().stated(
                     "this check could not open a file of its own to collect what the facility \
                      printed",
                 ),
             }),
-        };
+        );
     };
     let started = std::time::Instant::now();
     let spawned = {
@@ -2145,14 +2158,14 @@ pub(super) fn bounded_with(
         command.spawn()
     };
     let Ok(mut child) = spawned else {
-        return Run {
+        return Run::ended(
             facility,
-            exit: Exit::Unfinished(Outcome::NotAttempted {
+            Exit::Unfinished(Outcome::NotAttempted {
                 detail: Sentence::new()
                     .path(Path::new(program))
                     .stated(" could not be started"),
             }),
-        };
+        );
     };
     // A facility that finished has its group ended before it is collected, so that what it left
     // running does not outlive it, and one that failed is no different.
@@ -2170,11 +2183,14 @@ pub(super) fn bounded_with(
     };
     // What the facility printed is read within the same deadline: a check that is out of time has
     // nothing left to read it with.
+    let mut error_output = None;
     let exit = match status {
         Some(status) if status.success() => text_within(&out_path, deadline)
             .map_or(Exit::Unfinished(Outcome::TimedOut), Exit::Succeeded),
         Some(_) => {
-            let said = text_within(&err_path, deadline).and_then(|said| {
+            let on_error = text_within(&err_path, deadline);
+            error_output = on_error.as_ref().map(|said| said.trim().to_owned());
+            let said = on_error.and_then(|said| {
                 if said.trim().is_empty() {
                     text_within(&out_path, deadline)
                 } else {
@@ -2201,7 +2217,11 @@ pub(super) fn bounded_with(
     };
     let _ = std::fs::remove_file(&out_path);
     let _ = std::fs::remove_file(&err_path);
-    Run { facility, exit }
+    Run {
+        facility,
+        exit,
+        error_output,
+    }
 }
 
 /// Reads a file of this check's own in blocks, and gives up where the deadline has nothing left.
@@ -2751,11 +2771,9 @@ mod tests {
     /// platform's record stands, and nothing is started for it.
     #[test]
     fn no_route_means_no_record_and_nothing_started() {
-        for server in [
-            DisplayServer::X11,
-            DisplayServer::Wayland,
-            DisplayServer::WindowsDesktop,
-        ] {
+        // X11 has a route for the screen image, and its own cases show what a check with none gets
+        // there; these two have no row yet.
+        for server in [DisplayServer::Wayland, DisplayServer::WindowsDesktop] {
             let mut context = desktop();
             context.display_server = server;
             let seeing = Seeing::default();
