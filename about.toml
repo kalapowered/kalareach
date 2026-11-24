@@ -16,6 +16,7 @@
 
 accepted = [
     "MIT",
+    "CC0-1.0",
     "MIT-0",
     "ISC",
     "0BSD",
@@ -24,7 +25,6 @@ accepted = [
     "BSD-1-Clause",
     "Zlib",
     "Unlicense",
-    "CC0-1.0",
     "WTFPL",
     "BSL-1.0",
     "NCSA",

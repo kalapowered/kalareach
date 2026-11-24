@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Makes the third-party notice of a release, or holds the committed one to what the lock now makes.
 
-    generate-notices.py write --kr-release PROGRAM [--cargo-about PROGRAM] [--work DIR]
-    generate-notices.py check --kr-release PROGRAM [--cargo-about PROGRAM] [--work DIR]
-    generate-notices.py self-test
+    generate-notices.py write --kr-release PROGRAM [--cargo-about PROGRAM] [--askalono PROGRAM] [--work DIR]
+    generate-notices.py check --kr-release PROGRAM [--cargo-about PROGRAM] [--askalono PROGRAM] [--work DIR]
+    generate-notices.py self-test [--askalono PROGRAM]
 
 The notice, `docs/releases/third-party-notices.txt`, is what every release archive carries as
 `share/THIRD-PARTY-NOTICES.txt`. `kr-release` is built first (`cargo build -p kr-release`); its
@@ -18,18 +18,22 @@ licence each crate is recorded under; a listed crate that it does not answer for
 an answer for a crate that is not listed is left out. A path package that is not a member of the
 workspace it belongs to stops the run too.
 
-What the notice says for each crate. The text of a crate's own licence file, where `cargo-about`
-took one. Where it took none, every licence file in the crate's package (a name that starts
-`LICENSE`, `LICENCE`, `COPYING` or `UNLICENSE`), without the alternative of a dual licence that the
-crate declares. Every notice file of the package (a name that starts `COPYRIGHT`, `NOTICE`,
-`NOTICES` or `PATENTS`, or holds `THIRD-PARTY`), for every crate. Where a package ships no licence
-file, none of the licence it is recorded under, or a file that holds a template's placeholder, the
-upstream text that `scripts/notice-texts.json` keeps in `docs/releases/notice-texts/`, with its
-source and digest; a text kept for a crate whose package ships its own, or for a crate no release
-build compiles, stops the run. The same file names the licences of the works that a crate bundles
-and builds in (libsodium, llama.cpp and ggml, PCRE2). fish's `COPYING` and the licence file of each
-of its workspace crates are read from its pinned archive. A text that holds a template's
-placeholder stops the run.
+What the notice says for each crate. The licence files of the crate's own package (a name that starts
+`LICENSE`, `LICENCE`, `COPYING` or `UNLICENSE`), without a file that is only an alternative of a dual
+licence, and every notice file of the package (a name that starts `COPYRIGHT`, `NOTICE`, `NOTICES` or
+`PATENTS`, or holds `THIRD-PARTY`). askalono reads each file, offline, over the SPDX licence list at one
+pinned revision, without regard to case, punctuation and line breaks, and names every licence the file
+holds; the file is carried under the licence it is, or under a heading that says it names a licence and
+holds none of its text. A crate under several licences that all apply has the text of each. Where a
+package holds no text of a licence it is recorded under (a file that only names the licence is not a
+text of it), or a file holds a template's placeholder, the upstream text that `scripts/notice-texts.json`
+keeps in `docs/releases/notice-texts/`, with its source and digest, is carried beside the package's own
+files. A kept text for a crate from Git names the package's source and revision. A kept text for a crate
+that ships its own, or for a crate no release build compiles, stops the run, and so does a kept text that
+is not the licence the listing says it is. The same file names the licences of the works that a crate
+bundles and builds in (libsodium, llama.cpp and ggml, PCRE2). fish's `COPYING`, its `doc_src/license.rst`
+and the licence file of each of its workspace crates are read from its pinned archive. A text that holds
+a template's placeholder stops the run.
 
 The lock also names crates that no release build compiles. `kr-release notice-gaps` lists the crates
 the lock takes into the release programs that the entries do not name, and they are written last,
@@ -42,7 +46,9 @@ The merge reads no clock and no path of the machine, so the same lock gives the 
 machine.
 
 cargo-about runs offline over the sources cargo has fetched, because online it fetches a missing
-licence file from the crate's repository, and the notice would then depend on that server.
+licence file from the crate's repository, and the notice would then depend on that server. The fish
+preparation fetches the pinned fish archive and its crates, and the SPDX licence list is fetched at its
+pinned revision; the rest runs offline.
 """
 
 import argparse
@@ -56,6 +62,14 @@ import tarfile
 import tempfile
 
 ABOUT_VERSION = "0.9.3"
+# The licence reader: askalono, run over the SPDX licence list at this revision (list version 3.29.0).
+ASKALONO_VERSION = "0.5.0"
+SPDX_REPOSITORY = "https://github.com/spdx/license-list-data"
+SPDX_REVISION = "31ba1a50e5397e00a304dbadc76531740e89ee48"
+# The lowest score at which askalono, and cargo-about, take a match for a licence.
+MATCH_SCORE = 0.8
+READ_PASSES = 6
+NO_MATCH = "Confidence threshold not high enough for any known license"
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 NOTICE = os.path.join(ROOT, "docs", "releases", "third-party-notices.txt")
 CONFIG = os.path.join(ROOT, "about.toml")
@@ -79,21 +93,17 @@ FISH_TARGETS = [
 # What the permissive templates of the SPDX list hold where the owner's copyright line goes. The
 # GPL's own text has `<year>` and `<name of author>` in the paragraph that tells a program how to
 # apply it, so those are not here.
-PLACEHOLDER = re.compile(r"<(owner|copyright holders?|organi[sz]ation)>", re.IGNORECASE)
+PLACEHOLDER = re.compile(r"<(owner|copyright holders?|organi[sz]ation|owner organi[sz]ation name)>|\[(year|fullname)\]", re.IGNORECASE)
 LICENCE_FILE = re.compile(r"^(licen[cs]e|copying|unlicen[cs]e)", re.IGNORECASE)
 NOTICE_FILE = re.compile(r"^(copyright|notices?|patents)|third[-_ ]?party", re.IGNORECASE)
 
-# How a licence text announces itself. A file that matches exactly one is put under that licence.
-SIGNATURES = [
-    ("Apache-2.0", ["Apache License", "Version 2.0, January 2004"]),
-    ("MPL-2.0", ["Mozilla Public License Version 2.0"]),
-    ("BSD-3-Clause", ["Redistribution and use in source and binary forms", "Neither the name"]),
-    ("ISC", ["Permission to use, copy, modify, and/or distribute this software for any purpose"]),
-    ("MIT", ["Permission is hereby granted, free of charge"]),
-    ("Zlib", ["This software is provided 'as-is'"]),
-    ("CC0-1.0", ["CC0 1.0 Universal"]),
-    ("Unlicense", ["This is free and unencumbered software released into the public domain"]),
-]
+# A text that is another licence's text where a package records that licence: MITNFA is the MIT licence
+# and a rule on modified copies, and Unicode-3.0 is the text that Unicode-DFS-2016 became.
+VARIANTS = {"MITNFA": "MIT", "Unicode-3.0": "Unicode-DFS-2016"}
+# What fish's licence file COPYING names for the licences of the rest of fish's code, whose terms the
+# notice carries from the pinned archive and requires.
+FISH_LICENCES = os.path.join("doc_src", "license.rst")
+STATEMENT = "this file names a licence and holds none of its text"
 
 HEADER = """\
 THIRD-PARTY NOTICES
@@ -102,12 +112,15 @@ KalaReach is distributed under the BSD-3-Clause licence in share/LICENSE. Each s
 its own licence in its directory under shells/. This file carries the licence texts and notices of
 the third-party crates that the release's programs and its fish package are built from, as the
 crates' own packages state them, and the licence texts of the libraries that some of those crates
-bundle. It does not cover the companion application. It also carries the whole of fish's own
-licence file, COPYING, whose terms cover more than the licence in fish's directory under shells/.
+bundle. It does not cover the companion application. It also carries fish's own licence file,
+COPYING, and doc_src/license.rst, the file that COPYING names for the licences of the rest of fish's
+code, each as the pinned fish archive has it.
 
 The list covers every platform a release is built for, so the list for one archive is a subset of
 it. A crate that is offered under several licences is recorded under the one this project takes it
-under. Each text appears once, followed by the crates it applies to. An entry gives the crate, its
+under. Each block lists the crates that use a text and then gives the text, under the licence it is. A
+file that holds the texts of two licences is one block under a heading that names both, and a file
+that names a licence and holds none of its text has a heading that says so. An entry gives the crate, its
 version, whether the programs, the fish package or both are built from it, and the authors its
 package names. The entry of a crate under the Mozilla Public License 2.0, or taken from a Git
 repository, names where its source is. Where a package ships no licence text, the entry names the
@@ -127,7 +140,8 @@ release until this notice is made again.
 """
 
 REPAIR = (
-    "build kr-release with `cargo build -p kr-release`, run `python3 scripts/generate-notices.py write "
+    "build kr-release with `cargo build -p kr-release`, fetch the crates with `cargo fetch --locked`, put "
+    "cargo-about 0.9.3 and askalono 0.5.0 on the PATH, run `python3 scripts/generate-notices.py write "
     "--kr-release target/debug/kr-release`, and commit the result"
 )
 
@@ -174,16 +188,19 @@ def check_version(program):
         fail(f"{program} says '{said}' and the notice is made with cargo-about {ABOUT_VERSION}")
 
 
-def restricted(cargo_home):
+def git_environment():
     """The environment of every call that reaches a Git repository: Git reads no configuration of the
     account that runs this, whose rewrite of an https address to ssh would ask for a key."""
+    return {**os.environ, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
+
+
+def restricted(cargo_home):
+    """The environment of the calls that reach a Git repository through cargo."""
     return {
-        **os.environ,
+        **git_environment(),
         "CARGO_HOME": cargo_home,
         "RUSTUP_TOOLCHAIN": toolchain(),
         "CARGO_NET_GIT_FETCH_WITH_CLI": "true",
-        "GIT_CONFIG_GLOBAL": os.devnull,
-        "GIT_CONFIG_NOSYSTEM": "1",
     }
 
 
@@ -413,6 +430,113 @@ def by_identity(keys):
     return sorted(keys, key=lambda key: (key[0], key[1], key[2] or ""))
 
 
+class Reader:
+    """Says which licences a text is. It runs askalono over the SPDX licence list at one revision, offline
+    once the list is fetched. askalono reads each text normalised for case, punctuation and white space,
+    so a line break inside a phrase changes nothing. One run names one licence in a text, so the reader
+    blanks the lines that run matched and reads what is left, until nothing that is left matches."""
+
+    def __init__(self, program, work):
+        said = run([program, "--version"]).stdout.strip()
+        if said != f"askalono {ASKALONO_VERSION}":
+            fail(f"{program} says '{said}' and the notice is read with askalono {ASKALONO_VERSION}")
+        self.program = program
+        self.directory = os.path.join(work, "reader")
+        os.makedirs(self.directory, exist_ok=True)
+        self.cache = self.spdx_cache()
+        self.known = {}
+        with open(os.path.join(self.directory, "spdx-list", "json", "licenses.json"), encoding="utf-8") as source:
+            self.names = {item["licenseId"]: item["name"] for item in json.load(source)["licenses"]}
+
+    def of(self, text):
+        """The licences a text is, once `prepare` has read it."""
+        return self.known[text]
+
+    def prepare(self, texts):
+        """Reads the texts not read yet, all in one run."""
+        new = sorted({text for text in texts if text not in self.known})
+        if new:
+            for text, found in zip(new, self.read(new)):
+                self.known[text] = refine(found, text)
+
+    def spdx_cache(self):
+        """The cache askalono matches against, made from the pinned revision of the SPDX list."""
+        listing = os.path.join(self.directory, "spdx-list")
+        os.makedirs(listing, exist_ok=True)
+        environment = git_environment()
+        if not os.path.isdir(os.path.join(listing, ".git")):
+            run(["git", "init", "-q", listing], env=environment)
+        head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=listing, env=environment, capture_output=True, text=True)
+        if head.stdout.strip() != SPDX_REVISION:
+            run(["git", "fetch", "-q", "--depth", "1", SPDX_REPOSITORY, SPDX_REVISION], cwd=listing, env=environment)
+            run(["git", "checkout", "-q", "FETCH_HEAD"], cwd=listing, env=environment)
+            head = run(["git", "rev-parse", "HEAD"], cwd=listing, env=environment)
+            if head.stdout.strip() != SPDX_REVISION:
+                fail(f"the SPDX licence list fetched is at {head.stdout.strip()} and the notice is read against {SPDX_REVISION}")
+        cache = os.path.join(self.directory, "spdx.cache")
+        run([self.program, "--cache", cache, "cache", "load-spdx", os.path.join(listing, "json", "details")])
+        return cache
+
+    def batch(self, options, names):
+        """askalono's answer for each of these files, in order."""
+        done = subprocess.run([self.program, "--cache", self.cache, "--format", "json", "id", *options, "--batch"],
+                              input="\n".join(names) + "\n", capture_output=True, text=True)
+        answers = [json.loads(line) for line in done.stdout.splitlines()]
+        if done.returncode != 0 or len(answers) != len(names):
+            fail(f"askalono answered {len(answers)} lines for {len(names)} texts, exit {done.returncode}:\n{done.stderr[-1500:]}")
+        for answer in answers:
+            if "error" in answer and answer["error"] != NO_MATCH:
+                fail(f"askalono could not read a text: {answer['error']}")
+        return [None if "error" in answer else answer["result"] for answer in answers]
+
+    def read(self, texts):
+        """The licences each text is, as a set of SPDX names: empty for a text that is none of them. Two
+        readings are put together: the one that looks for every licence inside the text (`-m`), and the
+        one that takes the text whole and, where it finds a block of a licence inside, blanks the block
+        and reads what is left."""
+        found = [set() for _ in texts]
+        lines = [text.split("\n") for text in texts]
+        names = []
+        for index, text in enumerate(texts):
+            name = os.path.join(self.directory, f"{index}.txt")
+            with open(name, "w", encoding="utf-8", newline="\n") as target:
+                target.write(text)
+            names.append(name)
+        for index, result in enumerate(self.batch(["-m"], names)):
+            if result is not None:
+                found[index] |= {part["license"]["name"] for part in result["containing"] if part["score"] >= MATCH_SCORE}
+        pending = list(range(len(texts)))
+        for _ in range(READ_PASSES):
+            if not pending:
+                break
+            for index in pending:
+                with open(names[index], "w", encoding="utf-8", newline="\n") as target:
+                    target.write("\n".join(lines[index]))
+            again = []
+            for index, result in zip(pending, self.batch(["--optimize"], [names[index] for index in pending])):
+                if result is None:
+                    continue
+                if result["license"] is not None and result["score"] >= MATCH_SCORE:
+                    found[index].add(result["license"]["name"])
+                inside = [part for part in result["containing"] if part["score"] >= MATCH_SCORE]
+                for part in inside:
+                    found[index].add(part["license"]["name"])
+                    first, last = part["line_range"]
+                    lines[index][first:last + 1] = [""] * (last + 1 - first)
+                if inside:
+                    again.append(index)
+            pending = again
+        return [frozenset(names) for names in found]
+
+
+def refine(found, text):
+    """askalono's cache has no text of Unicode-3.0 and reads it as Unicode-DFS-2016, whose text is the
+    same but for a few words; the title of the text tells them apart."""
+    if "Unicode-DFS-2016" in found and re.search(r"UNICODE\s+LICENSE\s+V3", text, re.IGNORECASE):
+        return (found - {"Unicode-DFS-2016"}) | {"Unicode-3.0"}
+    return found
+
+
 def normal(text):
     return text.replace("\r\n", "\n").strip("\n") + "\n"
 
@@ -445,36 +569,6 @@ def licence_files(folder):
     return [name for name in files_named(folder, LICENCE_FILE) if not NOTICE_FILE.search(name)]
 
 
-def identify(text):
-    """The one licence a text announces, or None when it announces none or more than one."""
-    seen = [name for name, words in SIGNATURES if all(word in text for word in words)]
-    return seen[0] if len(seen) == 1 else None
-
-
-def alone(folder, recorded, declared):
-    """The licence files of a package, as (name, text), without the ones for another licence that the
-    package declares beside the recorded one: a crate under `MIT OR Apache-2.0` is taken under MIT, and
-    its Apache file is the alternative that this project does not take it under. A file for a licence
-    the package does not declare (the BSD-3-Clause terms of code that a crate carries) stays."""
-    base = recorded.split(" WITH ")[0]
-    kept = []
-    for file_name in licence_files(folder):
-        text = read_text(os.path.join(folder, file_name))
-        other = identify(text)
-        if other is not None and other != base and other in declared:
-            continue
-        kept.append((file_name, text))
-    return kept
-
-
-def lacks(recorded, texts):
-    """Whether none of the texts is the text of the recorded licence, where every one of them says
-    which licence it is."""
-    base = recorded.split(" WITH ")[0]
-    seen = [identify(text) for text in texts]
-    return base in {name for name, _ in SIGNATURES} and base not in seen and None not in seen
-
-
 def placeholder(text):
     found = PLACEHOLDER.search(text)
     return found.group(0) if found else None
@@ -504,16 +598,12 @@ def keep_texts(listing=TEXTS, directory=TEXTS_DIRECTORY):
     return kept, files
 
 
-def kept_title(text, names):
-    """The name a kept text's licence goes under: the one its entry in the listing gives, else the licence's."""
-    return text.get("name") or names.get(text["licence"], text["licence"])
-
-
 def kept_source(text):
     """The words that say where a kept text comes from and what was done to it."""
     words = f"text {text['source']}"
-    if "lines" in text:
-        words += f", lines {text['lines'][0]} to {text['lines'][1]}"
+    span = text.get("excerpt") or text.get("lines")
+    if span:
+        words += f", lines {span[0]} to {span[1]}"
     if "edit" in text:
         words += " without its copyright line"
     return words
@@ -529,7 +619,8 @@ def source_of(source, name, version):
 class Blocks:
     """The licence texts, each with the crates that use it."""
 
-    def __init__(self):
+    def __init__(self, reader):
+        self.reader = reader
         self.texts = {}
 
     def add(self, kind, licence, name, text, crate, authors, origin, source, extra=None):
@@ -543,6 +634,18 @@ class Blocks:
             {"origins": set(), "authors": authors, "source": source, "extra": extra},
         )
         entry["origins"].add(origin)
+
+    def add_licence(self, text, crate, authors, origin, source, file_name, extra=None):
+        """A licence file, under the licence or licences its text is, or as a statement where its text
+        is none of them."""
+        self.reader.prepare([text])
+        found = sorted(self.reader.of(text))
+        if not found:
+            self.add("statement", file_name, "", text, crate, authors, origin, source, extra)
+            return
+        names = [self.reader.names.get(identifier, identifier) for identifier in found]
+        self.add("licence", " and ".join(found), " and ".join(names) + (", in one file" if len(found) > 1 else ""),
+                 text, crate, authors, origin, source, extra)
 
 
 def entry_line(key, entry, licence):
@@ -561,8 +664,10 @@ def render(blocks):
     rule = "=" * 100
     parts = [HEADER]
     for block in ordered:
-        title = "Notice file" if block["kind"] == "notice" else "Licence"
-        parts.append(f"\n{rule}\n{title}: {block['id']} ({block['name']})\n{rule}\n\nUsed by:\n\n")
+        title = {"licence": f"Licence: {block['id']} ({block['name']})",
+                 "notice": f"Notice file: {block['id']}" + (f" ({block['name']})" if block["name"] else ""),
+                 "statement": f"Licence statement: {block['id']} ({STATEMENT})"}[block["kind"]]
+        parts.append(f"\n{rule}\n{title}\n{rule}\n\nUsed by:\n\n")
         for key in sorted(block["crates"]):
             parts.append(entry_line(key, block["crates"][key], block["id"]) + "\n")
         parts.append("\n" + block["text"])
@@ -570,13 +675,11 @@ def render(blocks):
 
 
 def pinned_for(kept, name, version, where):
-    """The kept entry for a crate, or None. An entry names a repository when it is for a crate taken
-    from one."""
+    """The kept entry for a crate, or None. An entry for a crate taken from Git names the package's
+    source as cargo tree gives it, the repository and the first eight letters of its revision."""
     for item in kept["crates"]:
-        if item["name"] == name and item["version"] == version:
-            repository = item.get("repository")
-            if (repository is None and where is None) or (repository and where and where.startswith(repository)):
-                return item
+        if item["name"] == name and item["version"] == version and item.get("package") == where:
+            return item
     return None
 
 
@@ -584,14 +687,51 @@ def declared_tokens(expression):
     return {word for word in re.findall(r"[A-Za-z0-9.+-]+", expression) if word not in ("AND", "OR", "WITH")}
 
 
-def gather(records, kept, files):
+def alone(files, required, declared, reader):
+    """The licence files of a package without the ones that are only an alternative the package
+    offers: a crate under `MIT OR Apache-2.0` is taken under MIT, and its Apache file is the alternative
+    that this project does not take it under. A file is dropped only when the reader names its licence
+    or licences and every one of them is declared and not required; a file that is none of them, or that
+    holds a required licence beside another, stays."""
+    alternatives = declared - set(required)
+    kept = []
+    for file_name, text in files:
+        found = reader.of(text)
+        if found and found <= alternatives:
+            continue
+        kept.append((file_name, text))
+    return kept
+
+
+def lacking(required, texts, reader):
+    """The required licences that none of the texts is. A text that is a licence with one clause more
+    (MITNFA, the MIT licence and a rule on modified copies) is that licence's text."""
+    covered = set()
+    for text in texts:
+        for found in reader.of(text):
+            covered |= {found, VARIANTS.get(found, found)}
+    return sorted(set(required) - covered)
+
+
+def gather(records, kept, files, reader):
     """Every crate's texts, put in blocks, with the checks on what the kept texts stand for."""
-    blocks = Blocks()
-    names = {}
+    blocks = Blocks(reader)
+    plans = {}
+    reading = [text["text"] for text in files.values()]
     for each in records:
-        for answer in each["answers"].values():
-            for identifier, name, _, _ in answer["licences"]:
-                names.setdefault(identifier, name)
+        for key in by_identity(each["answers"]):
+            answer = each["answers"][key]
+            folder = each["roots"][key]
+            item = pinned_for(kept, key[0], key[1], key[2])
+            taken = [normal(t) for _, _, t, own in answer["licences"] if own]
+            owned = [(name, read_text(os.path.join(folder, name))) for name in licence_files(folder)]
+            if item is not None:
+                # A file that holds a template's placeholder is the package's own template, not its text.
+                taken = [t for t in taken if not placeholder(t)]
+                owned = [(f, t) for f, t in owned if not placeholder(t)]
+            plans[(each["name"], key)] = (item, taken, owned)
+            reading += taken + [t for _, t in owned]
+    reader.prepare(reading)
     used_texts, used_crates = set(), set()
     compiled_crates = {}
     for each in records:
@@ -602,39 +742,44 @@ def gather(records, kept, files):
             compiled_crates.setdefault((name, version), set()).add(each["name"])
             crate = (name, version, where)
             args = (answer["authors"], each["name"], answer["source"])
-            recorded = answer["licences"][0][0]
-            taken = [(i, t) for i, _, t, own in answer["licences"] if own]
-            owned = alone(folder, recorded, declared_tokens(each["declared"][key]))
-            item = pinned_for(kept, name, version, where)
-            if item is not None:
-                # A file that holds a template's placeholder is the package's own template, not its text.
-                taken = [(i, t) for i, t in taken if not placeholder(t)]
-                owned = [(f, t) for f, t in owned if not placeholder(t)]
-            needs = not taken and (not owned or lacks(recorded, [text for _, text in owned]))
-            if item is not None and not needs:
+            required = sorted({i.split(" WITH ")[0] for i, _, _, _ in answer["licences"]})
+            item, taken, owned = plans[(each["name"], key)]
+            carried = alone(owned, required, declared_tokens(each["declared"][key]), reader)
+            carried += [(None, t) for t in taken if t not in {text for _, text in carried}]
+            missing = lacking(required, [t for _, t in carried], reader)
+            if item is not None and not missing:
                 fail(f"scripts/notice-texts.json keeps a text for {name} {version}, whose package ships the licence text itself")
-            if needs and item is None:
-                what = f"file of its recorded licence {recorded}" if owned else "licence file"
-                fail(f"{name} {version} ships no {what} and scripts/notice-texts.json keeps no text for it")
-            for identifier, text in taken:
-                blocks.add("licence", identifier, names.get(identifier, identifier), normal(text), crate, *args)
-            for file_name, text in owned:
-                identifier = identify(text) or recorded
-                blocks.add("licence", identifier, names.get(identifier, identifier), text, crate, *args)
+            if missing and item is None:
+                elsewhere = sorted(c.get("package") or "crates.io" for c in kept["crates"] if (c["name"], c["version"]) == (name, version))
+                note = f" (it keeps a text for this crate from {', '.join(elsewhere)}, not from {where or 'crates.io'})" if elsewhere else ""
+                if carried:
+                    held = ", ".join(f"{f or 'a file cargo-about took'} ({' and '.join(sorted(reader.of(t))) or 'no licence text'})" for f, t in carried)
+                    fail(f"{name} {version} ships no text of {' and '.join(missing)}, its recorded licence, only {held}, and scripts/notice-texts.json keeps no text for it{note}")
+                fail(f"{name} {version} ships no licence file and scripts/notice-texts.json keeps no text for it{note}")
+            for file_name, text in carried:
+                blocks.add_licence(text, crate, *args, file_name or "a file of the package")
             if item is not None:
-                used_crates.add((item["name"], item["version"], item.get("repository")))
+                used_crates.add((item["name"], item["version"], item.get("package")))
+                covered = [t for _, t in carried]
                 for identifier in item["texts"]:
                     used_texts.add(identifier)
-                    text = files[identifier]
-                    blocks.add("licence", text["licence"], kept_title(text, names), text["text"], crate, *args, kept_source(text))
+                    kept_text = files[identifier]
+                    add_kept(blocks, kept_text, crate, *args, extra=kept_source(kept_text))
+                    covered.append(kept_text["text"])
+                still = lacking(required, [t for t in covered], reader)
+                if still:
+                    fail(f"scripts/notice-texts.json keeps texts for {name} {version} that are not the text of {' and '.join(still)}")
             for file_name in files_named(folder, NOTICE_FILE):
                 blocks.add("notice", "Notice file", file_name, read_text(os.path.join(folder, file_name)), crate, *args)
         for name in sorted(each["paths"]):
             if each["name"] == "fish":
                 fish_member(blocks, name, each["members"][name])
     for item in kept["crates"]:
-        if (item["name"], item["version"], item.get("repository")) not in used_crates:
-            fail(f"scripts/notice-texts.json keeps a text for {item['name']} {item['version']}, which no release build compiles")
+        identity_of_item = (item["name"], item["version"], item.get("package"))
+        if identity_of_item not in used_crates:
+            now = sorted({k[2] or "crates.io" for each in records for k in each["answers"] if k[:2] == identity_of_item[:2]})
+            fail(f"scripts/notice-texts.json keeps a text for {item['name']} {item['version']} from {item.get('package') or 'crates.io'}, "
+                 f"which no release build compiles" + (f"; the lock has it from {', '.join(now)}" if now else ""))
     for work in kept["works"]:
         carrier = (work["carried_by"]["name"], work["carried_by"]["version"])
         if carrier not in compiled_crates:
@@ -642,25 +787,40 @@ def gather(records, kept, files):
         text = files[work["text"]]
         used_texts.add(work["text"])
         for origin in sorted(compiled_crates[carrier]):
-            blocks.add("licence", text["licence"], kept_title(text, names), text["text"],
-                       (work["name"], work["version"], None), [], origin, None,
-                       f"bundled in {carrier[0]} {carrier[1]}, {kept_source(text)}")
+            add_kept(blocks, text, (work["name"], work["version"], None), [], origin, None,
+                     extra=f"bundled in {carrier[0]} {carrier[1]}, {kept_source(text)}")
     for identifier in files:
         if identifier not in used_texts:
             fail(f"scripts/notice-texts.json lists the text {identifier}, which no crate or work uses")
     return blocks
 
 
+def add_kept(blocks, text, crate, authors, origin, source, extra):
+    """A kept text, under the licence its text is, which must be the one the listing says it is."""
+    blocks.reader.prepare([text["text"]])
+    found = blocks.reader.of(text["text"])
+    if text.get("statement"):
+        if found:
+            fail(f"scripts/notice-texts.json lists {text['id']} as a statement, and its text is {' and '.join(sorted(found))}")
+    elif text["licence"] not in found:
+        fail(f"scripts/notice-texts.json lists {text['id']} as {text['licence']}, and its text is {' and '.join(sorted(found)) or 'none of the licences'}")
+    blocks.add_licence(text["text"], crate, authors, origin, source, text["source"].rsplit("/", 1)[-1], extra)
+
+
 def fish_member(blocks, name, member):
-    """The licence files of a crate of fish's own workspace, put under the licence it declares."""
-    expression = member["licence"]
-    unknown = sorted(declared_tokens(expression) - FISH_MEMBER_LICENCES)
+    """The licence files of a crate of fish's own workspace, with the notice file the licence file of
+    fish names."""
+    unknown = sorted(declared_tokens(member["licence"]) - FISH_MEMBER_LICENCES)
     if unknown:
         fail(f"{name} of the fish workspace declares {', '.join(unknown)}, a licence this notice has no text for")
+    crate = (name, member["version"], None)
     for file_name in licence_files(member["root"]):
-        text = read_text(os.path.join(member["root"], file_name))
-        blocks.add("licence", expression or name, f"the fish package, {file_name}", text,
-                   (name, member["version"], None), member["authors"], "fish", None)
+        blocks.add_licence(read_text(os.path.join(member["root"], file_name)), crate, member["authors"], "fish", None, file_name)
+    if name == "fish":
+        path = os.path.join(member["root"], FISH_LICENCES)
+        if not os.path.isfile(path):
+            fail(f"the fish archive holds no {FISH_LICENCES}, the file that COPYING names for the licences of fish's other code")
+        blocks.add("notice", f"{FISH_LICENCES} of the fish package", "", read_text(path), crate, member["authors"], "fish", None)
 
 
 def reasons(gaps_list, packages, targets, environment):
@@ -686,10 +846,10 @@ def reasons(gaps_list, packages, targets, environment):
     return lines
 
 
-def make(program, kr_release, work):
+def make(program, askalono, kr_release, work):
     records = collect(program, work)
     kept, files = keep_texts()
-    body = render(gather(records, kept, files))
+    body = render(gather(records, kept, files, Reader(askalono, work)))
     entries = os.path.join(work, "entries.txt")
     with open(entries, "w", encoding="utf-8", newline="\n") as target:
         target.write(body)
@@ -705,15 +865,16 @@ def main(arguments):
         command = commands.add_parser(name)
         command.add_argument("--kr-release", required=True, help="the kr-release program, built from this checkout")
         command.add_argument("--cargo-about", default="cargo-about")
+        command.add_argument("--askalono", default="askalono")
         command.add_argument("--work", help="a directory for the runs, which is kept; a new one by default")
-    commands.add_parser("self-test")
+    commands.add_parser("self-test").add_argument("--askalono", default="askalono")
     chosen = parser.parse_args(arguments)
     if chosen.command == "self-test":
-        return self_test()
+        return self_test(chosen.askalono)
     with tempfile.TemporaryDirectory(prefix="kr-notices-") as scratch:
         work = chosen.work or scratch
         os.makedirs(work, exist_ok=True)
-        made = make(chosen.cargo_about, chosen.kr_release, work)
+        made = make(chosen.cargo_about, chosen.askalono, chosen.kr_release, work)
     if chosen.command == "write":
         with open(NOTICE, "w", encoding="utf-8", newline="\n") as target:
             target.write(made)
@@ -748,15 +909,15 @@ def made_up(crates, paths=(), members_=(), name="programs"):
             "members": {member: {"root": "/nowhere", "version": "0.1.0", "authors": [], "licence": "MIT"} for member in members_}}
 
 
-def self_test():
+def self_test(askalono):
     with tempfile.TemporaryDirectory(prefix="kr-notices-test-") as scratch:
-        return self_checks(scratch)
+        return self_checks(scratch, Reader(askalono, scratch))
 
 
-def self_checks(scratch):
-    """Holds the reading of cargo's lines, the placeholder refusal, the choice of a crate's texts, the
-    checks on the kept texts and the text's layout to what a notice must do, over made-up crates and
-    folders."""
+def self_checks(scratch, reader):
+    """Holds the reading of cargo's lines, the licence reader, the placeholder refusal, the choice of a
+    crate's texts, the checks on the kept texts and the text's layout to what a notice must do, over
+    made-up crates and folders."""
     failed = 0
     HOME[0] = os.path.join(scratch, "home")
     os.makedirs(HOME[0])
@@ -783,10 +944,25 @@ def self_checks(scratch):
         except SystemExit:
             return ""
 
-    mit = "MIT License\n\nCopyright (c) 2020 A Person\n\nPermission is hereby granted, free of charge, to any person\n"
-    template = "MIT License\n\nCopyright (c) <year> <copyright holders>\n\nPermission is hereby granted, free of charge\n"
-    bsd = "Copyright (c) 2020 Tailscale Inc\n\nRedistribution and use in source and binary forms\n\nNeither the name\n"
+    def rendered(crates, used, files_):
+        """The notice text of these crates, or an empty text where the run refuses."""
+        return made(lambda: render(gather(crates, used, files_, reader)))
+
+    def licence_text(identifier):
+        """The SPDX list's text of a licence, with a holder where the template has a placeholder."""
+        with open(os.path.join(reader.directory, "spdx-list", "json", "details", f"{identifier}.json"), encoding="utf-8") as source:
+            text = json.load(source)["licenseText"]
+        return normal(re.sub(r"<(copyright holders|owner)>", "A Person", text.replace("<year>", "2020")))
+
+    def write(folder, name, text):
+        os.makedirs(folder, exist_ok=True)
+        with open(os.path.join(folder, name), "w", encoding="utf-8", newline="\n") as target:
+            target.write(text)
+
+    mit, isc, apache, bsd = (licence_text(name) for name in ("MIT", "ISC", "Apache-2.0", "BSD-3-Clause"))
+    template = mit.replace("2020 A Person", "<year> <copyright holders>")
     gpl = "Copyright (C) <year>  <name of author>\n\nGNU GENERAL PUBLIC LICENSE\n"
+    statement = "Copyright 2012 The Authors\n\nLicensed under the Apache License or the MIT license, at your option.\n"
 
     expect("a crates.io line is a crate", tree_line("serde v1.0.1") == ("serde", "1.0.1", None))
     expect("a proc macro mark and a repeat mark are dropped", tree_line("serde_derive v1.0.1 (proc-macro) (*)") == ("serde_derive", "1.0.1", None))
@@ -796,9 +972,20 @@ def self_checks(scratch):
            == identity("forked", "0.1.0", REPOSITORY))
     refuses("a registry that is not crates.io is refused", lambda: identity("x", "1", "registry+https://other.example/index"), "not crates.io")
     expect("the placeholder of a permissive template is found", placeholder(template) == "<copyright holders>")
-    expect("the GPL's own paragraph is not a placeholder", placeholder(gpl) is None)
-    expect("a text names the one licence it announces", identify(mit) == "MIT" and identify(bsd) == "BSD-3-Clause")
-    expect("a text of two licences names none", identify(mit + bsd) is None)
+    expect("the placeholders of GitHub's and NCSA's templates are found",
+           placeholder("Copyright (c) [year] [fullname]") == "[year]" and placeholder("Copyright <Owner Organization Name>") == "<Owner Organization Name>")
+    expect("the GPL's own paragraph and Apache's appendix are not placeholders",
+           placeholder(gpl) is None and placeholder(apache) is None)
+
+    reader.prepare([mit, isc, apache, bsd, mit + bsd, statement, isc.replace("for any purpose", "for any\npurpose"),
+                    isc + "\n\n" + apache, "UNICODE LICENSE V3\n"])
+    expect("a text names the licence it is", reader.of(mit) == {"MIT"} and reader.of(bsd) == {"BSD-3-Clause"} and reader.of(apache) == {"Apache-2.0"})
+    expect("a line break inside a phrase does not hide a licence", reader.of(isc.replace("for any purpose", "for any\npurpose")) == {"ISC"})
+    expect("a file that holds two licences names both", reader.of(mit + bsd) == {"MIT", "BSD-3-Clause"} and reader.of(isc + "\n\n" + apache) == {"ISC", "Apache-2.0"})
+    expect("a statement of a licence is none of the licences", reader.of(statement) == frozenset())
+    expect("the Unicode licence's third version is told from its second",
+           refine(frozenset({"Unicode-DFS-2016"}), "UNICODE LICENSE V3\n") == {"Unicode-3.0"}
+           and refine(frozenset({"Unicode-DFS-2016"}), "UNICODE, INC. LICENSE AGREEMENT\n") == {"Unicode-DFS-2016"})
 
     def licences(text, own=True):
         return [("MIT", "MIT License", text, own)]
@@ -806,13 +993,13 @@ def self_checks(scratch):
     plain = synthetic("plain", "1.0.0", authors=["A"], licences=licences(mit))
     forked = synthetic("forked", "0.1.0", REPOSITORY, licences=licences(mit))
     nothing = {"texts": [], "crates": [], "works": []}
-    blocks = gather([made_up([plain, forked])], nothing, {})
+    blocks = gather([made_up([plain, forked])], nothing, {}, reader)
     text = render(blocks)
     expect("a text that two crates share appears once", text.count("Permission is hereby granted") == 1)
     expect("a crate that has a file of its own has its entry", "  - plain 1.0.0 | programs | A\n" in text)
     expect("a crate from a repository names its source", "source https://example.org/forked?rev=abcdef0123456789#abcdef0123456789\n" in text)
     refuses("a text with a template's placeholder is refused",
-            lambda: gather([made_up([synthetic("bad", "1.0.0", licences=licences(template))])], nothing, {}), "placeholder <copyright holders>")
+            lambda: gather([made_up([synthetic("bad", "1.0.0", licences=licences(template))])], nothing, {}, reader), "placeholder <copyright holders>")
     refuses("a path package that is not a member is refused",
             lambda: record("programs", set(), {"stranger"}, {}, {}, {}), "stranger")
     refuses("a crate cargo tree lists and cargo-about does not answer for is refused",
@@ -821,19 +1008,14 @@ def self_checks(scratch):
     empty = os.path.join(scratch, "empty-1.0.0")
     os.makedirs(empty)
     refuses("a crate that ships no file and has no kept text is refused",
-            lambda: gather([made_up([synthetic("empty", "1.0.0", licences=licences(template, False), folder=empty)])], nothing, {}),
+            lambda: gather([made_up([synthetic("empty", "1.0.0", licences=licences(template, False), folder=empty)])], nothing, {}, reader),
             "empty 1.0.0 ships no licence file")
     folder = os.path.join(scratch, "bare-1.0.0")
-    os.makedirs(folder)
-    with open(os.path.join(folder, "LICENSE-BSD3"), "w", encoding="utf-8") as target:
-        target.write(bsd)
-    with open(os.path.join(folder, "COPYRIGHT"), "w", encoding="utf-8") as target:
-        target.write("Copyright 2020 The Authors\n")
+    write(folder, "LICENSE-BSD3", bsd)
+    write(folder, "COPYRIGHT", "Copyright 2020 The Authors\n")
     directory = os.path.join(scratch, "texts")
-    os.makedirs(directory)
-    kept_text = "MIT License\n\nCopyright (c) 2025 N0, INC.\n\nPermission is hereby granted, free of charge\n"
-    with open(os.path.join(directory, "n0-MIT"), "w", encoding="utf-8") as target:
-        target.write(kept_text)
+    kept_text = mit.replace("2020 A Person", "2025 N0, INC.")
+    write(directory, "n0-MIT", kept_text)
     digest = hashlib.sha256(kept_text.encode("utf-8")).hexdigest()
     listing = os.path.join(scratch, "notice-texts.json")
 
@@ -848,39 +1030,78 @@ def self_checks(scratch):
     refuses("a kept text that is not in the folder is refused", lambda: keep([{**item, "id": "gone"}], [], []), "does not hold")
     kept, files = keep([item], [pinned], [])
     dual = os.path.join(scratch, "dual-1.0.0")
-    os.makedirs(dual)
-    for file_name, text in (("LICENSE-MIT", mit), ("LICENSE-APACHE", "Apache License\nVersion 2.0, January 2004\n")):
-        with open(os.path.join(dual, file_name), "w", encoding="utf-8") as target:
-            target.write(text)
-    text = render(gather([made_up([synthetic("dual", "1.0.0", licences=licences(template, False), folder=dual,
-                                             declared="MIT OR Apache-2.0")])], nothing, {}))
+    write(dual, "LICENSE-MIT", mit)
+    write(dual, "LICENSE-APACHE", apache)
+    text = rendered([made_up([synthetic("dual", "1.0.0", licences=licences(template, False), folder=dual,
+                                             declared="MIT OR Apache-2.0")])], nothing, {})
     expect("a crate under MIT or Apache is carried under the one it is recorded under",
            "Permission is hereby granted" in text and "Apache License" not in text)
     both = synthetic("bare", "1.0.0", licences=licences(template, False), folder=folder)
-    text = render(gather([made_up([both])], kept, files))
+    text = rendered([made_up([both])], kept, files)
     expect("a crate whose package lacks its recorded licence's text gets the kept one besides its own file",
-           "Copyright (c) 2025 N0, INC." in text and "Copyright (c) 2020 Tailscale Inc" in text)
+           "Copyright (c) 2025 N0, INC." in text and "Redistribution and use in source and binary forms" in text)
     expect("a crate's notice files are carried", "Notice file: Notice file" in text and "Copyright 2020 The Authors" in text)
     expect("a kept text names its source on the entry", "text https://example.org/n0/LICENSE-MIT" in text)
     refuses("a kept text for a crate that no release build compiles is refused",
-            lambda: gather([made_up([plain])], kept, files), "no release build compiles")
+            lambda: gather([made_up([plain])], kept, files, reader), "no release build compiles")
     refuses("a kept text for a crate that ships its licence text is refused",
-            lambda: gather([made_up([plain])], *keep([item], [{**pinned, "name": "plain"}], [])), "ships the licence text itself")
+            lambda: gather([made_up([plain])], *keep([item], [{**pinned, "name": "plain"}], []), reader), "ships the licence text itself")
     kept, files = keep([item], [], [])
-    refuses("a kept text that nothing uses is refused", lambda: gather([made_up([plain])], kept, files), "no crate or work uses")
+    refuses("a kept text that nothing uses is refused", lambda: gather([made_up([plain])], kept, files, reader), "no crate or work uses")
+    refuses("a kept text that is not the licence it is listed as is refused",
+            lambda: gather([made_up([both])], *keep([{**item, "licence": "ISC"}], [pinned], []), reader), "as ISC, and its text is MIT")
     work = {"name": "libx", "version": "1.0", "carried_by": {"name": "gone", "version": "1.0.0"}, "text": "n0-MIT"}
     kept, files = keep([item], [], [work])
-    refuses("a bundled work whose carrier is not compiled is refused", lambda: gather([made_up([plain])], kept, files), "which no release build compiles")
+    refuses("a bundled work whose carrier is not compiled is refused", lambda: gather([made_up([plain])], kept, files, reader), "which no release build compiles")
     work["carried_by"] = {"name": "plain", "version": "1.0.0"}
     kept, files = keep([item], [], [work])
-    text = render(gather([made_up([plain])], kept, files))
+    text = rendered([made_up([plain])], kept, files)
     expect("a bundled work has its entry and its text", "  - libx 1.0 | programs |  | bundled in plain 1.0.0, text https://example.org/n0/LICENSE-MIT\n" in text)
 
     refuses("a crate that cargo tree lists and cargo metadata cannot place is refused",
             lambda: record("programs", {plain[0]}, set(), {}, {plain[0]: plain[1]}, {}), "cargo metadata finds no package for 1 crates")
     expect("a crate from a Git repository and the same crate from crates.io are two entries",
-           render(gather([made_up([synthetic("twin", "1.0.0", licences=licences(mit)),
-                                   synthetic("twin", "1.0.0", REPOSITORY, licences=licences(mit))])], nothing, {})).count("  - twin 1.0.0 | programs") == 2)
+           rendered([made_up([synthetic("twin", "1.0.0", licences=licences(mit)),
+                                   synthetic("twin", "1.0.0", REPOSITORY, licences=licences(mit))])], nothing, {}).count("  - twin 1.0.0 | programs") == 2)
+
+    # A file that is a statement is no licence's text.
+    stated = os.path.join(scratch, "stated-1.0.0")
+    write(stated, "COPYING", statement)
+    refuses("a crate whose only file is a statement is refused until a text is kept for it",
+            lambda: gather([made_up([synthetic("stated", "1.0.0", licences=licences(template, False), folder=stated)])], nothing, {}, reader),
+            "ships no text of MIT, its recorded licence, only COPYING (no licence text)")
+    kept, files = keep([item], [{"name": "stated", "version": "1.0.0", "texts": ["n0-MIT"]}], [])
+    text = rendered([made_up([synthetic("stated", "1.0.0", licences=licences(template, False), folder=stated)])], kept, files)
+    expect("a statement is carried as one beside the kept text of the licence",
+           "Licence statement: COPYING (" + STATEMENT + ")" in text and "Copyright (c) 2025 N0, INC." in text)
+
+    # No licence of an AND is dropped, a file with two licences stays whole, and a file for an
+    # alternative that is not taken goes.
+    anded = os.path.join(scratch, "anded-1.0.0")
+    write(anded, "LICENSE-MIT", mit)
+    write(anded, "LICENSE-BSD", bsd)
+    answer = [("MIT", "MIT License", "", False), ("BSD-3-Clause", "BSD 3-Clause", "", False)]
+    text = rendered([made_up([synthetic("anded", "1.0.0", licences=answer, folder=anded, declared="MIT AND BSD-3-Clause")])], nothing, {})
+    expect("a crate under two licences that both apply carries both texts",
+           "Permission is hereby granted" in text and "Redistribution and use in source and binary forms" in text)
+    joined = os.path.join(scratch, "joined-1.0.0")
+    write(joined, "LICENSE", isc + "\n\n" + apache)
+    text = rendered([made_up([synthetic("joined", "1.0.0", licences=[("ISC", "ISC License", "", False)], folder=joined,
+                                             declared="ISC AND (Apache-2.0 OR ISC)")])], nothing, {})
+    expect("a file that holds two licences is carried whole under both",
+           "Licence: Apache-2.0 and ISC (Apache License 2.0 and ISC License, in one file)" in text and "Apache License" in text and "Permission to use, copy" in text)
+
+    # A kept text is bound to the source and the revision of its package.
+    moved = "git+https://example.org/forked?rev=1234567890abcdef#1234567890abcdef"
+    package = identity("forked", "0.1.0", REPOSITORY)[2]
+    kept, files = keep([item], [{"name": "forked", "version": "0.1.0", "package": package, "texts": ["n0-MIT"]}], [])
+    old = synthetic("forked", "0.1.0", REPOSITORY, licences=licences(template, False), folder=empty)
+    new = synthetic("forked", "0.1.0", moved, licences=licences(template, False), folder=empty)
+    expect("a kept text answers the package at the revision it names",
+           "Copyright (c) 2025 N0, INC." in made(lambda: render(gather([made_up([old])], kept, files, reader))))
+    refuses("a kept text for a Git package that has moved to another revision is refused",
+            lambda: gather([made_up([new])], kept, files, reader),
+            "keeps a text for this crate from https://example.org/forked?rev=abcdef0123456789#abcdef01, not from https://example.org/forked?rev=1234567890abcdef#12345678")
 
     def archive(name, member):
         path = os.path.join(scratch, name)
@@ -907,40 +1128,51 @@ def self_checks(scratch):
     with open(bytes_file, "wb") as target:
         target.write(b"Copyright \xa9 2020\n")
     refuses("a file that is not UTF-8 text is refused", lambda: read_text(bytes_file), "is not UTF-8 text")
+    patents = os.path.join(scratch, "rav1e-0.8.1")
+    os.makedirs(patents)
+    with open(os.path.join(patents, "PATENTS"), "wb") as target:
+        target.write(b"\x93Affiliate\x94\n")
+    expect("the one file that is Windows-1252 text is read as such",
+           made(lambda: read_text(os.path.join(patents, "PATENTS"))) == "“Affiliate”\n")
 
     shipped = os.path.join(scratch, "shipped-1.0.0")
-    os.makedirs(shipped)
-    with open(os.path.join(shipped, "LICENSE-MIT"), "w", encoding="utf-8") as target:
-        target.write(template)
+    write(shipped, "LICENSE-MIT", template)
     standard = os.path.join(scratch, "standard")
-    os.makedirs(standard)
-    with open(os.path.join(standard, "mit-plain"), "w", encoding="utf-8") as target:
-        target.write("Permission is hereby granted, free of charge\nline two\nline three\n")
+    plain_text = "Permission is hereby granted, free of charge\nline two\nline three\n"
+    write(standard, "mit-plain", mit.split("\n\n", 2)[2])
     plain_item = {"id": "mit-plain", "licence": "MIT", "source": "https://example.org/spdx/MIT.txt",
-                  "sha256": hashlib.sha256(b"Permission is hereby granted, free of charge\nline two\nline three\n").hexdigest(),
+                  "sha256": hashlib.sha256(mit.split("\n\n", 2)[2].encode("utf-8")).hexdigest(),
                   "edit": {"removed": "the copyright line"}, "name": "a standard text"}
     with open(listing, "w", encoding="utf-8") as target:
         json.dump({"texts": [plain_item], "crates": [{"name": "shipped", "version": "1.0.0", "texts": ["mit-plain"]}], "works": []}, target)
     kept_plain, files_plain = keep_texts(listing, standard)
     text = made(lambda: render(gather([made_up([synthetic("shipped", "1.0.0", licences=licences(template), folder=shipped)])],
-                                      kept_plain, files_plain)))
+                                      kept_plain, files_plain, reader)))
     expect("a kept text answers a crate whose own file holds a placeholder",
-           "Permission is hereby granted" in text and "<YEAR>" not in text and "<copyright holders>" not in text
-           and "text https://example.org/spdx/MIT.txt without its copyright line" in text and "(a standard text)" in text)
+           "Permission is hereby granted" in text and "<year>" not in text and "<copyright holders>" not in text
+           and "text https://example.org/spdx/MIT.txt without its copyright line" in text and "(MIT License)" in text)
 
+    # fish's own licence files.
     fish_folder = os.path.join(scratch, "fish-widecharwidth")
-    os.makedirs(fish_folder)
-    with open(os.path.join(fish_folder, "LICENSE"), "w", encoding="utf-8") as target:
-        target.write("CC0 1.0 Universal\n")
-    fish_blocks = Blocks()
+    write(fish_folder, "LICENSE", licence_text("CC0-1.0"))
+    fish_blocks = Blocks(reader)
     made(lambda: fish_member(fish_blocks, "widecharwidth", {"root": fish_folder, "version": "0.0.0", "authors": [], "licence": "CC0-1.0"}))
     text = render(fish_blocks)
-    expect("a crate of fish's own workspace under CC0-1.0 is carried with its licence file",
-           "Licence: CC0-1.0 (the fish package, LICENSE)" in text and "CC0 1.0 Universal" in text)
+    expect("a crate of fish's own workspace under CC0-1.0 is carried with its licence file under the licence it is",
+           "Licence: CC0-1.0 (Creative Commons Zero v1.0 Universal)" in text and "CC0 1.0 Universal" in text)
+    fish_root = os.path.join(scratch, "fish-root")
+    write(fish_root, "COPYING", statement)
+    fish_member_entry = {"root": fish_root, "version": "4.0.0", "authors": [], "licence": "GPL-2.0-only"}
+    refuses("fish's licence file for the rest of its code is required", lambda: fish_member(Blocks(reader), "fish", fish_member_entry), "holds no doc_src/license.rst")
+    write(os.path.join(fish_root, "doc_src"), "license.rst", "fish includes a copy of Alpine.js\n")
+    fish_blocks = Blocks(reader)
+    made(lambda: fish_member(fish_blocks, "fish", fish_member_entry))
+    text = render(fish_blocks)
+    expect("fish's licence file for the rest of its code is carried whole",
+           "Notice file: doc_src/license.rst of the fish package\n" in text and "Alpine.js" in text)
 
     lined = "one\ntwo\nthree\nfour\n"
-    with open(os.path.join(standard, "lined"), "w", encoding="utf-8") as target:
-        target.write(lined)
+    write(standard, "lined", lined)
     lined_item = {"id": "lined", "licence": "MIT", "source": "https://example.org/Readme", "lines": [2, 3],
                   "sha256": hashlib.sha256(lined.encode("utf-8")).hexdigest()}
     with open(listing, "w", encoding="utf-8") as target:
