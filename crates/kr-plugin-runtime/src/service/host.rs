@@ -692,7 +692,7 @@ impl PluginHost {
             return ResponseBody::Refused {
                 request: "hello".to_owned(),
                 detail: format!(
-                    "this host speaks {} and the caller offered {protocol}",
+                    "this endpoint speaks {} and the caller offered {protocol}",
                     HostProtocol::V4.name
                 ),
                 disabled: false,
@@ -923,12 +923,22 @@ impl PluginHost {
                 if served.dialect == Dialect::Four {
                     let own = registration_of(served, &binding);
                     if registration != own {
-                        return Err(refused(format!(
-                            "the restore is for registration {} and binding {binding_id} was registered as {}",
-                            registration
-                                .map_or_else(|| "none".to_owned(), |number| number.to_string()),
-                            own.map_or_else(|| "none".to_owned(), |number| number.to_string()),
-                        )));
+                        let named = |number: Option<u64>| {
+                            number.map_or_else(|| "none".to_owned(), |number| number.to_string())
+                        };
+                        // A binding that is still live and no longer has a registration is one an
+                        // unbind that was read after this request has retired.
+                        return Err(refused(match own {
+                            None => format!(
+                                "the restore is for registration {} and binding {binding_id} is being removed",
+                                named(registration)
+                            ),
+                            Some(_) => format!(
+                                "the restore is for registration {} and binding {binding_id} was registered as {}",
+                                named(registration),
+                                named(own)
+                            ),
+                        }));
                     }
                     if state.len() as u64 > MAX_NODE_BYTES {
                         // A state this host never produces. Refused before the component sees

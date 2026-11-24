@@ -80,6 +80,11 @@ impl Raw4 {
 
     async fn ask(&mut self, body: RequestBody4) -> ResponseBody4 {
         let request_id = self.send(body).await;
+        self.answer_of(request_id).await
+    }
+
+    /// Reads until the answer to `request_id` has come, and returns it.
+    async fn answer_of(&mut self, request_id: u64) -> ResponseBody4 {
         while !self.answers.contains_key(&request_id) {
             self.read().await;
         }
@@ -211,15 +216,22 @@ async fn kr_req_24_24_each_endpoint_speaks_one_protocol_and_the_fourth_states_it
             protocol: HostProtocol::V3.name.to_owned(),
         })
         .await;
-    assert!(
-        matches!(
-            refused,
-            ResponseBody4::Refused {
-                disabled: false,
-                ..
-            }
+    let ResponseBody4::Refused {
+        detail,
+        disabled: false,
+        ..
+    } = refused
+    else {
+        panic!("the fourth endpoint answered the third protocol's name with {refused:?}");
+    };
+    assert_eq!(
+        detail,
+        format!(
+            "this endpoint speaks {} and the caller offered {}",
+            HostProtocol::V4.name,
+            HostProtocol::V3.name
         ),
-        "the fourth endpoint answered the third protocol's name with {refused:?}"
+        "the fourth endpoint says which protocol it speaks"
     );
     let hello = four
         .ask(RequestBody4::Hello {
@@ -244,15 +256,23 @@ async fn kr_req_24_24_each_endpoint_speaks_one_protocol_and_the_fourth_states_it
             protocol: HostProtocol::V4.name.to_owned(),
         })
         .await;
-    assert!(
-        matches!(
-            refused,
-            ResponseBody::Refused {
-                disabled: false,
-                ..
-            }
+    let ResponseBody::Refused {
+        detail,
+        disabled: false,
+        ..
+    } = refused
+    else {
+        panic!("the third endpoint answered the fourth protocol's name with {refused:?}");
+    };
+    // The third protocol's refusal is the text it was released with.
+    assert_eq!(
+        detail,
+        format!(
+            "this host speaks {} and the caller offered {}",
+            HostProtocol::V3.name,
+            HostProtocol::V4.name
         ),
-        "the third endpoint answered the fourth protocol's name with {refused:?}"
+        "the third endpoint says what it said when it was released"
     );
 }
 
@@ -659,15 +679,21 @@ async fn kr_req_24_24_a_restore_that_carries_a_position_sets_the_record_of_the_r
     let refused = four
         .restore(&second, 7, saved.state.clone(), Some(through))
         .await;
-    assert!(
-        matches!(
-            refused,
-            ResponseBody4::Refused {
-                disabled: false,
-                ..
-            }
+    let ResponseBody4::Refused {
+        detail,
+        disabled: false,
+        ..
+    } = refused
+    else {
+        panic!("a restore for another registration was answered with {refused:?}");
+    };
+    assert_eq!(
+        detail,
+        format!(
+            "the restore is for registration 7 and binding {} was registered as 8",
+            second.binding_id.get()
         ),
-        "a restore for another registration was answered with {refused:?}"
+        "the refusal says which registration the binding has"
     );
     assert_eq!(four.checkpoint(&second).await.consumed, moved.consumed);
 
@@ -685,6 +711,50 @@ async fn kr_req_24_24_a_restore_that_carries_a_position_sets_the_record_of_the_r
     );
     let after = four.checkpoint(&second).await;
     assert_eq!(after.consumed.map(|consumed| consumed.clean), Some(false));
+}
+
+// An unbind retires the registration when it is read, so a restore that was read before it and runs
+// after it is for a binding that is being removed, and is told so.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_24_24_a_restore_read_before_an_unbind_and_run_after_it_is_refused_as_for_a_binding_being_removed()
+ {
+    let served = Served::start_dual(true).await;
+    let Some(component) = recording(&served) else {
+        return;
+    };
+    let mut four = Raw4::connect(served.endpoint4()).await;
+    let request = components::request("recording", 42);
+    four.register(&request, &component, 7).await;
+    let hold = served.host.hold_calls_before_they_run();
+    let restoring = four
+        .send(RequestBody4::Restore {
+            binding_id: request.binding_id.get(),
+            registration: 7,
+            state: Vec::new(),
+            through: None,
+            deadline_ms: u64::try_from(HANG_GUARD.as_millis()).expect("milliseconds"),
+        })
+        .await;
+    reached(&hold, "the restore's task never started").await;
+    four.unbind(&request).await;
+    hold.release();
+    let refused = four.answer_of(restoring).await;
+    let ResponseBody4::Refused {
+        detail,
+        disabled: false,
+        ..
+    } = refused
+    else {
+        panic!("a restore for a binding being removed was answered with {refused:?}");
+    };
+    assert_eq!(
+        detail,
+        format!(
+            "the restore is for registration 7 and binding {} is being removed",
+            request.binding_id.get()
+        ),
+        "the refusal says the binding is being removed"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
