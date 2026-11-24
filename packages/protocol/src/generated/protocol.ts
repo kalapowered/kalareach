@@ -6621,6 +6621,7 @@ export interface AttentionItem {
     | 'attention.automation_paused'
     | 'attention.authority_feed_removed'
     | 'attention.receipt_uncertain'
+    | 'attention.receipts_gap'
   /**
    * The session it belongs to, when it belongs to one.
    */

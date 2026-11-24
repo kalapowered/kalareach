@@ -4284,6 +4284,11 @@
           "const": "attention.receipt_uncertain",
           "description": "An action's upstream result is unknown, so the host cannot say whether it took effect.",
           "type": "string"
+        },
+        {
+          "const": "attention.receipts_gap",
+          "description": "The host did not read some of a session's action results in time, so it cannot say whether any of them is unknown.",
+          "type": "string"
         }
       ]
     },
