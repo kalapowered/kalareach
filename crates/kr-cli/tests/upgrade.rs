@@ -5778,6 +5778,10 @@ async fn a_report_store_the_release_before_keeps_too_is_kept_across_a_rollback_a
 /// makes a rollback to it state the limit of a draft's prompt record (`draft_limit`). The release
 /// this suite runs as the release before lists that store, and a rollback to it states no limit, as
 /// the case after this one shows.
+///
+/// The registry is not what the case asks about: a rollback to the release before is refused for the
+/// registry at the version this release writes, so the case puts it back to the version the release
+/// before writes.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_rollback_keeps_a_draft_written_for_an_application_and_its_binding_revision_for_the_update_again()
  {
@@ -5845,6 +5849,7 @@ async fn a_rollback_keeps_a_draft_written_for_an_application_and_its_binding_rev
         )
         .expect("writes the draft as a release from before the store of revisions wrote it");
 
+    updated.puts_the_registry_back_for_the_release_before();
     let (output, said) = host.kr_json(&["host", "rollback", "--json"]);
     assert_eq!(
         output.status.code(),
