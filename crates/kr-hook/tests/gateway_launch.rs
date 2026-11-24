@@ -1413,6 +1413,74 @@ fn kr_req_12_06_the_binding_of_a_gateway_served_terminal_is_what_the_servers_mes
     assert!(!state.rich_mutations_suspended);
 }
 
+/// KR-REQ-11.17, the launch profile and the schema through the gateway: the records the gateway's
+/// writer makes for a launched terminal name the profile the instance was launched under, and the
+/// table the launch pinned for the instance is the one for the version a signed record gives the
+/// server's digest. The gateway's records name no schema; it takes its schema through that table.
+///
+/// Not claimed: Windows, where no gateway runs.
+#[test]
+fn kr_req_11_17_a_gateway_served_terminals_records_name_the_profile_and_table_it_was_launched_with()
+{
+    let shell = answering();
+    let answer = shell
+        .establish(&["codex"])
+        .expect("a backend is established");
+    let release = shell.placed.host.root().join("answer");
+    let mut launched = shell.launch(
+        &answer,
+        "evidence",
+        &[
+            ("STAND_IN", "stay,answer-when-released"),
+            ("STAND_IN_COMMAND", COMMAND),
+            ("STAND_IN_RELEASE", release.to_str().expect("a text path")),
+        ],
+    );
+    launched.prints("TUI: the server asks for item/commandExecution/requestApproval");
+    let instance = shell.announcement().instance.application_instance_id;
+    let capability = kr_protocol::ids::CapabilityId::new("agent.approval").expect("valid");
+    eventually("the gateway's writer has recorded evidence", || {
+        shell
+            .broker
+            .capabilities(instance)
+            .record(&capability)
+            .is_some()
+    });
+    let record = shell
+        .broker
+        .capabilities(instance)
+        .record(&capability)
+        .cloned()
+        .expect("the evidence is held");
+    let profile = shell
+        .broker
+        .profile_of(instance)
+        .expect("the instance's launch profile is held");
+    assert_eq!(
+        record.identity.profile_id.0.as_ref(),
+        Some(&profile.profile_id),
+        "the record names the profile the instance was launched under"
+    );
+    let plugin = record
+        .identity
+        .plugin_id
+        .0
+        .clone()
+        .expect("the record names the package");
+    let pinned = shell
+        .broker
+        .pinned_table(instance, &plugin)
+        .expect("the launch pinned the connector's table for the instance");
+    assert_eq!(
+        pinned.table.upstream_protocol_version,
+        kr_worker::broker::connectors::fixture::GATEWAY_QUALIFIED_VERSION,
+        "the table is the one for the version a signed record gives the server's digest"
+    );
+
+    std::fs::write(&release, b"answer").expect("the terminal is released");
+    launched.prints("TUI: turn/completed");
+}
+
 /// KR-REQ-11.30: a method the terminal sends that the package's table does not list suspends rich
 /// mutations, and the suspension lifts when the terminal's next selection has named the thread, the
 /// binding naming it. The terminal's first request here, which asks the server who the account is,
