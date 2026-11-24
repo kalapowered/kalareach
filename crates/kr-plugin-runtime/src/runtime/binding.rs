@@ -55,9 +55,11 @@ use std::sync::{Arc, Mutex};
 
 use kr_ipc::clock::{SharedClock, SystemSharedClock};
 use kr_plugin_sdk::identity::PluginIdentity;
+use kr_plugin_service::protocol4::Through;
 use kr_plugin_service::vocabulary::{
-    Admission, AttachmentFact, BindingFacts, BindingId, ScopedSourceEvent,
+    Admission, AttachmentFact, BindingFacts, BindingId, ScopedSourceEvent, SourceProvenance,
 };
+use kr_protocol::ids::SourceEventHandle;
 
 use crate::runtime::bindings::{
     ActionToken, Binding as WireBinding, DecodedRequest, EffectPlan, EncodedResponse, Fault,
@@ -170,12 +172,83 @@ pub enum BindingEvent {
         detail: String,
         /// How many faults are inside the window now.
         faults_in_window: u32,
+        /// The event whose `observe` trapped, where the call was one.
+        event: Option<SourceEventHandle>,
+        /// The generation the next call runs under: the replacements so far, and one for the
+        /// replacement that call makes first.
+        generation: u32,
     },
     /// The binding is disabled and will run nothing more.
     Disabled {
         /// Why, in the words a person is shown.
         reason: String,
     },
+    /// What the instance has consumed, at the end of a pass that returned at least one event.
+    ///
+    /// Never one of the presentations a slow caller loses: a newer report takes the place of an
+    /// older one that has not been delivered, and one that finds no room waits until there is.
+    Consumed(Consumed),
+}
+
+/// What an instance has consumed, as its binding's thread keeps it.
+///
+/// An event is consumed when its `observe` call returned, whether the component took it in or
+/// declined it. An event that trapped, that the queue dropped or that was refused before it ran is
+/// not consumed, and what the instance consumed is then not a prefix of what was offered: `clean`
+/// says so from that event on, until a restore that carried the position of a state.
+///
+/// An event from a terminal scrape is the terminal source's, and any other is the native
+/// source's.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Consumed {
+    /// How many times the instance has been replaced.
+    pub generation: u32,
+    /// Whether it is a prefix: no event was dropped, trapped or refused since the state it
+    /// describes.
+    pub clean: bool,
+    /// The last native event whose `observe` returned, where one has.
+    pub native: Option<SourceEventHandle>,
+    /// The last terminal event whose `observe` returned, where one has.
+    pub terminal: Option<SourceEventHandle>,
+}
+
+impl Consumed {
+    const fn start() -> Self {
+        Self {
+            generation: 0,
+            clean: true,
+            native: None,
+            terminal: None,
+        }
+    }
+
+    fn returned(&mut self, provenance: SourceProvenance, handle: SourceEventHandle) {
+        match provenance {
+            SourceProvenance::TerminalScrape => self.terminal = Some(handle),
+            SourceProvenance::NativeProtocol | SourceProvenance::MachineOutput => {
+                self.native = Some(handle);
+            }
+        }
+    }
+}
+
+/// A checkpoint: the component's own resumable state, and what the instance had consumed when it
+/// was taken.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Checkpoint {
+    /// The component's own state.
+    pub state: Vec<u8>,
+    /// What the instance had consumed.
+    pub consumed: Consumed,
+}
+
+/// What offering an event to a binding's queue came to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Offered {
+    /// What happened to the event.
+    pub admission: Admission,
+    /// The bytes the queue can still take after this admission.
+    pub free_bytes: u64,
 }
 
 /// How a runtime is configured.
@@ -904,9 +977,10 @@ enum Command {
         event: Option<ScopedSourceEvent>,
         answer: Answer<EncodedResponse>,
     },
-    Checkpoint(Answer<Vec<u8>>),
+    Checkpoint(Answer<Checkpoint>),
     Restore {
         state: Vec<u8>,
+        through: Option<Through>,
         answer: Answer<()>,
     },
     Stop,
@@ -1008,6 +1082,10 @@ impl BindingHandle {
             outstanding: Arc::clone(&outstanding),
             commands: commands.clone(),
             identity: request.identity.clone(),
+            consumed: Consumed::start(),
+            observing: None,
+            returned_in_pass: false,
+            consumed_owed: None,
         };
         let name = format!("kr-plugin-binding-{}", request.binding_id);
         let thread = std::thread::Builder::new()
@@ -1143,15 +1221,24 @@ impl BindingHandle {
     /// The pump is woken only when it is not already awake, so a burst of observations adds one
     /// command rather than one per event: the 4 MiB queue is what bounds a burst, and a command
     /// channel that grew with it would be a second, unbounded copy of the same backlog.
-    pub fn enqueue_observation(&self, event: ScopedSourceEvent) -> Admission {
-        let admission = match self.queue.lock() {
-            Ok(mut queue) => queue.push(event),
+    pub fn enqueue_observation(&self, event: ScopedSourceEvent) -> Offered {
+        let offered = match self.queue.lock() {
+            Ok(mut queue) => {
+                let admission = queue.push(event);
+                Offered {
+                    admission,
+                    free_bytes: queue.free_bytes(),
+                }
+            }
             // A poisoned queue means a binding thread panicked holding it. Reporting the event as
             // refused is the honest answer: nothing will interpret it.
-            Err(_) => Admission::Refused { held_bytes: 0 },
+            Err(_) => Offered {
+                admission: Admission::Refused { held_bytes: 0 },
+                free_bytes: 0,
+            },
         };
         self.wake();
-        admission
+        offered
     }
 
     fn wake(&self) {
@@ -1231,7 +1318,7 @@ impl BindingHandle {
         .await
     }
 
-    /// Takes the component's own resumable state.
+    /// Takes the component's own resumable state, and what the instance has consumed.
     ///
     /// # Errors
     ///
@@ -1239,11 +1326,14 @@ impl BindingHandle {
     pub async fn checkpoint(
         &self,
         deadline: core::time::Duration,
-    ) -> RuntimeResult<CallResult<Vec<u8>>> {
+    ) -> RuntimeResult<CallResult<Checkpoint>> {
         self.dispatch(deadline, Command::Checkpoint).await
     }
 
     /// Restores state from a checkpoint this build produced.
+    ///
+    /// With `through`, what the instance has consumed becomes what the state was taken at, and is
+    /// clean, once the restore has answered. Without it, it stays as it was.
     ///
     /// # Errors
     ///
@@ -1251,10 +1341,15 @@ impl BindingHandle {
     pub async fn restore(
         &self,
         state: Vec<u8>,
+        through: Option<Through>,
         deadline: core::time::Duration,
     ) -> RuntimeResult<CallResult<()>> {
-        self.dispatch(deadline, |answer| Command::Restore { state, answer })
-            .await
+        self.dispatch(deadline, |answer| Command::Restore {
+            state,
+            through,
+            answer,
+        })
+        .await
     }
 
     /// Replaces the facts the component reads about its binding.
@@ -1432,6 +1527,14 @@ struct BindingWorker {
     outstanding: Arc<AtomicUsize>,
     commands: mpsc::Sender<Command>,
     identity: PluginIdentity,
+    /// What the instance has consumed.
+    consumed: Consumed,
+    /// The event whose `observe` is running, for the fault a trap in it raises.
+    observing: Option<SourceEventHandle>,
+    /// Whether the pass in hand returned at least one event.
+    returned_in_pass: bool,
+    /// What the caller has not been given yet. A newer one replaces it.
+    consumed_owed: Option<Consumed>,
 }
 
 impl BindingWorker {
@@ -1535,14 +1638,30 @@ impl BindingWorker {
                         continue;
                     }
                     let outcome = self.run_call(CallKind::Checkpoint, Instance::checkpoint);
-                    let _ = answer.send(outcome);
+                    let consumed = self.consumed.clone();
+                    let _ = answer.send(outcome.map(|result| CallResult {
+                        answer: result.answer.map(|state| Checkpoint { state, consumed }),
+                        nodes: result.nodes,
+                        document: result.document,
+                    }));
                 }
-                Command::Restore { state, answer } => {
+                Command::Restore {
+                    state,
+                    through,
+                    answer,
+                } => {
                     if self.abandoned(&answer) {
                         continue;
                     }
                     let outcome =
                         self.run_call(CallKind::Restore, move |instance| instance.restore(state));
+                    if let Some(through) = through
+                        && outcome.as_ref().is_ok_and(|result| result.answer.is_ok())
+                    {
+                        self.consumed.native = through.native;
+                        self.consumed.terminal = through.terminal;
+                        self.consumed.clean = true;
+                    }
                     let _ = answer.send(outcome);
                 }
                 Command::Stop => return,
@@ -1561,6 +1680,35 @@ impl BindingWorker {
     }
 
     fn pump(&mut self) {
+        self.returned_in_pass = false;
+        self.pump_pass();
+        // After the gap and the fault the pass raised, so the caller reads them first.
+        if self.returned_in_pass {
+            self.consumed_owed = Some(self.consumed.clone());
+        }
+        self.flush_consumed();
+    }
+
+    /// Gives the caller what it is owed, if the channel has room for it.
+    ///
+    /// The places the reserve keeps for a fault are not this report's, and a full channel leaves it
+    /// owed for the next pass or the next report, which a newer one then replaces.
+    fn flush_consumed(&mut self) {
+        let Some(owed) = self.consumed_owed.take() else {
+            return;
+        };
+        if self.events.capacity() > FAULT_RESERVE
+            && self
+                .events
+                .try_send(BindingEvent::Consumed(owed.clone()))
+                .is_ok()
+        {
+            return;
+        }
+        self.consumed_owed = Some(owed);
+    }
+
+    fn pump_pass(&mut self) {
         #[cfg(feature = "testing")]
         self.stand_when_stopped();
         // Cleared before the queue is read, so an event that arrives during this pass wakes the
@@ -1588,6 +1736,8 @@ impl BindingWorker {
             return;
         };
         if let Some(gap) = gap {
+            // Events were lost: what the instance consumed is no longer all that came before it.
+            self.consumed.clean = false;
             self.send(BindingEvent::Gap(gap));
         }
         if owed != 0 {
@@ -1622,12 +1772,21 @@ impl BindingWorker {
                 return;
             };
             let lost = event.clone();
+            self.observing = Some(lost.handle.clone());
             let outcome = self.run_call(CallKind::Observe, move |instance| instance.observe(event));
+            self.observing = None;
+            if outcome.is_ok() {
+                // The call returned: the component took the event in or declined it, and either
+                // way it will not be offered again.
+                self.consumed.returned(lost.provenance, lost.handle.clone());
+                self.returned_in_pass = true;
+            }
             if outcome.is_err() {
                 // A faulted instance is replaced and owes a snapshot. The event that faulted is
                 // one the component never took in, so it is recorded as lost; the events still in
                 // the queue are still in the queue, and the next pass takes the snapshot before it
                 // delivers any of them.
+                self.consumed.clean = false;
                 if let Ok(mut queue) = self.queue.lock() {
                     queue.taken_event_was_lost(&lost);
                 }
@@ -1729,6 +1888,7 @@ impl BindingWorker {
         if instance.faulted() {
             match instance.replace() {
                 Ok(nodes) => {
+                    self.consumed.generation = self.consumed.generation.saturating_add(1);
                     if let Ok(mut queue) = self.queue.lock() {
                         queue.require_snapshot();
                     }
@@ -1771,6 +1931,8 @@ impl BindingWorker {
             return;
         }
         let detail = clipped(error.to_string(), MAX_FAULT_DETAIL_BYTES);
+        // A trapped instance is not a state anything consumed describes.
+        self.consumed.clean = false;
         match self.faults.record(&detail) {
             FaultVerdict::Continue { faults_in_window } => {
                 // The binding survives, and the instance behind it does not: a trap is terminal
@@ -1783,6 +1945,8 @@ impl BindingWorker {
                     call: kind,
                     detail,
                     faults_in_window,
+                    event: self.observing.clone(),
+                    generation: self.consumed.generation.saturating_add(1),
                 });
             }
             FaultVerdict::Disabled { reason } => {
@@ -1821,6 +1985,7 @@ impl BindingWorker {
     /// anything else, so the send waits for room by blocking this thread, which is the binding's
     /// own and nothing else's.
     fn send(&mut self, event: BindingEvent) {
+        self.flush_consumed();
         if self.dropped_documents > 0 {
             let dropped = BindingEvent::PresentationDropped {
                 documents: self.dropped_documents,
@@ -2079,6 +2244,8 @@ mod tests {
                     call: CallKind::Observe,
                     detail: format!("fault {index}"),
                     faults_in_window: 1,
+                    event: None,
+                    generation: 1,
                 })
                 .expect("a fault always has room");
         }

@@ -728,7 +728,7 @@ impl PluginHost {
                     return Err((reason, true));
                 }
                 let scoped = event_of(&event).map_err(|detail| (detail, false))?;
-                let admission = binding.enqueue_observation(scoped);
+                let admission = binding.enqueue_observation(scoped).admission;
                 Ok(admission_of(admission))
             }
             RequestBody::Snapshot {
@@ -777,9 +777,14 @@ impl PluginHost {
                 let result = binding
                     .checkpoint(core::time::Duration::from_millis(deadline_ms))
                     .await;
-                called_of(
-                    result.map(|result| (result.answer.map(CallValue::State), result.document)),
-                )
+                called_of(result.map(|result| {
+                    (
+                        result
+                            .answer
+                            .map(|checkpoint| CallValue::State(checkpoint.state)),
+                        result.document,
+                    )
+                }))
             }
             RequestBody::Restore {
                 binding_id,
@@ -788,7 +793,7 @@ impl PluginHost {
             } => {
                 let binding = settled.binding_of(binding_id)?;
                 let result = binding
-                    .restore(state, core::time::Duration::from_millis(deadline_ms))
+                    .restore(state, None, core::time::Duration::from_millis(deadline_ms))
                     .await;
                 called_of(
                     result.map(|result| {
@@ -2222,6 +2227,7 @@ fn notices_of(binding_id: BindingId, event: BindingEvent) -> Vec<Notice> {
             call,
             detail,
             faults_in_window,
+            ..
         } => vec![Notice::Fault {
             binding_id,
             call: call.as_str().to_owned(),
@@ -2229,6 +2235,8 @@ fn notices_of(binding_id: BindingId, event: BindingEvent) -> Vec<Notice> {
             faults_in_window,
         }],
         BindingEvent::Disabled { reason } => vec![Notice::Disabled { binding_id, reason }],
+        // The third protocol has no frame for it.
+        BindingEvent::Consumed(_) => Vec::new(),
     }
 }
 
@@ -2702,6 +2710,8 @@ mod tests {
                 call: CallKind::Observe,
                 detail: "the component trapped".to_owned(),
                 faults_in_window: 2,
+                event: None,
+                generation: 1,
             },
         );
         assert_eq!(faults.len(), 1);

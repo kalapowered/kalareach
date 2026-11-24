@@ -1317,7 +1317,9 @@ async fn kr_req_11_41_a_cold_compile_is_not_inside_an_observation_deadline() {
         host.runtime.engine().advance_epoch();
     }
 
-    let admission = handle.enqueue_observation(components::scrape("se-1", "x"));
+    let admission = handle
+        .enqueue_observation(components::scrape("se-1", "x"))
+        .admission;
     assert_eq!(admission, Admission::Queued);
     let event = next_event(&mut received, LIVENESS)
         .await
@@ -2089,7 +2091,9 @@ async fn kr_req_11_38_queue_overflow_produces_a_gap_and_a_fresh_snapshot() {
     // queue holds, and the limit only ends a queue that never overflows.
     let filler = "y".repeat(64 * 1024);
     let mut stop = handle.stop_next_pump();
-    let first = handle.enqueue_observation(components::scrape("se-0", &filler));
+    let first = handle
+        .enqueue_observation(components::scrape("se-0", &filler))
+        .admission;
     assert!(
         !matches!(first, Admission::QueuedWithGap { .. }),
         "one observation of 64 KiB overflowed a 4 MiB queue"
@@ -2108,8 +2112,9 @@ async fn kr_req_11_38_queue_overflow_produces_a_gap_and_a_fresh_snapshot() {
     );
     let mut gapped = false;
     for index in 1..=130 {
-        let admission =
-            handle.enqueue_observation(components::scrape(&format!("se-{index}"), &filler));
+        let admission = handle
+            .enqueue_observation(components::scrape(&format!("se-{index}"), &filler))
+            .admission;
         assert!(
             handle.queued_bytes() <= OBSERVATION_QUEUE_BYTES,
             "the queue holds {} bytes, over its {OBSERVATION_QUEUE_BYTES} byte bound",
@@ -2137,7 +2142,7 @@ async fn kr_req_11_38_queue_overflow_produces_a_gap_and_a_fresh_snapshot() {
                 assert!(gap.bytes > 0);
                 saw_gap = true;
             }
-            Some(BindingEvent::PresentationDropped { .. }) => {}
+            Some(BindingEvent::PresentationDropped { .. } | BindingEvent::Consumed(_)) => {}
             Some(BindingEvent::Document { call, .. }) => {
                 if call == CallKind::Snapshot && saw_gap {
                     saw_snapshot = true;
@@ -2645,4 +2650,404 @@ async fn a_document_nobody_received_asks_the_component_to_draw_again() {
         !handle.snapshot_required(),
         "the obligation was not cleared"
     );
+}
+
+/// What an instance has consumed, and what the binding says of it.
+///
+/// An event is consumed when its `observe` call returned, whether the component took it in or
+/// declined it. The cursor a checkpoint carries names the last of them for each source, and says
+/// whether it is a prefix of what was offered.
+mod consumed {
+    use super::*;
+
+    use kr_plugin_runtime::runtime::binding::{BindingHandle, Consumed};
+    use kr_plugin_service::protocol4::Through;
+    use kr_plugin_service::vocabulary::{ScopedSourceEvent, SourceProvenance};
+    use kr_protocol::ids::SourceEventHandle;
+
+    type Received = tokio::sync::mpsc::Receiver<BindingEvent>;
+
+    /// How long a case waits for a call it has made to answer. Held hosts stop no call by a
+    /// deadline, so this ends only a call that never answers.
+    const ANSWER: core::time::Duration = core::time::Duration::from_secs(60 * 60);
+
+    fn handle(text: &str) -> SourceEventHandle {
+        SourceEventHandle::new(text).expect("a bounded handle")
+    }
+
+    /// One component bound on a host whose epoch is held, with its events on `channel`.
+    async fn bound(
+        plugin: &str,
+        seed: u8,
+        channel: usize,
+    ) -> Option<(Host, Arc<BindingHandle>, Received)> {
+        let wasm = components::component(plugin)?;
+        let host = held_host();
+        let (events, received) = tokio::sync::mpsc::channel(channel);
+        let compiled = host
+            .runtime
+            .compile(Payload::new(wasm))
+            .expect("a compile")
+            .wait(COMPILE_WAIT)
+            .await
+            .expect("the component compiles");
+        let binding = host
+            .runtime
+            .instantiate(
+                host.owner,
+                Incarnation::next(),
+                components::request(plugin, seed),
+                &compiled,
+                events,
+                COMPILE_WAIT,
+            )
+            .await
+            .expect("the component instantiates");
+        Some((host, binding, received))
+    }
+
+    async fn consumed_of(binding: &BindingHandle) -> Consumed {
+        binding
+            .checkpoint(ANSWER)
+            .await
+            .expect("the checkpoint runs")
+            .answer
+            .expect("the component answers")
+            .consumed
+    }
+
+    /// Reads what the binding reports until a cursor satisfies `wanted`, and returns it. Ends the
+    /// case when the binding reports nothing for a whole liveness wait.
+    async fn consumed_until(
+        received: &mut Received,
+        wanted: impl Fn(&Consumed) -> bool,
+    ) -> Consumed {
+        loop {
+            match next_event(received, LIVENESS).await {
+                Some(BindingEvent::Consumed(cursor)) if wanted(&cursor) => return cursor,
+                Some(BindingEvent::Disabled { reason }) => {
+                    panic!("the binding was disabled: {reason}")
+                }
+                Some(_) => {}
+                None => panic!("the cursor the case waits for never came"),
+            }
+        }
+    }
+
+    /// KR-REQ-24.24: a checkpoint names the last event a pass took, not the last one offered.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn kr_req_24_24_a_checkpoint_names_the_last_event_the_pass_before_it_took() {
+        let Some((_host, binding, _received)) = bound("recording", 21, DEFAULT_EVENT_QUEUE).await
+        else {
+            return;
+        };
+        let mut stop = binding.stop_next_pump();
+        for index in 0..18 {
+            binding.enqueue_observation(components::scrape(&format!("se-{index}"), "x"));
+        }
+        assert!(
+            tokio::time::timeout(core::time::Duration::from_secs(60), stop.reached())
+                .await
+                .expect("the pass stands at the stop"),
+            "the stop was replaced before a pass reached it"
+        );
+        // The checkpoint is behind the pass in the binding's commands, and the pass that follows
+        // it is behind the checkpoint: it sees the sixteen events the first pass took.
+        let mut checkpoint = std::pin::pin!(binding.checkpoint(ANSWER));
+        let _ = tokio::time::timeout(core::time::Duration::ZERO, checkpoint.as_mut()).await;
+        stop.release();
+        let cursor = checkpoint
+            .await
+            .expect("the checkpoint runs")
+            .answer
+            .expect("the component answers")
+            .consumed;
+        assert_eq!(
+            cursor.terminal,
+            Some(handle("se-15")),
+            "the sixteenth event"
+        );
+        assert_eq!(cursor.native, None);
+        assert!(cursor.clean);
+        assert_eq!(cursor.generation, 0);
+    }
+
+    /// KR-REQ-24.24: a trap names its event and the generation the next call runs under, the next
+    /// call replaces the instance, and a restore that carries a cursor makes it the instance's.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn kr_req_24_24_a_trap_raises_the_generation_at_the_next_call_and_a_restore_sets_the_cursor()
+     {
+        let Some((_host, binding, mut received)) =
+            bound("recording", 22, DEFAULT_EVENT_QUEUE).await
+        else {
+            return;
+        };
+        assert_eq!(
+            consumed_of(&binding).await,
+            Consumed {
+                generation: 0,
+                clean: true,
+                native: None,
+                terminal: None
+            }
+        );
+        binding.enqueue_observation(components::scrape("se-1", "x"));
+        binding.enqueue_observation(components::scrape("se-2", "!trap"));
+        let fault = loop {
+            match next_event(&mut received, LIVENESS).await {
+                Some(BindingEvent::Fault {
+                    event, generation, ..
+                }) => break (event, generation),
+                Some(BindingEvent::Disabled { reason }) => panic!("disabled: {reason}"),
+                _ => {}
+            }
+        };
+        assert_eq!(
+            fault,
+            (Some(handle("se-2")), 1),
+            "the fault names the event that trapped and the generation of the next call"
+        );
+        // A checkpoint after the notice comes from the replacement.
+        let cursor = consumed_of(&binding).await;
+        assert_eq!(cursor.generation, 1);
+        assert!(!cursor.clean);
+        assert_eq!(cursor.terminal, Some(handle("se-1")));
+
+        // A plain restore leaves the cursor as it was.
+        let state = binding
+            .checkpoint(ANSWER)
+            .await
+            .expect("the checkpoint runs")
+            .answer
+            .expect("the component answers")
+            .state;
+        binding
+            .restore(state.clone(), None, ANSWER)
+            .await
+            .expect("the restore runs")
+            .answer
+            .expect("the component answers");
+        assert_eq!(consumed_of(&binding).await, cursor);
+
+        // A restore that carries a cursor makes it the instance's, and clean, at its own generation.
+        binding
+            .restore(
+                state,
+                Some(Through {
+                    native: Some(handle("se-7")),
+                    terminal: None,
+                }),
+                ANSWER,
+            )
+            .await
+            .expect("the restore runs")
+            .answer
+            .expect("the component answers");
+        assert_eq!(
+            consumed_of(&binding).await,
+            Consumed {
+                generation: 1,
+                clean: true,
+                native: Some(handle("se-7")),
+                terminal: None
+            }
+        );
+    }
+
+    /// KR-REQ-24.24: an event the component declined is consumed, and a checkpoint right after it
+    /// names it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn kr_req_24_24_a_declined_event_is_consumed_and_a_checkpoint_after_it_names_it() {
+        let Some((_host, binding, mut received)) =
+            bound("well-behaved", 23, DEFAULT_EVENT_QUEUE).await
+        else {
+            return;
+        };
+        binding.enqueue_observation(components::scrape("se-0", "x"));
+        // Not text, which this component declines.
+        binding.enqueue_observation(ScopedSourceEvent::new(
+            handle("se-1"),
+            SourceProvenance::TerminalScrape,
+            0,
+            None,
+            vec![0xff, 0xfe],
+        ));
+        // The checkpoint is behind the pass the offers woke, so it comes after both events.
+        let checkpoint = consumed_of(&binding).await;
+        assert_eq!(
+            checkpoint.terminal,
+            Some(handle("se-1")),
+            "the declined event is the last the checkpoint names"
+        );
+        assert!(checkpoint.clean, "a decline is not a loss");
+        let cursor = consumed_until(&mut received, |cursor| {
+            cursor.terminal == Some(handle("se-1"))
+        })
+        .await;
+        assert!(cursor.clean);
+    }
+
+    /// KR-REQ-24.24: events lost to a full queue make the cursor not a prefix, and what the
+    /// component takes afterwards does not make it one again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn kr_req_24_24_a_queue_overflow_clears_clean_and_a_later_event_does_not_set_it() {
+        let Some((_host, binding, mut received)) =
+            bound("well-behaved", 24, DEFAULT_EVENT_QUEUE).await
+        else {
+            return;
+        };
+        let filler = "y".repeat(64 * 1024);
+        let mut stop = binding.stop_next_pump();
+        binding.enqueue_observation(components::scrape("se-0", &filler));
+        assert!(
+            tokio::time::timeout(core::time::Duration::from_secs(60), stop.reached())
+                .await
+                .expect("the pass stands at the stop"),
+            "the stop was replaced before a pass reached it"
+        );
+        let mut gapped = false;
+        for index in 1..=130 {
+            let offered =
+                binding.enqueue_observation(components::scrape(&format!("se-{index}"), &filler));
+            if matches!(offered.admission, Admission::QueuedWithGap { .. }) {
+                gapped = true;
+                break;
+            }
+        }
+        assert!(gapped, "the queue did not overflow");
+        stop.release();
+        let first = consumed_until(&mut received, |_| true).await;
+        assert!(!first.clean, "events were lost before this cursor");
+        // Let everything the queue still holds be taken, then offer one more.
+        binding.enqueue_observation(components::scrape("se-after", "x"));
+        let last = consumed_until(&mut received, |cursor| {
+            cursor.terminal == Some(handle("se-after"))
+        })
+        .await;
+        assert!(
+            !last.clean,
+            "a later event does not make the cursor a prefix again"
+        );
+    }
+
+    /// KR-REQ-24.24: the room an admission reports is what is left after it, for events of several
+    /// sizes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn kr_req_24_24_an_admission_reports_the_room_left_after_it() {
+        let Some((_host, binding, _received)) = bound("recording", 25, DEFAULT_EVENT_QUEUE).await
+        else {
+            return;
+        };
+        let mut stop = binding.stop_next_pump();
+        let mut held = 0_u64;
+        for (index, size) in [1_usize, 1_000, 64 * 1024, 300_000].into_iter().enumerate() {
+            let event = components::scrape(&format!("se-{index}"), &"z".repeat(size));
+            held += event.queue_bytes();
+            let offered = binding.enqueue_observation(event);
+            assert_eq!(offered.admission, Admission::Queued);
+            assert_eq!(
+                offered.free_bytes,
+                OBSERVATION_QUEUE_BYTES - held,
+                "the room after the event of {size} bytes"
+            );
+            if index == 0 {
+                assert!(
+                    tokio::time::timeout(core::time::Duration::from_secs(60), stop.reached())
+                        .await
+                        .expect("the pass stands at the stop"),
+                    "the stop was replaced before a pass reached it"
+                );
+            }
+        }
+        stop.release();
+    }
+
+    /// KR-REQ-24.24: a cursor comes after the fault of its pass.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn kr_req_24_24_a_cursor_follows_the_fault_of_the_pass_that_returned_it() {
+        let Some((_host, binding, mut received)) =
+            bound("recording", 26, DEFAULT_EVENT_QUEUE).await
+        else {
+            return;
+        };
+        let mut stop = binding.stop_next_pump();
+        binding.enqueue_observation(components::scrape("se-1", "x"));
+        assert!(
+            tokio::time::timeout(core::time::Duration::from_secs(60), stop.reached())
+                .await
+                .expect("the pass stands at the stop"),
+            "the stop was replaced before a pass reached it"
+        );
+        binding.enqueue_observation(components::scrape("se-2", "!trap"));
+        stop.release();
+        let mut order = Vec::new();
+        while !order.contains(&"consumed") {
+            match next_event(&mut received, LIVENESS).await {
+                Some(BindingEvent::Fault { .. }) => order.push("fault"),
+                Some(BindingEvent::Consumed(cursor)) => {
+                    assert_eq!(cursor.terminal, Some(handle("se-1")));
+                    assert!(!cursor.clean);
+                    order.push("consumed");
+                }
+                Some(BindingEvent::Disabled { reason }) => panic!("disabled: {reason}"),
+                _ => {}
+            }
+        }
+        assert_eq!(
+            order,
+            ["fault", "consumed"],
+            "the cursor comes after the fault"
+        );
+    }
+
+    /// KR-REQ-24.24: a cursor that finds no room waits for it, a newer one replaces it, and none is
+    /// lost.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn kr_req_24_24_a_cursor_that_finds_the_channel_full_waits_and_a_newer_one_replaces_it() {
+        // Four places beside the fault reserve: two passes' document and cursor fill them, and the
+        // cursors of the passes after that find no room.
+        let Some((_host, binding, mut received)) = bound("recording", 27, 12).await else {
+            return;
+        };
+        while received.try_recv().is_ok() {}
+        for index in 1..=6 {
+            binding.enqueue_observation(components::scrape(&format!("se-{index}"), "x"));
+            // A checkpoint answers after the pass before it has ended.
+            let _ = consumed_of(&binding).await;
+        }
+        // Nothing has been read yet. What fitted is read now, and the cursors among it are the first
+        // passes'.
+        let mut seen = Vec::new();
+        while let Ok(event) = received.try_recv() {
+            if let BindingEvent::Consumed(cursor) = event {
+                seen.push(cursor.terminal);
+            }
+        }
+        assert!(
+            !seen.is_empty() && !seen.contains(&Some(handle("se-6"))),
+            "the newest cursor found room: {seen:?}"
+        );
+        // The next thing the binding reports is preceded by the cursor it owes.
+        let called = binding.snapshot(ANSWER).await.expect("the snapshot runs");
+        assert!(called.answer.is_ok());
+        let mut owed = Vec::new();
+        loop {
+            match next_event(&mut received, LIVENESS).await {
+                Some(BindingEvent::Consumed(cursor)) => owed.push(cursor),
+                Some(BindingEvent::Document {
+                    call: CallKind::Snapshot,
+                    ..
+                }) => break,
+                Some(BindingEvent::Disabled { reason }) => panic!("disabled: {reason}"),
+                Some(_) => {}
+                None => panic!("the snapshot's document never came"),
+            }
+        }
+        assert_eq!(
+            owed.len(),
+            1,
+            "the cursors that found no room became one: {owed:?}"
+        );
+        assert_eq!(owed[0].terminal, Some(handle("se-6")), "the newest one");
+    }
 }

@@ -36,14 +36,24 @@ use std::collections::VecDeque;
 
 use kr_plugin_sdk::limits::OBSERVATION_QUEUE_BYTES;
 use kr_plugin_service::vocabulary::{Admission, ScopedSourceEvent};
+use kr_protocol::ids::SourceEventHandle;
 
 /// A gap in the observation stream.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ObservationGap {
     /// How many observations were lost.
     pub events: u32,
     /// How many bytes they held.
     pub bytes: u64,
+    /// The first lost event in the order the queue was offered events, where one was lost.
+    ///
+    /// Not every event between the first and the last was lost: a request is never evicted, so one
+    /// can stand between two that were. The two bound the loss.
+    pub first: Option<SourceEventHandle>,
+    /// The last lost event in that order.
+    pub last: Option<SourceEventHandle>,
+    first_order: u64,
+    last_order: u64,
 }
 
 impl ObservationGap {
@@ -56,6 +66,18 @@ impl ObservationGap {
     fn absorb(&mut self, events: u32, bytes: u64) {
         self.events = self.events.saturating_add(events);
         self.bytes = self.bytes.saturating_add(bytes);
+    }
+
+    /// Records that the event offered `order`th was lost, which moves the bounds of the gap.
+    fn note(&mut self, order: u64, handle: &SourceEventHandle) {
+        if self.first.is_none() || order < self.first_order {
+            self.first = Some(handle.clone());
+            self.first_order = order;
+        }
+        if self.last.is_none() || order > self.last_order {
+            self.last = Some(handle.clone());
+            self.last_order = order;
+        }
     }
 }
 
@@ -72,13 +94,24 @@ pub struct Drained {
     pub events: Vec<ScopedSourceEvent>,
 }
 
+/// An event in the queue, with the place it was offered in.
+#[derive(Debug)]
+struct Held {
+    order: u64,
+    event: ScopedSourceEvent,
+}
+
 /// One binding's bounded observation queue.
 #[derive(Debug)]
 pub struct ObservationQueue {
-    events: VecDeque<ScopedSourceEvent>,
+    events: VecDeque<Held>,
     held_bytes: u64,
     capacity_bytes: u64,
     gap: ObservationGap,
+    /// The place the next offered event takes, counted from one.
+    offered: u64,
+    /// The place of the event `take_one` took last.
+    taken: u64,
     /// Which snapshot obligation is outstanding, counted from one. Zero means none.
     snapshot_owed: u64,
     /// How many obligations have ever been raised, so a new one is always a new number.
@@ -102,7 +135,13 @@ impl ObservationQueue {
             gap: ObservationGap {
                 events: 0,
                 bytes: 0,
+                first: None,
+                last: None,
+                first_order: 0,
+                last_order: 0,
             },
+            offered: 0,
+            taken: 0,
             snapshot_owed: 0,
             obligations: 0,
         }
@@ -113,6 +152,12 @@ impl ObservationQueue {
     #[cfg(any(test, feature = "testing"))]
     pub const fn held_bytes(&self) -> u64 {
         self.held_bytes
+    }
+
+    /// Returns how many bytes the queue can still take.
+    #[must_use]
+    pub const fn free_bytes(&self) -> u64 {
+        self.capacity_bytes.saturating_sub(self.held_bytes)
     }
 
     /// Returns how many events the queue holds.
@@ -169,6 +214,8 @@ impl ObservationQueue {
 
     /// Offers one event to the queue. Never waits, and never runs a component.
     pub fn push(&mut self, event: ScopedSourceEvent) -> Admission {
+        self.offered = self.offered.saturating_add(1);
+        let order = self.offered;
         let bytes = event.queue_bytes();
         if bytes > self.capacity_bytes {
             // One event larger than the whole queue cannot be admitted by evicting anything. An
@@ -180,6 +227,7 @@ impl ObservationQueue {
                 };
             }
             self.gap.absorb(1, bytes);
+            self.gap.note(order, &event.handle);
             self.raise_obligation();
             return Admission::QueuedWithGap { events: 1, bytes };
         }
@@ -187,7 +235,10 @@ impl ObservationQueue {
         let mut evicted_events = 0_u32;
         let mut evicted_bytes = 0_u64;
         while self.held_bytes + bytes > self.capacity_bytes {
-            let Some(position) = self.events.iter().position(|held| !held.is_authoritative())
+            let Some(position) = self
+                .events
+                .iter()
+                .position(|held| !held.event.is_authoritative())
             else {
                 // Nothing left to evict but requests, and a request is never evicted. What was
                 // evicted on the way here is a gap, and so is this event if it is an ordinary
@@ -196,6 +247,7 @@ impl ObservationQueue {
                 if !event.is_authoritative() {
                     evicted_events = evicted_events.saturating_add(1);
                     evicted_bytes = evicted_bytes.saturating_add(bytes);
+                    self.gap.note(order, &event.handle);
                 }
                 if evicted_events > 0 {
                     self.gap.absorb(evicted_events, evicted_bytes);
@@ -209,13 +261,15 @@ impl ObservationQueue {
                 .events
                 .remove(position)
                 .expect("the position came from this queue");
-            self.held_bytes = self.held_bytes.saturating_sub(removed.queue_bytes());
+            let removed_bytes = removed.event.queue_bytes();
+            self.held_bytes = self.held_bytes.saturating_sub(removed_bytes);
+            self.gap.note(removed.order, &removed.event.handle);
             evicted_events = evicted_events.saturating_add(1);
-            evicted_bytes = evicted_bytes.saturating_add(removed.queue_bytes());
+            evicted_bytes = evicted_bytes.saturating_add(removed_bytes);
         }
 
         self.held_bytes += bytes;
-        self.events.push_back(event);
+        self.events.push_back(Held { order, event });
         if evicted_events == 0 {
             Admission::Queued
         } else {
@@ -242,17 +296,19 @@ impl ObservationQueue {
     /// One at a time is what lets a caller stop after a fault without having removed events it is
     /// not going to deliver.
     pub fn take_one(&mut self) -> Option<ScopedSourceEvent> {
-        let event = self.events.pop_front()?;
-        self.held_bytes = self.held_bytes.saturating_sub(event.queue_bytes());
-        Some(event)
+        let held = self.events.pop_front()?;
+        self.held_bytes = self.held_bytes.saturating_sub(held.event.queue_bytes());
+        self.taken = held.order;
+        Some(held.event)
     }
 
-    /// Records that one event was taken and then not delivered.
+    /// Records that the event `take_one` took last was taken and then not delivered.
     ///
     /// A fault costs the event that caused it. Saying so is what keeps the stream's account
     /// complete: the component's view is missing that event, and a gap is how it learns to rebuild.
     pub fn taken_event_was_lost(&mut self, event: &ScopedSourceEvent) {
         self.gap.absorb(1, event.queue_bytes());
+        self.gap.note(self.taken, &event.handle);
         self.raise_obligation();
     }
 
@@ -262,11 +318,11 @@ impl ObservationQueue {
         let gap = (!self.gap.is_empty()).then(|| core::mem::take(&mut self.gap));
         let mut events = Vec::new();
         while events.len() < limit {
-            let Some(event) = self.events.pop_front() else {
+            let Some(held) = self.events.pop_front() else {
                 break;
             };
-            self.held_bytes = self.held_bytes.saturating_sub(event.queue_bytes());
-            events.push(event);
+            self.held_bytes = self.held_bytes.saturating_sub(held.event.queue_bytes());
+            events.push(held.event);
         }
         Drained { gap, events }
     }
@@ -279,6 +335,9 @@ impl ObservationQueue {
         let events = u32::try_from(self.events.len()).unwrap_or(u32::MAX);
         if events > 0 {
             self.gap.absorb(events, self.held_bytes);
+            for held in &self.events {
+                self.gap.note(held.order, &held.event.handle);
+            }
             self.raise_obligation();
         }
         self.events.clear();

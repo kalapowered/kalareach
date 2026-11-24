@@ -69,7 +69,7 @@
 //! // Delivering an observation runs nothing and waits for nothing. Document nodes, gaps and
 //! // faults arrive on `received`.
 //! # let event = unimplemented!();
-//! let admission = binding.enqueue_observation(event);
+//! let admission = binding.enqueue_observation(event).admission;
 //! # let _ = (admission, received);
 //! # Ok(())
 //! # }

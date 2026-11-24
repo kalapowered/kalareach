@@ -1231,3 +1231,25 @@ fn a_build_serves_every_plugin_host_protocol_a_level_recorded_and_may_serve_more
     assert_eq!(host_names_outside(&[three, four], &[three]), vec![four]);
     assert!(host_names_outside(&[three], &[four, three]).is_empty());
 }
+
+/// The host's writer of consumed positions opens when every worker level the build retains speaks the
+/// fourth plugin host protocol, which is from the first level that does.
+#[test]
+fn the_replay_writer_opens_at_the_first_level_of_the_fourth_host_protocol() {
+    use kr_protocol::retained::{
+        FIRST_HOST_4_LEVEL, RETAINED_WORKER_LEVELS, replay_writer_open, writer_open_for,
+    };
+    let level = |minor| CompatibilityLevel::of(PackageVersion::new(0, minor, 0));
+    assert_eq!(FIRST_HOST_4_LEVEL, level(79));
+    assert!(writer_open_for(&[level(79)]), "open at the first level");
+    assert!(writer_open_for(&[level(79), level(80)]));
+    assert!(!writer_open_for(&[level(78)]), "closed below it");
+    assert!(
+        !writer_open_for(&[level(78), level(79)]),
+        "closed while one retained level is below it"
+    );
+    assert_eq!(
+        replay_writer_open(),
+        writer_open_for(&RETAINED_WORKER_LEVELS)
+    );
+}
