@@ -110,6 +110,9 @@ kr-shell-integration = { workspace = true, features = ["testing"] }
 # The Windows start and pairing tests register a test environment's scheduled task and host a
 # daemon that starts its workers through it.
 kr-controller = { workspace = true, features = ["testing"] }
+# The upgrade suite's cases write input to an attached session, a call the client compiles only for
+# tests. No shipped build enables this.
+kr-client = { workspace = true, features = ["terminal", "testing"] }
 # The stored-format lock is made of what each of these keeps: the update tests read their versions
 # and the tables they create.
 kr-automation.workspace = true
