@@ -694,7 +694,7 @@ impl Controller {
         let (evidence, _) = self.desktop_evidence().await;
         let worker = worker_for(self.directory_workers().await, evidence.worker_profile)?;
         let session_id = worker.descriptor.session_id;
-        let taken = fingerprint_of(&evidence, Some(&worker));
+        let taken = fingerprint_of(&evidence, Some(&worker), Some(&worker));
         let request_id = self
             .checks
             .lock()
@@ -1140,6 +1140,7 @@ mod tests {
         let taken = Fingerprint {
             facility: Some("what the controller found on its own search path".to_owned()),
             host_agent: Some("worker".to_owned()),
+            agent_build: None,
             desktop_generation: Some(2),
             profile: Some(WorkerProfile::DesktopBound),
         };
@@ -1176,6 +1177,7 @@ mod tests {
         let taken = Fingerprint {
             facility: None,
             host_agent: Some("worker".to_owned()),
+            agent_build: None,
             desktop_generation: Some(2),
             profile: Some(WorkerProfile::DesktopBound),
         };
@@ -1223,7 +1225,7 @@ mod tests {
         }
         let source = Scripted(std::sync::atomic::AtomicU64::new(2));
         let boot = context().boot_identity;
-        let read = || fingerprint_of(&resolved_desktop(None, &boot, &source).1, None);
+        let read = || fingerprint_of(&resolved_desktop(None, &boot, &source).1, None, None);
         let mut checks = Checks::new();
         checks.begin(TimestampMs::new(10), session(), read());
         checks.succeeded(TimestampMs::new(20), vec![screen_finding()]);
@@ -1253,7 +1255,7 @@ mod tests {
         finding.state = CapabilityState::MissingInstallation;
         finding.identity.binary = Nullable::some(tool.display().to_string());
         finding.identity.schema = Nullable::some("a-route".to_owned());
-        let taken = fingerprint_of(&context(), None);
+        let taken = fingerprint_of(&context(), None, None);
         let mut checks = Checks::new();
         checks.begin(TimestampMs::new(10), session(), taken.clone());
         checks.succeeded(TimestampMs::new(20), vec![finding]);
@@ -1274,7 +1276,7 @@ mod tests {
     /// about is what the worker ran, which its answer names.
     #[test]
     fn a_fingerprint_holds_no_tool_of_the_daemons_own() {
-        assert_eq!(fingerprint_of(&context(), None).facility, None);
+        assert_eq!(fingerprint_of(&context(), None, None).facility, None);
     }
 
     /// KR-REQ-03.29, R9: the tools are compared as the caller read them, which is outside the
@@ -1286,7 +1288,7 @@ mod tests {
         std::fs::create_dir_all(&directory).expect("a directory of this test's own");
         let tool = directory.join("the-workers-tool");
         std::fs::write(&tool, b"a build").expect("the tool");
-        let taken = fingerprint_of(&context(), None);
+        let taken = fingerprint_of(&context(), None, None);
         let mut checks = Checks::new();
         checks.begin(TimestampMs::new(10), session(), taken.clone());
         checks.succeeded(TimestampMs::new(20), vec![finding_naming(&tool)]);
