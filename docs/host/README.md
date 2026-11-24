@@ -7432,8 +7432,9 @@ afterwards, so a host that dies in between is offered the same page again and th
 it. The consumer registers before it relies on collection keeping anything for it.
 
 The attention store is the journal's source, and the daemon takes from it on every pass. The
-worker's receipt outbox is not a source: no attention rule or alert maps a receipt transition to a
-notification. The take is made with the store held, in the producer's order: the announcements are
+worker's receipt outbox is not a source: the daemon makes no notification from a receipt. An item
+of a receipt rule, which only a later release raises, is announced from the attention store like
+any other item. The take is made with the store held, in the producer's order: the announcements are
 read, the events and the cursor are committed to the journal, and only then is the store told. An
 announcement about a session the daemon is closing is not offered until the store has read the
 session's journal to its end. The take is made only while the journal stands where the privacy

@@ -3,10 +3,9 @@
 //! # One source, one journal, and a cursor committed with its effect
 //!
 //! Attention decides announcements: *this condition wants a person*. The worker's receipt outbox
-//! says *this happened*, and no attention rule or alert maps a receipt transition to a
-//! notification, so this producer takes announcements and nothing else. It keeps a cursor for each
-//! attention store, under that store's own consumer name, and registers before it relies on
-//! collection keeping anything for it.
+//! says *this happened*, and the daemon makes no notification from a receipt, so this producer
+//! takes announcements and nothing else. It keeps a cursor for each attention store, under that
+//! store's own consumer name, and registers before it relies on collection keeping anything for it.
 //!
 //! The order is the order crash-safety needs:
 //!
