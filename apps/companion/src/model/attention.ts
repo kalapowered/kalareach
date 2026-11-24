@@ -385,9 +385,9 @@ export function emptyMessage(chosen: AttentionFilter): string {
     case 'failed_action':
       return 'No item here says that something did not finish.'
     case 'unknown_result':
-      return 'No action has an unknown result.'
+      return 'No item here says that an action’s result is unknown.'
     case 'results_not_read':
-      return 'No action results went unread.'
+      return 'No item here says that action results cannot be read.'
     case 'awaiting_review':
       return 'No item here says that finished work is ready to review.'
     case 'disconnected':

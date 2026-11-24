@@ -320,7 +320,7 @@ describe('the attention inbox (KR-REQ-13.01, 13.02)', () => {
     expect(count(unknown).unknown_result, 'it is counted by its kind').toBe(1)
     expect(filter(order(unknown, NOW), 'unknown_result')).toHaveLength(1)
     expect(filter(order(INBOX, NOW), 'unknown_result')).toHaveLength(0)
-    expect(emptyMessage('unknown_result')).toBe('No action has an unknown result.')
+    expect(emptyMessage('unknown_result')).toBe('No item here says that an action’s result is unknown.')
   })
 
   it('shows an item for action results that cannot be read as results nobody read, and never as a failure', () => {
@@ -335,7 +335,7 @@ describe('the attention inbox (KR-REQ-13.01, 13.02)', () => {
     expect(count(gap).results_not_read, 'it is counted by its kind').toBe(1)
     expect(filter(order(gap, NOW), 'results_not_read')).toHaveLength(1)
     expect(filter(order(INBOX, NOW), 'results_not_read')).toHaveLength(0)
-    expect(emptyMessage('results_not_read')).toBe('No action results went unread.')
+    expect(emptyMessage('results_not_read')).toBe('No item here says that action results cannot be read.')
   })
 
   it('says what the inbox let go, what it can no longer read, and why it is not holding sounds', () => {
