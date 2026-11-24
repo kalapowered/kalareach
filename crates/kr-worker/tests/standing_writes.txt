@@ -72,6 +72,10 @@ site crates/kr-worker/src/service/standing.rs limits &mut 1
 # The accessor that hands out the journal the limits read through: a `&mut` parameter, as the
 # limits' own (the writes are the caller's, which are listed).
 site crates/kr-worker/src/session.rs journal_mut &mut 1
+# The count of the times that the authority lock was found held, which `check_authority` reaches
+# through `lock_authority` where this host's own tests are built in: an atomic that only those tests
+# read, and no check of the pass reads it.
+site crates/kr-worker/src/service.rs lock_authority fetch_add 1
 
 # The functions that make the time contract's writes. The full check and the second raise stand
 # with the first admission's local owner check and the writer's; the kept reading stands with the
@@ -160,7 +164,8 @@ allow crates/kr-worker/src/input_domain.rs assert_not_held with
 allow crates/kr-worker/src/input_domain.rs capabilities get
 allow crates/kr-worker/src/input_domain.rs check_validated_revision get
 allow crates/kr-worker/src/input_domain.rs lock expect lock with
-allow crates/kr-worker/src/input_domain.rs new default get set with
+allow crates/kr-worker/src/input_domain.rs new clone default get set with
+allow crates/kr-worker/src/input_room.rs pump clone
 allow crates/kr-worker/src/journal.rs faulted describe get now_ms
 allow crates/kr-worker/src/journal.rs outstanding as_str get
 allow crates/kr-worker/src/journal.rs parse_action new
@@ -188,13 +193,13 @@ allow crates/kr-worker/src/runtime.rs new new
 allow crates/kr-worker/src/runtime.rs session expect
 allow crates/kr-worker/src/service.rs check_accepted_deadline now
 allow crates/kr-worker/src/service.rs check_admission_limits drop filter get lock map
-allow crates/kr-worker/src/service.rs check_authority expect lock
 allow crates/kr-worker/src/service.rs check_bound contains
 allow crates/kr-worker/src/service.rs check_dispatch_lease expect now refused
 allow crates/kr-worker/src/service.rs check_envelope contains validate
 allow crates/kr-worker/src/service.rs check_granted as_str contains
 allow crates/kr-worker/src/service.rs check_preconditions as_str get
 allow crates/kr-worker/src/service.rs holds_attachment contains expect lock
+allow crates/kr-worker/src/service.rs lock_authority expect lock try_lock
 allow crates/kr-worker/src/service.rs params_application_target as_str
 allow crates/kr-worker/src/service.rs parse as_str default get
 allow crates/kr-worker/src/service.rs question_clock now_ms
@@ -208,6 +213,7 @@ allow crates/kr-worker/src/service.rs validate any as_str contains iter
 # body's own file by default. A name has an `allow` row or a `calls` row for a body, not both.
 calls crates/kr-worker/src/action/time.rs pure_proven_ms lock crates/kr-worker/src/action/time.rs
 calls crates/kr-worker/src/action/time.rs pure_proven_ms projected crates/kr-worker/src/action/time.rs
+calls crates/kr-worker/src/broker/ledger.rs decode ledger crates/kr-worker/src/broker/error.rs
 calls crates/kr-worker/src/broker/ledger.rs fault of crates/kr-worker/src/broker/ledger.rs
 calls crates/kr-worker/src/broker/ledger.rs of observe crates/kr-worker/src/persistence/fault.rs
 calls crates/kr-worker/src/broker/ledger.rs pending decode crates/kr-worker/src/broker/ledger.rs
@@ -243,6 +249,7 @@ calls crates/kr-worker/src/input_domain.rs lock new crates/kr-worker/src/input_d
 calls crates/kr-worker/src/input_domain.rs new new crates/kr-worker/src/input.rs
 calls crates/kr-worker/src/input_domain.rs new new crates/kr-worker/src/input_domain.rs
 calls crates/kr-worker/src/input_domain.rs new new crates/kr-worker/src/runtime.rs
+calls crates/kr-worker/src/input_domain.rs new pump crates/kr-worker/src/input_room.rs
 calls crates/kr-worker/src/journal.rs faulted observe crates/kr-worker/src/persistence/fault.rs
 calls crates/kr-worker/src/local_gate.rs check_bound lock crates/kr-worker/src/local_gate.rs
 calls crates/kr-worker/src/persistence/fault.rs is_healthy is_healthy crates/kr-worker/src/persistence/fault.rs

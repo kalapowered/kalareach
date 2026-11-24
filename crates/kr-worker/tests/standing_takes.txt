@@ -69,8 +69,11 @@ site crates/kr-worker/src/action/time.rs pure_proven_ms lock 1
 site crates/kr-worker/src/action/time.rs read_unbracketed lock 1
 # The gate's own lock: the bound is copied out and the lock is let go before any clock is read.
 site crates/kr-worker/src/local_gate.rs check_bound lock 1
-# The authority state.
-site crates/kr-worker/src/service.rs check_authority lock 1
+# The authority state, which `check_authority` takes through `lock_authority`: the take, and, where
+# this host's own tests are built in, a `try_lock` that only finds out whether the lock is held and
+# lets go of it at once.
+site crates/kr-worker/src/service.rs lock_authority lock 1
+site crates/kr-worker/src/service.rs lock_authority try_lock 1
 # The input domain's lock, for the revision the request was validated under.
 site crates/kr-worker/src/service.rs check_validated_revision lock 1
 # The authority state and the input domain's lock, each taken for one read.
@@ -318,7 +321,8 @@ allow crates/kr-worker/src/input_domain.rs assert_not_held with
 allow crates/kr-worker/src/input_domain.rs capabilities get
 allow crates/kr-worker/src/input_domain.rs check_validated_revision get
 allow crates/kr-worker/src/input_domain.rs lock expect with
-allow crates/kr-worker/src/input_domain.rs new default get set with
+allow crates/kr-worker/src/input_domain.rs new clone default get set with
+allow crates/kr-worker/src/input_room.rs pump clone
 allow crates/kr-worker/src/journal.rs faulted describe get now_ms
 allow crates/kr-worker/src/journal.rs outstanding as_str get
 allow crates/kr-worker/src/journal.rs parse_action new
@@ -350,13 +354,13 @@ allow crates/kr-worker/src/questions/token.rs covered get len
 allow crates/kr-worker/src/runtime.rs new new
 allow crates/kr-worker/src/service.rs check_accepted_deadline now
 allow crates/kr-worker/src/service.rs check_admission_limits drop filter get map
-allow crates/kr-worker/src/service.rs check_authority expect
 allow crates/kr-worker/src/service.rs check_bound contains
 allow crates/kr-worker/src/service.rs check_dispatch_lease expect now refused
 allow crates/kr-worker/src/service.rs check_envelope contains validate
 allow crates/kr-worker/src/service.rs check_granted as_str contains
 allow crates/kr-worker/src/service.rs check_preconditions as_str get
 allow crates/kr-worker/src/service.rs holds_attachment contains expect
+allow crates/kr-worker/src/service.rs lock_authority expect
 allow crates/kr-worker/src/service.rs params_application_target as_str
 allow crates/kr-worker/src/service.rs parse as_str default get
 allow crates/kr-worker/src/service.rs question_clock now_ms
@@ -373,6 +377,7 @@ calls crates/kr-worker/src/action/time.rs read_unbracketed now_ms crates/kr-work
 calls crates/kr-worker/src/broker/agents.rs attested attested_thread crates/kr-worker/src/broker/bridge.rs
 calls crates/kr-worker/src/broker/binder.rs admitted_open iter crates/kr-worker/src/broker/arbitration.rs
 calls crates/kr-worker/src/broker/bridge.rs attested_thread attested_thread crates/kr-worker/src/broker/bridge.rs
+calls crates/kr-worker/src/broker/ledger.rs decode ledger crates/kr-worker/src/broker/error.rs
 calls crates/kr-worker/src/broker/ledger.rs fault of crates/kr-worker/src/broker/ledger.rs
 calls crates/kr-worker/src/broker/ledger.rs of observe crates/kr-worker/src/persistence/fault.rs
 calls crates/kr-worker/src/broker/ledger.rs pending decode crates/kr-worker/src/broker/ledger.rs
@@ -407,6 +412,7 @@ calls crates/kr-worker/src/input_domain.rs lock new crates/kr-worker/src/input_d
 calls crates/kr-worker/src/input_domain.rs new new crates/kr-worker/src/input.rs
 calls crates/kr-worker/src/input_domain.rs new new crates/kr-worker/src/input_domain.rs
 calls crates/kr-worker/src/input_domain.rs new new crates/kr-worker/src/runtime.rs
+calls crates/kr-worker/src/input_domain.rs new pump crates/kr-worker/src/input_room.rs
 calls crates/kr-worker/src/journal.rs faulted observe crates/kr-worker/src/persistence/fault.rs
 calls crates/kr-worker/src/persistence/fault.rs is_healthy is_healthy crates/kr-worker/src/persistence/fault.rs
 calls crates/kr-worker/src/persistence/fault.rs note_fault is_healthy crates/kr-worker/src/persistence/fault.rs
@@ -529,8 +535,11 @@ taker receipt_once
 taker prepared_once
 taker recover_storage_now
 taker acknowledge_revision
+taker end_leases_of_dropped_batches
 mention acknowledge_revision crates/kr-worker/src/service.rs (declaration) 1
 mention acknowledge_revision crates/kr-worker/src/service.rs handle 1
+mention end_leases_of_dropped_batches crates/kr-worker/src/service.rs (declaration) 1
+mention end_leases_of_dropped_batches crates/kr-worker/src/service.rs serve 1
 mention fence_what_is_owed_for_tests crates/kr-worker/src/service.rs (declaration) 1
 mention hold_the_boundary_for_this_announcement crates/kr-worker/src/service.rs (declaration) 1
 mention hold_the_boundary_for_this_announcement crates/kr-worker/src/service.rs acknowledge_revision 1
@@ -550,6 +559,7 @@ mention receipt_once crates/kr-worker/src/service.rs mutation 1
 mention recover_storage_now crates/kr-worker/src/service.rs (declaration) 1
 mention release_expired_grants crates/kr-worker/src/service.rs (declaration) 1
 mention release_expired_grants crates/kr-worker/src/service.rs serve 1
+mention take_boundary crates/kr-worker/src/service.rs end_leases_of_dropped_batches 1
 mention take_boundary crates/kr-worker/src/service.rs fence_what_is_owed_for_tests 1
 mention take_boundary crates/kr-worker/src/service.rs hold_the_boundary_for_this_announcement 2
 mention take_boundary crates/kr-worker/src/service.rs hold_the_dispatch_boundary 1
