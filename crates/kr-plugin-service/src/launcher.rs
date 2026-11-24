@@ -762,7 +762,13 @@ pub async fn probe_four(
         host_public_key: claimed.host_public_key,
         build: descriptor.build.clone(),
     };
-    if *descriptor != published {
+    // A host does not know which reservation it was started for, and no proof covers it: the claim
+    // named it, and the claim's is what is published. Every other member is held against the claim.
+    let stated = HostDescriptor4 {
+        reservation_id: claimed.reservation_id,
+        ..(*descriptor).clone()
+    };
+    if stated != published {
         return Err(refused_probe(
             "the host's hello describes another process or endpoint than its claim did",
         ));
@@ -808,10 +814,9 @@ async fn ask_four(
     loop {
         if let Frame4::Response { reply_to, body } =
             reader.read_message_without_schema::<Frame4>().await?
+            && reply_to == request_id
         {
-            if reply_to == request_id {
-                return Ok(body);
-            }
+            return Ok(body);
         }
     }
 }
@@ -2665,7 +2670,6 @@ mod tests {
     fn serve_four(
         environment: &EnvironmentPaths,
         identity: HostIdentity,
-        reservation_id: ReservationId,
         behaviour: FourHost,
     ) -> tokio::task::JoinHandle<Seen> {
         let environment = environment.clone();
@@ -2678,7 +2682,8 @@ mod tests {
         let described = HostDescriptor4 {
             protocol: HostProtocol::V4.name.to_owned(),
             environment_id: identity.environment_id(),
-            reservation_id,
+            // As a plugin host states it: it does not know its reservation.
+            reservation_id: ReservationId::new(kr_protocol::scalars::Uuid::from_bytes([0; 16])),
             endpoint: endpoint.as_text(),
             boot_identity: identity.boot_identity().clone(),
             process_start_identity: identity.process_start_identity().clone(),
@@ -2810,14 +2815,7 @@ mod tests {
         let claim = identity
             .rendezvous(reservation.reservation_id(), &endpoint)
             .expect("a claim");
-        let serving = behaviour.map(|behaviour| {
-            serve_four(
-                &environment,
-                identity,
-                reservation.reservation_id(),
-                behaviour,
-            )
-        });
+        let serving = behaviour.map(|behaviour| serve_four(&environment, identity, behaviour));
         let (_reader, mut writer) = the_hosts_side(&reservation).await;
         writer.write_message(&claim).await.expect("the claim");
         let (descriptor, _fence) = reservation
