@@ -2382,11 +2382,10 @@ mod tests {
     /// A transient unit whose process failed is collected by the user manager rather than kept
     /// listed as failed.
     ///
-    /// It needs a user service manager for this account, which a Linux login session or an
-    /// account with lingering enabled has and a hosted CI runner's account does not, so an
-    /// ordinary run leaves it out. It runs with `--ignored` on a Linux host whose account has one,
-    /// as a developer's workstation or a build host where the account lingers; where there is
-    /// none it fails and says so.
+    /// It starts transient units in this account's own service manager (`systemctl --user`), so an
+    /// ordinary run on a person's machine does not run it. It runs with `--ignored` on a Linux
+    /// host whose account has a user service manager, as a developer's workstation or a build host
+    /// where the account lingers; where there is none it fails and says so.
     #[cfg(target_os = "linux")]
     #[test]
     #[ignore = "starts transient units in this account's own service manager (`systemctl --user`), so an ordinary run on a person's machine does not run it"]
