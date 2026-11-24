@@ -529,17 +529,21 @@ impl Process {
             &executable.to_string_lossy(),
             arguments,
         );
-        let mut child = crate::windows::launch::start(&crate::windows::launch::Spec {
-            program: executable,
-            arguments,
-            directory,
-            environment: &environment,
-            session: None,
-            agent: &job,
-            stdin: crate::windows::launch::Stdio::Null,
-            stdout: crate::windows::launch::Stdio::Blocking,
-            stderr: crate::windows::launch::Stdio::Null,
-        })?;
+        // A process that was created and cannot be started is given the cleanup bound to end in.
+        let mut child = crate::windows::launch::start_within(
+            &crate::windows::launch::Spec {
+                program: executable,
+                arguments,
+                directory,
+                environment: &environment,
+                session: None,
+                agent: &job,
+                stdin: crate::windows::launch::Stdio::Null,
+                stdout: crate::windows::launch::Stdio::Blocking,
+                stderr: crate::windows::launch::Stdio::Null,
+            },
+            CLEANUP_BOUND,
+        )?;
         let output = child.stdout.take().expect("the output is piped");
         Ok(Self { child, output, job })
     }

@@ -326,7 +326,7 @@ pub(crate) use platform::end_process;
 #[cfg(all(windows, feature = "testing"))]
 pub use platform::seams;
 #[cfg(windows)]
-pub use platform::{Child, Spec, StdinPipe, Stdio, available, start};
+pub use platform::{Child, Spec, StdinPipe, Stdio, available, start, start_within};
 
 /// The calls with no safe form, and the handles they own.
 #[cfg(windows)]
@@ -346,9 +346,10 @@ mod platform {
 
     use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
     use windows_sys::Win32::Foundation::{
-        ERROR_ACCESS_DENIED, ERROR_BROKEN_PIPE, ERROR_OPERATION_ABORTED, ERROR_PIPE_BUSY,
-        GENERIC_READ, GENERIC_WRITE, HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, LocalFree,
-        STILL_ACTIVE, SetHandleInformation, WAIT_OBJECT_0, WAIT_TIMEOUT,
+        DuplicateHandle, ERROR_ACCESS_DENIED, ERROR_BROKEN_PIPE, ERROR_OPERATION_ABORTED,
+        ERROR_PIPE_BUSY, GENERIC_READ, GENERIC_WRITE, HANDLE, HANDLE_FLAG_INHERIT,
+        INVALID_HANDLE_VALUE, LocalFree, STILL_ACTIVE, SetHandleInformation, WAIT_OBJECT_0,
+        WAIT_TIMEOUT,
     };
     use windows_sys::Win32::Security::Authorization::{
         ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
@@ -371,8 +372,9 @@ mod platform {
         DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess,
         GetExitCodeProcess, INFINITE, InitializeProcThreadAttributeList,
         LPPROC_THREAD_ATTRIBUTE_LIST, OpenProcessToken, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
-        PROC_THREAD_ATTRIBUTE_JOB_LIST, PROCESS_INFORMATION, ResumeThread, STARTF_USESTDHANDLES,
-        STARTUPINFOEXW, TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject,
+        PROC_THREAD_ATTRIBUTE_JOB_LIST, PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION,
+        PROCESS_SYNCHRONIZE, ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOEXW, TerminateProcess,
+        UpdateProcThreadAttribute, WaitForSingleObject,
     };
 
     use super::{
@@ -1158,6 +1160,7 @@ mod platform {
         type Shared = Arc<dyn Fn(&str) + Send + Sync>;
 
         static NAME: Mutex<Option<String>> = Mutex::new(None);
+        static FAILING_START: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
         static AFTER_SERVER_CREATE: Mutex<Option<Shared>> = Mutex::new(None);
 
         /// Makes every pipe the next starts make have this name, or not.
@@ -1173,6 +1176,22 @@ mod platform {
                 .unwrap_or_else(PoisonError::into_inner) = hook.map(Arc::from);
         }
 
+        /// Makes a start in `directory` fail after its process was created, and be unable to end
+        /// it, or stops doing so. Unlike the other seams it is keyed by the directory, so the cases
+        /// that use it need not run alone.
+        pub fn fail_start_in(directory: Option<&std::path::Path>) {
+            *FAILING_START.lock().unwrap_or_else(PoisonError::into_inner) =
+                directory.map(std::path::Path::to_path_buf);
+        }
+
+        pub(super) fn fails_in(directory: &std::path::Path) -> bool {
+            FAILING_START
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .as_deref()
+                == Some(directory)
+        }
+
         pub(super) fn fixed_name() -> Option<String> {
             NAME.lock().unwrap_or_else(PoisonError::into_inner).clone()
         }
@@ -1186,6 +1205,33 @@ mod platform {
                 hook(name);
             }
         }
+    }
+
+    /// Ends a process that was created and never resumed, as [`end_unstarted`] does, through a
+    /// handle that can be waited on and asked its status but cannot end the process, so that the
+    /// process neither ends nor shows that it is ending.
+    #[cfg(feature = "testing")]
+    fn failed_start(process: &OwnedHandle, patience: std::time::Duration) -> std::io::Error {
+        let mut watcher: HANDLE = std::ptr::null_mut();
+        // SAFETY: both handles are this process's own, the source is open for the call, and the
+        // new handle is stored in a local this thread owns.
+        let duplicated = unsafe {
+            DuplicateHandle(
+                GetCurrentProcess(),
+                process.as_raw_handle().cast(),
+                GetCurrentProcess(),
+                &raw mut watcher,
+                PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
+                0,
+                0,
+            )
+        };
+        if duplicated == 0 {
+            return std::io::Error::last_os_error();
+        }
+        // SAFETY: the call stored a new handle that nothing else holds.
+        let watcher = unsafe { OwnedHandle::from_raw_handle(watcher.cast()) };
+        end_unstarted(&watcher, "a case made the start fail", patience)
     }
 
     /// The null device, opened for reading or for writing, and not inheritable.
@@ -1264,16 +1310,28 @@ mod platform {
     }
 
     /// Ends a process that was created and never resumed, and says why, and if it cannot be ended,
-    /// that too: a suspended process nothing can reach is worse than a launch that failed.
-    fn end_unstarted(process: &OwnedHandle, because: &str) -> std::io::Error {
-        if let Err(failure) = end_process(process) {
+    /// that too: a suspended process nothing can reach is worse than a launch that failed. It waits
+    /// no longer than `patience` in all.
+    fn end_unstarted(
+        process: &OwnedHandle,
+        because: &str,
+        patience: std::time::Duration,
+    ) -> std::io::Error {
+        let until = std::time::Instant::now() + patience;
+        if let Err(failure) = end_process_within(process, patience) {
             return std::io::Error::other(format!(
                 "a process was created and never started, because {because}, and then could not \
                  be ended either: {failure}"
             ));
         }
+        let left = until.saturating_duration_since(std::time::Instant::now());
         // SAFETY: as above.
-        unsafe { WaitForSingleObject(process.as_raw_handle().cast(), END_WAIT_MS) };
+        unsafe {
+            WaitForSingleObject(
+                process.as_raw_handle().cast(),
+                u32::try_from(left.as_millis()).unwrap_or(u32::MAX),
+            );
+        }
         std::io::Error::other(format!(
             "a process was created and never started, because {because}"
         ))
@@ -1289,6 +1347,19 @@ mod platform {
     /// or a job does not hold the process once it exists, in which case the process is ended and
     /// never runs.
     pub fn start(spec: &Spec<'_>) -> std::io::Result<Child> {
+        start_within(
+            spec,
+            std::time::Duration::from_millis(u64::from(END_WAIT_MS)),
+        )
+    }
+
+    /// Starts a program as [`start`] does, and waits no longer than `patience` for a process that
+    /// was created and could not be started to end.
+    ///
+    /// # Errors
+    ///
+    /// Returns what [`start`] does.
+    pub fn start_within(spec: &Spec<'_>, patience: std::time::Duration) -> std::io::Result<Child> {
         refuse_program(spec.program).map_err(std::io::Error::other)?;
         let mut line = command_line(spec.program, spec.arguments).map_err(std::io::Error::other)?;
         let environment = spec.environment.block();
@@ -1431,6 +1502,7 @@ mod platform {
             return Err(end_unstarted(
                 &process,
                 &format!("a stream end could not be made private again: {failure}"),
+                patience,
             ));
         }
         // The ends this host gave away are closed here, so that what the agent holds is the only
@@ -1439,6 +1511,11 @@ mod platform {
         drop(input);
         drop(output);
         drop(errors);
+
+        #[cfg(feature = "testing")]
+        if seams::fails_in(spec.directory) {
+            return Err(failed_start(&process, patience));
+        }
 
         // Suspended, so nothing has run yet, and already inside both jobs because the create put it
         // there. The kernel is asked whether each really holds it rather than the creation being
@@ -1450,23 +1527,32 @@ mod platform {
                     return Err(end_unstarted(
                         &process,
                         "the session's job does not hold it",
+                        patience,
                     ));
                 }
                 Err(failure) => {
                     return Err(end_unstarted(
                         &process,
                         &format!("the session's job would not say whether it holds it: {failure}"),
+                        patience,
                     ));
                 }
             }
         }
         match spec.agent.holds_process(&process) {
             Ok(true) => {}
-            Ok(false) => return Err(end_unstarted(&process, "its job does not hold it")),
+            Ok(false) => {
+                return Err(end_unstarted(
+                    &process,
+                    "its job does not hold it",
+                    patience,
+                ));
+            }
             Err(failure) => {
                 return Err(end_unstarted(
                     &process,
                     &format!("its job would not say whether it holds it: {failure}"),
+                    patience,
                 ));
             }
         }
@@ -1477,6 +1563,7 @@ mod platform {
             return Err(end_unstarted(
                 &process,
                 &format!("its thread would not resume: {failure}"),
+                patience,
             ));
         }
         drop(thread);

@@ -693,3 +693,42 @@ fn kr_req_07_64_a_probe_not_collected_within_the_bound_is_collected_later() {
         "the probe was collected, not left to the end of this process"
     );
 }
+
+/// KR-REQ-07.64: a start that fails after the process was created, and cannot end it, gives up on
+/// ending it within the cleanup bound and not after the launch's own longer wait.
+///
+/// The start is made to fail after its create, with a handle that cannot end the process, so the
+/// process shows no sign of ending. A launch waits ten seconds for that; the probe's one second is
+/// what the call and its thread keep.
+#[cfg(windows)]
+#[test]
+fn kr_req_07_64_a_start_that_fails_after_the_create_is_ended_within_the_cleanup_bound() {
+    let here = directory();
+    let standin = Standin::running("", "Start-Sleep 600");
+    kr_worker::windows::launch::seams::fail_start_in(Some(here.path()));
+    let probed = probe::run_within(
+        &standin.program,
+        &standin.probe(&[]),
+        &[],
+        here.path(),
+        &given(&[]),
+        &ProbeRun::within(start_allowance()),
+        probe::MAX_OUTPUT_BYTES,
+    );
+    kr_worker::windows::launch::seams::fail_start_in(None);
+    let why = probed.unread.as_deref().unwrap_or_default();
+    assert!(
+        why.contains("could not be ended either"),
+        "the premise: the process could not be ended: {probed:?}"
+    );
+    assert!(
+        probed.took < probe::CLEANUP_BOUND + SLACK,
+        "the call gave up on the end within the cleanup bound: {:?}",
+        probed.took
+    );
+    let total = thread_total(&probed);
+    assert!(
+        total < probe::CLEANUP_BOUND + SLACK,
+        "the thread gave up on the end within the cleanup bound: {total:?}"
+    );
+}
