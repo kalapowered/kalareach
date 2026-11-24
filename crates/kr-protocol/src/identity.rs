@@ -883,8 +883,9 @@ pub struct EnvironmentRefreshResult {
 
 impl EnvironmentRefreshResult {
     /// Returns whether [`Self::connection`] is one of the sentences a host of this release
-    /// composes. A host of an earlier release wrote the refusal's own words there, and the user's
-    /// name, which this release's does not: its text is not one of them.
+    /// composes. A host of an earlier release names the program without its role, and some also
+    /// wrote the refusal's own words and the user's name there; such text is not one of these
+    /// sentences.
     #[must_use]
     pub fn connection_is_composed(&self) -> bool {
         is_composed_connection(self.connection.as_str())

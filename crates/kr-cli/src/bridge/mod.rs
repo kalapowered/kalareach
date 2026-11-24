@@ -176,9 +176,9 @@ fn readiness_detail(row: &EnvironmentInventoryRow) -> Shown {
 /// What the host says opening a bridge did, as the host composed it: the program it ran and how
 /// that went, with anything that arrived at the host given as its class and its length.
 ///
-/// A daemon of an earlier release writes the refusal's own words and the user's name into the same
-/// field, and states the same package version as this one. Text that is not one of the sentences
-/// the host composes is therefore shown as its class and its length, as every host sentence was.
+/// A daemon of an earlier release names the program without its role, and some write the refusal's
+/// own words and the user's name into the same field. Text that is not one of the sentences the
+/// host composes is therefore shown as its class and its length, as every host sentence was.
 fn connection(refreshed: &EnvironmentRefreshResult) -> Shown {
     if refreshed.connection_is_composed() {
         crate::shown::host_text(&refreshed.connection)
