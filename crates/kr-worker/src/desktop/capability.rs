@@ -451,7 +451,11 @@ fn decide_windows(capability: &str, tool: Option<String>) -> Answer {
 /// and not a finding about the desktop: what a worker's own context holds is what a check reads.
 /// A display name is all that is read here. The authority that opens the display is not checked,
 /// so the record does not say this process holds it.
-fn decide_x11(tool: Option<String>, holds_display_name: bool) -> Answer {
+///
+/// With no tool, the screen capture says which tools it looked for, because they are the four that
+/// a check of the screen image runs on X11 and a host with another tool installed, such as
+/// `spectacle`, has none of them. Any other capability keeps the general sentence.
+fn decide_x11(capability: &str, tool: Option<String>, holds_display_name: bool) -> Answer {
     match tool {
         Some(tool) if holds_display_name => Answer {
             state: CapabilityState::NotTested,
@@ -479,7 +483,12 @@ fn decide_x11(tool: Option<String>, holds_display_name: bool) -> Answer {
         None => Answer::refused(
             CapabilityState::MissingInstallation,
             CapabilityEvidenceSource::PlatformQuery,
-            "no installed tool on this host serves this capability on X11",
+            if capability == capabilities::SCREEN_CAPTURE {
+                "none of maim, import, scrot or xwd, the tools a check of the screen image runs \
+                 on X11, is installed on this host"
+            } else {
+                "no installed tool on this host serves this capability on X11"
+            },
         ),
     }
 }
@@ -510,7 +519,7 @@ pub fn decide_unix(capability: &str, desktop: &DesktopContext, tool: Option<Stri
         Sentence::new().withheld(ContentClass::Name, &compositor)
     };
     match desktop.display_server {
-        DisplayServer::X11 => decide_x11(tool, holds_display_name()),
+        DisplayServer::X11 => decide_x11(capability, tool, holds_display_name()),
         DisplayServer::Wayland => match tool {
             Some(tool) => {
                 let route = wayland_route(capability);
@@ -1411,7 +1420,7 @@ mod tests {
     #[test]
     fn kr_req_03_29_the_daemons_x11_record_without_a_display_is_not_a_permission() {
         let tool = Some("/usr/bin/maim".to_owned());
-        let without = decide_x11(tool.clone(), false);
+        let without = decide_x11(capabilities::SCREEN_CAPTURE, tool.clone(), false);
         assert_eq!(without.state, CapabilityState::NotTested);
         assert_eq!(without.evidence, CapabilityEvidenceSource::NotProbed);
         let reason = without.reason.expect("a reason").as_str().to_owned();
@@ -1427,7 +1436,7 @@ mod tests {
         assert_eq!(without.tool, tool);
         // With a display name the words say that this process holds a name and that nothing here
         // has checked its authority, and no tool is no installation.
-        let with = decide_x11(tool, true);
+        let with = decide_x11(capabilities::SCREEN_CAPTURE, tool, true);
         assert_eq!(with.state, CapabilityState::NotTested);
         let reason = with.reason.expect("a reason").as_str().to_owned();
         assert!(
@@ -1440,7 +1449,7 @@ mod tests {
         );
         assert!(!reason.contains("holds both"), "{reason}");
         assert!(!reason.contains("this context"), "{reason}");
-        let none = decide_x11(None, true);
+        let none = decide_x11(capabilities::SCREEN_CAPTURE, None, true);
         assert_eq!(none.state, CapabilityState::MissingInstallation);
         // What counts as a display name is `DISPLAY` and nothing else: an unset, an empty and a
         // blank value are none, and `HOME` or `XAUTHORITY` is no part of it.
@@ -1452,6 +1461,34 @@ mod tests {
         ] {
             assert_eq!(names_a_display(display), named, "{display:?}");
         }
+    }
+
+    /// KR-REQ-03.29, LX-17: the screen capture on an X11 host with none of the four tools says
+    /// that none of them is installed and names them, so a host with only another tool is not told
+    /// that no tool is installed. Another capability keeps the general sentence.
+    #[test]
+    fn kr_req_03_29_the_x11_screen_record_with_no_tool_names_the_four_the_check_runs() {
+        let words = |capability: &str| {
+            decide_x11(capability, None, true)
+                .reason
+                .expect("a reason")
+                .as_str()
+                .to_owned()
+        };
+        let capture = words(capabilities::SCREEN_CAPTURE);
+        assert_eq!(
+            capture,
+            "none of maim, import, scrot or xwd, the tools a check of the screen image runs on \
+             X11, is installed on this host"
+        );
+        // The four are the tools the platform record looks for.
+        for tool in candidates(capabilities::SCREEN_CAPTURE, DisplayServer::X11) {
+            assert!(capture.contains(tool), "{tool}: {capture}");
+        }
+        assert_eq!(
+            words(capabilities::INPUT_INJECTION),
+            "no installed tool on this host serves this capability on X11"
+        );
     }
 
     /// KR-REQ-03.29, LX-1: the platform's own record looks for the tools the check runs.
