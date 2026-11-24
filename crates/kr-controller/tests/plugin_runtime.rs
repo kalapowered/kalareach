@@ -426,8 +426,7 @@ impl Drop for HostEnding {
                     .collect()
             })
             .unwrap_or_default();
-        if let Ok(Some(published)) =
-            launcher::read_descriptor(&self.environment, &HostProtocol::THIS)
+        if let Ok(Some(published)) = launcher::read_descriptor(&self.environment, &HostProtocol::V3)
         {
             hosts.push(published.process_start_identity);
         }
@@ -1302,7 +1301,7 @@ impl World {
 
     /// The process identity the descriptor names, where a plugin runtime is published.
     fn published_host(&self) -> Option<ProcessStartIdentity> {
-        launcher::read_descriptor(&self.environment(), &HostProtocol::THIS)
+        launcher::read_descriptor(&self.environment(), &HostProtocol::V3)
             .ok()
             .flatten()
             .map(|descriptor| descriptor.process_start_identity)

@@ -74,9 +74,9 @@ impl Served {
         let packages = environment.state_dir().join("packages");
         kr_ipc::paths::create_private_directory(&packages).expect("the packages directory");
         let identity = HostIdentity::generate(temp.environment_id()).expect("an identity");
-        let endpoint = host_endpoint(&environment, &HostProtocol::THIS).expect("an endpoint");
+        let endpoint = host_endpoint(&environment, &HostProtocol::V3).expect("an endpoint");
         let descriptor = HostDescriptor {
-            protocol: HostProtocol::THIS.name.to_owned(),
+            protocol: HostProtocol::V3.name.to_owned(),
             environment_id: temp.environment_id(),
             reservation_id: kr_protocol::worker::ReservationId::new(kr_ipc::new_uuid()),
             endpoint: endpoint.as_text(),
@@ -212,7 +212,7 @@ async fn the_host_answers_a_challenge_before_it_is_trusted() {
     // Connecting runs the handshake and the challenge; a host that could not answer would make
     // this fail rather than serve.
     let client = served.client().await;
-    assert_eq!(client.descriptor().protocol, HostProtocol::THIS.name);
+    assert_eq!(client.descriptor().protocol, HostProtocol::V3.name);
 
     let health = client.health().await.expect("the host reports itself");
     assert_eq!(health.live_bindings, 0);
@@ -1437,9 +1437,9 @@ where
     let temp = kr_ipc::testing::TempHost::create();
     let environment = temp.environment();
     let identity = HostIdentity::generate(temp.environment_id()).expect("an identity");
-    let endpoint = host_endpoint(&environment, &HostProtocol::THIS).expect("an endpoint");
+    let endpoint = host_endpoint(&environment, &HostProtocol::V3).expect("an endpoint");
     let descriptor = HostDescriptor {
-        protocol: HostProtocol::THIS.name.to_owned(),
+        protocol: HostProtocol::V3.name.to_owned(),
         environment_id: temp.environment_id(),
         reservation_id: kr_protocol::worker::ReservationId::new(kr_ipc::new_uuid()),
         endpoint: endpoint.as_text(),
@@ -1462,7 +1462,7 @@ where
                     .expect("the handshake request");
                 let body = match request.body {
                     RequestBody::Hello { .. } => ResponseBody::Hello {
-                        protocol: HostProtocol::THIS.name.to_owned(),
+                        protocol: HostProtocol::V3.name.to_owned(),
                         descriptor: Box::new(descriptor.clone()),
                     },
                     RequestBody::Verify { nonce } => ResponseBody::Verified(Box::new(
@@ -1700,9 +1700,9 @@ async fn a_client_shows_a_later_registration_nothing_its_queue_held_for_the_bind
     let temp = kr_ipc::testing::TempHost::create();
     let environment = temp.environment();
     let identity = HostIdentity::generate(temp.environment_id()).expect("an identity");
-    let endpoint = host_endpoint(&environment, &HostProtocol::THIS).expect("an endpoint");
+    let endpoint = host_endpoint(&environment, &HostProtocol::V3).expect("an endpoint");
     let descriptor = HostDescriptor {
-        protocol: HostProtocol::THIS.name.to_owned(),
+        protocol: HostProtocol::V3.name.to_owned(),
         environment_id: temp.environment_id(),
         reservation_id: kr_protocol::worker::ReservationId::new(kr_ipc::new_uuid()),
         endpoint: endpoint.as_text(),
@@ -1746,7 +1746,7 @@ async fn a_client_shows_a_later_registration_nothing_its_queue_held_for_the_bind
                     RequestBody::Hello { .. } => (
                         None,
                         ResponseBody::Hello {
-                            protocol: HostProtocol::THIS.name.to_owned(),
+                            protocol: HostProtocol::V3.name.to_owned(),
                             descriptor: Box::new(descriptor.clone()),
                         },
                     ),
@@ -4310,9 +4310,9 @@ async fn a_client_whose_connection_failed_is_told_without_waiting() {
     let temp = kr_ipc::testing::TempHost::create();
     let environment = temp.environment();
     let identity = HostIdentity::generate(temp.environment_id()).expect("an identity");
-    let endpoint = host_endpoint(&environment, &HostProtocol::THIS).expect("an endpoint");
+    let endpoint = host_endpoint(&environment, &HostProtocol::V3).expect("an endpoint");
     let descriptor = HostDescriptor {
-        protocol: HostProtocol::THIS.name.to_owned(),
+        protocol: HostProtocol::V3.name.to_owned(),
         environment_id: temp.environment_id(),
         reservation_id: kr_protocol::worker::ReservationId::new(kr_ipc::new_uuid()),
         endpoint: endpoint.as_text(),
@@ -4337,7 +4337,7 @@ async fn a_client_whose_connection_failed_is_told_without_waiting() {
                     .expect("a request");
                 let body = match request.body {
                     RequestBody::Hello { .. } => ResponseBody::Hello {
-                        protocol: HostProtocol::THIS.name.to_owned(),
+                        protocol: HostProtocol::V3.name.to_owned(),
                         descriptor: Box::new(descriptor.clone()),
                     },
                     RequestBody::Verify { nonce } => ResponseBody::Verified(Box::new(
@@ -4408,9 +4408,9 @@ async fn a_client_forgets_what_its_queue_held_for_a_binding_when_the_host_answer
     let temp = kr_ipc::testing::TempHost::create();
     let environment = temp.environment();
     let identity = HostIdentity::generate(temp.environment_id()).expect("an identity");
-    let endpoint = host_endpoint(&environment, &HostProtocol::THIS).expect("an endpoint");
+    let endpoint = host_endpoint(&environment, &HostProtocol::V3).expect("an endpoint");
     let descriptor = HostDescriptor {
-        protocol: HostProtocol::THIS.name.to_owned(),
+        protocol: HostProtocol::V3.name.to_owned(),
         environment_id: temp.environment_id(),
         reservation_id: kr_protocol::worker::ReservationId::new(kr_ipc::new_uuid()),
         endpoint: endpoint.as_text(),
@@ -4464,7 +4464,7 @@ async fn a_client_forgets_what_its_queue_held_for_a_binding_when_the_host_answer
                 let reply_to = request.request_id;
                 let body = match request.body {
                     RequestBody::Hello { .. } => ResponseBody::Hello {
-                        protocol: HostProtocol::THIS.name.to_owned(),
+                        protocol: HostProtocol::V3.name.to_owned(),
                         descriptor: Box::new(descriptor.clone()),
                     },
                     RequestBody::Verify { nonce } => ResponseBody::Verified(Box::new(
@@ -4552,9 +4552,9 @@ async fn kr_req_11_38_an_event_handed_over_is_counted_until_it_is_written_and_a_
     let temp = kr_ipc::testing::TempHost::create();
     let environment = temp.environment();
     let identity = HostIdentity::generate(temp.environment_id()).expect("an identity");
-    let endpoint = host_endpoint(&environment, &HostProtocol::THIS).expect("an endpoint");
+    let endpoint = host_endpoint(&environment, &HostProtocol::V3).expect("an endpoint");
     let descriptor = HostDescriptor {
-        protocol: HostProtocol::THIS.name.to_owned(),
+        protocol: HostProtocol::V3.name.to_owned(),
         environment_id: temp.environment_id(),
         reservation_id: kr_protocol::worker::ReservationId::new(kr_ipc::new_uuid()),
         endpoint: endpoint.as_text(),
@@ -4580,7 +4580,7 @@ async fn kr_req_11_38_an_event_handed_over_is_counted_until_it_is_written_and_a_
             {
                 let body = match request.body {
                     RequestBody::Hello { .. } => ResponseBody::Hello {
-                        protocol: HostProtocol::THIS.name.to_owned(),
+                        protocol: HostProtocol::V3.name.to_owned(),
                         descriptor: Box::new(descriptor.clone()),
                     },
                     RequestBody::Verify { nonce } => ResponseBody::Verified(Box::new(
@@ -4843,9 +4843,9 @@ async fn a_plugin_runtime_of_an_earlier_protocol_is_refused_at_the_handshake() {
     let temp = kr_ipc::testing::TempHost::create();
     let environment = temp.environment();
     let identity = HostIdentity::generate(temp.environment_id()).expect("an identity");
-    let endpoint = host_endpoint(&environment, &HostProtocol::THIS).expect("an endpoint");
+    let endpoint = host_endpoint(&environment, &HostProtocol::V3).expect("an endpoint");
     let mut descriptor = HostDescriptor {
-        protocol: HostProtocol::THIS.name.to_owned(),
+        protocol: HostProtocol::V3.name.to_owned(),
         environment_id: temp.environment_id(),
         reservation_id: kr_protocol::worker::ReservationId::new(kr_ipc::new_uuid()),
         endpoint: endpoint.as_text(),

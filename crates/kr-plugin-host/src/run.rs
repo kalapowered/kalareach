@@ -147,7 +147,7 @@ fn prepare(options: &Options) -> Result<Prepared, Box<StartFailure>> {
 
     let identity = HostIdentity::generate(options.environment_id())
         .map_err(|error| StartFailure::at(Step::Identity, error))?;
-    let endpoint = host_endpoint(&environment, &HostProtocol::THIS)
+    let endpoint = host_endpoint(&environment, &HostProtocol::V3)
         .map_err(|error| StartFailure::at(Step::Endpoint, error))?;
 
     // The endpoint is the host's to own, and a previous incarnation's socket file may still be

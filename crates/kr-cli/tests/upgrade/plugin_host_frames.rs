@@ -111,7 +111,7 @@ async fn the_frames_of_the_plugin_host_of_the_release_before_are_read_and_writte
     assert_eq!(claim.reservation_id, reservation_id);
     assert_eq!(
         claim.endpoint,
-        launcher::host_endpoint(&environment, &HostProtocol::THIS)
+        launcher::host_endpoint(&environment, &HostProtocol::V3)
             .expect("an endpoint")
             .as_text(),
         "the host serves on the endpoint of the protocol both releases speak"
@@ -131,7 +131,7 @@ async fn the_frames_of_the_plugin_host_of_the_release_before_are_read_and_writte
 
     // `Hello`, a `Hello` for a protocol it does not speak, and `Verify`.
     let descriptor = HostDescriptor {
-        protocol: HostProtocol::THIS.name.to_owned(),
+        protocol: HostProtocol::V3.name.to_owned(),
         environment_id: environment.environment_id(),
         reservation_id: claim.reservation_id,
         endpoint: claim.endpoint.clone(),
@@ -150,7 +150,7 @@ async fn the_frames_of_the_plugin_host_of_the_release_before_are_read_and_writte
         (
             1,
             RequestBody::Hello {
-                protocol: HostProtocol::THIS.name.to_owned(),
+                protocol: HostProtocol::V3.name.to_owned(),
             },
         ),
         (
@@ -187,7 +187,7 @@ async fn the_frames_of_the_plugin_host_of_the_release_before_are_read_and_writte
                     descriptor: told,
                 },
             ) => {
-                assert_eq!(protocol, HostProtocol::THIS.name);
+                assert_eq!(protocol, HostProtocol::V3.name);
                 // The host's own account of its descriptor names no reservation: the launcher's
                 // is the one published.
                 assert_eq!(told.reservation_id.to_string(), uuid_nil());
@@ -238,12 +238,12 @@ async fn the_frames_of_the_plugin_host_of_the_release_before_are_read_and_writte
             .tree
             .environment()
             .runtime_dir()
-            .join(HostProtocol::THIS.descriptor),
+            .join(HostProtocol::V3.descriptor),
     )
     .expect("the descriptor the release before published");
     let read: HostDescriptor =
         serde_json::from_slice(&published).expect("this build reads the descriptor");
-    assert_eq!(read.protocol, HostProtocol::THIS.name);
+    assert_eq!(read.protocol, HostProtocol::V3.name);
     assert_eq!(
         serde_json::to_vec(&read).expect("a descriptor encodes"),
         published,
@@ -369,7 +369,7 @@ async fn a_host_that_cannot_bind_beside_the_daemon_of_the_release_before_leaves_
     kr_ipc::testing::place_program(&this_builds_host, &programs.join("kr-plugin-host"));
 
     // A file where the plugin host binds.
-    let endpoint = launcher::host_endpoint(&environment, &HostProtocol::THIS).expect("an endpoint");
+    let endpoint = launcher::host_endpoint(&environment, &HostProtocol::V3).expect("an endpoint");
     std::fs::write(endpoint.as_path(), b"").expect("a file where the plugin host binds");
 
     let mut arguments = host.daemon_arguments();

@@ -132,7 +132,7 @@ impl Setup {
 
     /// Where the host binds the endpoint workers use.
     fn endpoint(&self) -> Endpoint {
-        host_endpoint(&self.environment, &HostProtocol::THIS).expect("the host's endpoint")
+        host_endpoint(&self.environment, &HostProtocol::V3).expect("the host's endpoint")
     }
 
     fn path(&self) -> PathBuf {
@@ -164,7 +164,7 @@ impl Setup {
     /// [`Self::heard_after`] for a reservation and arguments made here.
     async fn heard(&self, delay: Duration) -> Result<(), LaunchError> {
         let reservation =
-            HostReservation::open(&self.environment, HostProtocol::THIS).expect("a reservation");
+            HostReservation::open(&self.environment, HostProtocol::V3).expect("a reservation");
         let arguments = self.arguments(&reservation);
         self.heard_after(reservation, &arguments, delay).await
     }
@@ -245,7 +245,7 @@ async fn a_failure_is_heard_when_the_launcher_accepts_a_second_late() {
 async fn a_step_before_the_endpoint_exists_says_it_could_not_start() {
     let setup = Setup::new();
     let reservation =
-        HostReservation::open(&setup.environment, HostProtocol::THIS).expect("a reservation");
+        HostReservation::open(&setup.environment, HostProtocol::V3).expect("a reservation");
     let blocker = setup.tree.root().join("blocker");
     std::fs::write(&blocker, b"a file where a folder is wanted").expect("a file");
     let arguments = with_argument(
@@ -284,7 +284,7 @@ async fn a_reason_from_the_longest_rendezvous_path_arrives_whole_and_within_its_
     let unpadded = {
         let environment = paths_at(root.path());
         let reservation =
-            HostReservation::open(&environment, HostProtocol::THIS).expect("a reservation");
+            HostReservation::open(&environment, HostProtocol::V3).expect("a reservation");
         reservation.endpoint().as_path().as_os_str().len()
     };
     let padding = MAX_SOCKET_PATH_LEN - unpadded;
@@ -292,13 +292,12 @@ async fn a_reason_from_the_longest_rendezvous_path_arrives_whole_and_within_its_
     let padded = root.path().join("p".repeat(padding - 1));
     kr_ipc::paths::create_dir_all_owner_only(&padded).expect("the padded folder");
     let environment = paths_at(&padded);
-    let reservation =
-        HostReservation::open(&environment, HostProtocol::THIS).expect("a reservation");
+    let reservation = HostReservation::open(&environment, HostProtocol::V3).expect("a reservation");
     assert_eq!(
         reservation.endpoint().as_path().as_os_str().len(),
         MAX_SOCKET_PATH_LEN
     );
-    let endpoint = host_endpoint(&environment, &HostProtocol::THIS).expect("the host's endpoint");
+    let endpoint = host_endpoint(&environment, &HostProtocol::V3).expect("the host's endpoint");
     std::fs::write(endpoint.as_path(), b"mine").expect("a file at the endpoint");
     let packages = state.path().join("packages");
     std::fs::create_dir_all(&packages).expect("a packages folder");
@@ -327,7 +326,7 @@ async fn the_endpoint_stays_held_from_the_bind_until_the_daemon_accepts() {
     let rendezvous = Endpoint::from_path(&rendezvous_path).expect("a rendezvous endpoint");
     let daemon = Listener::bind(&rendezvous).expect("a raw listener");
     let reservation =
-        HostReservation::open(&setup.environment, HostProtocol::THIS).expect("a reservation");
+        HostReservation::open(&setup.environment, HostProtocol::V3).expect("a reservation");
     let arguments = with_argument(
         &setup.arguments(&reservation),
         "--rendezvous",
@@ -356,7 +355,7 @@ async fn a_host_waits_for_the_launcher_to_close_and_then_ends_by_itself() {
     let rendezvous = Endpoint::from_path(&rendezvous_path).expect("a rendezvous endpoint");
     let daemon = Listener::bind(&rendezvous).expect("a raw listener");
     let reservation =
-        HostReservation::open(&setup.environment, HostProtocol::THIS).expect("a reservation");
+        HostReservation::open(&setup.environment, HostProtocol::V3).expect("a reservation");
     let arguments = with_argument(
         &setup.arguments(&reservation),
         "--rendezvous",
@@ -381,7 +380,7 @@ async fn a_host_waits_for_the_launcher_to_close_and_then_ends_by_itself() {
 async fn a_host_that_cannot_connect_binds_nothing() {
     let setup = Setup::new();
     let reservation =
-        HostReservation::open(&setup.environment, HostProtocol::THIS).expect("a reservation");
+        HostReservation::open(&setup.environment, HostProtocol::V3).expect("a reservation");
     let arguments = with_argument(
         &setup.arguments(&reservation),
         "--rendezvous",

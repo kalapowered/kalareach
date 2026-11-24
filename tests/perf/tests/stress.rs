@@ -785,7 +785,7 @@ impl PluginHost {
         });
         let (descriptor, fence) = launcher::start(
             &environment,
-            HostProtocol::THIS,
+            HostProtocol::V3,
             &host.plugin_host,
             &packages,
             &supervisor,
@@ -935,7 +935,7 @@ fn end_plugin_host(environment: &EnvironmentPaths, pid: u32, label: &str) {
         std::thread::sleep(Duration::from_millis(20));
     }
     let _ = kr_controller::supervision::retire_service_job(&environment.jobs_dir(), label);
-    let _ = launcher::retire_descriptor(environment, &HostProtocol::THIS);
+    let _ = launcher::retire_descriptor(environment, &HostProtocol::V3);
 }
 
 /// The processes of the host, by what they are.

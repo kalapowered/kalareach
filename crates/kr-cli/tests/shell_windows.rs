@@ -993,7 +993,7 @@ async fn a_program_whose_package_ships_a_component_starts_the_plugin_host_on_win
     let published = || {
         kr_plugin_service::launcher::read_descriptor(
             &environment,
-            &kr_plugin_service::protocol::HostProtocol::THIS,
+            &kr_plugin_service::protocol::HostProtocol::V3,
         )
         .ok()
         .flatten()
@@ -1630,7 +1630,7 @@ fn published_host(
 ) -> Option<kr_plugin_service::protocol::HostDescriptor> {
     kr_plugin_service::launcher::read_descriptor(
         environment,
-        &kr_plugin_service::protocol::HostProtocol::THIS,
+        &kr_plugin_service::protocol::HostProtocol::V3,
     )
     .ok()
     .flatten()

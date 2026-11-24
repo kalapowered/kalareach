@@ -695,17 +695,17 @@ impl PluginHost {
     ) -> Result<ResponseBody, (String, bool)> {
         match body {
             RequestBody::Hello { protocol } => {
-                if protocol != HostProtocol::THIS.name {
+                if protocol != HostProtocol::V3.name {
                     return Err((
                         format!(
                             "this host speaks {} and the caller offered {protocol}",
-                            HostProtocol::THIS.name
+                            HostProtocol::V3.name
                         ),
                         false,
                     ));
                 }
                 Ok(ResponseBody::Hello {
-                    protocol: HostProtocol::THIS.name.to_owned(),
+                    protocol: HostProtocol::V3.name.to_owned(),
                     descriptor: Box::new(self.descriptor()),
                 })
             }
@@ -1311,7 +1311,7 @@ impl PluginHost {
 
     fn descriptor(&self) -> kr_plugin_service::protocol::HostDescriptor {
         kr_plugin_service::protocol::HostDescriptor {
-            protocol: HostProtocol::THIS.name.to_owned(),
+            protocol: HostProtocol::V3.name.to_owned(),
             environment_id: self.identity.environment_id(),
             reservation_id: kr_protocol::worker::ReservationId::new(
                 kr_protocol::scalars::Uuid::from_bytes([0; 16]),
@@ -2455,7 +2455,7 @@ mod tests {
     #[cfg(unix)]
     fn config_over(packages: &Path, scratch: &Path) -> HostConfig {
         HostConfig {
-            endpoint: kr_ipc::paths::Endpoint::from_path(scratch.join(HostProtocol::THIS.endpoint))
+            endpoint: kr_ipc::paths::Endpoint::from_path(scratch.join(HostProtocol::V3.endpoint))
                 .expect("an endpoint"),
             packages_root: packages.to_path_buf(),
             cache_root: scratch.join("cache"),
