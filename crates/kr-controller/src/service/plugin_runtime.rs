@@ -18,14 +18,14 @@
 //!
 //! # One runtime for every level
 //!
-//! A plugin host speaks one protocol and is published under the names of that protocol
-//! ([`HostProtocol`]). This release and the release before speak the same one, so this daemon
-//! holds one [`PluginRuntime`] and answers the workers of every level it speaks to with it. It
-//! adopts a host that runs, which a daemon of the other release started and which outlived an
-//! update or a rollback, and otherwise starts the `kr-plugin-host` beside this daemon. A host that
-//! survives serves the sessions of both levels until it ends, so a change to the plugin host (a
-//! fix, its engine, its bounds or its component interface) reaches the sessions of the other level
-//! only after that.
+//! A plugin host of this release serves the third protocol and the fourth, each on an endpoint of
+//! its own, and is published under the names of both ([`HostProtocol`]); the release before speaks
+//! the third alone. This daemon holds one [`PluginRuntime`] and answers the workers of every level
+//! it speaks to with it, each over the newest protocol it can verify. It adopts a host that runs,
+//! which a daemon of the other release started and which outlived an update or a rollback, and
+//! otherwise starts the `kr-plugin-host` beside this daemon. A host that survives serves the
+//! sessions of both levels until it ends, so a change to the plugin host (a fix, its engine, its
+//! bounds or its component interface) reaches the sessions of the other level only after that.
 //!
 //! # Starting is bounded
 //!

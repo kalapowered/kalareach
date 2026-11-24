@@ -468,7 +468,9 @@ pub enum Notice4 {
     /// A restore that was answered replaces the state a report describes. A report of the state it
     /// replaced is never written after its answer, and one written between the request and its
     /// answer may describe either state, so a reader takes the position the restore carried and
-    /// ignores what came in between.
+    /// ignores what came in between. A restore that carries no position leaves the cursor where it
+    /// was and no longer clean: the state covers events the cursor cannot name, and a report
+    /// written after it says so.
     ///
     /// A report is not timely under load: a newer report goes behind every notice queued since the
     /// older one, so a reader that falls behind can go without a report for a long time. A caller
