@@ -236,6 +236,14 @@ function refuse(code: string, message: string): never {
 }
 
 /**
+ * What native code says to a request for a run of the checks that would take the file held while a
+ * run is going (`refuse_a_file_for_a_run_going`).
+ */
+const RUN_GOING_WORDS =
+  'A run of the checks is already going, so the file you chose has not been read. It stays ' +
+  'chosen: run the checks again once that run ends.'
+
+/**
  * What native code says when the pairing records could not be opened (`AppState::device`): what
  * does not work, the cause, and what to do. The cause is a real one: a phone's cache directory
  * that cannot be written, with its long path.
@@ -2234,6 +2242,12 @@ export function fakeHost(
       requireLocalSocket('the checks')
       if (params.environment_id !== ENVIRONMENT) {
         refuse('INVALID_ARGUMENT', 'This host does not own that environment.')
+      }
+      // As in the application, a request that would take the file held while a run is going is
+      // refused before the file is taken, so the file stays held for the next run. A request with
+      // no file held is answered with the run that is going.
+      if (chosenFile !== null && checks.state === 'running') {
+        return refused('PERMISSION_DENIED', RUN_GOING_WORDS)
       }
       checkRuns.push(params)
       checkFiles.push(chosenFile)

@@ -473,3 +473,46 @@ describe('the scripted host and packages', () => {
     ).rejects.toMatchObject({ code: 'ENVIRONMENT_UNAVAILABLE' })
   })
 })
+
+describe('the scripted host and the disclosed checks', () => {
+  const RUN_GOING =
+    'A run of the checks is already going, so the file you chose has not been read. It stays ' +
+    'chosen: run the checks again once that run ends.'
+
+  // As in the application, a request that would take the file held while a run is going is refused
+  // before the file is taken, so the file stays held for the next run.
+  it('refuses a request that would take the held file for a run that is going, and keeps the file', async () => {
+    const { port, controls } = fakeHost()
+    await port.chooseAuthorisedFile()
+    await port.environmentCapabilitiesCheck({ environment_id: ENVIRONMENT })
+    expect(controls.checkFiles).toEqual(['notes.txt'])
+
+    await port.chooseAuthorisedFile()
+    await expect(
+      Promise.resolve().then(() =>
+        port.environmentCapabilitiesCheck({ environment_id: ENVIRONMENT })
+      )
+    ).rejects.toMatchObject({ code: 'PERMISSION_DENIED', message: RUN_GOING })
+    expect(await port.heldAuthorisedFile()).toEqual({
+      dialog_open: false,
+      file: { name: 'notes.txt' }
+    })
+    expect(controls.checkRuns).toHaveLength(1)
+    expect(controls.checkFiles).toEqual(['notes.txt'])
+
+    // The run ends, and the next request takes the file that stayed held.
+    controls.setChecks({ state: 'current', finished_at_ms: String(Date.now()) })
+    await port.environmentCapabilitiesCheck({ environment_id: ENVIRONMENT })
+    expect(controls.checkFiles).toEqual(['notes.txt', 'notes.txt'])
+    expect(await port.heldAuthorisedFile()).toEqual({ dialog_open: false, file: null })
+  })
+
+  it('answers a request that carries no file with the run that is going', async () => {
+    const { port, controls } = fakeHost()
+    await port.environmentCapabilitiesCheck({ environment_id: ENVIRONMENT })
+    const again = await port.environmentCapabilitiesCheck({ environment_id: ENVIRONMENT })
+    expect(again.value?.state).toBe('running')
+    expect(controls.checkRuns).toHaveLength(2)
+    expect(controls.checkFiles).toEqual([null, null])
+  })
+})
