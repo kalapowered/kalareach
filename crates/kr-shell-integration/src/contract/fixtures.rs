@@ -10,8 +10,9 @@
 //!
 //! * A **handshake** script drives `decide_handshake` and `decide_activation`: who is admitted,
 //!   who is refused and with which named reason, and what a shell that inherited nothing does.
-//! * A **fence** script drives `FenceMachine`: one stimulus per step at a stated clock reading,
-//!   with the state, the fence, the held batches in order and the actions in order.
+//! * A **fence** script drives [`FenceMachine`](crate::contract::fence::FenceMachine): one
+//!   stimulus per step at a stated clock reading, with the state, the fence, the held batches in
+//!   order and the actions in order.
 //! * A **pre-EOF** script drives [`BridgeFenceView`]: the detach condition, the gesture, the one
 //!   hint per prompt, and what the bridge does when the worker refuses a submitted detach.
 //!

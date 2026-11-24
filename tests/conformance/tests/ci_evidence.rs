@@ -1528,6 +1528,35 @@ fn the_jobs_that_run_the_retained_surface_suite_install_the_windows_cross_compil
             "{file}: the {name} job runs its tests before it installs the cross compiler"
         );
     }
+    // The suite is `kr-cli`'s, so the legs of the macOS job that run it are the legs whose
+    // packages hold `-p kr-cli`, and the install step runs on those and on no other.
+    let workflow = fs::read_to_string(repository().join(".github/workflows/core-ci.yml"))
+        .expect("the landing workflow");
+    let text = job(&workflow, "macos");
+    let install = steps_holding(&text, "brew install mingw-w64").remove(0);
+    let matrix = matrix_legs(&text);
+    let holding: Vec<&str> = matrix
+        .iter()
+        .filter(|leg| {
+            leg.packages
+                .windows(2)
+                .any(|pair| pair[0] == "-p" && pair[1] == "kr-cli")
+        })
+        .map(|leg| leg.part.as_str())
+        .collect();
+    assert!(
+        !holding.is_empty(),
+        "no leg of the macOS job has `-p kr-cli` in its packages"
+    );
+    let installing: Vec<&str> = matrix
+        .iter()
+        .filter(|leg| runs_on_leg(&install, &leg.part))
+        .map(|leg| leg.part.as_str())
+        .collect();
+    assert_eq!(
+        installing, holding,
+        "the legs of the macOS job that install the cross compiler are not the legs whose packages hold `-p kr-cli`"
+    );
 }
 
 /// The commands `scripts/contract-cases.sh` runs through `expect`, each as its words, by the
@@ -2025,11 +2054,12 @@ esac
     assert_eq!(run("neither", "right").0, Some(2), "an unknown mode ran");
 }
 
-/// One leg of a job's matrix: its `part`, and the `minutes` its Test step is limited to when the
-/// entry has them.
+/// One leg of a job's matrix: its `part`, the `minutes` its Test step is limited to when the entry
+/// has them, and the words of its `packages`.
 struct Leg {
     part: String,
     minutes: Option<u32>,
+    packages: Vec<String>,
 }
 
 /// The legs of a job's matrix, in the order they are written: each entry from its `- name:` line
@@ -2054,9 +2084,18 @@ fn matrix_legs(job: &str) -> Vec<Leg> {
                 })
                 .map_or(lines.len(), |offset| start + 1 + offset);
             let entry = lines[start..end].join("\n");
+            let packages = entry
+                .lines()
+                .skip_while(|line| key_value(line).is_none_or(|(_, key, _)| key != "packages"))
+                .skip(1)
+                .take_while(|line| line.len() - line.trim_start().len() > 12)
+                .flat_map(str::split_whitespace)
+                .map(str::to_owned)
+                .collect();
             Leg {
                 part: value_at(&entry, 12, "part").expect("a leg names its part"),
                 minutes: value_at(&entry, 12, "minutes").and_then(|value| value.parse().ok()),
+                packages,
             }
         })
         .collect()
