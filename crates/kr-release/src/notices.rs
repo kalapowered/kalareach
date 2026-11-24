@@ -156,9 +156,13 @@ pub fn gaps(checkout: &Path, notice: &str, product: Product) -> Result<Vec<Strin
     let named: BTreeSet<Identity> = entries(notice)
         .into_iter()
         .filter_map(|entry| {
-            let mut fields = entry.split(" | ");
+            let mut fields = entry.split(" | ").peekable();
             let mut words = fields.next()?.split_whitespace();
             let (name, version) = (words.next()?.to_owned(), words.next()?.to_owned());
+            // A JavaScript package's entry names a package of npm, not a crate.
+            if fields.peek() == Some(&"javascript") {
+                return None;
+            }
             let repository = fields
                 .find_map(|field| field.strip_prefix("source "))
                 .filter(|address| !address.starts_with(REGISTRY_PAGE))

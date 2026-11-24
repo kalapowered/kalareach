@@ -1383,3 +1383,31 @@ fn the_refusal_of_a_companion_notice_names_the_steps_that_make_it_again() {
         );
     }
 }
+
+/// A JavaScript entry does not stand for a crate: with the entries of tauri made entries of a
+/// JavaScript package of the same name and version, the lock's tauri is still missing from the
+/// companion's notice.
+#[test]
+fn a_javascript_entry_does_not_stand_for_a_crate_of_the_same_name_and_version() {
+    let committed =
+        std::fs::read_to_string(checkout().join("docs/releases/companion-third-party-notices.txt"))
+            .expect("the committed companion notice");
+    let mut cut = Vec::new();
+    let text: String = committed
+        .lines()
+        .map(|line| match line.strip_prefix("  - tauri ") {
+            Some(rest) => match rest.split_once(" | rust") {
+                Some((version, others)) => {
+                    cut.push(format!("tauri {version}"));
+                    format!("  - tauri {version} | javascript{others}\n")
+                }
+                None => format!("{line}\n"),
+            },
+            None => format!("{line}\n"),
+        })
+        .collect();
+    assert!(!cut.is_empty(), "the companion notice has entries of tauri");
+    let lacking = kr_release::notices::gaps(&checkout(), &text, Product::Companion)
+        .expect("the lock is read");
+    assert_eq!(lacking, cut);
+}
