@@ -678,6 +678,44 @@ impl Controller {
     }
 }
 
+#[cfg(feature = "testing")]
+impl Controller {
+    /// Holds `records` as the findings of a run that a worker has just answered, for a suite that
+    /// scripts what the worker found.
+    ///
+    /// The run begins against the desktop and the worker as they are now, and ends as the answer of
+    /// a worker ends it, so the answer is checked and held as one is. No worker is asked. Returns
+    /// nothing where no run could begin: no worker of the profile this host creates sessions with,
+    /// or a run already in progress.
+    pub async fn hold_scripted_findings(
+        &self,
+        records: Vec<CapabilityRecord>,
+    ) -> Option<RequestId> {
+        let (evidence, _) = self.desktop_evidence().await;
+        let worker = worker_for(self.directory_workers().await, evidence.worker_profile)?;
+        let session_id = worker.descriptor.session_id;
+        let taken = fingerprint_of(&evidence, Some(&worker));
+        let request_id = self
+            .checks
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .ask(kr_ipc::now_ms(), Some(session_id), taken)?;
+        let asked = DesktopChecksRequest {
+            request_id,
+            environment_id: self.paths.environment_id(),
+            authorised_file: Nullable::null(),
+        };
+        let answer = DesktopChecksAnswer {
+            request_id,
+            session_id,
+            records,
+        };
+        self.capability_checks_ended(&worker, &asked, Ok(answer))
+            .await;
+        Some(request_id)
+    }
+}
+
 /// Performs one run: asks the worker over a connection of its own and waits for its findings.
 async fn perform(
     me: std::sync::Weak<Controller>,

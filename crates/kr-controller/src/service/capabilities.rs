@@ -77,21 +77,40 @@ impl Controller {
     pub(super) async fn desktop(&self) -> (DesktopContext, CapabilityRevision) {
         let mut reading = self.desktop.lock().await;
         if reading.read_at.elapsed() >= DESKTOP_REREAD_INTERVAL {
-            let source = self
-                .desktop_source
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone();
-            let (context, evidence) = resolved_desktop(
-                self.in_force().worker_profile,
-                &self.boot_identity,
-                source.as_ref(),
-            );
-            reading.context = context;
-            reading.evidence = evidence;
-            reading.read_at = std::time::Instant::now();
+            self.read_the_desktop(&mut reading);
         }
         (reading.context.clone(), reading.revision)
+    }
+
+    /// Asks the desktop's source now and keeps the answer as the reading.
+    fn read_the_desktop(&self, reading: &mut DesktopReading) {
+        let source = self
+            .desktop_source
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let (context, evidence) = resolved_desktop(
+            self.in_force().worker_profile,
+            &self.boot_identity,
+            source.as_ref(),
+        );
+        reading.context = context;
+        reading.evidence = evidence;
+        reading.read_at = std::time::Instant::now();
+    }
+
+    /// Has this daemon read the desktop from `source` from now on, and reads it once at once.
+    ///
+    /// For a suite that scripts the login: the desktop is read again whenever the suite says a
+    /// login has changed, and not when the reading's age says so.
+    #[cfg(feature = "testing")]
+    pub async fn read_the_desktop_from(&self, source: Arc<dyn crate::desktop::DesktopSource>) {
+        *self
+            .desktop_source
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = source;
+        let mut reading = self.desktop.lock().await;
+        self.read_the_desktop(&mut reading);
     }
 
     /// Returns the context this host's capability evidence is about, and its revision.

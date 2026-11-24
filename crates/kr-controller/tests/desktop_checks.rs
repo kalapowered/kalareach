@@ -14,7 +14,7 @@ use std::time::Duration;
 use kr_crypto::keys::DeviceKeys;
 use kr_protocol::desktop::{
     CapabilityChecks, CapabilityChecksFailure, CapabilityChecksState, CapabilityEvidenceSource,
-    CapabilityInvalidation, CapabilityState, EnvironmentCapabilitiesCheckParams,
+    CapabilityInvalidation, CapabilityState, DesktopContext, EnvironmentCapabilitiesCheckParams,
     EnvironmentCapabilitiesParams, EnvironmentCapabilitiesResult, capabilities,
 };
 use kr_protocol::envelope::ActionTarget;
@@ -845,6 +845,289 @@ async fn kr_req_11_17_findings_taken_under_one_profile_end_when_the_profile_chan
             .is_none(),
         "the finding is not served under the new profile: {:?}",
         after.desktop.record(capabilities::AUTHORISED_FILE_READ)
+    );
+    adopted.stop().await;
+}
+
+/// A graphical login of a case's own, in the headless profile this host is set to create sessions
+/// with, so that the adopted worker is the one the checks are performed in. The login's generation
+/// is what a case moves to show a new login.
+struct Login(std::sync::atomic::AtomicU64);
+
+impl Login {
+    fn new(generation: u64) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self(std::sync::atomic::AtomicU64::new(generation)))
+    }
+
+    fn becomes(&self, generation: u64) {
+        self.0
+            .store(generation, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl kr_controller::desktop::DesktopSource for Login {
+    fn current(&self, boot: kr_protocol::identity::BootIdentity) -> DesktopContext {
+        use kr_protocol::desktop::{
+            ContainerEnvironment, DesktopAvailability, DesktopGenerationSource, DesktopSessionKind,
+            DisplayServer,
+        };
+        use kr_protocol::ids::DesktopSessionId;
+        use kr_protocol::scalars::U64;
+
+        let generation = self.0.load(std::sync::atomic::Ordering::SeqCst);
+        DesktopContext {
+            desktop_session_id: Nullable::some(
+                DesktopSessionId::new(format!(
+                    "macos_security_session:user=someone:uid=501:session=1:generation={generation}"
+                ))
+                .expect("a desktop name"),
+            ),
+            kind: DesktopSessionKind::MacosSecuritySession,
+            platform_session: Nullable::some("1".to_owned()),
+            login_generation: Nullable::some(U64::new(generation)),
+            generation_source: DesktopGenerationSource::MacosSessionCreator,
+            os_user: "someone".to_owned(),
+            uid: Nullable::some(U64::new(501)),
+            boot_identity: boot,
+            graphic_access: true,
+            remote: false,
+            availability: DesktopAvailability::Available,
+            container: ContainerEnvironment::Host,
+            display_server: DisplayServer::Quartz,
+            compositor: Nullable::some("Aqua".to_owned()),
+            worker_profile: WorkerProfile::HeadlessUser,
+        }
+    }
+}
+
+/// Starts a daemon with one adopted worker, whose desktop is read from `login`.
+async fn adopted_on(login: &std::sync::Arc<Login>) -> Adopted {
+    let adopted = Adopted::start_with_document(1, &headless()).await;
+    adopted
+        .host
+        .controller()
+        .read_the_desktop_from(login.clone())
+        .await;
+    adopted
+}
+
+/// What a worker's answer holds for the screen-image check: about the adopted worker's session, by
+/// a disclosed probe, and naming the program it ran when there is one, with the digest it read.
+fn finding(
+    adopted: &Adopted,
+    state: CapabilityState,
+    program: Option<&std::path::Path>,
+) -> kr_protocol::desktop::CapabilityRecord {
+    use kr_protocol::desktop::{CapabilityIdentity, CapabilityRecord, CapabilitySubject};
+    use kr_protocol::hostinfo::export::Sentence;
+    use kr_protocol::ids::{CapabilityId, CapabilityRevision};
+    use kr_protocol::scalars::U64;
+
+    let path = program.map(|path| path.display().to_string());
+    CapabilityRecord {
+        capability: CapabilityId::new(capabilities::SCREEN_CAPTURE).expect("a capability"),
+        version: U64::new(1),
+        subject: CapabilitySubject {
+            environment_id: adopted.host.environment_id,
+            desktop_session_id: Nullable::null(),
+            session_id: Nullable::some(adopted.workers[0].session_id),
+            application: Nullable::null(),
+            terminal: Nullable::null(),
+        },
+        revision: CapabilityRevision::new(0),
+        state,
+        evidence_source: CapabilityEvidenceSource::DisclosedProbe,
+        identity: CapabilityIdentity {
+            binary: Nullable(path.clone()),
+            version: Nullable(
+                path.as_deref()
+                    .and_then(kr_worker::desktop::capability::facility_identity),
+            ),
+            package: Nullable::null(),
+            schema: Nullable(path.as_ref().map(|_| "a-route".to_owned())),
+            profile: Nullable::null(),
+        },
+        invalidation: kr_worker::desktop::probe::invalidation(),
+        disabled_reason: Nullable(
+            (state != CapabilityState::QualifiedAvailable)
+                .then(|| Sentence::new().stated("a permission the check needs is not granted")),
+        ),
+        observed_at_ms: TimestampMs::new(1),
+    }
+}
+
+/// Has the daemon hold `records` as the answer of the worker's run.
+async fn the_worker_answers(
+    adopted: &Adopted,
+    records: Vec<kr_protocol::desktop::CapabilityRecord>,
+) {
+    adopted
+        .host
+        .controller()
+        .hold_scripted_findings(records)
+        .await
+        .expect("a run begins in the adopted worker's session");
+}
+
+/// What `environment.capabilities` shows of the screen-image check: where the checks stand, the
+/// record's state and what it came from.
+async fn the_screen_image_check(
+    host: &Host,
+) -> (
+    CapabilityChecksState,
+    CapabilityState,
+    CapabilityEvidenceSource,
+) {
+    let shown = shown(host).await;
+    let record = shown
+        .desktop
+        .record(capabilities::SCREEN_CAPTURE)
+        .expect("the platform has a record of the check");
+    (shown.checks.state, record.state, record.evidence_source)
+}
+
+/// KR-REQ-03.29, S-4: the findings are held against the tool the worker ran, as
+/// `environment.capabilities` reads them. The worker's answer names its own tool by path and
+/// digest: replacing that file ends the findings, and replacing another file beside it, which the
+/// worker never ran, does not.
+///
+/// The limit: this case does not put a candidate on the daemon's own search path. The routes
+/// name absolute paths only, so the daemon's search finds none, and a case cannot set the
+/// environment's search path (`unsafe_code` is forbidden). Once a row names a program by a bare
+/// name, a case adds that candidate.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn what_is_held_follows_the_tool_the_worker_ran_and_not_another_beside_it() {
+    let login = Login::new(2);
+    let adopted = adopted_on(&login).await;
+    let directory = tempfile::tempdir().expect("a directory of this test's own");
+    let worker_tool = directory.path().join("the-workers-tool");
+    let another_tool = directory.path().join("the-controllers-candidate");
+    std::fs::write(&worker_tool, b"the first build").expect("the worker's tool");
+    std::fs::write(&another_tool, b"the first build").expect("another tool");
+
+    the_worker_answers(
+        &adopted,
+        vec![finding(
+            &adopted,
+            CapabilityState::QualifiedAvailable,
+            Some(&worker_tool),
+        )],
+    )
+    .await;
+    let held = (
+        CapabilityChecksState::Current,
+        CapabilityState::QualifiedAvailable,
+        CapabilityEvidenceSource::DisclosedProbe,
+    );
+    assert_eq!(
+        the_screen_image_check(&adopted.host).await,
+        held,
+        "nothing moved"
+    );
+
+    std::fs::write(&another_tool, b"the second build").expect("the replacement");
+    assert_eq!(
+        the_screen_image_check(&adopted.host).await,
+        held,
+        "a tool the worker never ran is not what the findings are about"
+    );
+
+    std::fs::write(&worker_tool, b"the second build").expect("the replacement");
+    let (checks, _, source) = the_screen_image_check(&adopted.host).await;
+    assert_eq!(
+        checks,
+        CapabilityChecksState::Stale,
+        "the worker's own tool was replaced"
+    );
+    assert_ne!(
+        source,
+        CapabilityEvidenceSource::DisclosedProbe,
+        "the finding is gone from the record"
+    );
+    adopted.stop().await;
+}
+
+/// KR-REQ-03.29, S-12: what a permission withdrawn since the first run comes to, as
+/// `environment.capabilities` shows it. With no second run the first finding stands, which is the
+/// limit the words state. A second run that the permission refuses replaces the first finding.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_repeat_run_finds_a_permission_withdrawn_since_in_what_the_daemon_shows() {
+    let login = Login::new(2);
+    let adopted = adopted_on(&login).await;
+
+    the_worker_answers(
+        &adopted,
+        vec![finding(&adopted, CapabilityState::QualifiedAvailable, None)],
+    )
+    .await;
+    let first = (
+        CapabilityChecksState::Current,
+        CapabilityState::QualifiedAvailable,
+        CapabilityEvidenceSource::DisclosedProbe,
+    );
+    assert_eq!(the_screen_image_check(&adopted.host).await, first);
+    assert_eq!(
+        the_screen_image_check(&adopted.host).await,
+        first,
+        "with no second run the first finding stands"
+    );
+
+    the_worker_answers(
+        &adopted,
+        vec![finding(&adopted, CapabilityState::PermissionRequired, None)],
+    )
+    .await;
+    assert_eq!(
+        the_screen_image_check(&adopted.host).await,
+        (
+            CapabilityChecksState::Current,
+            CapabilityState::PermissionRequired,
+            CapabilityEvidenceSource::DisclosedProbe
+        ),
+        "the second run found the permission withdrawn"
+    );
+    adopted.stop().await;
+}
+
+/// KR-REQ-03.29, KR-REQ-11.17, S-13: findings held against a login go stale when the login
+/// changes, as `environment.capabilities` shows it, through the daemon's own reading of the
+/// desktop, which here is scripted. This is the clause the worker's suite says it does not cover.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn held_findings_go_stale_in_what_the_daemon_shows_when_the_login_changes() {
+    let login = Login::new(2);
+    let adopted = adopted_on(&login).await;
+
+    the_worker_answers(
+        &adopted,
+        vec![finding(&adopted, CapabilityState::QualifiedAvailable, None)],
+    )
+    .await;
+    assert_eq!(
+        the_screen_image_check(&adopted.host).await,
+        (
+            CapabilityChecksState::Current,
+            CapabilityState::QualifiedAvailable,
+            CapabilityEvidenceSource::DisclosedProbe
+        ),
+        "the same login"
+    );
+
+    login.becomes(3);
+    adopted
+        .host
+        .controller()
+        .read_the_desktop_from(login.clone())
+        .await;
+    let (checks, _, source) = the_screen_image_check(&adopted.host).await;
+    assert_eq!(
+        checks,
+        CapabilityChecksState::Stale,
+        "a login that changed ends them"
+    );
+    assert_ne!(
+        source,
+        CapabilityEvidenceSource::DisclosedProbe,
+        "the finding is gone from the record"
     );
     adopted.stop().await;
 }
