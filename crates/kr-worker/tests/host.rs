@@ -2054,7 +2054,7 @@ async fn an_idle_session_runs_nothing_beside_its_shell() {
     assert!(
         kr_plugin_service::launcher::read_descriptor(
             &host.paths(),
-            &kr_plugin_service::protocol::HostProtocol::THIS
+            &kr_plugin_service::protocol::HostProtocol::V3
         )
         .expect("reads the plugin host's descriptor")
         .is_none(),

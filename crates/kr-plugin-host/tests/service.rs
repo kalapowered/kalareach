@@ -167,7 +167,7 @@ impl Host {
         });
         let outcome = launcher::start(
             &self.environment(),
-            HostProtocol::THIS,
+            HostProtocol::V3,
             &self.plugin_host,
             &self.packages,
             &supervisor,
@@ -771,7 +771,7 @@ async fn a_plugin_host_runs_in_a_directory_of_its_own_and_is_given_no_secret() {
     }
 
     started.kill();
-    let _ = launcher::retire_descriptor(&environment, &HostProtocol::THIS);
+    let _ = launcher::retire_descriptor(&environment, &HostProtocol::V3);
 }
 
 // A component that never returns costs its own binding and nothing else: the worker's terminal goes
@@ -848,7 +848,7 @@ async fn a_component_that_never_returns_costs_its_own_binding_and_not_the_termin
     assert!(snapshot.answered());
 
     started.kill();
-    let _ = launcher::retire_descriptor(&environment, &HostProtocol::THIS);
+    let _ = launcher::retire_descriptor(&environment, &HostProtocol::V3);
 }
 
 // KR-REQ-11.39: the terminal path is never behind a component.
@@ -1052,7 +1052,7 @@ async fn kr_req_11_39_a_terminal_drains_and_is_answered_while_a_component_runs()
     drop(stopped);
 
     started.kill();
-    let _ = launcher::retire_descriptor(&environment, &HostProtocol::THIS);
+    let _ = launcher::retire_descriptor(&environment, &HostProtocol::V3);
 }
 
 /// How long a window of a case in which a component works may go on before it is taken for hung.

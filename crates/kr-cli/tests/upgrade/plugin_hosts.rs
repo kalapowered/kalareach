@@ -67,7 +67,7 @@ impl Host {
             .tree
             .environment()
             .runtime_dir()
-            .join(HostProtocol::THIS.descriptor);
+            .join(HostProtocol::V3.descriptor);
         let bytes = std::fs::read(path).ok()?;
         serde_json::from_slice(&bytes).ok()
     }
@@ -101,8 +101,8 @@ impl Host {
         else {
             return None;
         };
-        (protocol == HostProtocol::THIS.name
-            && descriptor.protocol == HostProtocol::THIS.name
+        (protocol == HostProtocol::V3.name
+            && descriptor.protocol == HostProtocol::V3.name
             && launcher::check_proof(&descriptor, &nonce, &proof).is_ok())
         .then_some(*health)
     }

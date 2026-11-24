@@ -103,12 +103,12 @@ async fn the_plugin_host_is_started_by_the_platform_when_the_worker_asks_and_rep
     // by one function that every release that speaks the protocol calls, so this shows the host
     // and the daemon agree on it here. The launcher's own case spells the name out, in the form of
     // each platform.
-    let published = launcher::read_descriptor(&hosted.environment(), &HostProtocol::THIS)
+    let published = launcher::read_descriptor(&hosted.environment(), &HostProtocol::V3)
         .expect("the descriptor reads")
         .expect("the host is published");
     assert_eq!(
         published.endpoint,
-        launcher::host_endpoint(&hosted.environment(), &HostProtocol::THIS)
+        launcher::host_endpoint(&hosted.environment(), &HostProtocol::V3)
             .expect("an endpoint")
             .as_text(),
         "the host publishes the endpoint its protocol names"

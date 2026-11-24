@@ -361,7 +361,7 @@ impl PluginRuntime {
                     }
                     // Its job goes with it the next time a runtime is started; the descriptor
                     // goes now, so no worker connects to the address of a process that is gone.
-                    let _ = launcher::retire_descriptor(&self.paths, &HostProtocol::THIS);
+                    let _ = launcher::retire_descriptor(&self.paths, &HostProtocol::V3);
                     *state = State::Idle;
                 }
                 State::Starting(attempt) => {
@@ -462,7 +462,7 @@ impl PluginRuntime {
     async fn attempt(self: Arc<Self>, finished: watch::Sender<Option<PluginRuntimeState>>) {
         let started = launcher::start(
             &self.paths,
-            HostProtocol::THIS,
+            HostProtocol::V3,
             self.program.clone(),
             &self.packages,
             &self.starter,
@@ -501,7 +501,7 @@ impl PluginRuntime {
 
     /// Looks for a runtime a previous daemon started.
     async fn look(&self) -> Found {
-        let descriptor = match launcher::read_descriptor(&self.paths, &HostProtocol::THIS) {
+        let descriptor = match launcher::read_descriptor(&self.paths, &HostProtocol::V3) {
             Ok(Some(descriptor)) => descriptor,
             Ok(None) => return Found::Nothing,
             // A descriptor whose content this build refuses (another protocol, another
@@ -509,7 +509,7 @@ impl PluginRuntime {
             // is what lets a runtime be started; if one is in fact running behind it, it holds its
             // endpoint and the new one fails to report itself.
             Err(LaunchError::Refused { .. }) => {
-                let _ = launcher::retire_descriptor(&self.paths, &HostProtocol::THIS);
+                let _ = launcher::retire_descriptor(&self.paths, &HostProtocol::V3);
                 return Found::Nothing;
             }
             // A descriptor that could not be read at all may be a runtime's, and taking it away
@@ -524,7 +524,7 @@ impl PluginRuntime {
             kr_ipc::identity::process_state(&descriptor.process_start_identity),
             kr_ipc::identity::ProcessState::Ended
         ) {
-            let _ = launcher::retire_descriptor(&self.paths, &HostProtocol::THIS);
+            let _ = launcher::retire_descriptor(&self.paths, &HostProtocol::V3);
             return Found::Nothing;
         }
         // The runtime is looked at the way a worker connects to it.
@@ -960,12 +960,12 @@ mod tests {
             launcher::HostIdentity::generate(host.environment_id()).expect("an identity");
         launcher::publish_descriptor(
             &environment,
-            &HostProtocol::THIS,
+            &HostProtocol::V3,
             &kr_plugin_service::protocol::HostDescriptor {
-                protocol: HostProtocol::THIS.name.to_owned(),
+                protocol: HostProtocol::V3.name.to_owned(),
                 environment_id: host.environment_id(),
                 reservation_id: kr_protocol::worker::ReservationId::new(kr_ipc::new_uuid()),
-                endpoint: launcher::host_endpoint(&environment, &HostProtocol::THIS)
+                endpoint: launcher::host_endpoint(&environment, &HostProtocol::V3)
                     .expect("an endpoint")
                     .as_text(),
                 boot_identity: identity.boot_identity().clone(),
@@ -1003,7 +1003,7 @@ mod tests {
             let environment = host.environment();
             let identity =
                 launcher::HostIdentity::generate(host.environment_id()).expect("an identity");
-            let protocol = &HostProtocol::THIS;
+            let protocol = &HostProtocol::V3;
             let endpoint = launcher::host_endpoint(&environment, protocol).expect("an endpoint");
             let listener =
                 kr_ipc::endpoint::Listener::bind(&endpoint).expect("the stand-in listens");
@@ -1323,10 +1323,9 @@ mod tests {
     async fn a_start_that_succeeds_clears_the_kept_reason() {
         let host = kr_ipc::testing::TempHost::create();
         let environment = host.environment();
-        let endpoint =
-            kr_plugin_service::launcher::host_endpoint(&environment, &HostProtocol::THIS)
-                .expect("an endpoint")
-                .as_text();
+        let endpoint = kr_plugin_service::launcher::host_endpoint(&environment, &HostProtocol::V3)
+            .expect("an endpoint")
+            .as_text();
         let reason = "the plugin host could not listen on /run/p3.sock: it holds a file";
         let supervisor = Arc::new(FailingHost {
             reports_from: 1,

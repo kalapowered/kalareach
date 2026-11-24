@@ -636,7 +636,7 @@ impl PluginClient {
     /// cannot be reached, and [`ServiceError::Protocol`] when the host answers with
     /// something this client cannot read or cannot verify.
     pub async fn connect(environment: &EnvironmentPaths) -> ServiceResult<Self> {
-        let descriptor = launcher::read_descriptor(environment, &HostProtocol::THIS)
+        let descriptor = launcher::read_descriptor(environment, &HostProtocol::V3)
             .map_err(unavailable)?
             .ok_or_else(|| ServiceError::Unavailable {
                 detail: "this environment has no plugin host".to_owned(),
@@ -710,13 +710,13 @@ impl PluginClient {
 
         let hello = client
             .request(RequestBody::Hello {
-                protocol: HostProtocol::THIS.name.to_owned(),
+                protocol: HostProtocol::V3.name.to_owned(),
             })
             .await?;
         let ResponseBody::Hello { protocol, .. } = hello else {
             return Err(protocol_error(&hello));
         };
-        if protocol != HostProtocol::THIS.name {
+        if protocol != HostProtocol::V3.name {
             return Err(ServiceError::Protocol {
                 detail: format!("the host speaks {protocol}"),
             });

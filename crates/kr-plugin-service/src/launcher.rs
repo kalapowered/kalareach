@@ -1340,7 +1340,7 @@ mod tests {
 
     fn descriptor_of(identity: &HostIdentity, endpoint: &str) -> HostDescriptor {
         HostDescriptor {
-            protocol: HostProtocol::THIS.name.to_owned(),
+            protocol: HostProtocol::V3.name.to_owned(),
             environment_id: identity.environment_id(),
             reservation_id: ReservationId::new(kr_protocol::scalars::Uuid::from_bytes([2; 16])),
             endpoint: endpoint.to_owned(),
@@ -1426,7 +1426,7 @@ mod tests {
     fn the_endpoint_of_the_protocol_is_the_name_every_release_that_speaks_it_derives() {
         let host = kr_ipc::testing::TempHost::create();
         let environment = host.environment();
-        let endpoint = host_endpoint(&environment, &HostProtocol::THIS).expect("an endpoint");
+        let endpoint = host_endpoint(&environment, &HostProtocol::V3).expect("an endpoint");
         #[cfg(not(windows))]
         assert_eq!(
             endpoint,
@@ -1448,9 +1448,9 @@ mod tests {
         let host = kr_ipc::testing::TempHost::create();
         let environment = host.environment();
         let identity = HostIdentity::generate(host.environment_id()).expect("an identity");
-        let endpoint = host_endpoint(&environment, &HostProtocol::THIS).expect("an endpoint");
+        let endpoint = host_endpoint(&environment, &HostProtocol::V3).expect("an endpoint");
         let descriptor = HostDescriptor {
-            protocol: HostProtocol::THIS.name.to_owned(),
+            protocol: HostProtocol::V3.name.to_owned(),
             environment_id: host.environment_id(),
             reservation_id: ReservationId::new(kr_protocol::scalars::Uuid::from_bytes([2; 16])),
             endpoint: endpoint.as_text(),
@@ -1460,15 +1460,15 @@ mod tests {
         };
 
         assert!(
-            read_descriptor(&environment, &HostProtocol::THIS)
+            read_descriptor(&environment, &HostProtocol::V3)
                 .expect("a read")
                 .is_none(),
             "an environment with no plugin host has no descriptor"
         );
-        publish_descriptor(&environment, &HostProtocol::THIS, &descriptor)
+        publish_descriptor(&environment, &HostProtocol::V3, &descriptor)
             .expect("the descriptor is published");
         assert_eq!(
-            read_descriptor(&environment, &HostProtocol::THIS).expect("a read"),
+            read_descriptor(&environment, &HostProtocol::V3).expect("a read"),
             Some(descriptor.clone())
         );
 
@@ -1477,25 +1477,25 @@ mod tests {
         // Publishing refuses a descriptor of another protocol, so the foreign one is written as
         // another host would have.
         assert!(matches!(
-            publish_descriptor(&environment, &HostProtocol::THIS, &foreign),
+            publish_descriptor(&environment, &HostProtocol::V3, &foreign),
             Err(LaunchError::Refused { .. })
         ));
         kr_ipc::paths::write_owner_only_file(
-            &descriptor_path(&environment, &HostProtocol::THIS),
+            &descriptor_path(&environment, &HostProtocol::V3),
             &serde_json::to_vec(&foreign).expect("a document"),
         )
         .expect("the file is written");
-        let error = read_descriptor(&environment, &HostProtocol::THIS)
+        let error = read_descriptor(&environment, &HostProtocol::V3)
             .expect_err("a foreign protocol is refused");
         assert!(error.to_string().contains("kr-plugin-host/99"));
 
-        retire_descriptor(&environment, &HostProtocol::THIS).expect("the descriptor is retired");
+        retire_descriptor(&environment, &HostProtocol::V3).expect("the descriptor is retired");
         assert!(
-            read_descriptor(&environment, &HostProtocol::THIS)
+            read_descriptor(&environment, &HostProtocol::V3)
                 .expect("a read")
                 .is_none()
         );
-        retire_descriptor(&environment, &HostProtocol::THIS).expect("a second retirement is quiet");
+        retire_descriptor(&environment, &HostProtocol::V3).expect("a second retirement is quiet");
     }
 
     #[tokio::test]
@@ -1503,7 +1503,7 @@ mod tests {
         let host = kr_ipc::testing::TempHost::create();
         let environment = host.environment();
         let reservation =
-            HostReservation::open(&environment, HostProtocol::THIS).expect("a reservation");
+            HostReservation::open(&environment, HostProtocol::V3).expect("a reservation");
 
         // Relative names, as a caller in this directory would give them. The host runs somewhere
         // else, so a name left relative would be looked for there: the executable would not be
@@ -1539,7 +1539,7 @@ mod tests {
         let host = kr_ipc::testing::TempHost::create();
         let environment = host.environment();
         let reservation =
-            HostReservation::open(&environment, HostProtocol::THIS).expect("a reservation");
+            HostReservation::open(&environment, HostProtocol::V3).expect("a reservation");
         let arguments = reservation.arguments(&environment, std::path::Path::new("/var/packages"));
         assert!(arguments.contains(&"--reservation".to_owned()));
         assert!(arguments.contains(&"--rendezvous".to_owned()));
@@ -1727,7 +1727,7 @@ mod tests {
         let supervisor: Arc<dyn HostSupervisor> = told.clone();
         let outcome = start(
             &environment,
-            HostProtocol::THIS,
+            HostProtocol::V3,
             "/nonexistent/kr-plugin-host",
             std::path::Path::new("/var/packages"),
             &supervisor,
@@ -1738,7 +1738,7 @@ mod tests {
         assert!(matches!(outcome, LaunchError::NotStarted { .. }));
         // Nothing was published, so no worker can be told there is a host.
         assert!(
-            read_descriptor(&environment, &HostProtocol::THIS)
+            read_descriptor(&environment, &HostProtocol::V3)
                 .expect("a read")
                 .is_none()
         );
@@ -1754,7 +1754,7 @@ mod tests {
         let supervisor: Arc<dyn HostSupervisor> = told.clone();
         let outcome = start(
             &environment,
-            HostProtocol::THIS,
+            HostProtocol::V3,
             "/nonexistent/kr-plugin-host",
             std::path::Path::new("/var/packages"),
             &supervisor,
@@ -1764,7 +1764,7 @@ mod tests {
         .expect_err("nothing reported itself");
         assert!(matches!(outcome, LaunchError::NoRendezvous { .. }));
         assert!(
-            read_descriptor(&environment, &HostProtocol::THIS)
+            read_descriptor(&environment, &HostProtocol::V3)
                 .expect("a read")
                 .is_none()
         );
@@ -1784,7 +1784,7 @@ mod tests {
         // defined, and it is taken away all the same.
         let outcome = start(
             &environment,
-            HostProtocol::THIS,
+            HostProtocol::V3,
             "/nonexistent/kr-plugin-host",
             std::path::Path::new("/var/packages"),
             &supervisor,
@@ -1836,7 +1836,7 @@ mod tests {
         let supervisor: Arc<dyn HostSupervisor> = told.clone();
         let outcome = start(
             &environment,
-            HostProtocol::THIS,
+            HostProtocol::V3,
             "/nonexistent/kr-plugin-host",
             std::path::Path::new("/var/packages"),
             &supervisor,
@@ -1863,7 +1863,7 @@ mod tests {
         let supervisor: Arc<dyn HostSupervisor> = told.clone();
         let _ = start(
             &environment,
-            HostProtocol::THIS,
+            HostProtocol::V3,
             "/nonexistent/kr-plugin-host",
             std::path::Path::new("/var/packages"),
             &supervisor,
@@ -1895,7 +1895,7 @@ mod tests {
         let supervisor: Arc<dyn HostSupervisor> = told.clone();
         let _ = start(
             &environment,
-            HostProtocol::THIS,
+            HostProtocol::V3,
             "/nonexistent/kr-plugin-host",
             std::path::Path::new("/var/packages"),
             &supervisor,
@@ -1950,7 +1950,7 @@ mod tests {
         let supervisor: Arc<dyn HostSupervisor> = told.clone();
         let _ = start(
             &environment,
-            HostProtocol::THIS,
+            HostProtocol::V3,
             "/nonexistent/kr-plugin-host",
             std::path::Path::new("/var/packages"),
             &supervisor,
@@ -1990,7 +1990,7 @@ mod tests {
         let environment = host.environment();
         let identity = HostIdentity::generate(host.environment_id()).expect("an identity");
         let reservation =
-            HostReservation::open(&environment, HostProtocol::THIS).expect("a reservation");
+            HostReservation::open(&environment, HostProtocol::V3).expect("a reservation");
         let endpoint = reservation.endpoint().clone();
 
         // Somebody connects to the rendezvous endpoint and never writes a claim. The deadline
@@ -2021,7 +2021,7 @@ mod tests {
             "the launcher waited {waited:?}"
         );
         assert!(
-            read_descriptor(&environment, &HostProtocol::THIS)
+            read_descriptor(&environment, &HostProtocol::V3)
                 .expect("a read")
                 .is_none()
         );
@@ -2036,19 +2036,19 @@ mod tests {
             HostIdentity::generate(host.environment_id()).expect("this host can describe itself");
         let descriptor = descriptor_of(&identity, "/run/kr/first.sock");
 
-        let turn = publication_turn(host.environment_id(), &HostProtocol::THIS);
+        let turn = publication_turn(host.environment_id(), &HostProtocol::V3);
         let waiting = core::sync::atomic::AtomicBool::new(false);
 
         // The launch that reaches publication first publishes first.
         let later = descriptor_of(&identity, "/run/kr/second.sock");
-        publish_in_turn(&turn, &waiting, &environment, &HostProtocol::THIS, &later)
+        publish_in_turn(&turn, &waiting, &environment, &HostProtocol::V3, &later)
             .expect("the first publication wins");
 
         // A launch that reached publication later, with a number of its own, publishes after it.
         let third = descriptor_of(&identity, "/run/kr/third.sock");
-        publish_in_turn(&turn, &waiting, &environment, &HostProtocol::THIS, &third)
+        publish_in_turn(&turn, &waiting, &environment, &HostProtocol::V3, &third)
             .expect("a later launch publishes");
-        let published = read_descriptor(&environment, &HostProtocol::THIS)
+        let published = read_descriptor(&environment, &HostProtocol::V3)
             .expect("a read")
             .expect("a descriptor");
         assert_eq!(published.endpoint, "/run/kr/third.sock");
@@ -2060,19 +2060,19 @@ mod tests {
             &turn,
             &abandoned,
             &environment,
-            &HostProtocol::THIS,
+            &HostProtocol::V3,
             &descriptor,
         )
         .expect_err("an abandoned publication is refused");
         assert!(matches!(refused, LaunchError::Refused { .. }), "{refused}");
-        let published = read_descriptor(&environment, &HostProtocol::THIS)
+        let published = read_descriptor(&environment, &HostProtocol::V3)
             .expect("a read")
             .expect("a descriptor");
         assert_eq!(published.endpoint, "/run/kr/third.sock");
 
         // Another environment's publications are its own.
         let elsewhere = kr_ipc::testing::TempHost::create();
-        let their_turn = publication_turn(elsewhere.environment_id(), &HostProtocol::THIS);
+        let their_turn = publication_turn(elsewhere.environment_id(), &HostProtocol::V3);
         let their_identity =
             HostIdentity::generate(elsewhere.environment_id()).expect("an identity");
         let theirs = descriptor_of(&their_identity, "/run/kr/fourth.sock");
@@ -2080,7 +2080,7 @@ mod tests {
             &their_turn,
             &waiting,
             &elsewhere.environment(),
-            &HostProtocol::THIS,
+            &HostProtocol::V3,
             &theirs,
         )
         .expect("another environment is unaffected");
@@ -2091,7 +2091,7 @@ mod tests {
         let host = kr_ipc::testing::TempHost::create();
         let environment = host.environment();
         let reservation =
-            HostReservation::open(&environment, HostProtocol::THIS).expect("a reservation");
+            HostReservation::open(&environment, HostProtocol::V3).expect("a reservation");
         let reservation_id = reservation.reservation_id();
         let endpoint = reservation.endpoint().clone();
         // The fence takes the endpoint the reservation was made on, which is the only address a
@@ -2164,7 +2164,7 @@ mod tests {
         reason: &str,
     ) -> LaunchError {
         let reservation =
-            HostReservation::open(environment, HostProtocol::THIS).expect("a reservation");
+            HostReservation::open(environment, HostProtocol::V3).expect("a reservation");
         let (reservation_id, environment_id) = name(&reservation);
         let (_reader, mut writer) = the_hosts_side(&reservation).await;
         writer
@@ -2315,9 +2315,9 @@ mod tests {
         let host = kr_ipc::testing::TempHost::create();
         let environment = host.environment();
         let reservation =
-            HostReservation::open(&environment, HostProtocol::THIS).expect("a reservation");
+            HostReservation::open(&environment, HostProtocol::V3).expect("a reservation");
         let identity = HostIdentity::generate(environment.environment_id()).expect("an identity");
-        let endpoint = host_endpoint(&environment, &HostProtocol::THIS)
+        let endpoint = host_endpoint(&environment, &HostProtocol::V3)
             .expect("an endpoint")
             .as_text();
         let claim = identity
@@ -2370,9 +2370,9 @@ mod tests {
         let host = kr_ipc::testing::TempHost::create();
         let environment = host.environment();
         let reservation =
-            HostReservation::open(&environment, HostProtocol::THIS).expect("a reservation");
+            HostReservation::open(&environment, HostProtocol::V3).expect("a reservation");
         let identity = HostIdentity::generate(environment.environment_id()).expect("an identity");
-        let endpoint = host_endpoint(&environment, &HostProtocol::THIS)
+        let endpoint = host_endpoint(&environment, &HostProtocol::V3)
             .expect("an endpoint")
             .as_text();
         let claim = identity

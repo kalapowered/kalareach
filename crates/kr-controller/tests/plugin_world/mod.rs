@@ -401,8 +401,7 @@ impl HostEnding {
                 hosts.extend(process.clone());
             }
         }
-        if let Ok(Some(published)) =
-            launcher::read_descriptor(&self.environment, &HostProtocol::THIS)
+        if let Ok(Some(published)) = launcher::read_descriptor(&self.environment, &HostProtocol::V3)
         {
             hosts.push(published.process_start_identity);
         }
@@ -558,7 +557,7 @@ impl Hosted {
 
     /// The process the descriptor names, where a plugin host is published.
     pub fn published(&self) -> Option<ProcessStartIdentity> {
-        launcher::read_descriptor(&self.environment(), &HostProtocol::THIS)
+        launcher::read_descriptor(&self.environment(), &HostProtocol::V3)
             .ok()
             .flatten()
             .map(|descriptor| descriptor.process_start_identity)
@@ -772,7 +771,7 @@ impl Gate {
     async fn to_the_runtime_of(
         environment: &EnvironmentPaths,
     ) -> Result<(Self, PluginClient), String> {
-        let descriptor = launcher::read_descriptor(environment, &HostProtocol::THIS)
+        let descriptor = launcher::read_descriptor(environment, &HostProtocol::V3)
             .map_err(|error| error.to_string())?
             .ok_or_else(|| "this environment has no plugin host".to_owned())?;
         let host = kr_ipc::paths::Endpoint::from_path(&descriptor.endpoint)
