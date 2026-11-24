@@ -303,16 +303,18 @@ jobs:
       # hold the runner for the job's six hours and every branch's checks behind it, so the step is
       # given a little over twice those 110 minutes and no more: 225, which is 1.35 times the
       # longest of the seven. The job has no limit of its own, so it has GitHub's 360 minutes. The
-      # limits of its steps add up to 301: this step's 225, the pairing leg's 30 (a push to main, or
-      # a manual run that sets `deployment_legs`), 10 for each of the fetch of the crates of every
-      # target, the advisory check and the two stub-daemon steps, and 2 for each of the three
-      # steps that use the archive hosts or the desktop packages' archives (the host change, the
-      # restore and the save). They fit since the release
-      # gate, whose 150 minutes were the step that the job's end cut, stands in the job of its own
-      # below, `shipped-hold`. What the steps took in those seven runs: the steps before this one 12
-      # to 21 minutes, and 42 once, 26 of them for the desktop packages' install; the steps after
-      # it, the two stub-daemon steps apart, 17 to 25 minutes; those two steps 4.4 minutes together
-      # in the one run that had them.
+      # explicit limits of its steps add up to 305: this step's 225, the pairing leg's 30 (a push to
+      # main, or a manual run that sets `deployment_legs`), 10 for each of the fetch of the crates of
+      # every target, the advisory check and the two stub-daemon steps, and 2 for each of the five
+      # steps that use the archive hosts or the Actions cache (the host change, and the restore and
+      # the save of the desktop packages' archives and of the cross compiler's). The steps that
+      # install packages have deadlines instead, 70 minutes in all, and some steps have neither, so
+      # the limits do not bound the job: with the deadlines they come to 375, past the 360. The
+      # release gate, whose 150 minutes were the step that the job's end cut, stands in the job of
+      # its own below, `shipped-hold`, which is what gave the job its margin. What the steps took in
+      # those seven runs: the steps before this one 12 to 21 minutes, and 42 once, 26 of them for
+      # the desktop packages' install; the steps after it, the two stub-daemon steps apart, 17 to 25
+      # minutes; those two steps 4.4 minutes together in the one run that had them.
       - name: Test
         timeout-minutes: 225
         env:
