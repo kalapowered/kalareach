@@ -470,9 +470,18 @@ enum Attempt {
 }
 
 /// Connects to the socket at `path`, or to the abstract socket of that name, without waiting.
-#[cfg(unix)]
 fn attempt(path: &Path, abstract_name: bool) -> Attempt {
-    use rustix::io::Errno;
+    match connect_without_waiting(path, abstract_name) {
+        Ok(()) => Attempt::Connected,
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Attempt::Busy,
+        Err(_) => Attempt::Refused,
+    }
+}
+
+/// The connection itself. It ends as `WouldBlock` only when the socket's queue of connections is
+/// full.
+#[cfg(unix)]
+fn connect_without_waiting(path: &Path, abstract_name: bool) -> std::io::Result<()> {
     use rustix::net::{AddressFamily, SocketAddrUnix, SocketType};
 
     let address = if abstract_name {
@@ -481,21 +490,18 @@ fn attempt(path: &Path, abstract_name: bool) -> Attempt {
         SocketAddrUnix::new(path)
     };
     let Ok(address) = address else {
-        return Attempt::Refused;
+        return Err(std::io::ErrorKind::InvalidInput.into());
     };
     let Ok(socket) = nonblocking_socket(AddressFamily::UNIX, SocketType::STREAM) else {
-        return Attempt::Refused;
+        return Err(std::io::ErrorKind::Other.into());
     };
-    match rustix::net::connect(&socket, &address) {
-        Ok(()) => Attempt::Connected,
-        Err(Errno::AGAIN) => Attempt::Busy,
-        Err(_) => Attempt::Refused,
-    }
+    rustix::net::connect(&socket, &address).map_err(std::io::Error::from)
 }
 
+/// A host that has no Unix sockets has no X server to connect to, so no connection is made.
 #[cfg(not(unix))]
-fn attempt(_path: &Path, _abstract_name: bool) -> Attempt {
-    Attempt::Refused
+fn connect_without_waiting(_path: &Path, _abstract_name: bool) -> std::io::Result<()> {
+    Err(std::io::ErrorKind::Unsupported.into())
 }
 
 /// A socket that does not wait: not for a connection, and not for anything else.
