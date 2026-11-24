@@ -780,22 +780,24 @@ jobs:
   # plugin host and a published plugin can each be a build of another release than the one under
   # test, and what each reads of the other is held by the cases this job runs together: the surfaces
   # and frames of the releases a build retains, a client against a daemon or a worker of another
-  # release, a plugin host of the release before, a plugin whose SDK range does not take this host,
-  # and the upgrade suite, which builds the release before from its commit and runs a session of it
-  # beside this build. The workspace's test step runs most of the first cases too, and cannot run the
-  # upgrade suite, which builds only with its feature. The job is a job of its own because the rust
-  # job's steps already add up to more than its limit, and it has no `needs` so that it runs beside
-  # that job. The service side of the contract is the web repository's. The macOS upgrade suite is
+  # release, the frames, the registration and the hello that a forwarder and a worker of the release
+  # before recorded, a plugin host of the release before, a plugin whose SDK range does not take this
+  # host, the released plugin packages the repository keeps, and the upgrade suite, which builds the
+  # release before from its commit and runs a session of it beside this build. The workspace's test
+  # step runs most of the first cases too, and cannot run the upgrade suite, which builds only with
+  # its feature. The job is a job of its own because the rust job's steps already add up to more than
+  # its limit, and it has no `needs` so that it runs beside that job. The service side of the
+  # contract is the web repository's. The macOS upgrade suite is
   # not in this workflow: hosted macOS runners are the gate's scarcest, so no contract job takes one.
   # No job runs an installed app of the release before: the app side of these cases is the frames
   # and vectors that release recorded, and the paired-device harness.
   #
-  # The limits are estimates and not measurements of a hosted run. On the box, which has 64 threads
-  # and whose build was warm, the retained surface's cases took 7 minutes and the upgrade suite's 51
-  # cases 11; a hosted runner has 4 processors and builds everything from nothing: this tree, the
-  # release before in a tree of its own, and a third tree once a later release is tagged. The fast
-  # step has 90 minutes and the upgrade suite 190, which the first hosted run replaces with measured
-  # limits.
+  # The limits are estimates and not measurements of a hosted run. On the box, whose build was warm
+  # and which gave each run 4 to 12 build jobs, the retained surface's cases took 7 minutes and the
+  # upgrade suite's 51 cases up to 11; a hosted runner has 4 processors and builds everything from
+  # nothing: this tree, the release before in a tree of its own, and a third tree once a release of
+  # this build's own level is tagged. The fast step has 90 minutes and the upgrade suite 190, which
+  # the first hosted run replaces with measured limits.
   contract-tests:
     name: contract tests for installed apps, live workers and plugins
     runs-on: ubuntu-24.04

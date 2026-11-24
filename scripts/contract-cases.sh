@@ -66,14 +66,15 @@ expect() {
   rm -f "$log"
 }
 
-# The cases that need this tree alone.
+# The cases that need this tree alone. Each boundary names the cases that hold it. The other cases of
+# the same kind, such as the lifecycle cases that start a worker of another build and the plugin
+# runtime's refusal of an earlier protocol, run in the `rust` job's test of the whole workspace.
 fast() {
   # An installed app and the host: what each retained release's surface and frames say, the support
   # window of the public majors, the version a client and a daemon settle on, the matrix check a
   # release makes, and a host too old for a method.
   expect --at-least 20 cargo test --locked -p kr-protocol --test retained
   expect --at-least 10 cargo test --locked -p kr-protocol --test public_majors
-  expect --at-least 39 cargo test --locked -p kr-protocol --test contracts
   expect --at-least 127 cargo test --locked -p kr-cli --test retained_surface
   expect --at-least 6 cargo test --locked -p kr-client --test release_check
   expect cargo test --locked -p kr-client --test network_chunks -- --exact \
@@ -90,6 +91,7 @@ fast() {
     a_worker_of_an_earlier_build_is_named_and_not_reported_absent
   expect cargo test --locked -p kr-cli --test startup -- --exact \
     a_daemon_that_answers_the_hello_with_another_major_is_refused_with_exit_3_and_no_stop_asked
+  expect --at-least 39 cargo test --locked -p kr-protocol --test contracts
 
   # A client and a worker of an earlier build: the client names the worker and stops rather than wait
   # on its screens, and a refusal names it beside a worker that cannot be reached.
