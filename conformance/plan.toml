@@ -168,6 +168,8 @@ command = [
     'kr-stub-inference',
     '--bin',
     'kr-hook',
+    '--bin',
+    'kr-manager-stand-in',
 ]
 
 [[step]]
