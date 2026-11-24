@@ -5454,6 +5454,87 @@ async fn a_removal_whose_answer_is_lost_stays_unconfirmed_until_a_step_ends_it()
     }
 }
 
+/// KR-REQ-20.15: a first write whose answer was lost is ended by a step with no press of the person
+/// and no restart: the turn-on wants the step, as a cover does, and the card reaches `on` by itself.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_lost_turn_on_becomes_on_with_no_restart_and_no_press() {
+    let computer = Computer::new().await;
+    let (page, _settings) = computer.running_page(NO_WAIT).await;
+    computer.served.web().fail(SYNC_PATH, 1, Moment::After);
+    let lost = page
+        .call("recovery_turn_on", json!({}))
+        .expect_err("the answer to the first write was lost");
+    assert_eq!(lost["code"], "OUTCOME_UNKNOWN");
+    assert!(
+        until(Duration::from_secs(10), || async {
+            page.view()["state"] == "on"
+        })
+        .await,
+        "a step ended the write by itself: {}",
+        page.view()
+    );
+    assert_eq!(
+        writes_sent(&computer),
+        1,
+        "the first write was not made again"
+    );
+}
+
+/// KR-REQ-20.15, KR-REQ-20.17: a removal whose answer was lost is ended by a step with no press of
+/// the person: the removal wants the step, as a cover does, and the card reaches `on` with the
+/// member gone, which the service had applied.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_lost_removal_is_ended_by_a_step_with_no_press_of_the_person() {
+    let computer = Computer::new().await;
+    let (page, settings) = computer.running_page(NO_WAIT).await;
+    settings
+        .set_colour_mode(ColourMode::Dark)
+        .await
+        .expect("kept");
+    page.call("recovery_turn_on", json!({})).expect("on");
+    assert!(
+        until(Duration::from_secs(10), || async {
+            line_of(&page) == json!({ "state": "saved" })
+        })
+        .await,
+        "the settings are saved: {}",
+        line_of(&page)
+    );
+    let deletions = page.deletions();
+    let says = Says::yes();
+    let token = deletions
+        .ask(None, &settings, &says, "settings-saved")
+        .await
+        .expect("asked")
+        .token
+        .expect("yes");
+    // The removal reads the bundle and then writes it.
+    computer
+        .served
+        .web()
+        .fail_with_member(SYNC_PATH, "exchange", 1, Moment::After);
+    let finished = deletions
+        .finish(None, &settings, &token)
+        .await
+        .expect("finished");
+    assert!(!finished.deleted, "the service did not confirm it");
+    assert!(
+        until(Duration::from_secs(10), || async {
+            page.view()["state"] == "on"
+        })
+        .await,
+        "a step ended the write by itself: {}",
+        page.view()
+    );
+    assert!(
+        until(Duration::from_secs(10), || async {
+            colour_in(&bundle_of(&computer, &page).await).is_none()
+        })
+        .await,
+        "the member the service removed stays removed"
+    );
+}
+
 /// KR-REQ-20.17: nothing is asked of the person about settings the bundle does not hold.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn nothing_is_asked_about_settings_the_bundle_does_not_hold() {

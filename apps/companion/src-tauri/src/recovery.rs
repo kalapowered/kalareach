@@ -620,7 +620,14 @@ impl Recovery {
                     store.fetch(&seed).await.map_err(said)?;
                     false
                 }
-                Err(error) => return Err(said(error)),
+                Err(error) => {
+                    // A write still outstanding is a step's to end, as a cover's is: the person
+                    // settles only what the service cannot be asked about.
+                    if matches!(store.lost_write(), Some(LostWrite::Unsettled { .. })) {
+                        self.saving.want_now();
+                    }
+                    return Err(said(error));
+                }
             }
         };
         record.kept = true;

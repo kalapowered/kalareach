@@ -400,7 +400,7 @@ impl Recovery {
     /// The stop is kept before anything is sent, so a step that had already begun finds it under
     /// the lock and writes nothing back. The member alone leaves: the bundle, its keys and every
     /// other entry stay. A removal whose answer never came back is [`SettingsRemoved::Unconfirmed`]
-    /// and is not reported as done; the next step ends the write.
+    /// and is not reported as done; a step is wanted at once and ends the write.
     ///
     /// # Errors
     ///
@@ -419,7 +419,12 @@ impl Recovery {
         let mut store = self.store(&record, account)?;
         match store.remove_settings(&seed, now()).await {
             Ok(_) => Ok(SettingsRemoved::Removed),
-            Err(RecoveryError::BundleOutcomeUnknown { .. }) => Ok(SettingsRemoved::Unconfirmed),
+            // The write may have landed: a step is wanted at once to end it, as one is after a
+            // cover.
+            Err(RecoveryError::BundleOutcomeUnknown { .. }) => {
+                self.saving.want_now();
+                Ok(SettingsRemoved::Unconfirmed)
+            }
             Err(other) => Err(said(other)),
         }
     }
