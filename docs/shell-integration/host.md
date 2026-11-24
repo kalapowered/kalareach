@@ -266,6 +266,7 @@ the record's own shape is stated; these are the parts a session depends on.
 | `shell.patches` | Every published reader patch, with the upstream revision each applies to |
 | `shell.modules` | The module tree, with each module's search path and ABI |
 | `startup_entry.file` | The file the guarded startup entry sources |
+| `flags` | The arguments the shell is started with: an `interactive` list and a `login` list |
 | `launch` | What a start adds to the shell's environment (see below) |
 
 The Zsh, Bash and Fish packages rebuild their shell with a reader patch, so each record names its
@@ -309,11 +310,16 @@ A hello is checked against the package's editor ABI and integration version, and
 identity it carries (the executable, the upstream revision, the patches and the module tree) is
 recorded whole with the session, which is what its diagnostics report.
 
-The arguments that make one of these an interactive login shell are the host's rather than the
-package's: a record says what a package was built from, not how a session starts it, and the
-arguments belong to the shell family. A package whose recorded executable is no longer where the
-build put it is still read from its own directory, so a package that was copied somewhere else is
-the package that is there.
+The arguments a session starts a package's shell with are the package's own. The record's `flags`
+holds one list for the interactive startup and one for the login startup, which the build copies
+from the package's pinned manifest, and the worker passes on exactly the list for the session's
+mode, in its order. The session decides the mode: login on macOS and interactive elsewhere, unless
+its profile says otherwise. A record with no `flags` is refused for that shell alone, and the
+refusal names the step that writes a new one: `Publish-KalaReachQualification` for the PowerShell
+package, a new build for the others. A hello does not carry the flags, because they say how a host
+starts the shell and not what the shell is, so nothing compares them with the shell that started.
+A package whose recorded executable is no longer where the build put it is still read from its own
+directory, so a package that was copied somewhere else is the package that is there.
 
 ## Setup
 
