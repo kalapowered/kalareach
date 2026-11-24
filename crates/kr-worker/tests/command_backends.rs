@@ -1682,8 +1682,8 @@ const HELD_FOR: std::time::Duration = std::time::Duration::from_secs(1);
 /// The launcher fixture connects to the backend's launch record address, presents itself with an
 /// environment, is admitted, creates a program held and names it in `going`, and reads the backend's
 /// commit under its own clock, counted from before `going` was written. The program has not run
-/// when the commit is read, runs once the fixture starts it, and ends with the launcher that created
-/// it.
+/// when the commit is read, runs once the fixture starts it, and the launcher, which waits for it,
+/// ends when it does.
 #[cfg(windows)]
 #[tokio::test]
 async fn the_fixture_reads_a_commit_on_the_launchers_clock() {
@@ -1703,11 +1703,11 @@ async fn the_fixture_reads_a_commit_on_the_launchers_clock() {
     launch
         .environment
         .push(("KR_FIXTURE_PRESENTED".to_owned(), "yes".to_owned()));
-    // When it runs, the program leaves a file in its directory and then goes on for a minute.
+    // When it runs, the program leaves a file in its directory and then goes on for a second.
     launch.program_arguments = Some(vec![
         "/d".to_owned(),
         "/c".to_owned(),
-        format!("copy NUL {RAN} & ping -n 60 127.0.0.1 > NUL"),
+        format!("copy NUL {RAN} & ping -n 2 127.0.0.1 > NUL"),
     ]);
     let mark = setup.directory.join(RAN);
 
@@ -1757,16 +1757,25 @@ async fn the_fixture_reads_a_commit_on_the_launchers_clock() {
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
 
-    // And it ends with the launcher that made it.
-    launcher.end().await;
+    // The launcher waits for the program it started, and ends when the program does.
+    assert!(
+        !launcher.has_ended(),
+        "the launcher waits for the program it started"
+    );
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-    while kr_ipc::identity::process_state(&identity) != kr_ipc::identity::ProcessState::Ended {
+    while !launcher.has_ended() {
         assert!(
             std::time::Instant::now() < deadline,
-            "the program ended with the launcher that created it"
+            "the launcher ended when the program it waited for did"
         );
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
+    assert_eq!(
+        kr_ipc::identity::process_state(&identity),
+        kr_ipc::identity::ProcessState::Ended,
+        "the program the launcher waited for has ended"
+    );
+    launcher.end().await;
 }
 
 /// A launcher that stops after it created its program and before the backend has shown the program

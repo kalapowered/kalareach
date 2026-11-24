@@ -10,7 +10,16 @@
 //! session's root shell started it after the backend was established, and it shows a program only
 //! when the launcher started that. A case plays the root shell and starts the launcher as its child
 //! through [`Launcher::start`]; the launcher is this test program started again, which plays the
-//! role [`play_when_asked`] gives it and reports what it saw. A test file that uses this declares
+//! role [`play_when_asked`] gives it and reports what it saw.
+//!
+//! The program is created in a job of the launcher's own. The Windows launcher lets that job go
+//! before it starts the program and then waits for the program, so that the launcher's end never
+//! ends a program that runs. This launcher waits for the program in the same way and ends when
+//! the program does, but it keeps its job: a launcher that a case kills ends its program, started
+//! or not, and the case leaves nothing running. No case may take that for what the Windows
+//! launcher does.
+//!
+//! A test file that uses this declares
 //! the one case that gives the program its role, named [`ROLE_CASE`]:
 //!
 //! ```ignore
@@ -308,6 +317,11 @@ impl Launcher {
         while self.hear().await != "resumed" {}
     }
 
+    /// Whether the launcher has ended, as it does when the program it started ends.
+    pub fn has_ended(&mut self) -> bool {
+        matches!(self.process.try_wait(), Ok(Some(_)))
+    }
+
     /// Ends the launcher at once, as if it had died: the job it holds ends the program it created.
     pub fn kill(&mut self) {
         drop(self.input.take());
@@ -540,7 +554,9 @@ async fn play(plan: &serde_json::Value) {
             .expect("resumed is written");
         let _ = writer.flush().await;
         report(serde_json::json!({"event": "resumed"}));
-        while asked.recv().await.is_some() {}
+        // As the Windows launcher does, wait for the program that was started and end with it.
+        let _ = program.wait();
+        return;
     }
     // The job ends the program with this process.
     drop(job);
