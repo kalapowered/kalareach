@@ -2344,6 +2344,48 @@ mod tests {
         );
     }
 
+    /// The record of a read of a file the person nominated names no file: a nominated file is not a
+    /// program the platform installs, so the record's `binary` is null, and no part of the path is
+    /// anywhere in the record, whatever the read came to.
+    #[test]
+    fn the_record_of_a_nominated_file_read_holds_no_part_of_the_path() {
+        let path = "/mnt/kr_private_volume/kr_private_folder/kr_private_file.txt";
+        let plan = Plan {
+            authorised_file: Some(PathBuf::from(path)),
+            ..Plan::in_directory("/nonexistent/scratch")
+        };
+        let reads: [fn() -> std::io::Result<FirstBlock>; 4] = [
+            || Ok(FirstBlock::Read(5)),
+            || Ok(FirstBlock::NotRegular),
+            || Err(std::io::ErrorKind::PermissionDenied.into()),
+            || Err(std::io::ErrorKind::NotFound.into()),
+        ];
+        for read in reads {
+            let ran = read_authorised_file_with(&plan, move |_| read(), |_| None);
+            let made = record(
+                &ran,
+                &subject(),
+                desktop().worker_profile,
+                revision(),
+                kr_ipc::now_ms(),
+            )
+            .expect("a record of the read");
+            assert!(
+                !made.identity.binary.is_present(),
+                "the record names the file: {made:?}"
+            );
+            let json = serde_json::to_string(&made).expect("the record serialises");
+            for part in [
+                path,
+                "kr_private_volume",
+                "kr_private_folder",
+                "kr_private_file",
+            ] {
+                assert!(!json.contains(part), "{part} is in the record: {json}");
+            }
+        }
+    }
+
     /// A folder is not a file this check reads, whatever the platform says of opening it: Windows
     /// refuses the open of a folder as it refuses a file the account may not read, and a person
     /// told that the permissions on the file refuse this account has been told something false.
