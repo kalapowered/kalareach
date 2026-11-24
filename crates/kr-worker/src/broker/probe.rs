@@ -8,9 +8,10 @@
 //! deadline, a cap on what it may print, and a job of its own (a process group on Unix) that ends
 //! with it, within the limits below.
 //!
-//! On Unix the group holds what the probe started and leaves a descendant that makes a group or a
-//! session of its own, which the kill does not reach. A probe that the kernel does not release
-//! within [`CLEANUP_BOUND`] is collected later by its thread.
+//! On Unix the group holds what the probe started. A descendant that makes a group or a session of
+//! its own, or joins another group, is not in it, and the kill does not reach that descendant. The
+//! probe itself is ended by its own number as well. A probe that the kernel does not release within
+//! [`CLEANUP_BOUND`] is collected later by its thread.
 //!
 //! One absolute deadline covers the whole operation, from the caller's first instant: creating the
 //! process, reading its output, ending it and collecting it. The operation runs on one thread of its
@@ -93,10 +94,10 @@ pub struct Probed {
     pub mode: Option<String>,
     /// Why no mode was read, where none was.
     pub unread: Option<String>,
-    /// Whether the probe's output had not ended when its deadline passed: the application did not
-    /// finish, as against one that finished with something no mode can be read from. It holds
-    /// also for an application that printed a mode and then went on running, whose output the host
-    /// does not use.
+    /// Whether the probe's output had not ended when its deadline passed, or ended only after the
+    /// caller gave up: the application did not finish in time, as against one that finished with
+    /// something no mode can be read from. It holds also for an application that printed a mode
+    /// and then went on running, whose output the host does not use.
     pub late: bool,
     /// From the run's first instant to the return of the call, a wait for a thread included.
     pub took: Duration,
@@ -556,8 +557,8 @@ impl Process {
         self.output.read(buffer)
     }
 
-    /// Ends the probe's group and waits for the probe until `until`, and says whether the probe
-    /// was collected.
+    /// Ends the probe's group and the probe by its own number, waits for the probe until `until`,
+    /// and says whether the probe was collected.
     fn end(&mut self, until: Instant) -> bool {
         if let Some(group) = i32::try_from(self.child.id())
             .ok()

@@ -3,10 +3,10 @@
 //! A package can declare how to read the mode its application will run in: the application's own
 //! diagnostic, run before a launch with the options of the launch that decide which configuration
 //! it reads. The probe is a program the package chose, run on this host, so what it may cost is
-//! bounded: no input, no shell, a deadline, a cap on what it prints, and a job (a process group)
-//! that ends with it, so nothing it started outlives the answer. The stand-in for the application
-//! is a real program the platform has: `sh` on Unix and Windows PowerShell on Windows, each given
-//! the script a test needs.
+//! bounded: no input, no shell, a deadline, a cap on what it prints, and a job (a process group on
+//! Unix) that ends with it, within the limits that the probe module's documentation states. The
+//! stand-in for the application is a real program the platform has: `sh` on Unix and Windows
+//! PowerShell on Windows, each given the script a test needs.
 //!
 //! | Row | What is checked here |
 //! | --- | --- |
@@ -624,8 +624,9 @@ fn kr_req_07_64_the_total_time_is_bounded_by_the_deadline_plus_the_cleanup_bound
     );
     let run = ProbeRun::within(Duration::from_millis(200));
     std::thread::sleep(Duration::from_millis(400));
-    // Any thread that started is held back before its create, so it cannot end before the check: only
-    // the count of started threads can show it.
+    // The count of started threads shows a thread that started, whatever it does afterwards. The delay
+    // before the create only keeps such a thread from ending before the check; the check does not rest
+    // on it.
     probe::seams::delay_at(
         probe::seams::Point::Create,
         queued.path(),
