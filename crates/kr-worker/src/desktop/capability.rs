@@ -266,14 +266,20 @@ pub fn answer(capability: &str, desktop: &DesktopContext) -> Answer {
 }
 
 /// Whether the execution context itself refuses a capability: a container, a context without a
-/// graphical login session's access, a locked desktop and an ended one.
+/// graphical login session's access, a locked desktop, an ended one and one in the background.
 ///
 /// The disclosed checks are performed only where this is false, and an answer they produced is
 /// shown only where it is false, so a screen that has locked since is never reported as one that
 /// can be captured.
+///
+/// A session that a user switch has moved off the screen is there and its processes run, but the
+/// desktop it belongs to is not the one displayed, so a check that acts on it would take an image
+/// of a screen nobody sees. The platform's own answer for such a session is not changed here.
 #[must_use]
 pub fn context_refuses(capability: &str, desktop: &DesktopContext) -> bool {
     context_refusal(capability, desktop).is_some()
+        || (desktop.availability == DesktopAvailability::Background
+            && capability != capabilities::DISPLAY_SERVER)
 }
 
 /// Returns the refusal the execution context itself produces, where there is one.

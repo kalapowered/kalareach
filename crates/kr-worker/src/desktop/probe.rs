@@ -46,7 +46,7 @@ use std::time::Duration;
 
 use kr_protocol::desktop::{
     CapabilityEvidenceSource, CapabilityIdentity, CapabilityInvalidation, CapabilityRecord,
-    CapabilityState, CapabilitySubject, DesktopContext, capabilities,
+    CapabilityState, CapabilitySubject, DesktopContext, DisplayServer, capabilities,
 };
 use kr_protocol::hostinfo::export::{ContentClass, Sentence};
 use kr_protocol::identity::WorkerProfile;
@@ -474,27 +474,77 @@ pub fn record(
     })
 }
 
-/// Returns the checks a context can perform, in capability-name order.
+/// The operating system a worker runs on, as far as the choice of checks is concerned.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HostOs {
+    /// macOS.
+    Macos,
+    /// Linux.
+    Linux,
+    /// Windows.
+    Windows,
+    /// Any other system, which has no desktop context to check.
+    Other,
+}
+
+impl HostOs {
+    /// The operating system this build runs on.
+    #[must_use]
+    pub const fn this() -> Self {
+        if cfg!(target_os = "macos") {
+            Self::Macos
+        } else if cfg!(target_os = "linux") {
+            Self::Linux
+        } else if cfg!(windows) {
+            Self::Windows
+        } else {
+            Self::Other
+        }
+    }
+}
+
+/// Returns the checks a context can perform on this machine, in capability-name order.
+#[must_use]
+pub fn performable(desktop: &DesktopContext) -> Vec<Check> {
+    performable_on(HostOs::this(), desktop)
+}
+
+/// Returns the checks a context is asked for on an operating system, in capability-name order.
 ///
 /// The file read is the same operation everywhere and is asked of every context. The checks that
-/// act on a desktop are asked only on a platform whose operations this build performs, and only
-/// where the context does not refuse the capability: a container, a context without a graphical
-/// login session's access, a locked desktop and an ended one are answers the platform already gave,
+/// act on a desktop are asked only where the operating system and the display server the context
+/// names belong together: Quartz on macOS, X11 or Wayland on Linux, the interactive desktop on
+/// Windows. A context whose display server is unknown or absent, or does not belong to the
+/// operating system, is asked for the file read alone, because a check cannot be pointed at a
+/// desktop that was never named. They are asked only where the context does not refuse the
+/// capability either: a container, a context without a graphical login session's access, a locked
+/// desktop, an ended one and one that is in the background are answers the platform already gave,
 /// and a check that took an image there would test the wrong screen or none. Synthetic input is
 /// never asked; its record is the platform's.
 #[must_use]
-pub fn performable(desktop: &DesktopContext) -> Vec<Check> {
+pub fn performable_on(os: HostOs, desktop: &DesktopContext) -> Vec<Check> {
     Check::all()
         .into_iter()
         .filter(|check| match check {
             Check::SyntheticInput => false,
             Check::AuthorisedFileRead => true,
             _ => {
-                cfg!(target_os = "macos")
+                has_a_desktop_of(os, desktop.display_server)
                     && !super::capability::context_refuses(check.capability(), desktop)
             }
         })
         .collect()
+}
+
+/// Whether the display server belongs to the operating system, so that the checks that act on a
+/// desktop have one to act on.
+const fn has_a_desktop_of(os: HostOs, display_server: DisplayServer) -> bool {
+    matches!(
+        (os, display_server),
+        (HostOs::Macos, DisplayServer::Quartz)
+            | (HostOs::Linux, DisplayServer::X11 | DisplayServer::Wayland)
+            | (HostOs::Windows, DisplayServer::WindowsDesktop)
+    )
 }
 
 /// Runs the checks given and returns one record each, in the order given.
@@ -1419,20 +1469,29 @@ mod platform {
     //! the accessibility tree is a bus rather than an automation facility. Saying so is the honest
     //! answer; performing the wrong operation and reporting its result would not be.
 
-    use super::{Check, Outcome, Plan, Ran, Sentence};
+    use super::{Check, Plan, Ran, not_performed_on_this_platform};
 
     pub(super) fn perform(check: Check, _plan: &Plan) -> Ran {
-        Ran {
-            check,
-            facility: None,
-            outcome: Outcome::NotAttempted {
-                detail: Sentence::new().stated(
-                    "this build performs the disclosed checks on macOS; on this platform the \
-                     capability records carry what the platform itself answers and nothing here \
-                     has performed the operation",
-                ),
-            },
-        }
+        not_performed_on_this_platform(check)
+    }
+}
+
+/// What a check that acts on a desktop comes to where this build has no operation for the desktop.
+///
+/// The check was asked, so its record replaces the platform's, and it establishes nothing: the
+/// operation was not performed, and an answer the platform gave without performing it is not a
+/// success this check can claim.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+fn not_performed_on_this_platform(check: Check) -> Ran {
+    Ran {
+        check,
+        facility: None,
+        outcome: Outcome::NotAttempted {
+            detail: Sentence::new().stated(
+                "this build does not perform this check on this platform, so the operation was \
+                 not performed",
+            ),
+        },
     }
 }
 
@@ -2025,6 +2084,188 @@ mod tests {
         let mut container = desktop();
         container.container = ContainerEnvironment::Container;
         assert_eq!(performable(&container), vec![Check::AuthorisedFileRead]);
+    }
+
+    /// The context of an operating system and a display server, otherwise a desktop that nothing
+    /// refuses.
+    fn desktop_of(display_server: DisplayServer) -> DesktopContext {
+        let mut context = desktop();
+        context.display_server = display_server;
+        context.kind = match display_server {
+            DisplayServer::Quartz => DesktopSessionKind::MacosSecuritySession,
+            DisplayServer::X11 | DisplayServer::Wayland => DesktopSessionKind::LinuxLogind,
+            DisplayServer::WindowsDesktop => DesktopSessionKind::WindowsInteractive,
+            DisplayServer::Unknown | DisplayServer::None => context.kind,
+        };
+        context
+    }
+
+    /// The three checks that act on a desktop, with the file read, in capability-name order.
+    const ALL_FOUR: [Check; 4] = [
+        Check::AccessibleElement,
+        Check::ApplicationLaunch,
+        Check::AuthorisedFileRead,
+        Check::ScreenImage,
+    ];
+
+    /// KR-REQ-03.29: which checks a context is asked follows its operating system and the display
+    /// server it names. A desktop the build has an operation for gets the checks that act on it; a
+    /// display server that is unknown or absent, or that does not belong to the operating system,
+    /// gets the file read alone.
+    #[test]
+    fn kr_req_03_29_the_checks_asked_of_a_context_follow_its_platform_and_display_server() {
+        let file_read = vec![Check::AuthorisedFileRead];
+        for (os, display_server, wanted) in [
+            (HostOs::Macos, DisplayServer::Quartz, ALL_FOUR.to_vec()),
+            (HostOs::Linux, DisplayServer::X11, ALL_FOUR.to_vec()),
+            (HostOs::Linux, DisplayServer::Wayland, ALL_FOUR.to_vec()),
+            (
+                HostOs::Windows,
+                DisplayServer::WindowsDesktop,
+                ALL_FOUR.to_vec(),
+            ),
+            // A graphical session whose display server this host could not name, and a headless
+            // one, have no desktop to point a check at.
+            (HostOs::Linux, DisplayServer::Unknown, file_read.clone()),
+            (HostOs::Linux, DisplayServer::None, file_read.clone()),
+            (HostOs::Macos, DisplayServer::Unknown, file_read.clone()),
+            (HostOs::Windows, DisplayServer::Unknown, file_read.clone()),
+            (HostOs::Windows, DisplayServer::None, file_read.clone()),
+            // A display server of another operating system is not this one's desktop.
+            (HostOs::Linux, DisplayServer::Quartz, file_read.clone()),
+            (
+                HostOs::Linux,
+                DisplayServer::WindowsDesktop,
+                file_read.clone(),
+            ),
+            (HostOs::Macos, DisplayServer::X11, file_read.clone()),
+            (HostOs::Macos, DisplayServer::Wayland, file_read.clone()),
+            (HostOs::Windows, DisplayServer::Wayland, file_read.clone()),
+            (HostOs::Windows, DisplayServer::X11, file_read.clone()),
+            // A system the build knows no desktop of.
+            (HostOs::Other, DisplayServer::X11, file_read.clone()),
+            (HostOs::Other, DisplayServer::Quartz, file_read.clone()),
+        ] {
+            assert_eq!(
+                performable_on(os, &desktop_of(display_server)),
+                wanted,
+                "{os:?} with {display_server:?}"
+            );
+        }
+    }
+
+    /// KR-REQ-03.29: a context the platform already refuses is asked for the file read alone on
+    /// every operating system, and a platform that does not read whether the desktop is attended
+    /// is still asked.
+    #[test]
+    fn kr_req_03_29_a_context_the_platform_refuses_is_asked_for_the_file_read_alone() {
+        let file_read = vec![Check::AuthorisedFileRead];
+        for (os, display_server) in [
+            (HostOs::Macos, DisplayServer::Quartz),
+            (HostOs::Linux, DisplayServer::X11),
+            (HostOs::Linux, DisplayServer::Wayland),
+            (HostOs::Windows, DisplayServer::WindowsDesktop),
+        ] {
+            let mut headless = desktop_of(display_server);
+            headless.graphic_access = false;
+            let mut locked = desktop_of(display_server);
+            locked.availability = DesktopAvailability::Locked;
+            let mut ended = desktop_of(display_server);
+            ended.availability = DesktopAvailability::Ended;
+            let mut container = desktop_of(display_server);
+            container.container = ContainerEnvironment::Container;
+            let mut wsl = desktop_of(display_server);
+            wsl.container = ContainerEnvironment::Wsl;
+            for (name, context) in [
+                ("headless", headless),
+                ("locked", locked),
+                ("ended", ended),
+                ("container", container),
+                ("wsl", wsl),
+            ] {
+                assert_eq!(
+                    performable_on(os, &context),
+                    file_read,
+                    "{os:?} with {display_server:?}, {name}"
+                );
+            }
+            // Windows reads no attended state at all, and that is not a refusal.
+            let mut unread = desktop_of(display_server);
+            unread.availability = DesktopAvailability::Unknown;
+            assert_eq!(performable_on(os, &unread), ALL_FOUR.to_vec());
+        }
+    }
+
+    /// KR-REQ-03.29: a session that is present and not displayed, as after a user switch, is not
+    /// given the checks that act on the desktop: they would take an image of a screen nobody sees.
+    #[test]
+    fn kr_req_03_29_a_session_in_the_background_is_not_given_the_desktop_checks() {
+        for (os, display_server) in [
+            (HostOs::Macos, DisplayServer::Quartz),
+            (HostOs::Linux, DisplayServer::X11),
+            (HostOs::Linux, DisplayServer::Wayland),
+            (HostOs::Windows, DisplayServer::WindowsDesktop),
+        ] {
+            let mut context = desktop_of(display_server);
+            context.availability = DesktopAvailability::Background;
+            assert_eq!(
+                performable_on(os, &context),
+                vec![Check::AuthorisedFileRead],
+                "{os:?} with {display_server:?}"
+            );
+        }
+    }
+
+    /// KR-REQ-03.29: a check that acts on a desktop and is asked where this build has no operation
+    /// for that desktop establishes nothing: it is never a success, and the record says the
+    /// operation was not performed.
+    #[test]
+    fn kr_req_03_29_a_check_asked_where_this_build_has_no_operation_establishes_nothing() {
+        for check in [
+            Check::AccessibleElement,
+            Check::ApplicationLaunch,
+            Check::ScreenImage,
+        ] {
+            let ran = not_performed_on_this_platform(check);
+            let record = record(
+                &ran,
+                &subject(),
+                WorkerProfile::DesktopBound,
+                revision(),
+                kr_protocol::scalars::TimestampMs::new(1),
+            )
+            .expect("a record");
+            assert_eq!(record.capability.as_str(), check.capability());
+            assert_eq!(record.state, CapabilityState::TemporarilyUnavailable);
+            assert_eq!(
+                record.evidence_source,
+                CapabilityEvidenceSource::DisclosedProbe
+            );
+            assert_eq!(
+                record.disabled_reason.0.expect("a reason").as_str(),
+                "this check established nothing: this build does not perform this check on this \
+                 platform, so the operation was not performed",
+                "{check:?}"
+            );
+        }
+    }
+
+    /// KR-REQ-03.29: on an operating system whose operations this build lacks, the machine's own
+    /// facilities answer each of the checks that act on a desktop with nothing established.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn kr_req_03_29_the_platform_here_establishes_nothing_for_the_desktop_checks() {
+        for check in [
+            Check::AccessibleElement,
+            Check::ApplicationLaunch,
+            Check::ScreenImage,
+        ] {
+            let ran = Platform.perform(check, &Plan::in_directory("."));
+            assert!(
+                matches!(ran.outcome, Outcome::NotAttempted { .. }),
+                "{check:?}: {ran:?}"
+            );
+        }
     }
 
     #[test]

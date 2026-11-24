@@ -829,6 +829,43 @@ mod tests {
         );
     }
 
+    /// KR-REQ-03.29: findings taken while the desktop was displayed are not shown for a session that
+    /// a user switch has since moved into the background, where the platform's record stands, as it
+    /// does for a locked desktop.
+    #[test]
+    fn kr_req_03_29_a_finding_does_not_replace_the_record_of_a_session_in_the_background() {
+        let mut background = context();
+        background.availability = kr_protocol::desktop::DesktopAvailability::Background;
+        let mut records = platform();
+        let before = records.clone();
+        let findings = [
+            record(
+                capabilities::SCREEN_CAPTURE,
+                CapabilityState::QualifiedAvailable,
+                CapabilityEvidenceSource::DisclosedProbe,
+                Some(session()),
+            ),
+            record(
+                capabilities::ACCESSIBILITY,
+                CapabilityState::QualifiedAvailable,
+                CapabilityEvidenceSource::DisclosedProbe,
+                Some(session()),
+            ),
+        ];
+        merge(&mut records, &findings, &background);
+        assert_eq!(
+            records, before,
+            "the platform's records stand for a session that is not displayed"
+        );
+        // The same findings are shown once the session is displayed again.
+        merge(&mut records, &findings, &context());
+        let merged = states(&records);
+        assert!(merged.contains(&(
+            capabilities::SCREEN_CAPTURE,
+            CapabilityState::QualifiedAvailable
+        )));
+    }
+
     #[test]
     fn findings_are_held_only_as_what_a_run_can_establish() {
         let good = |name: &str| {
