@@ -142,24 +142,46 @@ describe('what each check says it does, before it is run', () => {
   })
 
   it('says each line of the screen image for its own route', () => {
-    const screenLine = (route: Parameters<typeof disclosedChecks>[0]): string =>
+    const screenCheck = (route: Parameters<typeof disclosedChecks>[0]) =>
       disclosedChecks(route).find((check) => check.capability === 'desktop.screen_capture')
-        ?.performs ?? ''
-    expect(screenLine('macos')).toBe('Takes one image of the desktop and measures it.')
-    expect(screenLine('x11')).toBe(
-      'Takes one image of the whole X screen, every monitor on it, reads it into memory to ' +
-        'measure it, and keeps nothing.'
+    expect(screenCheck('macos')?.performs).toBe('Takes one image of the desktop and measures it.')
+    expect(screenCheck('x11')?.performs).toBe(
+      'Takes one image of the whole X screen, every monitor on it, and reads it into memory to ' +
+        'measure it.'
     )
-    expect(screenLine('wayland')).toBe(
-      'On a compositor that offers its screen-copy protocol, asks it for one image of every ' +
-        'output, reads it into memory to measure it, and keeps nothing. On any other ' +
-        'compositor it takes no image.'
+    expect(screenCheck('wayland')?.performs).toBe(
+      'On a compositor this check knows to offer its screen-copy protocol, with its ' +
+        'screen-copy tool installed, asks it for one image of every output and reads it into ' +
+        'memory to measure it. In any other case it takes no image.'
     )
+  })
+
+  // The image's file is removed on a best effort, and the answer names one that was not: a line
+  // that said the check "removes it" or "keeps nothing" would be untrue exactly where it matters.
+  it('says the check tries to remove the image, and names a file it could not remove', () => {
+    const effect = (route: Parameters<typeof disclosedChecks>[0]): string | undefined =>
+      disclosedChecks(route).find((check) => check.capability === 'desktop.screen_capture')?.effect
+    expect(effect('macos')).toBe(
+      "Writes the image into the check's own directory and removes it before answering."
+    )
+    for (const route of ['x11', 'wayland'] as const) {
+      expect(effect(route), route).toBe(
+        "Writes the image into the check's own directory and tries to remove it before " +
+          'answering. If it cannot remove it, the answer names the file.'
+      )
+    }
+    for (const route of ['x11', 'wayland'] as const) {
+      const lines = disclosedChecks(route).flatMap((check) => [check.performs, check.effect])
+      expect(lines.join(' '), route).not.toMatch(/keeps nothing|removes it before answering/)
+    }
   })
 
   it.each([
     ['x11', /whole X screen, every monitor on it/],
-    ['wayland', /screen-copy protocol, asks it for one image of every output/]
+    [
+      'wayland',
+      /screen-copy protocol, with its screen-copy tool installed, asks it for one image of every output/
+    ]
   ] as const)('reads the %s lines before anything is asked of the host', async (desktop, line) => {
     const controls = start(desktop)
     await screen.findByTestId('setup-identity')
@@ -167,12 +189,14 @@ describe('what each check says it does, before it is run', () => {
     await goTo('permissions')
     const listed = screen.getByTestId('setup-panel-permissions').textContent
     expect(listed).toMatch(line)
+    expect(listed).toMatch(/tries to remove it before answering/)
     expect(listed).not.toMatch(/main display|accessibility tree|background instance/i)
     // And on the sheet that asks for the run, which says the same and asks for nothing by being read.
     await goTo('capabilities')
     await userEvent.click(screen.getByTestId('setup-run-checks'))
     const effects = await screen.findByTestId('setup-effects')
     expect(effects.textContent).toMatch(line)
+    expect(effects.textContent).toMatch(/tries to remove it before answering/)
     expect(effects.textContent).toMatch(/Reads that file and writes nothing/)
     expect(effects.textContent).toMatch(/only inside a test context of its own/)
     expect(effects.textContent).not.toMatch(/accessibility tree|background instance/i)
