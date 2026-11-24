@@ -153,14 +153,15 @@
       "sha256": "1a33fc12a3abb0b3eb14db70e36ef1d0af51c93b1cc1f80f022c3bd406e9b874"
     },
     {
-      "id": "llama.cpp-e79e4bf660e1-sgemm.cpp-lines-1-18",
+      "id": "llama.cpp-e79e4bf660e1-sgemm.cpp-lines-1-21",
       "licence": "MIT",
       "source": "https://raw.githubusercontent.com/ggml-org/llama.cpp/e79e4bf660e19f2ad851e06c6913f7a8c5852621/ggml/src/ggml-cpu/llamafile/sgemm.cpp",
-      "sha256": "bf9b11e2d6c85ef7a7bb8165f28281e06f07570a4ed0a681666e2963328aa56b",
+      "sha256": "7a5e15a60e6fbbf30c2e376d904dcda5e02fffe6473ecb465819393f3a547a0f",
       "excerpt": [
         1,
-        18
-      ]
+        21
+      ],
+      "file": "llama.cpp/ggml/src/ggml-cpu/llamafile/sgemm.cpp"
     },
     {
       "id": "llama.cpp-e79e4bf660e1-ops.cpp-lines-5827-5828",
@@ -171,6 +172,7 @@
         5827,
         5828
       ],
+      "file": "llama.cpp/ggml/src/ggml-cpu/ops.cpp",
       "statement": true
     }
   ],
@@ -578,7 +580,7 @@
         "name": "llama-cpp-sys-2",
         "version": "0.1.156"
       },
-      "text": "llama.cpp-e79e4bf660e1-sgemm.cpp-lines-1-18"
+      "text": "llama.cpp-e79e4bf660e1-sgemm.cpp-lines-1-21"
     },
     {
       "name": "YaRN code in ops.cpp of llama.cpp",

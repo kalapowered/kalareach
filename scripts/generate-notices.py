@@ -31,7 +31,8 @@ keeps in `docs/releases/notice-texts/`, with its source and digest, is carried b
 files. A kept text for a crate from Git names the package's source and revision. A kept text for a crate
 that ships its own, or for a crate no release build compiles, stops the run, and so does a kept text that
 is not the licence the listing says it is. The same file names the licences of the works that a crate
-bundles and builds in (libsodium, llama.cpp and ggml, PCRE2). fish's `COPYING`, its `doc_src/license.rst`
+bundles and builds in (libsodium, llama.cpp and ggml, PCRE2). An excerpt of a source file names `file`,
+its path in the package that carries the work, and ends where the file's licence comment ends. fish's `COPYING`, its `doc_src/license.rst`
 and the licence file of each of its workspace crates are read from its pinned archive. A text that holds
 a template's placeholder stops the run.
 
@@ -104,6 +105,8 @@ VARIANTS = {"MITNFA": "MIT", "Unicode-3.0": "Unicode-DFS-2016"}
 # notice carries from the pinned archive and requires.
 FISH_LICENCES = os.path.join("doc_src", "license.rst")
 STATEMENT = "this file names a licence and holds none of its text"
+# What a line of a source file's comment starts with, in the languages of the bundled works.
+COMMENT_LINE = ("//", "/*", "*")
 
 HEADER = """\
 THIRD-PARTY NOTICES
@@ -739,7 +742,7 @@ def gather(records, kept, files, reader):
             answer = each["answers"][key]
             name, version, where = key
             folder = each["roots"][key]
-            compiled_crates.setdefault((name, version), set()).add(each["name"])
+            compiled_crates.setdefault((name, version), {})[each["name"]] = folder
             crate = (name, version, where)
             args = (answer["authors"], each["name"], answer["source"])
             required = sorted({i.split(" WITH ")[0] for i, _, _, _ in answer["licences"]})
@@ -787,12 +790,33 @@ def gather(records, kept, files, reader):
         text = files[work["text"]]
         used_texts.add(work["text"])
         for origin in sorted(compiled_crates[carrier]):
+            if "excerpt" in text:
+                check_excerpt(text, compiled_crates[carrier][origin], carrier)
             add_kept(blocks, text, (work["name"], work["version"], None), [], origin, None,
                      extra=f"bundled in {carrier[0]} {carrier[1]}, {kept_source(text)}")
     for identifier in files:
         if identifier not in used_texts:
             fail(f"scripts/notice-texts.json lists the text {identifier}, which no crate or work uses")
     return blocks
+
+
+def check_excerpt(text, root, carrier):
+    """A kept excerpt of a source file is the lines of that file in the package that carries the work, and
+    it ends where the file's licence comment ends."""
+    first, last = text["excerpt"]
+    where = f"{text['id']} is kept as lines {first} to {last} of {text.get('file')}, and {carrier[0]} {carrier[1]}"
+    path = os.path.join(root, text.get("file") or "")
+    if not text.get("file") or not os.path.isfile(path):
+        fail(f"{where} has no such file")
+    with open(path, "rb") as source:
+        try:
+            lines = source.read().decode("utf-8").replace("\r\n", "\n").split("\n")
+        except UnicodeDecodeError:
+            fail(f"{path} is not UTF-8 text")
+    if lines[first - 1:last] != text["text"].split("\n")[:-1]:
+        fail(f"{where} holds other lines there")
+    if last < len(lines) and lines[last].lstrip().startswith(COMMENT_LINE):
+        fail(f"{text['id']} ends at line {last} of {text['file']}, and line {last + 1} still belongs to the comment")
 
 
 def add_kept(blocks, text, crate, authors, origin, source, extra):
@@ -1057,6 +1081,30 @@ def self_checks(scratch, reader):
     kept, files = keep([item], [], [work])
     text = rendered([made_up([plain])], kept, files)
     expect("a bundled work has its entry and its text", "  - libx 1.0 | programs |  | bundled in plain 1.0.0, text https://example.org/n0/LICENSE-MIT\n" in text)
+
+    # A kept excerpt of a source file is the file's own lines and ends where the licence comment ends.
+    carrier_folder = os.path.join(scratch, "carrier-1.0.0")
+    source_lines = ["// Copyright 2025 N0", "// Permission is hereby granted", "// to anyone.", "", "int x;"]
+    write(os.path.join(carrier_folder, "src"), "lib.c", "".join(line + "\n" for line in source_lines))
+    carrier = synthetic("carrier", "1.0.0", licences=licences(mit), folder=carrier_folder)
+
+    def excerpted(lines_, first, last, file_name="src/lib.c"):
+        """What the run does for a work that keeps these lines as lines `first` to `last` of a file of its carrier."""
+        body = "".join(line + "\n" for line in lines_)
+        write(directory, "excerpt", body)
+        entry = {"id": "excerpt", "licence": "MIT", "source": "https://example.org/lib.c", "statement": True,
+                 "sha256": hashlib.sha256(body.encode("utf-8")).hexdigest(), "excerpt": [first, last], "file": file_name}
+        kept_, files_ = keep([entry], [], [{"name": "libx", "version": "1.0", "carried_by": {"name": "carrier", "version": "1.0.0"}, "text": "excerpt"}])
+        return lambda: render(gather([made_up([carrier])], kept_, files_, reader))
+
+    refuses("a kept excerpt that stops before the licence comment of its file ends is refused",
+            excerpted(source_lines[:2], 1, 2), "ends at line 2 of src/lib.c, and line 3 still belongs to the comment")
+    expect("a kept excerpt that ends where the licence comment ends is carried",
+           "to anyone." in made(excerpted(source_lines[:3], 1, 3)) and "lines 1 to 3" in made(excerpted(source_lines[:3], 1, 3)))
+    refuses("a kept excerpt that is not the lines of its file is refused",
+            excerpted(["// Copyright 2025 N0", "// Permission is denied", "// to anyone."], 1, 3), "holds other lines there")
+    refuses("a kept excerpt of a file that the carrier does not have is refused",
+            excerpted(source_lines[:3], 1, 3, "src/gone.c"), "carrier 1.0.0 has no such file")
 
     refuses("a crate that cargo tree lists and cargo metadata cannot place is refused",
             lambda: record("programs", {plain[0]}, set(), {}, {plain[0]: plain[1]}, {}), "cargo metadata finds no package for 1 crates")
