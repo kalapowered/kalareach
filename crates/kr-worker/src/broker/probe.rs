@@ -410,6 +410,18 @@ pub mod seams {
 
     static STARTED: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
 
+    static REACHED: Mutex<Vec<(Point, PathBuf)>> = Mutex::new(Vec::new());
+
+    /// Whether a probe that runs in `directory` has come to `point`, whether or not a delay holds it
+    /// there.
+    pub fn reached(point: Point, directory: &Path) -> bool {
+        REACHED
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .any(|(at, here)| *at == point && here == directory)
+    }
+
     /// How many threads the probe has started for `directory`.
     pub fn threads_started(directory: &Path) -> usize {
         STARTED
@@ -460,6 +472,10 @@ pub mod seams {
     }
 
     pub(super) fn pause_at(point: Point, directory: &Path) {
+        REACHED
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push((point, directory.to_path_buf()));
         let delay = DELAYS
             .lock()
             .unwrap_or_else(PoisonError::into_inner)

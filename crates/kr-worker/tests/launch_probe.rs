@@ -908,9 +908,10 @@ fn kr_req_07_64_an_answer_that_ended_after_the_deadline_is_late_though_the_call_
 /// KR-REQ-07.64: an answer whose output ended after the caller gave up is late, though the deadline
 /// has not passed.
 ///
-/// The stand-in prints a mode at once. The thread is held back after its final read and the cancel
-/// flag is set while it is held, long before the deadline. The thread then notes that the output
-/// ended before the deadline, but the flag is set, so the answer is late.
+/// The stand-in prints a mode at once. The thread is held back after its final read. The case waits
+/// until the thread has come to that point and only then sets the cancel flag, long before the
+/// deadline. The thread notes that the output ended before the deadline, but the flag is set, so the
+/// answer is late.
 #[test]
 fn kr_req_07_64_an_answer_that_ended_after_the_caller_gave_up_is_late_before_the_deadline() {
     let here = directory();
@@ -923,9 +924,17 @@ fn kr_req_07_64_an_answer_that_ended_after_the_caller_gave_up_is_late_before_the
     probe::seams::delay_at(probe::seams::Point::FinalRead, here.path(), Some(hold));
     let run = ProbeRun::within(deadline);
     let cancel = std::sync::Arc::clone(&run.cancel);
+    let watched = here.path().to_path_buf();
     let giving_up = std::thread::spawn(move || {
-        std::thread::sleep(hold / 2);
+        let until = std::time::Instant::now() + deadline;
+        while !probe::seams::reached(probe::seams::Point::FinalRead, &watched) {
+            if std::time::Instant::now() >= until {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
         cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+        true
     });
     let probed = probe::run_within(
         &standin.program,
@@ -937,9 +946,13 @@ fn kr_req_07_64_an_answer_that_ended_after_the_caller_gave_up_is_late_before_the
         probe::MAX_OUTPUT_BYTES,
     );
     probe::seams::delay_at(probe::seams::Point::FinalRead, here.path(), None);
-    giving_up
+    let set_at_the_seam = giving_up
         .join()
         .expect("the thread that sets the flag ended");
+    assert!(
+        set_at_the_seam,
+        "the premise: the thread had come to its final read before the flag was set"
+    );
     assert!(
         probed.took < deadline,
         "the premise: the deadline had not passed when the call returned: {probed:?}"
