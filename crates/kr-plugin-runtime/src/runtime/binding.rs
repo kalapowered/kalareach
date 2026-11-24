@@ -1273,6 +1273,13 @@ impl BindingHandle {
         self.restores.load(Ordering::Acquire)
     }
 
+    /// Returns true when the binding has been offered an event since it was registered, whether the
+    /// queue took it or it was refused on the way.
+    #[must_use]
+    pub fn offered_events(&self) -> bool {
+        !self.queue.lock().is_ok_and(|queue| queue.offered() == 0)
+    }
+
     /// Records that an event offered to the binding was refused before it reached the queue.
     ///
     /// What the instance consumes after it is not a prefix of what was offered, and the queue

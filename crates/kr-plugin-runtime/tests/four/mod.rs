@@ -408,26 +408,18 @@ async fn kr_req_24_24_a_report_of_the_state_a_restore_replaced_is_not_written_af
         Some(handle("se-1")),
         "the instance had not consumed the first event when the state was saved"
     );
-    let restored = four
-        .restore(
-            &request,
-            7,
-            saved.state,
-            Some(Through {
-                native: None,
-                terminal: Some(handle("se-1")),
-            }),
-        )
-        .await;
+    // A plain restore: the registration has been offered an event, so one that carries a position
+    // would set nothing.
+    let restored = four.restore(&request, 7, saved.state, None).await;
     assert!(
         matches!(
             restored,
             ResponseBody4::Called {
-                record: Some(RecordState::Set),
+                record: Some(RecordState::NotSet),
                 ..
             }
         ),
-        "a restore with a position was answered with {restored:?}"
+        "a plain restore was answered with {restored:?}"
     );
     let before_the_answer = four.notices.len();
     hold.release();
@@ -806,63 +798,289 @@ async fn kr_req_24_24_a_closed_host_restores_nothing_for_a_position_and_says_it_
     );
 }
 
+// A registration that has been offered an event may have consumed past the state a restore would
+// bring back, and a position set from the restore would call what follows a continuation of it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn kr_req_24_24_a_third_protocol_connection_on_a_host_with_its_writer_open_is_told_nothing_new()
+async fn kr_req_24_24_an_open_host_restores_nothing_for_a_position_once_the_registration_has_been_offered_an_event()
  {
     let served = Served::start_dual(true).await;
     let Some(component) = recording(&served) else {
         return;
     };
+    let mut four = Raw4::connect(served.endpoint4()).await;
+    let first = components::request("recording", 43);
+    let second = components::request("recording", 44);
+    four.register(&first, &component, 7).await;
+    four.register(&second, &component, 8).await;
+    four.event(&first, "se-1", "x").await;
+    four.event(&second, "se-9", "y").await;
+    // Each instance has taken its event in.
+    let saved = loop {
+        let saved = four.checkpoint(&first).await;
+        if saved
+            .consumed
+            .as_ref()
+            .is_some_and(|consumed| consumed.terminal == Some(handle("se-1")))
+        {
+            break saved;
+        }
+        tokio::task::yield_now().await;
+    };
+    let current = loop {
+        let current = four.checkpoint(&second).await;
+        if current
+            .consumed
+            .as_ref()
+            .is_some_and(|consumed| consumed.terminal == Some(handle("se-9")))
+        {
+            break current;
+        }
+        tokio::task::yield_now().await;
+    };
+    assert_ne!(saved.state, current.state, "the two states do not differ");
+
+    let restored = four
+        .restore(
+            &second,
+            8,
+            saved.state.clone(),
+            Some(Through {
+                native: None,
+                terminal: Some(handle("se-1")),
+            }),
+        )
+        .await;
+    assert!(
+        matches!(
+            restored,
+            ResponseBody4::Called {
+                record: Some(RecordState::NotSet),
+                ..
+            }
+        ),
+        "an open host answered a restore with a position, after an event was offered, with {restored:?}"
+    );
+    let after = four.checkpoint(&second).await;
+    assert_eq!(
+        after.state, current.state,
+        "the host restored the state of another registration's position"
+    );
+    assert_eq!(
+        after.consumed, current.consumed,
+        "the host changed what the instance has consumed"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_24_24_a_third_protocol_connection_on_a_host_with_its_writer_open_is_told_nothing_new()
+ {
+    use kr_plugin_service::protocol::{CallValue, Notice};
+
+    let served = Served::start_dual(true).await;
+    let Some(component) = recording(&served) else {
+        return;
+    };
     // Every frame this connection is written is read here, as a frame of the third protocol, and
-    // not through a helper that unwraps a read: a frame that protocol does not have fails this case.
+    // not through a helper that unwraps a read: a frame that protocol does not have fails this case,
+    // and a connection the host closed is said to be closed.
     macro_rules! next_frame_of_three {
         ($three:expr) => {{
-            let frame: Result<Frame, _> = $three.reader.read_message_without_schema().await;
-            let Ok(frame) = frame else {
-                panic!("the host wrote a frame the third protocol does not have: {frame:?}");
-            };
-            frame
+            let frame: Result<Frame, _> =
+                tokio::time::timeout(HANG_GUARD, $three.reader.read_message_without_schema())
+                    .await
+                    .expect("the host wrote nothing");
+            match frame {
+                Ok(frame) => frame,
+                Err(kr_ipc::error::IpcError::PeerClosed) => {
+                    panic!("the host closed the connection")
+                }
+                Err(error) => {
+                    panic!("the host wrote a frame the third protocol does not have: {error:?}")
+                }
+            }
+        }};
+    }
+    // Reads until the answer to `$id`, and keeps the notices that come first.
+    macro_rules! answered_by {
+        ($three:expr, $id:expr, $notices:expr) => {{
+            loop {
+                match next_frame_of_three!($three) {
+                    Frame::Response { reply_to, body } if reply_to == $id => break body,
+                    Frame::Response { .. } => {}
+                    Frame::Notice(notice) => $notices.push(notice),
+                }
+            }
         }};
     }
     let mut three = Raw::connect(&served).await;
-    let request = components::request("recording", 37);
-    let registering = three.send_register(&request, &component).await;
-    // Read until the trap is told, and then until the answer to an unbind, which follows everything
-    // the binding produced.
     let mut notices = Vec::new();
-    let mut asked = None;
-    loop {
+
+    // A registration, two events one of which traps, and an unbind: the trap is told, and the
+    // answer to the unbind follows everything the binding produced.
+    let first = components::request("recording", 37);
+    let request = first.clone();
+    let registering = three.send_register(&request, &component).await;
+    let registered = answered_by!(three, registering, notices);
+    assert!(
+        matches!(registered, ResponseBody::Registered { .. }),
+        "the registration was answered with {registered:?}"
+    );
+    for (name, text) in [("se-1", "x"), ("se-2", "!trap")] {
+        let id = three
+            .send(RequestBody::Event {
+                binding_id: request.binding_id.get(),
+                event: wire_event(&components::scrape(name, text)),
+            })
+            .await;
+        answered_by!(three, id, notices);
+    }
+    while !notices
+        .iter()
+        .any(|notice| matches!(notice, Notice::Fault { .. }))
+    {
         match next_frame_of_three!(three) {
-            Frame::Response { reply_to, body } if reply_to == registering => {
-                assert!(
-                    matches!(body, ResponseBody::Registered { .. }),
-                    "the registration was answered with {body:?}"
-                );
-                for (name, text) in [("se-1", "x"), ("se-2", "!trap")] {
-                    three
-                        .send(RequestBody::Event {
-                            binding_id: request.binding_id.get(),
-                            event: wire_event(&components::scrape(name, text)),
-                        })
-                        .await;
-                }
-            }
-            Frame::Response { reply_to, .. } if Some(reply_to) == asked => break,
+            Frame::Notice(notice) => notices.push(notice),
             Frame::Response { .. } => {}
-            Frame::Notice(notice) => {
-                let trapped = matches!(notice, kr_plugin_service::protocol::Notice::Fault { .. });
-                notices.push(notice);
-                if trapped && asked.is_none() {
-                    asked = Some(three.send_unbind(&request).await);
-                }
+        }
+    }
+    let unbinding = three.send_unbind(&request).await;
+    answered_by!(three, unbinding, notices);
+    // A call into a binding that is gone is refused, and the connection stays open.
+    let id = three
+        .send(RequestBody::Checkpoint {
+            binding_id: first.binding_id.get(),
+            deadline_ms: u64::try_from(HANG_GUARD.as_millis()).expect("milliseconds"),
+        })
+        .await;
+    let gone = answered_by!(three, id, notices);
+    assert!(
+        matches!(
+            gone,
+            ResponseBody::Refused {
+                disabled: false,
+                ..
             }
+        ),
+        "a checkpoint of a binding that is gone was answered with {gone:?}"
+    );
+
+    // A checkpoint and a restore: the state comes back as the third protocol has it, and takes the
+    // restore, which carries no registration and no position.
+    let request = components::request("recording", 38);
+    let registering = three.send_register(&request, &component).await;
+    answered_by!(three, registering, notices);
+    let id = three
+        .send(RequestBody::Checkpoint {
+            binding_id: request.binding_id.get(),
+            deadline_ms: u64::try_from(HANG_GUARD.as_millis()).expect("milliseconds"),
+        })
+        .await;
+    let checkpointed = answered_by!(three, id, notices);
+    let ResponseBody::Called {
+        value: Some(CallValue::State(state)),
+        ..
+    } = checkpointed
+    else {
+        panic!("a checkpoint was answered with {checkpointed:?}");
+    };
+    assert!(!state.is_empty(), "the checkpoint carried no state");
+    let id = three
+        .send(RequestBody::Restore {
+            binding_id: request.binding_id.get(),
+            state,
+            deadline_ms: u64::try_from(HANG_GUARD.as_millis()).expect("milliseconds"),
+        })
+        .await;
+    let restored = answered_by!(three, id, notices);
+    assert!(
+        matches!(
+            restored,
+            ResponseBody::Called {
+                value: Some(CallValue::Document),
+                fault: None,
+                ..
+            }
+        ),
+        "a restore was answered with {restored:?}"
+    );
+
+    // A queue that drops events behind a pass that has not taken any, and then refuses a request
+    // it has no room for: the host tells the offerer of each, and later the reader of the loss.
+    let mut stop = served
+        .host
+        .runtime()
+        .stop_next_pump(request.binding_id)
+        .expect("the binding is live");
+    let big = "x".repeat(400 * 1024);
+    let mut admissions = std::collections::BTreeSet::new();
+    let mut offered = Vec::new();
+    for index in 0..12 {
+        offered.push(components::scrape(&format!("se-{index}"), &big));
+    }
+    for index in 0..24 {
+        offered.push(components::native_request(
+            &format!("se-{}", 100 + index),
+            &format!("{}", 100 + index),
+            &big,
+        ));
+    }
+    for (at, event) in offered.iter().enumerate() {
+        let id = three
+            .send(RequestBody::Event {
+                binding_id: request.binding_id.get(),
+                event: wire_event(event),
+            })
+            .await;
+        let admitted = answered_by!(three, id, notices);
+        let ResponseBody::Admitted { admission, .. } = admitted else {
+            panic!("an event was answered with {admitted:?}");
+        };
+        admissions.insert(admission);
+        if at == 0 {
+            assert!(
+                tokio::time::timeout(HANG_GUARD, stop.reached())
+                    .await
+                    .expect("the binding's pass stands at the stop"),
+                "the stop was replaced before a pass reached it"
+            );
         }
     }
     assert!(
+        admissions.contains("queued_with_gap") && admissions.contains("refused"),
+        "the events were admitted as {admissions:?}"
+    );
+    stop.release();
+    while !notices
+        .iter()
+        .any(|notice| matches!(notice, Notice::Gap { events, .. } if *events > 0))
+    {
+        match next_frame_of_three!(three) {
+            Frame::Notice(notice) => notices.push(notice),
+            Frame::Response { .. } => {}
+        }
+    }
+    let unbinding = three.send_unbind(&request).await;
+    answered_by!(three, unbinding, notices);
+
+    assert!(
         notices
             .iter()
-            .any(|notice| matches!(notice, kr_plugin_service::protocol::Notice::Fault { .. })),
+            .any(|notice| matches!(notice, Notice::Fault { .. })),
         "the third protocol was not told of the trap: {notices:?}"
+    );
+    // A report of what the instance consumed, written as a frame this protocol has, would be a gap
+    // that lost nothing.
+    assert!(
+        notices.iter().all(|notice| !matches!(
+            notice,
+            Notice::Gap {
+                events: 0,
+                bytes: 0,
+                documents: 0,
+                ..
+            }
+        )),
+        "the third protocol was told of a gap that lost nothing: {notices:?}"
     );
 }
 

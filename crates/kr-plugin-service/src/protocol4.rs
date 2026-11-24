@@ -297,7 +297,9 @@ pub enum RecordState {
     /// The record was not set from a position. A restore with no `through` restores the state
     /// plainly: what the instance consumed stays, and is no longer clean. A host with its writer
     /// closed answers `NotSet` to a restore that carries a `through` and leaves the instance as it
-    /// was.
+    /// was. A host with its writer open does the same once the registration has been offered an
+    /// event, because the position could then claim a prefix that the events offered since do not
+    /// continue.
     NotSet,
 }
 
@@ -448,6 +450,10 @@ pub enum Notice4 {
     /// replaced is never written after its answer, and one written between the request and its
     /// answer may describe either state, so a reader takes the position the restore carried and
     /// ignores what came in between.
+    ///
+    /// A report is not timely under load: a newer report goes behind every notice queued since the
+    /// older one, so a reader that falls behind can go without a report for a long time. A caller
+    /// that needs a position to keep takes it from `Checkpointed.consumed`.
     Consumed {
         /// The binding.
         binding_id: Uuid,
