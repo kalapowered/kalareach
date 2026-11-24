@@ -265,7 +265,8 @@ fn perform_in(plan: &Plan, setting: &Setting<'_>, operation: &Operation, sockets
 }
 
 /// The words of a display that this check does not try, as it answers before any tool starts.
-const NETWORK_DISPLAY: &str = "the display is reached over the network, which this check does not test, so no tool was started";
+const NETWORK_DISPLAY: &str = "the display is reached over the network, \
+                               which this check does not test, so no tool was started";
 
 /// The words of a display name that names no display on this machine.
 const NO_SUCH_DISPLAY: &str = "the X11 display name this worker holds names no display on this \
