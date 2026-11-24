@@ -340,7 +340,6 @@ impl Instance {
 
     /// Returns how many times this instance has been replaced after a fault.
     #[must_use]
-    #[cfg(any(test, feature = "testing"))]
     pub const fn replacements(&self) -> u64 {
         self.replacements
     }
