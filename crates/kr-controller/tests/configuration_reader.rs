@@ -228,9 +228,12 @@ async fn a_daemon_starts_over_the_document_the_release_before_it_accepted_at_ver
     as_a_later_release_left_it(&temp, registry_version, Some(&saved));
     write_the_document(&temp, &saved);
 
-    let controller = start(&temp)
-        .await
-        .expect("the daemon starts over a saved version-3 copy of the accepted document");
+    let controller = match start(&temp).await {
+        Ok(controller) => controller,
+        Err(error) => panic!(
+            "the daemon does not start over a saved version-3 copy of the accepted document: {error:?}"
+        ),
+    };
     let effective = controller.effective_configuration().await;
     assert_eq!(
         effective.status.state,
