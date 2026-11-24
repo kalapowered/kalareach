@@ -201,7 +201,9 @@ impl Launcher {
         std::thread::spawn(move || {
             for line in std::io::BufReader::new(output).lines() {
                 let Ok(line) = line else { return };
-                if let Some(report) = line.strip_prefix(REPORT)
+                // The test program's own output can stand before the first report on its line: it
+                // prints the case's name and no line end before the case runs.
+                if let Some((_, report)) = line.split_once(REPORT)
                     && let Ok(value) = serde_json::from_str(report)
                 {
                     let _ = sender.send(value);

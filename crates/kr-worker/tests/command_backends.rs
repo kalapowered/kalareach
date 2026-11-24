@@ -1672,7 +1672,12 @@ async fn the_fixture_reads_a_commit_on_the_launchers_clock() {
     let mut launcher = Launcher::start(&launch);
     let played = launcher.played().await;
     assert_eq!(played.admission, Admission::Admitted, "{played:?}");
-    assert_eq!(played.answer, Some(Answer::Committed), "{played:?}");
+    assert_eq!(
+        played.answer,
+        Some(Answer::Committed),
+        "{played:?}; the backend recorded: {:?}",
+        setup.backends.launch_failure_of(PromptGeneration::new(1))
+    );
     assert!(
         played.after >= std::time::Duration::from_millis(1),
         "the count began before `going` was written, so the commit took time on it: {played:?}"
