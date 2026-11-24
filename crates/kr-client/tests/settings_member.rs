@@ -816,6 +816,11 @@ async fn a_save_reads_the_bundle_again_after_it_moved_three_times_in_all() {
     // bundle at the fourth place, so the three reads are of the fourth, fifth and sixth.
     the_bundle_moves_after_the_next(&service, 10);
     let refused = store.save_settings(&seed, local("light"), now()).await;
+    assert_eq!(
+        *service.moves_after_a_fetch.lock().expect("a count"),
+        7,
+        "three reads were made, and no fourth"
+    );
     match refused {
         Err(RecoveryError::BundleConflict { expected, .. }) => assert_eq!(
             expected,
@@ -824,11 +829,6 @@ async fn a_save_reads_the_bundle_again_after_it_moved_three_times_in_all() {
         ),
         other => panic!("a conflict was expected: {:?}", other.ok()),
     }
-    assert_eq!(
-        *service.moves_after_a_fetch.lock().expect("a count"),
-        7,
-        "three reads were made, and no fourth"
-    );
     let held =
         kr_crypto::archive::decrypt_recovery_bundle(&key, &service.sealed()).expect("the bundle");
     assert_eq!(
