@@ -621,3 +621,53 @@ fn the_wrappers_refuse_a_command_that_makes_a_session_and_pass_every_other() {
         assert!(run.passed, "{asked:?}: {}", run.log);
     }
 }
+
+/// A fixture's program that did not end with success is told as one: the record keeps how it ended,
+/// and the last line of the log names it, so that a program the system killed before it printed
+/// anything is not read as one that printed nothing.
+#[test]
+#[cfg(unix)]
+fn a_fixture_program_that_did_not_end_with_success_says_how_it_ended() {
+    use std::os::unix::process::ExitStatusExt as _;
+
+    use kr_ipc::testing::account_launchd::run_fixture_as;
+
+    let folder = kr_ipc::testing::PrivateTempDir::create();
+    let place = |name: &str, text: &str| {
+        let program = folder.path().join(name);
+        kr_ipc::testing::place_script(&program, text);
+        program
+    };
+
+    let killed = run_fixture_as(
+        &place("killed", "#!/bin/sh\nkill -9 $$\n"),
+        "the_fixture",
+        &[],
+    );
+    assert!(!killed.passed);
+    assert_eq!(killed.status.signal(), Some(9));
+    assert_eq!(
+        killed.log,
+        "the program of fixture the_fixture did not end with success: signal: 9 (SIGKILL)\n"
+    );
+
+    let failed = run_fixture_as(
+        &place("failed", "#!/bin/sh\nprintf said\nexit 3\n"),
+        "a::b",
+        &[],
+    );
+    assert!(!failed.passed);
+    assert_eq!(failed.status.code(), Some(3));
+    assert_eq!(
+        failed.log,
+        "said\nthe program of fixture b did not end with success: exit status: 3\n"
+    );
+
+    let passed = run_fixture_as(
+        &place("passed", "#!/bin/sh\necho 'test result: ok. 1 passed;'\n"),
+        "the_fixture",
+        &[],
+    );
+    assert!(passed.passed && passed.status.success());
+    assert_eq!(passed.log, "test result: ok. 1 passed;\n");
+}

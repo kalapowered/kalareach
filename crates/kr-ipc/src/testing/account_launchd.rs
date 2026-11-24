@@ -204,8 +204,12 @@ pub fn place_fake_in(folder: &Path) -> (PathBuf, PathBuf) {
 pub struct FixtureRun {
     /// Whether the program ended with success and ran exactly one test that passed.
     pub passed: bool,
-    /// What the program printed, both streams, for the case's message.
+    /// What the program printed, both streams, for the case's message. When the program did not end
+    /// with success, its last line says how it ended, so that a program the system killed before it
+    /// printed anything is told apart from one that printed nothing and ended.
     pub log: String,
+    /// How the program ended: the exit code, or the signal that ended it.
+    pub status: std::process::ExitStatus,
 }
 
 /// Runs one `#[ignore]`d fixture of this test program in a child of its own, and says what it did.
@@ -281,14 +285,25 @@ fn run_fixture_command(
     let output = command
         .output()
         .unwrap_or_else(|error| panic!("the fixture {name} could not be started: {error}"));
-    let log = format!(
+    let mut log = format!(
         "{}{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+    let passed = output.status.success() && log.contains("test result: ok. 1 passed;");
+    if !output.status.success() {
+        if !log.is_empty() && !log.ends_with('\n') {
+            log.push('\n');
+        }
+        log.push_str(&format!(
+            "the program of fixture {name} did not end with success: {}\n",
+            output.status
+        ));
+    }
     FixtureRun {
-        passed: output.status.success() && log.contains("test result: ok. 1 passed;"),
+        passed,
         log,
+        status: output.status,
     }
 }
 
