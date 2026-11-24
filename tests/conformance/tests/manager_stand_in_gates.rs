@@ -273,6 +273,33 @@ fn first_start(tokens: &[Token], body: &std::ops::Range<usize>) -> Option<usize>
     })
 }
 
+/// The source of the startup suite that holds a host on the stand-in service manager.
+const HOST_FILE: &str = "crates/kr-cli/tests/support/manager_stand_in.rs";
+
+/// The function that builds a command in the host's source: the one that runs the stand-in.
+const HOST_COMMAND_FUNCTION: &str = "command";
+
+/// The function of `source` that holds each `Command::new(`, one entry for each, innermost function
+/// first, and the empty name for one outside every function.
+fn command_builders(source: &str) -> Vec<String> {
+    let tokens = code_tokens(source);
+    let all = functions(&tokens);
+    (0..tokens.len())
+        .filter(|&at| {
+            tokens[at].ident() == Some("Command")
+                && tokens.get(at + 1).is_some_and(|token| token.is_punct(':'))
+                && tokens.get(at + 2).is_some_and(|token| token.is_punct(':'))
+                && tokens.get(at + 3).and_then(Token::ident) == Some("new")
+        })
+        .map(|at| {
+            all.iter()
+                .filter(|function| function.body.contains(&at))
+                .min_by_key(|function| function.body.len())
+                .map_or_else(String::new, |function| function.name.clone())
+        })
+        .collect()
+}
+
 /// What is wrong with the runner `function` of `source`: the calls it lacks, and the order of
 /// those it has. A runner with a stand-in to give substitutes before it refuses, and refuses before
 /// it starts a program.
@@ -396,4 +423,31 @@ fn the_runner_reading_finds_a_missing_call_and_a_wrong_order_and_only_those() {
     assert!(runner_problems(no_stand_in, "run", false).is_empty());
     assert_eq!(runner_problems(held, "run", false).len(), 1);
     assert_eq!(runner_problems(held, "other", true).len(), 1);
+}
+
+/// The startup suite's host on the stand-in builds a command in one function only, the one that
+/// runs the stand-in with the tree's own environment, so that no other command of the host can
+/// reach a service manager.
+#[test]
+fn the_stand_in_host_builds_a_command_in_one_function_only() {
+    let text = std::fs::read_to_string(repository().join(HOST_FILE))
+        .unwrap_or_else(|error| panic!("{HOST_FILE}: {error}"));
+    assert_eq!(
+        command_builders(&text),
+        [HOST_COMMAND_FUNCTION],
+        "{HOST_FILE} builds a command in the one function {HOST_COMMAND_FUNCTION} and nowhere else"
+    );
+}
+
+/// The reading finds a second command, in another function or outside any, and no comment.
+#[test]
+fn the_command_reading_finds_each_command_and_no_comment() {
+    assert_eq!(
+        command_builders(
+            "fn command() { Command::new(a); } fn other() { std::process::Command::new(b); }"
+        ),
+        ["command", "other"]
+    );
+    assert_eq!(command_builders("static X: C = Command::new(a);"), [""]);
+    assert!(command_builders("fn command() { // Command::new(a)\n run(); }").is_empty());
 }

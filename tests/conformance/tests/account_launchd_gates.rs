@@ -543,7 +543,7 @@ const PLAIN_DAEMON_NAMES: [(&str, &[Entry]); 19] = [
                 "a path or a name in a fixture, compared and never run",
             ),
             (
-                "service_installation",
+                "place_service_installation",
                 2,
                 "the held daemon, or the script that hands over to it, placed under the installed name; nothing starts the plain build",
             ),

@@ -75,6 +75,9 @@ use kr_protocol::scalars::{CanonicalSet, Nullable};
 use kr_protocol::session::{Dimensions, SessionListParams, SessionListResult};
 use serde_json::Value;
 
+#[cfg(target_os = "macos")]
+#[path = "support/manager_stand_in.rs"]
+mod manager_stand_in;
 mod support;
 #[path = "../../kr-controller/tests/teardown/mod.rs"]
 mod teardown;
@@ -3767,41 +3770,83 @@ fn a_failing_test_with_a_partial_record_keeps_its_tree_and_does_not_end_the_suit
 /// daemon's parent.
 fn service_installation() -> &'static Path {
     static PLACED: OnceLock<PathBuf> = OnceLock::new();
+    PLACED.get_or_init(|| place_service_installation("service"))
+}
+
+/// The installation of a host on the stand-in service manager: the layout of
+/// [`service_installation`] in a folder of its own, with the stand-in program at its top beside
+/// `kr`, and the marker that makes every program of the installation refuse a service manager
+/// unless the run names the stand-in. It is not the shared installation, so no other case's
+/// processes are held to a stand-in, and it stays until this test program ends, which is after
+/// every process of a case that started from it.
+///
+/// A build that has not built the stand-in yet fails here and says why: the case never stands down.
+#[cfg(target_os = "macos")]
+fn stand_in_installation() -> &'static Path {
+    static PLACED: OnceLock<PathBuf> = OnceLock::new();
     PLACED.get_or_init(|| {
-        let (Some(controller), Some(worker)) = (
-            beside_this_test("kr-controller-held"),
-            beside_this_test("kr-worker"),
-        ) else {
+        let Some(stand_in) = beside_this_test("kr-manager-stand-in") else {
             panic!(
-                "the kr-controller-held and kr-worker executables are not built beside this test, \
-                 so this check cannot run; a workspace test run builds them, and so do \
-                 `cargo build -p kr-controller --features testing --bin kr-controller-held` \
-                 and `cargo build -p kr-worker`"
+                "the kr-manager-stand-in executable is not built beside this test, so this check \
+                 cannot run; a workspace test run builds it, and so does \
+                 `cargo build -p kr-manager-stand-in`"
             );
         };
-        let directory = support::command_binaries().join("service");
-        std::fs::create_dir(&directory).expect("a directory for the service installation");
-        for source in [
-            Path::new(env!("CARGO_BIN_EXE_kr")),
-            Path::new(env!("CARGO_BIN_EXE_kr-attach-guard")),
-        ] {
-            let name = source.file_name().expect("the binary has a name");
-            kr_ipc::testing::place_and_start_once(source, &directory.join(name), &["--version"]);
-        }
-        // The daemon and the worker are side by side, where a release keeps them, and the daemon is
-        // under its own name: what the worker takes for the daemon of its installation is the file
-        // beside it.
-        let real = directory.join("daemon");
-        std::fs::create_dir(&real).expect("a directory for the daemon and its worker");
-        kr_ipc::testing::place_and_start_once(&worker, &real.join("kr-worker"), &["--version"]);
-        let daemon = real.join("kr-controller");
-        kr_ipc::testing::place_and_start_once(&controller, &daemon, &["--version"]);
-        let source = directory.join("kr-controller.sh");
-        std::fs::write(&source, the_service_daemon_script(&daemon))
-            .expect("writes the daemon script");
-        kr_ipc::testing::place_program(&source, &directory.join("kr-controller"));
+        let directory = place_service_installation("service-stand-in");
+        let program = kr_ipc::testing::manager_stand_in::place_installation(&directory);
+        kr_ipc::testing::place_program(&stand_in, &program);
+        // The operating system checks a program the first time it is started from a new file; here
+        // it is started once, with no state directory, which it refuses at once and records
+        // nowhere, so that no case's first call pays for it.
+        let first = Command::new(&program)
+            .env_clear()
+            .stdin(Stdio::null())
+            .output()
+            .expect("the stand-in starts");
+        assert_eq!(
+            first.status.code(),
+            Some(64),
+            "a stand-in that is given no state directory refuses: {}",
+            String::from_utf8_lossy(&first.stderr)
+        );
         directory
     })
+}
+
+/// Places the service installation's programs in the folder `name` of this run's binaries.
+fn place_service_installation(name: &str) -> PathBuf {
+    let (Some(controller), Some(worker)) = (
+        beside_this_test("kr-controller-held"),
+        beside_this_test("kr-worker"),
+    ) else {
+        panic!(
+            "the kr-controller-held and kr-worker executables are not built beside this test, \
+             so this check cannot run; a workspace test run builds them, and so do \
+             `cargo build -p kr-controller --features testing --bin kr-controller-held` \
+             and `cargo build -p kr-worker`"
+        );
+    };
+    let directory = support::command_binaries().join(name);
+    std::fs::create_dir(&directory).expect("a directory for the service installation");
+    for source in [
+        Path::new(env!("CARGO_BIN_EXE_kr")),
+        Path::new(env!("CARGO_BIN_EXE_kr-attach-guard")),
+    ] {
+        let name = source.file_name().expect("the binary has a name");
+        kr_ipc::testing::place_and_start_once(source, &directory.join(name), &["--version"]);
+    }
+    // The daemon and the worker are side by side, where a release keeps them, and the daemon is
+    // under its own name: what the worker takes for the daemon of its installation is the file
+    // beside it.
+    let real = directory.join("daemon");
+    std::fs::create_dir(&real).expect("a directory for the daemon and its worker");
+    kr_ipc::testing::place_and_start_once(&worker, &real.join("kr-worker"), &["--version"]);
+    let daemon = real.join("kr-controller");
+    kr_ipc::testing::place_and_start_once(&controller, &daemon, &["--version"]);
+    let source = directory.join("kr-controller.sh");
+    std::fs::write(&source, the_service_daemon_script(&daemon)).expect("writes the daemon script");
+    kr_ipc::testing::place_program(&source, &directory.join("kr-controller"));
+    directory
 }
 
 /// What `kr` starts in the service installation: a script that hands over, with `exec`, to the
@@ -3913,6 +3958,19 @@ struct ServiceHost {
     manager: UserManager,
     tree: teardown::Tree,
     home: PathBuf,
+    /// The one `launchctl` program of this host, chosen when it is made: every command a macOS
+    /// method of the host puts to the manager runs it, and so does the teardown.
+    #[cfg(target_os = "macos")]
+    launchctl: Launchctl,
+}
+
+/// The program a macOS service host runs in the place of `launchctl`.
+#[cfg(target_os = "macos")]
+enum Launchctl {
+    /// The account's own `launchctl`, which a run uses only where it asked.
+    Account,
+    /// The stand-in service manager, which reaches no launchd.
+    StandIn(manager_stand_in::StandIn),
 }
 
 impl Drop for ServiceHost {
@@ -3998,10 +4056,48 @@ impl ServiceHost {
 
     /// The tree of a test's own, with the home of its own that a definition is written in.
     fn tree_and_home() -> (teardown::Tree, PathBuf) {
-        let tree = teardown::Tree::create();
+        Self::home_in(teardown::Tree::create())
+    }
+
+    /// `tree` with the home of its own that a definition is written in.
+    fn home_in(tree: teardown::Tree) -> (teardown::Tree, PathBuf) {
         let home = tree.root().join("home");
         std::fs::create_dir_all(&home).expect("a home of this test's own");
         (tree, home)
+    }
+
+    /// A tree whose service manager is the stand-in program: it reaches no launchd, neither to
+    /// read nor to change, and its teardown calls no manager of the account. The stand-in is the
+    /// installation's own, so this never stands down: a missing program fails the case.
+    #[cfg(target_os = "macos")]
+    fn on_stand_in() -> Self {
+        let installation = stand_in_installation();
+        let (tree, home) = Self::home_in(teardown::Tree::create().without_service_manager());
+        let stand_in =
+            manager_stand_in::StandIn::new(installation, tree.paths().state_root(), &home);
+        Self {
+            tree,
+            home,
+            launchctl: Launchctl::StandIn(stand_in),
+        }
+    }
+
+    /// The stand-in this host's manager is, where it is one.
+    #[cfg(target_os = "macos")]
+    fn stand_in(&self) -> Option<&manager_stand_in::StandIn> {
+        match &self.launchctl {
+            Launchctl::StandIn(stand_in) => Some(stand_in),
+            Launchctl::Account => None,
+        }
+    }
+
+    /// A command that runs this host's one `launchctl` program with `arguments`.
+    #[cfg(target_os = "macos")]
+    fn launchctl(&self, arguments: &[&str]) -> Command {
+        match &self.launchctl {
+            Launchctl::Account => kr_ipc::testing::account_launchd::command(arguments),
+            Launchctl::StandIn(stand_in) => stand_in.command(arguments),
+        }
     }
 
     /// A tree on the account's own launchd, which `launchctl` reaches, or why there is none. Where
@@ -4015,7 +4111,11 @@ impl ServiceHost {
         let mut print = Command::new(launchctl);
         print.args(["print", &domain]);
         match bounded(print, STREAMS_DEADLINE) {
-            Ok(printed) if printed.status.success() => Ok(Self { tree, home }),
+            Ok(printed) if printed.status.success() => Ok(Self {
+                tree,
+                home,
+                launchctl: Launchctl::Account,
+            }),
             answered => Err(format!(
                 "launchd has no {domain} domain for this user to load a definition into: \
                  {answered:?}"
@@ -4062,16 +4162,26 @@ impl ServiceHost {
 
     /// `kr` from the service installation, against this tree, this home and this host's manager.
     fn kr(&self, arguments: &[&str]) -> Command {
+        #[cfg(target_os = "macos")]
+        if self.stand_in().is_some() {
+            return self.kr_from(stand_in_installation(), arguments);
+        }
         self.kr_from(service_installation(), arguments)
     }
 
     /// [`Self::kr`] from another installation: the one a case with a stub daemon lays out. It runs
     /// in the working directory of the service installation, so the held daemon and the worker are
-    /// built first, as for every case of this host.
+    /// built first, as for every case of this host. On the stand-in it is told to reach the
+    /// stand-in and is given no ask, so that no `kr` of this host can reach the account's launchd:
+    /// this is the one function that builds one.
     fn kr_from(&self, installation: &Path, arguments: &[&str]) -> Command {
-        #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
+        #[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(unused_mut))]
         let mut command =
             service_command(&installation.join("kr"), arguments, &self.home, &self.tree);
+        #[cfg(target_os = "macos")]
+        if let Some(stand_in) = self.stand_in() {
+            stand_in.give_to(&mut command);
+        }
         #[cfg(target_os = "linux")]
         command.env("XDG_RUNTIME_DIR", &self.manager.runtime);
         command
@@ -4103,8 +4213,9 @@ impl ServiceHost {
         let chosen = document(&output, "kr host startup");
         assert!(
             output.status.success(),
-            "{chosen}; it said {}",
-            String::from_utf8_lossy(&output.stderr)
+            "{chosen}; it said {}{}",
+            String::from_utf8_lossy(&output.stderr),
+            self.stand_in_calls()
         );
         assert_eq!(chosen["startup"]["controller"], "service", "{chosen}");
         let definition = &chosen["startup"]["definition"];
@@ -4116,6 +4227,16 @@ impl ServiceHost {
             "{chosen}"
         );
         chosen
+    }
+
+    /// What a failed case says of the stand-in's calls: each one, in order, where this host's
+    /// manager is the stand-in, and nothing where it is not.
+    fn stand_in_calls(&self) -> String {
+        #[cfg(target_os = "macos")]
+        if let Some(stand_in) = self.stand_in() {
+            return format!("\nthe stand-in's calls:\n{}", stand_in.log());
+        }
+        String::new()
     }
 
     /// Has the test's user manager read its unit files again, as a person does after changing
@@ -4163,10 +4284,7 @@ impl ServiceHost {
             [format!("gui/{uid}"), format!("user/{uid}")]
                 .into_iter()
                 .find_map(|domain| {
-                    let print = kr_ipc::testing::account_launchd::command(&[
-                        "print",
-                        &format!("{domain}/{}", self.label()),
-                    ]);
+                    let print = self.launchctl(&["print", &format!("{domain}/{}", self.label())]);
                     let printed = bounded(print, STREAMS_DEADLINE).ok()?;
                     String::from_utf8_lossy(&printed.stdout)
                         .lines()
@@ -4279,13 +4397,13 @@ impl ServiceHost {
             for domain in [format!("gui/{uid}"), format!("user/{uid}")] {
                 let target = format!("{domain}/{}", self.label());
                 let loaded = |target: &str| {
-                    let print = kr_ipc::testing::account_launchd::command(&["print", target]);
+                    let print = self.launchctl(&["print", target]);
                     bounded(print, STREAMS_DEADLINE).map(|printed| printed.status.success())
                 };
                 if !loaded(&target)? {
                     continue;
                 }
-                let bootout = kr_ipc::testing::account_launchd::command(&["bootout", &target]);
+                let bootout = self.launchctl(&["bootout", &target]);
                 let removed = bounded(bootout, TEARDOWN_BOUND)?;
                 // The job goes a moment after `bootout` answers, so it is asked about again until
                 // the bound.
