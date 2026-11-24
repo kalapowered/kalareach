@@ -10,6 +10,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use kr_plugin_sdk::capability::PluginCapability;
 use kr_plugin_sdk::integration::{CommandIntegration, IntegrationBackend};
 use kr_plugin_sdk::plugin::PluginManifest;
 use kr_protocol::ids::PluginId;
@@ -38,6 +39,9 @@ pub struct Subject {
     person_trees: Vec<String>,
     integration: Option<CommandIntegration>,
     gateway: Option<GatewayRoute>,
+    requested: Vec<PluginCapability>,
+    version: String,
+    package: Option<PathBuf>,
 }
 
 impl Subject {
@@ -117,7 +121,16 @@ impl Subject {
             .as_ref()
             .and_then(|integration| integration.backend.clone())
             .map(|backend| GatewayRoute { backend });
+        let mut requested: Vec<PluginCapability> = manifest
+            .capabilities
+            .iter()
+            .map(|request| request.capability)
+            .collect();
+        requested.sort();
+        requested.dedup();
         Ok(Self {
+            package: (package == CODEX_PACKAGE)
+                .then(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("codex-package")),
             entry,
             plugin,
             command,
@@ -125,6 +138,8 @@ impl Subject {
             person_trees,
             integration: manifest.command_integration.clone(),
             gateway,
+            requested,
+            version: manifest.version.to_string(),
         })
     }
 
@@ -247,6 +262,25 @@ impl Subject {
             let _ = build.without_provider_keys(&mut variables);
         }
         variables
+    }
+
+    /// The capabilities the package's manifest requests.
+    #[must_use]
+    pub fn requested_capabilities(&self) -> &[PluginCapability] {
+        &self.requested
+    }
+
+    /// The directory of the package the driver keeps for the subject: the Codex package kept in
+    /// this crate; none for another subject.
+    #[must_use]
+    pub fn package(&self) -> Option<&Path> {
+        self.package.as_deref()
+    }
+
+    /// The version of the package the manifest declares.
+    #[must_use]
+    pub fn package_version(&self) -> String {
+        self.version.clone()
     }
 
     /// Where the agent's conversations are, relative to the run's directory; none for a subject

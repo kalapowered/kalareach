@@ -71,9 +71,15 @@ fn by_hand_login_case(
 }
 
 /// The package's actions, as its manifest declares them.
-fn package_actions() -> Vec<Action> {
+fn package_actions(subject: &Subject) -> Vec<Action> {
     let manifest: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(codex_package().join("plugin.json")).expect("the package's manifest"),
+        &std::fs::read(
+            subject
+                .package()
+                .expect("the subject's package")
+                .join("plugin.json"),
+        )
+        .expect("the package's manifest"),
     )
     .expect("a manifest");
     serde_json::from_value(manifest["actions"].clone()).expect("the package's actions")
@@ -249,7 +255,7 @@ fn shown_from(
     Shown {
         detection,
         binding,
-        live_bindings: live_bindings(remote, &ctx.runtime, &codex()),
+        live_bindings: live_bindings(remote, &ctx.runtime, &ctx.subject.plugin()),
     }
 }
 
@@ -271,9 +277,9 @@ fn shown_now(ctx: &Context, at: &Seated<'_>) -> Shown {
 }
 
 /// The detection of the launch that `agent` is, as section 12 requires it.
-fn detected(agent: &HandAgent, shown: &Shown, what: &str) {
+fn detected(ctx: &Context, agent: &HandAgent, shown: &Shown, what: &str) {
     let launched = Launched {
-        plugin_id: codex(),
+        plugin_id: ctx.subject.plugin(),
         running: agent.runs().is_ok(),
     };
     if let Err(why) = check_detected(&launched, shown) {
@@ -290,7 +296,7 @@ fn surface(
     at: &Seated<'_>,
     shown: &Shown,
 ) -> (Surface, Vec<Reply>) {
-    let upstream: Vec<Action> = package_actions()
+    let upstream: Vec<Action> = package_actions(&ctx.subject)
         .into_iter()
         .filter(Action::upstream)
         .collect();
@@ -298,7 +304,7 @@ fn surface(
         at.remote,
         &ctx.runtime,
         at.session_id,
-        &codex(),
+        &ctx.subject.plugin(),
         &upstream,
         Held::of(shown).map(|held| (held.instance, held.revision)),
     );
@@ -822,7 +828,7 @@ fn gateway_slash_commands_interrupts_queued_prompts_and_steering_each_work_from_
         let at = seated(session, Seat::First);
         let agent = starts_by_hand(ctx, session, Seat::First, &[], true);
         let shown = detects(ctx, &at);
-        detected(&agent, &shown, "the agent's launch");
+        detected(ctx, &agent, &shown, "the agent's launch");
         let mut typing = Typing::attach(ctx, session, Seat::First);
         let driven = match &ctx.route {
             Route::StandIn => {
@@ -856,7 +862,7 @@ fn gateway_slash_commands_interrupts_queued_prompts_and_steering_each_work_from_
         });
         // The package leaves the typed queue off, though the agent queues a prompt on its own
         // terminal.
-        let states = capability_states(at.remote, &ctx.runtime, &codex());
+        let states = capability_states(at.remote, &ctx.runtime, &ctx.subject.plugin());
         queue_declared_off(&states).unwrap_or_else(|why| panic!("{why}"));
         agent
             .runs()
@@ -2325,7 +2331,7 @@ fn second_process(
     let (a, b) = (seated(session, Seat::First), seated(session, Seat::Second));
     let agent_a = starts_by_hand(ctx, session, Seat::First, &[], true);
     let shown_a = detects(ctx, &a);
-    detected(&agent_a, &shown_a, "session A's launch");
+    detected(ctx, &agent_a, &shown_a, "session A's launch");
     let mut typing_a = Typing::attach(ctx, session, Seat::First);
     let mark = mark();
     let Route::Real(real) = &ctx.route else {
@@ -2416,7 +2422,7 @@ fn second_process(
     // A second process runs: the host detects it as an instance of its own.
     let agent_b = HandAgent::found(ctx, b.session_id);
     let shown_b = detects(ctx, &b);
-    detected(&agent_b, &shown_b, "session B's launch");
+    detected(ctx, &agent_b, &shown_b, "session B's launch");
     assert_ne!(
         Held::of(&shown_a).map(|held| held.instance),
         Held::of(&shown_b).map(|held| held.instance),
@@ -2520,7 +2526,7 @@ fn second_process_by_hand(
         false,
     );
     let shown_b = detects(ctx, &b);
-    detected(&agent_b, &shown_b, "session B's launch");
+    detected(ctx, &agent_b, &shown_b, "session B's launch");
     assert_ne!(
         Held::of(shown_a).map(|held| held.instance),
         Held::of(&shown_b).map(|held| held.instance),

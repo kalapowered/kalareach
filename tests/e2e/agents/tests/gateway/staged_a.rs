@@ -77,9 +77,15 @@ fn by_hand_case(
 }
 
 /// The package's actions, as its manifest declares them.
-fn package_actions() -> Vec<Action> {
+fn package_actions(subject: &Subject) -> Vec<Action> {
     let manifest: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(codex_package().join("plugin.json")).expect("the package's manifest"),
+        &std::fs::read(
+            subject
+                .package()
+                .expect("the subject's package")
+                .join("plugin.json"),
+        )
+        .expect("the package's manifest"),
     )
     .expect("a manifest");
     serde_json::from_value(manifest["actions"].clone()).expect("the package's actions")
@@ -173,7 +179,7 @@ fn shown_from(
     Shown {
         detection,
         binding,
-        live_bindings: live_bindings(remote, &ctx.runtime, &codex()),
+        live_bindings: live_bindings(remote, &ctx.runtime, &ctx.subject.plugin()),
     }
 }
 
@@ -212,7 +218,7 @@ fn surface(
     session_id: SessionId,
     shown: &Shown,
 ) -> (Surface, Vec<Reply>) {
-    let upstream: Vec<Action> = package_actions()
+    let upstream: Vec<Action> = package_actions(&ctx.subject)
         .into_iter()
         .filter(Action::upstream)
         .collect();
@@ -220,7 +226,7 @@ fn surface(
         remote,
         &ctx.runtime,
         session_id,
-        &codex(),
+        &ctx.subject.plugin(),
         &upstream,
         Held::of(shown).map(|held| (held.instance, held.revision)),
     );
@@ -242,9 +248,9 @@ fn surface(
 }
 
 /// What the agent started by hand was launched as, for the check of its detection.
-fn launched(agent: &HandAgent) -> Launched {
+fn launched(ctx: &Context, agent: &HandAgent) -> Launched {
     Launched {
-        plugin_id: codex(),
+        plugin_id: ctx.subject.plugin(),
         running: agent.runs().is_ok(),
     }
 }
@@ -456,7 +462,7 @@ fn gateway_an_agent_on_its_terminal_route_is_advertised_no_typed_capability_and_
         let session_id = session.session_id();
         let agent = HandAgent::starts(ctx, session);
         let shown = detects(ctx, &session.remote, session_id);
-        let running = launched(&agent);
+        let running = launched(ctx, &agent);
         let detected = check_detected(&running, &shown)
             .unwrap_or_else(|why| panic!("the host did not detect the manual launch: {why}"));
         let (offered, reads) = surface(ctx, session, &session.remote, session_id, &shown);
@@ -465,7 +471,7 @@ fn gateway_an_agent_on_its_terminal_route_is_advertised_no_typed_capability_and_
         let after = shown_now(ctx, &session.remote, session_id);
         check_unchanged(Held::of(&shown), &after)
             .unwrap_or_else(|why| panic!("the refusals change nothing: {why}"));
-        let states = capability_states(&session.remote, &ctx.runtime, &codex());
+        let states = capability_states(&session.remote, &ctx.runtime, &ctx.subject.plugin());
         advertises_nothing_as_available(&states).unwrap_or_else(|why| panic!("{why}"));
         shows_no_trace(&session.person.window.screen(), TYPED_PROMPT)
             .unwrap_or_else(|why| panic!("no refused prompt reached the agent: {why}"));
@@ -489,7 +495,7 @@ fn gateway_an_agent_on_its_terminal_route_is_advertised_no_typed_capability_and_
         // The live control for detection, which breaks it: the agent ends, and the check fails.
         agent.ends();
         let gone = shown_gone(ctx, &session.remote, session_id);
-        let ended = launched(&agent);
+        let ended = launched(ctx, &agent);
         let ended_check = check_detected(&ended, &gone);
         assert!(
             ended_check.is_err(),
@@ -554,10 +560,10 @@ fn gateway_under_a_binding_a_supported_action_is_permitted_and_an_unsupported_on
         let session_id = session.session_id();
         let agent = HandAgent::starts(ctx, session);
         let shown = detects(ctx, &session.remote, session_id);
-        check_detected(&launched(&agent), &shown)
+        check_detected(&launched(ctx, &agent), &shown)
             .unwrap_or_else(|why| panic!("the host did not detect the manual launch: {why}"));
         let held = Held::of(&shown).expect("the binding could not be read");
-        let actions = package_actions();
+        let actions = package_actions(&ctx.subject);
         let presentation: Vec<&Action> = actions
             .iter()
             .filter(|action| action.presentation())
@@ -571,7 +577,7 @@ fn gateway_under_a_binding_a_supported_action_is_permitted_and_an_unsupported_on
                 &ctx.runtime,
                 &envelope,
                 target,
-                &codex(),
+                &ctx.subject.plugin(),
                 action,
             )
         };
@@ -580,7 +586,7 @@ fn gateway_under_a_binding_a_supported_action_is_permitted_and_an_unsupported_on
             &session.remote,
             &ctx.runtime,
             session_id,
-            &codex(),
+            &ctx.subject.plugin(),
             &upstream,
             Some((held.instance, held.revision)),
         )
@@ -1341,7 +1347,7 @@ fn gateway_forged_titles_transcripts_identifiers_and_hook_input_leave_the_host_u
             // What the host shows before any forgery: the agent's instance, and none in the
             // forging session. Each forgery must leave it exactly so.
             let initial = detects(ctx, &session.remote, session_id);
-            check_detected(&launched(&agent), &initial)
+            check_detected(&launched(ctx, &agent), &initial)
                 .unwrap_or_else(|why| panic!("the host did not detect the manual launch: {why}"));
             let held = Held::of(&initial);
             let unchanged = |what: &str| {
@@ -1754,7 +1760,7 @@ fn gateway_a_path_typed_at_the_agent_is_terminal_input_that_reaches_its_composer
         let session_id = session.session_id();
         let agent = HandAgent::starts(ctx, session);
         let initial = detects(ctx, &session.remote, session_id);
-        check_detected(&launched(&agent), &initial)
+        check_detected(&launched(ctx, &agent), &initial)
             .unwrap_or_else(|why| panic!("the host did not detect the manual launch: {why}"));
         ctx.work
             .as_ref()

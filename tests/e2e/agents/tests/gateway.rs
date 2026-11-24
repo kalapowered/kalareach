@@ -109,6 +109,7 @@ use kr_e2e_agents::stage::{
     Installation, PlacedProgram, closed_port, inode_of, scan_rules, session_variables, text_image,
 };
 use kr_e2e_agents::stub::RequestStub;
+use kr_e2e_agents::subject::Subject;
 use kr_e2e_agents::{GENERATION_VARIABLE, RESULT_VARIABLE};
 use kr_e2e_m1b::device::{Device, PairedHost, Remote, RequestError};
 use kr_e2e_m1b::host::{Host, HostOptions, Preparation};
@@ -125,6 +126,7 @@ use kr_plugin_sdk::capability::PluginCapability;
 use kr_plugin_sdk::catalogue::QualifiedBuild;
 use kr_plugin_sdk::digest::PayloadDigest;
 use kr_plugin_sdk::matching::{Architecture, OperatingSystem};
+use kr_plugin_sdk::plugin::PluginManifest;
 use kr_plugin_sdk::text::Label;
 use kr_protocol::agent::{
     AgentApprovalInspectParams, AgentApprovalInspectResult, AgentApprovalRespondParams,
@@ -194,28 +196,12 @@ const ACCEPT: &str = "accept";
 /// The decision a device gives to end the turn that waits on an approval.
 const DECLINE: &str = "decline-and-stop";
 
-/// The person's own Codex directory, whose every entry a real run is held to leave as it found it:
-/// the login, the settings, the instructions and hooks the agent would load, its conversations and
-/// the files it appends to when it is used. Entries are looked at by their metadata alone: nothing
-/// of a file is read, and nothing is written there.
-const PERSON_TREES: [&str; 1] = [".codex"];
-
 fn runtime() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
         .enable_all()
         .build()
         .expect("a runtime for the device")
-}
-
-fn codex() -> PluginId {
-    PluginId::new("kalareach/codex").expect("a plugin identifier")
-}
-
-/// The directory of the Codex package the cases install: a byte copy of the package source whose
-/// table states the conditions under which a thread the terminal starts is not its conversation.
-fn codex_package() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("codex-package")
 }
 
 /// A marker only this case's text holds: `kr` and twelve hexadecimal digits.
@@ -292,6 +278,8 @@ enum Route {
 /// the person's own files as they stood before anything started.
 struct Real {
     build: Build,
+    /// The agent the entry and its package's manifest make.
+    subject: Subject,
     account: Account,
     /// The ledger the case's turns are charged to: none in a case that runs with no login, which
     /// starts no model turn and so owns no allowance.
@@ -370,6 +358,14 @@ impl Route {
         let account = build.account.clone().unwrap_or_else(|| {
             panic!("{BUILD_VARIABLE} names an entry with no login, which no case may start")
         });
+        let plugin = PluginId::new(&build.package).unwrap_or_else(|why| {
+            panic!(
+                "the entry's package {} is not a plugin identifier: {why}",
+                build.package
+            )
+        });
+        let subject = Subject::from_build(&build, &generation_manifest(&generation, &plugin))
+            .unwrap_or_else(|why| panic!("{why}"));
         // The person's files are the ones under the home the system names, and a run started under
         // another `HOME` would guard a tree that is not theirs and pass.
         let home =
@@ -392,9 +388,11 @@ impl Route {
         } else {
             HeldKeys::read_without_login(&who)
         };
-        let person = MetaGuard::take(&home, &PERSON_TREES);
+        let trees: Vec<&str> = subject.person_trees().iter().map(String::as_str).collect();
+        let person = MetaGuard::take(&home, &trees);
         Self::Real(Box::new(Real {
             build,
+            subject,
             account,
             ledger,
             held,
@@ -428,11 +426,7 @@ impl Real {
 
     /// The line typed at the shell to start the agent: the command, and `extra` after it.
     fn typed(&self, extra: &[&str]) -> String {
-        launch_words(&self.build.command, extra)
-            .iter()
-            .map(|word| build::quote(word))
-            .collect::<Vec<_>>()
-            .join(" ")
+        self.subject.typed_line(extra)
     }
 
     /// The run's directory and the working directory the entry's `{run}` and `{work}` stand for.
@@ -819,10 +813,15 @@ impl Real {
             program.command(run.root(), run.pin())?
         };
         command
-            .args(probe.arguments.iter().map(|argument| match &stub {
-                Some(stub) => argument.replace("{stub}", stub.address()),
-                None => argument.clone(),
-            }))
+            .args(
+                self.subject
+                    .probe_arguments(probe)
+                    .iter()
+                    .map(|argument| match &stub {
+                        Some(stub) => argument.replace("{stub}", stub.address()),
+                        None => argument.clone(),
+                    }),
+            )
             .env_clear()
             .envs(
                 variables
@@ -1027,9 +1026,6 @@ impl Real {
         Ok(text)
     }
 }
-
-/// Where the stand-in agent is placed in the run, below its directory.
-const STAND_IN_PLACE: &str = "t/codex";
 
 /// How many reads of the host's list of application instances a failure's text keeps.
 const POLLS_KEPT: usize = 20;
@@ -1406,6 +1402,9 @@ struct Context {
     run: Run,
     shell: shells::ManagedShell,
     route: Route,
+    /// The agent the route gives: the Codex stand-in's on the stand-in route, the entry's on a
+    /// real one.
+    subject: Subject,
     /// The file the qualified build's digest names.
     executable: PathBuf,
     /// The directory the shell's search path names first.
@@ -1448,11 +1447,16 @@ impl Context {
         run: Run,
         runtime: tokio::runtime::Runtime,
     ) -> Self {
+        let subject = match &route {
+            Route::StandIn => Subject::codex(),
+            Route::Real(real) => real.subject.clone(),
+        };
         Self {
             runtime,
             run,
             shell,
             route,
+            subject,
             executable: PathBuf::new(),
             bin: PathBuf::new(),
             work: None,
@@ -1501,44 +1505,47 @@ impl Context {
         let mut newer = None;
         let mut newer_placed = None;
         let mut newer_prefix = None;
+        let command = self.subject.command();
         let (executable, bin) = match &self.route {
             Route::StandIn if self.upgrade => {
                 // Two installed builds behind the link `agent/current`: the pinned stand-in and the
                 // newer one, each a program built from the stand-in's source, each at
-                // `t/<prefix>/bin/codex`; the link names the first.
+                // `t/<prefix>/bin/<command>`; the link names the first.
                 let (first, second) = (run.root().join("t/a"), run.root().join("t/b"));
                 for prefix in [&first, &second] {
                     kr_ipc::paths::create_private_tree(run.root(), &prefix.join("bin"))
                         .expect("a directory for the programs");
                 }
-                run.place_built("codex-stand-in", &first.join("bin/codex"), &["--version"]);
+                let program = format!("bin/{command}");
+                run.place_built("codex-stand-in", &first.join(&program), &["--version"]);
                 run.place_built(
                     "codex-stand-in-newer",
-                    &second.join("bin/codex"),
+                    &second.join(&program),
                     &["--version"],
                 );
-                for relative in ["t/a/bin/codex", "t/b/bin/codex"] {
-                    run.note_placed(Path::new(relative))
+                for relative in [format!("t/a/{program}"), format!("t/b/{program}")] {
+                    run.note_placed(Path::new(&relative))
                         .unwrap_or_else(|why| panic!("{ISOLATION_UNPROVEN} {why}"));
                     placed_files.push(PathBuf::from(relative));
                 }
                 let linked = Installation::link(run, &first, &[]);
                 let bin = linked.bin();
                 installation = Some(linked);
-                newer = Some((second.join("bin/codex"), "0.156.1".to_owned()));
+                newer = Some((second.join(&program), "0.156.1".to_owned()));
                 newer_prefix = Some(second);
-                (first.join("bin/codex"), bin)
+                (first.join(&program), bin)
             }
             Route::StandIn => {
                 let tools = run.root().join("t");
                 kr_ipc::paths::create_private_tree(run.root(), &tools)
                     .expect("a directory for the programs");
-                run.place_built("codex-stand-in", &tools.join("codex"), &["--version"]);
+                run.place_built("codex-stand-in", &tools.join(command), &["--version"]);
                 // The shell finds the stand-in by its name on a search path, as it finds the build.
-                run.note_placed(Path::new(STAND_IN_PLACE))
+                let place = self.subject.place();
+                run.note_placed(Path::new(&place))
                     .unwrap_or_else(|why| panic!("{ISOLATION_UNPROVEN} {why}"));
-                placed_files.push(PathBuf::from(STAND_IN_PLACE));
-                (tools.join("codex"), tools)
+                placed_files.push(PathBuf::from(place));
+                (tools.join(command), tools)
             }
             Route::Real(real) => {
                 real.checks_installs_off(run);
@@ -1683,10 +1690,10 @@ impl Context {
                 shell_packages: Some(self.shell.prefix.clone()),
             },
             &Preparation {
-                command_integrations: if self.manual {
+                command_integrations: if self.manual || self.subject.integration().is_none() {
                     Vec::new()
                 } else {
-                    vec![codex().to_string()]
+                    vec![self.subject.plugin().to_string()]
                 },
                 stable_address: true,
             },
@@ -1698,7 +1705,8 @@ impl Context {
                     Route::StandIn => None,
                     Route::Real(real) => Some(real.generation.as_path()),
                 };
-                let package = self.runtime.block_on(install_codex(
+                let package = self.runtime.block_on(install_agent(
+                    &self.subject,
                     environment,
                     &builds,
                     distribution,
@@ -2141,19 +2149,21 @@ fn subject(session_id: SessionId, instance: ApplicationInstanceId) -> AgentSubje
     }
 }
 
-/// Publishes the Codex package in a signed generation of its own, whose index names the digest of
-/// `executable` as the one build it qualifies, and installs and enables it in the environment with
-/// the grants it asks for, as the owner's confirmation of that exact installation does.
-async fn install_codex(
+/// Publishes the subject's package in a signed generation of its own, whose index names the digest
+/// of `executable` as the one build it qualifies, and installs and enables it in the environment
+/// with the grants it asks for, as the owner's confirmation of that exact installation does.
+async fn install_agent(
+    subject: &Subject,
     environment: &EnvironmentPaths,
     executables: &[(PathBuf, String)],
     distribution: &str,
     generation: Option<&Path>,
 ) -> [u8; 32] {
+    let plugin = subject.plugin();
     let builds: Vec<QualifiedBuild> = executables
         .iter()
         .map(|(executable, version)| QualifiedBuild {
-            application: Label::new("codex").expect("a label"),
+            application: Label::new(subject.command()).expect("a label"),
             distribution: Label::new(distribution).expect("a label"),
             version: kr_plugin_sdk::version::PackageVersion::parse(version).expect("a version"),
             os: if cfg!(target_os = "macos") {
@@ -2177,7 +2187,7 @@ async fn install_codex(
     // there is no fixture to fall back to.
     let fixture;
     let (metadata_url, targets_url, root_bytes, wanted) = if let Some(directory) = generation {
-        let wanted = generation_entry(directory);
+        let wanted = generation_entry(directory, &plugin);
         (
             generations::directory_url(&directory.join("metadata")),
             generations::directory_url(&directory.join("targets")),
@@ -2190,7 +2200,12 @@ async fn install_codex(
         fixture = generations::Generation::build(
             &home,
             generations::GenerationSpec {
-                package: Some(codex_package()),
+                package: Some(
+                    subject
+                        .package()
+                        .expect("the stand-in route installs a package the driver keeps")
+                        .to_path_buf(),
+                ),
                 builds,
                 ..generations::GenerationSpec::default()
             },
@@ -2230,31 +2245,26 @@ async fn install_codex(
     let version = kr_plugin_sdk::version::PackageVersion::parse(
         wanted
             .as_ref()
-            .map_or("0.3.0", |entry| entry.version.as_str()),
+            .map_or(subject.package_version().as_str(), |entry| {
+                entry.version.as_str()
+            }),
     )
     .expect("a version");
     let package = catalogue
         .index(&id)
         .expect("activated")
-        .find(&codex(), &version)
+        .find(&plugin, &version)
         .expect("the package")
         .manifest_digest;
     catalogue
         .install_with(
             &id,
             environment.environment_id(),
-            &codex(),
+            &plugin,
             &version,
             package,
             InstallationGrant::with(wanted.as_ref().map_or_else(
-                || {
-                    vec![
-                        PluginCapability::CommandIntegrationLaunch,
-                        PluginCapability::ApprovalDecode,
-                        PluginCapability::ApprovalRespond,
-                        PluginCapability::UpstreamAction,
-                    ]
-                },
+                || beyond_the_ceiling(subject.requested_capabilities().iter().copied()),
                 |entry| entry.grant.clone(),
             )),
             None,
@@ -2263,7 +2273,7 @@ async fn install_codex(
         .await
         .expect("installed");
     catalogue
-        .set_enabled(environment.environment_id(), &codex(), true)
+        .set_enabled(environment.environment_id(), &plugin, true)
         .await
         .expect("enabled");
     // The package installed is the one the generation's index names: its digest is recorded, and
@@ -2278,7 +2288,7 @@ async fn install_codex(
     *package.as_bytes()
 }
 
-/// The entry of the Codex package in a generation the operator names, as its index says it.
+/// The entry of a package in a generation the operator names, as its index says it.
 struct GenerationEntry {
     version: String,
     manifest_digest: String,
@@ -2286,13 +2296,13 @@ struct GenerationEntry {
     grant: Vec<PluginCapability>,
 }
 
-/// Reads the Codex package's entry of the generation at `directory`.
+/// Reads the entry of the package `plugin` in the generation at `directory`.
 ///
 /// # Panics
 ///
 /// Panics where the generation's index does not name the package exactly once, or names a
 /// capability the vocabulary does not hold.
-fn generation_entry(directory: &Path) -> GenerationEntry {
+fn generation_entry(directory: &Path, plugin: &PluginId) -> GenerationEntry {
     let index: serde_json::Value = serde_json::from_slice(
         &std::fs::read(directory.join("targets/index.json")).expect("the generation's index"),
     )
@@ -2301,33 +2311,70 @@ fn generation_entry(directory: &Path) -> GenerationEntry {
         .as_array()
         .into_iter()
         .flatten()
-        .filter(|entry| entry["plugin_id"] == codex().to_string())
+        .filter(|entry| entry["plugin_id"] == plugin.to_string())
         .collect();
     assert_eq!(
         named.len(),
         1,
-        "the generation's index names the Codex package once, not {} times",
+        "the generation's index names the package {plugin} once, not {} times",
         named.len()
     );
     let entry = named[0];
     let text = |value: &serde_json::Value| value.as_str().unwrap_or_default().to_owned();
-    let mut grant: Vec<PluginCapability> = entry["capabilities"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .map(|request| {
+    let grant = beyond_the_ceiling(entry["capabilities"].as_array().into_iter().flatten().map(
+        |request| {
             serde_json::from_value::<PluginCapability>(request["capability"].clone())
                 .expect("a capability of the vocabulary")
-        })
-        .filter(|capability| !CapabilityCeiling::default_ceiling().permits(*capability))
-        .collect();
-    grant.sort();
-    grant.dedup();
+        },
+    ));
     GenerationEntry {
         version: text(&entry["version"]),
         manifest_digest: text(&entry["manifest_digest"]),
         grant,
     }
+}
+
+/// Reads the manifest of the package `plugin` in the generation at `directory`.
+///
+/// # Panics
+///
+/// Panics where the manifest cannot be read or is not the digest the index names.
+fn generation_manifest(directory: &Path, plugin: &PluginId) -> PluginManifest {
+    let entry = generation_entry(directory, plugin);
+    let named = plugin.to_string();
+    let (publisher, name) = named
+        .split_once('/')
+        .expect("a plugin identifier is publisher/name");
+    let path = directory
+        .join("targets/packages")
+        .join(publisher)
+        .join(name)
+        .join(&entry.version)
+        .join("plugin.json");
+    let bytes = std::fs::read(&path)
+        .unwrap_or_else(|error| panic!("the manifest {}: {error}", path.display()));
+    assert_eq!(
+        PayloadDigest::of(&bytes).to_string(),
+        entry.manifest_digest,
+        "the manifest {} is not the digest the generation's index names",
+        path.display()
+    );
+    serde_json::from_slice(&bytes)
+        .unwrap_or_else(|error| panic!("the manifest {}: {error}", path.display()))
+}
+
+/// The capabilities among `requested` that the repository's ceiling does not already allow, each
+/// once, in order.
+fn beyond_the_ceiling(
+    requested: impl IntoIterator<Item = PluginCapability>,
+) -> Vec<PluginCapability> {
+    let mut grant: Vec<PluginCapability> = requested
+        .into_iter()
+        .filter(|capability| !CapabilityCeiling::default_ceiling().permits(*capability))
+        .collect();
+    grant.sort();
+    grant.dedup();
+    grant
 }
 
 /// Which list of variables a second person's shell is created with.
@@ -8425,7 +8472,13 @@ fn a_run_whose_processes_are_not_shown_ended_is_not_read() {
 #[test]
 fn the_launches_the_real_route_types_are_ones_the_command_integration_serves() {
     let manifest: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(codex_package().join("plugin.json")).expect("the package's manifest"),
+        &std::fs::read(
+            Subject::codex()
+                .package()
+                .expect("the Codex package")
+                .join("plugin.json"),
+        )
+        .expect("the package's manifest"),
     )
     .expect("a manifest");
     let backend: kr_plugin_sdk::integration::IntegrationBackend =
@@ -9200,7 +9253,7 @@ fn a_generation_index_that_names_the_codex_package_twice_is_refused() {
     std::fs::create_dir_all(place.join("targets")).expect("the targets directory");
     let entry = |version: &str| {
         serde_json::json!({
-            "plugin_id": codex().to_string(),
+            "plugin_id": Subject::codex().plugin().to_string(),
             "version": version,
             "manifest_digest": "00",
             "capabilities": [],
@@ -9214,9 +9267,10 @@ fn a_generation_index_that_names_the_codex_package_twice_is_refused() {
         .expect("the index");
     };
     write(serde_json::json!([entry("1.0.0")]));
-    assert_eq!(generation_entry(&place).version, "1.0.0");
+    let plugin = Subject::codex().plugin();
+    assert_eq!(generation_entry(&place, &plugin).version, "1.0.0");
     write(serde_json::json!([entry("1.0.0"), entry("1.1.0")]));
-    let refused = std::panic::catch_unwind(|| generation_entry(&place));
+    let refused = std::panic::catch_unwind(|| generation_entry(&place, &plugin));
     assert!(
         refused.is_err(),
         "an index that names the Codex package twice is refused"
@@ -9225,7 +9279,10 @@ fn a_generation_index_that_names_the_codex_package_twice_is_refused() {
         .err()
         .and_then(|why| why.downcast_ref::<String>().cloned())
         .unwrap_or_default();
-    assert!(said.contains("names the Codex package once"), "{said}");
+    assert!(
+        said.contains("names the package kalareach/codex once"),
+        "{said}"
+    );
 }
 
 /// A turn the newer build's record holds that its probes did not leave is found by its identity,
@@ -9317,4 +9374,81 @@ fn a_configuration_names_a_provider_by_its_name_its_table_or_an_address() {
         vec!["chatgpt_base_url".to_owned()]
     );
     assert!(!provider_keys_in("not = = toml").is_empty());
+}
+
+/// The Codex subject asks for the four capabilities the stand-in route's installation was
+/// confirmed with before, at the version of the package kept in this crate.
+#[test]
+fn the_codex_subject_asks_for_the_capabilities_the_stand_in_installation_was_confirmed_with() {
+    let subject = Subject::codex();
+    let mut before = vec![
+        PluginCapability::CommandIntegrationLaunch,
+        PluginCapability::ApprovalDecode,
+        PluginCapability::ApprovalRespond,
+        PluginCapability::UpstreamAction,
+    ];
+    before.sort();
+    assert_eq!(
+        beyond_the_ceiling(subject.requested_capabilities().iter().copied()),
+        before
+    );
+    assert_eq!(subject.package_version(), "0.3.0");
+    assert_eq!(
+        subject.package(),
+        Some(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("codex-package")
+                .as_path()
+        )
+    );
+}
+
+/// A generation gives the manifest its index names for a package, from the place the generation
+/// keeps it, and a manifest that is not the digest the index names is refused.
+#[test]
+fn a_generation_gives_the_manifest_its_index_names_for_a_package_and_refuses_another() {
+    let directory = kr_ipc::testing::PrivateTempDir::create();
+    let place = std::fs::canonicalize(directory.path()).expect("the directory");
+    let mut manifest: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(
+            Subject::codex()
+                .package()
+                .expect("the Codex package")
+                .join("plugin.json"),
+        )
+        .expect("the in-tree manifest"),
+    )
+    .expect("a manifest");
+    manifest["plugin_name"] = serde_json::json!("other");
+    manifest["version"] = serde_json::json!("1.2.3");
+    let bytes = serde_json::to_vec(&manifest).expect("the manifest's text");
+    let folder = place.join("targets/packages/kalareach/other/1.2.3");
+    std::fs::create_dir_all(&folder).expect("the package's folder");
+    std::fs::write(folder.join("plugin.json"), &bytes).expect("the manifest");
+    std::fs::write(
+        place.join("targets/index.json"),
+        serde_json::json!({ "entries": [{
+            "plugin_id": "kalareach/other",
+            "version": "1.2.3",
+            "manifest_digest": PayloadDigest::of(&bytes).to_string(),
+            "capabilities": [],
+        }] })
+        .to_string(),
+    )
+    .expect("the index");
+    let plugin = PluginId::new("kalareach/other").expect("a plugin identifier");
+    let read = generation_manifest(&place, &plugin);
+    assert_eq!(read.plugin_name.to_string(), "other");
+    assert_eq!(read.version.to_string(), "1.2.3");
+    std::fs::write(folder.join("plugin.json"), [&bytes[..], b" "].concat())
+        .expect("a changed file");
+    let refused = std::panic::catch_unwind(|| generation_manifest(&place, &plugin));
+    let said = refused
+        .err()
+        .and_then(|why| why.downcast_ref::<String>().cloned())
+        .unwrap_or_default();
+    assert!(
+        said.contains("is not the digest the generation's index names"),
+        "{said}"
+    );
 }
