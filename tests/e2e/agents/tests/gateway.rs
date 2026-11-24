@@ -102,6 +102,7 @@ use kr_e2e_agents::held::{
     kept_panic_text, new_turns, other_agent_processes, other_agents_refusal, panic_text,
     person_home, read_record, turns_recorded, unchanged_before_the_charge,
 };
+use kr_e2e_agents::launch_report::{Seen, launch_report};
 use kr_e2e_agents::outcome::{Failure, Outcome};
 use kr_e2e_agents::session_environment::{self, Expected};
 use kr_e2e_agents::stage::{
@@ -6276,6 +6277,8 @@ struct Presented {
     instance: Result<AgentInstancesResult, String>,
     ready: Result<(), String>,
     sampled: Result<(), String>,
+    /// When, from the typing, each step of the launch was first seen.
+    seen: Seen,
 }
 
 /// The helper's line, an instance served through the gateway and, where `ready` is given, the
@@ -6283,7 +6286,9 @@ struct Presented {
 /// is read every 25 ms by a thread of its own, with the servers below `worker` collected, from the
 /// typing until the wait ends, so that a read of the host's instances that blocks does not widen
 /// the gap between two reads of the table. A read of the table that fails ends the wait and is
-/// returned in `sampled`. A process that starts and ends between two reads is not seen.
+/// returned in `sampled`. A process that starts and ends between two reads is not seen. The time
+/// each step of the launch was first seen, from the typing, is returned in `seen`, for a launch that
+/// ran as typed to be told from one the host refused.
 fn presented_within(
     ctx: &Context,
     session: &Session<'_>,
@@ -6301,6 +6306,7 @@ fn presented_within(
     let mut found = false;
     let mut shown = ready.is_none();
     let mut rows = Vec::new();
+    let mut seen = Seen::default();
     let sampled = std::thread::scope(|scope| {
         let sampler = scope.spawn(|| {
             loop {
@@ -6318,9 +6324,10 @@ fn presented_within(
             if failed.load(std::sync::atomic::Ordering::SeqCst) {
                 break;
             }
-            if line.is_none() {
+            if line.is_none() || seen.launcher_report.is_none() {
                 let bytes = session.person.window.collected().since(mark);
-                if String::from_utf8_lossy(&bytes).contains(NEEDLE) {
+                seen.observe_terminal(started.elapsed(), &String::from_utf8_lossy(&bytes), NEEDLE);
+                if line.is_none() && seen.helper_line.is_some() {
                     line = Some(bytes);
                 }
             }
@@ -6331,6 +6338,14 @@ fn presented_within(
                     .iter()
                     .any(|summary| summary.mode.uses_gateway())
             });
+            seen.observe_instances(
+                started.elapsed(),
+                served
+                    .as_ref()
+                    .ok()
+                    .map(|read| read.agent_instances.instances.len()),
+                found,
+            );
             if let Some(needle) = ready {
                 rows = session.person.window.screen();
                 shown = rows.iter().any(|row| row.contains(needle));
@@ -6368,6 +6383,7 @@ fn presented_within(
             ))
         },
         sampled,
+        seen,
     }
 }
 
@@ -6468,6 +6484,7 @@ fn gateway_a_launch_whose_first_presentation_carries_a_forged_credential_is_refu
                 instance,
                 ready,
                 sampled,
+                seen,
             } = presented_within(
                 ctx,
                 session,
@@ -6523,7 +6540,13 @@ fn gateway_a_launch_whose_first_presentation_carries_a_forged_credential_is_refu
                 instance.is_ok(),
                 "the instance served through the gateway (the real launcher runs from `b/h/kr-hook` \
                  as a loose build, and a worker that refused it would end the launch here): \
-                 {instance:?}"
+                 {instance:?}\n{}",
+                launch_report(
+                    &after,
+                    &seen,
+                    &ctx.polls.text(),
+                    &session.host.daemon_said()
+                )
             );
             // (d) the program did not run as typed: the stand-in's marker is absent; the real
             // build reaches its first screen with the gateway behind it.

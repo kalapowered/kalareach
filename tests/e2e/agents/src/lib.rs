@@ -84,6 +84,7 @@ pub mod held;
 pub mod keychain;
 #[cfg(unix)]
 pub mod keys;
+pub mod launch_report;
 #[cfg(unix)]
 pub mod mirror;
 #[cfg(unix)]
