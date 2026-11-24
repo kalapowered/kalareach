@@ -5480,9 +5480,9 @@ impl WorkerService {
     /// scope of a forwarded read, holds a question read and what it retains to that scope, reads
     /// which grant a `session.attach` was decided under, reads which grants and devices an
     /// authority revision withdrew, holds a local caller to the local owner's statement and serves
-    /// `agent.instances` and `shell.launch.surface`. A control daemon from before the retained
-    /// levels read these before it sent the frames, and the daemon of the release before this one
-    /// reads the last, so a worker states them all.
+    /// `agent.instances` and `shell.launch.surface`. A control daemon of level 0.74 or earlier read
+    /// these before it sent the frames, and the daemon of the release before this one reads the
+    /// last, so a worker states them all.
     fn stated_capabilities(&self) -> CanonicalSet<kr_protocol::ids::CapabilityId> {
         let stated: CanonicalSet<kr_protocol::ids::CapabilityId> = self
             .time
