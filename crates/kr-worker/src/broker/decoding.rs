@@ -388,12 +388,12 @@ impl BrokerState {
     /// Nothing about the component's state is read: a request that is not decoded because its
     /// component is down stays opaque, and the table does not stand in.
     fn choose_decoder(&self, resource_id: PendingResourceId) -> BrokerResult<Chosen> {
-        let pending = self
+        let recorded = self
             .arbitration
             .get(resource_id)
-            .ok_or_else(|| BrokerError::unknown(format!("no pending resource {resource_id}")))?
-            .resource
-            .clone();
+            .ok_or_else(|| BrokerError::unknown(format!("no pending resource {resource_id}")))?;
+        let made_in_privacy = recorded.made_in_privacy;
+        let pending = recorded.resource.clone();
         let connection = pending.request.connection;
         let (offered, channel) = if let Some(channel) = self.gateway.channel(connection) {
             (channel.offered.clone(), true)
@@ -432,7 +432,7 @@ impl BrokerState {
                     upstream_id: pending.request.upstream.as_str().to_owned(),
                     handle,
                     table: offered,
-                    private: false,
+                    private: made_in_privacy,
                 }));
             }
             table = true;
@@ -476,7 +476,9 @@ impl Broker {
             Chosen::GatewayTable => self.interpret_native(resource_id, now),
             Chosen::ChannelTable => self.interpret_declared(resource_id, now),
             Chosen::Component(mut job) => {
-                job.private = self.observation.is_private();
+                // Privacy mode standing now adds to what the request was made in, and never takes
+                // from it: a request made in privacy mode is decoded again, after it, as one.
+                job.private = job.private || self.observation.is_private();
                 let binding_id = job.binding_id;
                 if !self.decoding.push(job) {
                     self.note_not_decoded(binding_id, NotDecoded::QueueFull);

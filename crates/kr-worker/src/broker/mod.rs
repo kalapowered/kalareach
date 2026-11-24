@@ -2154,7 +2154,13 @@ impl Broker {
                 forwarded.method
             )));
         }
-        let resource = state.record_native(connection, &forwarded, frame, now)?;
+        let resource = state.record_native(
+            connection,
+            &forwarded,
+            frame,
+            now,
+            self.observation.is_private(),
+        )?;
         let tap = self
             .observation
             .wants_native()
@@ -2200,7 +2206,13 @@ impl Broker {
         let mut state = self.state();
         let forwarded = state.gateway.forward_native(connection, frame)?;
         let Some(operation) = state.reverse_operation(connection, &forwarded.method) else {
-            let resource = state.record_native(connection, &forwarded, frame, now)?;
+            let resource = state.record_native(
+                connection,
+                &forwarded,
+                frame,
+                now,
+                self.observation.is_private(),
+            )?;
             let tap = self
                 .observation
                 .wants_native()
@@ -2241,7 +2253,13 @@ impl Broker {
             os_user,
         )?;
         let resource = state
-            .record_native(connection, &forwarded, frame, now)?
+            .record_native(
+                connection,
+                &forwarded,
+                frame,
+                now,
+                self.observation.is_private(),
+            )?
             .ok_or_else(|| BrokerError::invalid("a reverse request is recorded as a resource"))?;
         let grant = state
             .instances
@@ -5075,12 +5093,17 @@ impl BrokerState {
     }
 
     /// Records one native request the core has read, before anything is done with it.
+    ///
+    /// `private` is whether privacy mode stood when it was read. The record keeps it for good: what
+    /// any component is handed of the request later is made in privacy mode, however many times it
+    /// is decoded and whatever privacy mode is then.
     fn record_native(
         &mut self,
         connection: GatewayConnectionId,
         forwarded: &Forwarded,
         frame: &[u8],
         now: TimestampMs,
+        private: bool,
     ) -> Result<Option<PendingResource>> {
         // Before anything is counted, recorded or suspended. An upstream that mints an identifier
         // in this host's own namespace is an upstream whose next response this host could not tell
@@ -5198,6 +5221,8 @@ impl BrokerState {
         self.publish(&resource, &event);
         self.arbitration
             .record(resource.clone(), None, keeps_source.then_some(source))?;
+        self.arbitration
+            .set_made_in_privacy(resource.resource_id, private);
         // A request recorded while a recovery is running belongs to an upstream that has not said
         // what it still holds, so it joins what that recovery owes.
         self.volatile.owe_one(application_instance_id, connection);

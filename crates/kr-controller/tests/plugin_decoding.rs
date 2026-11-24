@@ -16,7 +16,7 @@ use kr_protocol::error::ErrorCode;
 use kr_protocol::gateway::{PendingResource, PendingState};
 use kr_protocol::local::ControllerConnectionRole;
 use kr_protocol::session::Durability;
-use kr_worker::broker::decoding::NotDecoded;
+use kr_worker::broker::decoding::{NotDecoded, Verdict};
 use plugin_world::observing::{
     Observing, Options, Spec, binding, digest, instance, package, request, request_noting,
 };
@@ -350,6 +350,82 @@ async fn kr_req_24_27_a_request_made_in_privacy_mode_marks_the_component_wheneve
     assert!(
         lane.is_marked(binding(1)),
         "the component was handed a request made in privacy mode and is not marked"
+    );
+}
+
+/// KR-REQ-24.27: a request keeps the privacy state it was recorded under through every decode,
+/// including one made again after privacy mode has ended.
+///
+/// The request is recorded in privacy mode and its first decode is passed over, as a decode is when
+/// the plugin runtime is away. Privacy mode ends and the request is decoded again. The component
+/// that decodes it is handed a request made in privacy mode and is marked; and after the runtime is
+/// replaced, so is the component that writes its answer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_24_27_a_request_made_in_privacy_mode_is_still_one_when_it_is_decoded_again_after_it()
+ {
+    let Some(world) =
+        Observing::start(Options::with(vec![Spec::decoder(1, "hostile-decoder")])).await
+    else {
+        return;
+    };
+    world.until_ready(1).await;
+    let lane = world.broker().observation();
+    let queue = world.broker().decode_queue();
+    let hold = queue.hold();
+    let mut authority = world
+        .hosted
+        .daemon_connection(ControllerConnectionRole::Authority)
+        .await;
+    world.tell_privacy(&mut authority, 1, true).await;
+    world.send(&request_noting(61, "!answer"));
+    until("the request to be queued for its decode", || async {
+        (queue.len() == 1).then_some(())
+    })
+    .await;
+    let (taken, dropped) = queue.take(|_| Verdict::Drop(NotDecoded::NotRegistered));
+    assert!(taken.is_none() && dropped.len() == 1, "{dropped:?}");
+    let recorded = resource_for(&world, "61").expect("the request is recorded");
+    assert!(!recorded.interpretation_verified, "{recorded:?}");
+
+    // Privacy mode ends, and the request is decoded again.
+    world.tell_privacy(&mut authority, 2, false).await;
+    assert!(!lane.is_private());
+    let again = world
+        .broker()
+        .interpret_request(recorded.resource_id, kr_ipc::now_ms())
+        .expect("the request is decoded again");
+    assert!(again.is_none(), "{again:?}");
+    until("the request to be queued again", || async {
+        (queue.len() == 1).then_some(())
+    })
+    .await;
+    hold.release();
+    let approval = approved(&world, "61").await;
+    assert!(
+        lane.is_marked(binding(1)),
+        "the component decoded again a request made in privacy mode and is not marked"
+    );
+
+    // The runtime is replaced, which takes the mark with the connection it described; the component
+    // that writes the answer is handed the request's bytes once more, and is marked.
+    let before = lane.connection();
+    let host = world.hosted.published().expect("the runtime is published");
+    plugin_world::kill(&host);
+    until("the link to connect to a replacement runtime", || async {
+        (lane.connection() > before).then_some(())
+    })
+    .await;
+    world.until_ready(1).await;
+    assert!(!lane.is_marked(binding(1)));
+    let mut owner = world.owner().await;
+    let outcome = world
+        .respond(&mut owner, approval.resource_id, "allow")
+        .await;
+    assert!(matches!(outcome, Outcome::Ok(_)), "{outcome:?}");
+    until_answered(&world, 61).await;
+    assert!(
+        lane.is_marked(binding(1)),
+        "the component wrote the answer to a request made in privacy mode and is not marked"
     );
 }
 
