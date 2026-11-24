@@ -549,10 +549,10 @@ mod tests {
         assert_eq!(second.state, CapabilityState::Incompatible);
     }
 
-    /// KR-REQ-03.29, KR-REQ-03.30, LP-3: an image is accepted only as a whole PNG, and is removed from the
-    /// check's own directory whatever came of it. A header alone, a payload that stops short, a
-    /// file of another format, an empty file and no file establish nothing, and a removal that
-    /// failed is said. The case gives the facility a scratch directory of its own.
+    /// KR-REQ-03.29, KR-REQ-03.30, LP-3: an image is accepted only as a whole PNG, and is removed
+    /// from the check's own directory whatever came of it. A header alone, a payload that stops
+    /// short, a file of another format, an empty file and no file establish nothing, and a removal
+    /// that failed is said. The case gives the facility a scratch directory of its own.
     #[test]
     fn an_image_counts_only_as_a_whole_png_and_is_removed() {
         let whole_png = whole(1280, 720);
@@ -951,9 +951,9 @@ mod tests {
         );
     }
 
-    /// KR-REQ-03.29, LP-7: a worker that names no display, with the variable absent or empty,
-    /// starts nothing, whatever sockets its runtime folder holds: the answer is that nothing was
-    /// established, the record still names the program, and nothing is left behind.
+    /// KR-REQ-03.29, KR-REQ-03.30, LP-7: a worker that names no display, with the variable absent
+    /// or empty, starts nothing, whatever sockets its runtime folder holds: the answer is that
+    /// nothing was established, the record still names the program, and nothing is left behind.
     #[test]
     fn a_worker_that_names_no_display_starts_nothing() {
         let tools = Folder::new();
@@ -1007,9 +1007,9 @@ mod tests {
         }
     }
 
-    /// KR-REQ-03.29, LP-12: the guard ends the program it holds when it goes out of scope. The
-    /// program's output pipe is read on a thread, and it reaches its end only when the program has
-    /// gone.
+    /// KR-REQ-03.29, KR-REQ-03.30, LP-12: the guard ends the program it holds when it goes out of
+    /// scope. The program's output pipe is read on a thread, and it reaches its end only when the
+    /// program has gone.
     #[test]
     fn a_compositor_a_case_started_is_ended_when_its_guard_goes_out_of_scope() {
         use std::io::Read as _;
@@ -1040,11 +1040,11 @@ mod tests {
         );
     }
 
-    /// KR-REQ-03.29, KR-REQ-03.30, LP-5, the real leg: a headless sway and the real `grim` on a runner's facts
-    /// (`WLR_RENDERER=pixman`, the socket read from the runtime folder, one output of 1280 by 720)
-    /// give an image the check performs, and the file `grim` writes for itself is a whole PNG of
-    /// that size. It needs `sway` and `grim` and fails with a reason beginning "not run" where
-    /// they are not installed, so it never reads as passed.
+    /// KR-REQ-03.29, KR-REQ-03.30, LP-5, the real leg: a headless sway and the real `grim` on a
+    /// runner's facts (`WLR_RENDERER=pixman`, the socket read from the runtime folder, one output
+    /// of 1280 by 720) give an image the check performs, and the file `grim` writes for itself is
+    /// a whole PNG of that size. It needs `sway` and `grim` and fails with a reason beginning "not
+    /// run" where they are not installed, so it never reads as passed.
     #[cfg(target_os = "linux")]
     #[test]
     #[ignore = "needs sway and grim: run where they are installed"]

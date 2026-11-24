@@ -439,7 +439,8 @@ pub(super) mod tests {
         );
     }
 
-    /// KR-REQ-03.29, LP-9: a link is not followed, and a folder is not a file: neither is read.
+    /// KR-REQ-03.29, KR-REQ-03.30, LP-9: a link is not followed, and a folder is not a file:
+    /// neither is read.
     #[cfg(unix)]
     #[test]
     fn a_link_and_a_folder_are_not_regular_files() {
@@ -460,7 +461,7 @@ pub(super) mod tests {
         assert_eq!(read_image(&folder, &plenty()), Some(Err(Fault::NotAFile)));
     }
 
-    /// KR-REQ-03.29, LP-9: a pipe with no writer is not waited for.
+    /// KR-REQ-03.29, KR-REQ-03.30, LP-9: a pipe with no writer is not waited for.
     #[cfg(unix)]
     #[test]
     fn a_pipe_is_refused_and_not_waited_for() {
@@ -483,8 +484,8 @@ pub(super) mod tests {
         );
     }
 
-    /// KR-REQ-03.29, LP-9: a file of more bytes than the limit is too large, whatever it holds, and
-    /// one of exactly the limit is whole.
+    /// KR-REQ-03.29, KR-REQ-03.30, LP-9: a file of more bytes than the limit is too large,
+    /// whatever it holds, and one of exactly the limit is whole.
     #[test]
     fn a_file_over_the_limit_is_too_large_and_one_at_the_limit_is_whole() {
         let dir = Dir::new();
@@ -500,9 +501,9 @@ pub(super) mod tests {
         );
     }
 
-    /// KR-REQ-03.29, LP-9: a file that is there and cannot be read is said, with the system's own
-    /// words, and is not called an absent or an empty one. A privileged process can read it, which
-    /// is a different case.
+    /// KR-REQ-03.29, KR-REQ-03.30, LP-9: a file that is there and cannot be read is said, with the
+    /// system's own words, and is not called an absent or an empty one. A privileged process can
+    /// read it, which is a different case.
     #[cfg(unix)]
     #[test]
     fn a_file_closed_to_this_process_is_unreadable_and_not_absent() {
