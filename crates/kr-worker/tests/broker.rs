@@ -3849,17 +3849,16 @@ fn kr_req_11_16_evidence_names_the_package_publisher_schema_and_binary_it_was_ga
     );
 }
 
-/// KR-REQ-12.02 and KR-REQ-11.35: a launch the fence refuses leaves the profile of the instance
-/// that runs.
+/// KR-REQ-12.02 and KR-REQ-11.35: a launch the fence refuses is kept nowhere.
 ///
 /// A launch's profile is written before it is kept. While the journal is faulted nothing can be
-/// written, so a preparation is refused before anything changes, and the instance launched earlier
-/// still reads the profile it was launched with. Of that profile only the version is read here;
-/// not shown here: the executable, the distribution, the arguments, the authentication state and
-/// the mode. A preparation under the identifier of a live instance's profile is refused before the
-/// journal is asked, and another case holds that.
+/// written, so a preparation is refused, the failed candidate's profile is not kept, and the
+/// instance launched earlier still reads the profile it was launched with. Of that profile only
+/// the version is read here; not shown here: the executable, the distribution, the arguments, the
+/// authentication state and the mode. A preparation under the identifier of a live instance's
+/// profile is refused before the journal is asked, and another case holds that.
 #[test]
-fn kr_req_12_02_a_launch_the_fence_refuses_leaves_the_profile_it_would_have_replaced() {
+fn kr_req_12_02_a_launch_the_fence_refuses_is_kept_nowhere() {
     let mut store = common::SharedStore::open();
     let broker =
         Broker::open(Some(&store.path), session(), store.health()).expect("the broker opens");
@@ -3875,16 +3874,18 @@ fn kr_req_12_02_a_launch_the_fence_refuses_leaves_the_profile_it_would_have_repl
         .expect("the launch runs");
 
     store.fault_acceptance();
+    let candidate = profile(IntegrationMode::Gateway, [4; 32], "1.0.0");
+    let candidate_id = candidate.profile_id.clone();
     let refused = broker
-        .prepare_launch(
-            profile(IntegrationMode::Gateway, [4; 32], "1.0.0"),
-            ForegroundMark::idle(5),
-            None,
-        )
+        .prepare_launch(candidate, ForegroundMark::idle(5), None)
         .expect_err("nothing can be recorded while the journal is faulted");
     assert_eq!(
         refused.code(),
         kr_protocol::error::ErrorCode::StorageUnavailable
+    );
+    assert!(
+        broker.kept_profile(&candidate_id).is_none(),
+        "the profile of the preparation that failed is not kept"
     );
     assert_eq!(
         broker

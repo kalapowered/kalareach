@@ -3097,6 +3097,14 @@ impl Broker {
             .cloned()
     }
 
+    /// Returns the profile this broker keeps under one identifier, whether or not an instance
+    /// holds it, for a case that asks if a preparation that failed was kept.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn kept_profile(&self, profile_id: &LaunchProfileId) -> Option<LaunchProfile> {
+        self.state().profiles.profile(profile_id).cloned()
+    }
+
     /// Has this broker claim the conversations its instances own on the host, so that no other
     /// session of the user runs against one of them as well.
     ///
