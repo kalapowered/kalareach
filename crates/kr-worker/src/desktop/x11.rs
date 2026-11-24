@@ -22,7 +22,9 @@ use kr_protocol::hostinfo::export::Sentence;
 
 use super::capability::installed_in;
 use super::payload::{self, Fault};
-use super::probe::{Check, Deadline, Exit, Outcome, Plan, Ran, Setting, bounded_with, on_a_thread};
+use super::probe::{
+    Check, Deadline, Exit, Outcome, Plan, Ran, Setting, bounded_with, failed, on_a_thread,
+};
 use super::routes::{Asking, Operation, Program, Route, Variables};
 
 /// The programs a screen image is taken with on X11, in the order they are looked for.
@@ -224,13 +226,11 @@ fn perform_in(plan: &Plan, setting: &Setting<'_>, operation: &Operation, sockets
                 }),
         },
         // A check with no time left to try the socket in does not guess at why the tool failed.
-        Exit::Failed(_) => Err(reach(number, sockets, setting.deadline).map_or(
+        Exit::Failed(said) => Err(reach(number, sockets, setting.deadline).map_or(
             Outcome::TimedOut,
             |reach| {
-                outcome_of(told_by(
-                    ran.error_output.as_deref().unwrap_or_default(),
-                    reach,
-                ))
+                let told = told_by(ran.error_output.as_deref().unwrap_or_default(), reach);
+                outcome_of(told, &said)
             },
         )),
         Exit::Unfinished(outcome) => Err(outcome),
@@ -340,21 +340,41 @@ enum Reach {
     Silent,
 }
 
-/// What a failed tool and the display's socket say together.
+/// What a failed tool, what it said and the display's socket say together.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Told {
     /// The display accepted the connection and refused the authority this worker holds.
     AuthorityRefused,
-    /// The display accepted a connection and the tool failed without the refusal line.
-    Accepted,
+    /// The display accepted a connection and the tool said, in its own words, that it could not
+    /// open the display.
+    NotOpened,
+    /// The display accepted a connection and the tool failed in some other way.
+    Failed,
     /// The display cannot be reached.
     Unreachable,
 }
 
 /// The lines the client library prints when the server refuses a connection, as recorded from four
-/// tools with an empty authority file and a wrong key. A tool's own sentence is never matched: the
-/// ImageMagick one carries its program name.
+/// tools with an empty authority file and a wrong key. They are the library's own and start the
+/// line: a tool's own sentence is not one of them.
 const REFUSALS: [&str; 2] = ["Authorization required", "Invalid MIT-MAGIC-COOKIE-1 key"];
+
+/// The sentences the four tools print when they cannot open the display, as recorded from each
+/// against a display that nothing holds. They are the tools' own words, matched anywhere in a line
+/// because the ImageMagick one carries its program name before them.
+const OPEN_FAILURES: [&str; 4] = [
+    "Failed to open X display",
+    "unable to open X server",
+    "Can't open X display",
+    "unable to open display",
+];
+
+/// Whether the error output holds a sentence in which a tool says it could not open the display.
+fn open_failure(error_output: &str) -> bool {
+    OPEN_FAILURES
+        .iter()
+        .any(|phrase| error_output.contains(phrase))
+}
 
 /// Whether the error output holds a line that says the server refused the connection.
 fn refusal_line(error_output: &str) -> bool {
@@ -370,20 +390,25 @@ fn refusal_line(error_output: &str) -> bool {
 fn told_by(error_output: &str, reach: Reach) -> Told {
     match reach {
         Reach::Connects if refusal_line(error_output) => Told::AuthorityRefused,
-        Reach::Connects => Told::Accepted,
+        Reach::Connects if open_failure(error_output) => Told::NotOpened,
+        Reach::Connects => Told::Failed,
         Reach::Silent => Told::Unreachable,
     }
 }
 
-/// The outcome a failed tool comes to. None of them is a permission a person grants.
-fn outcome_of(told: Told) -> Outcome {
+/// The outcome a failed tool comes to, with what it said. None of them is a permission a person
+/// grants.
+fn outcome_of(told: Told, said: &str) -> Outcome {
     let detail = match told {
         Told::AuthorityRefused => Sentence::new().stated(
             "the display refused the authority this worker holds. A worker holds the authority \
              its login had when it started; a new session may hold the current one",
         ),
-        Told::Accepted => Sentence::new()
+        Told::NotOpened => Sentence::new()
             .stated("the display accepted a connection and the tool could not open it"),
+        Told::Failed => Sentence::new()
+            .stated("the display accepted a connection, and ")
+            .sentence(&failed(said)),
         Told::Unreachable => Sentence::new().stated("the display cannot be reached"),
     };
     Outcome::NotAttempted { detail }
@@ -1129,6 +1154,115 @@ mod tests {
         }
     }
 
+    /// Whether this process is held to the permissions of a file it owns: a privileged one is not.
+    fn permissions_are_enforced() -> bool {
+        let folder = folder();
+        let file = program(folder.path(), "closed", "a file");
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o000)).expect("closes it");
+        std::fs::File::open(&file).is_err()
+    }
+
+    /// The record the report makes of the screen image on an X11 desktop that names `display`,
+    /// with the tools in `tools` and `scratch` as the check's own directory.
+    fn asked(
+        tools: &Path,
+        display: &str,
+        scratch: &Path,
+    ) -> kr_protocol::desktop::CapabilityRecord {
+        use kr_protocol::desktop::CapabilitySubject;
+        use kr_protocol::ids::{CapabilityRevision, EnvironmentId, SessionId};
+        use kr_protocol::scalars::Uuid;
+
+        use super::super::routes::Surroundings;
+
+        let surroundings = Surroundings {
+            desktop: context(DisplayServer::X11, true),
+            variables: Variables {
+                display: Some(display.to_owned()),
+                search: Some(tools.as_os_str().to_owned()),
+                ..Variables::default()
+            },
+        };
+        let source = |_: &Deadline| surroundings.clone();
+        let subject = CapabilitySubject {
+            environment_id: EnvironmentId::new(Uuid::from_bytes([7; 16])),
+            desktop_session_id: Nullable::null(),
+            session_id: Nullable::<SessionId>::null(),
+            application: Nullable::null(),
+            terminal: Nullable::null(),
+        };
+        let mut records = probe::report(
+            &surroundings,
+            &[Check::ScreenImage],
+            &subject,
+            &source,
+            CapabilityRevision::new(3),
+            &Plan::in_directory(scratch),
+            &probe::Platform,
+        );
+        assert_eq!(records.len(), 1, "{records:?}");
+        records.remove(0)
+    }
+
+    /// The words of a record's reason.
+    fn reason(record: &kr_protocol::desktop::CapabilityRecord) -> String {
+        record
+            .disabled_reason
+            .as_ref()
+            .map(Sentence::as_str)
+            .expect("a reason")
+            .to_owned()
+    }
+
+    /// KR-REQ-03.29, KR-REQ-03.30, LX-15: a file that cannot be read is said as that and not as no
+    /// file, and a removal that fails is said with the answer, which then does not say that
+    /// nothing was kept. A privileged process can read and remove what is closed to it, so there
+    /// the case has nothing to show.
+    #[test]
+    fn kr_req_03_29_a_file_that_cannot_be_read_or_removed_is_said_as_that() {
+        if !permissions_are_enforced() {
+            return;
+        }
+        let tools = folder();
+        let whole = tools.path().join("whole.png");
+        std::fs::write(&whole, png_of(1280, 800, 8, 6, 5969)).expect("an image");
+        // A file closed to the process that reads it.
+        making_tool(
+            tools.path(),
+            &format!("cp '{}' \"$last\"\nchmod 000 \"$last\"", whole.display()),
+        );
+        let scratch = folder();
+        let record = asked(tools.path(), ":7", scratch.path());
+        assert_eq!(record.state, CapabilityState::TemporarilyUnavailable);
+        let words = reason(&record);
+        assert!(
+            words.contains("left no usable image: a file that could not be read: "),
+            "{words}"
+        );
+        assert!(!words.contains("no file, or an empty one"), "{words}");
+        // A removal that fails after a whole image: the tool closes the directory after it writes.
+        making_tool(
+            tools.path(),
+            &format!(
+                "cp '{}' \"$last\"\nchmod 555 \"$(dirname \"$last\")\"",
+                whole.display()
+            ),
+        );
+        let scratch = folder();
+        let record = asked(tools.path(), ":7", scratch.path());
+        let words = reason(&record);
+        std::fs::set_permissions(scratch.path(), std::fs::Permissions::from_mode(0o755))
+            .expect("opens the directory again");
+        assert_eq!(record.state, CapabilityState::QualifiedAvailable, "{words}");
+        assert!(
+            words.contains(
+                "of the whole X screen, every monitor on it, into memory, and it could not remove "
+            ),
+            "{words}"
+        );
+        assert!(!words.contains("kept none of it"), "{words}");
+    }
+
     /// KR-REQ-03.29, LX-4: a refusal of the display's authority is told from a display that cannot
     /// be reached by two independent facts, the worker's own connection to the socket and the line
     /// the client library prints. The four fixtures are the error output the four tools gave on an
@@ -1153,10 +1287,11 @@ mod tests {
                     "{said}"
                 );
             }
-            // The tool's own sentence alone, with a display that accepted the connection.
+            // The tool's own sentence alone, with a display that accepted the connection: the tool
+            // says it could not open the display, which is not a refusal.
             assert_eq!(
                 told_by(sentence, Reach::Connects),
-                Told::Accepted,
+                Told::NotOpened,
                 "{sentence}"
             );
             // No socket: unreachable, with the sentence alone and with the refusal line too.
@@ -1171,10 +1306,18 @@ mod tests {
                 "{refused}"
             );
         }
+        // A failure that is not an open failure is neither a refusal nor said to be one.
+        for other in [
+            "scrot: Saving to file capture.png failed\n",
+            "sh: 1: maim: not found\n",
+            "",
+        ] {
+            assert_eq!(told_by(other, Reach::Connects), Told::Failed, "{other:?}");
+        }
         // What each answer comes to: none is a permission a person grants.
         let (state, evidence, reason) = judge(
             Check::ScreenImage,
-            &outcome_of(Told::AuthorityRefused),
+            &outcome_of(Told::AuthorityRefused, ""),
             Asking::Never,
         );
         assert_eq!(state, CapabilityState::TemporarilyUnavailable);
@@ -1189,8 +1332,12 @@ mod tests {
             "{reason}"
         );
         assert!(!reason.contains("xhost"), "{reason}");
-        for told in [Told::Accepted, Told::Unreachable] {
-            let (state, _, _) = judge(Check::ScreenImage, &outcome_of(told), Asking::Never);
+        for told in [Told::NotOpened, Told::Failed, Told::Unreachable] {
+            let (state, _, _) = judge(
+                Check::ScreenImage,
+                &outcome_of(told, "it failed"),
+                Asking::Never,
+            );
             assert_eq!(state, CapabilityState::TemporarilyUnavailable, "{told:?}");
         }
     }
@@ -1228,8 +1375,29 @@ mod tests {
             said(&ran)
         );
         // The same line on the output of a tool that printed nothing on its error output is not a
-        // refusal: the two streams are kept apart.
+        // refusal: the two streams are kept apart. It is a failure the tool gave no open failure
+        // for, and it is said as that.
         stand_in(tools.path(), "maim", None, refusal, "", 1);
+        let ran = perform_with(&plan, tools.path(), &variables(":7"), sockets.path());
+        assert!(
+            said(&ran).contains("the display accepted a connection, and the facility exited"),
+            "{}",
+            said(&ran)
+        );
+        assert!(
+            !said(&ran).contains("could not open it") && !said(&ran).contains("refused"),
+            "{}",
+            said(&ran)
+        );
+        // The tool's own sentence that it could not open the display, with the display accepting.
+        stand_in(
+            tools.path(),
+            "maim",
+            None,
+            "",
+            "Maim encountered an error:\nError: Failed to open X display: :7\n",
+            1,
+        );
         let ran = perform_with(&plan, tools.path(), &variables(":7"), sockets.path());
         assert!(
             said(&ran).contains("accepted a connection and the tool could not open it"),
