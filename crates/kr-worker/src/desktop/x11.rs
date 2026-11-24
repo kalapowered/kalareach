@@ -1681,9 +1681,13 @@ mod tests {
 
         let sockets = folder();
         let path = sockets.path().join("X5");
-        let _listening = std::os::unix::net::UnixListener::bind(&path).expect("a socket");
-        // Connections that nobody accepts, until the socket's queue holds no more.
         let address = SocketAddrUnix::new(&path).expect("an address");
+        // A listener with a backlog of 0 holds one waiting connection, so the next one finds the
+        // queue full.
+        let listener =
+            nonblocking_socket(AddressFamily::UNIX, SocketType::STREAM).expect("a socket");
+        rustix::net::bind(&listener, &address).expect("a socket at the path");
+        rustix::net::listen(&listener, 0).expect("a listener");
         let mut waiting = Vec::new();
         loop {
             let socket =
@@ -1693,7 +1697,7 @@ mod tests {
                 Err(rustix::io::Errno::AGAIN) => break,
                 Err(error) => panic!("the queue was never full: {error}"),
             }
-            assert!(waiting.len() < 100_000, "the queue was never full");
+            assert!(waiting.len() < 3, "the queue was never full");
         }
         let started = std::time::Instant::now();
         let reached = reach(
