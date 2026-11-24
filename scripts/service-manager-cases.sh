@@ -56,5 +56,6 @@ step() {
 
 step cargo test --locked -p kr-worker --test host -- --ignored --exact a_crashed_workers_tree_is_stopped_under_the_platforms_service_manager
 step cargo test --locked -p kr-worker --test host -- --ignored --exact a_session_in_a_service_rests_on_a_control_group_and_a_close_ends_what_left_its_tree
+step cargo test --locked -p kr-controller --lib -- --ignored --exact supervision::tests::a_transient_unit_whose_process_failed_is_collected
 
 exit "$failed"

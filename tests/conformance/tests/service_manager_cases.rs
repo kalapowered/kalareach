@@ -15,6 +15,7 @@ use std::process::Command;
 const CRASH_CASE: &str = "a_crashed_workers_tree_is_stopped_under_the_platforms_service_manager";
 const SESSION_CASE: &str =
     "a_session_in_a_service_rests_on_a_control_group_and_a_close_ends_what_left_its_tree";
+const COLLECT_CASE: &str = "supervision::tests::a_transient_unit_whose_process_failed_is_collected";
 const MANAGER_ASK: &str = "systemctl --user show --property=Version --value";
 
 /// What each stand-in does: the kernel's name the host reports, whether its user manager answers,
@@ -98,6 +99,10 @@ fn test_command(case: &str) -> String {
     format!("cargo test --locked -p kr-worker --test host -- --ignored --exact {case}")
 }
 
+fn collect_command() -> String {
+    format!("cargo test --locked -p kr-controller --lib -- --ignored --exact {COLLECT_CASE}")
+}
+
 #[test]
 fn a_host_that_is_not_linux_is_refused_before_a_service_manager_is_asked() {
     let host = Host {
@@ -131,7 +136,8 @@ fn each_case_runs_by_its_exact_name_and_the_step_passes_when_each_passed() {
         [
             MANAGER_ASK.to_owned(),
             test_command(CRASH_CASE),
-            test_command(SESSION_CASE)
+            test_command(SESSION_CASE),
+            collect_command()
         ],
         "{text}"
     );
@@ -142,10 +148,10 @@ fn a_case_that_cargo_filtered_out_fails_the_step_although_cargo_exited_0() {
     let (text, code, calls) = run(&a_linux_host(result(0)));
     assert_eq!(code, Some(1), "{text}");
     assert!(
-        text.contains(CRASH_CASE) && text.contains(SESSION_CASE),
+        text.contains(CRASH_CASE) && text.contains(SESSION_CASE) && text.contains(COLLECT_CASE),
         "{text}"
     );
-    assert_eq!(calls.len(), 3, "each command ran: {calls:?}");
+    assert_eq!(calls.len(), 4, "each command ran: {calls:?}");
 }
 
 #[test]
@@ -156,7 +162,7 @@ fn a_failed_case_fails_the_step_and_the_next_command_still_runs() {
     };
     let (text, code, calls) = run(&host);
     assert_eq!(code, Some(1), "{text}");
-    assert_eq!(calls.len(), 3, "each command ran: {calls:?}");
+    assert_eq!(calls.len(), 4, "each command ran: {calls:?}");
 }
 
 /// The script keeps what each command printed in a file `mktemp` makes in the temporary directory,
@@ -198,8 +204,8 @@ fn the_script_keeps_its_count_in_a_temporary_file_and_removes_it_when_it_ends() 
     let seen = std::fs::read_to_string(&during).unwrap_or_default();
     assert_eq!(
         seen.lines().count(),
-        2,
-        "one file in the temporary directory while each of the two commands ran: {seen:?}"
+        3,
+        "one file in the temporary directory while each of the three commands ran: {seen:?}"
     );
     assert!(
         seen.lines()
