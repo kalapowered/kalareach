@@ -124,8 +124,10 @@ const FAULT_RESERVE: usize = 8;
 /// binding disables itself instead, which is what the notice would have asked for.
 const FAULT_DELIVERY_WAIT: core::time::Duration = core::time::Duration::from_secs(2);
 
-/// How long the binding's thread waits for a command while it owes the caller a report, before it
-/// tries to send the report again: nothing wakes the thread when the caller reads and makes room.
+/// How long after a failed attempt the binding's thread tries to send an owed report again:
+/// nothing wakes the thread when the caller reads and makes room. The time is a deadline that
+/// commands do not move, so calls that follow one another closer than this still leave the report
+/// its turn.
 const OWED_RETRY: core::time::Duration = core::time::Duration::from_millis(50);
 
 /// What a broker asks for when it prepares a binding.
@@ -1095,6 +1097,7 @@ impl BindingHandle {
             observing: None,
             returned_in_pass: false,
             consumed_owed: None,
+            owed_due: std::time::Instant::now(),
             consumed_held: false,
         };
         let name = format!("kr-plugin-binding-{}", request.binding_id);
@@ -1564,6 +1567,9 @@ struct BindingWorker {
     returned_in_pass: bool,
     /// What the caller has not been given yet. A newer one replaces it.
     consumed_owed: Option<Consumed>,
+    /// When the thread next tries to send `consumed_owed`: [`OWED_RETRY`] after the last attempt,
+    /// whatever commands come in between.
+    owed_due: std::time::Instant,
     /// Whether `consumed_owed` waits for the gap a pass left to be reported first.
     consumed_held: bool,
 }
@@ -1614,19 +1620,20 @@ impl BindingWorker {
         }
 
         loop {
-            let received = if self.consumed_owed.is_some() {
-                inbox.recv_timeout(OWED_RETRY)
-            } else {
-                inbox
+            // Between two commands, so a run of calls that emit no document cannot keep a report
+            // from its turn.
+            if self.consumed_owed.is_some() && std::time::Instant::now() >= self.owed_due {
+                self.flush_consumed();
+            }
+            let received = match self.owed_wait() {
+                Some(wait) => inbox.recv_timeout(wait),
+                None => inbox
                     .recv()
-                    .map_err(|_| mpsc::RecvTimeoutError::Disconnected)
+                    .map_err(|_| mpsc::RecvTimeoutError::Disconnected),
             };
             let command = match received {
                 Ok(command) => command,
-                Err(mpsc::RecvTimeoutError::Timeout) => {
-                    self.flush_consumed();
-                    continue;
-                }
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
                 Err(mpsc::RecvTimeoutError::Disconnected) => return,
             };
             if self.stopping.load(Ordering::Acquire) {
@@ -1745,6 +1752,15 @@ impl BindingWorker {
         self.flush_consumed();
     }
 
+    /// How long the thread waits for a command: until the owed report is due, or without end when
+    /// nothing is owed.
+    fn owed_wait(&self) -> Option<core::time::Duration> {
+        self.consumed_owed.is_some().then(|| {
+            self.owed_due
+                .saturating_duration_since(std::time::Instant::now())
+        })
+    }
+
     /// How many times the instance has been replaced after a trap.
     fn replacements(&self) -> u32 {
         self.instance.as_ref().map_or(0, |instance| {
@@ -1776,6 +1792,7 @@ impl BindingWorker {
     /// owed for the next pass or the next report, which a newer one then replaces.
     fn flush_consumed(&mut self) {
         if self.consumed_held {
+            self.owed_due = std::time::Instant::now() + OWED_RETRY;
             return;
         }
         let Some(owed) = self.consumed_owed.take() else {
@@ -1790,6 +1807,7 @@ impl BindingWorker {
             return;
         }
         self.consumed_owed = Some(owed);
+        self.owed_due = std::time::Instant::now() + OWED_RETRY;
     }
 
     fn pump_pass(&mut self) {
