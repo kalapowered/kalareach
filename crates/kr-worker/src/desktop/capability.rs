@@ -45,7 +45,7 @@ use kr_protocol::ids::{CapabilityId, CapabilityRevision, EnvironmentId, SessionI
 use kr_protocol::scalars::{Nullable, U64};
 use std::path::Path;
 
-use super::probe::Check;
+use super::probe::{Check, Deadline};
 use super::routes::{Program, resolve};
 
 /// The version of the capability contracts this host writes records against.
@@ -806,6 +806,20 @@ fn runnable(path: &std::path::Path) -> bool {
 /// The digest is for noticing a change rather than for proving one: a capability record is
 /// evidence about what is feasible, never authority, and nothing here signs it.
 pub fn facility_identity(tool: &str) -> Option<Sentence> {
+    identified_until(tool, || false)
+}
+
+/// [`facility_identity`], for a check that has a deadline: a file not digested by the time the
+/// deadline has nothing left has no identity here.
+///
+/// The check's time is the one clock this takes: what the digest reads is the same as without it,
+/// and it is cut short only where the check itself has run out of time.
+pub(super) fn facility_identity_within(tool: &str, deadline: &Deadline) -> Option<Sentence> {
+    identified_until(tool, || deadline.expired())
+}
+
+/// Digests a file a block at a time, and gives up where `over` says so between two blocks.
+fn identified_until(tool: &str, over: impl Fn() -> bool) -> Option<Sentence> {
     use std::io::Read as _;
 
     let mut file = std::fs::File::open(tool).ok()?;
@@ -813,6 +827,9 @@ pub fn facility_identity(tool: &str) -> Option<Sentence> {
     let mut block = [0_u8; DIGEST_BLOCK];
     let mut digested: u64 = 0;
     loop {
+        if over() {
+            return None;
+        }
         match file.read(&mut block) {
             Ok(0) => break,
             Ok(count) => {
@@ -1162,6 +1179,24 @@ mod tests {
         let _ = std::fs::remove_file(&large);
         assert_eq!(answer.state, CapabilityState::TemporarilyUnavailable);
         assert!(identity.is_none(), "{identity:?}");
+    }
+
+    /// KR-REQ-03.29, S-8: a program is digested inside the check's time, and one not digested by the
+    /// time it is gone has no identity.
+    #[test]
+    fn a_digest_gives_up_where_the_checks_time_is_gone() {
+        let file = temporary("digest-time");
+        std::fs::write(&file, b"a program").expect("a file");
+        let path = file.display().to_string();
+        let with_time =
+            facility_identity_within(&path, &Deadline::after(std::time::Duration::from_secs(60)));
+        let without = facility_identity_within(&path, &Deadline::after(std::time::Duration::ZERO));
+        let _ = std::fs::remove_file(&file);
+        assert!(with_time.is_some(), "a digest with time to take it");
+        assert!(
+            without.is_none(),
+            "a digest after the time was gone: {without:?}"
+        );
     }
 
     #[test]

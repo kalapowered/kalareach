@@ -84,7 +84,9 @@ pub fn perform(
     };
     // The first reading names the desktop the records are about and which checks it is asked for.
     // Each operation that acts on the desktop reads it again before it starts and after it ends.
-    let desktop = source.read().desktop;
+    let desktop = source
+        .read(&probe::Deadline::after(probe::FIRST_READING))
+        .desktop;
     let subject = CapabilitySubject {
         environment_id: request.environment_id,
         desktop_session_id: desktop.desktop_session_id.clone(),
@@ -194,7 +196,7 @@ mod tests {
     /// A source that always reads the same desktop, with no variables.
     fn desktop(graphic_access: bool) -> impl ContextSource {
         let context = context(graphic_access);
-        move || Surroundings {
+        move |_: &probe::Deadline| Surroundings {
             desktop: context.clone(),
             variables: Variables::default(),
         }

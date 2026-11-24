@@ -5255,9 +5255,13 @@ impl WorkerService {
             // Read on this thread, each time it is asked for: asking the platform for the login
             // session can wait on it, and an operation reads it again before it starts and after
             // it ends.
-            let surroundings = move || crate::desktop::routes::Surroundings {
-                desktop: crate::desktop::context(profile, boot.clone()),
-                variables: crate::desktop::routes::Variables::of_this_process(),
+            let surroundings = move |deadline: &crate::desktop::probe::Deadline| {
+                crate::desktop::routes::Surroundings {
+                    desktop: crate::desktop::platform::within(deadline.left(), || {
+                        crate::desktop::context(profile, boot.clone())
+                    }),
+                    variables: crate::desktop::routes::Variables::of_this_process(),
+                }
             };
             crate::desktop::checks::perform(
                 &request,

@@ -54,7 +54,7 @@ use kr_protocol::identity::WorkerProfile;
 use kr_protocol::ids::{CapabilityId, CapabilityRevision};
 use kr_protocol::scalars::{Nullable, U64};
 
-use super::capability::{CAPABILITY_VERSION, facility_identity};
+use super::capability::{CAPABILITY_VERSION, facility_identity_within};
 use super::routes::{
     Asking, ContextSource, Operation, Program, Route, Surroundings, Variables, file_read_route,
     resolve,
@@ -307,6 +307,11 @@ pub enum Outcome {
         /// What the route is and why nothing was run.
         detail: Sentence,
     },
+    /// The check's time ran out where nothing of it was running: before its operation started, or
+    /// before the desktop could be read again to confirm what the operation found.
+    ///
+    /// It is not [`Outcome::NotAnswered`], which says an operation was started.
+    TimedOut,
 }
 
 /// One check, what it used and what came of it.
@@ -552,6 +557,13 @@ pub fn judge(
             CapabilityEvidenceSource::NotProbed,
             Some(detail.clone()),
         ),
+        Outcome::TimedOut => (
+            CapabilityState::TemporarilyUnavailable,
+            CapabilityEvidenceSource::DisclosedProbe,
+            Some(Sentence::new().stated(
+                "the check did not finish within its time limit. It established no result.",
+            )),
+        ),
     }
 }
 
@@ -585,9 +597,15 @@ pub fn record(
     profile: WorkerProfile,
     revision: CapabilityRevision,
     observed_at_ms: kr_protocol::scalars::TimestampMs,
+    deadline: &Deadline,
 ) -> Option<CapabilityRecord> {
     let (state, evidence, reason) = judge(ran.check, &ran.outcome, route.asking);
-    let identity = ran.facility.as_deref().and_then(facility_identity);
+    // Digesting a program takes the check's time like everything else in it: one that cannot be
+    // digested before the deadline has no identity, which a later reading finds changed.
+    let identity = ran
+        .facility
+        .as_deref()
+        .and_then(|program| facility_identity_within(program, deadline));
     Some(CapabilityRecord {
         capability: CapabilityId::new(ran.check.capability()).ok()?,
         version: U64::new(CAPABILITY_VERSION),
@@ -694,6 +712,10 @@ const fn has_a_desktop_of(os: HostOs, display_server: DisplayServer) -> bool {
 /// that fails either test stops every later operation too, which is answered without being started.
 /// A check that has no route on the desktop it is asked of produces no record, so the platform's
 /// record of it stands.
+///
+/// Each check has one deadline, which starts before its first reading and ends with its last: the
+/// readings, the lookup of its route, the operation and what it left behind, and the digest of the
+/// program all draw on it. A check whose time ran out before its operation started starts nothing.
 #[must_use]
 pub fn report(
     checks: &[Check],
@@ -703,17 +725,61 @@ pub fn report(
     plan: &Plan,
     facilities: &dyn Facilities,
 ) -> Vec<CapabilityRecord> {
+    report_timed(
+        checks, subject, source, revision, plan, facilities, &time_of,
+    )
+}
+
+/// How the time of one check is shared out.
+#[derive(Clone, Copy, Debug)]
+struct Time {
+    /// What the whole check has, from its first reading to its last.
+    bound: Duration,
+    /// What the check keeps for after its operation: collecting what the operation left behind,
+    /// and the reading that follows it.
+    after: Duration,
+}
+
+/// The time each check has.
+fn time_of(check: Check) -> Time {
+    Time {
+        bound: check.effects().bound,
+        after: AFTER_OPERATION,
+    }
+}
+
+/// The part of a check's time that is kept for after its operation.
+///
+/// The operation is stopped this long before the check's own end, so that collecting what it left
+/// behind and the reading taken after it still fit inside the check's one deadline.
+const AFTER_OPERATION: Duration = Duration::from_secs(5);
+
+/// The time the first reading has, which comes before every check and belongs to none.
+pub const FIRST_READING: Duration = Duration::from_secs(10);
+
+/// [`report`], with the time each check has given by the caller.
+fn report_timed(
+    checks: &[Check],
+    subject: &CapabilitySubject,
+    source: &dyn ContextSource,
+    revision: CapabilityRevision,
+    plan: &Plan,
+    facilities: &dyn Facilities,
+    time_of: &dyn Fn(Check) -> Time,
+) -> Vec<CapabilityRecord> {
     let observed_at_ms = kr_ipc::now_ms();
-    let first = source.read();
+    let first = source.read(&Deadline::after(FIRST_READING));
     let profile = first.desktop.worker_profile;
     let mut stopped = false;
     let mut records = Vec::new();
     for check in checks {
         let record = if check.acts_on_a_desktop() {
+            let time = time_of(*check);
+            let deadline = Deadline::after(time.bound);
             let before = if stopped {
                 first.clone()
             } else {
-                source.read()
+                source.read(&deadline)
             };
             let Some(operation) =
                 resolve(*check, &before.desktop, before.variables.search.as_deref())
@@ -724,11 +790,16 @@ pub fn report(
             // check act on.
             let ready =
                 !stopped && may_start(*check, &before.desktop) && unchanged(&first, &before);
-            let ran = if !ready {
+            let ran = if deadline.expired() {
+                // What the readings and the lookup took was all the time there was: nothing starts.
+                timed_out(*check, None)
+            } else if !ready {
                 stopped = true;
                 not_in_the_state_it_needs(*check, None)
             } else {
-                let deadline = Deadline::after(check.effects().bound);
+                // The operation is stopped early enough for what follows it to fit in the check's
+                // own time.
+                let working = deadline.ending_before(time.after);
                 let ran = facilities.perform(
                     *check,
                     plan,
@@ -736,10 +807,15 @@ pub fn report(
                         desktop: &before.desktop,
                         variables: &before.variables,
                         operation: Some(&operation),
-                        deadline: &deadline,
+                        deadline: &working,
                     },
                 );
-                if unchanged(&before, &source.read()) {
+                let after = source.read(&deadline);
+                if deadline.expired() {
+                    // A success whose desktop could not be read again in time is not one that
+                    // stands.
+                    timed_out(*check, ran.facility)
+                } else if unchanged(&before, &after) {
                     ran
                 } else {
                     stopped = true;
@@ -753,6 +829,7 @@ pub fn report(
                 profile,
                 revision,
                 observed_at_ms,
+                &deadline,
             )
         } else {
             let route = match check {
@@ -773,7 +850,15 @@ pub fn report(
                     deadline: &deadline,
                 },
             );
-            record(&ran, &route, subject, profile, revision, observed_at_ms)
+            record(
+                &ran,
+                &route,
+                subject,
+                profile,
+                revision,
+                observed_at_ms,
+                &deadline,
+            )
         };
         records.extend(record);
     }
@@ -801,6 +886,15 @@ fn unchanged(before: &Surroundings, after: &Surroundings) -> bool {
     before.desktop.availability == after.desktop.availability
         && before.desktop.login_generation == after.desktop.login_generation
         && before.desktop.is_same_desktop(&after.desktop)
+}
+
+/// What a check came to when its time ran out where nothing of it was running.
+fn timed_out(check: Check, facility: Option<String>) -> Ran {
+    Ran {
+        check,
+        facility,
+        outcome: Outcome::TimedOut,
+    }
 }
 
 /// What a check that did not start, or whose success cannot stand, came to.
@@ -1285,7 +1379,7 @@ mod platform {
 
     use super::{
         Check, ContentClass, Deadline, Exit, Operation, Outcome, Plan, Program, Ran, Sentence,
-        Setting, bounded,
+        Setting, bounded, read_within,
     };
 
     pub(super) fn perform(
@@ -1340,7 +1434,7 @@ mod platform {
         // Read into memory, which is what the capability is about, and dropped again. The bytes
         // are never looked at beyond their length and their first four, which say whether this is
         // an image at all.
-        let measured = std::fs::read(&image).ok().map(|bytes| {
+        let measured = read_within(&image, deadline).map(|bytes| {
             let png = bytes.starts_with(&[0x89, b'P', b'N', b'G']);
             (bytes.len() as u64, png)
         });
@@ -1361,7 +1455,9 @@ mod platform {
                     .number(bytes)
                     .stated("-byte image of the main display into memory and kept none of it"),
             },
-            (Exit::Succeeded(_), _) => refused_recording(Sentence::new().stated(
+            // The image could not be read before the check's time ran out.
+            (Exit::Succeeded(_), None) => Outcome::TimedOut,
+            (Exit::Succeeded(_), Some(_)) => refused_recording(Sentence::new().stated(
                 "the capture tool ran and produced no image, which is what this platform does \
                  when the application asking has no recording grant",
             )),
@@ -1906,16 +2002,22 @@ fn bounded(
             Err(_) => break None,
         }
     };
+    // What the facility printed is read within the same deadline: a check that is out of time has
+    // nothing left to read it with.
     let exit = match status {
-        Some(status) if status.success() => {
-            Exit::Succeeded(std::fs::read_to_string(&out_path).unwrap_or_default())
-        }
+        Some(status) if status.success() => text_within(&out_path, deadline)
+            .map_or(Exit::Unfinished(Outcome::TimedOut), Exit::Succeeded),
         Some(_) => {
-            let mut said = std::fs::read_to_string(&err_path).unwrap_or_default();
-            if said.trim().is_empty() {
-                said = std::fs::read_to_string(&out_path).unwrap_or_default();
-            }
-            Exit::Failed(said.trim().to_owned())
+            let said = text_within(&err_path, deadline).and_then(|said| {
+                if said.trim().is_empty() {
+                    text_within(&out_path, deadline)
+                } else {
+                    Some(said)
+                }
+            });
+            said.map_or(Exit::Unfinished(Outcome::TimedOut), |said| {
+                Exit::Failed(said.trim().to_owned())
+            })
         }
         None => {
             // Only this check's own child and its own group, by the handle and the group it holds:
@@ -1941,6 +2043,38 @@ fn bounded(
     let _ = std::fs::remove_file(&out_path);
     let _ = std::fs::remove_file(&err_path);
     Run { facility, exit }
+}
+
+/// Reads a file of this check's own in blocks, and gives up where the deadline has nothing left.
+///
+/// A file that cannot be read is an empty one, which is what every caller does with it. `None` is
+/// the time running out, which is a different thing.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn read_within(path: &Path, deadline: &Deadline) -> Option<Vec<u8>> {
+    use std::io::Read as _;
+
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return Some(Vec::new());
+    };
+    let mut bytes = Vec::new();
+    let mut block = [0_u8; 64 * 1024];
+    loop {
+        if deadline.expired() {
+            return None;
+        }
+        match file.read(&mut block) {
+            Ok(0) => return Some(bytes),
+            Ok(count) => bytes.extend_from_slice(&block[..count]),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return Some(Vec::new()),
+        }
+    }
+}
+
+/// [`read_within`], as the text the file holds, which is empty where it is not text.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn text_within(path: &Path, deadline: &Deadline) -> Option<String> {
+    read_within(path, deadline).map(|bytes| String::from_utf8(bytes).unwrap_or_default())
 }
 
 /// How often a running facility is asked whether it has finished.
@@ -2039,13 +2173,21 @@ mod tests {
         revision: CapabilityRevision,
         observed_at_ms: kr_protocol::scalars::TimestampMs,
     ) -> Option<CapabilityRecord> {
-        super::record(ran, &MACOS, subject, profile, revision, observed_at_ms)
+        super::record(
+            ran,
+            &MACOS,
+            subject,
+            profile,
+            revision,
+            observed_at_ms,
+            &Deadline::after(Duration::from_secs(60)),
+        )
     }
 
     /// A context source that always reads the same desktop, with no variables.
     fn fixed(desktop: &DesktopContext) -> impl ContextSource + use<> {
         let desktop = desktop.clone();
-        move || Surroundings {
+        move |_: &Deadline| Surroundings {
             desktop: desktop.clone(),
             variables: Variables::default(),
         }
@@ -2129,7 +2271,7 @@ mod tests {
     }
 
     impl ContextSource for Readings {
-        fn read(&self) -> Surroundings {
+        fn read(&self, _deadline: &Deadline) -> Surroundings {
             let at = self.next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             self.list[at.min(self.list.len() - 1)].clone()
         }
@@ -2492,6 +2634,7 @@ mod tests {
             WorkerProfile::DesktopBound,
             revision(),
             kr_ipc::now_ms(),
+            &Deadline::after(Duration::from_secs(60)),
         )
         .expect("a record");
         assert_eq!(record.state, CapabilityState::NotTested);
@@ -2523,6 +2666,7 @@ mod tests {
             WorkerProfile::DesktopBound,
             revision(),
             kr_ipc::now_ms(),
+            &Deadline::after(Duration::from_secs(60)),
         )
         .expect("a record");
         assert!(!helper.identity.binary.is_present());
@@ -2544,6 +2688,7 @@ mod tests {
             WorkerProfile::DesktopBound,
             revision(),
             kr_ipc::now_ms(),
+            &Deadline::after(Duration::from_secs(60)),
         )
         .expect("a record");
         let _ = std::fs::remove_file(&file);
@@ -2729,6 +2874,197 @@ mod tests {
                 "{what}: process {number} is still there after the call returned"
             );
         }
+    }
+
+    /// A source whose every reading takes `each`, or what the deadline has left if that is less,
+    /// and which notes how much the deadline had left when each began.
+    struct Paced {
+        each: Duration,
+        desktop: DesktopContext,
+        given: std::sync::Mutex<Vec<Duration>>,
+    }
+
+    impl Paced {
+        fn of(each: Duration) -> Self {
+            Self {
+                each,
+                desktop: desktop(),
+                given: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl ContextSource for Paced {
+        fn read(&self, deadline: &Deadline) -> Surroundings {
+            self.given.lock().expect("the notes").push(deadline.left());
+            std::thread::sleep(self.each.min(deadline.left()));
+            surroundings(self.desktop.clone())
+        }
+    }
+
+    /// A stand-in that works until the time it was given is gone, and notes how much it was given.
+    #[derive(Default)]
+    struct UntilTheDeadline(std::sync::Mutex<Vec<Duration>>);
+
+    impl Facilities for UntilTheDeadline {
+        fn perform(&self, check: Check, _plan: &Plan, setting: &Setting<'_>) -> Ran {
+            self.0
+                .lock()
+                .expect("the notes")
+                .push(setting.deadline.left());
+            while !setting.deadline.expired() {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            ran(
+                check,
+                Outcome::Performed {
+                    detail: Sentence::new().stated("it ran"),
+                },
+            )
+        }
+    }
+
+    /// KR-REQ-03.29, S-8, through the whole check: its readings, its operation and the reading
+    /// after it all draw on the one deadline that started before the first of them, so the check
+    /// takes no longer than its bound, and the operation is given what is left of it.
+    #[test]
+    fn the_whole_check_draws_on_one_deadline() {
+        let bound = Duration::from_millis(2_400);
+        let source = Paced::of(Duration::from_millis(500));
+        let facility = UntilTheDeadline::default();
+        let started = Instant::now();
+        let records = report_timed(
+            &[Check::AccessibleElement],
+            &subject(),
+            &source,
+            revision(),
+            &Plan::in_directory("."),
+            &facility,
+            &|_| Time {
+                bound,
+                after: Duration::from_millis(800),
+            },
+        );
+        // The first reading comes before every check and takes its 500 ms outside the bound.
+        let taken = started.elapsed();
+        assert!(
+            taken < Duration::from_millis(500) + bound + Duration::from_millis(100),
+            "the check took {taken:?}, which is more than its bound of {bound:?}"
+        );
+        let given = facility.0.lock().expect("the notes").clone();
+        assert_eq!(given.len(), 1, "the operation ran once");
+        assert!(
+            given[0] <= Duration::from_millis(1_200),
+            "the operation was given {:?}, which is more than was left of the check's time \
+             after its first reading and before the time kept for after it",
+            given[0]
+        );
+        let reads = source.given.lock().expect("the notes").clone();
+        assert!(
+            reads.last().is_some_and(|left| !left.is_zero()),
+            "the reading after the operation had no time left: {reads:?}"
+        );
+        assert_eq!(
+            state_of(&records, Check::AccessibleElement),
+            CapabilityState::QualifiedAvailable
+        );
+    }
+
+    /// KR-REQ-03.29, S-8: a check whose readings took all its time starts no operation, and says
+    /// that its time ran out and not that an operation was started.
+    #[test]
+    fn a_check_out_of_time_before_its_operation_starts_nothing() {
+        let source = Paced::of(Duration::from_millis(700));
+        let seeing = Seeing::default();
+        let records = report_timed(
+            &[Check::AccessibleElement],
+            &subject(),
+            &source,
+            revision(),
+            &Plan::in_directory("."),
+            &seeing,
+            &|_| Time {
+                bound: Duration::from_millis(600),
+                after: Duration::from_millis(100),
+            },
+        );
+        assert!(
+            seeing.0.lock().expect("the record").is_empty(),
+            "an operation was started with no time left"
+        );
+        assert_eq!(
+            state_of(&records, Check::AccessibleElement),
+            CapabilityState::TemporarilyUnavailable
+        );
+        let reason = records[0]
+            .disabled_reason
+            .as_ref()
+            .map(|sentence| sentence.as_str().to_owned())
+            .unwrap_or_default();
+        assert_eq!(
+            reason,
+            "the check did not finish within its time limit. It established no result."
+        );
+    }
+
+    /// KR-REQ-03.29, S-8: a success whose desktop could not be read again before the check's time
+    /// ran out does not stand.
+    #[test]
+    fn a_success_the_last_reading_had_no_time_to_confirm_does_not_stand() {
+        // The readings before the operation are quick; the one after it takes the time that is
+        // left, which the operation leaves none of.
+        struct SlowAfter {
+            reads: std::sync::atomic::AtomicUsize,
+        }
+        impl ContextSource for SlowAfter {
+            fn read(&self, deadline: &Deadline) -> Surroundings {
+                let at = self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if at >= 2 {
+                    std::thread::sleep(deadline.left() + Duration::from_millis(30));
+                }
+                surroundings(desktop())
+            }
+        }
+        let records = report_timed(
+            &[Check::AccessibleElement],
+            &subject(),
+            &SlowAfter {
+                reads: std::sync::atomic::AtomicUsize::new(0),
+            },
+            revision(),
+            &Plan::in_directory("."),
+            &Seeing::default(),
+            &|_| Time {
+                bound: Duration::from_millis(600),
+                after: Duration::from_millis(100),
+            },
+        );
+        assert_eq!(
+            state_of(&records, Check::AccessibleElement),
+            CapabilityState::TemporarilyUnavailable,
+            "a success nothing could confirm stands"
+        );
+    }
+
+    /// KR-REQ-03.29, S-8: what a check reads of its own files, an image and what a facility printed,
+    /// is read inside its time, and a file nobody can read is an empty one and not a time-out.
+    #[test]
+    fn what_a_check_reads_back_is_read_inside_its_time() {
+        let root = kr_ipc::testing::PrivateTempDir::create();
+        let file = root.path().join("printed.txt");
+        std::fs::write(&file, b"it printed this").expect("a file");
+        let live = Deadline::after(Duration::from_secs(60));
+        let gone = Deadline::after(Duration::ZERO);
+        assert_eq!(
+            text_within(&file, &live).as_deref(),
+            Some("it printed this")
+        );
+        assert_eq!(text_within(&file, &gone), None, "time that was gone");
+        assert_eq!(
+            read_within(&root.path().join("not-there"), &live),
+            Some(Vec::new()),
+            "a file that is not there is an empty one"
+        );
     }
 
     /// KR-REQ-03.29, S-8: the calls of one check draw on one deadline, so the time they take
@@ -4124,7 +4460,7 @@ fn the_disclosed_checks_on_this_desktop() {
         application: Nullable::null(),
         terminal: Nullable::null(),
     };
-    let reading = || crate::desktop::routes::Surroundings {
+    let reading = |_: &Deadline| crate::desktop::routes::Surroundings {
         desktop: desktop.clone(),
         variables: crate::desktop::routes::Variables::of_this_process(),
     };

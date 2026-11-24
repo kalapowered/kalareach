@@ -233,6 +233,10 @@ fn run(program: &str, arguments: &[&str]) -> Printed {
     // open long after the child this host started has gone. A file has none of those properties:
     // nothing has to read it while the command runs, and a descendant still holding it open costs
     // this host nothing.
+    // A reading that has run out of its time starts nothing more.
+    if reading_is_over() {
+        return Printed::NotRun;
+    }
     let Some((out, err, directory)) = capture_files() else {
         return Printed::NotRun;
     };
@@ -299,7 +303,7 @@ fn run(program: &str, arguments: &[&str]) -> Printed {
             // below rather than left behind.
             Err(_) => break None,
         }
-        if started.elapsed() >= probe_deadline() {
+        if started.elapsed() >= probe_deadline() || reading_is_over() {
             break None;
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
@@ -337,6 +341,36 @@ fn run(program: &str, arguments: &[&str]) -> Printed {
         said.push_str(&String::from_utf8_lossy(&printed));
         Printed::Failed(said.to_ascii_lowercase())
     }
+}
+
+std::thread_local! {
+    /// The instant by which every platform command this thread starts must be over, where the
+    /// reading it is part of has a deadline of its own.
+    static READING_ENDS: std::cell::Cell<Option<std::time::Instant>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Runs `reading` with every platform command in it held to what is left of `limit` as well as to
+/// its own bound.
+///
+/// A reading is several commands one after another, each with a bound of its own, so a deadline
+/// that the reading has to meet cannot be given to each command separately: the commands share the
+/// one instant at which it ends, and a command that would start after it starts nothing. What a
+/// reading that ran out of time says is what a command that did not finish says: nothing.
+pub fn within<T>(limit: std::time::Duration, reading: impl FnOnce() -> T) -> T {
+    let ends = std::time::Instant::now() + limit;
+    let before = READING_ENDS.with(|cell| cell.replace(Some(ends)));
+    let value = reading();
+    READING_ENDS.with(|cell| cell.set(before));
+    value
+}
+
+/// Whether the deadline of the reading this thread is making has passed.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn reading_is_over() -> bool {
+    READING_ENDS
+        .with(std::cell::Cell::get)
+        .is_some_and(|ends| std::time::Instant::now() >= ends)
 }
 
 /// Returns the two files one reading captures into, in a directory of its own.
@@ -1541,5 +1575,34 @@ mod tests {
                 "{what}: process {number} is still there after the reading"
             );
         }
+    }
+
+    /// KR-REQ-03.29, S-8: the commands of a reading that has a deadline stop at it, whatever bound
+    /// each has of its own, and a command that would start after it starts nothing.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn a_reading_with_a_deadline_stops_its_commands_at_it() {
+        let started = std::time::Instant::now();
+        let printed = super::within(std::time::Duration::from_millis(300), || {
+            super::run("/bin/sleep", &["30"])
+        });
+        assert!(matches!(printed, super::Printed::NotRun));
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(1_500),
+            "the command ran for {:?}, which is its own bound and not the reading's",
+            started.elapsed()
+        );
+        let late = super::within(std::time::Duration::ZERO, || {
+            super::run("/bin/sh", &["-c", "echo started"])
+        });
+        assert!(
+            matches!(late, super::Printed::NotRun),
+            "a command started after the reading's time was gone"
+        );
+        let after = super::run("/bin/sh", &["-c", "echo ready"]);
+        assert!(
+            matches!(after, super::Printed::Output(_)),
+            "the deadline outlived the reading it was for"
+        );
     }
 }

@@ -15,7 +15,7 @@ use std::ffi::{OsStr, OsString};
 use kr_protocol::desktop::{DesktopContext, DisplayServer};
 
 use super::capability::installed_in;
-use super::probe::Check;
+use super::probe::{Check, Deadline};
 
 /// What a person at the machine can be asked while an operation runs.
 ///
@@ -200,12 +200,12 @@ pub struct Surroundings {
 /// a success for a desktop that was not there when it ended. A worker reads the platform; a test
 /// scripts the readings.
 pub trait ContextSource {
-    /// Reads the surroundings now.
-    fn read(&self) -> Surroundings;
+    /// Reads the surroundings now, taking no more time than the deadline has left.
+    fn read(&self, deadline: &Deadline) -> Surroundings;
 }
 
-impl<F: Fn() -> Surroundings> ContextSource for F {
-    fn read(&self) -> Surroundings {
-        self()
+impl<F: Fn(&Deadline) -> Surroundings> ContextSource for F {
+    fn read(&self, deadline: &Deadline) -> Surroundings {
+        self(deadline)
     }
 }
