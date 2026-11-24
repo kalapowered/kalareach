@@ -553,7 +553,9 @@
         "name": "libsodium-sys-stable",
         "version": "1.24.0"
       },
-      "text": "libsodium-1.0.22-LICENSE"
+      "texts": [
+        "libsodium-1.0.22-LICENSE"
+      ]
     },
     {
       "name": "llama.cpp",
@@ -562,7 +564,9 @@
         "name": "llama-cpp-sys-2",
         "version": "0.1.156"
       },
-      "text": "llama.cpp-e79e4bf660e1-LICENSE"
+      "texts": [
+        "llama.cpp-e79e4bf660e1-LICENSE"
+      ]
     },
     {
       "name": "PCRE2",
@@ -572,7 +576,9 @@
         "version": "0.2.9",
         "package": "https://github.com/fish-shell/rust-pcre2?tag=0.2.9-utf32#85b7afba"
       },
-      "text": "pcre2-10.43-LICENCE"
+      "texts": [
+        "pcre2-10.43-LICENCE"
+      ]
     },
     {
       "name": "llamafile sgemm.cpp of llama.cpp",
@@ -581,7 +587,9 @@
         "name": "llama-cpp-sys-2",
         "version": "0.1.156"
       },
-      "text": "llama.cpp-e79e4bf660e1-sgemm.cpp-lines-1-21"
+      "texts": [
+        "llama.cpp-e79e4bf660e1-sgemm.cpp-lines-1-21"
+      ]
     },
     {
       "name": "YaRN code in ops.cpp of llama.cpp",
@@ -590,7 +598,10 @@
         "name": "llama-cpp-sys-2",
         "version": "0.1.156"
       },
-      "text": "llama.cpp-e79e4bf660e1-ops.cpp-lines-5827-5828"
+      "texts": [
+        "llama.cpp-e79e4bf660e1-ops.cpp-lines-5827-5828",
+        "MIT-spdx-3.29.0-without-copyright-line"
+      ]
     }
   ]
 }

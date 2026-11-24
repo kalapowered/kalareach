@@ -809,13 +809,14 @@ def gather(records, kept, files, reader):
                 fail(f"{work['name']} {work['version']} is bundled in {carrier[0]} {carrier[1]} from {carrier[2] or 'crates.io'}, "
                      f"and the lock has that crate from {', '.join(now)}")
             fail(f"{work['name']} {work['version']} is bundled in {carrier[0]} {carrier[1]}, which no release build compiles")
-        text = files[work["text"]]
-        used_texts.add(work["text"])
-        for origin in sorted(compiled_crates[carrier]):
-            if "excerpt" in text:
-                check_excerpt(text, compiled_crates[carrier][origin], carrier)
-            add_kept(blocks, text, (work["name"], work["version"], None), [], origin, None,
-                     extra=f"bundled in {carrier[0]} {carrier[1]}, {kept_source(text)}")
+        for identifier in work["texts"]:
+            text = files[identifier]
+            used_texts.add(identifier)
+            for origin in sorted(compiled_crates[carrier]):
+                if "excerpt" in text:
+                    check_excerpt(text, compiled_crates[carrier][origin], carrier)
+                add_kept(blocks, text, (work["name"], work["version"], None), [], origin, None,
+                         extra=f"bundled in {carrier[0]} {carrier[1]}, {kept_source(text)}")
     for identifier in files:
         if identifier not in used_texts:
             fail(f"scripts/notice-texts.json lists the text {identifier}, which no crate or work uses")
@@ -1102,13 +1103,20 @@ def self_checks(scratch, reader):
     refuses("a kept text that nothing uses is refused", lambda: gather([made_up([plain])], kept, files, reader), "no crate or work uses")
     refuses("a kept text that is not the licence it is listed as is refused",
             lambda: gather([made_up([both])], *keep([{**item, "licence": "ISC"}], [pinned], []), reader), "as ISC, and its text is MIT")
-    work = {"name": "libx", "version": "1.0", "carried_by": {"name": "gone", "version": "1.0.0"}, "text": "n0-MIT"}
+    work = {"name": "libx", "version": "1.0", "carried_by": {"name": "gone", "version": "1.0.0"}, "texts": ["n0-MIT"]}
     kept, files = keep([item], [], [work])
     refuses("a bundled work whose carrier is not compiled is refused", lambda: gather([made_up([plain])], kept, files, reader), "which no release build compiles")
     work["carried_by"] = {"name": "plain", "version": "1.0.0"}
     kept, files = keep([item], [], [work])
     text = rendered([made_up([plain])], kept, files)
     expect("a bundled work has its entry and its text", "  - libx 1.0 | programs |  | bundled in plain 1.0.0, text https://example.org/n0/LICENSE-MIT\n" in text)
+    write(directory, "n0-second", "Notice 2025 N0\n")
+    second = {"id": "n0-second", "licence": "MIT", "source": "https://example.org/n0/NOTICE", "statement": True,
+              "sha256": hashlib.sha256(b"Notice 2025 N0\n").hexdigest()}
+    work["texts"] = ["n0-MIT", "n0-second"]
+    kept, files = keep([item, second], [], [work])
+    text = rendered([made_up([plain])], kept, files)
+    expect("a bundled work takes more than one text", "Permission is hereby granted" in text and "Notice 2025 N0" in text)
 
     # A kept excerpt of a source file is the file's own lines and ends where the licence comment ends.
     carrier_folder = os.path.join(scratch, "carrier-1.0.0")
@@ -1122,7 +1130,7 @@ def self_checks(scratch, reader):
         write(directory, "excerpt", body)
         entry = {"id": "excerpt", "licence": "MIT", "source": "https://example.org/lib.c", "statement": True,
                  "sha256": hashlib.sha256(body.encode("utf-8")).hexdigest(), "excerpt": [first, last], "file": file_name}
-        kept_, files_ = keep([entry], [], [{"name": "libx", "version": "1.0", "carried_by": {"name": "carrier", "version": "1.0.0"}, "text": "excerpt"}])
+        kept_, files_ = keep([entry], [], [{"name": "libx", "version": "1.0", "carried_by": {"name": "carrier", "version": "1.0.0"}, "texts": ["excerpt"]}])
         return lambda: render(gather([made_up([carrier])], kept_, files_, reader))
 
     refuses("a kept excerpt that stops before the licence comment of its file ends is refused",
@@ -1198,7 +1206,7 @@ def self_checks(scratch, reader):
     # A bundled work is bound to the source and the revision of the crate that carries it.
     old_carrier = synthetic("forked", "0.1.0", REPOSITORY, licences=licences(mit))
     new_carrier = synthetic("forked", "0.1.0", moved, licences=licences(mit))
-    forked_work = {"name": "libx", "version": "1.0", "carried_by": {"name": "forked", "version": "0.1.0", "package": package}, "text": "n0-MIT"}
+    forked_work = {"name": "libx", "version": "1.0", "carried_by": {"name": "forked", "version": "0.1.0", "package": package}, "texts": ["n0-MIT"]}
     kept, files = keep([item], [], [forked_work])
     expect("a bundled work answers the carrier at the revision it names",
            "bundled in forked 0.1.0, text https://example.org/n0/LICENSE-MIT" in made(lambda: render(gather([made_up([old_carrier])], kept, files, reader))))
