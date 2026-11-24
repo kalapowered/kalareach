@@ -545,7 +545,7 @@ mod tests {
         assert_eq!(second.state, CapabilityState::Incompatible);
     }
 
-    /// KR-REQ-03.29, LP-3: an image is accepted only as a whole PNG, and is removed from the
+    /// KR-REQ-03.29, KR-REQ-03.30, LP-3: an image is accepted only as a whole PNG, and is removed from the
     /// check's own directory whatever came of it. A header alone, a payload that stops short, a
     /// file of another format, an empty file and no file establish nothing, and a removal that
     /// failed is said. The case gives the facility a scratch directory of its own.
@@ -989,7 +989,7 @@ mod tests {
         }
     }
 
-    /// KR-REQ-03.29, LP-5, the real leg: a headless sway and the real `grim` on a runner's facts
+    /// KR-REQ-03.29, KR-REQ-03.30, LP-5, the real leg: a headless sway and the real `grim` on a runner's facts
     /// (`WLR_RENDERER=pixman`, the socket read from the runtime folder, one output of 1280 by 720)
     /// give an image the check performs, and the file `grim` writes for itself is a whole PNG of
     /// that size. It needs `sway` and `grim` and fails with a reason beginning "not run" where
