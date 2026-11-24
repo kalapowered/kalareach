@@ -352,6 +352,26 @@ pub struct Ran {
     pub facility: Option<String>,
     /// What came of it.
     pub outcome: Outcome,
+    /// The image the check wrote for itself and could not remove, said wherever the answer ends
+    /// up: an outcome that the report replaces after the operation keeps it.
+    pub left: Option<ImageLeft>,
+}
+
+/// An image a check wrote for itself and could not remove.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ImageLeft {
+    /// Where it is.
+    pub path: std::path::PathBuf,
+    /// Why it could not be removed, in the system's own words.
+    pub error: String,
+}
+
+impl Ran {
+    /// This answer, with the image the operation left behind carried into it.
+    #[must_use]
+    fn keeping(self, left: Option<ImageLeft>) -> Self {
+        Self { left, ..self }
+    }
 }
 
 /// Performs one check on this machine.
@@ -642,7 +662,13 @@ pub fn record(
     observed_at_ms: kr_protocol::scalars::TimestampMs,
     identity: Option<Sentence>,
 ) -> Option<CapabilityRecord> {
-    let (state, evidence, reason) = judge(ran.check, &ran.outcome, route.asking);
+    // An image the check could not remove is said whatever the answer came to, including an answer
+    // the report put in the place of the operation's own.
+    let outcome = match &ran.left {
+        Some(left) => super::payload::with_the_image_left(ran.outcome.clone(), left, route.asking),
+        None => ran.outcome.clone(),
+    };
+    let (state, evidence, reason) = judge(ran.check, &outcome, route.asking);
     Some(CapabilityRecord {
         capability: CapabilityId::new(ran.check.capability()).ok()?,
         version: U64::new(CAPABILITY_VERSION),
@@ -892,18 +918,22 @@ fn report_timed(
                 if deadline.expired() {
                     // A success whose desktop could not be read again in time is not one that
                     // stands.
-                    timed_out(*check, ran.facility)
+                    timed_out(*check, ran.facility).keeping(ran.left)
                 } else if !unchanged(&before, &after) {
                     stopped = true;
-                    not_in_the_state_it_needs(*check, ran.facility)
+                    not_in_the_state_it_needs(*check, ran.facility).keeping(ran.left)
                 } else {
                     match again
                         .as_ref()
                         .map(|again| held(identity.as_ref(), again.as_ref()))
                     {
                         None | Some(Held::Same) => ran,
-                        Some(Held::Replaced) => replaced_while_running(*check, ran.facility),
-                        Some(Held::Unconfirmed) => program_not_confirmed(*check, ran.facility),
+                        Some(Held::Replaced) => {
+                            replaced_while_running(*check, ran.facility).keeping(ran.left)
+                        }
+                        Some(Held::Unconfirmed) => {
+                            program_not_confirmed(*check, ran.facility).keeping(ran.left)
+                        }
                     }
                 }
             };
@@ -1004,6 +1034,7 @@ fn program_not_confirmed(check: Check, facility: Option<String>) -> Ran {
                  not known whether it was replaced while it ran",
             ),
         },
+        left: None,
     }
 }
 
@@ -1015,6 +1046,7 @@ fn replaced_while_running(check: Check, facility: Option<String>) -> Ran {
         outcome: Outcome::NotAttempted {
             detail: Sentence::new().stated("the program it ran was replaced while it ran"),
         },
+        left: None,
     }
 }
 
@@ -1024,6 +1056,7 @@ fn timed_out(check: Check, facility: Option<String>) -> Ran {
         check,
         facility,
         outcome: Outcome::TimedOut,
+        left: None,
     }
 }
 
@@ -1041,6 +1074,7 @@ fn not_in_the_state_it_needs(check: Check, facility: Option<String>) -> Ran {
                  check, another desktop was in front, or its state could not be read",
             ),
         },
+        left: None,
     }
 }
 
@@ -1128,6 +1162,7 @@ impl Facilities for Platform {
                 check,
                 facility: None,
                 outcome: Outcome::WithheldForIsolation,
+                left: None,
             },
             _ => match setting.operation {
                 None => not_performed_on_this_platform(check),
@@ -1141,6 +1176,7 @@ impl Facilities for Platform {
                     outcome: Outcome::NotPerformed {
                         detail: Sentence::new().stated(words),
                     },
+                    left: None,
                 },
                 // A route is performed by the program it names, whichever platform this build is
                 // for: the Wayland screen-copy route is run the same way wherever a case runs it.
@@ -1194,6 +1230,7 @@ fn read_authorised_file_with(
                      person did not choose would establish something about the wrong file",
                 ),
             },
+            left: None,
         };
     };
     // The path is opened once and everything after is asked of that handle, so a file replaced by
@@ -1264,6 +1301,7 @@ fn read_authorised_file_with(
         check,
         facility: None,
         outcome,
+        left: None,
     }
 }
 
@@ -1531,6 +1569,7 @@ mod platform {
                 check,
                 facility: operation.program.named_path().map(str::to_owned),
                 outcome: Outcome::FacilityMissing,
+                left: None,
             };
         };
         let deadline = setting.deadline;
@@ -1577,12 +1616,7 @@ mod platform {
         });
         // Removed whatever happened: an image outliving the check is the one thing this must not
         // leave behind, and a removal that failed is said rather than passed over.
-        let removal = std::fs::remove_file(&image);
-        let left_behind = match removal {
-            Ok(()) => None,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-            Err(error) => Some(error.to_string()),
-        };
+        let left = super::super::payload::remove_image(&image);
         let outcome = match (ran.exit, measured) {
             // The tool exits successfully whether or not the platform let it see the screen, so
             // an image it did not write is the refusal rather than the exit status.
@@ -1590,7 +1624,13 @@ mod platform {
                 detail: Sentence::new()
                     .stated("it read a ")
                     .number(bytes)
-                    .stated("-byte image of the main display into memory and kept none of it"),
+                    .stated("-byte image of the main display into memory")
+                    // Kept none of it only where the removal worked.
+                    .stated(if left.is_none() {
+                        " and kept none of it"
+                    } else {
+                        ""
+                    }),
             },
             // The image could not be read before the check's time ran out.
             (Exit::Succeeded(_), None) => Outcome::TimedOut,
@@ -1617,11 +1657,9 @@ mod platform {
         Ran {
             check,
             facility: ran.facility,
+            outcome,
             // Whatever the answer, an image this check could not remove is part of it.
-            outcome: match left_behind {
-                None => outcome,
-                Some(error) => super::with_the_image_left(outcome, &image, &error),
-            },
+            left,
         }
     }
 
@@ -1680,6 +1718,7 @@ mod platform {
             check,
             facility: ran.facility,
             outcome,
+            left: None,
         }
     }
 
@@ -1836,6 +1875,7 @@ mod platform {
             check,
             facility: ran.facility,
             outcome,
+            left: None,
         }
     }
 
@@ -1958,6 +1998,7 @@ fn not_performed_on_this_platform(check: Check) -> Ran {
                  not performed",
             ),
         },
+        left: None,
     }
 }
 
@@ -1998,45 +2039,6 @@ pub(super) fn failed(said: &str) -> Sentence {
         failure.stated(" and printed nothing")
     } else {
         failure.stated(": ").withheld(ContentClass::Message, said)
-    }
-}
-
-/// An outcome with the image the screen check could not remove said as part of it.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-fn with_the_image_left(outcome: Outcome, image: &Path, error: &str) -> Outcome {
-    let behind = |detail: Sentence| {
-        detail
-            .stated(", and it could not remove ")
-            .path(image)
-            .stated(": ")
-            .withheld(ContentClass::Message, error)
-    };
-    match outcome {
-        Outcome::Performed { detail } => Outcome::Performed {
-            detail: behind(detail),
-        },
-        Outcome::PermissionRefused { permission, detail } => Outcome::PermissionRefused {
-            permission,
-            detail: behind(detail),
-        },
-        Outcome::NotAttempted { detail } => Outcome::NotAttempted {
-            detail: behind(detail),
-        },
-        // The time-out words end with a full stop, so what follows them would read as a second
-        // sentence that starts with a comma: the clause is given again without it.
-        Outcome::TimedOut => Outcome::NotAttempted {
-            detail: behind(
-                Sentence::new().stated("the check did not finish within its time limit"),
-            ),
-        },
-        // An outcome with no words of its own is said in the words its judgement gives it.
-        other => Outcome::NotAttempted {
-            detail: behind(
-                judge(Check::ScreenImage, &other, Asking::ForAGrant)
-                    .2
-                    .unwrap_or_default(),
-            ),
-        },
     }
 }
 
@@ -2404,6 +2406,7 @@ mod tests {
                     check,
                     facility: None,
                     outcome: Outcome::FacilityMissing,
+                    left: None,
                 })
         }
     }
@@ -2413,6 +2416,7 @@ mod tests {
             check,
             facility: None,
             outcome,
+            left: None,
         }
     }
 
@@ -2856,6 +2860,7 @@ mod tests {
                 check: Check::ScreenImage,
                 facility: Some(file.display().to_string()),
                 outcome: Outcome::FacilityMissing,
+                left: None,
             },
             &route,
             &subject(),
@@ -3260,6 +3265,8 @@ mod tests {
     struct Running {
         program: std::path::PathBuf,
         during: During,
+        /// The image the operation could not remove, where it left one.
+        left: Option<ImageLeft>,
     }
 
     impl Facilities for Running {
@@ -3279,6 +3286,7 @@ mod tests {
                 outcome: Outcome::Performed {
                     detail: Sentence::new().stated("it ran"),
                 },
+                left: self.left.clone(),
             }
         }
     }
@@ -3287,6 +3295,14 @@ mod tests {
     /// changes as `during` says, and gives the program's digest from before the operation and the
     /// records.
     fn run_around_a_program(during: During) -> (Option<Sentence>, Vec<CapabilityRecord>) {
+        run_around_a_program_leaving(during, None)
+    }
+
+    /// [`run_around_a_program`], with an image that the operation could not remove.
+    fn run_around_a_program_leaving(
+        during: During,
+        left: Option<ImageLeft>,
+    ) -> (Option<Sentence>, Vec<CapabilityRecord>) {
         let root = kr_ipc::testing::PrivateTempDir::create();
         let program = root.path().join("the-tool");
         let named = program.display().to_string();
@@ -3307,7 +3323,11 @@ mod tests {
             &source,
             revision(),
             &Plan::in_directory("."),
-            &Running { program, during },
+            &Running {
+                program,
+                during,
+                left,
+            },
             &Seams {
                 first: &first_of(&source),
                 time_of: &time_of,
@@ -3378,6 +3398,127 @@ mod tests {
             records[0].identity.version.as_ref().cloned(),
             before,
             "the record names the program as it was before the operation"
+        );
+    }
+
+    /// An image that an operation could not remove.
+    fn left_behind() -> ImageLeft {
+        ImageLeft {
+            path: std::path::PathBuf::from("/tmp/the-image.png"),
+            error: "permission denied".to_owned(),
+        }
+    }
+
+    /// What a record's reason says.
+    fn said_by(record: &CapabilityRecord) -> String {
+        record
+            .disabled_reason
+            .as_ref()
+            .map(|sentence| sentence.as_str().to_owned())
+            .unwrap_or_default()
+    }
+
+    /// A stand-in whose operation succeeds and leaves an image it could not remove.
+    struct Leaving;
+
+    impl Facilities for Leaving {
+        fn perform(&self, check: Check, _plan: &Plan, _setting: &Setting<'_>) -> Ran {
+            Ran {
+                check,
+                facility: None,
+                outcome: Outcome::Performed {
+                    detail: Sentence::new().stated("it ran"),
+                },
+                left: Some(left_behind()),
+            }
+        }
+    }
+
+    /// KR-REQ-03.29, KR-REQ-03.30, LP-10: an image that could not be removed is said in the answer
+    /// the report gives in place of the operation's own, whichever of the four reasons replaced it:
+    /// the time limit, a changed context, a program replaced while it ran and a program that could
+    /// not be read again.
+    #[test]
+    fn an_image_that_could_not_be_removed_is_said_when_the_answer_is_replaced_afterwards() {
+        let clause = ", and it could not remove ";
+
+        // The time limit: the reading after the operation takes the time that is left.
+        struct SlowAfter {
+            reads: std::sync::atomic::AtomicUsize,
+        }
+        impl ContextSource for SlowAfter {
+            fn read(&self, deadline: &Deadline) -> Surroundings {
+                let at = self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if at >= 2 {
+                    std::thread::sleep(deadline.left() + Duration::from_millis(30));
+                }
+                surroundings(desktop())
+            }
+        }
+        let source = SlowAfter {
+            reads: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let records = report_timed(
+            &[Check::AccessibleElement],
+            &subject(),
+            &source,
+            revision(),
+            &Plan::in_directory("."),
+            &Leaving,
+            &Seams {
+                first: &first_of(&source),
+                time_of: &|_| Time {
+                    bound: Duration::from_millis(600),
+                    after: Duration::from_millis(100),
+                },
+                routes: &resolve,
+            },
+        );
+        let said = said_by(&records[0]);
+        assert!(
+            said.starts_with(
+                "this check established nothing: the check did not finish within its time limit"
+            ) && said.contains(clause),
+            "the time limit: {said}"
+        );
+
+        // A changed context: the desktop is locked when it is read again.
+        let mut locked = desktop();
+        locked.availability = DesktopAvailability::Locked;
+        let source = Readings::of(vec![
+            surroundings(desktop()),
+            surroundings(desktop()),
+            surroundings(locked),
+        ]);
+        let records = super::report(
+            &first_of(&source),
+            &[Check::AccessibleElement],
+            &subject(),
+            &source,
+            revision(),
+            &Plan::in_directory("."),
+            &Leaving,
+        );
+        let said = said_by(&records[0]);
+        assert!(
+            said.contains("the desktop was not in the state this check needs")
+                && said.contains(clause),
+            "a changed context: {said}"
+        );
+
+        // A program replaced while it ran, and one that could not be read again.
+        let (_, records) = run_around_a_program_leaving(During::Replacing, Some(left_behind()));
+        let said = said_by(&records[0]);
+        assert!(
+            said.contains("the program it ran was replaced while it ran") && said.contains(clause),
+            "a replaced program: {said}"
+        );
+        let (_, records) = run_around_a_program_leaving(During::Removing, Some(left_behind()));
+        let said = said_by(&records[0]);
+        assert!(
+            said.contains("it is not known whether it was replaced while it ran")
+                && said.contains(clause),
+            "a program that could not be read again: {said}"
         );
     }
 
@@ -3482,10 +3623,13 @@ mod tests {
     /// sentence the time-out begins, not after the time-out's full stop and a comma.
     #[test]
     fn a_timed_out_image_that_could_not_be_removed_reads_as_one_sentence() {
-        let outcome = with_the_image_left(
+        let outcome = super::super::payload::with_the_image_left(
             Outcome::TimedOut,
-            Path::new("/tmp/the-image.png"),
-            "permission denied",
+            &ImageLeft {
+                path: std::path::PathBuf::from("/tmp/the-image.png"),
+                error: "permission denied".to_owned(),
+            },
+            Asking::ForAGrant,
         );
         let (state, _, reason) = super::judge(Check::ScreenImage, &outcome, Asking::ForAGrant);
         assert_eq!(state, CapabilityState::TemporarilyUnavailable);
@@ -3726,6 +3870,7 @@ mod tests {
             outcome: Outcome::Unsupported {
                 detail: Sentence::new().stated("it has no such option"),
             },
+            left: None,
         };
         let record = record(
             &tried,

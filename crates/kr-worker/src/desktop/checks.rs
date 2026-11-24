@@ -189,6 +189,7 @@ mod tests {
                 outcome: Outcome::Performed {
                     detail: kr_protocol::hostinfo::export::Sentence::new().stated("it ran"),
                 },
+                left: None,
             }
         }
     }
@@ -332,6 +333,7 @@ mod tests {
                     outcome: Outcome::NotAttempted {
                         detail: kr_protocol::hostinfo::export::Sentence::new().stated("left"),
                     },
+                    left: None,
                 }
             }
         }

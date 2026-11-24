@@ -16,7 +16,8 @@ use std::path::Path;
 
 use kr_protocol::hostinfo::export::{ContentClass, Sentence};
 
-use super::probe::Deadline;
+use super::probe::{Check, Deadline, ImageLeft, Outcome, judge};
+use super::routes::Asking;
 
 /// Why a payload is not an image a check can count.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -233,6 +234,61 @@ pub(super) fn png(bytes: &[u8]) -> Result<Png, Fault> {
     match size {
         Some(measured) if measured.width > 0 && measured.height > 0 && holds_pixels => Ok(measured),
         _ => Err(Fault::NoPixels),
+    }
+}
+
+/// Removes the image a check wrote for itself and gives back what could not be removed. A file that
+/// is not there is removed.
+pub(super) fn remove_image(path: &Path) -> Option<ImageLeft> {
+    match std::fs::remove_file(path) {
+        Ok(()) => None,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => Some(ImageLeft {
+            path: path.to_path_buf(),
+            error: error.to_string(),
+        }),
+    }
+}
+
+/// An outcome with the image the screen check could not remove said as part of it: the one place
+/// that says it, for every route that writes an image of its own.
+pub(super) fn with_the_image_left(outcome: Outcome, left: &ImageLeft, asking: Asking) -> Outcome {
+    let behind = |detail: Sentence| {
+        detail
+            .stated(", and it could not remove ")
+            .path(&left.path)
+            .stated(": ")
+            .withheld(ContentClass::Message, &left.error)
+    };
+    match outcome {
+        Outcome::Performed { detail } => Outcome::Performed {
+            detail: behind(detail),
+        },
+        Outcome::PermissionRefused { permission, detail } => Outcome::PermissionRefused {
+            permission,
+            detail: behind(detail),
+        },
+        Outcome::Unsupported { detail } => Outcome::Unsupported {
+            detail: behind(detail),
+        },
+        Outcome::NotAttempted { detail } => Outcome::NotAttempted {
+            detail: behind(detail),
+        },
+        // The time-out words end with a full stop, so what follows them would read as a second
+        // sentence that starts with a comma: the clause is given again without it.
+        Outcome::TimedOut => Outcome::NotAttempted {
+            detail: behind(
+                Sentence::new().stated("the check did not finish within its time limit"),
+            ),
+        },
+        // An outcome with no words of its own is said in the words its judgement gives it.
+        other => Outcome::NotAttempted {
+            detail: behind(
+                judge(Check::ScreenImage, &other, asking)
+                    .2
+                    .unwrap_or_default(),
+            ),
+        },
     }
 }
 
@@ -469,6 +525,38 @@ pub(super) mod tests {
         let gone = Deadline::after(std::time::Duration::ZERO);
         assert_eq!(read_image(&path, &gone), None);
         assert_eq!(read_image(&dir.0.join("absent.png"), &gone), None);
+    }
+
+    /// KR-REQ-03.29, KR-REQ-03.30, LP-10: the one clause that says an image could not be removed
+    /// is judged in the words of the route that asked: an unanswered operation on a route where a
+    /// compositor may ask the person says that, and one where an operating system grant is asked
+    /// does not.
+    #[test]
+    fn the_removal_clause_is_judged_by_the_route_that_asked() {
+        let left = ImageLeft {
+            path: std::path::PathBuf::from("/tmp/the-image.png"),
+            error: "permission denied".to_owned(),
+        };
+        let unanswered = Outcome::NotAnswered {
+            waited: std::time::Duration::from_secs(1),
+            stopped: true,
+        };
+        let said = |asking| {
+            let outcome = with_the_image_left(unanswered.clone(), &left, asking);
+            judge(Check::ScreenImage, &outcome, asking)
+                .2
+                .map(|reason| reason.as_str().to_owned())
+                .unwrap_or_default()
+        };
+        let maybe = said(Asking::Maybe);
+        assert!(
+            maybe.contains("Some compositors ask before a program may copy the screen"),
+            "{maybe}"
+        );
+        assert!(maybe.contains(", and it could not remove "), "{maybe}");
+        let grant = said(Asking::ForAGrant);
+        assert!(!grant.contains("Some compositors ask"), "{grant}");
+        assert!(grant.contains(", and it could not remove "), "{grant}");
     }
 
     /// KR-REQ-03.29, LP-9: what a check says of a tool that left no usable image, for the three

@@ -14,14 +14,13 @@
 //! replaced `grim` is a changed identity.
 
 use std::ffi::OsStr;
-use std::path::Path;
 
 use kr_protocol::desktop::{DesktopContext, DisplayServer};
 use kr_protocol::hostinfo::export::{ContentClass, Sentence};
 
 use super::capability::{installed_in, wlroots};
 use super::payload;
-use super::probe::{Check, Exit, Outcome, Plan, Ran, Setting, bounded_with, failed, judge};
+use super::probe::{Check, Exit, Outcome, Plan, Ran, Setting, bounded_with, failed};
 use super::routes::{Asking, Operation, Program, Route};
 
 /// The screen-copy protocol route.
@@ -90,6 +89,7 @@ pub(super) fn perform(
             check,
             facility: operation.program.named_path().map(str::to_owned),
             outcome: Outcome::FacilityMissing,
+            left: None,
         };
     };
     screen_copy(check, plan, setting, tool)
@@ -122,11 +122,12 @@ fn screen_copy(check: Check, plan: &Plan, setting: &Setting<'_>, tool: &str) -> 
                      started",
                 ),
             },
+            left: None,
         };
     };
     let image = plan.scratch.join(IMAGE);
     // A file from before is not this run's image.
-    let _ = std::fs::remove_file(&image);
+    let _ = payload::remove_image(&image);
     let ran = bounded_with(
         check,
         tool,
@@ -139,46 +140,50 @@ fn screen_copy(check: Check, plan: &Plan, setting: &Setting<'_>, tool: &str) -> 
         plan,
         setting.deadline,
     );
-    let outcome = match ran.exit {
+    // What the tool and the file it left came to. A whole image waits for the removal, because
+    // "kept none of it" is true only once the file is gone.
+    let measured: Result<usize, Outcome> = match ran.exit {
         Exit::Succeeded(_) => match payload::read_image(&image, setting.deadline) {
             // The image could not be read before the check's time ran out.
-            None => Outcome::TimedOut,
-            Some(read) => match read.and_then(|bytes| payload::png(&bytes).map(|_| bytes.len())) {
-                Ok(length) => Outcome::Performed {
-                    detail: Sentence::new()
-                        .stated("it read a ")
-                        .number(u64::try_from(length).unwrap_or(u64::MAX))
-                        .stated("-byte image of every output into memory and kept none of it"),
-                },
-                Err(fault) => Outcome::NotAttempted {
+            None => Err(Outcome::TimedOut),
+            Some(read) => read
+                .and_then(|bytes| payload::png(&bytes).map(|_| bytes.len()))
+                .map_err(|fault| Outcome::NotAttempted {
                     detail: fault.left_no_usable_image(),
-                },
-            },
+                }),
         },
         // The tool's own words for a compositor that does not have the protocol. That is an
         // operation the tool cannot perform here, which no installation and no permission changes.
-        Exit::Failed(said) if said.contains(MISSING_PROTOCOL) => Outcome::Unsupported {
+        Exit::Failed(said) if said.contains(MISSING_PROTOCOL) => Err(Outcome::Unsupported {
             detail: no_protocol(setting.desktop, &said),
-        },
-        Exit::Failed(said) => Outcome::NotAttempted {
+        }),
+        Exit::Failed(said) => Err(Outcome::NotAttempted {
             detail: failed(&said),
-        },
-        Exit::Unfinished(outcome) => outcome,
+        }),
+        Exit::Unfinished(outcome) => Err(outcome),
     };
     // Removed whatever happened: an image outliving the check is the one thing this must not leave
-    // behind, and a removal that failed is said rather than passed over.
-    let removal = match std::fs::remove_file(&image) {
-        Ok(()) => None,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(error) => Some(error.to_string()),
-    };
+    // behind, and a removal that failed is said with the answer rather than passed over.
+    let left = payload::remove_image(&image);
+    let outcome = measured.map_or_else(
+        |other| other,
+        |length| Outcome::Performed {
+            detail: Sentence::new()
+                .stated("it read a ")
+                .number(u64::try_from(length).unwrap_or(u64::MAX))
+                .stated("-byte image of every output into memory")
+                .stated(if left.is_none() {
+                    " and kept none of it"
+                } else {
+                    ""
+                }),
+        },
+    );
     Ran {
         check,
         facility: ran.facility,
-        outcome: match removal {
-            None => outcome,
-            Some(error) => left(outcome, &image, &error),
-        },
+        outcome,
+        left,
     }
 }
 
@@ -197,40 +202,10 @@ fn no_protocol(desktop: &DesktopContext, said: &str) -> Sentence {
         .withheld(ContentClass::Message, said)
 }
 
-/// An outcome with the image the check could not remove said as part of it.
-fn left(outcome: Outcome, image: &Path, error: &str) -> Outcome {
-    let behind = |detail: Sentence| {
-        detail
-            .stated(", and it could not remove ")
-            .path(image)
-            .stated(": ")
-            .withheld(ContentClass::Message, error)
-    };
-    match outcome {
-        Outcome::Performed { detail } => Outcome::Performed {
-            detail: behind(detail),
-        },
-        Outcome::Unsupported { detail } => Outcome::Unsupported {
-            detail: behind(detail),
-        },
-        Outcome::NotAttempted { detail } => Outcome::NotAttempted {
-            detail: behind(detail),
-        },
-        // An outcome with no words of its own is said in the words its judgement gives it.
-        other => Outcome::NotAttempted {
-            detail: behind(
-                judge(Check::ScreenImage, &other, SCREEN_COPY.asking)
-                    .2
-                    .unwrap_or_default(),
-            ),
-        },
-    }
-}
-
 #[cfg(all(test, unix))]
 mod tests {
     use std::os::unix::fs::PermissionsExt as _;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::time::Duration;
 
     use kr_protocol::desktop::{
@@ -621,7 +596,9 @@ mod tests {
                 None => {
                     assert_eq!(record.state, CapabilityState::QualifiedAvailable, "{name}");
                     assert!(
-                        reason(&record).contains("-byte image of every output into memory"),
+                        reason(&record).contains(
+                            "-byte image of every output into memory and kept none of it"
+                        ),
                         "{name}: {}",
                         reason(&record)
                     );
@@ -654,8 +631,9 @@ mod tests {
         assert_eq!(record.state, CapabilityState::TemporarilyUnavailable);
         assert!(reason(&record).contains(&wanted("no file, or an empty one")));
 
-        // A removal that fails is said, whether or not the image was whole: the tool makes the
-        // directory unwritable after it writes.
+        // A removal that fails is said, whether or not the image was whole, and the image that
+        // was whole is still a success: the tool makes the directory unwritable after it writes.
+        // What was kept is not claimed to be none of it.
         let tools = Folder::new();
         let scratch = Folder::new();
         let image = tools.file("image.png", &whole_png);
@@ -673,7 +651,13 @@ mod tests {
         ));
         assert_eq!(record.state, CapabilityState::QualifiedAvailable);
         assert!(
-            reason(&record).contains(", and it could not remove "),
+            reason(&record)
+                .contains("-byte image of every output into memory, and it could not remove "),
+            "{}",
+            reason(&record)
+        );
+        assert!(
+            !reason(&record).contains("kept none of it"),
             "{}",
             reason(&record)
         );
