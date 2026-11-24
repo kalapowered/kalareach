@@ -41,7 +41,11 @@ impl Drop for Fixture {
                 .unwrap_or_else(PoisonError::into_inner),
         );
         known.extend(self.recorded_daemons());
-        known.extend(self.written_down());
+        known.extend(
+            self.written_down()
+                .into_iter()
+                .map(|started| started.identity),
+        );
         known.sort();
         known.dedup();
         let mut everything = known.clone();
@@ -149,19 +153,18 @@ impl Fixture {
         format!("user/{}", self.uid)
     }
 
+    /// The file in which the stand-in writes down each process it starts.
+    fn started_file(&self) -> PathBuf {
+        self.tree
+            .path()
+            .join("state/manager-stand-in")
+            .join(kr_manager_stand_in::STARTED_FILE)
+    }
+
     /// The processes the stand-in wrote down as it started them, whatever came of their jobs'
     /// records.
-    fn written_down(&self) -> Vec<ProcessStartIdentity> {
-        std::fs::read_to_string(
-            self.tree
-                .path()
-                .join("state/manager-stand-in")
-                .join(kr_manager_stand_in::STARTED_FILE),
-        )
-        .unwrap_or_default()
-        .lines()
-        .filter_map(|line| serde_json::from_str(line).ok())
-        .collect()
+    fn written_down(&self) -> Vec<kr_manager_stand_in::Started> {
+        kr_manager_stand_in::read_started(&self.started_file()).unwrap_or_default()
     }
 
     /// The calls it recorded, as the lines of its log.
@@ -228,9 +231,9 @@ impl Fixture {
         (plist, loaded)
     }
 
-    /// The record of the job `label`, which a start that was never recorded leaves behind: the job is
-    /// loaded and marked as a start that began.
-    fn mark_pending(&self, label: &str) {
+    /// The record of the job `label` as a start whose process was never kept leaves it: the job is
+    /// loaded and names no process.
+    fn lose_identity(&self, label: &str) {
         let record = self
             .tree
             .path()
@@ -238,8 +241,8 @@ impl Fixture {
         let mut job: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&record).expect("the record"))
                 .expect("json");
-        job["pending"] = serde_json::Value::Bool(true);
-        std::fs::write(&record, job.to_string()).expect("a pending record");
+        job["identity"] = serde_json::Value::Null;
+        std::fs::write(&record, job.to_string()).expect("a record that names no process");
     }
 
     /// Starts the shell command `line` in `directory` with the variables `environment` added, as the
@@ -655,30 +658,44 @@ fn the_daemon_starts_as_the_definition_says_survives_its_exec_and_ends_by_identi
     );
 }
 
-/// A start that was never recorded is found by proof that it is the job's and ended: its arguments
-/// end with the definition's, whole word for whole word, it runs a program inside the test's
-/// folders, and its working directory is the definition's. The process is the wrapper as the system's
-/// shell reads it, which `ps` shows as the interpreter, the program and the arguments.
+/// A daemon that handed over by `exec` to a second program of the installation is ended by `bootout`
+/// though its record names no process: the stand-in wrote the process down with the job's label as it
+/// started it, and an `exec` leaves the identity of a process as it was.
 #[test]
-fn a_start_that_was_never_recorded_is_found_by_its_arguments_program_and_directory_and_ended() {
+fn bootout_ends_a_daemon_that_handed_over_by_exec_though_its_record_names_no_process() {
     let fixture = Fixture::new();
-    let script = "#!/bin/sh\nwhile :; do sleep 1; done\n";
-    let (_, loaded) = fixture.load("kr-controller-i", script, "");
-    assert_eq!(loaded.status.code(), Some(0), "{}", text(&loaded.stderr));
-    fixture.mark_pending("kr-controller-i");
-    let state = fixture.tree.path().join("state");
-    let program = fixture.installation.path().join("kr-daemon");
-    let wrapper = fixture.detached(
+    let second = fixture.installation.path().join("second");
+    let flag = fixture.tree.path().join("handed-over");
+    kr_ipc::testing::place_script(
+        &second,
         &format!(
-            "{} --runtime-dir {} --state-dir {}",
-            program.display(),
-            fixture.tree.path().join("r").display(),
-            state.display()
+            "#!/bin/sh\necho up > {}\nwhile :; do sleep 1; done\n",
+            flag.display()
         ),
-        &state,
-        &[],
     );
-    let target = format!("{}/kr-controller-i", fixture.domain());
+    let (_, loaded) = fixture.load(
+        "kr-controller-e",
+        &format!("#!/bin/sh\nexec {} \"$@\"\n", second.display()),
+        "",
+    );
+    assert_eq!(loaded.status.code(), Some(0), "{}", text(&loaded.stderr));
+    let target = format!("{}/kr-controller-e", fixture.domain());
+    let started = fixture.call(&["kickstart", "-p", &target]);
+    assert_eq!(started.status.code(), Some(0), "{}", text(&started.stderr));
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !flag.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "the job's program never handed over to the second program"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let written = fixture.written_down();
+    assert_eq!(written.len(), 1, "one start, written down: {written:?}");
+    assert_eq!(written[0].label, "kr-controller-e");
+    let daemon = written[0].identity.clone();
+    fixture.lose_identity("kr-controller-e");
+    assert_eq!(process_state(&daemon), ProcessState::Running);
     let ended_job = fixture.call(&["bootout", &target]);
     assert_eq!(
         ended_job.status.code(),
@@ -687,81 +704,32 @@ fn a_start_that_was_never_recorded_is_found_by_its_arguments_program_and_directo
         text(&ended_job.stderr)
     );
     assert!(
-        ended(&wrapper),
-        "the wrapper was found by its arguments, program and directory, and ended"
+        ended(&daemon),
+        "the daemon that handed over by exec was left running when its record named no process"
     );
 }
 
-/// A start that was never recorded is not confused with any other process, whatever text the other
-/// holds: a program outside the test's folders, a program inside them in another directory, a
-/// program inside them in the right directory whose last argument only starts with the definition's,
-/// and a program outside them that is given a path inside them as data, in the right directory with
-/// the definition's last argument, are all left running, though every one of them holds the
-/// definition's arguments in its own arguments or its environment.
+/// `bootout` ends the processes written down for its own job and for no other job.
 #[test]
-fn a_start_that_was_never_recorded_is_not_confused_with_processes_that_only_hold_the_same_text() {
+fn bootout_ends_the_processes_written_down_for_its_job_and_for_no_other_job() {
     let fixture = Fixture::new();
-    let program = fixture.installation.path().join("kr-daemon");
-    kr_ipc::testing::place_script(&program, "#!/bin/sh\nexit 0\n");
-    let state = fixture.tree.path().join("state");
-    let arguments = [program.display().to_string(), "30".to_owned()];
-    let plist = fixture
-        .tree
-        .path()
-        .join("home/Library/LaunchAgents/kr-controller-n.plist");
-    std::fs::write(
-        &plist,
-        fixture.plist_of("kr-controller-n", &arguments, &state, ""),
-    )
-    .expect("a plist");
-    let loaded = fixture.call(&[
-        "bootstrap",
-        &fixture.domain(),
-        plist.to_str().expect("text"),
-    ]);
-    assert_eq!(loaded.status.code(), Some(0), "{}", text(&loaded.stderr));
-    fixture.mark_pending("kr-controller-n");
-    // A program of the installation that waits as many seconds as its first argument says, a second
-    // at a time, so that it leaves no long-lived child behind it. The system shows it as the shell,
-    // the script and the argument.
-    let idle = fixture.installation.path().join("idle");
-    place_idle(&idle);
-    // A file that a reader of it waits at, so that a program outside the folders is given a path
-    // inside them as an argument and stays running.
-    let waited_at = fixture.tree.path().join("waited-at");
-    let made = run(Command::new("/usr/bin/mkfifo").arg(&waited_at));
-    assert!(made.status.success(), "{}", text(&made.stderr));
-    let same_text = format!("{} 30", program.display());
-    let environment = [("SAME_TEXT", same_text.as_str())];
-    let others = [
-        (
-            "a program outside the folders, in the right directory",
-            fixture.detached("/bin/sleep 30", &state, &environment),
-        ),
-        (
-            "a program inside the folders, in another directory",
-            fixture.detached(
-                &format!("{} 30", idle.display()),
-                fixture.tree.path(),
-                &environment,
-            ),
-        ),
-        (
-            "a program inside the folders and the right directory whose last argument only starts \
-             with the definition's",
-            fixture.detached(&format!("{} 300", idle.display()), &state, &environment),
-        ),
-        (
-            "a program outside the folders that is given a path inside them as data, in the right \
-             directory with the definition's last argument",
-            fixture.detached(
-                &format!("/bin/cat {} 30", waited_at.display()),
-                &state,
-                &environment,
-            ),
-        ),
-    ];
-    let target = format!("{}/kr-controller-n", fixture.domain());
+    let script = "#!/bin/sh\nwhile :; do sleep 1; done\n";
+    let mut daemons = Vec::new();
+    for label in ["kr-controller-a", "kr-controller-b"] {
+        let (_, loaded) = fixture.load(label, script, "");
+        assert_eq!(loaded.status.code(), Some(0), "{}", text(&loaded.stderr));
+        let target = format!("{}/{label}", fixture.domain());
+        let started = fixture.call(&["kickstart", "-p", &target]);
+        assert_eq!(started.status.code(), Some(0), "{}", text(&started.stderr));
+        let daemon = fixture
+            .written_down()
+            .into_iter()
+            .find(|started| started.label == label)
+            .expect("the start of the job, written down")
+            .identity;
+        daemons.push(daemon);
+    }
+    let target = format!("{}/kr-controller-a", fixture.domain());
     let ended_job = fixture.call(&["bootout", &target]);
     assert_eq!(
         ended_job.status.code(),
@@ -769,13 +737,21 @@ fn a_start_that_was_never_recorded_is_not_confused_with_processes_that_only_hold
         "{}",
         text(&ended_job.stderr)
     );
-    for (what, identity) in &others {
-        assert_eq!(
-            process_state(identity),
-            ProcessState::Running,
-            "{what} was taken for the job's and ended"
-        );
-    }
+    assert!(ended(&daemons[0]), "the daemon of the job was ended");
+    assert_eq!(
+        process_state(&daemons[1]),
+        ProcessState::Running,
+        "the daemon of another job was ended with it"
+    );
+    let target = format!("{}/kr-controller-b", fixture.domain());
+    let ended_job = fixture.call(&["bootout", &target]);
+    assert_eq!(
+        ended_job.status.code(),
+        Some(0),
+        "{}",
+        text(&ended_job.stderr)
+    );
+    assert!(ended(&daemons[1]), "the daemon of the other job was ended");
 }
 
 /// `bootout` ends the daemon and the group it leads: a process the daemon started and left running
@@ -1190,46 +1166,26 @@ fn a_case_that_loses_a_daemons_record_and_fails() {
     panic!("this case fails on purpose, after its daemon's record was lost");
 }
 
-/// A `bootout` that fails keeps the job: a start that was never recorded cannot be searched for when
-/// the working directory its record names lies outside the test's folders, so the answer is a
-/// failure, and the job is still loaded.
+/// A `bootout` that fails keeps the job: a line of the file of starts that cannot be read leaves it
+/// not known whose the line is, so the answer is a failure, and the job is still loaded.
 #[test]
 fn a_bootout_that_fails_keeps_the_job_loaded() {
     let fixture = Fixture::new();
-    let program = fixture.installation.path().join("kr-daemon");
-    kr_ipc::testing::place_script(&program, "#!/bin/sh\nexit 0\n");
-    let directory = fixture.tree.path().join("state");
-    let arguments = [program.display().to_string(), "30".to_owned()];
-    let plist = fixture
-        .tree
-        .path()
-        .join("home/Library/LaunchAgents/kr-controller-f.plist");
-    std::fs::write(
-        &plist,
-        fixture.plist_of("kr-controller-f", &arguments, &directory, ""),
-    )
-    .expect("a plist");
-    let loaded = fixture.call(&[
-        "bootstrap",
-        &fixture.domain(),
-        plist.to_str().expect("text"),
-    ]);
+    let (_, loaded) = fixture.load("kr-controller-f", "#!/bin/sh\nexit 0\n", "");
     assert_eq!(loaded.status.code(), Some(0), "{}", text(&loaded.stderr));
-    fixture.mark_pending("kr-controller-f");
-    let record = fixture
-        .tree
-        .path()
-        .join("state/manager-stand-in/jobs/kr-controller-f.json");
-    let mut job: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(&record).expect("the record")).expect("json");
-    job["working_directory"] = serde_json::Value::String("/".to_owned());
-    std::fs::write(&record, job.to_string()).expect("a record that names a directory outside");
+    let file = fixture.started_file();
+    std::fs::write(&file, "this is not a start\n").expect("a line that is not a start");
     let target = format!("{}/kr-controller-f", fixture.domain());
     let failed = fixture.call(&["bootout", &target]);
     assert_eq!(
         failed.status.code(),
         Some(64),
-        "a bootout that cannot search for the start fails: {}",
+        "a bootout that cannot read the starts fails: {}",
+        text(&failed.stderr)
+    );
+    assert!(
+        text(&failed.stderr).contains("is not a start"),
+        "{}",
         text(&failed.stderr)
     );
     let listed = fixture.call(&["print", &target]);
@@ -1239,6 +1195,8 @@ fn a_bootout_that_fails_keeps_the_job_loaded() {
         "the job of a bootout that failed is still loaded: {}",
         text(&listed.stderr)
     );
+    // The fixture reads the file when the case ends, and holds no line that is not a start.
+    std::fs::remove_file(&file).expect("the file is removed");
 }
 
 /// What a definition may name is bounded after every link is resolved: a plist, a log or a working

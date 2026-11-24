@@ -9,6 +9,12 @@
 //! and a path outside the test's own folders are refused with status 64. A call is not written down
 //! when the path of its record lies outside the test's own folders.
 //!
+//! Each process it starts is written down with the label of its job, as soon as it is started and
+//! before the record that names it is kept. `bootout` ends every process written down for the job,
+//! each with the members of the group it leads. One gap remains: a stand-in that is ended after it
+//! starts a process and before it writes the process down leaves that process running, and
+//! `bootout` does not find it. A write that fails ends the process it was for.
+//!
 //! What it cannot show: that real launchd accepts the file, that these answers are the real tool's
 //! (they are copied from what `kr` reads), the session and the keychain a real job runs in, the
 //! scheduling a process type asks for (the one value it accepts is the value `kr` writes, and it
@@ -50,9 +56,46 @@ const NOT_LOADED: i32 = 113;
 const ALREADY_LOADED: i32 = 5;
 
 /// The file, in the folder of the record, in which every process this program starts is written
-/// down, one identity a line, as soon as it is started and before any record of its job is
-/// published, so that a test's cleanup holds each one whatever came of the record.
+/// down, one line each, with the label of the job it was started for. A line is written as soon as
+/// the process is started and before the record that names it is kept, so that `bootout` and a
+/// test's cleanup hold each process whatever came of the record.
 pub const STARTED_FILE: &str = "started.jsonl";
+
+/// One line of [`STARTED_FILE`]: a process this program started, and the label of its job.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Started {
+    /// The label of the job the process was started for.
+    pub label: String,
+    /// The process.
+    pub identity: ProcessStartIdentity,
+}
+
+/// The starts written down in `file`, in the order they were made; none when the file is not
+/// there. A line that cannot be read is an error and is never skipped, since whose it is is not
+/// known.
+///
+/// # Errors
+///
+/// The file cannot be read, or a line of it is not a start.
+pub fn read_started(file: &Path) -> Result<Vec<Started>, String> {
+    let text = match std::fs::read_to_string(file) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(format!("{} cannot be read: {error}", file.display())),
+    };
+    text.lines()
+        .enumerate()
+        .map(|(index, line)| {
+            serde_json::from_str(line).map_err(|error| {
+                format!(
+                    "line {} of {} is not a start: {error}",
+                    index + 1,
+                    file.display()
+                )
+            })
+        })
+        .collect()
+}
 
 /// How long a daemon is given to end after it is asked to, and again after it is made to.
 const END_BOUND: Duration = Duration::from_secs(15);
@@ -104,8 +147,6 @@ pub struct Job {
     pub starts: u32,
     /// The daemon's process, once started.
     pub identity: Option<ProcessStartIdentity>,
-    /// Whether a start began and its process was not recorded yet.
-    pub pending: bool,
 }
 
 /// What a call knows of where it runs.
@@ -184,45 +225,6 @@ impl Context {
                 path.display()
             ))
         }
-    }
-
-    /// Whether `argv`, the argument vector of a process as the kernel keeps it, is that of the
-    /// job's program: it ends with the arguments the definition gives after its program, and its
-    /// first word is the job's program, or its first word is the interpreter that the first line of
-    /// the job's program names and its second word is the job's program. A word is the job's program
-    /// when it is an absolute path to the same file once every link is resolved. A path inside the
-    /// roots that a program outside is given as data is not the job's program.
-    fn runs_the_program_of(&self, job: &Job, argv: &[String]) -> bool {
-        let Some((program, given)) = job.arguments.split_first() else {
-            return false;
-        };
-        let Some(before) = argv
-            .len()
-            .checked_sub(given.len())
-            .filter(|count| *count >= 1)
-        else {
-            return false;
-        };
-        let (leading, tail) = argv.split_at(before);
-        if tail != given {
-            return false;
-        }
-        let Ok(program) = self
-            .bounded(Path::new(program))
-            .and_then(|path| path.canonicalize().map_err(|error| error.to_string()))
-        else {
-            return false;
-        };
-        let is_the_program = |word: &String| {
-            Path::new(word).is_absolute()
-                && Path::new(word)
-                    .canonicalize()
-                    .is_ok_and(|path| path == program)
-        };
-        is_the_program(&leading[0])
-            || (leading.len() >= 2
-                && is_the_program(&leading[1])
-                && interpreter_of(&program).is_some_and(|interpreter| interpreter == leading[0]))
     }
 
     /// A path of the store, once every link it holds is resolved and found inside the roots.
@@ -763,7 +765,6 @@ fn bootstrap(context: &Context, domain: &str, plist: &Path) -> Answer {
         environment_keys: Vec::new(),
         starts: 0,
         identity: None,
-        pending: false,
     };
     match context.keep(&job) {
         Ok(()) => Answer::said(String::new()),
@@ -797,18 +798,13 @@ fn kickstart(context: &Context, target: &str) -> Answer {
         Ok(definition) => definition,
         Err(why) => return Answer::refused(why),
     };
-    job.pending = true;
-    if let Err(why) = context.keep(&job) {
-        return Answer::refused(why);
-    }
-    match start(context, &definition) {
+    match start(context, &job.label, &definition) {
         Err(why) => Answer::refused(why),
         Ok((identity, keys)) => {
             let pid = identity.pid.get();
             job.identity = Some(identity);
             job.environment_keys = keys;
             job.starts += 1;
-            job.pending = false;
             match context.keep(&job) {
                 Ok(()) => Answer::said(format!("{pid}\n")),
                 Err(why) => Answer::refused(why),
@@ -824,6 +820,7 @@ fn kickstart(context: &Context, target: &str) -> Answer {
 /// hold `USER`, `LOGNAME` and `SHELL`, which this program does not set.
 fn start(
     context: &Context,
+    label: &str,
     definition: &Definition,
 ) -> Result<(ProcessStartIdentity, Vec<String>), String> {
     // A session of its own, so that the daemon has no controlling terminal from the test that
@@ -896,7 +893,7 @@ fn start(
             ));
         }
     };
-    if let Err(why) = write_down_start(context, &identity) {
+    if let Err(why) = write_down_start(context, label, &identity) {
         // The process is this program's own child, so ending it needs no identity.
         let _ = child.kill();
         let seen = if reap_within(&mut child, END_BOUND) {
@@ -923,21 +920,11 @@ fn identity_of(pid: u32) -> Result<ProcessStartIdentity, String> {
     started_process_identity(pid).map_err(|error| error.to_string())
 }
 
-/// The program that reads the directory a process runs in.
-#[cfg(target_os = "macos")]
-const LSOF: &str = "/usr/sbin/lsof";
-#[cfg(not(target_os = "macos"))]
-const LSOF: &str = "/usr/bin/lsof";
-
-/// What a search for a start that was never recorded reads the system with: the programs it runs,
-/// the way it reads an identity and the way it reads an argument vector, so that a case can put a
-/// program that fails, a reader that gives another identity the second time, or a reader that gives
-/// no vector, in their place.
+/// What the reading of a group reads the system with: the way it reads an identity and the way it
+/// lists a group, so that a case can put a reader that gives another identity the second time, or
+/// a list that fails, in their place.
 struct Tools<'a> {
-    ps: &'a Path,
-    lsof: &'a Path,
     identity: ReadIdentity<'a>,
-    arguments: &'a dyn Fn(u32) -> Arguments,
     group: &'a dyn Fn(u32) -> Result<Vec<u32>, String>,
 }
 
@@ -945,69 +932,10 @@ impl Tools<'static> {
     /// The system's own.
     fn system() -> Self {
         Self {
-            ps: Path::new("/bin/ps"),
-            lsof: Path::new(LSOF),
             identity: &identity_of,
-            arguments: &arguments_of,
             group: &listed_in_group,
         }
     }
-}
-
-/// What the kernel gives of the argument vector of a process.
-#[derive(Debug, PartialEq, Eq)]
-enum Arguments {
-    /// The words of the vector, each as the program was started with it.
-    Words(Vec<String>),
-    /// The process has ended, or has ended and is not yet collected.
-    Ended,
-    /// The kernel gave no vector for a process that runs.
-    Unread,
-}
-
-/// The argument vector of the process `pid`, word by word, as the kernel keeps it: macOS holds it as
-/// `KERN_PROCARGS2` and Linux as `/proc/<pid>/cmdline`, which `sysinfo` reads. A vector is never
-/// cut at white space, so a word that holds white space stays one word.
-fn arguments_of(pid: u32) -> Arguments {
-    use sysinfo::{ProcessRefreshKind, ProcessStatus, ProcessesToUpdate, UpdateKind};
-
-    let mut system = sysinfo::System::new();
-    let target = sysinfo::Pid::from_u32(pid);
-    system.refresh_processes_specifics(
-        ProcessesToUpdate::Some(&[target]),
-        true,
-        ProcessRefreshKind::nothing().with_cmd(UpdateKind::Always),
-    );
-    let Some(process) = system.process(target) else {
-        return Arguments::Ended;
-    };
-    if process.status() == ProcessStatus::Zombie {
-        return Arguments::Ended;
-    }
-    let words: Vec<String> = process
-        .cmd()
-        .iter()
-        .map(|word| word.to_string_lossy().into_owned())
-        .collect();
-    if words.is_empty() {
-        Arguments::Unread
-    } else {
-        Arguments::Words(words)
-    }
-}
-
-/// The interpreter the first line of the program `program` names, when it starts with `#!`.
-fn interpreter_of(program: &Path) -> Option<String> {
-    let mut head = [0_u8; 256];
-    let count = std::fs::File::open(program)
-        .and_then(|mut file| file.read(&mut head))
-        .ok()?;
-    let line = head[..count].strip_prefix(b"#!")?;
-    let first = line.split(|byte| *byte == b'\n').next()?;
-    String::from_utf8_lossy(first)
-        .split_whitespace()
-        .next()
-        .map(str::to_owned)
 }
 
 /// The processes the kernel lists in the group `group`.
@@ -1109,10 +1037,18 @@ fn members_of(
     })
 }
 
-/// Writes `identity` down as a process this program started.
-fn write_down_start(context: &Context, identity: &ProcessStartIdentity) -> Result<(), String> {
+/// Writes `identity` down as a process this program started for the job `label`.
+fn write_down_start(
+    context: &Context,
+    label: &str,
+    identity: &ProcessStartIdentity,
+) -> Result<(), String> {
     let path = context.in_store(STARTED_FILE)?;
-    let line = serde_json::to_string(identity).map_err(|error| error.to_string())?;
+    let line = serde_json::to_string(&Started {
+        label: label.to_owned(),
+        identity: identity.clone(),
+    })
+    .map_err(|error| error.to_string())?;
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -1182,148 +1118,30 @@ fn end_all(
     Ok(())
 }
 
-/// The processes of a start that was never recorded, found among the processes of this user that the
-/// program `ps` lists.
-///
-/// A process is the job's only on proof, each part read apart from the text around it: its argument
-/// vector, read with its own boundaries, ends with the arguments the definition gives after its
-/// program; its program is the job's program, run as it is or by the interpreter its first line
-/// names; and its working directory is the definition's. A process that fails any of the three is
-/// not the job's, whatever else it holds.
-///
-/// Each process found is held by identity: its identity is read before the three proofs and again
-/// after them, so that what is ended is the process that was proved and no other.
-///
-/// A search that cannot be made is an error and not an empty answer: an argument that is empty is
-/// not shown by the reader of argument vectors, and a list, a vector or a directory that cannot be
-/// read leaves a process unproved.
-fn found_unrecorded(
-    context: &Context,
-    job: &Job,
-    tools: &Tools<'_>,
-) -> Result<Vec<ProcessStartIdentity>, String> {
-    if job.arguments.iter().any(String::is_empty) {
-        return Err(
-            "an argument of the job is empty, and the reader of argument vectors does not show an \
-             empty argument"
-                .to_owned(),
-        );
-    }
-    let working = context.bounded(Path::new(&job.working_directory))?;
-    let output = match bounded_output(
-        Command::new(tools.ps).args(["-ax", "-o", "pid=,uid="]),
-        COMMAND_BOUND,
-    ) {
-        Ok(output) if output.status.success() => output,
-        Ok(output) => {
-            return Err(format!(
-                "the process list cannot be read: ps said {}",
-                output.status
-            ));
-        }
-        Err(error) => return Err(format!("the process list cannot be read: {error}")),
-    };
-    let own = rustix::process::getuid().as_raw();
-    let mut found = Vec::new();
-    for line in String::from_utf8_lossy(&output.stdout).lines() {
-        let Some((pid, rest)) = line.trim_start().split_once(char::is_whitespace) else {
-            continue;
-        };
-        let (Ok(pid), Ok(uid)) = (pid.parse::<u32>(), rest.trim().parse::<u32>()) else {
-            continue;
-        };
-        // The job's process runs as the user this program runs as: another user's processes are not
-        // the job's, and their identities are not for this program to read.
-        if pid == std::process::id() || uid != own {
-            continue;
-        }
-        let held = held_through(pid, tools.identity, &mut |identity| {
-            let argv = match (tools.arguments)(pid) {
-                Arguments::Words(argv) => argv,
-                Arguments::Ended => return Ok(false),
-                Arguments::Unread if process_state(identity) == ProcessState::Ended => {
-                    return Ok(false);
-                }
-                Arguments::Unread => {
-                    return Err(format!(
-                        "the arguments of the process {pid} cannot be read, so it cannot be told \
-                         from the job's"
-                    ));
-                }
-            };
-            if !context.runs_the_program_of(job, &argv) {
-                return Ok(false);
-            }
-            let listed = working_directory_of(pid, tools.lsof)?;
-            in_directory(pid, listed.as_deref(), &working, process_state(identity))
-        })?;
-        found.extend(held);
-    }
-    Ok(found)
+/// The processes written down for the job `label`.
+fn written_down_for(context: &Context, label: &str) -> Result<Vec<ProcessStartIdentity>, String> {
+    Ok(read_started(&context.in_store(STARTED_FILE)?)?
+        .into_iter()
+        .filter(|started| started.label == label)
+        .map(|started| started.identity)
+        .collect())
 }
 
-/// Whether the process `pid` runs in `working`, from the directory `lsof` listed for it, if it
-/// listed one. `lsof` gives status 1 and no line for any error, not only for a process that has
-/// ended, so a process with no directory listed is outside only when its identity shows it ended;
-/// otherwise its directory is not known, and that is an error.
-fn in_directory(
-    pid: u32,
-    listed: Option<&Path>,
-    working: &Path,
-    state: ProcessState,
-) -> Result<bool, String> {
-    match (listed, state) {
-        (Some(listed), _) => Ok(listed == working),
-        (None, ProcessState::Ended) => Ok(false),
-        (None, ProcessState::Running) => Err(format!(
-            "the directory of the process {pid} is not known: lsof listed none for a process that \
-             runs"
-        )),
-        (None, ProcessState::Unknown { detail }) => Err(format!(
-            "the directory of the process {pid} is not known: lsof listed none, and whether it \
-             runs is not known ({detail})"
-        )),
-    }
-}
-
-/// The working directory of the process `pid`, as `lsof` reads it, or `None` where it lists none
-/// and says so with status 1. Any other failure is an error.
-fn working_directory_of(pid: u32, lsof: &Path) -> Result<Option<PathBuf>, String> {
-    let output = bounded_output(
-        Command::new(lsof).args(["-a", "-d", "cwd", "-Fn", "-p", &pid.to_string()]),
-        COMMAND_BOUND,
-    )
-    .map_err(|error| format!("the directory of the process {pid} cannot be read: {error}"))?;
-    let listed = String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .find_map(|line| line.strip_prefix('n'))
-        .map(PathBuf::from);
-    match (listed, output.status.code()) {
-        (Some(path), _) => Ok(Some(path)),
-        (None, Some(1)) => Ok(None),
-        (None, _) => Err(format!(
-            "the directory of the process {pid} cannot be read: lsof said {}",
-            output.status
-        )),
-    }
-}
-
-/// Ends every process of `job`, the recorded one and, for a start that was never recorded, those
-/// found for it, with the groups they lead.
+/// Ends every process written down for `job` and the one its record names, each with the members of
+/// the group it leads. A line of the file that cannot be read is an error.
 fn end_job(context: &Context, job: &Job) -> Result<(), String> {
-    let tools = Tools::system();
     let mut identities: Vec<ProcessStartIdentity> = job.identity.clone().into_iter().collect();
-    if job.pending {
-        identities.extend(found_unrecorded(context, job, &tools)?);
-    }
-    end_all(&identities, &process_state, &tools, END_BOUND)
+    identities.extend(written_down_for(context, &job.label)?);
+    identities.sort();
+    identities.dedup();
+    end_all(&identities, &process_state, &Tools::system(), END_BOUND)
 }
 
-/// `bootout`: ends the daemon by the identity recorded for it and the members of the group it
-/// leads, each by its own identity, asking first and then making sure, and unloads the job. A start
-/// that was not recorded is found by what proves a process the job's. Nothing is signalled by a
-/// number, so a process that holds a number now that another process held is left alone. A process
-/// that is not shown to have ended keeps the job loaded and is reported as a failure.
+/// `bootout`: ends every process written down for the job and the one its record names, each with
+/// the members of the group it leads, each by its own identity, asking first and then making sure,
+/// and unloads the job. Nothing is signalled by a number, so a process that holds a number now that
+/// another process held is left alone. A process that is not shown to have ended, and a line of
+/// the file of starts that cannot be read, keep the job loaded and are reported as a failure.
 fn bootout(context: &Context, target: &str) -> Answer {
     let (domain, label) = match job_target(context, target) {
         Ok(found) => found,
@@ -1557,71 +1375,6 @@ mod tests {
         );
     }
 
-    /// A process list that cannot be read is an error and not an empty answer: `ps` that cannot be
-    /// started, `ps` that fails, an argument of the job that is empty, and an argument vector that
-    /// cannot be read for a process that runs. An argument that holds a space is no obstacle.
-    #[test]
-    fn a_process_list_that_cannot_be_read_is_an_error_and_not_an_empty_answer() {
-        let folder = PrivateTempDir::create();
-        let root = folder.path().canonicalize().expect("a folder");
-        let context = Context {
-            own: root.clone(),
-            roots: vec![root.clone()],
-            store: root.join("store"),
-            uid: 0,
-        };
-        let job = |arguments: [&str; 2]| Job {
-            arguments: arguments.map(str::to_owned).to_vec(),
-            working_directory: root.display().to_string(),
-            ..Job::default()
-        };
-        let plain = job(["/x/program", "argument"]);
-        fn with_ps(ps: &Path) -> Tools<'_> {
-            Tools {
-                ps,
-                ..Tools::system()
-            }
-        }
-        assert!(found_unrecorded(&context, &plain, &Tools::system()).is_ok());
-        assert!(
-            found_unrecorded(&context, &plain, &with_ps(&root.join("no-such-ps"))).is_err(),
-            "ps that cannot be started"
-        );
-        assert!(
-            found_unrecorded(&context, &plain, &with_ps(Path::new("/usr/bin/false"))).is_err(),
-            "ps that fails"
-        );
-        assert!(
-            found_unrecorded(
-                &context,
-                &job(["/x/program", "two words"]),
-                &Tools::system()
-            )
-            .is_ok(),
-            "an argument that holds a space is one word of the vector"
-        );
-        assert!(
-            found_unrecorded(&context, &job(["/x/program", ""]), &Tools::system()).is_err(),
-            "an empty argument is not shown by the reader of vectors"
-        );
-        let unread = Tools {
-            arguments: &|_| Arguments::Unread,
-            ..Tools::system()
-        };
-        assert!(
-            found_unrecorded(&context, &plain, &unread).is_err(),
-            "a vector that cannot be read for a process that runs"
-        );
-        let ended = Tools {
-            arguments: &|_| Arguments::Ended,
-            ..Tools::system()
-        };
-        assert!(
-            found_unrecorded(&context, &plain, &ended).is_ok_and(|found| found.is_empty()),
-            "a process that has no vector left is not the job's"
-        );
-    }
-
     /// A process is held only when it is the same process before and after its proof: one that had
     /// ended at the first reading, one that is another process at the second, and one whose
     /// identity cannot be read are not held, and the last is an error and not an absence.
@@ -1752,67 +1505,6 @@ mod tests {
         );
     }
 
-    /// A search for a start that was never recorded holds each process it finds by identity: a
-    /// process that is another process at the second reading is not found.
-    #[test]
-    fn a_process_found_for_a_start_that_was_never_recorded_is_the_one_that_was_proved() {
-        let folder = PrivateTempDir::create();
-        let root = folder.path().canonicalize().expect("a folder");
-        let program = root.join("kr-daemon");
-        kr_ipc::testing::place_script(&program, "#!/bin/sh\nwhile :; do sleep 1; done\n");
-        let held = Held(
-            Command::new(&program)
-                .arg("30")
-                .current_dir(&root)
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .expect("a program"),
-        );
-        let identity = started_process_identity(held.0.id()).expect("its identity");
-        let context = Context {
-            own: root.clone(),
-            roots: vec![root.clone()],
-            store: root.join("store"),
-            uid: 0,
-        };
-        let job = Job {
-            arguments: vec![program.display().to_string(), "30".to_owned()],
-            working_directory: root.display().to_string(),
-            ..Job::default()
-        };
-        let found = found_unrecorded(&context, &job, &Tools::system()).expect("a search");
-        assert_eq!(found, vec![identity.clone()], "the process is found");
-        let calls = std::cell::Cell::new(0_u32);
-        let swapped = |pid: u32| {
-            let read = identity_of(pid)?;
-            if u64::from(pid) != identity.pid.get() {
-                return Ok(read);
-            }
-            calls.set(calls.get() + 1);
-            Ok(if calls.get() % 2 == 1 {
-                read
-            } else {
-                ProcessStartIdentity::new(
-                    read.pid.get(),
-                    read.source,
-                    read.start_value.get().wrapping_add(1),
-                )
-            })
-        };
-        let tools = Tools {
-            identity: &swapped,
-            ..Tools::system()
-        };
-        let found = found_unrecorded(&context, &job, &tools).expect("a search");
-        assert!(calls.get() >= 2, "the process was read twice");
-        assert!(
-            found.is_empty(),
-            "a process that was another at its second reading was found: {found:?}"
-        );
-    }
-
     /// No signal goes to a number: every one goes to a process held by its identity, so no call that
     /// signals by number is in the program.
     #[test]
@@ -1928,164 +1620,5 @@ mod tests {
                 .is_err_and(|why| why.contains("cannot be listed")),
             "an ended leader's group that cannot be listed is not an end: {ended:?}"
         );
-    }
-
-    /// A directory that `lsof` lists none for is unknown unless the process is shown to have ended:
-    /// `lsof` gives status 1 and no line for any error.
-    #[test]
-    fn a_directory_lsof_lists_none_for_is_unknown_unless_the_process_ended() {
-        let working = Path::new("/w");
-        assert_eq!(
-            in_directory(7, Some(Path::new("/w")), working, ProcessState::Running),
-            Ok(true)
-        );
-        assert_eq!(
-            in_directory(7, Some(Path::new("/x")), working, ProcessState::Running),
-            Ok(false)
-        );
-        assert_eq!(
-            in_directory(7, None, working, ProcessState::Ended),
-            Ok(false),
-            "a process that ended has no directory"
-        );
-        let running = in_directory(7, None, working, ProcessState::Running);
-        assert!(
-            running.as_ref().is_err_and(|why| why.contains("not known")),
-            "{running:?}"
-        );
-        let unknown = in_directory(
-            7,
-            None,
-            working,
-            ProcessState::Unknown {
-                detail: "refused".to_owned(),
-            },
-        );
-        assert!(unknown.is_err(), "{unknown:?}");
-        // The search itself: an `lsof` that lists nothing and says 1 for a process that matches the
-        // job and runs is an error and not an absence.
-        let folder = PrivateTempDir::create();
-        let root = folder.path().canonicalize().expect("a folder");
-        let program = root.join("kr-daemon");
-        kr_ipc::testing::place_script(&program, "#!/bin/sh\nwhile :; do sleep 1; done\n");
-        let _held = Held(
-            Command::new(&program)
-                .arg("30")
-                .current_dir(&root)
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .expect("a program"),
-        );
-        let context = Context {
-            own: root.clone(),
-            roots: vec![root.clone()],
-            store: root.join("store"),
-            uid: 0,
-        };
-        let job = Job {
-            arguments: vec![program.display().to_string(), "30".to_owned()],
-            working_directory: root.display().to_string(),
-            ..Job::default()
-        };
-        let silent = Tools {
-            lsof: Path::new("/usr/bin/false"),
-            ..Tools::system()
-        };
-        let found = found_unrecorded(&context, &job, &silent);
-        assert!(
-            found.as_ref().is_err_and(|why| why.contains("not known")),
-            "{found:?}"
-        );
-    }
-
-    /// The argument vector of a process is the job's only when it ends with the arguments of the
-    /// definition word for word and its program is the job's: the program run as it is, run by the
-    /// interpreter its first line names, or run with arguments of its own first. A word that only
-    /// starts or ends like the definition's, another program, an outside program that is given the
-    /// job's program or another path inside the roots as data, an interpreter its first line does
-    /// not name, a path that is not absolute and no arguments at all are not.
-    #[test]
-    fn the_argument_vector_of_a_process_is_the_jobs_only_when_it_runs_the_jobs_program() {
-        let folder = PrivateTempDir::create();
-        let root = folder.path().canonicalize().expect("a folder");
-        let program = root.join("kr-daemon");
-        std::fs::write(&program, "#!/bin/sh\nexit 0\n").expect("a program");
-        let other = root.join("other");
-        std::fs::write(&other, "#!/bin/sh\nexit 0\n").expect("another program");
-        let program = program.display().to_string();
-        let other = other.display().to_string();
-        let context = Context {
-            own: root.clone(),
-            roots: vec![root.clone()],
-            store: root.join("store"),
-            uid: 0,
-        };
-        let job = Job {
-            arguments: [&program, "--runtime-dir", "/r", "--state-dir", "/s"]
-                .map(str::to_owned)
-                .to_vec(),
-            ..Job::default()
-        };
-        let is_the_jobs = |words: &[&str]| {
-            let argv: Vec<String> = words.iter().map(|word| (*word).to_owned()).collect();
-            context.runs_the_program_of(&job, &argv)
-        };
-        let tail = ["--runtime-dir", "/r", "--state-dir", "/s"];
-        let with = |leading: &[&str], tail: &[&str]| -> Vec<String> {
-            leading
-                .iter()
-                .chain(tail)
-                .map(|word| (*word).to_owned())
-                .collect()
-        };
-        let runs = |leading: &[&str]| {
-            is_the_jobs(
-                &with(leading, &tail)
-                    .iter()
-                    .map(String::as_str)
-                    .collect::<Vec<_>>(),
-            )
-        };
-        assert!(runs(&[&program]), "the program run as it is");
-        assert!(
-            runs(&["/bin/sh", &program]),
-            "run by the interpreter its first line names"
-        );
-        assert!(
-            runs(&[&program, "--secret-store", "file"]),
-            "handed over to with arguments of its own first"
-        );
-        assert!(
-            !is_the_jobs(&[&program, "--runtime-dir", "/r", "--state-dir", "/s2"]),
-            "a last word that only starts like the definition's"
-        );
-        assert!(
-            !is_the_jobs(&[&program, "--runtime-dir", "/r", "--state-dir", "/"]),
-            "a last word that only ends like it"
-        );
-        assert!(!runs(&["/bin/sh"]), "an interpreter and no program");
-        assert!(!runs(&[&other]), "another program inside the roots");
-        assert!(
-            !runs(&["/bin/cat", &program]),
-            "an outside program that is given the job's program as data"
-        );
-        assert!(
-            !runs(&["/usr/bin/yes", &other]),
-            "an outside program that is given another path inside the roots as data"
-        );
-        assert!(
-            !runs(&["/bin/echo", "x", &program]),
-            "the job's program too far from the start"
-        );
-        assert!(
-            !runs(&["/bin/dash", &program]),
-            "an interpreter that the first line of the program does not name"
-        );
-        assert!(!runs(&["kr-daemon"]), "a path that is not absolute");
-        assert!(!is_the_jobs(&tail), "no program at all");
-        assert!(!is_the_jobs(&[&program]), "no arguments of the definition");
-        assert!(!is_the_jobs(&[]), "an empty vector");
     }
 }

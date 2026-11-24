@@ -4952,7 +4952,6 @@ dependencies = [
  "rustix",
  "serde",
  "serde_json",
- "sysinfo",
 ]
 
 [[package]]
