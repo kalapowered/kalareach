@@ -1778,6 +1778,18 @@ async fn the_fixture_reads_a_commit_on_the_launchers_clock() {
     launcher.end().await;
 }
 
+/// A program a case watches and has to leave ended: it is ended by its identity, which the system
+/// checks against its start, when this is dropped, so that a case that fails leaves nothing running.
+#[cfg(windows)]
+struct EndsWhenDropped(ProcessStartIdentity);
+
+#[cfg(windows)]
+impl Drop for EndsWhenDropped {
+    fn drop(&mut self) {
+        let _ = kr_ipc::identity::stop_process(&self.0, kr_ipc::identity::Stop::Kill);
+    }
+}
+
 /// A launcher that stops after it created its program and before the backend has shown the program
 /// leaves no held program: the program ends with the launcher, because its job is all that can end
 /// it. The backend is held where it has read the program's name and not yet looked at it, so nothing
@@ -1803,6 +1815,9 @@ async fn a_program_the_fixture_created_ends_with_the_launcher_when_the_backend_n
     let mut launcher = Launcher::start(&launch);
     let program = launcher.program().await;
     let identity = kr_ipc::identity::process_start_identity(program).expect("a process");
+    // Ended after the check below, whatever it finds. The check is that the launcher's job ended
+    // the program, so nothing here ends it before then.
+    let _ends = EndsWhenDropped(identity.clone());
     tokio::time::timeout(std::time::Duration::from_secs(60), arrived)
         .await
         .expect("the launch reaches the backend before its program is shown")
