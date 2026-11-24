@@ -100,7 +100,9 @@ pub const FAILURE_MEMORY: Duration = Duration::from_secs(10);
 /// not been answered by then has already been given up by the runtime.
 const START_DEADLINE: Duration = Duration::from_secs(30);
 
-/// How long a look at a runtime another daemon started waits for it to answer a challenge.
+/// How long a look at a runtime another daemon started waits for it to answer a challenge. The
+/// attempt over the fourth protocol takes at most half of it, so that a fourth endpoint that never
+/// answers leaves the third its time.
 const ADOPTION_PROBE: Duration = Duration::from_secs(5);
 
 /// How long a worker that was told the runtime is not ready leaves before it asks again, where the
@@ -566,13 +568,13 @@ impl PluginRuntime {
             self.retire_descriptors();
             return Found::Nothing;
         }
-        // The runtime is looked at the way a worker connects to it. The descriptor kept is the one
-        // the connection verified: a connect that fell back from the fourth protocol's descriptor
-        // to the third's has verified the third's, and the process the fourth's descriptor names
-        // is not the host.
+        // The runtime is looked at the way a worker connects to it, but the attempt over the fourth
+        // protocol is bounded. The descriptor kept is the one the connection verified: a connect
+        // that fell back from the fourth protocol's descriptor to the third's has verified the
+        // third's, and the process the fourth's descriptor names is not the host.
         let paths = self.paths.clone();
         let probe = tokio::time::timeout(ADOPTION_PROBE, async move {
-            PluginClient::connect(&paths)
+            PluginClient::connect_limiting_four(&paths, ADOPTION_PROBE / 2)
                 .await
                 .map(|client| client.descriptor().clone())
         })

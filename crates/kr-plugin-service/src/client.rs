@@ -710,7 +710,37 @@ impl PluginClient {
     /// endpoint cannot be reached, and [`ServiceError::Protocol`] when the host answers with
     /// something this client cannot read or cannot verify.
     pub async fn connect(environment: &EnvironmentPaths) -> ServiceResult<Self> {
-        if let Ok(client) = Self::connect_four(environment).await {
+        Self::connect_giving(environment, None).await
+    }
+
+    /// Connects as [`Self::connect`] does, giving the attempt over `/4` at most `four`.
+    ///
+    /// A `/4` endpoint that takes the connection and never answers would otherwise use all the time
+    /// the caller allows, and leave the `/3` attempt none.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::connect`].
+    pub async fn connect_limiting_four(
+        environment: &EnvironmentPaths,
+        four: core::time::Duration,
+    ) -> ServiceResult<Self> {
+        Self::connect_giving(environment, Some(four)).await
+    }
+
+    async fn connect_giving(
+        environment: &EnvironmentPaths,
+        four: Option<core::time::Duration>,
+    ) -> ServiceResult<Self> {
+        let over_four = Self::connect_four(environment);
+        let over_four = match four {
+            Some(limit) => tokio::time::timeout(limit, over_four)
+                .await
+                .ok()
+                .and_then(Result::ok),
+            None => over_four.await.ok(),
+        };
+        if let Some(client) = over_four {
             return Ok(client);
         }
         let descriptor = launcher::read_descriptor(environment, &HostProtocol::V3)
