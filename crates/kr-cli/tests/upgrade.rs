@@ -1443,6 +1443,159 @@ fn registry_version_of(host: &Host) -> i64 {
     .expect("reads the registry's version")
 }
 
+impl Host {
+    /// Rolls back as a person types it, over a host whose attention store a daemon of this build
+    /// wrote at version 13, which the release before lists at version 12. At this build the two
+    /// versions differ in their number alone, and the cases that use this are about the rollback and
+    /// not about that store, so the version is written back first. The refusal itself is the subject
+    /// of the case in `update.rs` that rolls back over the attention store at version 13. A store that
+    /// is not at version 13, or that holds a value naming `attention.receipt_uncertain` or
+    /// `attention.receipts_gap`, which the release before cannot read, fails here and is not written
+    /// back.
+    fn roll_back_json(&self) -> (Output, Value) {
+        let store = self
+            .tree
+            .environment()
+            .state_dir()
+            .join("attention.sqlite3");
+        write_the_attention_version_back(&store);
+        self.kr_json(&["host", "rollback", "--json"])
+    }
+}
+
+/// Writes version 12 into the attention store at `store`, as `Host::roll_back_json` says.
+fn write_the_attention_version_back(store: &Path) {
+    let connection = rusqlite::Connection::open(store).expect("the attention store");
+    connection
+        .busy_timeout(Duration::from_secs(10))
+        .expect("a wait for the daemon's writes");
+    let found: i64 = connection
+        .query_row("SELECT version FROM attention_schema", [], |row| row.get(0))
+        .expect("the version");
+    assert_eq!(
+        found, 13,
+        "the attention store records version {found}; only version 13 is written back to version 12"
+    );
+    // Every column of every table: an item, an acknowledgement or a client's preference may name a
+    // rule, and a column is read as text whatever it holds.
+    let tables: Vec<String> = connection
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'")
+        .expect("the tables")
+        .query_map([], |row| row.get(0))
+        .expect("the table names")
+        .collect::<Result<_, _>>()
+        .expect("the names");
+    let mut held: i64 = 0;
+    for table in &tables {
+        let columns: Vec<String> = connection
+            .prepare(&format!("SELECT name FROM pragma_table_info('{table}')"))
+            .expect("the columns")
+            .query_map([], |row| row.get(0))
+            .expect("the column names")
+            .collect::<Result<_, _>>()
+            .expect("the names");
+        for column in columns {
+            for word in ["attention.receipt_uncertain", "attention.receipts_gap"] {
+                held += connection
+                    .query_row(
+                        &format!(
+                            "SELECT COUNT(*) FROM \"{table}\" \
+                             WHERE instr(CAST(\"{column}\" AS TEXT), '{word}') > 0"
+                        ),
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .expect("the count");
+            }
+        }
+    }
+    assert_eq!(
+        held, 0,
+        "the attention store holds {held} value(s) that name attention.receipt_uncertain or attention.receipts_gap, which a release that lists version 12 cannot read, so its version is not written back"
+    );
+    connection
+        .execute("UPDATE attention_schema SET version = 12", [])
+        .expect("the version is written back");
+}
+
+/// The version of an attention store that holds a value naming the receipt rule is not written back,
+/// wherever in the store the value is: a key that an acknowledgement is recorded under names a rule.
+#[test]
+fn the_version_of_an_attention_store_that_holds_a_value_naming_the_receipt_rule_is_not_written_back()
+ {
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    let store = directory.path().join("attention.sqlite3");
+    let boot = kr_attention::time::BootMark::from_bytes([7; 16]);
+    let reading = kr_attention::HostReading::new(boot, 0, 12 * 60 * 60 * 1_000, true);
+    let unknown = |_: &kr_protocol::identity::ProcessStartIdentity| kr_attention::Liveness::Unknown;
+    let opener = kr_attention::Claimant::new(
+        kr_protocol::identity::ProcessStartIdentity::new(
+            1,
+            kr_protocol::identity::ProcessStartSource::LinuxProcStat,
+            1_001,
+        ),
+        &unknown,
+    );
+    drop(kr_attention::Attention::open(&store, reading, &opener).expect("the store opens"));
+    let version = || -> i64 {
+        rusqlite::Connection::open(&store)
+            .expect("the attention store")
+            .query_row("SELECT version FROM attention_schema", [], |row| row.get(0))
+            .expect("the version")
+    };
+    assert_eq!(
+        version(),
+        13,
+        "an opened store is at the version this build writes"
+    );
+
+    // A store that holds no such value is written back: the control.
+    let control = directory.path().join("control.sqlite3");
+    std::fs::copy(&store, &control).expect("a copy of the store");
+    write_the_attention_version_back(&control);
+    assert_eq!(
+        rusqlite::Connection::open(&control)
+            .expect("the copy")
+            .query_row("SELECT version FROM attention_schema", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .expect("the version"),
+        12,
+        "a store that holds no value naming the receipt rule is written back to version 12"
+    );
+
+    for (word, what) in [
+        ("attention.receipt_uncertain", "the receipt rule"),
+        ("attention.receipts_gap", "the results gap rule"),
+    ] {
+        let held = directory.path().join(format!("{word}.sqlite3"));
+        std::fs::copy(&store, &held).expect("a copy of the store");
+        rusqlite::Connection::open(&held)
+            .expect("the copy")
+            .execute(
+                "INSERT INTO attention_item_acks (actor, key, revision, at_ms)
+                 VALUES ('someone', ?1, 1, 1)",
+                [format!("{word}|a")],
+            )
+            .expect("an acknowledgement that names the rule");
+        let refused = std::panic::catch_unwind(|| write_the_attention_version_back(&held));
+        assert!(
+            refused.is_err(),
+            "the version is not written back while the store holds a value that names {what}"
+        );
+        assert_eq!(
+            rusqlite::Connection::open(&held)
+                .expect("the copy")
+                .query_row("SELECT version FROM attention_schema", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("the version"),
+            13,
+            "the store is as it was found"
+        );
+    }
+}
+
 /// KR-REQ-26.10, KR-REQ-26.08: a rollback to the release before goes on while only its session is
 /// live, and waits, exit 9, naming the session, while a session of this release is live.
 ///
