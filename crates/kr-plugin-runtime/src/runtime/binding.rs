@@ -1264,6 +1264,16 @@ impl BindingHandle {
         self.restores.load(Ordering::Acquire)
     }
 
+    /// Records that an event offered to the binding was refused before it reached the queue.
+    ///
+    /// What the instance consumes after it is not a prefix of what was offered, and the queue
+    /// tells the pass that takes the next event so.
+    pub fn note_refused_event(&self) {
+        if let Ok(mut queue) = self.queue.lock() {
+            queue.refuse();
+        }
+    }
+
     /// Says the component's view is stale and a fresh snapshot is owed.
     ///
     /// For a caller that lost what the component drew: a document that never reached whoever was

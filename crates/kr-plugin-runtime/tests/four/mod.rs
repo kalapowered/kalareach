@@ -11,6 +11,7 @@ use kr_plugin_runtime::runtime::binding::BindingRequest;
 use kr_plugin_service::launcher::{check_proof, fresh_challenge};
 use kr_plugin_service::protocol::{
     BindingRegistration, ComponentSource, Frame, HostProtocol, RequestBody, ResponseBody,
+    WireSourceEvent,
 };
 use kr_plugin_service::protocol4::{
     BindingRegistration4, Checkpointed, Consumed, Frame4, Notice4, RecordState, Request4,
@@ -428,6 +429,56 @@ async fn kr_req_24_24_a_report_of_the_state_a_restore_replaced_is_not_written_af
         "the report of the state the restore replaced was written after its answer: {stale:?}"
     );
     four.unbind(&request).await;
+}
+
+/// An event the host refuses before it reaches the queue is a loss like any other: what the
+/// instance consumes after it is not a prefix of what was offered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_24_24_an_event_refused_before_the_queue_clears_clean_for_what_follows() {
+    let served = Served::start_dual(true).await;
+    let Some(component) = recording(&served) else {
+        return;
+    };
+    let mut four = Raw4::connect(served.endpoint4()).await;
+    let request = components::request("recording", 36);
+    four.register(&request, &component, 7).await;
+    four.event(&request, "se-1", "x").await;
+    let unknown = four
+        .ask(RequestBody4::Event {
+            binding_id: request.binding_id.get(),
+            event: WireSourceEvent {
+                provenance: "elsewhere".to_owned(),
+                ..wire_event(&components::scrape("se-2", "y"))
+            },
+        })
+        .await;
+    assert!(
+        matches!(
+            unknown,
+            ResponseBody4::Refused {
+                disabled: false,
+                ..
+            }
+        ),
+        "an event of a provenance the host does not know was answered with {unknown:?}"
+    );
+    four.event(&request, "se-3", "z").await;
+    let saved = loop {
+        let saved = four.checkpoint(&request).await;
+        let consumed = saved
+            .consumed
+            .clone()
+            .expect("an open host states what the instance has consumed");
+        if consumed.terminal == Some(handle("se-3")) {
+            break saved;
+        }
+        tokio::task::yield_now().await;
+    };
+    assert_eq!(
+        saved.consumed.map(|consumed| consumed.clean),
+        Some(false),
+        "what the instance consumed after the refused event was said to follow it"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

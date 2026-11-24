@@ -143,6 +143,8 @@ pub struct ObservationQueue {
     /// The place of the first request that was offered and refused, which no gap accounts for,
     /// until `take_loss_before_taken` reports it. Zero means none.
     refused: u64,
+    /// The place of the last one. Zero means none.
+    refused_last: u64,
     /// Which snapshot obligation is outstanding, counted from one. Zero means none.
     snapshot_owed: u64,
     /// How many obligations have ever been raised, so a new one is always a new number.
@@ -174,6 +176,7 @@ impl ObservationQueue {
             offered: 0,
             taken: 0,
             refused: 0,
+            refused_last: 0,
             snapshot_owed: 0,
             obligations: 0,
         }
@@ -321,11 +324,21 @@ impl ObservationQueue {
     ///
     /// A refused request stays with the broker, so the gap and the snapshot of `/3` do not change; the
     /// binding is told through [`Self::take_loss_before_taken`] so that what it consumed after the
-    /// request is not claimed to follow it.
+    /// request is not claimed to follow it. Every refusal counts, not the first alone.
     const fn note_refusal(&mut self, order: u64) {
         if self.refused == 0 {
             self.refused = order;
         }
+        self.refused_last = order;
+    }
+
+    /// Records that an event was offered and refused before it reached the queue.
+    ///
+    /// The refusal takes a place among the events offered, so what is taken after it is told it
+    /// came after a loss, as for a request the queue refused.
+    pub const fn refuse(&mut self) {
+        self.offered = self.offered.saturating_add(1);
+        self.note_refusal(self.offered);
     }
 
     /// Returns true when the gap holds a lost event, or a request was refused, that was offered
@@ -338,7 +351,15 @@ impl ObservationQueue {
         let gap = self.gap.first.is_some() && self.gap.first_order < self.taken;
         let refused = self.refused != 0 && self.refused < self.taken;
         if refused {
-            self.refused = 0;
+            if self.refused_last < self.taken {
+                self.refused = 0;
+                self.refused_last = 0;
+            } else {
+                // A later refusal is still to come before an event not yet taken. The queue keeps
+                // the place of the first and of the last only, so the next event taken is told of
+                // a loss as well: a loss said where there was none, and never one left unsaid.
+                self.refused = self.taken;
+            }
         }
         gap || refused
     }
@@ -813,6 +834,65 @@ mod tests {
             ),
             "the request that was offered first bounds the loss from the front"
         );
+    }
+
+    /// A second refusal is not forgotten because an event taken between the two was told of the
+    /// first.
+    #[test]
+    fn a_refusal_that_follows_one_already_told_is_told_as_well() {
+        let mut queue = ObservationQueue::with_capacity(500);
+        for index in 0..4 {
+            queue.push(request(&format!("se-{index}"), &format!("rq-{index}"), 100));
+        }
+        assert!(matches!(
+            queue.push(request("se-refused-1", "rq-refused-1", 100)),
+            Admission::Refused { .. }
+        ));
+        // Room for one more, which a second refusal then takes away again.
+        assert!(queue.take_one().is_some());
+        assert!(!queue.take_loss_before_taken(), "this came before both");
+        assert!(matches!(
+            queue.push(request("se-between", "rq-between", 100)),
+            Admission::Queued
+        ));
+        assert!(matches!(
+            queue.push(request("se-refused-2", "rq-refused-2", 100)),
+            Admission::Refused { .. }
+        ));
+        for _ in 0..3 {
+            assert!(queue.take_one().is_some());
+            assert!(
+                !queue.take_loss_before_taken(),
+                "these came before the first"
+            );
+        }
+        // The event offered between the two refusals is told of the first.
+        assert!(queue.take_one().is_some());
+        assert!(
+            queue.take_loss_before_taken(),
+            "this one came after the first"
+        );
+        queue.push(request("se-after", "rq-after", 100));
+        assert!(queue.take_one().is_some());
+        assert!(
+            queue.take_loss_before_taken(),
+            "this one came after the second, which the first one's report did not account for"
+        );
+        queue.push(request("se-last", "rq-last", 100));
+        assert!(queue.take_one().is_some());
+        assert!(!queue.take_loss_before_taken(), "both are told once");
+    }
+
+    #[test]
+    fn an_event_refused_before_it_reached_the_queue_is_a_loss_the_events_after_it_are_told_of() {
+        let mut queue = ObservationQueue::with_capacity(500);
+        queue.push(request("se-0", "rq-0", 100));
+        queue.refuse();
+        queue.push(request("se-1", "rq-1", 100));
+        assert!(queue.take_one().is_some());
+        assert!(!queue.take_loss_before_taken(), "this came before it");
+        assert!(queue.take_one().is_some());
+        assert!(queue.take_loss_before_taken(), "this one came after it");
     }
 
     impl ObservationGap {
