@@ -204,17 +204,40 @@ jobs:
       # `kr-cli`'s retained_surface suite checks the workspace for x86_64-pc-windows-gnu. The build
       # scripts of `ring`, `aws-lc-sys`, `libsqlite3-sys` and the companion application need
       # `x86_64-w64-mingw32-gcc` and `x86_64-w64-mingw32-windres`, which the runner image lacks, so
-      # the suite's build fails without them. The packages come to 90 MB; the install's deadline is
-      # 15 minutes.
+      # the suite's build fails without them. The packages come to 90 MB, which a mirror at 50 kB/s
+      # takes 30 minutes to send, past the install's deadline of 15. Their archives are kept in the
+      # Actions cache in an entry of their own: the desktop packages' entry is saved by the
+      # companion job too, with a list that lacks these packages.
+      - name: Restore the Windows cross compiler's archives
+        id: mingw-archives
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.cache/kalareach/apt/mingw
+          key: apt-v1-mingw-ubuntu-24.04-${{ runner.arch }}-${{ github.run_id }}
+          restore-keys: apt-v1-mingw-ubuntu-24.04-${{ runner.arch }}-
+
       - name: Install the Windows cross compiler
+        id: mingw-install
         env:
           DEBIAN_FRONTEND: noninteractive
         run: |
           if ! command -v x86_64-w64-mingw32-gcc > /dev/null; then
-            bash scripts/apt-install.sh --deadline 900 gcc-mingw-w64-x86-64
+            bash scripts/apt-install.sh --deadline 900 --archive ~/.cache/kalareach/apt/mingw \
+              gcc-mingw-w64-x86-64
           fi
           x86_64-w64-mingw32-gcc --version
           x86_64-w64-mingw32-windres --version
+
+      - name: Save the Windows cross compiler's archives
+        if: github.ref == 'refs/heads/main' && steps.mingw-install.outputs.save == 'true'
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.cache/kalareach/apt/mingw
+          key: apt-v1-mingw-ubuntu-24.04-${{ runner.arch }}-${{ steps.mingw-install.outputs.entry }}
 
       - name: Restore the cargo cache
         id: cargo-cache
