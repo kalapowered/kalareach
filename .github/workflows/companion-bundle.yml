@@ -39,6 +39,7 @@ on:
       - crates/kr-crypto/build.rs
       - crates/kr-crypto/build/**
       - scripts/read-windows-imports.py
+      - docs/releases/companion-third-party-notices.txt
       - scripts/place-libsodium-archive.sh
       - .github/actions/libsodium-archive/**
       - .github/workflows/companion-bundle.yml
@@ -175,6 +176,9 @@ jobs:
           Get-ChildItem $dir -Recurse -File | ForEach-Object { '{0,12} {1}' -f $_.Length, $_.FullName.Substring($dir.Length + 1) }
           $installed = @(Get-ChildItem $dir -Recurse -Filter 'kalareach-companion.exe')
           if ($installed.Count -ne 1) { throw "expected one installed executable, found $($installed.Count)" }
+          $notices = @(Get-ChildItem $dir -Recurse -Filter 'THIRD-PARTY-NOTICES.txt')
+          if ($notices.Count -ne 1) { throw "expected one installed notice, found $($notices.Count)" }
+          if ((Get-FileHash $notices[0].FullName -Algorithm SHA256).Hash -ne (Get-FileHash 'docs/releases/companion-third-party-notices.txt' -Algorithm SHA256).Hash) { throw 'the installed notice is not the committed one' }
           $after = Get-Imports $installed[0].FullName
           if (Compare-Object $built $after) { throw "the installed executable imports other libraries than the built one" }
           python scripts/read-windows-imports.py imports --dumpbin $env:DUMPBIN $installed[0].FullName
@@ -209,6 +213,9 @@ jobs:
           Get-ChildItem $dir -Recurse -File | ForEach-Object { '{0,12} {1}' -f $_.Length, $_.FullName.Substring($dir.Length + 1) }
           $extracted = @(Get-ChildItem $dir -Recurse -Filter 'kalareach-companion.exe')
           if ($extracted.Count -ne 1) { throw "expected one extracted executable, found $($extracted.Count)" }
+          $notices = @(Get-ChildItem $dir -Recurse -Filter 'THIRD-PARTY-NOTICES.txt')
+          if ($notices.Count -ne 1) { throw "expected one extracted notice, found $($notices.Count)" }
+          if ((Get-FileHash $notices[0].FullName -Algorithm SHA256).Hash -ne (Get-FileHash 'docs/releases/companion-third-party-notices.txt' -Algorithm SHA256).Hash) { throw 'the extracted notice is not the committed one' }
           $after = Get-Imports $extracted[0].FullName
           if (Compare-Object $built $after) { throw "the extracted executable imports other libraries than the built one" }
           python scripts/read-windows-imports.py imports --dumpbin $env:DUMPBIN $extracted[0].FullName

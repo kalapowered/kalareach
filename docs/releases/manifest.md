@@ -243,6 +243,36 @@ template's placeholder. The release-checks workflow makes the text again and ref
 one that differs. The crates of the fish source are covered by that comparison alone, since their
 lock is inside the pinned archive and not in this checkout.
 
+## The companion's third-party notice
+
+The companion application has a notice of its own, `docs/releases/companion-third-party-notices.txt`:
+the licence texts and notices of the Rust crates that its native program is built from and of the
+production JavaScript packages that its interface is built from. It does not yet list the native
+libraries that the Android and iOS builds link: the libraries Gradle resolves and the Swift packages
+Xcode resolves.
+
+Every installer and store bundle carries the text. The interface's bundle holds it, and the account
+panel opens it under "Third-party notices" on every platform. The desktop installers also place it as
+`THIRD-PARTY-NOTICES.txt` beside the application: `tauri.macos.conf.json`, `tauri.linux.conf.json` and
+`tauri.windows.conf.json` in `apps/companion/src-tauri` name it as a bundle resource, and the shared
+`tauri.conf.json`, which the mobile builds read, names none.
+
+`pnpm install --frozen-lockfile --prod --filter "@kalareach/companion..."` and then
+`python3 scripts/generate-notices.py write --product companion --kr-release <a built kr-release>` make
+the text. `scripts/companion-notice.json` names the package, its features and its platforms: the six
+desktop targets and the mobile targets that `scripts/check-mobile-graph.py` reads. The crates are made
+as the release archives' are (`cargo tree`, cargo-about, `about.toml`), and an entry of
+`scripts/notice-texts.json` says which notice it is for. The JavaScript packages are the ones
+`pnpm licenses list --prod` gives, which is the dependency closure and not only the part that the
+bundler keeps. Each is recorded under the first of its licences that `about.toml` lists, and its texts
+are the licence files of its installed package.
+
+`kr-release companion-notice` holds the committed text to the lock: it refuses a text that has no entry
+for a crate the lock takes into the companion application, or that holds a template's placeholder. The
+release-checks workflow makes the text again, for the crates and for the production packages of the
+lockfile, and refuses a committed one that differs. The companion-bundle workflow compares the notice
+that each Windows installer places with the committed text.
+
 ## Building and signing a release
 
 ```sh

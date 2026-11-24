@@ -150,7 +150,8 @@ jobs:
   # revision; the licence files are then identified offline. The committed text has to be the one
   # that makes.
   # cargo-about and askalono are each one pinned release, and each archive has to match the digest
-  # below before it runs.
+  # below before it runs. The companion application has a notice of its own, which the same job holds
+  # to the lock and to the production packages of its interface.
   third-party-notice:
     name: the third-party notice is the one the lock makes
     runs-on: ubuntu-24.04
@@ -206,3 +207,25 @@ jobs:
 
       - name: Make the notice again and compare it with the committed one
         run: python3 scripts/generate-notices.py check --kr-release target/debug/kr-release
+
+      # The companion application's notice is made the same way, from its own crate and from the
+      # production packages of its interface, which pnpm installs from the lockfile.
+      - name: Hold the companion's committed notice to the lock
+        run: target/debug/kr-release companion-notice --checkout .
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v4.4.0
+        with:
+          version: 11.14.0
+
+      - name: Install Node
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: 22.23.1
+          package-manager-cache: false
+
+      - name: Install the production packages of the interface
+        run: pnpm install --frozen-lockfile --prod --filter "@kalareach/companion..."
+
+      - name: Make the companion's notice again and compare it with the committed one
+        run: python3 scripts/generate-notices.py check --product companion --kr-release target/debug/kr-release
