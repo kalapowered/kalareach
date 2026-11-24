@@ -1077,6 +1077,29 @@ pub enum Launch {
     Wheel,
 }
 
+/// What the build list says keeps an agent from loading or changing the person's own data before
+/// and while it starts. An entry with an account gives its installs-off switches and its absent
+/// files in the account; an entry with none gives them here.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Isolation {
+    /// The directories and files of the person's home that the agent keeps its own data in, by path
+    /// below the home.
+    #[serde(default)]
+    pub person_trees: Vec<String>,
+    /// The switches that stop what the agent does when it starts: telemetry, project and external
+    /// configuration, sharing and model-list fetches.
+    #[serde(default)]
+    pub startup: Vec<InstallSwitch>,
+    /// For an entry with no account, the switches that stop the agent's updates and installs.
+    #[serde(default)]
+    pub installs_off: Vec<InstallSwitch>,
+    /// For an entry with no account, the files that must be absent from the run's home and working
+    /// folder before the agent starts.
+    #[serde(default)]
+    pub absent: Vec<String>,
+}
+
 /// The build under test.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1144,6 +1167,14 @@ pub struct Build {
     /// Why the upgrade part has no newer build, where the build has no `newer`.
     #[serde(default)]
     pub no_newer: Option<String>,
+    /// What keeps the agent from loading or changing the person's own data, where the entry gives
+    /// it; none for an entry that does not.
+    #[serde(default)]
+    pub isolation: Option<Isolation>,
+    /// The fields the entry gives as missing, each by its dotted path (`account.turn_line`) with
+    /// the reason no value was found. A field listed here is missing, and never empty.
+    #[serde(default)]
+    pub missing: BTreeMap<String, String>,
 }
 
 impl Account {
@@ -1839,6 +1870,53 @@ mod tests {
         assert!(
             said.contains("KR_VARIANTS") && !said.contains("stay"),
             "{said}"
+        );
+    }
+
+    /// An entry carries the isolation contract and the list of fields it gives as missing that the
+    /// build list holds, and one that has neither reads as having none.
+    #[test]
+    fn an_entry_carries_its_isolation_and_the_fields_it_lists_as_missing() {
+        let mut json = entry_json(&serde_json::json!({}), &serde_json::json!({}));
+        json["isolation"] = serde_json::json!({
+            "person_trees": [".agent"],
+            "startup": [{ "switch": "variable", "name": "NO_TELEMETRY", "value": "1" }],
+            "installs_off": [{ "switch": "argument", "text": "--no-update" }],
+            "absent": [".agent/settings.json"]
+        });
+        json["missing"] = serde_json::json!({ "account.turn_line": "no mark was found" });
+        let parsed = serde_json::from_value::<Build>(json.clone());
+        assert!(
+            parsed.is_ok(),
+            "an entry with isolation and missing is read: {:?}",
+            parsed.as_ref().err()
+        );
+        let build = parsed.expect("an entry");
+        let isolation = build.isolation.expect("the entry's isolation");
+        assert_eq!(isolation.person_trees, owned(&[".agent"]));
+        assert!(matches!(
+            isolation.startup.as_slice(),
+            [InstallSwitch::Variable { name, value }] if name == "NO_TELEMETRY" && value == "1"
+        ));
+        assert!(matches!(
+            isolation.installs_off.as_slice(),
+            [InstallSwitch::Argument { text }] if text == "--no-update"
+        ));
+        assert_eq!(isolation.absent, owned(&[".agent/settings.json"]));
+        assert_eq!(
+            build.missing.get("account.turn_line").map(String::as_str),
+            Some("no mark was found")
+        );
+        let plain = serde_json::from_value::<Build>(entry_json(
+            &serde_json::json!({}),
+            &serde_json::json!({}),
+        ))
+        .expect("an entry with neither member");
+        assert!(plain.isolation.is_none() && plain.missing.is_empty());
+        json["isolation"]["covers"] = serde_json::json!([]);
+        assert!(
+            serde_json::from_value::<Build>(json).is_err(),
+            "a member of isolation that the driver does not read is refused"
         );
     }
 
