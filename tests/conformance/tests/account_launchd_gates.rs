@@ -1059,7 +1059,7 @@ const THROUGH_A_FUNNEL: [(&str, &str, &str); 2] = [
     ),
     (
         "crates/kr-cli/tests/upgrade.rs",
-        "a_report_store_the_release_before_ignores_is_kept_across_a_rollback_and_an_update",
+        "a_report_store_the_release_before_keeps_too_is_kept_across_a_rollback_and_an_update",
         "Updated::prepare",
     ),
 ];
