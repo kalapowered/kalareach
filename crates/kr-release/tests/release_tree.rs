@@ -1308,3 +1308,32 @@ fn a_companion_notice_with_a_licence_template_placeholder_is_refused() {
         .expect_err("a companion notice with a template placeholder is refused");
     assert!(refused.to_string().contains("<owner>"), "{refused}");
 }
+
+/// The crates in the closing list of the companion's notice are named: with one of them cut out of
+/// that list the lock's crate is missing, and with the list whole none is.
+#[test]
+fn the_closing_list_of_a_companion_notice_names_its_crates() {
+    let committed =
+        std::fs::read_to_string(checkout().join("docs/releases/companion-third-party-notices.txt"))
+            .expect("the committed companion notice");
+    let at = committed
+        .find("Crates the lock reaches that no companion build compiles")
+        .expect("the closing list");
+    let (before, list) = committed.split_at(at);
+    let cut = list
+        .lines()
+        .find(|line| line.starts_with("  - ") && !line.contains(" | source "))
+        .expect("a crates.io crate in the closing list");
+    let name = cut
+        .strip_prefix("  - ")
+        .and_then(|rest| rest.split(" | ").next())
+        .expect("a crate and its version");
+    let text: String = before
+        .lines()
+        .chain(list.lines().filter(|line| *line != cut))
+        .map(|line| format!("{line}\n"))
+        .collect();
+    let lacking = kr_release::notices::gaps(&checkout(), &text, Product::Companion)
+        .expect("the lock is read");
+    assert_eq!(lacking, vec![name.to_owned()]);
+}

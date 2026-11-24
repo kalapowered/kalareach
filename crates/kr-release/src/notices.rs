@@ -184,6 +184,9 @@ enum Part {
 /// The title of the closing list of crates that no release build compiles.
 const CLOSING: &str = "Crates the lock reaches that no release build compiles";
 
+/// The title of the closing list of crates that no companion build compiles.
+const COMPANION_CLOSING: &str = "Crates the lock reaches that no companion build compiles";
+
 /// The entries of the notice, without their leading marker: the lines under a `Used by:` heading, up
 /// to the blank line that ends them, and the lines of the closing list. A line of a licence text that
 /// starts with the same marker is not an entry.
@@ -193,7 +196,7 @@ fn entries(notice: &str) -> Vec<&str> {
     for line in notice.lines() {
         part = match (part, line) {
             (Part::Text, "Used by:") => Part::Heading,
-            (Part::Text, CLOSING) => Part::Closing,
+            (Part::Text, CLOSING | COMPANION_CLOSING) => Part::Closing,
             (Part::Heading, _) => Part::Entries,
             (Part::Entries, "") => Part::Text,
             (same, entry) => {
