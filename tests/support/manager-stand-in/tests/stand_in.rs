@@ -10,8 +10,8 @@ use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use kr_ipc::identity::{
-    ProcessState, Stop, children_of, ended_process_identity, process_state, processes_in_group,
-    started_process_identity, stop_process,
+    ProcessState, Stop, children_of, process_state, processes_in_group, started_process_identity,
+    stop_process,
 };
 use kr_ipc::testing::PrivateTempDir;
 use kr_ipc::testing::manager_stand_in::{PROGRAM_NAME, place_installation};
@@ -694,7 +694,7 @@ fn bootout_ends_a_daemon_that_handed_over_by_exec_though_its_record_names_no_pro
     let flag = fixture.tree.path().join("handed-over");
     kr_ipc::testing::place_script(
         &second,
-        &format!(
+        format!(
             "#!/bin/sh\necho up > {}\nwhile :; do sleep 1; done\n",
             flag.display()
         ),
