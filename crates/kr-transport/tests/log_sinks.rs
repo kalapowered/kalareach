@@ -2,11 +2,13 @@
 //!
 //! Two of the libraries a dial goes through print what they hold at `debug`, and what they print
 //! can include a proxy's login. A log sink is where those lines would be read, so a new one must
-//! not land unreviewed. This scan reads every Rust source of the workspace, tests included, for
-//! the calls that install a `tracing` subscriber or a `log` logger, and for any use of the crates
-//! that provide one. The sites it finds must be exactly the approved ones. The scan's own text
-//! splits each identifier so that it never finds itself, and a planted fixture of each shows that
-//! the scan can fail. It proves that a new sink cannot land unreviewed, not that a filter is right.
+//! not land unreviewed. This scan reads every Rust source under `crates/` and `apps/`, tests
+//! included and folders named `gen` left out, for the calls that install a `tracing` subscriber or
+//! a `log` logger, and for any use of the crates that provide one. It does not read the workspace
+//! members under `tests/`. The sites it finds must be exactly the approved ones. The scan's own
+//! text splits each identifier so that it never finds itself, and a planted fixture of each shows
+//! that the scan can fail. It proves that a new sink cannot land unreviewed in the folders it
+//! reads, not that a filter is right.
 
 use std::fs;
 use std::path::{Path, PathBuf};
