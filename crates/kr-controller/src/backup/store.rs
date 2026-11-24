@@ -776,7 +776,8 @@ impl BackupStore {
         };
         store.migrate()?;
         // Only a store the steps above have read and taken is put in write-ahead mode. One they
-        // refused, in whatever mode its files are in, has not been changed by this build.
+        // refused keeps its main file and its log as found, and its log and index files present or
+        // absent as they were: `Database::open` made its settings before its first read.
         store
             .connection
             .accepted()

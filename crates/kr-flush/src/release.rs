@@ -37,11 +37,32 @@ pub fn open_connection(
     path: &std::path::Path,
     flags: Option<rusqlite::OpenFlags>,
 ) -> rusqlite::Result<Connection> {
+    open_connection_with(path, flags, |_| Ok(()))
+}
+
+/// Opens the store as [`open_connection`] does, and runs `before_the_first_read` on each
+/// connection it opens before that connection reads anything, on every ask.
+///
+/// The first read is also what opens a write-ahead store's log and its index, making them where
+/// there are none, so it is the first thing that can change a store's files. A setting that
+/// decides what the open may do to them has to be made before it, and this is the one place that
+/// can: once `open_connection` has returned, the read has been made.
+///
+/// # Errors
+///
+/// Returns what [`open_connection`] returns, and the refusal of `before_the_first_read` the first
+/// time it is given.
+pub fn open_connection_with(
+    path: &std::path::Path,
+    flags: Option<rusqlite::OpenFlags>,
+    before_the_first_read: impl Fn(&Connection) -> rusqlite::Result<()>,
+) -> rusqlite::Result<Connection> {
     while_the_index_cannot_be_made_ready(|| {
         let connection = match flags {
             Some(flags) => Connection::open_with_flags(path, flags)?,
             None => Connection::open(path)?,
         };
+        before_the_first_read(&connection)?;
         connection.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?;
         Ok(connection)
     })

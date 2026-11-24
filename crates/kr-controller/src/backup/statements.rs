@@ -11,7 +11,7 @@
 //! a [`Statement`] and will not take text, so this file is the only place in the module where a
 //! statement can reach SQLite at all.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use rusqlite::config::DbConfig;
 use rusqlite::{Connection, Params, Row, TransactionBehavior};
@@ -124,17 +124,80 @@ pub(super) trait Reads {
 #[derive(Debug)]
 pub(super) struct Database {
     connection: Connection,
+    /// Where to open the store again once it is accepted, for a store that was read through a
+    /// connection held exclusively. No other connection can reach a store held that way, so it is
+    /// let go of and opened as every store is.
+    reopen_at: Option<PathBuf>,
+}
+
+/// Which of the files SQLite keeps beside a write-ahead store were there before this build opened
+/// it. They are looked at once, before anything is opened, because opening a store can make them.
+#[derive(Clone, Copy, Debug)]
+struct SideFiles {
+    log: bool,
+    index: bool,
+}
+
+impl SideFiles {
+    fn beside(store: &Path) -> rusqlite::Result<Self> {
+        let is_there = |suffix: &str| {
+            let mut name = store.as_os_str().to_owned();
+            name.push(suffix);
+            // A file that cannot be looked for is not one that is not there.
+            PathBuf::from(name).try_exists().map_err(|error| {
+                rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CANTOPEN),
+                    Some(error.to_string()),
+                )
+            })
+        };
+        Ok(Self {
+            log: is_there("-wal")?,
+            index: is_there("-shm")?,
+        })
+    }
+
+    /// What a connection is told before it reads anything, so that a store this build then
+    /// refuses is left with the files it was found with.
+    ///
+    /// Where a log is there, closing the connection copies none of it into the file, as a close
+    /// otherwise does. Where a log is there and its index is not, SQLite would make the index to
+    /// read the log and leave it, so the connection keeps the index in memory instead, which is
+    /// what holding the store exclusively does. Where no log is there, SQLite makes an empty log
+    /// and an index to read the store and removes both as the connection closes.
+    fn guard(self, connection: &Connection) -> rusqlite::Result<()> {
+        if self.log {
+            connection.set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true)?;
+        }
+        if self.held_exclusively() {
+            connection.pragma_update(None, "locking_mode", "EXCLUSIVE")?;
+        }
+        Ok(())
+    }
+
+    /// Whether the connection that reads the store is held exclusively: there is a log and no
+    /// index for it.
+    fn held_exclusively(self) -> bool {
+        self.log && !self.index
+    }
 }
 
 impl Database {
     /// Opens the database one host keeps its backup accounting in.
     pub(super) fn open(path: &Path) -> rusqlite::Result<Self> {
-        Self::configured(kr_flush::release::open_connection(path, None)?)
+        let beside = SideFiles::beside(path)?;
+        let connection = kr_flush::release::open_connection_with(path, None, |connection| {
+            beside.guard(connection)
+        })?;
+        Self::configured(
+            connection,
+            beside.held_exclusively().then(|| path.to_path_buf()),
+        )
     }
 
     /// Opens one that exists only for the life of this process.
     pub(super) fn in_memory() -> rusqlite::Result<Self> {
-        Self::configured(Connection::open_in_memory()?)
+        Self::configured(Connection::open_in_memory()?, None)
     }
 
     /// The settings every connection of this store is opened under.
@@ -145,23 +208,34 @@ impl Database {
     /// meets the rules that guard a delete rather than slipping under them.
     ///
     /// Nothing here changes the file. Its journal mode is set by [`Database::accepted`], once the
-    /// store has been read and taken, and until then closing this connection copies no
-    /// write-ahead log into the file, so a store that is refused is left as it was found.
-    fn configured(connection: Connection) -> rusqlite::Result<Self> {
-        connection.set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true)?;
+    /// store has been read and taken.
+    fn configured(connection: Connection, reopen_at: Option<PathBuf>) -> rusqlite::Result<Self> {
         connection.pragma_update(None, "synchronous", "FULL")?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
         connection.pragma_update(None, "recursive_triggers", "ON")?;
-        Ok(Self { connection })
+        Ok(Self {
+            connection,
+            reopen_at,
+        })
     }
 
     /// Settles a store this build has read and taken: it is kept in write-ahead mode, and closing
     /// the connection copies the log into the file again, as it does for every store of this
-    /// build.
-    pub(super) fn accepted(&self) -> rusqlite::Result<()> {
+    /// build. A store that was read through a connection held exclusively is let go of, which
+    /// copies its log into the file, and opened again as every store is.
+    pub(super) fn accepted(&mut self) -> rusqlite::Result<()> {
         self.connection.pragma_update(None, "journal_mode", "WAL")?;
         self.connection
             .set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, false)?;
+        if let Some(path) = self.reopen_at.take() {
+            // The held connection is closed before the next one opens: it is the one that excludes
+            // it.
+            drop(std::mem::replace(
+                &mut self.connection,
+                Connection::open_in_memory()?,
+            ));
+            *self = Self::configured(kr_flush::release::open_connection(&path, None)?, None)?;
+        }
         Ok(())
     }
 
@@ -317,7 +391,9 @@ mod a_previous_holder_that_is_letting_go {
         let directory = tempfile::tempdir().expect("a directory");
         let path = directory.path().join("backup.sqlite");
         kr_flush::release::assert_an_open_succeeds_while_a_holder_maps_the_index(&path, || {
-            Database::open(&path).map(drop)
+            // Opening alone leaves a new store as a file of no bytes, with no index to hold; the
+            // store is taken as every store this build uses is, which puts it in write-ahead mode.
+            Database::open(&path).and_then(|mut database| database.accepted())
         });
     }
 }

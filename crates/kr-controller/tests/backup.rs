@@ -6012,9 +6012,15 @@ fn where_bytes_differ(after: &[u8], before: &[u8]) -> String {
 enum Journal {
     /// The store is in rollback-journal mode, as a store no build of this product wrote is.
     Rollback,
+    /// The store is in write-ahead mode and its last holder closed it: no log and no index are
+    /// beside it, as every store of this build is left by a clean stop.
+    CleanStop,
     /// The writer committed its last change to the write-ahead log and went away before anything
     /// was copied from the log into the main file, as a writer does that is stopped abruptly.
     AbruptExit,
+    /// The log of a writer that stopped abruptly, without the index that went with it, as when
+    /// the files are copied and the index is not.
+    LogWithoutIndex,
 }
 
 /// Makes the change in a store that is in the state `journal` names, and leaves the files as the
@@ -6029,7 +6035,10 @@ fn change_a_store_leaving_it(state: &std::path::Path, journal: Journal, change: 
                 .expect("the store leaves write-ahead mode");
             assert_eq!(mode, "delete");
         }
-        Journal::AbruptExit => {
+        // The store is in write-ahead mode already, and the last connection to close it copies
+        // the log into the file and removes the log and the index.
+        Journal::CleanStop => {}
+        Journal::AbruptExit | Journal::LogWithoutIndex => {
             // The writer never copies the log into the main file, neither as it works nor as it
             // goes away.
             connection
@@ -6047,6 +6056,11 @@ fn change_a_store_leaving_it(state: &std::path::Path, journal: Journal, change: 
         .execute_batch(change)
         .expect("the change is made");
     drop(connection);
+    if matches!(journal, Journal::LogWithoutIndex) {
+        let mut index = state.join("backup.sqlite").into_os_string();
+        index.push("-shm");
+        std::fs::remove_file(&index).expect("the index is taken away from the log");
+    }
     let files = store_files(state);
     match journal {
         Journal::Rollback => {
@@ -6061,7 +6075,18 @@ fn change_a_store_leaving_it(state: &std::path::Path, journal: Journal, change: 
                 "no log is kept"
             );
         }
-        Journal::AbruptExit => {
+        Journal::CleanStop => {
+            assert_eq!(
+                files.main[18..20],
+                [2, 2],
+                "the store is in write-ahead mode"
+            );
+            assert!(
+                files.log.is_none() && !files.index_is_there,
+                "a clean stop leaves neither a log nor an index: {files:?}"
+            );
+        }
+        Journal::AbruptExit | Journal::LogWithoutIndex => {
             assert_eq!(
                 files.main[18..20],
                 [2, 2],
@@ -6071,16 +6096,22 @@ fn change_a_store_leaving_it(state: &std::path::Path, journal: Journal, change: 
                 files.log.as_ref().is_some_and(|log| !log.is_empty()),
                 "the change is committed to the log and not yet in the main file"
             );
-            assert!(files.index_is_there, "the writer left its index behind");
+            assert_eq!(
+                files.index_is_there,
+                matches!(journal, Journal::AbruptExit),
+                "the writer left its index behind, unless it was taken away"
+            );
         }
     }
 }
 
-/// A store a build refuses is left exactly as it was found, in every state its files may be in:
-/// the main file and the log byte for byte, and no index made where the writer left none. A
-/// store in rollback-journal mode stays in it, and committed pages of a writer that stopped
-/// abruptly stay in the log: opening one for refusal must neither switch its mode nor copy its
-/// log into its file.
+/// A store a build refuses keeps its main file and its log byte for byte, and its log and index
+/// files present or absent as they were found, in each state its files may be in: rollback-journal
+/// mode, write-ahead mode after a clean stop, a log of a writer that stopped abruptly with its
+/// index, and that log without it. Opening one for refusal must neither switch its mode, nor copy
+/// its log into its file, nor make a log or an index where there was none. A hot rollback
+/// journal is the one thing outside this: SQLite plays it back into the file on the first read,
+/// before any build can read the version, and no case holds it.
 fn a_refused_store_keeps_its_files(journal: Journal) {
     // What each refused store is made of: the version it starts at, the change that makes it
     // one this build refuses, and what the refusal names.
@@ -6160,6 +6191,58 @@ fn a_refused_store_in_rollback_journal_mode_is_left_byte_for_byte_as_it_was_foun
 #[test]
 fn a_refused_store_with_committed_pages_in_the_log_of_a_writer_that_stopped_is_left_as_found() {
     a_refused_store_keeps_its_files(Journal::AbruptExit);
+}
+
+/// A refused store that a clean stop left in write-ahead mode has no log and no index beside it,
+/// and refusing it makes none: the first read opens the log, and a refused store is not left with
+/// the files that read made.
+#[test]
+fn a_refused_store_a_clean_stop_left_in_write_ahead_mode_is_left_with_no_log_and_no_index() {
+    a_refused_store_keeps_its_files(Journal::CleanStop);
+}
+
+/// A refused store with the committed pages of a writer that stopped abruptly, in a log that has
+/// no index beside it, keeps the log byte for byte and gains no index: the index SQLite reads a
+/// log through is kept in memory for the refusal.
+#[test]
+fn a_refused_store_with_a_log_and_no_index_is_left_with_no_index() {
+    a_refused_store_keeps_its_files(Journal::LogWithoutIndex);
+}
+
+/// A store this build accepts is opened as every store is, however its files were found. One
+/// found with a log and no index is read without an index file; it is then let go of and opened
+/// again, so that other connections reach it while it is open, and what its log held is in its
+/// file once it is closed.
+#[test]
+fn an_accepted_store_with_a_log_and_no_index_is_opened_and_closed_as_every_store_is() {
+    let (_root, state) = state_directory();
+    a_store_with_an_upload_in_flight(&state);
+    change_a_store_leaving_it(&state, Journal::LogWithoutIndex, "PRAGMA user_version = 5;");
+
+    let store = BackupStore::open(&state).expect("a store at this build's version is accepted");
+    // Another connection reaches the open store at once: it is not held exclusively.
+    let other =
+        rusqlite::Connection::open(state.join("backup.sqlite")).expect("a second connection");
+    other
+        .busy_timeout(std::time::Duration::ZERO)
+        .expect("a second connection that does not wait");
+    let version: i64 = other
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .expect("a second connection reads the open store");
+    assert_eq!(version, 5, "what the log held is read");
+    drop(other);
+    store.generations().expect("a read");
+    drop(store);
+    let closed = store_files(&state);
+    assert!(
+        closed.log.is_none() && !closed.index_is_there,
+        "the closed store's log was copied into its file and removed: {closed:?}"
+    );
+    assert_eq!(
+        closed.main[60..64],
+        5u32.to_be_bytes(),
+        "what the log held is in the file"
+    );
 }
 
 /// A store this build accepts is put in write-ahead mode once it is read, and it is closed as
