@@ -996,10 +996,10 @@ mod tests {
     /// The marker that makes the inner case of LX-3 run.
     const INNER: &str = "KR_X11_ENVIRONMENT_CASE_FOLDER";
 
-    /// KR-REQ-03.29, LX-3: the tool is given the display and the authority the worker holds and no
-    /// Wayland socket, whatever the process that runs the check holds. The case starts its own
-    /// test binary with `DISPLAY=:8` and a `WAYLAND_DISPLAY` in its environment, which no test of
-    /// this crate may set for itself.
+    /// KR-REQ-03.29, KR-REQ-03.30, LX-3: the tool is given the display and the authority the worker
+    /// holds and no Wayland socket, whatever the process that runs the check holds. The case starts
+    /// its own test binary with `DISPLAY=:8` and a `WAYLAND_DISPLAY` in its environment, which no
+    /// test of this crate may set for itself.
     #[test]
     fn kr_req_03_29_the_tool_is_given_the_display_and_authority_the_worker_holds() {
         let folder = folder();
@@ -1151,8 +1151,8 @@ mod tests {
         }
     }
 
-    /// KR-REQ-03.29, LX-1 at the facility: only a file that holds a whole image is performed, and
-    /// the file is gone afterwards whichever way it went.
+    /// KR-REQ-03.29, KR-REQ-03.30, LX-1 at the facility: only a file that holds a whole image is
+    /// performed, and the file is gone afterwards whichever way it went.
     #[test]
     fn kr_req_03_29_a_tool_that_exits_without_a_whole_image_establishes_nothing() {
         let tools = folder();
@@ -1240,9 +1240,9 @@ mod tests {
         );
     }
 
-    /// KR-REQ-03.29, LX-13: the image is read as a regular file and nothing else. A link at the
-    /// image path is not followed and what it points at is not touched, and a pipe there is not
-    /// waited for.
+    /// KR-REQ-03.29, KR-REQ-03.30, LX-13: the image is read as a regular file and nothing else. A
+    /// link at the image path is not followed and what it points at is not touched, and a pipe
+    /// there is not waited for.
     #[test]
     fn kr_req_03_29_what_is_at_the_image_path_is_read_only_if_it_is_a_regular_file() {
         let tools = folder();
@@ -1406,9 +1406,9 @@ mod tests {
         assert!(!words.contains("kept none of it"), "{words}");
     }
 
-    /// KR-REQ-03.29, LX-17: only the screen image has a row on X11. The accessibility check and the
-    /// launch of an application, run through the report on an X11 desktop with the tools installed,
-    /// give no record and start no tool.
+    /// KR-REQ-03.29, KR-REQ-03.30, LX-17: only the screen image has a row on X11. The accessibility
+    /// check and the launch of an application, run through the report on an X11 desktop with the
+    /// tools installed, give no record and start no tool.
     #[test]
     fn kr_req_03_29_an_x11_report_of_accessibility_and_launch_starts_no_tool() {
         let tools = folder();
@@ -1611,10 +1611,10 @@ mod tests {
         assert_eq!(reach(10, sockets.path(), &deadline), Some(Reach::Silent));
     }
 
-    /// KR-REQ-03.29, LX-12: a display that is not on this machine starts no tool. A host part
-    /// names a display reached over the network, and a name with no local display number names
-    /// none on this machine: each is answered before any tool starts, in its own words. A display
-    /// on this machine, with or without a screen number, starts the tool.
+    /// KR-REQ-03.29, KR-REQ-03.30, LX-12: a display that is not on this machine starts no tool. A
+    /// host part names a display reached over the network, and a name with no local display number
+    /// names none on this machine: each is answered before any tool starts, in its own words. A
+    /// display on this machine, with or without a screen number, starts the tool.
     #[test]
     fn kr_req_03_29_a_display_that_is_not_on_this_machine_starts_no_tool() {
         for (display, expected) in [
@@ -2025,11 +2025,11 @@ mod tests {
         )
     }
 
-    /// KR-REQ-03.29, LX-8a: a real X server and each real tool installed. With the cookie the
-    /// server holds, the tool writes a whole image, the check is performed and the file is gone
-    /// from the check's own directory before any directory is removed. With a wrong key and with an
-    /// empty authority file the display refuses and says so, and with a display number nobody
-    /// holds the display cannot be reached.
+    /// KR-REQ-03.29, KR-REQ-03.30, LX-8a: a real X server and each real tool installed. With the
+    /// cookie the server holds, the tool writes a whole image, the check is performed and the file
+    /// is gone from the check's own directory before any directory is removed. With a wrong key
+    /// and with an empty authority file the display refuses and says so, and with a display number
+    /// nobody holds the display cannot be reached.
     #[cfg(target_os = "linux")]
     #[test]
     fn kr_req_03_29_a_real_x_server_gives_an_image_and_a_refusal_its_words() {
