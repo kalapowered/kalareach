@@ -3413,6 +3413,74 @@ mod consumed {
         );
     }
 
+    /// KR-REQ-24.24: gaps that the binding cannot send for want of room are not lost with what they
+    /// bound: the first and the last event lost are told with the documents that went, and before
+    /// the report that follows.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn kr_req_24_24_a_gap_dropped_for_want_of_room_keeps_its_first_and_last_and_comes_before_the_report()
+     {
+        // The channel is full and nothing has been read, with the newest report owed.
+        let Some((_host, binding, mut received)) = with_an_owed_report(42).await else {
+            return;
+        };
+        // Two events that trap lose themselves, one in each of two passes. Each pass reports the
+        // gap of the one before, and finds no room for it.
+        let mut first = binding.stop_next_pump();
+        binding.enqueue_observation(components::scrape("se-7", "!trap"));
+        assert!(
+            tokio::time::timeout(core::time::Duration::from_secs(60), first.reached())
+                .await
+                .expect("the pass stands at the stop"),
+            "the stop was replaced before a pass reached it"
+        );
+        let mut second = binding.stop_next_pump();
+        first.release();
+        assert!(
+            tokio::time::timeout(core::time::Duration::from_secs(60), second.reached())
+                .await
+                .expect("the second pass stands at the stop"),
+            "the stop was replaced before a pass reached it"
+        );
+        binding.enqueue_observation(components::scrape("se-8", "!trap"));
+        let mut third = binding.stop_next_pump();
+        second.release();
+        assert!(
+            tokio::time::timeout(core::time::Duration::from_secs(60), third.reached())
+                .await
+                .expect("the third pass stands at the stop"),
+            "the stop was replaced before a pass reached it"
+        );
+        third.release();
+        // A checkpoint answers after the pass that stood has ended.
+        let _ = consumed_of(&binding).await;
+        // What the channel holds now is what the caller would have read before the loss.
+        for _ in 0..received.len() {
+            let _ = received.try_recv();
+        }
+        let mut dropped = None;
+        loop {
+            match next_event(&mut received, LIVENESS).await {
+                Some(BindingEvent::PresentationDropped {
+                    documents,
+                    first,
+                    last,
+                }) => {
+                    assert!(documents >= 2, "the two gaps went: {documents}");
+                    dropped = Some((first, last));
+                }
+                Some(BindingEvent::Consumed(_)) => break,
+                Some(BindingEvent::Disabled { reason }) => panic!("disabled: {reason}"),
+                Some(_) => {}
+                None => panic!("the report owed was never sent"),
+            }
+        }
+        assert_eq!(
+            dropped,
+            Some((Some(handle("se-7")), Some(handle("se-8")))),
+            "the loss was told before the report, with the first and the last event lost"
+        );
+    }
+
     /// KR-REQ-24.24: a restore that answered replaces what was owed, so a report of the state it
     /// replaced is not sent after it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -2559,7 +2559,7 @@ fn notices_of(binding_id: BindingId, event: BindingEvent) -> Vec<Notice> {
         // component has: no event was lost, and the component is rebuilding its document. The
         // worker is told by the same notice, counted apart from lost observations, so it knows to
         // expect a fresh document rather than a continuation.
-        BindingEvent::PresentationDropped { documents } => vec![Notice::Gap {
+        BindingEvent::PresentationDropped { documents, .. } => vec![Notice::Gap {
             binding_id,
             events: 0,
             bytes: 0,
@@ -2604,8 +2604,7 @@ enum Piece {
 /// the event a fault is about and what the instance has consumed are carried as well, where the
 /// host's writer is open: a host that keeps no record writes none of them. A gap's positions are
 /// the binding's own, and a gap that the binding could not send, because its channel was full, is
-/// told as lost documents with no positions; the report that follows says `clean` is false then,
-/// since the same loss cleared it.
+/// told as lost documents with the positions the binding kept of it.
 fn pieces_of(binding_id: BindingId, event: BindingEvent, shape: Shape) -> Vec<Piece> {
     let plain = |notices: Vec<Notice>, beyond: &Beyond| -> Vec<Piece> {
         notices
@@ -2625,6 +2624,23 @@ fn pieces_of(binding_id: BindingId, event: BindingEvent, shape: Shape) -> Vec<Pi
                 ..Beyond::default()
             };
             plain(notices_of(binding_id, BindingEvent::Gap(gap)), &beyond)
+        }
+        BindingEvent::PresentationDropped {
+            documents,
+            first,
+            last,
+        } => {
+            let beyond = Beyond {
+                first: first.clone().filter(|_| open),
+                last: last.clone().filter(|_| open),
+                ..Beyond::default()
+            };
+            let dropped = BindingEvent::PresentationDropped {
+                documents,
+                first,
+                last,
+            };
+            plain(notices_of(binding_id, dropped), &beyond)
         }
         BindingEvent::Fault {
             call,
@@ -2841,6 +2857,44 @@ mod tests {
         assert!(!callable().contains(&CallKind::Observe));
         assert!(!callable().contains(&CallKind::Bind));
         assert!(callable().contains(&CallKind::Snapshot));
+    }
+
+    #[test]
+    fn a_dropped_presentation_is_told_with_the_positions_it_kept_where_the_writer_is_open() {
+        let binding = BindingId::new(Uuid::from_bytes([6; 16]));
+        let handle =
+            |text: &str| kr_protocol::ids::SourceEventHandle::new(text).expect("a bounded handle");
+        let dropped = || BindingEvent::PresentationDropped {
+            documents: 3,
+            first: Some(handle("se-2")),
+            last: Some(handle("se-9")),
+        };
+        for (writer_open, expected) in [
+            (true, (Some(handle("se-2")), Some(handle("se-9")))),
+            (false, (None, None)),
+        ] {
+            let shape = Shape {
+                dialect: Dialect::Four,
+                writer_open,
+            };
+            let pieces = pieces_of(binding, dropped(), shape);
+            assert_eq!(pieces.len(), 1);
+            let Some(Piece::Notice(notice, beyond)) = pieces.into_iter().next() else {
+                panic!("a dropped presentation is a notice");
+            };
+            assert!(
+                matches!(
+                    notice,
+                    Notice::Gap {
+                        events: 0,
+                        documents: 3,
+                        ..
+                    }
+                ),
+                "{notice:?}"
+            );
+            assert_eq!((beyond.first, beyond.last), expected, "open: {writer_open}");
+        }
     }
 
     #[test]
