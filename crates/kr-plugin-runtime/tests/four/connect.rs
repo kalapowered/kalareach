@@ -6,6 +6,7 @@
 
 use kr_plugin_runtime::runtime::binding::BindingRequest;
 use kr_plugin_service::client::PluginClient;
+use kr_plugin_service::error::ServiceResult;
 use kr_plugin_service::launcher::{publish_descriptor, publish_descriptor4};
 use kr_plugin_service::protocol::{ComponentSource, HostProtocol, Notice};
 use kr_plugin_service::protocol4::HostDescriptor4;
@@ -50,10 +51,8 @@ fn publish_four(served: &Served, descriptor: &HostDescriptor4) {
         .expect("the descriptor of the fourth protocol is published");
 }
 
-async fn connected(served: &Served) -> PluginClient {
-    PluginClient::connect(&served._temp.environment())
-        .await
-        .expect("the client connects")
+async fn connected(served: &Served) -> ServiceResult<PluginClient> {
+    PluginClient::connect(&served._temp.environment()).await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -61,7 +60,7 @@ async fn kr_req_24_24_a_usable_descriptor_of_the_fourth_protocol_gives_a_connect
     let served = Served::start_dual(true).await;
     publish_three(&served);
     publish_four(&served, &descriptor4_of(&served));
-    let client = connected(&served).await;
+    let client = connected(&served).await.expect("the client connects");
     assert_eq!(
         client.protocol(),
         HostProtocol::V4,
@@ -75,7 +74,7 @@ async fn kr_req_24_24_a_usable_descriptor_of_the_fourth_protocol_gives_a_connect
 async fn kr_req_24_24_no_descriptor_of_the_fourth_protocol_gives_a_connection_over_the_third() {
     let served = Served::start_dual(true).await;
     publish_three(&served);
-    let client = connected(&served).await;
+    let client = connected(&served).await.expect("the client connects");
     assert_eq!(client.protocol(), HostProtocol::V3);
     client.health().await.expect("the host answers over it");
 }
@@ -88,7 +87,7 @@ async fn kr_req_24_24_a_descriptor_of_a_process_that_has_ended_is_not_used() {
     stale.process_start_identity = another_process(&stale.process_start_identity);
     // The endpoint is live, so a client that read nothing of the process would connect to it.
     publish_four(&served, &stale);
-    let client = connected(&served).await;
+    let client = connected(&served).await.expect("the client connects");
     assert_eq!(
         client.protocol(),
         HostProtocol::V3,
@@ -108,7 +107,7 @@ async fn kr_req_24_24_a_host_that_cannot_answer_the_challenge_with_the_published
     let mut foreign = descriptor4_of(&served);
     foreign.host_public_key = *other.public_key();
     publish_four(&served, &foreign);
-    let client = connected(&served).await;
+    let client = connected(&served).await.expect("the client connects");
     assert_eq!(
         client.protocol(),
         HostProtocol::V3,
@@ -120,11 +119,11 @@ async fn kr_req_24_24_a_host_that_cannot_answer_the_challenge_with_the_published
 async fn kr_req_24_24_each_connect_starts_at_the_fourth_protocol_again() {
     let served = Served::start_dual(true).await;
     publish_three(&served);
-    let first = connected(&served).await;
+    let first = connected(&served).await.expect("the client connects");
     assert_eq!(first.protocol(), HostProtocol::V3);
     // A host of the fourth protocol appears: the next connect finds it.
     publish_four(&served, &descriptor4_of(&served));
-    let second = connected(&served).await;
+    let second = connected(&served).await.expect("the client connects");
     assert_eq!(
         second.protocol(),
         HostProtocol::V4,
@@ -144,7 +143,7 @@ async fn kr_req_24_24_a_descriptor_left_by_a_host_that_is_gone_leaves_a_host_of_
     let mut stale = descriptor4_of_gone(&served);
     stale.process_start_identity = another_process(&stale.process_start_identity);
     publish_four(&served, &stale);
-    let client = connected(&served).await;
+    let client = connected(&served).await.expect("the client connects");
     assert_eq!(client.protocol(), HostProtocol::V3);
 
     // And the first observation arrives over it.
@@ -209,7 +208,7 @@ async fn kr_req_24_24_a_client_over_the_fourth_protocol_reads_every_member_and_u
     let served = Served::start_dual(true).await;
     publish_three(&served);
     publish_four(&served, &descriptor4_of(&served));
-    let client = connected(&served).await;
+    let client = connected(&served).await.expect("the client connects");
     assert_eq!(client.protocol(), HostProtocol::V4);
 
     let (path, digest, bytes) = served.install("recording", &component);
@@ -292,7 +291,7 @@ async fn kr_req_24_24_a_refused_duplicate_registration_leaves_the_registration_t
     let served = Served::start_dual(true).await;
     publish_three(&served);
     publish_four(&served, &descriptor4_of(&served));
-    let client = connected(&served).await;
+    let client = connected(&served).await.expect("the client connects");
     assert_eq!(client.protocol(), HostProtocol::V4);
     let (path, digest, bytes) = served.install("recording", &component);
     let source = ComponentSource {
@@ -345,7 +344,7 @@ async fn kr_req_24_24_a_binding_registered_and_removed_again_is_read_under_each_
     let served = Served::start_dual(true).await;
     publish_three(&served);
     publish_four(&served, &descriptor4_of(&served));
-    let client = connected(&served).await;
+    let client = connected(&served).await.expect("the client connects");
     assert_eq!(client.protocol(), HostProtocol::V4);
     let (path, digest, bytes) = served.install("recording", &component);
     let source = ComponentSource {
