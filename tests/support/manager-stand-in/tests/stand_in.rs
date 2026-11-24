@@ -613,10 +613,11 @@ fn a_start_that_was_never_recorded_is_found_by_its_arguments_program_and_directo
 }
 
 /// A start that was never recorded is not confused with any other process, whatever text the other
-/// holds: a program outside the test's folders, a program inside them in another directory, and a
-/// program inside them in the right directory whose last argument only starts with the definition's
-/// are all left running, though every one of them holds the definition's arguments in its own
-/// arguments or its environment.
+/// holds: a program outside the test's folders, a program inside them in another directory, a
+/// program inside them in the right directory whose last argument only starts with the definition's,
+/// and a program outside them that is given a path inside them as data, in the right directory with
+/// the definition's last argument, are all left running, though every one of them holds the
+/// definition's arguments in its own arguments or its environment.
 #[test]
 fn a_start_that_was_never_recorded_is_not_confused_with_processes_that_only_hold_the_same_text() {
     let fixture = Fixture::new();
@@ -644,6 +645,11 @@ fn a_start_that_was_never_recorded_is_not_confused_with_processes_that_only_hold
     // it as the shell, the script and the argument.
     let idle = fixture.installation.path().join("idle");
     kr_ipc::testing::place_script(&idle, "#!/bin/sh\nsleep \"$1\"\n");
+    // A file that a reader of it waits at, so that a program outside the folders is given a path
+    // inside them as an argument and stays running.
+    let waited_at = fixture.tree.path().join("waited-at");
+    let made = run(Command::new("/usr/bin/mkfifo").arg(&waited_at));
+    assert!(made.status.success(), "{}", text(&made.stderr));
     let same_text = format!("{} 30", program.display());
     let environment = [("SAME_TEXT", same_text.as_str())];
     let others = [
@@ -663,6 +669,15 @@ fn a_start_that_was_never_recorded_is_not_confused_with_processes_that_only_hold
             "a program inside the folders and the right directory whose last argument only starts \
              with the definition's",
             fixture.detached(&format!("{} 300", idle.display()), &state, &environment),
+        ),
+        (
+            "a program outside the folders that is given a path inside them as data, in the right \
+             directory with the definition's last argument",
+            fixture.detached(
+                &format!("/bin/cat {} 30", waited_at.display()),
+                &state,
+                &environment,
+            ),
         ),
     ];
     let target = format!("{}/kr-controller-n", fixture.domain());

@@ -180,27 +180,43 @@ impl Context {
         }
     }
 
-    /// Whether `words`, the arguments of a process as `ps` prints them, are those of the job's
-    /// program: they end with the arguments the definition gives after its program, whole word for
-    /// whole word, and one of the two words before them is a path inside the roots (the second
-    /// where an interpreter reads the program as a script).
-    fn runs_the_program_of(&self, job: &Job, words: &[&str]) -> bool {
-        let given = &job.arguments[1..];
-        let Some(before) = words
+    /// Whether `argv`, the argument vector of a process as the kernel keeps it, is that of the
+    /// job's program: it ends with the arguments the definition gives after its program, and its
+    /// first word is the job's program, or its first word is the interpreter that the first line of
+    /// the job's program names and its second word is the job's program. A word is the job's program
+    /// when it is an absolute path to the same file once every link is resolved. A path inside the
+    /// roots that a program outside is given as data is not the job's program.
+    fn runs_the_program_of(&self, job: &Job, argv: &[String]) -> bool {
+        let Some((program, given)) = job.arguments.split_first() else {
+            return false;
+        };
+        let Some(before) = argv
             .len()
             .checked_sub(given.len())
             .filter(|count| *count >= 1)
         else {
             return false;
         };
-        let (leading, tail) = words.split_at(before);
-        tail.iter()
-            .zip(given)
-            .all(|(word, argument)| word == argument)
-            && leading
-                .iter()
-                .take(2)
-                .any(|word| self.bounded(Path::new(word)).is_ok())
+        let (leading, tail) = argv.split_at(before);
+        if tail != given {
+            return false;
+        }
+        let Ok(program) = self
+            .bounded(Path::new(program))
+            .and_then(|path| path.canonicalize().map_err(|error| error.to_string()))
+        else {
+            return false;
+        };
+        let is_the_program = |word: &String| {
+            Path::new(word).is_absolute()
+                && Path::new(word)
+                    .canonicalize()
+                    .is_ok_and(|path| path == program)
+        };
+        is_the_program(&leading[0])
+            || (leading.len() >= 2
+                && is_the_program(&leading[1])
+                && interpreter_of(&program).is_some_and(|interpreter| interpreter == leading[0]))
     }
 
     /// A path of the store, once every link it holds is resolved and found inside the roots.
@@ -881,13 +897,15 @@ const LSOF: &str = "/usr/sbin/lsof";
 #[cfg(not(target_os = "macos"))]
 const LSOF: &str = "/usr/bin/lsof";
 
-/// What a search for a start that was never recorded reads the system with: the programs it runs and
-/// the way it reads an identity, so that a case can put a program that fails, or a reader that gives
-/// another identity the second time, in their place.
+/// What a search for a start that was never recorded reads the system with: the programs it runs,
+/// the way it reads an identity and the way it reads an argument vector, so that a case can put a
+/// program that fails, a reader that gives another identity the second time, or a reader that gives
+/// no vector, in their place.
 struct Tools<'a> {
     ps: &'a Path,
     lsof: &'a Path,
     identity: ReadIdentity<'a>,
+    arguments: &'a dyn Fn(u32) -> Arguments,
 }
 
 impl Tools<'static> {
@@ -897,8 +915,65 @@ impl Tools<'static> {
             ps: Path::new("/bin/ps"),
             lsof: Path::new(LSOF),
             identity: &identity_of,
+            arguments: &arguments_of,
         }
     }
+}
+
+/// What the kernel gives of the argument vector of a process.
+#[derive(Debug, PartialEq, Eq)]
+enum Arguments {
+    /// The words of the vector, each as the program was started with it.
+    Words(Vec<String>),
+    /// The process has ended, or has ended and is not yet collected.
+    Ended,
+    /// The kernel gave no vector for a process that runs.
+    Unread,
+}
+
+/// The argument vector of the process `pid`, word by word, as the kernel keeps it: macOS holds it as
+/// `KERN_PROCARGS2` and Linux as `/proc/<pid>/cmdline`, which `sysinfo` reads. A vector is never
+/// cut at white space, so a word that holds white space stays one word.
+fn arguments_of(pid: u32) -> Arguments {
+    use sysinfo::{ProcessRefreshKind, ProcessStatus, ProcessesToUpdate, UpdateKind};
+
+    let mut system = sysinfo::System::new();
+    let target = sysinfo::Pid::from_u32(pid);
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[target]),
+        true,
+        ProcessRefreshKind::nothing().with_cmd(UpdateKind::Always),
+    );
+    let Some(process) = system.process(target) else {
+        return Arguments::Ended;
+    };
+    if process.status() == ProcessStatus::Zombie {
+        return Arguments::Ended;
+    }
+    let words: Vec<String> = process
+        .cmd()
+        .iter()
+        .map(|word| word.to_string_lossy().into_owned())
+        .collect();
+    if words.is_empty() {
+        Arguments::Unread
+    } else {
+        Arguments::Words(words)
+    }
+}
+
+/// The interpreter the first line of the program `program` names, when it starts with `#!`.
+fn interpreter_of(program: &Path) -> Option<String> {
+    let mut head = [0_u8; 256];
+    let count = std::fs::File::open(program)
+        .and_then(|mut file| file.read(&mut head))
+        .ok()?;
+    let line = head[..count].strip_prefix(b"#!")?;
+    let first = line.split(|byte| *byte == b'\n').next()?;
+    String::from_utf8_lossy(first)
+        .split_whitespace()
+        .next()
+        .map(str::to_owned)
 }
 
 /// What a process whose identity cannot be read is said to be.
@@ -1036,41 +1111,36 @@ fn end_all(
     Ok(())
 }
 
-/// The processes of a start that was never recorded, found in the listing that the program `ps` prints.
+/// The processes of a start that was never recorded, found among the processes of this user that the
+/// program `ps` lists.
 ///
-/// `ps` prints a process's arguments as one line, so a line that holds the same text proves nothing.
-/// A process is the job's only on proof, each part read apart from the text around it: its
-/// arguments, taken as whole words, end with the arguments the definition gives after its program;
-/// the program it runs is a file inside the test's folders; and its working directory is the
-/// definition's. A process that fails any of the three is not the job's, whatever else its line or
-/// its environment holds.
+/// A process is the job's only on proof, each part read apart from the text around it: its argument
+/// vector, read with its own boundaries, ends with the arguments the definition gives after its
+/// program; its program is the job's program, run as it is or by the interpreter its first line
+/// names; and its working directory is the definition's. A process that fails any of the three is
+/// not the job's, whatever else it holds.
 ///
 /// Each process found is held by identity: its identity is read before the three proofs and again
 /// after them, so that what is ended is the process that was proved and no other.
 ///
-/// A search that cannot be made is an error and not an empty answer: an argument that holds a space
-/// cannot be told from two words in the listing, and a list or a directory that cannot be read
-/// leaves a process unproved.
+/// A search that cannot be made is an error and not an empty answer: an argument that is empty is
+/// not shown by the reader of argument vectors, and a list, a vector or a directory that cannot be
+/// read leaves a process unproved.
 fn found_unrecorded(
     context: &Context,
     job: &Job,
     tools: &Tools<'_>,
 ) -> Result<Vec<ProcessStartIdentity>, String> {
-    if let Some(argument) = job
-        .arguments
-        .iter()
-        .find(|argument| argument.split_whitespace().count() != 1)
-    {
-        return Err(format!(
-            "the argument {argument:?} holds a space or nothing, so a process list cannot show \
-             where it ends"
-        ));
+    if job.arguments.iter().any(String::is_empty) {
+        return Err(
+            "an argument of the job is empty, and the reader of argument vectors does not show an \
+             empty argument"
+                .to_owned(),
+        );
     }
     let working = context.bounded(Path::new(&job.working_directory))?;
     let output = match bounded_output(
-        Command::new(tools.ps)
-            // Twice `w`, so that a line is not cut at a width. No `E`: the environment is no proof.
-            .args(["-axww", "-o", "pid=,uid=,args="]),
+        Command::new(tools.ps).args(["-ax", "-o", "pid=,uid="]),
         COMMAND_BOUND,
     ) {
         Ok(output) if output.status.success() => output,
@@ -1088,10 +1158,7 @@ fn found_unrecorded(
         let Some((pid, rest)) = line.trim_start().split_once(char::is_whitespace) else {
             continue;
         };
-        let Some((uid, arguments)) = rest.trim_start().split_once(char::is_whitespace) else {
-            continue;
-        };
-        let (Ok(pid), Ok(uid)) = (pid.parse::<u32>(), uid.parse::<u32>()) else {
+        let (Ok(pid), Ok(uid)) = (pid.parse::<u32>(), rest.trim().parse::<u32>()) else {
             continue;
         };
         // The job's process runs as the user this program runs as: another user's processes are not
@@ -1099,9 +1166,21 @@ fn found_unrecorded(
         if pid == std::process::id() || uid != own {
             continue;
         }
-        let words: Vec<&str> = arguments.split_whitespace().collect();
-        let held = held_through(pid, tools.identity, &mut |_| {
-            Ok(context.runs_the_program_of(job, &words)
+        let held = held_through(pid, tools.identity, &mut |identity| {
+            let argv = match (tools.arguments)(pid) {
+                Arguments::Words(argv) => argv,
+                Arguments::Ended => return Ok(false),
+                Arguments::Unread if process_state(identity) == ProcessState::Ended => {
+                    return Ok(false);
+                }
+                Arguments::Unread => {
+                    return Err(format!(
+                        "the arguments of the process {pid} cannot be read, so it cannot be told \
+                         from the job's"
+                    ));
+                }
+            };
+            Ok(context.runs_the_program_of(job, &argv)
                 && working_directory_of(pid, tools.lsof)?.as_deref() == Some(working.as_path()))
         })?;
         found.extend(held);
@@ -1381,7 +1460,8 @@ mod tests {
     }
 
     /// A process list that cannot be read is an error and not an empty answer: `ps` that cannot be
-    /// started, `ps` that fails, and an argument of the job that a listing cannot show the end of.
+    /// started, `ps` that fails, an argument of the job that is empty, and an argument vector that
+    /// cannot be read for a process that runs. An argument that holds a space is no obstacle.
     #[test]
     fn a_process_list_that_cannot_be_read_is_an_error_and_not_an_empty_answer() {
         let folder = PrivateTempDir::create();
@@ -1419,8 +1499,28 @@ mod tests {
                 &job(["/x/program", "two words"]),
                 &Tools::system()
             )
-            .is_err(),
-            "an argument that holds a space"
+            .is_ok(),
+            "an argument that holds a space is one word of the vector"
+        );
+        assert!(
+            found_unrecorded(&context, &job(["/x/program", ""]), &Tools::system()).is_err(),
+            "an empty argument is not shown by the reader of vectors"
+        );
+        let unread = Tools {
+            arguments: &|_| Arguments::Unread,
+            ..Tools::system()
+        };
+        assert!(
+            found_unrecorded(&context, &plain, &unread).is_err(),
+            "a vector that cannot be read for a process that runs"
+        );
+        let ended = Tools {
+            arguments: &|_| Arguments::Ended,
+            ..Tools::system()
+        };
+        assert!(
+            found_unrecorded(&context, &plain, &ended).is_ok_and(|found| found.is_empty()),
+            "a process that has no vector left is not the job's"
         );
     }
 
@@ -1432,7 +1532,7 @@ mod tests {
         let own = kr_ipc::identity::current_process_start_identity().expect("an identity");
         let other = ProcessStartIdentity::new(
             own.pid.get(),
-            own.source.clone(),
+            own.source,
             own.start_value.get().wrapping_add(1),
         );
         let pid = u32::try_from(own.pid.get()).expect("a number");
@@ -1530,7 +1630,7 @@ mod tests {
             } else {
                 ProcessStartIdentity::new(
                     read.pid.get(),
-                    read.source.clone(),
+                    read.source,
                     read.start_value.get().wrapping_add(1),
                 )
             })
@@ -1595,7 +1695,7 @@ mod tests {
             } else {
                 ProcessStartIdentity::new(
                     read.pid.get(),
-                    read.source.clone(),
+                    read.source,
                     read.start_value.get().wrapping_add(1),
                 )
             })
@@ -1625,18 +1725,22 @@ mod tests {
         }
     }
 
-    /// The arguments of a process are the job's only as whole words after a program inside the
-    /// roots: the program run as it is, run by its interpreter, or handed over to with arguments of
-    /// its own first; a word that only starts or ends like the definition's, a program outside, a
-    /// program too far from the arguments, and no arguments at all are not.
+    /// The argument vector of a process is the job's only when it ends with the arguments of the
+    /// definition word for word and its program is the job's: the program run as it is, run by the
+    /// interpreter its first line names, or run with arguments of its own first. A word that only
+    /// starts or ends like the definition's, another program, an outside program that is given the
+    /// job's program or another path inside the roots as data, an interpreter its first line does
+    /// not name, a path that is not absolute and no arguments at all are not.
     #[test]
-    fn the_arguments_of_a_process_are_the_jobs_only_as_whole_words_after_a_program_inside_the_roots()
-     {
+    fn the_argument_vector_of_a_process_is_the_jobs_only_when_it_runs_the_jobs_program() {
         let folder = PrivateTempDir::create();
         let root = folder.path().canonicalize().expect("a folder");
         let program = root.join("kr-daemon");
-        std::fs::write(&program, "").expect("a program");
+        std::fs::write(&program, "#!/bin/sh\nexit 0\n").expect("a program");
+        let other = root.join("other");
+        std::fs::write(&other, "#!/bin/sh\nexit 0\n").expect("another program");
         let program = program.display().to_string();
+        let other = other.display().to_string();
         let context = Context {
             own: root.clone(),
             roots: vec![root.clone()],
@@ -1649,63 +1753,64 @@ mod tests {
                 .to_vec(),
             ..Job::default()
         };
-        let is_the_jobs = |words: &[&str]| context.runs_the_program_of(&job, words);
-        assert!(is_the_jobs(&[
-            &program,
-            "--runtime-dir",
-            "/r",
-            "--state-dir",
-            "/s"
-        ]));
-        assert!(is_the_jobs(&[
-            "/bin/sh",
-            &program,
-            "--runtime-dir",
-            "/r",
-            "--state-dir",
-            "/s"
-        ]));
-        assert!(is_the_jobs(&[
-            &program,
-            "--secret-store",
-            "file",
-            "--runtime-dir",
-            "/r",
-            "--state-dir",
-            "/s"
-        ]));
-        assert!(!is_the_jobs(&[
-            &program,
-            "--runtime-dir",
-            "/r",
-            "--state-dir",
-            "/s2"
-        ]));
-        assert!(!is_the_jobs(&[
-            &program,
-            "--runtime-dir",
-            "/r",
-            "--state-dir",
-            "/"
-        ]));
-        assert!(!is_the_jobs(&[
-            "/bin/sh",
-            "--runtime-dir",
-            "/r",
-            "--state-dir",
-            "/s"
-        ]));
-        assert!(!is_the_jobs(&[
-            "/bin/echo",
-            "x",
-            &program,
-            "--runtime-dir",
-            "/r",
-            "--state-dir",
-            "/s"
-        ]));
-        assert!(!is_the_jobs(&["--runtime-dir", "/r", "--state-dir", "/s"]));
-        assert!(!is_the_jobs(&[&program]));
-        assert!(!is_the_jobs(&[]));
+        let is_the_jobs = |words: &[&str]| {
+            let argv: Vec<String> = words.iter().map(|word| (*word).to_owned()).collect();
+            context.runs_the_program_of(&job, &argv)
+        };
+        let tail = ["--runtime-dir", "/r", "--state-dir", "/s"];
+        let with = |leading: &[&str], tail: &[&str]| -> Vec<String> {
+            leading
+                .iter()
+                .chain(tail)
+                .map(|word| (*word).to_owned())
+                .collect()
+        };
+        let runs = |leading: &[&str]| {
+            is_the_jobs(
+                &with(leading, &tail)
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>(),
+            )
+        };
+        assert!(runs(&[&program]), "the program run as it is");
+        assert!(
+            runs(&["/bin/sh", &program]),
+            "run by the interpreter its first line names"
+        );
+        assert!(
+            runs(&[&program, "--secret-store", "file"]),
+            "handed over to with arguments of its own first"
+        );
+        assert!(
+            !is_the_jobs(&[&program, "--runtime-dir", "/r", "--state-dir", "/s2"]),
+            "a last word that only starts like the definition's"
+        );
+        assert!(
+            !is_the_jobs(&[&program, "--runtime-dir", "/r", "--state-dir", "/"]),
+            "a last word that only ends like it"
+        );
+        assert!(!runs(&["/bin/sh"]), "an interpreter and no program");
+        assert!(!runs(&[&other]), "another program inside the roots");
+        assert!(
+            !runs(&["/bin/cat", &program]),
+            "an outside program that is given the job's program as data"
+        );
+        assert!(
+            !runs(&["/usr/bin/yes", &other]),
+            "an outside program that is given another path inside the roots as data"
+        );
+        assert!(
+            !runs(&["/bin/echo", "x", &program]),
+            "the job's program too far from the start"
+        );
+        assert!(
+            !runs(&["/bin/dash", &program]),
+            "an interpreter that the first line of the program does not name"
+        );
+        assert!(!runs(&["kr-daemon"]), "a path that is not absolute");
+        assert!(!is_the_jobs(&tail), "no program at all");
+        assert!(!is_the_jobs(&[&program]), "no arguments of the definition");
+        assert!(!is_the_jobs(&[]), "an empty vector");
     }
 }
