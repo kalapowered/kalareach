@@ -83,15 +83,8 @@ impl Broker {
             return None;
         }
         let instance = state.instances.get(&instance_id)?;
-        let mut rebuild = Rebuild {
-            instance: instance_id,
-            package: package.clone(),
-            boundary: state.arbitration.next_recorded(),
-            offers: Vec::new(),
-            unavailable: 0,
-            over_cap: 0,
-        };
-        let mut bytes = 0usize;
+        let boundary = state.arbitration.next_recorded();
+        let mut fill = Fill::default();
         for pending in state.arbitration.in_recorded_order() {
             let resource = &pending.resource;
             // Unanswered only: pending, or claimed for a rich answer that is not marked as sent,
@@ -108,10 +101,6 @@ impl Broker {
             let Some(handle) = pending.source.as_ref() else {
                 continue;
             };
-            if rebuild.offers.len() >= MAX_RETAINED_FRAMES {
-                rebuild.over_cap += 1;
-                continue;
-            }
             let read = if resource.interpretation_verified {
                 interpreted(
                     &state.ledger,
@@ -123,28 +112,21 @@ impl Broker {
             } else {
                 uninterpreted(instance, resource, handle, &package)
             };
-            let (event, approval) = match read {
-                Read::Given(event, approval) => (event, approval),
-                Read::OtherPackage => continue,
-                Read::Unavailable => {
-                    rebuild.unavailable += 1;
-                    continue;
-                }
-            };
-            if bytes.saturating_add(event.bytes.len()) > MAX_RETAINED_FRAME_BYTES {
-                rebuild.over_cap += 1;
-                continue;
-            }
-            bytes += event.bytes.len();
-            rebuild.offers.push(Offer {
-                resource_id: resource.resource_id,
-                generation: resource.source_generation,
-                event,
-                approval,
-                private: pending.made_in_privacy,
-            });
+            fill.add(
+                resource.resource_id,
+                resource.source_generation,
+                pending.made_in_privacy,
+                read,
+            );
         }
-        Some(rebuild)
+        Some(Rebuild {
+            instance: instance_id,
+            package,
+            boundary,
+            offers: fill.offers,
+            unavailable: fill.unavailable,
+            over_cap: fill.over_cap,
+        })
     }
 
     /// Returns true while a request is still unanswered (pending, or claimed for a rich answer that
@@ -166,6 +148,51 @@ impl Broker {
                     .get(&pending.resource.application_instance_id)
                     .is_some_and(|instance| instance.source_generation == generation)
         })
+    }
+}
+
+/// What reading the requests has gathered, and the bounds on what is given at once.
+#[derive(Default)]
+struct Fill {
+    offers: Vec<Offer>,
+    bytes: usize,
+    unavailable: u64,
+    over_cap: u64,
+}
+
+impl Fill {
+    /// Takes what reading one request came to. A request counts against the bounds only when it
+    /// could be given: another package's request is not this component's at all, and one whose
+    /// bytes could not be read is counted as that, however many have been given before it.
+    fn add(
+        &mut self,
+        resource_id: PendingResourceId,
+        generation: SourceGeneration,
+        private: bool,
+        read: Read,
+    ) {
+        let (event, approval) = match read {
+            Read::OtherPackage => return,
+            Read::Unavailable => {
+                self.unavailable += 1;
+                return;
+            }
+            Read::Given(event, approval) => (event, approval),
+        };
+        if self.offers.len() >= MAX_RETAINED_FRAMES
+            || self.bytes.saturating_add(event.bytes.len()) > MAX_RETAINED_FRAME_BYTES
+        {
+            self.over_cap += 1;
+            return;
+        }
+        self.bytes += event.bytes.len();
+        self.offers.push(Offer {
+            resource_id,
+            generation,
+            event,
+            approval,
+            private,
+        });
     }
 }
 
@@ -551,6 +578,70 @@ mod tests {
             ),
             "{words}"
         );
+    }
+
+    fn event(bytes: usize) -> ScopedSourceEvent {
+        ScopedSourceEvent::new(
+            SourceEventHandle::new("src-1").expect("a handle"),
+            SourceProvenance::NativeProtocol,
+            1,
+            Some("1".to_owned()),
+            vec![0_u8; bytes],
+        )
+    }
+
+    fn id(byte: u8) -> PendingResourceId {
+        PendingResourceId::new(kr_protocol::scalars::Uuid::from_bytes([byte; 16]))
+    }
+
+    /// A request of another package, or one whose frame is gone, that comes after the sixty-fourth
+    /// request that could be given is not counted as past the limit; one that could be given is.
+    #[test]
+    fn the_bounds_count_only_requests_that_could_have_been_given() {
+        let generation = SourceGeneration::new(1);
+        let mut fill = Fill::default();
+        for byte in 0..64 {
+            fill.add(id(byte), generation, false, Read::Given(event(10), true));
+        }
+        fill.add(id(100), generation, false, Read::OtherPackage);
+        fill.add(id(101), generation, false, Read::Unavailable);
+        fill.add(id(102), generation, false, Read::Given(event(10), true));
+        assert_eq!(fill.offers.len(), 64);
+        assert_eq!(
+            fill.unavailable, 1,
+            "a missing frame is counted as missing and not as past the limit"
+        );
+        assert_eq!(
+            fill.over_cap, 1,
+            "another package's request is not counted, and the one that could be given is"
+        );
+        let words = Recovery {
+            baseline: true,
+            given: 64,
+            approvals: 64,
+            unavailable: fill.unavailable,
+            over_cap: fill.over_cap,
+            ..Recovery::default()
+        }
+        .words();
+        for clause in [
+            "1 pending request could not be given because the worker no longer holds its frame",
+            "1 pending request was not given because the worker gives at most 64 requests",
+        ] {
+            assert!(words.contains(clause), "{clause}: {words}");
+        }
+
+        // The bound on bytes: two requests of two MiB fit, a third does not.
+        let mut fill = Fill::default();
+        for byte in 0..3 {
+            fill.add(
+                id(byte),
+                generation,
+                false,
+                Read::Given(event(2 * 1024 * 1024), false),
+            );
+        }
+        assert_eq!((fill.offers.len(), fill.over_cap), (2, 1));
     }
 
     #[test]
