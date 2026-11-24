@@ -270,6 +270,16 @@ pub enum Outcome {
     },
     /// The facility this check performs the operation with is not installed.
     FacilityMissing,
+    /// The facility is installed and the operation was started, and the installed version cannot
+    /// perform it.
+    ///
+    /// That is a limit of the version, which no permission and no installation changes, so it is
+    /// not [`Outcome::FacilityMissing`].
+    Unsupported {
+        /// What the facility said, as this check read it: what it printed is said as its class and
+        /// its length.
+        detail: Sentence,
+    },
     /// The facility did not answer inside the check's own bound.
     ///
     /// On a platform that asks the person at the machine for the permission, this is what a
@@ -408,6 +418,19 @@ pub fn judge(
                 "the platform facility this check performs the operation with is not installed, \
                  so there was nothing to run and nothing to grant",
             )),
+        ),
+        Outcome::Unsupported { detail } => (
+            CapabilityState::Incompatible,
+            CapabilityEvidenceSource::DisclosedProbe,
+            Some(
+                Sentence::new()
+                    .stated(
+                        "this context started the operation and the installed facility cannot \
+                         perform it: ",
+                    )
+                    .sentence(detail)
+                    .stated(". That is a limit of the installed version, not a missing permission"),
+            ),
         ),
         Outcome::NotAnswered { waited, stopped } => (
             CapabilityState::TemporarilyUnavailable,
@@ -1901,6 +1924,53 @@ mod tests {
                 .expect("a reason")
                 .as_str()
                 .contains("test context of its own")
+        );
+    }
+
+    /// KR-REQ-03.29: an operation the installed version of a facility cannot perform is
+    /// incompatible, and it was performed as far as it could be, so the probe is its evidence; a
+    /// facility that is not installed stays a missing installation, which the platform was asked
+    /// about and nothing was performed.
+    #[test]
+    fn kr_req_03_29_an_operation_the_installed_version_cannot_perform_is_incompatible_not_missing()
+    {
+        let (state, evidence, reason) = judge(
+            Check::ScreenImage,
+            &Outcome::Unsupported {
+                detail: Sentence::new().stated("it has no such option"),
+            },
+        );
+        assert_eq!(state, CapabilityState::Incompatible);
+        assert_eq!(evidence, CapabilityEvidenceSource::DisclosedProbe);
+        assert_eq!(
+            reason.expect("a reason").as_str(),
+            "this context started the operation and the installed facility cannot perform it: \
+             it has no such option. That is a limit of the installed version, not a missing \
+             permission"
+        );
+        let (state, evidence, _) = judge(Check::ScreenImage, &Outcome::FacilityMissing);
+        assert_eq!(state, CapabilityState::MissingInstallation);
+        assert_eq!(evidence, CapabilityEvidenceSource::PlatformQuery);
+        // The record a caller reads says the same, and names the facility that was tried.
+        let tried = Ran {
+            check: Check::ScreenImage,
+            facility: Some("/usr/bin/tool".to_owned()),
+            outcome: Outcome::Unsupported {
+                detail: Sentence::new().stated("it has no such option"),
+            },
+        };
+        let record = record(
+            &tried,
+            &subject(),
+            WorkerProfile::DesktopBound,
+            revision(),
+            kr_protocol::scalars::TimestampMs::new(1),
+        )
+        .expect("a record");
+        assert_eq!(record.state, CapabilityState::Incompatible);
+        assert_eq!(
+            record.evidence_source,
+            CapabilityEvidenceSource::DisclosedProbe
         );
     }
 
