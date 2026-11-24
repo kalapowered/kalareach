@@ -3668,8 +3668,7 @@ impl WorkerService {
             let service = Arc::clone(&self);
             let _ = tokio::task::spawn_blocking(move || {
                 let _barrier = service
-                    .dispatch
-                    .lock()
+                    .take_boundary()
                     .expect("the dispatch barrier is not poisoned");
                 for epoch in epochs {
                     service
@@ -12447,7 +12446,7 @@ impl WorkerService {
                     .facts
                     .add_attachment_unless_withdrawn(&state.withdrawn, attachment_id)
                 {
-                    let _ = session.detach(attachment_id);
+                    let _ = session.detach(attachment_id, None);
                     self.runtime.flush_input();
                     return Err(withdrawn_connection_refusal());
                 }
