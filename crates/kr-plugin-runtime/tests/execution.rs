@@ -3302,6 +3302,55 @@ mod consumed {
         );
     }
 
+    /// The terminal handles of the reports the channel holds at this moment, and no more: a place
+    /// that reading frees can be taken by a report the binding's thread sends while the reading
+    /// goes on.
+    fn reports_held(received: &mut Received) -> Vec<Option<SourceEventHandle>> {
+        let mut seen = Vec::new();
+        for _ in 0..received.len() {
+            if let Ok(BindingEvent::Consumed(consumed)) = received.try_recv() {
+                seen.push(consumed.terminal);
+            }
+        }
+        seen
+    }
+
+    /// KR-REQ-24.24: calls that follow one another closer than the retry and draw no document do
+    /// not keep an owed report waiting, for the retry is a deadline that a call does not move.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn kr_req_24_24_calls_that_follow_each_other_do_not_keep_an_owed_report_waiting() {
+        let Some((_host, binding, mut received)) = with_an_owed_report(34).await else {
+            return;
+        };
+        let held = reports_held(&mut received);
+        assert!(
+            !held.is_empty() && !held.contains(&Some(handle("se-6"))),
+            "the newest report found room, or none was sent: {held:?}"
+        );
+        // A checkpoint draws no document and answers in far less than the retry. Calls one after
+        // the other, with the caller reading between them, are all that comes.
+        let started = std::time::Instant::now();
+        let mut calls = 0_u32;
+        let mut newest = None;
+        while newest != Some(handle("se-6"))
+            && started.elapsed() < core::time::Duration::from_secs(5)
+        {
+            let _ = consumed_of(&binding).await;
+            calls += 1;
+            while let Ok(event) = received.try_recv() {
+                if let BindingEvent::Consumed(consumed) = event {
+                    newest = consumed.terminal;
+                }
+            }
+        }
+        assert_eq!(
+            newest,
+            Some(handle("se-6")),
+            "the report owed was not sent in {calls} calls that ran for {:?}",
+            started.elapsed()
+        );
+    }
+
     /// KR-REQ-24.24: a restore that answered replaces what was owed, so a report of the state it
     /// replaced is not sent after it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
