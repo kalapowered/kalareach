@@ -843,6 +843,21 @@ mod tests {
         assert_eq!(validate(Image::Xwd, &old), Err(Fault::NotThisFormat));
     }
 
+    /// KR-REQ-03.29, LX-1: a PNG whose data is cut short is told as cut short, wherever it is cut:
+    /// before its data, inside it, and after it with the end of its last chunk missing.
+    #[test]
+    fn kr_req_03_29_a_png_cut_in_its_data_is_told_as_cut_short_wherever_it_is_cut() {
+        let whole = png_of(1280, 800, 8, 6, 5969);
+        // The signature and the header chunk are 33 bytes, and the data chunk's head is 8 more.
+        for cut in [41, 3000, whole.len() - 1] {
+            assert_eq!(
+                validate(Image::Png, &whole[..cut]),
+                Err(Fault::CutShort),
+                "png cut at {cut}"
+            );
+        }
+    }
+
     /// Sets one big-endian word of an XWD header.
     fn set_word(bytes: &mut [u8], word: usize, value: u32) {
         bytes[word * 4..word * 4 + 4].copy_from_slice(&value.to_be_bytes());
