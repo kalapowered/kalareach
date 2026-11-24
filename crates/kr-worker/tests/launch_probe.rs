@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use kr_plugin_sdk::launch_probe::LaunchProbe;
-use kr_worker::broker::probe::{self, ProbeRun, Probed};
+use kr_worker::broker::probe::{self, ProbeRun, Probed, ThreadEnd};
 
 mod common;
 
@@ -429,12 +429,12 @@ const THREAD_PATIENCE: Duration = Duration::from_secs(30);
 /// How much later than its bound a call may be for a loaded machine's scheduling.
 const SLACK: Duration = Duration::from_millis(1500);
 
-/// The time the probe's thread took in all, waited for until it has ended.
-fn thread_total(probed: &Probed) -> Duration {
+/// How the probe's thread ended, waited for until it has.
+fn thread_end(probed: &Probed) -> ThreadEnd {
     let started = Instant::now();
     loop {
-        if let Some(total) = probed.thread_took.get() {
-            return *total;
+        if let Some(end) = probed.thread.get() {
+            return *end;
         }
         assert!(
             started.elapsed() < THREAD_PATIENCE,
@@ -442,6 +442,11 @@ fn thread_total(probed: &Probed) -> Duration {
         );
         std::thread::sleep(Duration::from_millis(20));
     }
+}
+
+/// The time the probe's thread took in all, waited for until it has ended.
+fn thread_total(probed: &Probed) -> Duration {
+    thread_end(probed).took
 }
 
 /// Waits until the process a stand-in wrote to `file` is gone.
@@ -626,4 +631,65 @@ fn kr_req_07_64_a_probe_whose_descendant_holds_the_output_does_not_hold_the_call
         probed.took
     );
     assert_gone(here.path(), "child.pid");
+}
+
+/// Whether the process table still holds `pid`, a process that has ended and has not been collected
+/// included.
+#[cfg(unix)]
+fn in_process_table(pid: u32) -> bool {
+    i32::try_from(pid)
+        .ok()
+        .and_then(rustix::process::Pid::from_raw)
+        .is_some_and(|pid| rustix::process::test_kill_process(pid).is_ok())
+}
+
+/// KR-REQ-07.64: on Unix a probe that the kernel has not let go of within the cleanup bound is
+/// collected later by the thread that owns it, and the call keeps its bound.
+///
+/// The case holds the probe's collection back for four seconds, past the deadline of two and the
+/// bound of one. The probe is ended at the deadline, so that it is a process that has ended and is
+/// not yet collected until the hold is over.
+#[cfg(unix)]
+#[test]
+fn kr_req_07_64_a_probe_not_collected_within_the_bound_is_collected_later() {
+    let here = directory();
+    let standin = Standin::running("echo $$ > main.pid; sleep 600", "");
+    let deadline = Duration::from_secs(2);
+    let hold = Duration::from_secs(4);
+    probe::seams::hold_collection(here.path(), Some(hold));
+    let run = ProbeRun::within(deadline);
+    let probed = probe::run_within(
+        &standin.program,
+        &standin.probe(&[]),
+        &[],
+        here.path(),
+        &given(&[]),
+        &run,
+        probe::MAX_OUTPUT_BYTES,
+    );
+    probe::seams::hold_collection(here.path(), None);
+    assert!(probed.late, "{probed:?}");
+    assert!(
+        probed.took >= deadline && probed.took <= deadline + probe::CLEANUP_BOUND + SLACK,
+        "the caller keeps its deadline: {:?}",
+        probed.took
+    );
+    let pid = written_pid(here.path(), "main.pid").expect("main.pid was written");
+    assert!(
+        in_process_table(pid),
+        "the premise: the probe has ended and is not yet collected"
+    );
+    let end = thread_end(&probed);
+    assert!(
+        !end.collected_in_bound,
+        "the collection was held past the bound: {end:?}"
+    );
+    assert!(
+        end.took >= hold,
+        "the thread kept the probe until it collected it: {end:?}"
+    );
+    assert!(
+        !in_process_table(pid),
+        "the probe was collected, not left to the end of this process"
+    );
 }

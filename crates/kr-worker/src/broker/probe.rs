@@ -90,9 +90,20 @@ pub struct Probed {
     pub late: bool,
     /// From the run's first instant to the return of the call, a wait for a thread included.
     pub took: Duration,
-    /// From the run's first instant to the end of the probe's own thread, its cleanup included. It
-    /// is set when that thread ends, which for a late probe is after the call has returned.
-    pub thread_took: Arc<OnceLock<Duration>>,
+    /// How the probe's own thread ended. It is set when that thread ends, which for a late probe
+    /// is after the call has returned, and on Unix for a process that was not collected within the
+    /// cleanup bound is after the thread has collected it.
+    pub thread: Arc<OnceLock<ThreadEnd>>,
+}
+
+/// How the probe's own thread ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ThreadEnd {
+    /// From the run's first instant to the end of the thread, its cleanup included.
+    pub took: Duration,
+    /// Whether the probe's process was ended and collected within the cleanup bound, or was never
+    /// created.
+    pub collected_in_bound: bool,
 }
 
 impl Probed {
@@ -102,7 +113,7 @@ impl Probed {
             unread: None,
             late: false,
             took: Duration::ZERO,
-            thread_took: Arc::default(),
+            thread: Arc::default(),
         }
     }
 
@@ -112,7 +123,7 @@ impl Probed {
             unread: Some(why.into()),
             late: false,
             took: Duration::ZERO,
-            thread_took: Arc::default(),
+            thread: Arc::default(),
         }
     }
 
@@ -148,7 +159,7 @@ struct Work {
     environment: Vec<(OsString, OsString)>,
     run: ProbeRun,
     cap: usize,
-    total: Arc<OnceLock<Duration>>,
+    end: Arc<OnceLock<ThreadEnd>>,
 }
 
 /// Runs `probe` against `executable` for a launch whose own arguments are `launch`, in
@@ -175,10 +186,10 @@ pub fn run_within(
     run: &ProbeRun,
     cap: usize,
 ) -> Probed {
-    let thread_took: Arc<OnceLock<Duration>> = Arc::default();
+    let thread: Arc<OnceLock<ThreadEnd>> = Arc::default();
     let finish = |probed: Probed| Probed {
         took: run.begin.elapsed(),
-        thread_took: Arc::clone(&thread_took),
+        thread: Arc::clone(&thread),
         ..probed
     };
     let shown = executable.display();
@@ -204,7 +215,7 @@ pub fn run_within(
         environment: environment.to_vec(),
         run: run.clone(),
         cap,
-        total: Arc::clone(&thread_took),
+        end: Arc::clone(&thread),
     };
     let _ = std::thread::spawn(move || operate(&work, &sender));
     let waited = run.by.saturating_duration_since(Instant::now());
@@ -270,12 +281,21 @@ fn operate(work: &Work, answers: &mpsc::Sender<Message>) {
         }
     };
     let _ = answers.send(Message::Answered(answer));
-    if let Some(process) = process.as_mut() {
-        process.end(Instant::now() + CLEANUP_BOUND);
+    let collected_in_bound = process
+        .as_mut()
+        .is_none_or(|process| process.end(Instant::now() + CLEANUP_BOUND));
+    let _ = answers.send(Message::Cleaned);
+    // A process the kernel has not let go of within the bound is collected by the thread that owns
+    // it, when the kernel does, so that none stays uncollected for the rest of this process's life.
+    #[cfg(unix)]
+    if let Some(process) = process.as_mut().filter(|_| !collected_in_bound) {
+        process.collect();
     }
     drop(process);
-    let _ = answers.send(Message::Cleaned);
-    let _ = work.total.set(work.run.begin.elapsed());
+    let _ = work.end.set(ThreadEnd {
+        took: work.run.begin.elapsed(),
+        collected_in_bound,
+    });
 }
 
 /// What the output of a process offers at a moment.
@@ -334,11 +354,32 @@ pub mod seams {
 
     static CREATE_DELAY: Mutex<Option<(PathBuf, Duration)>> = Mutex::new(None);
 
+    static COLLECTION_HOLD: Mutex<Option<(PathBuf, Duration)>> = Mutex::new(None);
+
     /// Makes the probe's thread wait this long before it creates a process that is to run in
     /// `directory`, or stops doing so.
     pub fn delay_create(directory: &Path, delay: Option<Duration>) {
         *CREATE_DELAY.lock().unwrap_or_else(PoisonError::into_inner) =
             delay.map(|delay| (directory.to_path_buf(), delay));
+    }
+
+    /// Makes the collection of a probe that is to run in `directory` wait this long after its
+    /// creation, as one the kernel does not let go of would, or stops doing so.
+    pub fn hold_collection(directory: &Path, hold: Option<Duration>) {
+        *COLLECTION_HOLD
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) =
+            hold.map(|hold| (directory.to_path_buf(), hold));
+    }
+
+    #[cfg(unix)]
+    pub(super) fn collection_held_until(directory: &Path) -> Option<std::time::Instant> {
+        let held = COLLECTION_HOLD
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        held.filter(|(held, _)| held == directory)
+            .map(|(_, hold)| std::time::Instant::now() + hold)
     }
 
     pub(super) fn before_create(directory: &Path) {
@@ -359,6 +400,9 @@ pub mod seams {
 struct Process {
     child: std::process::Child,
     output: std::process::ChildStdout,
+    /// Until when a case holds the child's collection back.
+    #[cfg(feature = "testing")]
+    held_until: Option<Instant>,
 }
 
 #[cfg(unix)]
@@ -386,7 +430,12 @@ impl Process {
         kr_ipc::testing::created::note_here("backend-probe", &command);
         let mut child = command.spawn()?;
         let output = child.stdout.take().expect("the output is piped");
-        Ok(Self { child, output })
+        Ok(Self {
+            child,
+            output,
+            #[cfg(feature = "testing")]
+            held_until: seams::collection_held_until(directory),
+        })
     }
 
     /// Waits up to `wait` for the output to have data or to end.
@@ -414,8 +463,9 @@ impl Process {
         self.output.read(buffer)
     }
 
-    /// Ends the probe's group and waits for the probe until `until`.
-    fn end(&mut self, until: Instant) {
+    /// Ends the probe's group and waits for the probe until `until`, and says whether the probe
+    /// was collected.
+    fn end(&mut self, until: Instant) -> bool {
         if let Some(group) = i32::try_from(self.child.id())
             .ok()
             .and_then(rustix::process::Pid::from_raw)
@@ -424,9 +474,32 @@ impl Process {
             // outcome wanted.
             let _ = rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
         }
-        while matches!(self.child.try_wait(), Ok(None)) && Instant::now() < until {
+        while !self.collected() {
+            if Instant::now() >= until {
+                return false;
+            }
             std::thread::sleep(Duration::from_millis(5));
         }
+        true
+    }
+
+    /// Whether the probe has been collected, or cannot be asked about.
+    fn collected(&mut self) -> bool {
+        #[cfg(feature = "testing")]
+        if self.held_until.is_some_and(|held| Instant::now() < held) {
+            return false;
+        }
+        !matches!(self.child.try_wait(), Ok(None))
+    }
+
+    /// Waits, for as long as the kernel takes, for the probe, which has been ended, so that it is
+    /// not left uncollected.
+    fn collect(&mut self) {
+        #[cfg(feature = "testing")]
+        if let Some(held) = self.held_until {
+            std::thread::sleep(held.saturating_duration_since(Instant::now()));
+        }
+        let _ = self.child.wait();
     }
 }
 
@@ -488,11 +561,14 @@ impl Process {
         self.output.read(buffer)
     }
 
-    /// Ends the probe's job and waits for the probe until `until`.
-    fn end(&mut self, until: Instant) {
+    /// Ends the probe's job and waits for the probe until `until`, and says whether the probe
+    /// ended.
+    fn end(&mut self, until: Instant) -> bool {
         let _ = self.job.terminate(1);
-        let _ = self
-            .child
-            .wait_for(until.saturating_duration_since(Instant::now()));
+        matches!(
+            self.child
+                .wait_for(until.saturating_duration_since(Instant::now())),
+            Ok(Some(_))
+        )
     }
 }
