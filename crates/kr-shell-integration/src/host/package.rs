@@ -195,10 +195,10 @@ impl ShellPackage {
     /// Reads the one package installed in a directory.
     ///
     /// The directory is an identity directory, one a build wrote or one an installed release holds,
-    /// which is what a controller records when it resolves a create request's package: the worker then launches exactly the package
-    /// its daemon qualified rather than resolving one of its own from its own environment. The
-    /// same ownership rule applies as for a discovered package: a record naming paths outside the
-    /// directory it sits in describes some other installation.
+    /// which is what a controller records when it resolves a create request's package: the worker
+    /// then launches exactly the package its daemon qualified rather than resolving one of its own
+    /// from its own environment. The same ownership rule applies as for a discovered package: a
+    /// record naming paths outside the directory it sits in describes some other installation.
     ///
     /// # Errors
     ///
@@ -710,8 +710,11 @@ enum Home<'a> {
 /// package's own shell and home.
 ///
 /// Each step is a command that runs: the build is named with the shell it builds, `--force` because
-/// a build keeps a record whose identity is installed, and the root the record was read from; the
-/// publish is named with that root, because the publisher's own default is not this host's.
+/// a build keeps a record whose identity is installed, and the root the record was read from. The
+/// publish is named with that root where the record is in a build's root, because the publisher's
+/// own default is not this host's. In an installed release's `shells` folder it names no root, so
+/// the publisher writes to its own default, and that mends the record there only if the default is
+/// that folder.
 fn flags_missing(kind: ShellKind, home: Home<'_>) -> String {
     let said = "the record declares no flags";
     let build = |root: &Path| {
@@ -938,7 +941,9 @@ impl PackageSet {
     /// As [`Self::discover`], for the one root whose packages the release came with: a record in it
     /// that cannot be used is mended by replacing the release, and not by a build. A PowerShell
     /// record is the one exception: a signed release holds no PowerShell package, so a record of one
-    /// in this folder is a person's own publication, and a publish mends it.
+    /// in this folder is a person's own publication. The refusal names a publish with no root, which
+    /// writes to the publisher's own default, so it mends this record only where the default is this
+    /// folder.
     ///
     /// # Errors
     ///
