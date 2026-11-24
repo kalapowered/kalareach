@@ -1216,6 +1216,138 @@ fn a_bad_command_line_is_refused() {
     }
 }
 
+/// A tree that holds what a hosted runner's apt reads: an os-release that says Ubuntu 24.04 and the
+/// image's own sources file, which names a regional mirror through the image's mirror list.
+fn runner_image(rig: &Rig) -> PathBuf {
+    let root = rig.path("image");
+    fs::create_dir_all(root.join("etc/apt/sources.list.d")).expect("the image's apt folder");
+    fs::write(
+        root.join("etc/os-release"),
+        "ID=ubuntu\nVERSION_CODENAME=noble\n",
+    )
+    .expect("the image's os-release");
+    fs::write(
+        root.join("etc/apt/sources.list.d/ubuntu.sources"),
+        "Types: deb\nURIs: mirror+file:/etc/apt/apt-mirrors.txt\nSuites: noble noble-updates\n",
+    )
+    .expect("the image's sources file");
+    root
+}
+
+#[test]
+fn a_runner_whose_sources_name_a_regional_mirror_is_pointed_at_the_archive_hosts_once() {
+    let rig = Rig::new();
+    let root = runner_image(&rig);
+    let root_text = root.to_str().expect("a plain path");
+    let archive_file = root.join("etc/apt/sources.list.d/ubuntu-archive.sources");
+
+    let first = rig.run_script("scripts/ubuntu-archive-hosts.sh", &["--root", root_text]);
+    assert_eq!(first.status, 0, "{}{}", first.stdout, first.stderr);
+    let archive = fs::read_to_string(&archive_file).expect("the new sources file");
+    assert!(
+        archive.contains(
+            "URIs: http://archive.ubuntu.com/ubuntu\nSuites: noble noble-updates noble-backports\n"
+        ),
+        "{archive}"
+    );
+    assert!(
+        archive.contains("URIs: http://security.ubuntu.com/ubuntu\nSuites: noble-security\n"),
+        "{archive}"
+    );
+    assert!(!archive.contains("mirror+file"), "{archive}");
+    assert!(
+        !root.join("etc/apt/sources.list.d/ubuntu.sources").exists(),
+        "the image's file stays in the folder apt reads"
+    );
+    let aside = fs::read_to_string(root.join("etc/apt/ubuntu.sources.runner"))
+        .expect("the image's file, moved aside");
+    assert!(
+        aside.contains("mirror+file:/etc/apt/apt-mirrors.txt"),
+        "{aside}"
+    );
+
+    let second = rig.run_script("scripts/ubuntu-archive-hosts.sh", &["--root", root_text]);
+    assert_eq!(second.status, 0, "{}{}", second.stdout, second.stderr);
+    assert!(
+        second.stdout.contains("already in place"),
+        "{}",
+        second.stdout
+    );
+    assert_eq!(
+        fs::read_to_string(&archive_file).expect("the file again"),
+        archive
+    );
+}
+
+#[test]
+fn an_image_the_script_does_not_know_fails_and_changes_nothing() {
+    let sources_of = |root: &Path| root.join("etc/apt/sources.list.d/ubuntu.sources");
+    let untouched = |root: &Path| {
+        sources_of(root).exists()
+            && !root
+                .join("etc/apt/sources.list.d/ubuntu-archive.sources")
+                .exists()
+            && !root.join("etc/apt/ubuntu.sources.runner").exists()
+    };
+
+    // Another release.
+    let rig = Rig::new();
+    let root = runner_image(&rig);
+    fs::write(
+        root.join("etc/os-release"),
+        "ID=ubuntu\nVERSION_CODENAME=jammy\n",
+    )
+    .expect("another release");
+    let outcome = rig.run_script(
+        "scripts/ubuntu-archive-hosts.sh",
+        &["--root", root.to_str().expect("a plain path")],
+    );
+    assert_eq!(outcome.status, 1, "{}{}", outcome.stdout, outcome.stderr);
+    assert!(outcome.stderr.contains("noble"), "{}", outcome.stderr);
+    assert!(untouched(&root));
+
+    // No sources file where the image keeps it.
+    let rig = Rig::new();
+    let root = runner_image(&rig);
+    fs::remove_file(sources_of(&root)).expect("no sources file");
+    let outcome = rig.run_script(
+        "scripts/ubuntu-archive-hosts.sh",
+        &["--root", root.to_str().expect("a plain path")],
+    );
+    assert_eq!(outcome.status, 1, "{}{}", outcome.stdout, outcome.stderr);
+    assert!(
+        outcome.stderr.contains("is not at") && outcome.stderr.contains("sources.list.d"),
+        "{}",
+        outcome.stderr
+    );
+    assert!(
+        !root
+            .join("etc/apt/sources.list.d/ubuntu-archive.sources")
+            .exists()
+    );
+
+    // A file of the new name beside the image's.
+    let rig = Rig::new();
+    let root = runner_image(&rig);
+    fs::write(
+        root.join("etc/apt/sources.list.d/ubuntu-archive.sources"),
+        "Types: deb\n",
+    )
+    .expect("a stray file");
+    let outcome = rig.run_script(
+        "scripts/ubuntu-archive-hosts.sh",
+        &["--root", root.to_str().expect("a plain path")],
+    );
+    assert_eq!(outcome.status, 1, "{}{}", outcome.stdout, outcome.stderr);
+    assert!(sources_of(&root).exists());
+    assert!(!root.join("etc/apt/ubuntu.sources.runner").exists());
+
+    // A command line it does not know.
+    let rig = Rig::new();
+    let outcome = rig.run_script("scripts/ubuntu-archive-hosts.sh", &["--mirror", "x"]);
+    assert_eq!(outcome.status, 2, "{}{}", outcome.stdout, outcome.stderr);
+}
+
 /// What Playwright's dry run prints, with the status it exits with, and what the package list
 /// script makes of it.
 fn playwright_names(printed: &str, status: i32) -> (Outcome, Vec<String>) {

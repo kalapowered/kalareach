@@ -88,6 +88,15 @@ jobs:
           rustc --version
           cargo --version
 
+      # The image's apt sources name a mirror that it picks by the runner's region, and one such
+      # mirror served a download at 79 kB/s on a day when the Ubuntu archive hosts served 12 to
+      # 36 MB/s. Every apt step of this job, and of the four jobs that install packages below, goes
+      # to the archive and security hosts by name. The script changes only the sources file, once
+      # (a second call changes nothing), and fails the step on an image that does not hold the file.
+      - name: Use the Ubuntu archive hosts
+        timeout-minutes: 2
+        run: bash scripts/ubuntu-archive-hosts.sh
+
       # The workspace contains the companion application's backend, which links the system WebView
       # and the window toolkit. A workspace-wide check needs them present before it can compile.
       # The login item's cases read the autostart entry kr writes with the desktop file validator
@@ -688,7 +697,7 @@ jobs:
   # job holds what the step needs of that job's setup: the disk freed, the pinned toolchain, and
   # the desktop packages that the workspace's release build links, from the same archives. It
   # restores no cargo cache: the builds go in a new directory, which no restored output serves.
-  # The steps' limits add up to 207 of the job's 210 minutes.
+  # The steps' limits add up to 209 of the job's 210 minutes.
   shipped-hold:
     name: shipped-hold
     runs-on: ubuntu-24.04
@@ -712,6 +721,10 @@ jobs:
           rustup show active-toolchain || rustup toolchain install
           rustc --version
           cargo --version
+
+      - name: Use the Ubuntu archive hosts
+        timeout-minutes: 2
+        run: bash scripts/ubuntu-archive-hosts.sh
 
       # The same list as the rust job's, from the same archives, with the deadline of its step.
       - name: Restore the desktop packages' archives
@@ -771,6 +784,10 @@ jobs:
           rustup show active-toolchain || rustup toolchain install
           rustc --version
           cargo --version
+
+      - name: Use the Ubuntu archive hosts
+        timeout-minutes: 2
+        run: bash scripts/ubuntu-archive-hosts.sh
 
       # Ubuntu 24.04 has squid in two builds, and the OpenSSL one is the one that intercepts TLS and
       # has the certificate helper. Installing the package starts a squid service of its own, which
@@ -2092,6 +2109,10 @@ jobs:
           rustup show active-toolchain || rustup toolchain install
           rustc --version
 
+      - name: Use the Ubuntu archive hosts
+        timeout-minutes: 2
+        run: bash scripts/ubuntu-archive-hosts.sh
+
       # What the shells need to configure and build from their own release tarballs. Upstream is
       # fetched, never vendored. The fish package is a Rust shell built through
       # CMake, and its own build turns the message catalogues with gettext. The install goes
@@ -2947,6 +2968,11 @@ jobs:
         run: |
           rustup show active-toolchain || rustup toolchain install
           rustc --version
+
+      - name: Use the Ubuntu archive hosts
+        if: runner.os == 'Linux'
+        timeout-minutes: 2
+        run: bash scripts/ubuntu-archive-hosts.sh
 
       # What the desktop shell links against on Linux: the WebView, its dependencies and the
       # window toolkit. macOS has its own in the system. The install goes through
