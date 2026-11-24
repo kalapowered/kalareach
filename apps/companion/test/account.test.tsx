@@ -15,6 +15,7 @@ import { AppProvider, type Place } from '../src/app/state'
 import { fakeHost } from '../src/host/fake'
 import type { HostPort } from '../src/host/port'
 import type { AccountView } from '../src/model/account'
+import { NOTICES_TITLE } from '../src/model/notices'
 import { PURCHASE_WORDS } from './purchase-words'
 
 const SESSION_MAIN = '8a7b6c50-22bb-4c3d-8e4f-000000000101'
@@ -39,6 +40,14 @@ describe('the desktop Account sheet', () => {
     expect(within(sheet).getByText('Sessions keep running while this is open.')).toBeInTheDocument()
     expect(await within(sheet).findByRole('button', { name: 'Sign in' })).toBeInTheDocument()
     expect(heading).toBeInTheDocument()
+  })
+
+  it('has the third-party notices row', async () => {
+    const person = userEvent.setup()
+    start()
+    await person.click(screen.getByRole('button', { name: /^Account/ }))
+    const sheet = await screen.findByRole('dialog', { name: 'Account' })
+    expect(within(sheet).queryByText(NOTICES_TITLE)).toBeInTheDocument()
   })
 
   it('carries a sign-in on with the sheet closed, and says who signed in', async () => {
