@@ -899,8 +899,9 @@ impl companion_tauri::services::SyncServices for Recording {
 }
 
 /// The transport of the sync service this computer reaches, with one fault: the first write of the
-/// bundle is applied by the service, and the answer names a place of nought, where no write of a
-/// bundle can be. The write has been sent and the store refuses what the service says about it.
+/// bundle after the fault is armed (the first of all, for [`Misreading::of`]) is applied by the
+/// service, and the answer names a place of nought, where no write of a bundle can be. The write
+/// has been sent and the store refuses what the service says about it.
 #[derive(Debug)]
 struct Misreads {
     http: HttpService,
@@ -982,6 +983,13 @@ struct Misreading {
 
 impl Misreading {
     fn of(computer: &Computer) -> Arc<Self> {
+        let service = Self::unarmed(computer);
+        service.arm();
+        service
+    }
+
+    /// The clients with the fault not yet set: the next write is answered truly until [`Self::arm`].
+    fn unarmed(computer: &Computer) -> Arc<Self> {
         let service = computer.origin();
         let http = HttpService::with(
             service.clone(),
@@ -994,9 +1002,16 @@ impl Misreading {
             key: computer.identity().keys.authorisation.clone(),
             http: Arc::new(Misreads {
                 http,
-                armed: std::sync::atomic::AtomicBool::new(true),
+                armed: std::sync::atomic::AtomicBool::new(false),
             }),
         })
+    }
+
+    /// Sets the fault: the next write the service applies is answered with a place of nought.
+    fn arm(&self) {
+        self.http
+            .armed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     fn client(&self) -> ManagedSyncService {
@@ -5223,6 +5238,78 @@ async fn a_first_write_of_the_settings_whose_applied_reply_is_refused_still_coun
         colour_in(&bundle_of(&computer, &page).await).as_deref(),
         Some("dark"),
         "the bundle holds what the first write carried"
+    );
+}
+
+/// KR-REQ-20.17: a step's own write that the service applied, and whose place the store refuses as
+/// it does a place no write of the bundle can be at, is ended at once and uses the window, as a
+/// write whose answer was lost is: the step writes at most once in a window. The first bundle
+/// carries no settings; the person chooses dark, and the step's write is answered with a place of
+/// nought. The step ends it and finds the settings landed; the person then chooses light, and the
+/// step that follows finds the window used.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_steps_write_whose_applied_reply_is_refused_is_ended_and_uses_the_window() {
+    let timing = SettingsTiming {
+        quiet: Duration::ZERO,
+        window: Duration::from_secs(600),
+    };
+    let computer = Computer::new().await;
+    let service = Misreading::unarmed(&computer);
+    let (page, settings) = computer
+        .saving_page_over(timing, level(OPEN), Some(Arc::clone(&service) as _))
+        .await;
+    page.call("recovery_turn_on", json!({})).expect("on");
+    assert_eq!(writes_sent(&computer), 1, "the first bundle");
+    assert_eq!(
+        colour_in(&bundle_of(&computer, &page).await),
+        None,
+        "nothing was chosen, so the first bundle carries no settings"
+    );
+
+    settings
+        .set_colour_mode(ColourMode::Dark)
+        .await
+        .expect("kept");
+    service.arm();
+    let step = page
+        .recovery
+        .save_settings(&page.account)
+        .await
+        .expect("a step");
+    assert!(
+        matches!(
+            step,
+            SettingsStep::Ended {
+                line: SettingsLine::Saved,
+                retry_at: None
+            }
+        ),
+        "the step ended its own write and found the settings landed: {step:?}"
+    );
+    assert_eq!(writes_sent(&computer), 2, "the step wrote once");
+    assert_eq!(page.view()["state"], "on", "nothing is left to settle");
+    assert_eq!(
+        colour_in(&bundle_of(&computer, &page).await).as_deref(),
+        Some("dark")
+    );
+
+    settings
+        .set_colour_mode(ColourMode::Light)
+        .await
+        .expect("kept");
+    let step = page
+        .recovery
+        .save_settings(&page.account)
+        .await
+        .expect("a step");
+    assert!(
+        matches!(step, SettingsStep::Deferred { .. }),
+        "the step's write used the window: {step:?}"
+    );
+    assert_eq!(
+        writes_sent(&computer),
+        2,
+        "no second write inside the window"
     );
 }
 

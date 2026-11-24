@@ -621,14 +621,20 @@ impl Recovery {
         let (line, reached, retry) = match outcome {
             Ok(SettingsSaved::AlreadySaved) => (SettingsLine::Saved, false, false),
             Ok(SettingsSaved::Saved { .. }) => (SettingsLine::Saved, true, false),
-            // The step's own write got no answer: it is ended now, and counts as saved only if the
-            // service says it landed.
-            Err(RecoveryError::BundleOutcomeUnknown { .. }) => {
-                match store.end_lost_write(&seed).await {
-                    Ok(Some(LostWrite::Applied)) => (SettingsLine::Saved, true, false),
-                    _ => (not_saved(NotSavedWhy::Service), true, true),
-                }
-            }
+            // The step's own write got no answer, or the service answered that it applied it and the
+            // store refuses the place it names, which leaves the write outstanding: it is ended
+            // now, and counts as saved only if the service says it landed.
+            Err(
+                RecoveryError::BundleOutcomeUnknown { .. }
+                | RecoveryError::BundleNotAWrite { .. }
+                | RecoveryError::BundlePutBack { .. }
+                | RecoveryError::BundleWentBack { .. }
+                | RecoveryError::BundleHistoryForked { .. }
+                | RecoveryError::BundleDidNotMoveOn { .. },
+            ) => match store.end_lost_write(&seed).await {
+                Ok(Some(LostWrite::Applied)) => (SettingsLine::Saved, true, false),
+                _ => (not_saved(NotSavedWhy::Service), true, true),
+            },
             Err(RecoveryError::BundleConflict { .. }) => {
                 (not_saved(NotSavedWhy::Moved), true, true)
             }
