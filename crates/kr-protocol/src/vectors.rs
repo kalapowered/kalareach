@@ -1105,7 +1105,7 @@ fn services() -> Value {
             ),
             recovery_bundle_case(
                 "recovery_bundle_with_settings",
-                "The same bundle once the owner device has saved its settings in it: one more member, an opaque byte string that only the settings restore reads, here 1,024 fixed bytes. The member sits in the canonical map under its own name, and the bundle's schema version is the same.",
+                "The same bundle once the owner device has saved its settings in it: one more member, an opaque byte string that the settings restore reads and a save of the settings decodes to compare it with what the device chose, here 1,024 fixed bytes. The member sits in the canonical map under its own name, and the bundle's schema version is the same.",
                 &recovery_bundle_with_settings(),
             ),
         ],
