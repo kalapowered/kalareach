@@ -12,6 +12,10 @@
 //! that the compositor does not support it and exits with a failure, which is an operation the tool
 //! cannot perform, apart from any other failure. The tool's own file is digested by the caller, so a
 //! replaced `grim` is a changed identity.
+//!
+//! The tool is looked for by its bare name, so a finding that it is not installed has no file to
+//! digest and nothing that changes it by itself. That finding is as old as the run of the checks
+//! that made it: installing `grim` is seen at the next run of the checks, and not before.
 
 use std::ffi::OsStr;
 
@@ -633,34 +637,37 @@ mod tests {
 
         // A removal that fails is said, whether or not the image was whole, and the image that
         // was whole is still a success: the tool makes the directory unwritable after it writes.
-        // What was kept is not claimed to be none of it.
-        let tools = Folder::new();
-        let scratch = Folder::new();
-        let image = tools.file("image.png", &whole_png);
-        tools.program(
-            "grim",
-            &format!(
-                "cp '{}' \"$1\"\nchmod 555 \"$(dirname \"$1\")\"",
-                image.display()
-            ),
-        );
-        let record = only(asked(
-            &desktop(Some("sway")),
-            variables(tools.path()),
-            scratch.path(),
-        ));
-        assert_eq!(record.state, CapabilityState::QualifiedAvailable);
-        assert!(
-            reason(&record)
-                .contains("-byte image of every output into memory, and it could not remove "),
-            "{}",
-            reason(&record)
-        );
-        assert!(
-            !reason(&record).contains("kept none of it"),
-            "{}",
-            reason(&record)
-        );
+        // What was kept is not claimed to be none of it. A privileged process can remove a file
+        // from a folder that is closed to it, so there it is not a removal that fails.
+        if permissions_are_enforced() {
+            let tools = Folder::new();
+            let scratch = Folder::new();
+            let image = tools.file("image.png", &whole_png);
+            tools.program(
+                "grim",
+                &format!(
+                    "cp '{}' \"$1\"\nchmod 555 \"$(dirname \"$1\")\"",
+                    image.display()
+                ),
+            );
+            let record = only(asked(
+                &desktop(Some("sway")),
+                variables(tools.path()),
+                scratch.path(),
+            ));
+            assert_eq!(record.state, CapabilityState::QualifiedAvailable);
+            assert!(
+                reason(&record)
+                    .contains("-byte image of every output into memory, and it could not remove "),
+                "{}",
+                reason(&record)
+            );
+            assert!(
+                !reason(&record).contains("kept none of it"),
+                "{}",
+                reason(&record)
+            );
+        }
     }
 
     /// Whether this process is held to the permissions of a file it owns: a privileged one is not.
@@ -989,6 +996,50 @@ mod tests {
         }
     }
 
+    /// A compositor a case started: ended and reaped when the guard goes out of scope, so that a
+    /// case that fails part of the way leaves none running.
+    struct Compositor(std::process::Child);
+
+    impl Drop for Compositor {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    /// KR-REQ-03.29, LP-12: the guard ends the program it holds when it goes out of scope. The
+    /// program's output pipe is read on a thread, and it reaches its end only when the program has
+    /// gone.
+    #[test]
+    fn a_compositor_a_case_started_is_ended_when_its_guard_goes_out_of_scope() {
+        use std::io::Read as _;
+
+        let mut program = std::process::Command::new("sleep")
+            .arg("30")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("a program that stays");
+        let mut output = program.stdout.take().expect("its output");
+        let guard = Compositor(program);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut rest = Vec::new();
+            let _ = output.read_to_end(&mut rest);
+            let _ = sender.send(());
+        });
+        assert!(
+            receiver.recv_timeout(Duration::from_millis(300)).is_err(),
+            "the program runs while the guard holds it"
+        );
+        drop(guard);
+        assert!(
+            receiver.recv_timeout(Duration::from_secs(10)).is_ok(),
+            "the program is gone once the guard is dropped"
+        );
+    }
+
     /// KR-REQ-03.29, KR-REQ-03.30, LP-5, the real leg: a headless sway and the real `grim` on a runner's facts
     /// (`WLR_RENDERER=pixman`, the socket read from the runtime folder, one output of 1280 by 720)
     /// give an image the check performs, and the file `grim` writes for itself is a whole PNG of
@@ -1009,21 +1060,24 @@ mod tests {
         let scratch = Folder::new();
         let config = runtime.file("config", b"");
         let log = std::fs::File::create(runtime.path().join("sway.log")).expect("a log");
-        let mut compositor = std::process::Command::new(&sway)
-            .arg("-c")
-            .arg(&config)
-            .env("XDG_RUNTIME_DIR", runtime.path())
-            .env("WLR_BACKENDS", "headless")
-            .env("WLR_RENDERER", "pixman")
-            .env("WLR_LIBINPUT_NO_DEVICES", "1")
-            .env_remove("WAYLAND_DISPLAY")
-            .env_remove("DISPLAY")
-            .env_remove("SWAYSOCK")
-            .stdin(std::process::Stdio::null())
-            .stdout(log.try_clone().expect("a log"))
-            .stderr(log)
-            .spawn()
-            .expect("sway starts");
+        // The guard ends sway when this case ends, however it ends.
+        let mut compositor = Compositor(
+            std::process::Command::new(&sway)
+                .arg("-c")
+                .arg(&config)
+                .env("XDG_RUNTIME_DIR", runtime.path())
+                .env("WLR_BACKENDS", "headless")
+                .env("WLR_RENDERER", "pixman")
+                .env("WLR_LIBINPUT_NO_DEVICES", "1")
+                .env_remove("WAYLAND_DISPLAY")
+                .env_remove("DISPLAY")
+                .env_remove("SWAYSOCK")
+                .stdin(std::process::Stdio::null())
+                .stdout(log.try_clone().expect("a log"))
+                .stderr(log)
+                .spawn()
+                .expect("sway starts"),
+        );
         // The display socket is read from the runtime folder: a name `wayland-` and a number.
         let socket = {
             let started = std::time::Instant::now();
@@ -1041,10 +1095,8 @@ mod tests {
                     break found;
                 }
                 if started.elapsed() > Duration::from_secs(20)
-                    || compositor.try_wait().expect("a wait").is_some()
+                    || compositor.0.try_wait().expect("a wait").is_some()
                 {
-                    let _ = compositor.kill();
-                    let _ = compositor.wait();
                     panic!(
                         "not run: sway made no display socket: {}",
                         std::fs::read_to_string(runtime.path().join("sway.log"))
@@ -1068,8 +1120,6 @@ mod tests {
             .output()
             .expect("grim runs");
         let measured = std::fs::read(&own).map(|bytes| payload::png(&bytes));
-        let _ = compositor.kill();
-        let _ = compositor.wait();
         let record = only(records);
         assert_eq!(
             record.state,
