@@ -186,6 +186,24 @@ impl Tally {
     }
 }
 
+/// What a binding's component did not see while the plugin runtime was away and it was started
+/// again, counted from the moment the runtime was lost until its baseline has been given. Bytes are
+/// the payload bytes, without the lane's own cost for an entry.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Outage {
+    /// Upstream frames the worker took off the lane and passed over. A request is not one: the
+    /// baseline gives it, if it is still pending.
+    pub passed: Tally,
+    /// Spans of terminal output the worker took off the lane and passed over.
+    pub terminal: Tally,
+    /// Observations the lane dropped for want of room.
+    pub dropped: Tally,
+    /// Pending requests queued to be decoded again when the component was registered.
+    pub decode_queued: u64,
+    /// Pending requests that could not be queued to be decoded again.
+    pub decode_full: u64,
+}
+
 /// What the lane lost of the upstream frames one package's table read on one instance.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NativeLoss {
@@ -313,6 +331,19 @@ pub struct View {
     /// The first entry the binding may be offered: those pushed before it was made ready are older
     /// than its view.
     pub ready_from: u64,
+    /// Whether the component that started again is still owed the requests the broker holds for it
+    /// (its baseline). Until it has them the binding is offered nothing and what is taken off the
+    /// lane for it is counted in [`Self::outage`].
+    pub rebuild_owed: bool,
+    /// The place in the broker's recording at which the baseline was read
+    /// ([`super::arbitration::Arbitration::next_recorded`]): a request recorded before it was
+    /// given with the baseline or left out of it, and is never offered again.
+    pub recorded_from: u64,
+    /// The connection to the plugin runtime the binding was last made ready under.
+    pub connection: u64,
+    /// What the component has not seen since the plugin runtime was lost, until its baseline is
+    /// given.
+    pub outage: Outage,
 }
 
 impl View {
@@ -731,12 +762,137 @@ impl ObservationLane {
         }
         let view = inner.views.entry(binding).or_default();
         view.ready = true;
+        view.connection = connection;
         view.silent_until = None;
         view.silence = None;
         view.snapshot_retry = None;
         view.ready_from = next;
         drop(inner);
         self.wake.notify_one();
+    }
+
+    /// Returns true when the binding has been ready before, so that a registration of it now is a
+    /// component that starts again and not a first one. A view is made when a binding first becomes
+    /// ready and kept, ready or not, until the lane forgets it ([`Self::forget`]).
+    #[must_use]
+    pub fn has_been_ready(&self, binding: BrokerBindingId) -> bool {
+        self.inner().views.contains_key(&binding)
+    }
+
+    /// Makes a binding whose component started again ready, owed what the broker holds for it.
+    ///
+    /// The component holds nothing, so what the view says it has missed is not owed a snapshot: the
+    /// loss and its note are cleared and the numbers met, and what is taken off the lane from now
+    /// until the baseline is given is counted in the outage, not as a loss. The entries pushed
+    /// before this call are older than the component's view and are passed over
+    /// ([`Self::count_passed`]); the first entry at or after it waits for the baseline
+    /// ([`Self::rebuilds_due`]). The outage the view holds is kept: it began when the runtime was
+    /// lost. `decode_queued` and `decode_full` are how many pending requests were queued to be
+    /// decoded again for the component, and how many could not be queued.
+    pub fn set_ready_for_rebuild(
+        &self,
+        binding: BrokerBindingId,
+        connection: u64,
+        decode_queued: u64,
+        decode_full: u64,
+    ) {
+        let mut inner = self.inner();
+        if inner
+            .marks
+            .get(&binding)
+            .is_some_and(|made| *made < connection)
+        {
+            inner.marks.remove(&binding);
+        }
+        let next = inner.next_seq;
+        let view = inner.views.entry(binding).or_default();
+        view.ready = true;
+        view.rebuild_owed = true;
+        view.connection = connection;
+        view.silent_until = None;
+        view.silence = None;
+        view.snapshot_retry = None;
+        view.ready_from = next;
+        view.snapshot_through = view.lost_seq;
+        view.loss_note = None;
+        view.offered_since_checkpoint = 0;
+        view.outage.decode_queued = decode_queued;
+        view.outage.decode_full = decode_full;
+        drop(inner);
+        self.wake.notify_one();
+    }
+
+    /// Counts an entry the pump took off the lane for a binding whose component was not given it
+    /// because the plugin runtime was away, or because its baseline is still owed. Returns true when
+    /// it was counted. A request is not counted: the baseline gives it if it is still pending.
+    pub fn count_passed(&self, binding: BrokerBindingId, entry: &Entry) -> bool {
+        let is_request = entry.is_authoritative();
+        if is_request {
+            return false;
+        }
+        let mut inner = self.inner();
+        let Some(view) = inner
+            .views
+            .get_mut(&binding)
+            .filter(|view| !view.ready || view.rebuild_owed)
+        else {
+            return false;
+        };
+        let payload = entry.cost.saturating_sub(ENTRY_OVERHEAD_BYTES);
+        match entry.source {
+            Source::Native(_) => view.outage.passed.add(payload),
+            Source::Terminal(_) => view.outage.terminal.add(payload),
+        }
+        true
+    }
+
+    /// Counts what the lane dropped for a binding whose component was not given it because the
+    /// plugin runtime was away, or because its baseline is still owed. Returns true when it was
+    /// counted, and false when the binding is to be told of it as a loss.
+    pub fn count_dropped(&self, binding: BrokerBindingId, lost: Tally) -> bool {
+        let mut inner = self.inner();
+        let Some(view) = inner
+            .views
+            .get_mut(&binding)
+            .filter(|view| !view.ready || view.rebuild_owed)
+        else {
+            return false;
+        };
+        let dropped = &mut view.outage.dropped;
+        dropped.events = dropped.events.saturating_add(lost.events);
+        dropped.bytes = dropped.bytes.saturating_add(
+            lost.bytes
+                .saturating_sub(lost.events.saturating_mul(ENTRY_OVERHEAD_BYTES)),
+        );
+        true
+    }
+
+    /// Returns the bindings that are ready, owed their baseline and not passed over for a while,
+    /// when the pump holds `entry` (the sequence number of the entry it took, where it took one): a
+    /// baseline is read only after every entry older than the component's view has been taken and
+    /// counted, and before the first entry at or after it is offered.
+    #[must_use]
+    pub fn rebuilds_due(&self, entry: Option<u64>, now: Instant) -> Vec<BrokerBindingId> {
+        self.inner()
+            .views
+            .iter()
+            .filter(|(_, view)| view.ready && view.rebuild_owed && !view.is_silent(now))
+            .filter(|(_, view)| entry.is_none_or(|seq| seq >= view.ready_from))
+            .map(|(binding, _)| *binding)
+            .collect()
+    }
+
+    /// Ends a binding's baseline: it is offered what is recorded from `boundary` on, and the outage
+    /// is handed back to be told. Returns nothing where the binding has no baseline owed.
+    pub fn finish_rebuild(&self, binding: BrokerBindingId, boundary: u64) -> Option<Outage> {
+        let mut inner = self.inner();
+        let view = inner
+            .views
+            .get_mut(&binding)
+            .filter(|view| view.rebuild_owed)?;
+        view.rebuild_owed = false;
+        view.recorded_from = boundary;
+        Some(std::mem::take(&mut view.outage))
     }
 
     /// Returns true when the binding may be offered something now.
@@ -1442,37 +1598,60 @@ impl Broker {
     /// package is the one whose table read the connection.
     #[must_use]
     pub fn observing(&self, audience: Audience<'_>) -> Vec<BrokerBindingId> {
+        self.bindings_of(audience, true)
+    }
+
+    /// Returns the bindings an entry would be offered to if their components were registered: the
+    /// bindings whose components were lost with the plugin runtime and are waiting to start again
+    /// are among them, and are counted what they were not offered.
+    #[must_use]
+    pub fn retaining(&self, audience: Audience<'_>) -> Vec<BrokerBindingId> {
+        self.bindings_of(audience, false)
+    }
+
+    fn bindings_of(&self, audience: Audience<'_>, registered: bool) -> Vec<BrokerBindingId> {
         let state = self.state();
         state
             .bindings
             .values()
-            .filter(|binding| binding.rich_disabled.is_none() && !binding.ending)
-            .filter(|binding| {
-                binding
-                    .grants
-                    .holds(kr_protocol::broker::BrokerGrant::Observation)
-            })
-            .filter(|binding| {
-                binding
-                    .component
-                    .as_ref()
-                    .is_some_and(|component| component.refusal.is_none())
-            })
-            .filter(|binding| {
-                matches!(
-                    state.component_states.get(&binding.binding_id),
+            .filter(|binding| state.retains(binding, audience, registered))
+            .map(|binding| binding.binding_id)
+            .collect()
+    }
+}
+
+impl super::BrokerState {
+    /// Returns true when a binding is offered the entries of an audience: it holds the
+    /// `Observation` grant and the stream the audience needs, its package ships a component the
+    /// package's own manifest agrees with, and it is neither rich-disabled nor ending. With
+    /// `registered`, its component must also be one the link has reported registered.
+    pub(super) fn retains(
+        &self,
+        binding: &super::Binding,
+        audience: Audience<'_>,
+        registered: bool,
+    ) -> bool {
+        binding.rich_disabled.is_none()
+            && !binding.ending
+            && binding
+                .grants
+                .holds(kr_protocol::broker::BrokerGrant::Observation)
+            && binding
+                .component
+                .as_ref()
+                .is_some_and(|component| component.refusal.is_none())
+            && (!registered
+                || matches!(
+                    self.component_states.get(&binding.binding_id),
                     Some((kr_protocol::admission::ComponentState::Registered, _))
-                )
-            })
-            .filter(|binding| match audience {
+                ))
+            && match audience {
                 Audience::Terminal => binding.streams.terminal,
                 Audience::Native { instance, package } => {
                     binding.streams.semantic
                         && binding.application_instance_id == instance
                         && package.is_none_or(|package| binding.package() == *package)
                 }
-            })
-            .map(|binding| binding.binding_id)
-            .collect()
+            }
     }
 }

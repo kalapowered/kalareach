@@ -83,6 +83,7 @@ pub mod probe;
 pub mod process;
 pub mod profiles;
 pub mod reading;
+pub mod rebuild;
 pub mod semantic;
 #[cfg(unix)]
 pub mod server;

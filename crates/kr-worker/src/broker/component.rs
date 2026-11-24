@@ -96,6 +96,9 @@ pub struct Execution {
 pub struct ComponentNotes {
     /// How the registration obtained the component and how long that took.
     pub registration: Option<String>,
+    /// That the component started again after the plugin runtime was lost, and what the worker gave
+    /// it and passed over then.
+    pub recovery: Option<String>,
     /// What the component has missed.
     pub loss: Option<String>,
     /// The last time a call into it faulted.
@@ -180,12 +183,20 @@ impl FaultNote {
 }
 
 impl ComponentNotes {
+    /// Records that the component started again and what the worker gave it and passed over then.
+    /// It holds nothing of what an earlier one missed, so that is no longer told.
+    fn started_again(&mut self, text: String) {
+        self.loss = None;
+        self.recovery = Some(text);
+    }
+
     fn text(&self, private: bool) -> Option<String> {
         let fault = self.fault.as_ref().map(|fault| fault.text(private));
         let decoding = self.decoding.map(DecodingNote::text);
         let encoding = self.encoding.map(EncodingNote::text);
         let parts: Vec<&str> = [
             self.registration.as_deref(),
+            self.recovery.as_deref(),
             self.loss.as_deref(),
             fault.as_deref(),
             decoding.as_deref(),
@@ -203,6 +214,9 @@ impl ComponentNotes {
 pub enum ComponentNote {
     /// How the registration obtained the component.
     Registration(String),
+    /// That the component started again after the plugin runtime was lost, and what the worker gave
+    /// it and passed over then.
+    Recovery(String),
     /// What the component has missed.
     Loss(String),
     /// A fault in a call into the component.
@@ -392,6 +406,7 @@ impl BrokerState {
         let notes = self.component_notes.entry(binding_id).or_default();
         match note {
             ComponentNote::Registration(text) => notes.registration = Some(text),
+            ComponentNote::Recovery(text) => notes.started_again(text),
             ComponentNote::Loss(text) => notes.loss = Some(text),
             ComponentNote::Fault(text) => notes.fault = Some(text),
             ComponentNote::Decoding(last) => {
@@ -623,5 +638,79 @@ impl Broker {
             .streams = streams;
         state.component_changes.notify_one();
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::broker::rebuild::Recovery;
+
+    #[test]
+    fn notes_are_told_in_the_order_the_component_lived_them() {
+        let notes = ComponentNotes {
+            registration: Some("compiled in 12 ms".to_owned()),
+            recovery: Some("started again".to_owned()),
+            loss: Some("lost".to_owned()),
+            fault: Some(FaultNote {
+                call: "decode".to_owned(),
+                detail: Some("trap".to_owned()),
+                faults_in_window: 1,
+            }),
+            decoding: Some(DecodingNote {
+                count: 2,
+                last: NotDecoded::Declined,
+            }),
+            encoding: Some(EncodingNote {
+                count: 3,
+                last: NotEncoded::Declined,
+            }),
+        };
+        assert_eq!(
+            notes.text(false).as_deref(),
+            Some(
+                "compiled in 12 ms; started again; lost; last fault, in decode: trap (1 in the \
+                 last minute); 2 requests were not decoded; the last: the component declined; 3 \
+                 answers were not written; the last: the component declined"
+            )
+        );
+    }
+
+    #[test]
+    fn a_component_that_started_again_is_not_told_as_missing_what_an_earlier_one_missed() {
+        let mut notes = ComponentNotes {
+            registration: Some("compiled in 12 ms".to_owned()),
+            loss: Some("2 observations were dropped; a fresh snapshot was taken".to_owned()),
+            ..ComponentNotes::default()
+        };
+        notes.started_again("started again".to_owned());
+        assert_eq!(
+            notes.text(false).as_deref(),
+            Some("compiled in 12 ms; started again")
+        );
+    }
+
+    #[test]
+    fn what_a_long_outage_says_does_not_cut_the_notes_that_follow_it() {
+        let notes = ComponentNotes {
+            registration: Some("loaded from the compiled-code cache in 120 ms".to_owned()),
+            recovery: Some(Recovery::after_a_long_outage().words()),
+            decoding: Some(DecodingNote {
+                count: 999,
+                last: NotDecoded::Failed,
+            }),
+            encoding: Some(EncodingNote {
+                count: 999,
+                last: NotEncoded::Failed,
+            }),
+            ..ComponentNotes::default()
+        };
+        let text = notes.text(false).expect("the notes say something");
+        let (_, was_cut) = cut(&text);
+        assert!(
+            !was_cut,
+            "{} bytes of {MAX_REPORT_DETAIL_BYTES}: {text}",
+            text.len()
+        );
     }
 }

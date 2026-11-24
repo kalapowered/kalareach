@@ -18,7 +18,7 @@ use std::sync::Arc;
 use kr_protocol::ids::{ApplicationInstanceId, BrokerBindingId, PluginId, PublisherId};
 use kr_protocol::scalars::{Digest256, Uuid};
 use kr_worker::broker::PackageIdentity;
-use kr_worker::broker::observation::{Held, NativeFrame, ObservationLane};
+use kr_worker::broker::observation::{Held, NativeFrame, ObservationLane, Outage, Tally};
 
 /// A span of terminal output of `bytes` bytes.
 fn span(bytes: usize) -> Arc<Vec<u8>> {
@@ -429,4 +429,178 @@ fn kr_req_24_27_a_mark_outlasts_an_unbinding_on_the_connection_it_was_made_on() 
     lane.began_connection();
     lane.forget_unwanted(&std::collections::BTreeSet::new());
     assert!(!lane.is_marked(other));
+}
+
+/// An upstream frame nobody is waiting on, of `bytes` bytes.
+fn news(bytes: usize) -> NativeFrame {
+    NativeFrame {
+        request_id: None,
+        ..request(bytes)
+    }
+}
+
+fn binding_of(byte: u8) -> BrokerBindingId {
+    BrokerBindingId::new(Uuid::from_bytes([byte; 16]))
+}
+
+/// KR-REQ-24.24: a component that starts again holds nothing of what an earlier one missed, so the
+/// loss the view held and the snapshot it owed are gone, and what the lane lost since is counted in
+/// the outage instead.
+#[test]
+fn kr_req_24_24_a_component_that_starts_again_owes_no_snapshot_for_what_the_earlier_one_missed() {
+    let lane = ObservationLane::new();
+    let binding = binding_of(21);
+    lane.began_connection();
+    lane.set_ready(binding, lane.connection());
+    lane.lose(binding, "an observation was passed over".to_owned());
+    assert_eq!(lane.view(binding).and_then(|view| view.owes()), Some(1));
+
+    lane.all_not_ready();
+    lane.began_connection();
+    lane.set_ready_for_rebuild(binding, lane.connection(), 0, 0);
+    let view = lane.view(binding).expect("the view stays");
+    assert_eq!(view.owes(), None, "a fresh component owes a snapshot");
+    assert_eq!(view.loss_note, None);
+    assert!(view.ready && view.rebuild_owed);
+    assert!(lane.owing(tokio::time::Instant::now()).is_empty());
+}
+
+/// KR-REQ-24.24: a binding is registered again, and not for the first time, only while the lane
+/// holds a view of it that was ever ready. A view the lane forgot is a first registration.
+#[test]
+fn kr_req_24_24_a_binding_the_lane_forgot_registers_as_a_first_one() {
+    let lane = ObservationLane::new();
+    let binding = binding_of(22);
+    assert!(!lane.has_been_ready(binding));
+    lane.began_connection();
+    lane.set_ready(binding, lane.connection());
+    assert!(lane.has_been_ready(binding));
+    lane.all_not_ready();
+    assert!(
+        lane.has_been_ready(binding),
+        "a runtime lost made the next registration a first one"
+    );
+    lane.forget(binding);
+    assert!(!lane.has_been_ready(binding));
+}
+
+/// KR-REQ-24.24: what the pump takes off the lane for a binding whose runtime is away, or whose
+/// baseline is owed, is counted by its payload bytes (not the lane's cost for the entry), a request
+/// is not counted, and a binding that was never ready is counted nothing.
+#[test]
+fn kr_req_24_24_what_is_taken_while_the_runtime_is_away_is_counted_by_its_payload_bytes() {
+    let lane = ObservationLane::new();
+    lane.set_wanted(true, true);
+    let binding = binding_of(23);
+    let never = binding_of(24);
+    lane.began_connection();
+    lane.set_ready(binding, lane.connection());
+    lane.all_not_ready();
+    for _ in 0..3 {
+        lane.push_native(news(100), 1);
+    }
+    lane.push_native(request(400), 1);
+    for _ in 0..2 {
+        lane.push_terminal(&span(500), 1);
+    }
+    while let Some(entry) = lane.take().entry {
+        let counted = lane.count_passed(binding, &entry);
+        assert_eq!(counted, !entry.is_authoritative());
+        assert!(!lane.count_passed(never, &entry));
+        lane.finish(&entry);
+    }
+    assert!(lane.count_dropped(
+        binding,
+        Tally {
+            events: 2,
+            bytes: 456
+        }
+    ));
+    assert!(!lane.count_dropped(
+        never,
+        Tally {
+            events: 1,
+            bytes: 10
+        }
+    ));
+
+    lane.began_connection();
+    lane.set_ready_for_rebuild(binding, lane.connection(), 8, 1);
+    let outage = lane.view(binding).expect("the view stays").outage;
+    assert_eq!(
+        outage,
+        Outage {
+            passed: Tally {
+                events: 3,
+                bytes: 300
+            },
+            terminal: Tally {
+                events: 2,
+                bytes: 1000
+            },
+            dropped: Tally {
+                events: 2,
+                bytes: 200
+            },
+            decode_queued: 8,
+            decode_full: 1,
+        }
+    );
+}
+
+/// KR-REQ-24.24: the baseline is read after every entry older than the component's view has been
+/// taken and counted, and before the first entry at or after it is offered, and not while the
+/// binding is passed over for a time.
+#[test]
+fn kr_req_24_24_a_baseline_comes_after_the_older_entries_and_before_the_first_newer_one() {
+    let lane = ObservationLane::new();
+    lane.set_wanted(true, true);
+    let binding = binding_of(25);
+    let now = tokio::time::Instant::now();
+    lane.began_connection();
+    lane.set_ready(binding, lane.connection());
+    lane.all_not_ready();
+    lane.push_terminal(&span(10), 1);
+    lane.push_terminal(&span(10), 1);
+    lane.began_connection();
+    lane.set_ready_for_rebuild(binding, lane.connection(), 0, 0);
+    lane.push_terminal(&span(10), 1);
+    let due = |entry: Option<u64>| lane.rebuilds_due(entry, now);
+    assert!(
+        due(Some(0)).is_empty() && due(Some(1)).is_empty(),
+        "before the older entries are taken"
+    );
+    assert_eq!(due(Some(2)), vec![binding]);
+    assert_eq!(due(None), vec![binding], "where no entry waits");
+    lane.go_silent(binding, now);
+    assert!(
+        due(Some(2)).is_empty(),
+        "a binding passed over for a time is not due"
+    );
+}
+
+/// KR-REQ-24.24: the baseline ends once, hands the outage back to be told, and moves the place from
+/// which requests are offered again.
+#[test]
+fn kr_req_24_24_a_baseline_ends_once_and_hands_the_outage_back() {
+    let lane = ObservationLane::new();
+    let binding = binding_of(26);
+    lane.began_connection();
+    lane.set_ready(binding, lane.connection());
+    lane.all_not_ready();
+    lane.began_connection();
+    lane.set_ready_for_rebuild(binding, lane.connection(), 2, 0);
+    let outage = lane
+        .finish_rebuild(binding, 17)
+        .expect("a baseline was owed");
+    assert_eq!(outage.decode_queued, 2);
+    let view = lane.view(binding).expect("the view stays");
+    assert!(!view.rebuild_owed);
+    assert_eq!(view.recorded_from, 17);
+    assert_eq!(view.outage, Outage::default());
+    assert_eq!(lane.finish_rebuild(binding, 99), None);
+    assert!(
+        lane.rebuilds_due(None, tokio::time::Instant::now())
+            .is_empty()
+    );
 }
