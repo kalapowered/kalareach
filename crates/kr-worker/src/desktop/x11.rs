@@ -115,7 +115,7 @@ const TOOLS: [Tool; 4] = [
             asking: Asking::Never,
         },
         program: PROGRAM_NAMES[2],
-        before: &[],
+        before: &["-z"],
         file: "capture.png",
         image: Image::Png,
     },
@@ -208,11 +208,12 @@ fn perform_in(plan: &Plan, setting: &Setting<'_>, operation: &Operation, sockets
     let _ = payload::remove_image(&image);
     let vector = tool.vector(&image);
     let arguments: Vec<&str> = vector.iter().map(String::as_str).collect();
+    let run_directory = plan.scratch.to_string_lossy();
     let ran = bounded_with(
         check,
         program,
         &arguments,
-        &environment_of(setting.variables, display),
+        &environment_of(setting.variables, display, &run_directory),
         plan,
         setting.deadline,
     );
@@ -318,7 +319,12 @@ fn named(display: &str) -> Named {
     }
 }
 
-/// The child's environment: the display and the authority this worker holds, and no Wayland socket.
+/// The child's environment: the display and the authority this worker holds, no Wayland socket, and
+/// the check's own directory for the files the child makes on the side.
+///
+/// ImageMagick keeps the pixels of an image above its memory limit in a file in `TMPDIR` or
+/// `MAGICK_TEMPORARY_PATH`, and a child that is ended at the deadline does not remove it. In the
+/// check's own directory it goes with the directory.
 ///
 /// The rest is the worker's own, so that a tool finds its home folder and its search path. A
 /// worker that holds no authority gives the child none, so that the child does not read the one of
@@ -327,11 +333,14 @@ fn named(display: &str) -> Named {
 fn environment_of<'a>(
     variables: &'a Variables,
     display: &'a str,
-) -> [(&'static str, Option<&'a str>); 3] {
+    run_directory: &'a str,
+) -> [(&'static str, Option<&'a str>); 5] {
     [
         ("DISPLAY", Some(display)),
         ("WAYLAND_DISPLAY", None),
         ("XAUTHORITY", variables.authority.as_deref()),
+        ("TMPDIR", Some(run_directory)),
+        ("MAGICK_TEMPORARY_PATH", Some(run_directory)),
     ]
 }
 
@@ -897,7 +906,7 @@ mod tests {
                 "import",
                 &["-silent", "-window", "root", "/run/dir/capture.png"],
             ),
-            ("scrot", &["/run/dir/capture.png"]),
+            ("scrot", &["-z", "/run/dir/capture.png"]),
             ("xwd", &["-root", "-silent", "-out", "/run/dir/capture.xwd"]),
         ];
         assert_eq!(vectors.len(), expected.len());
@@ -929,7 +938,9 @@ mod tests {
             "#!/bin/sh\n\
              here=$(dirname \"$0\")\n\
              { echo \"DISPLAY=${DISPLAY-unset}\"; echo \"XAUTHORITY=${XAUTHORITY-unset}\"; \
-             echo \"WAYLAND_DISPLAY=${WAYLAND_DISPLAY-unset}\"; } > \"$here/seen\"\n\
+             echo \"WAYLAND_DISPLAY=${WAYLAND_DISPLAY-unset}\"; \
+             echo \"TMPDIR=${TMPDIR-unset}\"; \
+             echo \"MAGICK_TEMPORARY_PATH=${MAGICK_TEMPORARY_PATH-unset}\"; } > \"$here/seen\"\n\
              for last do :; done\n\
              cp \"$here/whole.png\" \"$last\"\n",
         )
@@ -974,6 +985,8 @@ mod tests {
             .args(["--exact", &name, "--nocapture", "--test-threads=1"])
             .env("DISPLAY", ":8")
             .env("WAYLAND_DISPLAY", "wayland-9")
+            .env("TMPDIR", "/inherited/temporary")
+            .env("MAGICK_TEMPORARY_PATH", "/inherited/magick")
             .env(INNER, folder.path())
             .output()
             .expect("the test binary starts");
@@ -994,6 +1007,10 @@ mod tests {
         };
         assert_eq!(std::env::var("DISPLAY").as_deref(), Ok(":8"));
         assert_eq!(std::env::var("WAYLAND_DISPLAY").as_deref(), Ok("wayland-9"));
+        assert_eq!(
+            std::env::var("TMPDIR").as_deref(),
+            Ok("/inherited/temporary")
+        );
         recording_tool(&folder);
         let scratch = folder.join("run");
         let plan = Plan::in_directory(&scratch);
@@ -1006,10 +1023,16 @@ mod tests {
         let ran = perform_with(&plan, &folder, &variables, &folder);
         assert!(matches!(ran.outcome, Outcome::Performed { .. }), "{ran:?}");
         let seen = std::fs::read_to_string(folder.join("seen")).expect("what the tool saw");
+        // The files the tool makes on the side go to the check's own directory, not to the folder
+        // the process that runs the check names.
+        let run_directory = scratch.to_string_lossy();
         assert_eq!(
             seen,
-            "DISPLAY=:6\nXAUTHORITY=/home/someone/.Xauthority-of-the-login\n\
-             WAYLAND_DISPLAY=unset\n"
+            format!(
+                "DISPLAY=:6\nXAUTHORITY=/home/someone/.Xauthority-of-the-login\n\
+                 WAYLAND_DISPLAY=unset\nTMPDIR={run_directory}\n\
+                 MAGICK_TEMPORARY_PATH={run_directory}\n"
+            )
         );
         // A worker that holds no authority gives the tool none.
         let variables = Variables {
