@@ -1446,11 +1446,10 @@ impl BindingHandle {
 
     /// Restores state from a checkpoint this build produced.
     ///
-    /// With `through`, what the instance has consumed becomes what the state was taken at, and is
-    /// clean, once the restore has answered. Without it the position stays and is no longer clean:
-    /// the state covers events the position cannot name. A restore the component declines changes
-    /// nothing. It restores whether or not the binding has been offered an event: a caller that
-    /// sets a position from the state calls [`Self::restore_if_unoffered`] instead.
+    /// The position stays and is no longer clean: the state covers events the position cannot name.
+    /// A restore the component declines changes nothing. It restores whether or not the binding has
+    /// been offered an event: a caller that sets a position from the state calls
+    /// [`Self::restore_if_unoffered`] instead.
     ///
     /// # Errors
     ///
@@ -1458,10 +1457,28 @@ impl BindingHandle {
     pub async fn restore(
         &self,
         state: Vec<u8>,
-        through: Option<Through>,
         deadline: core::time::Duration,
     ) -> RuntimeResult<CallResult<Restored>> {
-        self.restore_as(state, through, false, deadline).await
+        self.restore_as(state, None, false, deadline).await
+    }
+
+    /// Restores state and sets the position it was taken at, whether or not the binding has been
+    /// offered an event: what the instance has consumed becomes `through`, and is clean, once the
+    /// restore has answered. It is for the tests of what a restore does to the position; a caller
+    /// that sets a position from the state calls [`Self::restore_if_unoffered`], which leaves the
+    /// decision to the binding's thread.
+    ///
+    /// # Errors
+    ///
+    /// Returns the component's failure, or [`RuntimeError::CallerDeadline`].
+    #[cfg(feature = "testing")]
+    pub async fn restore_through_unchecked(
+        &self,
+        state: Vec<u8>,
+        through: Through,
+        deadline: core::time::Duration,
+    ) -> RuntimeResult<CallResult<Restored>> {
+        self.restore_as(state, Some(through), false, deadline).await
     }
 
     /// Restores state and sets the position it was taken at, if the binding was never offered an

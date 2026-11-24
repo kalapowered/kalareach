@@ -980,7 +980,7 @@ impl PluginHost {
                 let deadline = core::time::Duration::from_millis(deadline_ms);
                 let result = match through {
                     Some(through) => binding.restore_if_unoffered(state, through, deadline).await,
-                    None => binding.restore(state, None, deadline).await,
+                    None => binding.restore(state, deadline).await,
                 };
                 called_of(result.map(|result| {
                     // A registration that had been offered an event is one the binding restored
