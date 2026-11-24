@@ -546,7 +546,7 @@ describe('the inbox of a phone paired with two hosts', () => {
       expect(rowsOf('laptop')).toHaveLength(0)
     })
     expect(screen.getByText('Reading the inbox…')).toBeInTheDocument()
-    expect(screen.queryByText(/Nothing needs you/)).toBeNull()
+    expect(screen.queryByText(/No item here says that anything needs you/)).toBeNull()
     held.release()
   })
 

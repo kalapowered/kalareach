@@ -265,9 +265,21 @@ describe('the attention inbox (KR-REQ-13.01, 13.02)', () => {
     }
   })
 
-  it('filters to one kind and says what an empty filter means', () => {
+  it('filters to one kind', () => {
     expect(filter(order(INBOX, NOW), 'failed_action')).toHaveLength(1)
-    expect(emptyMessage('disconnected')).toBe('Every host is in contact.')
+  })
+
+  // An empty list shows that no item says something, not that the thing is not so: an acknowledged
+  // item still stands and an item the host let go may leave its condition behind.
+  it.each([
+    ['pending_decision', 'No item here says that something is waiting for you.'],
+    ['failed_action', 'No item here says that something did not finish.'],
+    ['awaiting_review', 'No item here says that finished work is ready to review.'],
+    ['disconnected', 'No item here says that a host is out of contact.'],
+    ['notice', 'No item here says that an application asked for attention.'],
+    ['all', 'No item here says that anything needs you.']
+  ] as const)('says of an empty %s list what no item in it says', (chosen, words) => {
+    expect(emptyMessage(chosen)).toBe(words)
   })
 
   it('says a notice a program printed is not a request from the host, and never a decision', () => {

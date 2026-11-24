@@ -558,7 +558,7 @@ if platform == "android":
         say("a notification the person left alone until its question had run out of time opened the Attention screen, which says that nothing needs the person and offers nothing to send, and the host holds the question as expired with no answer",
             report.get("untouched_shown") is True and isinstance(shown_ms, int) and shown_ms > 0
             and report.get("untouched_expired_without_an_answer") is True and "PUSH-TAPPED" in late and "Attention" in late
-            and "PUSH-EMPTY" in late and "Nothing needs you right now." in late.split("PUSH-EMPTY", 1)[1]
+            and "PUSH-EMPTY" in late and "No item here says that anything needs you." in late.split("PUSH-EMPTY", 1)[1]
             and "Send answer" not in late.split("PUSH-EMPTY", 1)[1] and "A question is waiting" not in late.split("PUSH-EMPTY", 1)[1]
             and report.get("untouched_still_expired_without_an_answer") is True,
             late[:300].replace("\n", " "))

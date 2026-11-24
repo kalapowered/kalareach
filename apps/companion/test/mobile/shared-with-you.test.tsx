@@ -662,7 +662,7 @@ describe('a guest, whose pairing holds no view of any session (KR-REQ-25.28)', (
     start({ before: (c) => c.sharing.offer() })
     expect(await screen.findByText(INVITATION)).toBeInTheDocument()
     await waitFor(() => {
-      expect(screen.getByText('Nothing needs you right now.')).toBeInTheDocument()
+      expect(screen.getByText('No item here says that anything needs you.')).toBeInTheDocument()
     })
     expect(screen.queryByText('The inbox could not be read')).toBeNull()
   })
@@ -785,7 +785,7 @@ describe('a host that does not know the read (KR-REQ-18.13)', () => {
 describe('an invitation that arrives while the inbox is open (KR-REQ-18.13)', () => {
   it('is told once to a screen reader and takes its place at the head', async () => {
     const { controls, port } = start()
-    await screen.findByText('Nothing needs you right now.')
+    await screen.findByText('No item here says that anything needs you.')
     // An invitation the first read of what is held already lists was there before the inbox was
     // open, so it is not one that arrives: the first read is taken in before this one is offered.
     await waitFor(() => {

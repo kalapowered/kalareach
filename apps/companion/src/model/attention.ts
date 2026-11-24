@@ -361,17 +361,17 @@ export function filter(
 export function emptyMessage(chosen: AttentionFilter): string {
   switch (chosen) {
     case 'pending_decision':
-      return 'Nothing is waiting for you.'
+      return 'No item here says that something is waiting for you.'
     case 'failed_action':
-      return 'Nothing has failed.'
+      return 'No item here says that something did not finish.'
     case 'awaiting_review':
-      return 'Nothing is waiting to be reviewed.'
+      return 'No item here says that finished work is ready to review.'
     case 'disconnected':
-      return 'Every host is in contact.'
+      return 'No item here says that a host is out of contact.'
     case 'notice':
-      return 'No application has asked for attention.'
+      return 'No item here says that an application asked for attention.'
     case 'all':
-      return 'Nothing needs you right now.'
+      return 'No item here says that anything needs you.'
   }
 }
 

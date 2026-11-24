@@ -213,7 +213,7 @@ def empty(phone: Phone) -> None:
     def said(nodes: list[dict]) -> bool:
         labels = [each["label"] for each in nodes]
         return (
-            any(label == "Nothing needs you right now." for label in labels)
+            any(label == "No item here says that anything needs you." for label in labels)
             and not any(label.startswith("A question is waiting") for label in labels)
             and not any(label == "Send answer" for label in labels)
         )

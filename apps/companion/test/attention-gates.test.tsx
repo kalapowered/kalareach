@@ -175,7 +175,7 @@ describe('the contact row comes from the connection state', () => {
     await waitFor(() => {
       expect(screen.queryByTestId('attention-disconnected')).toBeNull()
     })
-    expect(screen.queryByText('Every host is in contact.')).toBeNull()
+    expect(screen.queryByText('No item here says that a host is out of contact.')).toBeNull()
     expect(contactRows()).toHaveLength(1)
   })
 
