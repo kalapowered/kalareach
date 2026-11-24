@@ -24,7 +24,7 @@ Commands, each given the adb program, the emulator's serial and a screenshot dir
       had chosen, and offers nothing to send. Prints `PUSH-ENDED <what the screen shows>`.
 
   tap-empty <words>
-      As `tap`, and then waits until the Attention screen says that nothing needs the person, with no
+      As `tap`, and then waits until the Attention screen says that no item there says that anything needs the person, with no
       waiting question and nothing to send. Prints `PUSH-TAPPED ...` and then `PUSH-EMPTY <what the
       screen shows>`.
 
@@ -208,7 +208,7 @@ def observe(phone: Phone) -> None:
 
 
 def empty(phone: Phone) -> None:
-    """Waits for the Attention screen to say that nothing needs the person: no waiting question and
+    """Waits for the Attention screen to say that no item there says that anything needs the person: no waiting question and
     nothing to send. The words are the page's own for an empty list."""
     def said(nodes: list[dict]) -> bool:
         labels = [each["label"] for each in nodes]
@@ -218,7 +218,7 @@ def empty(phone: Phone) -> None:
             and not any(label == "Send answer" for label in labels)
         )
 
-    phone.wait_screen(said, "the Attention screen to say that nothing needs you", 60, nudging=True)
+    phone.wait_screen(said, "the Attention screen to say that no item there says that anything needs you", 60, nudging=True)
     phone.shot("empty")
     print(f"PUSH-EMPTY {texts(phone)}", flush=True)
 

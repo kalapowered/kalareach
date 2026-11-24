@@ -555,7 +555,7 @@ if platform == "android":
               + ("on the screen" if "so this attempt changed nothing" in ended else "not on the screen") + " in that read")
         late = report.get("expire_tap_step") or ""
         shown_ms = report.get("untouched_shown_with_ms_left")
-        say("a notification the person left alone until its question had run out of time opened the Attention screen, which says that nothing needs the person and offers nothing to send, and the host holds the question as expired with no answer",
+        say("a notification the person left alone until its question had run out of time opened the Attention screen, which says that no item there says that anything needs the person and offers nothing to send, and the host holds the question as expired with no answer",
             report.get("untouched_shown") is True and isinstance(shown_ms, int) and shown_ms > 0
             and report.get("untouched_expired_without_an_answer") is True and "PUSH-TAPPED" in late and "Attention" in late
             and "PUSH-EMPTY" in late and "No item here says that anything needs you." in late.split("PUSH-EMPTY", 1)[1]
