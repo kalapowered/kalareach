@@ -1662,6 +1662,12 @@ mod tests {
         }
     }
 
+    /// A root as a refusal writes it into a command of `kind`'s shell, which is what `quote` makes
+    /// of it: a path with a `\` in it is quoted, as every path on a Windows host is.
+    fn quoted_root(kind: ShellKind, root: &Path) -> String {
+        quote(kind, &root.display().to_string())
+    }
+
     /// The refusal of `kind`'s record in `set`, which must be one that this host cannot read.
     fn refusal(set: &PackageSet, kind: ShellKind) -> String {
         assert!(set.packages().is_empty(), "no record is a package");
@@ -1708,9 +1714,15 @@ mod tests {
     fn a_built_package_that_declares_no_flags_is_refused_and_the_build_at_its_root_is_named() {
         let root = tempfile::tempdir().expect("a directory");
         let spaced = root.path().join("a root");
+        // A root with a `\` in it on every platform, as every root is on a Windows host.
+        let slashed = root.path().join(r"back\slash");
         for (path, written) in [
-            (root.path().to_path_buf(), root.path().display().to_string()),
+            (
+                root.path().to_path_buf(),
+                quoted_root(ShellKind::Bash, root.path()),
+            ),
             (spaced.clone(), format!("'{}'", spaced.display())),
+            (slashed.clone(), format!("'{}'", slashed.display())),
         ] {
             install_without_flags(&path, &[ShellKind::Zsh, ShellKind::Bash, ShellKind::Fish]);
             let set = PackageSet::discover(&path).expect("reads what it can");
@@ -1747,16 +1759,26 @@ mod tests {
     {
         let root = tempfile::tempdir().expect("a directory");
         let spaced = root.path().join("a root");
+        // A root with a `\` in it on every platform, as every root is on a Windows host.
+        let slashed = root.path().join(r"back\slash");
         install_without_flags(root.path(), &[ShellKind::PowerShell]);
         install_without_flags(&spaced, &[ShellKind::PowerShell]);
+        install_without_flags(&slashed, &[ShellKind::PowerShell]);
         for (set, prefix) in [
             (
                 PackageSet::discover(root.path()).expect("reads what it can"),
-                Some(format!("-Prefix {}", root.path().display())),
+                Some(format!(
+                    "-Prefix {}",
+                    quoted_root(ShellKind::PowerShell, root.path())
+                )),
             ),
             (
                 PackageSet::discover(&spaced).expect("reads what it can"),
                 Some(format!("-Prefix '{}'", spaced.display())),
+            ),
+            (
+                PackageSet::discover(&slashed).expect("reads what it can"),
+                Some(format!("-Prefix '{}'", slashed.display())),
             ),
             (
                 PackageSet::discover_release(root.path()).expect("reads what it can"),
@@ -1792,37 +1814,50 @@ mod tests {
     #[test]
     fn a_package_read_by_its_directory_that_declares_no_flags_names_the_step_of_each_home() {
         let root = tempfile::tempdir().expect("a directory");
-        install_without_flags(
-            root.path(),
-            &[ShellKind::Zsh, ShellKind::Fish, ShellKind::PowerShell],
-        );
-        for kind in [ShellKind::Zsh, ShellKind::Fish] {
-            let directory = root.path().join(kind.as_str()).join("identity-1");
+        // A root with a `\` in it on every platform, as every root is on a Windows host.
+        let slashed = root.path().join(r"back\slash");
+        for (home, build, publish) in [
+            (
+                root.path().to_path_buf(),
+                quoted_root(ShellKind::Bash, root.path()),
+                quoted_root(ShellKind::PowerShell, root.path()),
+            ),
+            (
+                slashed.clone(),
+                format!("'{}'", slashed.display()),
+                format!("'{}'", slashed.display()),
+            ),
+        ] {
+            install_without_flags(
+                &home,
+                &[ShellKind::Zsh, ShellKind::Fish, ShellKind::PowerShell],
+            );
+            for kind in [ShellKind::Zsh, ShellKind::Fish] {
+                let directory = home.join(kind.as_str()).join("identity-1");
+                let said = ShellPackage::read(&directory)
+                    .expect_err("the record is refused")
+                    .to_string();
+                assert!(
+                    said.contains(&format!(
+                        "the record declares no flags; if this package is a build, build it again \
+                         from current sources with scripts/build-shells.sh --{} --force --prefix \
+                         {build}; if it is in an installed release, replace the installed release",
+                        kind.as_str()
+                    )),
+                    "{kind:?}: {said}"
+                );
+            }
+            let directory = home.join("powershell").join("identity-1");
             let said = ShellPackage::read(&directory)
                 .expect_err("the record is refused")
                 .to_string();
             assert!(
                 said.contains(&format!(
-                    "the record declares no flags; if this package is a build, build it again from \
-                     current sources with scripts/build-shells.sh --{} --force --prefix {}; if it \
-                     is in an installed release, replace the installed release",
-                    kind.as_str(),
-                    root.path().display()
+                    "run {PUBLISH_COMMAND} -Prefix {publish} in PowerShell"
                 )),
-                "{kind:?}: {said}"
+                "{said}"
             );
         }
-        let directory = root.path().join("powershell").join("identity-1");
-        let said = ShellPackage::read(&directory)
-            .expect_err("the record is refused")
-            .to_string();
-        assert!(
-            said.contains(&format!(
-                "run {PUBLISH_COMMAND} -Prefix {} in PowerShell",
-                root.path().display()
-            )),
-            "{said}"
-        );
     }
 
     /// KR-REQ-07.16: the step a refusal names is the one for the folder the record is in, as that
