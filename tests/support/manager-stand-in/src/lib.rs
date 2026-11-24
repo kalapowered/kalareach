@@ -9,8 +9,9 @@
 //! and recorded as such.
 //!
 //! What it cannot show: that real launchd accepts the file, that these answers are the real tool's
-//! (they are copied from what `kr` reads), the session and the keychain a real job runs in, launchd's
-//! restart policy, and what a logout does.
+//! (they are copied from what `kr` reads), the session and the keychain a real job runs in, the
+//! scheduling a process type asks for (the one value it accepts is the value `kr` writes, and it
+//! applies none), launchd's restart policy, and what a logout does.
 #![cfg(unix)]
 
 pub mod plist;

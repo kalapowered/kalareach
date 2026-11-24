@@ -1,5 +1,7 @@
 //! The property list `kr host startup` writes, read as launchd reads it: every key it holds is one
-//! the stand-in applies, and any other is refused.
+//! the stand-in applies, and any other is refused. The one exception is `ProcessType`: it is
+//! accepted only with the value `kr` writes, `Interactive`, and the stand-in applies no
+//! process-type scheduling.
 
 use quick_xml::XmlVersion;
 use quick_xml::events::Event;
@@ -254,7 +256,14 @@ impl Definition {
                 ("RunAtLoad", Value::Bool(value)) => definition.run_at_load = value,
                 ("KeepAlive", Value::Bool(value)) => definition.keep_alive = value,
                 ("LimitLoadToSessionType", Value::String(value)) => definition.session_type = value,
-                ("ProcessType", Value::String(_)) => {}
+                ("ProcessType", Value::String(value)) => {
+                    if value != "Interactive" {
+                        return Err(format!(
+                            "the process type {value} is not the one `kr` writes, Interactive, and \
+                             the stand-in applies no process-type scheduling"
+                        ));
+                    }
+                }
                 ("WorkingDirectory", Value::String(value)) => definition.working_directory = value,
                 ("Umask", Value::Integer(value)) => {
                     definition.umask = u32::try_from(value)
@@ -287,6 +296,7 @@ impl Definition {
             "RunAtLoad",
             "KeepAlive",
             "LimitLoadToSessionType",
+            "ProcessType",
             "WorkingDirectory",
             "Umask",
             "StandardOutPath",

@@ -380,6 +380,42 @@ fn a_definition_is_loaded_as_written_and_what_it_does_not_apply_is_refused() {
         Some(64),
         "a session type that is not the domain's"
     );
+    let program = fixture.installation.path().join("kr-daemon");
+    let state = fixture.tree.path().join("state");
+    for (name, from, to, why) in [
+        (
+            "kr-controller-g",
+            "\t<string>Interactive</string>\n",
+            "\t<string>Background</string>\n",
+            "a process type that is not the one `kr` writes",
+        ),
+        (
+            "kr-controller-h",
+            "\t<key>ProcessType</key>\n\t<string>Interactive</string>\n",
+            "",
+            "no process type",
+        ),
+    ] {
+        let written = fixture.plist(name, &program, &state, "");
+        assert!(
+            written.contains(from),
+            "the definition holds the text this case changes"
+        );
+        let path = fixture
+            .tree
+            .path()
+            .join(format!("home/Library/LaunchAgents/{name}.plist"));
+        std::fs::write(&path, written.replace(from, to)).expect("a plist");
+        let refused = fixture.call(&["bootstrap", &fixture.domain(), path.to_str().expect("text")]);
+        assert_eq!(
+            refused.status.code(),
+            Some(64),
+            "{why}: {}",
+            text(&refused.stderr)
+        );
+        let listed = fixture.call(&["print", &format!("{}/{name}", fixture.domain())]);
+        assert_eq!(listed.status.code(), Some(113), "{why} is not loaded");
+    }
 }
 
 /// The daemon starts as the definition says: its arguments, directory, mask and log, the harness's
