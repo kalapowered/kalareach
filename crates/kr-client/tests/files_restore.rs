@@ -1012,8 +1012,9 @@ struct Bundle {
     source: Arc<Scripted>,
     /// The sealed bundle another device writes just before the next write meets the service.
     meanwhile: Mutex<Option<Vec<u8>>>,
-    /// Whether the next write that applies is answered at all.
-    loses_the_answer: Mutex<bool>,
+    /// The code the next write that applies is answered with in place of its answer, after the
+    /// service applied it.
+    loses_the_answer: Mutex<Option<ErrorCode>>,
     /// The code the next write that applies is refused with, before the service applies it.
     refuses_with: Mutex<Option<ErrorCode>>,
     /// The code every write that applies is refused with, before the service applies it.
@@ -1029,7 +1030,7 @@ impl Bundle {
         Self {
             source: Arc::clone(source),
             meanwhile: Mutex::new(None),
-            loses_the_answer: Mutex::new(false),
+            loses_the_answer: Mutex::new(None),
             refuses_with: Mutex::new(None),
             keeps_refusing_with: Mutex::new(None),
             conflicts: Mutex::new(0),
@@ -1068,9 +1069,9 @@ impl BundleWriter for Bundle {
                 )));
             }
             let placed = self.source.replace_bundle(write.sealed.to_vec());
-            if std::mem::take(&mut *self.loses_the_answer.lock().expect("loses")) {
+            if let Some(code) = self.loses_the_answer.lock().expect("loses").take() {
                 return Err(ClientError::Host(ProtocolError::new(
-                    ErrorCode::OutcomeUnknown,
+                    code,
                     "the answer did not arrive".to_owned(),
                 )));
             }
@@ -1151,7 +1152,7 @@ async fn recording_the_checkpoint_keeps_what_another_device_wrote_to_the_bundle_
         Arc::new(Scripted::serving(&world, world.bundle(&Shape::default())).publishing(&sealed));
     let prepared = restore(&world, &source, None).await.expect("a restore");
     let bundle = Bundle::over(&source);
-    *bundle.loses_the_answer.lock().expect("loses") = true;
+    *bundle.loses_the_answer.lock().expect("loses") = Some(ErrorCode::OutcomeUnknown);
     let recorded = prepared
         .record_checkpoint(&bundle, TimestampMs::new(9_000))
         .await
@@ -1240,7 +1241,7 @@ async fn a_lost_answer_on_a_checkpoint_that_left_the_settings_out_still_says_so(
     let source = Arc::new(Scripted::serving(&world, world.bundle(&shape)).publishing(&sealed));
     let prepared = restore(&world, &source, None).await.expect("a restore");
     let bundle = Bundle::over(&source);
-    *bundle.loses_the_answer.lock().expect("loses") = true;
+    *bundle.loses_the_answer.lock().expect("loses") = Some(ErrorCode::OutcomeUnknown);
     let recorded = prepared
         .record_checkpoint(&bundle, TimestampMs::new(9_000))
         .await
@@ -1262,7 +1263,7 @@ async fn a_lost_answer_on_a_checkpoint_that_left_the_settings_out_still_says_so(
     let source = Arc::new(Scripted::serving(&world, world.bundle(&shape)).publishing(&sealed));
     let prepared = restore(&world, &source, None).await.expect("a restore");
     let bundle = Bundle::over(&source);
-    *bundle.loses_the_answer.lock().expect("loses") = true;
+    *bundle.loses_the_answer.lock().expect("loses") = Some(ErrorCode::OutcomeUnknown);
     let recorded = prepared
         .record_checkpoint(&bundle, TimestampMs::new(9_000))
         .await
@@ -1272,6 +1273,45 @@ async fn a_lost_answer_on_a_checkpoint_that_left_the_settings_out_still_says_so(
         "{recorded:?}"
     );
     assert_eq!(bundle_held(&world, &source).device_settings, Some(member));
+}
+
+/// KR-REQ-20.17: a checkpoint written without the settings whose answer the service gave as a
+/// refusal for now, after it applied the write, is told as written without them too: the pause the
+/// policy gives passes, the next read finds the checkpoint recorded, and the settings are still out
+/// of the bundle. This is the branch of a service that refused for now, beside the one of a service
+/// that could not say.
+#[tokio::test(start_paused = true)]
+async fn a_checkpoint_that_left_the_settings_out_and_was_refused_for_now_still_says_so() {
+    assert!(
+        matches!(HostWord::of(ErrorCode::RateLimited), HostWord::Transient),
+        "the code is one the service gives for now"
+    );
+    let world = World::new();
+    let sealed = world.seal(4, &honest_members());
+    let member = Bytes::new(vec![0x5a; 1024]);
+
+    let shape = leaving(&world, Some(&member), 20);
+    let source = Arc::new(Scripted::serving(&world, world.bundle(&shape)).publishing(&sealed));
+    let prepared = restore(&world, &source, None).await.expect("a restore");
+    let bundle = Bundle::over(&source);
+    *bundle.loses_the_answer.lock().expect("loses") = Some(ErrorCode::RateLimited);
+    let started = tokio::time::Instant::now();
+    let recorded = prepared
+        .record_checkpoint(&bundle, TimestampMs::new(9_000))
+        .await
+        .expect("settled by reading");
+    assert!(
+        matches!(recorded, CheckpointRecorded::WrittenWithoutSettings { .. }),
+        "{recorded:?}"
+    );
+    assert!(
+        started.elapsed() >= RETRY_BACKOFF_MIN,
+        "the pause the policy gives was taken"
+    );
+    assert_eq!(*bundle.writes.lock().expect("writes"), 1, "written once");
+    let after = bundle_held(&world, &source);
+    assert_eq!(after.device_settings, None, "the settings were left out");
+    assert_eq!(after.checkpoints.len(), 1, "the checkpoint is in");
 }
 
 /// KR-REQ-24.16: a checkpoint write the service refuses for now, or cannot say the outcome of, is
