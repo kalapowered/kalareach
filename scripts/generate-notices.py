@@ -904,10 +904,13 @@ def gather(records, kept, files, reader, product="programs"):
             fail(f"scripts/notice-texts.json keeps a text for {item['name']} {item['version']} from {item.get('package') or 'crates.io'}, "
                  f"which no {PRODUCT_BUILDS[product]} compiles" + (f"; the lock has it from {', '.join(now)}" if now else ""))
     for work in kept["works"]:
-        if not in_scope(work, product):
-            continue
         carried_by = work["carried_by"]
         carrier = (carried_by["name"], carried_by["version"], carried_by.get("package"))
+        if not in_scope(work, product):
+            if carrier in compiled_crates:
+                fail(f"{work['name']} {work['version']} is bundled in {carrier[0]} {carrier[1]}, which a {PRODUCT_BUILDS[product]} "
+                     f"compiles, and scripts/notice-texts.json lists the work for another product only")
+            continue
         if carrier not in compiled_crates:
             now = sorted({k[2] or "crates.io" for k in compiled_crates if k[:2] == carrier[:2]})
             if now:
@@ -1382,6 +1385,14 @@ for path in paths:
     kept, files = keep([item, second], [], [work])
     text = rendered([made_up([plain])], kept, files)
     expect("a bundled work takes more than one text", "Permission is hereby granted" in text and "Notice 2025 N0" in text)
+    other = {"name": "libx", "version": "1.0", "carried_by": {"name": "plain", "version": "1.0.0"}, "texts": ["n0-MIT"],
+             "products": ["companion"]}
+    kept, files = keep([item], [], [other])
+    refuses("a work kept for another product alone is refused when this product compiles its carrier",
+            lambda: gather([made_up([plain])], kept, files, reader), "lists the work for another product only")
+    kept, files = keep([item], [], [{**other, "carried_by": {"name": "gone", "version": "1.0.0"}}])
+    expect("a work kept for another product alone is not asked of a product that compiles no carrier of it",
+           rendered([made_up([plain])], kept, files) != "")
 
     # A kept excerpt of a source file is the file's own lines and ends where the licence comment ends.
     carrier_folder = os.path.join(scratch, "carrier-1.0.0")
