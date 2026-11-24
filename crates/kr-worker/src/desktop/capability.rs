@@ -45,8 +45,7 @@ use kr_protocol::ids::{CapabilityId, CapabilityRevision, EnvironmentId, SessionI
 use kr_protocol::scalars::{Nullable, U64};
 use std::path::Path;
 
-use super::probe::{Check, Deadline};
-use super::routes::{Program, resolve};
+use super::probe::Deadline;
 
 /// The version of the capability contracts this host writes records against.
 pub const CAPABILITY_VERSION: u64 = 1;
@@ -677,47 +676,6 @@ fn facility_in(
         .find_map(|candidate| installed_in(candidate, search))
 }
 
-/// The tools the disclosed checks run on this desktop, each with the identity of its file, as one
-/// line.
-///
-/// A tool is named when the check's route runs one: the line reads the routes and not the
-/// candidate lists, so it names what a check would actually run. A check with no route on this
-/// desktop names none. It is read from the machine and not from what a context lets be answered: a
-/// locked screen does not remove the tool that takes a screen image.
-#[must_use]
-pub fn tools_of(desktop: &DesktopContext) -> String {
-    tools_in(desktop, std::env::var_os("PATH").as_deref())
-}
-
-/// [`tools_of`], looking for a tool given by a bare name in `search` as the search path.
-fn tools_in(desktop: &DesktopContext, search: Option<&std::ffi::OsStr>) -> String {
-    let mut tools: Vec<String> = [
-        Check::AccessibleElement,
-        Check::ApplicationLaunch,
-        Check::ScreenImage,
-    ]
-    .into_iter()
-    .map(|check| {
-        let tool = resolve(check, desktop, search).and_then(|operation| match operation.program {
-            Program::Tool(path) => Some(path),
-            _ => None,
-        });
-        let identity = tool
-            .as_deref()
-            .and_then(facility_identity)
-            .map(|identity| identity.as_str().to_owned());
-        format!(
-            "{}={}|{}",
-            check.capability(),
-            tool.as_deref().unwrap_or_default(),
-            identity.unwrap_or_default()
-        )
-    })
-    .collect();
-    tools.sort();
-    tools.join(";")
-}
-
 /// Returns the facilities that serve one capability, most specific first.
 fn candidates(capability: &str, display_server: DisplayServer) -> &'static [&'static str] {
     match (capability, display_server) {
@@ -870,6 +828,8 @@ const MAX_IDENTIFIED: u64 = 64 * 1024 * 1024;
 
 #[cfg(test)]
 mod tests {
+    use super::super::probe::Check;
+    use super::super::routes::resolve;
     use super::*;
     use kr_protocol::desktop::{ContainerEnvironment, DesktopGenerationSource, DesktopSessionKind};
     use kr_protocol::identity::{BootIdentity, BootIdentitySource, WorkerProfile};
@@ -915,13 +875,12 @@ mod tests {
         context
     }
 
-    /// KR-REQ-03.29, S-1: the line that names the tools the checks run reads the routes, so it
-    /// names what a check would actually run. A desktop with no route for a check names no tool
-    /// for it, whatever programs the search path holds: the candidates of the platform's own
-    /// record are not what a check runs.
+    /// KR-REQ-03.29, S-1: what a check runs on a desktop is what its route resolves to. A desktop
+    /// with no route for a check resolves it to nothing, whatever programs the search path holds:
+    /// the candidates of the platform's own record are not what a check runs.
     #[cfg(unix)]
     #[test]
-    fn tools_of_names_what_each_check_runs() {
+    fn a_check_resolves_to_the_tool_its_route_runs_and_to_nothing_without_one() {
         use std::os::unix::fs::PermissionsExt as _;
 
         let directory = std::env::temp_dir().join(format!("kr-tools-{}", kr_ipc::new_uuid()));
@@ -953,24 +912,35 @@ mod tests {
             (DisplayServer::Wayland, "sway"),
             (DisplayServer::WindowsDesktop, "dwm"),
         ] {
-            let line = tools_in(&desktop(server, Some(compositor)), Some(search.as_os_str()));
-            let parts: Vec<&str> = line.split(';').collect();
-            assert_eq!(parts.len(), 3, "{server:?}: {line}");
-            assert!(
-                parts.iter().all(|part| part.ends_with("=|")),
-                "{server:?} has no route yet, so it names no tool, and this line names {line}"
-            );
+            for check in [
+                Check::AccessibleElement,
+                Check::ApplicationLaunch,
+                Check::ScreenImage,
+            ] {
+                assert_eq!(
+                    resolve(
+                        check,
+                        &desktop(server, Some(compositor)),
+                        Some(search.as_os_str())
+                    ),
+                    None,
+                    "{server:?} has no route for {check:?} yet, so it names no tool for it"
+                );
+            }
         }
         #[cfg(target_os = "macos")]
-        {
-            let line = tools_in(&desktop(DisplayServer::Quartz, Some("Aqua")), None);
-            for tool in [
-                "/usr/sbin/screencapture",
-                "/usr/bin/osascript",
-                "/usr/bin/open",
-            ] {
-                assert!(line.contains(tool), "macOS names {tool}: {line}");
-            }
+        for (check, tool) in [
+            (Check::ScreenImage, "/usr/sbin/screencapture"),
+            (Check::AccessibleElement, "/usr/bin/osascript"),
+            (Check::ApplicationLaunch, "/usr/bin/open"),
+        ] {
+            let operation = resolve(check, &desktop(DisplayServer::Quartz, Some("Aqua")), None)
+                .expect("macOS has a route for the check");
+            assert_eq!(
+                operation.program.named_path(),
+                Some(tool),
+                "macOS runs {tool} for {check:?}"
+            );
         }
         std::fs::remove_dir_all(&directory).expect("removes the test's directory");
     }
