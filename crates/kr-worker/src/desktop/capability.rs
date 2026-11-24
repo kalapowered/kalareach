@@ -45,6 +45,9 @@ use kr_protocol::ids::{CapabilityId, CapabilityRevision, EnvironmentId, SessionI
 use kr_protocol::scalars::{Nullable, U64};
 use std::path::Path;
 
+use super::probe::Check;
+use super::routes::{Program, resolve};
+
 /// The version of the capability contracts this host writes records against.
 pub const CAPABILITY_VERSION: u64 = 1;
 
@@ -147,7 +150,7 @@ pub fn report(
                     schema: Nullable(server.then(|| desktop.display_server.as_str().to_owned())),
                     profile: Nullable::some(desktop.worker_profile),
                 },
-                invalidation: invalidation(name),
+                invalidation: invalidation(name, desktop.display_server),
                 disabled_reason: Nullable(answer.reason),
                 observed_at_ms,
             })
@@ -168,7 +171,7 @@ pub fn report(
 /// server is the one of those: the answer is about the server itself, which the platform names,
 /// and there is no installed thing whose replacement could invalidate it.
 fn identified(capability: &str, answer: Answer) -> (Answer, Option<Sentence>) {
-    if !invalidation(capability).contains(&CapabilityInvalidation::BinaryIdentity) {
+    if capability == capabilities::DISPLAY_SERVER {
         return (answer, None);
     }
     let Some(tool) = answer.tool.as_deref() else {
@@ -197,14 +200,20 @@ fn identified(capability: &str, answer: Answer) -> (Answer, Option<Sentence>) {
     }
 }
 
-/// Returns what invalidates one capability's evidence.
-fn invalidation(capability: &str) -> Vec<CapabilityInvalidation> {
+/// Returns what invalidates one capability's evidence on a display server.
+///
+/// A grant belongs to the signed application on macOS only, so only there can the operating system
+/// change what a record says. Nowhere else has a permission to withdraw, and a record that listed
+/// one would claim an ending nothing can cause.
+fn invalidation(capability: &str, display_server: DisplayServer) -> Vec<CapabilityInvalidation> {
     let mut triggers = vec![
         CapabilityInvalidation::DesktopGeneration,
         CapabilityInvalidation::WorkerProfile,
     ];
     if capability != capabilities::DISPLAY_SERVER {
-        triggers.push(CapabilityInvalidation::OsPermission);
+        if display_server == DisplayServer::Quartz {
+            triggers.push(CapabilityInvalidation::OsPermission);
+        }
         triggers.push(CapabilityInvalidation::BinaryIdentity);
     }
     triggers
@@ -234,8 +243,22 @@ pub fn answer(capability: &str, desktop: &DesktopContext) -> Answer {
     }
     let tool = facility(capability, desktop.display_server);
     // Starting an application on a desktop this context is in needs no permission on any of these
-    // platforms, so a present launcher settles it wherever the desktop is.
+    // platforms, but a launcher being there says nothing about whether an application starts. On
+    // macOS the platform's own launcher is the whole of the operation, so its presence settles it.
+    // Elsewhere only the check that starts an application establishes it, and until it has run the
+    // record says it has not been checked.
     if capability == capabilities::APPLICATION_LAUNCH {
+        if matches!(
+            desktop.display_server,
+            DisplayServer::X11 | DisplayServer::Wayland | DisplayServer::WindowsDesktop
+        ) {
+            return Answer::refused(
+                CapabilityState::NotTested,
+                CapabilityEvidenceSource::NotProbed,
+                "not checked: the check has not started an application on this desktop, and no \
+                 application it would start here is established",
+            );
+        }
         return match tool {
             Some(tool) => Answer {
                 state: CapabilityState::QualifiedAvailable,
@@ -654,13 +677,13 @@ fn facility_in(
         .find_map(|candidate| installed_in(candidate, search))
 }
 
-/// The tools the disclosed checks use on this desktop, each with the identity of its file, as one
+/// The tools the disclosed checks run on this desktop, each with the identity of its file, as one
 /// line.
 ///
-/// It is read from the machine and not from what a context lets be answered: a locked screen does
-/// not remove the tool that takes a screen image, and a tool installed since a run is a change.
-/// Two readings differ when a tool was installed, removed or replaced between them, and at no
-/// other time.
+/// A tool is named when the check's route runs one: the line reads the routes and not the
+/// candidate lists, so it names what a check would actually run. A check with no route on this
+/// desktop names none. It is read from the machine and not from what a context lets be answered: a
+/// locked screen does not remove the tool that takes a screen image.
 #[must_use]
 pub fn tools_of(desktop: &DesktopContext) -> String {
     tools_in(desktop, std::env::var_os("PATH").as_deref())
@@ -669,19 +692,23 @@ pub fn tools_of(desktop: &DesktopContext) -> String {
 /// [`tools_of`], looking for a tool given by a bare name in `search` as the search path.
 fn tools_in(desktop: &DesktopContext, search: Option<&std::ffi::OsStr>) -> String {
     let mut tools: Vec<String> = [
-        capabilities::ACCESSIBILITY,
-        capabilities::APPLICATION_LAUNCH,
-        capabilities::SCREEN_CAPTURE,
+        Check::AccessibleElement,
+        Check::ApplicationLaunch,
+        Check::ScreenImage,
     ]
     .into_iter()
-    .map(|capability| {
-        let tool = facility_in(capability, desktop.display_server, search);
+    .map(|check| {
+        let tool = resolve(check, desktop, search).and_then(|operation| match operation.program {
+            Program::Tool(path) => Some(path),
+            _ => None,
+        });
         let identity = tool
             .as_deref()
             .and_then(facility_identity)
             .map(|identity| identity.as_str().to_owned());
         format!(
-            "{capability}={}|{}",
+            "{}={}|{}",
+            check.capability(),
             tool.as_deref().unwrap_or_default(),
             identity.unwrap_or_default()
         )
@@ -726,7 +753,7 @@ fn candidates(capability: &str, display_server: DisplayServer) -> &'static [&'st
 /// execution context's own search path, because a facility installed for the user is as real as
 /// one installed for everybody, and the search path is part of the context the session runs in.
 /// A file that is not executable is not a facility: it would fail at the first attempt to run it.
-fn installed_in(candidate: &str, search: Option<&std::ffi::OsStr>) -> Option<String> {
+pub(super) fn installed_in(candidate: &str, search: Option<&std::ffi::OsStr>) -> Option<String> {
     let path = std::path::Path::new(candidate);
     if path.is_absolute() {
         return runnable(path).then(|| candidate.to_owned());
@@ -864,52 +891,63 @@ mod tests {
         context
     }
 
-    /// What the daemon holds findings against: it differs when a tool the checks use was installed,
-    /// replaced or removed, and only then.
+    /// KR-REQ-03.29, S-1: the line that names the tools the checks run reads the routes, so it
+    /// names what a check would actually run. A desktop with no route for a check names no tool
+    /// for it, whatever programs the search path holds: the candidates of the platform's own
+    /// record are not what a check runs.
     #[cfg(unix)]
     #[test]
-    fn the_tools_differ_when_one_is_installed_replaced_or_removed_and_at_no_other_time() {
+    fn tools_of_names_what_each_check_runs() {
         use std::os::unix::fs::PermissionsExt as _;
 
         let directory = std::env::temp_dir().join(format!("kr-tools-{}", kr_ipc::new_uuid()));
         std::fs::create_dir_all(&directory).expect("a directory of this test's own");
+        for name in [
+            "accerciser",
+            "dbus-send",
+            "gio",
+            "xdg-open",
+            "maim",
+            "import",
+            "scrot",
+            "xwd",
+            "spectacle",
+            "grim",
+            "grimblast",
+            "gnome-screenshot",
+            "powershell.exe",
+            "cmd.exe",
+        ] {
+            let tool = directory.join(name);
+            std::fs::write(&tool, b"a stand-in").expect("the tool");
+            std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755))
+                .expect("makes it runnable");
+        }
         let search = std::ffi::OsString::from(&directory);
-        let context = desktop(DisplayServer::X11, Some("x"));
-        let reading = || tools_in(&context, Some(search.as_os_str()));
-
-        let none = reading();
-        assert_eq!(none, reading(), "two readings of one state are equal");
-
-        let tool = directory.join("maim");
-        std::fs::write(&tool, b"the first build").expect("the tool");
-        let not_yet = reading();
-        assert_eq!(
-            not_yet, none,
-            "a file that cannot be run is not a tool, so it is no change"
-        );
-        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755))
-            .expect("makes it runnable");
-        let installed = reading();
-        assert_ne!(installed, none, "a tool installed since is a change");
-        assert_eq!(installed, reading());
-
-        std::fs::write(&tool, b"the second build").expect("the replacement");
-        let replaced = reading();
-        assert_ne!(replaced, installed, "a tool replaced is a change");
-
-        // A lock changes nothing about a tool that is there.
-        for availability in [DesktopAvailability::Locked, DesktopAvailability::Ended] {
-            let mut other = context.clone();
-            other.availability = availability;
-            assert_eq!(
-                tools_in(&other, Some(search.as_os_str())),
-                replaced,
-                "{availability:?}"
+        for (server, compositor) in [
+            (DisplayServer::X11, "x"),
+            (DisplayServer::Wayland, "sway"),
+            (DisplayServer::WindowsDesktop, "dwm"),
+        ] {
+            let line = tools_in(&desktop(server, Some(compositor)), Some(search.as_os_str()));
+            let parts: Vec<&str> = line.split(';').collect();
+            assert_eq!(parts.len(), 3, "{server:?}: {line}");
+            assert!(
+                parts.iter().all(|part| part.ends_with("=|")),
+                "{server:?} has no route yet, so it names no tool, and this line names {line}"
             );
         }
-
-        std::fs::remove_file(&tool).expect("removes the tool");
-        assert_eq!(reading(), none, "a tool removed is a change, back to none");
+        #[cfg(target_os = "macos")]
+        {
+            let line = tools_in(&desktop(DisplayServer::Quartz, Some("Aqua")), None);
+            for tool in [
+                "/usr/sbin/screencapture",
+                "/usr/bin/osascript",
+                "/usr/bin/open",
+            ] {
+                assert!(line.contains(tool), "macOS names {tool}: {line}");
+            }
+        }
         std::fs::remove_dir_all(&directory).expect("removes the test's directory");
     }
 
@@ -1341,6 +1379,76 @@ mod tests {
                 .contains(&CapabilityInvalidation::OsPermission),
             "a permission change invalidates a permission-gated capability"
         );
+    }
+
+    /// KR-REQ-03.29, S-7: off macOS a launcher being present is not a success, because only the
+    /// check that starts an application establishes it; the record says it was not checked.
+    #[test]
+    fn the_platform_launch_record_off_macos_is_not_a_success_by_presence() {
+        for (server, compositor) in [
+            (DisplayServer::X11, "x"),
+            (DisplayServer::Wayland, "sway"),
+            (DisplayServer::WindowsDesktop, "dwm"),
+        ] {
+            let answer = answer(
+                capabilities::APPLICATION_LAUNCH,
+                &desktop(server, Some(compositor)),
+            );
+            assert_eq!(answer.state, CapabilityState::NotTested, "{server:?}");
+            assert_eq!(
+                answer.evidence,
+                CapabilityEvidenceSource::NotProbed,
+                "{server:?}"
+            );
+            assert!(
+                answer
+                    .reason
+                    .as_ref()
+                    .is_some_and(|reason| reason.as_str().starts_with("not checked: ")),
+                "{server:?}"
+            );
+        }
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            answer(
+                capabilities::APPLICATION_LAUNCH,
+                &desktop(DisplayServer::Quartz, Some("Aqua"))
+            )
+            .state,
+            CapabilityState::QualifiedAvailable,
+            "macOS keeps the launcher's own answer"
+        );
+    }
+
+    /// KR-REQ-03.29, S-11, the platform's side: a grant belongs to the signed application on
+    /// macOS only, so no other platform's record lists a permission as what ends it.
+    #[test]
+    fn only_a_macos_record_lists_a_permission_as_what_ends_it() {
+        for (server, compositor, listed) in [
+            (DisplayServer::Quartz, "Aqua", true),
+            (DisplayServer::X11, "x", false),
+            (DisplayServer::Wayland, "sway", false),
+            (DisplayServer::WindowsDesktop, "dwm", false),
+        ] {
+            let report = report(
+                environment(),
+                None,
+                desktop(server, Some(compositor)),
+                CapabilityRevision::new(1),
+            );
+            let server_name = capabilities::DISPLAY_SERVER;
+            for record in &report.records {
+                let has = record
+                    .invalidation
+                    .contains(&CapabilityInvalidation::OsPermission);
+                assert_eq!(
+                    has,
+                    listed && record.capability.as_str() != server_name,
+                    "{server:?} {}",
+                    record.capability
+                );
+            }
+        }
     }
 
     /// KR-REQ-03.26, the part about the compositor: the display-server record is a different

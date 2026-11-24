@@ -13,13 +13,13 @@
 use std::path::{Path, PathBuf};
 
 use kr_protocol::desktop::{
-    CapabilitySubject, DesktopChecksAnswer, DesktopChecksRequest, DesktopContext,
-    MAX_AUTHORISED_FILE_BYTES,
+    CapabilitySubject, DesktopChecksAnswer, DesktopChecksRequest, MAX_AUTHORISED_FILE_BYTES,
 };
 use kr_protocol::ids::{CapabilityRevision, SessionId};
 use kr_protocol::scalars::Nullable;
 
 use super::probe::{self, Facilities, Plan};
+use super::routes::ContextSource;
 
 /// Why a request was not performed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -55,7 +55,7 @@ impl Refusal {
 pub fn perform(
     request: &DesktopChecksRequest,
     session_id: SessionId,
-    desktop: &DesktopContext,
+    source: &dyn ContextSource,
     scratch: &Path,
     facilities: &dyn Facilities,
 ) -> Result<DesktopChecksAnswer, Refusal> {
@@ -82,6 +82,9 @@ pub fn perform(
         scratch: directory.clone(),
         isolated: None,
     };
+    // The first reading names the desktop the records are about and which checks it is asked for.
+    // Each operation that acts on the desktop reads it again before it starts and after it ends.
+    let desktop = source.read().desktop;
     let subject = CapabilitySubject {
         environment_id: request.environment_id,
         desktop_session_id: desktop.desktop_session_id.clone(),
@@ -90,9 +93,9 @@ pub fn perform(
         terminal: Nullable::null(),
     };
     let records = probe::report(
-        &probe::performable(desktop),
+        &probe::performable(&desktop),
         &subject,
-        desktop,
+        source,
         // The control daemon stamps the revision it holds on every record it publishes.
         CapabilityRevision::new(0),
         &plan,
@@ -158,14 +161,15 @@ mod tests {
     use std::sync::Mutex;
 
     use kr_protocol::desktop::{
-        CapabilityState, ContainerEnvironment, DesktopAvailability, DesktopGenerationSource,
-        DesktopSessionKind, DisplayServer, capabilities,
+        CapabilityState, ContainerEnvironment, DesktopAvailability, DesktopContext,
+        DesktopGenerationSource, DesktopSessionKind, DisplayServer, capabilities,
     };
     use kr_protocol::identity::{BootIdentity, BootIdentitySource, WorkerProfile};
     use kr_protocol::ids::{DesktopSessionId, EnvironmentId, RequestId};
     use kr_protocol::scalars::{Bytes, U64, Uuid};
 
-    use super::super::probe::{Check, Outcome, Ran};
+    use super::super::probe::{Check, Outcome, Ran, Setting};
+    use super::super::routes::{Surroundings, Variables};
     use super::*;
 
     /// A stand-in that records which checks it was asked to perform and answers each as performed.
@@ -173,7 +177,7 @@ mod tests {
     struct Recording(Mutex<Vec<Check>>);
 
     impl Facilities for Recording {
-        fn perform(&self, check: Check, plan: &Plan) -> Ran {
+        fn perform(&self, check: Check, plan: &Plan, _setting: &Setting<'_>) -> Ran {
             self.0.lock().expect("the record").push(check);
             // The run's directory is there while a check runs, and nobody else can enter it.
             assert!(plan.scratch.is_dir(), "{}", plan.scratch.display());
@@ -187,7 +191,16 @@ mod tests {
         }
     }
 
-    fn desktop(graphic_access: bool) -> DesktopContext {
+    /// A source that always reads the same desktop, with no variables.
+    fn desktop(graphic_access: bool) -> impl ContextSource {
+        let context = context(graphic_access);
+        move || Surroundings {
+            desktop: context.clone(),
+            variables: Variables::default(),
+        }
+    }
+
+    fn context(graphic_access: bool) -> DesktopContext {
         DesktopContext {
             desktop_session_id: Nullable::some(
                 DesktopSessionId::new(
@@ -306,7 +319,7 @@ mod tests {
 
         struct Leaving;
         impl Facilities for Leaving {
-            fn perform(&self, check: Check, plan: &Plan) -> Ran {
+            fn perform(&self, check: Check, plan: &Plan, _setting: &Setting<'_>) -> Ran {
                 std::fs::write(plan.scratch.join("left"), b"a check's file").expect("a file");
                 // Nothing can be removed from a directory that cannot be written to.
                 std::fs::set_permissions(&plan.scratch, std::fs::Permissions::from_mode(0o500))

@@ -42,11 +42,12 @@
 //! it is the only thing here that touches the machine.
 
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use kr_protocol::desktop::{
     CapabilityEvidenceSource, CapabilityIdentity, CapabilityInvalidation, CapabilityRecord,
-    CapabilityState, CapabilitySubject, DesktopContext, DisplayServer, capabilities,
+    CapabilityState, CapabilitySubject, DesktopAvailability, DesktopContext, DisplayServer,
+    capabilities,
 };
 use kr_protocol::hostinfo::export::{ContentClass, Sentence};
 use kr_protocol::identity::WorkerProfile;
@@ -54,6 +55,10 @@ use kr_protocol::ids::{CapabilityId, CapabilityRevision};
 use kr_protocol::scalars::{Nullable, U64};
 
 use super::capability::{CAPABILITY_VERSION, facility_identity};
+use super::routes::{
+    Asking, ContextSource, Operation, Program, Route, Surroundings, Variables, file_read_route,
+    resolve,
+};
 
 /// One disclosed check.
 ///
@@ -87,6 +92,16 @@ impl Check {
             Self::SyntheticInput,
             Self::ScreenImage,
         ]
+    }
+
+    /// Whether the check acts on the desktop, so that it needs the desktop to be there when it
+    /// starts and when it ends. The file read and the withheld check do not.
+    #[must_use]
+    pub const fn acts_on_a_desktop(self) -> bool {
+        matches!(
+            self,
+            Self::ScreenImage | Self::AccessibleElement | Self::ApplicationLaunch
+        )
     }
 
     /// The capability this check is evidence about.
@@ -286,6 +301,12 @@ pub enum Outcome {
     },
     /// The check was not run because its effects need a test context of its own.
     WithheldForIsolation,
+    /// The route is one this worker records as what it is and does not perform, in the route's
+    /// own words.
+    NotPerformed {
+        /// What the route is and why nothing was run.
+        detail: Sentence,
+    },
 }
 
 /// One check, what it used and what came of it.
@@ -309,7 +330,70 @@ pub struct Ran {
 /// function over data.
 pub trait Facilities {
     /// Performs one check and says what came of it.
-    fn perform(&self, check: Check, plan: &Plan) -> Ran;
+    fn perform(&self, check: Check, plan: &Plan, setting: &Setting<'_>) -> Ran;
+}
+
+/// The time one check has, from its start to its end.
+///
+/// Every call a check makes draws on the same deadline: the route's program, the lookup of the
+/// instance it started, the call that ends it. A check that made twenty calls of twenty seconds
+/// would otherwise take far longer than the twenty seconds it declares.
+#[derive(Clone, Copy, Debug)]
+pub struct Deadline {
+    started: Instant,
+    bound: Duration,
+}
+
+impl Deadline {
+    /// A deadline that ends `bound` from now.
+    #[must_use]
+    pub fn after(bound: Duration) -> Self {
+        Self {
+            started: Instant::now(),
+            bound,
+        }
+    }
+
+    /// How much of the deadline is left.
+    #[must_use]
+    pub fn left(&self) -> Duration {
+        self.bound.saturating_sub(self.started.elapsed())
+    }
+
+    /// Whether nothing is left.
+    #[must_use]
+    pub fn expired(&self) -> bool {
+        self.left().is_zero()
+    }
+
+    /// How long ago the deadline began.
+    #[must_use]
+    pub fn elapsed(&self) -> Duration {
+        self.started.elapsed()
+    }
+
+    /// The same deadline, ended `reserve` sooner: what a call uses when the time after it is
+    /// needed for cleaning up what it started.
+    #[must_use]
+    pub fn ending_before(&self, reserve: Duration) -> Self {
+        Self {
+            started: self.started,
+            bound: self.bound.saturating_sub(reserve),
+        }
+    }
+}
+
+/// What a facility is given to perform one check, beyond the plan.
+#[derive(Clone, Copy, Debug)]
+pub struct Setting<'a> {
+    /// The desktop context the operation starts under: the reading taken just before it.
+    pub desktop: &'a DesktopContext,
+    /// The worker's own display variables and search path.
+    pub variables: &'a Variables,
+    /// The operation the check resolved to, for a check that acts on a desktop.
+    pub operation: Option<&'a Operation>,
+    /// The one deadline of this check.
+    pub deadline: &'a Deadline,
 }
 
 /// The state and evidence one outcome comes to.
@@ -323,6 +407,7 @@ pub trait Facilities {
 pub fn judge(
     check: Check,
     outcome: &Outcome,
+    asking: Asking,
 ) -> (CapabilityState, CapabilityEvidenceSource, Option<Sentence>) {
     match outcome {
         Outcome::Performed { detail } => (
@@ -419,11 +504,22 @@ pub fn judge(
                     } else {
                         ", which it had not done when this check answered"
                     })
-                    .stated(
-                        " and nothing is established either way. A permission the operating \
-                         system asks the person at the machine about looks exactly like this from \
-                         here",
-                    ),
+                    .stated(" and nothing is established either way. ")
+                    .stated(match asking {
+                        Asking::ForAGrant => {
+                            "A permission the operating system asks the person at the machine \
+                             about looks exactly like this from here"
+                        }
+                        Asking::Maybe => {
+                            "Nothing on this desktop is known to ask the person about this \
+                             operation. Some compositors ask before a program may copy the \
+                             screen; this one may be doing so"
+                        }
+                        Asking::Never => {
+                            "Nothing on this desktop is known to ask the person about this \
+                             operation"
+                        }
+                    }),
             ),
         ),
         Outcome::NotAttempted { detail } => (
@@ -449,34 +545,48 @@ pub fn judge(
                     ),
             ),
         ),
+        // The route's own words: what it is and that nothing was run, said where the route is
+        // defined.
+        Outcome::NotPerformed { detail } => (
+            CapabilityState::NotTested,
+            CapabilityEvidenceSource::NotProbed,
+            Some(detail.clone()),
+        ),
     }
 }
 
 /// What makes a disclosed probe's answer stale.
 ///
-/// The four section 3 names, in the order they are written. A timer is not among them: nothing
-/// about a permission changes because time passed, and a check that re-ran on a clock would take
-/// a screen image of somebody's desktop for no reason.
+/// The triggers a held answer can actually be ended by, in the order section 3 writes them. A
+/// timer is not among them: nothing about a permission changes because time passed, and a check
+/// that re-ran on a clock would take a screen image of somebody's desktop for no reason. A
+/// permission is not among them either: nothing in a [`Fingerprint`] reads one, so a finding that
+/// listed it would claim an ending nothing can cause. A permission withdrawn after a run shows
+/// only when the checks run again.
 #[must_use]
 pub fn invalidation() -> Vec<CapabilityInvalidation> {
     vec![
         CapabilityInvalidation::BinaryIdentity,
-        CapabilityInvalidation::OsPermission,
         CapabilityInvalidation::DesktopGeneration,
         CapabilityInvalidation::WorkerProfile,
     ]
 }
 
 /// Turns one run into the record a caller reads.
+///
+/// The identity names what the run was about: the program it ran, by path, with the digest of that
+/// file, and the route it took as the schema. A route that ran this worker's own helper names no
+/// program, because the helper is the worker program and the host agent's identity covers it.
 #[must_use]
 pub fn record(
     ran: &Ran,
+    route: &Route,
     subject: &CapabilitySubject,
     profile: WorkerProfile,
     revision: CapabilityRevision,
     observed_at_ms: kr_protocol::scalars::TimestampMs,
 ) -> Option<CapabilityRecord> {
-    let (state, evidence, reason) = judge(ran.check, &ran.outcome);
+    let (state, evidence, reason) = judge(ran.check, &ran.outcome, route.asking);
     let identity = ran.facility.as_deref().and_then(facility_identity);
     Some(CapabilityRecord {
         capability: CapabilityId::new(ran.check.capability()).ok()?,
@@ -489,7 +599,7 @@ pub fn record(
             binary: Nullable(ran.facility.clone()),
             version: Nullable(identity),
             package: Nullable::null(),
-            schema: Nullable::null(),
+            schema: Nullable::some(route.name.to_owned()),
             profile: Nullable::some(profile),
         },
         invalidation: invalidation(),
@@ -576,29 +686,130 @@ const fn has_a_desktop_of(os: HostOs, display_server: DisplayServer) -> bool {
 /// A tool-specific permission stays its own record here. There is no aggregate answer to collapse
 /// into, and a caller reading this list reads separate states: an accessibility grant that this
 /// context holds says nothing about a screen image, and the report never says otherwise.
+///
+/// The desktop is read before each operation that acts on it and again after it, and one rule
+/// settles what that means. An operation starts only if the reading before it names a desktop that
+/// is available, where the platform reports availability at all; a success stands only if the
+/// reading after it is the same desktop, in the same login, with the same availability. A reading
+/// that fails either test stops every later operation too, which is answered without being started.
+/// A check that has no route on the desktop it is asked of produces no record, so the platform's
+/// record of it stands.
 #[must_use]
 pub fn report(
     checks: &[Check],
     subject: &CapabilitySubject,
-    desktop: &DesktopContext,
+    source: &dyn ContextSource,
     revision: CapabilityRevision,
     plan: &Plan,
     facilities: &dyn Facilities,
 ) -> Vec<CapabilityRecord> {
     let observed_at_ms = kr_ipc::now_ms();
-    checks
-        .iter()
-        .filter_map(|check| {
-            let ran = facilities.perform(*check, plan);
+    let first = source.read();
+    let profile = first.desktop.worker_profile;
+    let mut stopped = false;
+    let mut records = Vec::new();
+    for check in checks {
+        let record = if check.acts_on_a_desktop() {
+            let before = if stopped {
+                first.clone()
+            } else {
+                source.read()
+            };
+            let Some(operation) =
+                resolve(*check, &before.desktop, before.variables.search.as_deref())
+            else {
+                continue;
+            };
+            let ran = if stopped || !may_start(&before.desktop) {
+                stopped = true;
+                not_in_the_state_it_needs(*check, None)
+            } else {
+                let deadline = Deadline::after(check.effects().bound);
+                let ran = facilities.perform(
+                    *check,
+                    plan,
+                    &Setting {
+                        desktop: &before.desktop,
+                        variables: &before.variables,
+                        operation: Some(&operation),
+                        deadline: &deadline,
+                    },
+                );
+                if unchanged(&before, &source.read()) {
+                    ran
+                } else {
+                    stopped = true;
+                    not_in_the_state_it_needs(*check, ran.facility)
+                }
+            };
             record(
                 &ran,
+                &operation.route,
                 subject,
-                desktop.worker_profile,
+                profile,
                 revision,
                 observed_at_ms,
             )
-        })
-        .collect()
+        } else {
+            let route = match check {
+                Check::SyntheticInput => Route {
+                    name: "synthetic-input",
+                    asking: Asking::Never,
+                },
+                _ => file_read_route(&first.desktop),
+            };
+            let deadline = Deadline::after(check.effects().bound);
+            let ran = facilities.perform(
+                *check,
+                plan,
+                &Setting {
+                    desktop: &first.desktop,
+                    variables: &first.variables,
+                    operation: None,
+                    deadline: &deadline,
+                },
+            );
+            record(&ran, &route, subject, profile, revision, observed_at_ms)
+        };
+        records.extend(record);
+    }
+    records
+}
+
+/// Whether an operation that acts on the desktop may start under this reading.
+///
+/// On Linux and Windows the reading must say the desktop is available, so a reading that could not
+/// be taken starts nothing. macOS keeps the rule it has: the checks run wherever the context does
+/// not refuse them, which includes the hosted runners whose sessions report another value.
+fn may_start(desktop: &DesktopContext) -> bool {
+    !matches!(
+        desktop.display_server,
+        DisplayServer::X11 | DisplayServer::Wayland | DisplayServer::WindowsDesktop
+    ) || desktop.availability == DesktopAvailability::Available
+}
+
+/// Whether the reading after an operation is the desktop the reading before it named.
+fn unchanged(before: &Surroundings, after: &Surroundings) -> bool {
+    before.desktop.availability == after.desktop.availability
+        && before.desktop.login_generation == after.desktop.login_generation
+        && before.desktop.is_same_desktop(&after.desktop)
+}
+
+/// What a check that did not start, or whose success cannot stand, came to.
+///
+/// The words do not say the session is locked: another desktop in front, a reading that failed and
+/// a change in the middle of the operation are not that.
+fn not_in_the_state_it_needs(check: Check, facility: Option<String>) -> Ran {
+    Ran {
+        check,
+        facility,
+        outcome: Outcome::NotAttempted {
+            detail: Sentence::new().stated(
+                "the desktop was not in the state this check needs: it changed during the \
+                 check, another desktop was in front, or its state could not be read",
+            ),
+        },
+    }
 }
 
 /// What a probe result was taken against.
@@ -673,7 +884,7 @@ pub fn stale(
 pub struct Platform;
 
 impl Facilities for Platform {
-    fn perform(&self, check: Check, plan: &Plan) -> Ran {
+    fn perform(&self, check: Check, plan: &Plan, setting: &Setting<'_>) -> Ran {
         match check {
             Check::AuthorisedFileRead => read_authorised_file(plan),
             // The destructive check is never performed here, with or without a context. Delivering
@@ -686,7 +897,21 @@ impl Facilities for Platform {
                 facility: None,
                 outcome: Outcome::WithheldForIsolation,
             },
-            _ => platform::perform(check, plan),
+            _ => match setting.operation {
+                None => not_performed_on_this_platform(check),
+                // A route recorded as what it is and never run: its own words are the record.
+                Some(Operation {
+                    program: Program::NotPerformed(words),
+                    ..
+                }) => Ran {
+                    check,
+                    facility: None,
+                    outcome: Outcome::NotPerformed {
+                        detail: Sentence::new().stated(words),
+                    },
+                },
+                Some(operation) => platform::perform(check, plan, setting, operation),
+            },
         }
     }
 }
@@ -1050,27 +1275,32 @@ mod platform {
 
     use std::path::{Path, PathBuf};
 
-    use super::{Check, ContentClass, Exit, Outcome, Plan, Ran, Sentence, bounded};
+    use super::{
+        Check, ContentClass, Deadline, Exit, Operation, Outcome, Plan, Program, Ran, Sentence,
+        Setting, bounded,
+    };
 
-    /// The platform's screen capture tool.
-    const CAPTURE: &str = "/usr/sbin/screencapture";
-    /// The platform's automation facility, which is how the accessibility tree is read.
-    const AUTOMATION: &str = "/usr/bin/osascript";
-    /// The platform's application launcher.
-    const LAUNCHER: &str = "/usr/bin/open";
-    /// The application the launch check starts.
-    ///
-    /// The platform's own calculator: it is on every installation, it has no documents to restore
-    /// and no saved state to reopen, so a new hidden instance of it does nothing to anything the
-    /// person owns. An editor would have reopened whatever they last had open, which is a check
-    /// that changes what is on somebody's screen to find out whether it can.
-    const APPLICATION: &str = "Calculator";
-
-    pub(super) fn perform(check: Check, plan: &Plan) -> Ran {
+    pub(super) fn perform(
+        check: Check,
+        plan: &Plan,
+        setting: &Setting<'_>,
+        operation: &Operation,
+    ) -> Ran {
+        let Program::Tool(tool) = &operation.program else {
+            // The program this route names is not on this host, or the route has none to run.
+            return Ran {
+                check,
+                facility: None,
+                outcome: Outcome::FacilityMissing,
+            };
+        };
+        let deadline = setting.deadline;
         match check {
-            Check::ScreenImage => screen_image(plan),
-            Check::AccessibleElement => accessible_element(plan),
-            Check::ApplicationLaunch => application_launch(plan),
+            Check::ScreenImage => screen_image(plan, tool, deadline),
+            Check::AccessibleElement => accessible_element(plan, tool, deadline),
+            Check::ApplicationLaunch => {
+                application_launch(plan, tool, operation.target.unwrap_or_default(), deadline)
+            }
             Check::SyntheticInput => {
                 unreachable!("the destructive check is withheld before it reaches a platform")
             }
@@ -1086,25 +1316,18 @@ mod platform {
     /// check's own directory, is measured, and is removed before the check answers, whichever way
     /// it went. `-x` takes it without the platform's shutter sound, because a diagnostic should
     /// not make a noise in a meeting.
-    fn screen_image(plan: &Plan) -> Ran {
+    fn screen_image(plan: &Plan, tool: &str, deadline: &Deadline) -> Ran {
         let check = Check::ScreenImage;
-        let facility = super::installed(CAPTURE);
-        if facility.is_none() {
-            return Ran {
-                check,
-                facility,
-                outcome: Outcome::FacilityMissing,
-            };
-        }
         let image: PathBuf = plan.scratch.join("screen-image-check.png");
         let _ = std::fs::remove_file(&image);
         // `-m` is the main display and nothing else: without it this tool writes one file per
         // display, and a check that removed the file it named would leave the others behind.
         let ran = bounded(
             check,
-            CAPTURE,
+            tool,
             &["-x", "-m", "-t", "png", &image.to_string_lossy()],
             plan,
+            deadline,
         );
         // Read into memory, which is what the capability is about, and dropped again. The bytes
         // are never looked at beyond their length and their first four, which say whether this is
@@ -1184,7 +1407,7 @@ mod platform {
             // An outcome with no words of its own is said in the words its judgement gives it.
             other => Outcome::NotAttempted {
                 detail: behind(
-                    super::judge(Check::ScreenImage, &other)
+                    super::judge(Check::ScreenImage, &other, super::Asking::ForAGrant)
                         .2
                         .unwrap_or_default(),
                 ),
@@ -1197,27 +1420,21 @@ mod platform {
     /// The frontmost application's own name is the smallest question that needs the tree at all:
     /// answering it needs the Accessibility grant, and asking it needs the Automation grant for
     /// the platform's user-interface service. Nothing is selected, moved or clicked.
-    fn accessible_element(plan: &Plan) -> Ran {
+    fn accessible_element(plan: &Plan, tool: &str, deadline: &Deadline) -> Ran {
         let check = Check::AccessibleElement;
-        if super::installed(AUTOMATION).is_none() {
-            return Ran {
-                check,
-                facility: None,
-                outcome: Outcome::FacilityMissing,
-            };
-        }
         // The question has to be one only the grant answers. A process's own name is a property
         // of the process and comes back without it; the elements inside that process are the
         // accessibility tree, and asking for one of those is what the platform gates.
         let ran = bounded(
             check,
-            AUTOMATION,
+            tool,
             &[
                 "-e",
                 "tell application \"System Events\" to tell (first application process whose \
                  frontmost is true) to get the count of UI elements",
             ],
             plan,
+            deadline,
         );
         let outcome = match ran.exit {
             Exit::Succeeded(said) => match said.trim().parse::<u64>() {
@@ -1330,19 +1547,17 @@ mod platform {
     /// `-g` keeps it behind whatever the person is looking at and `-n` makes it a new instance, so
     /// an application they already have open is not disturbed. The process identifiers this check
     /// is given back are the only ones it ends.
-    fn application_launch(plan: &Plan) -> Ran {
+    fn application_launch(
+        plan: &Plan,
+        tool: &str,
+        application: &'static str,
+        deadline: &Deadline,
+    ) -> Ran {
         let check = Check::ApplicationLaunch;
-        if super::installed(LAUNCHER).is_none() {
-            return Ran {
-                check,
-                facility: None,
-                outcome: Outcome::FacilityMissing,
-            };
-        }
-        // This check names its own application and takes none from a caller. An application a
-        // caller could nominate is one that could write something when it starts, and the effects
-        // this check declares would then be true of the default and not of the run.
-        let application = APPLICATION;
+        // This check names its own application, in its route, and takes none from a caller. An
+        // application a caller could nominate is one that could write something when it starts,
+        // and the effects this check declares would then be true of the default and not of the
+        // run.
         // A mark this check made up, passed to the instance it starts. It is how the instance this
         // check is responsible for is told apart from one the person already had open, and it is
         // the only thing this check will end.
@@ -1356,16 +1571,19 @@ mod platform {
         // Hidden, in the background, and without waiting. The launcher's own wait is for the
         // application to exit, and an application that stays open would make a launch that worked
         // look like a check that never answered.
+        // The time to find and end the instance is kept back from the launcher's own, so that a
+        // launcher that runs to the end of its allowance still leaves time to clean up after it.
         let ran = bounded(
             check,
-            LAUNCHER,
+            tool,
             &["-g", "-j", "-n", "-a", application, "--args", &mark],
             plan,
+            &deadline.ending_before(CLEANUP_RESERVE),
         );
         let outcome = match ran.exit {
             // The launcher accepting the request is not the application having started, so the
             // answer waits for the process and says what became of it.
-            Exit::Succeeded(_) => match end_marked(&mark, plan) {
+            Exit::Succeeded(_) => match end_marked(&mark, plan, deadline) {
                 Ended::Gone(named) => Outcome::Performed {
                     detail: Sentence::new()
                         .stated("it started a new hidden instance of ")
@@ -1394,13 +1612,13 @@ mod platform {
             // A launcher that did not answer may still have started something, so the instance is
             // looked for and ended on this path too.
             Exit::Failed(said) => {
-                let _ = end_marked(&mark, plan);
+                let _ = end_marked(&mark, plan, deadline);
                 Outcome::NotAttempted {
                     detail: super::failed(&said),
                 }
             }
             Exit::Unfinished(outcome) => {
-                let _ = end_marked(&mark, plan);
+                let _ = end_marked(&mark, plan, deadline);
                 outcome
             }
         };
@@ -1426,13 +1644,18 @@ mod platform {
     /// The mark was made a moment ago by this check, so a process carrying it is one this check
     /// started. Nothing else is looked for, and the processes are ended by the identifiers the
     /// platform gave back rather than by any pattern of its own.
-    fn end_marked(mark: &str, plan: &Plan) -> Ended {
-        let deadline = std::time::Instant::now() + Check::ApplicationLaunch.effects().bound;
-        while std::time::Instant::now() < deadline {
-            let pids = marked(mark, plan).unwrap_or_default();
+    fn end_marked(mark: &str, plan: &Plan, deadline: &Deadline) -> Ended {
+        while !deadline.expired() {
+            let pids = marked(mark, plan, deadline).unwrap_or_default();
             if !pids.is_empty() {
                 let arguments: Vec<&str> = pids.iter().map(String::as_str).collect();
-                let _ = bounded(Check::ApplicationLaunch, "/bin/kill", &arguments, plan);
+                let _ = bounded(
+                    Check::ApplicationLaunch,
+                    "/bin/kill",
+                    &arguments,
+                    plan,
+                    deadline,
+                );
                 let named = if pids.len() == 1 {
                     Sentence::new().stated("the one instance it started")
                 } else {
@@ -1443,9 +1666,9 @@ mod platform {
                 };
                 // Asked to end is not ended, and a listing this check could not take is not a
                 // listing that came back empty. Only an answer settles it.
-                while std::time::Instant::now() < deadline {
+                while !deadline.expired() {
                     std::thread::sleep(LAUNCH_POLL);
-                    if marked(mark, plan).is_some_and(|pids| pids.is_empty()) {
+                    if marked(mark, plan, deadline).is_some_and(|pids| pids.is_empty()) {
                         return Ended::Gone(named);
                     }
                 }
@@ -1460,12 +1683,13 @@ mod platform {
     ///
     /// `None` is the listing this check could not take, which is a different thing from a listing
     /// that came back empty: one says nothing is there and the other says nobody looked.
-    fn marked(mark: &str, plan: &Plan) -> Option<Vec<String>> {
+    fn marked(mark: &str, plan: &Plan, deadline: &Deadline) -> Option<Vec<String>> {
         let listed = bounded(
             Check::ApplicationLaunch,
             "/usr/bin/pgrep",
             &["-f", mark],
             plan,
+            deadline,
         );
         match listed.exit {
             Exit::Succeeded(said) => Some(
@@ -1482,6 +1706,9 @@ mod platform {
 
     /// How long the launch check waits between looks for the instance it started.
     const LAUNCH_POLL: std::time::Duration = std::time::Duration::from_millis(100);
+
+    /// The part of the launch check's time that is kept for finding and ending the instance.
+    const CLEANUP_RESERVE: std::time::Duration = std::time::Duration::from_secs(5);
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -1493,9 +1720,14 @@ mod platform {
     //! the accessibility tree is a bus rather than an automation facility. Saying so is the honest
     //! answer; performing the wrong operation and reporting its result would not be.
 
-    use super::{Check, Plan, Ran, not_performed_on_this_platform};
+    use super::{Check, Operation, Plan, Ran, Setting, not_performed_on_this_platform};
 
-    pub(super) fn perform(check: Check, _plan: &Plan) -> Ran {
+    pub(super) fn perform(
+        check: Check,
+        _plan: &Plan,
+        _setting: &Setting<'_>,
+        _operation: &Operation,
+    ) -> Ran {
         not_performed_on_this_platform(check)
     }
 }
@@ -1565,16 +1797,32 @@ fn failed(said: &str) -> Sentence {
 ///
 /// The output goes to files in the check's own directory rather than to pipes, so a facility that
 /// prints more than a pipe holds cannot stop halfway through waiting for somebody to read it. The
-/// allowance is the check's own: a facility still running at the end of it is ended and the check
-/// answers [`Outcome::NotAnswered`], which is what a permission prompt the person has not answered
-/// looks like from here.
+/// allowance is what is left of the check's one deadline: a facility still running at the end of it
+/// is ended with everything it started, and the check answers [`Outcome::NotAnswered`], which is
+/// what a permission prompt the person has not answered looks like from here. A call made after
+/// the deadline has passed starts nothing and answers the same.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-fn bounded(check: Check, program: &'static str, arguments: &[&str], plan: &Plan) -> Run {
+fn bounded(
+    check: Check,
+    program: &str,
+    arguments: &[&str],
+    plan: &Plan,
+    deadline: &Deadline,
+) -> Run {
     let facility = installed(program);
     if facility.is_none() {
         return Run {
             facility,
             exit: Exit::Unfinished(Outcome::FacilityMissing),
+        };
+    }
+    if deadline.expired() {
+        return Run {
+            facility,
+            exit: Exit::Unfinished(Outcome::NotAnswered {
+                waited: Duration::ZERO,
+                stopped: true,
+            }),
         };
     }
     if let Err(error) = std::fs::create_dir_all(&plan.scratch) {
@@ -1618,6 +1866,13 @@ fn bounded(check: Check, program: &'static str, arguments: &[&str], plan: &Plan)
             .stdin(std::process::Stdio::null())
             .stdout(out)
             .stderr(err);
+        // A group of its own, so that ending the facility ends what it started as well: a
+        // descendant that outlived its parent would go on running after the check answered.
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt as _;
+            command.process_group(0);
+        }
         #[cfg(feature = "testing")]
         kr_ipc::testing::created::note_here("check", &command);
         command.spawn()
@@ -1627,17 +1882,16 @@ fn bounded(check: Check, program: &'static str, arguments: &[&str], plan: &Plan)
             facility,
             exit: Exit::Unfinished(Outcome::NotAttempted {
                 detail: Sentence::new()
-                    .stated(program)
+                    .path(Path::new(program))
                     .stated(" could not be started"),
             }),
         };
     };
-    let bound = check.effects().bound;
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break Some(status),
             Ok(None) => {
-                if started.elapsed() >= bound {
+                if deadline.expired() {
                     break None;
                 }
                 std::thread::sleep(POLL);
@@ -1657,9 +1911,18 @@ fn bounded(check: Check, program: &'static str, arguments: &[&str], plan: &Plan)
             Exit::Failed(said.trim().to_owned())
         }
         None => {
-            // Only this check's own child, by the handle it holds: nothing here looks a process up
-            // by name. Collecting it is bounded as well, because a child that will not go is not
-            // a reason for a diagnostic to stop answering.
+            // Only this check's own child and its own group, by the handle and the group it holds:
+            // nothing here looks a process up by name. Collecting it is bounded as well, because a
+            // child that will not go is not a reason for a diagnostic to stop answering.
+            #[cfg(unix)]
+            if let Some(group) = i32::try_from(child.id())
+                .ok()
+                .and_then(rustix::process::Pid::from_raw)
+            {
+                // Best effort: a group that has ended already cannot be signalled, which is the
+                // outcome wanted.
+                let _ = rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
+            }
             let _ = child.kill();
             let collected = std::time::Instant::now();
             let stopped = loop {
@@ -1755,11 +2018,75 @@ mod tests {
         CapabilityRevision::new(3)
     }
 
+    /// What a person at a macOS machine can be asked, which is what these cases read.
+    const MACOS: Route = Route {
+        name: "macos-test",
+        asking: Asking::ForAGrant,
+    };
+
+    /// [`super::judge`] on a route that asks for a grant, as the cases here read the words.
+    fn judge(
+        check: Check,
+        outcome: &Outcome,
+    ) -> (CapabilityState, CapabilityEvidenceSource, Option<Sentence>) {
+        super::judge(check, outcome, Asking::ForAGrant)
+    }
+
+    /// [`super::record`] on a route that asks for a grant.
+    fn record(
+        ran: &Ran,
+        subject: &CapabilitySubject,
+        profile: WorkerProfile,
+        revision: CapabilityRevision,
+        observed_at_ms: kr_protocol::scalars::TimestampMs,
+    ) -> Option<CapabilityRecord> {
+        super::record(ran, &MACOS, subject, profile, revision, observed_at_ms)
+    }
+
+    /// A context source that always reads the same desktop, with no variables.
+    fn fixed(desktop: &DesktopContext) -> impl ContextSource + use<> {
+        let desktop = desktop.clone();
+        move || Surroundings {
+            desktop: desktop.clone(),
+            variables: Variables::default(),
+        }
+    }
+
+    /// [`super::report`] against a desktop that does not change.
+    fn report(
+        checks: &[Check],
+        subject: &CapabilitySubject,
+        desktop: &DesktopContext,
+        revision: CapabilityRevision,
+        plan: &Plan,
+        facilities: &dyn Facilities,
+    ) -> Vec<CapabilityRecord> {
+        super::report(checks, subject, &fixed(desktop), revision, plan, facilities)
+    }
+
+    /// Performs one check through the platform's facilities, on this test's own macOS desktop.
+    fn perform_here(check: Check, plan: &Plan) -> Ran {
+        let desktop = desktop();
+        let variables = Variables::default();
+        let deadline = Deadline::after(check.effects().bound);
+        let operation = resolve(check, &desktop, None);
+        Platform.perform(
+            check,
+            plan,
+            &Setting {
+                desktop: &desktop,
+                variables: &variables,
+                operation: operation.as_ref(),
+                deadline: &deadline,
+            },
+        )
+    }
+
     /// A stand-in that answers each check with whatever the test put in it.
     struct Scripted(Vec<Ran>);
 
     impl Facilities for Scripted {
-        fn perform(&self, check: Check, _plan: &Plan) -> Ran {
+        fn perform(&self, check: Check, _plan: &Plan, _setting: &Setting<'_>) -> Ran {
             self.0
                 .iter()
                 .find(|ran| ran.check == check)
@@ -1778,6 +2105,541 @@ mod tests {
             facility: None,
             outcome,
         }
+    }
+
+    fn surroundings(desktop: DesktopContext) -> Surroundings {
+        Surroundings {
+            desktop,
+            variables: Variables::default(),
+        }
+    }
+
+    /// Readings that come one at a time, the last one again after that.
+    struct Readings {
+        list: Vec<Surroundings>,
+        next: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Readings {
+        fn of(list: Vec<Surroundings>) -> Self {
+            Self {
+                list,
+                next: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl ContextSource for Readings {
+        fn read(&self) -> Surroundings {
+            let at = self.next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.list[at.min(self.list.len() - 1)].clone()
+        }
+    }
+
+    /// A stand-in that records what each check was given and answers it as performed.
+    #[derive(Default)]
+    struct Seeing(std::sync::Mutex<Vec<(Check, DisplayServer, DesktopAvailability, Variables)>>);
+
+    impl Facilities for Seeing {
+        fn perform(&self, check: Check, _plan: &Plan, setting: &Setting<'_>) -> Ran {
+            self.0.lock().expect("the record").push((
+                check,
+                setting.desktop.display_server,
+                setting.desktop.availability,
+                setting.variables.clone(),
+            ));
+            ran(
+                check,
+                Outcome::Performed {
+                    detail: Sentence::new().stated("it ran"),
+                },
+            )
+        }
+    }
+
+    fn state_of(records: &[CapabilityRecord], check: Check) -> CapabilityState {
+        records
+            .iter()
+            .find(|record| record.capability.as_str() == check.capability())
+            .expect("a record for the check")
+            .state
+    }
+
+    /// KR-REQ-03.29, S-2: the operation is given the context it starts under, with the worker's own
+    /// variables, and the route it resolved to.
+    #[test]
+    fn the_operation_receives_the_selected_context() {
+        let first = surroundings(desktop());
+        let before = Surroundings {
+            desktop: desktop(),
+            variables: Variables {
+                display: Some(":7".to_owned()),
+                ..Variables::default()
+            },
+        };
+        let source = Readings::of(vec![first, before.clone(), before]);
+        let seeing = Seeing::default();
+        let records = super::report(
+            &[Check::ScreenImage],
+            &subject(),
+            &source,
+            revision(),
+            &Plan::in_directory("."),
+            &seeing,
+        );
+        assert_eq!(records.len(), 1);
+        let seen = seeing.0.lock().expect("the record");
+        assert_eq!(seen.len(), 1);
+        let (_, server, availability, variables) = &seen[0];
+        assert_eq!(*server, DisplayServer::Quartz);
+        assert_eq!(*availability, DesktopAvailability::Available);
+        assert_eq!(variables.display.as_deref(), Some(":7"));
+        assert_eq!(
+            records[0].identity.schema.as_ref().map(String::as_str),
+            Some("macos-screen-capture"),
+            "the record names the route the check took"
+        );
+    }
+
+    /// KR-REQ-03.29, S-3: a success stands only if the reading after the operation is the desktop
+    /// the reading before it named, in availability, login and identity.
+    #[test]
+    fn a_success_is_dropped_unless_the_context_reads_as_at_first() {
+        type Change = fn(&mut DesktopContext);
+        let changes: [(&str, Change); 4] = [
+            ("locked", |desktop| {
+                desktop.availability = DesktopAvailability::Locked;
+            }),
+            ("unknown", |desktop| {
+                desktop.availability = DesktopAvailability::Unknown;
+            }),
+            ("another login, still available", |desktop| {
+                desktop.login_generation = Nullable::some(U64::new(3));
+            }),
+            ("another desktop, still available", |desktop| {
+                desktop.platform_session = Nullable::some("2".to_owned());
+            }),
+        ];
+        for (what, change) in changes {
+            let mut after = desktop();
+            change(&mut after);
+            let source = Readings::of(vec![
+                surroundings(desktop()),
+                surroundings(desktop()),
+                surroundings(after),
+            ]);
+            let records = super::report(
+                &[Check::ScreenImage],
+                &subject(),
+                &source,
+                revision(),
+                &Plan::in_directory("."),
+                &Seeing::default(),
+            );
+            assert_eq!(
+                state_of(&records, Check::ScreenImage),
+                CapabilityState::TemporarilyUnavailable,
+                "{what}: nothing is established"
+            );
+            let reason = records[0]
+                .disabled_reason
+                .as_ref()
+                .map(|sentence| sentence.as_str().to_owned())
+                .unwrap_or_default();
+            assert!(
+                reason.contains("not in the state this check needs"),
+                "{what}"
+            );
+            assert!(!reason.contains("locked"), "{what}: {reason}");
+        }
+        let same = Readings::of(vec![surroundings(desktop())]);
+        let records = super::report(
+            &[Check::ScreenImage],
+            &subject(),
+            &same,
+            revision(),
+            &Plan::in_directory("."),
+            &Seeing::default(),
+        );
+        assert_eq!(
+            state_of(&records, Check::ScreenImage),
+            CapabilityState::QualifiedAvailable,
+            "an unchanged reading keeps the success"
+        );
+    }
+
+    /// KR-REQ-03.29, S-3: a reading that is not available starts nothing on Linux or Windows,
+    /// `Unknown` included, and macOS keeps the rule it has.
+    #[test]
+    fn a_first_reading_that_is_not_available_starts_no_operation_off_macos() {
+        for server in [
+            DisplayServer::X11,
+            DisplayServer::Wayland,
+            DisplayServer::WindowsDesktop,
+        ] {
+            for availability in [
+                DesktopAvailability::Unknown,
+                DesktopAvailability::Locked,
+                DesktopAvailability::Background,
+                DesktopAvailability::Ended,
+            ] {
+                let mut context = desktop();
+                context.display_server = server;
+                context.availability = availability;
+                assert!(!may_start(&context), "{server:?} {availability:?}");
+            }
+            let mut context = desktop();
+            context.display_server = server;
+            assert!(may_start(&context), "{server:?} available");
+        }
+        let mut hosted = desktop();
+        hosted.availability = DesktopAvailability::Unknown;
+        assert!(may_start(&hosted), "macOS keeps its rule");
+    }
+
+    /// KR-REQ-03.29, S-10: after a refused re-read the remaining operations are answered without
+    /// being started.
+    #[test]
+    fn a_changed_context_stops_the_later_operations() {
+        let mut locked = desktop();
+        locked.availability = DesktopAvailability::Locked;
+        let source = Readings::of(vec![
+            surroundings(desktop()),
+            surroundings(desktop()),
+            surroundings(locked),
+        ]);
+        let seeing = Seeing::default();
+        let records = super::report(
+            &[
+                Check::ScreenImage,
+                Check::AccessibleElement,
+                Check::ApplicationLaunch,
+            ],
+            &subject(),
+            &source,
+            revision(),
+            &Plan::in_directory("."),
+            &seeing,
+        );
+        assert_eq!(records.len(), 3);
+        for check in [
+            Check::ScreenImage,
+            Check::AccessibleElement,
+            Check::ApplicationLaunch,
+        ] {
+            assert_eq!(
+                state_of(&records, check),
+                CapabilityState::TemporarilyUnavailable,
+                "{check:?}"
+            );
+        }
+        assert_eq!(
+            seeing.0.lock().expect("the record").len(),
+            1,
+            "only the first was started"
+        );
+    }
+
+    /// KR-REQ-03.29, S-5: a check with no route on this desktop produces no record, so the
+    /// platform's record stands, and nothing is started for it.
+    #[test]
+    fn no_route_means_no_record_and_nothing_started() {
+        for server in [
+            DisplayServer::X11,
+            DisplayServer::Wayland,
+            DisplayServer::WindowsDesktop,
+        ] {
+            let mut context = desktop();
+            context.display_server = server;
+            let seeing = Seeing::default();
+            let records = report(
+                &[
+                    Check::ApplicationLaunch,
+                    Check::ScreenImage,
+                    Check::AccessibleElement,
+                ],
+                &subject(),
+                &context,
+                revision(),
+                &Plan::in_directory("."),
+                &seeing,
+            );
+            assert!(records.is_empty(), "{server:?}: {records:?}");
+            assert!(
+                seeing.0.lock().expect("the record").is_empty(),
+                "{server:?}"
+            );
+        }
+    }
+
+    /// KR-REQ-03.29, S-5: a route this worker records as what it is and never performs comes back
+    /// as its own record, in the route's words.
+    #[test]
+    fn a_route_that_is_not_performed_comes_back_as_its_own_record() {
+        let desktop = desktop();
+        let variables = Variables::default();
+        let deadline = Deadline::after(Duration::from_secs(5));
+        let operation = Operation {
+            check: Check::ScreenImage,
+            route: Route {
+                name: "a-service-of-its-own",
+                asking: Asking::Never,
+            },
+            program: Program::NotPerformed("this desktop has a capture service of its own"),
+            target: None,
+        };
+        let ran = Platform.perform(
+            Check::ScreenImage,
+            &Plan::in_directory("."),
+            &Setting {
+                desktop: &desktop,
+                variables: &variables,
+                operation: Some(&operation),
+                deadline: &deadline,
+            },
+        );
+        let record = super::record(
+            &ran,
+            &operation.route,
+            &subject(),
+            WorkerProfile::DesktopBound,
+            revision(),
+            kr_ipc::now_ms(),
+        )
+        .expect("a record");
+        assert_eq!(record.state, CapabilityState::NotTested);
+        assert_eq!(record.evidence_source, CapabilityEvidenceSource::NotProbed);
+        assert_eq!(
+            record.disabled_reason.as_ref().map(Sentence::as_str),
+            Some("this desktop has a capture service of its own")
+        );
+    }
+
+    /// KR-REQ-03.29, S-9: a record names the program it ran and its digest, and the route it took;
+    /// a run that names no program, which is what a helper of this worker is, carries the route and
+    /// no digest.
+    #[test]
+    fn a_helper_row_is_named_by_its_route_with_no_digest() {
+        let route = Route {
+            name: "a-helper-route",
+            asking: Asking::Never,
+        };
+        let helper = super::record(
+            &ran(
+                Check::ScreenImage,
+                Outcome::Performed {
+                    detail: Sentence::new().stated("it ran"),
+                },
+            ),
+            &route,
+            &subject(),
+            WorkerProfile::DesktopBound,
+            revision(),
+            kr_ipc::now_ms(),
+        )
+        .expect("a record");
+        assert!(!helper.identity.binary.is_present());
+        assert!(!helper.identity.version.is_present(), "no digest");
+        assert_eq!(
+            helper.identity.schema.as_ref().map(String::as_str),
+            Some("a-helper-route")
+        );
+        let file = std::env::temp_dir().join(format!("kr-ran-{}", kr_ipc::new_uuid()));
+        std::fs::write(&file, b"a program").expect("a file");
+        let program = super::record(
+            &Ran {
+                check: Check::ScreenImage,
+                facility: Some(file.display().to_string()),
+                outcome: Outcome::FacilityMissing,
+            },
+            &route,
+            &subject(),
+            WorkerProfile::DesktopBound,
+            revision(),
+            kr_ipc::now_ms(),
+        )
+        .expect("a record");
+        let _ = std::fs::remove_file(&file);
+        assert!(program.identity.binary.as_ref().is_some());
+        assert!(program.identity.version.as_ref().is_some(), "a digest");
+    }
+
+    /// KR-REQ-03.29, S-11, the findings' side: each trigger a finding lists is one that two
+    /// fingerprints that differ in the matching field make `stale` return, and a permission is not
+    /// among them.
+    #[test]
+    fn a_finding_lists_only_triggers_something_can_fire() {
+        let records = report(
+            &Check::all(),
+            &subject(),
+            &desktop(),
+            revision(),
+            &Plan::in_directory("."),
+            &Scripted(Vec::new()),
+        );
+        assert!(!records.is_empty());
+        for record in &records {
+            for trigger in &record.invalidation {
+                let (earlier, later) = match trigger {
+                    CapabilityInvalidation::BinaryIdentity => (
+                        Fingerprint {
+                            facility: Some("a".to_owned()),
+                            ..Fingerprint::default()
+                        },
+                        Fingerprint {
+                            facility: Some("b".to_owned()),
+                            ..Fingerprint::default()
+                        },
+                    ),
+                    CapabilityInvalidation::DesktopGeneration => (
+                        Fingerprint {
+                            desktop_generation: Some(1),
+                            ..Fingerprint::default()
+                        },
+                        Fingerprint {
+                            desktop_generation: Some(2),
+                            ..Fingerprint::default()
+                        },
+                    ),
+                    CapabilityInvalidation::WorkerProfile => (
+                        Fingerprint {
+                            profile: Some(WorkerProfile::DesktopBound),
+                            ..Fingerprint::default()
+                        },
+                        Fingerprint {
+                            profile: Some(WorkerProfile::HeadlessUser),
+                            ..Fingerprint::default()
+                        },
+                    ),
+                    other => panic!(
+                        "{} lists {other:?}, which no fingerprint field fires",
+                        record.capability
+                    ),
+                };
+                assert!(
+                    stale(record, &earlier, &later).contains(trigger),
+                    "{} lists {trigger:?} and it does not fire",
+                    record.capability
+                );
+            }
+        }
+    }
+
+    /// KR-REQ-03.29, R5: what an operation that did not answer says follows its route: only a
+    /// route that asks the person may say that a prompt looks exactly like this.
+    #[test]
+    fn what_an_unanswered_operation_says_follows_its_route() {
+        let said = |asking| {
+            super::judge(
+                Check::ScreenImage,
+                &Outcome::NotAnswered {
+                    waited: Duration::from_secs(20),
+                    stopped: true,
+                },
+                asking,
+            )
+            .2
+            .expect("a reason")
+            .as_str()
+            .to_owned()
+        };
+        assert!(said(Asking::ForAGrant).contains("looks exactly like this from here"));
+        for asking in [Asking::Never, Asking::Maybe] {
+            let words = said(asking);
+            assert!(!words.contains("looks exactly like this"), "{asking:?}");
+            assert!(
+                words.contains("Nothing on this desktop is known to ask the person"),
+                "{asking:?}"
+            );
+        }
+        assert!(said(Asking::Maybe).contains("Some compositors ask"));
+        assert!(!said(Asking::Never).contains("Some compositors ask"));
+    }
+
+    /// KR-REQ-03.29, S-6: the facility's whole group ends at the bound, a descendant it started
+    /// included.
+    #[cfg(unix)]
+    #[test]
+    fn a_check_child_is_ended_with_its_group() {
+        let root = kr_ipc::testing::PrivateTempDir::create();
+        let scratch = root.path().join("group");
+        std::fs::create_dir_all(&scratch).expect("a directory for this check");
+        let child = scratch.join("child.pid");
+        let grandchild = scratch.join("grandchild.pid");
+        let script = "/bin/sleep 120 & echo $! > \"$2\"; echo $$ > \"$1\"; wait";
+        let run = bounded(
+            Check::ScreenImage,
+            "/bin/sh",
+            &[
+                "-c",
+                script,
+                "sh",
+                child.to_str().expect("text"),
+                grandchild.to_str().expect("text"),
+            ],
+            &Plan::in_directory(&scratch),
+            &Deadline::after(Duration::from_secs(2)),
+        );
+        let Exit::Unfinished(Outcome::NotAnswered { stopped, .. }) = run.exit else {
+            panic!("the stand-in did not run out of its bound");
+        };
+        assert!(stopped);
+        for file in [&child, &grandchild] {
+            let number = std::fs::read_to_string(file)
+                .expect("the process wrote its number")
+                .trim()
+                .parse::<i32>()
+                .expect("a process number");
+            let pid = rustix::process::Pid::from_raw(number).expect("a process number");
+            assert_eq!(
+                rustix::process::test_kill_process(pid),
+                Err(rustix::io::Errno::SRCH),
+                "process {number} of {} is still there after the check answered",
+                file.display()
+            );
+        }
+    }
+
+    /// KR-REQ-03.29, S-8: the calls of one check draw on one deadline, so the time they take
+    /// together never passes it and each is given the time that is left.
+    #[cfg(unix)]
+    #[test]
+    fn one_deadline_bounds_the_whole_check() {
+        let root = kr_ipc::testing::PrivateTempDir::create();
+        let scratch = root.path().join("deadline");
+        std::fs::create_dir_all(&scratch).expect("a directory for this check");
+        let plan = Plan::in_directory(&scratch);
+        let deadline = Deadline::after(Duration::from_millis(1_200));
+        let started = Instant::now();
+        let mut calls = Vec::new();
+        for _ in 0..3 {
+            let before = started.elapsed();
+            let run = bounded(
+                Check::ApplicationLaunch,
+                "/bin/sh",
+                &["-c", "/bin/sleep 0.7"],
+                &plan,
+                &deadline,
+            );
+            calls.push((run.exit, started.elapsed() - before));
+        }
+        assert!(
+            matches!(calls[0].0, Exit::Succeeded(_)),
+            "the first call has the time it needs"
+        );
+        let Exit::Unfinished(Outcome::NotAnswered { waited, .. }) = &calls[1].0 else {
+            panic!("the second call was given more than was left");
+        };
+        assert!(*waited < Duration::from_millis(650), "waited {waited:?}");
+        assert!(
+            matches!(calls[2].0, Exit::Unfinished(Outcome::NotAnswered { .. })),
+            "a call after the deadline starts nothing"
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(1_200) + Duration::from_secs(1),
+            "the three calls took {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]
@@ -2018,7 +2880,7 @@ mod tests {
     }
 
     #[test]
-    fn every_probe_record_carries_the_four_triggers_that_end_it() {
+    fn every_probe_record_carries_the_three_triggers_that_end_it() {
         let facilities = Scripted(Vec::new());
         let desktop = desktop();
         let records = report(
@@ -2034,7 +2896,6 @@ mod tests {
                 record.invalidation,
                 vec![
                     CapabilityInvalidation::BinaryIdentity,
-                    CapabilityInvalidation::OsPermission,
                     CapabilityInvalidation::DesktopGeneration,
                     CapabilityInvalidation::WorkerProfile,
                 ],
@@ -2352,7 +3213,7 @@ mod tests {
             Check::ApplicationLaunch,
             Check::ScreenImage,
         ] {
-            let ran = Platform.perform(check, &Plan::in_directory("."));
+            let ran = perform_here(check, &Plan::in_directory("."));
             assert!(
                 matches!(ran.outcome, Outcome::NotAttempted { .. }),
                 "{check:?}: {ran:?}"
@@ -2362,7 +3223,7 @@ mod tests {
 
     #[test]
     fn the_read_check_is_not_run_without_a_file_the_person_nominated() {
-        let ran = Platform.perform(Check::AuthorisedFileRead, &Plan::in_directory("."));
+        let ran = perform_here(Check::AuthorisedFileRead, &Plan::in_directory("."));
         assert!(matches!(ran.outcome, Outcome::NotAttempted { .. }));
     }
 
@@ -2370,7 +3231,7 @@ mod tests {
     /// nothing is sent.
     #[test]
     fn the_destructive_check_is_withheld_without_a_context_of_its_own() {
-        let ran = Platform.perform(Check::SyntheticInput, &Plan::in_directory("."));
+        let ran = perform_here(Check::SyntheticInput, &Plan::in_directory("."));
         assert_eq!(ran.outcome, Outcome::WithheldForIsolation);
     }
 
@@ -2384,7 +3245,7 @@ mod tests {
             authorised_file: Some(file.clone()),
             ..Plan::in_directory(&directory)
         };
-        let ran = Platform.perform(Check::AuthorisedFileRead, &plan);
+        let ran = perform_here(Check::AuthorisedFileRead, &plan);
         match &ran.outcome {
             Outcome::Performed { detail } => {
                 assert!(detail.as_str().contains("25 bytes"), "{detail}");
@@ -2422,7 +3283,7 @@ mod tests {
         };
         // Nothing writes to it. A read that opened it the ordinary way would wait for a writer
         // that is not coming and answer only when its bound ran out.
-        let ran = Platform.perform(Check::AuthorisedFileRead, &plan);
+        let ran = perform_here(Check::AuthorisedFileRead, &plan);
         match &ran.outcome {
             Outcome::NotAttempted { detail } => {
                 assert!(detail.as_str().contains("not a regular file"), "{detail}");
@@ -2473,6 +3334,7 @@ mod tests {
                             pid_file.to_str().expect("a path that is text"),
                         ],
                         &plan,
+                        &Deadline::after(check.effects().bound),
                     );
                     (check, run, pid_file)
                 })
@@ -3131,10 +3993,14 @@ fn the_disclosed_checks_on_this_desktop() {
         application: Nullable::null(),
         terminal: Nullable::null(),
     };
+    let reading = || crate::desktop::routes::Surroundings {
+        desktop: desktop.clone(),
+        variables: crate::desktop::routes::Variables::of_this_process(),
+    };
     let records = report(
         &Check::all(),
         &subject,
-        &desktop,
+        &reading,
         CapabilityRevision::new(1),
         &plan,
         &Platform,

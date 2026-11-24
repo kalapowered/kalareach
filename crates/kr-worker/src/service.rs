@@ -5252,12 +5252,17 @@ impl WorkerService {
             // The run ends when the thread does, whether or not the connection that asked is
             // still there to be answered, so a second request is never started beside it.
             let _run = run;
-            // Read on this thread: asking the platform for the login session can wait on it.
-            let desktop = crate::desktop::context(profile, boot);
+            // Read on this thread, each time it is asked for: asking the platform for the login
+            // session can wait on it, and an operation reads it again before it starts and after
+            // it ends.
+            let surroundings = move || crate::desktop::routes::Surroundings {
+                desktop: crate::desktop::context(profile, boot.clone()),
+                variables: crate::desktop::routes::Variables::of_this_process(),
+            };
             crate::desktop::checks::perform(
                 &request,
                 session_id,
-                &desktop,
+                &surroundings,
                 &std::env::temp_dir(),
                 &crate::desktop::probe::Platform,
             )

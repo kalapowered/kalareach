@@ -53,6 +53,7 @@ pub mod capability;
 pub mod checks;
 pub mod platform;
 pub mod probe;
+pub mod routes;
 
 use std::time::{Duration, Instant};
 
