@@ -66,9 +66,11 @@ pub(super) fn collect_within(child: &mut Child, bound: Duration) -> bool {
 /// Collects a child that was ended: within `bound` where the system has taken it down by then, and
 /// otherwise on a thread of its own, which waits for it for as long as it takes.
 ///
-/// The caller answers within `bound` either way, and a child that was not collected by then is
-/// still collected once the system has finished with it, so none is left in the process table. It
-/// says whether the child was collected within `bound`.
+/// The caller waits at most `bound` for the collection and then goes on. That is an allowance and
+/// not the time the call returns at: the start of the thread and the last short sleep of the wait
+/// come after it. A child that was not collected by then is collected on that thread once the
+/// system has finished with it, so it does not stay in the process table, unless the system
+/// refuses to start the thread. It says whether the child was collected within `bound`.
 #[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
 pub(super) fn collect_by(mut child: Child, bound: Duration) -> bool {
     if collect_within(&mut child, bound) {

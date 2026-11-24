@@ -42,17 +42,20 @@
 //! two blocks once the time is gone. A child that was ended is collected within a bound: for an
 //! operation, two seconds, inside the time the check keeps back for what follows the operation;
 //! for a context command, the time the reading has left, and no more than two seconds. A child not
-//! collected within its bound is collected on a thread of its own, and the check answers without
-//! it.
+//! collected within its bound is collected on a thread of its own, and the check goes on without
+//! it. A thread that the system refuses to start leaves its child in the process table; only
+//! resource exhaustion causes that.
 //!
 //! It does not bound a call on a regular file against a filesystem that has stopped answering: the
 //! open and each read of a capture, an output, a read-back or a digested file, the metadata read
-//! that finds a program, the creation of the check's directory and files, and the removal of the
-//! image and of the check's own files. Nothing in this process can abandon such a call. A check
-//! that meets one answers when the call returns. If the call came before a check's last test of
-//! its time, that check's record says it did not finish within its time limit. The removal of the
-//! run's own directory comes after the last of those tests, so nothing refuses it as late. These
-//! are stated limits: the bound is not exact.
+//! that finds a program, the start of a program, which waits until its file is loaded, the
+//! creation of the check's directory and files and of a reading's capture directory, and the
+//! removal of the image, of the check's own files and of a reading's capture directory. Nothing in
+//! this process can abandon such a call. A check that meets one answers when the call returns. If
+//! the call came before a check's last test of its time, that check's record says it did not
+//! finish within its time limit. The removal of the run's own directory comes after the last of
+//! those tests, so nothing in the worker refuses it as late. These are stated limits: the bound is
+//! not exact.
 //!
 //! # What runs the operation
 //!
@@ -2203,9 +2206,9 @@ pub(super) fn bounded_with(
         }
         None => {
             // Only this check's own child and its own group, by the handle and the group it holds:
-            // nothing here looks a process up by name. Collecting it is bounded as well, and a child
-            // that is not collected by then is collected on a thread of its own, because a child
-            // that will not go is not a reason for a diagnostic to stop answering.
+            // nothing here looks a process up by name. Collecting it is bounded as well, and a
+            // child that is not collected by then is collected on a thread of its own, because a
+            // child that will not go is not a reason for a diagnostic to stop answering.
             super::children::end_group(&child);
             let _ = child.kill();
             let stopped = super::children::collect_by(child, super::children::COLLECT);

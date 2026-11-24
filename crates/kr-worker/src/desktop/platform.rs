@@ -312,7 +312,9 @@ fn run(program: &str, arguments: &[&str]) -> Printed {
         // Terminated and collected: a child left running would outlive every probe after it. The
         // group goes with it. A child that cannot be collected at once is waited for only within
         // what is left of the reading's time and then on a thread of its own, because a reading
-        // that waited longer would answer late.
+        // that waited longer would answer late. This hand-off has no case of its own, by choice: a
+        // child that the system can collect at once cannot tell it from a dropped child, and a
+        // child that stays not collectable after SIGKILL cannot be made in a case.
         super::children::end_group(&child);
         let _ = child.kill();
         super::children::collect_by(child, collection_bound());

@@ -3,8 +3,9 @@
 //! A route is one row: the check, the display server it is for, the program that performs it and
 //! what a person at the machine can be asked while it runs. [`resolve`] is the one place a check
 //! turns into an operation. The facility that performs the check and the records a run produces
-//! both read its answer, so they cannot name different tools. A check with no row is not performed and produces no record: the platform's own record
-//! stands, and it says that no route is established.
+//! both read its answer, so they cannot name different tools. A check with no row is not performed
+//! and produces no record: the platform's own record stands, and it says that no route is
+//! established.
 //!
 //! The table holds the macOS rows. A route for another platform is a row its own part adds, from
 //! what was observed on a real machine of that platform.
