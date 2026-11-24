@@ -1349,6 +1349,9 @@ mod platform {
     /// holds its name or connects to it first, and where no runtime is entered), the create failed,
     /// or a job does not hold the process once it exists, in which case the process is ended and
     /// never runs.
+    ///
+    /// A process that was created and could not be started is waited for at most ten seconds in all:
+    /// the wait for its end and the wait for the signal that it ended share that time.
     pub fn start(spec: &Spec<'_>) -> std::io::Result<Child> {
         start_within(
             spec,
@@ -1356,8 +1359,8 @@ mod platform {
         )
     }
 
-    /// Starts a program as [`start`] does, and waits no longer than `patience` for a process that
-    /// was created and could not be started to end.
+    /// Starts a program as [`start`] does, and waits no longer than `patience` in all, for both of
+    /// its waits, for a process that was created and could not be started to end.
     ///
     /// # Errors
     ///
