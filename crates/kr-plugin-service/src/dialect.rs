@@ -31,6 +31,12 @@ static NEXT_REGISTRATION: AtomicU64 = AtomicU64::new(1);
 /// the host refuses a second registration of a binding that has one and keeps the first, so a
 /// number the client minted for the second attempt owns nothing. Each answer is read here, by the
 /// request it answers, and the record of what it settled is removed with it.
+///
+/// The host answers in tasks of its own, so an answer can be read after the requests written later
+/// than the one it answers. The order the client wrote the requests in decides what an answer
+/// means: a removal ends every registration of its binding that was written before it, and an
+/// answer never makes a registration the binding's once a removal, or a later registration that the
+/// host answered as registered, has ended it.
 #[derive(Debug, Default)]
 pub(crate) struct Registrations(Mutex<Held>);
 
@@ -41,9 +47,10 @@ struct Held {
     live: HashMap<Uuid, u64>,
     /// The registrations written whose answers have not been read, by the request that carries each.
     trying: HashMap<u64, Attempt>,
-    /// The removals written whose answers have not been read, by the request that carries each, with
-    /// the registration the binding ran under when it was written.
-    removing: HashMap<u64, (Uuid, Option<u64>)>,
+    /// The removals written whose answers have not been read, by the request that carries each.
+    removing: HashMap<u64, Removal>,
+    /// The number of the latest registration written, which orders every request against a removal.
+    latest: u64,
 }
 
 /// A registration written and not yet answered.
@@ -51,6 +58,18 @@ struct Held {
 struct Attempt {
     binding_id: Uuid,
     registration: u64,
+    /// Whether a removal of the binding has been written since: the host will have removed this
+    /// registration, if it made it, so its answer makes nothing the binding's.
+    ended: bool,
+}
+
+/// A removal written and not yet answered.
+#[derive(Debug)]
+struct Removal {
+    binding_id: Uuid,
+    /// The latest registration number written when the removal was written: the removal ends the
+    /// binding's registrations up to that number.
+    through: u64,
 }
 
 impl Registrations {
@@ -59,51 +78,85 @@ impl Registrations {
     fn begin(&self, request_id: u64, binding_id: Uuid) -> u64 {
         let registration = NEXT_REGISTRATION.fetch_add(1, Ordering::Relaxed);
         if let Ok(mut held) = self.0.lock() {
+            held.latest = registration;
             held.trying.insert(
                 request_id,
                 Attempt {
                     binding_id,
                     registration,
+                    ended: false,
                 },
             );
         }
         registration
     }
 
-    /// Notes that request `request_id` asks the host to remove a binding, and which registration the
-    /// binding runs under as it is written.
+    /// Notes that request `request_id` asks the host to remove a binding. It ends every registration
+    /// of the binding written so far for installing, whether or not its answer has been read; a
+    /// registration the host already answered as registered stays the binding's until the removal's
+    /// answer is read.
     fn removal(&self, request_id: u64, binding_id: Uuid) {
         if let Ok(mut held) = self.0.lock() {
-            let running = held.live.get(&binding_id).copied();
-            held.removing.insert(request_id, (binding_id, running));
+            let through = held.latest;
+            for attempt in held.trying.values_mut() {
+                if attempt.binding_id == binding_id {
+                    attempt.ended = true;
+                }
+            }
+            held.removing.insert(
+                request_id,
+                Removal {
+                    binding_id,
+                    through,
+                },
+            );
         }
     }
 
     /// Settles what the host's answer to request `reply_to` decides about registrations.
     ///
-    /// A registration answered as registered is the binding's. Any other answer to it leaves the
-    /// binding as it was, so a refused duplicate keeps the registration the host holds. A removal
-    /// that is answered ends the registration the binding ran under when it was written, unless a
-    /// registration made since has replaced it.
+    /// A registration answered as registered is the binding's, unless a removal written after it
+    /// has ended it or a later registration is already the binding's. Any other answer to it leaves
+    /// the binding as it was, so a refused duplicate keeps the registration the host holds. A
+    /// removal that is answered ends every registration of its binding that was written before it,
+    /// those not yet answered too, and no registration written after it.
     fn settled(&self, reply_to: u64, body: &ResponseBody4) {
         let Ok(mut held) = self.0.lock() else {
             return;
         };
         if let Some(attempt) = held.trying.remove(&reply_to) {
-            if matches!(
-                body,
-                ResponseBody4::Registered { registration, .. } if *registration == attempt.registration
-            ) {
+            if !attempt.ended
+                && matches!(
+                    body,
+                    ResponseBody4::Registered { registration, .. } if *registration == attempt.registration
+                )
+                && held
+                    .live
+                    .get(&attempt.binding_id)
+                    .is_none_or(|live| *live < attempt.registration)
+            {
                 held.live.insert(attempt.binding_id, attempt.registration);
             }
-        } else if let Some((binding_id, running)) = held.removing.remove(&reply_to)
+        } else if let Some(removal) = held.removing.remove(&reply_to)
             && matches!(
                 body,
                 ResponseBody4::Unbound { .. } | ResponseBody4::Refused { .. }
             )
-            && held.live.get(&binding_id).copied() == running
         {
-            held.live.remove(&binding_id);
+            let Removal {
+                binding_id,
+                through,
+            } = removal;
+            if held
+                .live
+                .get(&binding_id)
+                .is_some_and(|live| *live <= through)
+            {
+                held.live.remove(&binding_id);
+            }
+            held.trying.retain(|_, attempt| {
+                attempt.binding_id != binding_id || attempt.registration > through
+            });
         }
     }
 
@@ -468,6 +521,103 @@ mod tests {
             registrations.of(binding()),
             Some(second),
             "a removal of the first registration ended the second"
+        );
+    }
+
+    #[test]
+    fn a_registration_answered_after_a_later_one_took_its_place_does_not_replace_it() {
+        let registrations = Registrations::default();
+        let first = register(&registrations, 1);
+        // The caller stops waiting for the answer and unbinds. The host removes the first
+        // registration and answers the unbind before the first registration's answer is read.
+        registrations.removal(2, binding());
+        registrations.settled(2, &ResponseBody4::Unbound { existed: true });
+        assert!(
+            notice_of(document(first), &registrations).is_none(),
+            "a notice of a registration the unbind removed was kept while its answer was unread"
+        );
+        // A second registration is made and answered.
+        let second = register(&registrations, 3);
+        registrations.settled(3, &registered(second));
+        // The first registration's answer is read last.
+        registrations.settled(1, &registered(first));
+        assert_eq!(
+            registrations.of(binding()),
+            Some(second),
+            "a late answer of the first registration replaced the second"
+        );
+        assert!(
+            matches!(
+                notice_of(document(second), &registrations),
+                Some(Notice::Document { document: 1, .. })
+            ),
+            "a notice of the registration the host holds was dropped"
+        );
+        assert!(
+            notice_of(document(first), &registrations).is_none(),
+            "a notice of the removed registration was kept"
+        );
+        let request = Request {
+            request_id: 9,
+            body: RequestBody::Restore {
+                binding_id: binding(),
+                state: vec![1],
+                deadline_ms: 50,
+            },
+        };
+        let RequestBody4::Restore { registration, .. } =
+            request_of(request, &registrations, true).body
+        else {
+            panic!("a restore is a restore");
+        };
+        assert_eq!(
+            registration, second,
+            "a restore named a registration the host had removed"
+        );
+        let held = registrations.0.lock().expect("the record is usable");
+        assert!(
+            held.trying.is_empty() && held.removing.is_empty(),
+            "the answers left a record behind: {held:?}"
+        );
+    }
+
+    #[test]
+    fn a_registration_answered_after_the_unbind_that_ended_it_was_written_is_not_kept() {
+        let registrations = Registrations::default();
+        let first = register(&registrations, 1);
+        // The unbind is written before the host's answer to the registration is read.
+        registrations.removal(2, binding());
+        registrations.settled(1, &registered(first));
+        assert_eq!(
+            registrations.of(binding()),
+            None,
+            "a registration that an unbind already ended became the binding's"
+        );
+        registrations.settled(2, &ResponseBody4::Unbound { existed: true });
+        assert_eq!(registrations.of(binding()), None);
+        assert!(
+            notice_of(document(first), &registrations).is_none(),
+            "a notice of a removed registration was kept"
+        );
+        let held = registrations.0.lock().expect("the record is usable");
+        assert!(
+            held.trying.is_empty() && held.live.is_empty() && held.removing.is_empty(),
+            "the answers left a record behind: {held:?}"
+        );
+    }
+
+    #[test]
+    fn a_registration_answered_after_a_later_one_was_installed_does_not_replace_it() {
+        let registrations = Registrations::default();
+        let first = register(&registrations, 1);
+        let second = register(&registrations, 2);
+        // The answers are read in the reverse of the order the requests were written.
+        registrations.settled(2, &registered(second));
+        registrations.settled(1, &registered(first));
+        assert_eq!(
+            registrations.of(binding()),
+            Some(second),
+            "an answer of an earlier registration replaced a later one"
         );
     }
 
