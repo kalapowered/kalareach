@@ -34,6 +34,17 @@
 //! because nothing about a permission changes by itself. A change of permission is not something
 //! this host can read, so it is found by performing the checks again, which a person asks for.
 //!
+//! # What the time limit bounds, and what it does not
+//!
+//! One [`Deadline`] covers a whole check. It bounds what a check can give up: the waits on a child
+//! and its pipes, the collecting of a child that was ended, and the reads of what a command printed
+//! and of the files a check reads back or digests, each of which stops between two blocks once the
+//! time is gone. It does not bound a read or a removal of a regular file against a filesystem that
+//! has stopped answering: the digest of a program (`identified_until`), the validation of a route's
+//! path and the removal of the check's own files make one system call each that nothing in this
+//! process can abandon. A check that meets one answers when the call returns, and the answer is
+//! refused as late. That is a stated limit of the bound, not an exact bound.
+//!
 //! # What runs the operation
 //!
 //! [`Facilities`] is the seam. The judgements, the records and the staleness rules above are
