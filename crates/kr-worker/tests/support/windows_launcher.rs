@@ -164,6 +164,9 @@ pub struct Launcher {
     lines: tokio::sync::mpsc::UnboundedReceiver<serde_json::Value>,
     // Kept so that the launcher's standard input stays open until the case lets it go.
     input: Option<std::process::ChildStdin>,
+    // What the launcher has said so far, and whether it has said all that it plays.
+    seen: Played,
+    over: bool,
 }
 
 impl Launcher {
@@ -208,7 +211,71 @@ impl Launcher {
             process,
             lines,
             input,
+            seen: Played {
+                admission: Admission::Failed("the launcher said nothing of it".to_owned()),
+                program: None,
+                answer: None,
+                after: Duration::ZERO,
+            },
+            over: false,
         }
+    }
+
+    /// Hears what the launcher says next, notes it, and returns the name of the step it reports.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the launcher ends or says nothing in time.
+    async fn hear(&mut self) -> String {
+        let said = tokio::time::timeout(LIVENESS, self.lines.recv())
+            .await
+            .expect("the launcher said something in time")
+            .expect("the launcher went on until it had played");
+        let event = said["event"].as_str().unwrap_or_default().to_owned();
+        match event.as_str() {
+            "not_presented" => {
+                self.seen.admission = Admission::Failed(text(&said, "why"));
+                self.over = true;
+            }
+            "admission" => {
+                self.seen.admission = match said["answer"].as_str().unwrap_or_default() {
+                    "admitted" => Admission::Admitted,
+                    "closed" => Admission::Closed,
+                    _ => Admission::Other(text(&said, "read")),
+                };
+                self.over = self.seen.admission != Admission::Admitted;
+            }
+            "created" => {
+                self.seen.program = said["program"].as_u64().and_then(|p| p.try_into().ok());
+            }
+            "answer" => {
+                self.seen.answer = Some(match said["answer"].as_str().unwrap_or_default() {
+                    "committed" => Answer::Committed,
+                    "failed" => Answer::Failed(text(&said, "reason")),
+                    "closed" => Answer::Closed,
+                    "nothing" => Answer::Nothing,
+                    _ => Answer::Other(text(&said, "read")),
+                });
+                self.seen.after = Duration::from_micros(said["after_us"].as_u64().unwrap_or(0));
+                self.over = true;
+            }
+            _ => {}
+        }
+        event
+    }
+
+    /// Waits until the launcher has created its program, which is before it says it is going, and
+    /// returns the program's process.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the launcher ends or says nothing in time, or is over without having created a
+    /// program.
+    pub async fn program(&mut self) -> u32 {
+        while self.seen.program.is_none() && !self.over {
+            self.hear().await;
+        }
+        self.seen.program.expect("the launcher created a program")
     }
 
     /// Waits for the launcher to play to its end, and returns what it saw: until it has read an
@@ -218,49 +285,10 @@ impl Launcher {
     ///
     /// Panics when the launcher ends or says nothing in time.
     pub async fn played(&mut self) -> Played {
-        let mut played = Played {
-            admission: Admission::Failed("the launcher said nothing of it".to_owned()),
-            program: None,
-            answer: None,
-            after: Duration::ZERO,
-        };
-        loop {
-            let said = tokio::time::timeout(LIVENESS, self.lines.recv())
-                .await
-                .expect("the launcher said something in time")
-                .expect("the launcher went on until it had played");
-            match said["event"].as_str().unwrap_or_default() {
-                "not_presented" => {
-                    played.admission = Admission::Failed(text(&said, "why"));
-                    return played;
-                }
-                "admission" => {
-                    played.admission = match said["answer"].as_str().unwrap_or_default() {
-                        "admitted" => Admission::Admitted,
-                        "closed" => Admission::Closed,
-                        _ => Admission::Other(text(&said, "read")),
-                    };
-                    if played.admission != Admission::Admitted {
-                        return played;
-                    }
-                }
-                "created" => {
-                    played.program = said["program"].as_u64().and_then(|p| p.try_into().ok())
-                }
-                "answer" => {
-                    played.answer = Some(match said["answer"].as_str().unwrap_or_default() {
-                        "committed" => Answer::Committed,
-                        "failed" => Answer::Failed(text(&said, "reason")),
-                        "closed" => Answer::Closed,
-                        "nothing" => Answer::Nothing,
-                        _ => Answer::Other(text(&said, "read")),
-                    });
-                    played.after = Duration::from_micros(said["after_us"].as_u64().unwrap_or(0));
-                    return played;
-                }
-                _ => {}
-            }
+        while !self.over {
+            self.hear().await;
         }
+        self.seen.clone()
     }
 
     /// Asks the launcher to start the program it created, and waits until it has started it and
@@ -277,15 +305,14 @@ impl Launcher {
         writeln!(input, "resume")
             .and_then(|()| input.flush())
             .expect("the launcher is asked to start the program");
-        loop {
-            let said = tokio::time::timeout(LIVENESS, self.lines.recv())
-                .await
-                .expect("the launcher said it started the program in time")
-                .expect("the launcher went on until it started the program");
-            if said["event"] == "resumed" {
-                return;
-            }
-        }
+        while self.hear().await != "resumed" {}
+    }
+
+    /// Ends the launcher at once, as if it had died: the job it holds ends the program it created.
+    pub fn kill(&mut self) {
+        drop(self.input.take());
+        let _ = self.process.kill();
+        let _ = self.process.wait();
     }
 
     /// Lets the launcher go: it ends the program it created and itself.
@@ -305,9 +332,7 @@ impl Launcher {
 
 impl Drop for Launcher {
     fn drop(&mut self) {
-        drop(self.input.take());
-        let _ = self.process.kill();
-        let _ = self.process.wait();
+        self.kill();
     }
 }
 

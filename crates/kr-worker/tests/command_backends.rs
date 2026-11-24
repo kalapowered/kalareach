@@ -1769,6 +1769,53 @@ async fn the_fixture_reads_a_commit_on_the_launchers_clock() {
     }
 }
 
+/// A launcher that stops after it created its program and before the backend has shown the program
+/// leaves no held program: the program ends with the launcher, because its job is all that can end
+/// it. The backend is held where it has read the program's name and not yet looked at it, so nothing
+/// of the backend's can end the program.
+#[cfg(windows)]
+#[tokio::test]
+async fn a_program_the_fixture_created_ends_with_the_launcher_when_the_backend_never_showed_it() {
+    use windows_launcher::{Launch, Launcher};
+
+    let setup = Setup::new();
+    setup.admit();
+    let integration = Setup::integration();
+    let claude = invocation(&["claude", "--resume"]);
+    let answer = setup
+        .backends
+        .establish(&request(&setup, &claude, &integration, 1))
+        .expect("a backend is established");
+    let registration = PathBuf::from(&answer.environment[0].value);
+    let mut launch = Launch::new(&registration, &setup.executable, &claude.arguments);
+    launch.directory.clone_from(&setup.directory);
+    let (arrived, release) = setup.backends.pause_before_showing();
+
+    let mut launcher = Launcher::start(&launch);
+    let program = launcher.program().await;
+    let identity = kr_ipc::identity::process_start_identity(program).expect("a process");
+    tokio::time::timeout(std::time::Duration::from_secs(60), arrived)
+        .await
+        .expect("the launch reaches the backend before its program is shown")
+        .expect("and waits there");
+    assert_eq!(
+        kr_ipc::identity::process_state(&identity),
+        kr_ipc::identity::ProcessState::Running,
+        "the program was created and is held, so it has not ended"
+    );
+
+    launcher.kill();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while kr_ipc::identity::process_state(&identity) != kr_ipc::identity::ProcessState::Ended {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the program ended with the launcher that created it, which only its job could end"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let _ = release.send(());
+}
+
 /// A backend that refuses what a launcher presents closes the connection without a word, and the
 /// fixture says so: it presents an argument vector the backend did not answer and reads a closed
 /// connection, creates nothing and goes no further.
