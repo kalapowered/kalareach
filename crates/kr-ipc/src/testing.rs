@@ -577,6 +577,25 @@ fn copier_ended_within(
     }
 }
 
+/// A name that no file has, in the folder of `destination`, for the copy that is renamed onto it. The
+/// folder is the same so that the rename is one step of one file system, and the name is new on
+/// every call of every thread of every process that places into that folder.
+#[cfg(unix)]
+fn new_name_beside(destination: &Path) -> PathBuf {
+    static CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    let mut name = destination
+        .file_name()
+        .expect("a program has a name")
+        .to_owned();
+    name.push(format!(
+        ".placing-{}-{}",
+        std::process::id(),
+        CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    destination.with_file_name(name)
+}
+
 /// Places a program where a test can start it, and leaves nothing holding it open for writing.
 ///
 /// A test binary runs its cases on several threads. The moment one thread starts a child process,
@@ -592,6 +611,12 @@ fn copier_ended_within(
 /// test can be handed one it was never given. The placed program is the caller's to start from
 /// that moment on, however loaded the machine is and whatever else the test is doing beside it.
 ///
+/// A path that holds a program is never written over. On macOS, a start of a program that had been
+/// written over in place, after an earlier start of the same file, was killed by the system for an
+/// invalid code signature: one start in about 1,700 in a loop of one case under load, and never a
+/// start of a file that no start had met. So on Unix the copy is made at a new name beside
+/// `destination` and renamed onto it, and every start meets a whole file that no start has met.
+///
 /// # Panics
 ///
 /// Panics when the program cannot be placed, which in a test means the environment is unusable
@@ -602,9 +627,10 @@ pub fn place_program(source: &Path, destination: &Path) {
         use std::os::unix::fs::PermissionsExt as _;
 
         let copier = copying_program();
+        let placing = new_name_beside(destination);
         let mut copying = std::process::Command::new(&copier)
             .arg(source)
-            .arg(destination)
+            .arg(&placing)
             .spawn()
             .unwrap_or_else(|error| {
                 panic!(
@@ -631,13 +657,21 @@ pub fn place_program(source: &Path, destination: &Path) {
         );
         // Owner-only and runnable: a test's own copy of a program is nobody else's business, and
         // the mode a copy is given depends on the person's file-creation mask.
-        std::fs::set_permissions(destination, std::fs::Permissions::from_mode(0o700))
-            .unwrap_or_else(|error| {
+        std::fs::set_permissions(&placing, std::fs::Permissions::from_mode(0o700)).unwrap_or_else(
+            |error| {
                 panic!(
                     "the program placed at {} could not be made runnable: {error}",
-                    destination.display()
+                    placing.display()
                 )
-            });
+            },
+        );
+        std::fs::rename(&placing, destination).unwrap_or_else(|error| {
+            panic!(
+                "the program copied to {} could not be renamed to {}: {error}",
+                placing.display(),
+                destination.display()
+            )
+        });
     }
     #[cfg(windows)]
     {
@@ -861,6 +895,41 @@ mod tests {
             .expect("a process that ends");
         let status = super::copier_ended_within(&mut quick, Duration::from_secs(60));
         assert!(status.is_some_and(|status| status.success()));
+    }
+
+    /// A program placed where a program already is takes its place as a new file: the file that was
+    /// there is not written over, the new one is whole and runnable, and nothing is left beside it.
+    #[cfg(unix)]
+    #[test]
+    fn a_program_placed_over_a_program_is_a_new_file_and_leaves_nothing_beside_it() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        let folder = PrivateTempDir::create();
+        let source = folder.path().join("source");
+        std::fs::write(&source, b"the bytes of a program").expect("a source");
+        let destination = folder.path().join("program");
+
+        super::place_program(&source, &destination);
+        let first = std::fs::metadata(&destination).expect("the first program");
+        super::place_program(&source, &destination);
+        let second = std::fs::metadata(&destination).expect("the second program");
+
+        assert_ne!(
+            first.ino(),
+            second.ino(),
+            "the program was written over in place"
+        );
+        assert_eq!(
+            std::fs::read(&destination).expect("the program"),
+            b"the bytes of a program"
+        );
+        assert_eq!(second.permissions().mode() & 0o777, 0o700);
+        let mut names: Vec<_> = std::fs::read_dir(folder.path())
+            .expect("the folder")
+            .map(|entry| entry.expect("an entry").file_name())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["program", "source"]);
     }
 
     /// A private directory is made only where nothing is. A name that is already taken is another
