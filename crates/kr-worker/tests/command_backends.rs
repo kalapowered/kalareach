@@ -4,8 +4,10 @@
 //! invocation, from a Claude Code connector installed in the catalogue store's layout. What is
 //! checked here is what establishing creates, what it refuses before creating anything, and when a
 //! backend no launch took is retired. The launch that presents itself to a backend is proved with
-//! the real launcher in `kr-hook`'s own suite. The launcher and the application a case stands in for
-//! are copies of a program the machine has: `sleep` on Unix and `cmd.exe` on Windows.
+//! the real launcher in `kr-hook`'s own suite. On Windows a fixture plays the launcher in a few
+//! cases, and those cases run the program it creates. The launcher and the application a case
+//! stands in for are copies of a program the machine has: `sleep` on Unix and `cmd.exe` on
+//! Windows.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -82,7 +84,7 @@ fn a_private_directory_of(bytes: usize) -> Removed {
 }
 
 /// The program a case's launcher and application are copies of: one every machine of the platform
-/// has, which is never run here.
+/// has, which only the Windows cases that play the launcher run.
 fn stand_in_program() -> PathBuf {
     if cfg!(windows) {
         PathBuf::from(std::env::var_os("SystemRoot").expect("a system directory"))

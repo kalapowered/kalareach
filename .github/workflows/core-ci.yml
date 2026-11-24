@@ -1507,7 +1507,8 @@ jobs:
 
       # The backends an integrated invocation is given before it runs, on this platform: a launch's
       # endpoint and credential exist before the answer, a bypass creates nothing, and each session
-      # has a root of its own. The launcher against them is run by the forwarder's suite, above.
+      # has a root of its own. The launcher against them is run by the forwarder's suite, above, and
+      # by a fixture that plays it in a few cases here.
       - name: Test the command backends
         if: ${{ !cancelled() && matrix.part == 'second' }}
         run: cargo test --locked -p kr-worker --test command_backends
