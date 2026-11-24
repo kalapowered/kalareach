@@ -3487,12 +3487,13 @@ fn kr_req_11_17_a_launched_programs_record_names_the_profile_it_was_launched_und
     launched.release();
 }
 
-/// KR-REQ-11.17, the desktop generation: a session that closes because its login was lost ends the
-/// instances it launched, and the broker forgets the evidence they held. The close is the one a
-/// lost login makes (`DesktopLost`) and the evidence is what the product's writer recorded for a
-/// real launch, read before the close and found gone after it, while the program still runs.
+/// KR-REQ-11.17, the desktop generation: a session that closes ends the instances it launched, and
+/// the broker forgets the evidence they held. The session here is headless, so no login is lost and
+/// the reason given does not change the close; the lost login that closes a desktop-bound session
+/// with this reason is held by `kr-worker/tests/desktop.rs`. The evidence is what the product's
+/// writer recorded for a real launch, read before the close and found gone after it.
 #[test]
-fn kr_req_11_17_a_session_that_closes_with_its_login_lost_leaves_the_broker_no_evidence() {
+fn kr_req_11_17_a_session_that_closes_leaves_the_broker_no_evidence_of_its_launches() {
     let shell = Shell::qualified_viewed();
     let view = shell.view.as_ref().expect("a view");
     let launched = launched_with_evidence(&shell, "login");
