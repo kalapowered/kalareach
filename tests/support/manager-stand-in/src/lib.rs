@@ -4,9 +4,10 @@
 //! `kr_ipc::testing::manager_stand_in`. It answers the commands `kr` puts to a launchd user domain:
 //! `print`, `bootstrap`, `kickstart -p`, and the `bootout` the test's own teardown makes. It loads the
 //! definition `kr` wrote as written, starts the daemon it names as that definition says, keeps one
-//! record of each job, and writes down every call. A command it does not know, a key of the
-//! definition it does not apply, and a path outside the test's own folders are refused with status 64
-//! and recorded as such.
+//! record of each job, and writes down every call with its status. A command it does not know, a key
+//! of the definition it does not apply (it accepts `ProcessType` as `Interactive` and applies none),
+//! and a path outside the test's own folders are refused with status 64. A call is not written down
+//! when the path of its record lies outside the test's own folders.
 //!
 //! What it cannot show: that real launchd accepts the file, that these answers are the real tool's
 //! (they are copied from what `kr` reads), the session and the keychain a real job runs in, the
@@ -322,6 +323,20 @@ fn domain_absent(domain: &str) -> Answer {
     Answer::failed(status, said)
 }
 
+/// The domain and the label of a job target, where the domain is the user's own: any other domain,
+/// the graphical one included, is one the user does not have, and every command that names it gets
+/// the answer for an absent domain, as `print` gives for `gui/<uid>` itself.
+fn job_target<'a>(context: &Context, target: &'a str) -> Result<(String, &'a str), Answer> {
+    let Some((domain, label)) = split_target(target) else {
+        return Err(domain_absent(target));
+    };
+    if domain == format!("user/{}", context.uid) {
+        Ok((domain, label))
+    } else {
+        Err(domain_absent(&domain))
+    }
+}
+
 /// The job `label` loaded in `domain`: a job that is loaded in the other domain is not there, as
 /// launchd answers.
 fn job_in(context: &Context, domain: &str, label: &str) -> Result<Option<Job>, String> {
@@ -565,12 +580,10 @@ fn print(context: &Context, target: &str) -> Answer {
     if target == format!("user/{uid}") {
         return Answer::said(format!("{target} = {{\n\ttype = user\n}}\n"));
     }
-    let Some((domain, label)) = split_target(target) else {
-        return domain_absent(target);
+    let (domain, label) = match job_target(context, target) {
+        Ok(found) => found,
+        Err(absent) => return absent,
     };
-    if domain != format!("user/{uid}") && domain != format!("gui/{uid}") {
-        return domain_absent(&domain);
-    }
     match job_in(context, &domain, label) {
         Err(why) => Answer::refused(why),
         Ok(None) => Answer::failed(
@@ -761,8 +774,9 @@ fn bootstrap(context: &Context, domain: &str, plist: &Path) -> Answer {
 /// `kickstart -p`: starts the loaded job once as its definition says and prints the process; a job
 /// that runs is not started again and its process is printed.
 fn kickstart(context: &Context, target: &str) -> Answer {
-    let Some((domain, label)) = split_target(target) else {
-        return domain_absent(target);
+    let (domain, label) = match job_target(context, target) {
+        Ok(found) => found,
+        Err(absent) => return absent,
     };
     let mut job = match job_in(context, &domain, label) {
         Err(why) => return Answer::refused(why),
@@ -1305,14 +1319,15 @@ fn end_job(context: &Context, job: &Job) -> Result<(), String> {
     end_all(&identities, &process_state, &tools, END_BOUND)
 }
 
-/// `bootout`: ends the daemon by the identity recorded for it and the group it leads, asking first
-/// and then making sure, and unloads the job. A start that was not recorded is found by what proves
-/// a process the job's. The identity is checked by the signalling itself, so a number that belongs
-/// to another process now is left alone. A process that is not shown to have ended keeps the job
-/// loaded and is reported as a failure.
+/// `bootout`: ends the daemon by the identity recorded for it and the members of the group it
+/// leads, each by its own identity, asking first and then making sure, and unloads the job. A start
+/// that was not recorded is found by what proves a process the job's. Nothing is signalled by a
+/// number, so a process that holds a number now that another process held is left alone. A process
+/// that is not shown to have ended keeps the job loaded and is reported as a failure.
 fn bootout(context: &Context, target: &str) -> Answer {
-    let Some((domain, label)) = split_target(target) else {
-        return domain_absent(target);
+    let (domain, label) = match job_target(context, target) {
+        Ok(found) => found,
+        Err(absent) => return absent,
     };
     let job = match job_in(context, &domain, label) {
         Err(why) => return Answer::refused(why),

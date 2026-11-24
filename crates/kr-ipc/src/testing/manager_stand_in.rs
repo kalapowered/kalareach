@@ -6,15 +6,15 @@
 //! the installation finds the marker from the folder of its own executable and that folder's
 //! parent, so that a process whose environment lost the variable still knows what it belongs to.
 //!
-//! Three runners start a service manager: the command line's, the desktop reader's and the control
-//! daemon's. Each one calls [`substituted`] where it has one program to run, and then
-//! [`refusal_after`] for the program it is about to start. The second call does not depend on the
-//! first: a runner whose substitution is missing, skipped or ignored reaches it with the real
-//! program, and it refuses. In a run that names a stand-in, or in a marked installation, every
-//! command of a program whose file name is `launchctl` or `systemctl` is refused for every verb,
-//! reads included; nothing falls back to the real program. On Linux the control daemon's desktop
-//! agent also runs `systemctl --user show-environment`, a read, with a runner of its own that this
-//! seam does not cover.
+//! Three runners start a service manager through this seam: the command line's, the desktop
+//! reader's and the control daemon's. Each one calls [`substituted`] where it has one program to
+//! run, and then [`refusal_after`] for the program it is about to start. The second call does not
+//! depend on the first: a runner whose substitution is missing, skipped or ignored reaches it with
+//! the real program, and it refuses. In a run that names a stand-in, or in a marked installation,
+//! every command that one of the three runners makes of a program whose file name is `launchctl`
+//! or `systemctl` is refused for every verb, reads included; nothing falls back to the real
+//! program. On Linux the control daemon's desktop agent also runs `systemctl --user
+//! show-environment`, a read, with a runner of its own that this seam does not cover.
 //!
 //! A run that names no stand-in, in an installation that is not marked, is not changed by anything
 //! here. The module compiles only with the `testing` feature, which no shipped build enables.

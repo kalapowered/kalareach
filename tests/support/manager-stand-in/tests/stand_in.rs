@@ -356,9 +356,9 @@ fn the_stand_in_answers_the_reads_of_kr_as_launchd_does() {
     );
 }
 
-/// A job loaded in the background domain is not there for the graphical domain: `print`,
-/// `kickstart` and `bootout` answer 113, as launchd does for a job that a domain does not have,
-/// and the job stays loaded in its own domain.
+/// The graphical domain is one the user does not have, whatever is loaded in the background domain:
+/// `print`, `kickstart` and `bootout` of a job in it answer 112 and name the domain, as `print` does
+/// for the domain itself, and the job stays loaded in its own domain.
 #[test]
 fn a_job_loaded_in_the_background_domain_is_not_found_in_the_graphical_domain() {
     let fixture = Fixture::new();
@@ -373,8 +373,14 @@ fn a_job_loaded_in_the_background_domain_is_not_found_in_the_graphical_domain() 
         let answered = fixture.call(&arguments);
         assert_eq!(
             answered.status.code(),
-            Some(113),
+            Some(112),
             "{arguments:?}: {}",
+            text(&answered.stderr)
+        );
+        assert!(
+            text(&answered.stderr)
+                .contains(&format!("Could not find domain for gui/{}", fixture.uid)),
+            "{arguments:?} names the absent domain: {}",
             text(&answered.stderr)
         );
     }
