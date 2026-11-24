@@ -4506,7 +4506,24 @@ async fn a_colour_change_rewrites_the_member_and_three_quick_changes_make_one_wr
     };
     let computer = Computer::new().await;
     let (page, settings) = computer.running_page(timing).await;
+    // The step the application's start wants ends and tells the page first.
+    assert!(
+        until(Duration::from_secs(10), || async {
+            *page.recovery_told.lock().expect("the record") >= 1
+        })
+        .await,
+        "the start step told the page"
+    );
     page.call("recovery_turn_on", json!({})).expect("on");
+    // The step the turn-on wants ends and tells the page; then nothing is wanted until a change,
+    // so no step of the turn-on's can read the settings after the first change below.
+    assert!(
+        until(Duration::from_secs(10), || async {
+            *page.recovery_told.lock().expect("the record") >= 2
+        })
+        .await,
+        "the step the turn-on wanted told the page"
+    );
     let before = writes_sent(&computer);
     for mode in [ColourMode::Dark, ColourMode::System, ColourMode::Light] {
         settings.set_colour_mode(mode).await.expect("kept");
