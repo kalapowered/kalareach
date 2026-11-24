@@ -1276,6 +1276,17 @@ impl BindingHandle {
         self.report_owed.load(Ordering::Acquire)
     }
 
+    /// Poisons the lock of the observation queue, as a panic of a thread that held it would, for the
+    /// tests of what the binding does when it cannot read the queue.
+    #[cfg(feature = "testing")]
+    pub fn poison_queue(&self) {
+        let queue = Arc::clone(&self.queue);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _held = queue.lock();
+            std::panic::resume_unwind(Box::new("the queue's lock is poisoned by a test"));
+        }));
+    }
+
     /// Returns how many restores the binding has taken in.
     ///
     /// A report of what the instance consumed that names fewer is about a state a restore has
@@ -1829,10 +1840,12 @@ impl BindingWorker {
                     if self.abandoned(&answer) {
                         continue;
                     }
-                    if unoffered_only && self.queue.lock().is_ok_and(|queue| queue.offered() != 0) {
+                    if unoffered_only && !self.queue.lock().is_ok_and(|queue| queue.offered() == 0)
+                    {
                         // Decided here, on the thread that takes the events: an event offered
                         // since the restore was asked for is counted, and one this thread has
-                        // already taken was counted before it.
+                        // already taken was counted before it. A queue that cannot be read counts
+                        // as offered.
                         let _ = answer.send(Ok(CallResult {
                             answer: Ok(Restored::Skipped),
                             nodes: Vec::new(),
