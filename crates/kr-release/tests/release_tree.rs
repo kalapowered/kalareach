@@ -1076,6 +1076,33 @@ fn a_notice_that_lacks_a_crate_of_the_programs_is_refused() {
     assert_eq!(lacking, cut);
 }
 
+/// The lock takes `filedescriptor` 0.8.3 from crates.io and from a Git repository, and the notice
+/// has an entry for each. With the crates.io entries cut out and the Git ones left, the crates.io
+/// crate is named as missing and the Git one is not.
+#[test]
+fn a_notice_that_names_only_the_git_source_of_a_crate_is_refused() {
+    let committed =
+        std::fs::read_to_string(checkout().join("docs/releases/third-party-notices.txt"))
+            .expect("the committed notice");
+    let own = |line: &str| line.starts_with("  - filedescriptor 0.8.3 ");
+    let from_git = |line: &str| line.contains(" | source https://");
+    assert!(
+        committed.lines().any(|line| own(line) && from_git(line)),
+        "the notice has a Git entry of filedescriptor"
+    );
+    assert!(
+        committed.lines().any(|line| own(line) && !from_git(line)),
+        "the notice has a crates.io entry of filedescriptor"
+    );
+    let text: String = committed
+        .lines()
+        .filter(|line| !own(line) || from_git(line))
+        .map(|line| format!("{line}\n"))
+        .collect();
+    let lacking = kr_release::notices::gaps(&checkout(), &text).expect("the lock is read");
+    assert_eq!(lacking, vec!["filedescriptor 0.8.3".to_owned()]);
+}
+
 /// The parts of this checkout that the notice check reads (the lock, the manifests, the list of
 /// release programs), with `notice` as the text the stand-in commits, and a tree that carries the
 /// same text. The tree and the stand-in are in the one directory the first value holds.
