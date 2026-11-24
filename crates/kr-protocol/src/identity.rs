@@ -1278,18 +1278,18 @@ mod tests {
         }
     }
 
-    /// The reasons an enrolment can fail for, each named once. The match has no arm for anything
-    /// else, so a reason added to [`EnrolmentError`] does not compile here until it is named in
-    /// the list the macro is given.
-    macro_rules! every_enrolment_error {
-        ($($variant:ident),+ $(,)?) => {{
+    /// The variants of an enum, each named once. The match has no arm for anything else, so a
+    /// variant added to the enum does not compile here until it is named in the list the macro is
+    /// given.
+    macro_rules! every_variant {
+        ($enum:ident; $($variant:ident),+ $(,)?) => {{
             #[allow(dead_code)]
-            fn exhaustive(error: EnrolmentError) {
-                match error {
-                    $(EnrolmentError::$variant => {})+
+            fn exhaustive(value: $enum) {
+                match value {
+                    $($enum::$variant => {})+
                 }
             }
-            [$(EnrolmentError::$variant),+]
+            [$($enum::$variant),+]
         }};
     }
 
@@ -1298,7 +1298,8 @@ mod tests {
     /// withholds. This fails for a reason that is not in it.
     #[test]
     fn every_reason_an_enrolment_can_fail_for_is_in_the_list_the_recogniser_reads() {
-        let declared = every_enrolment_error!(
+        let declared = every_variant!(
+            EnrolmentError;
             ClipboardDestinationUnknown,
             EmptyLabel,
             EmptyTarget,
@@ -1321,6 +1322,77 @@ mod tests {
             EnrolmentError::ALL.len(),
             declared.len(),
             "EnrolmentError::ALL names a reason twice or one that is not declared"
+        );
+    }
+
+    /// KR-REQ-18.11: the recogniser accepts a role only when it is in [`LocalRole::ALL`], so a role
+    /// missing from the list would be one the host composes and the command line withholds. This
+    /// fails for a role that is not in it.
+    #[test]
+    fn every_role_a_destination_can_answer_in_is_in_the_list_the_recogniser_reads() {
+        let declared = every_variant!(LocalRole; Controller, Worker, Rendezvous);
+        for role in declared {
+            assert!(
+                LocalRole::ALL.contains(&role),
+                "{role:?} is not in LocalRole::ALL"
+            );
+        }
+        assert_eq!(
+            LocalRole::ALL.len(),
+            declared.len(),
+            "LocalRole::ALL names a role twice or one that is not declared"
+        );
+    }
+
+    /// KR-REQ-18.11: the recogniser accepts an ingress word only when it is in
+    /// [`ActorIngress::ALL`], so an ingress missing from the list would be one the host composes
+    /// and the command line withholds. This fails for an ingress that is not in it.
+    #[test]
+    fn every_ingress_a_request_can_enter_by_is_in_the_list_the_recogniser_reads() {
+        let declared = every_variant!(
+            ActorIngress;
+            LocalIpc,
+            PairedDevice,
+            UnpairedPeer,
+            Workflow,
+            Plugin,
+            ServiceClient,
+        );
+        for ingress in declared {
+            assert!(
+                ActorIngress::ALL.contains(&ingress),
+                "{ingress:?} is not in ActorIngress::ALL"
+            );
+        }
+        assert_eq!(
+            ActorIngress::ALL.len(),
+            declared.len(),
+            "ActorIngress::ALL names an ingress twice or one that is not declared"
+        );
+    }
+
+    /// KR-REQ-18.11: the recogniser accepts an access word only when it is in
+    /// [`EnvironmentAccess::ALL`], so an access class missing from the list would be one the host
+    /// composes and the command line withholds. This fails for an access class that is not in it.
+    #[test]
+    fn every_access_an_environment_can_have_is_in_the_list_the_recogniser_reads() {
+        let declared = every_variant!(
+            EnvironmentAccess;
+            WslDistribution,
+            Container,
+            SshHost,
+            PairedHost,
+        );
+        for access in declared {
+            assert!(
+                EnvironmentAccess::ALL.contains(&access),
+                "{access:?} is not in EnvironmentAccess::ALL"
+            );
+        }
+        assert_eq!(
+            EnvironmentAccess::ALL.len(),
+            declared.len(),
+            "EnvironmentAccess::ALL names an access class twice or one that is not declared"
         );
     }
 
