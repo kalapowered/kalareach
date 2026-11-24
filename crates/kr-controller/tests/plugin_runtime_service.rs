@@ -250,6 +250,60 @@ async fn the_daemon_adopts_a_host_of_both_protocols_through_either_descriptor() 
     assert_eq!(fourth.process_start_identity, replacement);
 }
 
+/// KR-REQ-05.06: a daemon that adopts a host keeps the identity of the host it verified. The fourth
+/// protocol's descriptor names another live process and fails its proof, the third's names the host:
+/// adoption goes through the third, and the daemon then replaces the host when it ends.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_daemon_keeps_the_identity_of_the_host_it_verified_when_the_fourth_descriptor_fails_its_proof()
+ {
+    let Some(wasm) = well_behaved() else {
+        return;
+    };
+    let mut hosted = hosted().await;
+    let environment = hosted.environment();
+    install(&environment, &wasm);
+    let runtime = hosted.runtime().await;
+    assert_eq!(hosted.started(), 1);
+    let host = hosted.published().expect("the host is published");
+    let mut foreign = launcher::read_descriptor4(&environment)
+        .expect("the descriptor reads")
+        .expect("the fourth protocol's descriptor is published");
+    // A live process that is not the host, and a key the host cannot sign with.
+    foreign.process_start_identity =
+        kr_ipc::identity::process_start_identity(std::process::id()).expect("an identity");
+    foreign.host_public_key = *launcher::HostIdentity::generate(foreign.environment_id)
+        .expect("an identity")
+        .public_key();
+    assert_ne!(foreign.process_start_identity, host);
+    drop(runtime);
+    launcher::publish_descriptor4(&environment, &foreign)
+        .expect("the foreign descriptor is published");
+
+    hosted.restart().await;
+    let runtime = hosted.runtime().await;
+    assert_eq!(hosted.started(), 0, "the restarted daemon started a host");
+    assert_eq!(
+        runtime.protocol(),
+        HostProtocol::V3,
+        "a worker whose fourth descriptor fails its proof speaks the third"
+    );
+
+    // The host ends. The daemon holds the host it verified, so it sees that and replaces it.
+    kill(&host);
+    until("the host to end", || async {
+        (kr_ipc::identity::process_state(&host) == ProcessState::Ended).then_some(())
+    })
+    .await;
+    drop(runtime);
+    let state = hosted.ask().await;
+    assert_eq!(
+        hosted.started(),
+        1,
+        "the daemon kept the identity of the process the failed descriptor named, and did not replace the host that ended: {state:?}"
+    );
+    assert_ne!(hosted.published(), Some(host));
+}
+
 /// The process group a process is in, as the operating system reports it.
 #[cfg(unix)]
 fn group_of(pid: u64) -> u32 {

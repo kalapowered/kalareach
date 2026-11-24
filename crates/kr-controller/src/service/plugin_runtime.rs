@@ -566,15 +566,20 @@ impl PluginRuntime {
             self.retire_descriptors();
             return Found::Nothing;
         }
-        // The runtime is looked at the way a worker connects to it.
+        // The runtime is looked at the way a worker connects to it. The descriptor kept is the one
+        // the connection verified: a connect that fell back from the fourth protocol's descriptor
+        // to the third's has verified the third's, and the process the fourth's descriptor names
+        // is not the host.
         let paths = self.paths.clone();
         let probe = tokio::time::timeout(ADOPTION_PROBE, async move {
-            PluginClient::connect(&paths).await.map(|_client| ())
+            PluginClient::connect(&paths)
+                .await
+                .map(|client| client.descriptor().clone())
         })
         .await;
         match probe {
-            Ok(Ok(())) => Found::Alive(Running {
-                descriptor,
+            Ok(Ok(verified)) => Found::Alive(Running {
+                descriptor: verified,
                 _fence: None,
             }),
             Ok(Err(error)) => Found::Silent(cut(&format!(
