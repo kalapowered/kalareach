@@ -1248,6 +1248,22 @@ for path in paths:
             lambda: gather([made_up([synthetic("headed", "1.0.0", licences=[("Apache-2.0", "Apache License 2.0", "", False)],
                                                     folder=headed, declared="Apache-2.0")])], nothing, {}, reader),
             "headed 1.0.0 ships no text of Apache-2.0, its recorded licence, only LICENSE (no licence text)")
+    write(directory, "n0-apache", apache)
+    kept_apache = {"id": "n0-apache", "licence": "Apache-2.0", "source": "https://example.org/n0/LICENSE-APACHE",
+                   "sha256": hashlib.sha256(apache.encode("utf-8")).hexdigest()}
+    kept, files = keep([kept_apache], [{"name": "headed", "version": "1.0.0", "texts": ["n0-apache"]}], [])
+    text = rendered([made_up([synthetic("headed", "1.0.0", licences=[("Apache-2.0", "Apache License 2.0", "", False)],
+                                         folder=headed, declared="Apache-2.0")])], kept, files)
+    expect("a crate under Apache-2.0 whose only file is the Apache header is carried once an Apache text is kept for it",
+           "Licence statement: LICENSE (" + STATEMENT + ")" in text and "Licence: Apache-2.0 (Apache License 2.0)" in text
+           and "TERMS AND CONDITIONS FOR USE, REPRODUCTION, AND DISTRIBUTION" in text and "text https://example.org/n0/LICENSE-APACHE" in text)
+    alternative = os.path.join(scratch, "alternative-1.0.0")
+    write(alternative, "LICENSE-MIT", mit)
+    write(alternative, "LICENSE-APACHE", header)
+    text = rendered([made_up([synthetic("alternative", "1.0.0", licences=licences(template, False), folder=alternative,
+                                         declared="MIT OR Apache-2.0")])], nothing, {})
+    expect("a file that holds only the header of the alternative licence stays, as a statement",
+           "Licence statement: LICENSE-APACHE (" + STATEMENT + ")" in text and "Permission is hereby granted" in text)
     third = os.path.join(scratch, "third-1.0.0")
     write(third, "LICENSE-THIRD-PARTY", header + "\n" + mit)
     text = rendered([made_up([synthetic("third", "1.0.0", licences=licences(header + "\n" + mit), folder=third)])], nothing, {})
