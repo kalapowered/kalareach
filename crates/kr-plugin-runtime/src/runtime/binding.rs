@@ -1086,6 +1086,7 @@ impl BindingHandle {
             observing: None,
             returned_in_pass: false,
             consumed_owed: None,
+            consumed_held: false,
         };
         let name = format!("kr-plugin-binding-{}", request.binding_id);
         let thread = std::thread::Builder::new()
@@ -1181,10 +1182,23 @@ impl BindingHandle {
     #[cfg(feature = "testing")]
     #[must_use]
     pub fn stop_next_pump(&self) -> PumpStop {
+        self.stop_pump_after(0)
+    }
+
+    /// As [`Self::stop_next_pump`], and the pass stands after it has taken `events` events and the
+    /// component has returned from the last of them, not at its start. Events the host offers while
+    /// it stands are held in the queue, and what overflows it is lost between two takes of the pass.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn stop_pump_after(&self, events: usize) -> PumpStop {
         let (reached, acknowledged) = tokio::sync::watch::channel(false);
         let (release, released) = mpsc::channel();
         if let Ok(mut slot) = self.pump_stop.lock() {
-            *slot = Some(PumpStopSide { reached, released });
+            *slot = Some(PumpStopSide {
+                after: events,
+                reached,
+                released,
+            });
         }
         PumpStop {
             acknowledged,
@@ -1494,6 +1508,7 @@ impl PumpStop {
 /// The pass's side of a [`PumpStop`].
 #[cfg(feature = "testing")]
 struct PumpStopSide {
+    after: usize,
     reached: tokio::sync::watch::Sender<bool>,
     released: mpsc::Receiver<()>,
 }
@@ -1535,6 +1550,8 @@ struct BindingWorker {
     returned_in_pass: bool,
     /// What the caller has not been given yet. A newer one replaces it.
     consumed_owed: Option<Consumed>,
+    /// Whether `consumed_owed` waits for the gap a pass left to be reported first.
+    consumed_held: bool,
 }
 
 impl BindingWorker {
@@ -1682,10 +1699,13 @@ impl BindingWorker {
     fn pump(&mut self) {
         self.returned_in_pass = false;
         self.pump_pass();
-        // After the gap and the fault the pass raised, so the caller reads them first.
+        // After the gap and the fault the pass raised, so the caller reads them first. A gap the pass
+        // left in the queue, which a trap or a loss during the pass does, is reported by the next
+        // pass, and what is owed waits for it.
         if self.returned_in_pass {
             self.consumed_owed = Some(self.consumed.clone());
         }
+        self.consumed_held = self.queue.lock().is_ok_and(|queue| queue.gap_pending());
         self.flush_consumed();
     }
 
@@ -1694,6 +1714,9 @@ impl BindingWorker {
     /// The places the reserve keeps for a fault are not this report's, and a full channel leaves it
     /// owed for the next pass or the next report, which a newer one then replaces.
     fn flush_consumed(&mut self) {
+        if self.consumed_held {
+            return;
+        }
         let Some(owed) = self.consumed_owed.take() else {
             return;
         };
@@ -1710,7 +1733,7 @@ impl BindingWorker {
 
     fn pump_pass(&mut self) {
         #[cfg(feature = "testing")]
-        self.stand_when_stopped();
+        self.stand_when_stopped(0);
         // Cleared before the queue is read, so an event that arrives during this pass wakes the
         // next one rather than being left in the queue with nobody coming for it.
         self.pump_pending.store(false, Ordering::Release);
@@ -1739,6 +1762,7 @@ impl BindingWorker {
             // Events were lost: what the instance consumed is no longer all that came before it.
             self.consumed.clean = false;
             self.send(BindingEvent::Gap(gap));
+            self.consumed_held = false;
         }
         if owed != 0 {
             // The component's view is stale: either events were lost, or the instance was replaced
@@ -1763,14 +1787,21 @@ impl BindingWorker {
             }
         }
 
-        for _ in 0..PUMP_BATCH {
+        for taken in 0..PUMP_BATCH {
+            // Read by the stop a test sets between two takes.
+            let _ = taken;
             if self.is_disabled() || self.stopping.load(Ordering::Acquire) {
                 return;
             }
             // One at a time, so a fault costs the event that caused it and not the batch.
-            let Some(event) = self.take_one() else {
+            let Some((event, lost_before)) = self.take_one() else {
                 return;
             };
+            if lost_before {
+                // An event before this one was lost or refused after the pass began: what the
+                // instance consumes from here on does not follow it.
+                self.consumed.clean = false;
+            }
             let lost = event.clone();
             self.observing = Some(lost.handle.clone());
             let outcome = self.run_call(CallKind::Observe, move |instance| instance.observe(event));
@@ -1781,6 +1812,8 @@ impl BindingWorker {
                 self.consumed.returned(lost.provenance, lost.handle.clone());
                 self.returned_in_pass = true;
             }
+            #[cfg(feature = "testing")]
+            self.stand_when_stopped(taken + 1);
             if outcome.is_err() {
                 // A faulted instance is replaced and owes a snapshot. The event that faulted is
                 // one the component never took in, so it is recorded as lost; the events still in
@@ -1822,11 +1855,11 @@ impl BindingWorker {
     }
 
     /// Takes the oldest observation, if there is one.
-    fn take_one(&self) -> Option<ScopedSourceEvent> {
-        self.queue
-            .lock()
-            .ok()
-            .and_then(|mut queue| queue.take_one())
+    fn take_one(&self) -> Option<(ScopedSourceEvent, bool)> {
+        let mut queue = self.queue.lock().ok()?;
+        let event = queue.take_one()?;
+        let lost_before = queue.take_loss_before_taken();
+        Some((event, lost_before))
     }
 
     /// Stands at the start of a pass a test has stopped, until the test lets it go.
@@ -1834,8 +1867,14 @@ impl BindingWorker {
     /// The stop is taken, so it holds one pass and the next runs freely. The pass is acknowledged
     /// before it waits, and nothing has left the queue by then.
     #[cfg(feature = "testing")]
-    fn stand_when_stopped(&self) {
-        let Some(stop) = self.pump_stop.lock().ok().and_then(|mut slot| slot.take()) else {
+    fn stand_when_stopped(&self, taken: usize) {
+        let Some(stop) = self.pump_stop.lock().ok().and_then(|mut slot| {
+            if slot.as_ref().is_some_and(|stop| stop.after == taken) {
+                slot.take()
+            } else {
+                None
+            }
+        }) else {
             return;
         };
         stop.reached.send_replace(true);

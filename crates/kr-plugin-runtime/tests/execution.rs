@@ -2962,9 +2962,9 @@ mod consumed {
         stop.release();
     }
 
-    /// KR-REQ-24.24: a cursor comes after the fault of its pass.
+    /// KR-REQ-24.24: what a pass consumed is reported after the fault and the gap the pass raised.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn kr_req_24_24_a_cursor_follows_the_fault_of_the_pass_that_returned_it() {
+    async fn kr_req_24_24_a_cursor_follows_the_fault_and_the_gap_of_the_pass_that_returned_it() {
         let Some((_host, binding, mut received)) =
             bound("recording", 26, DEFAULT_EVENT_QUEUE).await
         else {
@@ -2984,6 +2984,7 @@ mod consumed {
         while !order.contains(&"consumed") {
             match next_event(&mut received, LIVENESS).await {
                 Some(BindingEvent::Fault { .. }) => order.push("fault"),
+                Some(BindingEvent::Gap(_)) => order.push("gap"),
                 Some(BindingEvent::Consumed(cursor)) => {
                     assert_eq!(cursor.terminal, Some(handle("se-1")));
                     assert!(!cursor.clean);
@@ -2995,8 +2996,8 @@ mod consumed {
         }
         assert_eq!(
             order,
-            ["fault", "consumed"],
-            "the cursor comes after the fault"
+            ["fault", "gap", "consumed"],
+            "the cursor comes after the fault and the gap the trap left"
         );
     }
 
@@ -3049,5 +3050,133 @@ mod consumed {
             "the cursors that found no room became one: {owed:?}"
         );
         assert_eq!(owed[0].terminal, Some(handle("se-6")), "the newest one");
+    }
+
+    /// KR-REQ-24.24: events lost while a pass runs make what the pass consumes after them not a
+    /// prefix, and a checkpoint before the next pass says so.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn kr_req_24_24_a_loss_during_a_pass_clears_clean_before_the_events_after_it() {
+        let Some((_host, binding, _received)) = bound("recording", 28, DEFAULT_EVENT_QUEUE).await
+        else {
+            return;
+        };
+        let filler = "y".repeat(64 * 1024);
+        // The pass stands after the first event it took has returned.
+        let mut stop = binding.stop_pump_after(1);
+        binding.enqueue_observation(components::scrape("se-0", "x"));
+        assert!(
+            tokio::time::timeout(core::time::Duration::from_secs(60), stop.reached())
+                .await
+                .expect("the pass stands after its first event"),
+            "the stop was replaced before a pass reached it"
+        );
+        // The checkpoint is behind this pass and ahead of the pass the overflow wakes.
+        let mut checkpoint = std::pin::pin!(binding.checkpoint(ANSWER));
+        let _ = tokio::time::timeout(core::time::Duration::ZERO, checkpoint.as_mut()).await;
+        let mut gapped = false;
+        for index in 1..=130 {
+            let offered =
+                binding.enqueue_observation(components::scrape(&format!("se-{index}"), &filler));
+            if matches!(offered.admission, Admission::QueuedWithGap { .. }) {
+                gapped = true;
+                break;
+            }
+        }
+        assert!(gapped, "the queue did not overflow");
+        stop.release();
+        let consumed = checkpoint
+            .await
+            .expect("the checkpoint runs")
+            .answer
+            .expect("the component answers")
+            .consumed;
+        assert_ne!(
+            consumed.terminal,
+            Some(handle("se-0")),
+            "the pass went on after the stop"
+        );
+        assert!(
+            !consumed.clean,
+            "events were lost before the ones this pass consumed after the stop"
+        );
+    }
+
+    /// KR-REQ-24.24: a request the queue refuses is a loss, and what is consumed after it is not a
+    /// prefix; what came before it still is. Native events move the native handle.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn kr_req_24_24_a_refused_request_clears_clean_for_the_events_offered_after_it() {
+        let Some((_host, binding, mut received)) =
+            bound("recording", 29, DEFAULT_EVENT_QUEUE).await
+        else {
+            return;
+        };
+        let filler = "y".repeat(64 * 1024);
+        let request = |index: usize| {
+            components::native_request(&format!("se-{index}"), &format!("rq-{index}"), &filler)
+        };
+        let mut stop = binding.stop_next_pump();
+        binding.enqueue_observation(request(0));
+        assert!(
+            tokio::time::timeout(core::time::Duration::from_secs(60), stop.reached())
+                .await
+                .expect("the pass stands at the stop"),
+            "the stop was replaced before a pass reached it"
+        );
+        let mut refused_at = None;
+        for index in 1..=130 {
+            if matches!(
+                binding.enqueue_observation(request(index)).admission,
+                Admission::Refused { .. }
+            ) {
+                refused_at = Some(index);
+                break;
+            }
+        }
+        let refused_at = refused_at.expect("the queue never refused a request");
+        stop.release();
+        let last_queued = handle(&format!("se-{}", refused_at - 1));
+        let before = consumed_until(&mut received, |consumed| {
+            consumed.native == Some(last_queued.clone())
+        })
+        .await;
+        assert!(
+            before.clean,
+            "every request before the refused one was consumed in order"
+        );
+        assert_eq!(before.terminal, None);
+        binding.enqueue_observation(components::native_request("se-after", "rq-after", "x"));
+        let after = consumed_until(&mut received, |consumed| {
+            consumed.native == Some(handle("se-after"))
+        })
+        .await;
+        assert!(
+            !after.clean,
+            "a request was refused before the one consumed now"
+        );
+    }
+
+    /// KR-REQ-24.24: a native event and a machine output event move the native handle, and a scrape
+    /// the terminal one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn kr_req_24_24_native_and_machine_output_events_move_the_native_handle() {
+        let Some((_host, binding, _received)) = bound("recording", 30, DEFAULT_EVENT_QUEUE).await
+        else {
+            return;
+        };
+        binding.enqueue_observation(components::scrape("se-1", "x"));
+        binding.enqueue_observation(components::native_request("se-2", "rq-2", "x"));
+        binding.enqueue_observation(ScopedSourceEvent::new(
+            handle("se-3"),
+            SourceProvenance::MachineOutput,
+            0,
+            None,
+            b"x".to_vec(),
+        ));
+        binding.enqueue_observation(components::scrape("se-4", "x"));
+        // The checkpoint is behind the pass the offers woke.
+        let consumed = consumed_of(&binding).await;
+        assert_eq!(consumed.native, Some(handle("se-3")));
+        assert_eq!(consumed.terminal, Some(handle("se-4")));
+        assert!(consumed.clean);
     }
 }
