@@ -14,9 +14,8 @@ publish.workspace = true
 kr-cli.workspace = true
 # The projection a client holds, and the painter a terminal of the session's size is drawn with.
 kr-client = { workspace = true, features = ["terminal"] }
-# Simulated time hands a daemon the clocks it starts on, and the harness reads a daemon through the
-# accessors only tests build.
-kr-controller = { workspace = true, features = ["testing"] }
+# Simulated time hands a daemon the clocks it starts on.
+kr-controller.workspace = true
 # Identifiers for the sessions and attachments the harness makes.
 kr-ipc.workspace = true
 kr-protocol.workspace = true
@@ -40,6 +39,9 @@ serde_json.workspace = true
 [dev-dependencies]
 # The digest an upload declares.
 kr-cbor.workspace = true
+# The tests read a daemon through the accessors only tests build. They get them from here, so that
+# no build that is not a test build has them, and with them the seams of the project service.
+kr-controller = { workspace = true, features = ["testing"] }
 # A session attached over the worker's own endpoint, with the product's client.
 kr-crypto.workspace = true
 kr-ipc = { workspace = true, features = ["testing"] }
