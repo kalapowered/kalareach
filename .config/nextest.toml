@@ -1,0 +1,107 @@
+# cargo-nextest configuration for the workspace's test run on the build box.
+#
+# Status: a shadow. The gate's evidence is still `cargo test --workspace --no-fail-fast`; this file lets a
+# shadow run on the build box execute the same cases under nextest beside it and compare the two.
+#
+# nextest starts one process per case; cargo test starts one process per test binary and runs the binaries one
+# after another. Everything below exists to keep what a binary's cases shared inside one process, or what no
+# two binaries did at the same time, from being lost. Each group names the guard it replaces and where it is.
+nextest-version = "0.9.146"
+
+# The two `harness = false` binaries of the companion do not answer `--list`: `navigation` prints a line and
+# `host_events` starts Xvfb and its whole window check. They stay under `cargo test -p companion-tauri --test
+# navigation --test host_events`, as do the doctests (`cargo test --doc --workspace`), which nextest does not run.
+
+[profile.default]
+# Which cases run when no filter is given (see the note above on the two harness = false binaries).
+default-filter = "not (binary(navigation) | binary(host_events))"
+# A rerun is not a fix: a case that fails once fails.
+retries = 0
+fail-fast = false
+# One line for every case, so that the log names each one the way a libtest run does.
+status-level = "pass"
+final-status-level = "fail"
+failure-output = "immediate-final"
+success-output = "never"
+# A case that runs for 2 minutes is reported slow; one that runs for 20 minutes is ended and fails.
+slow-timeout = { period = "120s", terminate-after = 10 }
+# A passing case that leaves a process holding its output fails: cargo test does not see this, so a leak is
+# a finding, not a pass.
+leak-timeout = { period = "100ms", result = "fail" }
+
+[profile.default.junit]
+path = "junit.xml"
+store-success-output = false
+store-failure-output = true
+
+[test-groups]
+# static CONTAINER_RUNTIME_TURN, crates/kr-cli/tests/bridged_session.rs: `podman exec` stalled on the box
+# whenever two cases called the runtime at once.
+container-runtime = { max-threads = 1 }
+# static TURN, crates/kr-worker/tests/ownership.rs: each case holds it for as long as its process tree lives.
+worker-ownership = { max-threads = 1 }
+# static BUILDING, crates/kr-shell-integration/tests/module_abi.rs: one build of the modules at a time, into
+# a folder beside the package cache.
+module-build = { max-threads = 1 }
+# static PLACES, crates/kr-controller/tests/network_project.rs: CASES_AT_ONCE (4) case bodies at once.
+network-project = { max-threads = 4 }
+# static PLACES, crates/kr-cli/tests/support/update_harness.rs: HOST_CASES_AT_ONCE (4 on Linux) hosts at once
+# for each binary that includes the harness; cargo test runs one of those binaries at a time, so 4 in all.
+host-cases = { max-threads = 4 }
+
+[[profile.default.overrides]]
+filter = '''
+  package(kr-cli) & binary(bridged_session) & (
+      test(=__none__)
+      | test(=a_container_is_enrolled_by_name_and_a_refresh_of_it_starts_nothing)
+      | test(=a_container_probe_that_fails_outside_kr_exits_as_an_outside_failure)
+      | test(=a_connection_that_fails_claims_nothing_for_an_ssh_host_or_a_container)
+      | test(=a_helper_that_exits_before_the_environment_answers_is_told_with_its_program_and_its_code)
+      | test(=a_helper_that_a_signal_ends_is_told_with_its_program_and_the_signal)
+      | test(=a_helper_that_says_nothing_is_told_with_its_program_and_its_bound)
+      | test(=an_environment_that_refuses_the_bridge_is_told_with_its_program_and_the_code)
+      | test(=a_helper_whose_answer_cannot_be_read_is_told_with_its_step_and_the_length)
+      | test(=a_container_runtime_that_is_not_on_this_host_is_told_as_not_found)
+      | test(=a_look_at_the_container_that_fails_is_told_as_its_step_and_not_as_a_stopped_environment)
+      | test(=a_look_that_fails_after_a_start_is_told_as_a_failed_look_and_keeps_the_start)
+      | test(=a_step_of_the_platform_that_fails_is_told_by_the_class_of_its_failure)
+      | test(=a_container_runtime_that_cannot_be_started_is_told_by_its_step_and_the_length_of_the_reason)
+      | test(=an_ssh_refresh_that_cannot_be_recorded_keeps_what_the_helper_said)
+      | test(=a_refresh_that_answers_or_finds_the_environment_stopped_says_so_in_words)
+      | test(=an_enrolled_container_answers_a_bridge_and_a_session_made_through_it_lives_there)
+      | test(=a_stopped_container_is_started_by_a_create_and_keeps_its_identity)
+  )
+'''
+test-group = 'container-runtime'
+
+[[profile.default.overrides]]
+filter = 'package(kr-worker) & binary(ownership)'
+test-group = 'worker-ownership'
+
+# `an_idle_sessions_observation_reads_no_process_outside_its_own_tree` reads the process table: a case of
+# another binary running beside it is a process outside its tree, which cargo test never had. It runs alone.
+[[profile.default.overrides]]
+filter = 'package(kr-worker) & binary(ownership) & test(~an_idle_sessions_observation_reads_no_process_outside_its_own_tree)'
+threads-required = 'num-test-threads'
+
+[[profile.default.overrides]]
+filter = 'package(kr-shell-integration) & binary(module_abi)'
+test-group = 'module-build'
+
+# static ORIGINALS, crates/kr-shell-integration/tests/relocation.rs: a moved-package case puts the built shell
+# package out of the way and every other case of the file reads it. These cases are `#[ignore]`d and run in
+# the kept `--include-ignored` steps under cargo test; the rule is here for the day they run under nextest.
+[[profile.default.overrides]]
+filter = 'package(kr-shell-integration) & binary(relocation) & test(~a_moved_)'
+threads-required = 'num-test-threads'
+
+[[profile.default.overrides]]
+filter = 'package(kr-controller) & binary(network_project)'
+test-group = 'network-project'
+
+[[profile.default.overrides]]
+filter = '''
+  (package(kr-cli) & (binary(update) | binary(admit)))
+  | (package(kr-conformance) & binary(account_launchd_gates))
+'''
+test-group = 'host-cases'
