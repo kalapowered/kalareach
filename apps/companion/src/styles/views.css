@@ -58,7 +58,8 @@
   border-color: var(--danger-line);
 }
 
-.card[data-kind='unknown_result'] {
+.card[data-kind='unknown_result'],
+.card[data-kind='results_not_read'] {
   border-color: var(--warning-line);
 }
 

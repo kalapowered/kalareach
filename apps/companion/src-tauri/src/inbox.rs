@@ -927,39 +927,90 @@ mod tests {
         }
     }
 
-    /// A host of a later release lists an item that the receipt rule raised. The page is decoded as
-    /// every page is, and the item keeps the rule's word, so the read is not refused over one item
-    /// this release cannot say why it was raised.
+    /// A host of a later release lists an item of the receipt rule and one of the results gap rule.
+    /// The page is decoded as every page is, and each item keeps its rule's word, so the read is not
+    /// refused over an item this release cannot say why it was raised.
+    ///
+    /// The page is this release's own shape, with items of a rule it has always had; the later words
+    /// replace the rule and the key of each as text, so the words are all that differs.
     #[test]
-    fn a_page_that_holds_an_item_of_the_receipt_rule_is_decoded() {
-        let page = serde_json::json!({
-            "items": [{
-                "key": "attention.receipt_uncertain|~0123456789abcdef0123456789abcdef",
-                "rule": "attention.receipt_uncertain",
-                "source": "receipts",
-                "level": "notable",
-                "session_id": "8a7b6c50-22bb-4c3d-8e4f-000000000101",
-                "summary": null,
-                "trusted": true,
-                "routing": "owner_policy",
-                "occurrences": "1",
-                "first_seen_ms": "1763000000000",
-                "last_seen_ms": "1763000000000",
-                "notification": "delivered",
-                "awaiting_delivery": false,
-                "acknowledged": false,
-                "uncertain": false,
-                "revision": "1",
-                "automation": null
-            }],
-            "more": false,
-            "dropped": "0",
-            "gaps": [],
-            "quiet_hours": null,
-            "quiet_now": false,
-            "quiet_hours_provable": true
-        });
-        let bytes = kr_cbor::to_canonical_vec(&page).expect("the page encodes");
+    fn a_page_that_holds_an_item_of_each_rule_a_later_release_raises_is_decoded() {
+        use kr_cbor::{CanonicalMap, CanonicalValue};
+        use kr_protocol::attention::{
+            AttentionItem, AttentionKey, AttentionLevel, AttentionRouting, AttentionRule,
+            AttentionSource, NotificationState,
+        };
+        use kr_protocol::scalars::TimestampMs;
+
+        let later = ["attention.receipt_uncertain", "attention.receipts_gap"];
+        let item = |subject: &str| AttentionItem {
+            key: AttentionKey::of(AttentionRule::CommandFailed, subject).expect("a key"),
+            rule: AttentionRule::CommandFailed,
+            source: AttentionSource::Receipts,
+            level: AttentionLevel::Notable,
+            session_id: Nullable::some(SessionId::new(Uuid::from_bytes([1; 16]))),
+            summary: Nullable::null(),
+            trusted: true,
+            routing: AttentionRouting::OwnerPolicy,
+            occurrences: U64::new(1),
+            first_seen_ms: TimestampMs::new(1_763_000_000_000),
+            last_seen_ms: TimestampMs::new(1_763_000_000_000),
+            notification: NotificationState::Delivered,
+            awaiting_delivery: false,
+            acknowledged: false,
+            uncertain: false,
+            revision: U64::new(1),
+            automation: Nullable::null(),
+        };
+        let page = AttentionReadResult {
+            items: vec![
+                item("~0123456789abcdef0123456789abcdef"),
+                item("~fedcba9876543210fedcba9876543210"),
+            ],
+            more: false,
+            dropped: U64::new(0),
+            gaps: Vec::new(),
+            quiet_hours: Nullable::null(),
+            quiet_now: false,
+            quiet_hours_provable: true,
+        };
+        let CanonicalValue::Map(root) =
+            kr_cbor::to_canonical_value(&page).expect("the page encodes")
+        else {
+            panic!("a page is a map");
+        };
+        let entries = root
+            .entries()
+            .iter()
+            .map(|(name, value)| match (name.as_str(), value) {
+                ("items", CanonicalValue::Array(items)) => {
+                    let renamed = items.iter().zip(later).map(|(held, word)| {
+                        let CanonicalValue::Map(fields) = held else {
+                            panic!("an item is a map");
+                        };
+                        let fields =
+                            fields
+                                .entries()
+                                .iter()
+                                .map(|(field, value)| match field.as_str() {
+                                    "rule" => (field.clone(), CanonicalValue::text(word)),
+                                    "key" => (
+                                        field.clone(),
+                                        CanonicalValue::text(format!(
+                                            "{word}|~0123456789abcdef0123456789abcdef"
+                                        )),
+                                    ),
+                                    _ => (field.clone(), value.clone()),
+                                });
+                        CanonicalValue::Map(CanonicalMap::from_entries(fields).expect("an item"))
+                    });
+                    (name.clone(), CanonicalValue::Array(renamed.collect()))
+                }
+                _ => (name.clone(), value.clone()),
+            });
+        let bytes = kr_cbor::encode(&CanonicalValue::Map(
+            CanonicalMap::from_entries(entries).expect("a page"),
+        ));
         let decoded =
             kr_protocol::wire::decode::<AttentionReadResult>(&bytes, &kr_cbor::Limits::DEFAULT);
         let words: Vec<&str> = decoded
@@ -969,8 +1020,8 @@ mod tests {
             .collect();
         assert_eq!(
             words,
-            ["attention.receipt_uncertain"],
-            "a page with an item of the receipt rule is decoded: {:?}",
+            later,
+            "a page with an item of each rule a later release raises is decoded: {:?}",
             decoded.as_ref().err()
         );
     }

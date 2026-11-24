@@ -79,6 +79,7 @@ const FILTERS: readonly { readonly id: AttentionFilter; readonly label: string }
   { id: 'pending_decision', label: 'Waiting for you' },
   { id: 'failed_action', label: 'Failed' },
   { id: 'unknown_result', label: 'Result unknown' },
+  { id: 'results_not_read', label: 'Results not read' },
   { id: 'awaiting_review', label: 'To review' },
   { id: 'disconnected', label: 'Out of contact' },
   { id: 'notice', label: 'Notices' }
@@ -115,6 +116,7 @@ const NOTHING: AttentionCounts = {
   pending_decision: 0,
   failed_action: 0,
   unknown_result: 0,
+  results_not_read: 0,
   awaiting_review: 0,
   disconnected: 0,
   notice: 0,
