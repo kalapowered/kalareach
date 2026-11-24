@@ -11,6 +11,7 @@
 import { expect, test, type Locator, type Page } from '@playwright/test'
 
 import { screenshotPath } from './evidence'
+import { keyboard } from './keyboard'
 import { overrunning } from './layout'
 
 // A control that is not there fails its case at once, at the line that asks for it.
@@ -45,13 +46,6 @@ async function openSession(page: Page, phone: Phone): Promise<void> {
   await page.goto(`/harness.html?surface=${phone.surface}&session=${SESSION}`)
   await expect(page.getByText('Find why the reconnect test is flaky.')).toBeVisible()
   await expect(page.getByLabel('Message this session')).toBeVisible()
-}
-
-/** Covers the bottom `inset` pixels of the screen, as a software keyboard does. */
-async function keyboard(page: Page, inset: number): Promise<void> {
-  await page.evaluate((covered) => {
-    document.documentElement.style.setProperty('--keyboard', `${covered}px`)
-  }, inset)
 }
 
 /** The room the session adds under the composer, beyond the keyboard's own lift, so that the field rests on the keyboard's top edge. */
