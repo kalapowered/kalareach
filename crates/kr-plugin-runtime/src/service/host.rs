@@ -930,6 +930,13 @@ impl PluginHost {
                             own.map_or_else(|| "none".to_owned(), |number| number.to_string()),
                         )));
                     }
+                    if state.len() as u64 > MAX_NODE_BYTES {
+                        // A state this host never produces. Refused before the component sees
+                        // it, whatever the writer's gate says, so the instance stays as it was.
+                        return Err(refused(
+                            "the state is larger than this host carries to a component".to_owned(),
+                        ));
+                    }
                     if !self.writer_open && through.is_some() {
                         // A host that does not keep the record cannot say the state covers what the
                         // position says it does, so it restores nothing, and the worker is told the
