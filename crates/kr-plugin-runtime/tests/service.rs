@@ -5556,8 +5556,9 @@ mod recorded_session {
     use kr_plugin_service::client::PluginClient;
     use kr_plugin_service::protocol::{
         CallValue, ComponentSource, EncodeCall, Frame, Notice, PrepareActionCall, Request,
-        RequestBody, ResponseBody, WireArgument, WireDecoded, WireEncoded, WireMethodClass,
-        WireNamedArgument, WireNode, WireOperation, WirePlan, WireRequestSnapshot, WireToken,
+        RequestBody, ResponseBody, WireArgument, WireAttachment, WireDecoded, WireEncoded,
+        WireField, WireMethodClass, WireNamedArgument, WireNode, WireOperation, WirePlan,
+        WireRequestSnapshot, WireSegment, WireToken,
     };
     use kr_protocol::frame::StreamKind;
 
@@ -5956,6 +5957,49 @@ mod recorded_session {
             event: None,
             deadline_ms: 500,
         })));
+        // Every variant of the closed leaves the frames above use one of: the argument values, the
+        // operations a plan names with the effect class that goes with each, the classes of a
+        // native method, the steps of a path, and an attachment.
+        let every_argument = || {
+            vec![
+                ("text", WireArgument::Text("because".to_owned())),
+                ("count", WireArgument::Integer(-3)),
+                ("flag", WireArgument::Boolean(true)),
+                ("pick", WireArgument::Choice("accept".to_owned())),
+                ("file", WireArgument::AttachmentHandle("att-1".to_owned())),
+                ("node", WireArgument::NodeRef("n-1".to_owned())),
+            ]
+            .into_iter()
+            .map(|(name, value)| WireNamedArgument {
+                name: name.to_owned(),
+                value,
+            })
+            .collect::<Vec<_>>()
+        };
+        push_request(RequestBody::PrepareAction(Box::new(PrepareActionCall {
+            binding_id,
+            token: WireToken {
+                actor_id: "local:501".to_owned(),
+                grant_id: "grant-1".to_owned(),
+                binding_revision: 3,
+                thread_revision: Some(5),
+                action_id: "turn.start".to_owned(),
+                parameter_hash: vec![9; 32],
+                expires_at_ms: 1_700_000_005_000,
+            },
+            arguments: every_argument(),
+            deadline_ms: 500,
+        })));
+        push_request(RequestBody::ReviseAttachments {
+            binding_id,
+            attachments: vec![WireAttachment {
+                attachment_id: "att-1".to_owned(),
+                name: "notes.txt".to_owned(),
+                media_type: "text/plain".to_owned(),
+                size_bytes: 12,
+                completed_at_ms: 1_700_000_001_000,
+            }],
+        });
         let mut push_frame = |frame: Frame| {
             out.push((
                 kind_of_frame(&frame),
@@ -5971,6 +6015,67 @@ mod recorded_session {
             }])),
             None,
         ));
+        push_frame(called(Some(plan(every_argument())), None));
+        for (class, operation) in [
+            (EffectClass::Observe, WireOperation::Present),
+            (
+                EffectClass::UpstreamPrompt,
+                WireOperation::UpstreamMethod {
+                    method: "turn.start".to_owned(),
+                    fields: vec![
+                        WireField {
+                            path: vec![
+                                WireSegment::Member("input".to_owned()),
+                                WireSegment::Index(0),
+                            ],
+                            value: WireArgument::Text("hello".to_owned()),
+                        },
+                        WireField {
+                            path: vec![WireSegment::Member("count".to_owned())],
+                            value: WireArgument::Integer(2),
+                        },
+                    ],
+                },
+            ),
+            (
+                EffectClass::UpstreamAttachment,
+                WireOperation::UpstreamAttachment {
+                    attachment_id: "att-1".to_owned(),
+                },
+            ),
+            (
+                EffectClass::TerminalInput,
+                WireOperation::TerminalText("ls".to_owned()),
+            ),
+            (EffectClass::ApprovalDecode, WireOperation::Present),
+            (EffectClass::ApprovalRespond, WireOperation::Present),
+        ] {
+            push_frame(called(
+                Some(CallValue::Plan(Box::new(WirePlan {
+                    action_id: "turn.start".to_owned(),
+                    class,
+                    operation,
+                    arguments: vec![],
+                }))),
+                None,
+            ));
+        }
+        for class in [
+            WireMethodClass::Observation,
+            WireMethodClass::Credential,
+            WireMethodClass::Unsupported,
+        ] {
+            push_frame(called(
+                Some(CallValue::Decoded(Box::new(WireDecoded {
+                    request_id: "r-2".to_owned(),
+                    class,
+                    summary: "a request".to_owned(),
+                    decisions: vec![],
+                    presentation: vec![],
+                }))),
+                None,
+            ));
+        }
         push_frame(called(Some(CallValue::State(b"state".to_vec())), None));
         push_frame(called(
             Some(CallValue::Decoded(Box::new(WireDecoded {
@@ -6026,9 +6131,11 @@ mod recorded_session {
         let record: serde_json::Value = serde_json::from_str(RECORD).expect("the record");
         let limits = StreamKind::Control.cbor_limits();
         let mut kinds = BTreeSet::new();
+        let mut spelled = String::new();
         for entry in record["frames"].as_array().expect("the frames") {
             let kind = entry["kind"].as_str().expect("a kind");
             let bytes = unhex(entry["hex"].as_str().expect("the bytes"));
+            let spelling;
             let read = if kind.starts_with("request:") {
                 let read: Result<Request, _> = kr_cbor::from_canonical_slice(&bytes, &limits);
                 assert!(read.is_ok(), "{kind} is read by this build: {read:?}");
@@ -6038,6 +6145,7 @@ mod recorded_session {
                     bytes,
                     "{kind} writes back to the bytes it was recorded as"
                 );
+                spelling = format!("{request:?}");
                 format!("request:{}", request.body.name())
             } else {
                 let read: Result<Frame, _> = kr_cbor::from_canonical_slice(&bytes, &limits);
@@ -6048,13 +6156,47 @@ mod recorded_session {
                     bytes,
                     "{kind} writes back to the bytes it was recorded as"
                 );
+                spelling = format!("{frame:?}");
                 kind_of_frame(&frame)
             };
             assert_eq!(read, kind, "the frame is the kind it was recorded as");
             kinds.insert(read);
+            spelled.push_str(&spelling);
         }
         for kind in KINDS {
             assert!(kinds.contains(kind), "the record holds no frame of {kind}");
+        }
+        // Each variant of the closed leaves the frames are made of is in a frame of the record: a
+        // change to one that no frame holds would change nothing the record checks.
+        for variant in [
+            "value: Text(",
+            "Integer(",
+            "Boolean(",
+            "Choice(",
+            "AttachmentHandle(",
+            "NodeRef(",
+            "Present",
+            "UpstreamMethod {",
+            "UpstreamCancel",
+            "UpstreamAttachment {",
+            "TerminalText(",
+            "Member(",
+            "Index(",
+            "Observation",
+            "Mutation",
+            "Credential",
+            "Unsupported",
+            "WireAttachment {",
+            "Observe",
+            "UpstreamPrompt",
+            "TerminalInput",
+            "ApprovalDecode",
+            "ApprovalRespond",
+        ] {
+            assert!(
+                spelled.contains(variant),
+                "no frame of the record holds {variant}"
+            );
         }
     }
 
