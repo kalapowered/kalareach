@@ -1825,13 +1825,6 @@ impl BindingWorker {
     fn pump(&mut self) {
         self.returned_in_pass = false;
         self.pump_pass();
-        if self.is_disabled() {
-            // A disabled binding runs no pass that would report a gap, so nothing it owes is ever
-            // read: its caller has the notice that says why.
-            self.consumed_owed = None;
-            self.consumed_held = false;
-            return;
-        }
         // After the gap and the fault the pass raised, so the caller reads them first. A gap the pass
         // left in the queue, which a trap or a loss during the pass does, is reported by the next
         // pass, and what is owed waits for it.
@@ -1881,6 +1874,15 @@ impl BindingWorker {
     /// The places the reserve keeps for a fault are not this report's, and a full channel leaves it
     /// owed for the next pass or the next report, which a newer one then replaces.
     fn flush_consumed(&mut self) {
+        if self.events.is_closed() || self.is_disabled() {
+            // Nobody reads the channel any more, or the binding is disabled and runs no pass that
+            // would report the gap the report waits for: nothing is owed to anyone, and its caller
+            // has the notice that says why. Whichever call disabled the binding, and whenever the
+            // reader went, the report is dropped before any other reason to hold it.
+            self.consumed_owed = None;
+            self.consumed_held = false;
+            return;
+        }
         if self.consumed_held {
             self.owed_due = std::time::Instant::now() + OWED_RETRY;
             return;
@@ -1888,10 +1890,6 @@ impl BindingWorker {
         let Some(owed) = self.consumed_owed.take() else {
             return;
         };
-        if self.events.is_closed() {
-            // Nobody reads the channel any more, so nobody is owed anything.
-            return;
-        }
         // What the binding said before the report is told first: a loss that a full channel kept
         // from the caller comes with the positions it bounds.
         self.flush_dropped();
