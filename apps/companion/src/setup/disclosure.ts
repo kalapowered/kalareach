@@ -80,9 +80,9 @@ const CHECKS: readonly CheckLines[] = [
       },
       x11: {
         performs:
-          'With a local X display set for the worker and a screen-capture tool installed, takes ' +
-          'one image of the whole X screen, every monitor on it, and reads it into memory to ' +
-          'measure it. In any other case it takes no image.',
+          'With a local X display set for the worker and one of the screen-capture tools this ' +
+          'check knows installed, takes one image of the whole X screen, every monitor on it, ' +
+          'and reads it into memory to measure it. In any other case it takes no image.',
         effect: LINUX_IMAGE_FILE
       },
       wayland: {
