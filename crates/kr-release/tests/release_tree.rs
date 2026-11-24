@@ -1337,3 +1337,34 @@ fn the_closing_list_of_a_companion_notice_names_its_crates() {
         .expect("the lock is read");
     assert_eq!(lacking, vec![name.to_owned()]);
 }
+
+/// The refusal of a committed companion notice that lacks a crate names every step that makes the
+/// notice again: the packages, the build, the fetch, the two tools and the generator.
+#[test]
+fn the_refusal_of_a_companion_notice_names_the_steps_that_make_it_again() {
+    let committed =
+        std::fs::read_to_string(checkout().join("docs/releases/companion-third-party-notices.txt"))
+            .expect("the committed companion notice");
+    let without: String = committed
+        .lines()
+        .filter(|line| !line.starts_with("  - tauri "))
+        .map(|line| format!("{line}\n"))
+        .collect();
+    let (_directory, stand_in) = companion_stand_in(&without);
+    let refused = kr_release::notices::held_companion(&stand_in)
+        .expect_err("a companion notice with no entry for tauri is refused")
+        .to_string();
+    for step in [
+        "pnpm install --frozen-lockfile --prod --filter \"@kalareach/companion...\"",
+        "cargo build -p kr-release",
+        "cargo fetch --locked",
+        "cargo-about 0.9.3",
+        "askalono 0.5.0",
+        "generate-notices.py write --product companion",
+    ] {
+        assert!(
+            refused.contains(step),
+            "the refusal names {step}: {refused}"
+        );
+    }
+}

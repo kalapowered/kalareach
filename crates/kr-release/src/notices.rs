@@ -60,7 +60,8 @@ const PLACEHOLDERS: [&str; 9] = [
 /// What a person does when the committed companion text is not the one the lock makes.
 const COMPANION_REPAIR: &str = "install the production packages with `pnpm install --frozen-lockfile \
      --prod --filter \"@kalareach/companion...\"`, build kr-release with `cargo build -p kr-release`, \
-     run `python3 scripts/generate-notices.py write --product companion --kr-release \
+     fetch the crates with `cargo fetch --locked`, put cargo-about 0.9.3 and askalono 0.5.0 on the \
+     PATH, run `python3 scripts/generate-notices.py write --product companion --kr-release \
      target/debug/kr-release`, and commit the result";
 
 /// What a person does when the committed text is not the one the lock makes.
