@@ -1626,6 +1626,7 @@ type Boundary<'a> = (&'a str, &'a str, &'a [(&'a str, &'a str)]);
 /// the 360 minutes GitHub allows. The script runs a command for each boundary in the function that
 /// holds it, each command names a test target or library that exists, and each case it names with
 /// `--exact` exists in that target and is named once.
+/// A command that runs a whole target names how many cases it passes at least.
 #[test]
 fn the_contract_cases_for_installed_apps_live_workers_and_plugins_run_in_jobs_of_their_own() {
     let workflow = fs::read_to_string(repository().join(".github/workflows/core-ci.yml"))
@@ -1782,6 +1783,41 @@ fn the_contract_cases_for_installed_apps_live_workers_and_plugins_run_in_jobs_of
                 "no command of `{function}` holds {boundary}: {package} {target}"
             );
         }
+    }
+    // Each case that reads a frame the release before recorded is named by a command of `fast`.
+    for (package, target, case) in [
+        (
+            "kr-hook",
+            "channel",
+            "kr_req_12_18_the_frames_of_a_worker_of_the_release_before_cross_as_it_wrote_and_read_them",
+        ),
+        (
+            "kr-hook",
+            "registration",
+            "the_registration_a_worker_of_the_release_before_wrote_is_read_whole_and_names_its_release",
+        ),
+        (
+            "kr-hook",
+            "registration",
+            "the_hello_this_forwarder_writes_has_the_members_of_the_one_the_release_before_wrote",
+        ),
+        (
+            "kr-worker",
+            "channels",
+            "kr_req_12_18_an_answer_goes_out_on_the_channel_as_the_applications_verdict",
+        ),
+        (
+            "kr-worker",
+            "--lib",
+            "broker::attach::tests::the_hello_a_forwarder_of_the_release_before_wrote_is_read_as_it_always_was",
+        ),
+    ] {
+        assert!(
+            commands.iter().any(|(at, words)| at == "fast"
+                && runs_target(words, package, target)
+                && words.iter().any(|word| word == case)),
+            "`fast` does not name {case}, a case of {package} {target} that reads a frame the release before recorded"
+        );
     }
     for function in ["upgrade", "windows"] {
         let suites: Vec<String> = commands

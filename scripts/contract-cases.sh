@@ -103,7 +103,8 @@ fast() {
   expect cargo test --locked -p kr-hook --test channel -- --exact \
     kr_req_12_18_the_frames_of_a_worker_of_the_release_before_cross_as_it_wrote_and_read_them
   expect cargo test --locked -p kr-hook --test registration -- --exact \
-    the_registration_a_worker_of_the_release_before_wrote_is_read_whole_and_names_its_release
+    the_registration_a_worker_of_the_release_before_wrote_is_read_whole_and_names_its_release \
+    the_hello_this_forwarder_writes_has_the_members_of_the_one_the_release_before_wrote
   expect cargo test --locked -p kr-worker --test channels -- --exact \
     kr_req_12_18_an_answer_goes_out_on_the_channel_as_the_applications_verdict
   expect cargo test --locked -p kr-worker --lib -- --exact \
