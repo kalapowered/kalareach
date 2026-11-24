@@ -1227,3 +1227,84 @@ fn a_notice_with_a_licence_template_placeholder_is_refused() {
         );
     }
 }
+
+/// The checkout's committed companion notice, as the text and as the parts of this checkout that
+/// the check reads with that text committed in a stand-in.
+fn companion_stand_in(notice: &str) -> (tempfile::TempDir, PathBuf) {
+    let (directory, stand_in, _tree) = notice_stand_in("");
+    let committed = stand_in.join("docs/releases/companion-third-party-notices.txt");
+    std::fs::write(committed, notice).expect("the committed companion notice");
+    (directory, stand_in)
+}
+
+/// Every crate the lock takes into the companion application has an entry in the companion's
+/// notice. The committed text has none missing, which is the control; the same text with every
+/// entry of one crate cut out names that crate and its version.
+#[test]
+fn a_companion_notice_that_lacks_a_crate_of_the_application_is_refused() {
+    let committed =
+        std::fs::read_to_string(checkout().join("docs/releases/companion-third-party-notices.txt"))
+            .expect("the committed companion notice");
+    let none = kr_release::notices::gaps(&checkout(), &committed, Product::Companion)
+        .expect("the lock is read");
+    assert!(
+        none.is_empty(),
+        "the committed companion notice lacks {none:?}"
+    );
+
+    let mut cut = Vec::new();
+    let text: String = committed
+        .lines()
+        .filter(|line| match line.strip_prefix("  - tauri ") {
+            Some(rest) => {
+                cut.push(format!(
+                    "tauri {}",
+                    rest.split(" | ").next().expect("a version")
+                ));
+                false
+            }
+            None => true,
+        })
+        .map(|line| format!("{line}\n"))
+        .collect();
+    assert!(!cut.is_empty(), "the companion notice has entries of tauri");
+    let lacking = kr_release::notices::gaps(&checkout(), &text, Product::Companion)
+        .expect("the lock is read");
+    assert_eq!(lacking, cut);
+}
+
+/// A checkout whose committed companion notice has no entry for a crate the lock takes into the
+/// companion application is refused by `held_companion`. The committed text passes, which is the
+/// control.
+#[test]
+fn a_checkout_that_commits_a_companion_notice_without_a_crate_is_refused() {
+    let committed =
+        std::fs::read_to_string(checkout().join("docs/releases/companion-third-party-notices.txt"))
+            .expect("the committed companion notice");
+    let (_whole, stand_in) = companion_stand_in(&committed);
+    kr_release::notices::held_companion(&stand_in)
+        .expect("the committed companion notice is held to the lock");
+    let without: String = committed
+        .lines()
+        .filter(|line| !line.starts_with("  - tauri "))
+        .map(|line| format!("{line}\n"))
+        .collect();
+    let (_cut, stand_in) = companion_stand_in(&without);
+    let refused = kr_release::notices::held_companion(&stand_in)
+        .expect_err("a companion notice with no entry for tauri is refused");
+    assert!(refused.to_string().contains("tauri"), "{refused}");
+}
+
+/// A committed companion notice that holds the placeholder of a licence template is refused by
+/// name, though every crate has its entry.
+#[test]
+fn a_companion_notice_with_a_licence_template_placeholder_is_refused() {
+    let committed =
+        std::fs::read_to_string(checkout().join("docs/releases/companion-third-party-notices.txt"))
+            .expect("the committed companion notice");
+    let marked = format!("{committed}\nCopyright (c) 2020 <owner>\n");
+    let (_directory, stand_in) = companion_stand_in(&marked);
+    let refused = kr_release::notices::held_companion(&stand_in)
+        .expect_err("a companion notice with a template placeholder is refused");
+    assert!(refused.to_string().contains("<owner>"), "{refused}");
+}

@@ -28,6 +28,24 @@
       "sha256": "b47387386076db46382e2e37ca7d4fbbc85b77a5464a1666314a4a6eda6dd8a5"
     },
     {
+      "id": "android-ndk-rs-10f2ba388fca-LICENSE-MIT",
+      "licence": "MIT",
+      "source": "https://raw.githubusercontent.com/rust-windowing/android-ndk-rs/10f2ba388fca20f7349996ebae26ccda7a6fda5c/LICENSE-MIT",
+      "sha256": "508a77d2e7b51d98adeed32648ad124b7b30241a8e70b2e72c99f92d8e5874d1"
+    },
+    {
+      "id": "clipboard-win-3b27cf2bfd1a-LICENSE",
+      "licence": "BSL-1.0",
+      "source": "https://raw.githubusercontent.com/DoumanAsh/clipboard-win/3b27cf2bfd1adcfa6e0264eb51c1025ddaf0f342/LICENSE",
+      "sha256": "c9bff75738922193e67fa726fa225535870d2aa1059f91452c411736284ad566"
+    },
+    {
+      "id": "dlopen2-cc80e4a0a90d-LICENSE",
+      "licence": "MIT",
+      "source": "https://raw.githubusercontent.com/OpenByteDev/dlopen2/cc80e4a0a90d499b677fdf7743699b4b3a43a989/LICENSE",
+      "sha256": "39fa265207450e77c62e90c5594a06c085b655d8374c7ced4bf7894b6bd95dd2"
+    },
+    {
       "id": "fluent-langneg-rs-7fdc590466ea-LICENSE-MIT",
       "licence": "MIT",
       "source": "https://raw.githubusercontent.com/projectfluent/fluent-langneg-rs/7fdc590466ea63ca2367ac10fb1b881fe561f1a8/LICENSE-MIT",
@@ -52,6 +70,18 @@
       "sha256": "339060c99d5c80c2742cae417f765980afe6b0149a78f959bbf2a79f19ab3af5"
     },
     {
+      "id": "jni-rs-5ae9458a4ec4-LICENSE-MIT",
+      "licence": "MIT",
+      "source": "https://raw.githubusercontent.com/jni-rs/jni-rs/5ae9458a4ec44c5318f37ddc7569c1d4ae8a69e7/LICENSE-MIT",
+      "sha256": "fea1d5bf3dd71605ce5d7d2ff695c1837e914c77195e523a86b5391716477960"
+    },
+    {
+      "id": "jni-sys-64d77b7a5f11-LICENSE-MIT",
+      "licence": "MIT",
+      "source": "https://raw.githubusercontent.com/jni-rs/jni-sys/64d77b7a5f119d7b55b4e2c169a4668067ff59e6/LICENSE-MIT",
+      "sha256": "1d85bd754b04ceec93e98e890edd1fa3c6a22e81bcb32135806beeccefa51cd1"
+    },
+    {
       "id": "libsodium-1.0.22-LICENSE",
       "licence": "ISC",
       "source": "https://raw.githubusercontent.com/jedisct1/libsodium/77e1ce5d6dee871c49ef211222ba18ef0c486bda/LICENSE",
@@ -74,6 +104,12 @@
       "licence": "MIT",
       "source": "https://raw.githubusercontent.com/n0-computer/n0-error/596f4113918712d545cbb25b7fa12c7153706f54/LICENSE-MIT",
       "sha256": "339060c99d5c80c2742cae417f765980afe6b0149a78f959bbf2a79f19ab3af5"
+    },
+    {
+      "id": "ndk-49bbbba16c58-LICENSE-MIT",
+      "licence": "MIT",
+      "source": "https://raw.githubusercontent.com/rust-mobile/ndk/49bbbba16c58ff63cb8a0ad0eca5a9fb7ecaec25/LICENSE-MIT",
+      "sha256": "508a77d2e7b51d98adeed32648ad124b7b30241a8e70b2e72c99f92d8e5874d1"
     },
     {
       "id": "net-tools-0030e57fc709-LICENSE-MIT",
@@ -107,6 +143,24 @@
       "licence": "MIT",
       "source": "https://raw.githubusercontent.com/aclysma/profiling/8271551172eb6fa4cba47369aedd93790c623df9/LICENSE-MIT",
       "sha256": "c8167fdeeed46d3f244d3f85c5bf998ce889343691c32be2c61a8bc4b5c08333"
+    },
+    {
+      "id": "webview2-rs-edc2caf88617-LICENSE",
+      "licence": "MIT",
+      "source": "https://raw.githubusercontent.com/wravery/webview2-rs/edc2caf886175ccaebe86078c9cfe1ae2a187328/LICENSE",
+      "sha256": "0dcf41516e608bbcb6cdc5229feb7b86fe4a643b85e7df251133c93408fdac73"
+    },
+    {
+      "id": "tauri-6f6ab1207bb3-LICENSE_MIT",
+      "licence": "MIT",
+      "source": "https://raw.githubusercontent.com/tauri-apps/tauri/6f6ab1207bb3923c2721fbc67d2fdb1c8deb0c7a/LICENSE_MIT",
+      "sha256": "9dd42ea92cff2ede5cd477cbfcce051b2d0115c0ac7f368ee88cb545055dff1d"
+    },
+    {
+      "id": "rustls-platform-verifier-252e25161a91-LICENSE-MIT",
+      "licence": "MIT",
+      "source": "https://raw.githubusercontent.com/rustls/rustls-platform-verifier/252e25161a91af476cbea620e29d277592d27ec7/LICENSE-MIT",
+      "sha256": "1c7cf76689c837a68ed8d704994e52a0f2940c087958f860d17f3186afbdcc0c"
     },
     {
       "id": "pulp-5eb07fd7b68e-LICENSE",
@@ -182,6 +236,10 @@
       "version": "0.8.2",
       "texts": [
         "MIT-spdx-3.29.0-without-copyright-line"
+      ],
+      "products": [
+        "programs",
+        "companion"
       ]
     },
     {
@@ -190,6 +248,30 @@
       "texts": [
         "objc2-8852b424193c-LICENSE.md",
         "MIT-spdx-3.29.0-without-copyright-line"
+      ],
+      "products": [
+        "programs",
+        "companion"
+      ]
+    },
+    {
+      "name": "cesu8",
+      "version": "1.1.0",
+      "texts": [
+        "MIT-spdx-3.29.0-without-copyright-line"
+      ],
+      "products": [
+        "companion"
+      ]
+    },
+    {
+      "name": "clipboard-win",
+      "version": "5.4.1",
+      "texts": [
+        "clipboard-win-3b27cf2bfd1a-LICENSE"
+      ],
+      "products": [
+        "companion"
       ]
     },
     {
@@ -233,6 +315,30 @@
       "texts": [
         "objc2-8852b424193c-LICENSE.md",
         "MIT-spdx-3.29.0-without-copyright-line"
+      ],
+      "products": [
+        "programs",
+        "companion"
+      ]
+    },
+    {
+      "name": "dlopen2",
+      "version": "0.8.2",
+      "texts": [
+        "dlopen2-cc80e4a0a90d-LICENSE"
+      ],
+      "products": [
+        "companion"
+      ]
+    },
+    {
+      "name": "dlopen2_derive",
+      "version": "0.4.3",
+      "texts": [
+        "dlopen2-cc80e4a0a90d-LICENSE"
+      ],
+      "products": [
+        "companion"
       ]
     },
     {
@@ -240,6 +346,10 @@
       "version": "1.4.1",
       "texts": [
         "MIT-spdx-3.29.0-without-copyright-line"
+      ],
+      "products": [
+        "programs",
+        "companion"
       ]
     },
     {
@@ -269,6 +379,10 @@
       "package": "https://github.com/kalapowered/iroh?rev=9139ea0efa1bea32dc73a0b80868963cf026178d#9139ea0e",
       "texts": [
         "iroh-9139ea0efa1b-LICENSE-MIT"
+      ],
+      "products": [
+        "programs",
+        "companion"
       ]
     },
     {
@@ -277,6 +391,10 @@
       "package": "https://github.com/kalapowered/iroh?rev=9139ea0efa1bea32dc73a0b80868963cf026178d#9139ea0e",
       "texts": [
         "iroh-9139ea0efa1b-LICENSE-MIT"
+      ],
+      "products": [
+        "programs",
+        "companion"
       ]
     },
     {
@@ -285,6 +403,10 @@
       "package": "https://github.com/kalapowered/iroh?rev=9139ea0efa1bea32dc73a0b80868963cf026178d#9139ea0e",
       "texts": [
         "iroh-9139ea0efa1b-LICENSE-MIT"
+      ],
+      "products": [
+        "programs",
+        "companion"
       ]
     },
     {
@@ -292,6 +414,10 @@
       "version": "0.5.0",
       "texts": [
         "iroh-address-lookups-a0cc9dbfc292-LICENSE-MIT"
+      ],
+      "products": [
+        "programs",
+        "companion"
       ]
     },
     {
@@ -299,6 +425,10 @@
       "version": "0.5.0",
       "texts": [
         "iroh-address-lookups-a0cc9dbfc292-LICENSE-MIT"
+      ],
+      "products": [
+        "programs",
+        "companion"
       ]
     },
     {
@@ -306,6 +436,10 @@
       "version": "1.0.1",
       "texts": [
         "iroh-metrics-a9afb7cd49bb-LICENSE-MIT"
+      ],
+      "products": [
+        "programs",
+        "companion"
       ]
     },
     {
@@ -314,6 +448,40 @@
       "package": "https://github.com/kalapowered/iroh?rev=9139ea0efa1bea32dc73a0b80868963cf026178d#9139ea0e",
       "texts": [
         "iroh-9139ea0efa1b-LICENSE-MIT"
+      ],
+      "products": [
+        "programs",
+        "companion"
+      ]
+    },
+    {
+      "name": "jni",
+      "version": "0.22.4",
+      "texts": [
+        "jni-rs-5ae9458a4ec4-LICENSE-MIT"
+      ],
+      "products": [
+        "companion"
+      ]
+    },
+    {
+      "name": "jni-macros",
+      "version": "0.22.4",
+      "texts": [
+        "jni-rs-5ae9458a4ec4-LICENSE-MIT"
+      ],
+      "products": [
+        "companion"
+      ]
+    },
+    {
+      "name": "jni-sys-macros",
+      "version": "0.4.1",
+      "texts": [
+        "jni-sys-64d77b7a5f11-LICENSE-MIT"
+      ],
+      "products": [
+        "companion"
       ]
     },
     {
@@ -335,6 +503,40 @@
       "version": "1.0.1",
       "texts": [
         "n0-error-596f41139187-LICENSE-MIT"
+      ],
+      "products": [
+        "programs",
+        "companion"
+      ]
+    },
+    {
+      "name": "ndk",
+      "version": "0.9.0",
+      "texts": [
+        "ndk-49bbbba16c58-LICENSE-MIT"
+      ],
+      "products": [
+        "companion"
+      ]
+    },
+    {
+      "name": "ndk-context",
+      "version": "0.1.1",
+      "texts": [
+        "android-ndk-rs-10f2ba388fca-LICENSE-MIT"
+      ],
+      "products": [
+        "companion"
+      ]
+    },
+    {
+      "name": "ndk-sys",
+      "version": "0.6.0+11769913",
+      "texts": [
+        "ndk-49bbbba16c58-LICENSE-MIT"
+      ],
+      "products": [
+        "companion"
       ]
     },
     {
@@ -342,6 +544,10 @@
       "version": "0.19.3",
       "texts": [
         "net-tools-0030e57fc709-LICENSE-MIT"
+      ],
+      "products": [
+        "programs",
+        "companion"
       ]
     },
     {
@@ -350,6 +556,43 @@
       "texts": [
         "objc2-8852b424193c-LICENSE.md",
         "MIT-spdx-3.29.0-without-copyright-line"
+      ],
+      "products": [
+        "programs",
+        "companion"
+      ]
+    },
+    {
+      "name": "objc2-app-kit",
+      "version": "0.3.2",
+      "texts": [
+        "objc2-8852b424193c-LICENSE.md",
+        "MIT-spdx-3.29.0-without-copyright-line"
+      ],
+      "products": [
+        "companion"
+      ]
+    },
+    {
+      "name": "objc2-cloud-kit",
+      "version": "0.3.2",
+      "texts": [
+        "objc2-8852b424193c-LICENSE.md",
+        "MIT-spdx-3.29.0-without-copyright-line"
+      ],
+      "products": [
+        "companion"
+      ]
+    },
+    {
+      "name": "objc2-core-data",
+      "version": "0.3.2",
+      "texts": [
+        "objc2-8852b424193c-LICENSE.md",
+        "MIT-spdx-3.29.0-without-copyright-line"
+      ],
+      "products": [
+        "companion"
       ]
     },
     {
@@ -358,6 +601,54 @@
       "texts": [
         "objc2-8852b424193c-LICENSE.md",
         "MIT-spdx-3.29.0-without-copyright-line"
+      ],
+      "products": [
+        "programs",
+        "companion"
+      ]
+    },
+    {
+      "name": "objc2-core-graphics",
+      "version": "0.3.2",
+      "texts": [
+        "objc2-8852b424193c-LICENSE.md",
+        "MIT-spdx-3.29.0-without-copyright-line"
+      ],
+      "products": [
+        "companion"
+      ]
+    },
+    {
+      "name": "objc2-core-image",
+      "version": "0.3.2",
+      "texts": [
+        "objc2-8852b424193c-LICENSE.md",
+        "MIT-spdx-3.29.0-without-copyright-line"
+      ],
+      "products": [
+        "companion"
+      ]
+    },
+    {
+      "name": "objc2-core-location",
+      "version": "0.3.2",
+      "texts": [
+        "objc2-8852b424193c-LICENSE.md",
+        "MIT-spdx-3.29.0-without-copyright-line"
+      ],
+      "products": [
+        "companion"
+      ]
+    },
+    {
+      "name": "objc2-core-text",
+      "version": "0.3.2",
+      "texts": [
+        "objc2-8852b424193c-LICENSE.md",
+        "MIT-spdx-3.29.0-without-copyright-line"
+      ],
+      "products": [
+        "companion"
       ]
     },
     {
@@ -366,6 +657,54 @@
       "texts": [
         "objc2-8852b424193c-LICENSE.md",
         "MIT-spdx-3.29.0-without-copyright-line"
+      ],
+      "products": [
+        "programs",
+        "companion"
+      ]
+    },
+    {
+      "name": "objc2-exception-helper",
+      "version": "0.1.1",
+      "texts": [
+        "objc2-8852b424193c-LICENSE.md",
+        "MIT-spdx-3.29.0-without-copyright-line"
+      ],
+      "products": [
+        "companion"
+      ]
+    },
+    {
+      "name": "objc2-foundation",
+      "version": "0.3.2",
+      "texts": [
+        "objc2-8852b424193c-LICENSE.md",
+        "MIT-spdx-3.29.0-without-copyright-line"
+      ],
+      "products": [
+        "companion"
+      ]
+    },
+    {
+      "name": "objc2-local-authentication",
+      "version": "0.3.2",
+      "texts": [
+        "objc2-8852b424193c-LICENSE.md",
+        "MIT-spdx-3.29.0-without-copyright-line"
+      ],
+      "products": [
+        "companion"
+      ]
+    },
+    {
+      "name": "objc2-quartz-core",
+      "version": "0.3.2",
+      "texts": [
+        "objc2-8852b424193c-LICENSE.md",
+        "MIT-spdx-3.29.0-without-copyright-line"
+      ],
+      "products": [
+        "companion"
       ]
     },
     {
@@ -374,6 +713,10 @@
       "texts": [
         "objc2-8852b424193c-LICENSE.md",
         "MIT-spdx-3.29.0-without-copyright-line"
+      ],
+      "products": [
+        "programs",
+        "companion"
       ]
     },
     {
@@ -382,6 +725,43 @@
       "texts": [
         "objc2-8852b424193c-LICENSE.md",
         "MIT-spdx-3.29.0-without-copyright-line"
+      ],
+      "products": [
+        "programs",
+        "companion"
+      ]
+    },
+    {
+      "name": "objc2-ui-kit",
+      "version": "0.3.2",
+      "texts": [
+        "objc2-8852b424193c-LICENSE.md",
+        "MIT-spdx-3.29.0-without-copyright-line"
+      ],
+      "products": [
+        "companion"
+      ]
+    },
+    {
+      "name": "objc2-user-notifications",
+      "version": "0.3.2",
+      "texts": [
+        "objc2-8852b424193c-LICENSE.md",
+        "MIT-spdx-3.29.0-without-copyright-line"
+      ],
+      "products": [
+        "companion"
+      ]
+    },
+    {
+      "name": "objc2-web-kit",
+      "version": "0.3.2",
+      "texts": [
+        "objc2-8852b424193c-LICENSE.md",
+        "MIT-spdx-3.29.0-without-copyright-line"
+      ],
+      "products": [
+        "companion"
       ]
     },
     {
@@ -389,6 +769,10 @@
       "version": "0.19.3",
       "texts": [
         "net-tools-0030e57fc709-LICENSE-MIT"
+      ],
+      "products": [
+        "programs",
+        "companion"
       ]
     },
     {
@@ -431,6 +815,20 @@
       "version": "1.8.0",
       "texts": [
         "QR-Code-generator-720f62bddb72-Readme.markdown"
+      ],
+      "products": [
+        "programs",
+        "companion"
+      ]
+    },
+    {
+      "name": "rustls-platform-verifier-android",
+      "version": "0.2.0",
+      "texts": [
+        "rustls-platform-verifier-252e25161a91-LICENSE-MIT"
+      ],
+      "products": [
+        "companion"
       ]
     },
     {
@@ -445,6 +843,16 @@
       "version": "1.0.3",
       "texts": [
         "MIT-spdx-3.29.0-without-copyright-line"
+      ]
+    },
+    {
+      "name": "tauri-plugin",
+      "version": "2.6.3",
+      "texts": [
+        "tauri-6f6ab1207bb3-LICENSE_MIT"
+      ],
+      "products": [
+        "companion"
       ]
     },
     {
@@ -497,6 +905,36 @@
       ]
     },
     {
+      "name": "webview2-com",
+      "version": "0.39.1",
+      "texts": [
+        "webview2-rs-edc2caf88617-LICENSE"
+      ],
+      "products": [
+        "companion"
+      ]
+    },
+    {
+      "name": "webview2-com-macros",
+      "version": "0.8.1",
+      "texts": [
+        "webview2-rs-edc2caf88617-LICENSE"
+      ],
+      "products": [
+        "companion"
+      ]
+    },
+    {
+      "name": "webview2-com-sys",
+      "version": "0.39.1",
+      "texts": [
+        "webview2-rs-edc2caf88617-LICENSE"
+      ],
+      "products": [
+        "companion"
+      ]
+    },
+    {
       "name": "wezterm-bidi",
       "version": "0.2.3",
       "package": "https://github.com/kalapowered/wezterm?rev=f3227b5b167844e03ca588ad7093b3975602d287#f3227b5b",
@@ -510,6 +948,10 @@
       "package": "https://github.com/kalapowered/wezterm?rev=f3227b5b167844e03ca588ad7093b3975602d287#f3227b5b",
       "texts": [
         "wezterm-f3227b5b1678-LICENSE.md"
+      ],
+      "products": [
+        "programs",
+        "companion"
       ]
     },
     {
@@ -518,6 +960,10 @@
       "package": "https://github.com/kalapowered/wezterm?rev=f3227b5b167844e03ca588ad7093b3975602d287#f3227b5b",
       "texts": [
         "wezterm-f3227b5b1678-LICENSE.md"
+      ],
+      "products": [
+        "programs",
+        "companion"
       ]
     },
     {
@@ -526,6 +972,10 @@
       "package": "https://github.com/kalapowered/wezterm?rev=f3227b5b167844e03ca588ad7093b3975602d287#f3227b5b",
       "texts": [
         "wezterm-f3227b5b1678-LICENSE.md"
+      ],
+      "products": [
+        "programs",
+        "companion"
       ]
     },
     {
@@ -555,6 +1005,10 @@
       },
       "texts": [
         "libsodium-1.0.22-LICENSE"
+      ],
+      "products": [
+        "programs",
+        "companion"
       ]
     },
     {
