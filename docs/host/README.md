@@ -8942,15 +8942,18 @@ the host records nothing more for it. An installed upgrade invalidates nothing: 
 keeps the identity it was pinned to. A record only moves forward: a late answer at a revision the
 host has already passed is refused, so it cannot restore availability that was withdrawn.
 
-The other causes a record could name need no detector. The schema and the launch profile are named
-by the records and cannot change while the instance lives: the backend reads the version once, when
-it starts, a launch pins one table, and an instance has one launch and one profile. The signed
-qualification a binding was made with is a snapshot: a later update changes what a new binding
-takes, and the live one stays as it was. No broker record depends on an operating-system
-permission. A new graphical login closes the session, and the close ends each instance the session
-launched and forgets its map. The worker profile is the same: a running worker keeps the profile it
-was created in, one broker serves one session, and a change applies to sessions created
-afterwards.
+The other causes a record could name need no additional detector. The launch profile is named by
+the records and cannot change while the instance lives: an instance has one launch and one profile,
+and the broker refuses a launch or an adoption under the identifier of a profile that a live
+instance holds. The channel's records name the schema. The gateway's records name none: a gateway
+takes its schema through the pinned table. The schema cannot change while the instance lives
+either: the backend reads the version once, when it starts, and a gateway launch pins one table (a
+channel launch pins none). The signed qualification a binding was made with is a snapshot: a later
+update changes what a new binding takes, and the live one stays as it was. No broker record depends
+on an operating-system permission. The loss of the login that a desktop-bound session is bound to
+closes that session, and the close ends each instance the session launched, and the broker forgets
+the evidence they held. The worker profile is the same: a running worker keeps the profile it was
+created in, one broker serves one session, and a change applies to sessions created afterwards.
 
 ### Launch profiles
 

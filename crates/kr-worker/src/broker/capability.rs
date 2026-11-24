@@ -17,12 +17,16 @@
 //!   binding change, and a refused image check (`Broker::image_refused`) raises the binary change
 //!   and holds the instance, so nothing is recorded for it again. An installed upgrade raises
 //!   neither: the image check passes it, and a running process keeps the identity it was pinned to.
-//!   The other causes need no detector. The schema and the launch profile are named by the records
-//!   and cannot change while an instance lives: the backend reads the version once, when it starts,
-//!   a launch pins one table, and an instance has one launch and one profile. A signed
+//!   The other causes need no additional detector. The launch profile is named by the records and
+//!   cannot change while an instance lives: an instance has one launch and one profile, and a
+//!   launch or an adoption under the identifier of a live instance's profile is refused. The
+//!   channel's records name the schema; the gateway's name none, because a gateway takes its schema
+//!   through the pinned table. The schema cannot change while an instance lives either: the backend
+//!   reads the version once, when it starts, and a gateway launch pins one table. A signed
 //!   qualification is a snapshot taken when a binding is made. No record depends on an
-//!   operating-system permission. A new graphical login closes the session, which ends each
-//!   instance it launched and forgets its map.
+//!   operating-system permission. The loss of the login that a desktop-bound session is bound to
+//!   closes that session, which ends each instance it launched, and the broker forgets the evidence
+//!   they held.
 //! * **Every action rechecks.** [`CapabilityOwner::recheck`] is called on the dispatch path with
 //!   the revision the caller read, so acting on evidence that has since changed is refused rather
 //!   than attempted.
