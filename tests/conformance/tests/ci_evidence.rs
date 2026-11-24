@@ -1755,11 +1755,13 @@ fn the_contract_cases_for_installed_apps_live_workers_and_plugins_run_in_jobs_of
             ],
         ),
         (
-            "a published plugin whose SDK range does not take this host",
+            "a published plugin whose SDK range does not take this host, and the released packages the repository keeps",
             "fast",
             &[
                 ("kr-plugin-sdk", "sdk_range_first"),
                 ("kr-plugin-catalogue", "catalogue"),
+                ("kr-hook", "fixtures"),
+                ("kr-worker", "bundled_codex"),
             ],
         ),
         (

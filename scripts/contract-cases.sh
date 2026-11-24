@@ -97,6 +97,11 @@ fast() {
   expect cargo test --locked -p kr-plugin-sdk --test sdk_range_first
   expect cargo test --locked -p kr-plugin-catalogue --test catalogue -- --exact \
     a_package_that_needs_a_newer_sdk_is_refused_before_it_is_fetched
+
+  # The released packages the repository keeps, held to the package contract and to the host's
+  # package check.
+  expect cargo test --locked -p kr-hook --test fixtures
+  expect cargo test --locked -p kr-worker --test bundled_codex
 }
 
 # The programs a release is assembled from, built beside the test.
