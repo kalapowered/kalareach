@@ -52,6 +52,19 @@ pub struct KnownWorker {
     /// read and written under. Kept in memory only: a daemon that starts again meets the worker
     /// again and reads it from its answer.
     pub level: Level,
+    /// The release the worker stated it runs, where it stated one: what tells a worker of the
+    /// release this daemon runs from one of an earlier release, and so what the disclosed checks
+    /// are taken in. Kept in memory only, as the level is.
+    pub release: Option<kr_protocol::update::ReleaseName>,
+}
+
+/// The release a worker states it runs in its answer to this daemon's hello, where it states one.
+#[must_use]
+pub(crate) fn stated_release(link: &BoundLink) -> Option<kr_protocol::update::ReleaseName> {
+    link.acknowledgement()
+        .build
+        .as_ref()
+        .and_then(kr_protocol::local::LocalBuild::worker_release)
 }
 
 /// Why a descriptor is not in the directory.
@@ -175,12 +188,13 @@ impl Directory {
                 continue;
             }
             match reconnect_to(&descriptor, reconnect).await {
-                Ok((endpoint, described, level)) => {
+                Ok((endpoint, described, level, release)) => {
                     directory.insert(
                         KnownWorker {
                             descriptor,
                             endpoint,
                             level,
+                            release,
                         },
                         described,
                     );
@@ -335,7 +349,15 @@ pub struct Reconnect<'a> {
 async fn reconnect_to(
     descriptor: &WorkerDescriptor,
     reconnect: &Reconnect<'_>,
-) -> std::result::Result<(Endpoint, Option<SessionSummary>, Level), String> {
+) -> std::result::Result<
+    (
+        Endpoint,
+        Option<SessionSummary>,
+        Level,
+        Option<kr_protocol::update::ReleaseName>,
+    ),
+    String,
+> {
     let endpoint = Endpoint::from_path(&descriptor.endpoint).map_err(|error| error.to_string())?;
     // Bounded, because starting the daemon must not depend on a worker that never answers. A
     // descriptor that runs out of time is quarantined like any other that fails its challenge.
@@ -363,7 +385,7 @@ async fn reconnect_to(
     .await
     .map_err(|_| "the worker did not answer its challenge in time".to_owned())??;
     let described = describe(&mut client, descriptor.session_id).await;
-    Ok((endpoint, described, client.level()))
+    Ok((endpoint, described, client.level(), stated_release(&client)))
 }
 
 /// Asks a worker this daemon has just verified to describe its session, over the connection it
@@ -415,6 +437,7 @@ mod tests {
             .expect("an endpoint");
         KnownWorker {
             level: kr_protocol::retained::Level::this(),
+            release: None,
             descriptor: WorkerDescriptor {
                 session_id,
                 session_epoch: SessionEpoch::V1,

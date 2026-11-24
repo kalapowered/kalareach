@@ -2294,6 +2294,7 @@ impl Served {
         controller.directory.lock().await.insert(
             crate::directory::KnownWorker {
                 level: kr_protocol::retained::Level::this(),
+                release: None,
                 descriptor,
                 endpoint: endpoint.clone(),
             },

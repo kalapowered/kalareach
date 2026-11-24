@@ -151,7 +151,11 @@ impl Controller {
                 .held_stamp();
             let now = held.map(|session| {
                 let worker = workers.iter().find(|w| w.descriptor.session_id == session);
-                super::capability_checks::fingerprint_of(&context, worker)
+                // The build is that of the worker a run asked for now would be performed in, as
+                // the start of a run takes it.
+                let target =
+                    super::capability_checks::worker_for(workers.clone(), context.worker_profile);
+                super::capability_checks::fingerprint_of(&context, worker, target.as_ref())
             });
             let mut checks = self.checks.lock().unwrap_or_else(PoisonError::into_inner);
             if checks.held_stamp() != (held, generation) {

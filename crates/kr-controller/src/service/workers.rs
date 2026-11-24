@@ -82,12 +82,13 @@ pub(crate) struct Opening {
 }
 
 /// What a worker answered to a challenge against the key this daemon holds for it: its proof, its
-/// own description of its session where it gave one, and the level it speaks at. Recovery adopts a
+/// own description of its session where it gave one, the level it speaks at and the release it states. Recovery adopts a
 /// worker on it.
 pub(super) type Challenged = (
     kr_protocol::worker::WorkerVerifyProof,
     Option<SessionSummary>,
     kr_protocol::retained::Level,
+    Option<kr_protocol::update::ReleaseName>,
 );
 
 /// What the task of an opening came to.

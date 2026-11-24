@@ -201,6 +201,7 @@ async fn challenged(
     kr_protocol::worker::WorkerVerifyProof,
     Option<kr_protocol::session::SessionSummary>,
     kr_protocol::retained::Level,
+    Option<kr_protocol::update::ReleaseName>,
 ) {
     world
         .controller
@@ -217,10 +218,11 @@ async fn challenged(
 /// Adopts the worker on what a challenge of it gave.
 async fn adopt(
     world: &Served,
-    (proof, described, level): (
+    (proof, described, level, release): (
         kr_protocol::worker::WorkerVerifyProof,
         Option<kr_protocol::session::SessionSummary>,
         kr_protocol::retained::Level,
+        Option<kr_protocol::update::ReleaseName>,
     ),
 ) -> crate::error::Result<()> {
     let descriptor = &world.worker.descriptor;
@@ -231,7 +233,7 @@ async fn adopt(
             &descriptor.worker_public_key,
             &proof,
             &world.worker.endpoint,
-            (described, level),
+            (described, level, release),
             &world.held().await,
         )
         .await
@@ -412,7 +414,7 @@ async fn an_adoption_held_before_its_publication(
 ) {
     world.forget_the_worker().await;
     let descriptor = world.worker.descriptor.clone();
-    let (proof, described, level) = world
+    let (proof, described, level, release) = world
         .controller
         .challenge(
             &world.worker.endpoint,
@@ -433,7 +435,7 @@ async fn an_adoption_held_before_its_publication(
                 &descriptor.worker_public_key,
                 &proof,
                 &endpoint,
-                (described, level),
+                (described, level, release),
                 &held,
             )
             .await

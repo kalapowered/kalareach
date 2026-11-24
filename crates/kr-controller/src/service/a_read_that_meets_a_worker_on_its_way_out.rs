@@ -1250,6 +1250,7 @@ async fn reported(script: &Arc<Scripted>, admitted: bool) -> Silent {
             .expect("publishes the worker's descriptor");
         crate::directory::KnownWorker {
             level: kr_protocol::retained::Level::this(),
+            release: None,
             descriptor,
             endpoint,
         }

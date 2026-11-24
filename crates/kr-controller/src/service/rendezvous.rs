@@ -610,11 +610,20 @@ impl Controller {
                 endpoint,
                 // A worker this daemon launched is of this daemon's own release.
                 level: kr_protocol::retained::Level::this(),
+                release: self.own_release(),
             },
             Some(ready.session.as_ref().clone()),
             &held,
         )
         .await
+    }
+
+    /// The release this daemon runs, which a worker it launched from its own program states too.
+    fn own_release(&self) -> Option<kr_protocol::update::ReleaseName> {
+        self.build_id
+            .as_str()
+            .strip_prefix("kr-controller/")
+            .and_then(|release| kr_protocol::update::ReleaseName::new(release).ok())
     }
 
     async fn resolve(

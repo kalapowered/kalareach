@@ -29,7 +29,7 @@
 //! clock. [`Fingerprint`] is what a result was taken against: the facility's own identity, the
 //! host agent's, the desktop generation and the execution profile. [`Fingerprint::changes_since`]
 //! names which [`CapabilityInvalidation`] triggers fired between two of them, and [`stale`] keeps
-//! only the triggers the record itself lists. A host-agent update moves the agent's identity; a
+//! only the triggers the record itself lists. A host-agent update moves the agent's build; a
 //! new login moves the generation. Each of those ends what was held. The passage of time does not,
 //! because nothing about a permission changes by itself. A change of permission is not something
 //! this host can read, so it is found by performing the checks again, which a person asks for.
@@ -536,8 +536,11 @@ pub fn report(
 pub struct Fingerprint {
     /// The facility's own identity, as [`facility_identity`] reads it.
     pub facility: Option<String>,
-    /// The host agent's own identity. A host-agent update moves it.
+    /// The host agent's own identity: the process of the worker the findings were taken in.
     pub host_agent: Option<String>,
+    /// The release the host agent states it is, for the worker a run is performed in. A host-agent
+    /// update moves it, and starting another session of the same release does not.
+    pub agent_build: Option<String>,
     /// The desktop's login-session generation. A new login moves it.
     pub desktop_generation: Option<u64>,
     /// The execution profile the check ran under.
@@ -555,7 +558,10 @@ impl Fingerprint {
     #[must_use]
     pub fn changes_since(&self, earlier: &Self) -> Vec<CapabilityInvalidation> {
         let mut fired = Vec::new();
-        if earlier.facility != self.facility || earlier.host_agent != self.host_agent {
+        if earlier.facility != self.facility
+            || earlier.host_agent != self.host_agent
+            || earlier.agent_build != self.agent_build
+        {
             fired.push(CapabilityInvalidation::BinaryIdentity);
         }
         if earlier.desktop_generation != self.desktop_generation {
@@ -1897,6 +1903,7 @@ mod tests {
         let earlier = Fingerprint {
             facility: Some("a".to_owned()),
             host_agent: Some("one".to_owned()),
+            agent_build: None,
             desktop_generation: Some(11),
             profile: Some(WorkerProfile::DesktopBound),
         };
@@ -1931,6 +1938,7 @@ mod tests {
         let taken = Fingerprint {
             facility: Some("a".to_owned()),
             host_agent: Some("one".to_owned()),
+            agent_build: None,
             desktop_generation: Some(11),
             profile: Some(WorkerProfile::DesktopBound),
         };

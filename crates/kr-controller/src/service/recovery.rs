@@ -224,7 +224,7 @@ impl Controller {
         if let Some(Err(refused)) = &challenged {
             report_unretained(reservation.display_number, refused);
         }
-        if let Some(Ok((proof, described, level))) = challenged
+        if let Some(Ok((proof, described, level, release))) = challenged
             && let Some(key) = reservation.claimed_key
         {
             // The worker is alive and is the one this reservation admitted. Its descriptor and its
@@ -234,7 +234,7 @@ impl Controller {
                 &key,
                 &proof,
                 &endpoint,
-                (described, level),
+                (described, level, release),
                 held,
             )
             .await?;
@@ -441,13 +441,13 @@ impl Controller {
                 // answer is taken by the first look after its task has ended, which is after
                 // the worker has decided and the description has been asked for.
                 Ok(None) => {}
-                Ok(Some((proof, described, level))) => {
+                Ok(Some((proof, described, level, release))) => {
                     self.adopt(
                         row.display_number,
                         &row.public_key,
                         &proof,
                         &endpoint,
-                        (described, level),
+                        (described, level, release),
                         &held,
                     )
                     .await?;
@@ -502,7 +502,12 @@ impl Controller {
             })
             .await?;
         let described = crate::directory::describe(&mut client, session_id).await;
-        Ok((proof, described, client.level()))
+        Ok((
+            proof,
+            described,
+            client.level(),
+            crate::directory::stated_release(&client),
+        ))
     }
 
     /// Records a recovered worker and republishes its descriptor, and admits the worker with the
@@ -516,7 +521,11 @@ impl Controller {
         worker_public_key: &kr_protocol::scalars::AuthorisationKey,
         proof: &kr_protocol::worker::WorkerVerifyProof,
         endpoint: &Endpoint,
-        (described, level): (Option<SessionSummary>, kr_protocol::retained::Level),
+        (described, level, release): (
+            Option<SessionSummary>,
+            kr_protocol::retained::Level,
+            Option<kr_protocol::update::ReleaseName>,
+        ),
         held: &ReservationHold,
     ) -> Result<()> {
         let record = WorkerRecord {
@@ -573,6 +582,7 @@ impl Controller {
                 descriptor,
                 endpoint: endpoint.clone(),
                 level,
+                release,
             },
             described,
             held,

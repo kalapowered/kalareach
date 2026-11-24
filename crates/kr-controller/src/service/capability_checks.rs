@@ -250,16 +250,23 @@ impl Checks {
 /// What the desktop, the tools and the worker are, for a fingerprint of this moment.
 ///
 /// The host agent is the worker that performed the checks, by the identity the kernel records for
-/// its process: a replaced worker is another agent. The generation and the profile are the
-/// desktop's. The tools are the ones the checks use, read from the machine as [`tools_of`] reads
+/// its process: a replaced worker is another agent. Its build is the release the worker a run is
+/// performed in states, so that the agent is updated when that worker is of another release, and
+/// not when another session of the same release starts. `worker` is the one the findings were
+/// taken in, and `target` is the one a run asked for now would be performed in. The generation and
+/// the profile are the desktop's. The tools are the ones the checks use, read from the machine as [`tools_of`] reads
 /// them, so a lock does not change them and an installed, removed or replaced tool does.
 pub(super) fn fingerprint_of(
     context: &DesktopContext,
     worker: Option<&KnownWorker>,
+    target: Option<&KnownWorker>,
 ) -> Fingerprint {
     Fingerprint {
         facility: Some(tools_of(context)),
         host_agent: worker.map(|worker| format!("{:?}", worker.descriptor.process_start_identity)),
+        agent_build: target
+            .and_then(|target| target.release.as_ref())
+            .map(|release| release.as_str().to_owned()),
         desktop_generation: context
             .login_generation
             .as_ref()
@@ -425,7 +432,7 @@ impl Controller {
         };
         let worker = worker_for(workers, evidence.worker_profile);
         let now_ms = kr_ipc::now_ms();
-        let taken = fingerprint_of(&evidence, worker.as_ref());
+        let taken = fingerprint_of(&evidence, worker.as_ref(), worker.as_ref());
         let digest = match mutation_digest(mutation, actor_id) {
             Ok(digest) => digest,
             Err(error) => {
@@ -899,6 +906,7 @@ mod tests {
         let taken = Fingerprint {
             facility: Some("tools".to_owned()),
             host_agent: Some("worker".to_owned()),
+            agent_build: Some("release".to_owned()),
             desktop_generation: Some(2),
             profile: Some(WorkerProfile::DesktopBound),
         };
@@ -925,6 +933,14 @@ mod tests {
                 ..taken.clone()
             },
             Fingerprint {
+                agent_build: Some("another release".to_owned()),
+                ..taken.clone()
+            },
+            Fingerprint {
+                agent_build: None,
+                ..taken.clone()
+            },
+            Fingerprint {
                 desktop_generation: Some(3),
                 ..taken.clone()
             },
@@ -946,7 +962,7 @@ mod tests {
     #[test]
     fn a_fingerprint_holds_the_tools_the_machine_has() {
         assert_eq!(
-            fingerprint_of(&context(), None).facility,
+            fingerprint_of(&context(), None, None).facility,
             Some(tools_of(&context())),
             "the tools in a fingerprint are read from the machine, so one installed since is a change"
         );
@@ -956,13 +972,17 @@ mod tests {
     fn findings_are_about_the_desktop_as_the_run_began() {
         // A profile that changes while the run goes on is a change since the run began, so the
         // findings are over at the first reading after they arrive.
-        let began = fingerprint_of(&context(), None);
+        let began = fingerprint_of(&context(), None, None);
         let mut other = context();
         other.worker_profile = WorkerProfile::HeadlessUser;
         let mut checks = Checks::new();
         checks.begin(TimestampMs::new(10), session(), began);
         checks.succeeded(TimestampMs::new(20), vec![screen_finding()]);
-        assert!(checks.standing(&fingerprint_of(&other, None)).is_empty());
+        assert!(
+            checks
+                .standing(&fingerprint_of(&other, None, None))
+                .is_empty()
+        );
         assert_eq!(checks.view().state, CapabilityChecksState::Stale);
     }
 
@@ -975,7 +995,7 @@ mod tests {
         checks.begin(
             TimestampMs::new(10),
             session(),
-            fingerprint_of(&context(), None),
+            fingerprint_of(&context(), None, None),
         );
         checks.succeeded(TimestampMs::new(20), vec![screen_finding()]);
         for availability in [
@@ -986,7 +1006,7 @@ mod tests {
             let mut desktop = context();
             desktop.availability = availability;
             assert_eq!(
-                checks.standing(&fingerprint_of(&desktop, None)).len(),
+                checks.standing(&fingerprint_of(&desktop, None, None)).len(),
                 1,
                 "{availability:?}"
             );
@@ -1088,5 +1108,138 @@ mod tests {
         );
         assert_eq!(checks.standing(&taken).len(), 1);
         assert_eq!(checks.held_stamp().0, Some(session()));
+    }
+
+    /// A worker of `session_id` in `profile` that states `release`, published at `published`.
+    fn known(
+        controller: &Controller,
+        session_id: SessionId,
+        number: u8,
+        release: &str,
+        profile: WorkerProfile,
+        published: u64,
+    ) -> KnownWorker {
+        use kr_protocol::identity::{BootIdentity, BootIdentitySource, ProcessStartSource};
+        use kr_protocol::scalars::{AuthorisationKey, Bytes};
+        use kr_protocol::session::DisplayNumber;
+
+        let display = DisplayNumber::new(u64::from(number));
+        let endpoint = controller
+            .paths()
+            .worker_endpoint(display)
+            .expect("an endpoint");
+        KnownWorker {
+            level: kr_protocol::retained::Level::this(),
+            release: Some(kr_protocol::update::ReleaseName::new(release).expect("a release")),
+            descriptor: kr_protocol::worker::WorkerDescriptor {
+                session_id,
+                session_epoch: kr_protocol::ids::SessionEpoch::V1,
+                environment_id: controller.paths().environment_id(),
+                display_number: display,
+                boot_identity: BootIdentity {
+                    source: BootIdentitySource::LinuxBootId,
+                    value: Bytes::new(b"boot".to_vec()),
+                },
+                process_start_identity: kr_protocol::identity::ProcessStartIdentity::new(
+                    100 + u64::from(number),
+                    ProcessStartSource::LinuxProcStat,
+                    22,
+                ),
+                protocol_version: kr_protocol::hello::PROTOCOL_VERSION,
+                endpoint: endpoint.as_text(),
+                worker_public_key: AuthorisationKey::from_bytes([number; 32]),
+                worker_profile: profile,
+                published_at_ms: TimestampMs::new(published),
+            },
+            endpoint,
+        }
+    }
+
+    /// KR-REQ-03.29: findings taken in a host agent are no longer current once the worker a run
+    /// goes to states a newer release, and not while only another session of the same release
+    /// has started.
+    ///
+    /// This is the daemon's own report: findings are held for the worker that made them, and a
+    /// worker is put in the directory the way an update brings one. The release is what the worker
+    /// stated when the daemon met it, so a second session of one release is another process and
+    /// not another build.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn kr_req_03_29_findings_end_when_the_worker_a_run_goes_to_is_of_a_newer_release() {
+        let temp = kr_ipc::testing::TempHost::create();
+        let controller =
+            Controller::start(super::super::a_close_a_worker_never_answers::setup(&temp))
+                .await
+                .expect("the daemon starts");
+        let (context, _) = controller.desktop_evidence().await;
+        let profile = context.worker_profile;
+        let other = SessionId::new(Uuid::from_bytes([7; 16]));
+        let next = SessionId::new(Uuid::from_bytes([8; 16]));
+
+        let earlier = known(&controller, session(), 1, "0.2.0+aaaaaaaaaaaa", profile, 10);
+        controller
+            .directory
+            .lock()
+            .await
+            .insert(earlier.clone(), None);
+        let taken = fingerprint_of(&context, Some(&earlier), Some(&earlier));
+        {
+            let mut checks = controller
+                .checks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            checks.begin(TimestampMs::new(10), session(), taken);
+            checks.succeeded(
+                TimestampMs::new(20),
+                vec![record(
+                    capabilities::AUTHORISED_FILE_READ,
+                    CapabilityState::QualifiedAvailable,
+                    CapabilityEvidenceSource::DisclosedProbe,
+                    Some(session()),
+                )],
+            );
+        }
+        let (report, checks) = controller
+            .capability_report_with_checks()
+            .await
+            .expect("a report");
+        assert_eq!(checks.state, CapabilityChecksState::Current);
+        assert!(report.record(capabilities::AUTHORISED_FILE_READ).is_some());
+
+        // Another session of the same release is a newer worker, and the findings stand.
+        let same = known(&controller, other, 2, "0.2.0+aaaaaaaaaaaa", profile, 20);
+        controller.directory.lock().await.insert(same, None);
+        let (report, checks) = controller
+            .capability_report_with_checks()
+            .await
+            .expect("a report");
+        assert_eq!(
+            checks.state,
+            CapabilityChecksState::Current,
+            "a second session of the same release is not an update"
+        );
+        assert!(report.record(capabilities::AUTHORISED_FILE_READ).is_some());
+
+        // A worker of a newer release is where a run goes now, and the findings do not stand.
+        let newer = known(&controller, next, 3, "0.3.0+bbbbbbbbbbbb", profile, 30);
+        controller.directory.lock().await.insert(newer, None);
+        let (report, checks) = controller
+            .capability_report_with_checks()
+            .await
+            .expect("a report");
+        assert_eq!(
+            checks.state,
+            CapabilityChecksState::Stale,
+            "the findings were taken in a host agent of an earlier release"
+        );
+        assert!(
+            report.record(capabilities::AUTHORISED_FILE_READ).is_none(),
+            "the earlier host agent's finding is not served"
+        );
+        let chosen = worker_for(controller.directory_workers().await, profile)
+            .expect("a worker a run goes to");
+        assert_eq!(
+            chosen.descriptor.session_id, next,
+            "the run asked for next is performed in the worker of the newer release"
+        );
     }
 }
