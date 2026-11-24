@@ -1721,7 +1721,11 @@ fn the_contract_cases_for_installed_apps_live_workers_and_plugins_run_in_jobs_of
         (
             "a client and a daemon or a worker of another release or another major",
             "fast",
-            &[("kr-cli", "bridge"), ("kr-cli", "startup")],
+            &[
+                ("kr-cli", "bridge"),
+                ("kr-cli", "startup"),
+                ("kr-protocol", "contracts"),
+            ],
         ),
         (
             "a worker and a plugin host of the release before or of another protocol",

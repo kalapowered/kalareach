@@ -57,8 +57,9 @@ expect() {
 # The cases that need this tree alone.
 fast() {
   # An installed app and the host: what each retained release's surface and frames say, the support
-  # window of the public majors, the matrix check a release makes, and a host too old for a method.
-  expect cargo test --locked -p kr-protocol --test retained --test public_majors
+  # window of the public majors, the version a client and a daemon settle on, the matrix check a
+  # release makes, and a host too old for a method.
+  expect cargo test --locked -p kr-protocol --test retained --test public_majors --test contracts
   expect cargo test --locked -p kr-cli --test retained_surface
   expect cargo test --locked -p kr-client --test release_check
   expect cargo test --locked -p kr-client --test network_chunks -- --exact \
