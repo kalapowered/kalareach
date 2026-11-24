@@ -1586,13 +1586,22 @@ fn runs_target(words: &[String], package: &str, target: &str) -> bool {
 }
 
 /// The files that can hold the case `name` of a command that runs `package`'s `target`: for a
-/// library case `module::tests::name`, the module's source file; for a test target, its file and
-/// the files of the folder it has beside it.
+/// library case `module::tests::name` or `module::submodule::tests::name`, the file of the innermost
+/// module and of each module that holds it; for a test target, its file and the files of the folder
+/// it has beside it.
 fn files_of_cases(package: &str, target: &str, name: &str) -> Vec<PathBuf> {
     let root = repository().join("crates").join(package);
     if target == "--lib" {
-        let module = name.split("::").next().expect("a module");
-        return vec![root.join("src").join(format!("{module}.rs"))];
+        let mut modules: Vec<&str> = name.split("::").collect();
+        modules.pop();
+        modules.retain(|part| *part != "tests");
+        return (1..=modules.len())
+            .rev()
+            .flat_map(|depth| {
+                let path = root.join("src").join(modules[..depth].join("/"));
+                [path.with_extension("rs"), path.join("mod.rs")]
+            })
+            .collect();
     }
     let tests = root.join("tests");
     let mut files = vec![tests.join(format!("{target}.rs"))];
@@ -1607,9 +1616,9 @@ fn files_of_cases(package: &str, target: &str, name: &str) -> Vec<PathBuf> {
 type Boundary<'a> = (&'a str, &'a str, &'a [(&'a str, &'a str)]);
 
 /// KR-REQ-04.21, contract tests for installed apps, live workers and plugins. A build of one release
-/// meets builds of other releases at four boundaries: an installed app and the host, a client and a
-/// daemon or a worker, a worker and a plugin host, and a published plugin and the host. The landing
-/// workflow runs the cases for each in a job of its own on a hosted Linux machine, and the upgrade
+/// meets builds of other releases at five boundaries: an installed app and the host, a client and a
+/// daemon or a worker, a forwarder and a worker, a worker and a plugin host, and a published plugin
+/// and the host. The landing workflow runs the cases for each in a job of its own on a hosted Linux machine, and the upgrade
 /// suite's Windows case in another on a hosted Windows machine. A job has no `needs`, so it runs
 /// beside the rust job. Each step that runs the script is not disabled, has a limit and has no
 /// condition, except that the upgrade suite also runs after the cases before it failed. The steps'
@@ -1706,7 +1715,7 @@ fn the_contract_cases_for_installed_apps_live_workers_and_plugins_run_in_jobs_of
 
     // Each boundary has a command in the function that runs it.
     let commands = contract_commands(&script);
-    let boundaries: [Boundary; 6] = [
+    let boundaries: [Boundary; 7] = [
         (
             "an installed app and the surfaces, frames and majors of the releases a build retains",
             "fast",
@@ -1725,6 +1734,16 @@ fn the_contract_cases_for_installed_apps_live_workers_and_plugins_run_in_jobs_of
                 ("kr-cli", "bridge"),
                 ("kr-cli", "startup"),
                 ("kr-protocol", "contracts"),
+            ],
+        ),
+        (
+            "a forwarder and a worker of the release before, from the frames, the registration and the hello it recorded",
+            "fast",
+            &[
+                ("kr-hook", "channel"),
+                ("kr-hook", "registration"),
+                ("kr-worker", "channels"),
+                ("kr-worker", "--lib"),
             ],
         ),
         (

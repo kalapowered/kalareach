@@ -76,6 +76,17 @@ fast() {
   expect cargo test --locked -p kr-cli --test startup -- --exact \
     a_daemon_that_answers_the_hello_with_another_major_is_refused_with_exit_3_and_no_stop_asked
 
+  # A forwarder and a worker of the release before: the frames, the registration and the hello that
+  # release wrote are read as it wrote them.
+  expect cargo test --locked -p kr-hook --test channel -- --exact \
+    kr_req_12_18_the_frames_of_a_worker_of_the_release_before_cross_as_it_wrote_and_read_them
+  expect cargo test --locked -p kr-hook --test registration -- --exact \
+    the_registration_a_worker_of_the_release_before_wrote_is_read_whole_and_names_its_release
+  expect cargo test --locked -p kr-worker --test channels -- --exact \
+    kr_req_12_18_an_answer_goes_out_on_the_channel_as_the_applications_verdict
+  expect cargo test --locked -p kr-worker --lib -- --exact \
+    broker::attach::tests::the_hello_a_forwarder_of_the_release_before_wrote_is_read_as_it_always_was
+
   # A plugin host of the release before and one of another protocol.
   expect cargo test --locked -p kr-plugin-service --test retained_host_frames
   expect cargo test --locked -p kr-plugin-service --lib -- --exact \
