@@ -6020,6 +6020,10 @@ async fn a_rollback_keeps_a_draft_written_for_an_application_and_its_binding_rev
 /// KR-REQ-26.10: a rollback to the release before, which lists the store of binding revisions and
 /// reads the transfers journal through the version that keeps the revision in the journal, states no
 /// limit of a draft's prompt record.
+///
+/// The registry is not what the case asks about: a rollback to the release before is refused for the
+/// registry at the version this release writes, so the case puts it back to the version the release
+/// before writes.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_rollback_to_a_release_that_lists_the_store_of_binding_revisions_states_no_draft_limit() {
     let updated = Updated::new().await;
@@ -6031,6 +6035,7 @@ async fn a_rollback_to_a_release_that_lists_the_store_of_binding_revisions_state
         "the daemon of this release is stopped through its own door"
     );
 
+    updated.puts_the_registry_back_for_the_release_before();
     let (output, said) = host.kr_json(&["host", "rollback", "--json"]);
     assert_eq!(
         output.status.code(),
