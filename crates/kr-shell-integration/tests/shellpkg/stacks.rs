@@ -2436,12 +2436,45 @@ impl Session {
     /// A check that drove an excluded state can leave the editor inside a listing, a search or a
     /// pending sequence. The keys here are the ones every one of these editors answers with
     /// "stop what you are doing and keep the line", followed by clearing the line itself.
+    ///
+    /// The terminal hands the shell its keys in the order they were typed, so none is held back
+    /// for the one before it. What is not in that order is the interrupt the second key raises: a
+    /// shell that is still busy with the first can keep it for the next line it accepts, and that
+    /// line loses its first character. Where a shell does so, an empty line goes in last and its
+    /// return is awaited: see [`Session::spend_a_kept_interrupt`].
+    ///
+    /// # Panics
+    ///
+    /// Panics when the shell keeps interrupts and no reader came back from the empty line.
     pub fn recover(&mut self) {
         for bytes in self.recovery_keys().iter().copied() {
             self.type_bytes(bytes);
-            std::thread::sleep(self.bounded(Duration::from_millis(80)));
         }
-        std::thread::sleep(self.bounded(Duration::from_millis(120)));
+        self.spend_a_kept_interrupt();
+    }
+
+    /// Gives an interrupt the shell may be keeping a line to be spent on, and returns once the
+    /// reader has come back from it. A shell that acts on an interrupt when it arrives, or reads
+    /// it as a key, is given nothing.
+    ///
+    /// What is typed after this goes to a shell that keeps no interrupt. Nothing the reader
+    /// reports shows one being kept, so the line is the only way to know: see
+    /// [`Dialect::late_interrupt_waits_for_a_line`].
+    ///
+    /// # Panics
+    ///
+    /// Panics when the reader did not come back from the empty line, naming what the terminal
+    /// showed.
+    pub fn spend_a_kept_interrupt(&mut self) {
+        if !dialect(self.package_kind).late_interrupt_waits_for_a_line {
+            return;
+        }
+        if let Err(why) = self.give_a_kept_interrupt_a_line() {
+            panic!(
+                "an empty line did not come back to a reader after an interrupt: {why}:\n{}",
+                self.terminal_output()
+            );
+        }
     }
 
     /// The keys [`Session::recover`] types, in the order it types them.

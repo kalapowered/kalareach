@@ -3485,6 +3485,10 @@ pub fn the_detach_condition_excludes_what_the_corpus_names(kind: ShellKind) {
         assert!(session.alive(), "a vi motion's gesture ended the shell");
         driven.push(DetachExclusion::ViMotion);
         session.type_bytes(CTRL_C);
+        // No condition shows that a reader took this key: Fish keeps the operator's pending keys
+        // after it, so a fence about the reader is answered as not drained for as long as it is
+        // asked, and the keys that follow are asked about by their own fences below. What the
+        // interrupt can cost a command is spent by the empty line before the closing command.
         std::thread::sleep(Duration::from_millis(150));
 
         // A count being accumulated for the command that follows it is the same kind of state.
@@ -3513,6 +3517,9 @@ pub fn the_detach_condition_excludes_what_the_corpus_names(kind: ShellKind) {
             session.type_bytes(b"i");
             std::thread::sleep(Duration::from_millis(150));
         }
+        // The interrupt the drive raised above reached a shell that may still be keeping it, and
+        // the command that follows is the next line it accepts.
+        session.spend_a_kept_interrupt();
         assert!(session.run(emacs_mode, "kr-vi-off"));
         session.take_in_what_has_arrived();
         assert_eq!(
