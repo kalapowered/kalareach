@@ -680,6 +680,10 @@ def keep_texts(listing=TEXTS, directory=TEXTS_DIRECTORY):
     """The upstream texts kept in the repository, each held to its digest."""
     with open(listing, encoding="utf-8") as source:
         kept = json.load(source)
+    for entry in kept["crates"] + kept["works"]:
+        unknown = sorted(set(entry.get("products", [])) - set(PRODUCT_BUILDS))
+        if unknown:
+            fail(f"scripts/notice-texts.json lists the product {unknown[0]} for {entry['name']}, which is neither programs nor companion")
     files = {}
     for item in kept["texts"]:
         path = os.path.join(directory, item["id"])
@@ -1046,6 +1050,8 @@ def accepted_licences():
 def chosen(name, version, expression, accepted):
     """The licence a JavaScript package is recorded under: of the alternatives its expression offers,
     the first that `about.toml` accepts, as for a crate."""
+    if re.search(r"\bAND\b|[()]", expression.strip("() ")):
+        fail(f"{name} {version} declares {expression}, which has an AND or a parenthesis that this notice does not read")
     ranks = {alternative.strip(): accepted.index(alternative.strip())
              for alternative in re.split(r"\s+OR\s+", expression.strip("() ")) if alternative.strip() in accepted}
     if not ranks:
@@ -1673,6 +1679,11 @@ for path in paths:
     refuses("a package whose licences about.toml lists none of is refused",
             lambda: chosen("a", "1.0.0", "GPL-3.0-only OR AGPL-3.0-only", accepted), "names no licence that about.toml accepts")
     refuses("a package that declares no licence is refused", lambda: chosen("a", "1.0.0", "", accepted), "declares no licence")
+    refuses("a package whose licence expression has an AND is refused",
+            lambda: chosen("a", "1.0.0", "MIT AND ISC", accepted), "which has an AND or a parenthesis that this notice does not read")
+    refuses("a package whose licence expression has a parenthesis is refused",
+            lambda: chosen("a", "1.0.0", "MIT OR (ISC OR Apache-2.0)", accepted),
+            "which has an AND or a parenthesis that this notice does not read")
 
     def script(folder_, declared="MIT"):
         key = ("left-pad", "1.3.0", "npm")
@@ -1691,6 +1702,8 @@ for path in paths:
     os.makedirs(bare_package)
     refuses("a JavaScript package that ships no licence file and has no kept text is refused",
             lambda: gather([script(bare_package)], nothing, {}, reader, "companion"), "left-pad 1.3.0 ships no licence file")
+    refuses("a kept entry for an unknown product is refused",
+            lambda: keep([item], [{**pinned, "products": ["compainon"]}], []), "which is neither programs nor companion")
     kept_for, files_for = keep([item], [{**pinned, "products": ["companion"]}], [])
     try:
         gather([made_up([plain])], kept_for, files_for, reader, "programs")
