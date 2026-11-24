@@ -95,6 +95,7 @@ use std::time::{Duration, Instant};
 
 use kr_e2e_agents::account::{KEY_SCAN_VARIABLE, Ledger};
 use kr_e2e_agents::build::{self, Account, Build, InstallSwitch, Probe};
+use kr_e2e_agents::entry;
 use kr_e2e_agents::held::{
     Absent, Audit, CONFIG_DIRECTORY, HeldKeys, ISOLATION_UNPROVEN, MetaGuard,
     NEWER_CONFIG_DIRECTORY, Recorded, RunScan, Stop, absent_below, absent_paths, absent_paths_in,
@@ -326,9 +327,10 @@ impl Route {
     ///
     /// # Panics
     ///
-    /// Panics when the entry names no login, the run's `HOME` is not the person's home as the
-    /// system's account database names it, the values of the keys cannot be read, or the person's
-    /// files cannot be looked at: nothing has started, and no turn is spent.
+    /// Panics when the entry is one a real start refuses ([`entry::refuse_real_start`]), the entry
+    /// names no login, the run's `HOME` is not the person's home as the system's account database
+    /// names it, the values of the keys cannot be read, or the person's files cannot be looked at:
+    /// nothing has started, and no turn is spent.
     fn from_environment(case: &str, login: bool, probe_only: bool) -> Self {
         let Some(path) = std::env::var_os(BUILD_VARIABLE)
             .filter(|value| !value.is_empty())
@@ -355,6 +357,9 @@ impl Route {
             "{GENERATION_VARIABLE} names no generation (an absolute directory with a root.json)"
         );
         let build = build::read_build(&path);
+        entry::refuse_real_start(&build).unwrap_or_else(|why| {
+            panic!("{BUILD_VARIABLE} names an entry that a real start refuses: {why}")
+        });
         let account = build.account.clone().unwrap_or_else(|| {
             panic!("{BUILD_VARIABLE} names an entry with no login, which no case may start")
         });

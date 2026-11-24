@@ -269,6 +269,25 @@ pub fn check(build: &Build) -> Report {
     report
 }
 
+/// Refuses a real start of `build` with every reason [`check`] gives, joined; nothing where it
+/// gives none.
+///
+/// # Errors
+///
+/// Returns what the entry lacks for a real start.
+pub fn refuse_real_start(build: &Build) -> Result<(), String> {
+    let refusals = check(build).refusals;
+    if refusals.is_empty() {
+        Ok(())
+    } else {
+        Err(refusals
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("; "))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -488,5 +507,23 @@ mod tests {
                 "{package} does not list {field} as missing"
             );
         }
+    }
+
+    /// A real start is refused with every reason the check gives, and an entry with none is not.
+    #[test]
+    fn a_real_start_is_refused_with_every_reason_the_check_gives_and_a_complete_entry_is_not() {
+        let claude = refuse_real_start(&build_of("kalareach/claude-code"))
+            .expect_err("an entry with an account and no turn_line is refused");
+        assert!(claude.contains("turn_line"), "{claude}");
+        assert_eq!(refuse_real_start(&build_of("kalareach/codex")), Ok(()));
+        assert_eq!(refuse_real_start(&build_of("kalareach/opencode")), Ok(()));
+        let mut both = build_of("kalareach/opencode");
+        both.isolation = None;
+        both.sha256 = "00".to_owned();
+        let why = refuse_real_start(&both).expect_err("an entry that lacks two things is refused");
+        assert!(
+            why.contains("person_trees") && why.contains("the pinned build"),
+            "{why}"
+        );
     }
 }
