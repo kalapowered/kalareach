@@ -18,10 +18,6 @@ use std::time::{Duration, Instant};
 use kr_plugin_sdk::launch_probe::LaunchProbe;
 use kr_worker::broker::probe::{self, ProbeRun, Probed, ThreadEnd};
 
-mod common;
-
-use common::LIVENESS_DEADLINE;
-
 /// How long a probe is given in the tests that do not test the deadline.
 const GENEROUS: Duration = Duration::from_secs(60);
 
@@ -294,17 +290,21 @@ fn kr_req_07_64_a_program_that_never_finishes_is_ended_with_everything_it_starte
         "{probed:?}"
     );
     assert!(probed.late, "a probe that never finishes is late");
-    for file in ["main.pid", "child.pid"] {
-        let pid = written_pid(here.path(), file).expect("a process identifier");
-        let started = std::time::Instant::now();
-        while kr_ipc::identity::process_start_identity(pid).is_ok() {
-            assert!(
-                started.elapsed() < LIVENESS_DEADLINE,
-                "process {pid} ({file}) outlived the probe"
-            );
-            std::thread::sleep(Duration::from_millis(20));
-        }
-    }
+    let end = thread_end(&probed);
+    assert!(
+        end.collected_in_bound,
+        "the probe was ended and collected within the cleanup bound: {end:?}"
+    );
+    assert!(
+        end.took <= deadline + probe::CLEANUP_BOUND + SLACK,
+        "the thread's total, cleanup included: {:?}",
+        end.took
+    );
+    let left = survivors(here.path(), &["main.pid", "child.pid"]);
+    assert!(
+        left.is_empty(),
+        "left running after the thread ended: {left:?}"
+    );
 }
 
 /// KR-REQ-07.64: a program that cannot be started says so, by what it was.
@@ -449,17 +449,22 @@ fn thread_total(probed: &Probed) -> Duration {
     thread_end(probed).took
 }
 
-/// Waits until the process a stand-in wrote to `file` is gone.
-fn assert_gone(directory: &Path, file: &str) {
-    let pid = written_pid(directory, file).unwrap_or_else(|| panic!("{file} was not written"));
+/// The processes a stand-in wrote to `files` that are still there `SLACK` after the probe's thread
+/// has ended.
+fn survivors(directory: &Path, files: &[&str]) -> Vec<String> {
     let started = Instant::now();
-    while kr_ipc::identity::process_start_identity(pid).is_ok() {
-        assert!(
-            started.elapsed() < LIVENESS_DEADLINE,
-            "process {pid} ({file}) outlived the probe"
-        );
-        std::thread::sleep(Duration::from_millis(20));
+    let mut left = Vec::new();
+    for file in files {
+        let pid = written_pid(directory, file).unwrap_or_else(|| panic!("{file} was not written"));
+        while kr_ipc::identity::process_start_identity(pid).is_ok() {
+            if started.elapsed() >= SLACK {
+                left.push(format!("{file} ({pid})"));
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
+    left
 }
 
 /// How long a stand-in is given to start what it starts, where a case needs that to have happened.
@@ -547,7 +552,21 @@ fn kr_req_07_64_a_probe_that_prints_and_keeps_running_is_ended_within_the_cleanu
         "{:?}",
         probed.took
     );
-    assert_gone(here.path(), "main.pid");
+    let end = thread_end(&probed);
+    assert!(
+        end.collected_in_bound,
+        "the probe was ended and collected within the cleanup bound: {end:?}"
+    );
+    assert!(
+        end.took <= deadline + probe::CLEANUP_BOUND + SLACK,
+        "the thread's total, cleanup included: {:?}",
+        end.took
+    );
+    let left = survivors(here.path(), &["main.pid"]);
+    assert!(
+        left.is_empty(),
+        "left running after the thread ended: {left:?}"
+    );
 }
 
 /// KR-REQ-07.64: the whole call, a wait for a thread before it included, is bounded by the deadline
@@ -583,7 +602,16 @@ fn kr_req_07_64_the_total_time_is_bounded_by_the_deadline_plus_the_cleanup_bound
         total <= deadline + probe::CLEANUP_BOUND + SLACK,
         "the thread's total, cleanup included: {total:?}"
     );
-    assert_gone(here.path(), "main.pid");
+    let end = thread_end(&probed);
+    assert!(
+        end.collected_in_bound,
+        "the probe was ended and collected within the cleanup bound: {end:?}"
+    );
+    let left = survivors(here.path(), &["main.pid"]);
+    assert!(
+        left.is_empty(),
+        "left running after the thread ended: {left:?}"
+    );
 
     let queued = directory();
     let standin = Standin::running(
@@ -635,7 +663,21 @@ fn kr_req_07_64_a_probe_whose_descendant_holds_the_output_does_not_hold_the_call
         "{:?}",
         probed.took
     );
-    assert_gone(here.path(), "child.pid");
+    let end = thread_end(&probed);
+    assert!(
+        end.collected_in_bound,
+        "the probe was ended and collected within the cleanup bound: {end:?}"
+    );
+    assert!(
+        end.took <= deadline + probe::CLEANUP_BOUND + SLACK,
+        "the thread's total, cleanup included: {:?}",
+        end.took
+    );
+    let left = survivors(here.path(), &["child.pid"]);
+    assert!(
+        left.is_empty(),
+        "left running after the thread ended: {left:?}"
+    );
 }
 
 /// Whether the process table still holds `pid`, a process that has ended and has not been collected
