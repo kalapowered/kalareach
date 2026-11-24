@@ -13,7 +13,7 @@
 //! input source it came from, the reader's state and which reader is asking, and it answers
 //! [`PatchAnswer::Native`] or [`PatchAnswer::Consume`] without replacing the user's binding.
 //!
-//! [`BridgeFenceView::decide`] is that answer. It is a pure function of the reader's state and the
+//! `BridgeFenceView::decide` is that answer. It is a pure function of the reader's state and the
 //! fence the worker last published, which is what keeps three rules together:
 //!
 //! * Outside the detach condition the character is the editor's own, so the answer is `native`.
@@ -224,7 +224,7 @@ impl PreEofDecision {
 /// The bridge's own view of the fence, and what it has already printed.
 ///
 /// A bridge cannot infer that its acknowledgement published a fence, so this holds only what the
-/// worker has told it: [`Self::publish`] on a published fence, [`Self::invalidate`] when the worker
+/// worker has told it: `Self::publish` on a published fence, `Self::invalidate` when the worker
 /// withholds one, when the reader leaves, when the lease changes and after a successful detach.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

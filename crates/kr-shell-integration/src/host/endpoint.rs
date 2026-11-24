@@ -73,7 +73,7 @@ impl HostEndpoint {
     ///
     /// # Errors
     ///
-    /// The same as [`Self::open`].
+    /// The same as `Self::open`.
     pub fn open_named(session_id: SessionId, directory: &Path, basename: &str) -> Result<Self> {
         check_owner_only(directory)?;
         let (address, bound) = Self::address_in(session_id, directory, basename)?;
@@ -101,7 +101,7 @@ impl HostEndpoint {
     /// # Errors
     ///
     /// Returns [`HostError::Ipc`] when the directory cannot be created owner-only, and whatever
-    /// [`Self::open`] returns.
+    /// `Self::open` returns.
     pub fn open_for_session(
         runtime_root: &Path,
         runtime_dir: &Path,

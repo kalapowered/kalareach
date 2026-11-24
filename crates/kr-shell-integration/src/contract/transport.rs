@@ -10,7 +10,7 @@
 //!
 //! The bridge carries the same framing as every other local endpoint: a four-byte unsigned
 //! big-endian length followed by one KR-CBOR-1 object, bounded by the control stream's maximum
-//! frame. [`BRIDGE_STREAM_KIND`] names that bound, and [`frame_codec`] is the codec both sides use,
+//! frame. [`BRIDGE_STREAM_KIND`] names that bound, and `frame_codec` is the codec both sides use,
 //! so the bytes a shell package writes are the bytes the worker's own codec reads.
 //!
 //! # What a child shell inherits
@@ -19,7 +19,7 @@
 //! way:
 //!
 //! * The bootstrap variables leave the exported environment as soon as the handshake succeeds, so a
-//!   child process started afterwards sees no endpoint and no secret. [`decide_activation`] is the
+//!   child process started afterwards sees no endpoint and no secret. `decide_activation` is the
 //!   check a starting shell makes, and with nothing exported it skips activation entirely.
 //! * Even with the variables in hand, the handshake binds to the root process the worker started,
 //!   and it binds it to the *kernel's* view of the connection rather than to what the hello says. A
@@ -58,7 +58,7 @@ pub const ENDPOINT_VARIABLE: &str = "KR_SHELL_BRIDGE";
 
 /// The reserved variable that carries the one-time bootstrap secret.
 ///
-/// Unpadded base64url of [`BOOTSTRAP_SECRET_LEN`] random bytes. It is removed from the exported
+/// Unpadded base64url of `BOOTSTRAP_SECRET_LEN` random bytes. It is removed from the exported
 /// environment with the endpoint once the handshake is accepted, and the bridge wipes its own
 /// decoded copy at the same moment.
 pub const SECRET_VARIABLE: &str = "KR_SHELL_BRIDGE_SECRET";

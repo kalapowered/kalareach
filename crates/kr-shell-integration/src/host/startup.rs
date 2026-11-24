@@ -8,7 +8,7 @@
 //!
 //! The entry itself is inert in an ordinary shell. It runs in every interactive shell of that user,
 //! including one a session's own commands start, and the first thing it does is
-//! [`decide_activation`](crate::contract::transport::decide_activation): without both bootstrap
+//! `decide_activation`: without both bootstrap
 //! values in the exported environment there is nothing to attempt, and after the root handshake
 //! there are none to inherit.
 

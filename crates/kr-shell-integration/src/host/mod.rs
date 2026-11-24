@@ -11,7 +11,7 @@
 //! | [`handshake`] | The proof over the bootstrap secret, the kernel-observed peer and the accepted registration |
 //! | [`phase`] | The integration phase, what each phase permits, and which methods are root methods |
 //! | [`link`] | One bridge connection, with the direction of every frame enforced |
-//! | [`scripted`] | The reference bridge: the client half of the endpoint, driven frame by frame by its caller |
+//! | `scripted` | The reference bridge: the client half of the endpoint, driven frame by frame by its caller |
 //! | [`package`] | Which qualified shell package a session launches, with its executable, flags and module tree |
 //! | [`startup`] | The marked, guarded startup entries: where they go, what they contain and how they are removed |
 //! | [`question`] | The questions an install asks PowerShell, and what each way a question ends gives |

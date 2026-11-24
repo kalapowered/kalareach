@@ -8,9 +8,9 @@
 //!
 //! Three kinds of script, because the contract has three decision points the worker's host makes:
 //!
-//! * A **handshake** script drives [`decide_handshake`] and [`decide_activation`]: who is admitted,
+//! * A **handshake** script drives `decide_handshake` and `decide_activation`: who is admitted,
 //!   who is refused and with which named reason, and what a shell that inherited nothing does.
-//! * A **fence** script drives [`FenceMachine`]: one stimulus per step at a stated clock reading,
+//! * A **fence** script drives `FenceMachine`: one stimulus per step at a stated clock reading,
 //!   with the state, the fence, the held batches in order and the actions in order.
 //! * A **pre-EOF** script drives [`BridgeFenceView`]: the detach condition, the gesture, the one
 //!   hint per prompt, and what the bridge does when the worker refuses a submitted detach.
@@ -18,7 +18,7 @@
 //! The reader thread's own check of a launch is not here: it is the readers', and each shell
 //! package's real-reader tests drive it.
 //!
-//! [`replay`] runs one scenario and returns what did not match. The harness runs every committed
+//! `replay` runs one scenario and returns what did not match. The harness runs every committed
 //! file through it, and each shell package's own tests run the same files against its bridge, so
 //! "the packages agree with the worker" is a fact about one corpus rather than four opinions.
 

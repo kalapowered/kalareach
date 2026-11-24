@@ -10,7 +10,7 @@
 //!
 //! **The encoding.** `CSI Vk ; Sc ; Uc ; Kd ; Cs ; Rc _` - a final underscore, not an APC string.
 //! Omitted fields default to `0,0,0,0,0,1`, so [`KeyRecord::DEFAULT`] is what a reader fills in
-//! for a field that was not sent, and [`encode`] leaves out a trailing run of fields that are
+//! for a field that was not sent, and `encode` leaves out a trailing run of fields that are
 //! already their defaults.
 //!
 //! **The boundary.** `CSI ?9001h` requests the mode and `CSI ?9001l` disables it. Section 8 gives

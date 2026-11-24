@@ -2047,7 +2047,7 @@ impl CanonicalGrid {
     ///
     /// Carried rather than measured: a row is charged where it leaves the screen and gives its
     /// charge back where it is dropped, so this is a read of one figure however long the history
-    /// is. [`Self::measure_history_bytes`] is the same answer worked out by walking the rows, and
+    /// is. `Self::measure_history_bytes` is the same answer worked out by walking the rows, and
     /// the two agree after every operation.
     ///
     /// This counts the encoded text plus the per-cell bookkeeping the grid keeps for it, because
