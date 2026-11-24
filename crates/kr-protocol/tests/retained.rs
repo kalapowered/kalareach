@@ -1255,6 +1255,39 @@ fn a_build_serves_every_plugin_host_protocol_a_level_recorded_and_may_serve_more
     assert!(host_names_outside(&[three], &[four, three]).is_empty());
 }
 
+/// A build that lists the fourth plugin host protocol is at the first level that speaks it or after:
+/// the host's writer of consumed positions opens from that level, and a package below it would
+/// release a host that the levels it retains cannot tell from one of the third protocol alone.
+#[test]
+fn a_build_that_lists_the_fourth_host_protocol_is_at_the_first_level_that_speaks_it() {
+    use kr_protocol::retained::{FIRST_HOST_4_LEVEL, PLUGIN_HOST_PROTOCOLS};
+    let text = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../packages/protocol/package.json"
+    ))
+    .expect("the protocol package's file");
+    let version = text
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("\"version\": \""))
+        .and_then(|rest| rest.split('"').next())
+        .expect("a version");
+    let mut parts = version
+        .split('.')
+        .map(|part| part.parse::<u32>().expect("a number"));
+    let (major, minor) = (
+        parts.next().expect("a major"),
+        parts.next().expect("a minor"),
+    );
+    assert!(
+        PLUGIN_HOST_PROTOCOLS.contains(&"kr-plugin-host/4"),
+        "the list names the fourth protocol"
+    );
+    assert!(
+        CompatibilityLevel::of(PackageVersion::new(major, minor, 0)) >= FIRST_HOST_4_LEVEL,
+        "the package is at {version}, below the first level of the fourth host protocol"
+    );
+}
+
 /// The host's writer of consumed positions opens when every worker level the build retains speaks the
 /// fourth plugin host protocol, which is from the first level that does.
 #[test]

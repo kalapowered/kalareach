@@ -1489,13 +1489,13 @@ answers only the process it recorded for that session, as the kernel names that 
 the runtime, or finds the one a previous daemon started, and answers that it is running or why it
 cannot be reached and how long to leave before asking again. The runtime reports itself on a
 rendezvous endpoint of its own, signed with a keypair it generated at startup and keeps in memory,
-and the daemon publishes an owner-only descriptor in the file its protocol names, `plugin-host-3.json`
-for this release's, beside the worker descriptors. The worker reads it, challenges the process
+and the daemon publishes an owner-only descriptor in the file its protocol names, `plugin-host-3.json` and, for a host that also answers on the endpoint of the fourth protocol,
+`plugin-host-4.json`, beside the worker descriptors. The worker reads it, challenges the process
 behind the endpoint, and registers its bindings with it directly; the daemon is not in that path
 again.
 
-A worker of the release before speaks the same protocol, `kr-plugin-host/3`, and finds its host
-under the same names. The daemon answers it as it answers a worker of this release: it adopts a
+A worker of the release before speaks `kr-plugin-host/3`, which a host of this release also serves,
+and finds its host under the third protocol's names. The daemon answers it as it answers a worker of this release: it adopts a
 host that a daemon of the other release started and that outlived an update or a rollback, and
 otherwise starts the `kr-plugin-host` beside it, on a host with a release store and on one with
 none. A host that survives serves the sessions of both releases until it ends, so a change to the

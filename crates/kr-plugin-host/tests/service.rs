@@ -40,6 +40,7 @@ use kr_plugin_service::launcher::{
     self, HostJobRetirement, HostLaunchPlan, HostStartOutcome, HostSupervisor,
 };
 use kr_plugin_service::protocol::{ComponentSource, HostDescriptor, HostProtocol};
+use kr_plugin_service::protocol4::{Frame4, Request4, RequestBody4, ResponseBody4};
 use kr_plugin_service::vocabulary::{
     BindingActivity, BindingFacts, BindingId, ScopedSourceEvent, SourceProvenance,
 };
@@ -154,6 +155,17 @@ impl Host {
     }
 
     async fn start_plugin_host_with(&self, extra_arguments: &[&str]) -> Started {
+        match self.try_start_plugin_host_with(extra_arguments).await {
+            Ok(started) => started,
+            Err(failure) => panic!("{failure}"),
+        }
+    }
+
+    /// Starts a plugin host, and says why it did not start where it did not.
+    async fn try_start_plugin_host_with(
+        &self,
+        extra_arguments: &[&str],
+    ) -> Result<Started, String> {
         let recorded: Arc<std::sync::Mutex<Option<ServiceLaunch>>> =
             Arc::new(std::sync::Mutex::new(None));
         let seen: Arc<std::sync::Mutex<Option<u32>>> = Arc::new(std::sync::Mutex::new(None));
@@ -180,11 +192,11 @@ impl Host {
             .clone()
             .expect("a launch plan");
         match outcome {
-            Ok((descriptor, fence)) => Started {
+            Ok((descriptor, fence)) => Ok(Started {
                 descriptor,
                 launch: Some(launch),
                 fence: Some(fence),
-            },
+            }),
             Err(error) => {
                 // A host that failed before it had a connection has one place to say why: the
                 // job's diagnostics file in the owner-only state directory. Whatever the service
@@ -197,7 +209,9 @@ impl Host {
                     launched_state(seen.lock().ok().and_then(|slot| *slot))
                 );
                 retire_job(&launch.label);
-                panic!("the plugin host did not start and report itself: {error}\n{diagnostics}");
+                Err(format!(
+                    "the plugin host did not start and report itself: {error}\n{diagnostics}"
+                ))
             }
         }
     }
@@ -1164,4 +1178,130 @@ fn highest_line(text: &str) -> Option<u64> {
             digits.parse::<u64>().ok()
         })
         .max()
+}
+
+/// What the host states in its hello on the endpoint of `/4`, read over a connection of this test
+/// and not through the launcher.
+async fn stated_build(
+    environment: &kr_ipc::paths::EnvironmentPaths,
+) -> kr_protocol::local::LocalBuild {
+    let endpoint = launcher::host_endpoint(environment, &HostProtocol::V4).expect("an endpoint");
+    let connection = kr_ipc::endpoint::Connection::connect(&endpoint)
+        .await
+        .expect("the endpoint of the fourth protocol answers");
+    let (mut reader, mut writer) =
+        kr_ipc::framed::split(connection, kr_protocol::frame::StreamKind::Control);
+    writer
+        .write_message(&Request4 {
+            request_id: 1,
+            body: RequestBody4::Hello {
+                protocol: HostProtocol::V4.name.to_owned(),
+            },
+        })
+        .await
+        .expect("the hello is written");
+    loop {
+        let frame: Frame4 = reader
+            .read_message_without_schema()
+            .await
+            .expect("an answer");
+        if let Frame4::Response {
+            reply_to: 1,
+            body: ResponseBody4::Hello { descriptor, .. },
+        } = frame
+        {
+            return descriptor.build;
+        }
+    }
+}
+
+// A host the launcher starts serves the third protocol and the fourth, and is published for both:
+// the fourth's descriptor records the build the host states in its own hello. A worker of this
+// release finds it over the fourth, and one that reads the third's descriptor alone still does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_plugin_host_is_published_for_both_protocols_and_a_worker_of_either_reaches_it() {
+    let host = Host::create();
+    let environment = host.environment();
+    let started = host.start_plugin_host().await;
+    let third = launcher::read_descriptor(&environment, &HostProtocol::V3)
+        .expect("a read")
+        .expect("the third protocol's descriptor is published");
+    let fourth = launcher::read_descriptor4(&environment)
+        .expect("a read")
+        .expect("the fourth protocol's descriptor is published");
+    assert_eq!(fourth.process_start_identity, third.process_start_identity);
+    assert_eq!(fourth.host_public_key, third.host_public_key);
+    assert_eq!(
+        fourth.process_start_identity,
+        started.descriptor.process_start_identity
+    );
+    let stated = stated_build(&environment).await;
+    assert!(
+        stated.build_id.as_str().starts_with("kr-plugin-host/"),
+        "the host states the build of a plugin host: {}",
+        stated.build_id.as_str()
+    );
+    assert_eq!(
+        fourth.build, stated,
+        "the descriptor records the build the host states"
+    );
+
+    let client = host.plugin_client().await;
+    assert_eq!(
+        client.protocol(),
+        HostProtocol::V4,
+        "a worker of this release speaks the fourth protocol"
+    );
+    client.health().await.expect("the host reports itself");
+
+    // A worker of the release before reads the descriptor of the third protocol alone.
+    let endpoint = launcher::host_endpoint(&environment, &HostProtocol::V3).expect("an endpoint");
+    let connection = kr_ipc::endpoint::Connection::connect(&endpoint)
+        .await
+        .expect("the endpoint of the third protocol answers");
+    let older = PluginClient::over(connection, third)
+        .await
+        .expect("a worker of the third protocol verifies the host");
+    assert_eq!(older.protocol(), HostProtocol::V3);
+    older.health().await.expect("the host answers it");
+
+    started.kill();
+    let _ = launcher::retire_descriptor(&environment, &HostProtocol::V4);
+    let _ = launcher::retire_descriptor(&environment, &HostProtocol::V3);
+}
+
+// A host that cannot bind the endpoint of the fourth protocol still starts, serves the third, and
+// publishes the third's descriptor alone: a worker finds no descriptor of the fourth and speaks the
+// third.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_plugin_host_that_cannot_bind_the_fourth_endpoint_serves_the_third_alone() {
+    let host = Host::create();
+    let environment = host.environment();
+    // Another process holds the endpoint of the fourth protocol.
+    let endpoint = launcher::host_endpoint(&environment, &HostProtocol::V4).expect("an endpoint");
+    let _held = Listener::bind(&endpoint).expect("the endpoint is held");
+    let started = match host.try_start_plugin_host_with(&[]).await {
+        Ok(started) => started,
+        Err(failure) => panic!(
+            "a host that cannot bind the endpoint of the fourth protocol did not start: {failure}"
+        ),
+    };
+    assert!(
+        launcher::read_descriptor(&environment, &HostProtocol::V3)
+            .expect("a read")
+            .is_some(),
+        "the third protocol's descriptor is published"
+    );
+    assert!(
+        launcher::read_descriptor4(&environment)
+            .expect("a read")
+            .is_none(),
+        "a descriptor of the fourth protocol was published for a host that does not serve it"
+    );
+    let client = host.plugin_client().await;
+    assert_eq!(client.protocol(), HostProtocol::V3);
+    client.health().await.expect("the host serves the third");
+
+    started.kill();
+    let _ = launcher::retire_descriptor(&environment, &HostProtocol::V3);
 }

@@ -65,7 +65,7 @@ use crate::protocol::{
     MAX_FAILURE_REASON_BYTES, RENDEZVOUS_DOMAIN, RendezvousAccepted, VERIFY_DOMAIN,
     failure_reason_line,
 };
-use crate::protocol4::HostDescriptor4;
+use crate::protocol4::{Frame4, HostDescriptor4, Request4, RequestBody4, ResponseBody4};
 
 /// The largest descriptor this host writes or reads.
 const MAX_DESCRIPTOR_BYTES: u64 = 8 * 1024;
@@ -151,17 +151,30 @@ fn publish_in_turn(
     descriptor: &HostDescriptor,
 ) -> LaunchResult<()> {
     let attempt = NEXT_PUBLICATION.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-    publish_numbered(turn, attempt, abandoned, environment, protocol, descriptor)
+    publish_numbered(turn, attempt, abandoned, || {
+        publish_descriptor(environment, protocol, descriptor)
+    })
 }
 
-/// [`publish_in_turn`] for the attempt that took `attempt`.
+/// [`publish_in_turn`] for the descriptor of `/4`.
+fn publish_in_turn4(
+    turn: &std::sync::Mutex<u64>,
+    abandoned: &core::sync::atomic::AtomicBool,
+    environment: &EnvironmentPaths,
+    descriptor: &HostDescriptor4,
+) -> LaunchResult<()> {
+    let attempt = NEXT_PUBLICATION.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    publish_numbered(turn, attempt, abandoned, || {
+        publish_descriptor4(environment, descriptor)
+    })
+}
+
+/// [`publish_in_turn`] for the attempt that took `attempt`, writing with `publish`.
 fn publish_numbered(
     turn: &std::sync::Mutex<u64>,
     attempt: u64,
     abandoned: &core::sync::atomic::AtomicBool,
-    environment: &EnvironmentPaths,
-    protocol: &HostProtocol,
-    descriptor: &HostDescriptor,
+    publish: impl FnOnce() -> LaunchResult<()>,
 ) -> LaunchResult<()> {
     let Ok(mut newest) = turn.lock() else {
         return Err(LaunchError::Refused {
@@ -179,7 +192,7 @@ fn publish_numbered(
         });
     }
     *newest = attempt;
-    publish_descriptor(environment, protocol, descriptor)
+    publish()
 }
 
 /// What can go wrong starting or verifying a plugin host.
@@ -686,6 +699,123 @@ pub fn check_proof(
     Ok(())
 }
 
+/// How long the launcher waits for a host to answer on the endpoint of `/4`. A host that has not
+/// answered by then serves `/3` alone, and the start has still succeeded.
+const FOURTH_PROBE_DEADLINE: core::time::Duration = core::time::Duration::from_secs(5);
+
+/// The program name a plugin host states in its build identifier.
+const HOST_BUILD_PROGRAM: &str = "kr-plugin-host/";
+
+/// Asks the host on the endpoint of `/4` which process it is, and returns the descriptor of `/4`
+/// that this host may publish.
+///
+/// `claimed` is what the host's signed claim made of it. The host is asked for its hello and for a
+/// proof, on the endpoint this environment derives for `/4`, and nothing is published for it unless
+/// the hello names `/4` and the claim's own members and the proof verifies with the claim's key for
+/// that endpoint, the arrival endpoint, and the hello states a build of a plugin host.
+///
+/// # Errors
+///
+/// Returns [`LaunchError::Endpoint`] when the endpoint cannot be reached or read, and
+/// [`LaunchError::Refused`] when the host answers with anything that is not the process the claim
+/// named, speaking `/4`.
+pub async fn probe_four(
+    environment: &EnvironmentPaths,
+    claimed: &HostDescriptor,
+) -> LaunchResult<HostDescriptor4> {
+    let endpoint = host_endpoint(environment, &HostProtocol::V4)?;
+    let arrival = endpoint.as_text();
+    let connection = Connection::connect(&endpoint).await?;
+    let (mut reader, mut writer) = split(connection, StreamKind::Control);
+
+    let hello = ask_four(
+        &mut reader,
+        &mut writer,
+        1,
+        RequestBody4::Hello {
+            protocol: HostProtocol::V4.name.to_owned(),
+        },
+    )
+    .await?;
+    let ResponseBody4::Hello {
+        protocol,
+        descriptor,
+    } = hello
+    else {
+        return Err(refused_probe(
+            "the host did not answer the hello with a hello",
+        ));
+    };
+    if protocol != HostProtocol::V4.name || descriptor.protocol != HostProtocol::V4.name {
+        return Err(refused_probe(&format!(
+            "the host speaks {protocol} on the endpoint of {}",
+            HostProtocol::V4.name
+        )));
+    }
+    let published = HostDescriptor4 {
+        protocol: HostProtocol::V4.name.to_owned(),
+        environment_id: claimed.environment_id,
+        reservation_id: claimed.reservation_id,
+        endpoint: arrival.clone(),
+        boot_identity: claimed.boot_identity.clone(),
+        process_start_identity: claimed.process_start_identity.clone(),
+        host_public_key: claimed.host_public_key,
+        build: descriptor.build.clone(),
+    };
+    if *descriptor != published {
+        return Err(refused_probe(
+            "the host's hello describes another process or endpoint than its claim did",
+        ));
+    }
+    if !published
+        .build
+        .build_id
+        .as_str()
+        .starts_with(HOST_BUILD_PROGRAM)
+    {
+        return Err(refused_probe(
+            "the host states a build that is not a plugin host's",
+        ));
+    }
+
+    // The challenge settles which process answers: it signs a fresh nonce for the endpoint it
+    // was reached on, with the key its claim presented.
+    let nonce = fresh_challenge()?;
+    let verified = ask_four(&mut reader, &mut writer, 2, RequestBody4::Verify { nonce }).await?;
+    let ResponseBody4::Verified(proof) = verified else {
+        return Err(refused_probe(
+            "the host did not answer the challenge with a proof",
+        ));
+    };
+    check_proof(&published.proven_members(), &nonce, &proof)?;
+    Ok(published)
+}
+
+fn refused_probe(detail: &str) -> LaunchError {
+    LaunchError::Refused {
+        detail: detail.to_owned(),
+    }
+}
+
+/// Writes one request of `/4` and reads until its answer.
+async fn ask_four(
+    reader: &mut kr_ipc::framed::FrameReader,
+    writer: &mut kr_ipc::framed::FrameWriter,
+    request_id: u64,
+    body: RequestBody4,
+) -> LaunchResult<ResponseBody4> {
+    writer.write_message(&Request4 { request_id, body }).await?;
+    loop {
+        if let Frame4::Response { reply_to, body } =
+            reader.read_message_without_schema::<Frame4>().await?
+        {
+            if reply_to == request_id {
+                return Ok(body);
+            }
+        }
+    }
+}
+
 /// Generates a fresh 32-byte challenge.
 ///
 /// # Errors
@@ -1144,6 +1274,12 @@ impl HostReservation {
                         let descriptor = descriptor.clone();
                         let abandoned = Arc::clone(&abandoned);
                         tokio::task::spawn_blocking(move || {
+                            // A descriptor of `/4` that is still there belongs to a host that
+                            // has ended, and is taken away before the new host's is published,
+                            // so that no reader finds the old one beside the new `/3`.
+                            if protocol == HostProtocol::V3 {
+                                let _ = retire_descriptor(&paths, &HostProtocol::V4);
+                            }
                             publish_in_turn(&turn, &abandoned, &paths, &protocol, &descriptor)
                         })
                     };
@@ -1178,6 +1314,10 @@ impl HostReservation {
                         Ok(Err(error)) => return Err(LaunchError::Endpoint(error)),
                         Err(_elapsed) => return Err(LaunchError::NoRendezvous { deadline_ms }),
                     }
+                    // The host serves now, so the endpoint of `/4` can be asked who answers it.
+                    if self.protocol == HostProtocol::V3 {
+                        self.publish_four(environment, &descriptor, deadline).await;
+                    }
                     // One reservation, one host: the endpoint stays this launcher's, and every
                     // later claim on it is refused and counted.
                     return Ok((descriptor, fence(self.reservation_id, self.listener)));
@@ -1193,6 +1333,41 @@ impl HostReservation {
                     return Err(refused.unwrap_or(LaunchError::NoRendezvous { deadline_ms }));
                 }
             }
+        }
+    }
+
+    /// Publishes the descriptor of `/4` of a host that has answered on its endpoint, after the
+    /// descriptor of `/3`, inside the same deadline.
+    ///
+    /// A host that does not answer there, or answers as another process or another protocol, leaves
+    /// the environment with the descriptor of `/3` alone, and the start has still succeeded: a
+    /// worker that finds no descriptor of `/4` speaks `/3`.
+    async fn publish_four(
+        &self,
+        environment: &EnvironmentPaths,
+        claimed: &HostDescriptor,
+        deadline: tokio::time::Instant,
+    ) {
+        let left = deadline
+            .saturating_duration_since(tokio::time::Instant::now())
+            .min(FOURTH_PROBE_DEADLINE);
+        let Ok(Ok(descriptor)) = tokio::time::timeout(left, probe_four(environment, claimed)).await
+        else {
+            return;
+        };
+        let turn = publication_turn(self.environment_id, &HostProtocol::V4);
+        let abandoned = Arc::new(core::sync::atomic::AtomicBool::new(false));
+        let waiting = Waiting {
+            abandoned: Arc::clone(&abandoned),
+            finished: false,
+        };
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let paths = environment.clone();
+        let publishing = tokio::task::spawn_blocking(move || {
+            publish_in_turn4(&turn, &abandoned, &paths, &descriptor)
+        });
+        if matches!(tokio::time::timeout(left, publishing).await, Ok(Ok(Ok(())))) {
+            waiting.finished();
         }
     }
 
@@ -2447,5 +2622,311 @@ mod tests {
             .await
             .expect("the acknowledgement");
         assert_eq!(accepted.endpoint, endpoint);
+    }
+
+    /// What a host that answers on the endpoint of `/4` does in a case.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum FourHost {
+        /// Answers as a plugin host of `/4` does.
+        Honest,
+        /// Refuses the hello.
+        RefusesTheHello,
+        /// Names the third protocol on the endpoint of the fourth.
+        NamesTheThird,
+        /// Describes another process than the one that made the claim.
+        DescribesAnotherProcess,
+        /// States a build that is not a plugin host's.
+        StatesAForeignBuild,
+        /// Answers the challenge with a key that is not the claim's.
+        ProvesWithAnotherKey,
+        /// Answers the challenge for the endpoint of `/3`.
+        ProvesForAnotherEndpoint,
+        /// Reads the hello and says nothing.
+        IsSilent,
+    }
+
+    /// The build an honest host of these cases states.
+    fn honest_build() -> kr_protocol::local::LocalBuild {
+        kr_protocol::local::LocalBuild::this(
+            kr_protocol::ids::BuildId::new("kr-plugin-host/9.9.9").expect("a build identifier"),
+        )
+    }
+
+    /// What a host of `/4` found of the environment's descriptors when it was first asked.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    struct Seen {
+        third: bool,
+        fourth: bool,
+    }
+
+    /// Binds the endpoint of `/4` and serves one connection on it as `behaviour` says.
+    ///
+    /// Returns what the host found published when its hello came.
+    fn serve_four(
+        environment: &EnvironmentPaths,
+        identity: HostIdentity,
+        reservation_id: ReservationId,
+        behaviour: FourHost,
+    ) -> tokio::task::JoinHandle<Seen> {
+        let environment = environment.clone();
+        let endpoint = host_endpoint(&environment, &HostProtocol::V4).expect("an endpoint");
+        let third = host_endpoint(&environment, &HostProtocol::V3)
+            .expect("an endpoint")
+            .as_text();
+        let listener = Listener::bind(&endpoint).expect("the endpoint of the fourth protocol");
+        let other = HostIdentity::generate(environment.environment_id()).expect("an identity");
+        let described = HostDescriptor4 {
+            protocol: HostProtocol::V4.name.to_owned(),
+            environment_id: identity.environment_id(),
+            reservation_id,
+            endpoint: endpoint.as_text(),
+            boot_identity: identity.boot_identity().clone(),
+            process_start_identity: identity.process_start_identity().clone(),
+            host_public_key: *identity.public_key(),
+            build: honest_build(),
+        };
+        tokio::spawn(async move {
+            let mut seen = Seen::default();
+            let Ok((connection, _peer)) = listener.accept().await else {
+                return seen;
+            };
+            let (mut reader, mut writer) = split(connection, StreamKind::Control);
+            while let Ok(request) = reader.read_message_without_schema::<Request4>().await {
+                let body = match request.body {
+                    RequestBody4::Hello { .. } => {
+                        seen = Seen {
+                            third: read_descriptor(&environment, &HostProtocol::V3)
+                                .is_ok_and(|found| found.is_some()),
+                            fourth: read_descriptor4(&environment)
+                                .is_ok_and(|found| found.is_some()),
+                        };
+                        let mut hello = described.clone();
+                        let mut spoken = HostProtocol::V4.name.to_owned();
+                        match behaviour {
+                            FourHost::RefusesTheHello => ResponseBody4::Refused {
+                                request: "hello".to_owned(),
+                                detail: "no".to_owned(),
+                                disabled: false,
+                            },
+                            FourHost::IsSilent => continue,
+                            other_behaviour => {
+                                match other_behaviour {
+                                    FourHost::NamesTheThird => {
+                                        HostProtocol::V3.name.clone_into(&mut spoken);
+                                    }
+                                    FourHost::DescribesAnotherProcess => {
+                                        hello.process_start_identity = ProcessStartIdentity::new(
+                                            hello.process_start_identity.pid.get() + 1,
+                                            kr_protocol::identity::ProcessStartSource::LinuxProcStat,
+                                            7,
+                                        );
+                                    }
+                                    FourHost::StatesAForeignBuild => {
+                                        hello.build = kr_protocol::local::LocalBuild::this(
+                                            kr_protocol::ids::BuildId::new("kr-worker/9.9.9")
+                                                .expect("a build identifier"),
+                                        );
+                                    }
+                                    _ => {}
+                                }
+                                ResponseBody4::Hello {
+                                    protocol: spoken,
+                                    descriptor: Box::new(hello),
+                                }
+                            }
+                        }
+                    }
+                    RequestBody4::Verify { nonce } => {
+                        let (by, endpoint) = match behaviour {
+                            FourHost::ProvesWithAnotherKey => (&other, described.endpoint.clone()),
+                            FourHost::ProvesForAnotherEndpoint => (&identity, third.clone()),
+                            _ => (&identity, described.endpoint.clone()),
+                        };
+                        ResponseBody4::Verified(Box::new(
+                            by.answer(&nonce, &endpoint).expect("a proof"),
+                        ))
+                    }
+                    _ => ResponseBody4::Refused {
+                        request: "other".to_owned(),
+                        detail: "not asked".to_owned(),
+                        disabled: false,
+                    },
+                };
+                let frame = Frame4::Response {
+                    reply_to: request.request_id,
+                    body,
+                };
+                if writer.write_message(&frame).await.is_err() {
+                    break;
+                }
+            }
+            seen
+        })
+    }
+
+    /// Starts a launch with the claim of `identity` and a host of `/4` that behaves as told, and
+    /// returns what the launch published.
+    async fn launch_beside(
+        behaviour: Option<FourHost>,
+        stale: bool,
+        within: core::time::Duration,
+    ) -> (
+        Option<HostDescriptor>,
+        Option<HostDescriptor4>,
+        Seen,
+        HostDescriptor,
+    ) {
+        let host = kr_ipc::testing::TempHost::create();
+        let environment = host.environment();
+        if stale {
+            // The descriptor of a host of another release that has ended.
+            let old = HostIdentity::generate(environment.environment_id()).expect("an identity");
+            let endpoint = host_endpoint(&environment, &HostProtocol::V4)
+                .expect("an endpoint")
+                .as_text();
+            publish_descriptor4(
+                &environment,
+                &HostDescriptor4 {
+                    protocol: HostProtocol::V4.name.to_owned(),
+                    environment_id: old.environment_id(),
+                    reservation_id: ReservationId::new(kr_protocol::scalars::Uuid::from_bytes(
+                        [9; 16],
+                    )),
+                    endpoint,
+                    boot_identity: old.boot_identity().clone(),
+                    process_start_identity: old.process_start_identity().clone(),
+                    host_public_key: *old.public_key(),
+                    build: honest_build(),
+                },
+            )
+            .expect("a stale descriptor");
+        }
+        let reservation =
+            HostReservation::open(&environment, HostProtocol::V3).expect("a reservation");
+        let identity = HostIdentity::generate(environment.environment_id()).expect("an identity");
+        let endpoint = host_endpoint(&environment, &HostProtocol::V3)
+            .expect("an endpoint")
+            .as_text();
+        let claim = identity
+            .rendezvous(reservation.reservation_id(), &endpoint)
+            .expect("a claim");
+        let serving = behaviour.map(|behaviour| {
+            serve_four(
+                &environment,
+                identity,
+                reservation.reservation_id(),
+                behaviour,
+            )
+        });
+        let (_reader, mut writer) = the_hosts_side(&reservation).await;
+        writer.write_message(&claim).await.expect("the claim");
+        let (descriptor, _fence) = reservation
+            .accept(&environment, &this_process(), within)
+            .await
+            .expect("the claim is accepted");
+        let seen = match serving {
+            Some(serving) if behaviour != Some(FourHost::IsSilent) => {
+                serving.await.expect("the host of the fourth protocol")
+            }
+            Some(serving) => {
+                serving.abort();
+                Seen::default()
+            }
+            None => Seen::default(),
+        };
+        (
+            read_descriptor(&environment, &HostProtocol::V3).expect("a read"),
+            read_descriptor4(&environment).expect("a read"),
+            seen,
+            descriptor,
+        )
+    }
+
+    /// A host that answers on the endpoint of the fourth protocol as the process of its claim is
+    /// published as a host of both: the third's descriptor first, then the fourth's, which also
+    /// records the build the host stated.
+    #[tokio::test]
+    async fn a_host_that_answers_on_the_fourth_endpoint_is_published_after_the_third() {
+        let (third, fourth, seen, claimed) = launch_beside(
+            Some(FourHost::Honest),
+            false,
+            core::time::Duration::from_secs(10),
+        )
+        .await;
+        let third = third.expect("the third protocol's descriptor");
+        let fourth = fourth.expect("the fourth protocol's descriptor");
+        assert_eq!(
+            seen,
+            Seen {
+                third: true,
+                fourth: false
+            },
+            "the third's descriptor was there and the fourth's was not when the host was first asked"
+        );
+        assert_eq!(third, claimed);
+        assert_eq!(
+            fourth.proven_members().process_start_identity,
+            third.process_start_identity
+        );
+        assert_eq!(fourth.host_public_key, third.host_public_key);
+        assert_eq!(fourth.reservation_id, third.reservation_id);
+        assert!(
+            fourth.endpoint.ends_with("p4.sock"),
+            "the endpoint is the one derived for the fourth protocol: {}",
+            fourth.endpoint
+        );
+        assert_eq!(fourth.build, honest_build(), "the build the host stated");
+    }
+
+    /// A host whose endpoint of the fourth protocol does not answer as the process of its claim, as
+    /// a host of that protocol, gets no descriptor of it, and the start has succeeded all the same.
+    #[tokio::test]
+    async fn a_host_that_does_not_answer_on_the_fourth_endpoint_as_its_claim_says_gets_no_descriptor()
+     {
+        for behaviour in [
+            None,
+            Some(FourHost::RefusesTheHello),
+            Some(FourHost::NamesTheThird),
+            Some(FourHost::DescribesAnotherProcess),
+            Some(FourHost::StatesAForeignBuild),
+            Some(FourHost::ProvesWithAnotherKey),
+            Some(FourHost::ProvesForAnotherEndpoint),
+            Some(FourHost::IsSilent),
+        ] {
+            let within = if behaviour == Some(FourHost::IsSilent) {
+                core::time::Duration::from_millis(800)
+            } else {
+                core::time::Duration::from_secs(10)
+            };
+            let (third, fourth, _seen, _claimed) = launch_beside(behaviour, false, within).await;
+            assert!(third.is_some(), "{behaviour:?}: the third's descriptor");
+            assert_eq!(
+                fourth, None,
+                "{behaviour:?}: a descriptor of the fourth protocol was published"
+            );
+        }
+    }
+
+    /// A descriptor of the fourth protocol that an earlier host left is taken away when a new host
+    /// publishes the third's, whether or not the new host publishes a fourth.
+    #[tokio::test]
+    async fn the_fourth_descriptor_of_an_earlier_host_does_not_outlive_the_next_launch() {
+        let (_third, fourth, _seen, _claimed) =
+            launch_beside(None, true, core::time::Duration::from_secs(10)).await;
+        assert_eq!(
+            fourth, None,
+            "the earlier host's descriptor is still published"
+        );
+        let (_third, fourth, _seen, claimed) = launch_beside(
+            Some(FourHost::Honest),
+            true,
+            core::time::Duration::from_secs(10),
+        )
+        .await;
+        let fourth = fourth.expect("the new host's descriptor");
+        assert_eq!(
+            fourth.host_public_key, claimed.host_public_key,
+            "the descriptor is the new host's and not the earlier one's"
+        );
     }
 }
