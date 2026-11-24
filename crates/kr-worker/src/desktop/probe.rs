@@ -36,14 +36,23 @@
 //!
 //! # What the time limit bounds, and what it does not
 //!
-//! One [`Deadline`] covers a whole check. It bounds what a check can give up: the waits on a child
-//! and its pipes, the collecting of a child that was ended, and the reads of what a command printed
-//! and of the files a check reads back or digests, each of which stops between two blocks once the
-//! time is gone. It does not bound a read or a removal of a regular file against a filesystem that
-//! has stopped answering: the digest of a program (`identified_until`), the validation of a route's
-//! path and the removal of the check's own files make one system call each that nothing in this
-//! process can abandon. A check that meets one answers when the call returns, and the answer is
-//! refused as late. That is a stated limit of the bound, not an exact bound.
+//! One [`Deadline`] covers a whole check. It bounds every wait that a check can abandon: the wait
+//! for the child of an operation, the wait for the child of a context command, and the reads of
+//! what a command printed and of the files a check reads back or digests. Each read stops between
+//! two blocks once the time is gone. A child that was ended is collected within a bound: for an
+//! operation, two seconds, inside the time the check keeps back for what follows the operation;
+//! for a context command, the time the reading has left, and no more than two seconds. A child not
+//! collected within its bound is collected on a thread of its own, and the check answers without
+//! it.
+//!
+//! It does not bound a call on a regular file against a filesystem that has stopped answering: the
+//! open and each read of a capture, an output, a read-back or a digested file, the metadata read
+//! that finds a program, the creation of the check's directory and files, and the removal of the
+//! image and of the check's own files. Nothing in this process can abandon such a call. A check
+//! that meets one answers when the call returns. If the call came before a check's last test of
+//! its time, that check's record says it did not finish within its time limit. The removal of the
+//! run's own directory comes after the last of those tests, so nothing refuses it as late. These
+//! are stated limits: the bound is not exact.
 //!
 //! # What runs the operation
 //!
@@ -319,8 +328,8 @@ pub enum Outcome {
         detail: Sentence,
     },
     /// The check's time ran out, and its operation was not running when it did: before it started,
-    /// or after it ended and before what it printed could be read, or before the desktop could be
-    /// read again to confirm what it found.
+    /// or after it ended and before what it printed or wrote could be read, or before the desktop
+    /// could be read again to confirm what it found.
     ///
     /// It is not [`Outcome::NotAnswered`], which says the operation was still running at its bound
     /// and was asked to stop.
@@ -2028,8 +2037,9 @@ fn with_the_image_left(outcome: Outcome, image: &Path, error: &str) -> Outcome {
 /// is ended with everything it started, and the check answers [`Outcome::NotAnswered`], which is
 /// what a permission prompt the person has not answered looks like from here. A facility that
 /// finished, whether it succeeded or failed, is ended with everything it started too, before it is
-/// collected. A call made after the deadline has passed starts nothing and answers
-/// [`Outcome::TimedOut`].
+/// collected. A call whose program is not installed answers [`Outcome::FacilityMissing`] whatever
+/// the time. For a program that is installed, a call made after the deadline has passed starts
+/// nothing and answers [`Outcome::TimedOut`].
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn bounded(
     check: Check,
