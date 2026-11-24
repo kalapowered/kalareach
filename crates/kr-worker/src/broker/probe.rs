@@ -6,7 +6,7 @@
 //! one launch, with what it can cost bounded: the probe is a program the package chose, run on this
 //! host before a launch, so it gets no input, no shell, an environment its caller names, a short
 //! deadline, a cap on what it may print, and a job of its own (a process group on Unix) that ends
-//! with it, so nothing it started outlives the answer.
+//! with it, within the limits below.
 //!
 //! On Unix the group holds what the probe started and leaves a descendant that makes a group or a
 //! session of its own, which the kill does not reach. A probe that the kernel does not release

@@ -2443,14 +2443,14 @@ Every command in that list needs the developer environment for the target loaded
 
 The runner runs the worker's suites one at a time (its library, and the `windows`,
 `windows_endpoint`, `listener`, `transport`, `broker`, `gateway`, `agent_service`,
-`windows_inheritance`, `windows_environment`, `windows_pipes`, `command_backends`, `launch_probe`, `question_bindings`,
-`questions_answer`, `authority`, `persistence`, `snapshot`, `terminal`, `session`, `local_owner`,
-`input_lease`, `fence`, `desktop`, `performance`, `host`, `binder`, `channels`, `connectors` and
-`attention_source` suites) and does not run `cargo test -p kr-worker` with every suite, because the
-worker's other integration suites are the ones described above as compiled and not run. It also
-runs the protocol's library and a named set of the control daemon's cases and suites, among them
-its `project`, `network_project`, `shell`, `privacy` and `descriptions` suites, in steps of the
-workflow.
+`windows_inheritance`, `windows_environment`, `windows_pipes`, `command_backends`, `launch_probe`,
+`question_bindings`, `questions_answer`, `authority`, `persistence`, `snapshot`, `terminal`,
+`session`, `local_owner`, `input_lease`, `fence`, `desktop`, `performance`, `host`, `binder`,
+`channels`, `connectors` and `attention_source` suites) and does not run `cargo test -p kr-worker`
+with every suite, because the worker's other integration suites are the ones described above as
+compiled and not run. It also runs the protocol's library and a named set of the control daemon's
+cases and suites, among them its `project`, `network_project`, `shell`, `privacy` and `descriptions`
+suites, in steps of the workflow.
 Nothing has to be set for the link: `.cargo/config.toml` carries what the MSVC targets need, which
 is the `crt-static` target feature, so that every program links the static C runtime and imports no
 runtime library, to leave the debug static runtime out of a debug link, and to stop the linker

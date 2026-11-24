@@ -740,7 +740,7 @@ fn kr_req_07_64_a_probe_not_collected_within_the_bound_is_collected_later() {
     let pid = written_pid(here.path(), "main.pid").expect("main.pid was written");
     assert!(
         in_process_table(pid),
-        "the premise: the probe has ended and is not yet collected"
+        "the premise: the probe is still in the process table"
     );
     let end = thread_end(&probed);
     assert!(
