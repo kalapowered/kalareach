@@ -861,7 +861,8 @@ impl Real {
     /// holds its digest, the search's result and the rows the isolation criteria are read from
     /// (every feature row, and every row that holds a text the probe expects or refuses), within a
     /// bound for all probes together. A cut is reported, and adoption of the record is refused where
-    /// any evidence is incomplete ([`probe_record`]). Nothing is judged here: the criteria are no
+    /// any evidence is incomplete ([`probe_record`]); a row cut to the bound is not incomplete
+    /// evidence while the whole answer is kept. Nothing is judged here: the criteria are no
     /// server, each listed feature off, the read-only sandbox, no skills section, only the exec tools.
     fn records_the_newer_probes(
         &self,
@@ -900,14 +901,9 @@ impl Real {
                 },
             )
             .collect();
-        let refusals: Vec<String> = probes
-            .iter()
-            .filter(|probe| probe["adoptable"] != true)
-            .map(|probe| format!("probe {}: evidence incomplete", probe["arguments"]))
-            .collect();
         serde_json::json!({
             "probe_only": true,
-            "adoption": { "allowed": refusals.is_empty(), "refused_because": refusals },
+            "adoption": adoption_of(&probes),
             "probes": probes,
         })
     }
@@ -1174,16 +1170,26 @@ fn is_feature_row(line: &str) -> bool {
     words.len() >= 3 && matches!(words.last(), Some(&("true" | "false")))
 }
 
+/// The rows of one answer that the record keeps, and what of the answer it does not keep.
+struct RecordedRows {
+    /// The rows, in order, each of at most [`RECORDED_ROW_CHARS`] characters.
+    kept: Vec<String>,
+    /// Each kept row that was cut: its line in the whole answer (the first line is 1) and its
+    /// length in characters before the cut.
+    cut: Vec<(usize, usize)>,
+    /// Why relevant rows are missing from the record altogether, as texts.
+    missing: Vec<String>,
+    /// How many non-empty rows of the whole answer are not kept because they are not relevant.
+    left_out: usize,
+}
+
 /// The rows of `text` the record keeps for `probe`, in order: every feature row and every row that
 /// holds a text the probe expects or refuses (spaces and case aside), each cut to
 /// [`RECORDED_ROW_CHARS`], at most [`RECORDED_ROWS`] of them and at most `total_left` characters
-/// of all the probes' together, which it takes from; with what was cut, as texts, and how many
-/// non-empty rows of the whole answer are not kept because they are neither.
-fn relevant_rows(
-    probe: &Probe,
-    text: &str,
-    total_left: &mut usize,
-) -> (Vec<String>, Vec<String>, usize) {
+/// of all the probes' together, which it takes from; with each row that was cut, the reasons rows
+/// are missing, and how many non-empty rows of the whole answer are not kept because they are
+/// neither a feature row nor such a row.
+fn relevant_rows(probe: &Probe, text: &str, total_left: &mut usize) -> RecordedRows {
     let squeeze = |text: &str| {
         text.split_whitespace()
             .collect::<Vec<_>>()
@@ -1206,30 +1212,37 @@ fn relevant_rows(
         .lines()
         .filter(|line| !line.trim().is_empty() && !relevant(line))
         .count();
-    let (mut rows, mut cut) = (Vec::new(), Vec::new());
-    for line in text.lines() {
+    let mut recorded = RecordedRows {
+        kept: Vec::new(),
+        cut: Vec::new(),
+        missing: Vec::new(),
+        left_out,
+    };
+    for (index, line) in text.lines().enumerate() {
         if !relevant(line) {
             continue;
         }
-        if rows.len() == RECORDED_ROWS {
-            cut.push(format!("more than {RECORDED_ROWS} relevant rows"));
+        if recorded.kept.len() == RECORDED_ROWS {
+            recorded
+                .missing
+                .push(format!("more than {RECORDED_ROWS} relevant rows"));
             break;
         }
         let kept: String = line.chars().take(RECORDED_ROW_CHARS).collect();
-        if kept.chars().count() < line.chars().count() {
-            cut.push(format!(
-                "a row of {} characters was cut to {RECORDED_ROW_CHARS}",
-                line.chars().count()
-            ));
-        }
         if *total_left < kept.len() {
-            cut.push("the bound for all the probes' rows together was reached".to_owned());
+            recorded
+                .missing
+                .push("the bound for all the probes' rows together was reached".to_owned());
             break;
         }
         *total_left -= kept.len();
-        rows.push(kept);
+        let characters = line.chars().count();
+        if characters > RECORDED_ROW_CHARS {
+            recorded.cut.push((index + 1, characters));
+        }
+        recorded.kept.push(kept);
     }
-    (rows, cut, left_out)
+    recorded
 }
 
 /// Whether `probe` is the feature list, whose every row the criteria are read from.
@@ -1245,10 +1258,13 @@ fn lists_features(probe: &Probe) -> bool {
 /// One probe of the probe-only run: its arguments, how it ended, whether the answer holds what the
 /// probe expects of the pinned build, which expectation it misses where it does not, the answer's
 /// size and digest and the file that holds it whole, the search of it for keys, the rows the
-/// criteria are read from, what was cut, how many non-empty rows were left out of those (the
+/// criteria are read from, each row that was cut (its line, its length and the file that holds the
+/// whole answer), what is missing from the rows, how many non-empty rows were left out of those (the
 /// reviewers read them in the whole answer that was kept), and whether the record may be adopted:
-/// only where the probe answered, the whole answer is kept, no key was found in it, nothing was cut
-/// and, for the feature list, no non-empty row was left out.
+/// only where the probe answered and ended as a probe must, the whole answer is kept, no key was
+/// found in it, no row is missing from the record and, for the feature list, no non-empty row was
+/// left out. A row cut to [`RECORDED_ROW_CHARS`] does not refuse it: the whole answer, with its
+/// digest, is the evidence, and the record names the row.
 fn probe_record(
     probe: &Probe,
     answer: &Answer,
@@ -1256,15 +1272,36 @@ fn probe_record(
     total_left: &mut usize,
 ) -> serde_json::Value {
     let verdict = judged(probe, answer);
-    let (rows, cut, left_out) = relevant_rows(probe, &answer.text, total_left);
+    let rows = relevant_rows(probe, &answer.text, total_left);
     let digest: String = kr_cbor::sha256(answer.text.as_bytes())
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect();
-    let adoptable = kept.kept_in.is_ok()
+    let adoptable = answer.ended.is_ok()
+        && kept.kept_in.is_ok()
         && !kept.key_found
-        && cut.is_empty()
-        && !(lists_features(probe) && left_out > 0);
+        && rows.missing.is_empty()
+        && !(lists_features(probe) && rows.left_out > 0);
+    let cut_rows: Vec<serde_json::Value> = rows
+        .cut
+        .iter()
+        .map(|&(line, characters)| {
+            serde_json::json!({
+                "line": line,
+                "characters": characters,
+                "cut_to": RECORDED_ROW_CHARS,
+                "read_whole_in": kept.kept_in.clone().ok(),
+            })
+        })
+        .collect();
+    let truncated_because: Vec<String> = rows
+        .cut
+        .iter()
+        .map(|&(_, characters)| {
+            format!("a row of {characters} characters was cut to {RECORDED_ROW_CHARS}")
+        })
+        .chain(rows.missing.iter().cloned())
+        .collect();
     serde_json::json!({
         "arguments": probe.arguments,
         "answered": true,
@@ -1279,12 +1316,24 @@ fn probe_record(
             "not_kept_because": kept.kept_in.clone().err(),
         },
         "keys": { "values_searched": kept.keys_searched, "found": kept.key_found },
-        "relevant_rows": rows,
-        "rows_left_out": left_out,
-        "truncated": !cut.is_empty(),
-        "truncated_because": cut,
+        "relevant_rows": rows.kept,
+        "cut_rows": cut_rows,
+        "rows_left_out": rows.left_out,
+        "truncated": !truncated_because.is_empty(),
+        "truncated_because": truncated_because,
         "adoptable": adoptable,
     })
+}
+
+/// Whether the record of the probes may be adopted: only where every probe is adoptable, and each
+/// one that is not is named.
+fn adoption_of(probes: &[serde_json::Value]) -> serde_json::Value {
+    let refusals: Vec<String> = probes
+        .iter()
+        .filter(|probe| probe["adoptable"] != true)
+        .map(|probe| format!("probe {}: evidence incomplete", probe["arguments"]))
+        .collect();
+    serde_json::json!({ "allowed": refusals.is_empty(), "refused_because": refusals })
 }
 
 /// The last reads of the host's list of application instances, as the device read them, each with
@@ -8816,12 +8865,20 @@ fn a_probe_only_record_names_the_expectation_of_the_pinned_entry_the_answer_miss
     assert_eq!(record["rows_left_out"], 1, "{record}");
     assert_eq!(record["adoptable"], true, "{record}");
 
-    // A row longer than the bound is cut and said to be: adoption is refused.
+    // A row longer than the bound is cut and said to be; the whole answer is kept, so the record
+    // is still adopted.
     let long = format!("apps stable false {}\n", "x".repeat(RECORDED_ROW_CHARS * 2));
     let record = record_of(&long, Ok(()), &kept);
     assert_eq!(record["truncated"], true);
-    assert_eq!(record["adoptable"], false);
-    // More relevant rows than the bound: cut and refused.
+    assert_eq!(record["adoptable"], true, "{record}");
+    let row_of = |characters: usize| format!("{:<characters$}\n", "apps stable false");
+    let record = record_of(&row_of(RECORDED_ROW_CHARS), Ok(()), &kept);
+    assert_eq!(record["truncated"], false, "{record}");
+    assert_eq!(record["cut_rows"], serde_json::json!([]));
+    let record = record_of(&row_of(RECORDED_ROW_CHARS + 1), Ok(()), &kept);
+    assert_eq!(record["truncated"], true, "{record}");
+    assert_eq!(record["cut_rows"][0]["characters"], RECORDED_ROW_CHARS + 1);
+    // More relevant rows than the bound: rows are missing from the record, and it is refused.
     let many = "apps stable false\n".repeat(RECORDED_ROWS + 1);
     let record = record_of(&many, Ok(()), &kept);
     assert_eq!(record["truncated"], true);
@@ -8854,6 +8911,201 @@ fn a_probe_only_record_names_the_expectation_of_the_pinned_entry_the_answer_miss
     let record = record_of("apps stable false\n", Ok(()), &found);
     assert_eq!(record["keys"]["found"], true);
     assert_eq!(record["adoptable"], false);
+}
+
+/// The probe and the answer of the newer Codex build's `debug prompt-input`: a relevant row of 3,995
+/// characters on the second line, among rows the record does not keep, 10,000 bytes in all.
+fn a_prompt_input_answer_with_a_long_row() -> (Probe, String) {
+    let probe = a_probe(serde_json::json!({
+        "arguments": ["debug", "prompt-input"],
+        "shows": ["the sandbox is read-only"],
+    }));
+    let long = format!("the sandbox is read-only {}", "x".repeat(3_995 - 25));
+    assert_eq!(long.chars().count(), 3_995);
+    let text = format!(
+        "a row that is not relevant\n{long}\n{}",
+        "a row of the build\n".repeat(300)
+    );
+    (probe, text)
+}
+
+/// A probe whose only cut is a relevant row, whose whole answer is kept and searched with no key
+/// found, and which ended as a probe must, is adopted: the record names the row that was cut and the
+/// file that holds it whole, and the verdict on the record is that it is allowed.
+#[test]
+fn a_probe_whose_only_cut_is_a_relevant_row_is_adopted_on_its_whole_kept_answer() {
+    let (probe, text) = a_prompt_input_answer_with_a_long_row();
+    let kept = Kept {
+        kept_in: Ok("answer.txt".to_owned()),
+        keys_searched: 2,
+        key_found: false,
+    };
+    let answer = Answer {
+        text: text.clone(),
+        stubbed: false,
+        ended: Ok(()),
+    };
+    let record = probe_record(&probe, &answer, &kept, &mut RECORDED_TOTAL_CHARS.clone());
+    assert_eq!(
+        adoption_of(std::slice::from_ref(&record)),
+        serde_json::json!({ "allowed": true, "refused_because": [] }),
+        "{record}"
+    );
+    assert_eq!(record["adoptable"], true, "{record}");
+    assert_eq!(record["answer"]["kept_in"], "answer.txt");
+    assert_eq!(record["answer"]["bytes"], text.len());
+    assert_eq!(record["keys"]["found"], false);
+    assert_eq!(record["truncated"], true);
+    assert_eq!(
+        record["truncated_because"],
+        serde_json::json!(["a row of 3995 characters was cut to 240"])
+    );
+    assert_eq!(
+        record["cut_rows"],
+        serde_json::json!([{
+            "line": 2,
+            "characters": 3_995,
+            "cut_to": RECORDED_ROW_CHARS,
+            "read_whole_in": "answer.txt",
+        }])
+    );
+    let rows = record["relevant_rows"].as_array().expect("the rows");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].as_str().map(|row| row.chars().count()),
+        Some(RECORDED_ROW_CHARS)
+    );
+}
+
+/// A cut row adopts nothing by itself: the probe stays refused where its whole answer is not kept,
+/// where a key was found, where it is the feature list with a row left out, or where rows are missing
+/// from the record altogether, each with the same cut row that a kept answer would carry.
+#[test]
+fn a_cut_row_does_not_adopt_a_probe_that_is_refused_for_another_reason() {
+    let (probe, text) = a_prompt_input_answer_with_a_long_row();
+    let kept = Kept {
+        kept_in: Ok("answer.txt".to_owned()),
+        keys_searched: 2,
+        key_found: false,
+    };
+    let record_of = |probe: &Probe, text: &str, kept: &Kept, left: usize| {
+        let answer = Answer {
+            text: text.to_owned(),
+            stubbed: false,
+            ended: Ok(()),
+        };
+        probe_record(probe, &answer, kept, &mut left.clone())
+    };
+    let whole = RECORDED_TOTAL_CHARS;
+    assert_eq!(record_of(&probe, &text, &kept, whole)["adoptable"], true);
+
+    let not_kept = Kept {
+        kept_in: Err("no directory".to_owned()),
+        keys_searched: 2,
+        key_found: false,
+    };
+    let record = record_of(&probe, &text, &not_kept, whole);
+    assert_eq!(
+        record["cut_rows"][0]["read_whole_in"],
+        serde_json::Value::Null
+    );
+    assert_eq!(record["adoptable"], false, "{record}");
+
+    let found = Kept {
+        kept_in: Err("the answer holds a key".to_owned()),
+        keys_searched: 2,
+        key_found: true,
+    };
+    assert_eq!(record_of(&probe, &text, &found, whole)["adoptable"], false);
+    let found_in_a_kept_answer = Kept {
+        kept_in: Ok("answer.txt".to_owned()),
+        keys_searched: 2,
+        key_found: true,
+    };
+    assert_eq!(
+        record_of(&probe, &text, &found_in_a_kept_answer, whole)["adoptable"],
+        false
+    );
+
+    // Rows are missing from the record: more relevant rows than the bound, or the bound for all the
+    // probes together is used up before a row is kept.
+    let many = format!(
+        "{text}{}",
+        "the sandbox is read-only\n".repeat(RECORDED_ROWS)
+    );
+    let record = record_of(&probe, &many, &kept, whole);
+    assert_eq!(record["truncated"], true);
+    assert_eq!(record["adoptable"], false, "{record}");
+    let record = record_of(&probe, &text, &kept, RECORDED_ROW_CHARS - 1);
+    assert_eq!(record["truncated"], true);
+    assert_eq!(record["adoptable"], false, "{record}");
+
+    // The feature list with a row left out, and the same list with none.
+    let features = a_probe(serde_json::json!({
+        "arguments": ["features", "list"],
+        "lines": ["apps stable false"],
+    }));
+    let list = format!("apps stable false {}\n", "x".repeat(4_000));
+    let record = record_of(&features, &list, &kept, whole);
+    assert_eq!(record["rows_left_out"], 0);
+    assert_eq!(record["adoptable"], true, "{record}");
+    let record = record_of(
+        &features,
+        &format!("prose that is no feature\n{list}"),
+        &kept,
+        whole,
+    );
+    assert_eq!(record["rows_left_out"], 1);
+    assert_eq!(record["truncated"], true);
+    assert_eq!(record["adoptable"], false, "{record}");
+
+    // A probe that gave no answer is named in the verdict.
+    let silent = serde_json::json!({
+        "arguments": ["debug", "prompt-input"],
+        "answered": false,
+        "why": "it did not start",
+        "adoptable": false,
+    });
+    assert_eq!(
+        adoption_of(&[record_of(&probe, &text, &kept, whole), silent]),
+        serde_json::json!({
+            "allowed": false,
+            "refused_because": ["probe [\"debug\",\"prompt-input\"]: evidence incomplete"],
+        })
+    );
+}
+
+/// A probe whose command did not end as a probe must is not adopted, whatever it printed, and the
+/// record says why in its `ended` field.
+#[test]
+fn a_probe_that_did_not_end_as_a_probe_must_is_not_adopted() {
+    let (probe, _) = a_prompt_input_answer_with_a_long_row();
+    let kept = Kept {
+        kept_in: Ok("answer.txt".to_owned()),
+        keys_searched: 2,
+        key_found: false,
+    };
+    let text = "the sandbox is read-only\n".to_owned();
+    let answer = Answer {
+        text: text.clone(),
+        stubbed: false,
+        ended: Ok(()),
+    };
+    let record = probe_record(&probe, &answer, &kept, &mut RECORDED_TOTAL_CHARS.clone());
+    assert_eq!(record["adoptable"], true, "{record}");
+    let answer = Answer {
+        text,
+        stubbed: false,
+        ended: Err("it ended with exit status: 2".to_owned()),
+    };
+    let record = probe_record(&probe, &answer, &kept, &mut RECORDED_TOTAL_CHARS.clone());
+    assert_eq!(record["ended"], "it ended with exit status: 2");
+    assert_eq!(record["adoptable"], false, "{record}");
+    assert_eq!(
+        adoption_of(&[record])["allowed"],
+        false,
+        "a record with one such probe is not adopted"
+    );
 }
 
 /// A probe's whole answer is searched for the keys the run holds, by the part's own search, and kept
