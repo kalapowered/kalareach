@@ -21,6 +21,7 @@ import { Hosts, Sessions } from './views/Sessions'
 import { Pairing } from './views/Pairing'
 import { Plugins } from './views/Plugins'
 import { Session } from './views/Session'
+import { setupLinkFor, usePlatform } from './setup/platform'
 import { Setup } from './setup/Setup'
 import { KeptDrafts } from './views/KeptDrafts'
 import { useRebind } from './app/drafts'
@@ -61,6 +62,8 @@ export function App(): ReactNode {
   // The connection's latest state whole, which the inbox draws its row of contact from.
   const [latest, setLatest] = useState<ConnectionState | null>(null)
   const account = useAccount(port)
+  // What the setup link is called depends on the platform, which only the host's own reading says.
+  const platform = usePlatform(port)
   const [accountOpen, setAccountOpen] = useState(false)
   // Drafts the application was started or disconnected with are bound to their conversations again
   // once the host says where those stand.
@@ -181,7 +184,7 @@ export function App(): ReactNode {
               go({ view: 'setup' })
             }}
           >
-            Set up this Mac
+            {setupLinkFor(platform)}
           </button>
           <button
             type="button"

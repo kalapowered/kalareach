@@ -12,12 +12,50 @@
  * macOS card in front of a person on another system, which is the one mistake this file prevents.
  */
 
-import type { SetupPlatform } from '../host/port'
+import { useEffect, useState } from 'react'
+
+import type { HostPort, SetupPlatform } from '../host/port'
 import { categoriesFor } from './permissions'
 
 /** Whether this is the one platform whose permissions setup guides a person through. */
 export function guidesPermissions(platform: SetupPlatform | null): boolean {
   return platform === 'macos'
+}
+
+/**
+ * What the side bar calls the page that opens setup.
+ *
+ * "This Mac" is a macOS word, so it is said where the platform is macOS and nowhere else, and
+ * where the platform is not known yet the name is the one that is true everywhere.
+ */
+export function setupLinkFor(platform: SetupPlatform | null): string {
+  return guidesPermissions(platform) ? 'Set up this Mac' : 'Set up KalaReach'
+}
+
+/**
+ * The platform this application runs on, from one reading of its identity when the window opens.
+ *
+ * It is the same command the setup page reads, because the platform has no other source. It is
+ * read once: an application does not change platform while it runs. A reading that fails leaves it
+ * unknown, and the setup page reads the identity itself and shows the failure there.
+ */
+export function usePlatform(port: HostPort): SetupPlatform | null {
+  const [platform, setPlatform] = useState<SetupPlatform | null>(null)
+  useEffect(() => {
+    let watching = true
+    port
+      .setupIdentity()
+      .then((identity) => {
+        if (watching) setPlatform(identity.platform)
+      })
+      .catch(() => {
+        // Left unknown; nothing here has a failure to show.
+      })
+    return () => {
+      watching = false
+    }
+  }, [port])
+  return platform
 }
 
 /** One step of the setup path. */

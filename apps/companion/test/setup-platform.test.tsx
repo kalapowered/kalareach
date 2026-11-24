@@ -17,7 +17,7 @@ import { AppProvider } from '../src/app/state'
 import { fakeHost, type FakeDesktop, type FakeHostControls } from '../src/host/fake'
 import type { HostPort, SetupPlatform } from '../src/host/port'
 import { disclosedChecks, routeOf } from '../src/setup/disclosure'
-import { grantWasOffered } from '../src/setup/platform'
+import { grantWasOffered, setupLinkFor } from '../src/setup/platform'
 import setupStylesheet from '../src/setup/setup.css?raw'
 import { stateMeaning } from '../src/setup/states'
 
@@ -41,9 +41,12 @@ async function goTo(step: string): Promise<void> {
   await screen.findByTestId(`setup-panel-${step}`)
 }
 
-/** The page's text, in one string, where a macOS word would be found. */
+/**
+ * The whole window's text, in one string, where a macOS word would be found: the side bar and the
+ * toasts are as much of what a person reads as the setup page.
+ */
 function pageText(): string {
-  return screen.getByTestId('setup').textContent
+  return document.body.textContent
 }
 
 const OTHER_DESKTOPS: readonly FakeDesktop[] = ['x11', 'wayland', 'windows']
@@ -59,6 +62,11 @@ describe('which platform the page is shown for', () => {
     )
     expect(screen.getByTestId('setup-step-permissions').textContent).toMatch(/Permissions/)
     expect(screen.getByTestId('setup-signature')).toBeInTheDocument()
+    // The side bar names the page for this Mac, as it always did, once the platform is read.
+    expect(await screen.findByRole('button', { name: 'Set up this Mac' })).toHaveAttribute(
+      'aria-current',
+      'page'
+    )
     await goTo('permissions')
     for (const pane of ['accessibility', 'screen_recording', 'full_disk_access', 'automation']) {
       expect(screen.getByTestId(`setup-permission-${pane}`)).toBeInTheDocument()
@@ -69,6 +77,12 @@ describe('which platform the page is shown for', () => {
     start(desktop)
     await screen.findByTestId('setup-identity')
     expect(screen.getByRole('heading', { level: 1 }).textContent).toBe('Set up KalaReach')
+    // The side bar says the same: "this Mac" is not a thing on another desktop.
+    expect(screen.getByRole('button', { name: 'Set up KalaReach' })).toHaveAttribute(
+      'aria-current',
+      'page'
+    )
+    expect(screen.queryByRole('button', { name: /this Mac/ })).toBeNull()
     // The identity says which application this is, and nothing about a grant being filed.
     expect(screen.queryByTestId('setup-signature')).toBeNull()
     expect(screen.queryByTestId('setup-ceiling-identity')).toBeNull()
@@ -94,9 +108,17 @@ describe('which platform the page is shown for', () => {
       expect(screen.getByTestId('setup-step-permissions')).toBeInTheDocument()
     })
     expect(screen.getByRole('heading', { level: 1 }).textContent).toBe('Set up KalaReach')
+    expect(screen.getByRole('button', { name: 'Set up KalaReach' })).toBeInTheDocument()
     await goTo('permissions')
     expect(document.querySelector('[data-testid^="setup-permission-"]')).toBeNull()
     expect(pageText()).not.toMatch(/macOS|Mac\b|System Settings/)
+  })
+
+  it('names the side bar’s setup link for this Mac on macOS and plainly everywhere else', () => {
+    expect(setupLinkFor('macos')).toBe('Set up this Mac')
+    for (const platform of ['linux', 'windows', 'other', null] as const) {
+      expect(setupLinkFor(platform), String(platform)).toBe('Set up KalaReach')
+    }
   })
 })
 
