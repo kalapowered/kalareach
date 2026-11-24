@@ -888,6 +888,8 @@ async fn relay_asking(
     terminal
         .arg("--remote")
         .arg(format!("unix://{}", gateway.socket()))
+        // No person is at it: where the run inherits a console, the terminal would draw a composer.
+        .stdin(Stdio::null())
         .arg(prompt)
         .env("STAND_IN", variants)
         .stdout(Stdio::piped())
