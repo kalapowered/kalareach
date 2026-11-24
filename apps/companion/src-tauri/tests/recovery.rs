@@ -4808,15 +4808,24 @@ async fn a_change_to_the_settings_tells_the_page_and_takes_the_saved_line_away_a
     };
     let computer = Computer::new().await;
     let (page, settings) = computer.running_page(timing).await;
+    // The step the application's start wants ends and tells the page first.
+    assert!(
+        until(Duration::from_secs(10), || async {
+            *page.recovery_told.lock().expect("the record") >= 1
+        })
+        .await,
+        "the start step told the page"
+    );
     settings
         .set_colour_mode(ColourMode::Dark)
         .await
         .expect("kept");
     page.call("recovery_turn_on", json!({})).expect("on");
-    // The step the turn-on wants ends and tells the page; then nothing is wanted until the quiet.
+    // Three tells have been made: the start step's, the first change's and the step the turn-on
+    // wants; then nothing is wanted until the quiet.
     assert!(
         until(Duration::from_secs(10), || async {
-            *page.recovery_told.lock().expect("the record") >= 1
+            *page.recovery_told.lock().expect("the record") >= 3
         })
         .await,
         "the step the turn-on wanted told the page"
@@ -4824,6 +4833,10 @@ async fn a_change_to_the_settings_tells_the_page_and_takes_the_saved_line_away_a
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(line_of(&page), json!({ "state": "saved" }));
     let before = *page.recovery_told.lock().expect("the record");
+    assert_eq!(
+        before, 3,
+        "the start step, the change and the turn-on's step"
+    );
 
     settings
         .set_colour_mode(ColourMode::Light)
