@@ -200,6 +200,10 @@ pub struct PluginHost {
     /// holds to stand where a document has left the queue and not yet been written.
     #[cfg(feature = "testing")]
     notice_hold: Arc<kr_plugin_service::hold::Hold>,
+    /// The pause the notice writers take once they have dealt with a notice, which a test holds to
+    /// know that a writer is past the notice it held.
+    #[cfg(feature = "testing")]
+    notice_done_hold: Arc<kr_plugin_service::hold::Hold>,
     /// The pause a registration takes after the connection has recorded it and before the runtime
     /// reserves its identifier, which a test holds to stand where an unbind can come between the
     /// two.
@@ -311,6 +315,8 @@ impl PluginHost {
             #[cfg(feature = "testing")]
             notice_hold: Arc::new(kr_plugin_service::hold::Hold::default()),
             #[cfg(feature = "testing")]
+            notice_done_hold: Arc::new(kr_plugin_service::hold::Hold::default()),
+            #[cfg(feature = "testing")]
             reserving_hold: Arc::new(kr_plugin_service::hold::Hold::default()),
             #[cfg(feature = "testing")]
             unbinding_hold: Arc::new(kr_plugin_service::hold::Hold::default()),
@@ -383,6 +389,15 @@ impl PluginHost {
     #[must_use]
     pub fn hold_notice_writes(&self) -> kr_plugin_service::hold::HoldHandle {
         self.notice_hold.set()
+    }
+
+    /// Holds the notice writers once they are past a notice, for the tests that need to know that a
+    /// writer has written, or left unwritten, the notice it held: until the returned hold is
+    /// released a writer that has dealt with a notice stops before it takes the next.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn hold_after_notice_writes(&self) -> kr_plugin_service::hold::HoldHandle {
+        self.notice_done_hold.set()
     }
 
     /// Holds registrations after the connection has recorded them and before the runtime reserves
@@ -538,6 +553,8 @@ impl PluginHost {
             dialect,
             #[cfg(feature = "testing")]
             Arc::clone(&self.notice_hold),
+            #[cfg(feature = "testing")]
+            Arc::clone(&self.notice_done_hold),
         ));
 
         Arc::clone(&self).read_requests(reader, &served).await;
@@ -1973,6 +1990,7 @@ async fn write_notices(
     registered: Registered,
     dialect: Dialect,
     #[cfg(feature = "testing")] hold: Arc<kr_plugin_service::hold::Hold>,
+    #[cfg(feature = "testing")] done: Arc<kr_plugin_service::hold::Hold>,
 ) {
     if dialect == Dialect::Four {
         write_notices_four(
@@ -1982,6 +2000,8 @@ async fn write_notices(
             registered,
             #[cfg(feature = "testing")]
             hold,
+            #[cfg(feature = "testing")]
+            done,
         )
         .await;
         return;
@@ -2019,6 +2039,8 @@ async fn write_notices(
             conversation.end();
             return;
         }
+        #[cfg(feature = "testing")]
+        done.pause().await;
     }
     // The queue closed. If it closed because what had to arrive would not fit, that is the
     // connection's end rather than the writer's.
@@ -2036,6 +2058,7 @@ async fn write_notices_four(
     conversation: Arc<Conversation>,
     registered: Registered,
     #[cfg(feature = "testing")] hold: Arc<kr_plugin_service::hold::Hold>,
+    #[cfg(feature = "testing")] done: Arc<kr_plugin_service::hold::Hold>,
 ) {
     while let Some(delivery) = notices.recv_four().await {
         #[cfg(feature = "testing")]
@@ -2095,6 +2118,8 @@ async fn write_notices_four(
             conversation.end();
             return;
         }
+        #[cfg(feature = "testing")]
+        done.pause().await;
     }
     if notices.overflowed() {
         conversation.end();
