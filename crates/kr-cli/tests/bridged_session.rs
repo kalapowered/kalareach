@@ -96,8 +96,8 @@ fn installation() -> &'static Path {
     })
 }
 
-/// Held by the four cases that start a container or put a stand-in for the container runtime first
-/// on `kr`'s path, so that these four do not run beside each other. The cases below that run a
+/// Held by each case that starts a container or puts a stand-in for the container runtime first on
+/// `kr`'s path, so that these cases do not run beside each other. The cases below that run a
 /// stand-in runtime of their own, in a directory of their own, share nothing with them and take no
 /// turn.
 ///
