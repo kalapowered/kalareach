@@ -4,12 +4,13 @@
 //! can leave no file, an empty one, a different format, or the head of an image whose body never
 //! arrived. A header alone, or a payload that stops short, establishes nothing, so a check accepts
 //! an image only when the whole structure of its format is there. The rules read bytes and nothing
-//! else, so every route that measures an image shares them and a case settles them without a
-//! desktop.
+//! else, so every route that measures an image through [`png`] shares them, and a case can test
+//! them without a desktop. The macOS route reads its own image and tests its first four bytes.
 //!
-//! The file a tool wrote is read by [`read_image`], which is the one reader of an image: it opens
-//! the path without following a link and without waiting for a writer, takes a regular file and
-//! nothing else, reads no more than [`IMAGE_LIMIT`] bytes, and says why when it cannot.
+//! The Wayland and X11 routes read the file a tool wrote with [`read_image`]: it opens the path
+//! without following a link and without waiting for a writer, takes a regular file and nothing
+//! else, reads at most [`IMAGE_LIMIT`] bytes and one more, to tell a file over the limit, and says
+//! why when it cannot.
 
 use std::io::Read as _;
 use std::path::Path;
