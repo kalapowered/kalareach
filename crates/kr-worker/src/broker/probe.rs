@@ -74,6 +74,11 @@ impl ProbeRun {
     fn expired(&self) -> bool {
         self.cancel.load(Ordering::SeqCst) || Instant::now() >= self.by
     }
+
+    /// Whether an answer that was complete at `at` was complete before the deadline.
+    fn complete_in_time(&self, at: Instant) -> bool {
+        at < self.by
+    }
 }
 
 /// What running a probe produced.
@@ -137,7 +142,12 @@ impl Probed {
 
 /// What the probe's thread knew when it stopped reading.
 enum Answer {
-    Printed(Vec<u8>),
+    Printed {
+        /// What the process printed.
+        bytes: Vec<u8>,
+        /// When its output ended.
+        complete: Instant,
+    },
     TooMuch,
     Unread(String),
     Late,
@@ -219,6 +229,8 @@ pub fn run_within(
     };
     let _ = std::thread::spawn(move || operate(&work, &sender));
     let waited = run.by.saturating_duration_since(Instant::now());
+    #[cfg(feature = "testing")]
+    seams::pause_at(seams::Point::Receive, directory);
     let answer = match receiver.recv_timeout(waited) {
         Ok(Message::Answered(answer)) => answer,
         Ok(Message::Cleaned) | Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -236,7 +248,9 @@ pub fn run_within(
     let ended_by = run.by + CLEANUP_BOUND;
     let _ = receiver.recv_timeout(ended_by.saturating_duration_since(Instant::now()));
     finish(match answer {
-        Answer::Printed(printed) => probe.read_mode(&printed).map_or_else(
+        // However soon the call has it, an answer that was complete after the deadline is late.
+        Answer::Printed { complete, .. } if !run.complete_in_time(complete) => late(),
+        Answer::Printed { bytes, .. } => probe.read_mode(&bytes).map_or_else(
             || {
                 Probed::unread(format!(
                     "what {shown} printed holds no mode at {}",
@@ -255,7 +269,7 @@ pub fn run_within(
 /// call, ends the process and collects it.
 fn operate(work: &Work, answers: &mpsc::Sender<Message>) {
     #[cfg(feature = "testing")]
-    seams::before_create(&work.directory);
+    seams::pause_at(seams::Point::Create, &work.directory);
     let (answer, mut process) = match Process::start(
         &work.executable,
         &work.arguments,
@@ -330,7 +344,21 @@ fn read_output(process: &mut Process, work: &Work) -> Answer {
         // One byte past the cap is read, and says that the cap was passed.
         let room = (work.cap + 1 - printed.len()).min(chunk.len());
         match process.read(&mut chunk[..room]) {
-            Ok(0) => return Answer::Printed(printed),
+            Ok(0) => {
+                #[cfg(feature = "testing")]
+                seams::pause_at(seams::Point::FinalRead, &work.directory);
+                // The output has ended. The moment it did is noted, and an answer that was complete
+                // after the deadline is late, whenever it is read.
+                let complete = Instant::now();
+                return if work.run.complete_in_time(complete) {
+                    Answer::Printed {
+                        bytes: printed,
+                        complete,
+                    }
+                } else {
+                    Answer::Late
+                };
+            }
             Ok(read) => {
                 printed.extend_from_slice(&chunk[..read]);
                 if printed.len() > work.cap {
@@ -352,15 +380,30 @@ pub mod seams {
     use std::sync::{Mutex, PoisonError};
     use std::time::Duration;
 
-    static CREATE_DELAY: Mutex<Option<(PathBuf, Duration)>> = Mutex::new(None);
+    /// A point of the probe's call or thread at which a case holds it back.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Point {
+        /// Before the thread creates its process.
+        Create,
+        /// After the thread's final read of the output and before it notes when the answer was
+        /// complete.
+        FinalRead,
+        /// In the call, after it has worked out how long to wait for the thread's answer and
+        /// before it waits.
+        Receive,
+    }
+
+    static DELAYS: Mutex<Vec<(Point, PathBuf, Duration)>> = Mutex::new(Vec::new());
 
     static COLLECTION_HOLD: Mutex<Option<(PathBuf, Duration)>> = Mutex::new(None);
 
-    /// Makes the probe's thread wait this long before it creates a process that is to run in
-    /// `directory`, or stops doing so.
-    pub fn delay_create(directory: &Path, delay: Option<Duration>) {
-        *CREATE_DELAY.lock().unwrap_or_else(PoisonError::into_inner) =
-            delay.map(|delay| (directory.to_path_buf(), delay));
+    /// Makes a probe that is to run in `directory` wait this long at `point`, or stops doing so.
+    pub fn delay_at(point: Point, directory: &Path, delay: Option<Duration>) {
+        let mut delays = DELAYS.lock().unwrap_or_else(PoisonError::into_inner);
+        delays.retain(|(held, here, _)| !(*held == point && here == directory));
+        if let Some(delay) = delay {
+            delays.push((point, directory.to_path_buf(), delay));
+        }
     }
 
     /// Makes the collection of a probe that is to run in `directory` wait this long after its
@@ -382,14 +425,14 @@ pub mod seams {
             .map(|(_, hold)| std::time::Instant::now() + hold)
     }
 
-    pub(super) fn before_create(directory: &Path) {
-        let delay = CREATE_DELAY
+    pub(super) fn pause_at(point: Point, directory: &Path) {
+        let delay = DELAYS
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .clone();
-        if let Some((held, delay)) = delay
-            && held == directory
-        {
+            .iter()
+            .find(|(held, here, _)| *held == point && here == directory)
+            .map(|(.., delay)| *delay);
+        if let Some(delay) = delay {
             std::thread::sleep(delay);
         }
     }

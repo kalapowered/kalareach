@@ -484,7 +484,11 @@ fn kr_req_07_64_a_probe_created_after_the_deadline_is_ended_by_its_creator() {
         "Start-Sleep 1; 'ran' | Out-File ran.txt; Start-Sleep 600",
     );
     let deadline = Duration::from_secs(1);
-    probe::seams::delay_create(here.path(), Some(Duration::from_secs(2)));
+    probe::seams::delay_at(
+        probe::seams::Point::Create,
+        here.path(),
+        Some(Duration::from_secs(2)),
+    );
     let run = ProbeRun::within(deadline);
     let probed = probe::run_within(
         &standin.program,
@@ -495,7 +499,7 @@ fn kr_req_07_64_a_probe_created_after_the_deadline_is_ended_by_its_creator() {
         &run,
         probe::MAX_OUTPUT_BYTES,
     );
-    probe::seams::delay_create(here.path(), None);
+    probe::seams::delay_at(probe::seams::Point::Create, here.path(), None);
     assert!(probed.late, "{probed:?}");
     assert_eq!(probed.mode, None);
     assert!(
@@ -731,4 +735,63 @@ fn kr_req_07_64_a_start_that_fails_after_the_create_is_ended_within_the_cleanup_
         total < probe::CLEANUP_BOUND + SLACK,
         "the thread gave up on the end within the cleanup bound: {total:?}"
     );
+}
+
+/// KR-REQ-07.64: an answer whose output ended after the deadline is late, however soon the call has
+/// it: the call's wait is held back past the deadline, so that it takes the thread's answer after the
+/// moment it ought to have given up.
+///
+/// The stand-in prints a mode at once. A control run under the same deadline reads it. Then the
+/// thread is held back after its final read, past the deadline, and the call is held back before it
+/// waits, until the deadline has passed. The call then has the answer in hand, and the answer is
+/// late all the same.
+#[test]
+fn kr_req_07_64_an_answer_that_ended_after_the_deadline_is_late_though_the_call_has_it() {
+    let here = directory();
+    let standin = Standin::running(
+        r#"printf '{"mode":"elevated"}'"#,
+        r#"[Console]::Out.Write('{"mode":"elevated"}')"#,
+    );
+    let deadline = if cfg!(windows) {
+        start_allowance()
+    } else {
+        Duration::from_secs(2)
+    };
+    let within = || {
+        probe::run_within(
+            &standin.program,
+            &standin.probe(&[]),
+            &[],
+            here.path(),
+            &given(&[]),
+            &ProbeRun::within(deadline),
+            probe::MAX_OUTPUT_BYTES,
+        )
+    };
+    let control = within();
+    assert_eq!(
+        control.mode.as_deref(),
+        Some("elevated"),
+        "the premise: the program prints its mode within the deadline: {control:?}"
+    );
+    assert!(!control.late, "{control:?}");
+
+    probe::seams::delay_at(
+        probe::seams::Point::FinalRead,
+        here.path(),
+        Some(deadline + Duration::from_millis(300)),
+    );
+    probe::seams::delay_at(
+        probe::seams::Point::Receive,
+        here.path(),
+        Some(deadline + Duration::from_millis(100)),
+    );
+    let probed = within();
+    probe::seams::delay_at(probe::seams::Point::FinalRead, here.path(), None);
+    probe::seams::delay_at(probe::seams::Point::Receive, here.path(), None);
+    assert!(
+        probed.late,
+        "an answer that ended after the deadline is late: {probed:?}"
+    );
+    assert_eq!(probed.mode, None, "{probed:?}");
 }
