@@ -1729,6 +1729,8 @@ fn the_contract_cases_for_installed_apps_live_workers_and_plugins_run_in_jobs_of
             &[
                 ("kr-cli", "bridge"),
                 ("kr-cli", "startup"),
+                ("kr-cli", "lifecycle"),
+                ("kr-cli", "kept_answers"),
                 ("kr-protocol", "contracts"),
             ],
         ),
@@ -1850,6 +1852,16 @@ fn the_contract_cases_for_installed_apps_live_workers_and_plugins_run_in_jobs_of
                 });
                 assert!(held, "`{function}`: {package} has no case {name}");
             }
+        } else {
+            let minimum = words
+                .windows(2)
+                .find(|window| window[0] == "--at-least")
+                .and_then(|window| window[1].parse::<u32>().ok());
+            assert!(
+                minimum.is_some_and(|minimum| minimum > 0),
+                "`{function}`: a command that runs a whole target holds no minimum count of passed cases: {}",
+                words.join(" ")
+            );
         }
     }
 }
@@ -1858,9 +1870,10 @@ fn the_contract_cases_for_installed_apps_live_workers_and_plugins_run_in_jobs_of
 /// passes only when every test program reports passed cases and no failed one, and a command that
 /// names several cases with `--exact` passes only when as many passed as it names, because cargo
 /// exits 0 for a name that matches nothing. A failed test command does not stop the commands after
-/// it, and the script then exits 1. The upgrade suite reads test components that the repository does not
-/// hold, so the script builds them first; the fake `cargo` fails that suite when they are absent.
-/// This runs the script against a `cargo` that reports what each case asks of it.
+/// it, and the script then exits 1. A command that runs a whole target passes only when at least its
+/// minimum passed. The upgrade suite reads test components that the repository does not hold, so the
+/// script builds them first; the fake `cargo` fails that suite when they are absent. This runs the
+/// script against a `cargo` that reports what each case asks of it.
 #[test]
 fn the_contract_script_fails_a_command_whose_cases_did_not_all_run_and_pass() {
     let tools = TempDir::new().expect("a directory");
@@ -1890,9 +1903,12 @@ for word in "$@"; do
     seen=1
   fi
 done
-if [ "$named" -gt 0 ]; then count=$named; else count=7; fi
+if [ "$named" -gt 0 ]; then count=$named; else count=500; fi
 case "$FAKE_CARGO" in
   right) echo "test result: ok. $count passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.1s" ;;
+  few)
+    if [ "$named" -eq 0 ]; then count=1; fi
+    echo "test result: ok. $count passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.1s" ;;
   none) echo "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.0s" ;;
   short)
     if [ "$named" -gt 1 ]; then count=$((named - 1)); fi
@@ -1956,6 +1972,13 @@ esac
         Some(1),
         "a command that names its cases passed with one of them not run"
     );
+    for mode in ["fast", "upgrade"] {
+        assert_eq!(
+            run(mode, "few").0,
+            Some(1),
+            "a command that runs a whole target passed with fewer cases than its minimum"
+        );
+    }
     let (_, output) = run("fast", "failed");
     let commands = contract_commands(
         &fs::read_to_string(repository().join("scripts/contract-cases.sh")).expect("the script"),
