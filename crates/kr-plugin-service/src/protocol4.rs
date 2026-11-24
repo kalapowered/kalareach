@@ -29,9 +29,9 @@ use kr_protocol::worker::ReservationId;
 use serde::{Deserialize, Serialize};
 
 use crate::protocol::{
-    BindingRegistration, DecodeCall, EncodeCall, HostHealth, HostVerifyProof, PrepareActionCall,
-    WireAttachment, WireDecoded, WireEncoded, WireFacts, WireNode, WirePlan, WireSourceEvent,
-    serde_bytes_vec,
+    BindingRegistration, DecodeCall, EncodeCall, HostDescriptor, HostHealth, HostVerifyProof,
+    PrepareActionCall, WireAttachment, WireDecoded, WireEncoded, WireFacts, WireNode, WirePlan,
+    WireSourceEvent, serde_bytes_vec,
 };
 
 /// What the plugin host of this protocol publishes about itself.
@@ -58,6 +58,25 @@ pub struct HostDescriptor4 {
     pub host_public_key: AuthorisationKey,
     /// The build of the program: its build identifier and the protocol package it was built from.
     pub build: LocalBuild,
+}
+
+impl HostDescriptor4 {
+    /// Returns the members the challenge is checked against, in the shape the checks of `/3` read.
+    ///
+    /// The `build` member is a hint like the rest of the descriptor and is not part of what a proof
+    /// signs, so nothing that checks a proof needs it.
+    #[must_use]
+    pub fn proven_members(&self) -> HostDescriptor {
+        HostDescriptor {
+            protocol: self.protocol.clone(),
+            environment_id: self.environment_id,
+            reservation_id: self.reservation_id,
+            endpoint: self.endpoint.clone(),
+            boot_identity: self.boot_identity.clone(),
+            process_start_identity: self.process_start_identity.clone(),
+            host_public_key: self.host_public_key,
+        }
+    }
 }
 
 /// What a worker asks the plugin host to do.

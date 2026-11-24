@@ -22,6 +22,8 @@ use kr_protocol::ids::SourceEventHandle;
 
 use super::{HANG_GUARD, Raw, Served, components, reached};
 
+mod connect;
+
 fn handle(text: &str) -> SourceEventHandle {
     SourceEventHandle::new(text).expect("a bounded handle")
 }

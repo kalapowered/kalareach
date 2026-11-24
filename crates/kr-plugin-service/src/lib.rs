@@ -36,6 +36,7 @@
 //! | [`error`] | What the client reports when the host does not answer |
 
 pub mod client;
+mod dialect;
 pub mod error;
 #[cfg(feature = "testing")]
 pub mod hold;
