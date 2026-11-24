@@ -325,13 +325,24 @@ async fn kr_req_24_24_a_refused_duplicate_registration_leaves_the_registration_t
         .deliver(request.binding_id, &components::scrape("se-1", "x"))
         .await
         .expect("the event is offered");
-    let read = tokio::time::timeout(HANG_GUARD, client.notice())
+    let read = tokio::time::timeout(HANG_GUARD, observation(&client))
         .await
         .expect("the notice never arrived");
     assert!(
         matches!(read, Some(Notice::Document { .. })),
         "the notices of the registration the host holds were dropped: {read:?}"
     );
+}
+
+/// Reads notices until the document the component drew for an observed event, which comes after the
+/// documents it drew when the binding was registered; `None` once the connection has ended.
+async fn observation(client: &PluginClient) -> Option<Notice> {
+    loop {
+        let notice = client.notice().await?;
+        if matches!(&notice, Notice::Document { call, .. } if call == "observe") {
+            return Some(notice);
+        }
+    }
 }
 
 /// A binding that is registered, removed and registered again is read under its new registration
@@ -364,7 +375,7 @@ async fn kr_req_24_24_a_binding_registered_and_removed_again_is_read_under_each_
             )
             .await
             .expect("the event is offered");
-        let read = tokio::time::timeout(HANG_GUARD, client.notice())
+        let read = tokio::time::timeout(HANG_GUARD, observation(&client))
             .await
             .expect("the notice never arrived");
         assert!(
