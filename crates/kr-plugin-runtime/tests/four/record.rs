@@ -138,9 +138,19 @@ fn unhex(text: &str) -> Vec<u8> {
 #[derive(Default)]
 struct Held {
     registrations: Vec<u64>,
+    connection: usize,
 }
 
 impl Held {
+    /// A registration number belongs to one connection, and one process hands the client's out from
+    /// a single counter, so the places count again for each connection.
+    fn of_connection(&mut self, connection: usize) {
+        if self.connection != connection {
+            self.connection = connection;
+            self.registrations.clear();
+        }
+    }
+
     /// The place of a registration among those named so far, counted from one.
     fn place(&mut self, registration: u64) -> usize {
         let at = self
@@ -351,6 +361,9 @@ async fn tee(served: &Served) -> (Connection, Kept, tokio::task::JoinHandle<()>)
 #[derive(Default)]
 struct Session {
     frames: Vec<(String, Vec<u8>)>,
+    /// The connection each frame passed on, counted from zero in the order the session took them.
+    connection_of: Vec<usize>,
+    connections: usize,
     shape: Vec<(String, String)>,
     notices: BTreeSet<String>,
 }
@@ -368,6 +381,7 @@ impl Session {
                 let kind = format!("request:{}", request.body.name());
                 asked.push((request.request_id, kind.clone()));
                 self.frames.push((kind, payload.clone()));
+                self.connection_of.push(self.connections);
             } else {
                 let frame: Frame4 =
                     kr_cbor::from_canonical_slice(payload, &limits).expect("a frame");
@@ -381,8 +395,10 @@ impl Session {
                     }
                 }
                 self.frames.push((kind, payload.clone()));
+                self.connection_of.push(self.connections);
             }
         }
+        self.connections += 1;
         self.shape.extend(asked.into_iter().map(|(id, kind)| {
             let answer = answered.get(&id).cloned().unwrap_or_default();
             (kind, answer)
@@ -706,21 +722,25 @@ async fn session(served: &Served, open: bool) -> Option<Session> {
     Some(session)
 }
 
-fn entries(frames: &[(String, Vec<u8>)]) -> Vec<serde_json::Value> {
+fn entries(session: &Session) -> Vec<serde_json::Value> {
     let mut held_to = Held::default();
-    frames
+    session
+        .frames
         .iter()
-        .map(|(kind, bytes)| {
+        .zip(&session.connection_of)
+        .map(|((kind, bytes), connection)| {
+            held_to.of_connection(*connection);
             let held = held_to.frame(kind, bytes);
             if bytes.len() > LARGE_FRAME {
                 let (length, digest) = held.split_once(':').expect("a length and a digest");
                 serde_json::json!({
+                    "connection": connection,
                     "kind": kind,
                     "length": length.parse::<u64>().expect("a length"),
                     "digest": digest,
                 })
             } else {
-                serde_json::json!({ "kind": kind, "hex": hex(bytes) })
+                serde_json::json!({ "connection": connection, "kind": kind, "hex": hex(bytes) })
             }
         })
         .collect()
@@ -735,6 +755,10 @@ fn recorded_frames(session: &serde_json::Value) -> Vec<(String, String)> {
         .iter()
         .map(|entry| {
             let kind = entry["kind"].as_str().expect("a kind").to_owned();
+            held_to.of_connection(
+                usize::try_from(entry["connection"].as_u64().expect("a connection"))
+                    .expect("a connection that fits"),
+            );
             let held = match entry["hex"].as_str() {
                 Some(hexed) => held_to.frame(&kind, &unhex(hexed)),
                 None => format!(
@@ -887,7 +911,7 @@ async fn kr_req_24_24_the_fourth_protocol_host_answers_its_sessions_the_way_the_
     if std::env::var_os("KR_RECORD_PLUGIN_HOST_4_SESSION_FRAMES").is_some() {
         let of = |session: &Session| {
             serde_json::json!({
-                "frames": entries(&session.frames),
+                "frames": entries(session),
                 "shape": session.shape,
                 "notices": session.notices,
             })
@@ -919,7 +943,11 @@ async fn kr_req_24_24_the_fourth_protocol_host_answers_its_sessions_the_way_the_
         let live: Vec<(String, String)> = session
             .frames
             .iter()
-            .map(|(kind, bytes)| (kind.clone(), held_to.frame(kind, bytes)))
+            .zip(&session.connection_of)
+            .map(|((kind, bytes), connection)| {
+                held_to.of_connection(*connection);
+                (kind.clone(), held_to.frame(kind, bytes))
+            })
             .collect();
         let recorded = recorded_frames(recorded);
         let requests = |frames: &[(String, String)]| {
