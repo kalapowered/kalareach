@@ -48,7 +48,7 @@ pub const NARROWER: &[Narrower] = &[
         senders: &[
             Sender {
                 class: "the companion",
-                sends: "Each of the six commands of the companion's host builds the envelope's target from the application instance and the binding revision its parameters carry (`WorkerLinks::mutate` calls `Link::target(Some(instance), Some(binding))`), so the envelope names both as the parameters do; a prompt that names a draft builds its target the same way (`send_draft_prompt`); the items between a command and `WorkerLinks::mutate` that choose the target passed with the parameters are listed too (`macro:agent_mutate_command`, `macro:agent_prompt_command`, `send_prompt`, `WorkerLinks::submit`), and the carriers of `kr_client` pass the target on as given. The page sets `resource_id` of the plugin action in `model/agent.ts`, audited apart.",
+                sends: "Each of the six commands of the companion's host builds the envelope's target from the application instance and the binding revision its parameters carry (`WorkerLinks::mutate` calls `link.target(Some(instance), Some(binding))`; the releases 0.49.0 to 0.71.0 build the target there with `Nullable::some` of both instead), so the envelope names both as the parameters do; a prompt that names a draft builds its target the same way (`send_draft_prompt`); the items between a command and `WorkerLinks::mutate` that choose the target passed with the parameters are listed too (`macro:agent_mutate_command`, `macro:agent_prompt_command`, `send_prompt`, `WorkerLinks::submit`), and the carriers of `kr_client` pass the target on as given. The page sets `resource_id` of the plugin action in `model/agent.ts`, audited apart.",
                 evidence: Evidence::Builds {
                     items: &[
                         Item {
@@ -81,11 +81,11 @@ pub const NARROWER: &[Narrower] = &[
                                 ),
                                 (
                                     "d7f1edd9868390c0a73f29accc7f5e42b5e9ca454e16c3817fd3ea38a3da47cf",
-                                    "Builds the envelope's target with `Nullable::some` of the instance and of the binding revision its caller passes, so the envelope names what the parameters' target names.",
+                                    "Builds the envelope's target by `link.target(Some(..), Some(..))` from the application instance and the binding revision of the mutation target its caller passes (`about`), checks it with `ActionTarget::validate` and sends it through `submit`, so the envelope names what the parameters' target names.",
                                 ),
                                 (
                                     "119b78a88b569cf4bf3ada8ff7735e3de77e81038705a42a37f1719d23c1e192",
-                                    "Builds the envelope's target with `Nullable::some` of the instance and of the binding revision its caller passes, so the envelope names what the parameters' target names.",
+                                    "Builds the envelope's target by `link.target(Some(..), Some(..))` from the application instance and the binding revision of the mutation target its caller passes (`about`), checks it with `ActionTarget::validate` and sends it through `submit`, so the envelope names what the parameters' target names.",
                                 ),
                             ],
                         },
@@ -119,11 +119,11 @@ pub const NARROWER: &[Narrower] = &[
                                 ),
                                 (
                                     "fb71a7c64895756533e607b11252aeb087b746b78d5e2108553a6967d050366e",
-                                    "Takes the target from the prompt's own parameters (`typed.target`) and passes it to `WorkerLinks::mutate` or, for a draft, to `send_draft_prompt`; the envelope names what the parameters name.",
+                                    "Takes the target from the prompt's own parameters (`typed.target`) and passes it to `WorkerLinks::mutate`; a prompt that names a draft is refused on a host this device is paired with (`not_on_a_paired_host`) and otherwise the parameters go to `send_draft_prompt`, which builds its target from the parameters' instance and binding revision; the envelope names what the parameters name.",
                                 ),
                                 (
                                     "461099d4541b7046a4296c37ffb7182d924b335872632dd4e6e3c1f5efba2dc5",
-                                    "Takes the target from the prompt's own parameters (`typed.target`) and passes it to `WorkerLinks::mutate` or, for a draft, to `send_draft_prompt`, with the paired host's context; the envelope names what the parameters name.",
+                                    "Takes the target from the prompt's own parameters (`typed.target`) and passes it to `WorkerLinks::mutate`; a prompt that names a draft goes through `WorkerLinks::mutate` too when this device is paired with a host, and when it is paired with none the parameters go to `send_draft_prompt`, which builds its target from the parameters' instance and binding revision; the envelope names what the parameters name.",
                                 ),
                             ],
                         },
@@ -434,7 +434,7 @@ pub const NARROWER: &[Narrower] = &[
                                 ),
                                 (
                                     "3af18343051d40542388f3e1d2ccdf4b077bfc1ec8bf434dced5c44a07599f42",
-                                    "Defines the prompt commands: a prompt that names a draft goes to `send_draft_prompt` after a check that the host is paired, and any other passes the parameters' target (`typed.target`) to `WorkerLinks::mutate`.",
+                                    "Defines the prompt commands: a prompt that names a draft is refused on a host this device is paired with (`not_on_a_paired_host`) and otherwise goes to `send_draft_prompt`, and any other passes the parameters' target (`typed.target`) to `WorkerLinks::mutate`.",
                                 ),
                             ],
                         },
