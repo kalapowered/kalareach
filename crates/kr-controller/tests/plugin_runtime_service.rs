@@ -195,8 +195,9 @@ async fn the_daemon_adopts_a_host_of_both_protocols_through_either_descriptor() 
     // Adopted through the fourth's descriptor, with both published.
     drop(runtime);
     hosted.restart().await;
-    let runtime = hosted.runtime().await;
+    let _asked = hosted.ask().await;
     assert_eq!(hosted.started(), 0, "the restarted daemon started a host");
+    let runtime = hosted.runtime().await;
     assert_eq!(hosted.published(), Some(host.clone()));
     assert_eq!(runtime.protocol(), HostProtocol::V4);
 
@@ -204,12 +205,13 @@ async fn the_daemon_adopts_a_host_of_both_protocols_through_either_descriptor() 
     drop(runtime);
     launcher::retire_descriptor(&environment, &HostProtocol::V3).expect("the third's is removed");
     hosted.restart().await;
-    let runtime = hosted.runtime().await;
+    let _asked = hosted.ask().await;
     assert_eq!(
         hosted.started(),
         0,
         "a daemon that finds the fourth protocol's descriptor alone started a host"
     );
+    let runtime = hosted.runtime().await;
     assert_eq!(runtime.protocol(), HostProtocol::V4);
     register_and_snapshot(&runtime, &component).await;
 
@@ -219,12 +221,13 @@ async fn the_daemon_adopts_a_host_of_both_protocols_through_either_descriptor() 
         .expect("the third's descriptor is published again");
     launcher::retire_descriptor(&environment, &HostProtocol::V4).expect("the fourth's is removed");
     hosted.restart().await;
-    let runtime = hosted.runtime().await;
+    let _asked = hosted.ask().await;
     assert_eq!(
         hosted.started(),
         0,
         "a daemon that finds the third protocol's descriptor alone started a host"
     );
+    let runtime = hosted.runtime().await;
     assert_eq!(
         runtime.protocol(),
         HostProtocol::V3,
