@@ -1930,7 +1930,12 @@ fn worker_beside_this_test() -> std::path::PathBuf {
 ///
 /// What it does not judge: a worker with no such list, or with a list older than the program. A run
 /// that builds the programs only to test writes no list of its own, so there is nothing to tell that
-/// worker by and it is used as it is.
+/// worker by and it is used as it is. That is every run of this target in CI, where a test build
+/// makes the worker last, and any worker a test build makes in a local run, a mutant's among them.
+/// What it does catch is a worker that `cargo build -p kr-worker` made and the tree then changed, or
+/// one built from the sources of another checkout. A file that a crate includes from outside its
+/// sources is named through `..` from inside them; it is read as the path it comes to, as the update
+/// harness does.
 fn built_from_another_tree(worker: &Path, repository: &Path) -> Option<String> {
     let listing = worker.with_extension("d");
     let text = match std::fs::read_to_string(&listing) {
@@ -1966,9 +1971,21 @@ fn built_from_another_tree(worker: &Path, repository: &Path) -> Option<String> {
             // A source that is listed and cannot be looked at is one the tree no longer has.
             Err(error) => return Some(format!("{source} cannot be looked at: {error}")),
         };
-        let named = source.replace('\\', "/");
+        // A file that a crate includes from outside its sources is named through `..` from inside
+        // them; it is read as the path it comes to, and is one of the crate's sources only if that
+        // is.
+        let mut resolved = std::path::PathBuf::new();
+        for component in path.components() {
+            match component {
+                std::path::Component::ParentDir => {
+                    resolved.pop();
+                }
+                other => resolved.push(other),
+            }
+        }
+        let named = resolved.to_string_lossy().replace('\\', "/");
         if named.contains("crates/kr-worker/src/") {
-            let there = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+            let there = std::fs::canonicalize(&resolved).unwrap_or(resolved);
             if !there.starts_with(&here) {
                 return Some(format!("it was built from the sources at {source}"));
             }
@@ -2010,8 +2027,14 @@ fn a_worker_built_before_the_tree_changed_or_elsewhere_is_told_apart() {
     let source = repository.join("crates/kr-worker/src/main.rs");
     let elsewhere = directory.path().join("other/crates/kr-worker/src/main.rs");
     let unrelated = directory.path().join("repository/crates/kr-ipc/src/lib.rs");
+    let included = repository.join("crates/kr-worker/src/broker/connectors.rs");
+    let fixture = repository.join("fixtures/connector.json");
+    let through =
+        repository.join("crates/kr-worker/src/broker/../../../../fixtures/connector.json");
     let worker = directory.path().join("target/kr-worker");
-    for path in [&source, &elsewhere, &unrelated, &worker] {
+    for path in [
+        &source, &elsewhere, &unrelated, &included, &fixture, &worker,
+    ] {
         place(path);
     }
     let listing = worker.with_extension("d");
@@ -2029,7 +2052,7 @@ fn a_worker_built_before_the_tree_changed_or_elsewhere_is_told_apart() {
     let now = SystemTime::now();
     let earlier = now - Duration::from_secs(3600);
     let later = now + Duration::from_secs(3600);
-    for path in [&source, &elsewhere, &unrelated] {
+    for path in [&source, &elsewhere, &unrelated, &included, &fixture] {
         dated(path, earlier);
     }
     dated(&worker, now);
@@ -2046,6 +2069,17 @@ fn a_worker_built_before_the_tree_changed_or_elsewhere_is_told_apart() {
         built_from_another_tree(&worker, &repository),
         None,
         "sources as old as the build are this tree's"
+    );
+
+    // A file the worker's `testing` build includes from outside its sources is named through `..`
+    // from inside them. It comes to a fixture of this tree, so it is not a source of another
+    // checkout.
+    list(&[&source, &included, &through]);
+    dated(&listing, later);
+    assert_eq!(
+        built_from_another_tree(&worker, &repository),
+        None,
+        "a file included through `..` from the worker's sources is read as the path it comes to"
     );
 
     dated(&source, later);
