@@ -200,8 +200,8 @@ pub static RULES: &[Rule] = &[
     // Action results the host cannot read: it cannot say whether any of them is unknown. The person
     // is told once and has nothing to answer here, so it is notable and does not climb. It is the
     // host's own record, so it is trusted. Nothing resolves it, so the inbox bound may drop it when
-    // the inbox is full; the gap itself stays recorded in the store. No code of this release raises
-    // it.
+    // the inbox is full; the gap itself stays recorded in the store while it is among the 64 most
+    // recent. No code of this release raises it.
     Rule {
         id: AttentionRule::ReceiptsGap,
         initial: AttentionLevel::Notable,
