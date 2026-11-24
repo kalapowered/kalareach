@@ -5,9 +5,9 @@
 //! so everything above the connection reads the same answers and notices whichever protocol the
 //! host speaks. A `/4` member the client has no use for is read and dropped: the position a
 //! checkpoint states, the report of what an instance consumed, the events a gap lost and the
-//! generation of a fault. A notice or an answer that names an older registration of a binding than
-//! the one the client gave it last is dropped too, since it belongs to an attempt the client gave
-//! up.
+//! generation of a fault. A notice that names a registration of a binding that the host has not
+//! answered as registered, or has refused or removed, is dropped too, since it belongs to an attempt
+//! the host did not keep.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -25,31 +25,105 @@ use crate::protocol4::{
 /// leaves behind when it ends can never be taken for a later registration's.
 static NEXT_REGISTRATION: AtomicU64 = AtomicU64::new(1);
 
-/// The registration each binding of one connection runs under, as the client gave it.
+/// What the client knows of the registrations of one connection, settled by what the host answers.
+///
+/// A registration the client writes is not its binding's until the host answers it as registered:
+/// the host refuses a second registration of a binding that has one and keeps the first, so a
+/// number the client minted for the second attempt owns nothing. Each answer is read here, by the
+/// request it answers, and the record of what it settled is removed with it.
 #[derive(Debug, Default)]
-pub(crate) struct Registrations(Mutex<HashMap<Uuid, u64>>);
+pub(crate) struct Registrations(Mutex<Held>);
+
+#[derive(Debug, Default)]
+struct Held {
+    /// The registration each binding runs under: the one the host answered as registered, until
+    /// the answer to a removal of it.
+    live: HashMap<Uuid, u64>,
+    /// The registrations written whose answers have not been read, by the request that carries each.
+    trying: HashMap<u64, Attempt>,
+    /// The removals written whose answers have not been read, by the request that carries each, with
+    /// the registration the binding ran under when it was written.
+    removing: HashMap<u64, (Uuid, Option<u64>)>,
+}
+
+/// A registration written and not yet answered.
+#[derive(Debug)]
+struct Attempt {
+    binding_id: Uuid,
+    registration: u64,
+}
 
 impl Registrations {
-    /// Gives a binding a registration number it never had.
-    fn begin(&self, binding_id: Uuid) -> u64 {
+    /// Gives the registration carried by request `request_id` a number it never had, and waits for
+    /// the host's answer before it is the binding's.
+    fn begin(&self, request_id: u64, binding_id: Uuid) -> u64 {
         let registration = NEXT_REGISTRATION.fetch_add(1, Ordering::Relaxed);
         if let Ok(mut held) = self.0.lock() {
-            held.insert(binding_id, registration);
+            held.trying.insert(
+                request_id,
+                Attempt {
+                    binding_id,
+                    registration,
+                },
+            );
         }
         registration
     }
 
-    /// The registration the binding runs under, where the client gave it one.
+    /// Notes that request `request_id` asks the host to remove a binding, and which registration the
+    /// binding runs under as it is written.
+    fn removal(&self, request_id: u64, binding_id: Uuid) {
+        if let Ok(mut held) = self.0.lock() {
+            let running = held.live.get(&binding_id).copied();
+            held.removing.insert(request_id, (binding_id, running));
+        }
+    }
+
+    /// Settles what the host's answer to request `reply_to` decides about registrations.
+    ///
+    /// A registration answered as registered is the binding's. Any other answer to it leaves the
+    /// binding as it was, so a refused duplicate keeps the registration the host holds. A removal
+    /// that is answered ends the registration the binding ran under when it was written, unless a
+    /// registration made since has replaced it.
+    fn settled(&self, reply_to: u64, body: &ResponseBody4) {
+        let Ok(mut held) = self.0.lock() else {
+            return;
+        };
+        if let Some(attempt) = held.trying.remove(&reply_to) {
+            if matches!(
+                body,
+                ResponseBody4::Registered { registration, .. } if *registration == attempt.registration
+            ) {
+                held.live.insert(attempt.binding_id, attempt.registration);
+            }
+        } else if let Some((binding_id, running)) = held.removing.remove(&reply_to)
+            && matches!(
+                body,
+                ResponseBody4::Unbound { .. } | ResponseBody4::Refused { .. }
+            )
+            && held.live.get(&binding_id).copied() == running
+        {
+            held.live.remove(&binding_id);
+        }
+    }
+
+    /// The registration the binding runs under, where the host answered one as registered.
     fn of(&self, binding_id: Uuid) -> Option<u64> {
         self.0
             .lock()
             .ok()
-            .and_then(|held| held.get(&binding_id).copied())
+            .and_then(|held| held.live.get(&binding_id).copied())
     }
 
-    /// Whether what carries `registration` belongs to the binding's current registration.
+    /// Whether what carries `registration` belongs to the binding's registration, or to one the host
+    /// has not yet answered, whose first notices can be read before its answer.
     fn is_current(&self, binding_id: Uuid, registration: u64) -> bool {
-        self.of(binding_id) == Some(registration)
+        self.0.lock().is_ok_and(|held| {
+            held.live.get(&binding_id) == Some(&registration)
+                || held.trying.values().any(|attempt| {
+                    attempt.binding_id == binding_id && attempt.registration == registration
+                })
+        })
     }
 }
 
@@ -57,7 +131,7 @@ impl Registrations {
 ///
 /// A registration is given its number here, as the request is written, so that what the host
 /// writes about it can never arrive before the client knows the number. `minting` is false when
-/// only the size of the frame is wanted.
+/// only the size of the frame is wanted, which records nothing.
 pub(crate) fn request_of(
     request: Request,
     registrations: &Registrations,
@@ -69,7 +143,7 @@ pub(crate) fn request_of(
         RequestBody::Verify { nonce } => RequestBody4::Verify { nonce },
         RequestBody::RegisterBinding(binding) => {
             let registration = if minting {
-                registrations.begin(binding.binding_id)
+                registrations.begin(request_id, binding.binding_id)
             } else {
                 u64::MAX
             };
@@ -106,7 +180,12 @@ pub(crate) fn request_of(
             through: None,
             deadline_ms,
         },
-        RequestBody::Unbind { binding_id } => RequestBody4::Unbind { binding_id },
+        RequestBody::Unbind { binding_id } => {
+            if minting {
+                registrations.removal(request_id, binding_id);
+            }
+            RequestBody4::Unbind { binding_id }
+        }
         RequestBody::Health => RequestBody4::Health,
         RequestBody::Decode(call) => RequestBody4::Decode(call),
         RequestBody::Encode(call) => RequestBody4::Encode(call),
@@ -129,10 +208,13 @@ pub(crate) fn request_of(
 /// the client has no use for or one of a registration it gave up.
 pub(crate) fn frame_of(frame: Frame4, registrations: &Registrations) -> Option<Frame> {
     match frame {
-        Frame4::Response { reply_to, body } => Some(Frame::Response {
-            reply_to,
-            body: response_of(body),
-        }),
+        Frame4::Response { reply_to, body } => {
+            registrations.settled(reply_to, &body);
+            Some(Frame::Response {
+                reply_to,
+                body: response_of(body),
+            })
+        }
         Frame4::Notice(notice) => notice_of(notice, registrations).map(Frame::Notice),
     }
 }
@@ -263,16 +345,36 @@ mod tests {
         }
     }
 
+    fn registered(registration: u64) -> ResponseBody4 {
+        ResponseBody4::Registered {
+            registration,
+            origin: "cached".to_owned(),
+            elapsed_ms: 1,
+        }
+    }
+
+    fn refused() -> ResponseBody4 {
+        ResponseBody4::Refused {
+            request: "register_binding".to_owned(),
+            detail: "refused".to_owned(),
+            disabled: false,
+        }
+    }
+
+    /// Writes a registration of the binding as request `request_id` and returns its number.
+    fn register(registrations: &Registrations, request_id: u64) -> u64 {
+        registrations.begin(request_id, binding())
+    }
+
     #[test]
     fn a_registration_never_repeats_an_earlier_one_of_the_binding() {
         let registrations = Registrations::default();
-        let first = registrations.begin(binding());
-        let second = registrations.begin(binding());
+        let first = register(&registrations, 1);
+        let second = register(&registrations, 2);
         assert_ne!(first, second, "a registration repeated the one before it");
-        assert_eq!(registrations.of(binding()), Some(second));
         // A second connection's registrations are not the first's either.
         let other = Registrations::default();
-        let third = other.begin(binding());
+        let third = register(&other, 1);
         assert!(
             third != first && third != second,
             "a registration repeated one of an earlier connection"
@@ -280,29 +382,100 @@ mod tests {
     }
 
     #[test]
-    fn a_notice_of_a_registration_the_client_gave_up_is_dropped() {
+    fn a_registration_is_the_bindings_when_the_host_answers_it_as_registered() {
         let registrations = Registrations::default();
-        let old = registrations.begin(binding());
-        let current = registrations.begin(binding());
-        assert!(
-            notice_of(document(old), &registrations).is_none(),
-            "a notice of the older registration was kept"
+        let first = register(&registrations, 1);
+        assert_eq!(
+            registrations.of(binding()),
+            None,
+            "a registration was the binding's before the host answered it"
+        );
+        registrations.settled(1, &registered(first));
+        assert_eq!(registrations.of(binding()), Some(first));
+    }
+
+    #[test]
+    fn a_refused_duplicate_keeps_the_registration_the_host_holds() {
+        let registrations = Registrations::default();
+        let first = register(&registrations, 1);
+        registrations.settled(1, &registered(first));
+        let second = register(&registrations, 2);
+        // While its answer is awaited, the notices of both are the binding's.
+        assert!(notice_of(document(first), &registrations).is_some());
+        assert!(notice_of(document(second), &registrations).is_some());
+        registrations.settled(2, &refused());
+        assert_eq!(
+            registrations.of(binding()),
+            Some(first),
+            "a refused duplicate took the binding's registration"
         );
         assert!(
             matches!(
-                notice_of(document(current), &registrations),
+                notice_of(document(first), &registrations),
                 Some(Notice::Document { document: 1, .. })
             ),
-            "a notice of the current registration was dropped"
+            "a notice of the registration the host holds was dropped"
         );
-        // A binding the client gave no registration to has none to belong to.
-        assert!(notice_of(document(current + 1), &registrations).is_none());
+        assert!(
+            notice_of(document(second), &registrations).is_none(),
+            "a notice of the refused registration was kept"
+        );
+    }
+
+    #[test]
+    fn a_registration_the_host_refused_leaves_nothing_behind() {
+        let registrations = Registrations::default();
+        register(&registrations, 1);
+        registrations.settled(1, &refused());
+        let held = registrations.0.lock().expect("the record is usable");
+        assert!(
+            held.trying.is_empty() && held.live.is_empty() && held.removing.is_empty(),
+            "a refused registration left a record: {held:?}"
+        );
+    }
+
+    #[test]
+    fn a_removal_the_host_answered_leaves_nothing_behind() {
+        let registrations = Registrations::default();
+        let first = register(&registrations, 1);
+        registrations.settled(1, &registered(first));
+        registrations.removal(2, binding());
+        registrations.settled(2, &ResponseBody4::Unbound { existed: true });
+        assert_eq!(registrations.of(binding()), None);
+        assert!(
+            notice_of(document(first), &registrations).is_none(),
+            "a notice of a removed registration was kept"
+        );
+        let held = registrations.0.lock().expect("the record is usable");
+        assert!(
+            held.trying.is_empty() && held.live.is_empty() && held.removing.is_empty(),
+            "a removal left a record: {held:?}"
+        );
+    }
+
+    #[test]
+    fn a_removal_answered_after_a_later_registration_keeps_the_later_one() {
+        let registrations = Registrations::default();
+        let first = register(&registrations, 1);
+        registrations.settled(1, &registered(first));
+        registrations.removal(2, binding());
+        // The host removes the first, registers the second, and the second's answer is read before
+        // the removal's.
+        let second = register(&registrations, 3);
+        registrations.settled(3, &registered(second));
+        registrations.settled(2, &ResponseBody4::Unbound { existed: true });
+        assert_eq!(
+            registrations.of(binding()),
+            Some(second),
+            "a removal of the first registration ended the second"
+        );
     }
 
     #[test]
     fn a_report_of_what_was_consumed_is_not_passed_on() {
         let registrations = Registrations::default();
-        let current = registrations.begin(binding());
+        let current = register(&registrations, 1);
+        registrations.settled(1, &registered(current));
         let report = Notice4::Consumed {
             binding_id: binding(),
             registration: current,
@@ -317,7 +490,8 @@ mod tests {
     #[test]
     fn a_restore_carries_the_registration_of_its_binding_and_no_position() {
         let registrations = Registrations::default();
-        let current = registrations.begin(binding());
+        let current = register(&registrations, 1);
+        registrations.settled(1, &registered(current));
         let request = Request {
             request_id: 9,
             body: RequestBody::Restore {
