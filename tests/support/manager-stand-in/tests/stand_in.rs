@@ -1244,6 +1244,36 @@ fn a_case_that_leaves_a_line_that_is_not_a_start() {
     std::fs::write(&file, "this is not a start\n").expect("a line that is not a start");
 }
 
+/// A process the fixture cannot end fails the case: the fixture does not end the case as if it had
+/// ended every process when one is still there.
+#[test]
+fn a_process_the_fixture_cannot_end_fails_the_case() {
+    let child = run_as_child("a_case_that_leaves_a_process_the_fixture_cannot_end");
+    let said = text(&child.stdout);
+    assert_eq!(
+        child.status.code(),
+        Some(101),
+        "the child case does not fail: {said}"
+    );
+    assert!(
+        said.contains("the fixture could not end every process of the case")
+            && said.contains("not shown to have ended"),
+        "the child case fails for another reason: {said}"
+    );
+}
+
+/// Run by the case above, in a child test process: its fixture is told to end the test process
+/// itself, which nothing may end, and the case ends.
+#[test]
+#[ignore = "run by the case that shows a process the fixture cannot end fails the case"]
+fn a_case_that_leaves_a_process_the_fixture_cannot_end() {
+    if std::env::var_os(CHILD_VARIABLE).is_none() {
+        return;
+    }
+    let fixture = Fixture::new();
+    fixture.track(&started_process_identity(std::process::id()).expect("this process"));
+}
+
 /// A group the fixture cannot read is a problem of the case and not an empty group, and the
 /// processes it did find are ended all the same.
 #[test]
