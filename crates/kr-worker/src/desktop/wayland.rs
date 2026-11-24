@@ -149,7 +149,7 @@ fn screen_copy(check: Check, plan: &Plan, setting: &Setting<'_>, tool: &str) -> 
             Some(read) => read
                 .and_then(|bytes| payload::png(&bytes).map(|_| bytes.len()))
                 .map_err(|fault| Outcome::NotAttempted {
-                    detail: fault.left_no_usable_image(),
+                    detail: fault.left_no_usable_image(payload::PNG_IMAGE),
                 }),
         },
         // The tool's own words for a compositor that does not have the protocol. That is an

@@ -42,15 +42,17 @@ pub(super) enum Fault {
 impl Fault {
     /// What a check says of a tool that exited successfully and left a payload that is not an
     /// image: the one frame every route that measures an image uses, and the fault's own words at
-    /// its end.
-    pub(super) fn left_no_usable_image(&self) -> Sentence {
+    /// its end. `format` names the image the route asked for, as a phrase that reads after "a file
+    /// that is not " (such as [`PNG_IMAGE`]), so that the three faults of the format's own say which
+    /// format they mean.
+    pub(super) fn left_no_usable_image(&self, format: &'static str) -> Sentence {
         let frame = Sentence::new()
             .stated("the screen-copy tool exited successfully and left no usable image: ");
         match self {
             Self::Empty => frame.stated("no file, or an empty one"),
-            Self::NotThisFormat => frame.stated("a file that is not a PNG image"),
-            Self::NoPixels => frame.stated("a PNG image with no pixels"),
-            Self::CutShort => frame.stated("a PNG image that is cut short"),
+            Self::NotThisFormat => frame.stated("a file that is not ").stated(format),
+            Self::NoPixels => frame.stated(format).stated(" with no pixels"),
+            Self::CutShort => frame.stated(format).stated(" that is cut short"),
             Self::NotAFile => frame.stated("something that is not a regular file"),
             Self::TooLarge(limit) => frame
                 .stated("a file of more than ")
@@ -62,6 +64,9 @@ impl Fault {
         }
     }
 }
+
+/// The image [`png`] accepts, as the phrase [`Fault::left_no_usable_image`] puts into its endings.
+pub(super) const PNG_IMAGE: &str = "a PNG image";
 
 /// The most bytes of an image that a check reads into memory: 256 MiB.
 ///
@@ -563,7 +568,7 @@ pub(super) mod tests {
     /// faults of the file's own, in the words the lead approved.
     #[test]
     fn the_words_for_a_file_that_is_not_there_to_be_measured() {
-        let said = |fault: Fault| fault.left_no_usable_image().as_str().to_owned();
+        let said = |fault: Fault| fault.left_no_usable_image(PNG_IMAGE).as_str().to_owned();
         let frame = "the screen-copy tool exited successfully and left no usable image: ";
         assert_eq!(
             said(Fault::NotAFile),
@@ -578,5 +583,49 @@ pub(super) mod tests {
                 .starts_with(&format!("{frame}a file that could not be read: ")),
         );
         assert_eq!(IMAGE_LIMIT, 268_435_456);
+    }
+
+    /// KR-REQ-03.29, LP-11: the image's format goes into the three endings that name it, so a route
+    /// that asks for another format says that one, and the PNG words are the ones the lead approved.
+    #[test]
+    fn the_format_goes_into_the_endings_that_name_it() {
+        let said = |fault: Fault, format: &'static str| {
+            let whole = fault.left_no_usable_image(format).as_str().to_owned();
+            let frame = "the screen-copy tool exited successfully and left no usable image: ";
+            whole
+                .strip_prefix(frame)
+                .map(str::to_owned)
+                .unwrap_or_else(|| panic!("the frame is missing: {whole}"))
+        };
+        assert_eq!(
+            said(Fault::NotThisFormat, "a JPEG image"),
+            "a file that is not a JPEG image"
+        );
+        assert_eq!(
+            said(Fault::NoPixels, "a JPEG image"),
+            "a JPEG image with no pixels"
+        );
+        assert_eq!(
+            said(Fault::CutShort, "a JPEG image"),
+            "a JPEG image that is cut short"
+        );
+        // The format is not in the one ending that names no format.
+        assert_eq!(
+            said(Fault::Empty, "a JPEG image"),
+            "no file, or an empty one"
+        );
+        // The PNG words are the ones that stood before the format was a part.
+        assert_eq!(
+            said(Fault::NotThisFormat, PNG_IMAGE),
+            "a file that is not a PNG image"
+        );
+        assert_eq!(
+            said(Fault::NoPixels, PNG_IMAGE),
+            "a PNG image with no pixels"
+        );
+        assert_eq!(
+            said(Fault::CutShort, PNG_IMAGE),
+            "a PNG image that is cut short"
+        );
     }
 }
