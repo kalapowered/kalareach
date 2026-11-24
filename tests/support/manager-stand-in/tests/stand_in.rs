@@ -36,12 +36,13 @@ use kr_protocol::identity::ProcessStartIdentity;
 /// a second, run for as long as their case lets them. A number that passes to another process
 /// between the start of a process and its one reading is not guarded against.
 struct Fixture {
-    tree: PrivateTempDir,
-    installation: PrivateTempDir,
     program: PathBuf,
     uid: u32,
     /// The processes the case started itself.
     started: Mutex<Vec<ProcessStartIdentity>>,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    tree: PrivateTempDir,
+    installation: PrivateTempDir,
 }
 
 impl Drop for Fixture {
