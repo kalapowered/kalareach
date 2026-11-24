@@ -4776,7 +4776,8 @@ fn the_stand_in_saw_the_install(host: &ServiceHost, stand_in: &manager_stand_in:
 
 /// What the stand-in's calls and its job say once the first session has started the daemon: the
 /// changes are the load and one start, both from `kr`; the job runs the process the host's own
-/// question names, as its definition says; `kr` and the daemon each read the desktop through the
+/// question names, as its definition says, and that process's command line names the tree's roots
+/// as whole words; `kr` and the daemon each read the desktop through the
 /// stand-in in this step, after the `boundary` that the install's calls ended at; and no call came
 /// from a worker.
 #[cfg(target_os = "macos")]
@@ -4861,6 +4862,21 @@ fn the_stand_in_started_the_daemon(
     for kept in ["HOME", "PATH", kr_ipc::testing::manager_stand_in::VARIABLE] {
         assert!(keys.contains(&kept), "the daemon holds {kept}: {keys:?}");
     }
+    // The daemon's own command line names the roots of the tree as whole words, as the definition
+    // says, so a process started for another tree is not taken for it.
+    let arguments = arguments_of(daemon);
+    let words: Vec<&str> = arguments.split_whitespace().collect();
+    let paths = host.tree.paths();
+    for (flag, root) in [
+        ("--runtime-dir", paths.runtime_root()),
+        ("--state-dir", paths.state_root()),
+    ] {
+        let root = root.to_str().expect("a path that is text");
+        assert!(
+            words.windows(2).any(|pair| pair == [flag, root]),
+            "the daemon's command line names {flag} {root}: {arguments}"
+        );
+    }
     // The process is the daemon the definition names, as launchd would have it: a child of the
     // system's first process, leading a group of its own in a session of its own that no terminal
     // ends, with no controlling terminal and the state directory as its working directory.
@@ -4911,6 +4927,18 @@ fn the_stand_in_started_the_daemon(
         daemon,
         "the session's worker is the daemon's child"
     );
+}
+
+/// The command line of a process of this user's, as `ps` shows it.
+#[cfg(target_os = "macos")]
+fn arguments_of(pid: u32) -> String {
+    let output = spawning(|| {
+        Command::new("/bin/ps")
+            .args(["-o", "args=", "-p", &pid.to_string()])
+            .output()
+    })
+    .expect("runs ps");
+    String::from_utf8_lossy(&output.stdout).trim().to_owned()
 }
 
 /// After `kr host startup --clear`: the stand-in was asked for nothing but the load and the one
