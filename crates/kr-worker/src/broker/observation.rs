@@ -94,6 +94,10 @@ pub struct NativeFrame {
     /// The upstream's identifier for the request, where the frame is one the upstream is waiting
     /// on. Such an entry is authoritative.
     pub request_id: Option<String>,
+    /// The place the broker recorded the request in ([`super::arbitration::Pending::recorded`]),
+    /// where the frame is a request it recorded. A producer pushes the frame after the broker's lock
+    /// is dropped, so the order of pushes is not the order of records: this is.
+    pub recorded: Option<u64>,
     /// The frame's bytes, shared and never changed.
     pub bytes: Arc<[u8]>,
 }
@@ -1352,6 +1356,7 @@ pub(super) struct NativeTap {
     package: PackageIdentity,
     handle: Option<SourceEventHandle>,
     request_id: Option<String>,
+    recorded: Option<u64>,
 }
 
 impl super::BrokerState {
@@ -1374,20 +1379,25 @@ impl super::BrokerState {
         }
         let instance = self.gateway.instance_of(connection)?;
         let package = self.connection_package(connection)?;
-        let (handle, request_id) = match (&forwarded.request, forwarded.expects_response) {
+        let (handle, request_id, recorded) = match (&forwarded.request, forwarded.expects_response)
+        {
             (Some(request), true) => (
                 resource
                     .and_then(|resource| self.arbitration.source_of(resource.resource_id))
                     .cloned(),
                 Some(request.upstream.as_str().to_owned()),
+                resource
+                    .and_then(|resource| self.arbitration.get(resource.resource_id))
+                    .map(|pending| pending.recorded),
             ),
-            _ => (None, None),
+            _ => (None, None, None),
         };
         Some(NativeTap {
             instance,
             package,
             handle,
             request_id,
+            recorded,
         })
     }
 }
@@ -1410,6 +1420,7 @@ impl Broker {
                 package: tap.package,
                 handle: tap.handle,
                 request_id: tap.request_id,
+                recorded: tap.recorded,
                 bytes: Arc::from(frame),
             },
             now.get(),

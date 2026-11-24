@@ -82,6 +82,7 @@ fn request(bytes: usize) -> NativeFrame {
         },
         handle: None,
         request_id: Some("request-1".to_owned()),
+        recorded: None,
         bytes: Arc::from(vec![b'r'; bytes]),
     }
 }

@@ -61,6 +61,9 @@ pub struct Pending {
     /// decoded it: what a component is handed of it again, to observe it or to encode the answer, is
     /// made in privacy mode too. Once true it stays true.
     pub made_in_privacy: bool,
+    /// The place this resource has in the order the broker recorded its resources in: unique, and
+    /// higher for a later record. A resource's identifier says nothing of the order, and this does.
+    pub recorded: u64,
 }
 
 /// Which writer holds the one admission to transmit an answer for a pending resource.
@@ -197,6 +200,8 @@ pub struct Arbitration {
     /// ones would leave a request the upstream withdrew inside the gap recorded as pending for
     /// ever, because nothing would ever write its ending down.
     volatile_touched: std::collections::BTreeSet<PendingResourceId>,
+    /// The place the next resource takes in the order of recording ([`Pending::recorded`]).
+    next_recorded: u64,
 }
 
 impl Arbitration {
@@ -234,6 +239,7 @@ impl Arbitration {
         }
         self.by_request
             .insert(resource.request.clone(), resource.resource_id);
+        let recorded = self.take_place();
         self.by_id.insert(
             resource.resource_id,
             Pending {
@@ -244,9 +250,32 @@ impl Arbitration {
                 decoder,
                 source,
                 made_in_privacy: false,
+                recorded,
             },
         );
         Ok(())
+    }
+
+    /// Takes the next place in the order of recording.
+    fn take_place(&mut self) -> u64 {
+        let place = self.next_recorded;
+        self.next_recorded = place.saturating_add(1);
+        place
+    }
+
+    /// Returns the place the next resource takes in the order of recording: every resource recorded
+    /// so far is before it, and every resource recorded after is at or after it.
+    #[must_use]
+    pub const fn next_recorded(&self) -> u64 {
+        self.next_recorded
+    }
+
+    /// Returns every resource in the order the broker recorded them in, oldest first.
+    #[must_use]
+    pub fn in_recorded_order(&self) -> Vec<&Pending> {
+        let mut all: Vec<&Pending> = self.by_id.values().collect();
+        all.sort_by_key(|pending| pending.recorded);
+        all
     }
 
     /// Replaces one resource with its verified interpretation.
@@ -312,6 +341,7 @@ impl Arbitration {
     ) {
         self.by_request
             .insert(resource.request.clone(), resource.resource_id);
+        let recorded = self.take_place();
         self.by_id.insert(
             resource.resource_id,
             Pending {
@@ -325,6 +355,7 @@ impl Arbitration {
                 decoder,
                 source: None,
                 made_in_privacy: false,
+                recorded,
             },
         );
     }
@@ -1049,6 +1080,70 @@ mod tests {
         let claim = transition.claim().cloned().expect("a claim was planned");
         arbitration.commit(transition)?;
         Ok(claim)
+    }
+
+    #[test]
+    fn resources_are_listed_in_the_order_they_were_recorded_whatever_their_identifiers() {
+        let mut arbitration = Arbitration::new();
+        for (byte, request) in [(9, "1"), (3, "2"), (7, "3"), (1, "4"), (8, "5")] {
+            arbitration
+                .record(resource(byte, request), None, None)
+                .expect("recorded");
+        }
+        let recorded: Vec<&str> = arbitration
+            .in_recorded_order()
+            .into_iter()
+            .map(|pending| pending.resource.request.upstream.as_str())
+            .collect();
+        assert_eq!(recorded, ["1", "2", "3", "4", "5"]);
+        // The identifiers run the other way for these five, so the order is not theirs.
+        let by_identifier: Vec<&str> = arbitration
+            .iter()
+            .map(|pending| pending.resource.request.upstream.as_str())
+            .collect();
+        assert_ne!(by_identifier, recorded);
+    }
+
+    #[test]
+    fn the_recording_boundary_separates_what_was_recorded_before_from_what_comes_after() {
+        let mut arbitration = Arbitration::new();
+        arbitration
+            .record(resource(5, "1"), None, None)
+            .expect("recorded");
+        arbitration
+            .record(resource(2, "2"), None, None)
+            .expect("recorded");
+        let boundary = arbitration.next_recorded();
+        arbitration
+            .record(resource(9, "3"), None, None)
+            .expect("recorded");
+        let place = |byte: u8| {
+            arbitration
+                .get(PendingResourceId::new(Uuid::from_bytes([byte; 16])))
+                .expect("recorded")
+                .recorded
+        };
+        assert!(place(5) < boundary && place(2) < boundary);
+        assert!(place(9) >= boundary);
+        assert!(place(5) < place(2) && place(2) < place(9));
+    }
+
+    #[test]
+    fn a_resource_read_back_from_the_ledger_takes_its_place_after_those_before_it() {
+        let mut arbitration = Arbitration::new();
+        arbitration
+            .record(resource(5, "1"), None, None)
+            .expect("recorded");
+        arbitration.restore(resource(2, "2"), false, None);
+        arbitration
+            .record(resource(1, "3"), None, None)
+            .expect("recorded");
+        let order: Vec<&str> = arbitration
+            .in_recorded_order()
+            .into_iter()
+            .map(|pending| pending.resource.request.upstream.as_str())
+            .collect();
+        assert_eq!(order, ["1", "2", "3"]);
     }
 
     #[test]

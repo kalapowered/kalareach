@@ -14,7 +14,7 @@ mod plugin_world;
 
 use kr_protocol::gateway::{PendingKind, PendingState};
 use kr_protocol::local::ControllerConnectionRole;
-use kr_worker::broker::observation::Audience;
+use kr_worker::broker::observation::{Audience, Source};
 use plugin_world::observing::{
     Observing, Options, Spec, answered, binding, credential, digest, highest_line, instance,
     notification, request, unlisted,
@@ -643,6 +643,58 @@ async fn kr_req_11_41_a_compile_that_is_queued_and_not_done_leaves_the_terminal_
         !reason.contains("fault"),
         "a compile that waited faulted the binding: {reason}"
     );
+}
+
+/// KR-REQ-24.24: a request frame the lane holds carries the place the broker recorded the request
+/// in, which is the order of the broker's records and not the order of the request's identifier.
+///
+/// A producer pushes a frame after the broker's lock is dropped, so the order of pushes does not
+/// say which of two requests the broker recorded first. The place is what a rebuilt component's
+/// baseline and the lane's live entries are ordered by. A frame that is not a request carries none.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_24_24_a_request_frame_in_the_lane_carries_the_place_the_broker_recorded_it_in() {
+    let Some(world) = Observing::start(Options::with(vec![Spec::semantic_only(1)])).await else {
+        return;
+    };
+    world.until_ready(1).await;
+    let lane = world.broker().observation();
+    let hold = lane.hold_pump();
+    until("the pump to stop at the hold", || async {
+        hold.parked().then_some(())
+    })
+    .await;
+    world.send(&request(9));
+    world.send(&notification("between"));
+    world.send(&request(7));
+    until("the lane to hold the three frames", || async {
+        (lane.waiting() == 3).then_some(())
+    })
+    .await;
+    let mut taken = Vec::new();
+    for _ in 0..3 {
+        let entry = lane.take().entry.expect("an entry waits");
+        let Source::Native(frame) = &entry.source else {
+            panic!("an upstream frame: {entry:?}");
+        };
+        taken.push((frame.request_id.clone(), frame.recorded));
+        lane.finish(&entry);
+    }
+    hold.release();
+    assert_eq!(
+        taken
+            .iter()
+            .map(|(id, _)| id.as_deref())
+            .collect::<Vec<_>>(),
+        [Some("9"), None, Some("7")]
+    );
+    assert_eq!(taken[1].1, None, "a notification is no record");
+    let nine = taken[0]
+        .1
+        .expect("a request carries the place it was recorded in");
+    let seven = taken[2]
+        .1
+        .expect("a request carries the place it was recorded in");
+    assert!(nine < seven, "9 was recorded before 7: {taken:?}");
 }
 
 /// KR-REQ-24.06: a plugin runtime that is killed while the worker holds a receipt, a question and an
