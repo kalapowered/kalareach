@@ -5,9 +5,10 @@
 //! so everything above the connection reads the same answers and notices whichever protocol the
 //! host speaks. A `/4` member the client has no use for is read and dropped: the position a
 //! checkpoint states, the report of what an instance consumed, the events a gap lost and the
-//! generation of a fault. A notice that names a registration of a binding that the host has not
-//! answered as registered, or has refused or removed, is dropped too, since it belongs to an attempt
-//! the host did not keep.
+//! generation of a fault. A notice that names a registration the host refused or removed is dropped
+//! too, since it belongs to an attempt the host did not keep. A notice of a registration whose
+//! answer has not been read is kept, since the host can write it before the answer, unless the
+//! answer to a removal written since has been read.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
