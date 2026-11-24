@@ -740,6 +740,15 @@ fn within(at: &str, place: &str) -> bool {
 ///
 /// Returns one line for each problem.
 pub fn check() -> Result<(), Vec<String>> {
+    check_serving(PLUGIN_HOST_PROTOCOLS)
+}
+
+/// [`check`] for a build that serves the plugin host protocols `served`.
+///
+/// # Errors
+///
+/// Returns one line for each problem.
+pub fn check_serving(served: &[&str]) -> Result<(), Vec<String>> {
     let mut problems = Vec::new();
     let kept: Vec<CompatibilityLevel> = RETAINED.iter().map(|retained| retained.level).collect();
     if kept != RETAINED_WORKER_LEVELS {
@@ -766,7 +775,7 @@ pub fn check() -> Result<(), Vec<String>> {
         problems.extend(host_problems(
             retained.level,
             &retained.plugin_host_names(),
-            PLUGIN_HOST_PROTOCOLS,
+            served,
         ));
         if THIS_LEVEL <= retained.level {
             problems.push(format!(

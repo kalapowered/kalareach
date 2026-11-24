@@ -112,6 +112,29 @@ fn the_surface_kept_for_the_previous_release_is_the_one_this_build_has() {
     }
 }
 
+/// The check of the retained levels holds each level's plugin host protocol names against the
+/// names the build serves: a build that does not serve a name the level recorded is refused, and one
+/// that serves more is not.
+#[test]
+fn the_check_of_the_retained_levels_refuses_a_build_that_does_not_serve_a_recorded_host_protocol() {
+    use kr_protocol::retained::{PLUGIN_HOST_PROTOCOLS, RETAINED, check_serving};
+    let recorded = RETAINED[0].plugin_host_names();
+    assert!(!recorded.is_empty(), "the level records no name");
+    let problems = match check_serving(&["kr-plugin-host/9"]) {
+        Err(problems) => problems,
+        Ok(()) => panic!("a build that serves none of the recorded names was accepted"),
+    };
+    assert!(
+        problems
+            .iter()
+            .any(|line| line.contains(recorded[0]) && line.contains("does not serve")),
+        "{problems:?}"
+    );
+    let mut more = PLUGIN_HOST_PROTOCOLS.to_vec();
+    more.push("kr-plugin-host/9");
+    assert_eq!(check_serving(&more), Ok(()), "a build that serves one more");
+}
+
 /// Two real releases: one variant, found at the place that carries it.
 #[test]
 fn two_real_releases_differ_by_the_attention_source_authority() {
