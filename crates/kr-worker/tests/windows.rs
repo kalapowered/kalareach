@@ -688,8 +688,9 @@ fn start_in(
             .expect("an environment"),
         session: None,
         agent: job,
-        pipe_input: false,
-        pipe_output: false,
+        stdin: kr_worker::windows::launch::Stdio::Null,
+        stdout: kr_worker::windows::launch::Stdio::Null,
+        stderr: kr_worker::windows::launch::Stdio::Null,
     })
     .expect("the program starts in its job")
 }

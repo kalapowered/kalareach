@@ -247,8 +247,9 @@ impl Process {
             environment: &environment,
             session: None,
             agent: &job,
-            pipe_input: false,
-            pipe_output: true,
+            stdin: crate::windows::launch::Stdio::Null,
+            stdout: crate::windows::launch::Stdio::Blocking,
+            stderr: crate::windows::launch::Stdio::Null,
         })?;
         Ok(Self { child, job })
     }

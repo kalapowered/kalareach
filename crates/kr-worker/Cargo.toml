@@ -75,8 +75,9 @@ tokio-util = { workspace = true, features = ["compat"] }
 uds_windows.workspace = true
 # The login reader asks Terminal Services about the session its process runs in. The gateway socket
 # asks the kernel which process is at the other end of a connection (a socket control call), and
-# which Windows build this is when it cannot.
-windows-sys = { workspace = true, features = ["Wdk_System_SystemServices", "Win32_Networking_WinSock", "Win32_System_RemoteDesktop", "Win32_System_SystemInformation", "Win32_System_SystemServices"] }
+# which Windows build this is when it cannot. A private pipe is created with a security descriptor
+# written as text, and its access list is read back from the pipe's handle.
+windows-sys = { workspace = true, features = ["Wdk_System_SystemServices", "Win32_Networking_WinSock", "Win32_Security_Authorization", "Win32_System_RemoteDesktop", "Win32_System_SystemInformation", "Win32_System_SystemServices"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # The question ledger records the executable and the parent of a calling process, which macOS

@@ -428,8 +428,9 @@ impl Shell {
                 .expect("an environment"),
             session: Some(&self.job),
             agent,
-            pipe_input: false,
-            pipe_output: false,
+            stdin: kr_worker::windows::launch::Stdio::Null,
+            stdout: kr_worker::windows::launch::Stdio::Null,
+            stderr: kr_worker::windows::launch::Stdio::Null,
         })
         .expect("the launcher starts")
     }
@@ -913,8 +914,9 @@ impl Scripted {
                 .expect("an environment"),
             session: Some(&shell.job),
             agent: &agent,
-            pipe_input: true,
-            pipe_output: true,
+            stdin: kr_worker::windows::launch::Stdio::Blocking,
+            stdout: kr_worker::windows::launch::Stdio::Blocking,
+            stderr: kr_worker::windows::launch::Stdio::Null,
         })
         .expect("the scripted launcher starts");
         let answers = std::io::BufReader::new(child.stdout.take().expect("its output"));

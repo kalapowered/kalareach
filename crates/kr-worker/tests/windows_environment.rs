@@ -33,8 +33,9 @@ fn said(environment: &Environment, line: &str) -> (String, i32) {
         environment,
         session: None,
         agent: &job,
-        pipe_input: false,
-        pipe_output: true,
+        stdin: kr_worker::windows::launch::Stdio::Null,
+        stdout: kr_worker::windows::launch::Stdio::Blocking,
+        stderr: kr_worker::windows::launch::Stdio::Null,
     })
     .expect("cmd.exe starts");
     let mut text = String::new();

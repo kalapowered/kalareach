@@ -796,8 +796,9 @@ mod tests {
                 .expect("an environment"),
             session: None,
             agent: job,
-            pipe_input: false,
-            pipe_output: false,
+            stdin: super::super::launch::Stdio::Null,
+            stdout: super::super::launch::Stdio::Null,
+            stderr: super::super::launch::Stdio::Null,
         })
         .expect("the agent starts")
     }

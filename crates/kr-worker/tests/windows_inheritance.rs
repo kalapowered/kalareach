@@ -176,8 +176,28 @@ impl Jobs {
                 .expect("an environment"),
             session: Some(&*self.session),
             agent: &self.agent,
-            pipe_input: true,
-            pipe_output: true,
+            stdin: kr_worker::windows::launch::Stdio::Blocking,
+            stdout: kr_worker::windows::launch::Stdio::Blocking,
+            stderr: kr_worker::windows::launch::Stdio::Null,
+        })
+    }
+}
+
+impl Jobs {
+    /// Starts `ping` with all three streams overlapped, as a server's start does. A runtime has to
+    /// be entered.
+    fn launch_overlapped(&self) -> std::io::Result<kr_worker::windows::launch::Child> {
+        start(&Spec {
+            program: &system_program("ping.exe"),
+            arguments: &["-n".to_owned(), "600".to_owned(), "127.0.0.1".to_owned()],
+            directory: &std::env::temp_dir(),
+            environment: &kr_worker::windows::launch::Environment::of_this_process_with(&[])
+                .expect("an environment"),
+            session: Some(&*self.session),
+            agent: &self.agent,
+            stdin: kr_worker::windows::launch::Stdio::Overlapped,
+            stdout: kr_worker::windows::launch::Stdio::Overlapped,
+            stderr: kr_worker::windows::launch::Stdio::Overlapped,
         })
     }
 }
@@ -235,6 +255,28 @@ fn a_launch_gives_its_agent_only_the_handles_it_lists() {
         event.holders(),
         1,
         "the agent a launch started holds none of the worker's other handles"
+    );
+    drop(agent);
+}
+
+/// The same holds when the three streams are overlapped pipes: the agent holds the ends its launch
+/// lists, and no other handle of the worker.
+#[test]
+fn a_launch_with_overlapped_pipes_gives_its_agent_only_the_handles_it_lists() {
+    let _alone = alone();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a runtime");
+    let _enter = runtime.enter();
+    let event = Event::new();
+    event.inheritable(true);
+    let jobs = Jobs::new();
+    let agent = jobs.launch_overlapped().expect("the agent starts");
+    assert_eq!(
+        event.holders(),
+        1,
+        "the agent started with overlapped pipes holds none of the worker's other handles"
     );
     drop(agent);
 }

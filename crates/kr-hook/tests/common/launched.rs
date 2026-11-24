@@ -475,8 +475,9 @@ impl Started {
             .expect("an environment"),
             session: Some(session.as_ref()),
             agent: &job,
-            pipe_input: true,
-            pipe_output: true,
+            stdin: kr_worker::windows::launch::Stdio::Blocking,
+            stdout: kr_worker::windows::launch::Stdio::Blocking,
+            stderr: kr_worker::windows::launch::Stdio::Null,
         })
         .expect("the application starts");
         let identity =

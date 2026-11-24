@@ -6,12 +6,18 @@
 //! process is created suspended and asked whether each job holds it before its first instruction.
 //!
 //! What the agent is given is exactly three handles, named by the handle-list attribute: its
-//! standard input and output, which are pipes this host keeps the other ends of, and a null device
-//! for its standard error. Nothing else this worker holds that could be inherited reaches it, and
-//! the ends of the pipes are made inheritable only for the call that creates the process, under
-//! one lock that every start this worker makes takes, so that a process started by another part of
-//! the worker at the same moment does not hold a stream end either: the reader of a backend's
-//! output would never see the end of the file while a stranger held the other end.
+//! standard input, output and error, each a null device, a blocking pipe this host keeps the other
+//! end of, or an overlapped one the runtime reads and writes. Nothing else this worker holds that
+//! could be inherited reaches it, and the ends of the pipes are made inheritable only for the call
+//! that creates the process, under one lock that every start this worker makes takes, so that a
+//! process started by another part of the worker at the same moment does not hold a stream end
+//! either: the reader of a backend's output would never see the end of the file while a stranger
+//! held the other end.
+//!
+//! An overlapped stream is a named pipe made private at its creation, because a name can be opened
+//! by any process that knows it: the name has random bits in it, the access list names this account
+//! alone, there is one instance, and this worker's own client takes that instance before the agent
+//! exists. What opens the pipe in the interval is refused by name and the start goes no further.
 //!
 //! Only a program can be started. A script, a batch file or anything an interpreter runs is
 //! refused by name, because the process that would run is the interpreter, whose identity is not
@@ -271,6 +277,35 @@ impl std::fmt::Debug for Environment {
     }
 }
 
+/// Which way the bytes of one of an agent's streams go.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Direction {
+    /// The agent reads and this worker writes: its standard input.
+    ToAgent,
+    /// The agent writes and this worker reads: its standard output and its standard error.
+    FromAgent,
+}
+
+/// The name of the pipe made for one stream of a server this worker starts: the worker's own
+/// process identifier and 128 random bits, which no other process can guess.
+#[must_use]
+pub fn pipe_name(worker: u32, random: [u8; 16]) -> String {
+    use std::fmt::Write as _;
+
+    let mut name = format!(r"\\.\pipe\kr-server-{worker}-");
+    for byte in random {
+        let _ = write!(name, "{byte:02x}");
+    }
+    name
+}
+
+/// The security descriptor a private pipe is created with: an access list that no parent's list
+/// can add to (protected) and that holds one entry, full control for the account `sid` names.
+#[must_use]
+pub fn private_descriptor(sid: &str) -> String {
+    format!("D:P(A;;GA;;;{sid})")
+}
+
 /// Returns the handles a process is to inherit, each once, in the order given.
 ///
 /// A standard output and a standard error that are one handle are listed once: the list refuses a
@@ -288,8 +323,10 @@ pub fn distinct(handles: &[usize]) -> Vec<usize> {
 
 #[cfg(windows)]
 pub(crate) use platform::end_process;
+#[cfg(all(windows, feature = "testing"))]
+pub use platform::seams;
 #[cfg(windows)]
-pub use platform::{Child, Spec, StdinPipe, start};
+pub use platform::{Child, Spec, StdinPipe, Stdio, start};
 
 /// The calls with no safe form, and the handles they own.
 #[cfg(windows)]
@@ -307,24 +344,41 @@ mod platform {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex, PoisonError, RwLock};
 
+    use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
     use windows_sys::Win32::Foundation::{
-        ERROR_OPERATION_ABORTED, HANDLE, HANDLE_FLAG_INHERIT, STILL_ACTIVE, SetHandleInformation,
-        WAIT_OBJECT_0, WAIT_TIMEOUT,
+        ERROR_ACCESS_DENIED, ERROR_OPERATION_ABORTED, ERROR_PIPE_BUSY, GENERIC_READ, GENERIC_WRITE,
+        HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, LocalFree, STILL_ACTIVE,
+        SetHandleInformation, WAIT_OBJECT_0, WAIT_TIMEOUT,
     };
-    use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
-    use windows_sys::Win32::Storage::FileSystem::WriteFile;
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
+        GetSecurityInfo, SDDL_REVISION_1, SE_KERNEL_OBJECT,
+    };
+    use windows_sys::Win32::Security::{
+        ACCESS_ALLOWED_ACE, ACL, DACL_SECURITY_INFORMATION, EqualSid, GetAce, GetTokenInformation,
+        PSID, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER, TokenUser,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, OPEN_EXISTING, SECURITY_IDENTIFICATION, SECURITY_SQOS_PRESENT, WriteFile,
+    };
     use windows_sys::Win32::System::IO::CancelIoEx;
-    use windows_sys::Win32::System::Pipes::CreatePipe;
+    use windows_sys::Win32::System::Pipes::{
+        CreatePipe, GetNamedPipeClientProcessId, GetNamedPipeServerProcessId,
+    };
+    use windows_sys::Win32::System::SystemServices::ACCESS_ALLOWED_ACE_TYPE;
     use windows_sys::Win32::System::Threading::{
         CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW,
-        DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess, INFINITE,
-        InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST,
-        PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROC_THREAD_ATTRIBUTE_JOB_LIST, PROCESS_INFORMATION,
-        ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOEXW, TerminateProcess,
-        UpdateProcThreadAttribute, WaitForSingleObject,
+        DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess,
+        GetExitCodeProcess, INFINITE, InitializeProcThreadAttributeList,
+        LPPROC_THREAD_ATTRIBUTE_LIST, OpenProcessToken, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+        PROC_THREAD_ATTRIBUTE_JOB_LIST, PROCESS_INFORMATION, ResumeThread, STARTF_USESTDHANDLES,
+        STARTUPINFOEXW, TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject,
     };
 
-    use super::{Environment, Variable, command_line, distinct, inheriting, refuse_program};
+    use super::{
+        Direction, Environment, Variable, command_line, distinct, inheriting, pipe_name,
+        private_descriptor, refuse_program,
+    };
     use crate::windows::job::{AgentJob, SessionJob};
 
     /// How much a pipe holds before a write waits.
@@ -357,10 +411,24 @@ mod platform {
         pub session: Option<&'a SessionJob>,
         /// The agent's own job, which lists what the agent started.
         pub agent: &'a AgentJob,
-        /// Whether the agent's standard input is a pipe this host writes, and a null device if not.
-        pub pipe_input: bool,
-        /// Whether the agent's standard output is a pipe this host reads, and a null device if not.
-        pub pipe_output: bool,
+        /// What the agent's standard input is.
+        pub stdin: Stdio,
+        /// What the agent's standard output is.
+        pub stdout: Stdio,
+        /// What the agent's standard error is.
+        pub stderr: Stdio,
+    }
+
+    /// What one of an agent's streams is, and what this host keeps of it.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Stdio {
+        /// The null device: nothing to read and nowhere to write, and this host keeps nothing.
+        Null,
+        /// An anonymous pipe whose other end this host reads or writes with blocking calls.
+        Blocking,
+        /// A private named pipe whose other end this host reads or writes through the runtime. A
+        /// start that makes one has to run where a tokio runtime is entered.
+        Overlapped,
     }
 
     /// A process this host started, and the ends of its pipes this host keeps.
@@ -368,10 +436,18 @@ mod platform {
     pub struct Child {
         process: OwnedHandle,
         id: u32,
-        /// The agent's standard input, where it is a pipe.
+        /// The agent's standard input, where it is a blocking pipe.
         pub stdin: Option<StdinPipe>,
-        /// The agent's standard output, where it is a pipe.
+        /// The agent's standard output, where it is a blocking pipe.
         pub stdout: Option<std::fs::File>,
+        /// The agent's standard error, where it is a blocking pipe.
+        pub stderr: Option<std::fs::File>,
+        /// The agent's standard input, where it is an overlapped pipe.
+        pub overlapped_stdin: Option<NamedPipeServer>,
+        /// The agent's standard output, where it is an overlapped pipe.
+        pub overlapped_stdout: Option<NamedPipeServer>,
+        /// The agent's standard error, where it is an overlapped pipe.
+        pub overlapped_stderr: Option<NamedPipeServer>,
     }
 
     impl Child {
@@ -693,6 +769,370 @@ mod platform {
         })
     }
 
+    /// What this host keeps of a stream: nothing, an end it calls blocking, or one the runtime drives.
+    enum Kept {
+        Nothing,
+        Blocking(OwnedHandle),
+        Overlapped(NamedPipeServer),
+    }
+
+    impl Kept {
+        /// The kept end as a file and as an overlapped end: one of them at most.
+        fn files(self) -> (Option<std::fs::File>, Option<NamedPipeServer>) {
+            match self {
+                Self::Nothing => (None, None),
+                Self::Blocking(handle) => (Some(std::fs::File::from(handle)), None),
+                Self::Overlapped(server) => (None, Some(server)),
+            }
+        }
+    }
+
+    /// The end a stream gives the agent, and what this host keeps of it.
+    fn stream(kind: Stdio, direction: Direction) -> std::io::Result<(OwnedHandle, Kept)> {
+        match kind {
+            Stdio::Null => Ok((null_device(direction == Direction::ToAgent)?, Kept::Nothing)),
+            Stdio::Blocking => {
+                let (read, write) = pipe()?;
+                Ok(match direction {
+                    Direction::ToAgent => (read, Kept::Blocking(write)),
+                    Direction::FromAgent => (write, Kept::Blocking(read)),
+                })
+            }
+            Stdio::Overlapped => {
+                let (worker, agent) = overlapped_pipe(direction)?;
+                Ok((agent, Kept::Overlapped(worker)))
+            }
+        }
+    }
+
+    /// Memory the system allocated, freed when this is dropped.
+    struct Local(*mut std::ffi::c_void);
+
+    impl Drop for Local {
+        fn drop(&mut self) {
+            // SAFETY: the pointer is the system's own allocation, which nothing else frees.
+            unsafe { LocalFree(self.0) };
+        }
+    }
+
+    /// The account this process runs as, read from its token.
+    struct OwnSid {
+        /// The buffer holding the token's user, aligned for it.
+        buffer: Vec<u64>,
+    }
+
+    impl OwnSid {
+        fn read() -> std::io::Result<Self> {
+            let mut token: HANDLE = std::ptr::null_mut();
+            // SAFETY: the pseudo-handle names this process, and the token is a local this thread
+            // owns.
+            if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw mut token) } == 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // SAFETY: the call reported a token this process owns and nothing else holds.
+            let token = unsafe { OwnedHandle::from_raw_handle(token.cast()) };
+            let mut needed = 0_u32;
+            // SAFETY: a null buffer of no size asks for the size, which the call reports as a
+            // failure; the count is a local this thread owns.
+            unsafe {
+                GetTokenInformation(
+                    token.as_raw_handle().cast(),
+                    TokenUser,
+                    std::ptr::null_mut(),
+                    0,
+                    &raw mut needed,
+                );
+            }
+            let mut buffer = vec![0_u64; usize::try_from(needed).unwrap_or(0).div_ceil(8).max(1)];
+            // SAFETY: the buffer is at least the size the call above asked for.
+            let read = unsafe {
+                GetTokenInformation(
+                    token.as_raw_handle().cast(),
+                    TokenUser,
+                    buffer.as_mut_ptr().cast(),
+                    u32::try_from(buffer.len() * 8).unwrap_or(u32::MAX),
+                    &raw mut needed,
+                )
+            };
+            if read == 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(Self { buffer })
+        }
+
+        fn sid(&self) -> PSID {
+            // SAFETY: the buffer holds a `TOKEN_USER` the kernel wrote, aligned for it.
+            unsafe { (*self.buffer.as_ptr().cast::<TOKEN_USER>()).User.Sid }
+        }
+
+        /// The identifier as the text a security descriptor is written with.
+        fn text(&self) -> std::io::Result<String> {
+            let mut text: *mut u16 = std::ptr::null_mut();
+            // SAFETY: the identifier is valid for the call and the pointer is a local this thread
+            // owns.
+            if unsafe { ConvertSidToStringSidW(self.sid(), &raw mut text) } == 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let allocated = Local(text.cast());
+            let mut length = 0;
+            // SAFETY: the call wrote a NUL-terminated string, which the allocation holds.
+            while unsafe { *text.add(length) } != 0 {
+                length += 1;
+            }
+            // SAFETY: the string is `length` units long and lives as long as the allocation.
+            let units = unsafe { std::slice::from_raw_parts(text, length) };
+            let converted = String::from_utf16_lossy(units);
+            drop(allocated);
+            Ok(converted)
+        }
+    }
+
+    /// The pair of ends of one private overlapped pipe: the end this host keeps, and the end the
+    /// agent is given. Each is made in the order below, and any failure closes everything made so
+    /// far and refuses the start by name, before an agent exists.
+    ///
+    /// 1. A name no other pipe has: this process's identifier and 128 random bits.
+    /// 2. A security descriptor given at creation: one entry, full control for this account,
+    ///    protected, and no inheritance of the handle.
+    /// 3. This host's end, with one instance only that must be the first of its name, so that a name
+    ///    that exists already refuses the create, and no remote client.
+    /// 4. The agent's end, opened at once as a synchronous client: it takes the one instance, so a
+    ///    client that connected in the interval leaves the pipe busy here.
+    /// 5. This host's end completes its connect, and both ends are checked: the other process at
+    ///    each end is this one, and this host's end holds one entry in its access list.
+    fn overlapped_pipe(direction: Direction) -> std::io::Result<(NamedPipeServer, OwnedHandle)> {
+        let mut random = [0_u8; 16];
+        kr_crypto::random_bytes(&mut random)
+            .map_err(|failure| std::io::Error::other(format!("no random name: {failure}")))?;
+        let name = pipe_name(std::process::id(), random);
+        #[cfg(feature = "testing")]
+        let name = seams::fixed_name().unwrap_or(name);
+
+        let account = OwnSid::read()?;
+        let descriptor_text: Vec<u16> = private_descriptor(&account.text()?)
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        let mut descriptor: *mut std::ffi::c_void = std::ptr::null_mut();
+        // SAFETY: the text is NUL-terminated, and the out-parameters are locals this thread owns.
+        let converted = unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                descriptor_text.as_ptr(),
+                SDDL_REVISION_1,
+                &raw mut descriptor,
+                std::ptr::null_mut(),
+            )
+        };
+        if converted == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let descriptor = Local(descriptor);
+        let mut attributes = SECURITY_ATTRIBUTES {
+            nLength: u32::try_from(std::mem::size_of::<SECURITY_ATTRIBUTES>()).unwrap_or(0),
+            lpSecurityDescriptor: descriptor.0,
+            bInheritHandle: 0,
+        };
+
+        let toward_agent = direction == Direction::ToAgent;
+        let mut options = ServerOptions::new();
+        options
+            .first_pipe_instance(true)
+            .max_instances(1)
+            .reject_remote_clients(true)
+            .access_inbound(!toward_agent)
+            .access_outbound(toward_agent)
+            .in_buffer_size(PIPE_BYTES)
+            .out_buffer_size(PIPE_BYTES);
+        // SAFETY: the attributes and the descriptor they point to outlive the call, which copies
+        // them.
+        let server = unsafe {
+            options.create_with_security_attributes_raw(
+                &name,
+                (&raw mut attributes).cast::<std::ffi::c_void>(),
+            )
+        }
+        .map_err(
+            |failure| match failure.raw_os_error().map(i32::cast_unsigned) {
+                Some(ERROR_ACCESS_DENIED | ERROR_PIPE_BUSY) => {
+                    std::io::Error::other("the server's pipe name was already taken")
+                }
+                _ => failure,
+            },
+        )?;
+        drop(descriptor);
+
+        #[cfg(feature = "testing")]
+        seams::run_after_server_create(&name);
+
+        let wide_name: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+        // SAFETY: the name is NUL-terminated; the share mode, security attributes and template are
+        // none; and the create does not follow a link, because a pipe has none.
+        let opened = unsafe {
+            CreateFileW(
+                wide_name.as_ptr(),
+                if toward_agent {
+                    GENERIC_READ
+                } else {
+                    GENERIC_WRITE
+                },
+                0,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION,
+                std::ptr::null_mut(),
+            )
+        };
+        if opened == INVALID_HANDLE_VALUE {
+            let failure = std::io::Error::last_os_error();
+            return Err(
+                if failure.raw_os_error().map(i32::cast_unsigned) == Some(ERROR_PIPE_BUSY) {
+                    std::io::Error::other("another process connected to the server's pipe")
+                } else {
+                    failure
+                },
+            );
+        }
+        // SAFETY: the call reported a handle this process owns and nothing else holds.
+        let agent = unsafe { OwnedHandle::from_raw_handle(opened.cast()) };
+
+        // The agent's end has connected, so the connect completes at once, with the answer that
+        // says so. One that does not is a connect to something that is not ours.
+        {
+            let mut connect = std::pin::pin!(server.connect());
+            let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+            match std::future::Future::poll(connect.as_mut(), &mut context) {
+                std::task::Poll::Ready(Ok(())) => {}
+                std::task::Poll::Ready(Err(failure)) => return Err(failure),
+                std::task::Poll::Pending => {
+                    return Err(std::io::Error::other(
+                        "the server's pipe did not complete its connect",
+                    ));
+                }
+            }
+        }
+        let worker = std::process::id();
+        let mut other = 0_u32;
+        // SAFETY: the handle is open for the call and the identifier is a local this thread owns.
+        let asked =
+            unsafe { GetNamedPipeClientProcessId(server.as_raw_handle().cast(), &raw mut other) };
+        if asked == 0 || other != worker {
+            return Err(std::io::Error::other(
+                "another process connected to the server's pipe",
+            ));
+        }
+        // SAFETY: as above.
+        let asked =
+            unsafe { GetNamedPipeServerProcessId(agent.as_raw_handle().cast(), &raw mut other) };
+        if asked == 0 || other != worker {
+            return Err(std::io::Error::other(
+                "another process holds the server's end of the pipe",
+            ));
+        }
+        require_one_entry(server.as_raw_handle().cast(), account.sid())?;
+        Ok((server, agent))
+    }
+
+    /// Reads the access list of the object `handle` names and refuses it unless it has one entry,
+    /// which allows `account` and no one else.
+    fn require_one_entry(handle: HANDLE, account: PSID) -> std::io::Result<()> {
+        let mut list: *mut ACL = std::ptr::null_mut();
+        let mut descriptor: *mut std::ffi::c_void = std::ptr::null_mut();
+        // SAFETY: the handle is open for the call and the out-parameters are locals this thread
+        // owns; the descriptor is freed with the guard below.
+        let read = unsafe {
+            GetSecurityInfo(
+                handle,
+                SE_KERNEL_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &raw mut list,
+                std::ptr::null_mut(),
+                &raw mut descriptor,
+            )
+        };
+        if read != 0 {
+            return Err(std::io::Error::from_raw_os_error(read.cast_signed()));
+        }
+        let _descriptor = Local(descriptor);
+        let refusal = |why: &str| {
+            std::io::Error::other(format!(
+                "the server's pipe has an unexpected access list: {why}"
+            ))
+        };
+        if list.is_null() {
+            return Err(refusal("it has none"));
+        }
+        // SAFETY: the call reported a list inside the descriptor, which the guard keeps alive.
+        let count = unsafe { (*list).AceCount };
+        if count != 1 {
+            return Err(refusal(&format!("it has {count} entries")));
+        }
+        let mut entry: *mut std::ffi::c_void = std::ptr::null_mut();
+        // SAFETY: the list is valid, the index is in range, and the pointer is a local.
+        if unsafe { GetAce(list, 0, &raw mut entry) } == 0 || entry.is_null() {
+            return Err(std::io::Error::last_os_error());
+        }
+        let entry = entry.cast::<ACCESS_ALLOWED_ACE>();
+        // SAFETY: the entry lies inside the list; the identifier starts at its last field.
+        let (kind, sid) = unsafe {
+            (
+                (*entry).Header.AceType,
+                (&raw mut (*entry).SidStart).cast::<std::ffi::c_void>(),
+            )
+        };
+        if u32::from(kind) != ACCESS_ALLOWED_ACE_TYPE {
+            return Err(refusal("its one entry does not allow access"));
+        }
+        // SAFETY: both identifiers are valid for the call.
+        if unsafe { EqualSid(sid, account) } == 0 {
+            return Err(refusal("its one entry is not for this account"));
+        }
+        Ok(())
+    }
+
+    /// The seams the cases of the private pipes stand in. They are process-wide, so a case that uses
+    /// one runs alone; neither exists in a shipped build.
+    #[cfg(feature = "testing")]
+    pub mod seams {
+        use std::sync::{Arc, Mutex, PoisonError};
+
+        /// What runs at the seam, given the pipe's name.
+        pub type Hook = Box<dyn Fn(&str) + Send + Sync>;
+
+        type Shared = Arc<dyn Fn(&str) + Send + Sync>;
+
+        static NAME: Mutex<Option<String>> = Mutex::new(None);
+        static AFTER_SERVER_CREATE: Mutex<Option<Shared>> = Mutex::new(None);
+
+        /// Makes every pipe the next starts make have this name, or not.
+        pub fn fix_name(name: Option<String>) {
+            *NAME.lock().unwrap_or_else(PoisonError::into_inner) = name;
+        }
+
+        /// Sets what runs, given the pipe's name, after this host's end exists and before the
+        /// agent's end is opened, or clears it.
+        pub fn after_server_create(hook: Option<Hook>) {
+            *AFTER_SERVER_CREATE
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = hook.map(Arc::from);
+        }
+
+        pub(super) fn fixed_name() -> Option<String> {
+            NAME.lock().unwrap_or_else(PoisonError::into_inner).clone()
+        }
+
+        pub(super) fn run_after_server_create(name: &str) {
+            let hook = AFTER_SERVER_CREATE
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone();
+            if let Some(hook) = hook {
+                hook(name);
+            }
+        }
+    }
+
     /// The null device, opened for reading or for writing, and not inheritable.
     fn null_device(for_reading: bool) -> std::io::Result<OwnedHandle> {
         std::fs::OpenOptions::new()
@@ -789,8 +1229,10 @@ mod platform {
     /// # Errors
     ///
     /// Returns why nothing was started: the program is not an executable, the command line is too
-    /// long, a stream cannot be made, the create failed, or a job does not hold the process once it
-    /// exists, in which case the process is ended and never runs.
+    /// long, a stream cannot be made (an overlapped one is refused by name when another process
+    /// holds its name or connects to it first, and where no runtime is entered), the create failed,
+    /// or a job does not hold the process once it exists, in which case the process is ended and
+    /// never runs.
     pub fn start(spec: &Spec<'_>) -> std::io::Result<Child> {
         refuse_program(spec.program).map_err(std::io::Error::other)?;
         let mut line = command_line(spec.program, spec.arguments).map_err(std::io::Error::other)?;
@@ -798,20 +1240,19 @@ mod platform {
         let program = wide(spec.program);
         let directory = wide(spec.directory);
 
+        // An overlapped end belongs to a runtime, which is looked for before anything is made.
+        if [spec.stdin, spec.stdout, spec.stderr].contains(&Stdio::Overlapped)
+            && tokio::runtime::Handle::try_current().is_err()
+        {
+            return Err(std::io::Error::other(
+                "an overlapped stream belongs to a runtime, and none is entered on this thread",
+            ));
+        }
+
         // The ends the agent is given, and the ends this host keeps.
-        let (input, kept_input) = if spec.pipe_input {
-            let (read, write) = pipe()?;
-            (read, Some(write))
-        } else {
-            (null_device(true)?, None)
-        };
-        let (output, kept_output) = if spec.pipe_output {
-            let (read, write) = pipe()?;
-            (write, Some(read))
-        } else {
-            (null_device(false)?, None)
-        };
-        let errors = null_device(false)?;
+        let (input, kept_input) = stream(spec.stdin, Direction::ToAgent)?;
+        let (output, kept_output) = stream(spec.stdout, Direction::FromAgent)?;
+        let (errors, kept_errors) = stream(spec.stderr, Direction::FromAgent)?;
         let given = [&input, &output, &errors];
 
         let mut jobs: Vec<HANDLE> = Vec::new();
@@ -984,11 +1425,21 @@ mod platform {
             ));
         }
         drop(thread);
+        let (stdin, overlapped_stdin) = match kept_input {
+            Kept::Blocking(handle) => (Some(StdinPipe::new(handle)), None),
+            other => (None, other.files().1),
+        };
+        let (stdout, overlapped_stdout) = kept_output.files();
+        let (stderr, overlapped_stderr) = kept_errors.files();
         Ok(Child {
             process,
             id: started.dwProcessId,
-            stdin: kept_input.map(StdinPipe::new),
-            stdout: kept_output.map(std::fs::File::from),
+            stdin,
+            stdout,
+            stderr,
+            overlapped_stdin,
+            overlapped_stdout,
+            overlapped_stderr,
         })
     }
 
@@ -1345,6 +1796,31 @@ mod tests {
             .expect("an environment");
         let shown = format!("{environment:?}");
         assert_eq!(shown, "Environment(1 variables)");
+    }
+
+    #[test]
+    fn a_pipe_name_holds_the_workers_identifier_and_all_the_random_bits() {
+        let name = pipe_name(4242, [0xab; 16]);
+        assert_eq!(
+            name,
+            format!(r"\\.\pipe\kr-server-4242-{}", "ab".repeat(16))
+        );
+        assert_ne!(pipe_name(4242, [0xcd; 16]), name);
+        let mut last = [0xab; 16];
+        last[15] = 0xac;
+        assert_ne!(pipe_name(4242, last), name, "the last bit counts");
+        assert_ne!(pipe_name(4243, [0xab; 16]), name, "so does the worker's");
+    }
+
+    #[test]
+    fn a_private_descriptor_is_protected_and_has_one_entry_for_the_account() {
+        let text = private_descriptor("S-1-5-21-1-2-3-1001");
+        assert_eq!(text, "D:P(A;;GA;;;S-1-5-21-1-2-3-1001)");
+        assert!(
+            text.starts_with("D:P("),
+            "protected: no parent's list is added"
+        );
+        assert_eq!(text.matches('(').count(), 1, "one entry");
     }
 
     #[test]
