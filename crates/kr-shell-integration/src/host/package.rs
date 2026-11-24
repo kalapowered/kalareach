@@ -48,6 +48,11 @@ pub struct PackageManifest {
     pub shell: PackageShell,
     /// The guarded startup entry this package installs.
     pub startup_entry: PackageStartupEntry,
+    /// The arguments the package's shell is launched with, for each startup mode.
+    ///
+    /// Stated rather than defaulted, as the patches are: a record that says nothing about its
+    /// flags is refused when it is read, because the host has no table of its own to fall back on.
+    pub flags: PackageFlags,
     /// What a start of this package adds to the environment of its shell.
     ///
     /// A record that says nothing starts the shell in the environment the session built. The
@@ -56,6 +61,51 @@ pub struct PackageManifest {
     /// refused when it is read.
     #[serde(default)]
     pub launch: PackageLaunch,
+}
+
+/// The arguments a package's shell is launched with, one list for each startup mode.
+///
+/// The build writes them from the package's pinned manifest, so the record states them as the
+/// package declares them and the host passes on exactly those, in that order. Which mode a session
+/// is in is the session's own decision ([`StartupMode`]).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PackageFlags {
+    /// The arguments for the interactive startup only.
+    pub interactive: Vec<String>,
+    /// The arguments for the login startup as well.
+    pub login: Vec<String>,
+}
+
+impl PackageFlags {
+    /// Returns the arguments section 7 states for a shell, for a test to declare in a record.
+    ///
+    /// This is a test's own copy of the table and no product code reads it: a package declares its
+    /// flags in its record, and the pinned manifests the build writes them from are checked
+    /// against this table by the release tests.
+    #[cfg(any(test, feature = "testing"))]
+    #[must_use]
+    pub fn section_seven(kind: ShellKind) -> Self {
+        let own = |arguments: &[&str]| {
+            arguments
+                .iter()
+                .map(|argument| (*argument).to_owned())
+                .collect()
+        };
+        match kind {
+            ShellKind::Zsh | ShellKind::Bash => Self {
+                interactive: own(&["-i"]),
+                login: own(&["-l", "-i"]),
+            },
+            ShellKind::Fish => Self {
+                interactive: own(&["--interactive"]),
+                login: own(&["--login", "--interactive"]),
+            },
+            ShellKind::PowerShell => Self {
+                interactive: own(&["-NoLogo"]),
+                login: own(&["-NoLogo"]),
+            },
+        }
+    }
 }
 
 /// What a start of a package adds to its shell's environment.
@@ -292,6 +342,25 @@ impl ShellPackage {
                 .all(|module| self.inside(Path::new(&module.search_path)).is_some())
     }
 
+    /// Returns what is wrong with the flags, when something is.
+    ///
+    /// A flag is one argument of the shell's command line, so it is held to what an argument can
+    /// be: not empty, and with no NUL in it. What the flags make the shell do is the build's to
+    /// declare and the release check's to read.
+    fn flags_fault(&self) -> Option<String> {
+        let flags = &self.manifest.flags;
+        [("interactive", &flags.interactive), ("login", &flags.login)]
+            .into_iter()
+            .find(|(_, arguments)| {
+                arguments
+                    .iter()
+                    .any(|argument| argument.is_empty() || argument.contains('\0'))
+            })
+            .map(|(mode, _)| {
+                format!("the {mode} flags hold an argument that is empty or has a NUL in it")
+            })
+    }
+
     /// Returns what is wrong with the launch block, when something is.
     ///
     /// The block is the one place a record reaches the environment of the shell a session starts,
@@ -356,50 +425,31 @@ impl ShellPackage {
 
     /// Returns the arguments an interactive root shell of this package is launched with.
     ///
-    /// The host's, not the package's: a package records what it was built from rather than how a
-    /// session starts it. Section 7 states the defaults per platform, and they differ in one thing
-    /// only, which is whether the shell reads the user's login startup as well as the interactive
-    /// one. This host's own platform decides that; a profile that says otherwise is the caller's
-    /// to pass to [`Self::arguments`].
+    /// The package's own: its record declares them, and this host's platform decides only which
+    /// list applies. Section 7 gives macOS the login startup and Linux the interactive one; a
+    /// profile that says otherwise is the caller's to pass to [`Self::arguments`].
     #[must_use]
     pub fn interactive_flags(&self) -> Vec<String> {
         self.arguments(StartupMode::for_host())
     }
 
-    /// Returns the arguments this package's shell is launched with in one startup mode.
+    /// Returns the arguments this package's shell is launched with in one startup mode, exactly as
+    /// its record declares them.
     #[must_use]
     pub fn arguments(&self, mode: StartupMode) -> Vec<String> {
-        let login = mode == StartupMode::Login;
-        match self.manifest.shell.kind {
-            // Section 7: the packaged Zsh with `-l -i` on macOS, the packaged shell with `-i` on
-            // Linux, and a Linux profile may ask for login startup.
-            ShellKind::Zsh | ShellKind::Bash => {
-                let mut arguments = Vec::new();
-                if login {
-                    arguments.push("-l".to_owned());
-                }
-                arguments.push("-i".to_owned());
-                arguments
-            }
-            // Fish uses `--interactive` and adds `--login` for a login profile.
-            ShellKind::Fish => {
-                let mut arguments = Vec::new();
-                if login {
-                    arguments.push("--login".to_owned());
-                }
-                arguments.push("--interactive".to_owned());
-                arguments
-            }
-            // PowerShell 7 with `-NoLogo`; its startup integration is the profile's, not an
-            // argument, and it has no login-shell mode to ask for.
-            ShellKind::PowerShell => vec!["-NoLogo".to_owned()],
+        let flags = &self.manifest.flags;
+        match mode {
+            StartupMode::Login => flags.login.clone(),
+            StartupMode::Interactive => flags.interactive.clone(),
         }
     }
 
     /// Returns what this package declares about itself, for the handshake to compare against.
     ///
-    /// The whole record, not only the editor ABI and the integration version: two builds of one
-    /// shell agree on both of those and are still two different readers.
+    /// The whole identity, not only the editor ABI and the integration version: two builds of one
+    /// shell agree on both of those and are still two different readers. The record's flags are
+    /// not part of it: they say how a host starts the shell, which the bridge inside it does not
+    /// state, so a hello carries no flags and nothing compares them.
     ///
     /// It states the record as the build wrote it, paths included, because the bridge compiled
     /// into the shell says the same paths from the same build whatever directory the package has
@@ -628,6 +678,16 @@ fn unqualified(requested: &str) -> String {
     }
 }
 
+/// The words for a record that declares no flags, which say what writes a new one.
+fn flags_missing(kind: ShellKind) -> String {
+    let said = "the record declares no flags: it was written before packages declared them";
+    if kind == ShellKind::PowerShell {
+        format!("{said}; run {PUBLISH_COMMAND} in PowerShell to qualify the one this account runs")
+    } else {
+        format!("{said}; build the package again with scripts/build-shells.sh")
+    }
+}
+
 /// The command that qualifies the PowerShell a person has and publishes the package for it.
 pub const PUBLISH_COMMAND: &str = "Publish-KalaReachQualification";
 
@@ -709,11 +769,23 @@ fn read_manifest(
             });
         }
     };
+    let unreadable = |detail: String| PackageFault::Unreadable {
+        path: candidate.display().to_string(),
+        detail,
+    };
+    let record: serde_json::Value =
+        serde_json::from_str(&text).map_err(|error| unreadable(error.to_string()))?;
+    // A record from before packages declared their flags is refused by name, with the step that
+    // writes a new one, rather than by the parser's word for a field it has never heard of.
+    if record.get("flags").is_none()
+        && let Some(kind) = record
+            .pointer("/shell/kind")
+            .and_then(|kind| serde_json::from_value::<ShellKind>(kind.clone()).ok())
+    {
+        return Err(unreadable(flags_missing(kind)));
+    }
     let manifest: PackageManifest =
-        serde_json::from_str(&text).map_err(|error| PackageFault::Unreadable {
-            path: candidate.display().to_string(),
-            detail: error.to_string(),
-        })?;
+        serde_json::from_value(record).map_err(|error| unreadable(error.to_string()))?;
     if let Some(expected) = expected
         && manifest.shell.kind != expected
     {
@@ -741,6 +813,12 @@ fn read_manifest(
         return Err(PackageFault::Unreadable {
             path: candidate.display().to_string(),
             detail: "it names paths outside the package it is in".to_owned(),
+        });
+    }
+    if let Some(detail) = package.flags_fault() {
+        return Err(PackageFault::Unreadable {
+            path: candidate.display().to_string(),
+            detail,
         });
     }
     if let Some(detail) = package.launch_fault() {
@@ -1096,6 +1174,7 @@ mod tests {
             startup_entry: PackageStartupEntry {
                 file: "share/entry.sh".to_owned(),
             },
+            flags: PackageFlags::section_seven(kind),
             launch: PackageLaunch::default(),
         }
     }
@@ -1144,7 +1223,8 @@ mod tests {
                "shell":{"kind":"powershell","executable":"bin/pwsh",
                         "upstream_version":"7.4","editor_abi":"psreadline-2.3",
                         "integration_version":"1","patches":[],"modules":[]},
-               "startup_entry":{"file":"/opt/elsewhere/startup/entry"}}"#,
+               "startup_entry":{"file":"/opt/elsewhere/startup/entry"},
+               "flags":{"interactive":["-NoLogo"],"login":["-NoLogo"]}}"#,
         )
         .expect("writes the record");
         std::fs::write(
@@ -1399,7 +1479,8 @@ mod tests {
             directory.join(MANIFEST_BASENAME),
             r#"{"identity":"identity-1","shell":{"kind":"zsh","executable":"bin/shell",
                "upstream_version":"5.9","editor_abi":"zle-5.9","integration_version":"1"},
-               "startup_entry":{"file":"share/entry.sh"}}"#,
+               "startup_entry":{"file":"share/entry.sh"},
+               "flags":{"interactive":["-i"],"login":["-l","-i"]}}"#,
         )
         .expect("writes the record");
         std::fs::write(root.path().join("zsh/current"), "identity-1").expect("names one");
@@ -1414,47 +1495,134 @@ mod tests {
         );
     }
 
-    /// KR-REQ-07.16: the arguments an interactive root shell is launched with, for every shell
-    /// this host qualifies and both startup modes.
+    /// Writes the record `manifest` describes for a shell, with `edit` applied to its JSON, and
+    /// names it in the shell's `current` pointer.
+    fn install_edited(root: &Path, kind: ShellKind, edit: impl FnOnce(&mut serde_json::Value)) {
+        install(root, kind, true);
+        let file = root
+            .join(kind.as_str())
+            .join("identity-1")
+            .join(MANIFEST_BASENAME);
+        let mut record: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&file).expect("reads the record"))
+                .expect("a record");
+        edit(&mut record);
+        std::fs::write(&file, record.to_string()).expect("writes the record");
+        std::fs::write(
+            root.join(kind.as_str()).join(CURRENT_BASENAME),
+            "identity-1",
+        )
+        .expect("names the identity");
+    }
+
+    /// KR-REQ-07.16: a package is launched with the arguments its record declares, for every
+    /// shell this host qualifies and both startup modes, and with no others.
     ///
-    /// Section 7 states them: Zsh with `-l -i` on macOS and Bash and Zsh with `-i` on Linux, a
-    /// Linux profile that asks for login startup adds `-l`, Fish uses `--interactive` and adds
-    /// `--login` for a login profile, and PowerShell 7 starts with `-NoLogo` and has no login
-    /// mode. The host holds this table because a package records what it was built from, not how a
-    /// session starts it.
+    /// The flags here are not section 7's: a host that held a table of its own would pass that
+    /// table on, and the record's would never reach the shell.
     #[test]
-    fn every_shell_is_launched_with_the_arguments_section_seven_states_for_its_startup_mode() {
+    fn a_package_is_launched_with_the_flags_its_record_declares() {
         let root = tempfile::tempdir().expect("a directory");
         for kind in ShellKind::ALL {
-            install(root.path(), *kind, false);
+            install_edited(root.path(), *kind, |record| {
+                record["flags"] = serde_json::json!({
+                    "interactive": ["--declared-interactive", kind.as_str()],
+                    "login": ["--declared-login", "-x", kind.as_str()],
+                });
+            });
         }
         let set = PackageSet::discover(root.path()).expect("reads the packages");
-        let expected = |kind: ShellKind, mode: StartupMode| -> Vec<&'static str> {
-            match (kind, mode) {
-                (ShellKind::Zsh | ShellKind::Bash, StartupMode::Interactive) => vec!["-i"],
-                (ShellKind::Zsh | ShellKind::Bash, StartupMode::Login) => vec!["-l", "-i"],
-                (ShellKind::Fish, StartupMode::Interactive) => vec!["--interactive"],
-                (ShellKind::Fish, StartupMode::Login) => vec!["--login", "--interactive"],
-                (ShellKind::PowerShell, _) => vec!["-NoLogo"],
-            }
-        };
         for kind in ShellKind::ALL {
             let package = set.get(*kind).expect("the package");
-            for mode in [StartupMode::Interactive, StartupMode::Login] {
-                assert_eq!(
-                    package.arguments(mode),
-                    expected(*kind, mode),
-                    "{} in {mode:?} startup",
-                    kind.as_str()
-                );
-            }
+            assert_eq!(
+                package.arguments(StartupMode::Interactive),
+                vec!["--declared-interactive", kind.as_str()],
+                "{} in interactive startup",
+                kind.as_str()
+            );
+            assert_eq!(
+                package.arguments(StartupMode::Login),
+                vec!["--declared-login", "-x", kind.as_str()],
+                "{} in login startup",
+                kind.as_str()
+            );
             assert_eq!(
                 package.interactive_flags(),
                 package.arguments(StartupMode::for_host()),
-                "{}: the default is this platform's",
+                "{}: the default is this platform's mode",
                 kind.as_str()
             );
         }
+    }
+
+    /// KR-REQ-07.16: a record that declares no flags is refused, by name, with the step that
+    /// writes a new one; the host has no flags of its own to launch it with instead.
+    #[test]
+    fn a_record_that_declares_no_flags_is_refused_and_names_the_step_that_writes_a_new_one() {
+        let root = tempfile::tempdir().expect("a directory");
+        for kind in [ShellKind::Zsh, ShellKind::PowerShell] {
+            install_edited(root.path(), kind, |record| {
+                record
+                    .as_object_mut()
+                    .expect("an object")
+                    .remove("flags")
+                    .expect("the record had flags");
+            });
+        }
+        let set = PackageSet::discover(root.path()).expect("reads what it can");
+        assert!(set.packages().is_empty(), "neither record is a package");
+        for kind in [ShellKind::Zsh, ShellKind::PowerShell] {
+            let fault = set.fault(kind).expect("the record is refused");
+            assert!(matches!(fault, PackageFault::Unreadable { .. }), "{fault}");
+            assert!(
+                fault.to_string().contains("the record declares no flags"),
+                "{kind:?}: {fault}"
+            );
+        }
+        let powershell = set
+            .fault(ShellKind::PowerShell)
+            .expect("refused")
+            .to_string();
+        assert!(powershell.contains(PUBLISH_COMMAND), "{powershell}");
+        let zsh = set.fault(ShellKind::Zsh).expect("refused").to_string();
+        assert!(zsh.contains("scripts/build-shells.sh"), "{zsh}");
+        assert!(!zsh.contains(PUBLISH_COMMAND), "{zsh}");
+        assert!(
+            set.select(Some("zsh")).is_err(),
+            "and so is a request for it"
+        );
+    }
+
+    /// KR-REQ-07.16: a flag is one argument of the command line, so a record whose flags hold an
+    /// empty argument, or one with a NUL in it, is refused in whichever mode it is.
+    #[test]
+    fn a_flag_that_cannot_be_an_argument_is_refused() {
+        for (mode, bad) in [
+            ("interactive", ""),
+            ("login", ""),
+            ("interactive", "-i\u{0}x"),
+            ("login", "-l\u{0}x"),
+        ] {
+            let root = tempfile::tempdir().expect("a directory");
+            install_edited(root.path(), ShellKind::Zsh, |record| {
+                record["flags"][mode] = serde_json::json!(["-i", bad]);
+            });
+            let set = PackageSet::discover(root.path()).expect("reads what it can");
+            let fault = set.fault(ShellKind::Zsh).expect("the record is refused");
+            assert!(
+                fault
+                    .to_string()
+                    .contains(&format!("the {mode} flags hold an argument")),
+                "{mode} {bad:?}: {fault}"
+            );
+        }
+        // And what an argument can be is accepted: a value with a space or a dash in it.
+        let root = tempfile::tempdir().expect("a directory");
+        install_edited(root.path(), ShellKind::Zsh, |record| {
+            record["flags"] = serde_json::json!({"interactive": ["--a b"], "login": []});
+        });
+        let set = PackageSet::discover(root.path()).expect("reads the package");
+        assert!(set.fault(ShellKind::Zsh).is_none());
     }
 
     /// KR-REQ-07.16: what a session with no profile is launched with is the platform's own default
@@ -1635,6 +1803,7 @@ mod tests {
                 }],
             },
             "startup_entry": { "file": "startup/kr-profile.ps1" },
+            "flags": { "interactive": ["-NoLogo"], "login": ["-NoLogo"] },
             "launch": {
                 "environment": { "DOTNET_ROOT": "/opt/dotnet" },
                 "search_paths": { "PSModulePath": [package.join("modules")] },

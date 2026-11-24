@@ -1102,6 +1102,7 @@ mod tests {
                     }],
                 },
                 "startup_entry": { "file": "startup/kr-profile.ps1" },
+                "flags": { "interactive": ["-NoLogo"], "login": ["-NoLogo"] },
                 "launch": {
                     "environment": { "DOTNET_ROOT": "/packages/dotnet" },
                     "search_paths": { "PSModulePath": [package.join("modules")] },

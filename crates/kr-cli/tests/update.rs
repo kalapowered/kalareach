@@ -3184,6 +3184,7 @@ fn write_zsh_package(shells: &Path) {
         startup_entry: PackageStartupEntry {
             file: "startup/kr-zshrc.zsh".to_owned(),
         },
+        flags: kr_shell_integration::host::package::PackageFlags::section_seven(ShellKind::Zsh),
         launch: kr_shell_integration::host::package::PackageLaunch::default(),
     };
     std::fs::write(

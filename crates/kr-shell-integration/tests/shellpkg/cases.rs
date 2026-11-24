@@ -6720,6 +6720,7 @@ pub fn the_packages_host_is_started_with_the_launch_environment_its_record_holds
             }],
         },
         "startup_entry": { "file": "startup/kr-profile.ps1" },
+        "flags": { "interactive": ["-NoLogo"], "login": ["-NoLogo"] },
         "launch": {
             "environment": { "DOTNET_ROOT": "/opt/dotnet-the-record-holds" },
             "search_paths": { "PSModulePath": [modules] },

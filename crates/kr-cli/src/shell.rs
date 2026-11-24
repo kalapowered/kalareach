@@ -810,6 +810,7 @@ mod tests {
                 startup_entry: PackageStartupEntry {
                     file: "startup/entry".to_owned(),
                 },
+                flags: kr_shell_integration::host::package::PackageFlags::section_seven(kind),
                 launch: kr_shell_integration::host::package::PackageLaunch::default(),
             },
             directory,
@@ -1356,6 +1357,9 @@ mod tests {
                 startup_entry: PackageStartupEntry {
                     file: "startup/entry".to_owned(),
                 },
+                flags: kr_shell_integration::host::package::PackageFlags::section_seven(
+                    ShellKind::Bash,
+                ),
                 launch: kr_shell_integration::host::package::PackageLaunch::default(),
             },
             directory,
@@ -1426,6 +1430,9 @@ mod tests {
                 startup_entry: PackageStartupEntry {
                     file: "startup/entry".to_owned(),
                 },
+                flags: kr_shell_integration::host::package::PackageFlags::section_seven(
+                    ShellKind::Zsh,
+                ),
                 launch: kr_shell_integration::host::package::PackageLaunch::default(),
             },
             directory,

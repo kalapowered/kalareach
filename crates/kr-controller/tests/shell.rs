@@ -167,6 +167,7 @@ fn install_package(root: &Path, kind: ShellKind) {
         startup_entry: PackageStartupEntry {
             file: "startup/entry".to_owned(),
         },
+        flags: kr_shell_integration::host::package::PackageFlags::section_seven(kind),
         launch: kr_shell_integration::host::package::PackageLaunch::default(),
     };
     std::fs::write(
@@ -316,7 +317,7 @@ async fn a_stock_shell_is_labelled_rather_than_claiming_the_managed_contract() {
     windows,
     ignore = "a managed shell here is a zsh, bash or fish package placed from /bin/cat, and the root shell is /bin/sh, which this platform has not got"
 )]
-fn a_managed_session_launches_the_package_binary_with_this_platforms_arguments() {
+fn a_managed_session_launches_the_package_binary_with_the_arguments_its_record_declares() {
     let packages = tempfile::tempdir().expect("a directory");
     install_package(packages.path(), ShellKind::Zsh);
     let set = PackageSet::discover(packages.path()).expect("reads the package");
@@ -326,11 +327,15 @@ fn a_managed_session_launches_the_package_binary_with_this_platforms_arguments()
         packages.path().join("zsh/identity-1/bin/zsh"),
         "the exact binary the reader patch was built into"
     );
-    // The arguments belong to the host rather than to the record: a package says what it was built
-    // from, not how a session starts it. Section 7 gives macOS the login startup and Linux the
-    // interactive one, so what this asserts is the mode rather than one platform's answer.
-    assert_eq!(package.arguments(StartupMode::Login), vec!["-l", "-i"]);
-    assert_eq!(package.arguments(StartupMode::Interactive), vec!["-i"]);
+    // The arguments are the record's own, per startup mode. Section 7 gives macOS the login
+    // startup and Linux the interactive one, so what this asserts is the mode rather than one
+    // platform's answer.
+    let declared = kr_shell_integration::host::package::PackageFlags::section_seven(ShellKind::Zsh);
+    assert_eq!(package.arguments(StartupMode::Login), declared.login);
+    assert_eq!(
+        package.arguments(StartupMode::Interactive),
+        declared.interactive
+    );
     assert_eq!(
         package.interactive_flags(),
         package.arguments(StartupMode::for_host())
@@ -340,6 +345,137 @@ fn a_managed_session_launches_the_package_binary_with_this_platforms_arguments()
     assert_eq!(identity.upstream_version, "5.9");
     assert_eq!(identity.editor_abi, "zle-5.9");
     assert_eq!(identity.integration_version, "1");
+}
+
+/// Installs a Zsh package whose shell records the arguments it was started with and then ends, and
+/// whose record declares `interactive` and `login` as its flags.
+///
+/// Each start appends one line per argument to `report` and a line of `--` after them, so the
+/// launches of one package can be read in order.
+#[cfg(unix)]
+fn install_recording_package(root: &Path, report: &Path, interactive: &[&str], login: &[&str]) {
+    install_package(root, ShellKind::Zsh);
+    let directory = root.join("zsh/identity-1");
+    kr_ipc::testing::place_script(
+        &directory.join("bin/zsh"),
+        format!(
+            "#!/bin/sh\n{{ for argument in \"$@\"; do printf '%s\\n' \"$argument\"; done; \
+             printf -- '--\\n'; }} >> '{}'\n",
+            report.display()
+        ),
+    );
+    let record = directory.join(MANIFEST_BASENAME);
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&record).expect("reads the record"))
+            .expect("a record");
+    manifest["flags"] = serde_json::json!({ "interactive": interactive, "login": login });
+    std::fs::write(&record, manifest.to_string()).expect("writes the record");
+}
+
+/// Records an install of Zsh's startup entry in `home`, as `kr shell install` leaves it: the entry
+/// in a file of the person's, and that file in the installation's record. A managed create is
+/// refused without it, because a shell that never read the entry would never open its bridge.
+#[cfg(unix)]
+fn record_the_startup_entry(daemon: &Daemon, home: &Path) {
+    use kr_shell_integration::host::startup::{
+        ENTRY_WRITTEN, EntryRecord, Placement, StartupTarget, entry, install,
+    };
+
+    let zshrc = home.join(".zshrc");
+    let record = EntryRecord::in_state_directory(daemon.tree.environment().state_root());
+    let target = StartupTarget {
+        kind: ShellKind::Zsh,
+        path: zshrc.clone(),
+        reason: "the file this host's test writes",
+        shared: false,
+        placement: Placement::End,
+    };
+    let body = entry(&target, Path::new("startup/entry"), false).expect("the path is text");
+    install(&zshrc, &body, &target.placement, &record).expect("the entry goes in");
+    let root = daemon.tree.root();
+    let writers =
+        kr_ipc::install::hold_writers(&kr_ipc::install::Writing::in_roots(root, root), &mut || {})
+            .expect("a test outside a store holds nothing");
+    let permit = writers.permit(&ENTRY_WRITTEN).expect("permitted");
+    record
+        .hold(&permit)
+        .expect("holds the record")
+        .add(ShellKind::Zsh, &[zshrc])
+        .expect("records the file");
+}
+
+/// KR-REQ-07.16: a managed create launches the package's shell with the flags the package's record
+/// declares for the session's startup mode, and with no others.
+///
+/// The record here declares flags that are not section 7's, on a real daemon with a real worker:
+/// a host that launched a table of its own would start the shell with `-i` or `-l -i`, and what the
+/// shell records would say so. The shell never qualifies, so each create is refused once it has
+/// ended; what the case reads is the arguments it was started with.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_managed_create_launches_the_flags_its_package_declares() {
+    let packages = tempfile::tempdir().expect("a directory");
+    let report = packages.path().join("arguments-report.txt");
+    install_recording_package(
+        packages.path(),
+        &report,
+        &["--declared-interactive", "-q"],
+        &["--declared-login", "-q", "-x"],
+    );
+    let scratch = tempfile::tempdir().expect("a directory");
+    let daemon = Daemon::start_with_packages(
+        &[
+            ("PATH", "/usr/bin:/bin".to_owned()),
+            ("HOME", scratch.path().display().to_string()),
+        ],
+        packages.path(),
+    )
+    .await;
+
+    record_the_startup_entry(&daemon, scratch.path());
+
+    let mut launches: Vec<Vec<String>> = Vec::new();
+    for startup in [
+        kr_protocol::session::ShellStartup::Interactive,
+        kr_protocol::session::ShellStartup::Login,
+    ] {
+        let mut request = create(daemon.environment_id, ShellMode::Managed, Some("zsh"));
+        request.cwd = Nullable::some(scratch.path().display().to_string());
+        request.launch_profile.startup = startup;
+        let refused = daemon
+            .client()
+            .await
+            .mutate(
+                Method::SessionCreate,
+                ActionId::new(kr_ipc::new_uuid()),
+                target(daemon.environment_id),
+                &request,
+            )
+            .await
+            .expect("reaches the daemon")
+            .expect_err("a shell that ends without qualifying cannot be managed");
+        assert_eq!(refused.code, ErrorCode::ShellIntegrationUnsupported);
+        let text = std::fs::read_to_string(&report).unwrap_or_else(|error| {
+            panic!("the shell recorded no arguments ({error}); the create was refused: {refused:?}")
+        });
+        let arguments: Vec<String> = text
+            .split("--\n")
+            .nth(launches.len())
+            .expect("this launch is in the report")
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        launches.push(arguments);
+    }
+    assert_eq!(
+        launches,
+        vec![
+            vec!["--declared-interactive", "-q"],
+            vec!["--declared-login", "-q", "-x"],
+        ],
+        "the interactive create and then the login create, as the record declares them"
+    );
+    daemon.stop();
 }
 
 // --------------------------------------------------------------------------------------------
@@ -859,6 +995,8 @@ struct Daemon {
     worker: std::path::PathBuf,
     /// The environment the daemon runs in, which a daemon started again on the tree runs in too.
     host_environment: Vec<(String, String)>,
+    /// Where the daemon looks for qualified shell packages, when the case has installed some.
+    shell_packages: Option<std::path::PathBuf>,
     // Declared last: the directory is removed after every field above has let go of its files.
     tree: teardown::Tree,
 }
@@ -883,6 +1021,20 @@ impl Daemon {
     async fn start_with_additions(
         environment: &[(&str, String)],
         additions: &[(&str, &str)],
+    ) -> Self {
+        Self::start_in(environment, additions, None).await
+    }
+
+    /// As [`Self::start`], with the qualified shell packages the daemon is configured with under
+    /// `packages`, which a managed create resolves against.
+    async fn start_with_packages(environment: &[(&str, String)], packages: &Path) -> Self {
+        Self::start_in(environment, &[], Some(packages.to_path_buf())).await
+    }
+
+    async fn start_in(
+        environment: &[(&str, String)],
+        additions: &[(&str, &str)],
+        shell_packages: Option<std::path::PathBuf>,
     ) -> Self {
         let worker_build = worker_beside_this_test();
         let tree = teardown::Tree::create();
@@ -910,6 +1062,7 @@ impl Daemon {
             controller: None,
             serving: Vec::new(),
             worker,
+            shell_packages,
             host_environment: environment
                 .iter()
                 .map(|(name, value)| ((*name).to_owned(), value.clone()))
@@ -943,7 +1096,7 @@ impl Daemon {
             worker_program: self.worker.clone(),
             build_id: build(),
             release: "0".to_owned(),
-            shell_packages: None,
+            shell_packages: self.shell_packages.clone(),
             terminal: Box::new(RefusingTerminal::default()),
         })
         .await
@@ -1857,6 +2010,7 @@ fn a_package_that_patches_nothing_is_qualified_only_as_the_psreadline_package() 
             startup_entry: PackageStartupEntry {
                 file: "startup/entry".to_owned(),
             },
+            flags: kr_shell_integration::host::package::PackageFlags::section_seven(kind),
             launch: kr_shell_integration::host::package::PackageLaunch::default(),
         },
         directory: std::path::PathBuf::from("/nonexistent/package"),
