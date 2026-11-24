@@ -5495,13 +5495,11 @@ async fn a_reconnect_opens_a_new_input_stream_and_replays_no_input() {
     let session = Session::start(Arc::new(first)).expect("a session");
     let attached = attach(&session, environment_id, session_id).await;
     let old = acquire(&session, environment_id, session_id, attached.typing).await;
-    let mut lane = kr_transport::reconnect::InputLane::new(first_connection, old.lease.epoch);
     let old_attachment = attached.typing;
     let mut input = Typing::open(&session, environment_id, session_id, old_attachment)
         .await
         .expect("the input lane opens");
     let mut events = session.events();
-    let sent = lane.next_sequence();
     input
         .type_bytes(old.lease.epoch, MARKER_COMMAND.as_bytes())
         .await
@@ -5512,7 +5510,6 @@ async fn a_reconnect_opens_a_new_input_stream_and_replays_no_input() {
     // host's acceptance can come back: its delivery is uncertain. The lane admits the command and
     // the case reads what the lane has told so far, which is nothing of it, before the
     // connection ends; the lane's own end then tells where the epoch's frames stand.
-    lane.next_sequence();
     {
         input
             .lane()
@@ -5552,8 +5549,8 @@ async fn a_reconnect_opens_a_new_input_stream_and_replays_no_input() {
         );
     }
     drop(input);
-    let carried =
-        kr_client::reconnect::ClientState::from_session(&session, Some(lane.close())).await;
+    let mut carried = session.cursors().await;
+    carried.reconnected();
     assert!(
         session.submitted_actions().await.is_empty()
             && unresolved_actions(&session).await.is_empty(),
