@@ -4779,6 +4779,52 @@ async fn a_change_made_while_a_save_is_in_flight_leaves_no_saved_line() {
     assert_eq!(line_of(&page), Value::Null, "saved does not stand");
 }
 
+/// KR-REQ-20.17: a change to the settings tells the page to read recovery again, in the call that
+/// takes the saved line away, so the card does not go on saying "saved" until the step the change
+/// wants has run. The quiet before that step outlasts the case.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_change_to_the_settings_tells_the_page_and_takes_the_saved_line_away_at_once() {
+    let timing = SettingsTiming {
+        quiet: Duration::from_secs(600),
+        window: Duration::ZERO,
+    };
+    let computer = Computer::new().await;
+    let (page, settings) = computer.running_page(timing).await;
+    settings
+        .set_colour_mode(ColourMode::Dark)
+        .await
+        .expect("kept");
+    page.call("recovery_turn_on", json!({})).expect("on");
+    // The step the turn-on wants ends and tells the page; then nothing is wanted until the quiet.
+    assert!(
+        until(Duration::from_secs(10), || async {
+            *page.recovery_told.lock().expect("the record") >= 1
+        })
+        .await,
+        "the step the turn-on wanted told the page"
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(line_of(&page), json!({ "state": "saved" }));
+    let before = *page.recovery_told.lock().expect("the record");
+
+    settings
+        .set_colour_mode(ColourMode::Light)
+        .await
+        .expect("kept");
+    assert_eq!(
+        *page.recovery_told.lock().expect("the record"),
+        before + 1,
+        "the change told the page once"
+    );
+    assert_eq!(line_of(&page), Value::Null, "the saved line is gone");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        *page.recovery_told.lock().expect("the record"),
+        before + 1,
+        "no step ran inside the quiet, so nothing else told the page"
+    );
+}
+
 /// What this computer can read of a host's privacy mode, scripted: every host is in privacy mode,
 /// and the reads are counted.
 struct HostsInPrivacyMode {
