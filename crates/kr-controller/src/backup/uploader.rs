@@ -10,7 +10,7 @@
 //!
 //! # One step at a time
 //!
-//! [`Uploader::step`] does one thing: a record in the store, or one request and the record of its
+//! `Uploader::step` does one thing: a record in the store, or one request and the record of its
 //! answer. An object's parts go in one step, and each acknowledgement is recorded before the next
 //! part leaves. [`Uploader::pass`] steps until nothing more can be done now. A step decides from
 //! the store, so a process that stops between two steps, or in the middle of one, leaves the store

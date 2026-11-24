@@ -795,13 +795,13 @@ impl DeliveryModule {
         self.configure_if(record, &|| Ok(())).map(|_| ())
     }
 
-    /// Records a destination as [`Self::configure`] does, asking `admitted` once the journal's
+    /// Records a destination as `Self::configure` does, asking `admitted` once the journal's
     /// write lock is held and everything the write reads has been read, immediately before the
     /// row is written. Returns whether it wrote.
     ///
     /// # Errors
     ///
-    /// Returns what [`Self::configure`] returns, and what `admitted` refuses with.
+    /// Returns what `Self::configure` returns, and what `admitted` refuses with.
     pub fn configure_if(
         &self,
         record: &DestinationRecord,

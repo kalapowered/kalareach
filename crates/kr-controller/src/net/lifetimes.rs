@@ -448,7 +448,7 @@ impl GrantLifetimes {
     }
 
     /// Returns whether a stored grant is in force now on both clocks, and whether an end found is
-    /// on record ([`Self::stored_in_force`]).
+    /// on record (`Self::stored_in_force`).
     ///
     /// # Errors
     ///

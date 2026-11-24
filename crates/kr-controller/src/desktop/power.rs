@@ -4,7 +4,7 @@
 //! while work it has actually admitted is outstanding, and only on the power source the owner
 //! chose. Three rules follow from that, and every one of them is visible in this module.
 //!
-//! * **Off until chosen.** [`read`] returns [`SleepInhibitionSetting::Off`] for a host with no
+//! * **Off until chosen.** `read` returns [`SleepInhibitionSetting::Off`] for a host with no
 //!   setting file, for a file it cannot read and for a file whose contents it does not recognise.
 //!   Nothing here turns the setting on, and setup offers it rather than applying it.
 //! * **Mains is not battery.** `mains_only` holds nothing on battery *and nothing on a host that

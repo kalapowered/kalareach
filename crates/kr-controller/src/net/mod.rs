@@ -676,7 +676,7 @@ pub const DEVICE_CONNECTIONS_IN_USE: usize = 32;
 /// not for all of them.
 ///
 /// At the first connection above the bound the host withdraws a connection of the device only if it
-/// has been silent for more than [`DEVICE_SILENT_FOR`] at the reading the host makes then: the one
+/// has been silent for more than `DEVICE_SILENT_FOR` at the reading the host makes then: the one
 /// silent the longest and, of equal stamps, the one counted later. The new connection is never the
 /// one. When no connection of the device has been silent that long the host refuses the new
 /// connection for now ([`ControllerError::ConnectionsInUse`], whose code a device asks again after

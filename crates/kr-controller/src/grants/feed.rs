@@ -8,12 +8,12 @@
 //! > request."
 //!
 //! So a remote owner publishes a [`RevocationRequest`], which carries no revision at all, and this
-//! host answers with an [`AuthorityRevisionRecord`] it signs itself. A device that could number
+//! host answers with an `AuthorityRevisionRecord` it signs itself. A device that could number
 //! its own request could put itself ahead of a revocation already in flight.
 //!
 //! Four more rules, each a method here:
 //!
-//! * **A record that does not follow the accepted one is refused.** [`AuthorityFeed::accept`]
+//! * **A record that does not follow the accepted one is refused.** `AuthorityFeed::accept`
 //!   keeps the latest accepted revision and rejects anything at or below it, so replaying an old
 //!   feed entry cannot put authority back.
 //! * **Revocation records are retained until every enrolled host has acknowledged them.** They do

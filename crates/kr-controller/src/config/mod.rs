@@ -8,7 +8,7 @@
 //!   resource limits intersect. A configured value more permissive than what is already in force
 //!   is refused, and the rights intersection calls [`crate::grants::decide`] rather than repeating
 //!   its arithmetic.
-//! * **Validated edits** ([`apply`]). An edit is validated before a revision is applied, the
+//! * **Validated edits** (`apply`). An edit is validated before a revision is applied, the
 //!   revision it was based on is checked again immediately before the write, and a change that
 //!   affects authority fences dispatch before the caller is told it took effect.
 //! * **The report** ([`effective`]). Each value, its source and whether it applies immediately,
@@ -622,7 +622,7 @@ pub type Write<'a> = &'a mut dyn FnMut() -> Result<()>;
 /// What decides whether an edit's write is made: it is given the write, and runs it or refuses.
 pub type Standing<'a> = &'a (dyn Fn(Write<'_>) -> Result<()> + Sync);
 
-/// [`apply`] for an edit made under an admission: `standing` runs the write, and decides whether it
+/// `apply` for an edit made under an admission: `standing` runs the write, and decides whether it
 /// runs at all.
 ///
 /// The admission is asked at the last moment, once the edit lock is held and the edit is read,
@@ -632,7 +632,7 @@ pub type Standing<'a> = &'a (dyn Fn(Write<'_>) -> Result<()> + Sync);
 ///
 /// # Errors
 ///
-/// As [`apply`], and whatever `standing` refuses with, in which case nothing was written.
+/// As `apply`, and whatever `standing` refuses with, in which case nothing was written.
 pub fn apply_standing(
     paths: &EnvironmentPaths,
     change: &Change,
