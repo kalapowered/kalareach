@@ -444,21 +444,24 @@ fn decide_windows(capability: &str, tool: Option<String>) -> Answer {
     }
 }
 
-/// The answer on X11, from the tool found and whether this process holds a display.
+/// The answer on X11, from the tool found and whether this process holds a display name.
 ///
 /// This process is the control daemon, which is a service with no display of its own, and the
 /// record is read in it. A display it does not hold is therefore not a permission a person grants
 /// and not a finding about the desktop: what a worker's own context holds is what a check reads.
-fn decide_x11(tool: Option<String>, holds_display: bool) -> Answer {
+/// A display name is all that is read here. The authority that opens the display is not checked,
+/// so the record does not say this process holds it.
+fn decide_x11(tool: Option<String>, holds_display_name: bool) -> Answer {
     match tool {
-        Some(tool) if holds_display => Answer {
+        Some(tool) if holds_display_name => Answer {
             state: CapabilityState::NotTested,
             evidence: CapabilityEvidenceSource::NotProbed,
             reason: Some(
                 Sentence::new()
                     .stated(
-                        "X11 grants this to a client that holds the display and its authority, \
-                         and this process holds both. Nothing here has opened the display with ",
+                        "X11 grants this to a client that holds the display and its authority. \
+                         This process holds a display name. Nothing here has checked its \
+                         authority or opened the display with ",
                     )
                     .path(Path::new(&tool))
                     .stated(", so whether it opens is not established"),
@@ -507,7 +510,7 @@ pub fn decide_unix(capability: &str, desktop: &DesktopContext, tool: Option<Stri
         Sentence::new().withheld(ContentClass::Name, &compositor)
     };
     match desktop.display_server {
-        DisplayServer::X11 => decide_x11(tool, display_reachable()),
+        DisplayServer::X11 => decide_x11(tool, holds_display_name()),
         DisplayServer::Wayland => match tool {
             Some(tool) => {
                 let route = wayland_route(capability);
@@ -658,10 +661,15 @@ pub(super) fn wlroots(compositor: &str) -> bool {
         .any(|known| compositor.contains(known))
 }
 
-/// Returns whether this context holds an X11 display and its authority.
-fn display_reachable() -> bool {
-    std::env::var("DISPLAY").is_ok_and(|value| !value.trim().is_empty())
-        && (std::env::var_os("XAUTHORITY").is_some() || std::env::var_os("HOME").is_some())
+/// Returns whether this process holds an X11 display name: a `DISPLAY` that is not blank. Its
+/// authority is not read, because nothing here has checked that it opens the display.
+fn holds_display_name() -> bool {
+    names_a_display(std::env::var("DISPLAY").ok().as_deref())
+}
+
+/// Returns whether a value of `DISPLAY` is a display name: one that is set and not blank.
+fn names_a_display(display: Option<&str>) -> bool {
+    display.is_some_and(|value| !value.trim().is_empty())
 }
 
 /// Returns the first installed facility that serves one capability on this display server.
@@ -1417,14 +1425,33 @@ mod tests {
         );
         assert!(!reason.contains("permission"), "{reason}");
         assert_eq!(without.tool, tool);
-        // With a display the words say this process too, and no tool is no installation.
+        // With a display name the words say that this process holds a name and that nothing here
+        // has checked its authority, and no tool is no installation.
         let with = decide_x11(tool, true);
         assert_eq!(with.state, CapabilityState::NotTested);
         let reason = with.reason.expect("a reason").as_str().to_owned();
-        assert!(reason.contains("this process holds both"), "{reason}");
+        assert!(
+            reason.contains("This process holds a display name."),
+            "{reason}"
+        );
+        assert!(
+            reason.contains("Nothing here has checked its authority or opened the display with "),
+            "{reason}"
+        );
+        assert!(!reason.contains("holds both"), "{reason}");
         assert!(!reason.contains("this context"), "{reason}");
         let none = decide_x11(None, true);
         assert_eq!(none.state, CapabilityState::MissingInstallation);
+        // What counts as a display name is `DISPLAY` and nothing else: an unset, an empty and a
+        // blank value are none, and `HOME` or `XAUTHORITY` is no part of it.
+        for (display, named) in [
+            (None, false),
+            (Some(""), false),
+            (Some("  "), false),
+            (Some(":0"), true),
+        ] {
+            assert_eq!(names_a_display(display), named, "{display:?}");
+        }
     }
 
     /// KR-REQ-03.29, LX-1: the platform's own record looks for the tools the check runs.
