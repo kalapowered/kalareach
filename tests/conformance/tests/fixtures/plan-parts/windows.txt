@@ -97,6 +97,7 @@ the input lease suite :: cargo test --locked -p kr-worker --test input_lease -- 
 the fence suite :: cargo test --locked -p kr-worker --test fence -- --show-output
 the desktop suite :: cargo test --locked -p kr-worker --test desktop -- --show-output
 the worker's performance suite :: cargo test --locked -p kr-worker --test performance -- --show-output
+the observation lane :: cargo test --locked -p kr-worker --test observation_lane -- --show-output
 the shell suite :: cargo test --locked -p kr-controller --test shell -- --show-output
 the privacy suite :: cargo test --locked -p kr-controller --test privacy -- --show-output
 the descriptions suite :: cargo test --locked -p kr-controller --test descriptions -- --show-output

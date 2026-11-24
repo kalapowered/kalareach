@@ -1526,6 +1526,14 @@ reading = 'cargo'
 command = ['cargo', 'test', '--locked', '-p', 'kr-worker', '--test', 'performance']
 
 [[step]]
+id = 'rust-the-observation-lane'
+group = 'rust'
+what = 'the observation lane'
+platforms = ['windows']
+reading = 'cargo'
+command = ['cargo', 'test', '--locked', '-p', 'kr-worker', '--test', 'observation_lane']
+
+[[step]]
 id = 'rust-the-shell-suite'
 group = 'rust'
 what = 'the shell suite'
