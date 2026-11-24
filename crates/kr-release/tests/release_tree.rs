@@ -1273,8 +1273,8 @@ fn a_companion_notice_that_lacks_a_crate_of_the_application_is_refused() {
     assert_eq!(lacking, cut);
 }
 
-/// A checkout whose committed companion notice has no entry for a crate the lock takes into the
-/// companion application is refused by `held_companion`. The committed text passes, which is the
+/// A checkout whose committed companion notice has no entry for tauri is refused by
+/// `held_companion`, which names the crate and its version. The committed text passes, which is the
 /// control.
 #[test]
 fn a_checkout_that_commits_a_companion_notice_without_a_crate_is_refused() {
@@ -1284,15 +1284,30 @@ fn a_checkout_that_commits_a_companion_notice_without_a_crate_is_refused() {
     let (_whole, stand_in) = companion_stand_in(&committed);
     kr_release::notices::held_companion(&stand_in)
         .expect("the committed companion notice is held to the lock");
+    let mut cut = Vec::new();
     let without: String = committed
         .lines()
-        .filter(|line| !line.starts_with("  - tauri "))
+        .filter(|line| match line.strip_prefix("  - tauri ") {
+            Some(rest) => {
+                cut.push(format!(
+                    "tauri {}",
+                    rest.split(" | ").next().expect("a version")
+                ));
+                false
+            }
+            None => true,
+        })
         .map(|line| format!("{line}\n"))
         .collect();
+    assert!(!cut.is_empty(), "the companion notice has entries of tauri");
     let (_cut, stand_in) = companion_stand_in(&without);
     let refused = kr_release::notices::held_companion(&stand_in)
-        .expect_err("a companion notice with no entry for tauri is refused");
-    assert!(refused.to_string().contains("tauri"), "{refused}");
+        .expect_err("a companion notice with no entry for tauri is refused")
+        .to_string();
+    let count = format!("has no entry for {} of the crates", cut.len());
+    assert!(refused.contains(&count), "{refused}");
+    let first = format!("the first {}", cut[0]);
+    assert!(refused.contains(&first), "{refused}");
 }
 
 /// A committed companion notice that holds the placeholder of a licence template is refused by
