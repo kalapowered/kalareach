@@ -688,9 +688,9 @@ const fn has_a_desktop_of(os: HostOs, display_server: DisplayServer) -> bool {
 /// context holds says nothing about a screen image, and the report never says otherwise.
 ///
 /// The desktop is read before each operation that acts on it and again after it, and one rule
-/// settles what that means. An operation starts only if the reading before it names a desktop that
-/// is available, where the platform reports availability at all; a success stands only if the
-/// reading after it is the same desktop, in the same login, with the same availability. A reading
+/// settles what that means. An operation starts only if the reading before it is the desktop the
+/// first reading selected, in the same login, with the same availability, and the context lets the
+/// check act on it; a success stands only if the reading after it is that desktop too. A reading
 /// that fails either test stops every later operation too, which is answered without being started.
 /// A check that has no route on the desktop it is asked of produces no record, so the platform's
 /// record of it stands.
@@ -720,7 +720,11 @@ pub fn report(
             else {
                 continue;
             };
-            let ran = if stopped || !may_start(&before.desktop) {
+            // The reading must be the desktop the first one selected, and one the context lets the
+            // check act on.
+            let ready =
+                !stopped && may_start(*check, &before.desktop) && unchanged(&first, &before);
+            let ran = if !ready {
                 stopped = true;
                 not_in_the_state_it_needs(*check, None)
             } else {
@@ -778,14 +782,18 @@ pub fn report(
 
 /// Whether an operation that acts on the desktop may start under this reading.
 ///
-/// On Linux and Windows the reading must say the desktop is available, so a reading that could not
-/// be taken starts nothing. macOS keeps the rule it has: the checks run wherever the context does
-/// not refuse them, which includes the hosted runners whose sessions report another value.
-fn may_start(desktop: &DesktopContext) -> bool {
-    !matches!(
+/// The refusals of the context hold on every platform: a desktop that is locked, ended or in the
+/// background starts nothing. On Linux and Windows the reading must also say the desktop is
+/// available, so a reading that could not be taken starts nothing. macOS keeps the rule it has for
+/// the rest: the checks run wherever the context does not refuse them, which includes the hosted
+/// runners whose sessions report another value.
+fn may_start(check: Check, desktop: &DesktopContext) -> bool {
+    let reported = matches!(
         desktop.display_server,
         DisplayServer::X11 | DisplayServer::Wayland | DisplayServer::WindowsDesktop
-    ) || desktop.availability == DesktopAvailability::Available
+    );
+    !super::capability::context_refuses(check.capability(), desktop)
+        && (!reported || desktop.availability == DesktopAvailability::Available)
 }
 
 /// Whether the reading after an operation is the desktop the reading before it named.
@@ -2286,15 +2294,103 @@ mod tests {
                 let mut context = desktop();
                 context.display_server = server;
                 context.availability = availability;
-                assert!(!may_start(&context), "{server:?} {availability:?}");
+                assert!(
+                    !may_start(Check::ScreenImage, &context),
+                    "{server:?} {availability:?}"
+                );
             }
             let mut context = desktop();
             context.display_server = server;
-            assert!(may_start(&context), "{server:?} available");
+            assert!(
+                may_start(Check::ScreenImage, &context),
+                "{server:?} available"
+            );
         }
         let mut hosted = desktop();
         hosted.availability = DesktopAvailability::Unknown;
-        assert!(may_start(&hosted), "macOS keeps its rule");
+        assert!(
+            may_start(Check::ScreenImage, &hosted),
+            "macOS keeps its rule for a reading it cannot place"
+        );
+    }
+
+    /// KR-REQ-03.29, S-3 (R4 before every operation): on macOS a desktop the context refuses, one
+    /// that is locked, ended or in the background, starts no operation, and the reading is the
+    /// same before and after so that nothing but the start rule can refuse it.
+    #[test]
+    fn a_macos_desktop_the_context_refuses_starts_no_operation() {
+        for availability in [
+            DesktopAvailability::Locked,
+            DesktopAvailability::Background,
+            DesktopAvailability::Ended,
+        ] {
+            let mut context = desktop();
+            context.availability = availability;
+            let source = Readings::of(vec![surroundings(context)]);
+            let seeing = Seeing::default();
+            let records = super::report(
+                &[Check::ScreenImage],
+                &subject(),
+                &source,
+                revision(),
+                &Plan::in_directory("."),
+                &seeing,
+            );
+            assert!(
+                seeing.0.lock().expect("the record").is_empty(),
+                "{availability:?}: nothing was started"
+            );
+            assert_eq!(
+                state_of(&records, Check::ScreenImage),
+                CapabilityState::TemporarilyUnavailable,
+                "{availability:?}: nothing is established"
+            );
+        }
+    }
+
+    /// KR-REQ-03.29, S-3 (R4 before every operation): a new login that is still available is
+    /// another desktop, so the operation after it starts nothing, and the one before it stands.
+    #[test]
+    fn a_new_login_between_operations_starts_no_later_operation() {
+        let mut other = desktop();
+        other.login_generation = Nullable::some(U64::new(3));
+        // The first reading, the reading before the first operation and after it, then another
+        // login before the second operation.
+        let source = Readings::of(vec![
+            surroundings(desktop()),
+            surroundings(desktop()),
+            surroundings(desktop()),
+            surroundings(other),
+        ]);
+        let seeing = Seeing::default();
+        let records = super::report(
+            &[Check::AccessibleElement, Check::ScreenImage],
+            &subject(),
+            &source,
+            revision(),
+            &Plan::in_directory("."),
+            &seeing,
+        );
+        let started: Vec<Check> = seeing
+            .0
+            .lock()
+            .expect("the record")
+            .iter()
+            .map(|seen| seen.0)
+            .collect();
+        assert_eq!(
+            started,
+            vec![Check::AccessibleElement],
+            "only the operation before the new login started"
+        );
+        assert_eq!(
+            state_of(&records, Check::AccessibleElement),
+            CapabilityState::QualifiedAvailable
+        );
+        assert_eq!(
+            state_of(&records, Check::ScreenImage),
+            CapabilityState::TemporarilyUnavailable
+        );
     }
 
     /// KR-REQ-03.29, S-10: after a refused re-read the remaining operations are answered without
