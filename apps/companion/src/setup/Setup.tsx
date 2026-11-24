@@ -116,10 +116,17 @@ function sentence(said: string): string {
   return /[.!?]$/.test(capitalised) ? capitalised : `${capitalised}.`
 }
 
-/** One reading of the machine, before any of it is put on the screen. */
+/**
+ * One reading of the machine, before any of it is put on the screen.
+ *
+ * The application and the host are read apart, so that one failing leaves the other's answer on
+ * the screen. A part that could not be read is absent, and what the screen showed of it stays.
+ */
 interface Reading {
-  readonly identity: SetupIdentity
-  readonly capabilities: EnvironmentCapabilitiesResult | null
+  /** What the application said of itself; absent when it could not be read. */
+  readonly identity: SetupIdentity | undefined
+  /** What the host said of this machine; null when no host answered, absent when it could not be read. */
+  readonly capabilities: EnvironmentCapabilitiesResult | null | undefined
   readonly failure: string | null
 }
 
@@ -185,6 +192,11 @@ export function Setup(): ReactNode {
   const { port, say } = useApp()
   const [step, setStep] = useState(0)
   const [identity, setIdentity] = useState<SetupIdentity | null>(null)
+  // What this application runs on, from the first reading of it that succeeds and never from a
+  // later one: an application does not change platform while it runs. Until that reading ends, or
+  // when it never does, it is not known, and a platform that is not known shows nothing that
+  // belongs to macOS.
+  const [platform, setPlatform] = useState<SetupPlatform | null>(null)
   const [capabilities, setCapabilities] = useState<EnvironmentCapabilitiesResult | null>(null)
   const [failure, setFailure] = useState<string | null>(null)
   const [loaded, setLoaded] = useState(false)
@@ -230,34 +242,40 @@ export function Setup(): ReactNode {
   /** One reading of everything this screen is about, with no state written in it. */
   const load = useCallback(async (): Promise<Reading> => {
     const state = await port.connectionState()
-    const [who, what] = await Promise.all([
+    const [who, what] = await Promise.allSettled([
       port.setupIdentity(),
       state.environment_id
         ? port.environmentCapabilities({ environment_id: state.environment_id })
         : Promise.resolve(null)
     ])
+    let failure: string | null = null
+    if (who.status === 'rejected') failure = failureMessage(who.reason)
+    else if (what.status === 'rejected') failure = failureMessage(what.reason)
+    // A loss with no reason says only that: no host answered, and nothing said why. It is not a
+    // claim that this machine has no host.
+    else if (what.value === null) failure = state.reason ?? 'No reason was given.'
     return {
-      identity: who,
-      capabilities: what,
-      // A loss with no reason says only that: no host answered, and nothing said why. It is not
-      // a claim that this machine has no host.
-      failure: what ? null : (state.reason ?? 'No reason was given.')
+      identity: who.status === 'fulfilled' ? who.value : undefined,
+      capabilities: what.status === 'fulfilled' ? what.value : undefined,
+      failure
     }
   }, [port])
 
   const apply = useCallback((reading: Reading) => {
-    setIdentity(reading.identity)
-    setCapabilities(reading.capabilities)
-    // A host that answers says whether a run is going. One that does not answer says nothing.
-    if (reading.capabilities !== null) {
-      setAccepted(
-        reading.capabilities.checks.state === 'running'
-          ? reading.capabilities.environment_id
-          : null
-      )
+    const { identity: who, capabilities: what } = reading
+    if (who !== undefined) {
+      setIdentity(who)
+      setPlatform((known) => known ?? who.platform)
+    }
+    if (what !== undefined) {
+      setCapabilities(what)
+      // A host that answers says whether a run is going. One that does not answer says nothing.
+      if (what !== null) {
+        setAccepted(what.checks.state === 'running' ? what.environment_id : null)
+      }
+      setReads((count) => count + 1)
     }
     setFailure(reading.failure)
-    setReads((count) => count + 1)
     setLoaded(true)
   }, [])
 
@@ -424,9 +442,6 @@ export function Setup(): ReactNode {
     [port, reads, say]
   )
 
-  // What this application runs on, from its own reading. Until that reading ends, or when it fails,
-  // it is not known, and a platform that is not known shows nothing that belongs to macOS.
-  const platform = identity?.platform ?? null
   const steps = stepsFor(platform)
   const records = useMemo(() => capabilities?.desktop.records ?? [], [capabilities])
   const offered = useCallback(
@@ -512,7 +527,12 @@ export function Setup(): ReactNode {
 
       <div className="setup-body" key={current.id} data-testid={`setup-panel-${current.id}`}>
         {current.id === 'identity' ? (
-          <IdentityStep identity={identity} failure={failure} loaded={loaded} />
+          <IdentityStep
+            identity={identity}
+            platform={platform}
+            failure={failure}
+            loaded={loaded}
+          />
         ) : null}
         {current.id === 'permissions' && guidesPermissions(platform) ? (
           <PermissionsStep
@@ -696,17 +716,19 @@ function UnreadCard({
 
 function IdentityStep({
   identity,
+  platform,
   failure,
   loaded
 }: {
   readonly identity: SetupIdentity | null
+  readonly platform: SetupPlatform | null
   readonly failure: string | null
   readonly loaded: boolean
 }): ReactNode {
   if (!identity) return <UnreadCard failure={failure} loaded={loaded} />
   // The signature, the bundle and what a grant is filed under are macOS's: on another platform no
   // grant is filed under this application, so the card says which application this is and no more.
-  const filed = guidesPermissions(identity.platform)
+  const filed = guidesPermissions(platform)
   return (
     <>
       <Card data-testid="setup-identity">

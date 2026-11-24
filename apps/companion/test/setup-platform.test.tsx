@@ -168,6 +168,79 @@ describe('which platform the page is shown for', () => {
     expect(screen.getByTestId('setup-step-permissions').textContent).toMatch(/Permissions/)
   })
 
+  // The application's own answer and the host's answer are two readings. One failing must not take
+  // away what the other said: on a Mac that is the difference between the permission cards being
+  // there and not.
+  it('keeps the macOS cards when only the host’s reading of this machine fails', async () => {
+    start('macos', (port) => ({
+      ...port,
+      environmentCapabilities: () => Promise.reject(new Error('the host did not answer'))
+    }))
+    expect(await screen.findByTestId('setup-signature')).toBeInTheDocument()
+    expect(screen.getByRole('heading', { level: 1 }).textContent).toBe(
+      'Set up KalaReach on this Mac'
+    )
+    await goTo('permissions')
+    for (const pane of ['accessibility', 'screen_recording', 'full_disk_access', 'automation']) {
+      expect(screen.getByTestId(`setup-permission-${pane}`)).toBeInTheDocument()
+    }
+  })
+
+  it('shows the host’s records when only the first reading of the application fails, and its cards once it is read', async () => {
+    let failing = true
+    start('macos', (port) => ({
+      ...port,
+      setupIdentity: () =>
+        failing
+          ? Promise.reject(new Error('the application could not be read'))
+          : port.setupIdentity()
+    }))
+    await waitFor(() => {
+      expect(screen.getByTestId('setup-step-permissions')).toBeInTheDocument()
+    })
+    // Nothing of macOS while the application is unread, and the host's records all the same.
+    expect(screen.getByRole('heading', { level: 1 }).textContent).toBe('Set up KalaReach')
+    await goTo('capabilities')
+    expect(await screen.findByTestId('setup-capability-desktop.screen_capture')).toBeInTheDocument()
+    failing = false
+    await userEvent.click(screen.getByTestId('setup-recheck'))
+    await waitFor(() => {
+      expect(screen.getByRole('heading', { level: 1 }).textContent).toBe(
+        'Set up KalaReach on this Mac'
+      )
+    })
+    await goTo('permissions')
+    for (const pane of ['accessibility', 'screen_recording', 'full_disk_access', 'automation']) {
+      expect(screen.getByTestId(`setup-permission-${pane}`)).toBeInTheDocument()
+    }
+  })
+
+  it('keeps the platform the first reading named, whatever a later reading says', async () => {
+    let later = false
+    let reads = 0
+    start('x11', (port) => ({
+      ...port,
+      setupIdentity: async () => {
+        reads += 1
+        const identity = await port.setupIdentity()
+        return later ? { ...identity, platform: 'macos' as const } : identity
+      }
+    }))
+    await screen.findByTestId('setup-identity')
+    const before = reads
+    later = true
+    await goTo('capabilities')
+    await userEvent.click(screen.getByTestId('setup-recheck'))
+    await waitFor(() => {
+      expect(screen.getByTestId('setup-recheck').textContent).toBe('Read again')
+    })
+    expect(reads).toBeGreaterThan(before)
+    expect(screen.getByRole('heading', { level: 1 }).textContent).toBe('Set up KalaReach')
+    await goTo('permissions')
+    expect(document.querySelector('[data-testid^="setup-permission-"]')).toBeNull()
+    expect(pageText()).not.toMatch(/macOS|Mac\b|System Settings/)
+  })
+
   it('names the side bar’s setup link for this Mac on macOS and plainly everywhere else', () => {
     expect(setupLinkFor('macos')).toBe('Set up this Mac')
     for (const platform of ['linux', 'windows', 'other', null] as const) {
