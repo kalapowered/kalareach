@@ -9,7 +9,10 @@ use std::process::{Command, Output};
 use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
-use kr_ipc::identity::{ProcessState, Stop, process_state, started_process_identity, stop_process};
+use kr_ipc::identity::{
+    ProcessState, Stop, children_of, ended_process_identity, process_state, processes_in_group,
+    started_process_identity, stop_process,
+};
 use kr_ipc::testing::PrivateTempDir;
 use kr_ipc::testing::manager_stand_in::{PROGRAM_NAME, place_installation};
 use kr_protocol::identity::ProcessStartIdentity;
@@ -17,8 +20,10 @@ use kr_protocol::identity::ProcessStartIdentity;
 /// A test tree and an installation beside it, both of this case's own.
 ///
 /// When the fixture is dropped, which is when a case ends whether it passed or failed, it ends every
-/// process the case started, each by the identity it was recorded with: those the case started
-/// itself through [`Fixture::detached`] and the daemons the stand-in recorded in its jobs.
+/// process the case or the stand-in started for it, each by identity: those the case started itself
+/// through [`Fixture::detached`] and tracked, every process the stand-in wrote down as it started
+/// it (which holds whatever came of the record of its job), the daemons of the jobs' records, and
+/// the members of the groups those lead. A process it cannot show to have ended fails the case.
 struct Fixture {
     tree: PrivateTempDir,
     installation: PrivateTempDir,
@@ -30,19 +35,63 @@ struct Fixture {
 
 impl Drop for Fixture {
     fn drop(&mut self) {
-        let mut identities = std::mem::take(
+        let mut known = std::mem::take(
             self.started
                 .get_mut()
                 .unwrap_or_else(PoisonError::into_inner),
         );
-        identities.extend(self.recorded_daemons());
-        for identity in &identities {
-            let _ = stop_process(identity, Stop::Kill);
+        known.extend(self.recorded_daemons());
+        known.extend(self.written_down());
+        known.sort();
+        known.dedup();
+        let mut everything = known.clone();
+        // A member started while the others were being ended is found by the next pass.
+        for _ in 0..5 {
+            for leader in &known {
+                everything.extend(members_of_group(leader));
+            }
+            everything.sort();
+            everything.dedup();
+            for identity in &everything {
+                let _ = stop_process(identity, Stop::Kill);
+            }
         }
-        for identity in &identities {
-            let _ = ended(identity);
+        let alive: Vec<_> = everything
+            .iter()
+            .filter(|identity| !ended(identity))
+            .collect();
+        if !alive.is_empty() {
+            let said = format!("the fixture could not end every process of the case: {alive:?}");
+            if std::thread::panicking() {
+                eprintln!("{said}");
+            } else {
+                panic!("{said}");
+            }
         }
     }
+}
+
+/// The processes in the group the process `leader` leads, each by the identity it has now. The
+/// number is the group's only while the leader or a member runs, so a number that another process
+/// holds, read before the list and after it, gives none.
+fn members_of_group(leader: &ProcessStartIdentity) -> Vec<ProcessStartIdentity> {
+    let Ok(number) = u32::try_from(leader.pid.get()) else {
+        return Vec::new();
+    };
+    let is_the_groups = || {
+        started_process_identity(number)
+            .is_ok_and(|holder| holder == *leader || holder == ended_process_identity(number))
+    };
+    if !is_the_groups() {
+        return Vec::new();
+    }
+    let members: Vec<ProcessStartIdentity> = processes_in_group(number)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|pid| *pid != std::process::id())
+        .filter_map(|pid| started_process_identity(pid).ok())
+        .collect();
+    if is_the_groups() { members } else { Vec::new() }
 }
 
 impl Fixture {
@@ -98,6 +147,21 @@ impl Fixture {
 
     fn domain(&self) -> String {
         format!("user/{}", self.uid)
+    }
+
+    /// The processes the stand-in wrote down as it started them, whatever came of their jobs'
+    /// records.
+    fn written_down(&self) -> Vec<ProcessStartIdentity> {
+        std::fs::read_to_string(
+            self.tree
+                .path()
+                .join("state/manager-stand-in")
+                .join(kr_manager_stand_in::STARTED_FILE),
+        )
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect()
     }
 
     /// The calls it recorded, as the lines of its log.
@@ -210,6 +274,15 @@ impl Fixture {
             .unwrap_or_else(PoisonError::into_inner)
             .push(identity.clone());
     }
+}
+
+/// Places the program `idle` at `path`: it waits as many seconds as its first argument says, a
+/// second at a time.
+fn place_idle(path: &Path) {
+    kr_ipc::testing::place_script(
+        path,
+        "#!/bin/sh\ni=0\nwhile [ \"$i\" -lt \"$1\" ]; do sleep 1; i=$((i + 1)); done\n",
+    );
 }
 
 /// Whether the process `identity` has ended within ten seconds.
@@ -641,10 +714,11 @@ fn a_start_that_was_never_recorded_is_not_confused_with_processes_that_only_hold
     ]);
     assert_eq!(loaded.status.code(), Some(0), "{}", text(&loaded.stderr));
     fixture.mark_pending("kr-controller-n");
-    // A program of the installation that waits as long as its first argument says. The system shows
-    // it as the shell, the script and the argument.
+    // A program of the installation that waits as many seconds as its first argument says, a second
+    // at a time, so that it leaves no long-lived child behind it. The system shows it as the shell,
+    // the script and the argument.
     let idle = fixture.installation.path().join("idle");
-    kr_ipc::testing::place_script(&idle, "#!/bin/sh\nsleep \"$1\"\n");
+    place_idle(&idle);
     // A file that a reader of it waits at, so that a program outside the folders is given a path
     // inside them as an argument and stays running.
     let waited_at = fixture.tree.path().join("waited-at");
@@ -995,6 +1069,118 @@ fn a_case_that_fails_on_purpose_before_its_own_cleanup() {
     )
     .expect("the list is written");
     panic!("this case fails on purpose, before it ends anything it started");
+}
+
+/// A daemon whose record never reached its job is ended with the case, and so is what it started
+/// and what the case's own `idle` program started: the stand-in wrote the daemon down as it started
+/// it, and the fixture ends the members of its group. The case that loses the record runs in a child
+/// test process, and lists the processes before it fails.
+#[test]
+fn a_daemon_whose_record_was_lost_and_what_it_started_are_ended_with_the_case() {
+    let folder = PrivateTempDir::create();
+    let list = folder.path().join("started.json");
+    let child = run(
+        Command::new(std::env::current_exe().expect("this test program"))
+            .args([
+                "--ignored",
+                "--exact",
+                "a_case_that_loses_a_daemons_record_and_fails",
+                "--test-threads=1",
+            ])
+            .env(LIST_VARIABLE, &list),
+    );
+    let said = text(&child.stdout);
+    let started: Vec<ProcessStartIdentity> =
+        serde_json::from_str(&std::fs::read_to_string(&list).expect("the list of what it started"))
+            .expect("a list");
+    let leftovers = Leftovers(started.clone());
+    assert!(
+        said.contains("this case fails on purpose") && child.status.code() == Some(101),
+        "the child case fails on purpose and for no other reason: {said}"
+    );
+    assert!(
+        started.len() >= 3,
+        "the daemon, what it started and what idle started: {started:?}"
+    );
+    for identity in &started {
+        assert!(
+            ended(identity),
+            "a process of the case is still alive after its record was lost: {identity:?}"
+        );
+    }
+    drop(leftovers);
+}
+
+/// Run by the case above, in a child test process: it starts a daemon that starts a long-lived
+/// process of its own, loses the daemon's record, starts the `idle` program, lists what it started
+/// and fails before it ends any of it.
+#[test]
+#[ignore = "run by the case that shows a lost record leaves nothing alive"]
+fn a_case_that_loses_a_daemons_record_and_fails() {
+    let Some(list) = std::env::var_os(LIST_VARIABLE) else {
+        return;
+    };
+    let fixture = Fixture::new();
+    let child_file = fixture.tree.path().join("child.pid");
+    let script = format!(
+        "#!/bin/sh\nsleep 7300 &\necho $! > {}\nwhile :; do sleep 1; done\n",
+        child_file.display()
+    );
+    let (_, loaded) = fixture.load("kr-controller-l", &script, "");
+    assert_eq!(loaded.status.code(), Some(0), "{}", text(&loaded.stderr));
+    let target = format!("{}/kr-controller-l", fixture.domain());
+    let started = fixture.call(&["kickstart", "-p", &target]);
+    assert_eq!(started.status.code(), Some(0), "{}", text(&started.stderr));
+    let daemon = fixture
+        .recorded_daemons()
+        .pop()
+        .expect("the daemon the stand-in recorded");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let descendant = loop {
+        if let Some(pid) = std::fs::read_to_string(&child_file)
+            .ok()
+            .and_then(|written| written.trim().parse::<u32>().ok())
+        {
+            break started_process_identity(pid).expect("the process the daemon started");
+        }
+        assert!(Instant::now() < deadline, "the daemon started no process");
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    // The record the case failed to publish: the job has none that names the daemon.
+    std::fs::remove_file(
+        fixture
+            .tree
+            .path()
+            .join("state/manager-stand-in/jobs/kr-controller-l.json"),
+    )
+    .expect("the record is removed");
+    assert!(fixture.recorded_daemons().is_empty());
+    let idle = fixture.installation.path().join("idle");
+    place_idle(&idle);
+    let state = fixture.tree.path().join("state");
+    let waiting = fixture.detached(&format!("{} 7301", idle.display()), &state, &[]);
+    let pid = u32::try_from(waiting.pid.get()).expect("a number");
+    let mut listed = vec![daemon, descendant, waiting];
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let children: Vec<ProcessStartIdentity> = children_of(pid)
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|child| started_process_identity(child).ok())
+            .collect();
+        if !children.is_empty() {
+            listed.extend(children);
+            break;
+        }
+        assert!(Instant::now() < deadline, "idle started no process");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    std::fs::write(
+        list,
+        serde_json::to_string(&listed).expect("the identities as text"),
+    )
+    .expect("the list is written");
+    panic!("this case fails on purpose, after its daemon's record was lost");
 }
 
 /// What a definition may name is bounded after every link is resolved: a plist, a log or a working

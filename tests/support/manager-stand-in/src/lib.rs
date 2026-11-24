@@ -48,6 +48,11 @@ const NOT_LOADED: i32 = 113;
 /// What `launchctl bootstrap` exits with for a label already loaded.
 const ALREADY_LOADED: i32 = 5;
 
+/// The file, in the folder of the record, in which every process this program starts is written
+/// down, one identity a line, as soon as it is started and before any record of its job is
+/// published, so that a test's cleanup holds each one whatever came of the record.
+pub const STARTED_FILE: &str = "started.jsonl";
+
 /// How long a daemon is given to end after it is asked to, and again after it is made to.
 const END_BOUND: Duration = Duration::from_secs(15);
 
@@ -877,6 +882,19 @@ fn start(
             ));
         }
     };
+    if let Err(why) = write_down_start(context, &identity) {
+        // The process is this program's own child, so ending it needs no identity.
+        let _ = child.kill();
+        let seen = if reap_within(&mut child, END_BOUND) {
+            "and was ended"
+        } else {
+            "and was killed, but not seen to end"
+        };
+        return Err(format!(
+            "the start of the process {} cannot be written down, {seen}: {why}",
+            child.id()
+        ));
+    }
     let mut keys: Vec<String> = environment.into_iter().map(|(name, _)| name).collect();
     keys.sort();
     Ok((identity, keys))
@@ -1075,6 +1093,19 @@ fn members_of(
     } else {
         Vec::new()
     })
+}
+
+/// Writes `identity` down as a process this program started.
+fn write_down_start(context: &Context, identity: &ProcessStartIdentity) -> Result<(), String> {
+    let path = context.in_store(STARTED_FILE)?;
+    let line = serde_json::to_string(identity).map_err(|error| error.to_string())?;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(|error| format!("{} cannot be opened: {error}", path.display()))?;
+    writeln!(file, "{line}")
+        .map_err(|error| format!("{} cannot be written: {error}", path.display()))
 }
 
 /// Whether the process `identity` and every process of its group are shown to have ended within
