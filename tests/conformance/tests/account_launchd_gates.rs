@@ -396,7 +396,7 @@ const PLAIN_DAEMON_NAMES: [(&str, &[Entry]); 19] = [
                 "the path the held daemon is mounted at in a container, under the installed name",
             ),
             (
-                "World::start_with",
+                "World::start_bounding",
                 1,
                 "the held daemon, or the script that hands over to it, placed under the installed name; nothing starts the plain build",
             ),
