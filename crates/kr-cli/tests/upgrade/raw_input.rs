@@ -137,6 +137,10 @@ impl ControlTransport for RawInput {
         self.inner.revoke_streams();
     }
 
+    fn host_states_placement_reading(&self) -> bool {
+        self.inner.host_states_placement_reading()
+    }
+
     fn close(&self) {
         self.inner.close();
     }
