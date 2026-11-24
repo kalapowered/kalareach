@@ -775,7 +775,7 @@ jobs:
     name: desktop probe
     if: github.event_name == 'workflow_dispatch' && inputs.desktop_probe
     runs-on: ubuntu-24.04
-    timeout-minutes: 75
+    timeout-minutes: 95
     defaults:
       run:
         shell: bash
@@ -800,10 +800,42 @@ jobs:
           echo "dl2-packages.sh before $rc" >> "$PROBE_RESULTS/exit-codes.txt"
           exit "$rc"
 
+      # The runner's own sources name a regional mirror, on which the download of about 150 archives
+      # stalled in two runs. The install takes the Ubuntu archive and security hosts by name instead,
+      # and the runner's sources file stays aside, outside the folder apt reads.
+      - name: Use the Ubuntu archive hosts
+        timeout-minutes: 1
+        run: |
+          runner_sources=/etc/apt/sources.list.d/ubuntu.sources
+          new_sources=/etc/apt/sources.list.d/ubuntu-archive.sources
+          aside_sources=/etc/apt/ubuntu.sources.runner
+          if [ ! -f "$runner_sources" ]; then
+            echo "the runner's sources file is not at $runner_sources; /etc/apt/sources.list.d/ holds:" >&2
+            ls -la /etc/apt/sources.list.d/ >&2
+            exit 1
+          fi
+          sudo tee "$new_sources" > /dev/null <<'EOF'
+          Types: deb
+          URIs: http://archive.ubuntu.com/ubuntu
+          Suites: noble noble-updates noble-backports
+          Components: main restricted universe multiverse
+          Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+
+          Types: deb
+          URIs: http://security.ubuntu.com/ubuntu
+          Suites: noble-security
+          Components: main restricted universe multiverse
+          Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+          EOF
+          sudo mv "$runner_sources" "$aside_sources"
+          echo "new sources file: $new_sources"
+          echo "runner's sources file, moved aside: $aside_sources"
+          cat "$new_sources"
+
       # The packages are the list in dl2-packages.sh. The script retries the update and the download,
-      # each under a bound, for 25 minutes at most; the step's 30 are those 25 and the install.
+      # each under a bound, for 45 minutes at most; the step's 50 are those 45 and the install.
       - name: Install the packages
-        timeout-minutes: 30
+        timeout-minutes: 50
         run: |
           rc=0
           read -r -a packages <<< "$(awk -F'"' '/^PACKAGES=/ { print $2 }' scripts/probe-desktop/dl2-packages.sh)"
@@ -812,7 +844,7 @@ jobs:
             rc=2
           else
             echo "installing ${#packages[@]} packages: ${packages[*]}"
-            bash scripts/apt-install.sh --deadline 1500 "${packages[@]}" 2>&1 | tee "$PROBE_RESULTS/apt-install.log" || rc=$?
+            bash scripts/apt-install.sh --deadline 2700 "${packages[@]}" 2>&1 | tee "$PROBE_RESULTS/apt-install.log" || rc=$?
           fi
           echo "apt-install.sh $rc" >> "$PROBE_RESULTS/exit-codes.txt"
           exit "$rc"
