@@ -247,6 +247,9 @@ fn package(tree: &Path, checkout: &Path, shell: &str) -> Result<ReleaseShell> {
     if !pins["flags"].is_object() {
         refuse!("{}", at("the pins declare no flags"));
     }
+    if !record["flags"].is_object() {
+        refuse!("{}", at("its record declares no flags"));
+    }
     if record["flags"] != pins["flags"] {
         refuse!("{}", at("it records other flags than the pins declare"));
     }

@@ -554,6 +554,12 @@ declared mechanisms, and the build's own inputs and compiler. The record also st
 shell's own test suite did, and holds as `build.inputs` the exact text the identity is a digest of,
 so which of the inputs were the tree's and which the machine's can be read back line by line.
 
+The record also holds `flags`, the arguments a host starts the shell with: one list for the
+interactive startup and one for the login startup. The build copies them from the package's pinned
+`manifest.json`, as the PowerShell publish does, and the release check refuses a package whose
+record differs from the pins. The handshake does not carry them, because they say how a host starts
+the shell and not what the shell is.
+
 The manifest's compilation flags are part of the package rather than a local preference. Zsh
 writes some of its configure probes in pre-C99 style, and a compiler that rejects implicit `int`
 answers "missing" where the truth is "did not compile": that is how a build ends up with

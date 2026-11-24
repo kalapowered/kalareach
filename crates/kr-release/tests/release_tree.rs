@@ -917,8 +917,8 @@ fn the_pins_declare_the_flags_section_seven_states() {
     }
 }
 
-/// KR-REQ-07.16: a package whose record states other flags than the pins declare, or whose pins
-/// declare none, is refused before the tree is signed.
+/// KR-REQ-07.16: a package whose record states other flags than the pins declare, or states none,
+/// is refused before the tree is signed.
 ///
 /// The record is a file and an edit of it changes none of the inputs the identity is a digest of,
 /// so the flags are compared with the pins on their own.
@@ -967,9 +967,7 @@ fn a_record_whose_flags_differ_from_the_pins_is_refused_before_it_is_signed() {
     });
     let refused = assemble(&inputs(&release.tree())).expect_err("no flags");
     assert!(
-        refused
-            .to_string()
-            .contains("it records other flags than the pins declare"),
+        refused.to_string().contains("its record declares no flags"),
         "{refused}"
     );
 }

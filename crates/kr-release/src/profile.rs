@@ -1,11 +1,11 @@
 //! How a host starts each shell, and where it puts the package's marked entry.
 //!
-//! A release says it once, from the host's own tables: the arguments a shell is started with in
-//! each mode, and the startup files that hold the entry. The arguments name no option that skips or
-//! replaces a startup file of the person's, and the entries are put in files the shell reads
-//! itself; the order the shell reads its startup files in is the shell's, and is not stated. A
-//! person who moves a startup directory (`ZDOTDIR`, `XDG_CONFIG_HOME`) moves the entry with it,
-//! which the location says in the shell's own words.
+//! A release says it once: the arguments a shell is started with in each mode, which its package's
+//! record declares, and the startup files that hold the entry, which are the host's own table. The
+//! arguments name no option that skips or replaces a startup file of the person's, and the entries
+//! are put in files the shell reads itself; the order the shell reads its startup files in is the
+//! shell's, and is not stated. A person who moves a startup directory (`ZDOTDIR`,
+//! `XDG_CONFIG_HOME`) moves the entry with it, which the location says in the shell's own words.
 
 use std::path::{Path, PathBuf};
 
