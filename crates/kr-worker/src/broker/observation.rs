@@ -450,6 +450,8 @@ pub struct ObservationLane {
     documents_read: Mutex<BTreeMap<BrokerBindingId, u64>>,
     #[cfg(feature = "testing")]
     hold: Mutex<Option<Arc<HoldState>>>,
+    #[cfg(feature = "testing")]
+    pause: Mutex<Option<Arc<PauseState>>>,
 }
 
 /// The two halves of a hold on the pump, for this host's own tests: a signal that the pump has
@@ -459,6 +461,48 @@ pub struct ObservationLane {
 struct HoldState {
     parked: AtomicBool,
     released: AtomicBool,
+}
+
+/// Where a test stops the pump in the middle of one of its calls. For this host's own tests.
+#[cfg(feature = "testing")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Pause {
+    /// A baseline that has given this many requests, before it hands over the next or ends.
+    BaselineGiven(u64),
+    /// An entry that has been handed to this binding, before it is offered to the next one.
+    OfferedTo(BrokerBindingId),
+}
+
+/// A pause a test set and the two halves of its hold: a signal that the pump has stopped there, and
+/// the release.
+#[cfg(feature = "testing")]
+#[derive(Debug)]
+struct PauseState {
+    at: Pause,
+    parked: AtomicBool,
+    released: AtomicBool,
+}
+
+/// A hold on the pump at a [`Pause`]: the pump stops there until the hold is released. For this
+/// host's own tests, the way a hold on the pump is.
+#[cfg(feature = "testing")]
+#[derive(Debug)]
+pub struct PauseHold {
+    state: Arc<PauseState>,
+}
+
+#[cfg(feature = "testing")]
+impl PauseHold {
+    /// Returns true once the pump has reached the pause and is waiting at it.
+    #[must_use]
+    pub fn parked(&self) -> bool {
+        self.state.parked.load(Ordering::Acquire)
+    }
+
+    /// Lets the pump go on.
+    pub fn release(&self) {
+        self.state.released.store(true, Ordering::Release);
+    }
 }
 
 /// A hold on the pump. While it is held the pump takes nothing off the lane. It is for this host's
@@ -509,6 +553,8 @@ impl ObservationLane {
             documents_read: Mutex::new(BTreeMap::new()),
             #[cfg(feature = "testing")]
             hold: Mutex::new(None),
+            #[cfg(feature = "testing")]
+            pause: Mutex::new(None),
         }
     }
 
@@ -826,29 +872,48 @@ impl ObservationLane {
         true
     }
 
-    /// Returns the bindings that are ready, owed their baseline and not passed over for a while,
-    /// when the pump holds `entry` (the sequence number of the entry it took, where it took one): a
-    /// baseline is read only after every entry older than the component's view has been taken and
-    /// counted, and before the first entry at or after it is offered.
+    /// Returns the bindings that are ready, owed their baseline and not passed over for a while, each
+    /// with the connection its registration was made on, when the pump holds `entry` (the sequence
+    /// number of the entry it took, where it took one): a baseline is read only after every entry
+    /// older than the component's view has been taken and counted, and before the first entry at or
+    /// after it is offered.
     #[must_use]
-    pub fn rebuilds_due(&self, entry: Option<u64>, now: Instant) -> Vec<BrokerBindingId> {
+    pub fn rebuilds_due(&self, entry: Option<u64>, now: Instant) -> Vec<(BrokerBindingId, u64)> {
         self.inner()
             .views
             .iter()
             .filter(|(_, view)| view.ready && view.rebuild_owed && !view.is_silent(now))
             .filter(|(_, view)| entry.is_none_or(|seq| seq >= view.ready_from))
-            .map(|(binding, _)| *binding)
+            .map(|(binding, view)| (*binding, view.connection))
             .collect()
     }
 
+    /// Returns true while a binding's baseline is owed to the registration made on `connection`: the
+    /// binding is ready, still owed it, and has not been registered again since. A baseline that
+    /// began on one registration is given to that registration's component and to no other.
+    #[must_use]
+    pub fn rebuild_owed_on(&self, binding: BrokerBindingId, connection: u64) -> bool {
+        self.inner()
+            .views
+            .get(&binding)
+            .is_some_and(|view| view.ready && view.rebuild_owed && view.connection == connection)
+    }
+
     /// Ends a binding's baseline: it is offered what is recorded from `boundary` on, and the outage
-    /// is handed back to be told. Returns nothing where the binding has no baseline owed.
-    pub fn finish_rebuild(&self, binding: BrokerBindingId, boundary: u64) -> Option<Outage> {
+    /// is handed back to be told. Returns nothing where the baseline is not owed to the registration
+    /// made on `connection`: the component the baseline was given to is gone, and its replacement
+    /// is still owed its own.
+    pub fn finish_rebuild(
+        &self,
+        binding: BrokerBindingId,
+        boundary: u64,
+        connection: u64,
+    ) -> Option<Outage> {
         let mut inner = self.inner();
         let view = inner
             .views
             .get_mut(&binding)
-            .filter(|view| view.rebuild_owed)?;
+            .filter(|view| view.ready && view.rebuild_owed && view.connection == connection)?;
         view.rebuild_owed = false;
         view.recorded_from = boundary;
         Some(std::mem::take(&mut view.outage))
@@ -1174,6 +1239,40 @@ impl ObservationLane {
         }
         state.parked.store(true, Ordering::Release);
         true
+    }
+
+    /// Stops the pump the next time it reaches `at`, and until the returned hold is released. For
+    /// this host's own tests.
+    #[cfg(feature = "testing")]
+    pub fn pause_at(&self, at: Pause) -> PauseHold {
+        let state = Arc::new(PauseState {
+            at,
+            parked: AtomicBool::new(false),
+            released: AtomicBool::new(false),
+        });
+        *self
+            .pause
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(&state));
+        PauseHold { state }
+    }
+
+    /// Stops the pump at `at` where a test holds it there, until the hold is released.
+    #[cfg(feature = "testing")]
+    pub async fn paused_at(&self, at: Pause) {
+        let state = self
+            .pause
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .filter(|state| state.at == at);
+        let Some(state) = state else {
+            return;
+        };
+        while !state.released.load(Ordering::Acquire) {
+            state.parked.store(true, Ordering::Release);
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
     }
 }
 

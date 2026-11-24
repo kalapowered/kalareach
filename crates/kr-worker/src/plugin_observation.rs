@@ -71,6 +71,8 @@ use tokio::time::Instant;
 
 use crate::broker::Broker;
 use crate::broker::component::ComponentNote;
+#[cfg(feature = "testing")]
+use crate::broker::observation::Pause;
 use crate::broker::observation::{
     Audience, Entry, LaneLoss, NativeFrame, ObservationLane, PIECE_BYTES, Source, Tally,
 };
@@ -113,8 +115,8 @@ pub async fn pump(broker: Weak<Broker>) {
         // A baseline is read after every entry older than the component's view has been taken and
         // counted, and before the first entry at or after it is offered.
         let at = taken.entry.as_ref().map(Entry::seq);
-        for binding in lane.rebuilds_due(at, Instant::now()) {
-            rebuild(&strong, &lane, binding).await;
+        for (binding, connection) in lane.rebuilds_due(at, Instant::now()) {
+            rebuild(&strong, &lane, binding, connection).await;
         }
         snapshots(&strong, &lane).await;
         match taken.entry {
@@ -334,10 +336,21 @@ async fn offer(broker: &Broker, lane: &ObservationLane, entry: &Entry) {
 /// Gives a binding's component, which started again, the requests the broker holds for it, and puts
 /// in its report what it was given and what it was not.
 ///
-/// Everything is read again before each request is handed over, and no wait is made while the
-/// broker's lock is held. A runtime that cannot be reached leaves the baseline owed to the
-/// registration that follows; any other answer ends it, and what was not given is counted.
-async fn rebuild(broker: &Broker, lane: &ObservationLane, binding: BrokerBindingId) {
+/// The baseline is given to one registration: the connection to the runtime it began on, and the
+/// registration made on it, are taken once, before the first request is handed over, and every
+/// request goes through them. Everything else is read again before each request is handed over, and
+/// no wait is made while the broker's lock is held. A runtime that cannot be reached, or that was
+/// replaced while a request was handed over, leaves the baseline owed to the registration that
+/// follows; any other answer ends it, and what was not given is counted.
+async fn rebuild(
+    broker: &Broker,
+    lane: &ObservationLane,
+    binding: BrokerBindingId,
+    connection: u64,
+) {
+    let Some(client) = broker.component_calls().client() else {
+        return;
+    };
     let mut recovery = Recovery::default();
     let mut boundary = 0;
     if let Some(read) = broker.rebuild_of(binding) {
@@ -351,13 +364,9 @@ async fn rebuild(broker: &Broker, lane: &ObservationLane, binding: BrokerBinding
         };
         let mut offers = read.offers.into_iter();
         while let Some(given) = offers.next() {
-            let Some(client) = broker.component_calls().client() else {
-                return;
-            };
-            let on_it = lane.view(binding).is_some_and(|view| {
-                view.ready && view.rebuild_owed && view.connection == lane.connection()
-            });
-            if !on_it || !broker.observing(audience).contains(&binding) {
+            if !(current(broker, &client) && lane.rebuild_owed_on(binding, connection))
+                || !broker.observing(audience).contains(&binding)
+            {
                 return;
             }
             // Answered, or left behind by the source, while an earlier request was handed over.
@@ -388,6 +397,8 @@ async fn rebuild(broker: &Broker, lane: &ObservationLane, binding: BrokerBinding
                     recovery.given += 1;
                     recovery.approvals += u64::from(given.approval);
                     lane.answered(binding);
+                    #[cfg(feature = "testing")]
+                    lane.paused_at(Pause::BaselineGiven(recovery.given)).await;
                 }
                 Ok(Admission::Refused { .. }) => {
                     recovery.refused += 1 + left;
@@ -410,7 +421,7 @@ async fn rebuild(broker: &Broker, lane: &ObservationLane, binding: BrokerBinding
             }
         }
     }
-    let Some(outage) = lane.finish_rebuild(binding, boundary) else {
+    let Some(outage) = lane.finish_rebuild(binding, boundary, connection) else {
         return;
     };
     let told = Recovery {

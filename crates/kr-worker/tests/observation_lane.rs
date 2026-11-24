@@ -461,8 +461,13 @@ fn kr_req_24_24_a_baseline_comes_after_the_older_entries_and_before_the_first_ne
         due(Some(0)).is_empty() && due(Some(1)).is_empty(),
         "before the older entries are taken"
     );
-    assert_eq!(due(Some(2)), vec![binding]);
-    assert_eq!(due(None), vec![binding], "where no entry waits");
+    let connection = lane.connection();
+    assert_eq!(due(Some(2)), vec![(binding, connection)]);
+    assert_eq!(
+        due(None),
+        vec![(binding, connection)],
+        "where no entry waits"
+    );
     lane.go_silent(binding, now);
     assert!(
         due(Some(2)).is_empty(),
@@ -480,18 +485,57 @@ fn kr_req_24_24_a_baseline_ends_once_and_hands_the_outage_back() {
     lane.set_ready(binding, lane.connection());
     lane.all_not_ready();
     lane.began_connection();
-    lane.set_ready_for_rebuild(binding, lane.connection(), 2, 0);
+    let connection = lane.connection();
+    lane.set_ready_for_rebuild(binding, connection, 2, 0);
     let outage = lane
-        .finish_rebuild(binding, 17)
+        .finish_rebuild(binding, 17, connection)
         .expect("a baseline was owed");
     assert_eq!(outage.decode_queued, 2);
     let view = lane.view(binding).expect("the view stays");
     assert!(!view.rebuild_owed);
     assert_eq!(view.recorded_from, 17);
     assert_eq!(view.outage, Outage::default());
-    assert_eq!(lane.finish_rebuild(binding, 99), None);
+    assert_eq!(lane.finish_rebuild(binding, 99, connection), None);
     assert!(
         lane.rebuilds_due(None, tokio::time::Instant::now())
             .is_empty()
     );
+}
+
+/// KR-REQ-24.24: a baseline is owed to the registration it began on. A binding registered again on a
+/// later connection, or not ready, is owed a baseline of its own, and the end of an earlier one
+/// leaves it owed.
+#[test]
+fn kr_req_24_24_a_baseline_ends_only_for_the_registration_it_began_on() {
+    let lane = ObservationLane::new();
+    let binding = binding_of(27);
+    lane.began_connection();
+    lane.set_ready(binding, lane.connection());
+    lane.all_not_ready();
+    lane.began_connection();
+    let first = lane.connection();
+    lane.set_ready_for_rebuild(binding, first, 0, 0);
+    assert!(lane.rebuild_owed_on(binding, first));
+
+    // The runtime is lost and the component registered again on the next connection.
+    lane.all_not_ready();
+    assert!(
+        !lane.rebuild_owed_on(binding, first) && lane.finish_rebuild(binding, 5, first).is_none(),
+        "a component that is gone is owed nothing, and the end of its baseline changes nothing"
+    );
+    lane.began_connection();
+    let second = lane.connection();
+    lane.set_ready_for_rebuild(binding, second, 0, 0);
+    assert!(
+        !lane.rebuild_owed_on(binding, first),
+        "the first registration's baseline is not the second's"
+    );
+    assert_eq!(
+        lane.finish_rebuild(binding, 5, first),
+        None,
+        "the end of the first baseline leaves the second owed"
+    );
+    assert!(lane.rebuild_owed_on(binding, second));
+    assert!(lane.finish_rebuild(binding, 6, second).is_some());
+    assert!(!lane.rebuild_owed_on(binding, second));
 }

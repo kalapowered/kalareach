@@ -15,7 +15,7 @@ mod plugin_world;
 use kr_protocol::gateway::{PendingKind, PendingState};
 use kr_protocol::local::ControllerConnectionRole;
 use kr_worker::broker::decoding::{NotDecoded, Verdict};
-use kr_worker::broker::observation::{Audience, Source};
+use kr_worker::broker::observation::{Audience, Pause, Source};
 use plugin_world::observing::{
     Observing, Options, Spec, answered, binding, credential, digest, highest_line, instance,
     notification, request, request_noting, unlisted,
@@ -1166,6 +1166,143 @@ async fn kr_req_24_24_a_request_whose_answer_is_being_written_is_not_given_to_a_
         reason.contains("the worker gave it 2 pending requests from its own records"),
         "{reason}"
     );
+}
+
+/// Starts a world whose binding 1 observes and whose binding 2 reads requests, and sends three
+/// requests that binding 2 reads into approvals and binding 1 has observed.
+async fn three_requests_read_into_approvals() -> Option<Observing> {
+    let world = Observing::start(Options::with(vec![
+        Spec::semantic_only(1),
+        Spec::interpreter(2),
+    ]))
+    .await?;
+    world.until_ready(1).await;
+    for id in 1..=3_u64 {
+        world.send(&request(id));
+    }
+    until("every request to be read into an approval", || async {
+        (world
+            .broker()
+            .pending_resources()
+            .iter()
+            .filter(|resource| {
+                resource.kind == PendingKind::Approval && resource.interpretation_verified
+            })
+            .count()
+            == 3)
+            .then_some(())
+    })
+    .await;
+    world
+        .until_account(1, "the component to have observed them all", |account| {
+            account.requests.len() == 3
+        })
+        .await;
+    Some(world)
+}
+
+/// Waits until binding `number` is registered on a later connection to the plugin runtime than
+/// `than`, and is owed its baseline.
+async fn until_registered_on_a_later_connection(world: &Observing, number: u8, than: u64) {
+    let lane = world.broker().observation();
+    until(
+        "the component to be registered on the next runtime, owed its baseline",
+        || async {
+            lane.view(binding(number))
+                .is_some_and(|view| view.ready && view.rebuild_owed && view.connection > than)
+                .then_some(())
+        },
+    )
+    .await;
+}
+
+/// KR-REQ-24.24: a baseline that began on one registration is never given to the next one. The plugin
+/// runtime is lost a second time between two hand-overs of the baseline, and the component that
+/// starts the second time is given every pending request, once each.
+///
+/// Three requests are read into approvals and the runtime is lost. The baseline is held once it has
+/// given the first request, the runtime is lost again, and the component is registered in the third
+/// runtime, owed its baseline, before the first baseline goes on. That baseline gives the third
+/// runtime's component nothing; the baseline of the second registration gives it all three.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_24_24_a_second_loss_between_two_hand_overs_leaves_the_replacement_every_pending_request_once()
+ {
+    let Some(world) = three_requests_read_into_approvals().await else {
+        return;
+    };
+    let lane = world.broker().observation();
+    let hold = lane.pause_at(Pause::BaselineGiven(1));
+
+    lose_the_runtime(&world).await;
+    world.let_the_compiles_go();
+    until(
+        "the baseline to be held after its first request",
+        || async { hold.parked().then_some(()) },
+    )
+    .await;
+    let first = lane.view(binding(1)).expect("a view").connection;
+
+    lose_the_runtime(&world).await;
+    world.let_the_compiles_go();
+    until_registered_on_a_later_connection(&world, 1, first).await;
+    hold.release();
+    until_started_again(&world, 1).await;
+
+    let account = world.account(1).await.expect("the component answers");
+    assert_eq!(account.restores, 0, "{account:?}");
+    assert_eq!(account.binds, 1, "{account:?}");
+    assert_eq!(
+        account.requests,
+        ["1", "2", "3"],
+        "the component of the second registration was given the first baseline's rest, or not every \
+         request: {account:?}"
+    );
+    assert_eq!(account.observes, 3, "{account:?}");
+    let reason = world.reason(1);
+    assert!(
+        reason.contains("the worker gave it 3 pending requests from its own records"),
+        "{reason}"
+    );
+}
+
+/// KR-REQ-24.24: a baseline that has given every request ends only for the registration it began on.
+/// The plugin runtime is lost a second time after the last hand-over and before the baseline ends,
+/// and the component that starts the second time is given every pending request, once each.
+///
+/// The baseline is held once it has given the third of three requests. The runtime is lost again and
+/// the component is registered in the third runtime, owed its baseline, before the first baseline
+/// ends. It does not end the owed baseline of the second registration.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_24_24_a_second_loss_before_a_baseline_ends_leaves_the_replacement_every_pending_request_once()
+ {
+    let Some(world) = three_requests_read_into_approvals().await else {
+        return;
+    };
+    let lane = world.broker().observation();
+    let hold = lane.pause_at(Pause::BaselineGiven(3));
+
+    lose_the_runtime(&world).await;
+    world.let_the_compiles_go();
+    until("the baseline to be held after its last request", || async {
+        hold.parked().then_some(())
+    })
+    .await;
+    let first = lane.view(binding(1)).expect("a view").connection;
+
+    lose_the_runtime(&world).await;
+    world.let_the_compiles_go();
+    until_registered_on_a_later_connection(&world, 1, first).await;
+    hold.release();
+    until_started_again(&world, 1).await;
+
+    let account = world.account(1).await.expect("the component answers");
+    assert_eq!(account.binds, 1, "{account:?}");
+    assert_eq!(
+        account.requests,
+        ["1", "2", "3"],
+        "the first baseline ended the second registration's baseline: {account:?}"
+    );
+    assert_eq!(account.observes, 3, "{account:?}");
 }
 
 /// KR-REQ-24.24: what the worker passed over while the plugin runtime was away is counted, whether
