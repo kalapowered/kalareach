@@ -711,15 +711,25 @@ fn candidates(capability: &str, display_server: DisplayServer) -> &'static [&'st
 /// execution context's own search path, because a facility installed for the user is as real as
 /// one installed for everybody, and the search path is part of the context the session runs in.
 /// A file that is not executable is not a facility: it would fail at the first attempt to run it.
+///
+/// The answer is always an absolute path, which is what is digested and what is run. An entry of the
+/// search path that is not absolute, a relative one or an empty one, is skipped: it names a place
+/// relative to the folder the lookup happens in, and a program started from the check's own folder
+/// would be another file than the one found.
 pub(super) fn installed_in(candidate: &str, search: Option<&std::ffi::OsStr>) -> Option<String> {
     let path = std::path::Path::new(candidate);
     if path.is_absolute() {
         return runnable(path).then(|| candidate.to_owned());
     }
-    std::env::split_paths(search?)
+    absolute_entries(search?)
         .map(|directory| directory.join(candidate))
         .find(|full| runnable(full))
         .map(|full| full.display().to_string())
+}
+
+/// The entries of a search path that name a place on their own: the absolute ones.
+fn absolute_entries(search: &std::ffi::OsStr) -> impl Iterator<Item = std::path::PathBuf> + '_ {
+    std::env::split_paths(search).filter(|entry| entry.is_absolute())
 }
 
 /// Returns whether a path is a file this context could run.
@@ -962,6 +972,65 @@ mod tests {
             );
         }
         std::fs::remove_dir_all(&directory).expect("removes the test's directory");
+    }
+
+    /// KR-REQ-03.29, LP-8: a bare name is found only in an absolute entry of the search path, and
+    /// the answer is an absolute path. A relative entry that reaches the tool's folder from the
+    /// folder this lookup runs in finds nothing, and an absolute entry after it is still searched.
+    #[cfg(unix)]
+    #[test]
+    fn a_relative_entry_of_the_search_path_finds_no_program() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = std::env::temp_dir().join(format!("kr-search-{}", kr_ipc::new_uuid()));
+        std::fs::create_dir_all(&directory).expect("a directory of this test's own");
+        let tool = directory.join("kr-stand-in");
+        std::fs::write(&tool, b"a stand-in").expect("the tool");
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755))
+            .expect("makes it runnable");
+        // The same folder as a relative path from wherever this lookup runs: up to the root, which
+        // is where `..` stops, and down again.
+        let relative = std::path::PathBuf::from("../".repeat(64)).join(
+            directory
+                .strip_prefix("/")
+                .expect("a temporary folder is absolute"),
+        );
+        assert!(relative.is_relative());
+        assert!(runnable(&relative.join("kr-stand-in")), "it does reach it");
+
+        let found = tool.display().to_string();
+        assert_eq!(
+            installed_in("kr-stand-in", Some(directory.as_os_str())),
+            Some(found.clone())
+        );
+        assert_eq!(
+            installed_in("kr-stand-in", Some(relative.as_os_str())),
+            None,
+            "a relative entry names a place relative to the folder the lookup is in"
+        );
+        let both = std::env::join_paths([relative.as_path(), directory.as_path()]).expect("joins");
+        assert_eq!(
+            installed_in("kr-stand-in", Some(both.as_os_str())),
+            Some(found),
+            "the absolute entry after it is searched, and the answer is absolute"
+        );
+        std::fs::remove_dir_all(&directory).expect("removes the test's directory");
+    }
+
+    /// KR-REQ-03.29, LP-8: an empty entry of a search path, which a shell reads as the current
+    /// folder, is not an entry that names a place: only the absolute entries are searched.
+    #[cfg(unix)]
+    #[test]
+    fn an_empty_or_relative_entry_is_not_searched() {
+        let search = std::ffi::OsString::from(":relative:/usr/bin::./here:/bin:");
+        let entries: Vec<_> = absolute_entries(&search).collect();
+        assert_eq!(
+            entries,
+            [
+                std::path::PathBuf::from("/usr/bin"),
+                std::path::PathBuf::from("/bin")
+            ]
+        );
     }
 
     /// KR-REQ-03.26, the part about selecting a macOS desktop: selecting a desktop alone never
