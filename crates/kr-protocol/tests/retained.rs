@@ -1273,7 +1273,7 @@ fn a_build_that_lists_the_fourth_host_protocol_is_at_the_first_level_that_speaks
         .expect("a version");
     let mut parts = version
         .split('.')
-        .map(|part| part.parse::<u32>().expect("a number"));
+        .map(|part| part.parse::<u16>().expect("a number"));
     let (major, minor) = (
         parts.next().expect("a major"),
         parts.next().expect("a minor"),
