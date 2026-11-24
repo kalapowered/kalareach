@@ -1051,7 +1051,8 @@ mod tests {
         // And with no display, an empty one or a blank one, no tool starts, and the words say that
         // this worker holds no display.
         for display in [None, Some(""), Some("  ")] {
-            std::fs::remove_file(folder.join("seen")).expect("the earlier reading");
+            // The reading of the run before, which is there only where a tool ran.
+            let _ = std::fs::remove_file(folder.join("seen"));
             let variables = Variables {
                 display: display.map(str::to_owned),
                 ..variables.clone()
