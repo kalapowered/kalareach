@@ -2867,7 +2867,7 @@ mod consumed {
             .expect("the component answers")
             .state;
         binding
-            .restore(state.clone(), None, ANSWER)
+            .restore(state.clone(), ANSWER)
             .await
             .expect("the restore runs")
             .answer
@@ -2882,12 +2882,12 @@ mod consumed {
 
         // A restore that carries a cursor makes it the instance's, and clean, at its own generation.
         binding
-            .restore(
+            .restore_through_unchecked(
                 state,
-                Some(Through {
+                Through {
                     native: Some(handle("se-7")),
                     terminal: None,
-                }),
+                },
                 ANSWER,
             )
             .await
@@ -3685,12 +3685,12 @@ mod consumed {
             .state;
         // Nothing has been read, so the report is still owed when the restore answers.
         binding
-            .restore(
+            .restore_through_unchecked(
                 state,
-                Some(Through {
+                Through {
                     native: Some(handle("se-7")),
                     terminal: None,
-                }),
+                },
                 ANSWER,
             )
             .await
@@ -3733,7 +3733,7 @@ mod consumed {
             .state;
 
         binding
-            .restore(state.clone(), None, ANSWER)
+            .restore(state.clone(), ANSWER)
             .await
             .expect("the restore runs")
             .answer
@@ -3744,12 +3744,12 @@ mod consumed {
 
         // A state the component declines changes nothing, whatever position it came with.
         let declined = binding
-            .restore(
+            .restore_through_unchecked(
                 vec![0xff, 0xfe],
-                Some(Through {
+                Through {
                     native: None,
                     terminal: Some(handle("se-9")),
-                }),
+                },
                 ANSWER,
             )
             .await
@@ -3758,12 +3758,12 @@ mod consumed {
         assert_eq!(consumed_of(&binding).await, plain);
 
         binding
-            .restore(
+            .restore_through_unchecked(
                 state,
-                Some(Through {
+                Through {
                     native: None,
                     terminal: Some(handle("se-9")),
-                }),
+                },
                 ANSWER,
             )
             .await
