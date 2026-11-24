@@ -28,18 +28,6 @@
       "sha256": "b47387386076db46382e2e37ca7d4fbbc85b77a5464a1666314a4a6eda6dd8a5"
     },
     {
-      "id": "aws-lc-rs-22e629d5c462-aws-lc-sys-LICENSE",
-      "licence": "ISC",
-      "source": "https://raw.githubusercontent.com/aws/aws-lc-rs/22e629d5c46276497a24ee3e575be4315940e7cb/aws-lc-sys/LICENSE",
-      "sha256": "728536b4160e051f86d7c9c388f704866b3d512cd7df97ac3516c65279523c4e"
-    },
-    {
-      "id": "dunce-1ee29a83526c-LICENSE",
-      "licence": "CC0-1.0",
-      "source": "https://gitlab.com/kornelski/dunce/-/raw/1ee29a83526c9f4c3618e1335f0454c878a54dcf/LICENSE",
-      "sha256": "a2010f343487d3f7618affe54f789f5487602331c0a8d03f49e9a7c547cf0499"
-    },
-    {
       "id": "fluent-langneg-rs-7fdc590466ea-LICENSE-MIT",
       "licence": "MIT",
       "source": "https://raw.githubusercontent.com/projectfluent/fluent-langneg-rs/7fdc590466ea63ca2367ac10fb1b881fe561f1a8/LICENSE-MIT",
@@ -98,7 +86,8 @@
       "licence": "MIT",
       "source": "https://raw.githubusercontent.com/madsmtm/objc2/8852b424193ca41602281b3d7540d7c8ed51e49a/LICENSE.md",
       "sha256": "7f976f7e9cb2d87df7230606feb932c3f21ac0e664045a775b600046ff850c54",
-      "name": "the licensing statement of the objc2 repository, which holds no licence text"
+      "name": "the licensing statement of the objc2 repository, which holds no licence text",
+      "statement": true
     },
     {
       "id": "pcre2-10.43-LICENCE",
@@ -154,7 +143,35 @@
       "licence": "MIT",
       "source": "https://raw.githubusercontent.com/etemesi254/zune-image/69502ce83fdfecdd0beefd677e2abb3781b29d98/LICENSE.md",
       "sha256": "e870d7fd7819a9f0453c62798cb52ae95d148a8c91dc2de1d983f997143c72de",
-      "name": "the licence header of the zune-image repository"
+      "name": "the licence header of the zune-image repository",
+      "statement": true
+    },
+    {
+      "id": "Unicode-DFS-2016-spdx-3.29.0",
+      "licence": "Unicode-DFS-2016",
+      "source": "https://raw.githubusercontent.com/spdx/license-list-data/31ba1a50e5397e00a304dbadc76531740e89ee48/text/Unicode-DFS-2016.txt",
+      "sha256": "1a33fc12a3abb0b3eb14db70e36ef1d0af51c93b1cc1f80f022c3bd406e9b874"
+    },
+    {
+      "id": "llama.cpp-e79e4bf660e1-sgemm.cpp-lines-1-18",
+      "licence": "MIT",
+      "source": "https://raw.githubusercontent.com/ggml-org/llama.cpp/e79e4bf660e19f2ad851e06c6913f7a8c5852621/ggml/src/ggml-cpu/llamafile/sgemm.cpp",
+      "sha256": "bf9b11e2d6c85ef7a7bb8165f28281e06f07570a4ed0a681666e2963328aa56b",
+      "excerpt": [
+        1,
+        18
+      ]
+    },
+    {
+      "id": "llama.cpp-e79e4bf660e1-ops.cpp-lines-5827-5828",
+      "licence": "MIT",
+      "source": "https://raw.githubusercontent.com/ggml-org/llama.cpp/e79e4bf660e19f2ad851e06c6913f7a8c5852621/ggml/src/ggml-cpu/ops.cpp",
+      "sha256": "974027171759f8557402304c3612c2b73479b1262a07f7b9bc062478a2f3a862",
+      "excerpt": [
+        5827,
+        5828
+      ],
+      "statement": true
     }
   ],
   "crates": [
@@ -163,13 +180,6 @@
       "version": "0.8.2",
       "texts": [
         "MIT-spdx-3.29.0-without-copyright-line"
-      ]
-    },
-    {
-      "name": "aws-lc-rs",
-      "version": "1.18.1",
-      "texts": [
-        "aws-lc-rs-22e629d5c462-aws-lc-sys-LICENSE"
       ]
     },
     {
@@ -224,13 +234,6 @@
       ]
     },
     {
-      "name": "dunce",
-      "version": "1.0.5",
-      "texts": [
-        "dunce-1ee29a83526c-LICENSE"
-      ]
-    },
-    {
       "name": "enum-assoc",
       "version": "1.4.1",
       "texts": [
@@ -261,7 +264,7 @@
     {
       "name": "iroh",
       "version": "1.4.1",
-      "repository": "https://github.com/kalapowered/iroh",
+      "package": "https://github.com/kalapowered/iroh?rev=9139ea0efa1bea32dc73a0b80868963cf026178d#9139ea0e",
       "texts": [
         "iroh-9139ea0efa1b-LICENSE-MIT"
       ]
@@ -269,7 +272,7 @@
     {
       "name": "iroh-base",
       "version": "1.4.1",
-      "repository": "https://github.com/kalapowered/iroh",
+      "package": "https://github.com/kalapowered/iroh?rev=9139ea0efa1bea32dc73a0b80868963cf026178d#9139ea0e",
       "texts": [
         "iroh-9139ea0efa1b-LICENSE-MIT"
       ]
@@ -277,7 +280,7 @@
     {
       "name": "iroh-dns",
       "version": "1.4.1",
-      "repository": "https://github.com/kalapowered/iroh",
+      "package": "https://github.com/kalapowered/iroh?rev=9139ea0efa1bea32dc73a0b80868963cf026178d#9139ea0e",
       "texts": [
         "iroh-9139ea0efa1b-LICENSE-MIT"
       ]
@@ -306,7 +309,7 @@
     {
       "name": "iroh-relay",
       "version": "1.4.1",
-      "repository": "https://github.com/kalapowered/iroh",
+      "package": "https://github.com/kalapowered/iroh?rev=9139ea0efa1bea32dc73a0b80868963cf026178d#9139ea0e",
       "texts": [
         "iroh-9139ea0efa1b-LICENSE-MIT"
       ]
@@ -436,6 +439,13 @@
       ]
     },
     {
+      "name": "siphasher",
+      "version": "1.0.3",
+      "texts": [
+        "MIT-spdx-3.29.0-without-copyright-line"
+      ]
+    },
+    {
       "name": "typed-path",
       "version": "0.9.3",
       "texts": [
@@ -485,9 +495,17 @@
       ]
     },
     {
+      "name": "wezterm-bidi",
+      "version": "0.2.3",
+      "package": "https://github.com/kalapowered/wezterm?rev=f3227b5b167844e03ca588ad7093b3975602d287#f3227b5b",
+      "texts": [
+        "Unicode-DFS-2016-spdx-3.29.0"
+      ]
+    },
+    {
       "name": "wezterm-cell",
       "version": "0.1.0",
-      "repository": "https://github.com/kalapowered/wezterm",
+      "package": "https://github.com/kalapowered/wezterm?rev=f3227b5b167844e03ca588ad7093b3975602d287#f3227b5b",
       "texts": [
         "wezterm-f3227b5b1678-LICENSE.md"
       ]
@@ -495,7 +513,7 @@
     {
       "name": "wezterm-char-props",
       "version": "0.1.3",
-      "repository": "https://github.com/kalapowered/wezterm",
+      "package": "https://github.com/kalapowered/wezterm?rev=f3227b5b167844e03ca588ad7093b3975602d287#f3227b5b",
       "texts": [
         "wezterm-f3227b5b1678-LICENSE.md"
       ]
@@ -503,7 +521,7 @@
     {
       "name": "wezterm-escape-parser",
       "version": "0.1.0",
-      "repository": "https://github.com/kalapowered/wezterm",
+      "package": "https://github.com/kalapowered/wezterm?rev=f3227b5b167844e03ca588ad7093b3975602d287#f3227b5b",
       "texts": [
         "wezterm-f3227b5b1678-LICENSE.md"
       ]
@@ -511,7 +529,7 @@
     {
       "name": "wezterm-surface",
       "version": "0.1.0",
-      "repository": "https://github.com/kalapowered/wezterm",
+      "package": "https://github.com/kalapowered/wezterm?rev=f3227b5b167844e03ca588ad7093b3975602d287#f3227b5b",
       "texts": [
         "wezterm-f3227b5b1678-LICENSE.md"
       ]
@@ -552,6 +570,24 @@
         "version": "0.2.9"
       },
       "text": "pcre2-10.43-LICENCE"
+    },
+    {
+      "name": "llamafile sgemm.cpp of llama.cpp",
+      "version": "e79e4bf660e1",
+      "carried_by": {
+        "name": "llama-cpp-sys-2",
+        "version": "0.1.156"
+      },
+      "text": "llama.cpp-e79e4bf660e1-sgemm.cpp-lines-1-18"
+    },
+    {
+      "name": "YaRN code in ops.cpp of llama.cpp",
+      "version": "e79e4bf660e1",
+      "carried_by": {
+        "name": "llama-cpp-sys-2",
+        "version": "0.1.156"
+      },
+      "text": "llama.cpp-e79e4bf660e1-ops.cpp-lines-5827-5828"
     }
   ]
 }
