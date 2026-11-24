@@ -179,6 +179,7 @@ class Phone:
                         "class": node.get("class", ""),
                         "box": bounds,
                         "enabled": node.get("enabled") == "true",
+                        "focused": node.get("focused") == "true",
                     }
                 )
         return nodes
@@ -257,9 +258,11 @@ class Phone:
         nodes = self.screen()
         labels = " | ".join(each["label"] for each in nodes if each["label"])
         self.shot("timeout")
-        # Every node `uiautomator` reported, with its class and box, for whoever reads the failure.
+        # Every node `uiautomator` reported, with its class, box and focus, for whoever reads the failure.
         (self.shots / "android-timeout-nodes.txt").write_text(
-            "\n".join(f"{each['class']} {each['box']} {each['label']!r}" for each in nodes) + "\n", encoding="utf-8"
+            "\n".join(f"{each['class']} {each['box']} {each['label']!r}{' focused' if each['focused'] else ''}" for each in nodes)
+            + "\n",
+            encoding="utf-8",
         )
         raise SystemExit(f"{message}; the screen shows: {labels}")
 
@@ -1305,7 +1308,104 @@ def write_and_send(phone: Phone, text: str) -> None:
     phone.wait_screen(lambda nodes: any(each["label"] == "Applied" for each in nodes), "the phone to say the send is applied", 60)
 
 
-def pair_by_scan(phone: Phone, directory: Path, picture: str, port: str, shot: str, answers: tuple[str, str], opener: str) -> None:
+# The bounds of the line typed into the terminal view: how long the keyboard has to come up after the field
+# is touched, how long a key has to show in the pane before it is judged missing, and how many keys may be
+# sent again, in all, before the run ends.
+KEYBOARD_UP_WAIT = 20.0
+KEY_SHOWN_WAIT = 6.0
+MOST_KEYS_SENT_AGAIN = 6
+
+
+def wait_for_the_field(phone: Phone) -> None:
+    """Waits until the touched field has the focus and the software keyboard is up, as a person waits
+    before typing: keys sent while the keyboard is still starting its session are not a person's keys."""
+    end = time.monotonic() + KEYBOARD_UP_WAIT
+    while time.monotonic() < end:
+        field = composer_of(phone)
+        shown = phone.run("shell", "dumpsys", "input_method").stdout.decode("utf-8", "replace")
+        if field is not None and field["focused"] and "mInputShown=true" in shown:
+            return
+        time.sleep(0.3)
+    phone.give_up("the terminal's field did not get the focus with the keyboard up")
+
+
+def pane_line(phone: Phone) -> str:
+    """The last line of text the terminal's pane shows. The pane is the largest tall text view of the
+    terminal tab; a pane with no text is not reported at all, which reads as an empty line."""
+    panes = [
+        each
+        for each in phone.screen()
+        if each["class"] == "android.widget.TextView" and each["box"][3] - each["box"][1] >= 300
+    ]
+    if not panes:
+        return ""
+    pane = max(panes, key=lambda each: (each["box"][2] - each["box"][0]) * (each["box"][3] - each["box"][1]))
+    lines = [line.rstrip() for line in pane["label"].split("\n") if line.strip()]
+    return lines[-1] if lines else ""
+
+
+def pane_shows(phone: Phone, typed: str) -> str:
+    """Reads the pane's last line until it is `typed`, for at most KEY_SHOWN_WAIT, and returns the last
+    reading."""
+    end = time.monotonic() + KEY_SHOWN_WAIT
+    while True:
+        shown = pane_line(phone)
+        if shown == typed or time.monotonic() >= end:
+            return shown
+        time.sleep(0.2)
+
+
+def type_the_line(phone: Phone, line: str, touched: float, keyboard_up: float) -> tuple[int, int]:
+    """Types `line` into the terminal's field one key at a time, as the keys of a hardware keyboard, and
+    reads the pane after each letter until it shows the line so far. A key that adb did not send, or that
+    the pane does not show within KEY_SHOWN_WAIT, is sent again, after erasing what the pane shows beyond
+    the line so far. Each such key is told in a PAIRING-NOTE, and the count of them is returned with the
+    count of erased keys. A space cannot be read from the pane (a line shows no trailing space), so the
+    letter after it shows whether it landed."""
+    typed = ""
+    sent = erased = 0
+
+    def when() -> str:
+        now = time.monotonic()
+        return f"{now - touched:.1f} s after the touch and {now - keyboard_up:.1f} s after the keyboard was up"
+
+    while typed != line:
+        if sent - len(line) > MOST_KEYS_SENT_AGAIN:
+            phone.give_up(f"more than {MOST_KEYS_SENT_AGAIN} keys had to be sent again while the line was typed ({typed!r} of {line!r})")
+        each = line[len(typed)]
+        answer = phone.run("shell", "input", "keyevent", str(62 if each == " " else 29 + ord(each) - ord("a")))
+        sent += 1
+        if answer.returncode != 0:
+            print(
+                f"PAIRING-NOTE key {len(typed) + 1} of {len(line)} ({each!r}) was not sent: adb exited {answer.returncode}, {when()}; sending it again",
+                flush=True,
+            )
+            continue
+        typed += each
+        if each == " ":
+            continue
+        shown = pane_shows(phone, typed)
+        if shown == typed:
+            continue
+        kept = len(os.path.commonprefix([shown, typed]))
+        surplus = len(shown) - kept
+        if surplus == 0 and typed[kept:-1].strip(" ") == "":
+            # Only spaces lie between what the pane shows and the letter just sent, and a pane does not show
+            # them: the letter alone is the one missing.
+            kept = len(typed) - 1
+        print(
+            f"PAIRING-NOTE key {kept + 1} of {len(line)} is missing from the pane {when()}: it shows {shown!r} where it should show {typed!r};"
+            f" erasing {surplus} and sending {len(typed) - kept} again",
+            flush=True,
+        )
+        if surplus:
+            phone.run("shell", "input", "keyevent", *(["KEYCODE_DEL"] * surplus))
+            erased += surplus
+        typed = typed[:kept]
+    return sent - len(line), erased
+
+
+def pair_by_scan(phone: Phone,directory: Path, picture: str, port: str, shot: str, answers: tuple[str, str], opener: str) -> None:
     """Scans the host's picture and pairs: the value the host shows is the one the phone shows, and the
     host approves it. A scan that reads a picture a host no longer holds is refused, and a person scans
     again."""
@@ -1398,11 +1498,13 @@ def sessions(adb: str, serial: str, directory: Path, shots: Path, port: str) -> 
     # The program's keyboard is the one text field of the view, which holds an invisible character.
     phone.wait_screen(lambda nodes: any(each["class"] == "android.widget.EditText" for each in nodes), "the terminal's keyboard field", 30)
     phone.tap(composer_of(phone))
+    touched = time.monotonic()
+    # A person types once the field has the focus and the keyboard is up.
+    wait_for_the_field(phone)
+    keyboard_up = time.monotonic()
     # Typed as the keys of a hardware keyboard (the software keyboard composes a word and drops or changes
     # parts of it), and ended by the Enter key once the whole line is in the pane.
-    # One key at a time: keys injected together are dropped now and then by the page.
-    for each in TERMINAL_LINE:
-        phone.run("shell", "input", "keyevent", str(62 if each == " " else 29 + ord(each) - ord("a")))
+    sent_again, erased = type_the_line(phone, TERMINAL_LINE, touched, keyboard_up)
     phone.wait_screen(
         lambda nodes: any(TERMINAL_LINE in each["label"] for each in nodes),
         "the line to reach the terminal's pane",
@@ -1414,7 +1516,10 @@ def sessions(adb: str, serial: str, directory: Path, shots: Path, port: str) -> 
     shown = read(directory, "screen-1-2.txt")
     if re.fullmatch(rf"h1s1=0 h1s2=[2-9] h2s1=0 text={TERMINAL_LINE}", shown) is None:
         raise SystemExit(f"the session's program was not sent the typed line: {shown}")
-    say("a line typed into the first host's second session's terminal view reached that session's program and no other")
+    say(
+        "a line typed into the first host's second session's terminal view reached that session's program and no other"
+        f" (keys sent again: {sent_again}, keys erased: {erased}, keyboard up {keyboard_up - touched:.1f} s after the touch)"
+    )
     leave_session(phone)
 
     # The second host is chosen, and its session is listed in place of the first host's.
