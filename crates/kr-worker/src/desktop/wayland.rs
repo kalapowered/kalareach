@@ -103,17 +103,39 @@ pub(super) fn perform(
 /// memory, measured against the payload rules and removed before the check answers, whichever way
 /// it went. The tool acts on the display this worker's own variables name, and on none that the
 /// worker lacks.
+///
+/// A worker that names no display starts nothing: the tool would look for the default socket in the
+/// runtime folder, which is the compositor of whichever login put one there and not necessarily the
+/// one this worker belongs to. A socket handed down from the process that started the worker is
+/// removed for the same reason.
 fn screen_copy(check: Check, plan: &Plan, setting: &Setting<'_>, tool: &str) -> Ran {
+    let variables = setting.variables;
+    let Some(display) = variables
+        .wayland_display
+        .as_deref()
+        .filter(|name| !name.is_empty())
+    else {
+        return Ran {
+            check,
+            facility: Some(tool.to_owned()),
+            outcome: Outcome::NotAttempted {
+                detail: Sentence::new().stated(
+                    "the worker holds no Wayland display name, so the screen-copy tool was not \
+                     started",
+                ),
+            },
+        };
+    };
     let image = plan.scratch.join(IMAGE);
     // A file from before is not this run's image.
     let _ = std::fs::remove_file(&image);
-    let variables = setting.variables;
     let ran = bounded_with(
         check,
         tool,
         &[&image.to_string_lossy()],
         &[
-            ("WAYLAND_DISPLAY", variables.wayland_display.as_deref()),
+            ("WAYLAND_DISPLAY", Some(display)),
+            ("WAYLAND_SOCKET", None),
             ("XDG_RUNTIME_DIR", variables.runtime_dir.as_deref()),
         ],
         plan,
@@ -773,36 +795,128 @@ mod tests {
         assert!(!ran.exists(), "grim is not run against weston");
     }
 
-    /// KR-REQ-03.29, LP-6: the tool acts on the display the worker's own variables name and on none
-    /// that the worker lacks: a variable the worker holds reaches it as it is, and one the worker
-    /// does not hold is not inherited from whatever process started the worker.
-    #[test]
-    fn the_tool_acts_on_the_display_the_workers_own_variables_name() {
-        let tools = Folder::new();
-        let scratch = Folder::new();
+    /// A stand-in for `grim` that writes what it sees of the three variables that name a display,
+    /// as `display|socket|runtime`, to a file, and then a whole image.
+    fn sees_the_display(tools: &Folder) -> PathBuf {
         let seen = tools.path().join("seen");
         let image = tools.file("image.png", &whole(1280, 720));
         tools.program(
             "grim",
             &format!(
-                "echo \"${{WAYLAND_DISPLAY-unset}}|${{XDG_RUNTIME_DIR-unset}}\" > '{}'\ncp '{}' \"$1\"",
+                "echo \"${{WAYLAND_DISPLAY-unset}}|${{WAYLAND_SOCKET-unset}}|${{XDG_RUNTIME_DIR-unset}}\" > '{}'\ncp '{}' \"$1\"",
                 seen.display(),
                 image.display()
             ),
         );
-        let mut held = variables(tools.path());
-        only(asked(&desktop(Some("sway")), held.clone(), scratch.path()));
+        seen
+    }
+
+    /// KR-REQ-03.29, LP-6: the tool acts on the display the worker's own variables name: the
+    /// variables the worker holds reach it as they are.
+    #[test]
+    fn the_tool_acts_on_the_display_the_workers_own_variables_name() {
+        let tools = Folder::new();
+        let scratch = Folder::new();
+        let seen = sees_the_display(&tools);
+        only(asked(
+            &desktop(Some("sway")),
+            variables(tools.path()),
+            scratch.path(),
+        ));
         assert_eq!(
             std::fs::read_to_string(&seen).expect("what it saw").trim(),
-            "wayland-1|/run/user/1000"
+            "wayland-1|unset|/run/user/1000"
         );
-        held.wayland_display = None;
-        held.runtime_dir = None;
-        only(asked(&desktop(Some("sway")), held, scratch.path()));
+    }
+
+    /// KR-REQ-03.29, LP-6: and on none that the worker lacks: a runtime folder the worker does not
+    /// hold, and a socket handed down to the process that started the worker, are not inherited by
+    /// the tool. The process that holds them is another one of this case's own, because a case
+    /// cannot set a variable of the program it runs in.
+    #[test]
+    fn a_variable_the_worker_lacks_is_not_inherited() {
+        const SEEN: &str = "KR_WAYLAND_CASE_SEEN";
+        const NAME: &str = "a_variable_the_worker_lacks_is_not_inherited";
+        if let Some(seen) = std::env::var_os(SEEN) {
+            // The inner process: the check, asked of a worker that holds a display and no runtime
+            // folder, writes what the tool saw where the outer process looks.
+            let tools = Folder::new();
+            let scratch = Folder::new();
+            let inner = sees_the_display(&tools);
+            let mut held = variables(tools.path());
+            held.runtime_dir = None;
+            only(asked(&desktop(Some("sway")), held, scratch.path()));
+            std::fs::copy(inner, seen).expect("what it saw");
+            return;
+        }
+        let place = Folder::new();
+        let seen = place.path().join("seen");
+        let outcome = std::process::Command::new(std::env::current_exe().expect("this program"))
+            .args([
+                "--exact",
+                &format!("desktop::wayland::tests::{NAME}"),
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(SEEN, &seen)
+            .env("WAYLAND_SOCKET", "3")
+            .env("XDG_RUNTIME_DIR", "/run/user/inherited")
+            .output()
+            .expect("the case runs again");
+        assert!(
+            outcome.status.success(),
+            "{}",
+            String::from_utf8_lossy(&outcome.stdout)
+        );
         assert_eq!(
             std::fs::read_to_string(&seen).expect("what it saw").trim(),
-            "unset|unset"
+            "wayland-1|unset|unset"
         );
+    }
+
+    /// KR-REQ-03.29, LP-7: a worker that names no display, with the variable absent or empty,
+    /// starts nothing, whatever sockets its runtime folder holds: the answer is that nothing was
+    /// established, the record still names the program, and nothing is left behind.
+    #[test]
+    fn a_worker_that_names_no_display_starts_nothing() {
+        let tools = Folder::new();
+        let scratch = Folder::new();
+        let runtime = Folder::new();
+        // The default socket of another login, in the folder this worker's variables name.
+        runtime.file("wayland-0", b"");
+        let ran = tools.path().join("ran");
+        let image = tools.file("image.png", &whole(1280, 720));
+        let grim = tools.program(
+            "grim",
+            &format!(": > '{}'\ncp '{}' \"$1\"", ran.display(), image.display()),
+        );
+        for display in [None, Some(String::new())] {
+            let mut held = variables(tools.path());
+            held.wayland_display = display.clone();
+            held.runtime_dir = Some(runtime.path().display().to_string());
+            let record = only(asked(&desktop(Some("sway")), held, scratch.path()));
+            assert!(!ran.exists(), "the tool was started with {display:?}");
+            assert_eq!(
+                record.state,
+                CapabilityState::TemporarilyUnavailable,
+                "{display:?}"
+            );
+            assert_eq!(
+                record.evidence_source,
+                CapabilityEvidenceSource::DisclosedProbe
+            );
+            assert_eq!(
+                reason(&record),
+                "this check established nothing: the worker holds no Wayland display name, so \
+                 the screen-copy tool was not started"
+            );
+            assert_eq!(
+                record.identity.binary.as_ref().map(String::as_str),
+                Some(grim.display().to_string().as_str()),
+                "the record names the program"
+            );
+            assert_eq!(left_in(scratch.path()), Vec::<String>::new());
+        }
     }
 
     /// KR-REQ-03.29, LP-5, the real leg: a headless sway and the real `grim` on a runner's facts
