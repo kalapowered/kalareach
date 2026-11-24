@@ -315,15 +315,85 @@ describe('a file the operating system refused to open', () => {
   })
 
   it('keeps macOS’s own sentence on macOS', () => {
-    expect(stateMeaning('permission_required', 'disclosed_probe', 'macos')).toBe(
+    expect(stateMeaning('permission_required', 'disclosed_probe', 'macos', 'desktop.screen_capture')).toBe(
       'macOS refused it. The grant is yours to give.'
     )
+    expect(
+      stateMeaning('permission_required', 'platform_query', 'macos', 'desktop.authorised_file_read')
+    ).toBe('This needs a grant macOS has not given. The grant is yours to give.')
+  })
+
+  it('gives the file’s own sentence to the file read and to no other capability', () => {
     for (const platform of ['linux', 'windows', 'other', null] as const) {
-      expect(stateMeaning('permission_required', 'disclosed_probe', platform)).toBe(
+      for (const evidence of ['disclosed_probe', 'platform_query'] as const) {
+        expect(
+          stateMeaning('permission_required', evidence, platform, 'desktop.authorised_file_read')
+        ).toBe("The file's own access settings refused it. Changing them is yours to do.")
+        for (const capability of [
+          'desktop.screen_capture',
+          'desktop.accessibility',
+          'desktop.application_launch',
+          'desktop.input_injection',
+          'desktop.display_server'
+        ]) {
+          expect(
+            stateMeaning('permission_required', evidence, platform, capability),
+            `${capability} on ${platform}`
+          ).toBeNull()
+        }
+      }
+    }
+  })
+
+  it('keeps the host’s reason for another capability’s refusal and adds no sentence', async () => {
+    const reason = 'no X11 display is set for this process, and the tool it found needs one'
+    const controls = start('x11', (port) => ({
+      ...port,
+      environmentCapabilities: async (request) => {
+        const answer = await port.environmentCapabilities(request)
+        return {
+          ...answer,
+          desktop: {
+            ...answer.desktop,
+            records: answer.desktop.records.map((record) =>
+              record.capability === 'desktop.screen_capture'
+                ? {
+                    ...record,
+                    state: 'permission_required' as const,
+                    evidence_source: 'platform_query' as const,
+                    disabled_reason: reason
+                  }
+                : record
+            )
+          }
+        }
+      }
+    }))
+    await screen.findByTestId('setup-identity')
+    // Both refusals on one page: the file's own, and a capability that is not a file.
+    controls.revokePermission('desktop.authorised_file_read')
+    await goTo('capabilities')
+    await userEvent.click(screen.getByTestId('setup-recheck'))
+    await waitFor(() => {
+      expect(screen.getByTestId('setup-state-desktop.authorised_file_read').textContent).toBe(
+        'Permission required'
+      )
+    })
+    const card = screen.getByTestId('setup-capability-desktop.screen_capture')
+    expect(screen.getByTestId('setup-state-desktop.screen_capture').textContent).toBe(
+      'Permission required'
+    )
+    expect(screen.getByTestId('setup-reason-desktop.screen_capture').textContent).toBe(reason)
+    expect(card.textContent).not.toMatch(/access settings|macOS|grant is yours to give/)
+    // The one paragraph of the card's body that is not the host's reason is the "about" line, and
+    // this record has none: the reason is the only sentence the card has.
+    expect(card.querySelectorAll('.card-body > p')).toHaveLength(1)
+    // The file read, refused on the same page, keeps its own sentence.
+    expect(
+      within(screen.getByTestId('setup-capability-desktop.authorised_file_read')).getByText(
         "The file's own access settings refused it. Changing them is yours to do."
       )
-      expect(stateMeaning('permission_required', 'platform_query', platform)).not.toMatch(/macOS/)
-    }
+    ).toBeInTheDocument()
   })
 })
 

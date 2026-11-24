@@ -21,6 +21,9 @@ import type { CapabilityRecord } from '@kalareach/protocol'
 import type { SetupPlatform } from '../host/port'
 import { guidesPermissions } from './platform'
 
+/** The capability whose refusal is the file's own access settings, on a platform with no panes. */
+const FILE_READ = 'desktop.authorised_file_read'
+
 /** What one capability is shown as. */
 export type DisplayState =
   | 'ready'
@@ -110,8 +113,9 @@ export const STATE_TONE: Readonly<
 export function stateMeaning(
   state: DisplayState,
   evidence: CapabilityRecord['evidence_source'],
-  platform: SetupPlatform | null
-): string {
+  platform: SetupPlatform | null,
+  capability: string
+): string | null {
   const probed = evidence === 'disclosed_probe'
   switch (state) {
     case 'ready':
@@ -119,10 +123,14 @@ export function stateMeaning(
         ? 'This machine did the thing and it worked.'
         : 'The operating system says nothing stands in the way. Nothing has done it yet.'
     case 'permission_required':
-      // Off macOS the only refusal a person can undo is the file's own: no grant is filed under
-      // an application there, so the macOS sentence would send somebody to a switch that is not.
+      // Off macOS no grant is filed under an application, so the macOS sentence would send
+      // somebody to a switch that is not there. The one refusal a person can undo there is the
+      // file's own, and only the file read can be refused by it. Another capability's refusal keeps
+      // the host's reason, which says what refused it, and gains no sentence of ours.
       if (!guidesPermissions(platform)) {
-        return "The file's own access settings refused it. Changing them is yours to do."
+        return capability === FILE_READ
+          ? "The file's own access settings refused it. Changing them is yours to do."
+          : null
       }
       return probed
         ? 'macOS refused it. The grant is yours to give.'

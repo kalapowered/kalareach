@@ -1152,6 +1152,7 @@ function CapabilityCard({
   const state = displayState(record, { grantWasOffered: offered })
   const about = aboutLine(record)
   const establishedFor = establishedAbout(record)
+  const meaning = stateMeaning(state, record.evidence_source, platform, record.capability)
   return (
     <Card data-testid={`setup-capability-${record.capability}`}>
       <header className="card-header">
@@ -1166,7 +1167,7 @@ function CapabilityCard({
             {about}
           </p>
         ) : null}
-        <p>{stateMeaning(state, record.evidence_source, platform)}</p>
+        {meaning ? <p>{meaning}</p> : null}
         {record.disabled_reason ? (
           <p className="faint small" data-testid={`setup-reason-${record.capability}`}>
             {record.disabled_reason}

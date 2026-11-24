@@ -91,16 +91,16 @@ describe('the state one capability is shown as', () => {
   it('asks for a restart once the grant was given and the answer did not change', () => {
     const waiting = record('desktop.screen_capture', 'permission_required')
     expect(displayState(waiting, { grantWasOffered: true })).toBe('restart_required')
-    expect(stateMeaning('restart_required', 'disclosed_probe', 'macos')).toMatch(
+    expect(stateMeaning('restart_required', 'disclosed_probe', 'macos', 'desktop.screen_capture')).toMatch(
       /start a new session and run the checks again/i
     )
   })
 
   it('says what an answer means differently when nothing performed the operation', () => {
-    expect(stateMeaning('ready', 'disclosed_probe', 'macos')).toMatch(/did the thing and it worked/)
-    expect(stateMeaning('ready', 'platform_query', 'macos')).toMatch(/Nothing has done it yet/)
-    expect(stateMeaning('desktop_unavailable', 'platform_query', 'macos')).toMatch(/no desktop/)
-    expect(stateMeaning('not_established', 'disclosed_probe', 'macos')).toMatch(
+    expect(stateMeaning('ready', 'disclosed_probe', 'macos', 'desktop.screen_capture')).toMatch(/did the thing and it worked/)
+    expect(stateMeaning('ready', 'platform_query', 'macos', 'desktop.screen_capture')).toMatch(/Nothing has done it yet/)
+    expect(stateMeaning('desktop_unavailable', 'platform_query', 'macos', 'desktop.screen_capture')).toMatch(/no desktop/)
+    expect(stateMeaning('not_established', 'disclosed_probe', 'macos', 'desktop.screen_capture')).toMatch(
       /did not get far enough/i
     )
   })
@@ -120,8 +120,8 @@ describe('the state one capability is shown as', () => {
   it('has a label for every state it can produce', () => {
     for (const state of Object.keys(STATE_LABEL) as DisplayState[]) {
       expect(STATE_LABEL[state]).toBeTruthy()
-      expect(stateMeaning(state, 'disclosed_probe', 'macos')).toBeTruthy()
-      expect(stateMeaning(state, 'platform_query', 'macos')).toBeTruthy()
+      expect(stateMeaning(state, 'disclosed_probe', 'macos', 'desktop.screen_capture')).toBeTruthy()
+      expect(stateMeaning(state, 'platform_query', 'macos', 'desktop.screen_capture')).toBeTruthy()
     }
   })
 })
