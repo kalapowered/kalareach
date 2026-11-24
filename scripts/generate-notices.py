@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Makes the third-party notice of a release, or holds the committed one to what the lock now makes.
 
-    generate-notices.py write --kr-release PROGRAM [--cargo-about PROGRAM] [--askalono PROGRAM] [--work DIR]
-    generate-notices.py check --kr-release PROGRAM [--cargo-about PROGRAM] [--askalono PROGRAM] [--work DIR]
+    generate-notices.py write [--product programs|companion] --kr-release PROGRAM [--cargo-about PROGRAM] [--askalono PROGRAM] [--work DIR]
+    generate-notices.py check [--product programs|companion] --kr-release PROGRAM [--cargo-about PROGRAM] [--askalono PROGRAM] [--work DIR]
     generate-notices.py self-test [--askalono PROGRAM]
 
 The notice, `docs/releases/third-party-notices.txt`, is what every release archive carries as
@@ -44,6 +44,15 @@ the lock takes into the release programs that the entries do not name, and they 
 each with the reason it is left out, so that `kr-release` can hold the committed text to the lock
 and a crate added to the lock stops a release until this runs again.
 
+`--product companion` makes the notice of the companion application instead,
+`docs/releases/companion-third-party-notices.txt`. It covers the crates of the package that
+`scripts/companion-notice.json` names, with the features and for the platforms that file lists, made
+as above, and the production JavaScript packages of the interface, which `pnpm licenses` lists from the
+packages that `pnpm install --frozen-lockfile --prod --filter "@kalareach/companion..."` installed. A
+JavaScript package is recorded under the first of its licences that `about.toml` lists, and its texts
+are chosen as a crate's are. An entry of `scripts/notice-texts.json` is for the release programs' notice
+unless it lists `"products": ["companion"]`, or both.
+
 `about.toml` says which licences a crate may be used under and which one a crate that offers
 several is recorded under. `check` makes the notice again and refuses a committed one that differs.
 The merge reads no clock and no path of the machine, so the same lock gives the same bytes on every
@@ -78,6 +87,8 @@ NO_MATCH = "Confidence threshold not high enough for any known license"
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 NOTICE = os.path.join(ROOT, "docs", "releases", "third-party-notices.txt")
 CONFIG = os.path.join(ROOT, "about.toml")
+COMPANION_NOTICE = os.path.join(ROOT, "docs", "releases", "companion-third-party-notices.txt")
+COMPANION_CONFIG = os.path.join(ROOT, "scripts", "companion-notice.json")
 TEXTS = os.path.join(ROOT, "scripts", "notice-texts.json")
 TEXTS_DIRECTORY = os.path.join(ROOT, "docs", "releases", "notice-texts")
 # fish's own crates are licensed as fish is, and the run over fish's tree accepts those licences so
@@ -135,6 +146,36 @@ a licence it is recorded under, the notice carries the upstream text beside the 
 the entry names the upstream file.
 """
 
+COMPANION_HEADER = """\
+THIRD-PARTY NOTICES
+
+KalaReach is distributed under the BSD-3-Clause licence in the file LICENSE. This file carries the
+licence texts and notices of the third-party software that the KalaReach companion application is
+built from: the Rust crates of its native program, for every platform it is built for, and the
+JavaScript packages of its interface, as the packages themselves state them. It does not yet list the
+native libraries that the Android and iOS builds link.
+
+The list covers every platform the application is built for, so the list for one platform is a subset
+of it. A crate that is offered under several licences is recorded under the one this project takes it
+under. Each text appears once, followed by the packages it applies to. An entry gives the package, its
+version, whether it is a Rust crate (rust) or a JavaScript package (javascript), and the authors its
+package names. The entry of a crate under the Mozilla Public License 2.0, or taken from a Git
+repository, names where its source is. Where a package ships no licence text, the entry names the
+upstream file that the text comes from.
+"""
+
+COMPANION_UNUSED = """\
+
+====================================================================================================
+Crates the lock reaches that no companion build compiles
+====================================================================================================
+
+The lock names these crates among the dependencies of the companion application, and no companion
+build compiles them in. Each line says why. They are listed so that a crate added to the lock fails a
+check until this notice is made again.
+
+"""
+
 UNUSED = """\
 
 ====================================================================================================
@@ -151,6 +192,12 @@ REPAIR = (
     "build kr-release with `cargo build -p kr-release`, fetch the crates with `cargo fetch --locked`, put "
     "cargo-about 0.9.3 and askalono 0.5.0 on the PATH, run `python3 scripts/generate-notices.py write "
     "--kr-release target/debug/kr-release`, and commit the result"
+)
+COMPANION_REPAIR = (
+    "install the production packages with `pnpm install --frozen-lockfile --prod --filter "
+    "\"@kalareach/companion...\"`, build kr-release with `cargo build -p kr-release`, run "
+    "`python3 scripts/generate-notices.py write --product companion --kr-release target/debug/kr-release`, "
+    "and commit the result"
 )
 
 
@@ -703,10 +750,10 @@ def entry_line(key, entry, licence):
     return ("  - " + " | ".join(fields)).rstrip()
 
 
-def render(blocks):
+def render(blocks, header=HEADER):
     ordered = sorted(blocks.texts.values(), key=lambda block: (block["kind"], block["id"], min(block["crates"]), block["text"]))
     rule = "=" * 100
-    parts = [HEADER]
+    parts = [header]
     for block in ordered:
         title = {"licence": f"Licence: {block['id']} ({block['name']})",
                  "notice": f"Notice file: {block['id']}" + (f" ({block['name']})" if block["name"] else ""),
@@ -718,11 +765,16 @@ def render(blocks):
     return "".join(parts)
 
 
-def pinned_for(kept, name, version, where):
+def in_scope(item, product):
+    """Whether a kept entry is for this product's notice: the release programs' unless it says otherwise."""
+    return product in item.get("products", ["programs"])
+
+
+def pinned_for(kept, name, version, where, product):
     """The kept entry for a crate, or None. An entry for a crate taken from Git names the package's
     source as cargo tree gives it, the repository and the first eight letters of its revision."""
     for item in kept["crates"]:
-        if item["name"] == name and item["version"] == version and item.get("package") == where:
+        if in_scope(item, product) and item["name"] == name and item["version"] == version and item.get("package") == where:
             return item
     return None
 
@@ -758,7 +810,22 @@ def lacking(required, texts, reader):
     return sorted(set(required) - covered)
 
 
-def gather(records, kept, files, reader):
+PRODUCT_BUILDS = {"programs": "release build", "companion": "companion build"}
+
+
+def texts_of_other_products(kept, product):
+    """The kept texts that only entries of another product's notice use."""
+    found = set()
+    for item in kept["crates"]:
+        if not in_scope(item, product):
+            found.update(item["texts"])
+    for work in kept["works"]:
+        if not in_scope(work, product):
+            found.update(work["texts"])
+    return found
+
+
+def gather(records, kept, files, reader, product="programs"):
     """Every crate's texts, put in blocks, with the checks on what the kept texts stand for."""
     blocks = Blocks(reader)
     plans = {}
@@ -767,7 +834,7 @@ def gather(records, kept, files, reader):
         for key in by_identity(each["answers"]):
             answer = each["answers"][key]
             folder = each["roots"][key]
-            item = pinned_for(kept, key[0], key[1], key[2])
+            item = pinned_for(kept, key[0], key[1], key[2], product)
             taken = [normal(t) for _, _, t, own in answer["licences"] if own]
             owned = [(name, read_text(os.path.join(folder, name))) for name in licence_files(folder)]
             if item is not None:
@@ -826,11 +893,13 @@ def gather(records, kept, files, reader):
                 fish_member(blocks, name, each["members"][name])
     for item in kept["crates"]:
         identity_of_item = (item["name"], item["version"], item.get("package"))
-        if identity_of_item not in used_crates:
+        if in_scope(item, product) and identity_of_item not in used_crates:
             now = sorted({k[2] or "crates.io" for each in records for k in each["answers"] if k[:2] == identity_of_item[:2]})
             fail(f"scripts/notice-texts.json keeps a text for {item['name']} {item['version']} from {item.get('package') or 'crates.io'}, "
-                 f"which no release build compiles" + (f"; the lock has it from {', '.join(now)}" if now else ""))
+                 f"which no {PRODUCT_BUILDS[product]} compiles" + (f"; the lock has it from {', '.join(now)}" if now else ""))
     for work in kept["works"]:
+        if not in_scope(work, product):
+            continue
         carried_by = work["carried_by"]
         carrier = (carried_by["name"], carried_by["version"], carried_by.get("package"))
         if carrier not in compiled_crates:
@@ -838,7 +907,7 @@ def gather(records, kept, files, reader):
             if now:
                 fail(f"{work['name']} {work['version']} is bundled in {carrier[0]} {carrier[1]} from {carrier[2] or 'crates.io'}, "
                      f"and the lock has that crate from {', '.join(now)}")
-            fail(f"{work['name']} {work['version']} is bundled in {carrier[0]} {carrier[1]}, which no release build compiles")
+            fail(f"{work['name']} {work['version']} is bundled in {carrier[0]} {carrier[1]}, which no {PRODUCT_BUILDS[product]} compiles")
         for identifier in work["texts"]:
             text = files[identifier]
             used_texts.add(identifier)
@@ -848,7 +917,7 @@ def gather(records, kept, files, reader):
                 add_kept(blocks, text, (work["name"], work["version"], None), [], origin, None,
                          extra=f"bundled in {carrier[0]} {carrier[1]}, {kept_source(text)}")
     for identifier in files:
-        if identifier not in used_texts:
+        if identifier not in used_texts and identifier not in texts_of_other_products(kept, product):
             fail(f"scripts/notice-texts.json lists the text {identifier}, which no crate or work uses")
     return blocks
 
@@ -910,11 +979,18 @@ def fish_member(blocks, name, member):
         blocks.add("notice", f"{FISH_LICENCES} of the fish package", "", read_text(path), crate, member["authors"], "fish", None)
 
 
-def reasons(gaps_list, packages, targets, environment):
+WHOSE = {
+    "programs": {"tests": "a release program", "platforms": "no release is built for"},
+    "companion": {"tests": "the companion application", "platforms": "the companion application is not built for"},
+}
+
+
+def reasons(gaps_list, packages, targets, environment, extra=(), product="programs"):
     """Why each crate that the lock reaches and no build compiles is left out, one line to a crate."""
-    built, _ = compiled(ROOT, packages, targets, [], environment)
-    tested, _ = compiled(ROOT, packages, targets, [], environment, "normal,build,dev")
-    elsewhere, _ = compiled(ROOT, packages, ["all"], [], environment)
+    built, _ = compiled(ROOT, packages, targets, list(extra), environment)
+    tested, _ = compiled(ROOT, packages, targets, list(extra), environment, "normal,build,dev")
+    elsewhere, _ = compiled(ROOT, packages, ["all"], list(extra), environment)
+    whose = WHOSE[product]
     lines = []
     for gap in gaps_list:
         crate, _, source = gap.partition(" | source ")
@@ -922,15 +998,112 @@ def reasons(gaps_list, packages, targets, environment):
         address, _, revision = source.partition("#")
         key = (name, version, f"{address}#{revision[:8]}" if source else None)
         if key in built:
-            fail(f"{name} {version} is compiled by a release build and the notice has no entry for it")
+            fail(f"{name} {version} is compiled by a {PRODUCT_BUILDS[product]} and the notice has no entry for it")
         if key in tested:
-            why = "only a test of a release program uses it"
+            why = f"only a test of {whose['tests']} uses it"
         elif key in elsewhere:
-            why = "only a platform that no release is built for uses it"
+            why = f"only a platform that {whose['platforms']} uses it"
         else:
             why = "only features that other packages of the workspace turn on bring it in"
         lines.append(f"{gap} | {why}")
     return lines
+
+
+JAVASCRIPT_ORIGIN = "javascript"
+
+
+def read_companion():
+    """What the companion's notice is made for: its package, the features its bundles are built with,
+    its platforms and the JavaScript package its interface is built from."""
+    with open(COMPANION_CONFIG, encoding="utf-8") as source:
+        return json.load(source)
+
+
+def accepted_licences():
+    """The licences `about.toml` accepts, in the order that chooses between the alternatives of an `OR`."""
+    with open(CONFIG, encoding="utf-8") as source:
+        found = re.search(r"^accepted = \[(.*?)\]", source.read(), re.DOTALL | re.MULTILINE)
+    if not found:
+        fail("about.toml has no accepted list")
+    return re.findall(r'"([^"]+)"', found.group(1))
+
+
+def chosen(name, version, expression, accepted):
+    """The licence a JavaScript package is recorded under: of the alternatives its expression offers,
+    the first that `about.toml` accepts, as for a crate."""
+    ranks = {alternative.strip(): accepted.index(alternative.strip())
+             for alternative in re.split(r"\s+OR\s+", expression.strip("() ")) if alternative.strip() in accepted}
+    if not ranks:
+        fail(f"{name} {version} declares {expression or 'no licence'}, which names no licence that about.toml accepts")
+    return min(ranks, key=ranks.get)
+
+
+def package_manager():
+    with open(os.path.join(ROOT, "package.json"), encoding="utf-8") as source:
+        return json.load(source)["packageManager"].split("@", 1)[1]
+
+
+def javascript_record(config):
+    """What `pnpm licenses` lists for the production packages of the interface and of the workspace
+    packages it is built from, as the record `gather` takes: one entry for each version, with the folder
+    of its installed package."""
+    wanted = package_manager()
+    said = run(["pnpm", "--version"], cwd=ROOT).stdout.strip()
+    if said != wanted:
+        fail(f"pnpm says '{said}' and the notice is made with pnpm {wanted}")
+    listing = json.loads(run(["pnpm", "licenses", "list", "--prod", "--json", "--long",
+                              "--filter", config["javascript"] + "..."], cwd=ROOT).stdout)
+    accepted = accepted_licences()
+    answers, roots_, declared = {}, {}, {}
+    for expression, group in sorted(listing.items()):
+        for item in group:
+            if len(item["versions"]) != len(item["paths"]):
+                fail(f"pnpm lists {item['name']} with {len(item['versions'])} versions and {len(item['paths'])} folders")
+            for version, path in zip(item["versions"], item["paths"]):
+                if not os.path.isdir(path):
+                    fail(f"{item['name']} {version} is not installed, which pnpm needs to name its licence files: {COMPANION_REPAIR}")
+                key = (item["name"], version, "npm")
+                recorded = chosen(item["name"], version, item.get("license") or expression, accepted)
+                answers[key] = {"authors": [item["author"]] if item.get("author") else [], "source": None,
+                                "licences": [(recorded, recorded, "", False)]}
+                roots_[key] = path
+                declared[key] = item.get("license") or expression
+    if not answers:
+        fail(f"pnpm lists no production package of {config['javascript']}")
+    return {"name": JAVASCRIPT_ORIGIN, "listed": set(answers), "answers": answers, "roots": roots_,
+            "declared": declared, "paths": set(), "members": {}}
+
+
+def collect_companion(program, work):
+    """The Rust crates the companion's package compiles in on its platforms, as for the programs, and
+    the JavaScript packages of its interface."""
+    check_version(program)
+    config = read_companion()
+    environment = dict(os.environ)
+    flags = ["--features", ",".join(config["features"])]
+    workspace = members(ROOT, environment)
+    if config["package"] not in workspace:
+        fail(f"scripts/companion-notice.json names {config['package']}, which is no package of the workspace")
+    manifest = os.path.join(workspace[config["package"]]["root"], "Cargo.toml")
+    answered = answers_of(about(program, manifest, os.path.join(work, "companion.json"), CONFIG,
+                                [item for target in config["targets"] for item in ("--target", target)] + flags))
+    listed, paths = compiled(ROOT, [config["package"]], config["targets"], flags, environment)
+    return [record("rust", listed, paths, workspace, answered, roots(ROOT, environment)), javascript_record(config)]
+
+
+def make_companion(program, askalono, kr_release, work):
+    records = collect_companion(program, work)
+    kept, files = keep_texts()
+    body = render(gather(records, kept, files, Reader(askalono, work), "companion"), COMPANION_HEADER)
+    entries = os.path.join(work, "companion-entries.txt")
+    with open(entries, "w", encoding="utf-8", newline="\n") as target:
+        target.write(body)
+    gaps_list = [line for line in run([kr_release, "notice-gaps", "--product", "companion", "--checkout", ROOT,
+                                       "--notice", entries]).stdout.split("\n") if line]
+    config = read_companion()
+    lines = reasons(gaps_list, [config["package"]], config["targets"], dict(os.environ),
+                    ["--features", ",".join(config["features"])], "companion")
+    return body + (COMPANION_UNUSED + "".join(f"  - {line}\n" for line in lines) if lines else "")
 
 
 def make(program, askalono, kr_release, work):
@@ -950,6 +1123,8 @@ def main(arguments):
     commands = parser.add_subparsers(dest="command", required=True)
     for name in ("write", "check"):
         command = commands.add_parser(name)
+        command.add_argument("--product", choices=["programs", "companion"], default="programs",
+                             help="the notice of the release archives (the default) or of the companion application")
         command.add_argument("--kr-release", required=True, help="the kr-release program, built from this checkout")
         command.add_argument("--cargo-about", default="cargo-about")
         command.add_argument("--askalono", default="askalono")
@@ -961,17 +1136,20 @@ def main(arguments):
     with tempfile.TemporaryDirectory(prefix="kr-notices-") as scratch:
         work = chosen.work or scratch
         os.makedirs(work, exist_ok=True)
-        made = make(chosen.cargo_about, chosen.askalono, chosen.kr_release, work)
+        made = (make_companion if chosen.product == "companion" else make)(
+            chosen.cargo_about, chosen.askalono, chosen.kr_release, work)
+    notice = COMPANION_NOTICE if chosen.product == "companion" else NOTICE
     if chosen.command == "write":
-        with open(NOTICE, "w", encoding="utf-8", newline="\n") as target:
+        with open(notice, "w", encoding="utf-8", newline="\n") as target:
             target.write(made)
-        print(f"generate-notices: wrote {NOTICE}")
+        print(f"generate-notices: wrote {notice}")
         return 0
-    with open(NOTICE, encoding="utf-8", newline="") as source:
+    with open(notice, encoding="utf-8", newline="") as source:
         committed = source.read()
     if committed != made:
-        print(f"generate-notices: docs/releases/third-party-notices.txt is not what the lock makes: {REPAIR}",
-              file=sys.stderr)
+        committed_name = os.path.relpath(notice, ROOT).replace(os.sep, "/")
+        repair = COMPANION_REPAIR if chosen.product == "companion" else REPAIR
+        print(f"generate-notices: {committed_name} is not what the lock makes: {repair}", file=sys.stderr)
         return 1
     print("generate-notices: the committed notice is the one the lock makes")
     return 0
@@ -1415,6 +1593,44 @@ for path in paths:
     text = render(fish_blocks)
     expect("fish's licence file for the rest of its code is carried whole",
            "Notice file: doc_src/license.rst of the fish package\n" in text and "Alpine.js" in text)
+
+    accepted = ["MIT", "ISC", "Apache-2.0"]
+    expect("a package under an OR is recorded under the first licence that about.toml lists",
+           chosen("a", "1.0.0", "Apache-2.0 OR MIT", accepted) == "MIT")
+    refuses("a package whose licences about.toml lists none of is refused",
+            lambda: chosen("a", "1.0.0", "GPL-3.0-only OR AGPL-3.0-only", accepted), "names no licence that about.toml accepts")
+    refuses("a package that declares no licence is refused", lambda: chosen("a", "1.0.0", "", accepted), "declares no licence")
+
+    def script(folder_, declared="MIT"):
+        key = ("left-pad", "1.3.0", "npm")
+        return {"name": JAVASCRIPT_ORIGIN, "listed": {key},
+                "answers": {key: {"authors": [], "source": None, "licences": [(declared, declared, "", False)]}},
+                "roots": {key: folder_}, "declared": {key: declared}, "paths": set(), "members": {}}
+
+    packaged = os.path.join(scratch, "left-pad")
+    os.makedirs(packaged)
+    with open(os.path.join(packaged, "LICENSE"), "w", encoding="utf-8") as target:
+        target.write(mit)
+    text = render(gather([script(packaged)], nothing, {}, reader, "companion"), COMPANION_HEADER)
+    expect("a JavaScript package has an entry that says javascript and carries the text of its own licence file",
+           "  - left-pad 1.3.0 | javascript" in text and "Permission is hereby granted" in text)
+    bare_package = os.path.join(scratch, "bare-package")
+    os.makedirs(bare_package)
+    refuses("a JavaScript package that ships no licence file and has no kept text is refused",
+            lambda: gather([script(bare_package)], nothing, {}, reader, "companion"), "left-pad 1.3.0 ships no licence file")
+    kept_for, files_for = keep([item], [{**pinned, "products": ["companion"]}], [])
+    try:
+        gather([made_up([plain])], kept_for, files_for, reader, "programs")
+        asked = True
+    except SystemExit:
+        asked = False
+    expect("a text kept for the companion alone is not asked of the release programs' notice", asked)
+    refuses("a text kept for the companion alone is refused when no companion build compiles its crate",
+            lambda: gather([made_up([plain], name="rust")], kept_for, files_for, reader, "companion"), "which no companion build compiles")
+    with open(os.path.join(ROOT, "scripts", "check-mobile-graph.py"), encoding="utf-8") as source:
+        graph = re.search(r"^MOBILE_TARGETS = \[(.*?)\]", source.read(), re.DOTALL | re.MULTILINE)
+    expect("the companion's notice covers every mobile target that the graph check reads",
+           bool(graph) and set(re.findall(r'"([^"]+)"', graph.group(1))) <= set(read_companion()["targets"]))
 
     lined = "one\ntwo\nthree\nfour\n"
     write(standard, "lined", lined)
