@@ -13,8 +13,10 @@
 #   1. `apt-get update`, bound 180 s. A non-zero exit fails the attempt. An exit of 0 that printed
 #      `W: Failed to fetch` is what a 503 on an index gives, since apt reports a failed index as a
 #      warning: the update runs again, twice at most, after 10 and 20 s, and then the attempt goes
-#      on with the indexes it has. If the index arrives at less than about 72 kB/s (13 MB in 180 s)
-#      this bound stops every update, and the step fails at its deadline.
+#      on with the indexes it has. The first update of a runner fetches the indexes in full, 37.8 MB
+#      from the archive hosts (scripts/ubuntu-archive-hosts.sh): if they arrive at less than about
+#      210 kB/s (37.8 MB in 180 s) this bound stops every update, and the step fails at its deadline.
+#      No other host is tried: the image's mirror list is not read once the archive hosts are in place.
 #   2. With --names-from, the program SCRIPT is run by bash against the indexes just updated and
 #      prints one package name per line, which are installed with the PACKAGEs. It runs again in
 #      each attempt, after that attempt's last update, so the names match the indexes the download

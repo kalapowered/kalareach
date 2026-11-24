@@ -1228,7 +1228,12 @@ fn runner_image(rig: &Rig) -> PathBuf {
     .expect("the image's os-release");
     fs::write(
         root.join("etc/apt/sources.list.d/ubuntu.sources"),
-        "Types: deb\nURIs: mirror+file:/etc/apt/apt-mirrors.txt\nSuites: noble noble-updates\n",
+        "Types: deb\nURIs: mirror+file:/etc/apt/apt-mirrors.txt\nSuites: noble noble-updates noble-backports\n\
+         Components: main universe restricted multiverse\n\
+         Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg\n\n\
+         Types: deb\nURIs: http://security.ubuntu.com/ubuntu/\nSuites: noble-security\n\
+         Components: main universe restricted multiverse\n\
+         Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg\n",
     )
     .expect("the image's sources file");
     root
@@ -1246,15 +1251,27 @@ fn a_runner_whose_sources_name_a_regional_mirror_is_pointed_at_the_archive_hosts
     let archive = fs::read_to_string(&archive_file).expect("the new sources file");
     assert!(
         archive.contains(
-            "URIs: http://archive.ubuntu.com/ubuntu\nSuites: noble noble-updates noble-backports\n"
+            "URIs: https://archive.ubuntu.com/ubuntu\nSuites: noble noble-updates noble-backports\n"
         ),
         "{archive}"
     );
     assert!(
-        archive.contains("URIs: http://security.ubuntu.com/ubuntu\nSuites: noble-security\n"),
+        archive.contains("URIs: https://security.ubuntu.com/ubuntu\nSuites: noble-security\n"),
         "{archive}"
     );
     assert!(!archive.contains("mirror+file"), "{archive}");
+    assert!(
+        !first.stdout.contains("::warning::"),
+        "an image like the expected one gets no warning: {}",
+        first.stdout
+    );
+    assert!(
+        first
+            .stdout
+            .contains("no source that apt reads names a mirror list or a regional host"),
+        "{}",
+        first.stdout
+    );
     assert!(
         !root.join("etc/apt/sources.list.d/ubuntu.sources").exists(),
         "the image's file stays in the folder apt reads"
@@ -1280,7 +1297,7 @@ fn a_runner_whose_sources_name_a_regional_mirror_is_pointed_at_the_archive_hosts
 }
 
 #[test]
-fn an_image_the_script_does_not_know_fails_and_changes_nothing() {
+fn an_image_the_script_does_not_know_changes_nothing_and_fails_or_warns() {
     let sources_of = |root: &Path| root.join("etc/apt/sources.list.d/ubuntu.sources");
     let untouched = |root: &Path| {
         sources_of(root).exists()
@@ -1306,7 +1323,7 @@ fn an_image_the_script_does_not_know_fails_and_changes_nothing() {
     assert!(outcome.stderr.contains("noble"), "{}", outcome.stderr);
     assert!(untouched(&root));
 
-    // No sources file where the image keeps it.
+    // No sources file where the image keeps it: a warning in the run's annotations, no red, nothing written.
     let rig = Rig::new();
     let root = runner_image(&rig);
     fs::remove_file(sources_of(&root)).expect("no sources file");
@@ -1314,11 +1331,13 @@ fn an_image_the_script_does_not_know_fails_and_changes_nothing() {
         "scripts/ubuntu-archive-hosts.sh",
         &["--root", root.to_str().expect("a plain path")],
     );
-    assert_eq!(outcome.status, 1, "{}{}", outcome.stdout, outcome.stderr);
+    assert_eq!(outcome.status, 0, "{}{}", outcome.stdout, outcome.stderr);
     assert!(
-        outcome.stderr.contains("is not at") && outcome.stderr.contains("sources.list.d"),
+        outcome.stdout.contains("::warning::ubuntu-archive-hosts:")
+            && outcome.stdout.contains("is not at")
+            && outcome.stdout.contains("sources.list.d"),
         "{}",
-        outcome.stderr
+        outcome.stdout
     );
     assert!(
         !root
@@ -1346,6 +1365,77 @@ fn an_image_the_script_does_not_know_fails_and_changes_nothing() {
     let rig = Rig::new();
     let outcome = rig.run_script("scripts/ubuntu-archive-hosts.sh", &["--mirror", "x"]);
     assert_eq!(outcome.status, 2, "{}{}", outcome.stdout, outcome.stderr);
+}
+
+#[test]
+fn an_image_that_names_other_suites_gets_a_warning_and_the_new_file_all_the_same() {
+    let rig = Rig::new();
+    let root = runner_image(&rig);
+    fs::write(
+        root.join("etc/apt/sources.list.d/ubuntu.sources"),
+        "Types: deb\nURIs: mirror+file:/etc/apt/apt-mirrors.txt\nSuites: noble noble-updates plucky\n\
+         Components: main universe\n",
+    )
+    .expect("an image with other suites");
+    let outcome = rig.run_script(
+        "scripts/ubuntu-archive-hosts.sh",
+        &["--root", root.to_str().expect("a plain path")],
+    );
+    assert_eq!(outcome.status, 0, "{}{}", outcome.stdout, outcome.stderr);
+    assert!(
+        outcome.stdout.contains("::warning::")
+            && outcome.stdout.contains("suites")
+            && outcome.stdout.contains("components"),
+        "{}",
+        outcome.stdout
+    );
+    assert!(
+        root.join("etc/apt/sources.list.d/ubuntu-archive.sources")
+            .exists()
+    );
+}
+
+#[test]
+fn a_source_that_still_names_a_regional_host_is_reported_and_a_comment_is_not() {
+    let rig = Rig::new();
+    let root = runner_image(&rig);
+    fs::write(
+        root.join("etc/apt/sources.list"),
+        "# deb http://azure.archive.ubuntu.com/ubuntu noble main\n",
+    )
+    .expect("a commented line");
+    let quiet = rig.run_script(
+        "scripts/ubuntu-archive-hosts.sh",
+        &["--root", root.to_str().expect("a plain path")],
+    );
+    assert_eq!(quiet.status, 0, "{}{}", quiet.stdout, quiet.stderr);
+    assert!(!quiet.stdout.contains("::warning::"), "{}", quiet.stdout);
+
+    fs::write(
+        root.join("etc/apt/sources.list.d/extra.sources"),
+        "Types: deb\nURIs: http://us-east-1.ec2.archive.ubuntu.com/ubuntu\nSuites: noble\n",
+    )
+    .expect("a regional source");
+    fs::write(
+        root.join("etc/apt/sources.list.d/other.list"),
+        "deb mirror+file:/etc/apt/apt-mirrors.txt noble main\n",
+    )
+    .expect("a mirror list source");
+    let loud = rig.run_script(
+        "scripts/ubuntu-archive-hosts.sh",
+        &["--root", root.to_str().expect("a plain path")],
+    );
+    assert_eq!(loud.status, 0, "{}{}", loud.stdout, loud.stderr);
+    assert!(
+        loud.stdout.contains("extra.sources still names") && loud.stdout.contains("ec2"),
+        "{}",
+        loud.stdout
+    );
+    assert!(
+        loud.stdout.contains("other.list still names") && loud.stdout.contains("mirror+file"),
+        "{}",
+        loud.stdout
+    );
 }
 
 /// What Playwright's dry run prints, with the status it exits with, and what the package list
