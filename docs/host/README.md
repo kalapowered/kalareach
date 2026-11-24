@@ -8918,12 +8918,17 @@ maps. Each record names the capability and its version, the exact identity it wa
 qualification profile, the launch profile, the binding and its revision), the state, where the
 evidence came from and what makes it stale.
 
-Every field a record names is compared with something this host established itself: the binary
-against the launch profile or the managed process's own handle, the package and its publisher
-against the binding that loaded them or the table this host pinned, the package bytes against the
-binding, and the schema against the upstream version that table was qualified for. A field the host
-has nothing to compare against is refused rather than believed, because evidence about a binary or
-a package this host cannot identify is a claim about something else.
+The host's own two writers, the channel's and the gateway's, build each record from what this host
+established at the launch: the binary from the managed process's own handle, the launch profile
+from the instance, the package, its bytes and its publisher from the connector the launch bound,
+and, for the channel, the schema from the version a signed record names for the executable's
+digest. A record offered to the broker from any other source is compared with the same things
+before it is held: the binary against the launch profile or the managed process's own handle, the
+package and its publisher against the binding that loaded them or the table this host pinned, the
+package bytes against the binding, and the schema against the upstream version that table was
+qualified for. A field the host has nothing to compare against is refused rather than believed,
+because evidence about a binary or a package this host cannot identify is a claim about something
+else.
 
 Evidence is never permission. Only a probe this host ran or a binding that performed the operation
 here can say a capability works here; a signed qualification result is evidence about a version. A
@@ -8936,6 +8941,16 @@ runs the code it checked, invalidates the records that name the binary and holds
 the host records nothing more for it. An installed upgrade invalidates nothing: a running process
 keeps the identity it was pinned to. A record only moves forward: a late answer at a revision the
 host has already passed is refused, so it cannot restore availability that was withdrawn.
+
+The other causes a record could name need no detector. The schema and the launch profile are named
+by the records and cannot change while the instance lives: the backend reads the version once, when
+it starts, a launch pins one table, and an instance has one launch and one profile. The signed
+qualification a binding was made with is a snapshot: a later update changes what a new binding
+takes, and the live one stays as it was. No broker record depends on an operating-system
+permission. A new graphical login closes the session, and the close ends each instance the session
+launched and forgets its map. The worker profile is the same: a running worker keeps the profile it
+was created in, one broker serves one session, and a change applies to sessions created
+afterwards.
 
 ### Launch profiles
 

@@ -17,6 +17,12 @@
 //!   binding change, and a refused image check (`Broker::image_refused`) raises the binary change
 //!   and holds the instance, so nothing is recorded for it again. An installed upgrade raises
 //!   neither: the image check passes it, and a running process keeps the identity it was pinned to.
+//!   The other causes need no detector. The schema and the launch profile are named by the records
+//!   and cannot change while an instance lives: the backend reads the version once, when it starts,
+//!   a launch pins one table, and an instance has one launch and one profile. A signed
+//!   qualification is a snapshot taken when a binding is made. No record depends on an
+//!   operating-system permission. A new graphical login closes the session, which ends each
+//!   instance it launched and forgets its map.
 //! * **Every action rechecks.** [`CapabilityOwner::recheck`] is called on the dispatch path with
 //!   the revision the caller read, so acting on evidence that has since changed is refused rather
 //!   than attempted.
