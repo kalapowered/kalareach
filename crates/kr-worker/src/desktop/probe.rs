@@ -1488,7 +1488,7 @@ mod platform {
     //! asked, and a refusal names which. An application is started in the background as a new
     //! instance, and the instance this check started is the only process it ends.
 
-    use std::path::{Path, PathBuf};
+    use std::path::PathBuf;
 
     use super::{
         Check, ContentClass, Deadline, Exit, Operation, Outcome, Plan, Program, Ran, Sentence,
@@ -1598,38 +1598,7 @@ mod platform {
             // Whatever the answer, an image this check could not remove is part of it.
             outcome: match left_behind {
                 None => outcome,
-                Some(error) => left(outcome, &image, &error),
-            },
-        }
-    }
-
-    /// An outcome with the image the screen check could not remove said as part of it.
-    fn left(outcome: Outcome, image: &Path, error: &str) -> Outcome {
-        let behind = |detail: Sentence| {
-            detail
-                .stated(", and it could not remove ")
-                .path(image)
-                .stated(": ")
-                .withheld(ContentClass::Message, error)
-        };
-        match outcome {
-            Outcome::Performed { detail } => Outcome::Performed {
-                detail: behind(detail),
-            },
-            Outcome::PermissionRefused { permission, detail } => Outcome::PermissionRefused {
-                permission,
-                detail: behind(detail),
-            },
-            Outcome::NotAttempted { detail } => Outcome::NotAttempted {
-                detail: behind(detail),
-            },
-            // An outcome with no words of its own is said in the words its judgement gives it.
-            other => Outcome::NotAttempted {
-                detail: behind(
-                    super::judge(Check::ScreenImage, &other, super::Asking::ForAGrant)
-                        .2
-                        .unwrap_or_default(),
-                ),
+                Some(error) => super::with_the_image_left(outcome, &image, &error),
             },
         }
     }
@@ -2009,6 +1978,45 @@ fn failed(said: &str) -> Sentence {
         failure.stated(" and printed nothing")
     } else {
         failure.stated(": ").withheld(ContentClass::Message, said)
+    }
+}
+
+/// An outcome with the image the screen check could not remove said as part of it.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn with_the_image_left(outcome: Outcome, image: &Path, error: &str) -> Outcome {
+    let behind = |detail: Sentence| {
+        detail
+            .stated(", and it could not remove ")
+            .path(image)
+            .stated(": ")
+            .withheld(ContentClass::Message, error)
+    };
+    match outcome {
+        Outcome::Performed { detail } => Outcome::Performed {
+            detail: behind(detail),
+        },
+        Outcome::PermissionRefused { permission, detail } => Outcome::PermissionRefused {
+            permission,
+            detail: behind(detail),
+        },
+        Outcome::NotAttempted { detail } => Outcome::NotAttempted {
+            detail: behind(detail),
+        },
+        // The time-out words end with a full stop, so what follows them would read as a second
+        // sentence that starts with a comma: the clause is given again without it.
+        Outcome::TimedOut => Outcome::NotAttempted {
+            detail: behind(
+                Sentence::new().stated("the check did not finish within its time limit"),
+            ),
+        },
+        // An outcome with no words of its own is said in the words its judgement gives it.
+        other => Outcome::NotAttempted {
+            detail: behind(
+                judge(Check::ScreenImage, &other, Asking::ForAGrant)
+                    .2
+                    .unwrap_or_default(),
+            ),
+        },
     }
 }
 
@@ -3417,6 +3425,31 @@ mod tests {
             Some(Vec::new()),
             "a file that is not there is an empty one"
         );
+    }
+
+    /// KR-REQ-03.29: a screen image that could not be removed after a time-out is said in the one
+    /// sentence the time-out begins, not after the time-out's full stop and a comma.
+    #[test]
+    fn a_timed_out_image_that_could_not_be_removed_reads_as_one_sentence() {
+        let outcome = with_the_image_left(
+            Outcome::TimedOut,
+            Path::new("/tmp/the-image.png"),
+            "permission denied",
+        );
+        let (state, _, reason) = super::judge(Check::ScreenImage, &outcome, Asking::ForAGrant);
+        assert_eq!(state, CapabilityState::TemporarilyUnavailable);
+        let said = reason
+            .expect("the check gives its reason")
+            .as_str()
+            .to_owned();
+        assert!(
+            said.starts_with(
+                "this check established nothing: the check did not finish within its time limit, \
+                 and it could not remove "
+            ),
+            "the words are one sentence: {said}"
+        );
+        assert!(!said.contains(".,"), "a comma after a full stop: {said}");
     }
 
     /// KR-REQ-03.29, S-8: a file is not opened once the time is gone, so what the open would have
