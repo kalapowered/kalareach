@@ -32,6 +32,11 @@
 //! the vector, so what was typed is known from the variable alone, whatever has become of the
 //! backend.
 //!
+//! Every refusal of a presentation passes through one function, which says it in this worker's
+//! diagnostics. A presentation whose credential authenticated has the reason kept in the backend's
+//! record and told to the launcher in place of its admission; one whose credential did not
+//! authenticate, or was not checked, is closed without a word and leaves nothing in the record.
+//!
 //! # A backend that runs a server
 //!
 //! A package whose integration declares a backend (an application whose terminal talks to a server
@@ -2187,7 +2192,8 @@ fn presented_identity(backend: &Backend, _executable: &str) -> std::io::Result<F
         .and_then(FileIdentity::of_file)
 }
 
-/// Answers one launch that presented itself: admitted, or closed without a word.
+/// Answers one launch that presented itself: admitted, or refused. Every refusal passes through
+/// [`deny`], which keeps the reason and, to a launcher whose credential authenticated, tells it.
 async fn admit_launch(
     backend: &Arc<Backend>,
     broker: &Arc<Broker>,
@@ -2198,8 +2204,56 @@ async fn admit_launch(
         peer,
         credential,
         launch,
-        stream,
+        mut stream,
     } = presented;
+    let process = match authenticate_presentation(backend, &peer, &credential, &launch) {
+        Ok(process) => process,
+        Err(error) => return Err(deny(backend, &mut stream, false, error).await),
+    };
+    let identity = match vet_presentation(backend, &launch).await {
+        Ok(identity) => identity,
+        Err(error) => return Err(deny(backend, &mut stream, true, error).await),
+    };
+    // Unbound to launching, or refused: one launch per backend.
+    let claimed = backend.lifecycle.state.send_if_modified(|state| {
+        if matches!(state, BackendState::Unbound) {
+            *state = BackendState::Launching;
+            true
+        } else {
+            false
+        }
+    });
+    if !claimed {
+        let error = BrokerError::denied("this backend is not waiting for a launch");
+        return Err(deny(backend, &mut stream, true, error).await);
+    }
+    #[cfg(not(windows))]
+    return continue_launch(
+        backend,
+        broker,
+        environment_id,
+        &process,
+        &identity,
+        stream,
+        launch.environment,
+    )
+    .await;
+    #[cfg(windows)]
+    continue_launch(backend, broker, environment_id, &process, &identity, stream).await
+}
+
+/// Checks what a presentation says of its sender before its credential can be known: the kernel's
+/// account of the peer, the process it names, the root shell's own child, started after this
+/// backend was established, and finally the credential itself. Returns the process it is, which is
+/// the launcher.
+///
+/// A presentation refused here has not proved it is the launcher, so it is told nothing.
+fn authenticate_presentation(
+    backend: &Backend,
+    peer: &crate::broker::endpoint::PeerIdentity,
+    credential: &[u8],
+    launch: &crate::broker::attach::LaunchHello,
+) -> Result<ProcessStartIdentity> {
     // The kernel's account of the peer, first: the owner, and the process it names, which is the one
     // the launcher says it is.
     if !peer.is_owner() {
@@ -2233,11 +2287,23 @@ async fn admit_launch(
     }
     // Started after this backend was established, on the clock the kernel records starts on.
     started_after(&process, backend.established_at)?;
-    if !backend.credential.authenticates(&credential) {
+    if !backend.credential.authenticates(credential) {
         return Err(BrokerError::denied(
             "this connection did not present this backend's credential",
         ));
     }
+    Ok(process)
+}
+
+/// Checks what a presentation whose credential authenticated says of what it will run: the file
+/// this backend hashed, the vector it answered, and, for a backend that starts a server, the
+/// environment it is to be started with. Returns the identity of that file.
+///
+/// The launcher holds the backend's credential, so it is told why it is refused.
+async fn vet_presentation(
+    backend: &Backend,
+    launch: &crate::broker::attach::LaunchHello,
+) -> Result<ExecutableIdentity> {
     let identity = backend
         .identity(IDENTITY_WAIT)
         .await
@@ -2277,33 +2343,7 @@ async fn admit_launch(
             Some(_) => {}
         }
     }
-    // Unbound to launching, or refused: one launch per backend.
-    let claimed = backend.lifecycle.state.send_if_modified(|state| {
-        if matches!(state, BackendState::Unbound) {
-            *state = BackendState::Launching;
-            true
-        } else {
-            false
-        }
-    });
-    if !claimed {
-        return Err(BrokerError::denied(
-            "this backend is not waiting for a launch",
-        ));
-    }
-    #[cfg(not(windows))]
-    return continue_launch(
-        backend,
-        broker,
-        environment_id,
-        &process,
-        &identity,
-        stream,
-        launch.environment,
-    )
-    .await;
-    #[cfg(windows)]
-    continue_launch(backend, broker, environment_id, &process, &identity, stream).await
+    Ok(identity)
 }
 
 /// Takes a launch this admission claimed from its admission to its commitment, for a program that
@@ -2334,7 +2374,7 @@ async fn continue_launch(
     let registered = match admitted {
         Ok(registered) => registered,
         Err(error) => {
-            record_failure(backend, error.to_string());
+            let error = deny(backend, &mut stream, true, error).await;
             backend.roll_back();
             return Err(error);
         }
@@ -2519,6 +2559,35 @@ fn record_failure(backend: &Backend, why: String) {
         .launch_failure
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(why);
+}
+
+/// How long the reason for a refused launch is given to be written to its launcher. The frame is
+/// one short line on a connection nothing else was written to, so this bounds only a launcher that
+/// does not read.
+const DENIAL_WRITE_BUDGET: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Keeps the reason a presented launch is refused for, and tells the launcher where it may be told.
+///
+/// Every refusal of a presentation before its admission frame is written passes through here, and
+/// each is one line in this worker's diagnostics. A presentation whose credential authenticated
+/// is also kept in the backend's record, and told to its launcher in the frame that says a launch
+/// is not committed, which the launcher reads in place of its admission. A presentation whose
+/// credential did not authenticate, or was not checked yet, is neither kept in the record nor told
+/// anything: a connection that does not hold the credential learns nothing of the backend, and
+/// cannot replace the reason of the launch that does.
+async fn deny(
+    backend: &Backend,
+    stream: &mut BridgeStream,
+    authenticated: bool,
+    error: BrokerError,
+) -> BrokerError {
+    let why = said_to_launcher(&error.to_string());
+    crate::diagnostics::tell(format_args!("a launch was not admitted: {why}"));
+    if authenticated {
+        record_failure(backend, why.clone());
+        write_refusal(stream, &why, DENIAL_WRITE_BUDGET).await;
+    }
+    error
 }
 
 /// Records why a launch did not go, on the backend that took it, and returns it as the refusal.
@@ -2710,7 +2779,7 @@ async fn continue_launch(
     let reservation = match reserved {
         Ok(reservation) => reservation,
         Err(error) => {
-            record_failure(backend, error.to_string());
+            let error = deny(backend, &mut stream, true, error).await;
             backend.roll_back();
             return Err(error);
         }
@@ -3159,9 +3228,8 @@ fn admission() -> Vec<u8> {
         .into_bytes()
 }
 
-/// The frame a launch that was admitted and could not go on is answered with in place of the
-/// confirmation: the launch is not committed, and the frame says why.
-#[cfg(unix)]
+/// The frame a launch that could not go on is answered with in place of the frame it waits for,
+/// the admission or the confirmation: the launch is not committed, and the frame says why.
 fn refusal_frame(why: &str) -> Vec<u8> {
     serde_json::json!({ "kr_launch": { "committed": false, "failed": why } })
         .to_string()
@@ -3194,6 +3262,12 @@ fn gateway_failure_said(error: &BrokerError) -> String {
         ),
         other => format!("the gateway did not start: {other}"),
     };
+    said_to_launcher(&text)
+}
+
+/// A reason as it is kept and told to a launcher: its control characters replaced by spaces and cut
+/// to [`MAX_REFUSAL_BYTES`].
+fn said_to_launcher(text: &str) -> String {
     let cleaned: String = text
         .chars()
         .map(|character| {
@@ -3210,7 +3284,6 @@ fn gateway_failure_said(error: &BrokerError) -> String {
 /// Writes the refusal frame whole within `budget`, and says whether it did. A write that waits
 /// longer, or fails, or takes only part of the frame is not claimed: the connection is let go by
 /// the caller, and the launcher reads what it reads of a connection that ends.
-#[cfg(unix)]
 async fn write_refusal(stream: &mut BridgeStream, why: &str, budget: std::time::Duration) -> bool {
     matches!(
         tokio::time::timeout(budget, stream.write_frame(&refusal_frame(why))).await,

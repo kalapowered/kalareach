@@ -1029,6 +1029,152 @@ fn kr_req_12_07_an_environment_that_cannot_be_presented_runs_the_program_as_type
     }
 }
 
+/// KR-REQ-12.07: a launch the backend does not admit after its credential authenticated says why.
+/// The launcher presents the credential it was given and an argument vector that is not the one the
+/// backend answered; the launcher's own line carries the backend's reason, the backend's record
+/// holds the same words, and the program runs as typed.
+#[test]
+fn kr_req_12_07_a_launch_refused_after_its_credential_authenticated_says_why() {
+    let shell = Gateway::new();
+    let answer = shell
+        .establish(&["codex"])
+        .expect("a backend is established");
+    let mut launched = shell.launch_typed(&answer, "a-wrong-vector", &[], &["a-word-not-answered"]);
+    let status = launched.ends();
+    let said = launched.said();
+    assert_eq!(status.code(), Some(2), "{said}");
+    assert!(
+        said.contains(
+            "the backend did not admit this launch (the argument vector presented is not the one \
+             this backend answered), so the program runs as typed"
+        ),
+        "{said}"
+    );
+    assert!(
+        !said.contains("the backend refused it"),
+        "the launcher is told a reason and does not guess one: {said}"
+    );
+    assert_eq!(
+        shell.last_launch_failure().as_deref(),
+        Some("the argument vector presented is not the one this backend answered"),
+        "the backend's record says why"
+    );
+    assert!(shell.servers().is_empty(), "no server was started");
+}
+
+/// KR-REQ-12.07: a presentation whose credential does not authenticate is told nothing and leaves
+/// nothing in the backend's record, so a forger learns no reason, and cannot replace the reason of a
+/// real launch. The launcher is given a credential that is not the backend's; its own line says only
+/// that the backend refused it.
+#[test]
+fn kr_req_12_07_a_launch_whose_credential_does_not_authenticate_is_told_no_reason() {
+    let shell = Gateway::new();
+    let answer = shell
+        .establish(&["codex"])
+        .expect("a backend is established");
+    // Not the backend's credential, and also a wrong argument vector: the vector is a reason the
+    // backend would give an authenticated launcher, so a reason said here would be said to a forger.
+    let credential = directory_of(&answer).join("credential");
+    std::fs::write(&credential, "ab".repeat(32)).expect("a credential that is not the backend's");
+    let mut launched = shell.launch_typed(&answer, "a-forged-credential", &[], &["a-word"]);
+    let status = launched.ends();
+    let said = launched.said();
+    assert_eq!(status.code(), Some(2), "{said}");
+    assert!(
+        said.contains(
+            "the backend did not admit this launch (the backend refused it), so the program runs \
+             as typed"
+        ),
+        "{said}"
+    );
+    assert!(
+        !said.contains("argument vector") && !said.contains("credential"),
+        "no reason reached the forger: {said}"
+    );
+    assert_eq!(
+        shell.last_launch_failure(),
+        None,
+        "a forged presentation leaves nothing in the backend's record"
+    );
+}
+
+/// KR-REQ-12.07: a second launcher that holds the credential of a backend a launch has already
+/// claimed is told the backend is not waiting for a launch, and the launch that holds the backend
+/// goes on.
+#[test]
+fn kr_req_12_07_a_second_launch_of_a_claimed_backend_is_told_why() {
+    let shell = Gateway::new();
+    let answer = shell
+        .establish(&["codex"])
+        .expect("a backend is established");
+    let mut first = shell.launch(
+        &answer,
+        "the-first",
+        &[("STAND_IN", "stay"), ("STAND_IN_COMMAND", COMMAND)],
+    );
+    first.prints("TUI: turn/completed");
+    let mut second = shell.launch(&answer, "the-second", &[]);
+    let status = second.ends();
+    let said = second.said();
+    assert_eq!(status.code(), Some(2), "{said}");
+    assert!(
+        said.contains(
+            "the backend did not admit this launch (this backend is not waiting for a launch), \
+             so the program runs as typed"
+        ),
+        "{said}"
+    );
+    assert_eq!(
+        shell.last_launch_failure().as_deref(),
+        Some("this backend is not waiting for a launch"),
+        "the backend's record says why"
+    );
+    assert_eq!(
+        shell.servers().len(),
+        1,
+        "the first launch's server runs on"
+    );
+    let _ = first.child.kill();
+    let _ = first.ends();
+}
+
+/// KR-REQ-12.07: a step of the admission that fails after the backend is claimed, here the
+/// publication of the registration, is told to the launcher and kept in the backend's record, and
+/// the program runs as typed.
+#[test]
+fn kr_req_12_07_a_registration_that_cannot_be_published_is_told_to_the_launcher() {
+    let shell = Gateway::new();
+    let answer = shell
+        .establish(&["codex"])
+        .expect("a backend is established");
+    // A directory where the registration is to be written.
+    std::fs::create_dir(&answer.environment[0].value)
+        .expect("a directory where the registration belongs");
+    let mut launched = shell.launch(&answer, "no-registration", &[]);
+    let status = launched.ends();
+    let said = launched.said();
+    assert_eq!(status.code(), Some(2), "{said}");
+    assert!(
+        said.contains(
+            "the backend did not admit this launch (the broker ledger is unavailable: could not \
+             write the registration"
+        ),
+        "{said}"
+    );
+    assert!(
+        said.contains("so the program runs as typed"),
+        "the program ran as typed: {said}"
+    );
+    let recorded = shell.last_launch_failure();
+    assert!(
+        recorded.as_deref().is_some_and(|text| {
+            text.starts_with("the broker ledger is unavailable: could not write the registration")
+        }),
+        "the backend's record says why: {recorded:?}"
+    );
+    assert!(shell.servers().is_empty(), "no server was started");
+}
+
 /// KR-REQ-07.60 and KR-REQ-12.07: a server whose record cannot be written is not left running: a
 /// daemon could not stop it after this worker, so the launch is given back and the program runs as
 /// typed.

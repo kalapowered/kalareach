@@ -599,6 +599,8 @@ fn present(
     let answer = admitted.read_line(deadline)?;
     if super::answers(&answer, "admitted") {
         Ok(admitted)
+    } else if let super::Committed::Refused(why) = super::committed(&answer) {
+        Err(why)
     } else {
         Err("the backend answered something other than an admission".to_owned())
     }

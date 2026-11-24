@@ -28,6 +28,11 @@
 //! environment exactly, with their own value of a declared variable where they have one. An agent
 //! started with the integration's flags and no backend behind them is worse off than one started
 //! without them.
+//!
+//! A backend that refuses a launch after the credential authenticated says why, in the frame it
+//! answers a launch it cannot commit with, and the launcher repeats the reason. A refusal with no
+//! reason (the connection closes without a word) is what a presentation gets whose credential did
+//! not authenticate, and the launcher says only that the backend refused it.
 
 use std::ffi::OsString;
 #[cfg(unix)]
@@ -67,8 +72,9 @@ const MAX_RECORD_BYTES: u64 = 64 * 1024;
 #[cfg(unix)]
 const MAX_ANSWER_BYTES: usize = 4096;
 
-/// The most bytes of a backend's reason for a launch it did not commit that the launcher repeats.
-#[cfg(unix)]
+/// The most bytes of a backend's reason for a launch it did not admit or commit that the launcher
+/// repeats.
+#[cfg(any(unix, windows))]
 const MAX_REFUSAL_BYTES: usize = 512;
 
 /// The flag element an integration writes where the gateway's address goes, as the package
@@ -497,6 +503,8 @@ fn present(
     let answer = read_line_by(&mut stream, deadline)?;
     if answers(&answer, "admitted") {
         Ok(stream)
+    } else if let Committed::Refused(why) = committed(&answer) {
+        Err(why)
     } else {
         Err("the backend answered something other than an admission".to_owned())
     }
@@ -569,8 +577,9 @@ fn go(stream: &mut std::os::unix::net::UnixStream) -> Result<(), String> {
     }
 }
 
-/// What the backend's answer to a launch that said it is going says of the commit.
-#[cfg(unix)]
+/// What the backend's answer says of the commit: to a launch that said it is going, or, where the
+/// backend refuses the launch in place of its admission, the refusal.
+#[cfg(any(unix, windows))]
 enum Committed {
     /// The launch is committed.
     Yes,
@@ -581,8 +590,9 @@ enum Committed {
 }
 
 /// Reads the backend's answer to a launch that said it is going: `{"kr_launch":{"committed":true}}`,
-/// or `{"kr_launch":{"committed":false,"failed":"<why>"}}`.
-#[cfg(unix)]
+/// or `{"kr_launch":{"committed":false,"failed":"<why>"}}`. The second is also what the backend
+/// answers a presentation with when it refuses it after its credential authenticated.
+#[cfg(any(unix, windows))]
 fn committed(line: &str) -> Committed {
     let value: serde_json::Value = match serde_json::from_str(line) {
         Ok(value) => value,
@@ -606,7 +616,7 @@ fn committed(line: &str) -> Committed {
 /// A reason a backend gave, as the launcher repeats it: its control characters replaced by spaces
 /// and at most [`MAX_REFUSAL_BYTES`] bytes of it, cut at a character boundary. What a backend
 /// sends is text a person reads on a terminal, so it is never written as it arrived.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn refusal_text(why: &str) -> String {
     let mut text: String = why
         .chars()

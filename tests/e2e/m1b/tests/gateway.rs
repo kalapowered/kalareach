@@ -850,15 +850,16 @@ impl Person {
     /// Types `line`, which runs through the integration, and waits until the launcher says the
     /// backend refused the launch and ran the program as typed.
     ///
-    /// The launcher says that when the worker closed the connection without admitting it, and
-    /// for no other cause than a refusal the worker made: a worker that answered late, or a
-    /// launcher out of time, is told apart by what it prints. A line the shell ran as typed before
-    /// the worker answered (its bound for the answer is one second) says nothing of the launch and
-    /// is typed again, as [`Person::types_until_it_shows`] does. A line a gateway serves fails the
-    /// case at once, where waiting for the refusal would only time out. What the worker refused
-    /// it for is the caller's to establish: the claim, in a session whose worker has served.
+    /// The launcher says that when the worker answered the presentation with a refusal and its
+    /// reason, and for no other cause than a refusal the worker made: a worker that answered late,
+    /// or a launcher out of time, is told apart by what it prints (the reason is in the
+    /// parentheses). A line the shell ran as typed before the worker answered (its bound for the
+    /// answer is one second) says nothing of the launch and is typed again, as
+    /// [`Person::types_until_it_shows`] does. A line a gateway serves fails the case at once,
+    /// where waiting for the refusal would only time out. What the worker refused it for is the
+    /// caller's to establish: the claim, in a session whose worker has served.
     fn types_until_the_launch_is_refused(&self, line: &str, why: &str) -> Vec<String> {
-        const REFUSED: &str = "did not admit this launch (the backend refused it)";
+        const REFUSED: &str = "did not admit this launch (";
         let started = Instant::now();
         loop {
             self.clears_the_screen();
@@ -1257,11 +1258,12 @@ fn server_besides(
 /// has answered a launch, so it has read the executable, and a refusal that came from a worker
 /// still reading it, or a launcher out of time, is not taken for one.
 ///
-/// What the worker refuses a launch for is not told to anyone outside it: the launcher says the
-/// backend refused it, whatever the reason. So the case shows the claim is the reason by what the
-/// refusal follows. A conversation nothing runs against, whose claim the test itself holds and lets
-/// go of, is refused to the second session each time it is typed while the test holds the claim,
-/// and served each time it is typed while the test does not, over two rounds. A refusal for any
+/// What the worker refuses a launch for is told to the launcher, whose line carries the reason in
+/// its parentheses. The case still shows the claim is the reason by what the refusal follows, so
+/// that a refusal for another cause does not pass for it. A conversation nothing runs against,
+/// whose claim the test itself holds and lets go of, is refused to the second session each time it
+/// is typed while the test holds the claim, and served each time it is typed while the test does
+/// not, over two rounds. A refusal for any
 /// other cause (a read of the executable that outlasted its bound, a launch refused on its own
 /// grounds) does not follow the claim's being held and let go of, and a worker that does not check
 /// the claim serves the line while it is held.
