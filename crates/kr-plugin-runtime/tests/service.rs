@@ -5552,6 +5552,7 @@ mod recorded_session {
 
     use kr_ipc::endpoint::{Connection, Listener};
     use kr_ipc::framed::split;
+    use kr_plugin_sdk::digest::PayloadDigest;
     use kr_plugin_sdk::effect::EffectClass;
     use kr_plugin_service::client::PluginClient;
     use kr_plugin_service::protocol::{
@@ -5562,7 +5563,10 @@ mod recorded_session {
     };
     use kr_protocol::frame::StreamKind;
 
-    use super::{HANG_GUARD, REGISTRATION_PATIENCE, Served, components, documents_until};
+    use super::{
+        HANG_GUARD, REGISTRATION_PATIENCE, Served, components, documents_until, invocation,
+        overflow_behind_a_stopped_pass, pending_request,
+    };
 
     const RECORD: &str =
         include_str!("../../kr-plugin-service/tests/recorded/host-3-session-frames.json");
@@ -5607,6 +5611,11 @@ mod recorded_session {
         "response:called:plan:with_arguments",
     ];
 
+    /// A frame longer than this is kept as its length and digest: the events that fill a queue to
+    /// its bound are most of a megabyte each way, and what matters of them is that they are the
+    /// same.
+    const LARGE_FRAME: usize = 4096;
+
     fn hex(bytes: &[u8]) -> String {
         bytes.iter().map(|byte| format!("{byte:02x}")).collect()
     }
@@ -5617,6 +5626,99 @@ mod recorded_session {
             .step_by(2)
             .map(|at| u8::from_str_radix(&text[at..at + 2], 16).expect("hexadecimal"))
             .collect()
+    }
+
+    /// The kinds of frame a session with these components reaches, so that the record holds a frame
+    /// of each from a session of the host the record was made from, and not only from the types.
+    const REACHED: [&str; 11] = [
+        "request:prepare_action",
+        "request:encode",
+        "response:called:plan:with_arguments",
+        "response:called:fault",
+        "response:called:encoded",
+        "response:refused",
+        "notice:document",
+        "notice:gap",
+        "notice:fault",
+        "notice:disabled",
+        "response:admitted",
+    ];
+
+    /// The kinds of frame that hold something of the run they were written in.
+    const OF_A_RUN: [&str; 6] = [
+        "request:verify",
+        "request:register_binding",
+        "response:hello",
+        "response:verified",
+        "response:registered",
+        "response:health",
+    ];
+
+    /// The members of those frames that differ from one run to the next: the challenge and its
+    /// signature, a path in a folder made for the run, the identity of the host's process and how
+    /// long something took.
+    const OF_THE_RUN: [&str; 10] = [
+        "nonce",
+        "path",
+        "endpoint",
+        "environment_id",
+        "host_public_key",
+        "pid",
+        "start_value",
+        "signature",
+        "elapsed_ms",
+        "uptime_ms",
+    ];
+
+    /// What a frame is held to when a session is compared with the record: its bytes, its length and
+    /// digest when it is a long one, and, for a frame that holds something of its run, what it reads
+    /// as with each such member replaced by what kind of value it is.
+    fn held_to(kind: &str, bytes: &[u8]) -> String {
+        fn of_the_run(value: serde_json::Value) -> serde_json::Value {
+            use serde_json::Value;
+            match value {
+                Value::Object(members) => Value::Object(
+                    members
+                        .into_iter()
+                        .map(|(name, member)| {
+                            let member = if OF_THE_RUN.contains(&name.as_str()) {
+                                match member {
+                                    Value::Array(items) => {
+                                        Value::from(format!("{} members", items.len()))
+                                    }
+                                    Value::String(_) => Value::from("text"),
+                                    Value::Number(_) => Value::from("number"),
+                                    other => Value::from(other.to_string()),
+                                }
+                            } else {
+                                of_the_run(member)
+                            };
+                            (name, member)
+                        })
+                        .collect(),
+                ),
+                Value::Array(items) => Value::Array(items.into_iter().map(of_the_run).collect()),
+                other => other,
+            }
+        }
+
+        let limits = StreamKind::Control.cbor_limits();
+        if OF_A_RUN.contains(&kind) {
+            let read = if kind.starts_with("request:") {
+                serde_json::to_value(
+                    kr_cbor::from_canonical_slice::<Request>(bytes, &limits).expect("a request"),
+                )
+            } else {
+                serde_json::to_value(
+                    kr_cbor::from_canonical_slice::<Frame>(bytes, &limits).expect("a frame"),
+                )
+            };
+            return of_the_run(read.expect("it reads as data")).to_string();
+        }
+        if bytes.len() > LARGE_FRAME {
+            return format!("{}:{}", bytes.len(), PayloadDigest::of(bytes));
+        }
+        hex(bytes)
     }
 
     /// The name of what a frame is: a request, an answer (a call's by what it carries) or a notice.
@@ -5738,12 +5840,16 @@ mod recorded_session {
         notices: BTreeSet<String>,
     }
 
-    /// A session with this host through a tee: a worker registers two components, delivers an event,
-    /// takes a snapshot, a checkpoint and a restore, revises facts and attachments, sets privacy mode,
-    /// decodes (once to a component that traps), and unbinds.
+    /// A session with this host through a tee: a worker registers components, delivers an event,
+    /// takes a snapshot, a checkpoint and a restore, revises facts and attachments, sets privacy mode
+    /// while a document is held (so that its end tells of the loss), asks a component to prepare
+    /// actions (a plan, a plan with fields, and a fault it declares), decodes and encodes (a decode
+    /// that traps, a decode that declares a fault, three faults that disable the binding), floods
+    /// the queue of a binding until the host tells of the gap, and unbinds.
     async fn session(served: &Served) -> Option<Session> {
         let behaved = components::well_behaved()?;
         let hostile = components::component("hostile-decoder")?;
+        let preparing = components::component("preparing")?;
         let (connection, kept, tee_task) = tee(served).await;
         let mut client = PluginClient::over(connection, served.descriptor.clone())
             .await
@@ -5797,8 +5903,69 @@ mod recorded_session {
             .revise_attachments(first.binding_id, &[])
             .await
             .expect("the attachments are revised");
+        // Privacy mode is acknowledged while a document is held at the writer, so that its end
+        // tells the reader that documents were lost, and a fresh one follows.
+        let hold = served.host.hold_notice_writes();
+        client
+            .snapshot(first.binding_id, deadline)
+            .await
+            .expect("the snapshot runs");
+        tokio::time::timeout(HANG_GUARD, async {
+            while !hold.parked() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the writer never took the document off the queue");
         client.privacy(true).await.expect("privacy mode is set");
+        hold.release();
         client.privacy(false).await.expect("privacy mode ends");
+        tokio::time::timeout(HANG_GUARD, async {
+            let mut told = false;
+            loop {
+                match client.notice().await.expect("the connection is open") {
+                    Notice::Gap { documents, .. } if documents > 0 => told = true,
+                    Notice::Document { last: true, .. } if told => break,
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("no fresh document followed the end of privacy mode");
+
+        // A component that prepares actions: a plan, a plan that fills in fields, and a fault it
+        // declares.
+        let (path, digest, bytes) = served.install("preparing", &preparing);
+        let third = components::request("preparing", 5);
+        client
+            .register(
+                third.binding_id,
+                &third.identity,
+                &third.facts,
+                &third.executable,
+                &ComponentSource {
+                    path,
+                    digest,
+                    bytes,
+                },
+            )
+            .await
+            .expect("the third binding registers");
+        let given = vec![WireNamedArgument {
+            name: "reason".to_owned(),
+            value: WireArgument::Text("because".to_owned()),
+        }];
+        for action in ["turn.cancel", "prompt.with.fields", "cancel.fault"] {
+            client
+                .prepare_action(
+                    third.binding_id,
+                    invocation(action),
+                    given.clone(),
+                    deadline,
+                )
+                .await
+                .expect("the call runs");
+        }
 
         let (path, digest, bytes) = served.install("hostile-decoder", &hostile);
         let second = components::request("hostile-decoder", 14);
@@ -5841,9 +6008,108 @@ mod recorded_session {
         })
         .await
         .expect("the fault was never written");
+
+        // An offered decision is encoded, and a request the component declines to decode is a fault
+        // it declares, which is an answer and not a trap.
+        let source = components::native_request("se-1", "7", "a request to write");
+        client
+            .encode(
+                second.binding_id,
+                pending_request("7", "session/request_permission"),
+                "allow",
+                Some(&source),
+                deadline,
+            )
+            .await
+            .expect("an offered decision is encoded");
+        let _ = client
+            .decode(
+                second.binding_id,
+                &components::native_request("se-5", "10", "!decline"),
+                deadline,
+            )
+            .await;
+
+        // The third fault disables a binding, and the host tells the reader so.
+        let (path, digest, bytes) = served.install("hostile-decoder", &hostile);
+        let fourth = components::request("hostile-decoder", 16);
+        client
+            .register(
+                fourth.binding_id,
+                &fourth.identity,
+                &fourth.facts,
+                &fourth.executable,
+                &ComponentSource {
+                    path,
+                    digest,
+                    bytes,
+                },
+            )
+            .await
+            .expect("the fourth binding registers");
+        for index in 0..3 {
+            client
+                .decode(
+                    fourth.binding_id,
+                    &components::native_request(&format!("se-{}", 6 + index), "11", "!trap"),
+                    deadline,
+                )
+                .await
+                .expect_err("a decode that traps is refused");
+        }
+        tokio::time::timeout(HANG_GUARD, async {
+            loop {
+                if let Notice::Disabled { .. } =
+                    client.notice().await.expect("the connection is open")
+                {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("the host never said the binding was disabled");
+
+        // A queue that overflows behind a pass that has not taken anything: the host tells the
+        // reader how much was lost, and a snapshot follows. A component that draws nothing when
+        // it observes keeps the number of documents after the gap from depending on how far the
+        // pass got.
+        let (path, digest, bytes) = served.install("hostile-decoder", &hostile);
+        let fifth = components::request("hostile-decoder", 17);
+        client
+            .register(
+                fifth.binding_id,
+                &fifth.identity,
+                &fifth.facts,
+                &fifth.executable,
+                &ComponentSource {
+                    path,
+                    digest,
+                    bytes,
+                },
+            )
+            .await
+            .expect("the fifth binding registers");
+        let stop = overflow_behind_a_stopped_pass(served, &client, &fifth).await;
+        stop.release();
+        tokio::time::timeout(HANG_GUARD, async {
+            let mut told = false;
+            loop {
+                match client.notice().await.expect("the connection is open") {
+                    Notice::Gap { events, .. } if events > 0 => told = true,
+                    Notice::Document { last: true, .. } if told => break,
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("no snapshot followed the gap");
+
         assert!(client.unbind(first.binding_id).await.expect("an unbind"));
         assert!(!client.unbind(first.binding_id).await.expect("an unbind"));
         assert!(client.unbind(second.binding_id).await.expect("an unbind"));
+        assert!(client.unbind(third.binding_id).await.expect("an unbind"));
+        let _ = client.unbind(fourth.binding_id).await.expect("an unbind");
+        assert!(client.unbind(fifth.binding_id).await.expect("an unbind"));
         drop(client);
         tokio::time::timeout(HANG_GUARD, tee_task)
             .await
@@ -6134,7 +6400,21 @@ mod recorded_session {
         let mut spelled = String::new();
         for entry in record["frames"].as_array().expect("the frames") {
             let kind = entry["kind"].as_str().expect("a kind");
-            let bytes = unhex(entry["hex"].as_str().expect("the bytes"));
+            let Some(hexed) = entry["hex"].as_str() else {
+                // A frame too long to keep is held as its length and digest.
+                assert!(
+                    entry["length"]
+                        .as_u64()
+                        .is_some_and(|length| length > LARGE_FRAME as u64)
+                        && entry["digest"]
+                            .as_str()
+                            .is_some_and(|digest| digest.len() > 8),
+                    "{kind} holds neither its bytes nor its length and digest"
+                );
+                kinds.insert(kind.to_owned());
+                continue;
+            };
+            let bytes = unhex(hexed);
             let spelling;
             let read = if kind.starts_with("request:") {
                 let read: Result<Request, _> = kr_cbor::from_canonical_slice(&bytes, &limits);
@@ -6165,6 +6445,19 @@ mod recorded_session {
         }
         for kind in KINDS {
             assert!(kinds.contains(kind), "the record holds no frame of {kind}");
+        }
+        let from_a_session: BTreeSet<&str> = record["frames"]
+            .as_array()
+            .expect("the frames")
+            .iter()
+            .filter(|entry| entry["source"] == "session")
+            .filter_map(|entry| entry["kind"].as_str())
+            .collect();
+        for kind in REACHED {
+            assert!(
+                from_a_session.contains(kind),
+                "no frame of {kind} in the record is from a session"
+            );
         }
         // Each variant of the closed leaves the frames are made of is in a frame of the record: a
         // change to one that no frame holds would change nothing the record checks.
@@ -6211,7 +6504,16 @@ mod recorded_session {
                 frames
                     .iter()
                     .map(|(kind, bytes)| {
-                        serde_json::json!({ "source": source, "kind": kind, "hex": hex(bytes) })
+                        if bytes.len() > LARGE_FRAME {
+                            serde_json::json!({
+                                "source": source,
+                                "kind": kind,
+                                "length": bytes.len(),
+                                "digest": PayloadDigest::of(bytes).to_string(),
+                            })
+                        } else {
+                            serde_json::json!({ "source": source, "kind": kind, "hex": hex(bytes) })
+                        }
                     })
                     .collect::<Vec<_>>()
             };
@@ -6235,12 +6537,82 @@ mod recorded_session {
             session.shape, shape,
             "each request is answered with the kind of answer it was recorded with"
         );
-        let notices: BTreeSet<String> =
-            serde_json::from_value(record["notices"].clone()).expect("the recorded notices");
-        assert!(
-            notices.is_subset(&session.notices),
-            "{notices:?} is not within {:?}",
-            session.notices
+
+        // The frames, one by one: what this host wrote and read in the session is what the host the
+        // record was made from wrote and read.
+        let live: Vec<(String, String)> = session
+            .frames
+            .iter()
+            .map(|(kind, bytes)| (kind.clone(), held_to(kind, bytes)))
+            .collect();
+        let recorded: Vec<(String, String)> = record["frames"]
+            .as_array()
+            .expect("the frames")
+            .iter()
+            .filter(|entry| entry["source"] == "session")
+            .map(|entry| {
+                let kind = entry["kind"].as_str().expect("a kind").to_owned();
+                let held = match entry["hex"].as_str() {
+                    Some(hexed) => held_to(&kind, &unhex(hexed)),
+                    None => format!(
+                        "{}:{}",
+                        entry["length"].as_u64().expect("a length"),
+                        entry["digest"].as_str().expect("a digest")
+                    ),
+                };
+                (kind, held)
+            })
+            .collect();
+        for kind in REACHED {
+            assert!(
+                live.iter().any(|(held, _)| held == kind),
+                "the session reached no frame of {kind}"
+            );
+        }
+        // Requests are the session's own and come in its order.
+        let requests = |frames: &[(String, String)]| {
+            frames
+                .iter()
+                .filter(|(kind, _)| kind.starts_with("request:"))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        let (live_requests, recorded_requests) = (requests(&live), requests(&recorded));
+        assert_eq!(
+            live_requests.len(),
+            recorded_requests.len(),
+            "the session asked for another number of things than it did when it was recorded"
         );
+        for (at, (asked, was)) in live_requests.iter().zip(&recorded_requests).enumerate() {
+            assert!(
+                asked == was,
+                "request {at} ({}) is not the request that was recorded",
+                asked.0
+            );
+        }
+        // Answers and notices are a multiset: when a notice is written beside an answer is not
+        // what the protocol fixes.
+        for (what, prefix) in [("answer", "response:"), ("notice", "notice:")] {
+            let mut counts: std::collections::BTreeMap<(String, String), i64> = Default::default();
+            for (kind, held) in &live {
+                if kind.starts_with(prefix) {
+                    *counts.entry((kind.clone(), held.clone())).or_default() += 1;
+                }
+            }
+            for (kind, held) in &recorded {
+                if kind.starts_with(prefix) {
+                    *counts.entry((kind.clone(), held.clone())).or_default() -= 1;
+                }
+            }
+            let differing: Vec<(&str, i64)> = counts
+                .iter()
+                .filter(|(_, left)| **left != 0)
+                .map(|((kind, _), left)| (kind.as_str(), *left))
+                .collect();
+            assert!(
+                differing.is_empty(),
+                "these {what}s were written more times (positive) or fewer (negative) than they were recorded: {differing:?}"
+            );
+        }
     }
 }
