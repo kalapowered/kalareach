@@ -6506,7 +6506,7 @@ mod recorded_session {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn kr_req_24_24_the_host_answers_a_session_the_way_the_record_says() {
-        let served = Served::start_held().await;
+        let served = Served::start_dual(false).await;
         let Some(session) = session(&served).await else {
             return;
         };
