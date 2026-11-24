@@ -49,6 +49,7 @@ members = [
     "tests/perf",
     "tests/support/artifacts",
     "tests/support/codex-stand-in",
+    "tests/support/manager-stand-in",
     "tests/support/service-stand-in",
 ]
 

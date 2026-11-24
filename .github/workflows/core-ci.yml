@@ -3070,7 +3070,8 @@ jobs:
               -p companion-platform -p companion-preview -p companion-tauri -p kr-attention
               -p kr-automation -p kr-backup-integration -p kr-boundary-windows -p kr-cbor -p kr-cli -p kr-codex-stand-in
               -p kr-crypto -p kr-delivery -p kr-describe -p kr-describe-model -p kr-e2e-agents
-              -p kr-e2e-m1b -p kr-faults -p kr-flush -p kr-keys -p kr-loopback -p kr-pairing
+              -p kr-e2e-m1b -p kr-faults -p kr-flush -p kr-keys -p kr-loopback -p kr-manager-stand-in
+              -p kr-pairing
               -p kr-perf -p kr-plugin-catalogue -p kr-plugin-host -p kr-plugin-runtime
               -p kr-plugin-sdk -p kr-plugin-service -p kr-privacy-integration -p kr-protocol
               -p kr-release -p kr-release-matrix-check -p kr-service-stand-in
@@ -3390,7 +3391,8 @@ jobs:
       # worker and the plugin host that the controller's suites start, and the Codex stand-ins that
       # its gateway suites start. `tests-2` builds the control daemon, its held build and its
       # stub inference process, which `kr-cli`'s suites start, and the forwarder that the
-      # end-to-end suites start. The limit of 45 minutes is a guess: no run has measured the step,
+      # end-to-end suites start, and the stand-in service manager that its service-start cases
+      # start. The limit of 45 minutes is a guess: no run has measured the step,
       # and the first run on a hosted runner without a cache sets it.
       - name: Build the programs the suites of this leg start
         if: ${{ !cancelled() && matrix.part == 'tests-1' }}
@@ -3406,7 +3408,7 @@ jobs:
         run: >-
           cargo build --locked --workspace --exclude kr-sync-integration --examples
           --bin kr-controller --bin kr-controller-held
-          --bin kr-stub-inference --bin kr-hook
+          --bin kr-stub-inference --bin kr-hook --bin kr-manager-stand-in
 
       # The workspace's tests, less what this runner cannot run, each left out by name here:
       #

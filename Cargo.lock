@@ -4943,6 +4943,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "kr-manager-stand-in"
+version = "0.1.0"
+dependencies = [
+ "kr-ipc",
+ "kr-protocol",
+ "quick-xml 0.42.0",
+ "rustix",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "kr-pairing"
 version = "0.1.0"
 dependencies = [

@@ -1,0 +1,34 @@
+[package]
+name = "kr-manager-stand-in"
+description = "A stand-in for launchctl that a test run puts in the place of the service manager: it answers the commands kr puts to it, loads a definition as written, starts the daemon it names as that definition says, and records every call"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "kr-manager-stand-in"
+path = "src/main.rs"
+
+[dependencies]
+# The start identity of the process it starts, which every later signal is checked against, and the
+# names of the variables a test tree's directories are found by.
+kr-ipc.workspace = true
+kr-protocol.workspace = true
+# The definition kr writes is an XML property list.
+quick-xml.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+# The lock around the record of the job, the file mode mask, and a session of its own, all safe calls.
+rustix = { workspace = true, features = ["fs", "process"] }
+
+[dev-dependencies]
+# The cases place the program and the installation's marker as the suites do.
+kr-ipc = { workspace = true, features = ["testing"] }
+
+[lints]
+workspace = true
