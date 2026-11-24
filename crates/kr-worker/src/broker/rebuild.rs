@@ -313,21 +313,27 @@ impl Recovery {
                 self.terminal.bytes
             ));
         }
+        // One clause for the time the runtime was away: what the worker passed over, and what its
+        // queue dropped.
+        let mut away = Vec::new();
         if !passed.is_empty() {
-            parts.push(format!(
-                "while the plugin runtime was away the worker passed over {}, which the component \
-                 was never given",
+            away.push(format!(
+                "passed over {}, which the component was never given",
                 passed.join(" and ")
             ));
         }
         if self.dropped.events > 0 {
-            parts.push(format!(
-                "{} {} ({} bytes) {} dropped because the worker's queue was full while the plugin \
-                 runtime was away",
+            away.push(format!(
+                "dropped {} {} ({} bytes) because its queue was full",
                 self.dropped.events,
                 noun(self.dropped.events, "observation", "observations"),
-                self.dropped.bytes,
-                noun(self.dropped.events, "was", "were")
+                self.dropped.bytes
+            ));
+        }
+        if !away.is_empty() {
+            parts.push(format!(
+                "while the runtime was away the worker {}",
+                away.join(", and ")
             ));
         }
         if self.decode_queued > 0 {
@@ -367,16 +373,24 @@ impl Recovery {
         }
     }
 
-    /// A restart's words with a clause for every way a request is left out, and every count at its
-    /// widest: the longest the words can be. For the cases that bound a report.
+    /// A restart's words with a clause for every way a request is left out, and every tally of what
+    /// was passed over and dropped at `u64::MAX`, which its counters can reach: the longest the words
+    /// can be. For the cases that bound a report.
     #[cfg(test)]
     pub(super) fn with_every_clause() -> Self {
+        let widest = Tally {
+            events: u64::MAX,
+            bytes: u64::MAX,
+        };
         Self {
             unavailable: 99_999,
             oversized: 64,
             over_cap: 99_999,
             refused: 64,
             unanswered: 64,
+            passed: widest,
+            terminal: widest,
+            dropped: widest,
             ..Self::after_a_long_outage()
         }
     }
@@ -425,7 +439,7 @@ impl Recovery {
             ));
         }
         if self.refused > 0 {
-            causes.push(format!("{} refused by the plugin runtime", self.refused));
+            causes.push(format!("{} refused by the runtime", self.refused));
         }
         if let Some((last, earlier)) = causes.split_last() {
             let list = if earlier.is_empty() {
@@ -437,7 +451,7 @@ impl Recovery {
         }
         if self.unanswered > 0 {
             parts.push(format!(
-                "{} not confirmed as given because the plugin runtime did not answer",
+                "{} not confirmed as given because the runtime did not answer",
                 self.unanswered
             ));
         }
@@ -494,7 +508,7 @@ mod tests {
             words,
             "started again after the plugin runtime was lost, with no state or history from \
              before the loss; the worker gave it 1 pending request from its own records, oldest first, \
-             already read as an approval; while the plugin runtime was away the worker passed over \
+             already read as an approval; while the runtime was away the worker passed over \
              2 upstream frames (310 bytes), which the component was never given"
         );
         let words = Recovery {
@@ -515,17 +529,24 @@ mod tests {
             "{words}"
         );
         assert!(
-            words.contains(
-                "passed over 1 upstream frame (10 bytes) and 4 terminal spans (2000 bytes), which"
+            words.ends_with(
+                "; while the runtime was away the worker passed over 1 upstream frame (10 bytes) \
+                 and 4 terminal spans (2000 bytes), which the component was never given, and \
+                 dropped 1 observation (90 bytes) because its queue was full"
             ),
             "{words}"
         );
+        let dropped_only = Recovery {
+            dropped: tally(3, 90),
+            ..Recovery::default()
+        }
+        .words();
         assert!(
-            words.contains(
-                "1 observation (90 bytes) was dropped because the worker's queue was full while \
-                 the plugin runtime was away"
+            dropped_only.ends_with(
+                "; while the runtime was away the worker dropped 3 observations (90 bytes) because \
+                 its queue was full"
             ),
-            "{words}"
+            "{dropped_only}"
         );
     }
 
@@ -544,8 +565,8 @@ mod tests {
         assert!(
             words.ends_with(
                 "; pending requests left out: 1 whose bytes could not be used, 2 too large for \
-                 one event, 3 over the limit of 64 requests or 4 MiB and 1 refused by the plugin \
-                 runtime; 2 not confirmed as given because the plugin runtime did not answer"
+                 one event, 3 over the limit of 64 requests or 4 MiB and 1 refused by the \
+                 runtime; 2 not confirmed as given because the runtime did not answer"
             ),
             "{words}"
         );
@@ -576,12 +597,12 @@ mod tests {
             words_of(0, 4, 0, 2, 0),
             format!(
                 "{after}pending requests left out: 4 too large for one event and 2 refused by the \
-                 plugin runtime"
+                 runtime"
             )
         );
         assert_eq!(
             words_of(0, 0, 0, 0, 3),
-            format!("{after}3 not confirmed as given because the plugin runtime did not answer")
+            format!("{after}3 not confirmed as given because the runtime did not answer")
         );
     }
 
@@ -670,14 +691,20 @@ mod tests {
     #[test]
     fn the_longest_form_of_a_restart_says_every_clause() {
         let words = Recovery::with_every_clause().words();
+        let widest = u64::MAX;
+        let away = format!(
+            "while the runtime was away the worker passed over {widest} upstream frames \
+             ({widest} bytes) and {widest} terminal spans ({widest} bytes), which the component \
+             was never given, and dropped {widest} observations ({widest} bytes) because its \
+             queue was full"
+        );
         for clause in [
             "the worker gave it 64 pending requests from its own records, oldest first, 64 of them \
              already read as approvals",
             "pending requests left out: 99999 whose bytes could not be used, 64 too large for one \
-             event, 99999 over the limit of 64 requests or 4 MiB and 64 refused by the plugin \
-             runtime; 64 not confirmed as given because the plugin runtime did not answer",
-            "99999 upstream frames (99999999 bytes) and 99999 terminal spans (99999999 bytes)",
-            "99999 observations (9999999 bytes) were dropped because the worker's queue was full",
+             event, 99999 over the limit of 64 requests or 4 MiB and 64 refused by the \
+             runtime; 64 not confirmed as given because the runtime did not answer",
+            away.as_str(),
             "8 pending requests were queued to be decoded again",
             "56 pending requests could not be queued to be decoded again because the decode queue \
              was full",

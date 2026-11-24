@@ -1178,15 +1178,15 @@ async fn kr_req_24_24_a_frame_not_offered_because_the_runtime_was_lost_during_an
     until_started_again(&world, 1).await;
     until_started_again(&world, 2).await;
 
-    let second = world.reason(2);
+    let second = world.until_reason(2, "started again").await;
     assert!(
         second.contains(&format!(
-            "while the plugin runtime was away the worker passed over 1 upstream frame ({each} \
+            "while the runtime was away the worker passed over 1 upstream frame ({each} \
              bytes), which the component was never given"
         )),
         "the frame the second binding was not offered is not counted: {second}"
     );
-    let first = world.reason(1);
+    let first = world.until_reason(1, "started again").await;
     assert!(
         !first.contains("passed over"),
         "the first binding was handed the frame: {first}"
@@ -1648,10 +1648,10 @@ async fn kr_req_24_24_what_the_worker_passed_over_while_the_runtime_was_away_is_
     hold.release();
     until_started_again(&world, 1).await;
 
-    let reason = world.reason(1);
+    let reason = world.until_reason(1, "started again").await;
     assert!(
         reason.contains(&format!(
-            "while the plugin runtime was away the worker passed over 5 upstream frames ({} bytes) \
+            "while the runtime was away the worker passed over 5 upstream frames ({} bytes) \
              and 2 terminal spans (1000 bytes), which the component was never given",
             5 * each
         )),
@@ -1696,31 +1696,15 @@ async fn kr_req_24_24_observations_dropped_while_the_runtime_was_away_are_told_a
     hold.release();
     until_started_again(&world, 1).await;
 
-    let reason = world.reason(1);
+    let reason = world.until_reason(1, "started again").await;
     assert!(
-        reason.contains(&format!(
-            "{dropped} observations ("
-        )) && reason.contains(
-            " were dropped because the worker's queue was full while the plugin runtime was away"
-        ),
+        reason.contains(&format!("dropped {dropped} observations ("))
+            && reason.contains(" bytes) because its queue was full"),
         "{reason}"
     );
     assert!(!reason.contains("fresh snapshot"), "{reason}");
     let account = world.account(1).await.expect("the component answers");
     assert_eq!(account.snapshots, 0, "a snapshot was taken: {account:?}");
-}
-
-/// Says that `dropped` observations were told as dropped for want of room while the runtime was
-/// away, and that no snapshot was owed for them.
-fn told_as_dropped_while_the_runtime_was_away(world: &Observing, dropped: u64) {
-    let reason = world.reason(1);
-    assert!(
-        reason.contains(&format!("{dropped} observations (")) && reason.contains(
-            " were dropped because the worker's queue was full while the plugin runtime was away"
-        ),
-        "{dropped} were dropped: {reason}"
-    );
-    assert!(!reason.contains("fresh snapshot"), "{reason}");
 }
 
 /// KR-REQ-24.24: the frames the worker's queue dropped while the plugin runtime was away are counted
@@ -1763,7 +1747,13 @@ async fn kr_req_24_24_frames_dropped_while_the_runtime_was_away_are_counted_when
     world.let_the_compiles_go();
     until_started_again(&world, 1).await;
 
-    told_as_dropped_while_the_runtime_was_away(&world, dropped);
+    let reason = world.until_reason(1, "started again").await;
+    assert!(
+        reason.contains(&format!("dropped {dropped} observations ("))
+            && reason.contains(" bytes) because its queue was full"),
+        "{dropped} were dropped: {reason}"
+    );
+    assert!(!reason.contains("fresh snapshot"), "{reason}");
 }
 
 /// KR-REQ-24.24: the terminal output the worker's queue dropped while the plugin runtime was away is
@@ -1800,7 +1790,13 @@ async fn kr_req_24_24_terminal_output_dropped_while_the_runtime_was_away_is_coun
     world.let_the_compiles_go();
     until_started_again(&world, 1).await;
 
-    told_as_dropped_while_the_runtime_was_away(&world, dropped);
+    let reason = world.until_reason(1, "started again").await;
+    assert!(
+        reason.contains(&format!("dropped {dropped} observations ("))
+            && reason.contains(" bytes) because its queue was full"),
+        "{dropped} were dropped: {reason}"
+    );
+    assert!(!reason.contains("fresh snapshot"), "{reason}");
 }
 
 /// KR-REQ-24.24: a request is given to the component once when the producer pushes it to the lane
@@ -1967,7 +1963,9 @@ async fn kr_req_24_24_a_request_made_in_privacy_mode_is_given_as_one_and_a_reque
         || async { until_decoded(&world, 62).then_some(()) },
     )
     .await;
-    let decoding = world.reason(2);
+    let decoding = world
+        .until_reason(2, "1 pending request was queued to be decoded again")
+        .await;
     assert!(
         decoding.contains("1 pending request was queued to be decoded again"),
         "{decoding}"
@@ -2298,14 +2296,14 @@ async fn kr_req_24_24_the_worker_gives_at_most_what_it_holds_and_says_what_it_co
     until_started_again(&world, 1).await;
     until_started_again(&world, 2).await;
 
-    let reason = world.reason(1);
+    let reason = world.until_reason(1, "started again").await;
     for clause in [
         "the worker gave it 64 pending requests from its own records, oldest first",
         "pending requests left out: 5 whose bytes could not be used",
     ] {
         assert!(reason.contains(clause), "{clause}: {reason}");
     }
-    let decoding = world.reason(2);
+    let decoding = world.until_reason(2, "started again").await;
     for clause in [
         "8 pending requests were queued to be decoded again",
         "56 pending requests could not be queued to be decoded again because the decode queue was full",

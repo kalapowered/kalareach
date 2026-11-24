@@ -704,8 +704,8 @@ mod tests {
     }
 
     /// The longest form of the restart's words, a clause for every way a request is left out and
-    /// every count at its widest, fits the report's bound with the longest registration note
-    /// before it: nothing is cut and nothing is flagged.
+    /// every tally of what was passed over and dropped at `u64::MAX`, fits the report's bound with
+    /// the longest registration note before it: nothing is cut and nothing is flagged.
     #[test]
     fn the_longest_form_of_the_restart_words_fits_the_bound_with_the_registration_note() {
         let words = Recovery::with_every_clause().words();
