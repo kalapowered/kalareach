@@ -1651,7 +1651,10 @@ async fn managed(
             // policy was not read, or it may restart the daemon (a systemd drop-in can set
             // Restart, and launchd can hold a job loaded with KeepAlive), the line may be another
             // start's daemon's or the manager's next start may follow it, and the requested daemon
-            // may still come up. A unit that another unit starts by name is not read.
+            // may still come up. A unit that another unit starts by name is not read, and neither
+            // are the other launchd keys that start a job (`StartInterval`,
+            // `StartCalendarInterval`, `WatchPaths`, `QueueDirectories`, `Sockets`,
+            // `MachServices`, `LaunchEvents`).
             if asked.pid.is_some() && asked.no_restart {
                 launched.process_ended();
             }

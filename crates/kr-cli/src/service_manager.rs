@@ -1055,7 +1055,9 @@ pub struct Asked {
     /// restart: the daemon it runs is not started again when it ends. False where the policy was
     /// not read, or may start the daemon again: a unit's drop-in can set `Restart`, and launchd can
     /// hold a job that was loaded with `KeepAlive`. A unit that another unit starts by name is not
-    /// read.
+    /// read, and neither are the other launchd keys that start a job (`StartInterval`,
+    /// `StartCalendarInterval`, `WatchPaths`, `QueueDirectories`, `Sockets`, `MachServices`,
+    /// `LaunchEvents`).
     pub no_restart: bool,
 }
 
@@ -1544,6 +1546,12 @@ mod platform {
             .replace('>', "&gt;")
     }
 
+    /// The process `launchctl kickstart -p` printed, read as the controller reads it: the last
+    /// number in the output, so that a sentence naming the process gives it too.
+    pub(super) fn kickstart_pid(printed: &[u8]) -> Option<u32> {
+        kr_controller::supervision::parse_pid(&String::from_utf8_lossy(printed))
+    }
+
     /// What launchd holds under one target.
     #[derive(Debug, PartialEq, Eq)]
     pub(super) enum Job {
@@ -1559,8 +1567,8 @@ mod platform {
         arguments: Vec<String>,
         working_directory: Option<String>,
         pid: Option<u32>,
-        /// What the description says of keeping the job alive: some true where it lists the
-        /// `keepalive` property or a field of that name, some false where it lists its properties
+        /// What the description says of keeping the job alive: some true where its properties line
+        /// holds `keepalive` or a field's name holds it, some false where it lists its properties
         /// and `keepalive` is none of them, none where it lists no properties, so that nothing is
         /// known.
         keep_alive: Option<bool>,
@@ -1610,9 +1618,7 @@ mod platform {
                     "pid" => loaded.pid = value.trim().parse().ok(),
                     "arguments" if value == "{" => in_arguments = true,
                     "properties" => {
-                        let kept = value
-                            .split('|')
-                            .any(|property| property.trim().eq_ignore_ascii_case("keepalive"));
+                        let kept = value.to_ascii_lowercase().contains("keepalive");
                         loaded.keep_alive = Some(kept || loaded.keep_alive == Some(true));
                     }
                     _ if name.to_ascii_lowercase().contains("keepalive") => {
@@ -1875,7 +1881,7 @@ mod platform {
         }
         Ok(Asked {
             manager: Manager::Launchd,
-            pid: String::from_utf8_lossy(&output.stdout).trim().parse().ok(),
+            pid: kickstart_pid(&output.stdout),
             no_restart: matches!(&held, Job::Loaded(loaded) if loaded.without_restart()),
         })
     }
@@ -3447,6 +3453,14 @@ mod tests {
             "keepalive is listed in another case"
         );
         assert!(
+            !described("\tproperties = keepalive, runatload\n").without_restart(),
+            "keepalive is listed with another separator"
+        );
+        assert!(
+            !described("\tproperties = keepalive (conditional)\n").without_restart(),
+            "keepalive is listed with more words than its own"
+        );
+        assert!(
             !described("\tkeepalive = {\n\t\tSuccessfulExit => false\n\t}\n").without_restart(),
             "a field of its own is a job that is kept alive, and no properties are listed"
         );
@@ -3466,6 +3480,23 @@ mod tests {
             !described("\tendpoints = {\n\t\tkeepalive = 1\n\t}\n").without_restart(),
             "a nested line is not a field of the job, and nothing is known"
         );
+        assert!(
+            !described("\tendpoints = {\n\t\tproperties = runatload\n\t}\n").without_restart(),
+            "a nested properties line is not the job's own, so it does not clear the job"
+        );
+    }
+
+    /// `launchctl kickstart -p` names the process in a sentence, for example "service spawned with
+    /// pid 4242", and the start takes the last number in it, as the controller does.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_process_a_kickstart_names_is_the_last_number_it_printed() {
+        assert_eq!(
+            platform::kickstart_pid(b"service spawned with pid 4242\n"),
+            Some(4242)
+        );
+        assert_eq!(platform::kickstart_pid(b"4242\n"), Some(4242));
+        assert_eq!(platform::kickstart_pid(b"no process is named\n"), None);
     }
 
     /// What launchd holds for a label, as `launchctl print` describes it: a job loaded from

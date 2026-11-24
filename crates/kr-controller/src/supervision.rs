@@ -1657,8 +1657,11 @@ fn run(program: &str, arguments: &[&str]) -> std::result::Result<String, RunFail
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
+/// The process that `launchctl kickstart -p` names: the last number in what it printed. The
+/// command line reads it the same way.
 #[cfg(target_os = "macos")]
-fn parse_pid(output: &str) -> Option<u32> {
+#[must_use]
+pub fn parse_pid(output: &str) -> Option<u32> {
     // The documented output names the process, for example "service spawned with pid 4242".
     output
         .split_whitespace()
