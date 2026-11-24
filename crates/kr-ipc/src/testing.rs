@@ -17,6 +17,8 @@ pub mod account_launchd;
 pub mod created;
 #[cfg(target_os = "linux")]
 pub mod hung_mount;
+#[cfg(unix)]
+pub mod manager_stand_in;
 pub mod started_environment;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod volumes;

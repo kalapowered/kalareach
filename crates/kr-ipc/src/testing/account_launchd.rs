@@ -48,6 +48,16 @@ pub fn asked() -> bool {
     asked_given(std::env::var_os(VARIABLE).as_deref())
 }
 
+/// Whether `program`'s file name is `launchctl`, in any letter case, since the file system a Mac test
+/// run is on does not tell them apart.
+#[must_use]
+pub fn is_launchctl(program: &Path) -> bool {
+    program
+        .file_name()
+        .and_then(OsStr::to_str)
+        .is_some_and(|name| name.eq_ignore_ascii_case("launchctl"))
+}
+
 /// Why `program` run with `arguments` is refused, when it is.
 ///
 /// Only a program whose file name is `launchctl` (in any letter case, since the file system a Mac
@@ -57,11 +67,7 @@ pub fn asked() -> bool {
 /// through. Every other program is allowed, whatever its arguments.
 #[must_use]
 pub fn refusal_given(asked: bool, program: &Path, arguments: &[&str]) -> Option<&'static str> {
-    let is_launchctl = program
-        .file_name()
-        .and_then(OsStr::to_str)
-        .is_some_and(|name| name.eq_ignore_ascii_case("launchctl"));
-    if asked || !is_launchctl {
+    if asked || !is_launchctl(program) {
         return None;
     }
     if matches!(arguments.first().copied(), Some("print" | "list")) {
@@ -228,17 +234,50 @@ pub fn run_fixture(name: &str, asked: Option<&str>) -> FixtureRun {
 /// Panics when the program cannot be started.
 #[must_use]
 pub fn run_fixture_with(name: &str, asked: Option<&str>, options: &[&str]) -> FixtureRun {
+    run_fixture_command(
+        &std::env::current_exe().expect("this test program's path"),
+        name,
+        options,
+        &[(VARIABLE, asked.map(OsStr::new))],
+    )
+}
+
+/// [`run_fixture`] for the test program at `program`, with each variable of `environment` set to its
+/// value, or removed when it has none.
+///
+/// # Panics
+///
+/// Panics when the program cannot be started.
+#[must_use]
+pub fn run_fixture_as(
+    program: &Path,
+    name: &str,
+    environment: &[(&str, Option<&OsStr>)],
+) -> FixtureRun {
+    run_fixture_command(program, name, &[], environment)
+}
+
+/// Runs the one `#[ignore]`d fixture `name` of the test program at `program` with `options`, and says
+/// what it did.
+fn run_fixture_command(
+    program: &Path,
+    name: &str,
+    options: &[&str],
+    environment: &[(&str, Option<&OsStr>)],
+) -> FixtureRun {
     // The program names a test without its crate: `module_path!()` begins with the crate's name.
     let name = name.split_once("::").map_or(name, |(_, rest)| rest);
-    let mut command = Command::new(std::env::current_exe().expect("this test program's path"));
+    let mut command = Command::new(program);
     command
         .args(["--ignored", "--exact", name, "--test-threads=1"])
         .args(options)
         .stdin(Stdio::null());
-    match asked {
-        Some(value) => command.env(VARIABLE, value),
-        None => command.env_remove(VARIABLE),
-    };
+    for (variable, value) in environment {
+        match value {
+            Some(value) => command.env(variable, value),
+            None => command.env_remove(variable),
+        };
+    }
     let output = command
         .output()
         .unwrap_or_else(|error| panic!("the fixture {name} could not be started: {error}"));

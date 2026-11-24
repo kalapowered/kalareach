@@ -66,6 +66,12 @@ use kr_protocol::scalars::{Nullable, U64};
 
 pub use platform::{Login, Presence, Reading};
 
+/// Whether the desktop reader holds the seam that a test run's stand-in service manager needs. It
+/// exists only in a build with the `testing` feature, and the crates whose own `testing` feature
+/// must reach this one name it, so that a build in which the reader has no seam does not compile.
+#[cfg(feature = "testing")]
+pub const HOLDS_THE_STAND_IN_SEAM: bool = true;
+
 /// The shortest time between two readings of whether a bound desktop is still there.
 ///
 /// The reading itself is one kernel query, so this is a bound on what a caller can ask for rather

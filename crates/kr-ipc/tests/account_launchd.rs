@@ -210,6 +210,45 @@ fn a_shipped_program_holds_none_of_the_launchd_refusal() {
             "{program} is a shipped program and holds the name of the variable that asks"
         );
     }
+    the_stand_in_seams_bytes_are_in_the_suites_programs_only(&held, &shipped);
+}
+
+/// The seam of a test run's stand-in service manager: the name of its variable, the sentence of its
+/// refusal and the file name of its marker. The programs built with the `testing` features hold all
+/// three on macOS, which is where the seam is exercised, so that a search that finds nothing is not
+/// one that cannot find; no shipped program of a platform that compiles the seam holds any.
+#[cfg(unix)]
+fn the_stand_in_seams_bytes_are_in_the_suites_programs_only(held: &[String], shipped: &[String]) {
+    use kr_ipc::testing::manager_stand_in::{MARKER_NAME, STAND_IN_REFUSAL, VARIABLE};
+
+    let needles = [
+        ("the name of the variable that names a stand-in", VARIABLE),
+        ("the stand-in refusal", STAND_IN_REFUSAL),
+        ("the marker's file name", MARKER_NAME),
+    ];
+    if cfg!(target_os = "macos") {
+        for program in held {
+            for (what, needle) in needles {
+                assert!(
+                    holds(program, needle),
+                    "{program} is built with the feature and does not hold {what}"
+                );
+            }
+        }
+    }
+    for program in shipped {
+        for (what, needle) in needles {
+            assert!(
+                !holds(program, needle),
+                "{program} is a shipped program and holds {what}"
+            );
+        }
+    }
+}
+
+/// Nothing: a platform with no stand-in seam compiles none of its bytes.
+#[cfg(not(unix))]
+fn the_stand_in_seams_bytes_are_in_the_suites_programs_only(_held: &[String], _shipped: &[String]) {
 }
 
 /// What a child of the case checks, with the variable removed: a command that changes the manager

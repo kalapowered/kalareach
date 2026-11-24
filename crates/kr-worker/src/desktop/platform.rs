@@ -245,6 +245,27 @@ fn run(program: &str, arguments: &[&str]) -> Printed {
     let started = {
         #[cfg(feature = "testing")]
         let program = probe_program(program);
+        // A build with the `testing` feature starts a run's stand-in service manager in the place
+        // of `launchctl` when the run names one, and then refuses a command of any service-manager
+        // program in a run that names a stand-in or in a marked installation: a substitution that
+        // did not happen reaches that second check with the real program, so such a run never reads
+        // the account's own manager here. A refused reading is one that was not run.
+        #[cfg(feature = "testing")]
+        let program =
+            match kr_ipc::testing::manager_stand_in::substituted(std::path::Path::new(&program)) {
+                Ok(program) => program,
+                Err(_) => {
+                    let _ = std::fs::remove_dir_all(&directory);
+                    return Printed::NotRun;
+                }
+            };
+        #[cfg(feature = "testing")]
+        {
+            if kr_ipc::testing::manager_stand_in::refusal_after(&program).is_some() {
+                let _ = std::fs::remove_dir_all(&directory);
+                return Printed::NotRun;
+            }
+        }
         let mut command = std::process::Command::new(program);
         command
             .args(arguments)
@@ -1370,5 +1391,76 @@ mod tests {
                 "session {number}, which nobody holds, is a login that has ended"
             );
         }
+    }
+
+    /// What a child of the case checks, with a stand-in named: the reader runs the stand-in for a
+    /// `launchctl` command, and never the program it was given.
+    #[test]
+    #[ignore = "run by a child of the case with a stand-in named"]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn the_reader_fixture_for_a_run_that_names_a_stand_in() {
+        kr_ipc::testing::manager_stand_in::assert_runner_starts_the_stand_in(|program| {
+            matches!(
+                super::run(
+                    program.to_str().expect("a path that is text"),
+                    &["print", "gui/501"]
+                ),
+                super::Printed::Output(_)
+            )
+        });
+    }
+
+    /// What a child of the case checks, in a marked installation with the variable removed: the
+    /// reader runs nothing.
+    #[test]
+    #[ignore = "run by a child of the case, copied into a marked folder, with the variable removed"]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn the_reader_fixture_for_a_marked_installation_with_no_variable() {
+        kr_ipc::testing::manager_stand_in::assert_runner_refuses_a_marked_installation_with_no_variable(
+            |program| {
+                !matches!(
+                    super::run(program.to_str().expect("a path that is text"), &["print", "gui/501"]),
+                    super::Printed::NotRun
+                )
+            },
+        );
+    }
+
+    /// The desktop reader runs a run's stand-in in the place of `launchctl` and never the program
+    /// it was given, and runs nothing in a marked installation whose run lost the variable, so that
+    /// a run that names a stand-in never reads the account's own manager.
+    #[test]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn the_desktop_reader_runs_the_stand_in_and_never_the_real_program() {
+        let folder = kr_ipc::testing::PrivateTempDir::create();
+        let stand_in = kr_ipc::testing::manager_stand_in::place_installation(folder.path());
+        let named = kr_ipc::testing::manager_stand_in::run_fixture(
+            concat!(
+                module_path!(),
+                "::the_reader_fixture_for_a_run_that_names_a_stand_in"
+            ),
+            Some(stand_in.as_os_str()),
+            None,
+        );
+        assert!(
+            named.passed,
+            "the reader of a run that names a stand-in:\n{}",
+            named.log
+        );
+        let marked = kr_ipc::testing::PrivateTempDir::create();
+        let _ = kr_ipc::testing::manager_stand_in::place_installation(marked.path());
+        let lost = kr_ipc::testing::manager_stand_in::run_fixture(
+            concat!(
+                module_path!(),
+                "::the_reader_fixture_for_a_marked_installation_with_no_variable"
+            ),
+            None,
+            Some(marked.path()),
+        );
+        assert!(
+            lost.passed,
+            "the reader of a marked installation with no variable:\n{}",
+            lost.log
+        );
     }
 }

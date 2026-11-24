@@ -87,6 +87,12 @@ use serde::{Deserialize, Serialize};
 use crate::error::{CliError, Result};
 use crate::output::Line;
 
+// A build of the command line with the `testing` feature reads the desktop through a reader that holds
+// the seam of a test run's stand-in service manager: the feature reaches the worker crate's own
+// through the controller's, and a build in which it did not does not compile.
+#[cfg(feature = "testing")]
+const _: bool = kr_controller::desktop::READER_HOLDS_THE_STAND_IN_SEAM;
+
 /// The file in an environment's state directory that records the definition `kr host startup`
 /// wrote.
 pub const RECORD_FILE: &str = "controller-service.json";
@@ -1219,13 +1225,38 @@ fn run_within(
     environment: &[(&str, &std::ffi::OsStr)],
     asked: &Shown,
 ) -> std::result::Result<std::process::Output, Unanswered> {
+    // A build with the `testing` feature starts a run's stand-in service manager in the place of
+    // `launchctl` when the run names one, and then refuses a command of any service-manager program
+    // in a run that names a stand-in or in a marked installation: a substitution that did not
+    // happen reaches that second check with the real program.
+    #[cfg(feature = "testing")]
+    let program = match kr_ipc::testing::manager_stand_in::substituted(Path::new(program)) {
+        Ok(program) => program,
+        Err(refusal) => {
+            return Err(Unanswered::not_asked(shown!(
+                "{}: {}",
+                *asked,
+                Shown::said(refusal)
+            )));
+        }
+    };
+    #[cfg(feature = "testing")]
+    {
+        if let Some(refusal) = kr_ipc::testing::manager_stand_in::refusal_after(&program) {
+            return Err(Unanswered::not_asked(shown!(
+                "{}: {}",
+                *asked,
+                Shown::said(refusal)
+            )));
+        }
+    }
     // A build with the `testing` feature does not run a `launchctl` command that changes the
     // manager when the run did not ask for the account's own launchd.
     #[cfg(feature = "testing")]
     {
         if let Some(refusal) = kr_ipc::testing::account_launchd::refusal_given(
             kr_ipc::testing::account_launchd::asked(),
-            Path::new(program),
+            &program,
             arguments,
         ) {
             return Err(Unanswered::not_asked(shown!(
@@ -1359,11 +1390,14 @@ mod platform {
     /// launchd is always there; what it needs is the domain, and that is asked when it is chosen.
     ///
     /// A build with the `testing` feature refuses where the run did not ask for the account's own
-    /// launchd, before a definition is written: the file is loaded by launchd at the next login.
+    /// launchd, before a definition is written: the file is loaded by launchd at the next login. A
+    /// run that names a stand-in service manager needs no such ask, since it reaches no launchd.
     pub(super) fn available() -> Result<()> {
         #[cfg(feature = "testing")]
         {
-            if !kr_ipc::testing::account_launchd::asked() {
+            if !kr_ipc::testing::account_launchd::asked()
+                && !kr_ipc::testing::manager_stand_in::names_a_stand_in()
+            {
                 return Err(CliError::Usage(Shown::said(
                     kr_ipc::testing::account_launchd::REFUSAL,
                 )));
@@ -4302,6 +4336,80 @@ mod tests {
             child.passed,
             "the runner of a run that did not ask:\n{}",
             child.log
+        );
+    }
+
+    /// What a child of the case checks, with a stand-in named: the runner starts the stand-in for
+    /// a `launchctl` command, and never the program it was given.
+    #[test]
+    #[ignore = "run by a child of the case with a stand-in named"]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn the_runner_fixture_for_a_run_that_names_a_stand_in() {
+        kr_ipc::testing::manager_stand_in::assert_runner_starts_the_stand_in(|program| {
+            run(
+                program.to_str().expect("a path that is text"),
+                &["print", "gui/501"],
+                &[],
+                &Shown::said("the probe"),
+            )
+            .is_ok()
+        });
+    }
+
+    /// What a child of the case checks, in a marked installation with the variable removed: the
+    /// runner starts nothing.
+    #[test]
+    #[ignore = "run by a child of the case, copied into a marked folder, with the variable removed"]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn the_runner_fixture_for_a_marked_installation_with_no_variable() {
+        kr_ipc::testing::manager_stand_in::assert_runner_refuses_a_marked_installation_with_no_variable(
+            |program| {
+                run(
+                    program.to_str().expect("a path that is text"),
+                    &["print", "gui/501"],
+                    &[],
+                    &Shown::said("the probe"),
+                )
+                .is_ok()
+            },
+        );
+    }
+
+    /// The command line's runner of service-manager commands starts a run's stand-in in the place of
+    /// `launchctl` and never the program it was given, and starts nothing in a marked installation
+    /// whose run lost the variable.
+    #[test]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn the_command_lines_service_manager_runner_starts_the_stand_in_and_never_the_real_program() {
+        let folder = kr_ipc::testing::PrivateTempDir::create();
+        let stand_in = kr_ipc::testing::manager_stand_in::place_installation(folder.path());
+        let named = kr_ipc::testing::manager_stand_in::run_fixture(
+            concat!(
+                module_path!(),
+                "::the_runner_fixture_for_a_run_that_names_a_stand_in"
+            ),
+            Some(stand_in.as_os_str()),
+            None,
+        );
+        assert!(
+            named.passed,
+            "the runner of a run that names a stand-in:\n{}",
+            named.log
+        );
+        let marked = kr_ipc::testing::PrivateTempDir::create();
+        let _ = kr_ipc::testing::manager_stand_in::place_installation(marked.path());
+        let lost = kr_ipc::testing::manager_stand_in::run_fixture(
+            concat!(
+                module_path!(),
+                "::the_runner_fixture_for_a_marked_installation_with_no_variable"
+            ),
+            None,
+            Some(marked.path()),
+        );
+        assert!(
+            lost.passed,
+            "the runner of a marked installation with no variable:\n{}",
+            lost.log
         );
     }
 

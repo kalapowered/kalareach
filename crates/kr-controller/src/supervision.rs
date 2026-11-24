@@ -436,8 +436,8 @@ pub(crate) fn blocking_start<T>(start: impl FnOnce() -> T) -> T {
 /// argument is read elsewhere.
 ///
 /// A build with the `testing` feature on macOS chooses the detached process, before it reads
-/// anything of launchd, when the run did not ask for the account's own launchd. No shipped build
-/// has the feature.
+/// anything of launchd, when the run did not ask for the account's own launchd, and whenever the run
+/// is held to a stand-in service manager, whether it asked or not. No shipped build has the feature.
 #[must_use]
 pub fn detect(
     environment: &kr_ipc::paths::EnvironmentPaths,
@@ -445,7 +445,7 @@ pub fn detect(
 ) -> Box<dyn WorkerSupervisor> {
     #[cfg(all(feature = "testing", target_os = "macos"))]
     {
-        if !kr_ipc::testing::account_launchd::asked() {
+        if !kr_ipc::testing::account_launchd::asked() || kr_ipc::testing::manager_stand_in::held() {
             return fallback(environment, daemon);
         }
     }
@@ -880,15 +880,24 @@ fn launchctl_within(arguments: &[&str]) -> std::result::Result<std::process::Out
 /// A command that could not be started at all is [`RunFailure::NotRun`]; every failure after it
 /// started is [`RunFailure::Failed`], because it may have reached the service manager first.
 ///
-/// A build with the `testing` feature does not start a `launchctl` command that changes the
-/// manager when the run did not ask for the account's own launchd: that is a command that could
-/// not be started.
+/// A build with the `testing` feature does not start a command of a service-manager program, for any
+/// verb, in a run that names a stand-in service manager or in a marked installation, and does not
+/// start a `launchctl` command that changes the manager when the run did not ask for the account's
+/// own launchd: that is a command that could not be started. This runner has no stand-in to give a
+/// command, so a run that names one never reaches a manager through it.
 #[cfg(any(target_os = "macos", target_os = "linux", windows))]
 fn command_within(
     program: &str,
     arguments: &[&str],
     bound: std::time::Duration,
 ) -> std::result::Result<std::process::Output, RunFailure> {
+    #[cfg(all(feature = "testing", unix))]
+    {
+        if let Some(refusal) = kr_ipc::testing::manager_stand_in::refusal_after(Path::new(program))
+        {
+            return Err(RunFailure::NotRun(format!("{program}: {refusal}")));
+        }
+    }
     #[cfg(feature = "testing")]
     {
         if let Some(refusal) = kr_ipc::testing::account_launchd::refusal_given(
@@ -2612,6 +2621,80 @@ mod tests {
             child.passed,
             "the runner of a run that did not ask:\n{}",
             child.log
+        );
+    }
+
+    /// What a child of the case checks, with a stand-in named: the runner has no stand-in to give a
+    /// command, so it starts nothing, neither the program it was given nor the stand-in.
+    #[test]
+    #[ignore = "run by a child of the case with a stand-in named"]
+    #[cfg(unix)]
+    fn the_runner_fixture_for_a_run_that_names_a_stand_in() {
+        kr_ipc::testing::manager_stand_in::assert_runner_refuses_a_manager_program_beside_a_stand_in(
+            |program| {
+                command_within(
+                    program.to_str().expect("a path that is text"),
+                    &["print", "gui/501"],
+                    std::time::Duration::from_secs(5),
+                )
+                .is_ok()
+            },
+        );
+    }
+
+    /// What a child of the case checks, in a marked installation with the variable removed: the
+    /// runner starts nothing.
+    #[test]
+    #[ignore = "run by a child of the case, copied into a marked folder, with the variable removed"]
+    #[cfg(unix)]
+    fn the_runner_fixture_for_a_marked_installation_with_no_variable() {
+        kr_ipc::testing::manager_stand_in::assert_runner_refuses_a_marked_installation_with_no_variable(
+            |program| {
+                command_within(
+                    program.to_str().expect("a path that is text"),
+                    &["print", "gui/501"],
+                    std::time::Duration::from_secs(5),
+                )
+                .is_ok()
+            },
+        );
+    }
+
+    /// The controller's runner of service-manager commands starts nothing in a run that names a
+    /// stand-in, and nothing in a marked installation whose run lost the variable: it has no
+    /// stand-in to give a command, and the real program is refused for every verb.
+    #[test]
+    #[cfg(unix)]
+    fn the_controllers_runner_starts_no_service_manager_program_in_a_held_run() {
+        let folder = kr_ipc::testing::PrivateTempDir::create();
+        let stand_in = kr_ipc::testing::manager_stand_in::place_installation(folder.path());
+        let named = kr_ipc::testing::manager_stand_in::run_fixture(
+            concat!(
+                module_path!(),
+                "::the_runner_fixture_for_a_run_that_names_a_stand_in"
+            ),
+            Some(stand_in.as_os_str()),
+            None,
+        );
+        assert!(
+            named.passed,
+            "the runner of a run that names a stand-in:\n{}",
+            named.log
+        );
+        let marked = kr_ipc::testing::PrivateTempDir::create();
+        let _ = kr_ipc::testing::manager_stand_in::place_installation(marked.path());
+        let lost = kr_ipc::testing::manager_stand_in::run_fixture(
+            concat!(
+                module_path!(),
+                "::the_runner_fixture_for_a_marked_installation_with_no_variable"
+            ),
+            None,
+            Some(marked.path()),
+        );
+        assert!(
+            lost.passed,
+            "the runner of a marked installation with no variable:\n{}",
+            lost.log
         );
     }
 }

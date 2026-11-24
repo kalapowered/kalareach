@@ -28,8 +28,11 @@ upgrade-suite = []
 
 # A `launchctl` command that changes the manager is refused when the run did not ask for the
 # account's own launchd, and the service definition carries the run's asking to the daemon it
-# starts. It compiles to nothing without this feature, and no shipped build enables it.
-testing = ["kr-ipc/testing"]
+# starts. A test run's stand-in service manager replaces `launchctl` for the command line and for the
+# desktop reader it shares with the daemon, which is why the feature reaches the controller's, and
+# through it the worker crate's. It compiles to nothing without this feature, and no shipped build
+# enables it.
+testing = ["kr-ipc/testing", "kr-controller/testing"]
 
 [[test]]
 name = "upgrade"

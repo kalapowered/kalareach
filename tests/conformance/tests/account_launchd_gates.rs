@@ -42,7 +42,7 @@ type Entry = (&'static str, usize, &'static str);
 /// The sources that name `launchctl` without running it, by the functions that hold the strings.
 /// A new string, in a function that is not listed or beyond its count, is refused, so a string in
 /// one place cannot make room for a launch in another.
-const NAMED_NOT_RUN: [(&str, &[Entry]); 5] = [
+const NAMED_NOT_RUN: [(&str, &[Entry]); 6] = [
     (
         "crates/kr-cli/tests/startup.rs",
         &[
@@ -99,6 +99,14 @@ const NAMED_NOT_RUN: [(&str, &[Entry]); 5] = [
             "is_a_platform_question",
             1,
             "a match arm that tells a platform question from other commands, which runs nothing",
+        )],
+    ),
+    (
+        "tests/conformance/tests/manager_stand_in_gates.rs",
+        &[(
+            "names_launchctl",
+            2,
+            "the two spellings of the program's name that the stand-in gate looks for in sources, which runs nothing",
         )],
     ),
 ];

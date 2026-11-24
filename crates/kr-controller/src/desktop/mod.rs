@@ -34,6 +34,13 @@ use kr_protocol::desktop::{
 use kr_protocol::identity::{BootIdentity, WorkerProfile};
 use kr_protocol::ids::{CapabilityRevision, EnvironmentId};
 
+/// Whether the desktop reader that the daemon and the command line share holds the seam of a test
+/// run's stand-in service manager. It exists only with the `testing` feature, which is wired to the
+/// worker crate's own: a controller build with the feature and a reader without the seam does not
+/// compile. The command line names it for the same reason.
+#[cfg(feature = "testing")]
+pub const READER_HOLDS_THE_STAND_IN_SEAM: bool = kr_worker::desktop::HOLDS_THE_STAND_IN_SEAM;
+
 /// Reads the desktop this host's user currently has.
 ///
 /// The reading is the worker crate's, because the desktop a worker runs in and the desktop the
