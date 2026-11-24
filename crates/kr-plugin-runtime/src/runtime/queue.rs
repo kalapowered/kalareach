@@ -901,6 +901,49 @@ mod tests {
         assert!(queue.take_loss_before_taken(), "this one came after it");
     }
 
+    /// One gap that is noted out of order: two observations are evicted, and then the request that
+    /// stood before them is taken and lost. The gap names the request as its first event and the
+    /// later observation as its last, whichever it noted first or last.
+    #[test]
+    fn a_loss_noted_after_evictions_widens_the_same_gap_by_where_each_event_was_offered() {
+        let mut queue = ObservationQueue::with_capacity(500);
+        queue.push(request("se-0", "rq-0", 100));
+        for index in 1..=5 {
+            queue.push(scrape(&format!("se-{index}"), 100));
+        }
+        let taken = queue.take_one().expect("the request");
+        queue.taken_event_was_lost(&taken);
+        let gap = queue.take_gap().expect("one gap");
+        assert_eq!(gap.events, 3);
+        assert_eq!(
+            gap.first,
+            SourceEventHandle::new("se-0").ok(),
+            "the request was offered before the two that were evicted"
+        );
+        assert_eq!(
+            gap.last,
+            SourceEventHandle::new("se-2").ok(),
+            "the request was offered before the last of the two"
+        );
+    }
+
+    /// A request larger than the whole queue is refused, and what is offered after it is told that
+    /// a refusal came before it, as for a request the queue had no room for.
+    #[test]
+    fn a_request_larger_than_the_whole_queue_is_a_refusal_the_events_after_it_are_told_of() {
+        let mut queue = ObservationQueue::with_capacity(1024);
+        assert!(matches!(
+            queue.push(request("se-0", "rq-0", 4096)),
+            Admission::Refused { .. }
+        ));
+        queue.push(scrape("se-1", 100));
+        assert!(queue.take_one().is_some());
+        assert!(
+            queue.take_loss_before_taken(),
+            "the event taken came after the refused request"
+        );
+    }
+
     impl ObservationGap {
         fn u64_events(&self) -> u64 {
             u64::from(self.events)

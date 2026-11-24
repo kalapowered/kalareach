@@ -3212,6 +3212,18 @@ mod consumed {
         };
         binding.enqueue_observation(components::scrape("se-1", "x"));
         binding.enqueue_observation(components::native_request("se-2", "rq-2", "x"));
+        // Each handle on its own: the events after this one move both again.
+        let after_two = consumed_of(&binding).await;
+        assert_eq!(
+            after_two.terminal,
+            Some(handle("se-1")),
+            "a scrape moves the terminal handle and nothing else"
+        );
+        assert_eq!(
+            after_two.native,
+            Some(handle("se-2")),
+            "a native request moves the native handle and nothing else"
+        );
         binding.enqueue_observation(ScopedSourceEvent::new(
             handle("se-3"),
             SourceProvenance::MachineOutput,
