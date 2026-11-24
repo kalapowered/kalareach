@@ -19,7 +19,7 @@ use kr_plugin_service::protocol4::{
 use kr_plugin_service::vocabulary::wire_event;
 use kr_protocol::ids::SourceEventHandle;
 
-use super::{HANG_GUARD, Raw, Served, components};
+use super::{HANG_GUARD, Raw, Served, components, reached};
 
 fn handle(text: &str) -> SourceEventHandle {
     SourceEventHandle::new(text).expect("a bounded handle")
@@ -358,6 +358,74 @@ async fn kr_req_24_24_an_open_host_names_the_registration_and_reports_what_a_pas
         (*registration, *clean, terminal.clone()),
         (7, false, Some(handle("se-1"))),
         "the report names the registration, that the trap made it unclean, and the last event returned"
+    );
+    four.unbind(&request).await;
+}
+
+/// A report that the binding made before a restore, and that the notice writer holds while the
+/// restore completes, is not written after the restore's answer: it describes the state the restore
+/// replaced.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_24_24_a_report_of_the_state_a_restore_replaced_is_not_written_after_its_answer() {
+    let served = Served::start_dual(true).await;
+    let Some(component) = recording(&served) else {
+        return;
+    };
+    let mut four = Raw4::connect(served.endpoint4()).await;
+    let request = components::request("recording", 35);
+    four.register(&request, &component, 7).await;
+    // The report of the first event is taken off the notice queue and held at the writer.
+    let hold = served.host.hold_notice_writes();
+    four.event(&request, "se-1", "x").await;
+    reached(&hold, "the writer never took the report off the queue").await;
+    let saved = four.checkpoint(&request).await;
+    assert_eq!(
+        saved
+            .consumed
+            .as_ref()
+            .and_then(|consumed| consumed.terminal.clone()),
+        Some(handle("se-1")),
+        "the instance had not consumed the first event when the state was saved"
+    );
+    let restored = four
+        .restore(
+            &request,
+            7,
+            saved.state,
+            Some(Through {
+                native: None,
+                terminal: Some(handle("se-1")),
+            }),
+        )
+        .await;
+    assert!(
+        matches!(
+            restored,
+            ResponseBody4::Called {
+                record: Some(RecordState::Set),
+                ..
+            }
+        ),
+        "a restore with a position was answered with {restored:?}"
+    );
+    let before_the_answer = four.notices.len();
+    hold.release();
+    // What the instance consumes after the restore is reported after it, and only that.
+    four.event(&request, "se-2", "y").await;
+    let notices = four
+        .until(|notice| {
+            matches!(notice, Notice4::Consumed { terminal: Some(last), .. } if *last == handle("se-2"))
+        })
+        .await;
+    let stale: Vec<&Notice4> = notices[before_the_answer..]
+        .iter()
+        .filter(|notice| {
+            matches!(notice, Notice4::Consumed { terminal: Some(last), .. } if *last == handle("se-1"))
+        })
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "the report of the state the restore replaced was written after its answer: {stale:?}"
     );
     four.unbind(&request).await;
 }

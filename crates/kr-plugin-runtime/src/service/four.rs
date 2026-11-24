@@ -335,6 +335,7 @@ pub(super) fn consumed_notice4_of(report: ConsumedReport, registration: u64) -> 
         clean,
         native,
         terminal,
+        restores: _,
     } = report;
     Notice4::Consumed {
         binding_id,

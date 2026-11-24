@@ -2831,7 +2831,8 @@ mod consumed {
                 generation: 0,
                 clean: true,
                 native: None,
-                terminal: None
+                terminal: None,
+                restores: 0
             }
         );
         binding.enqueue_observation(components::scrape("se-1", "x"));
@@ -2857,7 +2858,7 @@ mod consumed {
         assert_eq!(cursor.terminal, Some(handle("se-1")));
 
         // A plain restore sets no position and claims no prefix. The trap had cleared `clean`
-        // already, so the cursor is as it was.
+        // already, so the cursor is as it was, and the restore is counted.
         let state = binding
             .checkpoint(ANSWER)
             .await
@@ -2871,7 +2872,13 @@ mod consumed {
             .expect("the restore runs")
             .answer
             .expect("the component answers");
-        assert_eq!(consumed_of(&binding).await, cursor);
+        assert_eq!(
+            consumed_of(&binding).await,
+            Consumed {
+                restores: 1,
+                ..cursor
+            }
+        );
 
         // A restore that carries a cursor makes it the instance's, and clean, at its own generation.
         binding
@@ -2893,7 +2900,8 @@ mod consumed {
                 generation: 1,
                 clean: true,
                 native: Some(handle("se-7")),
-                terminal: None
+                terminal: None,
+                restores: 2
             }
         );
     }
