@@ -2605,7 +2605,7 @@ impl Person {
             typed += 1;
             loop {
                 let rows = self.window.screen();
-                if rows.iter().any(|row| row.contains(needle)) {
+                if screen_shows(&rows, needle) {
                     return rows;
                 }
                 assert!(
@@ -4577,7 +4577,7 @@ fn launch_within(
             break;
         }
         rows = person.window.screen();
-        shown = rows.iter().any(|row| row.contains(shows));
+        shown = screen_shows(&rows, shows);
         if (process.is_some() && shown) || started.elapsed() >= LIVENESS {
             break;
         }
@@ -5622,6 +5622,100 @@ fn asked_since(person: &Person, mark: usize) -> usize {
     asked_in(&person.window.collected().since(mark))
 }
 
+/// Whether `row` shows `needle` as a person reads it. An agent that scrolls its screen up and
+/// writes a line over the border of the box it drew before writes each word at its own place, and
+/// the cells between the words keep the border's characters: those are read as the blanks they
+/// stand over.
+fn row_shows(row: &str, needle: &str) -> bool {
+    row.contains(needle) || row.replace(['╭', '╮', '╰', '╯', '─'], " ").contains(needle)
+}
+
+/// Whether a row of `rows` shows `needle` ([`row_shows`]).
+fn screen_shows(rows: &[String], needle: &str) -> bool {
+    rows.iter().any(|row| row_shows(row, needle))
+}
+
+/// `text` written the way the pinned build writes a line of its sign-in menu: each word at its own
+/// place, from `column` (counted from one) of `row`, with the cells between the words left alone.
+fn written_by_words(row: usize, column: usize, text: &str) -> String {
+    let mut at = column;
+    let mut written = String::new();
+    for word in text.split(' ') {
+        written.push_str(&format!("\x1b[{row};{at}H{word}"));
+        at += word.chars().count() + 1;
+    }
+    written
+}
+
+/// The screen of the pinned build with no login as the build draws it: the header of a chat that is
+/// still loading, then, once the build knows there is no login, a scroll of one row, a clear below
+/// the first row and the sign-in menu written word by word. The scroll keeps the header's top border
+/// in the first row, and the menu's welcome line is written over it.
+fn sign_in_menu_over_a_scrolled_header() -> Vec<String> {
+    let mut terminal =
+        kr_e2e_m1b::screen::Terminal::new(kr_e2e_m1b::window::COLUMNS, kr_e2e_m1b::window::ROWS);
+    let border = "─".repeat(40);
+    let header = format!(
+        "\x1b[2;1H\x1b[J\x1b[2;1H╭{border}╮\x1b[3;1H│{:<40}│\x1b[4;1H│{:<40}│\x1b[5;1H│{:<40}│\
+         \x1b[6;1H│{:<40}│\x1b[7;1H╰{border}╯\x1b[10;1H› Ask Codex to do anything",
+        " >_ OpenAI Codex (v0.155.1)", "", " model:     loading", " directory: loading",
+    );
+    terminal.feed(header.as_bytes());
+    terminal.feed(b"\x1b[1;1r\x1b[1S\x1b[r\x1b[2;1H\x1b[J");
+    let menu = [
+        written_by_words(1, 3, "Welcome to Codex, OpenAI's command-line coding agent"),
+        written_by_words(
+            3,
+            3,
+            "Sign in with ChatGPT to use Codex as part of your paid plan",
+        ),
+        written_by_words(4, 3, "or connect an API key for usage-based billing"),
+        "\x1b[6;1H> 1. Sign in with ChatGPT".to_owned(),
+        written_by_words(9, 3, "2. Sign in with Device Code"),
+        written_by_words(12, 3, "3. Provide your own API key"),
+        "\x1b[15;1H  Press enter to continue".to_owned(),
+    ]
+    .concat();
+    terminal.feed(menu.as_bytes());
+    terminal.rows()
+}
+
+/// The first screen of the pinned build with no login is found, whatever the scroll left in the
+/// cells between the words of its welcome line: a row that shows the words with the cells of the
+/// header's border between them is read as the words, and a row of other words is not.
+#[test]
+fn the_sign_in_menu_over_a_scrolled_header_shows_its_welcome_line() {
+    let rows = sign_in_menu_over_a_scrolled_header();
+    // The screen is the one the 2b leg read, and the plain search misses it.
+    assert_eq!(
+        rows[0], "╭─Welcome─to─Codex,─OpenAI's─command-line╮coding agent",
+        "the scripted screen is the one the leg read"
+    );
+    assert!(
+        !rows.iter().any(|row| row.contains("Welcome to Codex")),
+        "the words are not on the screen with blanks between them"
+    );
+    assert!(
+        screen_shows(&rows, "Welcome to Codex"),
+        "the welcome line is read where the border's cells stand between its words: {rows:?}"
+    );
+    assert!(
+        screen_shows(&rows, "> 1. Sign in with ChatGPT"),
+        "a row with no border cells is read as it is"
+    );
+    assert!(
+        !screen_shows(&rows, "Welcome to Claude"),
+        "other words are not the welcome line"
+    );
+    assert!(
+        !screen_shows(
+            &["╭─Welcome─to─Claude─╮".to_owned(), "Codex".to_owned()],
+            "Welcome to Codex"
+        ),
+        "words of two rows are not one line"
+    );
+}
+
 /// Waits until the person's screen shows `needle`, within [`LIVENESS`].
 ///
 /// # Errors
@@ -6348,7 +6442,7 @@ fn presented_within(
             );
             if let Some(needle) = ready {
                 rows = session.person.window.screen();
-                shown = rows.iter().any(|row| row.contains(needle));
+                shown = screen_shows(&rows, needle);
             }
             if (line.is_some() && found && shown) || started.elapsed() >= LIVENESS {
                 break;
