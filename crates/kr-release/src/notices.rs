@@ -29,6 +29,19 @@ pub const FILE: &str = "share/THIRD-PARTY-NOTICES.txt";
 /// Where the checkout commits the notice.
 pub const COMMITTED: &str = "docs/releases/third-party-notices.txt";
 
+/// Where the checkout commits the companion application's notice, which its installers and store
+/// bundles carry.
+pub const COMPANION_COMMITTED: &str = "docs/releases/companion-third-party-notices.txt";
+
+/// What a notice covers, and so which packages the lock is read from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Product {
+    /// The release programs and the fish package, which a release archive carries.
+    Programs,
+    /// The companion application.
+    Companion,
+}
+
 /// What the permissive licence templates of the SPDX list hold where the owner's copyright line
 /// belongs, in lower case. The GPL's own text has `<year>` and `<name of author>` in the paragraph
 /// that tells a program how to apply it, so those two are not in the list.
@@ -43,6 +56,12 @@ const PLACEHOLDERS: [&str; 9] = [
     "[year]",
     "[fullname]",
 ];
+
+/// What a person does when the committed companion text is not the one the lock makes.
+const COMPANION_REPAIR: &str = "install the production packages with `pnpm install --frozen-lockfile \
+     --prod --filter \"@kalareach/companion...\"`, build kr-release with `cargo build -p kr-release`, \
+     run `python3 scripts/generate-notices.py write --product companion --kr-release \
+     target/debug/kr-release`, and commit the result";
 
 /// What a person does when the committed text is not the one the lock makes.
 const REPAIR: &str = "build kr-release with `cargo build -p kr-release`, fetch the crates with \
@@ -82,7 +101,7 @@ pub fn held(tree: &Path, checkout: &Path) -> Result<()> {
              own copyright line belongs: {REPAIR}"
         );
     }
-    let lacking = gaps(checkout, &text)?;
+    let lacking = gaps(checkout, &text, Product::Programs)?;
     if let Some(first) = lacking.first() {
         refuse!(
             "{COMMITTED} has no entry for {} of the crates the lock takes into the release \
@@ -93,14 +112,42 @@ pub fn held(tree: &Path, checkout: &Path) -> Result<()> {
     Ok(())
 }
 
-/// The crates the lock reaches from the release programs, without a crate that only a package's
-/// tests use, that `notice` names in no entry, each as `name version`, or `name version | source
-/// ADDRESS` when a Git repository gives it, in order.
+/// Holds the companion's committed notice to the lock: it holds no licence template's placeholder
+/// and has an entry for every crate the lock takes into the companion application.
+///
+/// # Errors
+///
+/// Returns a refusal when the committed text is missing or is not text, holds a placeholder, or has
+/// no entry for a crate that the lock takes into the companion.
+pub fn held_companion(checkout: &Path) -> Result<()> {
+    let text = String::from_utf8(read(&checkout.join(COMPANION_COMMITTED))?)
+        .map_err(|_| Refusal(format!("{COMPANION_COMMITTED} is not text")))?;
+    let lower = text.to_lowercase();
+    if let Some(found) = PLACEHOLDERS.iter().find(|word| lower.contains(**word)) {
+        refuse!(
+            "{COMPANION_COMMITTED} holds {found}, the placeholder of a licence template, where \
+             the crate's own copyright line belongs: {COMPANION_REPAIR}"
+        );
+    }
+    let lacking = gaps(checkout, &text, Product::Companion)?;
+    if let Some(first) = lacking.first() {
+        refuse!(
+            "{COMPANION_COMMITTED} has no entry for {} of the crates the lock takes into the \
+             companion application, the first {first}: {COMPANION_REPAIR}",
+            lacking.len()
+        );
+    }
+    Ok(())
+}
+
+/// The crates the lock reaches from the packages of `product`, without a crate that only a
+/// package's tests use, that `notice` names in no entry, each as `name version`, or `name version |
+/// source ADDRESS` when a Git repository gives it, in order.
 ///
 /// # Errors
 ///
 /// Returns a refusal when a file it reads is missing or is not what it expects.
-pub fn gaps(checkout: &Path, notice: &str) -> Result<Vec<String>> {
+pub fn gaps(checkout: &Path, notice: &str, product: Product) -> Result<Vec<String>> {
     let named: BTreeSet<Identity> = entries(notice)
         .into_iter()
         .filter_map(|entry| {
@@ -114,7 +161,7 @@ pub fn gaps(checkout: &Path, notice: &str) -> Result<Vec<String>> {
             Some((name, version, repository))
         })
         .collect();
-    Ok(reached(checkout)?
+    Ok(reached(checkout, product)?
         .into_iter()
         .filter(|identity| !named.contains(identity))
         .map(|(name, version, repository)| match repository {
@@ -277,24 +324,51 @@ fn named_by<'a>(entry: &str, all: &'a [Package]) -> impl Iterator<Item = usize> 
         .map(|(index, _)| index)
 }
 
-/// Every package the lock takes from a registry or a repository into the release programs. The
-/// lock holds the dependencies of a package under every feature of every package of the workspace,
-/// so this is the crates a build can reach, which are more than the crates it compiles.
-fn reached(checkout: &Path) -> Result<BTreeSet<Identity>> {
+/// The packages a product is built from: the release programs of `scripts/release-programs.json`,
+/// or the companion's package of `scripts/companion-notice.json`.
+fn package_names(checkout: &Path, product: Product) -> Result<Vec<String>> {
+    match product {
+        Product::Programs => {
+            let listed = read_json(&checkout.join("scripts/release-programs.json"))?;
+            let Some(programs) = listed["programs"].as_array() else {
+                refuse!("scripts/release-programs.json lists no programs");
+            };
+            programs
+                .iter()
+                .map(|program| {
+                    program["package"]
+                        .as_str()
+                        .map(str::to_owned)
+                        .ok_or_else(|| {
+                            Refusal(
+                                "scripts/release-programs.json lists a program with no package"
+                                    .into(),
+                            )
+                        })
+                })
+                .collect()
+        }
+        Product::Companion => {
+            let listed = read_json(&checkout.join("scripts/companion-notice.json"))?;
+            let Some(package) = listed["package"].as_str() else {
+                refuse!("scripts/companion-notice.json names no package");
+            };
+            Ok(vec![package.to_owned()])
+        }
+    }
+}
+
+/// Every package the lock takes from a registry or a repository into the packages of `product`.
+/// The lock holds the dependencies of a package under every feature of every package of the
+/// workspace, so this is the crates a build can reach, which are more than the crates it compiles.
+fn reached(checkout: &Path, product: Product) -> Result<BTreeSet<Identity>> {
     let lock = read_text(&checkout.join("Cargo.lock"))?
         .parse::<DocumentMut>()
         .map_err(|error| Refusal(format!("Cargo.lock is not TOML: {error}")))?;
     let all = packages(&lock)?;
     let wants = workspace_wants(checkout)?;
-    let listed = read_json(&checkout.join("scripts/release-programs.json"))?;
-    let Some(programs) = listed["programs"].as_array() else {
-        refuse!("scripts/release-programs.json lists no programs");
-    };
     let mut stack = Vec::new();
-    for program in programs {
-        let Some(name) = program["package"].as_str() else {
-            refuse!("scripts/release-programs.json lists a program with no package");
-        };
+    for name in package_names(checkout, product)? {
         let roots: Vec<usize> = all
             .iter()
             .enumerate()
@@ -302,7 +376,9 @@ fn reached(checkout: &Path) -> Result<BTreeSet<Identity>> {
             .map(|(index, _)| index)
             .collect();
         if roots.is_empty() {
-            refuse!("the lock holds no package {name}, which scripts/release-programs.json builds");
+            refuse!(
+                "the lock holds no package {name}, which the notice of this product is made for"
+            );
         }
         stack.extend(roots);
     }

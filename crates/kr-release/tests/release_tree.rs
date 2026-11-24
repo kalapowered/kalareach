@@ -13,6 +13,7 @@ use std::process::{Command, Output};
 
 use kr_protocol::update::{FileMode, ReleaseManifest};
 use kr_release::assemble::{Inputs, assemble};
+use kr_release::notices::Product;
 
 const COMMIT: &str = "4254aa6e62e585478ff8dcff5518f23c7263f4ce";
 
@@ -1053,7 +1054,8 @@ fn a_notice_that_lacks_a_crate_of_the_programs_is_refused() {
     let committed =
         std::fs::read_to_string(checkout().join("docs/releases/third-party-notices.txt"))
             .expect("the committed notice");
-    let none = kr_release::notices::gaps(&checkout(), &committed).expect("the lock is read");
+    let none = kr_release::notices::gaps(&checkout(), &committed, Product::Programs)
+        .expect("the lock is read");
     assert!(none.is_empty(), "the committed notice lacks {none:?}");
 
     let mut cut = Vec::new();
@@ -1072,7 +1074,8 @@ fn a_notice_that_lacks_a_crate_of_the_programs_is_refused() {
         .map(|line| format!("{line}\n"))
         .collect();
     assert!(!cut.is_empty(), "the notice has entries of serde_json");
-    let lacking = kr_release::notices::gaps(&checkout(), &text).expect("the lock is read");
+    let lacking =
+        kr_release::notices::gaps(&checkout(), &text, Product::Programs).expect("the lock is read");
     assert_eq!(lacking, cut);
 }
 
@@ -1116,7 +1119,8 @@ fn a_line_of_a_licence_text_does_not_stand_for_an_entry() {
             .expect("the end of the entries");
     lines.insert(ends + 1, format!("  - {} | programs", cut[0]));
     let text: String = lines.iter().map(|line| format!("{line}\n")).collect();
-    let lacking = kr_release::notices::gaps(&checkout(), &text).expect("the lock is read");
+    let lacking =
+        kr_release::notices::gaps(&checkout(), &text, Product::Programs).expect("the lock is read");
     assert_eq!(lacking, cut);
 }
 
@@ -1143,7 +1147,8 @@ fn a_notice_that_names_only_the_git_source_of_a_crate_is_refused() {
         .filter(|line| !own(line) || from_git(line))
         .map(|line| format!("{line}\n"))
         .collect();
-    let lacking = kr_release::notices::gaps(&checkout(), &text).expect("the lock is read");
+    let lacking =
+        kr_release::notices::gaps(&checkout(), &text, Product::Programs).expect("the lock is read");
     assert_eq!(lacking, vec!["filedescriptor 0.8.3".to_owned()]);
 }
 
@@ -1162,6 +1167,7 @@ fn notice_stand_in(notice: &str) -> (tempfile::TempDir, PathBuf, PathBuf) {
     copy("Cargo.toml");
     copy("Cargo.lock");
     copy("scripts/release-programs.json");
+    copy("scripts/companion-notice.json");
     let root: toml_edit::DocumentMut = std::fs::read_to_string(checkout().join("Cargo.toml"))
         .expect("the workspace manifest")
         .parse()
