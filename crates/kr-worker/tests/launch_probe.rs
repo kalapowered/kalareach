@@ -471,11 +471,16 @@ fn start_allowance() -> Duration {
     }
 }
 
+/// How long the case of a late create holds the create back.
+const LATE_CREATE: Duration = Duration::from_secs(5);
+
 /// KR-REQ-07.64: a process created after the deadline is ended by the thread that created it, at
 /// once, and the call has returned at the deadline without waiting for the create.
 ///
-/// The create is held back past the deadline. The stand-in would write `ran.txt` a second after it
-/// starts, and it never does, because it is ended as it is made.
+/// The create is held back for `LATE_CREATE`, which is far longer than the deadline and the slack a
+/// call may take, so that a call that waited for the create would be seen on a machine of any speed.
+/// The stand-in would write `ran.txt` a second after it starts, and it never does, because it is
+/// ended as it is made.
 #[test]
 fn kr_req_07_64_a_probe_created_after_the_deadline_is_ended_by_its_creator() {
     let here = directory();
@@ -484,11 +489,7 @@ fn kr_req_07_64_a_probe_created_after_the_deadline_is_ended_by_its_creator() {
         "Start-Sleep 1; 'ran' | Out-File ran.txt; Start-Sleep 600",
     );
     let deadline = Duration::from_secs(1);
-    probe::seams::delay_at(
-        probe::seams::Point::Create,
-        here.path(),
-        Some(Duration::from_secs(2)),
-    );
+    probe::seams::delay_at(probe::seams::Point::Create, here.path(), Some(LATE_CREATE));
     let run = ProbeRun::within(deadline);
     let probed = probe::run_within(
         &standin.program,
@@ -509,7 +510,7 @@ fn kr_req_07_64_a_probe_created_after_the_deadline_is_ended_by_its_creator() {
     );
     let total = thread_total(&probed);
     assert!(
-        total < Duration::from_secs(2) + probe::CLEANUP_BOUND + SLACK,
+        total < LATE_CREATE + probe::CLEANUP_BOUND + SLACK,
         "the thread ended what it made at once: {total:?}"
     );
     // Longer than the stand-in's own second, and than a Windows shell takes to begin.
