@@ -584,6 +584,19 @@ fn item_names(item: &Item) -> Vec<String> {
     item.label.split(", ").map(str::to_owned).collect()
 }
 
+/// Whether the scan of `name` finds this item of the walker: a function, constant or type by its
+/// name, a method by `Type::name` (its label), and a `macro_rules!` item by `macro:` and its name
+/// (the walker's label is the bare name). An `impl` block and a macro call are never found by a
+/// plain name.
+fn is_scanned_as(item: &Item, name: &str) -> bool {
+    let has = |wanted: &str| item_names(item).iter().any(|label| label == wanted);
+    match (&item.kind, name.strip_prefix("macro:")) {
+        (Kind::MacroRules, Some(macro_name)) => has(macro_name),
+        (Kind::Named | Kind::Method, None) => has(name),
+        _ => false,
+    }
+}
+
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
@@ -1418,9 +1431,18 @@ impl Tree {
                         files.push(item.file.clone());
                     }
                 }
-                let indexed = files.clone();
+                let index = self.index(krate)?;
                 for (file, found) in &scanned {
-                    if indexed.contains(file) && found.len() == 1 {
+                    // The scan names a method `Type::name` and a test function `name`, so a file
+                    // the walker indexes may hold a scanned item that is not the walker's own. The
+                    // file is skipped only when its scanned items are the walker's: as many as
+                    // the walker's items of the file that the scan names this way.
+                    let own = index
+                        .items
+                        .iter()
+                        .filter(|item| item.file == *file && is_scanned_as(item, name))
+                        .count();
+                    if found.len() == own {
                         continue;
                     }
                     let found = found.join("\n");

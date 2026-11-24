@@ -595,6 +595,84 @@ fn the_identity_of_a_name_is_every_item_of_that_name_in_its_crate() {
     assert_ne!(digest_of(&tree_test_moved, "twice"), before_twice);
 }
 
+/// W5: a method and a test function of one bare name in one file are two items. The walker's item
+/// of `send` is the method (`Link::send`); the scan finds the test function alone, so the file's
+/// one scanned item is not the walker's own and the test function is in the name's identity.
+#[test]
+fn a_test_function_beside_a_method_of_its_bare_name_is_in_the_identity_of_the_name() {
+    let lib = "crates/kr-sender/src/lib.rs";
+    let sender = |method_body: &str, test_body: &str| {
+        small_tree(&format!(
+            "pub struct Link;\nimpl Link {{\n    pub fn send(&self) {{ {method_body} }}\n}}\n\
+             #[cfg(test)]\nmod tests {{\n    fn send() {{ {test_body} }}\n}}\n"
+        ))
+    };
+    let base = sender("first();", "one();");
+    let tree = tree_at(base.path()).expect("the tree");
+    let source = tree
+        .source("kr_sender", "send")
+        .expect("read")
+        .expect("found");
+    assert!(
+        source.text.contains("first ()") && source.text.contains("one ()"),
+        "the method and the test function are both in the identity: {}",
+        source.text
+    );
+    assert_eq!(source.files, vec![lib.to_owned()]);
+    let before = digest_of(&tree, "send");
+    // A change to the test function moves the digest, and so does a change to the method.
+    let test_moved = sender("first();", "two();");
+    let tree_test_moved = tree_at(test_moved.path()).expect("the tree");
+    assert_ne!(
+        digest_of(&tree_test_moved, "send"),
+        before,
+        "a change to the test function"
+    );
+    let method_moved = sender("second();", "one();");
+    let tree_method_moved = tree_at(method_moved.path()).expect("the tree");
+    assert_ne!(
+        digest_of(&tree_method_moved, "send"),
+        before,
+        "a change to the method"
+    );
+    // The method named as a method has no namesake: the test function is not its item.
+    let method = digest_of(&tree, "Link::send");
+    assert_eq!(digest_of(&tree_test_moved, "Link::send"), method);
+}
+
+/// W5: an item the walker indexes is in the identity of its name once. A file whose scanned items of
+/// a name are all the walker's own adds nothing to the digest: a `macro_rules!` item (named
+/// `macro:name`, where the walker's label is the bare name), a method (`Type::name`), and two
+/// functions of one bare name in one file, which the walker indexes both.
+#[test]
+fn an_item_the_walker_indexes_is_in_the_identity_of_its_name_once() {
+    let lib = "crates/kr-sender/src/lib.rs";
+    let folder = small_tree(
+        "macro_rules! make {\n    () => {};\n}\n\
+         pub struct Link;\nimpl Link {\n    pub fn send(&self) {}\n}\n\
+         mod one {\n    pub fn helper() { a(); }\n}\n\
+         mod two {\n    pub fn helper() { b(); }\n}\n",
+    );
+    let tree = tree_at(folder.path()).expect("the tree");
+    for (name, needle, times) in [
+        ("macro:make", "macro_rules ! make", 1),
+        ("Link::send", "fn send", 1),
+        ("helper", "fn helper", 2),
+    ] {
+        let source = tree
+            .source("kr_sender", name)
+            .expect("read")
+            .expect("found");
+        assert_eq!(
+            source.text.matches(needle).count(),
+            times,
+            "{name}: {}",
+            source.text
+        );
+        assert_eq!(source.files, vec![lib.to_owned()], "{name}");
+    }
+}
+
 /// W5: a plain name that only files no build reads hold, in two files, is one identity of both: a
 /// change to either file moves it, and each file's path is in it.
 #[test]
