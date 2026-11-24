@@ -268,18 +268,15 @@ jobs:
       # test that waits for something that never comes would otherwise
       # hold the runner for the job's six hours and every branch's checks behind it, so the step is
       # given a little over twice those 110 minutes and no more: 225, which is 1.35 times the
-      # longest of the seven. The job has no limit of its own, so it has GitHub's 360 minutes, and
-      # the limits of its steps do not all fit in them. They add up to 439: this step's 225, the
-      # release gate's 150, the pairing leg's 30 (a push to main, or a manual run that sets
-      # `deployment_legs`), 10 for each of the advisory check and the two stub-daemon steps, and 2
-      # for each of the two archive steps. What the steps took in those seven runs is what has to
-      # fit: the steps before this one 12 to 21 minutes, and 42 once, 26 of them for the desktop
-      # packages' install; the steps after it, the release gate and the two stub-daemon steps
-      # apart, 17 to 25 minutes; those two steps 4.4 minutes together in the one run that had them;
-      # and the gate 79 minutes in the one run that had it. A run of this step to its limit leaves
-      # the gate 85 minutes after the usual start and 64 after the slow one, and 69 and 48 if the
-      # two stub-daemon steps also ran to their limits, so the gate is the step that the job's end
-      # cuts, and the steps between this one and the gate still report.
+      # longest of the seven. The job has no limit of its own, so it has GitHub's 360 minutes. The
+      # limits of its steps add up to 289: this step's 225, the pairing leg's 30 (a push to main, or
+      # a manual run that sets `deployment_legs`), 10 for each of the advisory check and the two
+      # stub-daemon steps, and 2 for each of the two archive steps. They fit since the release
+      # gate, whose 150 minutes were the step that the job's end cut, stands in the job of its own
+      # below, `shipped-hold`. What the steps took in those seven runs: the steps before this one 12
+      # to 21 minutes, and 42 once, 26 of them for the desktop packages' install; the steps after
+      # it, the two stub-daemon steps apart, 17 to 25 minutes; those two steps 4.4 minutes together
+      # in the one run that had them.
       - name: Test
         timeout-minutes: 225
         env:
@@ -667,15 +664,6 @@ jobs:
             !/tmp/kr-test-artifacts/m1b-*
           if-no-files-found: error
 
-      # The programs a release ships hold none of the refusal that test builds carry for the
-      # account's own launchd: each is built alone, in a target directory of its own, as a release
-      # tree builds it, and the whole workspace is built in the release profile too, and the bytes
-      # of both are searched, after the test programs that carry the refusal are shown to hold it.
-      - name: The programs a release ships hold no launchd refusal
-        if: ${{ !cancelled() }}
-        timeout-minutes: 150
-        run: bash scripts/shipped-hold-gate.sh
-
       # What the disk had left once the build and every check above it were done, beside the
       # reading the first step took.
       - name: What the disk has left
@@ -688,14 +676,87 @@ jobs:
           primary-key: ${{ steps.cargo-cache.outputs.primary-key }}
           cache-hit: ${{ steps.cargo-cache.outputs.cache-hit }}
 
+  # The programs a release ships hold none of the refusal that test builds carry for the account's
+  # own launchd: each is built alone, in a target directory of its own, as a release tree builds
+  # it, and the whole workspace is built in the release profile too, and the bytes of both are
+  # searched, after the test programs that carry the refusal are shown to hold it. The check was
+  # the last step of the rust job and began after that job's tests: 67 of the 236 minutes the job
+  # took in its last passing run. It reads nothing the other steps made:
+  # `scripts/shipped-hold-gate.sh` builds from nothing, in a new temporary directory, and compiles
+  # the one debug test it reads itself. So it stands in a job of its own beside the rust job and
+  # starts with the run. The step, its limit and its output are those it had in the rust job; the
+  # job holds what the step needs of that job's setup: the disk freed, the pinned toolchain, and
+  # the desktop packages that the workspace's release build links, from the same archives. It
+  # restores no cargo cache: the builds go in a new directory, which no restored output serves.
+  # The steps' limits add up to 207 of the job's 210 minutes.
+  shipped-hold:
+    name: shipped-hold
+    runs-on: ubuntu-24.04
+    timeout-minutes: 210
+    steps:
+      - name: Free the disk the build needs
+        timeout-minutes: 6
+        run: |
+          df -h /
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force
+          df -h /
+
+      - name: Check out
+        timeout-minutes: 5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      - name: Install the pinned toolchain
+        timeout-minutes: 5
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustc --version
+          cargo --version
+
+      # The same list as the rust job's, from the same archives, with the deadline of its step.
+      - name: Restore the desktop packages' archives
+        id: desktop-archives
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.cache/kalareach/apt/desktop
+          key: apt-v1-desktop-ubuntu-24.04-${{ runner.arch }}-${{ github.run_id }}
+          restore-keys: apt-v1-desktop-ubuntu-24.04-${{ runner.arch }}-
+
+      - name: Install the desktop build dependencies
+        id: desktop-install
+        timeout-minutes: 35
+        run: |
+          bash scripts/apt-install.sh --deadline 1800 --archive ~/.cache/kalareach/apt/desktop \
+            libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev \
+            libsoup-3.0-dev libjavascriptcoregtk-4.1-dev desktop-file-utils python3-gi
+
+      - name: Save the desktop packages' archives
+        if: github.ref == 'refs/heads/main' && steps.desktop-install.outputs.save == 'true'
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.cache/kalareach/apt/desktop
+          key: apt-v1-desktop-ubuntu-24.04-${{ runner.arch }}-${{ steps.desktop-install.outputs.entry }}
+
+      - name: The programs a release ships hold no launchd refusal
+        timeout-minutes: 150
+        run: bash scripts/shipped-hold-gate.sh
+
+      - name: What the disk has left
+        if: ${{ !cancelled() }}
+        timeout-minutes: 2
+        run: df -h /
+
   # The cases that run against a real squid proxy: one that asks for a login by HTTP Basic, one that
   # offers Digest only, and one that intercepts TLS. The workspace's test run leaves them out
   # (they are ignored, and name the proxy in the environment), so this job installs squid, starts the
-  # three proxies and runs the cases by name. It is a job of its own because the rust job's steps
-  # already add up to more than its limit, and the release gate at the end of that job is the step
-  # its limit cuts. It builds the four test programs from nothing, in parallel with the other jobs,
-  # and saves no cache: an entry of its own would take room in the repository's cache from the
-  # entries the other jobs restore.
+  # three proxies and runs the cases by name. It is a job of its own, beside the others, so that it
+  # does not add its own install and runs to the rust job's steps. It builds the four test programs
+  # from nothing, in parallel with the other jobs, and saves no cache: an entry of its own would
+  # take room in the repository's cache from the entries the other jobs restore.
   real-proxy:
     name: real-proxy
     runs-on: ubuntu-24.04
