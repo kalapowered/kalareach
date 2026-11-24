@@ -25,6 +25,19 @@
 //! keeping open, and pretending otherwise would be the unbounded growth this bound exists to
 //! prevent.
 //!
+//! # What the fourth protocol adds
+//!
+//! A notice of the third protocol is the same notice on the fourth, and the fourth says more of
+//! some: a gap names the first and last event it lost, and a fault names the event that trapped
+//! ([`Beyond`]). The queue keeps that with the notice and folds the positions of losses into one
+//! record as it folds their counts, so a gap bounds everything it counts.
+//!
+//! What an instance has consumed ([`ConsumedReport`]) is not a notice of the third protocol, and
+//! only a reader of the fourth is given it ([`NoticeStream::recv_four`]). It is one for each
+//! registration, a newer report replaces one that has not been taken, and it is taken after every
+//! notice queued before it was made and before every notice queued after. A loss is still told
+//! first, so a reader hears of what was lost before it hears what was consumed.
+//!
 //! # Whose a notice is
 //!
 //! A notice names its binding and nothing else, and an identifier can be registered, removed and
@@ -39,6 +52,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
+use kr_protocol::ids::SourceEventHandle;
 use kr_protocol::scalars::Uuid;
 
 use crate::protocol::{Notice, WireNode};
@@ -86,6 +100,49 @@ impl Origin {
     }
 }
 
+/// What a notice says for the fourth plugin host protocol beyond what the third says.
+///
+/// The queue keeps it with the notice and never reads it, except to fold the positions of one
+/// registration's losses into one record as it folds their counts. A producer for the third
+/// protocol offers none, and every member is then empty.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Beyond {
+    /// For a gap: the first event lost, in the order the events were offered to the binding.
+    pub first: Option<SourceEventHandle>,
+    /// For a gap: the last event lost, in that order.
+    pub last: Option<SourceEventHandle>,
+    /// For a fault: the event whose `observe` trapped, where the call was one.
+    pub event: Option<SourceEventHandle>,
+    /// For a fault: the generation the next call runs under.
+    pub generation: u32,
+}
+
+impl Beyond {
+    /// What the handles of this record cost of the queue.
+    fn bytes(&self) -> u64 {
+        [&self.first, &self.last, &self.event]
+            .into_iter()
+            .flatten()
+            .map(|handle| handle.as_str().len() as u64)
+            .sum()
+    }
+}
+
+/// What one registration's instance has consumed, as a notice reports it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConsumedReport {
+    /// The binding.
+    pub binding_id: Uuid,
+    /// How many times the instance has been replaced since the registration.
+    pub generation: u32,
+    /// Whether what it consumed is a prefix of what was offered.
+    pub clean: bool,
+    /// The last native event whose `observe` returned.
+    pub native: Option<SourceEventHandle>,
+    /// The last terminal event whose `observe` returned.
+    pub terminal: Option<SourceEventHandle>,
+}
+
 /// A notice taken from the queue, and the registration it came from.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Delivered {
@@ -93,6 +150,26 @@ pub struct Delivered {
     pub origin: Option<Origin>,
     /// The notice.
     pub notice: Notice,
+    /// What the fourth protocol adds to it.
+    pub beyond: Beyond,
+}
+
+/// A report taken from the queue, and the registration it came from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConsumedDelivered {
+    /// The registration whose instance the report is about.
+    pub origin: Option<Origin>,
+    /// The report.
+    pub report: ConsumedReport,
+}
+
+/// What a reader of the fourth protocol takes from the queue.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Delivery {
+    /// A notice of the third protocol, and what the fourth adds to it.
+    Notice(Delivered),
+    /// What an instance has consumed.
+    Consumed(ConsumedDelivered),
 }
 
 /// What became of a notice this queue was offered.
@@ -133,11 +210,15 @@ pub fn node_bytes(node: &WireNode) -> u64 {
 }
 
 /// What one registration of a binding has lost, waiting to be told.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct Loss {
     events: u32,
     bytes: u64,
     documents: u64,
+    /// The first event lost, as the oldest loss folded into this record names it.
+    first: Option<SourceEventHandle>,
+    /// The last event lost, as the newest loss folded into this record names it.
+    last: Option<SourceEventHandle>,
 }
 
 /// One registration of a binding, which is whose records the queue keeps.
@@ -158,12 +239,32 @@ impl Subject {
 struct Entry {
     origin: Option<Origin>,
     notice: Notice,
+    beyond: Beyond,
+    /// Where the entry stands among the entries queued: a report that follows it is due once no
+    /// entry with a lower or equal number is left.
+    sequence: u64,
 }
 
 impl Entry {
     fn subject(&self) -> Subject {
         Subject::new(self.notice.binding_id(), self.origin)
     }
+
+    /// What the entry costs of the queue.
+    fn bytes(&self) -> u64 {
+        notice_bytes(&self.notice) + self.beyond.bytes()
+    }
+}
+
+/// What one registration's instance has consumed, waiting to be reported once every notice that
+/// was queued before it has been taken.
+#[derive(Debug)]
+struct Owed {
+    subject: Subject,
+    /// The number of the last entry queued when the report was made: the report is due when no
+    /// entry that number or lower is left.
+    after: u64,
+    report: ConsumedReport,
 }
 
 /// The shared state behind a sink and its stream.
@@ -177,6 +278,12 @@ struct Shared {
 struct Queued {
     waiting: VecDeque<Entry>,
     held: u64,
+    /// The number the next entry is given.
+    next_sequence: u64,
+    /// What each registration's instance has consumed, waiting to be reported, oldest first: one
+    /// for each registration, a newer one replacing an older one that has not been taken and
+    /// standing behind everything queued since.
+    owed: VecDeque<Owed>,
     /// What each registration has lost, waiting to be reported as one gap.
     lost: HashMap<Subject, Loss>,
     /// The order the losses are reported in, so the oldest loss is the first a reader hears about.
@@ -235,23 +342,53 @@ impl NoticeSink {
     /// Offers one notice that comes with no word of which registration produced it, dropping
     /// presentation rather than growing or waiting.
     pub fn send(&self, notice: Notice) -> Offered {
-        self.offer(None, notice)
+        self.offer(None, notice, Beyond::default())
     }
 
     /// Offers one notice that `origin` produced, dropping presentation rather than growing or
     /// waiting.
     pub fn send_from(&self, origin: Origin, notice: Notice) -> Offered {
-        self.offer(Some(origin), notice)
+        self.offer(Some(origin), notice, Beyond::default())
     }
 
-    fn offer(&self, origin: Option<Origin>, notice: Notice) -> Offered {
+    /// Offers one notice that `origin` produced, with what the fourth protocol adds to it.
+    ///
+    /// A gap's positions fold into the positions of the loss record it folds into, and a fault's
+    /// stay with it.
+    pub fn send_from_with(&self, origin: Origin, notice: Notice, beyond: Beyond) -> Offered {
+        self.offer(Some(origin), notice, beyond)
+    }
+
+    /// Offers what the instance of `origin`'s registration has consumed, replacing the report that
+    /// registration has not been told yet.
+    ///
+    /// A reader of the fourth protocol is given it after every notice queued before it.
+    pub fn send_consumed_from(&self, origin: Origin, report: ConsumedReport) -> Offered {
         let Ok(mut queue) = self.shared.queue.lock() else {
             return Offered::Closed;
         };
         if queue.closed {
             return Offered::Closed;
         }
-        let offered = queue.admit(origin, notice);
+        let offered = queue.report_consumed(Some(origin), report);
+        let offered = if queue.overflowed {
+            Offered::Overflowed
+        } else {
+            offered
+        };
+        drop(queue);
+        self.shared.wake.notify_one();
+        offered
+    }
+
+    fn offer(&self, origin: Option<Origin>, notice: Notice, beyond: Beyond) -> Offered {
+        let Ok(mut queue) = self.shared.queue.lock() else {
+            return Offered::Closed;
+        };
+        if queue.closed {
+            return Offered::Closed;
+        }
+        let offered = queue.admit(origin, notice, beyond);
         // Admitting can be what ends the connection -- too many unfinished dropped documents, or
         // something that had to arrive and would not fit. The caller is told by this answer rather
         // than by the next one it happens to make.
@@ -388,7 +525,36 @@ impl NoticeStream {
             .queue
             .lock()
             .ok()
-            .and_then(|mut queue| queue.take())
+            .and_then(|mut queue| match queue.take(false) {
+                Some(Delivery::Notice(delivered)) => Some(delivered),
+                Some(Delivery::Consumed(_)) | None => None,
+            })
+    }
+
+    /// Waits for the next notice or report, or returns nothing once the queue is closed and empty.
+    ///
+    /// For a reader of the fourth protocol: it is given what an instance has consumed as well.
+    pub async fn recv_four(&mut self) -> Option<Delivery> {
+        let shared = Arc::clone(&self.shared);
+        loop {
+            let waiting = shared.wake.notified();
+            if let Some(delivery) = self.try_recv_four() {
+                return Some(delivery);
+            }
+            if self.is_closed() {
+                return None;
+            }
+            waiting.await;
+        }
+    }
+
+    /// Takes the next notice or report if one is waiting.
+    pub fn try_recv_four(&mut self) -> Option<Delivery> {
+        self.shared
+            .queue
+            .lock()
+            .ok()
+            .and_then(|mut queue| queue.take(true))
     }
 
     /// Returns how many bytes the queue holds.
@@ -454,6 +620,7 @@ impl Drop for NoticeStream {
         if let Ok(mut queue) = self.shared.queue.lock() {
             queue.closed = true;
             queue.waiting.clear();
+            queue.owed.clear();
             queue.lost.clear();
             queue.lost_order.clear();
             queue.gone.clear();
@@ -466,7 +633,7 @@ impl Drop for NoticeStream {
 
 impl Queued {
     /// Admits one notice, making room by dropping presentation.
-    fn admit(&mut self, origin: Option<Origin>, notice: Notice) -> Offered {
+    fn admit(&mut self, origin: Option<Origin>, notice: Notice, beyond: Beyond) -> Offered {
         // A gap is not queued: it folds into what its registration has already lost, so a reader
         // that has stopped reading cannot be given a backlog of them either.
         if let Notice::Gap {
@@ -482,6 +649,8 @@ impl Queued {
                     events,
                     bytes,
                     documents,
+                    first: beyond.first,
+                    last: beyond.last,
                 },
             );
         }
@@ -514,7 +683,7 @@ impl Queued {
             return Offered::Dropped;
         }
 
-        let cost = notice_bytes(&notice);
+        let cost = notice_bytes(&notice) + beyond.bytes();
         let droppable = matches!(notice, Notice::Document { .. });
         while self.held + cost > MAX_NOTICE_BYTES && self.evict_oldest_document() {}
         // Making room can drop the very document this piece belongs to, and a piece admitted after
@@ -561,7 +730,13 @@ impl Queued {
             return Offered::Overflowed;
         }
         self.held += cost;
-        self.waiting.push_back(Entry { origin, notice });
+        self.next_sequence += 1;
+        self.waiting.push_back(Entry {
+            origin,
+            notice,
+            beyond,
+            sequence: self.next_sequence,
+        });
         Offered::Kept
     }
 
@@ -614,7 +789,7 @@ impl Queued {
         } else {
             Offered::Kept
         };
-        if self.merge(subject, loss) {
+        if self.merge(subject, &loss) {
             return answer;
         }
         // A registration this queue has no loss record for yet. The record is one more thing the
@@ -624,7 +799,7 @@ impl Queued {
         // Making room may have created this registration's record, if what it evicted was this
         // registration's document. Merging again is what keeps one registration to one record and
         // one charge.
-        if self.merge(subject, loss) {
+        if self.merge(subject, &loss) {
             return answer;
         }
         if self.held + NOTICE_OVERHEAD_BYTES > MAX_NOTICE_BYTES {
@@ -637,13 +812,22 @@ impl Queued {
     }
 
     /// Adds one loss to a record this queue already holds, and says whether it did.
-    fn merge(&mut self, subject: Subject, loss: Loss) -> bool {
+    ///
+    /// The record keeps the first event of the oldest loss folded into it and the last event of the
+    /// newest one that names any, so the positions bound everything the record counts.
+    fn merge(&mut self, subject: Subject, loss: &Loss) -> bool {
         let Some(held) = self.lost.get_mut(&subject) else {
             return false;
         };
         held.events = held.events.saturating_add(loss.events);
         held.bytes = held.bytes.saturating_add(loss.bytes);
         held.documents = held.documents.saturating_add(loss.documents);
+        if held.first.is_none() {
+            held.first.clone_from(&loss.first);
+        }
+        if loss.last.is_some() {
+            held.last.clone_from(&loss.last);
+        }
         self.dropped = self.dropped.saturating_add(loss.documents);
         true
     }
@@ -651,9 +835,9 @@ impl Queued {
     /// Starts one registration's loss record, and charges the queue for holding it.
     fn charge_loss(&mut self, subject: Subject, loss: Loss) {
         self.held += NOTICE_OVERHEAD_BYTES;
+        self.dropped = self.dropped.saturating_add(loss.documents);
         self.lost.insert(subject, loss);
         self.lost_order.push_back(subject);
-        self.dropped = self.dropped.saturating_add(loss.documents);
     }
 
     /// Records that one piece of a document was withheld.
@@ -703,7 +887,7 @@ impl Queued {
                 last,
                 ..
             } => {
-                freed += notice_bytes(&entry.notice);
+                freed += entry.bytes();
                 pieces.push((Subject::new(*binding_id, entry.origin), *document, *last));
                 false
             }
@@ -739,7 +923,7 @@ impl Queued {
                 } if entry.subject() == subject && *number == document
             );
             if theirs {
-                freed += notice_bytes(&entry.notice);
+                freed += entry.bytes();
                 if matches!(entry.notice, Notice::Document { last: true, .. }) {
                     ended = true;
                 }
@@ -757,19 +941,24 @@ impl Queued {
             documents: 1,
             ..Loss::default()
         };
-        if !self.merge(subject, one) {
+        if !self.merge(subject, &one) {
             self.charge_loss(subject, one);
         }
         true
     }
 
     /// Takes the next notice: a loss first, because a reader has to know before it reads on.
-    fn take(&mut self) -> Option<Delivered> {
+    ///
+    /// A reader of the fourth protocol, which says so by `four`, is also given what an instance has
+    /// consumed, and it is given it after every notice that was queued before the report was made
+    /// and before every notice queued since. The third protocol has no such report, and a reader of
+    /// it is given none.
+    fn take(&mut self, four: bool) -> Option<Delivery> {
         if let Some(subject) = self.lost_order.pop_front()
             && let Some(loss) = self.lost.remove(&subject)
         {
             self.held = self.held.saturating_sub(NOTICE_OVERHEAD_BYTES);
-            return Some(Delivered {
+            return Some(Delivery::Notice(Delivered {
                 origin: subject.origin,
                 notice: Notice::Gap {
                     binding_id: subject.binding_id,
@@ -777,11 +966,70 @@ impl Queued {
                     bytes: loss.bytes,
                     documents: loss.documents,
                 },
-            });
+                beyond: Beyond {
+                    first: loss.first,
+                    last: loss.last,
+                    ..Beyond::default()
+                },
+            }));
         }
-        let Entry { origin, notice } = self.waiting.pop_front()?;
-        self.held = self.held.saturating_sub(notice_bytes(&notice));
-        Some(Delivered { origin, notice })
+        if four
+            && let Some(due) = self.owed.front()
+            && self
+                .waiting
+                .front()
+                .is_none_or(|entry| entry.sequence > due.after)
+            && let Some(Owed {
+                subject, report, ..
+            }) = self.owed.pop_front()
+        {
+            self.held = self.held.saturating_sub(NOTICE_OVERHEAD_BYTES);
+            return Some(Delivery::Consumed(ConsumedDelivered {
+                origin: subject.origin,
+                report,
+            }));
+        }
+        let entry = self.waiting.pop_front()?;
+        self.held = self.held.saturating_sub(entry.bytes());
+        Some(Delivery::Notice(Delivered {
+            origin: entry.origin,
+            notice: entry.notice,
+            beyond: entry.beyond,
+        }))
+    }
+
+    /// Records what one registration's instance has consumed, replacing the report it has not been
+    /// told yet, and says what became of it.
+    ///
+    /// The report waits behind every notice queued so far, and a newer report moves to the back, so
+    /// a reader is never told what an instance consumed before it is told what that pass lost or
+    /// faulted on. It costs the queue what a loss record does and is never dropped for want of room:
+    /// one that would not fit once every document is gone ends the connection, as a loss does.
+    fn report_consumed(&mut self, origin: Option<Origin>, report: ConsumedReport) -> Offered {
+        let subject = Subject::new(report.binding_id, origin);
+        let replaced = self
+            .owed
+            .iter()
+            .position(|owed| owed.subject == subject)
+            .and_then(|place| self.owed.remove(place))
+            .is_some();
+        if !replaced {
+            while self.held + NOTICE_OVERHEAD_BYTES > MAX_NOTICE_BYTES
+                && self.evict_oldest_document()
+            {}
+            if self.held + NOTICE_OVERHEAD_BYTES > MAX_NOTICE_BYTES {
+                self.closed = true;
+                self.overflowed = true;
+                return Offered::Overflowed;
+            }
+            self.held += NOTICE_OVERHEAD_BYTES;
+        }
+        self.owed.push_back(Owed {
+            subject,
+            after: self.next_sequence,
+            report,
+        });
+        Offered::Kept
     }
 
     /// Removes everything held for the registrations `doomed` names, and what holding it cost.
@@ -790,10 +1038,13 @@ impl Queued {
         self.waiting.retain(|entry| {
             let theirs = doomed(&entry.subject());
             if theirs {
-                freed += notice_bytes(&entry.notice);
+                freed += entry.bytes();
             }
             !theirs
         });
+        let reports = self.owed.len();
+        self.owed.retain(|owed| !doomed(&owed.subject));
+        freed += NOTICE_OVERHEAD_BYTES * (reports - self.owed.len()) as u64;
         let losses = self.lost.len();
         self.lost.retain(|subject, _loss| !doomed(subject));
         freed += NOTICE_OVERHEAD_BYTES * (losses - self.lost.len()) as u64;
@@ -1352,7 +1603,7 @@ mod tests {
         sink.send_from(second, gap(binding(1), 5));
         sink.send_from(first, gap(binding(1), 1));
         let mut told = Vec::new();
-        while let Some(Delivered { origin, notice }) = stream.try_recv_delivered() {
+        while let Some(Delivered { origin, notice, .. }) = stream.try_recv_delivered() {
             let Notice::Gap { events, .. } = notice else {
                 panic!("{notice:?} was queued for a loss");
             };
@@ -1397,5 +1648,166 @@ mod tests {
             Some(Notice::Document { binding_id, .. }) if binding_id == binding(2)
         ));
         assert!(stream.try_recv().is_none());
+    }
+
+    fn handle(number: u32) -> SourceEventHandle {
+        SourceEventHandle::new(format!("se-{number}")).expect("a handle")
+    }
+
+    fn fault(binding_id: Uuid) -> Notice {
+        Notice::Fault {
+            binding_id,
+            call: "observe".to_owned(),
+            detail: "trap".to_owned(),
+            faults_in_window: 1,
+        }
+    }
+
+    fn report(binding_id: Uuid, native: u32) -> ConsumedReport {
+        ConsumedReport {
+            binding_id,
+            generation: 0,
+            clean: true,
+            native: Some(handle(native)),
+            terminal: None,
+        }
+    }
+
+    fn four(stream: &mut NoticeStream) -> Vec<Delivery> {
+        std::iter::from_fn(|| stream.try_recv_four()).collect()
+    }
+
+    #[test]
+    fn kr_req_24_24_a_gap_names_the_first_and_last_event_of_every_loss_it_folds() {
+        let (sink, mut stream) = channel();
+        let origin = Origin::new(1);
+        let lost = |first: u32, last: u32| Beyond {
+            first: Some(handle(first)),
+            last: Some(handle(last)),
+            ..Beyond::default()
+        };
+        sink.send_from_with(origin, gap(binding(1), 2), lost(3, 4));
+        sink.send_from_with(origin, gap(binding(1), 3), lost(7, 9));
+        // A loss of documents only names no event, and does not take the positions away.
+        sink.send_from_with(
+            origin,
+            Notice::Gap {
+                binding_id: binding(1),
+                events: 0,
+                bytes: 0,
+                documents: 1,
+            },
+            Beyond::default(),
+        );
+        let taken = four(&mut stream);
+        assert_eq!(taken.len(), 1, "three losses are one record");
+        let Some(Delivery::Notice(delivered)) = taken.first() else {
+            panic!("a gap was expected");
+        };
+        assert!(matches!(
+            delivered.notice,
+            Notice::Gap {
+                events: 5,
+                documents: 1,
+                ..
+            }
+        ));
+        assert_eq!(delivered.beyond.first, Some(handle(3)), "the oldest first");
+        assert_eq!(delivered.beyond.last, Some(handle(9)), "the newest last");
+    }
+
+    #[test]
+    fn kr_req_24_24_a_fault_keeps_its_event_and_generation_in_the_order_it_was_queued() {
+        let (sink, mut stream) = channel();
+        let origin = Origin::new(1);
+        sink.send_from(origin, document(binding(1), 8));
+        sink.send_from_with(
+            origin,
+            fault(binding(1)),
+            Beyond {
+                event: Some(handle(5)),
+                generation: 2,
+                ..Beyond::default()
+            },
+        );
+        let taken = four(&mut stream);
+        let [Delivery::Notice(first), Delivery::Notice(second)] = taken.as_slice() else {
+            panic!("a document and a fault were expected, got {taken:?}");
+        };
+        assert!(matches!(first.notice, Notice::Document { .. }));
+        assert!(matches!(second.notice, Notice::Fault { .. }));
+        assert_eq!(second.beyond.event, Some(handle(5)));
+        assert_eq!(second.beyond.generation, 2);
+    }
+
+    #[test]
+    fn kr_req_24_24_a_report_follows_what_was_queued_before_it_and_leads_what_was_queued_after() {
+        let (sink, mut stream) = channel();
+        let origin = Origin::new(1);
+        sink.send_from(origin, fault(binding(1)));
+        sink.send_consumed_from(origin, report(binding(1), 1));
+        sink.send_from(origin, document(binding(1), 8));
+        let taken = four(&mut stream);
+        let kinds: Vec<&str> = taken
+            .iter()
+            .map(|next| match next {
+                Delivery::Notice(delivered) => match delivered.notice {
+                    Notice::Fault { .. } => "fault",
+                    Notice::Document { .. } => "document",
+                    _ => "other",
+                },
+                Delivery::Consumed(_) => "report",
+            })
+            .collect();
+        assert_eq!(kinds, ["fault", "report", "document"]);
+    }
+
+    #[test]
+    fn kr_req_24_24_a_loss_is_told_before_a_report_and_a_report_is_one_for_each_registration() {
+        let (sink, mut stream) = channel();
+        let origin = Origin::new(1);
+        sink.send_from(origin, fault(binding(1)));
+        sink.send_consumed_from(origin, report(binding(1), 1));
+        sink.send_from_with(origin, gap(binding(1), 1), Beyond::default());
+        // A newer report replaces the one waiting and stands behind everything queued since.
+        sink.send_from(origin, document(binding(1), 8));
+        sink.send_consumed_from(origin, report(binding(1), 2));
+        let taken = four(&mut stream);
+        assert_eq!(taken.len(), 4, "a gap, a fault, a document and one report");
+        assert!(matches!(
+            taken[0],
+            Delivery::Notice(Delivered {
+                notice: Notice::Gap { .. },
+                ..
+            })
+        ));
+        let Some(Delivery::Consumed(last)) = taken.last() else {
+            panic!("the report is last");
+        };
+        assert_eq!(last.report.native, Some(handle(2)), "the newer report");
+        assert_eq!(stream.held_bytes(), 0, "nothing is left charged");
+    }
+
+    #[test]
+    fn kr_req_24_24_a_reader_of_the_third_protocol_is_given_no_report_and_a_retraction_takes_it_out()
+     {
+        let (sink, mut stream) = channel();
+        let origin = Origin::new(1);
+        let other = Origin::new(2);
+        sink.send_consumed_from(origin, report(binding(1), 1));
+        sink.send_consumed_from(other, report(binding(1), 2));
+        sink.send_from(origin, fault(binding(1)));
+        assert!(
+            matches!(stream.try_recv(), Some(Notice::Fault { .. })),
+            "the third protocol reads the notice"
+        );
+        assert!(stream.try_recv().is_none(), "and no report");
+        sink.retract(origin);
+        let taken = four(&mut stream);
+        let [Delivery::Consumed(left)] = taken.as_slice() else {
+            panic!("only the other registration's report was expected, got {taken:?}");
+        };
+        assert_eq!(left.origin, Some(other));
+        assert_eq!(stream.held_bytes(), 0);
     }
 }

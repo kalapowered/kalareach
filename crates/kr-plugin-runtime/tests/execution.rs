@@ -10,7 +10,8 @@ use std::sync::Arc;
 
 use kr_plugin_runtime::RuntimeError;
 use kr_plugin_runtime::runtime::binding::{
-    BindingEvent, BindingOwner, DEFAULT_EVENT_QUEUE, Incarnation, Runtime, RuntimeConfig, Unbound,
+    BindingEvent, BindingOwner, BindingRequest, DEFAULT_EVENT_QUEUE, Incarnation, Runtime,
+    RuntimeConfig, Unbound,
 };
 use kr_plugin_runtime::runtime::bindings::{
     ActionToken, Argument, EffectClass, Fault, NamedArgument, PreparedOperation, RequestSnapshot,
@@ -2681,6 +2682,16 @@ mod consumed {
         seed: u8,
         channel: usize,
     ) -> Option<(Host, Arc<BindingHandle>, Received)> {
+        bound_asking(plugin, seed, channel, true).await
+    }
+
+    /// As [`bound`], for a caller that asks to be told what the instance has consumed or does not.
+    async fn bound_asking(
+        plugin: &str,
+        seed: u8,
+        channel: usize,
+        report_consumed: bool,
+    ) -> Option<(Host, Arc<BindingHandle>, Received)> {
         let wasm = components::component(plugin)?;
         let host = held_host();
         let (events, received) = tokio::sync::mpsc::channel(channel);
@@ -2696,7 +2707,10 @@ mod consumed {
             .instantiate(
                 host.owner,
                 Incarnation::next(),
-                components::request(plugin, seed),
+                BindingRequest {
+                    report_consumed,
+                    ..components::request(plugin, seed)
+                },
                 &compiled,
                 events,
                 COMPILE_WAIT,
@@ -2704,6 +2718,35 @@ mod consumed {
             .await
             .expect("the component instantiates");
         Some((host, binding, received))
+    }
+
+    /// A caller that asked for no report is sent none, and a checkpoint still says what the
+    /// instance consumed: the report is for a caller that reads it, and it takes a place in the
+    /// channel the caller's documents are in.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn kr_req_24_24_a_binding_whose_caller_asked_for_no_report_is_sent_none() {
+        let Some((_host, binding, mut received)) =
+            bound_asking("recording", 40, DEFAULT_EVENT_QUEUE, false).await
+        else {
+            return;
+        };
+        binding.enqueue_observation(components::scrape("se-1", "x"));
+        // The pass has returned its event once a checkpoint, which runs after the pass, names it,
+        // and a report the pass made is in the channel by then.
+        let consumed = loop {
+            let consumed = consumed_of(&binding).await;
+            if consumed.terminal.is_some() {
+                break consumed;
+            }
+            tokio::task::yield_now().await;
+        };
+        assert_eq!(consumed.terminal, Some(handle("se-1")));
+        while let Ok(event) = received.try_recv() {
+            assert!(
+                !matches!(event, BindingEvent::Consumed(_)),
+                "a caller that asked for no report was sent {event:?}"
+            );
+        }
     }
 
     async fn consumed_of(binding: &BindingHandle) -> Consumed {

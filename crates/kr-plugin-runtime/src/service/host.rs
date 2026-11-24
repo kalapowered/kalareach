@@ -32,18 +32,23 @@ use kr_protocol::scalars::Uuid;
 
 use kr_plugin_service::launcher::{HostIdentity, LaunchError, LaunchResult};
 use kr_plugin_service::notices::{
-    Delivered, NoticeSink, NoticeStream, Offered, Origin, node_bytes,
+    Beyond, ConsumedDelivered, ConsumedReport, Delivered, Delivery, NoticeSink, NoticeStream,
+    Offered, Origin, node_bytes,
 };
 use kr_plugin_service::protocol::{
     BindingRegistration, CallValue, ComponentSource, DecodeCall, EncodeCall, Frame, HostHealth,
     HostProtocol, Notice, PrepareActionCall, Request, RequestBody, ResponseBody, WireNode,
     WireSourceEvent,
 };
+use kr_plugin_service::protocol4::{
+    Consumed as ConsumedFrame, Frame4, HostDescriptor4, RecordState, Request4,
+};
 use kr_plugin_service::vocabulary::{
     Admission, BindingId, COMPILE_DEADLINE_MS, MAX_NODE_BYTES, MAX_REQUEST_ID_BYTES,
     MAX_REQUEST_TEXT_BYTES, ScopedSourceEvent, attachments_of, check_attachments, check_facts,
     check_snapshot, deadline_of, event_of, facts_of,
 };
+use kr_protocol::local::LocalBuild;
 
 use crate::runtime::binding::{
     BindingEvent, BindingHandle, BindingOwner, BindingRequest, DEFAULT_EVENT_QUEUE, Incarnation,
@@ -52,6 +57,9 @@ use crate::runtime::binding::{
 use crate::runtime::budget::CallKind;
 use crate::runtime::compile::{CompileOrigin, Payload};
 use crate::runtime::error::RuntimeError;
+use crate::service::four::{
+    self, Added, Answered, Dialect, Extra, Incoming, consumed_notice4_of, notice4_of,
+};
 use crate::service::wire;
 
 /// How long a registration may keep a worker waiting.
@@ -182,6 +190,12 @@ pub struct PluginHost {
     register_deadline: core::time::Duration,
     /// How long an unbind may keep a worker waiting.
     unbind_deadline: core::time::Duration,
+    /// Whether this host writes what only `kr-plugin-host/4` has a word for: what an instance has
+    /// consumed, and the positions of what a loss or a fault was about. A host with it closed
+    /// reads every member of a request and writes none of them.
+    writer_open: bool,
+    /// The build of this program, as its `/4` hello answers it.
+    build: LocalBuild,
     /// The pause the notice writers take between taking a notice and writing it, which a test
     /// holds to stand where a document has left the queue and not yet been written.
     #[cfg(feature = "testing")]
@@ -292,6 +306,8 @@ impl PluginHost {
             started: std::time::Instant::now(),
             register_deadline: REGISTER_DEADLINE,
             unbind_deadline: UNBIND_DEADLINE,
+            writer_open: kr_protocol::retained::replay_writer_open(),
+            build: four::own_build(),
             #[cfg(feature = "testing")]
             notice_hold: Arc::new(kr_plugin_service::hold::Hold::default()),
             #[cfg(feature = "testing")]
@@ -311,6 +327,25 @@ impl PluginHost {
     #[must_use]
     pub fn registering_within(mut self, deadline: core::time::Duration) -> Self {
         self.register_deadline = deadline;
+        self
+    }
+
+    /// Opens or closes this host's writer, for the tests of what a host writes either way: the
+    /// shipped default is `kr_protocol::retained::replay_writer_open`, which no test should depend
+    /// on.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub const fn with_writer_open(mut self, open: bool) -> Self {
+        self.writer_open = open;
+        self
+    }
+
+    /// Gives this host `build` as the build its `/4` hello states, for the tests of what a worker
+    /// is told.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn with_build(mut self, build: LocalBuild) -> Self {
+        self.build = build;
         self
     }
 
@@ -397,21 +432,24 @@ impl PluginHost {
         &self.config
     }
 
-    /// Serves workers until `shutdown` resolves.
+    /// Serves workers of `protocol` until `shutdown` resolves, on the endpoint the host was
+    /// configured with.
     ///
     /// Every accepted connection is served by its own task, so one worker's registration does not
     /// delay another's observation.
     ///
     /// # Errors
     ///
-    /// Returns [`LaunchError::Endpoint`] when the endpoint cannot be bound.
+    /// Returns [`LaunchError::Endpoint`] when the endpoint cannot be bound, and
+    /// [`LaunchError::Refused`] for a protocol this host has no frames for.
     #[cfg(any(test, feature = "testing"))]
     pub async fn serve(
         self: Arc<Self>,
+        protocol: HostProtocol,
         shutdown: impl core::future::Future<Output = ()> + Send,
     ) -> LaunchResult<()> {
         let listener = Listener::bind(&self.config.endpoint)?;
-        self.serve_on(listener, shutdown).await
+        self.serve_on(listener, protocol, shutdown).await
     }
 
     /// Serves workers on an endpoint this process already holds.
@@ -422,12 +460,26 @@ impl PluginHost {
     ///
     /// # Errors
     ///
-    /// Returns [`LaunchError::Endpoint`] when the listener fails.
+    /// Every connection it accepts speaks `protocol`: each endpoint speaks one protocol, and a
+    /// host that serves two does so on two listeners, one call each. What `Verify` signs is the
+    /// endpoint of the listener, which is the one the connection arrived on.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LaunchError::Endpoint`] when the listener fails, and [`LaunchError::Refused`] for a
+    /// protocol this host has no frames for.
     pub async fn serve_on(
         self: Arc<Self>,
         listener: Listener,
+        protocol: HostProtocol,
         shutdown: impl core::future::Future<Output = ()> + Send,
     ) -> LaunchResult<()> {
+        let Some(dialect) = Dialect::of(protocol) else {
+            return Err(LaunchError::Refused {
+                detail: format!("this host has no frames for {}", protocol.name),
+            });
+        };
+        let arrival = listener.endpoint().as_text();
         let mut shutdown = core::pin::pin!(shutdown);
         loop {
             tokio::select! {
@@ -444,13 +496,21 @@ impl PluginHost {
                         continue;
                     }
                     let host = Arc::clone(&self);
-                    tokio::spawn(async move { host.serve_connection(connection).await });
+                    let arrival = arrival.clone();
+                    tokio::spawn(async move {
+                        host.serve_connection(connection, dialect, arrival).await;
+                    });
                 }
             }
         }
     }
 
-    async fn serve_connection(self: Arc<Self>, connection: kr_ipc::endpoint::Connection) {
+    async fn serve_connection(
+        self: Arc<Self>,
+        connection: kr_ipc::endpoint::Connection,
+        dialect: Dialect,
+        arrival: String,
+    ) {
         let (reader, writer) = split(connection, StreamKind::Control);
         let writer = Arc::new(tokio::sync::Mutex::new(writer));
         let (sink, stream) = kr_plugin_service::notices::channel();
@@ -463,6 +523,8 @@ impl PluginHost {
             bindings: Arc::default(),
             conversation: Arc::clone(&conversation),
             registered: Registered::default(),
+            dialect,
+            arrival,
         });
 
         // One task writes notices, so a burst of document nodes from one binding cannot interleave
@@ -473,6 +535,7 @@ impl PluginHost {
             notice_writer,
             Arc::clone(&conversation),
             Arc::clone(&served.registered),
+            dialect,
             #[cfg(feature = "testing")]
             Arc::clone(&self.notice_hold),
         ));
@@ -516,16 +579,17 @@ impl PluginHost {
 
     async fn read_requests(self: Arc<Self>, mut reader: FrameReader, served: &Arc<Served>) {
         loop {
-            let request: Request = tokio::select! {
+            let request: Incoming = tokio::select! {
                 // Anything that decided this connection is over ends the reading too, rather than
                 // leaving a reader waiting for a request nobody could be answered about.
                 () = served.conversation.ended() => return,
-                read = reader.read_message_without_schema() => match read {
-                    Ok(request) => request,
+                read = read_request(&mut reader, served.dialect) => match read {
+                    Some(request) => request,
                     // A closed connection or a frame this protocol does not admit. Either way this
                     // conversation is over; the union is closed so an unrecognised frame is a
-                    // refusal rather than something to guess at.
-                    Err(_error) => return,
+                    // refusal rather than something to guess at, and a handle over its bound is
+                    // one the frame cannot hold.
+                    None => return,
                 },
             };
             if served.conversation.is_over() {
@@ -544,8 +608,12 @@ impl PluginHost {
             if immediate(&request.body) {
                 // Answered on the reading task, because none of these enters a component: the
                 // answer is this host's own and it is already known.
-                let body = self.answer(request.body, Settled::default(), served).await;
-                if !respond(served, reply_to, name, body).await {
+                let settled = Settled {
+                    extra: request.extra,
+                    ..Settled::default()
+                };
+                let answered = self.answer(request.body, settled, served).await;
+                if !respond(served, reply_to, name, answered).await {
                     return;
                 }
                 continue;
@@ -554,7 +622,7 @@ impl PluginHost {
             // request never waits for it. That is what keeps an observation from queueing behind a
             // snapshot, and a registration from delaying either.
             let Ok(permit) = Arc::clone(&served.work).try_acquire_owned() else {
-                let body = match request.body {
+                let answered = match request.body {
                     // An unbind is answered with the binding out of the runtime like any other,
                     // and taking it out waits for nothing.
                     RequestBody::Unbind { binding_id } => {
@@ -567,8 +635,9 @@ impl PluginHost {
                         ),
                         disabled: false,
                     },
-                };
-                if !respond(served, reply_to, name, body).await {
+                }
+                .into();
+                if !respond(served, reply_to, name, answered).await {
                     return;
                 }
                 continue;
@@ -576,7 +645,7 @@ impl PluginHost {
             // What the request is about is settled here, as it is read, and not when its task
             // runs: the requests after it are read before the task starts, and the registrations
             // they make are not what this one is about.
-            let settled = settle(&request.body, served);
+            let settled = settle(&request.body, request.extra, served);
             let host = Arc::clone(&self);
             let served = Arc::clone(served);
             tokio::spawn(async move {
@@ -585,11 +654,11 @@ impl PluginHost {
                 if called_binding(&request.body).is_some() {
                     host.calling_hold.pause().await;
                 }
-                let body = host.answer(request.body, settled, &served).await;
+                let answered = host.answer(request.body, settled, &served).await;
                 // An answer that could not be delivered ends the connection. Leaving the reader
                 // waiting for the next request on a connection whose last answer never arrived
                 // would be serving a worker that cannot hear.
-                if !respond(&served, reply_to, name, body).await {
+                if !respond(&served, reply_to, name, answered).await {
                     served.conversation.end();
                 }
             });
@@ -597,20 +666,40 @@ impl PluginHost {
     }
 
     /// Answers one request, turning a refusal into the answer that carries it.
-    async fn answer(
-        &self,
-        body: RequestBody,
-        settled: Settled,
-        served: &Arc<Served>,
-    ) -> ResponseBody {
+    async fn answer(&self, body: RequestBody, settled: Settled, served: &Arc<Served>) -> Answered {
         let name = body.name();
-        self.handle(body, settled, served)
-            .await
-            .unwrap_or_else(|(detail, disabled)| ResponseBody::Refused {
+        if served.dialect == Dialect::Four
+            && let RequestBody::Hello { protocol } = &body
+        {
+            return self.hello_four(protocol, served);
+        }
+        let mut added = Added::default();
+        match self.handle(body, settled, served, &mut added).await {
+            Ok(body) => Answered::Shared(body, added),
+            Err((detail, disabled)) => ResponseBody::Refused {
                 request: name.to_owned(),
                 detail: clipped(detail),
                 disabled,
-            })
+            }
+            .into(),
+        }
+    }
+
+    /// Answers a hello on the endpoint of `/4`: the descriptor of this host as that endpoint states
+    /// it, or the refusal, which disables nothing, when the caller offers another protocol.
+    fn hello_four(&self, protocol: &str, served: &Served) -> Answered {
+        if protocol != HostProtocol::V4.name {
+            return ResponseBody::Refused {
+                request: "hello".to_owned(),
+                detail: format!(
+                    "this host speaks {} and the caller offered {protocol}",
+                    HostProtocol::V4.name
+                ),
+                disabled: false,
+            }
+            .into();
+        }
+        Answered::Hello4(Box::new(self.descriptor4(&served.arrival)))
     }
 
     /// Starts a task that stamps one registration's events with its identifier, and returns the
@@ -641,6 +730,7 @@ impl PluginHost {
         registered: Registered,
         conversation: Arc<Conversation>,
         place: Place,
+        shape: Shape,
     ) -> (tokio::sync::mpsc::Sender<BindingEvent>, Ended) {
         let (events, mut pending) = tokio::sync::mpsc::channel::<BindingEvent>(DEFAULT_EVENT_QUEUE);
         let (ending, ended) = Ended::new();
@@ -650,7 +740,7 @@ impl PluginHost {
             let _ending = ending;
             let _place = place;
             while let Some(event) = pending.recv().await {
-                let pieces = notices_of(binding_id, event);
+                let pieces = pieces_of(binding_id, event, shape);
                 let outcome = {
                     let Ok(held) = registered.lock() else {
                         continue;
@@ -659,8 +749,14 @@ impl PluginHost {
                         continue;
                     }
                     let mut outcome = Offered::Kept;
-                    for notice in pieces {
-                        match notices.send_from(origin, notice) {
+                    for piece in pieces {
+                        let offered = match piece {
+                            Piece::Notice(notice, beyond) => {
+                                notices.send_from_with(origin, notice, beyond)
+                            }
+                            Piece::Consumed(report) => notices.send_consumed_from(origin, report),
+                        };
+                        match offered {
                             // A dropped document is answered where the loss is reported, because
                             // the binding that lost one is not always the binding that made room.
                             Offered::Kept | Offered::Dropped | Offered::Withheld => {}
@@ -687,11 +783,14 @@ impl PluginHost {
         (events, ended)
     }
 
+    /// Answers one request in the vocabulary both protocols share, and puts what only `/4` says of
+    /// the answer in `added`.
     async fn handle(
         &self,
         body: RequestBody,
         settled: Settled,
         served: &Arc<Served>,
+        added: &mut Added,
     ) -> Result<ResponseBody, (String, bool)> {
         match body {
             RequestBody::Hello { protocol } => {
@@ -710,13 +809,16 @@ impl PluginHost {
                 })
             }
             RequestBody::Verify { nonce } => {
+                // The endpoint the connection came in on, which the caller reached and checks the
+                // proof against, and not the one this host was configured with.
                 let proof = self
                     .identity
-                    .answer(&nonce, &self.config.endpoint.as_text())
+                    .answer(&nonce, &served.arrival)
                     .map_err(|error| (error.to_string(), false))?;
                 Ok(ResponseBody::Verified(Box::new(proof)))
             }
             RequestBody::RegisterBinding(registration) => {
+                added.registration = settled.extra.registration;
                 self.register(*registration, settled.registering, served)
                     .await
             }
@@ -728,8 +830,9 @@ impl PluginHost {
                     return Err((reason, true));
                 }
                 let scoped = event_of(&event).map_err(|detail| (detail, false))?;
-                let admission = binding.enqueue_observation(scoped).admission;
-                Ok(admission_of(admission))
+                let offered = binding.enqueue_observation(scoped);
+                added.free_bytes = Some(offered.free_bytes);
+                Ok(admission_of(offered.admission))
             }
             RequestBody::Snapshot {
                 binding_id,
@@ -779,9 +882,21 @@ impl PluginHost {
                     .await;
                 called_of(result.map(|result| {
                     (
-                        result
-                            .answer
-                            .map(|checkpoint| CallValue::State(checkpoint.state)),
+                        result.answer.map(|checkpoint| {
+                            if served.dialect == Dialect::Four && self.writer_open {
+                                added.consumed =
+                                    registration_of(served, &binding).map(|registration| {
+                                        ConsumedFrame {
+                                            registration,
+                                            generation: checkpoint.consumed.generation,
+                                            clean: checkpoint.consumed.clean,
+                                            native: checkpoint.consumed.native,
+                                            terminal: checkpoint.consumed.terminal,
+                                        }
+                                    });
+                            }
+                            CallValue::State(checkpoint.state)
+                        }),
                         result.document,
                     )
                 }))
@@ -791,15 +906,52 @@ impl PluginHost {
                 state,
                 deadline_ms,
             } => {
+                let Extra {
+                    registration,
+                    through,
+                } = settled.extra.clone();
                 let binding = settled.binding_of(binding_id)?;
+                let mut through = through;
+                if served.dialect == Dialect::Four {
+                    let own = registration_of(served, &binding);
+                    if registration != own {
+                        return Err(refused(format!(
+                            "the restore is for registration {} and binding {binding_id} was registered as {}",
+                            registration
+                                .map_or_else(|| "none".to_owned(), |number| number.to_string()),
+                            own.map_or_else(|| "none".to_owned(), |number| number.to_string()),
+                        )));
+                    }
+                    if !self.writer_open && through.is_some() {
+                        // A host that does not keep the record cannot say the state covers what the
+                        // position says it does, so it restores nothing, and the worker is told the
+                        // record was not set.
+                        added.record = Some(RecordState::NotSet);
+                        return Ok(ResponseBody::Called {
+                            value: Some(CallValue::Document),
+                            fault: None,
+                            document: None,
+                        });
+                    }
+                } else {
+                    through = None;
+                }
+                let asked_to_set = through.is_some();
                 let result = binding
-                    .restore(state, None, core::time::Duration::from_millis(deadline_ms))
+                    .restore(
+                        state,
+                        through,
+                        core::time::Duration::from_millis(deadline_ms),
+                    )
                     .await;
-                called_of(
-                    result.map(|result| {
-                        (result.answer.map(|()| CallValue::Document), result.document)
-                    }),
-                )
+                called_of(result.map(|result| {
+                    added.record = Some(if asked_to_set && result.answer.is_ok() {
+                        RecordState::Set
+                    } else {
+                        RecordState::NotSet
+                    });
+                    (result.answer.map(|()| CallValue::Document), result.document)
+                }))
             }
             RequestBody::Decode(call) => {
                 let DecodeCall {
@@ -1072,6 +1224,10 @@ impl PluginHost {
             identity,
             facts: facts_of(&facts),
             executable,
+            // A host that does not write the report, or a connection that has no frame for it,
+            // asks the binding for none, so a report never shares the channel with a document of
+            // a worker that cannot read it.
+            report_consumed: served.dialect == Dialect::Four && self.writer_open,
         };
         // This registration's own number, which everything that concerns it is kept and removed
         // by: the notices its thread produces, the place it holds and its entry in the runtime.
@@ -1084,6 +1240,10 @@ impl PluginHost {
             Arc::clone(&served.registered),
             Arc::clone(&served.conversation),
             binding_place,
+            Shape {
+                dialect: served.dialect,
+                writer_open: self.writer_open,
+            },
         );
         // Standing behind the registration is what lets its forwarder pass its notices on, and
         // the forwarder is attached in one step with finding out that the connection still does,
@@ -1314,6 +1474,22 @@ impl PluginHost {
         refused(format!("{why}, and {outcome}"))
     }
 
+    /// The descriptor of this host as the endpoint `arrival` of `/4` states it.
+    fn descriptor4(&self, arrival: &str) -> HostDescriptor4 {
+        HostDescriptor4 {
+            protocol: HostProtocol::V4.name.to_owned(),
+            environment_id: self.identity.environment_id(),
+            reservation_id: kr_protocol::worker::ReservationId::new(
+                kr_protocol::scalars::Uuid::from_bytes([0; 16]),
+            ),
+            endpoint: arrival.to_owned(),
+            boot_identity: self.identity.boot_identity().clone(),
+            process_start_identity: self.identity.process_start_identity().clone(),
+            host_public_key: *self.identity.public_key(),
+            build: self.build.clone(),
+        }
+    }
+
     fn descriptor(&self) -> kr_plugin_service::protocol::HostDescriptor {
         kr_plugin_service::protocol::HostDescriptor {
             protocol: HostProtocol::V3.name.to_owned(),
@@ -1385,6 +1561,10 @@ struct Served {
     bindings: Arc<BindingPlaces>,
     /// Whether it is still worth talking on.
     conversation: Arc<Conversation>,
+    /// The protocol this connection speaks, which is what the endpoint it arrived on speaks.
+    dialect: Dialect,
+    /// The endpoint it arrived on, as `Verify` signs it.
+    arrival: String,
     /// The bindings this connection holds, by identifier.
     ///
     /// The notice writer needs them: when it tells a worker that documents were lost, it asks the
@@ -1447,7 +1627,10 @@ struct Held {
     /// connection stops standing behind it: a removal began, or it failed to finish registering.
     /// A forwarder passes nothing on for a registration that is not here, whatever its thread still
     /// produces, and the notice writer writes nothing that registration left behind.
-    standing: std::collections::HashSet<Origin>,
+    ///
+    /// Each is kept with the number the worker gave it on `/4`, which is how a notice on that
+    /// endpoint names the registration it is about, and nothing on `/3`.
+    standing: std::collections::HashMap<Origin, u64>,
     /// When each registration's forwarder has ended, for as long as the connection records the
     /// registration, which is after it stops standing behind it and until it is out of the runtime.
     /// A registration has none until its forwarder starts.
@@ -1534,8 +1717,14 @@ impl Held {
     }
 
     /// Starts standing behind a registration the connection has read.
-    fn stand(&mut self, incarnation: Incarnation) {
-        self.standing.insert(origin_of(incarnation));
+    fn stand(&mut self, incarnation: Incarnation, registration: u64) {
+        self.standing.insert(origin_of(incarnation), registration);
+    }
+
+    /// Returns the number the worker gave the registration `origin` names, while this connection
+    /// stands behind it.
+    fn registration_number(&self, origin: Origin) -> Option<u64> {
+        self.standing.get(&origin).copied()
     }
 
     /// Records when a registration's forwarder ends, and says whether the connection still stands
@@ -1556,7 +1745,7 @@ impl Held {
 
     /// Returns true while this connection stands behind the registration that `origin` names.
     fn stands_behind(&self, origin: Origin) -> bool {
-        self.standing.contains(&origin)
+        self.standing.contains_key(&origin)
     }
 
     /// Returns when the registration's forwarder has ended, while this connection records it.
@@ -1593,7 +1782,7 @@ impl Held {
     /// From here nothing that registration's thread produces reaches the notice queue: the
     /// forwarder checks and sends under this record.
     fn retire(&mut self, incarnation: Incarnation) -> bool {
-        self.standing.remove(&origin_of(incarnation))
+        self.standing.remove(&origin_of(incarnation)).is_some()
     }
 
     /// Removes one registration's entries once it is out of the runtime: its binding, if it is the
@@ -1748,13 +1937,27 @@ impl BindingPlaces {
 
 /// Writes one connection's notices, one frame at a time.
 async fn write_notices(
-    mut notices: NoticeStream,
+    notices: NoticeStream,
     writer: Arc<tokio::sync::Mutex<FrameWriter>>,
     conversation: Arc<Conversation>,
     registered: Registered,
+    dialect: Dialect,
     #[cfg(feature = "testing")] hold: Arc<kr_plugin_service::hold::Hold>,
 ) {
-    while let Some(Delivered { origin, notice }) = notices.recv_delivered().await {
+    if dialect == Dialect::Four {
+        write_notices_four(
+            notices,
+            writer,
+            conversation,
+            registered,
+            #[cfg(feature = "testing")]
+            hold,
+        )
+        .await;
+        return;
+    }
+    let mut notices = notices;
+    while let Some(Delivered { origin, notice, .. }) = notices.recv_delivered().await {
         #[cfg(feature = "testing")]
         hold.pause().await;
         // A document the worker never received leaves it with a stale view, and the component is
@@ -1794,6 +1997,81 @@ async fn write_notices(
     }
 }
 
+/// Writes the notices of a `/4` connection, one frame at a time, in the order the queue gives them:
+/// a loss first, then what was queued, and a report of what an instance consumed after every
+/// notice queued before it.
+async fn write_notices_four(
+    mut notices: NoticeStream,
+    writer: Arc<tokio::sync::Mutex<FrameWriter>>,
+    conversation: Arc<Conversation>,
+    registered: Registered,
+    #[cfg(feature = "testing")] hold: Arc<kr_plugin_service::hold::Hold>,
+) {
+    while let Some(delivery) = notices.recv_four().await {
+        #[cfg(feature = "testing")]
+        hold.pause().await;
+        if let Delivery::Notice(Delivered {
+            origin: Some(origin),
+            notice:
+                Notice::Gap {
+                    binding_id,
+                    documents,
+                    ..
+                },
+            ..
+        }) = &delivery
+            && *documents > 0
+            && let Ok(mut held) = registered.lock()
+        {
+            // As on `/3`: documents the worker never received are documents the component draws
+            // again.
+            held.redraw(*origin, *binding_id);
+        }
+        let written = tokio::time::timeout(WRITE_DEADLINE, async {
+            let mut writer = writer.lock().await;
+            let frame = match delivery {
+                Delivery::Notice(Delivered {
+                    origin,
+                    notice,
+                    beyond,
+                }) => {
+                    if leaves_unwritten(&notices, &registered, origin, &notice) {
+                        return Ok(());
+                    }
+                    let Some(registration) = registration_behind(&registered, origin) else {
+                        return Ok(());
+                    };
+                    notice4_of(notice, beyond, registration)
+                }
+                Delivery::Consumed(ConsumedDelivered { origin, report }) => {
+                    // A registration the connection no longer stands behind has no number, and
+                    // what it consumed is nothing a worker is told.
+                    let Some(registration) = registration_behind(&registered, origin) else {
+                        return Ok(());
+                    };
+                    consumed_notice4_of(report, registration)
+                }
+            };
+            writer.write_message(&Frame4::Notice(frame)).await
+        })
+        .await;
+        if !matches!(written, Ok(Ok(()))) {
+            conversation.end();
+            return;
+        }
+    }
+    if notices.overflowed() {
+        conversation.end();
+    }
+}
+
+/// Returns the number the worker gave the registration `origin` names, while the connection stands
+/// behind it. A notice that came with no word of its registration is not one `/4` can name.
+fn registration_behind(registered: &Registered, origin: Option<Origin>) -> Option<u64> {
+    let held = registered.lock().ok()?;
+    held.registration_number(origin?)
+}
+
 /// Says whether the notice writer, holding the connection's writer, leaves a notice unwritten.
 ///
 /// Looked at under the writer, which the answer to an unbind is written under: what a registration
@@ -1823,26 +2101,74 @@ fn leaves_unwritten(
     notices.skips_withheld(origin, notice)
 }
 
+/// Reads the next request of a connection, in the protocol the connection speaks.
+///
+/// Nothing when the connection is closed or the frame is not one this protocol admits.
+async fn read_request(reader: &mut FrameReader, dialect: Dialect) -> Option<Incoming> {
+    match dialect {
+        Dialect::Three => reader
+            .read_message_without_schema::<Request>()
+            .await
+            .ok()
+            .map(Incoming::three),
+        Dialect::Four => reader
+            .read_message_without_schema::<Request4>()
+            .await
+            .ok()
+            .map(Incoming::four),
+    }
+}
+
+/// Writes one answer as a frame of the protocol the connection speaks.
+async fn write_answer(
+    writer: &mut FrameWriter,
+    dialect: Dialect,
+    reply_to: u64,
+    answered: Answered,
+) -> kr_ipc::Result<()> {
+    match (dialect, answered) {
+        (Dialect::Three, Answered::Shared(body, _added)) => {
+            writer
+                .write_message(&Frame::Response { reply_to, body })
+                .await
+        }
+        (Dialect::Three, Answered::Hello4(_)) => {
+            // Nothing asks a `/3` connection for a `/4` hello. Said rather than left unanswered.
+            let body = ResponseBody::Refused {
+                request: "hello".to_owned(),
+                detail: format!("this host speaks {}", HostProtocol::V3.name),
+                disabled: false,
+            };
+            writer
+                .write_message(&Frame::Response { reply_to, body })
+                .await
+        }
+        (Dialect::Four, answered) => {
+            let body = answered.into_four(HostProtocol::V4.name);
+            writer
+                .write_message(&Frame4::Response { reply_to, body })
+                .await
+        }
+    }
+}
+
 /// Writes one answer, and says whether the connection is still usable.
 ///
 /// An answer that will not fit a frame is this host's failure to bound something, not the
 /// connection's end: the caller is told so by name and the connection carries on.
-async fn respond(served: &Served, reply_to: u64, name: &str, body: ResponseBody) -> bool {
+async fn respond(served: &Served, reply_to: u64, name: &str, answered: Answered) -> bool {
     // The whole of it, the wait for the writer included: a peer that has stopped reading would
     // otherwise hold this task and every other answer on this connection behind it.
     let written = tokio::time::timeout(WRITE_DEADLINE, async {
         let mut writer = served.writer.lock().await;
         // Looked at under the writer, as a document is: while documents are withheld the
         // presentation of a decoded request is as much a document as a notice is.
-        let body = if served.notices.documents_withheld() {
-            without_presentation(body)
+        let answered = if served.notices.documents_withheld() {
+            answered.without_presentation()
         } else {
-            body
+            answered
         };
-        match writer
-            .write_message(&Frame::Response { reply_to, body })
-            .await
-        {
+        match write_answer(&mut writer, served.dialect, reply_to, answered).await {
             Ok(()) => true,
             Err(kr_ipc::IpcError::Frame(error)) => {
                 let refused = ResponseBody::Refused {
@@ -1850,11 +2176,7 @@ async fn respond(served: &Served, reply_to: u64, name: &str, body: ResponseBody)
                     detail: format!("this host could not deliver its own answer: {error}"),
                     disabled: false,
                 };
-                writer
-                    .write_message(&Frame::Response {
-                        reply_to,
-                        body: refused,
-                    })
+                write_answer(&mut writer, served.dialect, reply_to, refused.into())
                     .await
                     .is_ok()
             }
@@ -1874,20 +2196,21 @@ async fn set_privacy(served: &Served, reply_to: u64, private: bool) -> bool {
     let written = tokio::time::timeout(WRITE_DEADLINE, async {
         let mut writer = served.writer.lock().await;
         served.notices.withhold_documents(private);
-        writer
-            .write_message(&Frame::Response {
-                reply_to,
-                body: ResponseBody::PrivacySet { private },
-            })
-            .await
-            .is_ok()
+        write_answer(
+            &mut writer,
+            served.dialect,
+            reply_to,
+            ResponseBody::PrivacySet { private }.into(),
+        )
+        .await
+        .is_ok()
     })
     .await;
     written.unwrap_or(false)
 }
 
 /// Returns an answer with the presentation of a decoded request left out.
-fn without_presentation(body: ResponseBody) -> ResponseBody {
+pub(super) fn without_presentation(body: ResponseBody) -> ResponseBody {
     match body {
         ResponseBody::Called {
             value: Some(CallValue::Decoded(mut decoded)),
@@ -1968,6 +2291,8 @@ struct Settled {
     /// For a call into a binding, the binding it is about; none when the connection stood behind
     /// none under the identifier.
     binding: Option<Arc<BindingHandle>>,
+    /// What the request says that only `/4` has a word for.
+    extra: Extra,
 }
 
 impl Settled {
@@ -1982,14 +2307,20 @@ impl Settled {
 
 /// Settles what one request is about: the registration a request to register records, the one a
 /// request to unbind is about, and the binding a call into a component is about.
-fn settle(body: &RequestBody, served: &Served) -> Settled {
+fn settle(body: &RequestBody, extra: Extra, served: &Served) -> Settled {
     match body {
         RequestBody::RegisterBinding(registration) => Settled {
-            registering: begin(served, registration.binding_id),
+            registering: begin(
+                served,
+                registration.binding_id,
+                extra.registration.unwrap_or_default(),
+            ),
+            extra,
             ..Settled::default()
         },
         RequestBody::Unbind { binding_id } => Settled {
             leaving: leave(served, *binding_id),
+            extra,
             ..Settled::default()
         },
         _ => Settled {
@@ -2000,6 +2331,7 @@ fn settle(body: &RequestBody, served: &Served) -> Settled {
                     .ok()
                     .and_then(|held| held.standing_binding(binding_id))
             }),
+            extra,
             ..Settled::default()
         },
     }
@@ -2023,14 +2355,24 @@ fn called_binding(body: &RequestBody) -> Option<Uuid> {
 ///
 /// An identifier has one registration in flight at a time: nothing is recorded, and there is no
 /// incarnation, when it already has one.
-fn begin(served: &Served, binding_id: Uuid) -> Option<Incarnation> {
+fn begin(served: &Served, binding_id: Uuid, registration: u64) -> Option<Incarnation> {
     let incarnation = Incarnation::next();
     let mut held = served.registered.lock().ok()?;
     if !held.preparing(binding_id, incarnation) {
         return None;
     }
-    held.stand(incarnation);
+    held.stand(incarnation, registration);
     Some(incarnation)
+}
+
+/// Returns the number the worker gave the registration of `binding` on `/4`, while the connection
+/// stands behind the registration.
+fn registration_of(served: &Served, binding: &BindingHandle) -> Option<u64> {
+    served
+        .registered
+        .lock()
+        .ok()
+        .and_then(|held| held.registration_number(origin_of(binding.incarnation())))
 }
 
 /// What an unbind is about: the registration the connection holds under the identifier.
@@ -2237,6 +2579,84 @@ fn notices_of(binding_id: BindingId, event: BindingEvent) -> Vec<Notice> {
         BindingEvent::Disabled { reason } => vec![Notice::Disabled { binding_id, reason }],
         // The third protocol has no frame for it.
         BindingEvent::Consumed(_) => Vec::new(),
+    }
+}
+
+/// What a registration's events become as notices: how it is shaped by the protocol of its
+/// connection and by whether the host's writer is open.
+#[derive(Clone, Copy, Debug)]
+struct Shape {
+    dialect: Dialect,
+    writer_open: bool,
+}
+
+/// One thing the queue is offered for a registration's event.
+enum Piece {
+    /// A notice of `/3`, and what `/4` says of it.
+    Notice(Notice, Beyond),
+    /// What the instance has consumed.
+    Consumed(ConsumedReport),
+}
+
+/// Turns one thing a binding produced into what the connection's queue is offered.
+///
+/// On `/3` that is the notices of [`notices_of`], and nothing else. On `/4` the positions of a loss,
+/// the event a fault is about and what the instance has consumed are carried as well, where the
+/// host's writer is open: a host that keeps no record writes none of them. A gap's positions are
+/// the binding's own, and a gap that the binding could not send, because its channel was full, is
+/// told as lost documents with no positions; the report that follows says `clean` is false then,
+/// since the same loss cleared it.
+fn pieces_of(binding_id: BindingId, event: BindingEvent, shape: Shape) -> Vec<Piece> {
+    let plain = |notices: Vec<Notice>, beyond: &Beyond| -> Vec<Piece> {
+        notices
+            .into_iter()
+            .map(|notice| Piece::Notice(notice, beyond.clone()))
+            .collect()
+    };
+    if shape.dialect == Dialect::Three {
+        return plain(notices_of(binding_id, event), &Beyond::default());
+    }
+    let open = shape.writer_open;
+    match event {
+        BindingEvent::Gap(gap) => {
+            let beyond = Beyond {
+                first: gap.first.clone().filter(|_| open),
+                last: gap.last.clone().filter(|_| open),
+                ..Beyond::default()
+            };
+            plain(notices_of(binding_id, BindingEvent::Gap(gap)), &beyond)
+        }
+        BindingEvent::Fault {
+            call,
+            detail,
+            faults_in_window,
+            event: trapped,
+            generation,
+        } => {
+            let beyond = Beyond {
+                event: trapped.filter(|_| open),
+                generation,
+                ..Beyond::default()
+            };
+            let fault = BindingEvent::Fault {
+                call,
+                detail,
+                faults_in_window,
+                event: None,
+                generation,
+            };
+            plain(notices_of(binding_id, fault), &beyond)
+        }
+        // A binding reports only to a caller that asked, and a host asks only with its writer
+        // open, so a report that arrives is one to write.
+        BindingEvent::Consumed(consumed) => vec![Piece::Consumed(ConsumedReport {
+            binding_id: binding_id.get(),
+            generation: consumed.generation,
+            clean: consumed.clean,
+            native: consumed.native,
+            terminal: consumed.terminal,
+        })],
+        other => plain(notices_of(binding_id, other), &Beyond::default()),
     }
 }
 

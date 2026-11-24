@@ -6,6 +6,7 @@
 //! `crates/kr-plugin-host/tests/service.rs`, where there is a real one to kill.
 
 mod components;
+mod four;
 
 use std::sync::Arc;
 
@@ -40,6 +41,8 @@ struct Served {
     descriptor: HostDescriptor,
     host: Arc<PluginHost>,
     serving: tokio::task::JoinHandle<()>,
+    /// The endpoint of the fourth protocol and the task serving it, on a host that serves both.
+    four: Option<(String, tokio::task::JoinHandle<()>)>,
     // Declared last: the directory is removed after every field above has let go of its files.
     _temp: kr_ipc::testing::TempHost,
 }
@@ -48,7 +51,27 @@ impl Served {
     /// A host whose epoch runs, so that a call into a component is stopped by its deadline when the
     /// machine's time passes it.
     async fn start() -> Self {
-        Self::start_with(false, None).await
+        Self::start_with(false, None, None).await
+    }
+
+    /// A host whose epoch no time advances, serving the third protocol on its endpoint and the
+    /// fourth on its own, with its writer `open` or closed by the setter and a build of its own
+    /// ([`Served::build`]).
+    async fn start_dual(open: bool) -> Self {
+        Self::start_with(true, None, Some(open)).await
+    }
+
+    /// The build a host started by [`Served::start_dual`] states.
+    fn build() -> kr_protocol::local::LocalBuild {
+        kr_protocol::local::LocalBuild::this(
+            kr_protocol::ids::BuildId::new("kr-plugin-host/0.0.0-test")
+                .expect("a build identifier"),
+        )
+    }
+
+    /// The endpoint of the fourth protocol, on a host started by [`Served::start_dual`].
+    fn endpoint4(&self) -> &str {
+        &self.four.as_ref().expect("a host serving both").0
     }
 
     /// A host whose epoch no time advances: a call into a component is stopped by its deadline only
@@ -56,17 +79,21 @@ impl Served {
     /// slow to run a call cannot make a component fault. For the cases that read what a call
     /// returns and are not about a deadline.
     async fn start_held() -> Self {
-        Self::start_with(true, None).await
+        Self::start_with(true, None, None).await
     }
 
     /// A host that gives an unbind `deadline` to be answered in, instead of half a second short of
     /// what a worker's client waits for it, and whose epoch no time advances, so that nothing
     /// registering a component on it is stopped by a deadline of the component's.
     async fn start_unbinding_within(deadline: core::time::Duration) -> Self {
-        Self::start_with(true, Some(deadline)).await
+        Self::start_with(true, Some(deadline), None).await
     }
 
-    async fn start_with(epoch_held: bool, unbinding_within: Option<core::time::Duration>) -> Self {
+    async fn start_with(
+        epoch_held: bool,
+        unbinding_within: Option<core::time::Duration>,
+        four: Option<bool>,
+    ) -> Self {
         let temp = kr_ipc::testing::TempHost::create();
         let environment = temp.environment();
         // Owner-only: it holds the payloads this host compiles, and the host refuses a packages
@@ -96,8 +123,12 @@ impl Served {
         }
         .expect("a plugin host")
         .registering_within(REGISTRATION_PATIENCE);
-        let host = Arc::new(match unbinding_within {
+        let host = match unbinding_within {
             Some(deadline) => host.unbinding_within(deadline),
+            None => host,
+        };
+        let host = Arc::new(match four {
+            Some(open) => host.with_writer_open(open).with_build(Self::build()),
             None => host,
         });
         // The endpoint is bound here, before the host serves on it, so a client that connects at
@@ -110,15 +141,34 @@ impl Served {
         let serving = tokio::spawn({
             let host = Arc::clone(&host);
             async move {
-                let _ = host.serve_on(listener, core::future::pending::<()>()).await;
+                let _ = host
+                    .serve_on(listener, HostProtocol::V3, core::future::pending::<()>())
+                    .await;
             }
         });
+        let four = if four.is_some() {
+            let endpoint = host_endpoint(&environment, &HostProtocol::V4).expect("an endpoint");
+            let listener = kr_ipc::endpoint::Listener::bind(&endpoint)
+                .expect("the fourth protocol's endpoint is bound");
+            let serving = tokio::spawn({
+                let host = Arc::clone(&host);
+                async move {
+                    let _ = host
+                        .serve_on(listener, HostProtocol::V4, core::future::pending::<()>())
+                        .await;
+                }
+            });
+            Some((endpoint.as_text(), serving))
+        } else {
+            None
+        };
         Self {
             _temp: temp,
             packages,
             descriptor,
             host,
             serving,
+            four,
         }
     }
 
@@ -166,6 +216,9 @@ impl Served {
 impl Drop for Served {
     fn drop(&mut self) {
         self.serving.abort();
+        if let Some((_endpoint, serving)) = &self.four {
+            serving.abort();
+        }
     }
 }
 

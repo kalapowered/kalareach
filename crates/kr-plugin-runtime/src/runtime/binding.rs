@@ -144,6 +144,10 @@ pub struct BindingRequest {
     pub facts: BindingFacts,
     /// The executable path the host matched, as the host observed it.
     pub executable: String,
+    /// Whether the caller wants to be told what the instance has consumed
+    /// ([`BindingEvent::Consumed`]). A caller that has no use for it asks for none, so the
+    /// report does not share the channel with what it does use.
+    pub report_consumed: bool,
 }
 
 /// Something a binding produced without being asked.
@@ -1087,6 +1091,7 @@ impl BindingHandle {
             commands: commands.clone(),
             identity: request.identity.clone(),
             consumed: Consumed::start(),
+            report_consumed: request.report_consumed,
             observing: None,
             returned_in_pass: false,
             consumed_owed: None,
@@ -1551,6 +1556,8 @@ struct BindingWorker {
     /// What the instance has consumed. Its generation is the instance's own and is read from it
     /// when a report is made ([`Self::consumed_now`]).
     consumed: Consumed,
+    /// Whether the caller asked to be told what the instance has consumed.
+    report_consumed: bool,
     /// The event whose `observe` is running, for the fault a trap in it raises.
     observing: Option<SourceEventHandle>,
     /// Whether the pass in hand returned at least one event.
@@ -1731,7 +1738,7 @@ impl BindingWorker {
         // After the gap and the fault the pass raised, so the caller reads them first. A gap the pass
         // left in the queue, which a trap or a loss during the pass does, is reported by the next
         // pass, and what is owed waits for it.
-        if self.returned_in_pass {
+        if self.returned_in_pass && self.report_consumed {
             self.consumed_owed = Some(self.consumed_now());
         }
         self.consumed_held = self.queue.lock().is_ok_and(|queue| queue.gap_pending());
@@ -2282,6 +2289,7 @@ mod tests {
                 held_rights: Vec::new(),
             },
             executable: "/usr/local/bin/example".to_owned(),
+            report_consumed: true,
         };
         let rendered = request.identity.to_string();
         assert!(rendered.contains("kalareach/example@1.0.0+"));

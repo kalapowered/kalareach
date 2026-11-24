@@ -89,6 +89,7 @@ pub fn request(plugin: &str, seed: u8) -> BindingRequest {
         ),
         facts: facts(plugin),
         executable: "/usr/local/bin/example-agent".to_owned(),
+        report_consumed: true,
     }
 }
 
