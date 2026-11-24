@@ -170,6 +170,9 @@ const ROOMY_SESSION_REM = 25
 /** How long nothing about the keyboard or the page's pan has changed before the field's place is worked out once more. */
 const SETTLE_MS = 150
 
+/** The most, in pixels, that the field may lie from the keyboard's top before the lift is added to. */
+const LIFT_STOPS_WITHIN = 1
+
 /** One node as the phone holds it. */
 interface ReadNode {
   readonly id: string
@@ -741,7 +744,10 @@ export function MobileSession({
           // than what lies under it (a suggestion bar over the tab bar): the field is not taken
           // below what the area shows.
           const off = restOn(typing, Math.min(edge - covered, scroller.getBoundingClientRect().bottom), scroller, moved)
-          if (Math.abs(off) <= 0.5 || (off < 0 && more === 0)) break
+          // A field within a pixel of the edge is where it is meant to rest: WebKit keeps a scroll
+          // position in whole pixels, so some widths leave 0.94 px that no lift closes, and a lift
+          // added for it is added again at every run.
+          if (Math.abs(off) <= LIFT_STOPS_WITHIN || (off < 0 && more === 0)) break
           more = Math.max(0, more + off)
           element.style.setProperty('--lift-more', `${more}px`)
         }

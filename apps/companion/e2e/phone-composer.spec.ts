@@ -54,6 +54,11 @@ async function keyboard(page: Page, inset: number): Promise<void> {
   }, inset)
 }
 
+/** The room the session adds under the composer, beyond the keyboard's own lift, so that the field rests on the keyboard's top edge. */
+async function liftOf(page: Page): Promise<number> {
+  return page.locator('.m-session').evaluate((node) => parseFloat(node.style.getPropertyValue('--lift-more')) || 0)
+}
+
 /**
  * How many pixels of each control lie outside what a person sees of it: past the window, behind a
  * keyboard that covers `covered` pixels, or outside a box around it that clips what it holds. It is
@@ -259,6 +264,27 @@ for (const phone of PHONES) {
       await field.fill('/')
       await expectCommandsReachable(page, phone, phone.keyboard)
       await page.screenshot({ path: shot(`slash-all-keyboard-${phone.surface}-${phone.width}`) })
+    })
+
+    test('keeps the lift under the composer the same when the field is worked out again over the same keyboard', async ({
+      page
+    }) => {
+      const field = page.getByLabel('Message this session')
+      await field.focus()
+      await keyboard(page, phone.keyboard)
+      await page.waitForTimeout(SETTLE_MS * 4)
+      const first = await liftOf(page)
+      for (let again = 0; again < 3; again += 1) {
+        // The view works the field's rest out again at a resize and at a focus: over the same keyboard it finds the field where it is, and adds nothing.
+        await page.evaluate(() => window.dispatchEvent(new Event('resize')))
+        await field.blur()
+        await field.focus()
+        await page.waitForTimeout(SETTLE_MS * 4)
+      }
+      expect(
+        Math.abs((await liftOf(page)) - first),
+        'pixels by which the lift under the composer differs after the field was worked out again over the same keyboard'
+      ).toBeLessThanOrEqual(1)
     })
 
     test('keeps the field in view and every one of the three commands reachable on a window too short for the whole composer', async ({
