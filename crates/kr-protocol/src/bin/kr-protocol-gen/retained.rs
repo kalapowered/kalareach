@@ -134,6 +134,7 @@ pub fn kept_release_differences(
     kept: &Surface,
     kept_majors: Option<&str>,
     kept_host: &[&str],
+    source: bool,
 ) -> Result<Vec<String>, String> {
     let schema_text = releases::git_in(
         repository,
@@ -175,6 +176,16 @@ pub fn kept_release_differences(
             release.tag,
             kept_host.join(", ")
         ));
+    }
+    // The record is taken from this release, so it lists what the release lists and no name more.
+    if source {
+        for name in host_names_outside(kept_host, &listed) {
+            found.push(format!(
+                "the plugin host protocol {name} is in the kept record ({}) and is not listed by {}, the release the record is taken from",
+                kept_host.join(", "),
+                release.tag
+            ));
+        }
     }
     Ok(found)
 }
@@ -402,6 +413,7 @@ pub fn release_commit(level: &str, commit: &str) -> Result<(), String> {
             retained.surface(),
             retained.public_majors,
             &retained.plugin_host_names(),
+            release.commit == full,
         )?;
         if !found.is_empty() {
             let mut lines = vec![format!(
