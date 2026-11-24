@@ -947,10 +947,12 @@ impl PluginHost {
                             "the state is larger than this host carries to a component".to_owned(),
                         ));
                     }
-                    if !self.writer_open && through.is_some() {
+                    if through.is_some() && (!self.writer_open || binding.offered_events()) {
                         // A host that does not keep the record cannot say the state covers what the
-                        // position says it does, so it restores nothing, and the worker is told the
-                        // record was not set.
+                        // position says it does. Nor can one whose registration has been offered an
+                        // event: the instance may have consumed past the state, and the record would
+                        // call what follows a continuation of it. It restores nothing, and the
+                        // worker is told the record was not set.
                         added.record = Some(RecordState::NotSet);
                         return Ok(ResponseBody::Called {
                             value: Some(CallValue::Document),

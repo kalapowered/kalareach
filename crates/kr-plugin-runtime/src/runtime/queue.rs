@@ -247,6 +247,12 @@ impl ObservationQueue {
         self.snapshot_owed = self.obligations;
     }
 
+    /// Returns how many events have been offered to the queue.
+    #[must_use]
+    pub const fn offered(&self) -> u64 {
+        self.offered
+    }
+
     /// Offers one event to the queue. Never waits, and never runs a component.
     pub fn push(&mut self, event: ScopedSourceEvent) -> Admission {
         self.offered = self.offered.saturating_add(1);
