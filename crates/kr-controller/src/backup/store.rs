@@ -85,11 +85,14 @@ pub const OLDEST_SCHEMA_VERSION: i64 = VERSION_WITHOUT_UPLOADS;
 pub const READS_THROUGH_SCHEMA_VERSION: i64 = 9;
 
 // `migrate` opens a store as found only at this one version and compares it with version 9's
-// schema, so the version this build reads through must stay the one above the one it writes. The
-// build that writes version 9 does not compile until it removes that arm.
+// schema, which `definition_of_version_9` holds, so the version this build reads through stays 9
+// and the one above the one it writes. A build that writes version 9, or moves either number,
+// does not compile until it removes that arm and this assertion.
 const _: () = assert!(
-    READS_THROUGH_SCHEMA_VERSION == SCHEMA_VERSION + 1,
-    "the arm of `migrate` that opens version 9 as found is for a build that writes 8: remove it"
+    READS_THROUGH_SCHEMA_VERSION == SCHEMA_VERSION + 1 && READS_THROUGH_SCHEMA_VERSION == 9,
+    "the arm of `migrate` that opens version 9 as found, and `definition_of_version_9`, are for \
+     a build that writes 8 and reads through 9: a build that changes either number removes this \
+     assertion with the arm"
 );
 
 /// Whether this host may go on producing for one generation.
