@@ -124,6 +124,10 @@ const FAULT_RESERVE: usize = 8;
 /// binding disables itself instead, which is what the notice would have asked for.
 const FAULT_DELIVERY_WAIT: core::time::Duration = core::time::Duration::from_secs(2);
 
+/// How long the binding's thread waits for a command while it owes the caller a report, before it
+/// tries to send the report again: nothing wakes the thread when the caller reads and makes room.
+const OWED_RETRY: core::time::Duration = core::time::Duration::from_millis(50);
+
 /// What a broker asks for when it prepares a binding.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BindingRequest {
@@ -1347,7 +1351,9 @@ impl BindingHandle {
     /// Restores state from a checkpoint this build produced.
     ///
     /// With `through`, what the instance has consumed becomes what the state was taken at, and is
-    /// clean, once the restore has answered. Without it, it stays as it was.
+    /// clean, once the restore has answered. Without it the position stays and is no longer clean:
+    /// the state covers events the position cannot name. A restore the component declines changes
+    /// nothing.
     ///
     /// # Errors
     ///
@@ -1542,7 +1548,8 @@ struct BindingWorker {
     outstanding: Arc<AtomicUsize>,
     commands: mpsc::Sender<Command>,
     identity: PluginIdentity,
-    /// What the instance has consumed.
+    /// What the instance has consumed. Its generation is the instance's own and is read from it
+    /// when a report is made ([`Self::consumed_now`]).
     consumed: Consumed,
     /// The event whose `observe` is running, for the fault a trap in it raises.
     observing: Option<SourceEventHandle>,
@@ -1599,7 +1606,22 @@ impl BindingWorker {
             return;
         }
 
-        while let Ok(command) = inbox.recv() {
+        loop {
+            let received = if self.consumed_owed.is_some() {
+                inbox.recv_timeout(OWED_RETRY)
+            } else {
+                inbox
+                    .recv()
+                    .map_err(|_| mpsc::RecvTimeoutError::Disconnected)
+            };
+            let command = match received {
+                Ok(command) => command,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    self.flush_consumed();
+                    continue;
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => return,
+            };
             if self.stopping.load(Ordering::Acquire) {
                 return;
             }
@@ -1655,7 +1677,7 @@ impl BindingWorker {
                         continue;
                     }
                     let outcome = self.run_call(CallKind::Checkpoint, Instance::checkpoint);
-                    let consumed = self.consumed.clone();
+                    let consumed = self.consumed_now();
                     let _ = answer.send(outcome.map(|result| CallResult {
                         answer: result.answer.map(|state| Checkpoint { state, consumed }),
                         nodes: result.nodes,
@@ -1672,12 +1694,19 @@ impl BindingWorker {
                     }
                     let outcome =
                         self.run_call(CallKind::Restore, move |instance| instance.restore(state));
-                    if let Some(through) = through
-                        && outcome.as_ref().is_ok_and(|result| result.answer.is_ok())
-                    {
-                        self.consumed.native = through.native;
-                        self.consumed.terminal = through.terminal;
-                        self.consumed.clean = true;
+                    if outcome.as_ref().is_ok_and(|result| result.answer.is_ok()) {
+                        // The state was replaced, and what was owed described the one it replaced:
+                        // the answer to the restore is what the caller reads now.
+                        self.consumed_owed = None;
+                        match through {
+                            Some(through) => {
+                                self.consumed.native = through.native;
+                                self.consumed.terminal = through.terminal;
+                                self.consumed.clean = true;
+                            }
+                            // The state covers events the position cannot name.
+                            None => self.consumed.clean = false,
+                        }
                     }
                     let _ = answer.send(outcome);
                 }
@@ -1703,10 +1732,35 @@ impl BindingWorker {
         // left in the queue, which a trap or a loss during the pass does, is reported by the next
         // pass, and what is owed waits for it.
         if self.returned_in_pass {
-            self.consumed_owed = Some(self.consumed.clone());
+            self.consumed_owed = Some(self.consumed_now());
         }
         self.consumed_held = self.queue.lock().is_ok_and(|queue| queue.gap_pending());
         self.flush_consumed();
+    }
+
+    /// How many times the instance has been replaced after a trap.
+    fn replacements(&self) -> u32 {
+        self.instance.as_ref().map_or(0, |instance| {
+            u32::try_from(instance.replacements()).unwrap_or(u32::MAX)
+        })
+    }
+
+    /// The generation the next call runs under: the replacements so far, and one for the
+    /// replacement that call makes first when the instance has trapped.
+    fn next_generation(&self) -> u32 {
+        self.instance.as_ref().map_or(0, |instance| {
+            u32::try_from(instance.replacements())
+                .unwrap_or(u32::MAX)
+                .saturating_add(u32::from(instance.faulted()))
+        })
+    }
+
+    /// What the instance has consumed, at the generation it runs under now.
+    fn consumed_now(&self) -> Consumed {
+        Consumed {
+            generation: self.replacements(),
+            ..self.consumed.clone()
+        }
     }
 
     /// Gives the caller what it is owed, if the channel has room for it.
@@ -1927,7 +1981,6 @@ impl BindingWorker {
         if instance.faulted() {
             match instance.replace() {
                 Ok(nodes) => {
-                    self.consumed.generation = self.consumed.generation.saturating_add(1);
                     if let Ok(mut queue) = self.queue.lock() {
                         queue.require_snapshot();
                     }
@@ -1985,7 +2038,7 @@ impl BindingWorker {
                     detail,
                     faults_in_window,
                     event: self.observing.clone(),
-                    generation: self.consumed.generation.saturating_add(1),
+                    generation: self.next_generation(),
                 });
             }
             FaultVerdict::Disabled { reason } => {

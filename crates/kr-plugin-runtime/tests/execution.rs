@@ -3179,4 +3179,188 @@ mod consumed {
         assert_eq!(consumed.terminal, Some(handle("se-4")));
         assert!(consumed.clean);
     }
+
+    /// KR-REQ-24.24: a fault that does not trap the instance names the generation the next call runs
+    /// under, which is the one it already runs under.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn kr_req_24_24_a_fault_that_does_not_replace_the_instance_keeps_its_generation() {
+        let Some((_host, binding, mut received)) =
+            bound("oversized-output", 31, DEFAULT_EVENT_QUEUE).await
+        else {
+            return;
+        };
+        binding.enqueue_observation(components::scrape("se-1", "x"));
+        let mut generations = Vec::new();
+        loop {
+            match next_event(&mut received, LIVENESS).await {
+                Some(BindingEvent::Fault { generation, .. }) => generations.push(generation),
+                Some(BindingEvent::Disabled { .. }) => break,
+                Some(_) => {}
+                None => panic!("the binding was not disabled by its faults"),
+            }
+        }
+        assert!(generations.len() >= 2, "{generations:?}");
+        assert_eq!(
+            generations,
+            vec![0; generations.len()],
+            "an output budget fault leaves the instance in place"
+        );
+    }
+
+    /// A binding whose channel holds the reports of its first passes and not the newest, which is
+    /// owed: nothing has been read from the channel.
+    async fn with_an_owed_report(seed: u8) -> Option<(Host, Arc<BindingHandle>, Received)> {
+        let (host, binding, mut received) = bound("recording", seed, 12).await?;
+        while received.try_recv().is_ok() {}
+        for index in 1..=6 {
+            binding.enqueue_observation(components::scrape(&format!("se-{index}"), "x"));
+            // A checkpoint answers after the pass before it has ended.
+            let _ = consumed_of(&binding).await;
+        }
+        Some((host, binding, received))
+    }
+
+    /// The terminal handles of the reports a channel holds now.
+    fn reports_in(received: &mut Received) -> Vec<Option<SourceEventHandle>> {
+        let mut seen = Vec::new();
+        while let Ok(event) = received.try_recv() {
+            if let BindingEvent::Consumed(consumed) = event {
+                seen.push(consumed.terminal);
+            }
+        }
+        seen
+    }
+
+    /// KR-REQ-24.24: what is owed is sent once the caller has made room, with no other call or event.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn kr_req_24_24_an_owed_report_is_sent_when_the_channel_has_room_again() {
+        let Some((_host, _binding, mut received)) = with_an_owed_report(32).await else {
+            return;
+        };
+        let held = reports_in(&mut received);
+        assert!(
+            !held.contains(&Some(handle("se-6"))),
+            "the newest report found room: {held:?}"
+        );
+        let mut newest = None;
+        while let Some(event) = next_event(&mut received, core::time::Duration::from_secs(10)).await
+        {
+            if let BindingEvent::Consumed(consumed) = event {
+                newest = consumed.terminal;
+                if newest == Some(handle("se-6")) {
+                    break;
+                }
+            }
+        }
+        assert_eq!(
+            newest,
+            Some(handle("se-6")),
+            "the report owed was never sent"
+        );
+    }
+
+    /// KR-REQ-24.24: a restore that answered replaces what was owed, so a report of the state it
+    /// replaced is not sent after it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn kr_req_24_24_a_restore_drops_the_report_owed_before_it() {
+        let Some((_host, binding, mut received)) = with_an_owed_report(33).await else {
+            return;
+        };
+        let state = binding
+            .checkpoint(ANSWER)
+            .await
+            .expect("the checkpoint runs")
+            .answer
+            .expect("the component answers")
+            .state;
+        // Nothing has been read, so the report is still owed when the restore answers.
+        binding
+            .restore(
+                state,
+                Some(Through {
+                    native: Some(handle("se-7")),
+                    terminal: None,
+                }),
+                ANSWER,
+            )
+            .await
+            .expect("the restore runs")
+            .answer
+            .expect("the component answers");
+        let mut later = reports_in(&mut received);
+        while let Some(event) = next_event(&mut received, core::time::Duration::from_secs(2)).await
+        {
+            if let BindingEvent::Consumed(consumed) = event {
+                later.push(consumed.terminal);
+            }
+        }
+        assert!(
+            !later.contains(&Some(handle("se-6"))),
+            "the report of the replaced state was sent after the restore: {later:?}"
+        );
+    }
+
+    /// KR-REQ-24.24: a restore without a position leaves nothing to claim a prefix, one the component
+    /// declined changes nothing, and one with a position sets it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn kr_req_24_24_a_restore_sets_clean_from_what_its_state_can_claim() {
+        let Some((_host, binding, _received)) = bound("recording", 34, DEFAULT_EVENT_QUEUE).await
+        else {
+            return;
+        };
+        binding.enqueue_observation(components::scrape("se-1", "x"));
+        let first = consumed_of(&binding).await;
+        assert_eq!(
+            (first.clean, first.terminal.clone()),
+            (true, Some(handle("se-1")))
+        );
+        let state = binding
+            .checkpoint(ANSWER)
+            .await
+            .expect("the checkpoint runs")
+            .answer
+            .expect("the component answers")
+            .state;
+
+        binding
+            .restore(state.clone(), None, ANSWER)
+            .await
+            .expect("the restore runs")
+            .answer
+            .expect("the component answers");
+        let plain = consumed_of(&binding).await;
+        assert_eq!(plain.terminal, Some(handle("se-1")), "the position stays");
+        assert!(!plain.clean, "the state may cover less than was consumed");
+
+        // A state the component declines changes nothing, whatever position it came with.
+        let declined = binding
+            .restore(
+                vec![0xff, 0xfe],
+                Some(Through {
+                    native: None,
+                    terminal: Some(handle("se-9")),
+                }),
+                ANSWER,
+            )
+            .await
+            .expect("the restore runs");
+        assert!(declined.answer.is_err(), "the component took the state");
+        assert_eq!(consumed_of(&binding).await, plain);
+
+        binding
+            .restore(
+                state,
+                Some(Through {
+                    native: None,
+                    terminal: Some(handle("se-9")),
+                }),
+                ANSWER,
+            )
+            .await
+            .expect("the restore runs")
+            .answer
+            .expect("the component answers");
+        let set = consumed_of(&binding).await;
+        assert_eq!((set.clean, set.terminal), (true, Some(handle("se-9"))));
+    }
 }
