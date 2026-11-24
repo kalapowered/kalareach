@@ -260,7 +260,11 @@ describe('which platform the page is shown for', () => {
     const whole = disclosedChecks('macos')
     expect(items).toHaveLength(whole.length)
     whole.forEach((check, index) => {
-      expect(items[index]?.textContent).toBe(`${check.name}${check.performs}${check.effect}`)
+      const dialog =
+        check.chooses === true
+          ? 'Choose a fileNo file chosen. The read check will read nothing and say so.'
+          : ''
+      expect(items[index]?.textContent).toBe(`${check.name}${check.performs}${check.effect}${dialog}`)
     })
     expect(controls.checkRuns).toEqual([])
     await userEvent.click(screen.getByTestId('setup-checks-run'))
@@ -484,6 +488,36 @@ describe('what each check says it does, before it is run', () => {
       "The checks are running in a session's worker, and they can take about two minutes."
     )
   })
+
+  it('marks the file read, and no other check, as the one that offers the file dialog, on every route', () => {
+    for (const route of ['macos', 'x11', 'wayland', 'linux', 'windows', 'other'] as const) {
+      expect(
+        disclosedChecks(route)
+          .filter((check) => check.chooses === true)
+          .map((check) => check.capability),
+        route
+      ).toEqual(['desktop.authorised_file_read'])
+    }
+  })
+
+  it.each(['macos', 'x11', 'wayland', 'windows'] as const)(
+    'offers the file dialog beside the file read, once and beside no other check, on %s',
+    async (desktop) => {
+      start(desktop)
+      await waitFor(() => {
+        expect(screen.getByTestId('setup-step-capabilities')).toBeInTheDocument()
+      })
+      await goTo('capabilities')
+      await waitFor(() => {
+        expect(screen.getByTestId('setup-run-checks')).toBeEnabled()
+      })
+      await userEvent.click(screen.getByTestId('setup-run-checks'))
+      const sheet = await screen.findByTestId('setup-effects')
+      const offered = within(sheet).getAllByTestId('setup-checks-choose')
+      expect(offered).toHaveLength(1)
+      expect(offered[0]?.closest('li')?.textContent).toContain('Read a file you authorised')
+    }
+  )
 })
 
 // KR-REQ-03.29: what the host says about each capability is shown beside what its check does,

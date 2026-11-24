@@ -27,6 +27,8 @@ export interface DisclosedCheck {
   readonly performs: string
   /** What it touches, and what it leaves alone. */
   readonly effect: string
+  /** The check reads a file the person chooses, so its entry offers the file dialog. */
+  readonly chooses?: true
 }
 
 /** What a check says on one route. */
@@ -39,6 +41,8 @@ interface Lines {
 interface CheckLines {
   readonly name: string
   readonly capability: string
+  /** The check reads a file the person chooses, so its entry offers the file dialog. */
+  readonly chooses?: true
   /** The same words on every route. */
   readonly all?: Lines
   /** Words for one route; a route with neither these nor `all` does not list the check. */
@@ -65,6 +69,7 @@ const CHECKS: readonly CheckLines[] = [
   {
     name: 'Read a file you authorised',
     capability: 'desktop.authorised_file_read',
+    chooses: true,
     all: {
       performs: 'Opens a file you chose and reads the first few thousand bytes of it.',
       effect: 'Reads that file and writes nothing. With no file chosen it reads nothing and says so.'
@@ -153,7 +158,15 @@ export function disclosedChecks(route: CheckRoute): readonly DisclosedCheck[] {
   return CHECKS.flatMap((check) => {
     const lines = check.by?.[route] ?? check.all
     return lines
-      ? [{ name: check.name, capability: check.capability, performs: lines.performs, effect: lines.effect }]
+      ? [
+          {
+            name: check.name,
+            capability: check.capability,
+            performs: lines.performs,
+            effect: lines.effect,
+            ...(check.chooses === true ? { chooses: true as const } : {})
+          }
+        ]
       : []
   })
 }
