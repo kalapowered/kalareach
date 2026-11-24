@@ -7,6 +7,7 @@
 //! then, and at the bound before the child is collected.
 
 use std::process::{Child, Command, ExitStatus};
+use std::time::{Duration, Instant};
 
 /// Starts the child in a process group of its own, whose number is the child's.
 pub(super) fn in_a_group_of_its_own(command: &mut Command) {
@@ -38,6 +39,28 @@ pub(super) fn poll(child: &mut Child) -> std::io::Result<Option<ExitStatus>> {
         end_group(child);
     }
     child.try_wait()
+}
+
+/// How long a child that was asked to stop is waited for before the caller answers anyway.
+#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
+pub(super) const COLLECT: Duration = Duration::from_secs(2);
+
+/// Collects a child that was ended, for at most `bound`, and says whether it was collected.
+///
+/// A child that cannot be collected at once, one that the system has not finished taking down, is
+/// not a reason for the call that ended it to stop answering: it is left to the process table and
+/// the call goes on.
+#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
+pub(super) fn collect_within(child: &mut Child, bound: Duration) -> bool {
+    let until = Instant::now() + bound;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return true,
+            Err(_) => return false,
+            Ok(None) if Instant::now() >= until => return false,
+            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+        }
+    }
 }
 
 /// Ends the child's whole group, the child and everything it started.
@@ -115,6 +138,53 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+
+    /// KR-REQ-03.29, S-8: a child that cannot be collected at once is waited for only within a
+    /// bound, so the call that ended it answers anyway.
+    #[test]
+    fn a_child_that_cannot_be_collected_at_once_is_waited_for_only_within_a_bound() {
+        // A child that is still running is one that cannot be collected: the wait has nothing to
+        // return until it ends, which is what a child the system cannot finish taking down is
+        // like from here.
+        let mut command = Command::new("/bin/sleep");
+        command
+            .arg("120")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        in_a_group_of_its_own(&mut command);
+        let child = command.spawn().expect("the stand-in starts");
+        let number = child.id();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut child = child;
+            let began = Instant::now();
+            let collected = collect_within(&mut child, Duration::from_millis(300));
+            let _ = sender.send((collected, began.elapsed()));
+            end_group(&child);
+            let _ = child.kill();
+            let _ = child.wait();
+        });
+        let answered = receiver.recv_timeout(Duration::from_secs(5));
+        if answered.is_err() {
+            // The case's own cleanup: a wait that did not give up leaves nothing running.
+            if let Some(group) = i32::try_from(number)
+                .ok()
+                .and_then(rustix::process::Pid::from_raw)
+            {
+                let _ = rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
+            }
+        }
+        let (collected, took) = answered.expect("the call gave up at its bound and answered");
+        assert!(
+            !collected,
+            "a child that was still running was not collected"
+        );
+        assert!(
+            took < Duration::from_secs(2),
+            "the call took {took:?} for a bound of 300 ms"
+        );
+    }
 
     /// KR-REQ-03.29, S-6: a child that exits on its own, by success or by failure, is ended with the
     /// descendants it started, before it is collected.

@@ -2081,15 +2081,7 @@ fn bounded(
             // child that will not go is not a reason for a diagnostic to stop answering.
             super::children::end_group(&child);
             let _ = child.kill();
-            let collected = std::time::Instant::now();
-            let stopped = loop {
-                match child.try_wait() {
-                    Ok(Some(_)) => break true,
-                    Err(_) => break false,
-                    Ok(None) if collected.elapsed() >= COLLECT => break false,
-                    Ok(None) => std::thread::sleep(POLL),
-                }
-            };
+            let stopped = super::children::collect_within(&mut child, super::children::COLLECT);
             Exit::Unfinished(Outcome::NotAnswered {
                 waited: started.elapsed(),
                 stopped,
@@ -2109,6 +2101,9 @@ fn bounded(
 fn read_within(path: &Path, deadline: &Deadline) -> Option<Vec<u8>> {
     use std::io::Read as _;
 
+    if deadline.expired() {
+        return None;
+    }
     let Ok(mut file) = std::fs::File::open(path) else {
         return Some(Vec::new());
     };
@@ -2136,10 +2131,6 @@ fn text_within(path: &Path, deadline: &Deadline) -> Option<String> {
 /// How often a running facility is asked whether it has finished.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 const POLL: Duration = Duration::from_millis(50);
-
-/// How long a facility that was asked to stop is waited for before the check answers anyway.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-const COLLECT: Duration = Duration::from_secs(2);
 
 /// A short file-name stem for one check.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
@@ -3324,6 +3315,19 @@ mod tests {
         );
     }
 
+    /// KR-REQ-03.29, S-8: a file is not opened once the time is gone, so what the open would have
+    /// said is not an answer: not an empty file and not a missing one.
+    #[test]
+    fn a_file_is_not_opened_after_the_time_is_gone() {
+        let root = kr_ipc::testing::PrivateTempDir::create();
+        let gone = Deadline::after(Duration::ZERO);
+        assert_eq!(
+            read_within(&root.path().join("not-there"), &gone),
+            None,
+            "a file asked for after the time was gone, which is no answer and not an empty file"
+        );
+    }
+
     /// KR-REQ-03.29, S-8: the calls of one check draw on one deadline, so the time they take
     /// together never passes it and each is given the time that is left.
     #[cfg(unix)]
@@ -4076,7 +4080,7 @@ mod tests {
                 "{check:?} gave up after {waited:?}, before its bound of {bound:?}"
             );
             assert!(
-                waited < bound + COLLECT + SLACK,
+                waited < bound + super::super::children::COLLECT + SLACK,
                 "{check:?} waited {waited:?} for a facility, past its bound of {bound:?}"
             );
             assert!(

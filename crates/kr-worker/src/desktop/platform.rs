@@ -309,11 +309,13 @@ fn run(program: &str, arguments: &[&str]) -> Printed {
         std::thread::sleep(std::time::Duration::from_millis(10));
     };
     if !ended {
-        // Terminated and reaped: a child left running would outlive every probe after it, and one
-        // left unreaped would outlive the process. The group goes with it.
+        // Terminated and collected: a child left running would outlive every probe after it. The
+        // group goes with it. A child that cannot be collected at once is waited for only within a
+        // bound and then left to the process table, because a reading that waited for it would
+        // stop answering with it.
         super::children::end_group(&child);
         let _ = child.kill();
-        let _ = child.wait();
+        let _ = super::children::collect_within(&mut child, super::children::COLLECT);
     }
     let Some(status) = status else {
         // Nothing is read from a command that did not finish. A descendant it left behind can
@@ -322,7 +324,10 @@ fn run(program: &str, arguments: &[&str]) -> Printed {
         let _ = std::fs::remove_dir_all(&directory);
         return Printed::NotRun;
     };
-    let captured = read_capture(&out).zip(read_capture(&err));
+    // The capture is read within the same bound: time that has run out leaves nothing to read it
+    // with, which is a reading that did not finish.
+    let over = || reading_is_over() || started.elapsed() >= probe_deadline();
+    let captured = read_capture(&out, over).zip(read_capture(&err, over));
     // The directory goes whether or not it could be read. A descendant that still holds one of
     // the files keeps it on a filesystem that has no POSIX deletion; that is a file in the
     // platform's temporary directory, which the platform clears, and not a reading this host owes
@@ -417,18 +422,26 @@ fn new_file(path: &std::path::Path) -> Option<std::fs::File> {
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 const CAPTURE_LIMIT: u64 = 1024 * 1024;
 
-/// Reads one capture, up to [`CAPTURE_LIMIT`], or nothing where it could not be read.
+/// Reads one capture, up to [`CAPTURE_LIMIT`], in blocks, or nothing where it could not be read or
+/// where `over` says the time for it has run out, before a block is read.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-fn read_capture(path: &std::path::Path) -> Option<Vec<u8>> {
+fn read_capture(path: &std::path::Path, over: impl Fn() -> bool) -> Option<Vec<u8>> {
     use std::io::Read as _;
 
+    let mut file = std::fs::File::open(path).ok()?.take(CAPTURE_LIMIT);
     let mut said = Vec::new();
-    std::fs::File::open(path)
-        .ok()?
-        .take(CAPTURE_LIMIT)
-        .read_to_end(&mut said)
-        .ok()?;
-    Some(said)
+    let mut block = [0_u8; 64 * 1024];
+    loop {
+        if over() {
+            return None;
+        }
+        match file.read(&mut block) {
+            Ok(0) => return Some(said),
+            Ok(count) => said.extend_from_slice(&block[..count]),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return None,
+        }
+    }
 }
 
 /// How long a platform command is given before the reading is abandoned.
@@ -1575,6 +1588,38 @@ mod tests {
                 "{what}: process {number} is still there after the reading"
             );
         }
+    }
+
+    /// KR-REQ-03.29, S-8: a capture is read until the time of the reading runs out and no further:
+    /// not at all where the time is gone at the start, and not to the end where it goes between two
+    /// blocks.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn a_capture_is_read_only_while_the_time_of_the_reading_lasts() {
+        let root = kr_ipc::testing::PrivateTempDir::create();
+        let file = root.path().join("out");
+        let printed = vec![b'x'; 200 * 1024];
+        std::fs::write(&file, &printed).expect("the capture is written");
+        assert_eq!(
+            super::read_capture(&file, || false).as_deref(),
+            Some(printed.as_slice()),
+            "time left: the whole capture"
+        );
+        assert_eq!(
+            super::read_capture(&file, || true),
+            None,
+            "time gone before the first block"
+        );
+        let asked = std::cell::Cell::new(0_u32);
+        let gone_after_one_block = || {
+            asked.set(asked.get() + 1);
+            asked.get() > 1
+        };
+        assert_eq!(
+            super::read_capture(&file, gone_after_one_block),
+            None,
+            "time gone between two blocks"
+        );
     }
 
     /// KR-REQ-03.29, S-8: the commands of a reading that has a deadline stop at it, whatever bound
