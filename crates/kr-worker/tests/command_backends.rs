@@ -16,6 +16,8 @@ use kr_protocol::root::{CwdRevision, PromptGeneration};
 use kr_protocol::scalars::Uuid;
 use kr_protocol::session::CommandIntegration;
 use kr_worker::broker::Broker;
+#[cfg(windows)]
+use kr_worker::broker::catalogue::{Admissions, testing};
 use kr_worker::broker::commands::{CommandBackends, CommandBackendsConfig, EstablishRequest};
 use kr_worker::broker::connectors::{ConnectorRefusal, ConnectorSource, ConnectorSources, fixture};
 use kr_worker::persistence::JournalHealth;
@@ -139,6 +141,9 @@ struct Setup {
     broker: Arc<Broker>,
     executable: PathBuf,
     runtime: PathBuf,
+    /// The installed package, kept for a case that hands it over as the worker's admissions.
+    #[cfg(windows)]
+    source: ConnectorSource,
 }
 
 impl Setup {
@@ -193,6 +198,8 @@ impl Setup {
         let store = directory.join("store");
         std::fs::create_dir_all(&store).expect("a store");
         let source = fixture::package(&store, &launcher, shape).expect("the package");
+        #[cfg(windows)]
+        let installed = source.clone();
         let refused = sources.replace(vec![source]);
         // The case's own directory, so a backend's socket path stays inside the bound it has on
         // macOS: the session root and the backend's directory add two short levels below it.
@@ -221,9 +228,26 @@ impl Setup {
                 broker,
                 executable,
                 runtime,
+                #[cfg(windows)]
+                source: installed,
             },
             refused,
         )
+    }
+
+    /// Hands the installed package over as the admissions this worker holds, so that the connector
+    /// a launch binds to has the frame it came from, as it has in a running worker. A package
+    /// installed with `ConnectorSources::replace` alone has none, and a launch cannot bind.
+    #[cfg(windows)]
+    fn admit(&self) {
+        let admissions = Admissions::new();
+        let _frame = testing::admit(
+            &admissions,
+            self.backends.sources(),
+            &self.broker,
+            vec![testing::admitted(&self.source)],
+            1,
+        );
     }
 
     fn integration() -> CommandIntegration {
@@ -1656,6 +1680,7 @@ async fn the_fixture_reads_a_commit_on_the_launchers_clock() {
     use windows_launcher::{Admission, Answer, COMMIT_DEADLINE, Launch, Launcher};
 
     let setup = Setup::new();
+    setup.admit();
     let integration = Setup::integration();
     let claude = invocation(&["claude", "--resume"]);
     let answer = setup
