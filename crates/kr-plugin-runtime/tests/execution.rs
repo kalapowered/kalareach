@@ -3257,7 +3257,15 @@ mod consumed {
     /// A binding whose channel holds the reports of its first passes and not the newest, which is
     /// owed: nothing has been read from the channel.
     async fn with_an_owed_report(seed: u8) -> Option<(Host, Arc<BindingHandle>, Received)> {
-        let (host, binding, mut received) = bound("recording", seed, 12).await?;
+        owed_report_of("recording", seed).await
+    }
+
+    /// As [`with_an_owed_report`], for another component.
+    async fn owed_report_of(
+        plugin: &str,
+        seed: u8,
+    ) -> Option<(Host, Arc<BindingHandle>, Received)> {
+        let (host, binding, mut received) = bound(plugin, seed, 12).await?;
         while received.try_recv().is_ok() {}
         for index in 1..=6 {
             binding.enqueue_observation(components::scrape(&format!("se-{index}"), "x"));
@@ -3379,9 +3387,58 @@ mod consumed {
                 None => panic!("the third trap did not disable the binding"),
             }
         }
+        // The notice is sent inside the pass, and the thread records what it still owes when the
+        // pass is over: given time to get there, the flag is what the pass left and not what it
+        // held before it.
+        tokio::time::sleep(core::time::Duration::from_millis(500)).await;
         assert!(
-            eventually(|| !binding.report_owed()).await,
+            !binding.report_owed(),
             "the disabled binding still owes a report"
+        );
+    }
+
+    /// KR-REQ-24.24: a binding that a call disables drops the report it owed, and no report follows
+    /// the notice that says why, however much room the caller makes after it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn kr_req_24_24_a_binding_that_a_call_disables_drops_the_report_it_owed() {
+        let Some((_host, binding, mut received)) = owed_report_of("hostile-decoder", 43).await
+        else {
+            return;
+        };
+        assert!(
+            eventually(|| binding.report_owed()).await,
+            "no report was owed"
+        );
+        // Three decodes that trap, each a call of its own, disable the binding while the channel
+        // has no room for the report.
+        for index in 0..3 {
+            let _ = binding
+                .decode_request(
+                    components::native_request(
+                        &format!("se-{}", 20 + index),
+                        &index.to_string(),
+                        "!trap",
+                    ),
+                    ANSWER,
+                )
+                .await;
+        }
+        let mut disabled = false;
+        let mut after = Vec::new();
+        loop {
+            match next_event(&mut received, core::time::Duration::from_secs(2)).await {
+                Some(BindingEvent::Disabled { .. }) => disabled = true,
+                Some(BindingEvent::Consumed(consumed)) if disabled => {
+                    after.push(consumed.terminal);
+                }
+                Some(_) => {}
+                None => break,
+            }
+        }
+        assert!(disabled, "the third trap did not disable the binding");
+        assert!(
+            after.is_empty(),
+            "a report was sent after the binding was disabled: {after:?}"
         );
     }
 
