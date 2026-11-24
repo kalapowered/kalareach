@@ -164,6 +164,27 @@ pub const FROZEN_VARIANTS: &[&str] = &[
 /// release (`kr-protocol-gen`).
 pub const PLUGIN_HOST_PROTOCOLS: &[&str] = &["kr-plugin-host/3"];
 
+/// The first level whose builds speak the fourth plugin host protocol, `kr-plugin-host/4`.
+pub const FIRST_HOST_4_LEVEL: CompatibilityLevel =
+    CompatibilityLevel::of(crate::hello::PackageVersion::new(0, 79, 0));
+
+/// Whether a host's writer of consumed positions and loss positions is open when it serves workers
+/// of `levels`: every one of them is a level that speaks the fourth plugin host protocol.
+///
+/// A host with its writer closed reads every member of the fourth protocol and writes none of them,
+/// so the protocol is in the field one level before anything depends on what it writes.
+#[must_use]
+pub fn writer_open_for(levels: &[CompatibilityLevel]) -> bool {
+    levels.iter().all(|level| *level >= FIRST_HOST_4_LEVEL)
+}
+
+/// Whether this build's host writes consumed positions and loss positions: its retained worker
+/// levels all speak the fourth plugin host protocol.
+#[must_use]
+pub fn replay_writer_open() -> bool {
+    writer_open_for(&RETAINED_WORKER_LEVELS)
+}
+
 /// The names a `PLUGIN_HOST` record lists: one on each line that holds one.
 #[must_use]
 pub fn host_names(document: &str) -> Vec<&str> {
