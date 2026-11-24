@@ -829,7 +829,15 @@ impl PluginHost {
                 if let Some(reason) = binding.disabled_reason() {
                     return Err((reason, true));
                 }
-                let scoped = event_of(&event).map_err(|detail| (detail, false))?;
+                let scoped = match event_of(&event) {
+                    Ok(scoped) => scoped,
+                    Err(detail) => {
+                        // Refused before the queue saw it, and still an event the instance does not
+                        // consume: what it takes after it does not follow what it took before.
+                        binding.note_refused_event();
+                        return Err((detail, false));
+                    }
+                };
                 let offered = binding.enqueue_observation(scoped);
                 added.free_bytes = Some(offered.free_bytes);
                 Ok(admission_of(offered.admission))
