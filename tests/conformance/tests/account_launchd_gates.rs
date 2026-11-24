@@ -557,6 +557,11 @@ const PLAIN_DAEMON_NAMES: [(&str, &[Entry]); 19] = [
                 7,
                 "a path or a name in a fixture, compared and never run",
             ),
+            (
+                "the_stand_in_started_the_daemon",
+                1,
+                "the installed name of the placed held daemon, compared with the program a recorded call came from; nothing starts it",
+            ),
         ],
     ),
     (

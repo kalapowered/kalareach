@@ -4674,6 +4674,379 @@ fn the_install_fixture_for_a_run_that_did_not_ask() {
     );
 }
 
+/// The settings a service join owns that `document` holds: each of `ServiceSelection::KEYS` whose
+/// section and name the document has, however it is valued.
+fn service_settings_in(document: &Value) -> Vec<&'static str> {
+    kr_protocol::hostinfo::configuration::ServiceSelection::KEYS
+        .into_iter()
+        .filter(|key| {
+            key.split('.')
+                .try_fold(document, |value, part| value.get(part))
+                .is_some_and(|found| !found.is_null())
+        })
+        .collect()
+}
+
+/// What the stand-in's calls came to after the install: the one change to the manager is the load
+/// of the definition `kr` wrote, into the user domain, with no ask in it; every read is one of
+/// three; `kr`'s own read of the desktop reached the stand-in, which said the graphical domain is
+/// absent; and the job is loaded as the file says and started none.
+#[cfg(target_os = "macos")]
+fn the_stand_in_saw_the_install(host: &ServiceHost, stand_in: &manager_stand_in::StandIn) {
+    let log = stand_in.log();
+    let calls = stand_in.calls();
+    let (gui, domain) = (
+        format!("gui/{}", stand_in.uid()),
+        format!("user/{}", stand_in.uid()),
+    );
+    let target = format!("{domain}/{}", host.label());
+    let definition = host.definition().display().to_string();
+    let changes: Vec<Vec<&str>> = calls
+        .iter()
+        .filter(|call| call.changes_the_manager())
+        .map(|call| call.arguments.iter().map(String::as_str).collect())
+        .collect();
+    assert_eq!(
+        changes,
+        [vec!["bootstrap", domain.as_str(), definition.as_str()]],
+        "the install loads the definition it wrote into the user domain and changes nothing else:\n{log}"
+    );
+    let reads = [
+        format!("print {gui}"),
+        format!("print {domain}"),
+        format!("print {target}"),
+    ];
+    for call in calls.iter().filter(|call| !call.changes_the_manager()) {
+        assert!(
+            reads.contains(&call.arguments.join(" ")),
+            "a read that the install does not make: {}\n{log}",
+            call.line()
+        );
+    }
+    assert!(
+        calls.iter().any(|call| call.caller == "kr"
+            && call.arguments == ["print", gui.as_str()]
+            && call.status == 112),
+        "kr's read of the desktop reached the stand-in, which said the graphical domain is not \
+         there:\n{log}"
+    );
+    let written = std::fs::read_to_string(host.definition()).expect("the definition kr wrote");
+    assert!(
+        !written.contains("EnvironmentVariables"),
+        "a run that asks nothing of the account's launchd writes no environment into the \
+         definition: {written}"
+    );
+    let job = stand_in
+        .job(&host.label())
+        .unwrap_or_else(|| panic!("the definition is loaded:\n{log}"));
+    assert_eq!(job["starts"], 0, "the install starts nothing: {job}");
+    assert_eq!(
+        job["definition"].as_str(),
+        Some(written.as_str()),
+        "the stand-in loaded the file kr wrote, as it is: {job}"
+    );
+    assert_eq!(job["umask"], 63, "{job}");
+}
+
+/// What the stand-in's calls and its job say once the first session has started the daemon: the
+/// changes are the load and one start, both from `kr`; the job runs the process the host's own
+/// question names, as its definition says; the daemon read the desktop through the stand-in too;
+/// and no call came from a worker.
+#[cfg(target_os = "macos")]
+fn the_stand_in_started_the_daemon(
+    host: &ServiceHost,
+    stand_in: &manager_stand_in::StandIn,
+    daemon: u32,
+    created: &Value,
+) {
+    let log = stand_in.log();
+    let calls = stand_in.calls();
+    let gui = format!("gui/{}", stand_in.uid());
+    let target = format!("user/{}/{}", stand_in.uid(), host.label());
+    let changes: Vec<(&str, &str)> = calls
+        .iter()
+        .filter(|call| call.changes_the_manager())
+        .map(|call| (call.caller.as_str(), call.arguments[0].as_str()))
+        .collect();
+    assert_eq!(
+        changes,
+        [("kr", "bootstrap"), ("kr", "kickstart")],
+        "the load and one start of the job, both from kr:\n{log}"
+    );
+    assert!(
+        calls
+            .iter()
+            .any(|call| call.arguments == ["kickstart", "-p", target.as_str()]),
+        "the start names the job's target {target}:\n{log}"
+    );
+    assert!(
+        calls.iter().any(|call| call.caller == "kr-controller"
+            && call.arguments == ["print", gui.as_str()]
+            && call.status == 112),
+        "the daemon's own read of the desktop reached the stand-in:\n{log}"
+    );
+    assert!(
+        calls.iter().all(|call| call.caller != "kr-worker"),
+        "no worker called the manager:\n{log}"
+    );
+    let job = stand_in.job(&host.label()).expect("the job is loaded");
+    assert_eq!(job["starts"], 1, "{job}");
+    // The protocol writes a 64-bit number as text.
+    let recorded = &job["identity"]["pid"];
+    assert_eq!(
+        recorded
+            .as_u64()
+            .or_else(|| recorded.as_str()?.parse().ok()),
+        Some(u64::from(daemon)),
+        "the process the stand-in recorded is the one the host's question names: {job}"
+    );
+    let written = std::fs::read_to_string(host.definition()).expect("the definition kr wrote");
+    for argument in job["arguments"].as_array().expect("the arguments") {
+        let argument = argument.as_str().expect("an argument is text");
+        assert!(
+            written.contains(&format!("<string>{argument}</string>")),
+            "the argument {argument} is in the definition: {written}"
+        );
+    }
+    assert_eq!(
+        job["working_directory"].as_str().map(PathBuf::from),
+        Some(host.tree.environment().state_dir().to_path_buf()),
+        "{job}"
+    );
+    let keys: Vec<&str> = job["environment_keys"]
+        .as_array()
+        .expect("the keys")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    assert!(
+        !keys.contains(&kr_ipc::testing::account_launchd::VARIABLE),
+        "the daemon has no ask for the account's launchd: {keys:?}"
+    );
+    for kept in ["HOME", "PATH", kr_ipc::testing::manager_stand_in::VARIABLE] {
+        assert!(keys.contains(&kept), "the daemon holds {kept}: {keys:?}");
+    }
+    // The process is the daemon the definition names, as launchd would have it: a child of the
+    // system's first process, leading a group of its own in a session of its own that no terminal
+    // ends, with no controlling terminal and the state directory as its working directory.
+    let (parent, name) = parent_of(daemon);
+    assert!(
+        parent == 1 && name.ends_with("launchd"),
+        "the daemon's parent is {parent} ({name})"
+    );
+    let process = rustix::process::Pid::from_raw(i32::try_from(daemon).expect("a process number"))
+        .expect("a process number");
+    assert_eq!(
+        rustix::process::getpgid(Some(process)).expect("its process group"),
+        process,
+        "the daemon leads a process group of its own"
+    );
+    assert_ne!(
+        rustix::process::getsid(Some(process)).expect("its session"),
+        rustix::process::getsid(None).expect("this test's session"),
+        "the daemon is outside the session this test runs in"
+    );
+    assert_eq!(
+        kr_ipc::identity::controlling_terminal(daemon).expect("its controlling terminal"),
+        None,
+        "the daemon has no controlling terminal"
+    );
+    assert_eq!(
+        working_directory(daemon),
+        std::fs::canonicalize(host.tree.environment().state_dir()).expect("the state directory"),
+        "the daemon works in the environment's own directory"
+    );
+    // The session's worker is the daemon's child: the daemon the stand-in started is the host's.
+    let session_id: SessionId = created["session_id"]
+        .as_str()
+        .expect("a session identifier")
+        .parse()
+        .expect("parses");
+    let worker = kr_ipc::descriptor::read_all(&host.tree.environment())
+        .expect("reads the runtime directory")
+        .into_iter()
+        .filter_map(|entry| entry.descriptor.ok())
+        .find(|descriptor| descriptor.session_id == session_id)
+        .expect("the session's descriptor is published")
+        .process_start_identity
+        .pid
+        .get();
+    assert_eq!(
+        parent_of(u32::try_from(worker).expect("a process number")).0,
+        daemon,
+        "the session's worker is the daemon's child"
+    );
+}
+
+/// After `kr host startup --clear`: the stand-in was asked for nothing but the load and the one
+/// start, and `kr` ended nothing: the job is still loaded.
+#[cfg(target_os = "macos")]
+fn the_stand_in_saw_nothing_end(host: &ServiceHost, stand_in: &manager_stand_in::StandIn) {
+    let log = stand_in.log();
+    for call in stand_in.calls().iter().filter(|call| call.caller == "kr") {
+        assert!(
+            matches!(
+                call.arguments[0].as_str(),
+                "print" | "bootstrap" | "kickstart"
+            ),
+            "kr asked the manager to end or change something: {}\n{log}",
+            call.line()
+        );
+    }
+    assert!(
+        stand_in.job(&host.label()).is_some(),
+        "the job is still loaded:\n{log}"
+    );
+}
+
+/// KR-REQ-26.42: an ordinary user needs no account of any kind, and a host that is the user's
+/// own service manager's job needs none either. On a host with no account that selects no managed
+/// service, the headless host (the install with no GUI host, which sets no worker profile) is
+/// chosen as a person chooses it, and the first session starts the daemon through the service
+/// manager from the definition `kr` wrote. The configuration the install wrote and the effective
+/// configuration the daemon reports select no service, `kr account show` and `kr account sign-in`
+/// say what is missing, and clearing the start ends nothing: the session is live before and after.
+/// With the stand-in service manager the calls that reached it are part of the case: the load, the
+/// one start, the desktop read of `kr` and of the daemon, and nothing that ends a job.
+fn the_headless_host_case(host: &ServiceHost) {
+    for path in [host.document(), host.definition(), host.record()] {
+        assert!(
+            !path.exists(),
+            "a first run: {} is not there",
+            path.display()
+        );
+    }
+
+    // The start is chosen as a person chooses it: the definition and its record are written, the
+    // configuration holds the choice, and it selects no managed service.
+    host.select_service();
+    assert!(host.definition().exists() && host.record().exists());
+    let written: Value =
+        serde_json::from_slice(&std::fs::read(host.document()).expect("the document is there"))
+            .expect("the document is JSON");
+    assert_eq!(written["startup"]["controller"], "service", "{written}");
+    assert!(
+        service_settings_in(&written).is_empty(),
+        "the install selects no managed service: {written}"
+    );
+    #[cfg(target_os = "macos")]
+    if let Some(stand_in) = host.stand_in() {
+        the_stand_in_saw_the_install(host, stand_in);
+    }
+
+    // The first session starts the daemon through the manager.
+    let output = start(host.new_session()).finish("kr new");
+    let created = document(&output, "kr new");
+    assert!(
+        output.status.success(),
+        "{created}; it said {}{}",
+        String::from_utf8_lossy(&output.stderr),
+        host.stand_in_calls()
+    );
+    assert_eq!(created["state"], "live", "{created}");
+    let session = created["session_id"]
+        .as_str()
+        .expect("a session identifier");
+    let live = |what: &str| {
+        let output = start(host.kr(&["--json", "list"])).finish(what);
+        let listed = document(&output, what);
+        assert!(output.status.success(), "{listed}");
+        assert!(listed.to_string().contains(session), "{what}: {listed}");
+    };
+    live("kr list");
+    let daemon = host
+        .daemon()
+        .expect("the service manager reports the daemon it started");
+    #[cfg(target_os = "macos")]
+    if let Some(stand_in) = host.stand_in() {
+        the_stand_in_started_the_daemon(host, stand_in, daemon, &created);
+    } else {
+        host.assert_started_by_the_manager(daemon);
+    }
+    #[cfg(not(target_os = "macos"))]
+    host.assert_started_by_the_manager(daemon);
+
+    // The managed integrations are named, each as one the host does without, and the effective
+    // configuration takes every setting a service join owns from the product's own defaults.
+    let output = start(host.kr(&["--json", "doctor"])).finish("kr doctor");
+    let report = document(&output, "kr doctor");
+    support::the_managed_integrations_are_named_as_ones_the_host_does_without(&report);
+    for key in kr_protocol::hostinfo::configuration::ServiceSelection::KEYS {
+        let row = report["configuration"]["values"]
+            .as_array()
+            .and_then(|values| values.iter().find(|value| value["key"] == key))
+            .unwrap_or_else(|| panic!("kr doctor reports {key}: {report}"));
+        assert_eq!(
+            row["source"], "default",
+            "{key} is as the product has it, which selects no service: {row}"
+        );
+    }
+
+    // No account is signed in, and the host says it names no managed service.
+    let output = start(host.kr(&["--json", "account", "show"])).finish("kr account show");
+    let account = document(&output, "kr account show");
+    assert!(output.status.success(), "{account}");
+    assert_eq!(account["state"], "signed_out", "{account}");
+    assert_eq!(account["unavailable"], "no_managed_service", "{account}");
+
+    // An optional add that needs a service is refused by what is missing.
+    let output = start(host.kr(&["--json", "account", "sign-in"])).finish("kr account sign-in");
+    let refused = document(&output, "kr account sign-in");
+    assert!(!output.status.success(), "{refused}");
+    assert_eq!(refused["code"], "HOST_NOT_CONFIGURED", "{refused}");
+    assert!(
+        refused["message"]
+            .as_str()
+            .is_some_and(|said| said.contains("names no managed service")),
+        "the refusal says what is missing: {refused}"
+    );
+
+    // Clearing the start removes the definition and its record and ends nothing.
+    let cleared =
+        start(host.kr(&["--json", "host", "startup", "--clear"])).finish("kr host startup");
+    let none = document(&cleared, "kr host startup");
+    assert!(cleared.status.success(), "{none}");
+    for path in [host.definition(), host.record()] {
+        assert!(!path.exists(), "{} is gone", path.display());
+    }
+    live("kr list after the clear");
+    assert_eq!(
+        host.daemon(),
+        Some(daemon),
+        "the same daemon, which nothing ended"
+    );
+    #[cfg(target_os = "macos")]
+    if let Some(stand_in) = host.stand_in() {
+        the_stand_in_saw_nothing_end(host, stand_in);
+    }
+    host.close(&created);
+}
+
+/// KR-REQ-26.42: the headless host is installed and started under the user's service manager with
+/// no account and no managed service: on Linux the user's systemd, and on macOS the account's own
+/// launchd where the run asked for it. Where the host has no such manager the case says so and
+/// stands down; the case on the stand-in service manager is the one that runs everywhere on macOS.
+#[test]
+fn kr_req_26_42_the_headless_host_is_installed_and_started_under_the_user_service_manager_with_no_account_and_no_managed_service()
+ {
+    let Some(host) = ServiceHost::create() else {
+        return;
+    };
+    the_headless_host_case(&host);
+}
+
+/// KR-REQ-26.42: the same case on macOS through the stand-in service manager, which every run
+/// there can do: the install and the start reach the stand-in and no launchd of the account, the
+/// stand-in's calls are asserted, and its job is the process the definition describes. It never
+/// stands down: a missing stand-in fails it.
+#[test]
+#[cfg(target_os = "macos")]
+fn kr_req_26_42_the_headless_host_is_installed_and_started_under_a_stand_in_service_manager_with_no_account_and_no_managed_service()
+ {
+    let host = ServiceHost::on_stand_in();
+    the_headless_host_case(&host);
+}
+
 /// KR-REQ-07.12: installing the service start in a run that did not ask for the account's own
 /// launchd refuses before it writes a definition, which launchd would load at the next login.
 #[test]
