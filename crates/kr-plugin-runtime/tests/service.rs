@@ -5977,8 +5977,9 @@ mod recorded_session {
             let kind = entry["kind"].as_str().expect("a kind");
             let bytes = unhex(entry["hex"].as_str().expect("the bytes"));
             let read = if kind.starts_with("request:") {
-                let request: Request =
-                    kr_cbor::from_canonical_slice(&bytes, &limits).expect("this build reads it");
+                let read: Result<Request, _> = kr_cbor::from_canonical_slice(&bytes, &limits);
+                assert!(read.is_ok(), "{kind} is read by this build: {read:?}");
+                let request = read.expect("checked above");
                 assert_eq!(
                     kr_cbor::to_canonical_vec(&request).expect("it encodes"),
                     bytes,
@@ -5986,8 +5987,9 @@ mod recorded_session {
                 );
                 format!("request:{}", request.body.name())
             } else {
-                let frame: Frame =
-                    kr_cbor::from_canonical_slice(&bytes, &limits).expect("this build reads it");
+                let read: Result<Frame, _> = kr_cbor::from_canonical_slice(&bytes, &limits);
+                assert!(read.is_ok(), "{kind} is read by this build: {read:?}");
+                let frame = read.expect("checked above");
                 assert_eq!(
                     kr_cbor::to_canonical_vec(&frame).expect("it encodes"),
                     bytes,
