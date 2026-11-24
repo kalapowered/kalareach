@@ -5,12 +5,15 @@
 //! The checkout commits the text in `docs/releases/third-party-notices.txt`, which
 //! `scripts/generate-notices.py` makes from `cargo-about`; a tree whose copy differs is refused.
 //!
-//! The generator and a release check both read the lock, and the lock names crates that no release
-//! platform builds, such as the ones a dependency uses only on an operating system a release does not
-//! target. So the committed text ends with a list of the crates the lock reaches from the release
-//! programs that no platform's build uses, which the generator writes from `gaps`, and a text that
-//! leaves any crate of that closure out of both its entries and that list is refused. A dependency
-//! added to the lock fails the check until the notice is made again.
+//! The generator knows which crates a release build compiles in, because it asks `cargo tree` for
+//! the packages and platforms a release is built for. This check reads only the lock, and the lock
+//! names crates that no release build compiles, such as the ones a dependency uses only on an
+//! operating system a release does not target, or only for its own tests. So the committed text
+//! ends with a list of the crates the lock reaches from the release programs that no build
+//! compiles, which the generator writes from `gaps`, and a text that leaves any crate of that
+//! closure out of both its entries and that list is refused. A dependency added to the lock fails
+//! the check until the notice is made again. A text that still holds the placeholder of a licence
+//! template, where a crate's copyright line belongs, is refused too.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -26,13 +29,38 @@ pub const FILE: &str = "share/THIRD-PARTY-NOTICES.txt";
 /// Where the checkout commits the notice.
 pub const COMMITTED: &str = "docs/releases/third-party-notices.txt";
 
+/// What the permissive licence templates of the SPDX list hold where the owner's copyright line
+/// belongs, in lower case. The GPL's own text has `<year>` and `<name of author>` in the paragraph
+/// that tells a program how to apply it, so those two are not in the list.
+const PLACEHOLDERS: [&str; 5] = [
+    "<owner>",
+    "<copyright holder>",
+    "<copyright holders>",
+    "<organization>",
+    "<organisation>",
+];
+
+/// What a person does when the committed text is not the one the lock makes.
+const REPAIR: &str = "build kr-release with `cargo build -p kr-release`, run \
+     `python3 scripts/generate-notices.py write --kr-release target/debug/kr-release`, and commit \
+     the result";
+
+/// What names a crate in the lock and in the notice: its name, its version and the Git repository
+/// it comes from, which crates.io crates do not have. A repository and a registry can offer the
+/// same name and version, and the notice has to carry the text of each.
+type Identity = (String, String, Option<String>);
+
+/// The address of the crates.io page an entry of a registry crate names as its source.
+const REGISTRY_PAGE: &str = "https://crates.io/crates/";
+
 /// Holds what a tree carries of the notice to what its checkout commits, and the committed text to
 /// the lock.
 ///
 /// # Errors
 ///
-/// Returns a refusal when the tree has no notice or a different one, or when the committed text has
-/// no entry for a crate that the lock takes into the release programs.
+/// Returns a refusal when the tree has no notice or a different one, when the committed text holds
+/// a licence template's placeholder, or when it has no entry for a crate that the lock takes into
+/// the release programs.
 pub fn held(tree: &Path, checkout: &Path) -> Result<()> {
     let committed = read(&checkout.join(COMMITTED))?;
     let carried =
@@ -42,11 +70,18 @@ pub fn held(tree: &Path, checkout: &Path) -> Result<()> {
     }
     let text =
         String::from_utf8(committed).map_err(|_| Refusal(format!("{COMMITTED} is not text")))?;
+    let lower = text.to_lowercase();
+    if let Some(found) = PLACEHOLDERS.iter().find(|word| lower.contains(**word)) {
+        refuse!(
+            "{COMMITTED} holds {found}, the placeholder of a licence template, where the crate's \
+             own copyright line belongs: {REPAIR}"
+        );
+    }
     let lacking = gaps(checkout, &text)?;
     if let Some(first) = lacking.first() {
         refuse!(
             "{COMMITTED} has no entry for {} of the crates the lock takes into the release \
-             programs, the first {first}: `python3 scripts/generate-notices.py write` makes it again",
+             programs, the first {first}: {REPAIR}",
             lacking.len()
         );
     }
@@ -54,24 +89,34 @@ pub fn held(tree: &Path, checkout: &Path) -> Result<()> {
 }
 
 /// The crates the lock reaches from the release programs, without a crate that only a package's
-/// tests use, that `notice` names in no entry, each as `name version`, in order.
+/// tests use, that `notice` names in no entry, each as `name version`, or `name version | source
+/// ADDRESS` when a Git repository gives it, in order.
 ///
 /// # Errors
 ///
 /// Returns a refusal when a file it reads is missing or is not what it expects.
 pub fn gaps(checkout: &Path, notice: &str) -> Result<Vec<String>> {
-    let named: BTreeSet<(String, String)> = notice
+    let named: BTreeSet<Identity> = notice
         .lines()
         .filter_map(|line| line.strip_prefix("  - "))
         .filter_map(|entry| {
-            let mut words = entry.split(" | ").next()?.split_whitespace();
-            Some((words.next()?.to_owned(), words.next()?.to_owned()))
+            let mut fields = entry.split(" | ");
+            let mut words = fields.next()?.split_whitespace();
+            let (name, version) = (words.next()?.to_owned(), words.next()?.to_owned());
+            let repository = fields
+                .find_map(|field| field.strip_prefix("source "))
+                .filter(|address| !address.starts_with(REGISTRY_PAGE))
+                .map(str::to_owned);
+            Some((name, version, repository))
         })
         .collect();
     Ok(reached(checkout)?
         .into_iter()
-        .filter(|crate_version| !named.contains(crate_version))
-        .map(|(name, version)| format!("{name} {version}"))
+        .filter(|identity| !named.contains(identity))
+        .map(|(name, version, repository)| match repository {
+            Some(address) => format!("{name} {version} | source {address}"),
+            None => format!("{name} {version}"),
+        })
         .collect())
 }
 
@@ -171,6 +216,11 @@ fn named_by<'a>(entry: &str, all: &'a [Package]) -> impl Iterator<Item = usize> 
     let mut words = entry.split_whitespace();
     let name = words.next().unwrap_or_default().to_owned();
     let version = words.next().map(str::to_owned);
+    let source = words.next().map(|word| {
+        word.trim_start_matches('(')
+            .trim_end_matches(')')
+            .to_owned()
+    });
     all.iter()
         .enumerate()
         .filter(move |(_, package)| {
@@ -178,13 +228,17 @@ fn named_by<'a>(entry: &str, all: &'a [Package]) -> impl Iterator<Item = usize> 
                 && version
                     .as_ref()
                     .is_none_or(|wanted| package.version == *wanted)
+                && source
+                    .as_ref()
+                    .is_none_or(|wanted| package.source.as_ref() == Some(wanted))
         })
         .map(|(index, _)| index)
 }
 
-/// Every package the lock takes from a registry or a repository into the release programs, as
-/// `(name, version)`.
-fn reached(checkout: &Path) -> Result<BTreeSet<(String, String)>> {
+/// Every package the lock takes from a registry or a repository into the release programs. The
+/// lock holds the dependencies of a package under every feature of every package of the workspace,
+/// so this is the crates a build can reach, which are more than the crates it compiles.
+fn reached(checkout: &Path) -> Result<BTreeSet<Identity>> {
     let lock = read_text(&checkout.join("Cargo.lock"))?
         .parse::<DocumentMut>()
         .map_err(|error| Refusal(format!("Cargo.lock is not TOML: {error}")))?;
@@ -234,6 +288,13 @@ fn reached(checkout: &Path) -> Result<BTreeSet<(String, String)>> {
         .iter()
         .zip(seen)
         .filter(|(package, reached)| *reached && package.source.is_some())
-        .map(|(package, _)| (package.name.clone(), package.version.clone()))
+        .map(|(package, _)| {
+            let repository = package
+                .source
+                .as_deref()
+                .and_then(|source| source.strip_prefix("git+"))
+                .map(str::to_owned);
+            (package.name.clone(), package.version.clone(), repository)
+        })
         .collect())
 }

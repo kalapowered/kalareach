@@ -1075,3 +1075,68 @@ fn a_notice_that_lacks_a_crate_of_the_programs_is_refused() {
     let lacking = kr_release::notices::gaps(&checkout(), &text).expect("the lock is read");
     assert_eq!(lacking, cut);
 }
+
+/// The parts of this checkout that the notice check reads (the lock, the manifests, the list of
+/// release programs), with `notice` as the text the stand-in commits, and a tree that carries the
+/// same text. The tree and the stand-in are in the one directory the first value holds.
+fn notice_stand_in(notice: &str) -> (tempfile::TempDir, PathBuf, PathBuf) {
+    let directory = tempfile::tempdir().expect("a directory");
+    let stand_in = directory.path().join("checkout");
+    let tree = directory.path().join("tree");
+    let copy = |relative: &str| {
+        let to = stand_in.join(relative);
+        std::fs::create_dir_all(to.parent().expect("a parent")).expect("a folder");
+        std::fs::copy(checkout().join(relative), to).expect("copied");
+    };
+    copy("Cargo.toml");
+    copy("Cargo.lock");
+    copy("scripts/release-programs.json");
+    let root: toml_edit::DocumentMut = std::fs::read_to_string(checkout().join("Cargo.toml"))
+        .expect("the workspace manifest")
+        .parse()
+        .expect("TOML");
+    for member in root["workspace"]["members"].as_array().expect("members") {
+        copy(&format!("{}/Cargo.toml", member.as_str().expect("a path")));
+    }
+    let committed = stand_in.join("docs/releases/third-party-notices.txt");
+    std::fs::create_dir_all(committed.parent().expect("a parent")).expect("a folder");
+    std::fs::write(committed, notice).expect("the committed notice");
+    std::fs::create_dir_all(tree.join("share")).expect("a folder");
+    std::fs::write(tree.join("share/THIRD-PARTY-NOTICES.txt"), notice).expect("the carried notice");
+    (directory, stand_in, tree)
+}
+
+/// A checkout whose committed notice, and the copy its tree carries, has no entry for a crate the
+/// lock takes into the release programs is refused by `held`, which the manifest, check and sign
+/// steps call. The committed text itself passes, which is the control.
+#[test]
+fn a_checkout_that_commits_a_notice_without_a_crate_is_refused() {
+    let committed =
+        std::fs::read_to_string(checkout().join("docs/releases/third-party-notices.txt"))
+            .expect("the committed notice");
+    let (_whole, stand_in, tree) = notice_stand_in(&committed);
+    kr_release::notices::held(&tree, &stand_in).expect("the committed notice is held to the lock");
+    let without: String = committed
+        .lines()
+        .filter(|line| !line.starts_with("  - serde_json "))
+        .map(|line| format!("{line}\n"))
+        .collect();
+    let (_cut, stand_in, tree) = notice_stand_in(&without);
+    let refused = kr_release::notices::held(&tree, &stand_in)
+        .expect_err("a notice with no entry for serde_json is refused");
+    assert!(refused.to_string().contains("serde_json"), "{refused}");
+}
+
+/// A committed notice that still holds the placeholder a permissive licence template has where
+/// the owner's copyright line goes is refused by name, though every crate has its entry.
+#[test]
+fn a_notice_with_a_licence_template_placeholder_is_refused() {
+    let committed =
+        std::fs::read_to_string(checkout().join("docs/releases/third-party-notices.txt"))
+            .expect("the committed notice");
+    let marked = format!("{committed}\nCopyright (c) 2020 <owner>\n");
+    let (_directory, stand_in, tree) = notice_stand_in(&marked);
+    let refused = kr_release::notices::held(&tree, &stand_in)
+        .expect_err("a notice with a template placeholder is refused");
+    assert!(refused.to_string().contains("<owner>"), "{refused}");
+}
