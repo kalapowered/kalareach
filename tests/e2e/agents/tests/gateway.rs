@@ -4510,6 +4510,46 @@ fn run_case_in(
             std::panic::resume_unwind(panic);
         }
     };
+    let subject = match &route {
+        Route::StandIn => Subject::codex(),
+        Route::Real(real) => real.subject.clone(),
+    };
+    run_case_on(
+        setup,
+        leg,
+        case,
+        test,
+        variants,
+        (shell, route, subject),
+        body,
+    );
+}
+
+/// [`run_case_in`] on the shell, the route and the agent it has made. A case that drives the
+/// gateway for an agent with no gateway ends here, as not run with its reason, before a run, a
+/// host or a session exists.
+fn run_case_on(
+    setup: Setup,
+    leg: &str,
+    case: &str,
+    test: &str,
+    variants: &str,
+    (shell, route, subject): (shells::ManagedShell, Route, Subject),
+    body: impl FnOnce(&Context, &Session<'_>) -> serde_json::Value,
+) {
+    let probe_only = matches!(&route, Route::Real(real) if real.probe_only);
+    if let Some(why) = subject.gateway_not_run(setup.manual, probe_only) {
+        let outcome = Outcome::not_run(
+            case,
+            test,
+            &why,
+            serde_json::json!({ "subject": { "plugin": subject.plugin().to_string() } }),
+        );
+        if let Some(path) = std::env::var_os(RESULT_VARIABLE).filter(|value| !value.is_empty()) {
+            outcome.append(Path::new(&path));
+        }
+        return;
+    }
     // The runtime is made before the run's directory, so that nothing that can fail is left to
     // fail between the run and the context that holds it.
     let runtime = match std::panic::catch_unwind(runtime) {
@@ -4521,6 +4561,7 @@ fn run_case_in(
         Err(panic) => fails_before_its_run(route, case, test, panic),
     };
     let mut ctx = Context::new(shell, route, run, runtime);
+    ctx.subject = subject;
     ctx.upgrade = setup.upgrade;
     ctx.forge = setup.forge;
     ctx.manual = setup.manual;
@@ -9450,5 +9491,68 @@ fn a_generation_gives_the_manifest_its_index_names_for_a_package_and_refuses_ano
     assert!(
         said.contains("is not the digest the generation's index names"),
         "{said}"
+    );
+}
+
+/// A subject whose package declares no command integration, and so no gateway.
+fn subject_with_no_gateway() -> Subject {
+    let mut manifest: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(
+            Subject::codex()
+                .package()
+                .expect("the Codex package")
+                .join("plugin.json"),
+        )
+        .expect("the in-tree manifest"),
+    )
+    .expect("a manifest");
+    manifest["plugin_name"] = serde_json::json!("other");
+    manifest
+        .as_object_mut()
+        .expect("an object")
+        .remove("command_integration");
+    let build: Build = serde_json::from_value(serde_json::json!({
+        "package": "kalareach/other", "application": "a", "version": "1", "prefix": "/p",
+        "pinned": "bin/other", "sha256": "00", "command": "other", "launch": "native",
+        "ready": "r", "harmless": { "input": "h", "shows": "h" }, "transcript": "t"
+    }))
+    .expect("an entry");
+    Subject::from_build(
+        &build,
+        &serde_json::from_value(manifest).expect("a manifest"),
+    )
+    .expect("a subject")
+}
+
+/// A case that drives the gateway for an agent with no gateway ends as not run before a run, a host
+/// or a session is made, and its body never runs.
+#[test]
+fn a_case_that_drives_the_gateway_for_an_agent_with_no_gateway_ends_before_its_body_runs() {
+    let shell = match shells::managed_zsh() {
+        Ok(shell) => shell,
+        Err(why) => {
+            eprintln!("skipping: {why}");
+            return;
+        }
+    };
+    let ran = std::sync::atomic::AtomicBool::new(false);
+    let ended = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        run_case_on(
+            Setup::default(),
+            "gateway-no-gateway",
+            "5b",
+            "a test",
+            "",
+            (shell, Route::StandIn, subject_with_no_gateway()),
+            |_, _| {
+                ran.store(true, std::sync::atomic::Ordering::SeqCst);
+                serde_json::json!({})
+            },
+        );
+    }));
+    assert!(ended.is_ok(), "the case ended as not run, without a panic");
+    assert!(
+        !ran.load(std::sync::atomic::Ordering::SeqCst),
+        "the body of a case that drives the gateway ran for an agent with no gateway"
     );
 }

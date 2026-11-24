@@ -185,6 +185,20 @@ impl Subject {
         self.gateway.as_ref()
     }
 
+    /// Why a case that drives the gateway has nothing to run for this subject: the package declares
+    /// no gateway backend. None where the subject has a gateway, where the agent is started by hand
+    /// (`by_hand`), and in the probe-only run (`probe_only`), which has an entry point of its own.
+    #[must_use]
+    pub fn gateway_not_run(&self, by_hand: bool, probe_only: bool) -> Option<String> {
+        (!by_hand && !probe_only && self.gateway.is_none()).then(|| {
+            format!(
+                "the package {} declares no gateway backend, so a part that drives the gateway \
+                 has nothing to run for it",
+                self.plugin
+            )
+        })
+    }
+
     /// The entry's account; none on the stand-in route and for an entry that has none.
     #[must_use]
     pub fn account(&self) -> Option<&Account> {
@@ -524,6 +538,30 @@ mod tests {
                 "stdio://".to_owned()
             ])
         );
+    }
+
+    /// A case that drives the gateway has nothing to run for a subject with no gateway, unless the
+    /// agent is started by hand or the run is the probe-only one; a subject with a gateway always
+    /// has something to run.
+    #[test]
+    fn a_gateway_case_has_nothing_to_run_for_a_subject_with_no_gateway_unless_by_hand_or_probed() {
+        let build = build_of("kalareach/kimi-code-cli");
+        let without = Subject::from_build(&build, &manifest("kimi-code-cli", Integration::Flags))
+            .expect("a subject");
+        let why = without
+            .gateway_not_run(false, false)
+            .expect("a subject with no gateway has nothing to run");
+        assert!(
+            why.contains("kalareach/kimi-code-cli") && why.contains("declares no gateway backend"),
+            "{why}"
+        );
+        assert_eq!(without.gateway_not_run(true, false), None, "by hand");
+        assert_eq!(without.gateway_not_run(false, true), None, "probe only");
+        let with = Subject::from_build(&build_of(CODEX), &manifest("codex", Integration::Backend))
+            .expect("the Codex subject");
+        for (by_hand, probe_only) in [(false, false), (true, false), (false, true)] {
+            assert_eq!(with.gateway_not_run(by_hand, probe_only), None);
+        }
     }
 
     /// The Codex subject gives the typed line, the configuration file's bytes, the probes'
