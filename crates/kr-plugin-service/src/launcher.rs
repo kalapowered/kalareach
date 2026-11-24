@@ -2823,8 +2823,17 @@ mod tests {
             .await
             .expect("the claim is accepted");
         let seen = match serving {
-            Some(serving) if behaviour != Some(FourHost::IsSilent) => {
-                serving.await.expect("the host of the fourth protocol")
+            Some(mut serving) if behaviour != Some(FourHost::IsSilent) => {
+                // The launch is over, so a host it asked has answered. One it never asked still
+                // waits for a connection, and has seen nothing.
+                if let Ok(seen) =
+                    tokio::time::timeout(core::time::Duration::from_secs(3), &mut serving).await
+                {
+                    seen.expect("the host of the fourth protocol")
+                } else {
+                    serving.abort();
+                    Seen::default()
+                }
             }
             Some(serving) => {
                 serving.abort();
