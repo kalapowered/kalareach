@@ -62,7 +62,7 @@ pub async fn run(options: Options) -> LaunchResult<()> {
     .await?;
     prepared
         .host
-        .serve_on(prepared.listener, termination())
+        .serve_on(prepared.listener, HostProtocol::V3, termination())
         .await
 }
 
