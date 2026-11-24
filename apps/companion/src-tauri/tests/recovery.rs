@@ -4496,6 +4496,20 @@ fn line_of(page: &Page) -> Value {
     page.view().get("settings").cloned().unwrap_or(Value::Null)
 }
 
+/// Waits until the page has been told `count` times that recovery changed. The first is the step
+/// the application's start wants and the second the step a turn-on wants: once both ended and
+/// told, nothing is wanted until a change, so no step of theirs reads the settings after the first
+/// change a case makes next.
+async fn told_at_least(page: &Page, count: usize, what: &str) {
+    assert!(
+        until(Duration::from_secs(10), || async {
+            *page.recovery_told.lock().expect("the record") >= count
+        })
+        .await,
+        "{what}"
+    );
+}
+
 /// KR-REQ-20.17: a change to the colour mode rewrites the member, and three changes in quick
 /// succession make one write.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4560,7 +4574,9 @@ async fn a_failed_write_is_retried_at_the_end_of_the_window_and_saved_shows_only
     };
     let computer = Computer::new().await;
     let (page, settings) = computer.running_page(timing).await;
+    told_at_least(&page, 1, "the start step told the page").await;
     page.call("recovery_turn_on", json!({})).expect("on");
+    told_at_least(&page, 2, "the step the turn-on wanted told the page").await;
     // The first write after this one fails before the service sees it.
     computer
         .served
@@ -4619,13 +4635,15 @@ async fn a_step_that_ends_by_itself_tells_the_page_to_read_recovery_again() {
     };
     let computer = Computer::new().await;
     let (page, settings) = computer.running_page(timing).await;
+    told_at_least(&page, 1, "the start step told the page").await;
     page.call("recovery_turn_on", json!({})).expect("on");
+    told_at_least(&page, 2, "the step the turn-on wanted told the page").await;
     // The first write after this one fails before the service sees it.
     computer
         .served
         .web()
         .fail_with_member(SYNC_PATH, "exchange", 1, Moment::Before);
-    let mut seen = 0;
+    let mut seen = *page.recovery_told.lock().expect("the record");
     settings
         .set_colour_mode(ColourMode::Dark)
         .await
@@ -4967,7 +4985,9 @@ async fn a_colour_change_beside_hosts_in_privacy_mode_is_saved_with_the_bundle()
         Arc::new(Confirms),
     )
     .expect("settings sync opens");
+    told_at_least(&page, 1, "the start step told the page").await;
     page.call("recovery_turn_on", json!({})).expect("on");
+    told_at_least(&page, 2, "the step the turn-on wanted told the page").await;
 
     // Privacy mode is in force: settings sync is on and drafts sync with it, and a draft written
     // for a session of a host that reports privacy mode on is read as private and stays here.
@@ -5080,7 +5100,9 @@ async fn a_cover_that_reaches_the_service_runs_a_fresh_comparison() {
     };
     let computer = Computer::new().await;
     let (page, _) = computer.running_page(timing).await;
+    told_at_least(&page, 1, "the start step told the page").await;
     page.call("recovery_turn_on", json!({})).expect("on");
+    told_at_least(&page, 2, "the step the turn-on wanted told the page").await;
     // A change made through another reader of the file, which no one here heard.
     Settings::open(computer.data.path())
         .local()
@@ -5112,7 +5134,9 @@ async fn every_trigger_shares_one_deadline_and_a_change_in_the_window_stays_sche
     };
     let computer = Computer::new().await;
     let (page, settings) = computer.running_page(timing).await;
+    told_at_least(&page, 1, "the start step told the page").await;
     page.call("recovery_turn_on", json!({})).expect("on");
+    told_at_least(&page, 2, "the step the turn-on wanted told the page").await;
     settings
         .set_colour_mode(ColourMode::Dark)
         .await
@@ -5411,7 +5435,9 @@ async fn the_loop_writes_no_settings_while_the_oldest_retained_level_cannot_read
     };
     let computer = Computer::new().await;
     let (page, settings) = computer.running_page_at(timing, level(CLOSED)).await;
+    told_at_least(&page, 1, "the start step told the page").await;
     page.call("recovery_turn_on", json!({})).expect("on");
+    told_at_least(&page, 2, "the step the turn-on wanted told the page").await;
     let before = writes_sent(&computer);
     settings
         .set_colour_mode(ColourMode::Dark)
