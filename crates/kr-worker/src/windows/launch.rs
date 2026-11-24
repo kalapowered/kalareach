@@ -326,7 +326,7 @@ pub(crate) use platform::end_process;
 #[cfg(all(windows, feature = "testing"))]
 pub use platform::seams;
 #[cfg(windows)]
-pub use platform::{Child, Spec, StdinPipe, Stdio, start};
+pub use platform::{Child, Spec, StdinPipe, Stdio, available, start};
 
 /// The calls with no safe form, and the handles they own.
 #[cfg(windows)]
@@ -346,9 +346,9 @@ mod platform {
 
     use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
     use windows_sys::Win32::Foundation::{
-        ERROR_ACCESS_DENIED, ERROR_OPERATION_ABORTED, ERROR_PIPE_BUSY, GENERIC_READ, GENERIC_WRITE,
-        HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, LocalFree, STILL_ACTIVE,
-        SetHandleInformation, WAIT_OBJECT_0, WAIT_TIMEOUT,
+        ERROR_ACCESS_DENIED, ERROR_BROKEN_PIPE, ERROR_OPERATION_ABORTED, ERROR_PIPE_BUSY,
+        GENERIC_READ, GENERIC_WRITE, HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, LocalFree,
+        STILL_ACTIVE, SetHandleInformation, WAIT_OBJECT_0, WAIT_TIMEOUT,
     };
     use windows_sys::Win32::Security::Authorization::{
         ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
@@ -363,7 +363,7 @@ mod platform {
     };
     use windows_sys::Win32::System::IO::CancelIoEx;
     use windows_sys::Win32::System::Pipes::{
-        CreatePipe, GetNamedPipeClientProcessId, GetNamedPipeServerProcessId,
+        CreatePipe, GetNamedPipeClientProcessId, GetNamedPipeServerProcessId, PeekNamedPipe,
     };
     use windows_sys::Win32::System::SystemServices::ACCESS_ALLOWED_ACE_TYPE;
     use windows_sys::Win32::System::Threading::{
@@ -504,6 +504,29 @@ mod platform {
             }
         }
 
+        /// Waits up to `timeout` for the process to end, and says how it ended, or nothing if it is
+        /// still running when the time is up.
+        ///
+        /// # Errors
+        ///
+        /// Returns the operating system's failure.
+        pub fn wait_for(
+            &mut self,
+            timeout: std::time::Duration,
+        ) -> std::io::Result<Option<std::process::ExitStatus>> {
+            let millis = u32::try_from(timeout.as_millis())
+                .unwrap_or(u32::MAX)
+                .min(INFINITE - 1);
+            // SAFETY: the handle is this value's own and open for the call.
+            let waited =
+                unsafe { WaitForSingleObject(self.process.as_raw_handle().cast(), millis) };
+            match waited {
+                WAIT_TIMEOUT => Ok(None),
+                WAIT_OBJECT_0 => self.status().map(Some),
+                _ => Err(std::io::Error::last_os_error()),
+            }
+        }
+
         fn status(&self) -> std::io::Result<std::process::ExitStatus> {
             let mut code = 0_u32;
             // SAFETY: the handle is open for the call and the code is a local this thread owns.
@@ -513,6 +536,38 @@ mod platform {
                 return Err(std::io::Error::last_os_error());
             }
             Ok(std::process::ExitStatus::from_raw(code))
+        }
+    }
+
+    /// How many bytes the blocking pipe `pipe` holds to be read now, which a read takes without
+    /// waiting; none means nothing yet, and nothing means its other end has closed and the end of
+    /// the file is the next read.
+    ///
+    /// # Errors
+    ///
+    /// Returns the operating system's failure.
+    pub fn available(pipe: &std::fs::File) -> std::io::Result<Option<u32>> {
+        let mut count = 0_u32;
+        // SAFETY: the handle is open for the call; the count is a local this thread owns, and the
+        // call is asked for nothing else.
+        let peeked = unsafe {
+            PeekNamedPipe(
+                pipe.as_raw_handle().cast(),
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                &raw mut count,
+                std::ptr::null_mut(),
+            )
+        };
+        if peeked != 0 {
+            return Ok(Some(count));
+        }
+        let failure = std::io::Error::last_os_error();
+        if failure.raw_os_error().map(i32::cast_unsigned) == Some(ERROR_BROKEN_PIPE) {
+            Ok(None)
+        } else {
+            Err(failure)
         }
     }
 

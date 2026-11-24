@@ -108,7 +108,7 @@ fn one(
         &[],
         directory,
         &environment,
-        deadline,
+        &kr_worker::broker::probe::ProbeRun::within(deadline),
         kr_worker::broker::probe::MAX_OUTPUT_BYTES,
     );
     match probed.mode {

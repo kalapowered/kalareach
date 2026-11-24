@@ -10,13 +10,13 @@
 //!
 //! | Row | What is checked here |
 //! | --- | --- |
-//! | KR-REQ-07.64 | The mode is read from what the program prints, and a nonzero exit status does not change that; the program runs in the launch's directory with no input; one that prints too much or never finishes records no mode and is ended with everything it started; one that cannot start says so; a program is held to the deadline it is given, and an answer after it is not taken |
+//! | KR-REQ-07.64 | The mode is read from what the program prints, and a nonzero exit status does not change that; the program runs in the launch's directory with no input; one that prints too much or never finishes records no mode and is ended with everything it started; one that cannot start says so; a program is held to the deadline it is given, and an answer after it is not taken; the probe runs in the environment it is given and in no other; one that is created after the deadline is ended by the thread that created it, and the call returns at the deadline; one that prints and keeps running, or whose descendant holds the output, is ended within the cleanup bound; the whole call, a wait for a thread included, takes no longer than the deadline and the cleanup bound |
 
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use kr_plugin_sdk::launch_probe::LaunchProbe;
-use kr_worker::broker::probe::{self, Probed};
+use kr_worker::broker::probe::{self, ProbeRun, Probed};
 
 mod common;
 
@@ -107,7 +107,7 @@ impl Standin {
             &[],
             directory,
             &given(&[]),
-            GENEROUS,
+            &ProbeRun::within(GENEROUS),
             probe::MAX_OUTPUT_BYTES,
         )
     }
@@ -164,7 +164,7 @@ fn kr_req_07_64_the_probe_runs_in_the_environment_it_is_given() {
         &[],
         directory().path(),
         &given(&[("KR_PROBE_GIVEN", "yes")]),
-        GENEROUS,
+        &ProbeRun::within(GENEROUS),
         probe::MAX_OUTPUT_BYTES,
     );
     assert_eq!(probed.mode.as_deref(), Some("yes|none"), "{probed:?}");
@@ -221,7 +221,7 @@ fn kr_req_07_64_a_program_that_prints_more_than_the_cap_records_no_mode() {
         &[],
         directory().path(),
         &given(&[]),
-        GENEROUS,
+        &ProbeRun::within(GENEROUS),
         1000,
     );
     assert_eq!(probed.mode, None);
@@ -270,7 +270,7 @@ fn kr_req_07_64_a_program_that_never_finishes_is_ended_with_everything_it_starte
             &[],
             here.path(),
             &given(&[]),
-            deadline,
+            &ProbeRun::within(deadline),
             probe::MAX_OUTPUT_BYTES,
         );
         if ["main.pid", "child.pid"]
@@ -318,7 +318,7 @@ fn kr_req_07_64_a_program_that_cannot_start_records_no_mode_and_says_so() {
         &[],
         directory().path(),
         &given(&[]),
-        GENEROUS,
+        &ProbeRun::within(GENEROUS),
         probe::MAX_OUTPUT_BYTES,
     );
     assert_eq!(probed.mode, None);
@@ -392,7 +392,7 @@ fn kr_req_07_64_a_probe_is_held_to_the_deadline_it_is_given_and_a_late_answer_is
             &[],
             root,
             &given(&[]),
-            deadline,
+            &ProbeRun::within(deadline),
             probe::MAX_OUTPUT_BYTES,
         )
     };
@@ -421,4 +421,209 @@ fn kr_req_07_64_a_probe_is_held_to_the_deadline_it_is_given_and_a_late_answer_is
         before,
         "the directory is as it was after an answered probe"
     );
+}
+
+/// How long a case waits for the probe's own thread to end after the call has returned.
+const THREAD_PATIENCE: Duration = Duration::from_secs(30);
+
+/// How much later than its bound a call may be for a loaded machine's scheduling.
+const SLACK: Duration = Duration::from_millis(1500);
+
+/// The time the probe's thread took in all, waited for until it has ended.
+fn thread_total(probed: &Probed) -> Duration {
+    let started = Instant::now();
+    loop {
+        if let Some(total) = probed.thread_took.get() {
+            return *total;
+        }
+        assert!(
+            started.elapsed() < THREAD_PATIENCE,
+            "the probe's thread never ended"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Waits until the process a stand-in wrote to `file` is gone.
+fn assert_gone(directory: &Path, file: &str) {
+    let pid = written_pid(directory, file).unwrap_or_else(|| panic!("{file} was not written"));
+    let started = Instant::now();
+    while kr_ipc::identity::process_start_identity(pid).is_ok() {
+        assert!(
+            started.elapsed() < LIVENESS_DEADLINE,
+            "process {pid} ({file}) outlived the probe"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// How long a stand-in is given to start what it starts, where a case needs that to have happened.
+fn start_allowance() -> Duration {
+    if cfg!(windows) {
+        Duration::from_secs(15)
+    } else {
+        Duration::from_secs(5)
+    }
+}
+
+/// KR-REQ-07.64: a process created after the deadline is ended by the thread that created it, at
+/// once, and the call has returned at the deadline without waiting for the create.
+///
+/// The create is held back past the deadline. The stand-in would write `ran.txt` a second after it
+/// starts, and it never does, because it is ended as it is made.
+#[test]
+fn kr_req_07_64_a_probe_created_after_the_deadline_is_ended_by_its_creator() {
+    let here = directory();
+    let standin = Standin::running(
+        "sleep 1; echo ran > ran.txt; sleep 600",
+        "Start-Sleep 1; 'ran' | Out-File ran.txt; Start-Sleep 600",
+    );
+    let deadline = Duration::from_secs(1);
+    probe::seams::delay_create(here.path(), Some(Duration::from_secs(2)));
+    let run = ProbeRun::within(deadline);
+    let probed = probe::run_within(
+        &standin.program,
+        &standin.probe(&[]),
+        &[],
+        here.path(),
+        &given(&[]),
+        &run,
+        probe::MAX_OUTPUT_BYTES,
+    );
+    probe::seams::delay_create(here.path(), None);
+    assert!(probed.late, "{probed:?}");
+    assert_eq!(probed.mode, None);
+    assert!(
+        probed.took >= deadline && probed.took < deadline + SLACK,
+        "the call returned at the deadline, not when the create did: {:?}",
+        probed.took
+    );
+    let total = thread_total(&probed);
+    assert!(
+        total < Duration::from_secs(2) + probe::CLEANUP_BOUND + SLACK,
+        "the thread ended what it made at once: {total:?}"
+    );
+    // Longer than the stand-in's own second, and than a Windows shell takes to begin.
+    std::thread::sleep(Duration::from_secs(if cfg!(windows) { 8 } else { 3 }));
+    assert!(
+        !here.path().join("ran.txt").exists(),
+        "a probe created after the deadline ran"
+    );
+}
+
+/// KR-REQ-07.64: a probe that prints a mode and goes on running is late, is ended within the cleanup
+/// bound after the deadline, and nothing it ran is left.
+#[test]
+fn kr_req_07_64_a_probe_that_prints_and_keeps_running_is_ended_within_the_cleanup_bound() {
+    let here = directory();
+    let standin = Standin::running(
+        r#"echo $$ > main.pid; printf '{"mode":"elevated"}'; sleep 600"#,
+        r#"$PID | Out-File -Encoding ascii main.pid; [Console]::Out.Write('{"mode":"elevated"}'); Start-Sleep 600"#,
+    );
+    let deadline = start_allowance();
+    let run = ProbeRun::within(deadline);
+    let probed = probe::run_within(
+        &standin.program,
+        &standin.probe(&[]),
+        &[],
+        here.path(),
+        &given(&[]),
+        &run,
+        probe::MAX_OUTPUT_BYTES,
+    );
+    assert!(probed.late, "its output had not ended: {probed:?}");
+    assert!(
+        probed.took <= deadline + probe::CLEANUP_BOUND + SLACK,
+        "{:?}",
+        probed.took
+    );
+    assert_gone(here.path(), "main.pid");
+}
+
+/// KR-REQ-07.64: the whole call, a wait for a thread before it included, is bounded by the deadline
+/// and the cleanup bound, and a call whose deadline passed in the wait starts nothing.
+#[test]
+fn kr_req_07_64_the_total_time_is_bounded_by_the_deadline_plus_the_cleanup_bound() {
+    let here = directory();
+    let standin = Standin::running(
+        "echo $$ > main.pid; sleep 600",
+        "$PID | Out-File -Encoding ascii main.pid; Start-Sleep 600",
+    );
+    let deadline = start_allowance();
+    let run = ProbeRun::within(deadline);
+    // A queue: a second of the deadline goes before the call is made.
+    std::thread::sleep(Duration::from_secs(1));
+    let probed = probe::run_within(
+        &standin.program,
+        &standin.probe(&[]),
+        &[],
+        here.path(),
+        &given(&[]),
+        &run,
+        probe::MAX_OUTPUT_BYTES,
+    );
+    assert!(probed.late, "{probed:?}");
+    assert!(
+        probed.took >= deadline && probed.took <= deadline + probe::CLEANUP_BOUND + SLACK,
+        "from the caller's first instant, the wait included: {:?}",
+        probed.took
+    );
+    let total = thread_total(&probed);
+    assert!(
+        total <= deadline + probe::CLEANUP_BOUND + SLACK,
+        "the thread's total, cleanup included: {total:?}"
+    );
+    assert_gone(here.path(), "main.pid");
+
+    let queued = directory();
+    let standin = Standin::running(
+        "echo ran > ran.txt; sleep 600",
+        "'ran' | Out-File ran.txt; Start-Sleep 600",
+    );
+    let run = ProbeRun::within(Duration::from_millis(200));
+    std::thread::sleep(Duration::from_millis(400));
+    let probed = probe::run_within(
+        &standin.program,
+        &standin.probe(&[]),
+        &[],
+        queued.path(),
+        &given(&[]),
+        &run,
+        probe::MAX_OUTPUT_BYTES,
+    );
+    assert!(probed.late, "{probed:?}");
+    std::thread::sleep(Duration::from_secs(if cfg!(windows) { 6 } else { 2 }));
+    assert!(
+        !queued.path().join("ran.txt").exists(),
+        "a call whose deadline passed in the queue started a probe"
+    );
+}
+
+/// KR-REQ-07.64: a descendant that holds the output open after the probe has printed and ended does
+/// not hold the call: it returns at the deadline, and the descendant is ended with the probe.
+#[test]
+fn kr_req_07_64_a_probe_whose_descendant_holds_the_output_does_not_hold_the_call() {
+    let here = directory();
+    let standin = Standin::running(
+        r#"(sleep 600 & echo $! > child.pid); printf '{"mode":"elevated"}'; exit 0"#,
+        r#"$child = Start-Process "$env:SystemRoot\System32\ping.exe" -ArgumentList '-n','600','127.0.0.1' -PassThru -NoNewWindow; $child.Id | Out-File -Encoding ascii child.pid; [Console]::Out.Write('{"mode":"elevated"}')"#,
+    );
+    let deadline = start_allowance();
+    let run = ProbeRun::within(deadline);
+    let probed = probe::run_within(
+        &standin.program,
+        &standin.probe(&[]),
+        &[],
+        here.path(),
+        &given(&[]),
+        &run,
+        probe::MAX_OUTPUT_BYTES,
+    );
+    assert!(probed.late, "the output had not ended: {probed:?}");
+    assert!(
+        probed.took <= deadline + probe::CLEANUP_BOUND + SLACK,
+        "{:?}",
+        probed.took
+    );
+    assert_gone(here.path(), "child.pid");
 }
