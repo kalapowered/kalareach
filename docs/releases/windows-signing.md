@@ -55,8 +55,8 @@ A Windows release is one archive for each Windows target, `kalareach-x86_64-pc-w
 and `kalareach-aarch64-pc-windows-msvc-<release>.zip`, and one `SHA256SUMS` that names both. An archive
 holds one directory, named as the archive is, and that directory is the release tree: `bin/` with the
 host's programs, `shells/psreadline/` with the PowerShell package, `share/` with the update channel's
-root, the release record, the terminal's capability manifest and terminfo database, `signatures.txt` and
-the licence, and `release.json`, the manifest.
+root, the release record, the terminal's capability manifest and terminfo database, `signatures.txt`,
+the licence and the third-party notice, and `release.json`, the manifest.
 [manifest.md](manifest.md) says what the manifest and the record state.
 
 Two kinds of signature hold it. Authenticode signs the executables, `bin\kr.exe`, `kr-attach-guard.exe`,

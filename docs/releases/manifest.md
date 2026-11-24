@@ -201,27 +201,38 @@ built and not on a release being installed.
 
 ## The third-party notice
 
-A release for every target carries `share/THIRD-PARTY-NOTICES.txt`, the licences of the third-party
-crates that its programs and its fish package are built from. The manifest lists it like any other
-file, so the signature covers it. The checkout commits the text as
-`docs/releases/third-party-notices.txt`, and `scripts/build-release.sh` copies it into the tree.
+A release for every target carries `share/THIRD-PARTY-NOTICES.txt`: the licence texts and notices of
+the third-party crates that its programs and its fish package are built from, as each crate's
+package states them, the licence texts of the libraries that some of those crates bundle, and the
+whole of fish's own `COPYING`. The manifest lists it like any other file, so the signature covers
+it. The checkout commits the text as `docs/releases/third-party-notices.txt`, and
+`scripts/build-release.sh` copies it into the tree.
 
-`python3 scripts/generate-notices.py write` makes the text with cargo-about, pinned to one version
-and run offline, over the crates of each program in `scripts/release-programs.json` and over the
-crates of the fish source that `shells/fish/manifest.json` pins. `about.toml` names the licences a
-dependency may be used under. A crate that is offered under several is recorded under the first of
-them that `about.toml` lists, and a crate under a licence it does not list stops the run until a
-person has read that licence and added it. Each licence text appears once, with the crates that use
-it. The entry of a crate under the Mozilla Public License 2.0, or taken from a Git repository, names
-where its source is. The text covers every platform a release is built for, so the list for one
-archive is a subset of it.
+`python3 scripts/generate-notices.py write --kr-release <a built kr-release>` makes the text. It
+takes the crates that a release compiles from `cargo tree`, over normal and build edges, for the
+packages in `scripts/release-programs.json` on every platform a release is built for, and for the
+fish source that `shells/fish/manifest.json` pins with the features its build selects. cargo-about,
+pinned to one version and run offline, says which licence each crate is recorded under.
+`about.toml` names the licences a dependency may be used under. A crate that is offered under
+several is recorded under the first of them that `about.toml` lists, and a crate under a licence it
+does not list stops the run until a person has read that licence and added it.
 
-The lock also names crates that no release platform builds. They are listed last, so that
-`kr-release manifest`, `check` and `sign` can hold the committed text to the lock: they refuse a tree
-that carries no notice or a copy that is not the committed text, and a committed text that has no
-entry for a crate the lock takes into the release programs. The release-checks workflow makes the
-text again and refuses a committed one that differs. The crates of the fish source are covered by
-that comparison alone, since their lock is inside the pinned archive and not in this checkout.
+The text of a crate is the licence files of its own package, without the alternative of a dual
+licence, and every notice file the package ships. Where a package ships no licence file, or none for
+the licence it is recorded under, `scripts/notice-texts.json` names the upstream file kept in
+`docs/releases/notice-texts/`, with its address, its commit and its digest, and the entry names that
+file. A text that holds a template's placeholder in place of a copyright line stops the run. Each
+licence text appears once, with the crates that use it. The entry of a crate under the Mozilla
+Public License 2.0, or taken from a Git repository, names where its source is. The text covers
+every platform a release is built for, so the list for one archive is a subset of it.
+
+The lock also names crates that no release build compiles. They are listed last, each with the
+reason, so that `kr-release manifest`, `check` and `sign` can hold the committed text to the lock:
+they refuse a tree that carries no notice or a copy that is not the committed text, and a committed
+text that has no entry for a crate the lock takes into the release programs or that holds a
+template's placeholder. The release-checks workflow makes the text again and refuses a committed
+one that differs. The crates of the fish source are covered by that comparison alone, since their
+lock is inside the pinned archive and not in this checkout.
 
 ## Building and signing a release
 

@@ -143,9 +143,11 @@ jobs:
             ~/.cargo/registry/cache
 
   # The third-party notice that every release archive carries is made from the lock by
-  # `scripts/generate-notices.py`, which runs cargo-about over the programs a release builds and over
-  # fish's own crates. The committed text has to be the one that makes. The checker is one release,
-  # and its archive has to match the digest below before it runs.
+  # `scripts/generate-notices.py`: it lists the crates the programs and fish are built from with
+  # `cargo tree`, takes each crate's licence files from its package, and asks cargo-about, run
+  # offline, which licence each crate is recorded under. The committed text has to be the one that
+  # makes. cargo-about is one pinned release, and its archive has to match the digest below before
+  # it runs.
   third-party-notice:
     name: the third-party notice is the one the lock makes
     runs-on: ubuntu-24.04
@@ -180,8 +182,8 @@ jobs:
       - name: Build kr-release
         run: cargo build --locked -p kr-release
 
-      # cargo-about reads the licence files from the sources cargo has fetched, for every platform
-      # the lock names, and runs offline.
+      # The generator and cargo-about read the sources cargo has fetched, for every platform the
+      # lock names, and run offline.
       - name: Fetch the lock's crates
         run: cargo fetch --locked
 
