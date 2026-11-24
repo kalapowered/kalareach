@@ -65,6 +65,7 @@ use crate::protocol::{
     MAX_FAILURE_REASON_BYTES, RENDEZVOUS_DOMAIN, RendezvousAccepted, VERIFY_DOMAIN,
     failure_reason_line,
 };
+use crate::protocol4::HostDescriptor4;
 
 /// The largest descriptor this host writes or reads.
 const MAX_DESCRIPTOR_BYTES: u64 = 8 * 1024;
@@ -756,11 +757,37 @@ pub fn publish_descriptor(
     protocol: &HostProtocol,
     descriptor: &HostDescriptor,
 ) -> LaunchResult<()> {
-    if descriptor.protocol != protocol.name {
+    publish_published(environment, protocol, &descriptor.protocol, descriptor)
+}
+
+/// Publishes the descriptor of a plugin host of `/4`, atomically and owner-only.
+///
+/// # Errors
+///
+/// Returns [`LaunchError::Endpoint`] when the file cannot be written.
+pub fn publish_descriptor4(
+    environment: &EnvironmentPaths,
+    descriptor: &HostDescriptor4,
+) -> LaunchResult<()> {
+    publish_published(
+        environment,
+        &HostProtocol::V4,
+        &descriptor.protocol,
+        descriptor,
+    )
+}
+
+fn publish_published<D: serde::Serialize>(
+    environment: &EnvironmentPaths,
+    protocol: &HostProtocol,
+    named_protocol: &str,
+    descriptor: &D,
+) -> LaunchResult<()> {
+    if named_protocol != protocol.name {
         return Err(LaunchError::Refused {
             detail: format!(
-                "a descriptor of protocol {} is not published as one of {}",
-                descriptor.protocol, protocol.name
+                "a descriptor of protocol {named_protocol} is not published as one of {}",
+                protocol.name
             ),
         });
     }
@@ -783,26 +810,52 @@ pub fn read_descriptor(
     environment: &EnvironmentPaths,
     protocol: &HostProtocol,
 ) -> LaunchResult<Option<HostDescriptor>> {
+    read_published(environment, protocol, |descriptor: &HostDescriptor| {
+        (descriptor.protocol.as_str(), descriptor.environment_id)
+    })
+}
+
+/// Reads the descriptor of a plugin host of `/4`, if one is published.
+///
+/// The same as [`read_descriptor`], for the descriptor that also records the host's build.
+///
+/// # Errors
+///
+/// Returns [`LaunchError::Endpoint`] when the file cannot be read, or [`LaunchError::Refused`] when
+/// it is not a descriptor of `/4` this host wrote.
+pub fn read_descriptor4(environment: &EnvironmentPaths) -> LaunchResult<Option<HostDescriptor4>> {
+    read_published(
+        environment,
+        &HostProtocol::V4,
+        |descriptor: &HostDescriptor4| (descriptor.protocol.as_str(), descriptor.environment_id),
+    )
+}
+
+fn read_published<D: serde::de::DeserializeOwned>(
+    environment: &EnvironmentPaths,
+    protocol: &HostProtocol,
+    named: impl Fn(&D) -> (&str, EnvironmentId),
+) -> LaunchResult<Option<D>> {
     let path = descriptor_path(environment, protocol);
     let Some(bytes) = kr_ipc::paths::read_owner_only_file(&path, MAX_DESCRIPTOR_BYTES)? else {
         return Ok(None);
     };
-    let descriptor: HostDescriptor =
-        serde_json::from_slice(&bytes).map_err(|error| LaunchError::Refused {
-            detail: format!(
-                "{} is not a plugin host descriptor: {error}",
-                path.display()
-            ),
-        })?;
-    if descriptor.protocol != protocol.name {
+    let descriptor: D = serde_json::from_slice(&bytes).map_err(|error| LaunchError::Refused {
+        detail: format!(
+            "{} is not a plugin host descriptor: {error}",
+            path.display()
+        ),
+    })?;
+    let (named_protocol, environment_id) = named(&descriptor);
+    if named_protocol != protocol.name {
         return Err(LaunchError::Refused {
             detail: format!(
-                "the descriptor names protocol {}, and this one is for {}",
-                descriptor.protocol, protocol.name
+                "the descriptor names protocol {named_protocol}, and this one is for {}",
+                protocol.name
             ),
         });
     }
-    if descriptor.environment_id != environment.environment_id() {
+    if environment_id != environment.environment_id() {
         return Err(LaunchError::Refused {
             detail: "the descriptor names a different environment from its directory".to_owned(),
         });

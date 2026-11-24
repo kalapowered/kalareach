@@ -42,6 +42,7 @@ use tokio::sync::oneshot;
 
 use kr_plugin_sdk::identity::PluginIdentity;
 
+use crate::dialect::{self, Registrations};
 use crate::error::{ServiceError, ServiceResult};
 #[cfg(feature = "testing")]
 use crate::hold::{Hold, HoldHandle};
@@ -52,6 +53,7 @@ use crate::protocol::{
     HostHealth, HostProtocol, Notice, PrepareActionCall, Request, RequestBody, ResponseBody,
     WireDecoded, WireEncoded, WireNamedArgument, WirePlan, WireRequestSnapshot, WireToken,
 };
+use crate::protocol4::{Frame4, HostDescriptor4};
 use crate::vocabulary::{
     Admission, AttachmentFact, BindingFacts, BindingId, COMPILE_DEADLINE_MS, MAX_NODE_BYTES,
     ScopedSourceEvent, wire_attachments, wire_event, wire_facts,
@@ -588,6 +590,72 @@ impl Drop for Waiting<'_> {
     }
 }
 
+/// Which protocol a connection speaks.
+///
+/// Everything above the connection is written in the words of `/3`. Over `/4` each request is
+/// turned into its frame of `/4` as it is written, and each frame read into the one of `/3` it
+/// comes to, by [`crate::dialect`].
+#[derive(Clone, Debug)]
+enum Dialect {
+    Three,
+    Four(Arc<Registrations>),
+}
+
+impl Dialect {
+    /// The protocol this dialect is.
+    const fn protocol(&self) -> HostProtocol {
+        match self {
+            Self::Three => HostProtocol::V3,
+            Self::Four(_) => HostProtocol::V4,
+        }
+    }
+
+    /// Writes one request as a frame of this protocol.
+    async fn write(
+        &self,
+        writer: &mut FrameWriter,
+        request: Request,
+    ) -> Result<(), kr_ipc::IpcError> {
+        match self {
+            Self::Three => writer.write_message(&request).await,
+            Self::Four(registrations) => {
+                writer
+                    .write_message(&dialect::request_of(request, registrations, true))
+                    .await
+            }
+        }
+    }
+
+    /// Reads the next frame, in the words of `/3`. A frame the client has no use for is skipped.
+    async fn read(&self, reader: &mut FrameReader) -> Result<Frame, kr_ipc::IpcError> {
+        loop {
+            match self {
+                Self::Three => return reader.read_message_without_schema().await,
+                Self::Four(registrations) => {
+                    let frame: Frame4 = reader.read_message_without_schema().await?;
+                    if let Some(frame) = dialect::frame_of(frame, registrations) {
+                        return Ok(frame);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Checks that a request encodes to one frame the host reads.
+    fn fits(&self, request: Request) -> bool {
+        let limit = StreamKind::Control.max_payload_len();
+        match self {
+            Self::Three => {
+                kr_cbor::to_canonical_vec(&request).is_ok_and(|bytes| bytes.len() <= limit)
+            }
+            Self::Four(registrations) => {
+                kr_cbor::to_canonical_vec(&dialect::request_of(request, registrations, false))
+                    .is_ok_and(|bytes| bytes.len() <= limit)
+            }
+        }
+    }
+}
+
 /// A worker's connection to the plugin host.
 pub struct PluginClient {
     writer: Writer,
@@ -608,6 +676,7 @@ pub struct PluginClient {
     unbind_deadline: core::time::Duration,
     next_request: AtomicU64,
     descriptor: HostDescriptor,
+    dialect: Dialect,
     reader_task: tokio::task::JoinHandle<()>,
     offer_task: tokio::task::JoinHandle<()>,
 }
@@ -622,51 +691,104 @@ impl core::fmt::Debug for PluginClient {
 }
 
 impl PluginClient {
-    /// Connects to the plugin host of this build's protocol named in the environment's descriptor
-    /// (`plugin-host-3.json`), and verifies it. A host of another protocol has a descriptor of its
-    /// own, which this client never reads, so it never opens a connection to that host.
+    /// Connects to the plugin host of the environment: over `/4` when the host publishes a usable
+    /// descriptor for it, and over `/3` otherwise.
     ///
-    /// The descriptor is a hint. What settles which process is answering is the challenge below:
-    /// the host signs a fresh nonce with the key the descriptor records, and a process that cannot
-    /// is not the one the launcher started.
+    /// A `/4` descriptor is usable when it is there, its process has not ended, its endpoint takes a
+    /// connection, the host accepts the `/4` hello and its answer to the challenge verifies with the
+    /// key the descriptor records. Any of them failing leaves `plugin-host-3.json` to be read, as it
+    /// is by a client that has no `/4`. Nothing is remembered: each connect starts at `/4` again,
+    /// so a client that fell back finds a host that appeared since.
+    ///
+    /// The descriptor is a hint. What settles which process is answering is the challenge: the host
+    /// signs a fresh nonce with the key the descriptor records, and a process that cannot is not
+    /// the one the launcher started.
     ///
     /// # Errors
     ///
-    /// Returns [`ServiceError::Unavailable`] when there is no descriptor or the endpoint
-    /// cannot be reached, and [`ServiceError::Protocol`] when the host answers with
+    /// Returns [`ServiceError::Unavailable`] when there is no descriptor of either protocol or the
+    /// endpoint cannot be reached, and [`ServiceError::Protocol`] when the host answers with
     /// something this client cannot read or cannot verify.
     pub async fn connect(environment: &EnvironmentPaths) -> ServiceResult<Self> {
+        if let Ok(client) = Self::connect_four(environment).await {
+            return Ok(client);
+        }
         let descriptor = launcher::read_descriptor(environment, &HostProtocol::V3)
             .map_err(unavailable)?
             .ok_or_else(|| ServiceError::Unavailable {
                 detail: "this environment has no plugin host".to_owned(),
             })?;
-        let endpoint = Endpoint::from_path(&descriptor.endpoint).map_err(|error| {
-            ServiceError::Unavailable {
-                detail: error.to_string(),
-            }
-        })?;
-        let connection =
-            Connection::connect(&endpoint)
-                .await
-                .map_err(|error| ServiceError::Unavailable {
-                    detail: error.to_string(),
-                })?;
+        let connection = reach(&descriptor.endpoint).await?;
         Self::over(connection, descriptor).await
     }
 
-    /// Opens a client over an existing connection and verifies the host.
+    /// Connects over `/4` to the host the environment's `/4` descriptor names.
+    async fn connect_four(environment: &EnvironmentPaths) -> ServiceResult<Self> {
+        let descriptor = launcher::read_descriptor4(environment)
+            .map_err(unavailable)?
+            .ok_or_else(|| ServiceError::Unavailable {
+                detail: "this environment has no plugin host of the fourth protocol".to_owned(),
+            })?;
+        if !matches!(
+            kr_ipc::identity::process_state(&descriptor.process_start_identity),
+            kr_ipc::identity::ProcessState::Running
+        ) {
+            return Err(ServiceError::Unavailable {
+                detail: "the plugin host of the fourth protocol has ended".to_owned(),
+            });
+        }
+        let connection = reach(&descriptor.endpoint).await?;
+        Self::over_four(connection, descriptor).await
+    }
+
+    /// Returns the protocol this connection speaks.
+    #[must_use]
+    pub const fn protocol(&self) -> HostProtocol {
+        self.dialect.protocol()
+    }
+
+    /// Opens a client over an existing connection to a host of `/3` and verifies the host.
     ///
     /// # Errors
     ///
     /// Returns the handshake or verification failure.
     pub async fn over(connection: Connection, descriptor: HostDescriptor) -> ServiceResult<Self> {
+        Self::open(connection, descriptor, Dialect::Three).await
+    }
+
+    /// Opens a client over an existing connection to a host of `/4` and verifies the host.
+    ///
+    /// # Errors
+    ///
+    /// Returns the handshake or verification failure.
+    pub async fn over_four(
+        connection: Connection,
+        descriptor: HostDescriptor4,
+    ) -> ServiceResult<Self> {
+        Self::open(
+            connection,
+            descriptor.proven_members(),
+            Dialect::Four(Arc::new(Registrations::default())),
+        )
+        .await
+    }
+
+    async fn open(
+        connection: Connection,
+        descriptor: HostDescriptor,
+        dialect: Dialect,
+    ) -> ServiceResult<Self> {
         let (reader, writer) = split(connection, StreamKind::Control);
         let writer: Writer = Arc::new(tokio::sync::Mutex::new(Some(writer)));
         let pending = Arc::new(Pending::default());
         let (sink, notices) = notices::channel();
         let sink_for_client = sink.clone();
-        let reader_task = tokio::spawn(read_frames(reader, Arc::clone(&pending), sink.clone()));
+        let reader_task = tokio::spawn(read_frames(
+            reader,
+            Arc::clone(&pending),
+            sink.clone(),
+            dialect.clone(),
+        ));
 
         // The handoff the terminal path uses: bounded, written by a task of its own, never waited
         // on by whoever offered the event.
@@ -679,6 +801,7 @@ impl PluginClient {
             Arc::clone(&writer),
             Arc::clone(&offered_bytes),
             Arc::clone(&pending),
+            dialect.clone(),
             #[cfg(feature = "testing")]
             Arc::clone(&offer_hold),
         ));
@@ -691,6 +814,7 @@ impl PluginClient {
             offered_bytes: Arc::clone(&offered_bytes),
         });
 
+        let protocol = dialect.protocol();
         let client = Self {
             writer,
             pending,
@@ -704,21 +828,25 @@ impl PluginClient {
             unbind_deadline: DEFAULT_DEADLINE,
             next_request: AtomicU64::new(1),
             descriptor,
+            dialect,
             reader_task,
             offer_task,
         };
 
         let hello = client
             .request(RequestBody::Hello {
-                protocol: HostProtocol::V3.name.to_owned(),
+                protocol: protocol.name.to_owned(),
             })
             .await?;
-        let ResponseBody::Hello { protocol, .. } = hello else {
+        let ResponseBody::Hello {
+            protocol: spoken, ..
+        } = hello
+        else {
             return Err(protocol_error(&hello));
         };
-        if protocol != HostProtocol::V3.name {
+        if spoken != protocol.name {
             return Err(ServiceError::Protocol {
-                detail: format!("the host speaks {protocol}"),
+                detail: format!("the host speaks {spoken}"),
             });
         }
 
@@ -1193,7 +1321,7 @@ impl PluginClient {
             binding_id: binding_id.get(),
             facts: wire_facts(facts),
         };
-        check_fits(&request)?;
+        self.check_fits(&request)?;
         revised(self.request(request).await?)
     }
 
@@ -1211,7 +1339,7 @@ impl PluginClient {
             binding_id: binding_id.get(),
             attachments: wire_attachments(attachments),
         };
-        check_fits(&request)?;
+        self.check_fits(&request)?;
         revised(self.request(request).await?)
     }
 
@@ -1248,7 +1376,7 @@ impl PluginClient {
         body: RequestBody,
         deadline: core::time::Duration,
     ) -> ServiceResult<Called> {
-        check_fits(&body)?;
+        self.check_fits(&body)?;
         self.call(body, deadline).await
     }
 
@@ -1290,6 +1418,29 @@ impl PluginClient {
                 detail, disabled, ..
             } => Err(refused(detail, disabled)),
             other => Err(protocol_error(&other)),
+        }
+    }
+
+    /// Checks that a request encodes to one frame the host reads, in the protocol this connection
+    /// speaks.
+    ///
+    /// # Errors
+    ///
+    /// Returns a protocol error, and writes nothing, when it does not.
+    fn check_fits(&self, body: &RequestBody) -> ServiceResult<()> {
+        let request = Request {
+            request_id: u64::MAX,
+            body: body.clone(),
+        };
+        if self.dialect.fits(request) {
+            Ok(())
+        } else {
+            Err(ServiceError::Protocol {
+                detail: format!(
+                    "the {} request is larger than one frame carries",
+                    body.name()
+                ),
+            })
         }
     }
 
@@ -1377,7 +1528,10 @@ impl PluginClient {
                     pending: &self.pending,
                     finished: false,
                 };
-                let written = writer.write_message(&Request { request_id, body }).await;
+                let written = self
+                    .dialect
+                    .write(&mut writer, Request { request_id, body })
+                    .await;
                 frame.finished(written.is_ok());
                 if written.is_ok() {
                     self.pending.written(request_id);
@@ -1487,10 +1641,15 @@ impl Drop for ClearsWhenTheReaderEnds {
 }
 
 /// Reads frames until the connection ends, then tells everyone waiting that it has.
-async fn read_frames(mut reader: FrameReader, pending: Arc<Pending>, notices: NoticeSink) {
+async fn read_frames(
+    mut reader: FrameReader,
+    pending: Arc<Pending>,
+    notices: NoticeSink,
+    dialect: Dialect,
+) {
     let _account = ClearsWhenTheReaderEnds(Arc::clone(&pending));
     loop {
-        let frame: Frame = match reader.read_message_without_schema().await {
+        let frame: Frame = match dialect.read(&mut reader).await {
             Ok(frame) => frame,
             // The connection is gone, or the host sent something this protocol does not admit.
             // Either way every caller waiting on it is told now: an answer that cannot arrive is
@@ -1526,6 +1685,7 @@ async fn write_offered(
     writer: Writer,
     held: Arc<AtomicU64>,
     pending: Arc<Pending>,
+    dialect: Dialect,
     #[cfg(feature = "testing")] hold: Arc<Hold>,
 ) {
     while let Some(request) = offered.recv().await {
@@ -1555,7 +1715,7 @@ async fn write_offered(
                 drop(owned);
                 return Err(kr_ipc::IpcError::PeerClosed);
             }
-            let written = owned.write_message(&request).await;
+            let written = dialect.write(&mut owned, request).await;
             if written.is_ok() && !pending.is_closed() {
                 *held = Some(owned);
             }
@@ -1636,28 +1796,16 @@ fn revised(body: ResponseBody) -> ServiceResult<()> {
     }
 }
 
-/// Checks that a request encodes to one frame the host reads.
-///
-/// # Errors
-///
-/// Returns a protocol error, and writes nothing, when it does not.
-fn check_fits(body: &RequestBody) -> ServiceResult<()> {
-    let request = Request {
-        request_id: u64::MAX,
-        body: body.clone(),
-    };
-    let fits = kr_cbor::to_canonical_vec(&request)
-        .is_ok_and(|encoded| encoded.len() <= StreamKind::Control.max_payload_len());
-    if fits {
-        Ok(())
-    } else {
-        Err(ServiceError::Protocol {
-            detail: format!(
-                "the {} request is larger than one frame carries",
-                body.name()
-            ),
+/// Connects to the endpoint a descriptor names.
+async fn reach(endpoint: &str) -> ServiceResult<Connection> {
+    let endpoint = Endpoint::from_path(endpoint).map_err(|error| ServiceError::Unavailable {
+        detail: error.to_string(),
+    })?;
+    Connection::connect(&endpoint)
+        .await
+        .map_err(|error| ServiceError::Unavailable {
+            detail: error.to_string(),
         })
-    }
 }
 
 fn millis(duration: core::time::Duration) -> u64 {
