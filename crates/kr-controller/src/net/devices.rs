@@ -1775,6 +1775,7 @@ pub(crate) enum ClaimRefusal {
 
 impl ClaimRefusal {
     /// The refusal as the controller gives it, with the words a person reads.
+    #[cfg(any(test, feature = "testing"))]
     pub(crate) fn into_error(self) -> ControllerError {
         self.into_error_until(None)
     }
