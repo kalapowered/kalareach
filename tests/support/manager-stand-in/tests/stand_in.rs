@@ -641,6 +641,130 @@ fn bootout_ends_the_processes_the_daemon_started_with_it() {
     );
 }
 
+/// A label is checked before any path is made of it: a label that is an absolute path, one with a
+/// parent component and one with a separator are refused, however the command names it, and no
+/// record is made at the place the label points to.
+#[test]
+fn a_label_that_is_a_path_is_refused_and_no_record_is_made_where_it_points() {
+    let fixture = Fixture::new();
+    let tree = fixture.tree.path();
+    let program = fixture.installation.path().join("kr-daemon");
+    kr_ipc::testing::place_script(&program, "#!/bin/sh\nexit 0\n");
+    let arguments = [program.display().to_string(), "30".to_owned()];
+    let absolute = tree.join("escaped").display().to_string();
+    for (label, made) in [
+        (absolute.as_str(), tree.join("escaped.json")),
+        (
+            "../escaped-up",
+            tree.join("state/manager-stand-in/escaped-up.json"),
+        ),
+        ("a/b", tree.join("state/manager-stand-in/jobs/a/b.json")),
+    ] {
+        let plist = tree.join("home/Library/LaunchAgents/kr-controller-label.plist");
+        std::fs::write(
+            &plist,
+            fixture.plist_of(label, &arguments, &tree.join("state"), ""),
+        )
+        .expect("a plist");
+        let loaded = fixture.call(&[
+            "bootstrap",
+            &fixture.domain(),
+            plist.to_str().expect("text"),
+        ]);
+        assert_eq!(loaded.status.code(), Some(64), "the label {label}");
+        assert!(!made.exists(), "the label {label} made {}", made.display());
+        let read = fixture.call(&["print", &format!("{}/{label}", fixture.domain())]);
+        assert_eq!(read.status.code(), Some(64), "a read of the label {label}");
+    }
+}
+
+/// A path argument is bounded or refused in every form the definition can give it: the value of
+/// `--state-dir` as a separate argument or after an equals sign, inside the test's folders or
+/// outside, and any other argument that may name a path.
+#[test]
+fn a_path_argument_in_every_form_is_bounded_or_refused_when_a_definition_is_loaded() {
+    let fixture = Fixture::new();
+    let tree = fixture.tree.path();
+    let program = fixture.installation.path().join("kr-daemon");
+    kr_ipc::testing::place_script(&program, "#!/bin/sh\nexit 0\n");
+    let state = tree.join("state");
+    let load = |label: &str, extra: &[String]| {
+        let mut arguments = vec![program.display().to_string()];
+        arguments.extend_from_slice(extra);
+        let plist = tree.join(format!("home/Library/LaunchAgents/{label}.plist"));
+        std::fs::write(&plist, fixture.plist_of(label, &arguments, &state, "")).expect("a plist");
+        fixture.call(&[
+            "bootstrap",
+            &fixture.domain(),
+            plist.to_str().expect("text"),
+        ])
+    };
+    let inside = format!("--state-dir={}", state.display());
+    let loaded = load("kr-controller-s0", &[inside]);
+    assert_eq!(loaded.status.code(), Some(0), "{}", text(&loaded.stderr));
+    for (index, refused) in [
+        vec!["--state-dir=/outside"],
+        vec!["--runtime-dir=/outside"],
+        vec!["--state-dir", "/outside"],
+        vec!["--secret-store=/outside"],
+        vec!["../escape"],
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let label = format!("kr-controller-s{}", index + 1);
+        let extra: Vec<String> = refused
+            .iter()
+            .map(|argument| (*argument).to_owned())
+            .collect();
+        let answered = load(&label, &extra);
+        assert_eq!(answered.status.code(), Some(64), "{refused:?}");
+        let listed = fixture.call(&["print", &format!("{}/{label}", fixture.domain())]);
+        assert_eq!(listed.status.code(), Some(113), "{refused:?} is not loaded");
+    }
+}
+
+/// The store's own folders, files and links are bounded as a definition's are: a link in the
+/// place of the store, of its folder of jobs, of its lock or of its log that leads out of the
+/// test's folders is refused, and nothing is made outside.
+#[test]
+fn a_link_in_the_place_of_the_stores_own_paths_is_refused_and_nothing_is_made_outside() {
+    for place in ["", "jobs", "lock", "calls.jsonl"] {
+        let fixture = Fixture::new();
+        let outside = PrivateTempDir::create();
+        let store = fixture.tree.path().join("state/manager-stand-in");
+        // The link takes the place of the store, of its folder of jobs (which leads to a folder
+        // outside), or of its lock or log (which lead to a file outside that is not there yet).
+        let (at, led_to) = match place {
+            "" => (store.clone(), outside.path().to_path_buf()),
+            "jobs" => {
+                std::fs::create_dir_all(&store).expect("a store");
+                (store.join("jobs"), outside.path().to_path_buf())
+            }
+            file => {
+                std::fs::create_dir_all(store.join("jobs")).expect("a store");
+                (store.join(file), outside.path().join(file))
+            }
+        };
+        std::os::unix::fs::symlink(&led_to, &at).expect("a link");
+        let answered = fixture.call(&["print", &format!("gui/{}", fixture.uid)]);
+        assert_eq!(
+            answered.status.code(),
+            Some(64),
+            "a link in the place of {place:?}: {}",
+            text(&answered.stderr)
+        );
+        let made: Vec<_> = std::fs::read_dir(outside.path())
+            .expect("the folder outside")
+            .filter_map(Result::ok)
+            .collect();
+        assert!(
+            made.is_empty(),
+            "a link in the place of {place:?} let something be made outside: {made:?}"
+        );
+    }
+}
+
 /// Ends the processes it holds when it is dropped, by their identities, independently of the fixture.
 struct Leftovers(Vec<ProcessStartIdentity>);
 

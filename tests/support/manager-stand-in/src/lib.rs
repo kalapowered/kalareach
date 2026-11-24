@@ -189,14 +189,25 @@ impl Context {
                 .any(|word| self.bounded(Path::new(word)).is_ok())
     }
 
-    /// The path of the record of the job `label`.
-    fn job_path(&self, label: &str) -> PathBuf {
-        self.store.join("jobs").join(format!("{label}.json"))
+    /// A path of the store, once every link it holds is resolved and found inside the roots.
+    fn in_store(&self, relative: &str) -> Result<PathBuf, String> {
+        self.bounded(&self.store.join(relative))
+    }
+
+    /// The path of the record of the job `label`. A label that is a path or names none is an error,
+    /// before any path is made of it.
+    fn job_path(&self, label: &str) -> Result<PathBuf, String> {
+        if !names_one_record(label) {
+            return Err(format!(
+                "the label {label:?} is a path or names none, and a label names one record"
+            ));
+        }
+        self.in_store(&format!("jobs/{label}.json"))
     }
 
     /// The job `label` holds, if it is loaded.
     fn job(&self, label: &str) -> Result<Option<Job>, String> {
-        match std::fs::read_to_string(self.job_path(label)) {
+        match std::fs::read_to_string(self.job_path(label)?) {
             Ok(text) => serde_json::from_str(&text)
                 .map(Some)
                 .map_err(|error| format!("the record of {label} cannot be read: {error}")),
@@ -207,13 +218,18 @@ impl Context {
 
     /// Keeps `job`, whole or not at all.
     fn keep(&self, job: &Job) -> Result<(), String> {
-        let path = self.job_path(&job.label);
+        let path = self.job_path(&job.label)?;
         let text = serde_json::to_string_pretty(job).map_err(|error| error.to_string())?;
-        let aside = path.with_extension("json.new");
+        let aside = self.in_store(&format!("jobs/{}.json.new", job.label))?;
         std::fs::write(&aside, text)
             .and_then(|()| std::fs::rename(&aside, &path))
             .map_err(|error| format!("the record of {} cannot be kept: {error}", job.label))
     }
+}
+
+/// Whether `label` can name one record of the store: it holds no separator and is not a folder.
+fn names_one_record(label: &str) -> bool {
+    !label.is_empty() && label != "." && label != ".." && !label.contains(['/', '\\', '\0'])
 }
 
 /// What one call came to.
@@ -265,17 +281,32 @@ pub fn run(arguments: &[String]) -> i32 {
             return REFUSED;
         }
     };
-    if let Err(error) = std::fs::create_dir_all(context.store.join("jobs")) {
-        let _ = writeln!(
-            std::io::stderr(),
-            "the stand-in cannot keep its record: {error}"
-        );
-        return REFUSED;
-    }
+    // The store's own folders, files and links are judged as a definition's are, before anything is
+    // made through them: a link that leads out of the test's folders is refused.
+    let made = context.bounded(&context.store).and_then(|store| {
+        std::fs::create_dir_all(store.join("jobs")).map_err(|error| error.to_string())
+    });
+    let paths = made.and_then(|()| {
+        Ok((
+            context.in_store("jobs")?,
+            context.in_store("lock")?,
+            context.in_store("calls.jsonl")?,
+        ))
+    });
+    let lock_path = match paths {
+        Ok((_, lock_path, _)) => lock_path,
+        Err(why) => {
+            let _ = writeln!(
+                std::io::stderr(),
+                "the stand-in cannot keep its record: {why}"
+            );
+            return REFUSED;
+        }
+    };
     let lock = match std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(context.store.join("lock"))
+        .open(&lock_path)
     {
         Ok(lock) => lock,
         Err(error) => {
@@ -303,7 +334,13 @@ pub fn run(arguments: &[String]) -> i32 {
 
 /// Writes one line of the call log: its number, who called, the exact arguments and the status.
 fn record(context: &Context, arguments: &[String], status: i32) {
-    let log = context.store.join("calls.jsonl");
+    let Ok(log) = context.in_store("calls.jsonl") else {
+        let _ = writeln!(
+            std::io::stderr(),
+            "the stand-in cannot record this call: its log is outside the folders of this test"
+        );
+        return;
+    };
     let number = std::fs::read_to_string(&log).map_or(1, |text| text.lines().count() + 1);
     let parent = rustix::process::getppid().map_or(0, |pid| pid.as_raw_nonzero().get());
     let program = Command::new("/bin/ps")
@@ -421,12 +458,48 @@ fn bound_arguments(context: &Context, definition: &Definition) -> Result<(), Str
     }
     context.bounded(Path::new(&definition.working_directory))?;
     context.bounded(Path::new(&definition.standard_out))?;
-    for pair in definition.arguments.windows(2) {
-        if matches!(pair[0].as_str(), "--runtime-dir" | "--state-dir") {
-            context.bounded(Path::new(&pair[1]))?;
+    bound_path_arguments(context, &definition.arguments[1..])
+}
+
+/// What is wrong with the arguments after the program: the value of `--runtime-dir` and of
+/// `--state-dir`, in the form of two arguments and in the form `--state-dir=<path>`, is bounded like
+/// every other path; any other argument that may name a path is refused, since a path that is not
+/// read as one is not bounded.
+fn bound_path_arguments(context: &Context, arguments: &[String]) -> Result<(), String> {
+    let mut at = 0;
+    while at < arguments.len() {
+        let argument = arguments[at].as_str();
+        let value = if matches!(argument, "--runtime-dir" | "--state-dir") {
+            at += 1;
+            let value = arguments
+                .get(at)
+                .ok_or_else(|| format!("the argument {argument} has no value"))?;
+            Some(value.as_str())
+        } else {
+            argument
+                .strip_prefix("--runtime-dir=")
+                .or_else(|| argument.strip_prefix("--state-dir="))
+        };
+        match value {
+            Some(path) => {
+                context.bounded(Path::new(path))?;
+            }
+            None if may_name_a_path(argument) => {
+                return Err(format!(
+                    "the argument {argument} may name a path, and only the values of --runtime-dir \
+                     and --state-dir are bounded"
+                ));
+            }
+            None => {}
         }
+        at += 1;
     }
     Ok(())
+}
+
+/// Whether an argument may be read as a path: it holds a separator, or is a folder or a home.
+fn may_name_a_path(argument: &str) -> bool {
+    argument.contains('/') || argument.starts_with('~') || matches!(argument, "." | "..")
 }
 
 /// Whether a program is a service manager by its file name, in any letter case.
@@ -862,7 +935,11 @@ fn bootout(context: &Context, target: &str) -> Answer {
     if let Err(why) = end_job(context, &job) {
         return Answer::failed(REFUSED, format!("{why}, and the job is kept\n"));
     }
-    match std::fs::remove_file(context.job_path(label)) {
+    let record = match context.job_path(label) {
+        Ok(record) => record,
+        Err(why) => return Answer::refused(why),
+    };
+    match std::fs::remove_file(record) {
         Ok(()) => Answer::said(String::new()),
         Err(error) => Answer::refused(format!("the record of {label} cannot be removed: {error}")),
     }
@@ -872,6 +949,81 @@ fn bootout(context: &Context, target: &str) -> Answer {
 mod tests {
     use super::*;
     use kr_ipc::testing::PrivateTempDir;
+
+    /// A label names one record: an absolute label, a label with a parent component, a label with a
+    /// separator, a folder and an empty label are errors before any path is made of them.
+    #[test]
+    fn a_label_that_is_a_path_is_refused_before_any_record_is_looked_up() {
+        let folder = PrivateTempDir::create();
+        let root = folder.path().canonicalize().expect("a folder");
+        std::fs::create_dir_all(root.join("store/jobs")).expect("a store");
+        let context = Context {
+            own: root.clone(),
+            roots: vec![root.clone()],
+            store: root.join("store"),
+            uid: 0,
+        };
+        for label in ["/abs/x", "../escape", "a/b", "..", ".", "", "a\\b", "a\0b"] {
+            assert!(context.job_path(label).is_err(), "{label:?}");
+            assert!(context.job(label).is_err(), "{label:?}");
+        }
+        assert!(context.job_path("kr-controller-x").is_ok());
+        assert!(context.job("kr-controller-x").expect("no record").is_none());
+    }
+
+    /// A path argument is bounded or refused in every form: the values of `--runtime-dir` and
+    /// `--state-dir` as two arguments and as one, inside the roots or not, and any other argument
+    /// that may name a path.
+    #[test]
+    fn a_path_argument_in_every_form_is_bounded_or_refused() {
+        let folder = PrivateTempDir::create();
+        let root = folder.path().canonicalize().expect("a folder");
+        let context = Context {
+            own: root.clone(),
+            roots: vec![root.clone()],
+            store: root.join("store"),
+            uid: 0,
+        };
+        let inside = root.display().to_string();
+        let words = |arguments: &[&str]| {
+            bound_path_arguments(
+                &context,
+                &arguments
+                    .iter()
+                    .map(|word| (*word).to_owned())
+                    .collect::<Vec<_>>(),
+            )
+        };
+        for held in [
+            vec!["--runtime-dir", inside.as_str()],
+            vec!["--state-dir", inside.as_str()],
+            vec!["--secret-store", "file", "30"],
+        ] {
+            assert_eq!(words(&held), Ok(()), "{held:?}");
+        }
+        let equals = [
+            format!("--runtime-dir={inside}"),
+            format!("--state-dir={inside}"),
+        ];
+        for held in &equals {
+            assert_eq!(words(&[held.as_str()]), Ok(()), "{held}");
+        }
+        for refused in [
+            vec!["--state-dir", "/outside"],
+            vec!["--runtime-dir", "/outside"],
+            vec!["--state-dir=/outside"],
+            vec!["--runtime-dir=/outside"],
+            vec!["--state-dir"],
+            vec!["--secret-store=/outside"],
+            vec!["/outside"],
+            vec!["../x"],
+            vec!["~/x"],
+            vec![".."],
+            vec!["a/b"],
+        ] {
+            assert!(words(&refused).is_err(), "{refused:?}");
+        }
+    }
 
     /// Ends the child it holds when it is dropped.
     struct Held(std::process::Child);
