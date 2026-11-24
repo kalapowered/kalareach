@@ -739,6 +739,54 @@ fn bootout_ends_the_processes_the_daemon_started_with_it() {
     );
 }
 
+/// `bootout` ends what a daemon left when it ended: a wrapper that exits at once and leaves a child
+/// running in its group does not end the job's duty to that child, and the job is unloaded only
+/// once the child has ended.
+#[test]
+fn bootout_ends_the_processes_a_daemon_left_behind_when_it_ended() {
+    let fixture = Fixture::new();
+    let child_file = fixture.tree.path().join("child.pid");
+    let script = format!(
+        "#!/bin/sh\nsleep 60 &\necho $! > {}\nexit 0\n",
+        child_file.display()
+    );
+    let (_, loaded) = fixture.load("kr-controller-w", &script, "");
+    assert_eq!(loaded.status.code(), Some(0), "{}", text(&loaded.stderr));
+    let target = format!("{}/kr-controller-w", fixture.domain());
+    let started = fixture.call(&["kickstart", "-p", &target]);
+    assert_eq!(started.status.code(), Some(0), "{}", text(&started.stderr));
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let child = loop {
+        if let Some(pid) = std::fs::read_to_string(&child_file)
+            .ok()
+            .and_then(|written| written.trim().parse::<u32>().ok())
+        {
+            break pid;
+        }
+        assert!(Instant::now() < deadline, "the daemon started no process");
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let child = started_process_identity(child).expect("the process the daemon started");
+    fixture.track(&child);
+    let wrapper = fixture
+        .recorded_daemons()
+        .pop()
+        .expect("the daemon the stand-in recorded");
+    assert!(ended(&wrapper), "the wrapper exits and leaves its child");
+    assert_eq!(process_state(&child), ProcessState::Running);
+    let ended_job = fixture.call(&["bootout", &target]);
+    assert_eq!(
+        ended_job.status.code(),
+        Some(0),
+        "{}",
+        text(&ended_job.stderr)
+    );
+    assert!(
+        ended(&child),
+        "the process the daemon left when it ended was left running and the job was unloaded"
+    );
+}
+
 /// A label is checked before any path is made of it: a label that is an absolute path, one with a
 /// parent component and one with a separator are refused, however the command names it, and no
 /// record is made at the place the label points to.

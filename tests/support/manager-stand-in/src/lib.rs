@@ -906,6 +906,7 @@ struct Tools<'a> {
     lsof: &'a Path,
     identity: ReadIdentity<'a>,
     arguments: &'a dyn Fn(u32) -> Arguments,
+    group: &'a dyn Fn(u32) -> Result<Vec<u32>, String>,
 }
 
 impl Tools<'static> {
@@ -916,6 +917,7 @@ impl Tools<'static> {
             lsof: Path::new(LSOF),
             identity: &identity_of,
             arguments: &arguments_of,
+            group: &listed_in_group,
         }
     }
 }
@@ -976,6 +978,12 @@ fn interpreter_of(program: &Path) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// The processes the kernel lists in the group `group`.
+fn listed_in_group(group: u32) -> Result<Vec<u32>, String> {
+    processes_in_group(group)
+        .map_err(|error| format!("the group {group} cannot be listed: {error}"))
+}
+
 /// What a process whose identity cannot be read is said to be.
 fn unreadable(pid: u32, why: &str) -> String {
     format!("the process {pid} cannot be identified: {why}")
@@ -1017,15 +1025,30 @@ fn group_of(identity: &ProcessStartIdentity) -> Result<Pid, String> {
         .ok_or_else(|| format!("the process {} has no group number", identity.pid.get()))
 }
 
-/// The processes in the group `group` now, each held by identity as a member of it: its identity is
-/// read, its group is read, and its identity is read again, and a process that does not give the
-/// same identity both times, or is not in the group, is left out. A group that cannot be listed or
-/// read is an error, which is not an empty group.
-fn members_of(group: Pid, read: ReadIdentity<'_>) -> Result<Vec<ProcessStartIdentity>, String> {
-    let listed = processes_in_group(group.as_raw_pid().unsigned_abs())
-        .map_err(|error| format!("the group {} cannot be listed: {error}", group.as_raw_pid()))?;
+/// The processes in the group `leader` leads, now, each held by identity as a member of it: its
+/// identity is read, its group is read, and its identity is read again, and a process that does not
+/// give the same identity both times, or is not in the group, is left out. A group that cannot be
+/// listed or read is an error, which is not an empty group.
+///
+/// The group's number is the leader's. While the leader runs, or a member does, no other process
+/// holds the number. Once both have ended, another process can be given it and lead a group of its
+/// own, so the number is read before the list and after it: where another process holds it, the
+/// group has ended, and nothing in the list is the leader's to end.
+fn members_of(
+    leader: &ProcessStartIdentity,
+    group: Pid,
+    tools: &Tools<'_>,
+) -> Result<Vec<ProcessStartIdentity>, String> {
+    let number = group.as_raw_pid().unsigned_abs();
+    let number_is_the_groups = || -> Result<bool, String> {
+        let holder = (tools.identity)(number).map_err(|why| unreadable(number, &why))?;
+        Ok(holder == *leader || holder == ended_process_identity(number))
+    };
+    if !number_is_the_groups()? {
+        return Ok(Vec::new());
+    }
     let mut members = Vec::new();
-    for pid in listed {
+    for pid in (tools.group)(number)? {
         if pid == std::process::id() {
             continue;
         }
@@ -1043,11 +1066,15 @@ fn members_of(group: Pid, read: ReadIdentity<'_>) -> Result<Vec<ProcessStartIden
         };
         // A member that has ended and is not yet collected is listed, and is not a member.
         members.extend(
-            held_through(pid, read, &mut in_group)?
+            held_through(pid, tools.identity, &mut in_group)?
                 .filter(|member| process_state(member) != ProcessState::Ended),
         );
     }
-    Ok(members)
+    Ok(if number_is_the_groups()? {
+        members
+    } else {
+        Vec::new()
+    })
 }
 
 /// Whether the process `identity` and every process of its group are shown to have ended within
@@ -1056,13 +1083,13 @@ fn ended_within(
     identity: &ProcessStartIdentity,
     group: Pid,
     state: &dyn Fn(&ProcessStartIdentity) -> ProcessState,
-    read: ReadIdentity<'_>,
+    tools: &Tools<'_>,
     bound: Duration,
 ) -> Result<bool, String> {
     let over = || match state(identity) {
         ProcessState::Running => Ok(false),
         ProcessState::Unknown { detail } => Err(unknown(identity, &detail)),
-        ProcessState::Ended => Ok(members_of(group, read)?.is_empty()),
+        ProcessState::Ended => Ok(members_of(identity, group, tools)?.is_empty()),
     };
     let deadline = Instant::now() + bound;
     while Instant::now() < deadline {
@@ -1075,7 +1102,8 @@ fn ended_within(
 }
 
 /// Ends every process of `identities` and of the groups they lead, asking first and then making
-/// sure, each within `bound`. A signal goes to a process only by its identity, and to the members of
+/// sure, each within `bound`. A leader that has ended does not end the duty to its group: its
+/// members are ended by identity before the end is reported. A signal goes to a process only by its identity, and to the members of
 /// a group only as members found and held by identity just before: never to a number, which can name
 /// another process or group by the time a signal arrives. A process whose state is not known, and a
 /// process or group that is not shown to have ended after it was made to, is an error: nothing is
@@ -1083,23 +1111,21 @@ fn ended_within(
 fn end_all(
     identities: &[ProcessStartIdentity],
     state: &dyn Fn(&ProcessStartIdentity) -> ProcessState,
-    read: ReadIdentity<'_>,
+    tools: &Tools<'_>,
     bound: Duration,
 ) -> Result<(), String> {
     for identity in identities {
-        match state(identity) {
-            ProcessState::Ended => continue,
-            ProcessState::Unknown { detail } => return Err(unknown(identity, &detail)),
-            ProcessState::Running => {}
+        if let ProcessState::Unknown { detail } = state(identity) {
+            return Err(unknown(identity, &detail));
         }
         let group = group_of(identity)?;
         let mut ended = false;
         for stop in [Stop::Terminate, Stop::Kill] {
             let _ = stop_process(identity, stop);
-            for member in members_of(group, read)? {
+            for member in members_of(identity, group, tools)? {
                 let _ = stop_process(&member, stop);
             }
-            if ended_within(identity, group, state, read, bound)? {
+            if ended_within(identity, group, state, tools, bound)? {
                 ended = true;
                 break;
             }
@@ -1180,17 +1206,43 @@ fn found_unrecorded(
                     ));
                 }
             };
-            Ok(context.runs_the_program_of(job, &argv)
-                && working_directory_of(pid, tools.lsof)?.as_deref() == Some(working.as_path()))
+            if !context.runs_the_program_of(job, &argv) {
+                return Ok(false);
+            }
+            let listed = working_directory_of(pid, tools.lsof)?;
+            in_directory(pid, listed.as_deref(), &working, process_state(identity))
         })?;
         found.extend(held);
     }
     Ok(found)
 }
 
-/// The working directory of the process `pid`, as `lsof` reads it, or `None` where it has none to
-/// read: `lsof` lists nothing for a process that has ended since it was found. Any other failure is
-/// an error.
+/// Whether the process `pid` runs in `working`, from the directory `lsof` listed for it, if it
+/// listed one. `lsof` gives status 1 and no line for any error, not only for a process that has
+/// ended, so a process with no directory listed is outside only when its identity shows it ended;
+/// otherwise its directory is not known, and that is an error.
+fn in_directory(
+    pid: u32,
+    listed: Option<&Path>,
+    working: &Path,
+    state: ProcessState,
+) -> Result<bool, String> {
+    match (listed, state) {
+        (Some(listed), _) => Ok(listed == working),
+        (None, ProcessState::Ended) => Ok(false),
+        (None, ProcessState::Running) => Err(format!(
+            "the directory of the process {pid} is not known: lsof listed none for a process that \
+             runs"
+        )),
+        (None, ProcessState::Unknown { detail }) => Err(format!(
+            "the directory of the process {pid} is not known: lsof listed none, and whether it \
+             runs is not known ({detail})"
+        )),
+    }
+}
+
+/// The working directory of the process `pid`, as `lsof` reads it, or `None` where it lists none
+/// and says so with status 1. Any other failure is an error.
 fn working_directory_of(pid: u32, lsof: &Path) -> Result<Option<PathBuf>, String> {
     let output = bounded_output(
         Command::new(lsof).args(["-a", "-d", "cwd", "-Fn", "-p", &pid.to_string()]),
@@ -1219,7 +1271,7 @@ fn end_job(context: &Context, job: &Job) -> Result<(), String> {
     if job.pending {
         identities.extend(found_unrecorded(context, job, &tools)?);
     }
-    end_all(&identities, &process_state, tools.identity, END_BOUND)
+    end_all(&identities, &process_state, &tools, END_BOUND)
 }
 
 /// `bootout`: ends the daemon by the identity recorded for it and the group it leads, asking first
@@ -1445,7 +1497,7 @@ mod tests {
         let ended = end_all(
             std::slice::from_ref(&identity),
             &not_known,
-            &identity_of,
+            &Tools::system(),
             Duration::from_secs(1),
         );
         assert!(
@@ -1638,7 +1690,10 @@ mod tests {
         end_all(
             std::slice::from_ref(&identity),
             &process_state,
-            &swapped,
+            &Tools {
+                identity: &swapped,
+                ..Tools::system()
+            },
             Duration::from_secs(5),
         )
         .expect("the leader ends");
@@ -1723,6 +1778,180 @@ mod tests {
                 "the program signals by number with {call}"
             );
         }
+    }
+
+    /// A group whose leader has ended is still ended: the members it left are ended by identity
+    /// before the end is reported.
+    #[test]
+    fn the_members_a_leader_left_are_ended_when_the_leader_has_ended() {
+        let (mut leader, identity, member) = a_leader_with_a_member();
+        let _ = leader.0.kill();
+        assert!(reap_within(&mut leader.0, Duration::from_secs(5)));
+        assert_eq!(process_state(&identity), ProcessState::Ended);
+        assert_eq!(process_state(&member.0), ProcessState::Running);
+        end_all(
+            std::slice::from_ref(&identity),
+            &process_state,
+            &Tools::system(),
+            Duration::from_secs(5),
+        )
+        .expect("the group ends");
+        assert_eq!(
+            process_state(&member.0),
+            ProcessState::Ended,
+            "the member the leader left was not ended"
+        );
+    }
+
+    /// A group whose number another process holds has ended: nothing the process that holds the
+    /// number leads is the group's to end, whatever the kernel lists under the number.
+    #[test]
+    fn a_number_that_another_process_holds_is_not_the_group_of_the_leader_that_had_it() {
+        let (_leader, identity, member) = a_leader_with_a_member();
+        let stranger = |pid: u32| {
+            let read = identity_of(pid)?;
+            Ok(if u64::from(pid) == identity.pid.get() {
+                ProcessStartIdentity::new(
+                    read.pid.get(),
+                    read.source,
+                    read.start_value.get().wrapping_add(1),
+                )
+            } else {
+                read
+            })
+        };
+        let tools = Tools {
+            identity: &stranger,
+            ..Tools::system()
+        };
+        let group = group_of(&identity).expect("a group number");
+        assert!(
+            members_of(&identity, group, &tools)
+                .expect("a list")
+                .is_empty(),
+            "the group of a leader that is another process now was listed"
+        );
+        let own = Tools::system();
+        assert!(
+            members_of(&identity, group, &own)
+                .expect("a list")
+                .contains(&member.0),
+            "the group of the leader that runs lists its member"
+        );
+    }
+
+    /// A group that cannot be listed is not known to be empty: ending it is an error, whether or not
+    /// its leader has ended.
+    #[test]
+    fn a_group_that_cannot_be_listed_is_not_known_and_is_an_error() {
+        let mut held = Held(
+            Command::new("/bin/sleep")
+                .arg("30")
+                .process_group(0)
+                .spawn()
+                .expect("a process that runs"),
+        );
+        let identity = started_process_identity(held.0.id()).expect("its identity");
+        let tools = Tools {
+            group: &|group| Err(format!("the group {group} cannot be listed: refused")),
+            ..Tools::system()
+        };
+        let running = end_all(
+            std::slice::from_ref(&identity),
+            &process_state,
+            &tools,
+            Duration::from_secs(1),
+        );
+        assert!(
+            running
+                .as_ref()
+                .is_err_and(|why| why.contains("cannot be listed")),
+            "{running:?}"
+        );
+        let _ = held.0.kill();
+        assert!(reap_within(&mut held.0, Duration::from_secs(5)));
+        let ended = end_all(
+            std::slice::from_ref(&identity),
+            &process_state,
+            &tools,
+            Duration::from_secs(1),
+        );
+        assert!(
+            ended
+                .as_ref()
+                .is_err_and(|why| why.contains("cannot be listed")),
+            "an ended leader's group that cannot be listed is not an end: {ended:?}"
+        );
+    }
+
+    /// A directory that `lsof` lists none for is unknown unless the process is shown to have ended:
+    /// `lsof` gives status 1 and no line for any error.
+    #[test]
+    fn a_directory_lsof_lists_none_for_is_unknown_unless_the_process_ended() {
+        let working = Path::new("/w");
+        assert_eq!(
+            in_directory(7, Some(Path::new("/w")), working, ProcessState::Running),
+            Ok(true)
+        );
+        assert_eq!(
+            in_directory(7, Some(Path::new("/x")), working, ProcessState::Running),
+            Ok(false)
+        );
+        assert_eq!(
+            in_directory(7, None, working, ProcessState::Ended),
+            Ok(false),
+            "a process that ended has no directory"
+        );
+        let running = in_directory(7, None, working, ProcessState::Running);
+        assert!(
+            running.as_ref().is_err_and(|why| why.contains("not known")),
+            "{running:?}"
+        );
+        let unknown = in_directory(
+            7,
+            None,
+            working,
+            ProcessState::Unknown {
+                detail: "refused".to_owned(),
+            },
+        );
+        assert!(unknown.is_err(), "{unknown:?}");
+        // The search itself: an `lsof` that lists nothing and says 1 for a process that matches the
+        // job and runs is an error and not an absence.
+        let folder = PrivateTempDir::create();
+        let root = folder.path().canonicalize().expect("a folder");
+        let program = root.join("kr-daemon");
+        kr_ipc::testing::place_script(&program, "#!/bin/sh\nwhile :; do sleep 1; done\n");
+        let _held = Held(
+            Command::new(&program)
+                .arg("30")
+                .current_dir(&root)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("a program"),
+        );
+        let context = Context {
+            own: root.clone(),
+            roots: vec![root.clone()],
+            store: root.join("store"),
+            uid: 0,
+        };
+        let job = Job {
+            arguments: vec![program.display().to_string(), "30".to_owned()],
+            working_directory: root.display().to_string(),
+            ..Job::default()
+        };
+        let silent = Tools {
+            lsof: Path::new("/usr/bin/false"),
+            ..Tools::system()
+        };
+        let found = found_unrecorded(&context, &job, &silent);
+        assert!(
+            found.as_ref().is_err_and(|why| why.contains("not known")),
+            "{found:?}"
+        );
     }
 
     /// The argument vector of a process is the job's only when it ends with the arguments of the
