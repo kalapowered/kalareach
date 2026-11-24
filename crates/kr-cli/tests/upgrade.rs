@@ -618,9 +618,10 @@ struct Setup {
     /// the update check on that manifest, with the release's own programs behind it.
     without_the_organisation_store: bool,
     /// The first release's manifest lists the stores of a release built before a draft's binding
-    /// revision had a store of its own, as releases of this level were: no store of binding
-    /// revisions, and the transfers journal read at version 5 and no higher. A rollback to it is
-    /// decided by that manifest, and states the limit of a draft's prompt record.
+    /// revision had a store of its own: no store of binding revisions, and the transfers journal
+    /// read at version 5 and no higher. Only the manifest is changed; the programs are those of the
+    /// release before this one. A rollback to it is decided by that manifest, and states the limit
+    /// of a draft's prompt record.
     without_the_store_of_binding_revisions: bool,
     /// The configuration document names a test suite, `reports`, that writes a JUnit report as its
     /// output, for a workflow's `run_tests` node to run.
@@ -5056,8 +5057,8 @@ async fn a_report_store_the_release_before_keeps_too_is_kept_across_a_rollback_a
 /// for a prompt. After the update again the record still names its session, and a prompt under
 /// another binding revision is refused and removes nothing.
 ///
-/// The release before is made as one of this level built before the binding revision had a store of
-/// its own: its programs are the predecessor's, and its manifest, which is all the update check
+/// The release before keeps its own programs and has its manifest changed to read as one built
+/// before the binding revision had a store of its own: the manifest, which is all the update check
 /// reads, lists no such store and reads the transfers journal at version 5, no higher. That is what
 /// makes a rollback to it state the limit of a draft's prompt record (`draft_limit`). The release
 /// this suite runs as the release before lists that store, and a rollback to it states no limit, as
