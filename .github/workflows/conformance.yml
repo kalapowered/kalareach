@@ -858,31 +858,31 @@ jobs:
           echo "dl2-packages.sh after $rc" >> "$PROBE_RESULTS/exit-codes.txt"
           exit "$rc"
 
-      - name: Probe the X11 capture tools
+      - name: Run A, the X11 capture tools
         if: ${{ !cancelled() }}
         timeout-minutes: 6
         run: |
           rc=0
-          timeout --kill-after=15 300 bash scripts/probe-desktop/dl2-x11.sh "$PROBE_RESULTS/x11" || rc=$?
-          echo "dl2-x11.sh $rc" >> "$PROBE_RESULTS/exit-codes.txt"
+          timeout --kill-after=15 300 bash scripts/probe-desktop/dl2-x11.sh "$PROBE_RESULTS/run-a-x11" || rc=$?
+          echo "dl2-x11.sh run-a-x11 $rc" >> "$PROBE_RESULTS/exit-codes.txt"
           exit "$rc"
 
-      - name: Probe the accessibility bus
+      - name: Run B, the accessibility bus
         if: ${{ !cancelled() }}
         timeout-minutes: 6
         run: |
           rc=0
-          timeout --kill-after=15 300 bash scripts/probe-desktop/dl2-atspi.sh "$PROBE_RESULTS/atspi" || rc=$?
-          echo "dl2-atspi.sh $rc" >> "$PROBE_RESULTS/exit-codes.txt"
+          timeout --kill-after=15 300 bash scripts/probe-desktop/dl2-atspi.sh "$PROBE_RESULTS/run-b-atspi" || rc=$?
+          echo "dl2-atspi.sh run-b-atspi $rc" >> "$PROBE_RESULTS/exit-codes.txt"
           exit "$rc"
 
-      - name: Probe the launch targets
+      - name: Run C, the launch targets
         if: ${{ !cancelled() }}
         timeout-minutes: 6
         run: |
           rc=0
-          timeout --kill-after=15 300 bash scripts/probe-desktop/dl2-launch.sh "$PROBE_RESULTS/launch" || rc=$?
-          echo "dl2-launch.sh $rc" >> "$PROBE_RESULTS/exit-codes.txt"
+          timeout --kill-after=15 300 bash scripts/probe-desktop/dl2-launch.sh "$PROBE_RESULTS/run-c-launch" || rc=$?
+          echo "dl2-launch.sh run-c-launch $rc" >> "$PROBE_RESULTS/exit-codes.txt"
           exit "$rc"
 
       - name: Probe the Wayland compositors
