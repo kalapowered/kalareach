@@ -52,7 +52,7 @@ use kr_protocol::local::LocalBuild;
 
 use crate::runtime::binding::{
     BindingEvent, BindingHandle, BindingOwner, BindingRequest, DEFAULT_EVENT_QUEUE, Incarnation,
-    Runtime, RuntimeConfig, Unbound, remaining_of,
+    Restored, Runtime, RuntimeConfig, Unbound, remaining_of,
 };
 use crate::runtime::budget::CallKind;
 use crate::runtime::compile::{CompileOrigin, Payload};
@@ -947,12 +947,10 @@ impl PluginHost {
                             "the state is larger than this host carries to a component".to_owned(),
                         ));
                     }
-                    if through.is_some() && (!self.writer_open || binding.offered_events()) {
+                    if through.is_some() && !self.writer_open {
                         // A host that does not keep the record cannot say the state covers what the
-                        // position says it does. Nor can one whose registration has been offered an
-                        // event: the instance may have consumed past the state, and the record would
-                        // call what follows a continuation of it. It restores nothing, and the
-                        // worker is told the record was not set.
+                        // position says it does. It restores nothing, and the worker is told the
+                        // record was not set.
                         added.record = Some(RecordState::NotSet);
                         return Ok(ResponseBody::Called {
                             value: Some(CallValue::Document),
@@ -964,20 +962,25 @@ impl PluginHost {
                     through = None;
                 }
                 let asked_to_set = through.is_some();
-                let result = binding
-                    .restore(
-                        state,
-                        through,
-                        core::time::Duration::from_millis(deadline_ms),
-                    )
-                    .await;
+                let deadline = core::time::Duration::from_millis(deadline_ms);
+                let result = match through {
+                    Some(through) => binding.restore_if_unoffered(state, through, deadline).await,
+                    None => binding.restore(state, None, deadline).await,
+                };
                 called_of(result.map(|result| {
-                    added.record = Some(if asked_to_set && result.answer.is_ok() {
+                    // A registration that had been offered an event is one the binding restored
+                    // nothing for, so a restore it skipped sets no record either: the instance may
+                    // have consumed past the state, and the record would call what follows a
+                    // continuation of it.
+                    added.record = Some(if asked_to_set && result.answer == Ok(Restored::Done) {
                         RecordState::Set
                     } else {
                         RecordState::NotSet
                     });
-                    (result.answer.map(|()| CallValue::Document), result.document)
+                    (
+                        result.answer.map(|_restored| CallValue::Document),
+                        result.document,
+                    )
                 }))
             }
             RequestBody::Decode(call) => {

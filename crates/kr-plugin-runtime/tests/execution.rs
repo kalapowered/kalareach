@@ -2661,7 +2661,7 @@ async fn a_document_nobody_received_asks_the_component_to_draw_again() {
 mod consumed {
     use super::*;
 
-    use kr_plugin_runtime::runtime::binding::{BindingHandle, Consumed};
+    use kr_plugin_runtime::runtime::binding::{BindingHandle, Consumed, Restored};
     use kr_plugin_service::protocol4::Through;
     use kr_plugin_service::vocabulary::{ScopedSourceEvent, SourceProvenance};
     use kr_protocol::ids::SourceEventHandle;
@@ -2903,6 +2903,67 @@ mod consumed {
                 terminal: None,
                 restores: 2
             }
+        );
+    }
+
+    /// KR-REQ-24.24: a restore that carries a position is decided on the thread that runs it. An
+    /// event offered after the restore was asked for and before it runs has been offered by then:
+    /// the restore replaces nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn kr_req_24_24_a_restore_with_a_position_is_decided_where_it_runs() {
+        let Some((_host, binding, mut received)) =
+            bound("recording", 27, DEFAULT_EVENT_QUEUE).await
+        else {
+            return;
+        };
+        let state = binding
+            .checkpoint(ANSWER)
+            .await
+            .expect("the checkpoint runs")
+            .answer
+            .expect("the component answers")
+            .state;
+        // The binding's next pass stands before it takes anything. A revision of the facts wakes a
+        // pass without offering an event, so nothing has been offered when the restore is asked for.
+        let mut stop = binding.stop_next_pump();
+        binding.set_facts(components::request("recording", 27).facts);
+        assert!(
+            tokio::time::timeout(core::time::Duration::from_secs(60), stop.reached())
+                .await
+                .expect("the pass stands at the stop"),
+            "the stop was replaced before a pass reached it"
+        );
+        let restoring = binding.restore_if_unoffered(
+            state,
+            Through {
+                native: None,
+                terminal: Some(handle("se-1")),
+            },
+            ANSWER,
+        );
+        tokio::pin!(restoring);
+        assert!(
+            tokio::time::timeout(core::time::Duration::from_millis(300), &mut restoring)
+                .await
+                .is_err(),
+            "the restore ran while the pass stood"
+        );
+        binding.enqueue_observation(components::scrape("se-2", "x"));
+        stop.release();
+        let restored = restoring.await.expect("the restore runs");
+        assert_eq!(
+            restored.answer,
+            Ok(Restored::Skipped),
+            "a restore with a position replaced the state after an event was offered"
+        );
+        consumed_until(&mut received, |cursor| {
+            cursor.terminal == Some(handle("se-2"))
+        })
+        .await;
+        assert_eq!(
+            consumed_of(&binding).await.restores,
+            0,
+            "the binding took a restore in"
         );
     }
 
