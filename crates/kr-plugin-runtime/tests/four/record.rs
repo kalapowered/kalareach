@@ -837,11 +837,11 @@ fn kr_req_24_24_every_recorded_frame_of_the_fourth_plugin_host_protocol_reads_an
         );
     }
 
-    let third = &record["descriptors"]["plugin-host-3.json"];
+    let third = &record["descriptors"]["descriptor-3-served-by-the-test"];
     let read: HostDescriptor = serde_json::from_value(third.clone()).expect("the third descriptor");
     assert_eq!(&serde_json::to_value(&read).expect("it writes"), third);
     assert_eq!(read.protocol, HostProtocol::V3.name);
-    let fourth = &record["descriptors"]["plugin-host-4.json"];
+    let fourth = &record["descriptors"]["descriptor-4-stated-by-the-hello"];
     let read: HostDescriptor4 =
         serde_json::from_value(fourth.clone()).expect("the fourth descriptor");
     assert_eq!(&serde_json::to_value(&read).expect("it writes"), fourth);
@@ -894,8 +894,8 @@ async fn kr_req_24_24_the_fourth_protocol_host_answers_its_sessions_the_way_the_
         };
         let record = serde_json::json!({
             "descriptors": {
-                "plugin-host-3.json": third,
-                "plugin-host-4.json": hellos[0],
+                "descriptor-3-served-by-the-test": third,
+                "descriptor-4-stated-by-the-hello": hellos[0],
             },
             "open": of(&sessions[0]),
             "closed": of(&sessions[1]),
@@ -991,12 +991,12 @@ async fn kr_req_24_24_the_fourth_protocol_host_answers_its_sessions_the_way_the_
     let held = |value: &serde_json::Value| Held::default().read(value.clone(), true);
     assert_eq!(
         held(&hellos[0]),
-        held(&record["descriptors"]["plugin-host-4.json"]),
+        held(&record["descriptors"]["descriptor-4-stated-by-the-hello"]),
         "the fourth descriptor is the one that was recorded"
     );
     assert_eq!(
         held(third.as_ref().expect("a third descriptor")),
-        held(&record["descriptors"]["plugin-host-3.json"]),
+        held(&record["descriptors"]["descriptor-3-served-by-the-test"]),
         "the third descriptor is the one that was recorded"
     );
 }
