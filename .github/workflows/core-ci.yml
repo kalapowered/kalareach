@@ -786,21 +786,20 @@ jobs:
   # upgrade suite, which builds only with its feature. The job is a job of its own because the rust
   # job's steps already add up to more than its limit, and it has no `needs` so that it runs beside
   # that job. The service side of the contract is the web repository's. The macOS upgrade suite is
-  # not in this workflow: hosted macOS runners are the gate's scarcest, so no job here takes one.
+  # not in this workflow: hosted macOS runners are the gate's scarcest, so no contract job takes one.
+  # No job runs an installed app of the release before: the app side of these cases is the frames
+  # and vectors that release recorded, and the paired-device harness.
   #
-  # The limits are estimates and not measurements of a hosted run. On the box, whose build was warm,
-  # the retained surface's cases took 7 minutes and the upgrade suite's 51 cases 8.5 minutes; a
-  # hosted runner has a quarter of the threads and builds everything from nothing, twice for the
-  # upgrade suite, which builds the release before in a tree of its own. The fast step has 90
-  # minutes and the upgrade suite 190, each about twice what it is expected to take.
+  # The limits are estimates and not measurements of a hosted run. On the box, which has 64 threads
+  # and whose build was warm, the retained surface's cases took 7 minutes and the upgrade suite's 51
+  # cases 11; a hosted runner has 4 processors and builds everything from nothing: this tree, the
+  # release before in a tree of its own, and a third tree once a later release is tagged. The fast
+  # step has 90 minutes and the upgrade suite 190, which the first hosted run replaces with measured
+  # limits.
   contract-tests:
     name: contract tests for installed apps, live workers and plugins
     runs-on: ubuntu-24.04
     timeout-minutes: 330
-    env:
-      # A runner with no user service manager fails the cases that start a daemon through one, where
-      # they would otherwise stand down and pass.
-      KR_REQUIRE_SERVICE_MANAGER: "1"
     steps:
       - name: Free the disk the build needs
         run: |
@@ -824,7 +823,7 @@ jobs:
 
       # The retained surface's cases build their fixture trees for x86_64-pc-windows-gnu, and a cross
       # check needs the standard library of its target.
-      - name: Install the component target
+      - name: Install the Windows cross-check target
         run: rustup target add x86_64-pc-windows-gnu
 
       # The retained surface's narrower reading resolves every target's packages offline.

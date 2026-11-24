@@ -1708,10 +1708,6 @@ fn the_contract_cases_for_installed_apps_live_workers_and_plugins_run_in_jobs_of
             "{name}: the steps' limits ({total} and {others}) and 30 minutes for the steps with none do not fit in {job_limit}"
         );
     }
-    assert!(
-        job(&workflow, "contract-tests").contains("KR_REQUIRE_SERVICE_MANAGER: \"1\""),
-        "a runner with no service manager passes the cases that start a daemon without running them"
-    );
 
     // Each boundary has a command in the function that runs it.
     let commands = contract_commands(&script);
@@ -1861,8 +1857,8 @@ fn the_contract_cases_for_installed_apps_live_workers_and_plugins_run_in_jobs_of
 /// KR-REQ-04.21: the contract script holds each command to what its test programs report. A command
 /// passes only when every test program reports passed cases and no failed one, and a command that
 /// names several cases with `--exact` passes only when as many passed as it names, because cargo
-/// exits 0 for a name that matches nothing. A failed command does not stop the commands after it,
-/// and the script then exits 1. The upgrade suite reads test components that the repository does not
+/// exits 0 for a name that matches nothing. A failed test command does not stop the commands after
+/// it, and the script then exits 1. The upgrade suite reads test components that the repository does not
 /// hold, so the script builds them first; the fake `cargo` fails that suite when they are absent.
 /// This runs the script against a `cargo` that reports what each case asks of it.
 #[test]

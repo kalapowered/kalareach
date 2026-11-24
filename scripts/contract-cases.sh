@@ -10,7 +10,12 @@
 # A command passes only when its test programs say that cases passed and that none failed, and,
 # for a command that names its cases (`--exact`), that as many passed as it names. Cargo exits 0
 # for a name that matches no test, so a case that is renamed would otherwise pass by not running.
-# Every command runs whatever an earlier one did, and the script exits 1 if any of them failed.
+# A test command that fails does not stop the commands after it, and the script then exits 1; a build
+# that fails stops the script at once, with its own status.
+#
+# A case that returns at once counts as passed, because a test program reports no more than that.
+# While the history holds no release of the level after the release before, two cases of the upgrade
+# suite do this; the cases that update from and roll back to the release before still run.
 
 set -euo pipefail
 
@@ -65,8 +70,9 @@ fast() {
   expect cargo test --locked -p kr-client --test network_chunks -- --exact \
     a_host_of_an_earlier_build_is_told_to_update_before_anything_is_reserved
 
-  # A client and a daemon or a worker of another release or another major. The startup case starts
-  # the daemon and the worker, which it finds built beside it.
+  # A client and a daemon or a worker of another release or another major. The startup case talks to
+  # a stand-in daemon; its set-up places the held daemon and the worker, which it finds built beside
+  # it, and starts each once with `--version`.
   cargo build --locked -p kr-controller --features testing --bin kr-controller-held
   cargo build --locked -p kr-worker
   expect cargo test --locked -p kr-cli --test bridge -- --exact \
