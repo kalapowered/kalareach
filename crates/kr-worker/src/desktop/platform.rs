@@ -364,10 +364,20 @@ std::thread_local! {
 /// reading that ran out of time says is what a command that did not finish says: nothing.
 pub fn within<T>(limit: std::time::Duration, reading: impl FnOnce() -> T) -> T {
     let ends = std::time::Instant::now() + limit;
-    let before = READING_ENDS.with(|cell| cell.replace(Some(ends)));
-    let value = reading();
-    READING_ENDS.with(|cell| cell.set(before));
-    value
+    let _restore = RestoreReadingEnds(READING_ENDS.with(|cell| cell.replace(Some(ends))));
+    reading()
+}
+
+/// Puts back the instant a reading found when it started, however the reading ends.
+///
+/// A reading that panics unwinds through here, and an instant left behind on a thread that a pool
+/// reuses would make every later reading on it start nothing.
+struct RestoreReadingEnds(Option<std::time::Instant>);
+
+impl Drop for RestoreReadingEnds {
+    fn drop(&mut self) {
+        READING_ENDS.with(|cell| cell.set(self.0));
+    }
 }
 
 /// Whether the deadline of the reading this thread is making has passed.
@@ -1619,6 +1629,24 @@ mod tests {
             super::read_capture(&file, gone_after_one_block),
             None,
             "time gone between two blocks"
+        );
+    }
+
+    /// KR-REQ-03.29, S-8: a reading that panics puts back the instant it found, so the thread that
+    /// a pool reuses does not start every later reading out of time.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn a_reading_that_panics_leaves_the_threads_deadline_as_it_found_it() {
+        let panicked = std::panic::catch_unwind(|| {
+            super::within::<()>(std::time::Duration::from_millis(1), || {
+                std::panic::resume_unwind(Box::new("a reading that failed"))
+            })
+        });
+        assert!(panicked.is_err(), "the stand-in reading ended in a panic");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert!(
+            !super::reading_is_over(),
+            "the instant of a reading that ended in a panic was left on the thread"
         );
     }
 
