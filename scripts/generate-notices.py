@@ -485,16 +485,23 @@ class Reader:
         return cache
 
     def batch(self, options, names):
-        """askalono's answer for each of these files, in order."""
+        """askalono's answer for each of these files, in the order of the files: each answer names the
+        file it is for."""
         done = subprocess.run([self.program, "--cache", self.cache, "--format", "json", "id", *options, "--batch"],
                               input="\n".join(names) + "\n", capture_output=True, text=True)
         answers = [json.loads(line) for line in done.stdout.splitlines()]
         if done.returncode != 0 or len(answers) != len(names):
             fail(f"askalono answered {len(answers)} lines for {len(names)} texts, exit {done.returncode}:\n{done.stderr[-1500:]}")
+        by_path = {}
+        for answer in answers:
+            path = answer["path"].rstrip("\n")
+            if path not in names or path in by_path:
+                fail(f"askalono answered for {path}, a text that was not asked for or is answered twice")
+            by_path[path] = answer
         for answer in answers:
             if "error" in answer and answer["error"] != NO_MATCH:
                 fail(f"askalono could not read a text: {answer['error']}")
-        return [None if "error" in answer else answer["result"] for answer in answers]
+        return [None if "error" in by_path[name] else by_path[name]["result"] for name in names]
 
     def read(self, texts):
         """The licences each text is, as a set of SPDX names: empty for a text that is none of them. Two
@@ -502,6 +509,7 @@ class Reader:
         one that takes the text whole and, where it finds a block of a licence inside, blanks the block
         and reads what is left."""
         found = [set() for _ in texts]
+        regions = [[] for _ in texts]
         lines = [text.split("\n") for text in texts]
         names = []
         for index, text in enumerate(texts):
@@ -511,8 +519,9 @@ class Reader:
             names.append(name)
         for index, result in enumerate(self.batch(["-m"], names)):
             if result is not None:
-                found[index] |= {part["license"]["name"] for part in result["containing"]
-                                 if part["score"] >= MATCH_SCORE and is_text(part)}
+                inside = [part for part in result["containing"] if part["score"] >= MATCH_SCORE]
+                found[index] |= {part["license"]["name"] for part in inside if is_text(part)}
+                regions[index] = [(*part["line_range"], part["license"]["name"]) for part in inside if is_text(part)]
         pending = list(range(len(texts)))
         for _ in range(READ_PASSES):
             if not pending:
@@ -528,14 +537,32 @@ class Reader:
                     found[index].add(result["license"]["name"])
                 inside = [part for part in result["containing"] if part["score"] >= MATCH_SCORE]
                 for part in inside:
+                    first, last = part["line_range"]
+                    clash = is_text(part) and disagreeing(regions[index], first, last, part["license"]["name"])
+                    if clash:
+                        fail(f"askalono reads lines {clash[0]} to {clash[1]} of a text as {clash[2]} in one reading and as {clash[3]} in the other")
                     if is_text(part):
                         found[index].add(part["license"]["name"])
-                    first, last = part["line_range"]
-                    lines[index][first:last + 1] = [""] * (last + 1 - first)
+                    blank(lines[index], first, last)
                 if inside:
                     again.append(index)
             pending = again
         return [frozenset(names) for names in found]
+
+
+def blank(lines, first, last):
+    """Blanks the lines of a match: askalono's range starts at the index of a line and ends before the index `last`."""
+    lines[first:last] = [""] * (last - first)
+
+
+def disagreeing(regions, first, last, name):
+    """The first region of the other reading that overlaps these lines and names another licence, as the
+    lines they share (counted from 1), its licence and this one; None where there is none. Only matches
+    that are a licence's text are regions: a header makes no claim on the lines it is found in."""
+    for start, end, other in regions:
+        if other != name and max(start, first) < min(end, last):
+            return max(start, first) + 1, min(end, last), other, name
+    return None
 
 
 def is_text(match):
@@ -1039,6 +1066,45 @@ def self_checks(scratch, reader):
     expect("the Unicode licence's third version is told from its second",
            refine(frozenset({"Unicode-DFS-2016"}), "UNICODE LICENSE V3\n") == {"Unicode-3.0"}
            and refine(frozenset({"Unicode-DFS-2016"}), "UNICODE, INC. LICENSE AGREEMENT\n") == {"Unicode-DFS-2016"})
+
+    # How askalono's answers are read: a range blanks the lines it names, an answer is for the file it names,
+    # and the two readings of a text may not call one region two licences.
+    blanked = ["a", "b", "c", "d"]
+    blank(blanked, 1, 3)
+    expect("a licence match blanks its own lines and no more", blanked == ["a", "", "", "d"])
+
+    def fake(name, body):
+        """A reader whose program answers as `body` says, for the `paths` it is given and the options it is run with."""
+        program = os.path.join(scratch, name)
+        with open(program, "w", encoding="utf-8") as target:
+            target.write(f"#!{sys.executable}\nimport json, sys\npaths = [line.rstrip('\\n') for line in sys.stdin if line.strip()]\n{body}")
+        os.chmod(program, 0o755)
+        stand_in = object.__new__(Reader)
+        stand_in.program, stand_in.cache, stand_in.directory = program, "none", os.path.join(scratch, name + "-reader")
+        os.makedirs(stand_in.directory)
+        return stand_in
+
+    backwards = fake("answers-backwards", '''
+for path in reversed(paths):
+    print(json.dumps({"path": path + "\\n", "result": {"score": 0.0, "license": None, "containing": [], "marker": path}}))
+''')
+    expect("askalono's answers are matched to the texts by their paths, not their order",
+           [answer["marker"] for answer in backwards.batch(["--optimize"], ["x", "y"])] == ["x", "y"])
+    stranger = fake("answers-for-another", '''
+for path in paths:
+    print(json.dumps({"path": "other\\n", "result": {"score": 0.0, "license": None, "containing": []}}))
+''')
+    refuses("an answer for a path that was not asked for is refused", lambda: stranger.batch(["--optimize"], ["x"]),
+            "askalono answered for other, a text that was not asked for or is answered twice")
+    clashing = fake("answers-that-clash", '''
+def part(name, first, last):
+    return {"score": 0.95, "license": {"name": name, "kind": "original", "aliases": []}, "line_range": [first, last]}
+for path in paths:
+    containing = [part("MIT", 0, 5)] if "-m" in sys.argv else [part("ISC", 2, 8)]
+    print(json.dumps({"path": path + "\\n", "result": {"score": 0.0, "license": None, "containing": containing}}))
+''')
+    refuses("a region that the two readings call two licences is refused", lambda: clashing.read(["a\nb\nc\nd\ne\nf\ng\nh\n"]),
+            "askalono reads lines 3 to 5 of a text as MIT in one reading and as ISC in the other")
 
     def licences(text, own=True):
         return [("MIT", "MIT License", text, own)]
