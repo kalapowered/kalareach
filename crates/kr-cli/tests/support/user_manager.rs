@@ -42,7 +42,12 @@ const COMES_UP: Duration = Duration::from_secs(120);
 /// Starts one process at a time: the turn [`spawning`] and [`bounded`] take.
 static SPAWNING: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// Starts one process at a time.
+/// How long [`spawning`] waits for its turn: longer than any start takes, so that only a start
+/// that never gives the turn up fails it.
+const TURN_BOUND: Duration = Duration::from_secs(120);
+
+/// Starts one process at a time, waiting for its turn for at most [`TURN_BOUND`] and failing the
+/// test when it is not given it.
 ///
 /// A pipe is made and only then marked to close when a program is started, and on macOS those are
 /// two steps. A process another test's thread starts in between inherits both ends, and a `kr`
@@ -50,10 +55,7 @@ static SPAWNING: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// never reaches its end, and the command that made it looks as if it had left something holding
 /// its output. Starting one process at a time closes that window for every pipe made through it.
 pub fn spawning<T>(start: impl FnOnce() -> T) -> T {
-    let _one_at_a_time = SPAWNING
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    start()
+    spawning_before(Instant::now() + TURN_BOUND, start).unwrap_or_else(|why| panic!("{why}"))
 }
 
 /// [`spawning`], for a caller that has a deadline: it gives up the turn it is waiting for at

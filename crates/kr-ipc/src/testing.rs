@@ -790,8 +790,8 @@ pub fn place_and_start_once(
             }
             Ok(None) => {
                 // This process's own child, which it has not collected, so the number is still its.
-                let _ = child.kill();
-                let _ = child.wait();
+                // It is ended and collected within a bound, as a copier is.
+                let _ = copier_ended_within(&mut child, std::time::Duration::ZERO);
                 panic!(
                     "the first start of the program placed at {} did not end within \
                      {FIRST_START_BOUND:?}",

@@ -86,7 +86,9 @@ mod user_manager;
 
 #[cfg(target_os = "linux")]
 use user_manager::{REQUIRE_SERVICE_MANAGER, UserManager};
-use user_manager::{STREAMS_DEADLINE, TEARDOWN_BOUND, bounded, read_aside, spawning};
+use user_manager::{
+    STREAMS_DEADLINE, TEARDOWN_BOUND, bounded, kill_and_collect, read_aside, spawning,
+};
 
 /// How long a command, or anything a test waits for, is given. It fails when the thing never
 /// happens.
@@ -1140,9 +1142,9 @@ impl Drop for Running {
         while matches!(child.try_wait(), Ok(None)) && started.elapsed() < LIVENESS_DEADLINE {
             std::thread::sleep(Duration::from_millis(20));
         }
-        // This test's own child, not collected yet, so the number is still its.
-        let _ = child.kill();
-        let _ = child.wait();
+        // This test's own child, not collected yet, so the number is still its. It is collected
+        // within a bound.
+        let _ = kill_and_collect(&mut child);
     }
 }
 
@@ -1191,10 +1193,10 @@ impl Running {
                     std::thread::sleep(Duration::from_millis(20));
                 }
                 None => {
-                    // This test's own child, not collected yet, so the number is still its.
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    panic!("{what} did not end within {LIVENESS_DEADLINE:?}");
+                    // This test's own child, not collected yet, so the number is still its. It
+                    // is collected within a bound.
+                    let failed = kill_and_collect(&mut child);
+                    panic!("{what} did not end within {LIVENESS_DEADLINE:?}{failed}");
                 }
             }
         };

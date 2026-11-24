@@ -11,19 +11,21 @@
 //!    until it is listed, and a listed one that names none is refused too.
 //! 3. In the startup suite, the host builds the account's launchd command in one function; the
 //!    case that runs on the stand-in and its steps build no command and name nothing of the
-//!    account's launchd; and neither they nor four helpers they call wait for a program without a
-//!    bound.
-//! 4. The helpers that place a program for a test (`place_program` and `place_script`) wait for
-//!    their copier with a bound.
+//!    account's launchd; and neither they, nor four helpers they call, nor the methods of
+//!    `Running` (a `kr` that has been started) wait for a program without a bound.
+//! 4. The helpers that place a program for a test (`place_program` and `place_script`) and the
+//!    one that starts it once (`place_and_start_once`) wait with a bound.
+//! 5. In the startup suite's support module, `spawning` waits for its turn with a bound.
 //!
 //! What the readings cannot see: a program named by a string a macro builds, a path made at run
 //! time, a command inside shell text, and a call of `systemctl`: on Linux the control daemon's
 //! desktop agent runs `systemctl --user show-environment`, a read, outside the three runners. The
-//! third reading reads the case, its steps and four free helpers of the startup suite, and not the
-//! methods of the host that they call: a program a method starts and a wait a method hides are
-//! outside it. The fourth reads the two placing helpers, and not the copier they start. The
-//! behaviour of each runner is shown by its own cases, each in a child of its own with the variable
-//! and the marker in the state the case names.
+//! third reading reads the case, its steps, four free helpers and the methods of `Running` of the
+//! startup suite, and not the methods of the host that they call: a program a method of the host
+//! starts and a wait it hides are outside it. The fourth reads three placing helpers, and not the
+//! copier they start. The fifth reads one function. The behaviour of each runner is shown by its
+//! own cases, each in a child of its own with the variable and the marker in the state the case
+//! names.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -513,6 +515,19 @@ fn impl_block(tokens: &[Token], name: &str) -> Option<std::ops::Range<usize>> {
     })
 }
 
+/// The index range of the tokens between the braces of every `impl <name> {` and
+/// `impl <trait> for <name> {`.
+fn impl_blocks(tokens: &[Token], name: &str) -> Vec<std::ops::Range<usize>> {
+    (0..tokens.len())
+        .filter(|&at| tokens[at].ident() == Some("impl"))
+        .filter_map(|at| {
+            let open = (at..tokens.len()).find(|&index| tokens[index].is_punct('{'))?;
+            (open > 0 && tokens[open - 1].ident() == Some(name))
+                .then(|| open + 1..closing_brace(tokens, open))
+        })
+        .collect()
+}
+
 /// The index of each `account_launchd::<item>` in `range`, followed by `(` where `call` is set. With
 /// no item it is each `account_launchd::`.
 fn account_launchd_paths(
@@ -535,8 +550,8 @@ fn account_launchd_paths(
 
 /// What is wrong with the startup suite's source: the account's launchd is reached by one function
 /// of `impl ServiceHost` for its command and one for its program path, the case and its steps build
-/// no command and name nothing of it, and neither they nor their helpers wait for a program without
-/// a bound.
+/// no command and name nothing of it, and neither they, nor their helpers, nor the methods of
+/// `Running` wait for a program without a bound.
 fn startup_problems(source: &str) -> Vec<String> {
     let tokens = code_tokens(source);
     let all = functions(&tokens);
@@ -567,6 +582,17 @@ fn startup_problems(source: &str) -> Vec<String> {
             }
         }
     }
+    let running = impl_blocks(&tokens, "Running");
+    if running.is_empty() {
+        problems.push("there is no `impl Running` in this source".to_owned());
+    }
+    for block in running {
+        for wait in unbounded_waits(&tokens, &block) {
+            problems.push(format!(
+                "a method of Running waits for a program with {wait}() and no bound"
+            ));
+        }
+    }
     let builders = command_builders(source);
     for name in CASE_FUNCTIONS.into_iter().chain(CASE_HELPERS) {
         let Some(found) = all.iter().find(|function| function.name == name) else {
@@ -592,8 +618,9 @@ fn startup_problems(source: &str) -> Vec<String> {
 }
 
 /// The startup suite reaches the account's own launchd in one place for its command and one for its
-/// program path, and the headless-host case, its steps and their helpers build no command that names
-/// it and wait for no program without a bound, so that no step can bypass the host's one `launchctl`.
+/// program path, the headless-host case and its steps build no command that names it, and the case,
+/// its steps, four helpers and the methods of `Running` wait for no program without a bound, so that
+/// no step can bypass the host's one `launchctl`.
 #[test]
 fn the_startup_suite_reaches_the_accounts_launchd_only_where_the_host_chooses_it() {
     let text = std::fs::read_to_string(repository().join(STARTUP_FILE))
@@ -618,33 +645,38 @@ fn the_startup_reading_finds_each_wrong_place_and_only_those() {
                  fn arguments_of() {}";
     let host = "impl ServiceHost { fn create() { account_launchd::LAUNCHCTL; } \
                 fn launchctl() { account_launchd::command(a); } }";
-    assert!(startup_problems(&format!("{host} {steps}")).is_empty());
+    let running = "impl Running { fn finish() { c.try_wait(); } } \
+                   impl Drop for Running { fn drop() { kill_and_collect(&mut c); } }";
+    assert!(startup_problems(&format!("{host} {steps} {running}")).is_empty());
     let wrong_command = "impl ServiceHost { fn create() { account_launchd::LAUNCHCTL; } \
                          fn kr_from() { account_launchd::command(a); } \
                          fn launchctl() { account_launchd::command(a); } }";
     assert_eq!(
-        startup_problems(&format!("{wrong_command} {steps}")).len(),
+        startup_problems(&format!("{wrong_command} {steps} {running}")).len(),
         1
     );
     let wrong_program = "impl ServiceHost { fn create() { account_launchd::LAUNCHCTL; } \
                          fn launchctl() { account_launchd::command(a); account_launchd::LAUNCHCTL; } }";
     assert_eq!(
-        startup_problems(&format!("{wrong_program} {steps}")).len(),
+        startup_problems(&format!("{wrong_program} {steps} {running}")).len(),
         1
     );
     let moot = "impl ServiceHost { fn create() {} fn launchctl() {} }";
-    assert_eq!(startup_problems(&format!("{moot} {steps}")).len(), 2);
+    assert_eq!(
+        startup_problems(&format!("{moot} {steps} {running}")).len(),
+        2
+    );
     let builds = "fn the_headless_host_case() { Command::new(a); } fn the_stand_in_saw_the_install() {} \
                   fn the_stand_in_started_the_daemon() {} fn the_stand_in_saw_nothing_end() {}";
     assert_eq!(
-        startup_problems(&format!("{host} {builds} {helpers}")).len(),
+        startup_problems(&format!("{host} {builds} {helpers} {running}")).len(),
         1
     );
     let names = "fn the_headless_host_case() {} fn the_stand_in_saw_the_install() {} \
                  fn the_stand_in_started_the_daemon() { x(kr_ipc::testing::account_launchd::VARIABLE); } \
                  fn the_stand_in_saw_nothing_end() {}";
     assert_eq!(
-        startup_problems(&format!("{host} {names} {helpers}")).len(),
+        startup_problems(&format!("{host} {names} {helpers} {running}")).len(),
         1
     );
     let waits_in_a_step = "fn the_headless_host_case() { a.output(); } \
@@ -652,7 +684,7 @@ fn the_startup_reading_finds_each_wrong_place_and_only_those() {
                            fn the_stand_in_started_the_daemon() { c.wait(); } \
                            fn the_stand_in_saw_nothing_end() { d.wait_with_output(); }";
     assert_eq!(
-        startup_problems(&format!("{host} {waits_in_a_step} {helpers}")).len(),
+        startup_problems(&format!("{host} {waits_in_a_step} {helpers} {running}")).len(),
         4
     );
     let waits_in_a_helper = "fn the_headless_host_case() {} fn the_stand_in_saw_the_install() {} \
@@ -663,25 +695,37 @@ fn the_startup_reading_finds_each_wrong_place_and_only_those() {
                              fn working_directory() { x.status.code(); } \
                              fn arguments_of() { bounded(c, d).output_like(); }";
     assert_eq!(
-        startup_problems(&format!("{host} {waits_in_a_helper}")).len(),
+        startup_problems(&format!("{host} {waits_in_a_helper} {running}")).len(),
         2,
         "a wait inside a closure is found, a field and a longer method name are not"
     );
     let comment = "impl ServiceHost { fn create() { account_launchd::LAUNCHCTL; } \
                    fn launchctl() { account_launchd::command(a); } \
                    fn other() { // account_launchd::command(b)\n } }";
-    assert!(startup_problems(&format!("{comment} {steps}")).is_empty());
+    assert!(startup_problems(&format!("{comment} {steps} {running}")).is_empty());
     assert_eq!(startup_problems("fn other() {}").len(), 1);
+    let waits_in_running = "impl Running { fn finish() { c.wait(); } } \
+                            impl Drop for Running { fn drop() { c.child.wait(); } }";
+    assert_eq!(
+        startup_problems(&format!("{host} {steps} {waits_in_running}")).len(),
+        2,
+        "a wait in either impl of Running is found"
+    );
+    assert_eq!(
+        startup_problems(&format!("{host} {steps}")).len(),
+        1,
+        "a source with no impl Running is found"
+    );
 }
 
 /// The source of the testing helpers that place a program for a test to start.
 const PLACING_FILE: &str = "crates/kr-ipc/src/testing.rs";
 
-/// The helpers that start a copier to place a program, and so wait for it.
-const PLACERS: [&str; 2] = ["place_program", "place_script"];
+/// The helpers that start a copier to place a program, or start it once, and so wait for a program.
+const PLACERS: [&str; 3] = ["place_program", "place_script", "place_and_start_once"];
 
 /// What is wrong with the placing helpers of `source`: a helper that is missing, and a helper that
-/// waits for its copier with a call that has no bound.
+/// waits for a program with a call that has no bound.
 fn placing_problems(source: &str) -> Vec<String> {
     let tokens = code_tokens(source);
     let all = functions(&tokens);
@@ -697,7 +741,7 @@ fn placing_problems(source: &str) -> Vec<String> {
         for function in found {
             for wait in unbounded_waits(&tokens, &function.body) {
                 problems.push(format!(
-                    "{name} waits for its copier with {wait}() and no bound"
+                    "{name} waits for a program with {wait}() and no bound"
                 ));
             }
         }
@@ -705,8 +749,9 @@ fn placing_problems(source: &str) -> Vec<String> {
     problems
 }
 
-/// The helpers that place a program for a test wait for their copier with a bound, so that a test
-/// that places a program cannot wait for ever on a copier that does not end.
+/// The helpers that place a program for a test, and the one that starts it once, wait with a bound,
+/// so that a test that places a program cannot wait for ever on a copier or a program that does not
+/// end.
 #[test]
 fn the_helpers_that_place_a_program_wait_for_their_copier_with_a_bound() {
     let text = std::fs::read_to_string(repository().join(PLACING_FILE))
@@ -721,18 +766,86 @@ fn the_helpers_that_place_a_program_wait_for_their_copier_with_a_bound() {
 /// The placing reading finds a wait with no bound and a missing helper, and not a bounded wait.
 #[test]
 fn the_placing_reading_finds_each_wait_with_no_bound_and_only_those() {
+    let once = "fn place_and_start_once() { c.try_wait(); }";
     assert!(
-        placing_problems("fn place_program() { c.try_wait(); } fn place_script() { x(); }")
-            .is_empty()
+        placing_problems(&format!(
+            "fn place_program() {{ c.try_wait(); }} fn place_script() {{ x(); }} {once}"
+        ))
+        .is_empty()
     );
     assert_eq!(
-        placing_problems("fn place_program() { c.status(); } fn place_script() {}").len(),
+        placing_problems(&format!(
+            "fn place_program() {{ c.status(); }} fn place_script() {{}} {once}"
+        ))
+        .len(),
         1
     );
     assert_eq!(
-        placing_problems("fn place_program() { c.output(); } fn place_script() { d.wait(); }")
-            .len(),
+        placing_problems(&format!(
+            "fn place_program() {{ c.output(); }} fn place_script() {{ d.wait(); }} {once}"
+        ))
+        .len(),
         2
     );
-    assert_eq!(placing_problems("fn place_program() {}").len(), 1);
+    assert_eq!(
+        placing_problems(
+            "fn place_program() {} fn place_script() {} fn place_and_start_once() { c.wait(); }"
+        )
+        .len(),
+        1,
+        "a wait for the program's first start with no bound is found"
+    );
+    assert_eq!(placing_problems("fn place_program() {}").len(), 2);
+}
+
+/// The source of the startup suite's support module, which holds the turn at which a process is
+/// started.
+const SUPPORT_FILE: &str = "crates/kr-cli/tests/support/user_manager.rs";
+
+/// What is wrong with the support module of `source`: `spawning` missing, and `spawning` taking
+/// its turn with a lock that waits for as long as another start takes.
+fn support_problems(source: &str) -> Vec<String> {
+    let tokens = code_tokens(source);
+    let Some(spawning) = functions(&tokens)
+        .into_iter()
+        .find(|function| function.name == "spawning")
+    else {
+        return vec!["spawning is not a function of this source".to_owned()];
+    };
+    spawning
+        .body
+        .filter(|&at| {
+            tokens[at].is_punct('.')
+                && tokens.get(at + 1).and_then(Token::ident) == Some("lock")
+                && tokens.get(at + 2).is_some_and(|token| token.is_punct('('))
+        })
+        .map(|_| "spawning waits for its turn with lock() and no bound".to_owned())
+        .collect()
+}
+
+/// `spawning` takes its turn within a bound, so that a start that never gives the turn up fails the
+/// test that waits for it and does not hold it for ever.
+#[test]
+fn the_support_helper_that_takes_the_turn_to_start_a_process_waits_for_it_with_a_bound() {
+    let text = std::fs::read_to_string(repository().join(SUPPORT_FILE))
+        .unwrap_or_else(|error| panic!("{SUPPORT_FILE}: {error}"));
+    let problems = support_problems(&text);
+    assert!(
+        problems.is_empty(),
+        "{SUPPORT_FILE} waits for a turn where it must not: {problems:#?}"
+    );
+}
+
+/// The support reading finds a lock that waits and a missing function, and not a lock that does not
+/// wait, or one in another function.
+#[test]
+fn the_support_reading_finds_a_wait_for_the_turn_with_no_bound_and_only_that() {
+    assert!(
+        support_problems("fn spawning() { S.try_lock(); } fn other() { S.lock(); }").is_empty()
+    );
+    assert_eq!(
+        support_problems("fn spawning() { S.lock().unwrap(); }").len(),
+        1
+    );
+    assert_eq!(support_problems("fn other() {}").len(), 1);
 }
