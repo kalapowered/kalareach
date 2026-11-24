@@ -660,14 +660,35 @@ mod tests {
         tempfile::tempdir().expect("a folder of this test's own")
     }
 
-    /// An executable file of this test's own.
+    /// An executable file of this test's own, a script whose first line names its interpreter.
+    ///
+    /// A child that another case started while this file was open for writing holds it until
+    /// that child has started its own program, and a file held that way cannot be run. So the
+    /// file is run once here, to nothing, until it can be: no child holds it after that, and one
+    /// that is started later cannot.
     fn program(folder: &Path, name: &str, script: &str) -> PathBuf {
+        let (interpreter, body) = script.split_once('\n').expect("a script of lines");
+        assert!(
+            interpreter.starts_with("#!"),
+            "{name}: a script that names its interpreter"
+        );
         let path = folder.join(name);
         let mut file = std::fs::File::create(&path).expect("a program");
-        file.write_all(script.as_bytes()).expect("its text");
+        let ready = "if [ \"$1\" = --ready ]; then exit 0; fi";
+        file.write_all(format!("{interpreter}\n{ready}\n{body}").as_bytes())
+            .expect("its text");
         file.sync_all().expect("its text on disk");
         drop(file);
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("its mode");
+        loop {
+            match std::process::Command::new(&path).arg("--ready").status() {
+                Ok(_) => break,
+                Err(error) if error.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("{name}: a stand-in that does not run: {error}"),
+            }
+        }
         path
     }
 
@@ -1268,7 +1289,8 @@ mod tests {
     /// Whether this process is held to the permissions of a file it owns: a privileged one is not.
     fn permissions_are_enforced() -> bool {
         let folder = folder();
-        let file = program(folder.path(), "closed", "a file");
+        let file = folder.path().join("closed");
+        std::fs::write(&file, "a file").expect("a file");
         std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o000)).expect("closes it");
         std::fs::File::open(&file).is_err()
     }
