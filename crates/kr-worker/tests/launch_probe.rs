@@ -761,7 +761,7 @@ fn kr_req_07_64_a_probe_not_collected_within_the_bound_is_collected_later() {
 /// what the call and its thread keep.
 #[cfg(windows)]
 #[test]
-fn kr_req_07_64_a_start_that_fails_after_the_create_is_ended_within_the_cleanup_bound() {
+fn kr_req_07_64_a_start_that_fails_after_the_create_gives_up_within_the_cleanup_bound() {
     let here = directory();
     let standin = Standin::running("", "Start-Sleep 600");
     kr_worker::windows::launch::seams::fail_start_in(Some(here.path()));

@@ -111,8 +111,9 @@ pub struct Probed {
 pub struct ThreadEnd {
     /// From the run's first instant to the end of the thread, its cleanup included.
     pub took: Duration,
-    /// Whether the probe's process was ended and collected within the cleanup bound, or was never
-    /// created.
+    /// Whether the probe's process was ended and collected within the cleanup bound. It is also true
+    /// when the thread holds no process: none was created, or a start that created one gave up on
+    /// ending it within the bound.
     pub collected_in_bound: bool,
 }
 
