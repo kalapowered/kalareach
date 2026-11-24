@@ -1836,8 +1836,8 @@ async fn kr_req_24_24_a_request_answered_before_the_baseline_was_read_and_pushed
 /// again after it.
 ///
 /// A request is recorded in privacy mode and decoded, and privacy mode ends. The runtime is lost, and
-/// the component of the binding that observes is marked as handed it again when it is given the
-/// request. A request that arrives while the runtime is away, with the decoder's component down, is
+/// the connection withholds the runtime's words when the component of the binding that observes is
+/// given the request. A request that arrives while the runtime is away, with the decoder's component down, is
 /// decoded by the component that starts again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn kr_req_24_24_a_request_made_in_privacy_mode_is_given_as_one_and_a_request_sent_while_the_runtime_was_away_is_decoded_again()
@@ -1886,8 +1886,8 @@ async fn kr_req_24_24_a_request_made_in_privacy_mode_is_given_as_one_and_a_reque
     world.let_the_compiles_go();
     until_started_again(&world, 1).await;
     assert!(
-        lane.is_marked(binding(1)),
-        "the component was given a request made in privacy mode and is not marked"
+        lane.words_withheld(),
+        "the component was given a request made in privacy mode and the runtime's words are not withheld"
     );
     let account = world.account(1).await.expect("the component answers");
     assert_eq!(account.requests.iter().filter(|id| *id == "61").count(), 1);
@@ -1909,8 +1909,8 @@ async fn kr_req_24_24_a_request_made_in_privacy_mode_is_given_as_one_and_a_reque
 /// The runtime is lost, privacy mode is turned on, a request arrives for a decoder that is away, its
 /// queued decode is dropped, and privacy mode is turned off. The component that starts again is
 /// given the request and the decoder reads it. The runtime is lost again, and the component that
-/// starts the second time is given the approval as a request made in privacy mode: it is marked as
-/// handed it, as the first was.
+/// starts the second time is given the approval as a request made in privacy mode: the connection
+/// withholds the runtime's words, as it did for the first.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn kr_req_24_24_a_request_made_in_privacy_mode_while_the_runtime_was_away_is_still_one_when_the_runtime_is_lost_again()
  {
@@ -1952,8 +1952,9 @@ async fn kr_req_24_24_a_request_made_in_privacy_mode_while_the_runtime_was_away_
     )
     .await;
     assert!(
-        lane.is_marked(binding(1)),
-        "the component that started again was given a request made in privacy mode and is not marked"
+        lane.words_withheld(),
+        "the component that started again was given a request made in privacy mode and the \
+         runtime's words are not withheld"
     );
 
     lose_the_runtime(&world).await;
@@ -1966,9 +1967,9 @@ async fn kr_req_24_24_a_request_made_in_privacy_mode_while_the_runtime_was_away_
         "the component that started the second time was not given the request: {account:?}"
     );
     assert!(
-        lane.is_marked(binding(1)),
+        lane.words_withheld(),
         "the component that started the second time was given a request made in privacy mode and \
-         is not marked"
+         the runtime's words are not withheld"
     );
 }
 

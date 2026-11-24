@@ -317,9 +317,10 @@ impl Broker {
             .checked_sub(ROUND_TRIP_ALLOWANCE)
             .filter(|call| call.as_millis() > 0)
             .ok_or(NotEncoded::Failed)?;
-        // Marked before the hand-over, not after the answer: a call that is written and then times
-        // out may still have been read, and a request made in privacy mode stays made in it.
-        self.observation.expose(request.binding_id, request.private);
+        // The connection's words are withheld before the hand-over, not after the answer: a call
+        // that is written and then times out may still have been read, and a request made in
+        // privacy mode stays made in it.
+        self.observation.expose(request.private);
         let called = client
             .encode(
                 BindingId::new(request.binding_id.get()),

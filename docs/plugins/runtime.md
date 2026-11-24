@@ -703,18 +703,7 @@ want of room, and how many requests were queued to be decoded again. A request t
 refused while the runtime was away is counted among the observations dropped, and is still given
 from the broker's records.
 
-Privacy mode does not stop observation for live use. A component is marked before a hand-over of anything the worker had while privacy mode was on,
-including something that waited in the lane and was handed over after privacy mode ended, and
-including a hand-over the component did not answer, since what it holds may be what it was handed. An observation, the
-arguments of an action and a request to decode all mark it. A component holds only what it was
-handed on the connection it is registered on. A mark made on the connection a component is
-registered on stays when the component becomes ready, whichever of them made it and whether it was
-made before the component was registered or while it was, and when the binding is unbound and
-registered again on that connection, since a call that was started before can reach the new
-registration; a mark made on an earlier connection goes, because a component registered afresh holds
-nothing its predecessor was handed.
-
-The runtime's words in a fault, and in the reason a component is disabled for, are withheld from the
+Privacy mode does not stop observation for live use. The runtime's words in a fault, and in the reason a component is disabled for, are withheld from the
 report once privacy mode has been on at any time since the worker made the connection to the runtime
 that carries them, and until it makes another. The connection decides it, not the notice: any
 component on it may have been handed something while privacy mode stood, by an observation or an action, and its words can be made of what it was handed. So every notice about every
@@ -905,8 +894,8 @@ runs out its deadline, declines, or returns bytes the broker refuses: that answe
 the receipt is rejected and not refused, the terminal can still answer, and the binding's report
 counts the answers not written by kind and never in the component's words. The third fault within a
 minute disables the binding, as for any call, though a fault the component declares itself is not
-counted. The request's privacy mark is kept with it, so a
-component handed it again to encode it is marked whatever privacy mode is by then. A bridge
+counted. The request's privacy state is kept with it, so the
+runtime's words stay withheld when a component is handed it again to encode it, whatever privacy mode is by then. A bridge
 channel's answer is the host's, written from the validated decision, whoever read the request.
 
 A component that is faulted, disabled or slow changes none of step 1. That is the whole of the

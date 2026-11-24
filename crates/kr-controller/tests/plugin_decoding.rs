@@ -117,11 +117,6 @@ async fn kr_req_11_21_a_request_the_connector_leaves_to_its_component_becomes_th
         "the hash the decoding package was installed under"
     );
     assert_eq!(
-        Some(entry.source_generation.get()),
-        world.broker().component_generation(binding(1)),
-        "the generation of the source the decoder read is the instance's"
-    );
-    assert_eq!(
         entry.projection.schema_version,
         kr_worker::broker::connectors::component_schema()
     );
@@ -314,11 +309,12 @@ async fn kr_req_11_26_a_request_answered_natively_while_its_decode_is_held_is_no
 /// KR-REQ-24.27 and KR-REQ-11.26: what a component is handed of a request made in privacy mode is
 /// made in it, however long the request waited and whatever privacy mode is when it is decoded.
 ///
-/// A request made outside privacy mode marks nothing. A request recorded in it, whose decode is
+/// A request made outside privacy mode withholds nothing. A request recorded in it, whose decode is
 /// held until privacy mode has ended, withholds the runtime's words once the component has been
 /// handed it, whenever it is decoded.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn kr_req_24_27_a_request_made_in_privacy_mode_marks_the_component_whenever_it_is_decoded() {
+async fn kr_req_24_27_a_request_made_in_privacy_mode_withholds_the_runtimes_words_whenever_it_is_decoded()
+ {
     let Some(world) =
         Observing::start(Options::with(vec![Spec::decoder(1, "hostile-decoder")])).await
     else {
@@ -328,7 +324,7 @@ async fn kr_req_24_27_a_request_made_in_privacy_mode_marks_the_component_wheneve
     let lane = world.broker().observation();
     world.send(&request(31));
     approved(&world, "31").await;
-    assert!(!lane.is_marked(binding(1)));
+    assert!(!lane.words_withheld());
 
     let queue = world.broker().decode_queue();
     let hold = queue.hold();
@@ -348,8 +344,8 @@ async fn kr_req_24_27_a_request_made_in_privacy_mode_marks_the_component_wheneve
 
     approved(&world, "32").await;
     assert!(
-        lane.is_marked(binding(1)),
-        "the component was handed a request made in privacy mode and is not marked"
+        lane.words_withheld(),
+        "the component was handed a request made in privacy mode and the runtime's words are not withheld"
     );
 }
 
@@ -358,8 +354,9 @@ async fn kr_req_24_27_a_request_made_in_privacy_mode_marks_the_component_wheneve
 ///
 /// The request is recorded in privacy mode and its first decode is passed over, as a decode is when
 /// the plugin runtime is away. Privacy mode ends and the request is decoded again. The component
-/// that decodes it is handed a request made in privacy mode and is marked; and after the runtime is
-/// replaced, so is the component that writes its answer.
+/// that decodes it is handed a request made in privacy mode and the runtime's words are withheld;
+/// after the runtime is replaced they are withheld again when the component that writes its answer
+/// is handed it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn kr_req_24_27_a_request_made_in_privacy_mode_is_still_one_when_it_is_decoded_again_after_it()
  {
@@ -402,12 +399,12 @@ async fn kr_req_24_27_a_request_made_in_privacy_mode_is_still_one_when_it_is_dec
     hold.release();
     let approval = approved(&world, "61").await;
     assert!(
-        lane.is_marked(binding(1)),
-        "the component decoded again a request made in privacy mode and is not marked"
+        lane.words_withheld(),
+        "the component decoded again a request made in privacy mode and the runtime's words are not withheld"
     );
 
-    // The runtime is replaced, which takes the mark with the connection it described; the component
-    // that writes the answer is handed the request's bytes once more, and is marked.
+    // The runtime is replaced, and the new connection withholds nothing; the component that writes
+    // the answer is handed the request's bytes once more, and the words are withheld again.
     let before = lane.connection();
     let host = world.hosted.published().expect("the runtime is published");
     plugin_world::kill(&host);
@@ -416,7 +413,7 @@ async fn kr_req_24_27_a_request_made_in_privacy_mode_is_still_one_when_it_is_dec
     })
     .await;
     world.until_ready(1).await;
-    assert!(!lane.is_marked(binding(1)));
+    assert!(!lane.words_withheld());
     let mut owner = world.owner().await;
     let outcome = world
         .respond(&mut owner, approval.resource_id, "allow")
@@ -424,20 +421,21 @@ async fn kr_req_24_27_a_request_made_in_privacy_mode_is_still_one_when_it_is_dec
     assert!(matches!(outcome, Outcome::Ok(_)), "{outcome:?}");
     until_answered(&world, 61).await;
     assert!(
-        lane.is_marked(binding(1)),
-        "the component wrote the answer to a request made in privacy mode and is not marked"
+        lane.words_withheld(),
+        "the component wrote the answer to a request made in privacy mode and the runtime's words are not withheld"
     );
 }
 
 /// KR-REQ-24.27 and KR-REQ-11.33: the component that writes the answer to an approval made in
-/// privacy mode is marked as handed something made in it, on the connection that writes the answer.
+/// privacy mode is handed something made in it, and the runtime's words are withheld on the
+/// connection that writes the answer.
 ///
-/// The request is made and decoded in privacy mode, which marks the component. The plugin runtime
-/// is then replaced, which takes that mark with the connection it described, and privacy mode ends.
-/// The answer is written by the component on the replacement, which is handed the request's bytes
-/// again, and the request is still one made in privacy mode.
+/// The request is made and decoded in privacy mode. Privacy mode ends and the plugin runtime is
+/// replaced, and the replacement's connection withholds nothing. The answer is written by the
+/// component on the replacement, which is handed the request's bytes again, and the request is
+/// still one made in privacy mode: the connection withholds the runtime's words.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn kr_req_24_27_an_answer_written_for_a_request_made_in_privacy_mode_marks_the_component_that_writes_it()
+async fn kr_req_24_27_an_answer_written_for_a_request_made_in_privacy_mode_withholds_the_runtimes_words_on_its_connection()
  {
     let Some(world) =
         Observing::start(Options::with(vec![Spec::decoder(1, "hostile-decoder")])).await
@@ -454,12 +452,14 @@ async fn kr_req_24_27_an_answer_written_for_a_request_made_in_privacy_mode_marks
     world.send(&request_noting(51, "!answer"));
     let approval = approved(&world, "51").await;
     assert!(
-        lane.is_marked(binding(1)),
-        "the component decoded a request made in privacy mode and is not marked"
+        lane.words_withheld(),
+        "the component decoded a request made in privacy mode and the runtime's words are not withheld"
     );
 
-    // The runtime that decoded it is killed, and the link connects to another. A component
-    // registered afresh holds nothing it was handed before.
+    // Privacy mode ends, the runtime that decoded it is killed, and the link connects to another.
+    // A connection made with privacy mode off carries nothing the earlier one was handed.
+    world.tell_privacy(&mut authority, 2, false).await;
+    assert!(!lane.is_private());
     let before = lane.connection();
     let host = world.hosted.published().expect("the runtime is published");
     plugin_world::kill(&host);
@@ -469,12 +469,10 @@ async fn kr_req_24_27_an_answer_written_for_a_request_made_in_privacy_mode_marks
     .await;
     world.until_ready(1).await;
     assert!(
-        !lane.is_marked(binding(1)),
-        "the mark described a connection that has ended"
+        !lane.words_withheld(),
+        "the replacement's connection kept the words of the one that ended withheld"
     );
 
-    world.tell_privacy(&mut authority, 2, false).await;
-    assert!(!lane.is_private());
     let mut owner = world.owner().await;
     let outcome = world
         .respond(&mut owner, approval.resource_id, "allow")
@@ -487,8 +485,8 @@ async fn kr_req_24_27_an_answer_written_for_a_request_made_in_privacy_mode_marks
         "the replacement component wrote the answer: {answers:?}"
     );
     assert!(
-        lane.is_marked(binding(1)),
-        "the component wrote the answer to a request made in privacy mode and is not marked"
+        lane.words_withheld(),
+        "the component wrote the answer to a request made in privacy mode and the runtime's words are not withheld"
     );
 }
 

@@ -312,9 +312,9 @@ async fn offer(broker: &Broker, lane: &ObservationLane, entry: &Entry) {
             );
             continue;
         }
-        // Marked before the hand-over, not after the answer: a delivery that is written and then
-        // times out may still be observed.
-        lane.expose(binding, entry.private);
+        // The connection's words are withheld before the hand-over, not after the answer: a
+        // delivery that is written and then times out may still be observed.
+        lane.expose(entry.private);
         match &entry.source {
             Source::Native(frame) => {
                 deliver_frame(broker, lane, &client, binding, frame, entry).await;
@@ -403,9 +403,9 @@ async fn rebuild(
                 recovery.oversized += 1;
                 continue;
             }
-            // Marked before the hand-over, not after the answer, and for the privacy state the
-            // request was recorded in.
-            lane.expose(binding, given.private);
+            // The connection's words are withheld before the hand-over, not after the answer, and
+            // for the privacy state the request was recorded in.
+            lane.expose(given.private);
             let answer = client.deliver(service_id(binding), &given.event).await;
             if !current(broker, &client) {
                 return;

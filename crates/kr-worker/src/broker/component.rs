@@ -66,8 +66,6 @@ pub struct ComponentWant {
     pub streams: super::binder::Streams,
     /// Whether the binding holds the `Observation` grant, without which it is offered nothing.
     pub observing: bool,
-    /// The generation of the instance's source: a new execution of the instance advances it.
-    pub generation: u64,
     /// What the instance's bound execution is, as a component is told it.
     pub execution: Execution,
 }
@@ -471,10 +469,6 @@ impl Broker {
                     observing: binding
                         .grants
                         .holds(kr_protocol::broker::BrokerGrant::Observation),
-                    generation: state
-                        .instances
-                        .get(&binding.application_instance_id)
-                        .map_or(0, |instance| instance.source_generation.get()),
                     execution: state
                         .instances
                         .get(&binding.application_instance_id)
@@ -555,18 +549,6 @@ impl Broker {
         if let Some(adapter) = Adapter::of_package(package.as_str()) {
             self.adapter_failed(adapter, MetricOutcome::Unavailable);
         }
-    }
-
-    /// Returns the source generation the binding's instance has reached now, where the broker holds
-    /// the binding.
-    #[must_use]
-    pub fn component_generation(&self, binding_id: BrokerBindingId) -> Option<u64> {
-        let state = self.state();
-        let binding = state.bindings.get(&binding_id)?;
-        state
-            .instances
-            .get(&binding.application_instance_id)
-            .map(|instance| instance.source_generation.get())
     }
 
     /// Records one thing a person is told about a binding's component. A binding the broker no

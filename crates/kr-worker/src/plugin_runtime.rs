@@ -549,8 +549,9 @@ impl Link {
                 ComponentState::Pending,
                 Some(REGISTERING),
             );
-            // Before the component exists, on the connection it is registered on: whatever it is
-            // handed on this connection marks it, and the mark outlasts its becoming ready.
+            // Before the component exists, on the connection it is registered on: a hand-over from
+            // here on is made on this connection, and the connection's words are withheld if it is
+            // of something made in privacy mode.
             let connection = self.lane.connection();
             #[cfg(feature = "testing")]
             let began = link_trace::began(
@@ -953,8 +954,7 @@ impl Link {
     /// [`crate::plugin_observation`]), and the requests nobody has interpreted are queued to be
     /// decoded by it. A binding that has not been ready before starts from the live point.
     ///
-    /// `connection` is the one the registration was made on: a component handed something made in
-    /// privacy mode on it stays marked as having been, and a mark of an earlier connection goes.
+    /// `connection` is the one the registration was made on.
     fn make_ready(&self, broker: &Weak<Broker>, binding: BrokerBindingId, connection: u64) {
         if self.lane.has_been_ready(binding) {
             let decoded = broker

@@ -376,11 +376,6 @@ struct Inner {
     /// How many connections to the plugin runtime the link has made: the one it holds now is this
     /// one. A component is registered on a connection and holds only what it was handed on it.
     connection: u64,
-    /// The bindings whose component was handed something made in privacy mode, or while it stood,
-    /// and the connection it was handed on. A mark belongs to the binding and the connection and not to a view: a binding that is
-    /// unbound and registered again on the same connection can be reached by a call that was
-    /// started before it was unbound, and that call finds the mark.
-    marks: BTreeMap<BrokerBindingId, u64>,
 }
 
 impl Inner {
@@ -812,25 +807,9 @@ impl ObservationLane {
 
     /// Makes a binding ready to be offered anything, its component registered afresh on
     /// `connection`, which [`Self::connection`] returned before the registration began.
-    ///
-    /// A component registered on a connection holds only what it was handed on it, and a component
-    /// handed something made in privacy mode is marked when it is handed it ([`Self::expose`]),
-    /// before the registration has ended or after. So a mark made on an earlier connection goes,
-    /// since the component it described went with that connection, and a mark made on this one
-    /// stays, whenever in the registration it was made: the component may already hold what it was
-    /// handed.
     pub fn set_ready(&self, binding: BrokerBindingId, connection: u64) {
         let mut inner = self.inner();
         let next = inner.next_seq;
-        // A component registered afresh on a later connection holds nothing it was handed on an
-        // earlier one.
-        if inner
-            .marks
-            .get(&binding)
-            .is_some_and(|made| *made < connection)
-        {
-            inner.marks.remove(&binding);
-        }
         let view = inner.views.entry(binding).or_default();
         view.ready = true;
         view.connection = connection;
@@ -868,13 +847,6 @@ impl ObservationLane {
         decode_full: u64,
     ) {
         let mut inner = self.inner();
-        if inner
-            .marks
-            .get(&binding)
-            .is_some_and(|made| *made < connection)
-        {
-            inner.marks.remove(&binding);
-        }
         let next = inner.next_seq;
         let view = inner.views.entry(binding).or_default();
         view.ready = true;
@@ -1001,22 +973,16 @@ impl ObservationLane {
         }
     }
 
-    /// Forgets a binding's view. Its mark stays: see [`Self::forget_unwanted`].
+    /// Forgets a binding's view.
     pub fn forget(&self, binding: BrokerBindingId) {
         self.inner().views.remove(&binding);
     }
 
     /// Forgets the view of every binding that is not in `wanted`: a binding that ended while the plugin runtime was lost is not unbound by anything else.
-    ///
-    /// A mark made on an earlier connection of a binding that is not wanted goes with it. One made
-    /// on this connection stays, for the binding may be registered again on it.
     pub fn forget_unwanted(&self, wanted: &std::collections::BTreeSet<BrokerBindingId>) {
-        let mut inner = self.inner();
-        let connection = inner.connection;
-        inner
-            .marks
-            .retain(|binding, made| wanted.contains(binding) || *made >= connection);
-        inner.views.retain(|binding, _| wanted.contains(binding));
+        self.inner()
+            .views
+            .retain(|binding, _| wanted.contains(binding));
     }
 
     /// Returns a copy of a binding's view.
@@ -1104,32 +1070,16 @@ impl ObservationLane {
             .min()
     }
 
-    /// Marks that a component is about to be handed something made in privacy mode, or while it
-    /// stood, before the hand-over, so that an answer that does not come back cannot leave the
-    /// component holding it unmarked. The connection the component is on is marked too
-    /// ([`Self::words_withheld`]): the pump may have read what it needed before the link made that
-    /// connection, so that privacy mode having stood on it is not the only way it can be handed
-    /// something made in privacy mode.
-    ///
-    /// The call writes only to the per-binding marks and gives the binding no view. The mark carries
-    /// the connection the lane holds when it is made, so a caller that holds an older connection
-    /// stamps the newer one. A hand-over that comes before the component is registered is marked
-    /// too, and the mark stays when the binding's view is forgotten ([`Self::forget`]).
-    pub fn expose(&self, binding: BrokerBindingId, made_in_privacy: bool) {
-        if !(made_in_privacy || self.private.load(Ordering::Acquire)) {
-            return;
+    /// Marks the connection to the plugin runtime ([`Self::words_withheld`]) when a component on it
+    /// is about to be handed something made in privacy mode, or while it stood. It is made before
+    /// the hand-over, so that an answer that does not come back cannot leave the component holding
+    /// it with the runtime's words kept. The pump may have read what it needed before the link made
+    /// the connection, so that privacy mode having stood on it is not the only way a component on
+    /// it can be handed something made in privacy mode.
+    pub fn expose(&self, made_in_privacy: bool) {
+        if made_in_privacy || self.private.load(Ordering::Acquire) {
+            self.inner().words_tainted = true;
         }
-        let mut inner = self.inner();
-        inner.words_tainted = true;
-        let connection = inner.connection;
-        inner.marks.insert(binding, connection);
-    }
-
-    /// Returns true when the binding's component was handed something made in privacy mode, or while
-    /// it stood, on the connection it is registered on.
-    #[must_use]
-    pub fn is_marked(&self, binding: BrokerBindingId) -> bool {
-        self.inner().marks.contains_key(&binding)
     }
 
     /// Returns the number privacy mode's changes have reached.

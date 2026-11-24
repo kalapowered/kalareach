@@ -1,15 +1,14 @@
 //! The worker's observation lane keeps promises that no timing of a running worker can show
-//! deterministically: what it lost comes with the entry it hands over, older than that entry; the
-//! runtime's words are withheld once privacy mode has stood on the connection that carries them; and
-//! a component that was handed something made in privacy mode is marked as having been.
+//! deterministically: what it lost comes with the entry it hands over, older than that entry; and
+//! the runtime's words are withheld once privacy mode has stood on the connection that carries
+//! them, or a component on it was handed something made in privacy mode.
 //!
 //! The first is what keeps a component from being offered an entry newer than a loss before the
 //! fresh snapshot the loss owes it, and an entry older than a loss from being offered after the
 //! snapshot the loss owes. The second is what keeps words a component made from what it was handed
-//! in privacy mode from reaching a report, however late they are read. The third keeps the mark of a
-//! component that was handed such content while it was registering, whichever task handed it. All
-//! are decided at the lane's own interface, and the cases in kr-controller's `plugin_observation`
-//! show the same lane at work in a running worker.
+//! in privacy mode from reaching a report, however late they are read. Both are decided at the
+//! lane's own interface, and the cases in kr-controller's `plugin_observation` show the same lane
+//! at work in a running worker.
 
 use std::sync::Arc;
 
@@ -210,116 +209,17 @@ fn kr_req_24_27_the_runtimes_words_are_withheld_for_the_life_of_a_connection_pri
     // Handing a component something made in privacy mode taints the connection it goes on, however
     // the pump and the link interleaved: the pump may have read what it needed before the link made
     // this connection, and hands the entry over after.
-    let binding = BrokerBindingId::new(Uuid::from_bytes([9; 16]));
-    lane.expose(binding, true);
+    lane.expose(true);
     assert!(
         lane.words_withheld(),
         "private content reached a connection that was not withheld"
     );
     lane.began_connection();
-    lane.expose(binding, false);
+    lane.expose(false);
     assert!(
         !lane.words_withheld(),
         "a hand-over of something not made in privacy mode, with it off, withholds nothing"
     );
-}
-
-/// KR-REQ-24.27: a component registered on a connection holds only what it was handed on it. A mark
-/// of an earlier connection goes when the component is registered afresh; a mark made on the
-/// connection the component is registered on stays when it becomes ready, whenever in its
-/// registration it was made, and whatever handed it the content: the pump, a decode or an action.
-#[test]
-fn kr_req_24_27_a_component_handed_private_content_on_the_connection_it_registers_on_stays_marked()
-{
-    let lane = ObservationLane::new();
-    let binding = BrokerBindingId::new(Uuid::from_bytes([11; 16]));
-    let marked = |lane: &ObservationLane| Some(lane.is_marked(binding));
-
-    // A first registration, and a component handed something made in privacy mode.
-    lane.began_connection();
-    lane.set_ready(binding, lane.connection());
-    lane.expose(binding, true);
-    assert_eq!(marked(&lane), Some(true));
-
-    // The runtime is replaced: the registration on the new connection holds nothing its
-    // predecessor was handed.
-    lane.all_not_ready();
-    lane.began_connection();
-    lane.set_ready(binding, lane.connection());
-    assert_eq!(
-        marked(&lane),
-        Some(false),
-        "a component registered afresh was still marked for what its predecessor was handed"
-    );
-
-    // An action accepted in privacy mode is handed over on the new connection before the component
-    // is registered on it, which the link does after it has published the connection: the mark is
-    // made, and then the registration begins.
-    lane.all_not_ready();
-    lane.began_connection();
-    lane.expose(binding, true);
-    let connection = lane.connection();
-    lane.set_ready(binding, connection);
-    assert_eq!(
-        marked(&lane),
-        Some(true),
-        "becoming ready cleared a mark made on the connection before the registration began"
-    );
-}
-
-/// KR-REQ-24.27: the same hand-over, to a binding the lane has no view of yet: the first
-/// connection, and an action accepted in privacy mode that reaches its component's call before the
-/// component is registered. The mark is kept.
-#[test]
-fn kr_req_24_27_a_first_hand_over_before_the_component_is_registered_is_marked() {
-    let lane = ObservationLane::new();
-    let binding = BrokerBindingId::new(Uuid::from_bytes([12; 16]));
-    lane.began_connection();
-    lane.expose(binding, true);
-    lane.set_ready(binding, lane.connection());
-    assert!(
-        lane.is_marked(binding),
-        "a component handed private content before it was registered was not marked"
-    );
-}
-
-/// KR-REQ-24.27: a mark belongs to the binding and the connection, not to a view. A call that took
-/// the connection and marked the component, and was delayed, can reach a registration that is made
-/// after the binding was unbound and bound again on the same connection (a revocation that was
-/// lifted): the mark is still there. It goes when the component is registered on a later
-/// connection, and the link's cleanup of bindings it no longer wants drops the marks of an earlier
-/// connection and keeps those of this one.
-#[test]
-fn kr_req_24_27_a_mark_outlasts_an_unbinding_on_the_connection_it_was_made_on() {
-    let lane = ObservationLane::new();
-    let binding = BrokerBindingId::new(Uuid::from_bytes([13; 16]));
-    let other = BrokerBindingId::new(Uuid::from_bytes([14; 16]));
-
-    lane.began_connection();
-    lane.set_ready(binding, lane.connection());
-    // A call accepted in privacy mode took the connection and marked the component; it is delayed.
-    lane.expose(binding, true);
-    // The binding is revoked: the link unbinds it, and nothing wants it.
-    lane.forget(binding);
-    lane.forget_unwanted(&std::collections::BTreeSet::new());
-    // The revocation is lifted and the same binding is registered again on the same connection.
-    lane.set_ready(binding, lane.connection());
-    assert!(
-        lane.is_marked(binding),
-        "an unbinding dropped the mark of a call that had not yet reached its component"
-    );
-
-    // A later connection's registration holds nothing the earlier one was handed.
-    lane.all_not_ready();
-    lane.began_connection();
-    lane.set_ready(binding, lane.connection());
-    assert!(!lane.is_marked(binding));
-
-    // The cleanup of bindings no longer wanted drops the marks of an earlier connection.
-    lane.expose(other, true);
-    lane.began_connection();
-    lane.forget_unwanted(&std::collections::BTreeSet::new());
-    assert!(!lane.is_marked(other));
 }
 
 /// An upstream frame nobody is waiting on, of `bytes` bytes.

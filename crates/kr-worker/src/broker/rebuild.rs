@@ -21,7 +21,7 @@ use kr_protocol::ids::{
 };
 
 use super::encode::source_event_of;
-use super::observation::{Audience, Outage, Tally};
+use super::observation::{Audience, Tally};
 use super::{Broker, MAX_RETAINED_FRAME_BYTES, MAX_RETAINED_FRAMES, PackageIdentity};
 
 /// One pending request, as a component that starts again is given it.
@@ -285,20 +285,6 @@ const fn noun(count: u64, one: &'static str, many: &'static str) -> &'static str
 }
 
 impl Recovery {
-    /// What a restart came to, from what was counted while the runtime was away, before what the
-    /// baseline gave is added.
-    #[must_use]
-    pub fn after(outage: Outage) -> Self {
-        Self {
-            passed: outage.passed,
-            terminal: outage.terminal,
-            dropped: outage.dropped,
-            decode_queued: outage.decode_queued,
-            decode_full: outage.decode_full,
-            ..Self::default()
-        }
-    }
-
     /// The words a binding's report carries: counts, never content.
     #[must_use]
     pub fn words(&self) -> String {

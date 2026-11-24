@@ -661,9 +661,10 @@ impl Broker {
                     .to_owned(),
             });
         };
-        // Marked before the hand-over, not after the answer: a call that is written and then times
-        // out may still have been read, and arguments made in privacy mode stay made in it.
-        self.observation.expose(request.binding_id, request.private);
+        // The connection's words are withheld before the hand-over, not after the answer: a call
+        // that is written and then times out may still have been read, and arguments made in
+        // privacy mode stay made in it.
+        self.observation.expose(request.private);
         let token = WireToken {
             expires_at_ms: kr_ipc::now_ms()
                 .get()

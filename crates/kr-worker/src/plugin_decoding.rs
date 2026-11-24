@@ -144,9 +144,10 @@ async fn attempt(broker: &Broker, job: &DecodeJob) -> Result<(), Option<NotDecod
         return Err(Some(NotDecoded::NotConnected));
     };
     let event = broker.decode_event(job)?;
-    // Marked before the hand-over, not after the answer: a call that is written and then times out
-    // may still have been read, and a request made in privacy mode stays made in it.
-    broker.observation().expose(job.binding_id, job.private);
+    // The connection's words are withheld before the hand-over, not after the answer: a call that
+    // is written and then times out may still have been read, and a request made in privacy mode
+    // stays made in it.
+    broker.observation().expose(job.private);
     let called = client
         .decode(service_id(job.binding_id), &event, CALL_WAIT)
         .await

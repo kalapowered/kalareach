@@ -1165,8 +1165,8 @@ async fn kr_req_24_27_a_reply_read_after_its_connection_was_replaced_is_still_wi
 
 /// KR-REQ-24.27: what a component says when it declines an action it was handed arguments for is
 /// made of what it was handed, and in privacy mode, or once privacy mode has stood on the
-/// connection, a person is not told its words; the connection is marked, because a component on it
-/// was handed something made in privacy mode, so the runtime's words stay withheld.
+/// connection, a person is not told its words; the connection withholds them, because a component
+/// on it was handed something made in privacy mode.
 ///
 /// The control is first: outside privacy mode the refusal carries what the component said.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
@@ -1207,7 +1207,7 @@ async fn kr_req_24_27_the_words_a_component_declines_an_action_with_are_withheld
         "outside privacy mode the refusal carries the component's words: {}",
         control.message
     );
-    assert!(!lane.is_marked(binding()));
+    assert!(!lane.words_withheld());
     // A plan for another action is refused in words that name the action the component chose.
     let other = refused(&acting, &mut client, "cancel.other.action").await;
     assert!(
@@ -1230,8 +1230,8 @@ async fn kr_req_24_27_the_words_a_component_declines_an_action_with_are_withheld
     );
     assert!(private.message.contains("withheld"), "{}", private.message);
     assert!(
-        lane.is_marked(binding()),
-        "the component was handed arguments in privacy mode and is not marked"
+        lane.words_withheld(),
+        "the component was handed arguments in privacy mode and the runtime's words are not withheld"
     );
 
     let other = refused(&acting, &mut client, "cancel.other.action").await;
