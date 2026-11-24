@@ -282,10 +282,15 @@ impl Computer {
         // What the application tells the page on the recovery event, as it hands it over.
         let recovery_told = Arc::new(Mutex::new(0_usize));
         let counting = Arc::clone(&recovery_told);
+        // And the settings the window is told on the settings event, as the text it receives.
+        let settings_told = Arc::new(Mutex::new(Vec::new()));
+        let hearing = Arc::clone(&settings_told);
         let app = mock_builder()
-            .manage(companion_tauri::told::Tap::new(move |event, _text| {
+            .manage(companion_tauri::told::Tap::new(move |event, text| {
                 if event == "kr://recovery" {
                     *counting.lock().expect("the record") += 1;
+                } else if event == "kr://settings" {
+                    hearing.lock().expect("the record").push(text);
                 }
             }))
             .manage(AppState::new())
@@ -331,6 +336,7 @@ impl Computer {
             account,
             told: Mutex::new(Vec::new()),
             recovery_told,
+            settings_told,
         }
     }
 
@@ -366,6 +372,8 @@ struct Page {
     told: Mutex<Vec<String>>,
     /// How many times the page was told on the recovery event to read recovery again.
     recovery_told: Arc<Mutex<usize>>,
+    /// Each settings view the window was told on the settings event, as the text it received.
+    settings_told: Arc<Mutex<Vec<String>>>,
 }
 
 impl Page {
@@ -5802,6 +5810,68 @@ async fn a_restore_puts_the_colour_mode_back_on_a_fresh_device_and_replaces_noth
         "the recovery bundle did not authenticate at that origin and locator"
     );
     assert_eq!(untouched.local().chosen_colour_mode(), None);
+}
+
+/// KR-REQ-20.17: a restore reaches the window through the application's own settings event, the
+/// one `watch_settings` sends: a single `kr://settings` with the mode the restore put back, which is
+/// what the window's colour mode and the appearance control read, and none from a restore that
+/// replaced nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_restore_tells_the_window_the_mode_it_put_back_on_the_settings_event() {
+    let (computer, _out, kit_path, _kit) = computer_with_saved_mode(ColourMode::Dark).await;
+    // A device that has chosen nothing: the choice the first run kept is gone.
+    std::fs::remove_file(computer.data.path().join(companion_tauri::settings::FILE))
+        .expect("the settings file the first run kept");
+    let (page, _) = computer.saving_page_at(NO_WAIT, level(CLOSED)).await;
+    companion_tauri::watch_settings(page.app.handle());
+    let settings = page
+        .app
+        .state::<AppState>()
+        .settings()
+        .expect("the application's settings");
+    assert_eq!(settings.local().chosen_colour_mode(), None);
+    assert!(page.settings_told.lock().expect("the record").is_empty());
+
+    let restored = page
+        .recovery
+        .restore_settings_with(
+            &Chooses::answering(vec![Some(kit_path.clone())]),
+            &page.account,
+            &settings,
+            false,
+        )
+        .await
+        .expect("a restore");
+    assert!(
+        matches!(restored, SettingsRestored::Restored { .. }),
+        "{restored:?}"
+    );
+    let told = page.settings_told.lock().expect("the record").clone();
+    assert_eq!(told.len(), 1, "one settings event: {told:?}");
+    let view: Value = serde_json::from_str(&told[0]).expect("a settings view");
+    assert_eq!(
+        view["colour_mode"], "dark",
+        "the window is told the mode put back"
+    );
+
+    // The device has chosen now, so a second restore replaces nothing and tells nothing.
+    assert_eq!(
+        page.recovery
+            .restore_settings_with(
+                &Chooses::answering(vec![Some(kit_path)]),
+                &page.account,
+                &settings,
+                false,
+            )
+            .await
+            .expect("a restore"),
+        SettingsRestored::AlreadyChosen
+    );
+    assert_eq!(
+        page.settings_told.lock().expect("the record").len(),
+        1,
+        "nothing changed, so the window is told nothing more"
+    );
 }
 
 /// KR-REQ-20.17: a restore from an export file needs no account and sends no request, and asks for
