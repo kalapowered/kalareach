@@ -991,10 +991,9 @@ async fn the_screen_image_check(
 /// digest: replacing that file ends the findings, and replacing another file beside it, which the
 /// worker never ran, does not.
 ///
-/// The limit: this case does not put a candidate on the daemon's own search path. The routes
-/// name absolute paths only, so the daemon's search finds none, and a case cannot set the
-/// environment's search path (`unsafe_code` is forbidden). Once a row names a program by a bare
-/// name, a case adds that candidate.
+/// The daemon's own search path takes no part in what is held: the daemon reads no tool of its
+/// own into the findings' fingerprint (`a_fingerprint_holds_no_tool_of_the_daemons_own` holds
+/// that), so a candidate on that path cannot change what is held, and this case puts none there.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn what_is_held_follows_the_tool_the_worker_ran_and_not_another_beside_it() {
     let login = Login::new(2);

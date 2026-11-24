@@ -318,10 +318,12 @@ pub enum Outcome {
         /// What the route is and why nothing was run.
         detail: Sentence,
     },
-    /// The check's time ran out where nothing of it was running: before its operation started, or
-    /// before the desktop could be read again to confirm what the operation found.
+    /// The check's time ran out, and its operation was not running when it did: before it started,
+    /// or after it ended and before what it printed could be read, or before the desktop could be
+    /// read again to confirm what it found.
     ///
-    /// It is not [`Outcome::NotAnswered`], which says an operation was started.
+    /// It is not [`Outcome::NotAnswered`], which says the operation was still running at its bound
+    /// and was asked to stop.
     TimedOut,
 }
 
@@ -330,7 +332,9 @@ pub enum Outcome {
 pub struct Ran {
     /// The check.
     pub check: Check,
-    /// The facility it performed the operation with, by absolute path, where it found one.
+    /// The facility it performed the operation with, by absolute path: where it found the
+    /// facility, or, for one that is not installed and that the route names by an absolute path,
+    /// where it would be.
     ///
     /// A facility is a program the platform installs, and the record names it and digests it. A
     /// file the person nominated is not one: the read check has none, so no record names the
@@ -432,15 +436,18 @@ pub fn judge(
                 CapabilityEvidenceSource::DisclosedProbe,
                 Some({
                     let said = Sentence::new()
-                    .stated("this context performed the operation: ")
-                    .sentence(detail)
-                    .stated(
-                        ". That is what establishes it, and it establishes it for this binary and \
-                         this permission state only",
-                    );
+                        .stated("this context performed the operation: ")
+                        .sentence(detail)
+                        .stated(
+                            ". That is what establishes it, and it establishes it for this binary \
+                             and this permission state only",
+                        );
                     // Where a grant exists and nothing can see it withdrawn, the person is told so.
                     if asking == Asking::ForAGrant && check != Check::ApplicationLaunch {
-                        said.stated(". A permission you withdraw later shows only when the checks run again")
+                        said.stated(
+                            ". A permission you withdraw later shows only when the checks run \
+                             again",
+                        )
                     } else {
                         said
                     }
@@ -2013,7 +2020,8 @@ fn failed(said: &str) -> Sentence {
 /// is ended with everything it started, and the check answers [`Outcome::NotAnswered`], which is
 /// what a permission prompt the person has not answered looks like from here. A facility that
 /// finished, whether it succeeded or failed, is ended with everything it started too, before it is
-/// collected. A call made after the deadline has passed starts nothing and answers the same.
+/// collected. A call made after the deadline has passed starts nothing and answers
+/// [`Outcome::TimedOut`].
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn bounded(
     check: Check,
