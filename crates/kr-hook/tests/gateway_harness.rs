@@ -137,6 +137,28 @@ fn a_groups_job_holds_what_a_launch_started_and_ends_it() {
     let _ = launched.wait();
 }
 
+/// A launch that was created held and has no job yet is ended and collected when what holds it is
+/// dropped, as it is when its placement in the group's job fails.
+#[cfg(windows)]
+#[test]
+fn a_held_launch_that_no_job_took_is_ended_when_it_is_dropped() {
+    let held =
+        common::session::HeldChild::start(&mut lingering()).expect("the launch is created held");
+    let identity = process_start_identity(held.id()).expect("a process");
+    assert_eq!(
+        process_state(&identity),
+        ProcessState::Running,
+        "the launch was created and is held, so it has not ended"
+    );
+
+    drop(held);
+    assert_eq!(
+        process_state(&identity),
+        ProcessState::Ended,
+        "the launch was ended and collected when what held it was dropped"
+    );
+}
+
 /// The role the test binary takes when a case starts it again to be the process that holds a group
 /// and then goes without letting go of it.
 const HOLDER: &str = "KR_HARNESS_GROUP_HOLDER";

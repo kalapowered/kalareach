@@ -97,26 +97,27 @@ impl LaunchGroup {
     ///
     /// The program is created suspended, put in the job and started only then, so nothing it
     /// starts can be outside the job: a program put in the job after it ran could already have
-    /// started another.
+    /// started another. This replaces the creation flags that `command` had.
     ///
     /// # Errors
     ///
     /// Returns the system's failure to start the program, to put it in the job, or to start it
-    /// there. A program that was created and could not be put in the job is ended and collected.
+    /// there. A program that was created and could not be put in the job is ended and collected. A
+    /// test process that ends between the creation and the placement leaves the program held:
+    /// nothing is left that could end it.
     pub fn spawn(
         &self,
         command: &mut std::process::Command,
     ) -> std::io::Result<std::process::Child> {
         use std::os::windows::io::AsHandle as _;
 
-        let mut child = kr_ipc::memory_limit::start_held(command).spawn()?;
-        let started = self.job.assign(child.id()).and_then(|()| {
-            kr_ipc::memory_limit::resume(child.as_handle()).map_err(std::io::Error::other)
-        });
-        if let Err(error) = started {
+        let held = HeldChild::start(command)?;
+        self.job.assign(held.id())?;
+        let mut child = held.placed();
+        if let Err(error) = kr_ipc::memory_limit::resume(child.as_handle()) {
             let _ = child.kill();
             let _ = child.wait();
-            return Err(error);
+            return Err(std::io::Error::other(error));
         }
         Ok(child)
     }
@@ -129,6 +130,58 @@ impl LaunchGroup {
     #[must_use]
     pub fn members(&self) -> Vec<u32> {
         self.job.process_ids().expect("the job's members are read")
+    }
+}
+
+/// A program created held that no job holds yet.
+///
+/// It is ended and collected when this is dropped, as when its placement in a job fails or
+/// panics, unless [`HeldChild::placed`] has given it up. A test process that ends between the
+/// creation and the placement leaves the program held: nothing is left that could end it.
+#[cfg(windows)]
+pub struct HeldChild(Option<std::process::Child>);
+
+#[cfg(windows)]
+impl HeldChild {
+    /// Creates the program held. The command's creation flags are replaced.
+    ///
+    /// # Errors
+    ///
+    /// Returns the system's failure to create the program.
+    pub fn start(command: &mut std::process::Command) -> std::io::Result<Self> {
+        kr_ipc::memory_limit::start_held(command)
+            .spawn()
+            .map(|child| Self(Some(child)))
+    }
+
+    /// The program's process identifier.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the program has been given up.
+    #[must_use]
+    pub fn id(&self) -> u32 {
+        self.0.as_ref().expect("the program is held").id()
+    }
+
+    /// Gives the program up, once a job holds it.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the program has been given up.
+    #[must_use]
+    pub fn placed(mut self) -> std::process::Child {
+        self.0.take().expect("the program is held")
+    }
+}
+
+#[cfg(windows)]
+impl Drop for HeldChild {
+    fn drop(&mut self) {
+        if let Some(mut program) = self.0.take() {
+            let _ = program.kill();
+            let _ = program.wait();
+        }
     }
 }
 

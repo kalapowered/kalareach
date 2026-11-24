@@ -1825,6 +1825,34 @@ async fn a_program_the_fixture_created_ends_with_the_launcher_when_the_backend_n
     let _ = release.send(());
 }
 
+/// A program that was created held and has no job yet is ended and collected when what holds it is
+/// dropped, as it is when its placement in a job fails.
+#[cfg(windows)]
+#[test]
+fn a_held_program_that_no_job_took_is_ended_when_it_is_dropped() {
+    let mut command = std::process::Command::new(stand_in_program());
+    command
+        .args(["/d", "/c", "ping -n 60 127.0.0.1 > NUL"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    let held =
+        windows_launcher::HeldProgram::start(&mut command).expect("the program is created held");
+    let identity = kr_ipc::identity::process_start_identity(held.id()).expect("a process");
+    assert_eq!(
+        kr_ipc::identity::process_state(&identity),
+        kr_ipc::identity::ProcessState::Running,
+        "the program was created and is held, so it has not ended"
+    );
+
+    drop(held);
+    assert_eq!(
+        kr_ipc::identity::process_state(&identity),
+        kr_ipc::identity::ProcessState::Ended,
+        "the program was ended and collected when what held it was dropped"
+    );
+}
+
 /// A backend that refuses what a launcher presents closes the connection without a word, and the
 /// fixture says so: it presents an argument vector the backend did not answer and reads a closed
 /// connection, creates nothing and goes no further.

@@ -350,6 +350,55 @@ impl Drop for Launcher {
     }
 }
 
+/// A program created held that no job holds yet.
+///
+/// It is ended and collected when this is dropped, as when its placement in a job fails or
+/// panics, unless [`HeldProgram::placed`] has given it up. A test process that ends between the
+/// creation and the placement leaves the program held: nothing is left that could end it.
+pub struct HeldProgram(Option<Child>);
+
+impl HeldProgram {
+    /// Creates the program held. The command's creation flags are replaced.
+    ///
+    /// # Errors
+    ///
+    /// Returns the system's failure to create the program.
+    pub fn start(command: &mut Command) -> std::io::Result<Self> {
+        kr_ipc::memory_limit::start_held(command)
+            .spawn()
+            .map(|child| Self(Some(child)))
+    }
+
+    /// The program's process identifier.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the program has been given up.
+    #[must_use]
+    pub fn id(&self) -> u32 {
+        self.0.as_ref().expect("the program is held").id()
+    }
+
+    /// Gives the program up, once a job holds it.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the program has been given up.
+    #[must_use]
+    pub fn placed(mut self) -> Child {
+        self.0.take().expect("the program is held")
+    }
+}
+
+impl Drop for HeldProgram {
+    fn drop(&mut self) {
+        if let Some(mut program) = self.0.take() {
+            let _ = program.kill();
+            let _ = program.wait();
+        }
+    }
+}
+
 fn text(value: &serde_json::Value, name: &str) -> String {
     value[name].as_str().unwrap_or_default().to_owned()
 }
@@ -498,11 +547,11 @@ async fn play(plan: &serde_json::Value) {
             variable["value"].as_str().expect("a value"),
         );
     }
-    let mut program = kr_ipc::memory_limit::start_held(&mut command)
-        .spawn()
-        .expect("the program is created held");
-    job.assign(program.id())
+    let held = HeldProgram::start(&mut command).expect("the program is created held");
+    // A program that cannot be put in the job is ended here, and not left held.
+    job.assign(held.id())
         .expect("the program is put in the launcher's job");
+    let mut program = held.placed();
     report(serde_json::json!({"event": "created", "program": program.id()}));
 
     // The count is from before `going` is written, as the launcher counts it, and covers the write
