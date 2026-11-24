@@ -57,6 +57,17 @@ impl HostProtocol {
         endpoint: "p3.sock",
         descriptor: "plugin-host-3.json",
     };
+
+    /// The fourth protocol, and the names it is found under. Its endpoint and its descriptor are its
+    /// own, so a host that serves both protocols answers each on a name the other never uses.
+    pub const V4: Self = Self {
+        name: "kr-plugin-host/4",
+        endpoint: "p4.sock",
+        descriptor: "plugin-host-4.json",
+    };
+
+    /// Every protocol this build has frames for, oldest first.
+    pub const ALL: [Self; 2] = [Self::V3, Self::V4];
 }
 
 /// The prefix of the rendezvous endpoint a launcher listens on for one plugin host.
@@ -936,7 +947,7 @@ impl Notice {
 }
 
 /// Byte strings, as CBOR byte strings rather than as arrays of numbers.
-mod serde_bytes_vec {
+pub(crate) mod serde_bytes_vec {
     use serde::{Deserialize as _, Deserializer, Serializer};
 
     pub fn serialize<S: Serializer>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
@@ -1204,5 +1215,21 @@ mod tests {
         );
         assert_eq!(HostProtocol::V3.endpoint, "p3.sock");
         assert_eq!(HostProtocol::V3.descriptor, "plugin-host-3.json");
+        assert_eq!(HostProtocol::V4.name, "kr-plugin-host/4");
+        assert_eq!(HostProtocol::V4.endpoint, "p4.sock");
+        assert_eq!(HostProtocol::V4.descriptor, "plugin-host-4.json");
+    }
+
+    /// Two protocols that shared a name, an endpoint or a descriptor would answer for each other.
+    #[test]
+    fn no_two_protocols_share_a_name_an_endpoint_or_a_descriptor() {
+        assert_eq!(HostProtocol::ALL, [HostProtocol::V3, HostProtocol::V4]);
+        for (at, protocol) in HostProtocol::ALL.iter().enumerate() {
+            for other in &HostProtocol::ALL[at + 1..] {
+                assert_ne!(protocol.name, other.name);
+                assert_ne!(protocol.endpoint, other.endpoint);
+                assert_ne!(protocol.descriptor, other.descriptor);
+            }
+        }
     }
 }
