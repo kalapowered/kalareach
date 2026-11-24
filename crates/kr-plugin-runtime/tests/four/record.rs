@@ -861,6 +861,31 @@ fn kr_req_24_24_every_recorded_frame_of_the_fourth_plugin_host_protocol_reads_an
         );
     }
 
+    // A call answered with nothing is an answer the type admits and no handler of this host writes,
+    // so it is built here, written, and read back.
+    let nothing = Frame4::Response {
+        reply_to: 1,
+        body: ResponseBody4::Called {
+            value: None,
+            fault: None,
+            document: None,
+            record: None,
+        },
+    };
+    let written = kr_cbor::to_canonical_vec(&nothing).expect("it encodes");
+    assert_eq!(
+        hex(&written),
+        "a168726573706f6e7365a264626f6479a16663616c6c6564a0687265706c795f746f01",
+        "an answer that holds nothing is not written as an empty call"
+    );
+    let limits = StreamKind::Control.cbor_limits();
+    let read: Frame4 = kr_cbor::from_canonical_slice(&written, &limits).expect("it reads");
+    assert_eq!(
+        kind_of_frame(&read),
+        "response:called:none",
+        "an answer that holds nothing reads as the kind it was built as"
+    );
+
     let third = &record["descriptors"]["descriptor-3-served-by-the-test"];
     let read: HostDescriptor = serde_json::from_value(third.clone()).expect("the third descriptor");
     assert_eq!(&serde_json::to_value(&read).expect("it writes"), third);
