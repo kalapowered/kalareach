@@ -35,6 +35,9 @@ use crate::{
 
 const RECORD: &str = include_str!("../../../kr-plugin-service/tests/recorded/host-4-frames.json");
 
+/// The kind of the notice that reports what an instance has consumed.
+const CONSUMED: &str = "notice:consumed";
+
 /// A frame longer than this is kept as its length and digest: the events that fill a queue to its
 /// bound are most of a megabyte each way, and what matters of them is that they are the same.
 const LARGE_FRAME: usize = 4096;
@@ -883,12 +886,12 @@ async fn kr_req_24_24_the_fourth_protocol_host_answers_its_sessions_the_way_the_
         for (what, prefix) in [("answer", "response:"), ("notice", "notice:")] {
             let mut counts: std::collections::BTreeMap<(String, String), i64> = Default::default();
             for (kind, held) in &live {
-                if kind.starts_with(prefix) {
+                if kind.starts_with(prefix) && kind != CONSUMED {
                     *counts.entry((kind.clone(), held.clone())).or_default() += 1;
                 }
             }
             for (kind, held) in &recorded {
-                if kind.starts_with(prefix) {
+                if kind.starts_with(prefix) && kind != CONSUMED {
                     *counts.entry((kind.clone(), held.clone())).or_default() -= 1;
                 }
             }
@@ -902,6 +905,26 @@ async fn kr_req_24_24_the_fourth_protocol_host_answers_its_sessions_the_way_the_
                 "{which}: these {what}s were written more times (positive) or fewer (negative) than they were recorded: {differing:?}"
             );
         }
+        // What an instance has consumed is told as the latest report: a newer report replaces one
+        // the reader has not taken, so how many are written depends on how fast the reader takes
+        // them. The record holds which reports can be written.
+        let reports = |frames: &[(String, String)]| {
+            frames
+                .iter()
+                .filter(|(kind, _)| kind == CONSUMED)
+                .map(|(_, held)| held.clone())
+                .collect::<BTreeSet<_>>()
+        };
+        let (written, held) = (reports(&live), reports(&recorded));
+        let unrecorded: Vec<&String> = written.difference(&held).collect();
+        assert!(
+            unrecorded.is_empty(),
+            "{which}: a report of what was consumed was written that the record does not hold: {unrecorded:?}"
+        );
+        assert!(
+            held.is_empty() || !written.is_empty(),
+            "{which}: no report of what was consumed was written"
+        );
     }
     // The descriptors this host publishes are the ones that were recorded, but for what is of the run.
     let held = |value: &serde_json::Value| of_the_run(value.clone());
