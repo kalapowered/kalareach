@@ -215,6 +215,60 @@ describe('which platform the page is shown for', () => {
     }
   })
 
+  // KR-REQ-03.30: what a check does depends on the platform, and the list a person reads before a
+  // run is worded for it. The host's records can be read while the application is not, and that
+  // must not leave a run on offer that the list does not describe.
+  it('starts no check while the platform is not known, and lists them all once it is read', async () => {
+    let failing = true
+    const controls = start('macos', (port) => ({
+      ...port,
+      setupIdentity: () =>
+        failing
+          ? Promise.reject(new Error('the application could not be read'))
+          : port.setupIdentity()
+    }))
+    await waitFor(() => {
+      expect(screen.getByTestId('setup-step-capabilities')).toBeInTheDocument()
+    })
+    await goTo('capabilities')
+    const run = await screen.findByTestId('setup-run-checks')
+    // Pressing the control asks for nothing, and when a list or a run button were still reached it
+    // is pressed too: no check request is made from anywhere on the page.
+    await userEvent.click(run)
+    const sheetRun = screen.queryByTestId('setup-checks-run')
+    if (sheetRun) await userEvent.click(sheetRun)
+    expect(controls.checkRuns).toEqual([])
+    expect(screen.queryByTestId('setup-effects')).toBeNull()
+    expect(run).toBeDisabled()
+    expect(run).toHaveAttribute('aria-describedby', 'setup-run-unavailable')
+    expect(screen.getByTestId('setup-run-unavailable').textContent).toBe(
+      'The checks cannot run until this app has read which system it runs on, because what they ' +
+        'do depends on it. Use “Read again” to try once more.'
+    )
+    // Reading again is still on offer, and once the application is read the list is the whole one.
+    expect(screen.getByTestId('setup-recheck')).toBeEnabled()
+    failing = false
+    await userEvent.click(screen.getByTestId('setup-recheck'))
+    await waitFor(() => {
+      expect(screen.getByTestId('setup-run-checks')).toBeEnabled()
+    })
+    expect(screen.queryByTestId('setup-run-unavailable')).toBeNull()
+    expect(screen.getByTestId('setup-run-checks')).not.toHaveAttribute('aria-describedby')
+    await userEvent.click(screen.getByTestId('setup-run-checks'))
+    const sheet = await screen.findByTestId('setup-effects')
+    const items = within(sheet).getAllByRole('listitem')
+    const whole = disclosedChecks('macos')
+    expect(items).toHaveLength(whole.length)
+    whole.forEach((check, index) => {
+      expect(items[index]?.textContent).toBe(`${check.name}${check.performs}${check.effect}`)
+    })
+    expect(controls.checkRuns).toEqual([])
+    await userEvent.click(screen.getByTestId('setup-checks-run'))
+    await waitFor(() => {
+      expect(controls.checkRuns).toHaveLength(1)
+    })
+  })
+
   it('keeps the platform the first reading named, whatever a later reading says', async () => {
     let later = false
     let reads = 0

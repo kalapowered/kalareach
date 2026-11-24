@@ -359,10 +359,14 @@ export function Setup(): ReactNode {
   const watching = accepted
   const checking = watching !== null
 
+  // What a check does depends on the platform, and the list a person reads before a run is worded
+  // for it. So no run starts, and none can be asked for, while the platform is not known.
+  const runnable = environmentId !== null && platform !== null
+
   // Asking starts the run and answers at once. The sheet closes on the press, so the card behind it
   // is the one that says the checks are running.
   const runChecks = useCallback(() => {
-    if (environmentId === null || chosen === undefined || choosing) return
+    if (!runnable || chosen === undefined || choosing) return
     setEffectsOpen(false)
     setAsking(true)
     port
@@ -387,7 +391,7 @@ export function Setup(): ReactNode {
         // it took the file leaves the file held.
         readChosen()
       })
-  }, [port, environmentId, chosen, choosing, load, apply, say, readChosen])
+  }, [port, environmentId, runnable, chosen, choosing, load, apply, say, readChosen])
 
   // The platform's own dialog answers. Closing it with no choice leaves an earlier choice as it was,
   // and either way the line says what the application holds afterwards.
@@ -565,6 +569,7 @@ export function Setup(): ReactNode {
             offered={offered}
             reading={reading}
             loaded={loaded}
+            runnable={runnable}
             onRead={reread}
             onRunChecks={() => {
               setEffectsRunnable(true)
@@ -632,9 +637,7 @@ export function Setup(): ReactNode {
               <Button
                 tone="primary"
                 onClick={runChecks}
-                disabled={
-                  asking || checking || environmentId === null || chosen === undefined || choosing
-                }
+                disabled={asking || checking || !runnable || chosen === undefined || choosing}
                 data-testid="setup-checks-run"
               >
                 {asking || checking ? 'Running…' : 'Run the checks'}
@@ -1053,6 +1056,7 @@ function CapabilitiesStep({
   offered,
   reading,
   loaded,
+  runnable,
   onRead,
   onRunChecks
 }: {
@@ -1061,6 +1065,8 @@ function CapabilitiesStep({
   readonly offered: (capability: string) => boolean
   readonly reading: boolean
   readonly loaded: boolean
+  /** Whether a run can be asked for: it cannot while the platform is not known. */
+  readonly runnable: boolean
   readonly onRead: () => void
   readonly onRunChecks: () => void
 }): ReactNode {
@@ -1107,12 +1113,25 @@ function CapabilitiesStep({
             below was established on its own.
           </p>
           <ChecksLine checks={capabilities.checks} platform={platform} />
+          {!runnable ? (
+            <p className="faint small" id="setup-run-unavailable" data-testid="setup-run-unavailable">
+              The checks cannot run until this app has read which system it runs on, because what
+              they do depends on it. Use “Read again” to try once more.
+            </p>
+          ) : null}
         </div>
         <footer className="card-footer setup-route">
           <Button onClick={onRead} disabled={reading} data-testid="setup-recheck" data-wraps>
             {reading ? 'Reading…' : 'Read again'}
           </Button>
-          <Button tone="primary" onClick={onRunChecks} data-testid="setup-run-checks" data-wraps>
+          <Button
+            tone="primary"
+            onClick={onRunChecks}
+            disabled={!runnable}
+            aria-describedby={runnable ? undefined : 'setup-run-unavailable'}
+            data-testid="setup-run-checks"
+            data-wraps
+          >
             Run the checks…
           </Button>
         </footer>
