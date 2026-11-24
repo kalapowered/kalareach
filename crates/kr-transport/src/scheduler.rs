@@ -406,7 +406,6 @@ impl StreamBudget {
     /// refused again makes a new wait and waits again. A write larger than
     /// [`SendLimits::ceiling_for`] its class is refused for good: no room given back admits it, and
     /// its writer must not wait.
-    #[cfg(any(test, feature = "testing"))]
     pub fn released(&self) -> impl Future<Output = ()> + '_ {
         self.released.notified()
     }

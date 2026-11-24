@@ -411,7 +411,6 @@ impl DataWriter {
 
     /// Returns the handle that revokes the stream, which both halves share.
     #[must_use]
-    #[cfg(any(test, feature = "testing"))]
     pub fn handle(&self) -> StreamHandle {
         self.handle.clone()
     }
@@ -986,7 +985,6 @@ impl StreamRegistry {
 
     /// Returns the shared send budget.
     #[must_use]
-    #[cfg(any(test, feature = "testing"))]
     pub fn budget(&self) -> &Arc<StreamBudget> {
         &self.state.budget
     }
