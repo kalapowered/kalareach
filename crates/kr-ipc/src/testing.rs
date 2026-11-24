@@ -550,7 +550,6 @@ const COPIER_BOUND: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// Waits for `copier`, a child of this process, for at most `bound`, and ends it when it has not
 /// ended. Returns what it ended with, or `None` for a copier that outlasted its bound.
-#[cfg(unix)]
 fn copier_ended_within(
     copier: &mut std::process::Child,
     bound: std::time::Duration,
