@@ -16,6 +16,7 @@ import { expect, test, type Page } from '@playwright/test'
 
 import { PRESENTATION_DEADLINE } from './bounds'
 import { screenshotPath } from './evidence'
+import { keyboard } from './keyboard'
 import { overrunning, stopWrapping } from './layout'
 
 /** The longest a passing message stays once nothing holds it, in milliseconds (the application's `TOAST_CEILING_MS`). */
@@ -1185,9 +1186,7 @@ test.describe('a passing message on the phone, above the bar and the keyboard', 
 
           // A software keyboard over the page: the message goes up with it, and the bar is under it.
           const covered = 336
-          await page.evaluate((inset) => {
-            document.documentElement.style.setProperty('--keyboard', `${String(inset)}px`)
-          }, covered)
+          await keyboard(page, covered)
           await expect
             .poll(async () => {
               const now = await where()
@@ -1204,9 +1203,7 @@ test.describe('a passing message on the phone, above the bar and the keyboard', 
           await page.screenshot({ path: screenshotPath(`kr-text-size-toast-keyboard-${surface}-${size}-${String(width)}-${test.info().project.name}`) })
 
           // The keyboard goes, and the message comes back down to the bar.
-          await page.evaluate(() => {
-            document.documentElement.style.setProperty('--keyboard', '0px')
-          })
+          await keyboard(page, 0)
           await expect
             .poll(async () => {
               const now = await where()
@@ -1259,9 +1256,7 @@ test.describe('a passing message on a short phone with a keyboard up', () => {
       const toast = page.locator('.toast')
       await expect(toast).toContainText('notes.png')
       await toast.dispatchEvent('pointerover', { pointerType: 'mouse', pointerId: 1 })
-      await page.evaluate(() => {
-        document.documentElement.style.setProperty('--keyboard', '336px')
-      })
+      await keyboard(page, 336)
       const read = () =>
         page.evaluate(() => {
           const message = document.querySelector('.toast')?.getBoundingClientRect()

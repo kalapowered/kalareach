@@ -16,6 +16,7 @@ import type { Submission } from '../src/model/receipts'
 
 import { PRESENTATION_DEADLINE } from './bounds'
 import { screenshotPath } from './evidence'
+import { keyboard } from './keyboard'
 import { overrunning, stopWrapping } from './layout'
 
 /** Where a screenshot for the evidence goes. */
@@ -1587,11 +1588,7 @@ test.describe("the program's keyboard", () => {
     await takeControl(page)
     await page.getByLabel('Type to the program').focus()
     // A software keyboard over the page hides the bar that holds the mode button.
-    const cover = (inset: number) =>
-      page.evaluate((covered) => {
-        document.documentElement.style.setProperty('--keyboard', `${covered}px`)
-      }, inset)
-    await cover(336)
+    await keyboard(page, 336)
     await expect(page.locator('.m-terminal-hud')).toBeHidden()
     await page.evaluate(() => {
       window.krTestHost?.terminalViews.at(-1)?.loseControl()
@@ -1601,7 +1598,7 @@ test.describe("the program's keyboard", () => {
     await expect(page.getByRole('button', { name: 'Take control', includeHidden: true })).toBeHidden()
     await expect(page.getByRole('button', { name: 'Take control', includeHidden: true })).not.toBeFocused()
     // The field gone, the keyboard goes: the bar is back, and the focus goes to the mode button.
-    await cover(0)
+    await keyboard(page, 0)
     await expect(page.getByRole('button', { name: 'Take control' })).toBeFocused()
   })
 
@@ -1614,11 +1611,7 @@ test.describe("the program's keyboard", () => {
     await expect(page.getByTestId('mobile-terminal-line').first()).toContainText('$ cargo')
     await takeControl(page)
     await page.getByLabel('Type to the program').focus()
-    const cover = (inset: number) =>
-      page.evaluate((covered) => {
-        document.documentElement.style.setProperty('--keyboard', `${covered}px`)
-      }, inset)
-    await cover(336)
+    await keyboard(page, 336)
     await expect(page.locator('.m-terminal-hud')).toBeHidden()
     await page.evaluate(() => {
       window.krTestHost?.terminalViews.at(-1)?.loseControl()
@@ -1629,7 +1622,7 @@ test.describe("the program's keyboard", () => {
       ;(field as HTMLTextAreaElement).focus()
       ;(field as HTMLTextAreaElement).blur()
     })
-    await cover(0)
+    await keyboard(page, 0)
     await expect(page.getByRole('button', { name: 'Take control' })).toBeVisible()
     await expect(page.getByRole('button', { name: 'Take control' })).not.toBeFocused()
   })
@@ -1936,13 +1929,6 @@ test.describe("the phone's room for its terminal", () => {
     await page.addInitScript((mode) => {
       window.kalareachSettings = { colour_mode: mode }
     }, theme)
-  }
-
-  /** Covers the bottom `inset` pixels of the screen, as a software keyboard does. */
-  async function keyboard(page: Page, inset: number): Promise<void> {
-    await page.evaluate((covered) => {
-      document.documentElement.style.setProperty('--keyboard', `${covered}px`)
-    }, inset)
   }
 
   /**
