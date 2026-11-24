@@ -5391,6 +5391,7 @@ dependencies = [
  "kr-crypto",
  "kr-flush",
  "kr-ipc",
+ "kr-manager-stand-in",
  "kr-plugin-sdk",
  "kr-plugin-service",
  "kr-protocol",

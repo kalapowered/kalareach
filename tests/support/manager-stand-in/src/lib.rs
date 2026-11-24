@@ -282,6 +282,22 @@ fn split_target(target: &str) -> Option<(String, &str)> {
     Some((format!("{kind}/{uid}"), label))
 }
 
+/// The status and the text that `launchctl` gives for a domain the user does not have, which the
+/// stand-in gives for every command that names one.
+#[must_use]
+pub fn absent_domain(domain: &str) -> (i32, String) {
+    (
+        NO_SUCH_DOMAIN,
+        format!("Could not find domain for {domain}\n"),
+    )
+}
+
+/// The answer to a command that names a domain the user does not have.
+fn domain_absent(domain: &str) -> Answer {
+    let (status, said) = absent_domain(domain);
+    Answer::failed(status, said)
+}
+
 /// The job `label` loaded in `domain`: a job that is loaded in the other domain is not there, as
 /// launchd answers.
 fn job_in(context: &Context, domain: &str, label: &str) -> Result<Option<Job>, String> {
@@ -520,25 +536,16 @@ fn answer(context: &Context, arguments: &[String]) -> Answer {
 fn print(context: &Context, target: &str) -> Answer {
     let uid = context.uid;
     if target == format!("gui/{uid}") {
-        return Answer::failed(
-            NO_SUCH_DOMAIN,
-            format!("Could not find domain for {target}\n"),
-        );
+        return domain_absent(target);
     }
     if target == format!("user/{uid}") {
         return Answer::said(format!("{target} = {{\n\ttype = user\n}}\n"));
     }
     let Some((domain, label)) = split_target(target) else {
-        return Answer::failed(
-            NO_SUCH_DOMAIN,
-            format!("Could not find domain for {target}\n"),
-        );
+        return domain_absent(target);
     };
     if domain != format!("user/{uid}") && domain != format!("gui/{uid}") {
-        return Answer::failed(
-            NO_SUCH_DOMAIN,
-            format!("Could not find domain for {domain}\n"),
-        );
+        return domain_absent(&domain);
     }
     match job_in(context, &domain, label) {
         Err(why) => Answer::refused(why),
@@ -651,10 +658,7 @@ fn plist_names_a_manager(program: &Path) -> bool {
 /// `bootstrap`: loads the file as it is now, into the background domain, and starts nothing.
 fn bootstrap(context: &Context, domain: &str, plist: &Path) -> Answer {
     if domain != format!("user/{}", context.uid) {
-        return Answer::failed(
-            NO_SUCH_DOMAIN,
-            format!("Could not find domain for {domain}\n"),
-        );
+        return domain_absent(domain);
     }
     let plist = match context.bounded(plist) {
         Ok(plist) => plist,
@@ -734,10 +738,7 @@ fn bootstrap(context: &Context, domain: &str, plist: &Path) -> Answer {
 /// that runs is not started again and its process is printed.
 fn kickstart(context: &Context, target: &str) -> Answer {
     let Some((domain, label)) = split_target(target) else {
-        return Answer::failed(
-            NO_SUCH_DOMAIN,
-            format!("Could not find domain for {target}\n"),
-        );
+        return domain_absent(target);
     };
     let mut job = match job_in(context, &domain, label) {
         Err(why) => return Answer::refused(why),
@@ -1055,10 +1056,7 @@ fn end_job(context: &Context, job: &Job) -> Result<(), String> {
 /// loaded and is reported as a failure.
 fn bootout(context: &Context, target: &str) -> Answer {
     let Some((domain, label)) = split_target(target) else {
-        return Answer::failed(
-            NO_SUCH_DOMAIN,
-            format!("Could not find domain for {target}\n"),
-        );
+        return domain_absent(target);
     };
     let job = match job_in(context, &domain, label) {
         Err(why) => return Answer::refused(why),

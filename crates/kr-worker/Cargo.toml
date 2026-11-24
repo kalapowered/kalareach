@@ -129,6 +129,11 @@ tempfile.workspace = true
 # A rate over a window of time is tested with a clock the test moves.
 tokio = { workspace = true, features = ["test-util"] }
 
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+# The desktop reader's test gives it the answer a stand-in service manager gives for a domain that
+# is not there, taken from the stand-in itself.
+kr-manager-stand-in = { path = "../../tests/support/manager-stand-in" }
+
 [target.'cfg(windows)'.dev-dependencies]
 # A test that needs a process held while it is ending attaches a debugger to it, which holds the
 # process at the event that says it has exited, and one that needs to know a thread is waiting for

@@ -1463,4 +1463,41 @@ mod tests {
             lost.log
         );
     }
+
+    /// What a child of the case checks when a stand-in is named whose program gives the stand-in's
+    /// own answer for a domain that is not there: the reader finds no login.
+    #[test]
+    #[ignore = "run by a child of the case with a stand-in named"]
+    #[cfg(target_os = "macos")]
+    fn the_reader_fixture_for_the_stand_ins_answer_for_an_absent_domain() {
+        assert_eq!(super::read_login(501), Reading::None);
+    }
+
+    /// The desktop reader takes the answer that the stand-in service manager gives for the graphical
+    /// domain, its status and its text as the stand-in gives them, as the absence of a login and not
+    /// as a reading it could not make.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn the_reader_takes_the_stand_ins_answer_for_an_absent_graphical_domain_as_no_login() {
+        let folder = kr_ipc::testing::PrivateTempDir::create();
+        let stand_in = kr_ipc::testing::manager_stand_in::place_installation(folder.path());
+        let (status, said) = kr_manager_stand_in::absent_domain("gui/501");
+        kr_ipc::testing::place_script(
+            &stand_in,
+            format!("#!/bin/sh\nprintf '%s' '{said}' >&2\nexit {status}\n"),
+        );
+        let run = kr_ipc::testing::manager_stand_in::run_fixture(
+            concat!(
+                module_path!(),
+                "::the_reader_fixture_for_the_stand_ins_answer_for_an_absent_domain"
+            ),
+            Some(stand_in.as_os_str()),
+            None,
+        );
+        assert!(
+            run.passed,
+            "the reader of the stand-in's answer for a domain that is not there:\n{}",
+            run.log
+        );
+    }
 }
