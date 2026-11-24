@@ -209,21 +209,7 @@ impl Context {
         }
         let resolved = match path.canonicalize() {
             Ok(resolved) => resolved,
-            Err(_) => {
-                // A link that leads nowhere would be followed when a file is made through it, so
-                // what a path ends in is never a link unless it leads to an existing file.
-                if std::fs::symlink_metadata(path).is_ok() {
-                    return Err(format!("{} is a link that leads nowhere", path.display()));
-                }
-                path.parent()
-                    .ok_or_else(|| format!("{} has no folder", path.display()))?
-                    .canonicalize()
-                    .map_err(|error| format!("{} cannot be placed: {error}", path.display()))?
-                    .join(
-                        path.file_name()
-                            .ok_or_else(|| format!("{} names no file", path.display()))?,
-                    )
-            }
+            Err(_) => placed_by_its_folder(path)?,
         };
         if self.roots.iter().any(|root| resolved.starts_with(root)) {
             Ok(resolved)
@@ -271,6 +257,28 @@ impl Context {
             .and_then(|()| std::fs::rename(&aside, &path))
             .map_err(|error| format!("the record of {} cannot be kept: {error}", job.label))
     }
+}
+
+/// Where a path that did not resolve is placed: in the folder it will be made in, under its own
+/// name. A link that leads nowhere is refused, because a file made through it would be made where
+/// it leads. Any other entry is placed as a path that is not there yet is: calls run at the same
+/// time, and the entry may be a file or a folder that another call made after the first reading
+/// failed.
+fn placed_by_its_folder(path: &Path) -> Result<PathBuf, String> {
+    let is_a_link =
+        std::fs::symlink_metadata(path).is_ok_and(|entry| entry.file_type().is_symlink());
+    if is_a_link {
+        return Err(format!("{} is a link that leads nowhere", path.display()));
+    }
+    Ok(path
+        .parent()
+        .ok_or_else(|| format!("{} has no folder", path.display()))?
+        .canonicalize()
+        .map_err(|error| format!("{} cannot be placed: {error}", path.display()))?
+        .join(
+            path.file_name()
+                .ok_or_else(|| format!("{} names no file", path.display()))?,
+        ))
 }
 
 /// Whether `label` can name one record of the store: it holds no separator and is not a folder.
@@ -1271,6 +1279,31 @@ mod tests {
         }
         assert!(context.job_path("kr-controller-x").is_ok());
         assert!(context.job("kr-controller-x").expect("no record").is_none());
+    }
+
+    /// A path that did not resolve is placed by its folder when it is not there yet and when it is
+    /// a file or a folder, as it is when another call made it after the first reading failed. A link
+    /// that leads nowhere is refused.
+    #[test]
+    fn a_path_made_after_it_failed_to_resolve_is_placed_and_a_link_that_leads_nowhere_is_refused() {
+        let folder = PrivateTempDir::create();
+        let root = folder.path().canonicalize().expect("a folder");
+        std::fs::write(root.join("file"), b"").expect("a file");
+        std::fs::create_dir(root.join("folder")).expect("a folder");
+        std::os::unix::fs::symlink(root.join("never"), root.join("link")).expect("a link");
+
+        for name in ["file", "folder", "not-there-yet"] {
+            assert_eq!(
+                placed_by_its_folder(&root.join(name)),
+                Ok(root.join(name)),
+                "{name}"
+            );
+        }
+        let refused = placed_by_its_folder(&root.join("link")).expect_err("a link");
+        assert!(
+            refused.contains("is a link that leads nowhere"),
+            "{refused}"
+        );
     }
 
     /// A path argument is bounded or refused in every form: the values of `--runtime-dir` and
