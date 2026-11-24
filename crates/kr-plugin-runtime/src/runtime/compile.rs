@@ -34,7 +34,7 @@
 //! threads this figure does not see.
 //!
 //! The caller has a deadline of its own on top of both, and it is the one that matters to anything
-//! waiting: [`crate::runtime::binding::Runtime::prepare`] bounds the whole preparation -- the
+//! waiting: `crate::runtime::binding::Runtime::prepare` bounds the whole preparation -- the
 //! compile, the instantiation and `bind` -- and answers when that runs out, whatever the pool is
 //! still doing. That deadline is on the clock, because a caller waits on the clock. A compile it
 //! stopped waiting for goes on and files its result when it is within budget, so the next
@@ -68,7 +68,7 @@
 //! | Windows | takes the lowest thread priority |
 //!
 //! A platform that refuses is not a failure: the compile still runs off the hot path, which is the
-//! property that matters, and [`CompilePool::background_priority`] reports what was achieved
+//! property that matters, and `CompilePool::background_priority` reports what was achieved
 //! rather than what was asked for. Lowering a thread's priority is best effort on every one of
 //! them, so nothing here depends on it having worked.
 

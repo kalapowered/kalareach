@@ -95,7 +95,7 @@
 //! A membership listing is the service's index, and each entry names a history too. An entry in
 //! another history than the one this device holds, whatever revision it names, or at a later
 //! revision in the same one, is news: a reason to refresh, and nothing more
-//! ([`crate::services::MembershipListing::names_news`]).
+//! (`crate::services::MembershipListing::names_news`).
 //!
 //! # Stated limits
 //!

@@ -57,7 +57,7 @@
 //! [`ManagedSyncService::status_shared`], [`ManagedSyncService::fence_shared`],
 //! [`ManagedSyncService::compare_shared`] and [`ManagedSyncService::resolve_shared`]. A shared
 //! comparison follows the service's pages of objects until nothing it names is missing.
-//! [`ManagedSyncService::inventory`] reads what one holds, each with the epoch it is sealed under,
+//! `ManagedSyncService::inventory` reads what one holds, each with the epoch it is sealed under,
 //! under a budget of pages its caller continues from, and [`ManagedSyncService::memberships`] lists
 //! the shared collections whose newest record names this installation. Its key records are this
 //! client's [`KeyRecordService`].
@@ -202,7 +202,7 @@ pub const MAX_KNOWN_REVISIONS: usize = 8 * 64;
 /// The most pages one shared comparison follows to bring every object the reader lacks.
 ///
 /// A collection holds at most [`kr_protocol::sync::MAX_SYNC_OBJECTS_PER_COLLECTION`] objects and
-/// a page carries [`SYNC_ANSWER_PAGE`] of them, so four pages bring them all; the rest allows for
+/// a page carries `SYNC_ANSWER_PAGE` of them, so four pages bring them all; the rest allows for
 /// objects written again while the pages are read.
 pub const MAX_COMPARISON_PAGES: usize = 16;
 

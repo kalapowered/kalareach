@@ -48,13 +48,13 @@
 //! | This client | The host's subsystem contract |
 //! | --- | --- |
 //! | [`SyncClient::fence`] | stop every content-bearing queue, at once |
-//! | [`SyncClient::cancel_undispatched`] | take back what was admitted and never dispatched |
-//! | [`SyncClient::remove_retained`] | remove the retained local content |
+//! | `SyncClient::cancel_undispatched` | take back what was admitted and never dispatched |
+//! | `SyncClient::remove_retained` | remove the retained local content |
 //! | [`SyncClient::reconcile_unsettled`] | reconcile the work that was dispatched, before reporting |
 //! | [`SyncClient::outstanding`] | how much dispatched work has no settled outcome |
 //! | [`SyncClient::kept`] | what is kept, explicitly |
-//! | [`SyncClient::exported`] | what already left, which is shown rather than erased |
-//! | [`SyncClient::accepts_result`] | a result is published only under the generation in force |
+//! | `SyncClient::exported` | what already left, which is shown rather than erased |
+//! | `SyncClient::accepts_result` | a result is published only under the generation in force |
 //!
 //! [`SyncClient::resume`] is the other half of the same contract: turning privacy mode off is a
 //! boundary as much as turning it on, so it takes the new generation and lets production start
@@ -187,7 +187,7 @@ pub struct Reconciled {
     /// A fence says the service holds no outcome for the identity, which is what a request that
     /// never arrived and a request whose receipt has passed its retention both look like. Inside
     /// the retention the request provably never ran and nothing of it is anywhere. Past it, the
-    /// ciphertext may be on the service, so the account of it stays in [`SyncClient::exported`]
+    /// ciphertext may be on the service, so the account of it stays in `SyncClient::exported`
     /// rather than being deleted because this device could not tell which had happened.
     pub accounts_kept: u64,
     /// How many this pass established no outcome for.
@@ -288,7 +288,7 @@ crate::debug_fields!(Exported {
 /// [`SyncClient::drop_kept_copy`] asks the service to drop it by.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct KeptCopy {
-    /// The entry [`SyncClient::exported`] lists for it.
+    /// The entry `SyncClient::exported` lists for it.
     pub listed: Exported,
     /// The copy's identity.
     pub copy: SyncConflictId,
@@ -321,7 +321,7 @@ pub fn kept_copies(store: &SyncStore) -> Result<Vec<KeptCopy>> {
 }
 
 /// The entries for the records `store` holds that this build cannot read, as
-/// [`SyncClient::exported`] names them: each may account for something that left this device, and
+/// `SyncClient::exported` names them: each may account for something that left this device, and
 /// none can be described or dropped.
 ///
 /// A list of copies that left out a record it could not read would read as complete, so an
@@ -500,7 +500,7 @@ impl SyncClient {
     ///
     /// An answer this device cannot make sense of leaves the work outstanding rather than throwing
     /// it away: only an accepted write and a refused comparison say what became of a request, and
-    /// nothing else in this contract can. [`Self::exported`] lists such work as content sent
+    /// nothing else in this contract can. `Self::exported` lists such work as content sent
     /// without an answer.
     ///
     /// # Errors
@@ -759,7 +759,7 @@ impl SyncClient {
     /// Asks the service to drop one copy it kept of this device's refused write, because the person
     /// asked for exactly that.
     ///
-    /// It is the way to a copy with nothing on this device to choose about: [`Self::exported`]
+    /// It is the way to a copy with nothing on this device to choose about: `Self::exported`
     /// names each copy the service keeps, as deletable and by the identity the service gave it, and
     /// this is the explicit deletion section 24 offers for it. It asks the service about every
     /// other copy still to go as well, as [`Self::finish_resolutions`] does.
@@ -1325,7 +1325,7 @@ impl SyncClient {
     /// a dispatch with no answer into a settled one, and the privacy steps run it before they
     /// measure. A dispatch whose answer was lost therefore stays counted until something asks the
     /// service about it, and one the service holds no receipt for stays counted until privacy mode
-    /// moves past the generation that admitted it. [`Self::exported`] lists both as content sent
+    /// moves past the generation that admitted it. `Self::exported` lists both as content sent
     /// without an answer, which is what section 24 asks of anything that may already have left.
     ///
     /// # Errors

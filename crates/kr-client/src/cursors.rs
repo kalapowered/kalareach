@@ -34,7 +34,7 @@ use kr_protocol::scalars::{CanonicalSet, Nullable};
 /// orders one stream on one connection: the host starts a fresh subscription at its first event, so
 /// a sequence means nothing on the next connection and is what gap detection works from here. A
 /// *content cursor* is the host's own durable position in what the session produced, so it is what
-/// survives a disconnect and what [`EventsSubscribeParams::from_cursor`] names. A reconnect
+/// survives a disconnect and what `EventsSubscribeParams::from_cursor` names. A reconnect
 /// therefore resumes from the content cursor and starts its sequences again from nothing.
 #[derive(Clone, Default)]
 pub struct StreamCursors {

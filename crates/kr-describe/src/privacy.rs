@@ -15,7 +15,7 @@
 //! applies it at its own moment: `Session::enable_privacy` records it in that session's journal
 //! when the session is told. The model is shared and the queue is shared, but what privacy mode
 //! reaches is each session's, so every type here is keyed by [`SessionId`] and
-//! [`crate::service::DescriptionService::privacy`] hands out a hook for one session. A hook that
+//! `crate::service::DescriptionService::privacy` hands out a hook for one session. A hook that
 //! emptied the whole queue would be cancelling work for sessions not yet told.
 //!
 //! | Call | What it does here |

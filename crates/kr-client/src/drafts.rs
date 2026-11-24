@@ -33,7 +33,7 @@
 //!
 //! There is one way to reach a submission, [`Draft::submission`], and it is a check rather than an
 //! action: it returns the target a caller would submit against, or the reason it may not.
-//! [`Associations::bind`], [`Associations::connection_lost`] and [`Draft::rebind`] return no such
+//! [`Associations::bind`], `Associations::connection_lost` and `Draft::rebind` return no such
 //! thing, so no reconnect and no rebind can turn into a submitted prompt. Sending it is the
 //! caller's own separate step, as section 12 requires of transfer, insertion and submission.
 

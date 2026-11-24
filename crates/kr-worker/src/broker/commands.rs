@@ -860,7 +860,7 @@ impl CommandBackends {
     /// this host's own tests: an open that takes its time.
     ///
     /// Returns the end that says the reading has arrived there and the end that lets it go on;
-    /// unreleased, it goes on by itself after [`DIRECTORY_PAUSE_LIMIT`]. It is compiled away in
+    /// unreleased, it goes on by itself after `DIRECTORY_PAUSE_LIMIT`. It is compiled away in
     /// every shipped build.
     #[cfg(feature = "testing")]
     pub fn pause_before_opening_the_directory(

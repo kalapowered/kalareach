@@ -10,10 +10,10 @@
 //! The document union, the control model and the predicate grammar are the package contract's, in
 //! `kr-plugin-sdk`. What is here is the client's half of the same contract:
 //!
-//! * [`read_document`] turns what arrived into things this build can draw, and anything it cannot
+//! * `read_document` turns what arrived into things this build can draw, and anything it cannot
 //!   read into an [`kr_plugin_sdk::presentation::UnsupportedNode`] that carries no control;
-//! * [`visibility`] decides whether a control is shown, from what this client actually knows;
-//! * [`invoke`] produces the invocation, carrying the control's revision so the host can recheck.
+//! * `visibility` decides whether a control is shown, from what this client actually knows;
+//! * `invoke` produces the invocation, carrying the control's revision so the host can recheck.
 //!
 //! # Why the evaluation here is not the host's
 //!

@@ -24,7 +24,7 @@
 //!
 //! Section 22 bounds the input to *directory/repository metadata and authorised recent semantic
 //! events* and excludes *raw keystrokes, hidden input, environment values, file bodies and full
-//! histories*. [`InputClass`] is that list, [`admits`] is the decision, and
+//! histories*. [`InputClass`] is that list, `admits` is the decision, and
 //! [`ContextBuilder`] is the only way to build a context, so an excluded class has no route in.
 //!
 //! Project text - a repository name, a branch, a task intent somebody typed - is *treated as data*.

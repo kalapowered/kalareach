@@ -1016,7 +1016,7 @@ impl ConnectorSources {
 
 /// Builds connector packages the way the catalogue's store extracts one, for this host's tests.
 ///
-/// A [`Shape`] says what a package is. Claude Code's has its Channels table with the decision
+/// A `Shape` says what a package is. Claude Code's has its Channels table with the decision
 /// destination that answers a relayed tool approval, and the three bridge files core pins; the
 /// Gemini CLI, Qoder CLI and Codex shapes have the integration they release and, for Codex, the
 /// table of its application server. Every manifest names each file by digest and declares the

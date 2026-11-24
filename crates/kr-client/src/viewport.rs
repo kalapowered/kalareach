@@ -18,7 +18,7 @@
 //!   applied from that same cursor afterwards.
 //!
 //! Taking the keyboard is not in that list, deliberately. The input lease and the size are separate
-//! ownerships: [`Display::took_the_keyboard`] records one and touches nothing about the other.
+//! ownerships: `Display::took_the_keyboard` records one and touches nothing about the other.
 
 /// How a client is being shown the session.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -589,13 +589,13 @@ impl Display {
 
     /// Installs the snapshot the switch was waiting for, and returns what to draw after it.
     ///
-    /// `at` is the cursor the snapshot describes, which is the one [`Display::begin_switch`]
+    /// `at` is the cursor the snapshot describes, which is the one `Display::begin_switch`
     /// returned or a later one. Held output the snapshot already contains is discarded; everything
     /// from that cursor onwards is replayed in order, so the client resumes exactly where the
     /// installed state ends.
     ///
     /// `generation` is the value `begin_switch` returned alongside its cursor, obtained from
-    /// [`Display::switch_generation`]. A snapshot for an earlier switch is refused.
+    /// `Display::switch_generation`. A snapshot for an earlier switch is refused.
     ///
     /// # Errors
     ///

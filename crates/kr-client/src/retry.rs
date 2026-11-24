@@ -49,7 +49,7 @@ pub const RETRY_BACKOFF_MAX: Duration = Duration::from_secs(5);
 /// call that never returns, and the caller would have nothing to show for the wait.
 ///
 /// It is also what keeps a retry out of a reconnect's budget. Section 27's KR-PERF-006 gives a
-/// reconnect [`RECONNECT_BUDGET`] to reach a usable screen, and a restoration is idempotent reads,
+/// reconnect `RECONNECT_BUDGET` to reach a usable screen, and a restoration is idempotent reads,
 /// which is exactly what this library retries. The most the delays can add to one of them is the
 /// sum of the ceilings this many retries draw under, and `a_retry_cannot_spend_a_reconnects_budget`
 /// holds that sum well inside it.

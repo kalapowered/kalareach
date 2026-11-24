@@ -249,7 +249,7 @@ pub struct SubmittedAction {
     /// its caller does not hold is marked.
     ///
     /// The host performed nothing of it, so the caller may send it again under this identifier
-    /// ([`Session::mutate_continuing`]), and the host performs an identifier at most once. A
+    /// (`Session::mutate_continuing`), and the host performs an identifier at most once. A
     /// service that keeps the refusals it decides answers the same refusal again. Only the newest
     /// 64 such actions stay on the book, and they do not count toward [`MAX_UNRESOLVED_ACTIONS`]
     /// until a send under the identifier counts again.
@@ -693,8 +693,8 @@ impl Session {
     /// Starts a session that carries what a previous connection had reached.
     ///
     /// This is the client half of section 8's restoration: the cursors are the ones the ended
-    /// session had reached ([`Session::cursors`]), after
-    /// [`StreamCursors::reconnected`](crate::cursors::StreamCursors::reconnected) kept each stream's
+    /// session had reached (`Session::cursors`), after
+    /// `StreamCursors::reconnected` kept each stream's
     /// content position and dropped the previous connection's event sequences.
     ///
     /// # Errors
@@ -781,7 +781,7 @@ impl Session {
     /// A reconnecting client asks the host about these. It never resubmits one: section 9 forbids
     /// dispatching an identifier again because its receipt is incomplete. The exception is an
     /// action marked [`SubmittedAction::refused_for_now`]: the host decided nothing of it, and its
-    /// caller may send it again under its identifier ([`Session::mutate_continuing`]).
+    /// caller may send it again under its identifier (`Session::mutate_continuing`).
     pub async fn submitted_actions(&self) -> Vec<SubmittedAction> {
         self.state
             .outcomes
@@ -1072,7 +1072,7 @@ impl Session {
     /// A host that refuses the mutation for now (a transient code) has decided nothing: the action
     /// stays on the unresolved list, with the others the host refused for now, of which the
     /// newest 64 are kept. A caller that wants the same send tried again sends it under its own
-    /// identifier ([`Session::mutate_continuing`]), or composes it and sends it
+    /// identifier (`Session::mutate_continuing`), or composes it and sends it
     /// ([`Session::send`]); calling this again is a new intent under a new identifier. The host
     /// performs the identifier it is sent at most once.
     ///
