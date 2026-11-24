@@ -813,6 +813,71 @@ mod tests {
         assert!(!said.contains("signed application"), "{said}");
     }
 
+    /// KR-REQ-03.29, KR-REQ-03.30, LP-4: when the removal fails, the answer uses the route's own
+    /// words. A compositor that did not answer and left its image says that a compositor may ask
+    /// the person and that the image could not be removed; it does not use the words of a route
+    /// that asks for an operating system grant.
+    #[test]
+    fn an_unanswered_wayland_route_that_left_its_image_says_so_in_its_own_words() {
+        if !permissions_are_enforced() {
+            return;
+        }
+        let tools = Folder::new();
+        let scratch = Folder::new();
+        let image = tools.file("image.png", &whole(1280, 720));
+        tools.program(
+            "grim",
+            &format!(
+                "cp '{}' \"$1\"\nchmod 555 \"$(dirname \"$1\")\"\nsleep 30",
+                image.display()
+            ),
+        );
+        let operation = resolve(
+            Check::ScreenImage,
+            &desktop(Some("sway")),
+            Some(tools.path().as_os_str()),
+        )
+        .expect("a row");
+        let deadline = Deadline::after(Duration::from_secs(2));
+        let surroundings = Surroundings {
+            desktop: desktop(Some("sway")),
+            variables: variables(tools.path()),
+        };
+        let ran = Platform.perform(
+            Check::ScreenImage,
+            &Plan::in_directory(scratch.path()),
+            &Setting {
+                desktop: &surroundings.desktop,
+                variables: &surroundings.variables,
+                operation: Some(&operation),
+                deadline: &deadline,
+            },
+        );
+        assert!(
+            matches!(ran.outcome, Outcome::NotAnswered { stopped: true, .. }),
+            "{:?}",
+            ran.outcome
+        );
+        assert!(ran.left.is_some(), "the image was not left: {:?}", ran.left);
+        let record = probe::record(
+            &ran,
+            &operation.route,
+            &subject(),
+            WorkerProfile::DesktopBound,
+            CapabilityRevision::new(3),
+            kr_ipc::now_ms(),
+            None,
+        )
+        .expect("a record");
+        let said = reason(&record);
+        assert!(
+            said.contains("Some compositors ask before a program may copy the screen"),
+            "{said}"
+        );
+        assert!(said.contains(", and it could not remove "), "{said}");
+        assert!(!said.contains("signed application"), "{said}");
+    }
+
     /// KR-REQ-03.29, LP-5, the legs that need no compositor: with `grim` on the search path and a
     /// session with no bus, the check performs; with `grim` off the search path it is a missing
     /// installation, and no portal or other row stands in for it. A compositor outside the family,
