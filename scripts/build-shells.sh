@@ -343,6 +343,8 @@ record = {
         "upstream_tests": tests,
     },
     "startup_entry": manifest["startup"],
+    # How a host starts the shell, as the pinned manifest declares it, for each startup mode.
+    "flags": manifest["flags"],
 }
 
 with open(destination, "w", encoding="utf-8") as handle:

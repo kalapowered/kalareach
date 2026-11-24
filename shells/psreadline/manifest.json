@@ -70,6 +70,10 @@
     "marker": "# >>> kalareach shell integration >>>",
     "end_marker": "# <<< kalareach shell integration <<<"
   },
+  "flags": {
+    "interactive": ["-NoLogo"],
+    "login": ["-NoLogo"]
+  },
   "upstream_tests": {
     "command": "",
     "reason": "this package builds no shell"

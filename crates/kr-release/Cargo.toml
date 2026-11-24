@@ -45,6 +45,8 @@ tough.workspace = true
 [dev-dependencies]
 # Places the stand-in programs the sealing tests run, as a separate process writes them.
 kr-ipc = { workspace = true, features = ["testing"] }
+# The table a test holds of what section 7 says each shell is started with.
+kr-shell-integration = { workspace = true, features = ["testing"] }
 tempfile.workspace = true
 
 [lints]

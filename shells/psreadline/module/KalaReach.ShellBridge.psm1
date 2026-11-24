@@ -2206,6 +2206,11 @@ function Publish-KalaReachQualification {
             marker     = $manifest.startup.marker
             end_marker = $manifest.startup.end_marker
         }
+        # How a host starts the shell, as the pinned manifest declares it, for each startup mode.
+        flags         = [ordered]@{
+            interactive = @($manifest.flags.interactive)
+            login       = @($manifest.flags.login)
+        }
         # What this package was qualified against, which is the person's own host and editor. It
         # is recorded here rather than among the paths this package holds, because it is neither
         # installed nor replaced by this package.

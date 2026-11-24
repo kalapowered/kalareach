@@ -242,6 +242,15 @@ fn package(tree: &Path, checkout: &Path, shell: &str) -> Result<ReleaseShell> {
     held_to_the_checkout(checkout, &pins_directory, shell, &pins, &record)
         .map_err(|Refusal(why)| Refusal(at(&why)))?;
 
+    // How a host starts the shell: the record states the flags the pins declare, for each startup
+    // mode. A record is a file, and an edit of it changes no input the identity is a digest of.
+    if !pins["flags"].is_object() {
+        refuse!("{}", at("the pins declare no flags"));
+    }
+    if record["flags"] != pins["flags"] {
+        refuse!("{}", at("it records other flags than the pins declare"));
+    }
+
     // The startup entry in the tree is the checkout's, in the package and in the stable place an
     // installed host's startup files source it from.
     let entry = text(&pins["startup"]["file"])?;

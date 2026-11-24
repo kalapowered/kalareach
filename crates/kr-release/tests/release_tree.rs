@@ -885,3 +885,91 @@ fn a_windows_tree_carries_the_powershell_package_as_files() {
         why(&refused)
     );
 }
+
+/// KR-REQ-07.16: the flags each shell package is started with are the pins' own, and they are the
+/// ones section 7 states for that shell.
+///
+/// Section 7 gives the packaged Zsh `-l -i` on macOS and `-i` on Linux, Bash the same, Fish
+/// `--interactive` with `--login` for a login profile, and PowerShell 7 `-NoLogo`. The pins are
+/// where the repository declares them, the build copies them into a package's record, and a host
+/// passes on what the record says, so this is the one place the table is checked against the text.
+#[test]
+fn the_pins_declare_the_flags_section_seven_states() {
+    use kr_shell_integration::contract::qualification::ShellKind;
+    use kr_shell_integration::host::package::PackageFlags;
+
+    for (pins, kind) in [
+        ("zsh", ShellKind::Zsh),
+        ("bash", ShellKind::Bash),
+        ("fish", ShellKind::Fish),
+        ("psreadline", ShellKind::PowerShell),
+    ] {
+        let file = checkout().join("shells").join(pins).join("manifest.json");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&file).expect("the pins")).expect("the pins");
+        let declared: PackageFlags =
+            serde_json::from_value(manifest["flags"].clone()).expect("the pins declare flags");
+        assert_eq!(
+            declared,
+            PackageFlags::section_seven(kind),
+            "{pins}: the flags the pins declare"
+        );
+    }
+}
+
+/// KR-REQ-07.16: a package whose record states other flags than the pins declare, or whose pins
+/// declare none, is refused before the tree is signed.
+///
+/// The record is a file and an edit of it changes none of the inputs the identity is a digest of,
+/// so the flags are compared with the pins on their own.
+#[test]
+#[ignore = "builds a tree of this checkout's shell packages; it runs with --include-ignored where they are built"]
+fn a_record_whose_flags_differ_from_the_pins_is_refused_before_it_is_signed() {
+    assert!(
+        packages().contains(&"zsh"),
+        "the Zsh package is not built here"
+    );
+    let edit_record = |release: &Release, edit: &dyn Fn(&mut serde_json::Value)| {
+        let shell = release.tree().join("shells/zsh");
+        let identity = std::fs::read_to_string(shell.join("current")).expect("the pointer");
+        let path = shell.join(identity.trim()).join("kr-shell-identity.json");
+        let mut record: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).expect("a record")).expect("a record");
+        edit(&mut record);
+        std::fs::write(path, record.to_string()).expect("the record");
+    };
+
+    // The unedited tree is the control.
+    let release = tree_of();
+    assemble(&inputs(&release.tree())).expect("the unedited tree passes");
+
+    // A record that states the login flags of another shell.
+    let release = tree_of();
+    edit_record(&release, &|record| {
+        record["flags"]["login"] = serde_json::json!(["--login", "--interactive"]);
+    });
+    let refused = assemble(&inputs(&release.tree())).expect_err("other flags");
+    assert!(
+        refused
+            .to_string()
+            .contains("it records other flags than the pins declare"),
+        "{refused}"
+    );
+
+    // A record that states none.
+    let release = tree_of();
+    edit_record(&release, &|record| {
+        record
+            .as_object_mut()
+            .expect("an object")
+            .remove("flags")
+            .expect("the record had flags");
+    });
+    let refused = assemble(&inputs(&release.tree())).expect_err("no flags");
+    assert!(
+        refused
+            .to_string()
+            .contains("it records other flags than the pins declare"),
+        "{refused}"
+    );
+}

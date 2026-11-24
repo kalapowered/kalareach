@@ -111,6 +111,10 @@
     "marker": "# >>> kalareach shell integration >>>",
     "end_marker": "# <<< kalareach shell integration <<<"
   },
+  "flags": {
+    "interactive": ["-i"],
+    "login": ["-l", "-i"]
+  },
   "upstream_tests": {
     "command": "check",
     "reason": ""
