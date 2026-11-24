@@ -1723,8 +1723,9 @@ async fn the_fixture_reads_a_commit_on_the_launchers_clock() {
     let (arrived, release) = setup.backends.pause_before_showing();
     let mut launcher = Launcher::start(&launch);
     let pause = async {
-        arrived
+        tokio::time::timeout(std::time::Duration::from_secs(60), arrived)
             .await
+            .expect("the launch reaches the backend and waits there")
             .expect("the launch reaches the backend and waits there");
         tokio::time::sleep(BACKEND_PAUSE).await;
         release.send(()).expect("the backend is let go");
