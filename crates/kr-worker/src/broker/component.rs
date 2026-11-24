@@ -713,4 +713,69 @@ mod tests {
             text.len()
         );
     }
+
+    /// Notes that pass the report's bound are cut from their last clauses, at a character boundary,
+    /// with the cut flagged and no marker text added. The restart's own words come before the
+    /// faults and the counts, so they are cut last.
+    #[test]
+    fn notes_that_pass_the_report_bound_are_cut_from_their_last_clauses_and_flagged() {
+        let recovery = Recovery::after_a_long_outage().words();
+        // The runtime's words come in any length and any script: two-byte characters here, set so
+        // that the bound falls inside one.
+        let whole_with = |detail: String| {
+            let notes = ComponentNotes {
+                registration: Some("loaded from the compiled-code cache in 120 ms".to_owned()),
+                recovery: Some(recovery.clone()),
+                fault: Some(FaultNote {
+                    call: "decode".to_owned(),
+                    detail: Some(detail),
+                    faults_in_window: 3,
+                }),
+                decoding: Some(DecodingNote {
+                    count: 99_999,
+                    last: NotDecoded::Failed,
+                }),
+                encoding: Some(EncodingNote {
+                    count: 99_999,
+                    last: NotEncoded::Failed,
+                }),
+                ..ComponentNotes::default()
+            };
+            notes.text(false).expect("the notes say something")
+        };
+        let mut whole = whole_with("é".repeat(600));
+        if whole.is_char_boundary(MAX_REPORT_DETAIL_BYTES) {
+            whole = whole_with(format!("x{}", "é".repeat(600)));
+        }
+        assert!(
+            !whole.is_char_boundary(MAX_REPORT_DETAIL_BYTES),
+            "the bound falls inside a character"
+        );
+
+        let (shown, was_cut) = std::panic::catch_unwind(|| cut(&whole))
+            .expect("a cut inside a character does not panic");
+        assert!(was_cut, "the cut is flagged");
+        assert!(
+            shown.len() <= MAX_REPORT_DETAIL_BYTES,
+            "{} bytes of {MAX_REPORT_DETAIL_BYTES}",
+            shown.len()
+        );
+        assert!(
+            whole.starts_with(&shown),
+            "the cut text is a prefix of the whole, with no marker added"
+        );
+        assert!(
+            shown.contains(&recovery),
+            "the restart's words are cut last"
+        );
+        assert!(
+            !shown.contains("answers were not written"),
+            "the last clause goes first"
+        );
+
+        let (at_the_bound, was_cut) = cut(&"a".repeat(MAX_REPORT_DETAIL_BYTES));
+        assert!(!was_cut && at_the_bound.len() == MAX_REPORT_DETAIL_BYTES);
+        let (over_the_bound, was_cut) = cut(&"a".repeat(MAX_REPORT_DETAIL_BYTES + 1));
+        assert!(was_cut && over_the_bound.len() == MAX_REPORT_DETAIL_BYTES);
+    }
 }
