@@ -301,10 +301,11 @@ fn named(display: &str) -> Named {
         let (number, screen) = rest
             .split_once('.')
             .map_or((rest, None), |(number, screen)| (number, Some(screen)));
-        if digits(number) && screen.is_none_or(digits) {
-            if let Ok(number) = number.parse() {
-                return Named::Here(number);
-            }
+        if digits(number)
+            && screen.is_none_or(digits)
+            && let Ok(number) = number.parse()
+        {
+            return Named::Here(number);
         }
         return Named::Nowhere;
     }
