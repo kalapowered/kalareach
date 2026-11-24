@@ -28,6 +28,18 @@
       "sha256": "b47387386076db46382e2e37ca7d4fbbc85b77a5464a1666314a4a6eda6dd8a5"
     },
     {
+      "id": "aws-lc-rs-22e629d5c462-aws-lc-sys-LICENSE",
+      "licence": "ISC",
+      "source": "https://raw.githubusercontent.com/aws/aws-lc-rs/22e629d5c46276497a24ee3e575be4315940e7cb/aws-lc-sys/LICENSE",
+      "sha256": "728536b4160e051f86d7c9c388f704866b3d512cd7df97ac3516c65279523c4e"
+    },
+    {
+      "id": "dunce-1ee29a83526c-LICENSE",
+      "licence": "CC0-1.0",
+      "source": "https://gitlab.com/kornelski/dunce/-/raw/1ee29a83526c9f4c3618e1335f0454c878a54dcf/LICENSE",
+      "sha256": "a2010f343487d3f7618affe54f789f5487602331c0a8d03f49e9a7c547cf0499"
+    },
+    {
       "id": "fluent-langneg-rs-7fdc590466ea-LICENSE-MIT",
       "licence": "MIT",
       "source": "https://raw.githubusercontent.com/projectfluent/fluent-langneg-rs/7fdc590466ea63ca2367ac10fb1b881fe561f1a8/LICENSE-MIT",
@@ -154,6 +166,13 @@
       ]
     },
     {
+      "name": "aws-lc-rs",
+      "version": "1.18.1",
+      "texts": [
+        "aws-lc-rs-22e629d5c462-aws-lc-sys-LICENSE"
+      ]
+    },
+    {
       "name": "block2",
       "version": "0.6.2",
       "texts": [
@@ -202,6 +221,13 @@
       "texts": [
         "objc2-8852b424193c-LICENSE.md",
         "MIT-spdx-3.29.0-without-copyright-line"
+      ]
+    },
+    {
+      "name": "dunce",
+      "version": "1.0.5",
+      "texts": [
+        "dunce-1ee29a83526c-LICENSE"
       ]
     },
     {
