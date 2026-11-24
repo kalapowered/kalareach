@@ -68,10 +68,10 @@
           "kind": "sqlite_table",
           "table": "attention_schema"
         },
-        "version": 12,
+        "version": 13,
         "migrates_from": 9
       },
-      "digest": "c1f7a7d3b4d65fd3e36644d92957928b76b0d24c25257c09f129a5e599e3e45b",
+      "digest": "439131d20dfd7297d3620e1ce64f0ed84aa2e836e958365523d5876ddd338cf0",
       "kept": [
         "AttentionAcknowledgeResult",
         "AttentionQuietHoursResult",
