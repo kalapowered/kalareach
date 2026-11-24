@@ -5647,10 +5647,11 @@ fn written_by_words(row: usize, column: usize, text: &str) -> String {
     written
 }
 
-/// The screen of the pinned build with no login as the build draws it: the header of a chat that is
-/// still loading, then, once the build knows there is no login, a scroll of one row, a clear below
-/// the first row and the sign-in menu written word by word. The scroll keeps the header's top border
-/// in the first row, and the menu's welcome line is written over it.
+/// The screen that the pinned build with no login showed in the 2b leg, scripted in the order of the
+/// bytes that were captured: the header of a chat that is still loading, then a scroll of one row, a
+/// clear below the first row and the sign-in menu, whose titles are written word by word and whose
+/// descriptions are written whole. The scroll keeps the header's top border in the first row, and
+/// the menu's welcome line is written over it.
 fn sign_in_menu_over_a_scrolled_header() -> Vec<String> {
     let mut terminal =
         kr_e2e_m1b::screen::Terminal::new(kr_e2e_m1b::window::COLUMNS, kr_e2e_m1b::window::ROWS);
@@ -5671,8 +5672,11 @@ fn sign_in_menu_over_a_scrolled_header() -> Vec<String> {
         ),
         written_by_words(4, 3, "or connect an API key for usage-based billing"),
         "\x1b[6;1H> 1. Sign in with ChatGPT".to_owned(),
+        "\x1b[7;1H     Usage included with Plus, Pro, Business, and Enterprise plans".to_owned(),
         written_by_words(9, 3, "2. Sign in with Device Code"),
+        "\x1b[10;1H     Sign in from another device with a one-time code".to_owned(),
         written_by_words(12, 3, "3. Provide your own API key"),
+        "\x1b[13;1H     Pay for what you use".to_owned(),
         "\x1b[15;1H  Press enter to continue".to_owned(),
     ]
     .concat();
@@ -5680,15 +5684,38 @@ fn sign_in_menu_over_a_scrolled_header() -> Vec<String> {
     terminal.rows()
 }
 
-/// The first screen of the pinned build with no login is found, whatever the scroll left in the
-/// cells between the words of its welcome line: a row that shows the words with the cells of the
-/// header's border between them is read as the words, and a row of other words is not.
+/// The first screen of the pinned build with no login is found when the border characters that a
+/// scroll left between the words of its welcome line stand where blanks would be: a row that shows
+/// the words with such characters between them is read as the words, a row of other words is not,
+/// and the words of two rows are not one line.
 #[test]
 fn the_sign_in_menu_over_a_scrolled_header_shows_its_welcome_line() {
     let rows = sign_in_menu_over_a_scrolled_header();
     // The screen is the one the 2b leg read, and the plain search misses it.
+    let read_by_the_leg = [
+        "╭─Welcome─to─Codex,─OpenAI's─command-line╮coding agent",
+        "",
+        "  Sign in with ChatGPT to use Codex as part of your paid plan",
+        "  or connect an API key for usage-based billing",
+        "",
+        "> 1. Sign in with ChatGPT",
+        "     Usage included with Plus, Pro, Business, and Enterprise plans",
+        "",
+        "  2. Sign in with Device Code",
+        "     Sign in from another device with a one-time code",
+        "",
+        "  3. Provide your own API key",
+        "     Pay for what you use",
+        "",
+        "  Press enter to continue",
+    ];
     assert_eq!(
-        rows[0], "╭─Welcome─to─Codex,─OpenAI's─command-line╮coding agent",
+        rows,
+        read_by_the_leg
+            .into_iter()
+            .chain(std::iter::repeat(""))
+            .take(rows.len())
+            .collect::<Vec<_>>(),
         "the scripted screen is the one the leg read"
     );
     assert!(
@@ -5709,7 +5736,7 @@ fn the_sign_in_menu_over_a_scrolled_header_shows_its_welcome_line() {
     );
     assert!(
         !screen_shows(
-            &["╭─Welcome─to─Claude─╮".to_owned(), "Codex".to_owned()],
+            &["Welcome to".to_owned(), "Codex".to_owned()],
             "Welcome to Codex"
         ),
         "words of two rows are not one line"
