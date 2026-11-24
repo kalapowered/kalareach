@@ -6118,17 +6118,13 @@ async fn a_kit_or_export_file_that_is_not_one_is_refused_in_words() {
             "{path:?}"
         );
     }
-    // A file over a kit's size, and text that is no kit, show the library's own words.
+    // A file over a kit's size is refused with no size, since the read stops one byte past the
+    // limit and the file's own size is not known; text that is no kit shows the library's words.
     let long = join("long.txt");
     std::fs::write(&long, vec![b'a'; 4096]).expect("a file");
     assert_eq!(
         refused(vec![Some(long)], false).await,
-        format!(
-            "the recovery kit renders to {} bytes, over the {}-byte limit",
-            kr_client::recovery::MAX_RECOVERY_KIT_BYTES + 1,
-            kr_client::recovery::MAX_RECOVERY_KIT_BYTES
-        ),
-        "the read stops one byte past a kit's size"
+        "the kit file is larger than a recovery kit is"
     );
     let no_kit = join("no-kit.txt");
     std::fs::write(&no_kit, b"this is not a kit").expect("a file");

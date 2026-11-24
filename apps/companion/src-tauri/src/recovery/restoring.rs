@@ -216,6 +216,12 @@ fn read_kit(path: &Path) -> Result<RecoveryKit> {
                 .read_to_end(&mut bytes)
         })
         .map_err(|_| unreadable())?;
+    // The read stopped one byte past the limit, so this is all that is known of the file's size.
+    if bytes.len() > MAX_RECOVERY_KIT_BYTES {
+        return Err(CommandError::invalid(
+            "the kit file is larger than a recovery kit is",
+        ));
+    }
     let text = std::str::from_utf8(&bytes).map_err(|_| unreadable())?;
     parse_kit(text).map_err(said)
 }
