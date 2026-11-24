@@ -2967,6 +2967,42 @@ mod consumed {
         );
     }
 
+    /// KR-REQ-24.24: a binding that cannot read its queue cannot say that nothing was offered, so a
+    /// restore that carries a position replaces nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn kr_req_24_24_a_restore_with_a_position_replaces_nothing_when_the_queue_cannot_be_read()
+    {
+        let Some((_host, binding, _received)) = bound("recording", 28, DEFAULT_EVENT_QUEUE).await
+        else {
+            return;
+        };
+        let state = binding
+            .checkpoint(ANSWER)
+            .await
+            .expect("the checkpoint runs")
+            .answer
+            .expect("the component answers")
+            .state;
+        binding.poison_queue();
+        let restored = binding
+            .restore_if_unoffered(
+                state,
+                Through {
+                    native: None,
+                    terminal: Some(handle("se-1")),
+                },
+                ANSWER,
+            )
+            .await
+            .expect("the restore runs");
+        assert_eq!(
+            restored.answer,
+            Ok(Restored::Skipped),
+            "a restore with a position replaced the state although the queue could not be read"
+        );
+        assert_eq!(binding.restores(), 0, "the binding took a restore in");
+    }
+
     /// KR-REQ-24.24: an event the component declined is consumed, and a checkpoint right after it
     /// names it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
