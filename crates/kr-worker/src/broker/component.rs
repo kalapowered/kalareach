@@ -690,9 +690,8 @@ mod tests {
         );
     }
 
-    /// What a long outage usually says leaves room for the notes before and after it. The words
-    /// with a clause for every way a request is left out, and every count at its widest, can pass
-    /// the bound by themselves: the next case.
+    /// What a long outage usually says leaves room for the notes before and after it. The longest
+    /// form of the words is the next case.
     #[test]
     fn what_a_long_outage_says_does_not_cut_the_notes_that_follow_it() {
         let notes = ComponentNotes {
@@ -717,39 +716,32 @@ mod tests {
         );
     }
 
+    /// The longest registration note: a count of milliseconds at its widest.
+    fn the_longest_registration_note() -> String {
+        format!("loaded from the compiled-code cache in {} ms", u64::MAX)
+    }
+
     /// The longest form of the restart's words, a clause for every way a request is left out and
-    /// every count at its widest, passes the report's bound by itself. It is cut from its last
-    /// clauses, the decode counts first, and flagged; what the component was given and what was
-    /// left out come before it.
+    /// every count at its widest, fits the report's bound with the longest registration note
+    /// before it: nothing is cut and nothing is flagged.
     #[test]
-    fn the_longest_form_of_the_restart_words_is_cut_from_its_last_clauses_and_flagged() {
+    fn the_longest_form_of_the_restart_words_fits_the_bound_with_the_registration_note() {
         let words = Recovery::with_every_clause().words();
         let notes = ComponentNotes {
+            registration: Some(the_longest_registration_note()),
             recovery: Some(words.clone()),
             ..ComponentNotes::default()
         };
         let text = notes.text(false).expect("the notes say something");
-        assert_eq!(text, words);
+        assert!(text.ends_with(&words), "{text}");
         assert!(
-            text.len() > MAX_REPORT_DETAIL_BYTES,
-            "the longest form is {} bytes of {MAX_REPORT_DETAIL_BYTES}",
+            text.len() <= MAX_REPORT_DETAIL_BYTES,
+            "{} bytes of {MAX_REPORT_DETAIL_BYTES}: {text}",
             text.len()
         );
         let (shown, was_cut) = cut(&text);
-        assert!(was_cut, "the cut is flagged");
-        assert!(shown.len() <= MAX_REPORT_DETAIL_BYTES);
-        assert!(text.starts_with(&shown), "a prefix, with no marker added");
-        for kept in [
-            "the worker gave it 64 pending requests from its own records",
-            "could not be given because the worker could not use their bytes",
-            "while the plugin runtime was away the worker passed over",
-        ] {
-            assert!(shown.contains(kept), "{kept}: {shown}");
-        }
-        assert!(
-            !shown.contains("because the decode queue was full"),
-            "the decode counts are the last clause, and it is cut: {shown}"
-        );
+        assert!(!was_cut, "the longest form is cut: {text}");
+        assert_eq!(shown, text);
     }
 
     /// Notes that pass the report's bound are cut from their last clauses, at a character boundary,
@@ -757,12 +749,12 @@ mod tests {
     /// faults and the counts, so they are cut last.
     #[test]
     fn notes_that_pass_the_report_bound_are_cut_from_their_last_clauses_and_flagged() {
-        let recovery = Recovery::after_a_long_outage().words();
+        let recovery = Recovery::with_every_clause().words();
         // The runtime's words come in any length and any script: two-byte characters here, set so
         // that the bound falls inside one.
         let whole_with = |detail: String| {
             let notes = ComponentNotes {
-                registration: Some("loaded from the compiled-code cache in 120 ms".to_owned()),
+                registration: Some(the_longest_registration_note()),
                 recovery: Some(recovery.clone()),
                 fault: Some(FaultNote {
                     call: "decode".to_owned(),

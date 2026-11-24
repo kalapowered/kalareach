@@ -265,7 +265,7 @@ pub struct Recovery {
     pub over_cap: u64,
     /// Requests the plugin runtime refused.
     pub refused: u64,
-    /// Requests that were not given because the plugin runtime did not answer.
+    /// Requests the plugin runtime did not answer about: they may have been given.
     pub unanswered: u64,
     /// Upstream frames the worker passed over while the plugin runtime was away, with their bytes.
     pub passed: Tally,
@@ -420,49 +420,39 @@ impl Recovery {
             }
             parts.push(text);
         }
-        let request = |count: u64| noun(count, "request", "requests");
+        // One sentence, one count for each cause. A request the runtime did not answer about may
+        // have been given, so it is not among those left out.
+        let mut causes = Vec::new();
         if self.unavailable > 0 {
-            parts.push(format!(
-                "{} pending {} could not be given because the worker could not use {}",
-                self.unavailable,
-                request(self.unavailable),
-                noun(self.unavailable, "its bytes", "their bytes")
+            causes.push(format!(
+                "{} whose bytes could not be used",
+                self.unavailable
             ));
         }
         if self.oversized > 0 {
-            parts.push(format!(
-                "{} pending {} could not be given because {} too large for one event",
-                self.oversized,
-                request(self.oversized),
-                noun(self.oversized, "it is", "they are")
-            ));
+            causes.push(format!("{} too large for one event", self.oversized));
         }
         if self.over_cap > 0 {
-            parts.push(format!(
-                "{} pending {} {} not given because the worker gives at most {} requests or 4 MiB \
-                 when a component starts again",
-                self.over_cap,
-                request(self.over_cap),
-                noun(self.over_cap, "was", "were"),
-                MAX_RETAINED_FRAMES
+            causes.push(format!(
+                "{} over the limit of {MAX_RETAINED_FRAMES} requests or 4 MiB",
+                self.over_cap
             ));
         }
         if self.refused > 0 {
-            parts.push(format!(
-                "{} pending {} {} not given because the plugin runtime refused {}",
-                self.refused,
-                request(self.refused),
-                noun(self.refused, "was", "were"),
-                noun(self.refused, "it", "them")
-            ));
+            causes.push(format!("{} refused by the plugin runtime", self.refused));
+        }
+        if let Some((last, earlier)) = causes.split_last() {
+            let list = if earlier.is_empty() {
+                last.clone()
+            } else {
+                format!("{} and {last}", earlier.join(", "))
+            };
+            parts.push(format!("pending requests left out: {list}"));
         }
         if self.unanswered > 0 {
             parts.push(format!(
-                "{} pending {} {} not confirmed as given because the plugin runtime did not \
-                 answer",
-                self.unanswered,
-                request(self.unanswered),
-                noun(self.unanswered, "was", "were")
+                "{} not confirmed as given because the plugin runtime did not answer",
+                self.unanswered
             ));
         }
     }
@@ -565,17 +555,48 @@ mod tests {
             ..Recovery::default()
         }
         .words();
-        for clause in [
-            "1 pending request could not be given because the worker could not use its bytes",
-            "2 pending requests could not be given because they are too large for one event",
-            "3 pending requests were not given because the worker gives at most 64 requests or 4 \
-             MiB when a component starts again",
-            "1 pending request was not given because the plugin runtime refused it",
-            "2 pending requests were not confirmed as given because the plugin runtime did not answer",
-        ] {
-            assert!(words.contains(clause), "{clause}: {words}");
-        }
+        assert!(
+            words.ends_with(
+                "; pending requests left out: 1 whose bytes could not be used, 2 too large for \
+                 one event, 3 over the limit of 64 requests or 4 MiB and 1 refused by the plugin \
+                 runtime; 2 not confirmed as given because the plugin runtime did not answer"
+            ),
+            "{words}"
+        );
         assert!(!words.contains("had no pending request"), "{words}");
+    }
+
+    #[test]
+    fn the_requests_left_out_are_one_sentence_with_a_count_for_each_cause_that_has_one() {
+        let words_of = |unavailable, oversized, over_cap, refused, unanswered| {
+            Recovery {
+                baseline: true,
+                unavailable,
+                oversized,
+                over_cap,
+                refused,
+                unanswered,
+                ..Recovery::default()
+            }
+            .words()
+        };
+        let after = "started again after the plugin runtime was lost, with no state or history from \
+                     before the loss; ";
+        assert_eq!(
+            words_of(1, 0, 0, 0, 0),
+            format!("{after}pending requests left out: 1 whose bytes could not be used")
+        );
+        assert_eq!(
+            words_of(0, 4, 0, 2, 0),
+            format!(
+                "{after}pending requests left out: 4 too large for one event and 2 refused by the \
+                 plugin runtime"
+            )
+        );
+        assert_eq!(
+            words_of(0, 0, 0, 0, 3),
+            format!("{after}3 not confirmed as given because the plugin runtime did not answer")
+        );
     }
 
     #[test]
@@ -639,12 +660,13 @@ mod tests {
             ..Recovery::default()
         }
         .words();
-        for clause in [
-            "1 pending request could not be given because the worker could not use its bytes",
-            "1 pending request was not given because the worker gives at most 64 requests",
-        ] {
-            assert!(words.contains(clause), "{clause}: {words}");
-        }
+        assert!(
+            words.contains(
+                "pending requests left out: 1 whose bytes could not be used and 1 over the limit \
+                 of 64 requests or 4 MiB"
+            ),
+            "{words}"
+        );
 
         // The bound on bytes: two requests of two MiB fit, a third does not.
         let mut fill = Fill::default();
@@ -665,13 +687,9 @@ mod tests {
         for clause in [
             "the worker gave it 64 pending requests from its own records, oldest first, 64 of them \
              already read as approvals",
-            "99999 pending requests could not be given because the worker could not use their bytes",
-            "64 pending requests could not be given because they are too large for one event",
-            "99999 pending requests were not given because the worker gives at most 64 requests or 4 \
-             MiB when a component starts again",
-            "64 pending requests were not given because the plugin runtime refused them",
-            "64 pending requests were not confirmed as given because the plugin runtime did not \
-             answer",
+            "pending requests left out: 99999 whose bytes could not be used, 64 too large for one \
+             event, 99999 over the limit of 64 requests or 4 MiB and 64 refused by the plugin \
+             runtime; 64 not confirmed as given because the plugin runtime did not answer",
             "99999 upstream frames (99999999 bytes) and 99999 terminal spans (99999999 bytes)",
             "99999 observations (9999999 bytes) were dropped because the worker's queue was full",
             "8 pending requests were queued to be decoded again",

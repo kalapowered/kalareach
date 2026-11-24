@@ -2229,7 +2229,7 @@ async fn kr_req_24_24_the_worker_gives_at_most_what_it_holds_and_says_what_it_co
     let reason = world.reason(1);
     for clause in [
         "the worker gave it 64 pending requests from its own records, oldest first",
-        "5 pending requests could not be given because the worker could not use their bytes",
+        "pending requests left out: 5 whose bytes could not be used",
     ] {
         assert!(reason.contains(clause), "{clause}: {reason}");
     }
