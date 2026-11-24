@@ -158,6 +158,8 @@ pub fn resolve(
             ),
             target: row.target,
         })
+        // A part adds the rows of its own desktop from a file of its own.
+        .or_else(|| super::wayland::resolve(check, desktop, search))
 }
 
 /// The route the file read takes, which is the same operation everywhere and has no program.

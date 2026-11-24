@@ -644,7 +644,7 @@ const PROTOCOL_TOOLS: &[&str] = &["grim", "grimblast", "wtype"];
 /// built against those protocols is not waiting on a permission. Both halves are checked: this
 /// list is about the compositor and [`PROTOCOL_TOOLS`] is about the tool. A compositor that is not
 /// on it leaves the answer unestablished rather than claimed either way.
-fn wlroots(compositor: &str) -> bool {
+pub(super) fn wlroots(compositor: &str) -> bool {
     ["sway", "river", "hyprland", "wayfire", "labwc", "niri"]
         .iter()
         .any(|known| compositor.contains(known))
@@ -911,7 +911,7 @@ mod tests {
         let search = std::ffi::OsString::from(&directory);
         for (server, compositor) in [
             (DisplayServer::X11, "x"),
-            (DisplayServer::Wayland, "sway"),
+            (DisplayServer::Wayland, "gnome"),
             (DisplayServer::WindowsDesktop, "dwm"),
         ] {
             for check in [
@@ -929,6 +929,23 @@ mod tests {
                     "{server:?} has no route for {check:?} yet, so it names no tool for it"
                 );
             }
+        }
+        // A compositor of the wlroots family has a route for the screen image, and it names the
+        // program that route runs and no other.
+        let sway = desktop(DisplayServer::Wayland, Some("sway"));
+        let operation = resolve(Check::ScreenImage, &sway, Some(search.as_os_str()))
+            .expect("the wlroots family has a route for the screen image");
+        assert_eq!(
+            operation.program.named_path(),
+            Some(format!("{}/grim", directory.display()).as_str()),
+            "names grim and not grimblast"
+        );
+        for check in [Check::AccessibleElement, Check::ApplicationLaunch] {
+            assert_eq!(
+                resolve(check, &sway, Some(search.as_os_str())),
+                None,
+                "no route for {check:?}"
+            );
         }
         #[cfg(target_os = "macos")]
         for (check, tool) in [

@@ -52,9 +52,11 @@
 pub mod capability;
 pub mod checks;
 mod children;
+mod payload;
 pub mod platform;
 pub mod probe;
 pub mod routes;
+mod wayland;
 
 use std::time::{Duration, Instant};
 

@@ -79,6 +79,7 @@ use super::routes::{
     Asking, ContextSource, Operation, Program, Route, Surroundings, Variables, file_read_route,
     resolve,
 };
+use super::wayland;
 
 /// One disclosed check.
 ///
@@ -513,10 +514,14 @@ pub fn judge(
         Outcome::FacilityMissing => (
             CapabilityState::MissingInstallation,
             CapabilityEvidenceSource::PlatformQuery,
-            Some(Sentence::new().stated(
+            Some(Sentence::new().stated(if asking == Asking::ForAGrant {
                 "the platform facility this check performs the operation with is not installed, \
-                 so there was nothing to run and nothing to grant",
-            )),
+                 so there was nothing to run and nothing to grant"
+            } else {
+                // Where no grant exists there is nothing to grant, and saying so would name a
+                // permission that is not part of this route.
+                "the tool this check runs is not installed, so nothing was run"
+            })),
         ),
         Outcome::Unsupported { detail } => (
             CapabilityState::Incompatible,
@@ -528,7 +533,10 @@ pub fn judge(
                          perform it: ",
                     )
                     .sentence(detail)
-                    .stated(". That is a limit of the installed version, not a missing permission"),
+                    .stated(
+                        ". That is a limit of this tool on this desktop, not a missing permission; \
+                         another tool or route may still work",
+                    ),
             ),
         ),
         Outcome::NotAnswered { waited, stopped } => (
@@ -1134,6 +1142,11 @@ impl Facilities for Platform {
                         detail: Sentence::new().stated(words),
                     },
                 },
+                // A route is performed by the program it names, whichever platform this build is
+                // for: the Wayland screen-copy route is run the same way wherever a case runs it.
+                Some(operation) if wayland::performs(operation) => {
+                    wayland::perform(check, plan, setting, operation)
+                }
                 Some(operation) => platform::perform(check, plan, setting, operation),
             },
         }
@@ -1960,7 +1973,7 @@ fn installed(path: &str) -> Option<String> {
 /// them to decide what happened and says what it decided, so they reach an answer as their class
 /// and their length and never as themselves.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-enum Exit {
+pub(super) enum Exit {
     /// It exited successfully, having printed this.
     Succeeded(String),
     /// It exited with a failure, having said this: what it printed on its error output, or on its
@@ -1971,17 +1984,15 @@ enum Exit {
 }
 
 /// One facility, run to an end.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-struct Run {
+pub(super) struct Run {
     /// The facility, by absolute path, where it was there to run.
-    facility: Option<String>,
+    pub(super) facility: Option<String>,
     /// What came of it.
-    exit: Exit,
+    pub(super) exit: Exit,
 }
 
 /// What a facility that exited with a failure said, as an answer carries it.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-fn failed(said: &str) -> Sentence {
+pub(super) fn failed(said: &str) -> Sentence {
     let failure = Sentence::new().stated("the facility exited with a failure");
     if said.is_empty() {
         failure.stated(" and printed nothing")
@@ -2048,6 +2059,22 @@ fn bounded(
     plan: &Plan,
     deadline: &Deadline,
 ) -> Run {
+    bounded_with(check, program, arguments, &[], plan, deadline)
+}
+
+/// [`bounded`], with variables of its own for the facility: each is set to its value, or removed
+/// from what the facility inherits where it has none.
+///
+/// A route whose facility reads the desktop from its environment gives it the variables the check
+/// was resolved with, so that what the check read and what the facility acts on cannot differ.
+pub(super) fn bounded_with(
+    check: Check,
+    program: &str,
+    arguments: &[&str],
+    environment: &[(&str, Option<&str>)],
+    plan: &Plan,
+    deadline: &Deadline,
+) -> Run {
     let facility = installed(program);
     if facility.is_none() {
         return Run {
@@ -2102,6 +2129,12 @@ fn bounded(
             .stdin(std::process::Stdio::null())
             .stdout(out)
             .stderr(err);
+        for (variable, value) in environment {
+            match value {
+                Some(value) => command.env(variable, value),
+                None => command.env_remove(variable),
+            };
+        }
         // A group of its own, so that ending the facility ends what it started as well: a
         // descendant that outlived its parent would go on running after the check answered.
         super::children::in_a_group_of_its_own(&mut command);
@@ -2173,8 +2206,7 @@ fn bounded(
 ///
 /// A file that cannot be read is an empty one, which is what every caller does with it. `None` is
 /// the time running out, which is a different thing.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-fn read_within(path: &Path, deadline: &Deadline) -> Option<Vec<u8>> {
+pub(super) fn read_within(path: &Path, deadline: &Deadline) -> Option<Vec<u8>> {
     use std::io::Read as _;
 
     if deadline.expired() {
@@ -2199,17 +2231,14 @@ fn read_within(path: &Path, deadline: &Deadline) -> Option<Vec<u8>> {
 }
 
 /// [`read_within`], as the text the file holds, which is empty where it is not text.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn text_within(path: &Path, deadline: &Deadline) -> Option<String> {
     read_within(path, deadline).map(|bytes| String::from_utf8(bytes).unwrap_or_default())
 }
 
 /// How often a running facility is asked whether it has finished.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 const POLL: Duration = Duration::from_millis(50);
 
 /// A short file-name stem for one check.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 const fn name(check: Check) -> &'static str {
     match check {
         Check::AuthorisedFileRead => "authorised-file-read",
@@ -3684,8 +3713,8 @@ mod tests {
         assert_eq!(
             reason.expect("a reason").as_str(),
             "this context started the operation and the installed facility cannot perform it: \
-             it has no such option. That is a limit of the installed version, not a missing \
-             permission"
+             it has no such option. That is a limit of this tool on this desktop, not a missing \
+             permission; another tool or route may still work"
         );
         let (state, evidence, _) = judge(Check::ScreenImage, &Outcome::FacilityMissing);
         assert_eq!(state, CapabilityState::MissingInstallation);
