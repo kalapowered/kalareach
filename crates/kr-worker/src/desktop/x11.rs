@@ -497,13 +497,17 @@ fn connect_without_waiting(path: &Path, abstract_name: bool) -> std::io::Result<
     let Ok(address) = address else {
         return Err(std::io::ErrorKind::InvalidInput.into());
     };
+    // A socket that cannot be made, because the worker is at its limit of open files or of memory,
+    // reads as a display that refused, and the answer then says that the display cannot be
+    // reached, which this check did not find. Only the exhaustion of a resource causes that, and
+    // it is a stated limit.
     let Ok(socket) = nonblocking_socket(AddressFamily::UNIX, SocketType::STREAM) else {
         return Err(std::io::ErrorKind::Other.into());
     };
     rustix::net::connect(&socket, &address).map_err(std::io::Error::from)
 }
 
-/// A host that has no Unix sockets has no X server to connect to, so no connection is made.
+/// A build that is not for Unix makes no connection.
 #[cfg(not(unix))]
 fn connect_without_waiting(_path: &Path, _abstract_name: bool) -> std::io::Result<()> {
     Err(std::io::ErrorKind::Unsupported.into())
