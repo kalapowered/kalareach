@@ -349,13 +349,14 @@ describe('what each check says it does, before it is run', () => {
       disclosedChecks(route).find((check) => check.capability === 'desktop.screen_capture')
     expect(screenCheck('macos')?.performs).toBe('Takes one image of the desktop and measures it.')
     expect(screenCheck('x11')?.performs).toBe(
-      'Takes one image of the whole X screen, every monitor on it, and reads it into memory to ' +
-        'measure it.'
+      'With a local X display set for the worker and a screen-capture tool installed, takes one ' +
+        'image of the whole X screen, every monitor on it, and reads it into memory to measure ' +
+        'it. In any other case it takes no image.'
     )
     expect(screenCheck('wayland')?.performs).toBe(
-      'On a compositor this check knows to offer its screen-copy protocol, with its ' +
-        'screen-copy tool installed, asks it for one image of every output and reads it into ' +
-        'memory to measure it. In any other case it takes no image.'
+      'With a Wayland display set for the worker, on a compositor this check knows to offer its ' +
+        'screen-copy protocol, with its screen-copy tool installed, asks it for one image of ' +
+        'every output and reads it into memory to measure it. In any other case it takes no image.'
     )
   })
 

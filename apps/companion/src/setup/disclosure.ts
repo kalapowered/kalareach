@@ -45,7 +45,11 @@ interface CheckLines {
   readonly by?: Readonly<Partial<Record<CheckRoute, Lines>>>
 }
 
-/** On macOS the image is written to the check's own directory and removed before the check answers. */
+/**
+ * On macOS the line says the image is removed before the check answers. The route tries that
+ * removal and names a file it could not remove, as the Linux routes do, so the line says more than
+ * the route does. Its words stay as they are.
+ */
 const IMAGE_FILE = "Writes the image into the check's own directory and removes it before answering."
 
 /**
@@ -76,15 +80,17 @@ const CHECKS: readonly CheckLines[] = [
       },
       x11: {
         performs:
-          'Takes one image of the whole X screen, every monitor on it, and reads it into memory ' +
-          'to measure it.',
+          'With a local X display set for the worker and a screen-capture tool installed, takes ' +
+          'one image of the whole X screen, every monitor on it, and reads it into memory to ' +
+          'measure it. In any other case it takes no image.',
         effect: LINUX_IMAGE_FILE
       },
       wayland: {
         performs:
-          'On a compositor this check knows to offer its screen-copy protocol, with its ' +
-          'screen-copy tool installed, asks it for one image of every output and reads it into ' +
-          'memory to measure it. In any other case it takes no image.',
+          'With a Wayland display set for the worker, on a compositor this check knows to offer ' +
+          'its screen-copy protocol, with its screen-copy tool installed, asks it for one image ' +
+          'of every output and reads it into memory to measure it. In any other case it takes ' +
+          'no image.',
         effect: LINUX_IMAGE_FILE
       }
     }
