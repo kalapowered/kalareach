@@ -10785,7 +10785,7 @@ async fn a_takeover_returns_its_epoch_while_the_writer_stands_in_a_look_at_the_f
     let holder = holder_over(&mut first, &wired).await;
     let challenger = attached_over(&mut second, &wired).await;
     let epoch = wired.runtime.session().lease().epoch.get();
-    let queued = wired.runtime.input().lock().queued_input_bytes();
+    let room = wired.runtime.input().lock().input_room();
     let release = stand_the_writer_in_a_look(&wired, holder, LEFT_BEHIND, None).await;
 
     let answered = acquiring(second, &wired, challenger);
@@ -10819,13 +10819,11 @@ async fn a_takeover_returns_its_epoch_while_the_writer_stands_in_a_look_at_the_f
     // The writer is serial, so the first holder's batch is settled once nothing is owed for it, and
     // what it settled to is what the application was handed.
     let settled = std::time::Instant::now() + SOON;
-    while queued.load(std::sync::atomic::Ordering::Acquire) != 0
-        && std::time::Instant::now() < settled
-    {
+    while room.held().bytes != 0 && std::time::Instant::now() < settled {
         std::thread::sleep(Duration::from_millis(5));
     }
     assert_eq!(
-        queued.load(std::sync::atomic::Ordering::Acquire),
+        room.held().bytes,
         0,
         "the writer settled the first holder's batch"
     );
@@ -10977,7 +10975,7 @@ async fn a_piece_whose_boot_end_passes_while_the_writer_stands_in_a_look_is_not_
     use kr_ipc::clock::SharedClock as _;
     let wired = wired_with_a_floor().await;
     let holder = wired.holder();
-    let queued = wired.runtime.input().lock().queued_input_bytes();
+    let room = wired.runtime.input().lock().input_room();
     let clock = kr_ipc::clock::SystemSharedClock;
     let end = clock.boot_elapsed_ms() + 3_000;
     let release = stand_the_writer_in_a_look(&wired, holder, LEFT_BEHIND, Some(end)).await;
@@ -10993,13 +10991,11 @@ async fn a_piece_whose_boot_end_passes_while_the_writer_stands_in_a_look_is_not_
     );
     drop(release);
     let settled = std::time::Instant::now() + SOON;
-    while queued.load(std::sync::atomic::Ordering::Acquire) != 0
-        && std::time::Instant::now() < settled
-    {
+    while room.held().bytes != 0 && std::time::Instant::now() < settled {
         std::thread::sleep(Duration::from_millis(5));
     }
     assert_eq!(
-        queued.load(std::sync::atomic::Ordering::Acquire),
+        room.held().bytes,
         0,
         "the writer settled the holder's batch"
     );
@@ -11043,7 +11039,7 @@ fn fill_the_terminal_until_the_writer_waits_for_room(
         contains(&retained(&wired.runtime.session()), b"kr-ready"),
         "the application has set its terminal"
     );
-    let queued = wired.runtime.input().lock().queued_input_bytes();
+    let room = wired.runtime.input().lock().input_room();
     let bytes = more_than_the_terminal_takes();
     {
         let mut session = wired.runtime.session();
@@ -11061,11 +11057,11 @@ fn fill_the_terminal_until_the_writer_waits_for_room(
     }
     wired.runtime.flush_input();
     let by = std::time::Instant::now() + 6 * SOON;
-    let mut owed = queued.load(std::sync::atomic::Ordering::Acquire);
+    let mut owed = room.held().bytes;
     let mut since = std::time::Instant::now();
     while std::time::Instant::now() < by {
         std::thread::sleep(Duration::from_millis(20));
-        let now = queued.load(std::sync::atomic::Ordering::Acquire);
+        let now = room.held().bytes;
         if now != owed {
             owed = now;
             since = std::time::Instant::now();
@@ -11131,7 +11127,7 @@ async fn a_takeover_returns_its_epoch_while_the_writer_waiting_for_room_stands_i
         .attach(&params, params.requested.clone(), challenger)
         .expect("attaches");
     let epoch = wired.runtime.session().lease().epoch.get();
-    let queued = wired.runtime.input().lock().queued_input_bytes();
+    let room = wired.runtime.input().lock().input_room();
     let (release, owed) = stand_the_writer_waiting_for_room_in_a_look(&wired, holder).await;
 
     // The takeover is made on a thread of its own, which notes whether the look had been let go
@@ -11176,13 +11172,11 @@ async fn a_takeover_returns_its_epoch_while_the_writer_waiting_for_room_stands_i
 
     // The look returns and finds the lease ended: nothing more of the first holder's bytes goes.
     let settled = std::time::Instant::now() + SOON;
-    while queued.load(std::sync::atomic::Ordering::Acquire) != 0
-        && std::time::Instant::now() < settled
-    {
+    while room.held().bytes != 0 && std::time::Instant::now() < settled {
         std::thread::sleep(Duration::from_millis(5));
     }
     assert_eq!(
-        queued.load(std::sync::atomic::Ordering::Acquire),
+        room.held().bytes,
         0,
         "the writer settled the first holder's batch"
     );
