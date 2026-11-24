@@ -190,15 +190,15 @@ fn perform_in(plan: &Plan, setting: &Setting<'_>, operation: &Operation, sockets
         .as_deref()
         .filter(|display| !display.trim().is_empty())
     else {
-        return Ran {
-            check,
-            facility: Some(program.clone()),
-            outcome: Outcome::NotAttempted {
-                detail: Sentence::new()
-                    .stated("this worker holds no X11 display, so no tool was started"),
-            },
-            left: None,
-        };
+        return not_started(
+            program,
+            "this worker holds no X11 display, so no tool was started",
+        );
+    };
+    let number = match named(display) {
+        Named::Here(number) => number,
+        Named::Network => return not_started(program, NETWORK_DISPLAY),
+        Named::Nowhere => return not_started(program, NO_SUCH_DISPLAY),
     };
     let image = plan.scratch.join(tool.file);
     // A file from before is not this run's image.
@@ -227,7 +227,7 @@ fn perform_in(plan: &Plan, setting: &Setting<'_>, operation: &Operation, sockets
         },
         // A check with no time left to try the socket in does not guess at why the tool failed.
         Exit::Failed(_) => Err(
-            reach(display, sockets, setting.deadline).map_or(Outcome::TimedOut, |reach| {
+            reach(number, sockets, setting.deadline).map_or(Outcome::TimedOut, |reach| {
                 outcome_of(told_by(
                     ran.error_output.as_deref().unwrap_or_default(),
                     reach,
@@ -261,6 +261,61 @@ fn perform_in(plan: &Plan, setting: &Setting<'_>, operation: &Operation, sockets
     }
 }
 
+/// The words of a display that this check does not try, as it answers before any tool starts.
+const NETWORK_DISPLAY: &str =
+    "the display is reached over the network, which this check does not test, so no tool was started";
+
+/// The words of a display name that names no display on this machine.
+const NO_SUCH_DISPLAY: &str = "the X11 display name this worker holds names no display on this \
+                               machine, so no tool was started";
+
+/// An answer that no tool was started, in these words.
+fn not_started(program: &str, words: &'static str) -> Ran {
+    Ran {
+        check: Check::ScreenImage,
+        facility: Some(program.to_owned()),
+        outcome: Outcome::NotAttempted {
+            detail: Sentence::new().stated(words),
+        },
+        left: None,
+    }
+}
+
+/// What a display name names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Named {
+    /// A display on this machine, by its number: `:0`, `:0.0` and `unix:0` name display 0.
+    Here(u32),
+    /// A display on another machine: a host comes before the colon.
+    Network,
+    /// Nothing on this machine: there is no display number in it, or no display name at all.
+    Nowhere,
+}
+
+/// What the display name names. The worker's own socket is tried only for a display on this
+/// machine, and no tool is started for any other.
+fn named(display: &str) -> Named {
+    let digits = |text: &str| !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit());
+    if let Some(rest) = display
+        .strip_prefix(':')
+        .or_else(|| display.strip_prefix("unix:"))
+    {
+        let (number, screen) = rest
+            .split_once('.')
+            .map_or((rest, None), |(number, screen)| (number, Some(screen)));
+        if digits(number) && screen.is_none_or(digits) {
+            if let Ok(number) = number.parse() {
+                return Named::Here(number);
+            }
+        }
+        return Named::Nowhere;
+    }
+    match display.split_once(':') {
+        Some((host, _)) if !host.trim().is_empty() => Named::Network,
+        _ => Named::Nowhere,
+    }
+}
+
 /// The child's environment: the display and the authority this worker holds, and no Wayland socket.
 ///
 /// The rest is the worker's own, so that a tool finds its home folder and its search path. A
@@ -285,8 +340,6 @@ enum Reach {
     Connects,
     /// The display's socket did not.
     Silent,
-    /// The display is reached over the network, so there is no local socket to try.
-    Elsewhere,
 }
 
 /// What a failed tool and the display's socket say together.
@@ -298,8 +351,6 @@ enum Told {
     Accepted,
     /// The display cannot be reached.
     Unreachable,
-    /// The display is reached over the network, which this check does not test.
-    Untested,
 }
 
 /// The lines the client library prints when the server refuses a connection, as recorded from four
@@ -323,7 +374,6 @@ fn told_by(error_output: &str, reach: Reach) -> Told {
         Reach::Connects if refusal_line(error_output) => Told::AuthorityRefused,
         Reach::Connects => Told::Accepted,
         Reach::Silent => Told::Unreachable,
-        Reach::Elsewhere => Told::Untested,
     }
 }
 
@@ -337,37 +387,22 @@ fn outcome_of(told: Told) -> Outcome {
         Told::Accepted => Sentence::new()
             .stated("the display accepted a connection and the tool could not open it"),
         Told::Unreachable => Sentence::new().stated("the display cannot be reached"),
-        Told::Untested => Sentence::new().stated(
-            "the display is reached over the network, which this check does not test, so it \
-             could not tell a refused authority from a display that cannot be reached",
-        ),
     };
     Outcome::NotAttempted { detail }
 }
 
-/// Whether this worker can connect to the display's socket, as the number in `display` names it.
+/// Whether this worker can connect to the display's socket, as `number` names it.
 ///
 /// `None` is the deadline having no time left to try in, which says nothing about the display.
-fn reach(display: &str, sockets: &Path, deadline: &Deadline) -> Option<Reach> {
+fn reach(number: u32, sockets: &Path, deadline: &Deadline) -> Option<Reach> {
     if deadline.expired() {
         return None;
     }
-    let Some(number) = local_display_number(display) else {
-        return Some(Reach::Elsewhere);
-    };
     Some(if connects(&sockets.join(format!("X{number}")), deadline) {
         Reach::Connects
     } else {
         Reach::Silent
     })
-}
-
-/// The display number of a display on this machine: `:0`, `:0.0` and `unix:0` name display 0.
-fn local_display_number(display: &str) -> Option<u32> {
-    let rest = display
-        .strip_prefix(':')
-        .or_else(|| display.strip_prefix("unix:"))?;
-    rest.split('.').next()?.parse().ok()
 }
 
 /// Whether a connection to the socket is accepted: the file system name first, then the abstract
@@ -746,7 +781,7 @@ mod tests {
 
     /// KR-REQ-03.29, LX-3: the tool is given the display and the authority the worker holds and no
     /// Wayland socket, whatever the process that runs the check holds. The case starts its own
-    /// test binary with `DISPLAY=:B` and a `WAYLAND_DISPLAY` in its environment, which no test of
+    /// test binary with `DISPLAY=:8` and a `WAYLAND_DISPLAY` in its environment, which no test of
     /// this crate may set for itself.
     #[test]
     fn kr_req_03_29_the_tool_is_given_the_display_and_authority_the_worker_holds() {
@@ -758,7 +793,7 @@ mod tests {
         );
         let output = std::process::Command::new(exe)
             .args(["--exact", &name, "--nocapture", "--test-threads=1"])
-            .env("DISPLAY", ":B")
+            .env("DISPLAY", ":8")
             .env("WAYLAND_DISPLAY", "wayland-9")
             .env(INNER, folder.path())
             .output()
@@ -778,13 +813,13 @@ mod tests {
         let Some(folder) = std::env::var_os(INNER).map(PathBuf::from) else {
             return;
         };
-        assert_eq!(std::env::var("DISPLAY").as_deref(), Ok(":B"));
+        assert_eq!(std::env::var("DISPLAY").as_deref(), Ok(":8"));
         assert_eq!(std::env::var("WAYLAND_DISPLAY").as_deref(), Ok("wayland-9"));
         recording_tool(&folder);
         let scratch = folder.join("run");
         let plan = Plan::in_directory(&scratch);
         let variables = Variables {
-            display: Some(":A".to_owned()),
+            display: Some(":6".to_owned()),
             wayland_display: Some("wayland-0".to_owned()),
             authority: Some("/home/someone/.Xauthority-of-the-login".to_owned()),
             ..Variables::default()
@@ -794,7 +829,7 @@ mod tests {
         let seen = std::fs::read_to_string(folder.join("seen")).expect("what the tool saw");
         assert_eq!(
             seen,
-            "DISPLAY=:A\nXAUTHORITY=/home/someone/.Xauthority-of-the-login\n\
+            "DISPLAY=:6\nXAUTHORITY=/home/someone/.Xauthority-of-the-login\n\
              WAYLAND_DISPLAY=unset\n"
         );
         // A worker that holds no authority gives the tool none.
@@ -986,11 +1021,6 @@ mod tests {
                 Told::Unreachable,
                 "{refused}"
             );
-            assert_eq!(
-                told_by(&refused, Reach::Elsewhere),
-                Told::Untested,
-                "{refused}"
-            );
         }
         // What each answer comes to: none is a permission a person grants.
         let (state, evidence, reason) = judge(
@@ -1010,7 +1040,7 @@ mod tests {
             "{reason}"
         );
         assert!(!reason.contains("xhost"), "{reason}");
-        for told in [Told::Accepted, Told::Unreachable, Told::Untested] {
+        for told in [Told::Accepted, Told::Unreachable] {
             let (state, _, _) = judge(Check::ScreenImage, &outcome_of(told), Asking::Never);
             assert_eq!(state, CapabilityState::TemporarilyUnavailable, "{told:?}");
         }
@@ -1026,22 +1056,16 @@ mod tests {
         let tools = folder();
         let refusal = "Authorization required, but no authorization protocol specified\n\n";
         let deadline = Deadline::after(Duration::from_secs(5));
-        for (display, expected) in [
-            (":7", Reach::Connects),
-            (":7.0", Reach::Connects),
-            ("unix:7", Reach::Connects),
-            (":8", Reach::Silent),
-            ("somewhere:0", Reach::Elsewhere),
-        ] {
+        for (number, expected) in [(7, Reach::Connects), (8, Reach::Silent)] {
             assert_eq!(
-                reach(display, sockets.path(), &deadline),
+                reach(number, sockets.path(), &deadline),
                 Some(expected),
-                "{display}"
+                "{number}"
             );
         }
         // With no time left nothing is tried, and nothing is said of the display.
         assert_eq!(
-            reach(":7", sockets.path(), &Deadline::after(Duration::ZERO)),
+            reach(7, sockets.path(), &Deadline::after(Duration::ZERO)),
             None
         );
         // The refusal line on the error output of a tool that failed, and the display accepts.
@@ -1086,10 +1110,79 @@ mod tests {
         let _listening = UnixListener::bind_addr(&address).expect("an abstract socket");
         let deadline = Deadline::after(Duration::from_secs(5));
         assert_eq!(
-            reach(":9", sockets.path(), &deadline),
+            reach(9, sockets.path(), &deadline),
             Some(Reach::Connects)
         );
-        assert_eq!(reach(":10", sockets.path(), &deadline), Some(Reach::Silent));
+        assert_eq!(reach(10, sockets.path(), &deadline), Some(Reach::Silent));
+    }
+
+    /// KR-REQ-03.29, LX-12: a display that is not on this machine starts no tool. A host part
+    /// names a display reached over the network, and a name with no local display number names
+    /// none on this machine: each is answered before any tool starts, in its own words. A display
+    /// on this machine, with or without a screen number, starts the tool.
+    #[test]
+    fn kr_req_03_29_a_display_that_is_not_on_this_machine_starts_no_tool() {
+        for (display, expected) in [
+            (":0", Named::Here(0)),
+            (":7.1", Named::Here(7)),
+            ("unix:7", Named::Here(7)),
+            ("unix:7.0", Named::Here(7)),
+            ("host:0", Named::Network),
+            ("host:0.0", Named::Network),
+            ("tcp/host:0", Named::Network),
+            ("10.0.0.1:0", Named::Network),
+            (":abc", Named::Nowhere),
+            (":", Named::Nowhere),
+            (" :0", Named::Nowhere),
+            (":0.x", Named::Nowhere),
+            (":0.", Named::Nowhere),
+            (":+7", Named::Nowhere),
+            ("unix:", Named::Nowhere),
+            ("host", Named::Nowhere),
+        ] {
+            assert_eq!(named(display), expected, "{display:?}");
+        }
+        let tools = folder();
+        recording_tool(tools.path());
+        let seen = tools.path().join("seen");
+        let scratch = folder();
+        let plan = Plan::in_directory(scratch.path());
+        let ran = perform_with(
+            &plan,
+            tools.path(),
+            &variables(":7"),
+            tools.path(),
+        );
+        assert!(
+            matches!(ran.outcome, Outcome::Performed { .. }),
+            "a display on this machine: {ran:?}"
+        );
+        assert!(seen.exists(), "a display on this machine starts the tool");
+        for (display, words) in [
+            ("host:0", "reached over the network"),
+            ("tcp/host:0", "reached over the network"),
+            (":abc", "names no display on this machine"),
+            (":", "names no display on this machine"),
+            (" :0", "names no display on this machine"),
+        ] {
+            let _ = std::fs::remove_file(&seen);
+            let ran = perform_with(
+                &plan,
+                tools.path(),
+                &variables(display),
+                tools.path(),
+            );
+            assert!(
+                matches!(ran.outcome, Outcome::NotAttempted { .. }),
+                "{display:?}: {ran:?}"
+            );
+            assert!(
+                said(&ran).contains(words) && said(&ran).contains("so no tool was started"),
+                "{display:?}: {}",
+                said(&ran)
+            );
+            assert!(!seen.exists(), "{display:?}: a tool was started");
+        }
     }
 
     /// KR-REQ-03.29, LX-6: the rows are chosen by the display server of the context. A Wayland
