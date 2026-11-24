@@ -96,11 +96,14 @@ const OF_A_RUN: [&str; 6] = [
 /// The members of those frames that differ from one run to the next or one machine to the next: the
 /// challenge and its signature, the endpoint and identity of the host and of the machine it runs on,
 /// how long something took, the component a registration carries (built with paths of the machine
-/// that built it), and what the engine says of the target it compiles for and how much it compiled.
-const OF_THE_RUN: [&str; 16] = [
+/// that built it), what the engine says of the target it compiles for and how much it compiled, and
+/// the version of the engine and the build of the host, which change with the release.
+const OF_THE_RUN: [&str; 18] = [
     "component",
     "target",
     "engine_compatibility",
+    "engine_version",
+    "build",
     "resident_bytes",
     "reservation_id",
     "nonce",
