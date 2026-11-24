@@ -207,22 +207,32 @@ impl Run {
             });
         serde_json::from_str(&text).expect("the result is JSON")
     }
-}
 
-/// The pids a script recorded in `file`, once it has recorded `count` of them.
-fn recorded_pids(file: &Path, count: usize) -> Vec<String> {
-    let until = Instant::now() + Duration::from_secs(60);
-    loop {
-        let text = std::fs::read_to_string(file).unwrap_or_default();
-        let pids: Vec<String> = text.lines().map(str::to_owned).collect();
-        if pids.len() >= count {
-            return pids;
+    /// The pids a script recorded in `file`, once it has recorded `count` of them. A report's
+    /// program that ends before that stops the wait, and the failure shows what it said.
+    fn recorded_pids(&mut self, file: &Path, count: usize) -> Vec<String> {
+        let until = Instant::now() + Duration::from_secs(60);
+        loop {
+            // Asked before the file is read, so that a program that ended is read after its end.
+            let ended = self.child.try_wait().expect("a wait");
+            let text = std::fs::read_to_string(file).unwrap_or_default();
+            let pids: Vec<String> = text.lines().map(str::to_owned).collect();
+            if pids.len() >= count {
+                return pids;
+            }
+            if let Some(status) = ended {
+                panic!(
+                    "the report's program ended {status:?} before the script recorded {count} pids \
+                     ({text:?}); it said: {}",
+                    std::fs::read_to_string(&self.output).unwrap_or_default()
+                );
+            }
+            assert!(
+                Instant::now() < until,
+                "the script recorded {text:?}, not {count} pids"
+            );
+            std::thread::sleep(Duration::from_millis(20));
         }
-        assert!(
-            Instant::now() < until,
-            "the script recorded {text:?}, not {count} pids"
-        );
-        std::thread::sleep(Duration::from_millis(20));
     }
 }
 
@@ -260,7 +270,7 @@ fn assert_stopped_by(signal: Signal, words: &str, script: (&str, &str)) {
         ],
         &[script, ("later", WAITS)],
     );
-    let started = recorded_pids(&pids, 2);
+    let started = run.recorded_pids(&pids, 2);
     run.send(signal);
     let status = run.ended_within(BOUND);
     assert_eq!(
@@ -325,7 +335,7 @@ fn a_group_that_ignores_the_signal_is_ended_by_force_after_the_grace() {
         &[step("held", "timeout = 600", "held", &pids)],
         &[("held", IGNORES)],
     );
-    let started = recorded_pids(&pids, 2);
+    let started = run.recorded_pids(&pids, 2);
     let sent = Instant::now();
     run.send(Signal::INT);
     let status = run.ended_within(BOUND);
@@ -354,7 +364,7 @@ fn a_signal_outside_a_step_with_a_limit_ends_the_report_as_it_always_did() {
         ],
         &[("quick", QUICK), ("waits", WAITS)],
     );
-    recorded_pids(&pids, 1);
+    run.recorded_pids(&pids, 1);
     let sent = Instant::now();
     run.send(Signal::INT);
     let status = run.ended_within(Duration::from_secs(15));
@@ -410,7 +420,7 @@ fn a_second_signal_in_the_grace_does_not_change_the_signal_of_the_run() {
         ],
         &[("held", ANSWERS_TERM_WITH_INT), ("later", WAITS)],
     );
-    recorded_pids(&pids, 2);
+    run.recorded_pids(&pids, 2);
     run.send(Signal::TERM);
     let status = run.ended_within(BOUND);
     // The leader wrote this when the report sent it `TERM`, and then sent `INT`: without this line
