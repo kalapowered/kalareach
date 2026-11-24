@@ -23,7 +23,15 @@ use kr_protocol::identity::ProcessStartIdentity;
 /// process the case or the stand-in started for it, each by identity: those the case started itself
 /// through [`Fixture::detached`] and tracked, every process the stand-in wrote down as it started
 /// it (which holds whatever came of the record of its job), the daemons of the jobs' records, and
-/// the members of the groups those lead. A process it cannot show to have ended fails the case.
+/// the members of the groups those lead, read as the stand-in reads a group. A process it cannot
+/// show to have ended, a group or a record it cannot read, and a line of the file of starts that is
+/// not a start fail the case.
+///
+/// Two readings are single, with no second reading to show that the process is the same one: the
+/// identity [`Fixture::detached`] reads of the process its shell started, and the identity of each
+/// `sleep` that `idle` starts, which the one case that tracks them reads once. The first runs for as
+/// long as the case lets it and the others end within a second. A number that passes to another
+/// process between the start of a process and its one reading is not guarded against.
 struct Fixture {
     tree: PrivateTempDir,
     installation: PrivateTempDir,
@@ -40,32 +48,23 @@ impl Drop for Fixture {
                 .get_mut()
                 .unwrap_or_else(PoisonError::into_inner),
         );
-        known.extend(self.recorded_daemons());
-        known.extend(
-            self.written_down()
-                .into_iter()
-                .map(|started| started.identity),
-        );
+        let mut problems = Vec::new();
+        match self.recorded_daemons() {
+            Ok(daemons) => known.extend(daemons),
+            Err(why) => problems.push(why),
+        }
+        match kr_manager_stand_in::read_started(&self.started_file()) {
+            Ok(starts) => known.extend(starts.into_iter().map(|start| start.identity)),
+            Err(why) => problems.push(why),
+        }
         known.sort();
         known.dedup();
-        let mut everything = known.clone();
-        // A member started while the others were being ended is found by the next pass.
-        for _ in 0..5 {
-            for leader in &known {
-                everything.extend(members_of_group(leader));
-            }
-            everything.sort();
-            everything.dedup();
-            for identity in &everything {
-                let _ = stop_process(identity, Stop::Kill);
-            }
-        }
-        let alive: Vec<_> = everything
-            .iter()
-            .filter(|identity| !ended(identity))
-            .collect();
-        if !alive.is_empty() {
-            let said = format!("the fixture could not end every process of the case: {alive:?}");
+        problems.extend(end_everything(
+            &known,
+            &kr_manager_stand_in::members_of_group,
+        ));
+        if !problems.is_empty() {
+            let said = format!("the fixture could not end every process of the case: {problems:?}");
             if std::thread::panicking() {
                 eprintln!("{said}");
             } else {
@@ -75,27 +74,41 @@ impl Drop for Fixture {
     }
 }
 
-/// The processes in the group the process `leader` leads, each by the identity it has now. The
-/// number is the group's only while the leader or a member runs, so a number that another process
-/// holds, read before the list and after it, gives none.
-fn members_of_group(leader: &ProcessStartIdentity) -> Vec<ProcessStartIdentity> {
-    let Ok(number) = u32::try_from(leader.pid.get()) else {
-        return Vec::new();
-    };
-    let is_the_groups = || {
-        started_process_identity(number)
-            .is_ok_and(|holder| holder == *leader || holder == ended_process_identity(number))
-    };
-    if !is_the_groups() {
-        return Vec::new();
+/// Ends every process of `known` and of the groups they lead, each by identity, and says what it
+/// could not do: a group that `members` cannot read, and a process that is not shown to have ended.
+fn end_everything(
+    known: &[ProcessStartIdentity],
+    members: &dyn Fn(&ProcessStartIdentity) -> Result<Vec<ProcessStartIdentity>, String>,
+) -> Vec<String> {
+    let mut problems = Vec::new();
+    let mut everything = known.to_vec();
+    // A member started while the others were being ended is found by the next pass.
+    for _ in 0..5 {
+        for leader in known {
+            match members(leader) {
+                Ok(found) => everything.extend(found),
+                Err(why) => problems.push(format!(
+                    "the group of the process {} cannot be read: {why}",
+                    leader.pid.get()
+                )),
+            }
+        }
+        everything.sort();
+        everything.dedup();
+        for identity in &everything {
+            let _ = stop_process(identity, Stop::Kill);
+        }
     }
-    let members: Vec<ProcessStartIdentity> = processes_in_group(number)
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|pid| *pid != std::process::id())
-        .filter_map(|pid| started_process_identity(pid).ok())
+    problems.sort();
+    problems.dedup();
+    let alive: Vec<_> = everything
+        .iter()
+        .filter(|identity| !ended(identity))
         .collect();
-    if is_the_groups() { members } else { Vec::new() }
+    if !alive.is_empty() {
+        problems.push(format!("not shown to have ended: {alive:?}"));
+    }
+    problems
 }
 
 impl Fixture {
@@ -122,18 +135,30 @@ impl Fixture {
         }
     }
 
-    /// The processes the stand-in recorded as the daemons of its jobs.
-    fn recorded_daemons(&self) -> Vec<ProcessStartIdentity> {
-        let Ok(entries) = std::fs::read_dir(self.tree.path().join("state/manager-stand-in/jobs"))
-        else {
-            return Vec::new();
+    /// The processes the stand-in recorded as the daemons of its jobs. A record that cannot be read
+    /// is an error.
+    fn recorded_daemons(&self) -> Result<Vec<ProcessStartIdentity>, String> {
+        let folder = self.tree.path().join("state/manager-stand-in/jobs");
+        let entries = match std::fs::read_dir(&folder) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(format!("{} cannot be read: {error}", folder.display())),
         };
-        entries
-            .filter_map(Result::ok)
-            .filter_map(|entry| std::fs::read_to_string(entry.path()).ok())
-            .filter_map(|record| serde_json::from_str::<kr_manager_stand_in::Job>(&record).ok())
-            .filter_map(|job| job.identity)
-            .collect()
+        let mut daemons = Vec::new();
+        for entry in entries {
+            let path = entry
+                .map_err(|error| format!("{} cannot be read: {error}", folder.display()))?
+                .path();
+            if path.extension().is_none_or(|extension| extension != "json") {
+                continue;
+            }
+            let job: kr_manager_stand_in::Job = std::fs::read_to_string(&path)
+                .map_err(|error| error.to_string())
+                .and_then(|record| serde_json::from_str(&record).map_err(|error| error.to_string()))
+                .map_err(|why| format!("the record {} cannot be read: {why}", path.display()))?;
+            daemons.extend(job.identity);
+        }
+        Ok(daemons)
     }
 
     /// The stand-in run with `arguments`, from a caller that names this tree's state directory.
@@ -162,9 +187,10 @@ impl Fixture {
     }
 
     /// The processes the stand-in wrote down as it started them, whatever came of their jobs'
-    /// records.
+    /// records. A line that is not a start fails the case.
     fn written_down(&self) -> Vec<kr_manager_stand_in::Started> {
-        kr_manager_stand_in::read_started(&self.started_file()).unwrap_or_default()
+        kr_manager_stand_in::read_started(&self.started_file())
+            .unwrap_or_else(|why| panic!("the starts the stand-in wrote down: {why}"))
     }
 
     /// The calls it recorded, as the lines of its log.
@@ -827,6 +853,7 @@ fn bootout_ends_the_processes_a_daemon_left_behind_when_it_ended() {
     fixture.track(&child);
     let wrapper = fixture
         .recorded_daemons()
+        .expect("the records of the jobs")
         .pop()
         .expect("the daemon the stand-in recorded");
     assert!(ended(&wrapper), "the wrapper exits and leaves its child");
@@ -1044,7 +1071,7 @@ fn a_case_that_fails_on_purpose_before_its_own_cleanup() {
         &state,
         &[],
     );
-    let mut identities = fixture.recorded_daemons();
+    let mut identities = fixture.recorded_daemons().expect("the records of the jobs");
     identities.push(own_loop);
     std::fs::write(
         list,
@@ -1116,6 +1143,7 @@ fn a_case_that_loses_a_daemons_record_and_fails() {
     assert_eq!(started.status.code(), Some(0), "{}", text(&started.stderr));
     let daemon = fixture
         .recorded_daemons()
+        .expect("the records of the jobs")
         .pop()
         .expect("the daemon the stand-in recorded");
     let deadline = Instant::now() + Duration::from_secs(20);
@@ -1137,7 +1165,12 @@ fn a_case_that_loses_a_daemons_record_and_fails() {
             .join("state/manager-stand-in/jobs/kr-controller-l.json"),
     )
     .expect("the record is removed");
-    assert!(fixture.recorded_daemons().is_empty());
+    assert!(
+        fixture
+            .recorded_daemons()
+            .expect("the records of the jobs")
+            .is_empty()
+    );
     let idle = fixture.installation.path().join("idle");
     place_idle(&idle);
     let state = fixture.tree.path().join("state");
@@ -1164,6 +1197,78 @@ fn a_case_that_loses_a_daemons_record_and_fails() {
     )
     .expect("the list is written");
     panic!("this case fails on purpose, after its daemon's record was lost");
+}
+
+/// The variable that tells a case that fails on purpose that another case has run it, in a child
+/// test process.
+const CHILD_VARIABLE: &str = "KR_STAND_IN_TEST_AS_CHILD";
+
+/// Runs the case `name`, which does nothing unless another case runs it, in a child test process.
+fn run_as_child(name: &str) -> Output {
+    run(
+        Command::new(std::env::current_exe().expect("this test program"))
+            .args(["--ignored", "--exact", name, "--test-threads=1"])
+            .env(CHILD_VARIABLE, "1"),
+    )
+}
+
+/// A line of the file of starts that is not a start fails the case: the fixture does not end the
+/// case as if it had ended every process when it cannot read which processes the stand-in started.
+#[test]
+fn a_line_of_the_file_of_starts_that_is_not_a_start_fails_the_case() {
+    let child = run_as_child("a_case_that_leaves_a_line_that_is_not_a_start");
+    let said = text(&child.stdout);
+    assert_eq!(
+        child.status.code(),
+        Some(101),
+        "the child case does not fail: {said}"
+    );
+    assert!(
+        said.contains("the fixture could not end every process of the case")
+            && said.contains("is not a start"),
+        "the child case fails for another reason: {said}"
+    );
+}
+
+/// Run by the case above, in a child test process: it leaves a line that is not a start in the file
+/// of starts and ends.
+#[test]
+#[ignore = "run by the case that shows a line that is not a start fails the case"]
+fn a_case_that_leaves_a_line_that_is_not_a_start() {
+    if std::env::var_os(CHILD_VARIABLE).is_none() {
+        return;
+    }
+    let fixture = Fixture::new();
+    let file = fixture.started_file();
+    std::fs::create_dir_all(file.parent().expect("a folder")).expect("the stand-in's folder");
+    std::fs::write(&file, "this is not a start\n").expect("a line that is not a start");
+}
+
+/// A group the fixture cannot read is a problem of the case and not an empty group, and the
+/// processes it did find are ended all the same.
+#[test]
+fn a_group_the_fixture_cannot_read_is_a_problem_and_not_an_empty_group() {
+    let started =
+        run(Command::new("/bin/sh")
+            .args(["-c", "/bin/sleep 30 </dev/null >/dev/null 2>&1 & echo $!"]));
+    let pid: u32 = text(&started.stdout)
+        .trim()
+        .parse()
+        .expect("a process number");
+    let sleeping = started_process_identity(pid).expect("the process is there");
+    let leftovers = Leftovers(vec![sleeping.clone()]);
+    let problems = end_everything(std::slice::from_ref(&sleeping), &|_| {
+        Err("the system would not list the group".to_owned())
+    });
+    assert!(
+        problems
+            .iter()
+            .any(|problem| problem.contains("cannot be read")
+                && problem.contains("the system would not list the group")),
+        "a group that cannot be read was taken for an empty one: {problems:?}"
+    );
+    assert!(ended(&sleeping), "the process that was found was not ended");
+    drop(leftovers);
 }
 
 /// A `bootout` that fails keeps the job: a line of the file of starts that cannot be read leaves it

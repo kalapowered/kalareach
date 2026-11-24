@@ -1037,6 +1037,18 @@ fn members_of(
     })
 }
 
+/// The processes in the group the process `leader` leads, now, each held by identity as a member of
+/// it, as `bootout` reads them: a test's cleanup reads a group no other way.
+///
+/// # Errors
+///
+/// A group that cannot be listed or read is an error, which is not an empty group.
+pub fn members_of_group(
+    leader: &ProcessStartIdentity,
+) -> Result<Vec<ProcessStartIdentity>, String> {
+    members_of(leader, group_of(leader)?, &Tools::system())
+}
+
 /// Writes `identity` down as a process this program started for the job `label`.
 fn write_down_start(
     context: &Context,
