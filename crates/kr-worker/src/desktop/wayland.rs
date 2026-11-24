@@ -220,7 +220,7 @@ mod tests {
     use kr_protocol::ids::{CapabilityRevision, DesktopSessionId, EnvironmentId, SessionId};
     use kr_protocol::scalars::{Bytes, Nullable, U64, Uuid};
 
-    use super::super::payload::tests::whole;
+    use super::super::payload::tests::{run_when_free, whole};
     use super::super::probe::{self, Deadline, Facilities as _, Platform};
     use super::super::routes::{Surroundings, Variables};
     use super::*;
@@ -266,18 +266,7 @@ mod tests {
             );
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
                 .expect("a program");
-            // A child that another case started while this file was open for writing holds it
-            // until that child has started its own program, and a file held that way cannot be
-            // run. It is run once here, to nothing, until it can be.
-            loop {
-                match std::process::Command::new(&path).arg("--ready").status() {
-                    Ok(_) => break,
-                    Err(error) if error.kind() == std::io::ErrorKind::ExecutableFileBusy => {
-                        std::thread::sleep(Duration::from_millis(5));
-                    }
-                    Err(error) => panic!("a stand-in that does not run: {error}"),
-                }
-            }
+            run_when_free(&path, name, Duration::from_secs(10));
             path
         }
 

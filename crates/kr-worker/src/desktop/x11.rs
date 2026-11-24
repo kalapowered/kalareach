@@ -624,6 +624,7 @@ mod tests {
     use kr_protocol::ids::DesktopSessionId;
     use kr_protocol::scalars::{Bytes, Nullable, U64};
 
+    use super::super::payload::tests::run_when_free;
     use super::super::probe::{self, HostOs, judge};
     use super::*;
 
@@ -681,15 +682,7 @@ mod tests {
         file.sync_all().expect("its text on disk");
         drop(file);
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("its mode");
-        loop {
-            match std::process::Command::new(&path).arg("--ready").status() {
-                Ok(_) => break,
-                Err(error) if error.kind() == std::io::ErrorKind::ExecutableFileBusy => {
-                    std::thread::sleep(Duration::from_millis(5));
-                }
-                Err(error) => panic!("{name}: a stand-in that does not run: {error}"),
-            }
-        }
+        run_when_free(&path, name, Duration::from_secs(10));
         path
     }
 

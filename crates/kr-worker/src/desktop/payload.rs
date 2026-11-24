@@ -425,6 +425,57 @@ pub(super) mod tests {
         Deadline::after(std::time::Duration::from_secs(30))
     }
 
+    /// Runs a stand-in program once, to nothing, until it can be run. A child that another case
+    /// started while the file was open for writing holds it until that child has started its own
+    /// program, and a file held that way cannot be run. A file that is still held after `bound` is
+    /// a fault of the case, and the panic names the stand-in.
+    #[cfg(unix)]
+    pub(in crate::desktop) fn run_when_free(path: &Path, name: &str, bound: std::time::Duration) {
+        let started = std::time::Instant::now();
+        loop {
+            match std::process::Command::new(path).arg("--ready").status() {
+                Ok(_) => return,
+                Err(error) if error.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                    assert!(
+                        started.elapsed() < bound,
+                        "{name}: the stand-in was still held open for writing after {bound:?}"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(error) => panic!("{name}: a stand-in that does not run: {error}"),
+            }
+        }
+    }
+
+    /// A stand-in program that stays held open for writing stops its case after the bound, and the
+    /// panic names the stand-in.
+    #[cfg(unix)]
+    #[test]
+    fn a_stand_in_held_open_for_writing_stops_its_case_after_the_bound_and_names_it() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = Dir::new();
+        let path = dir.file("held-stand-in", b"#!/bin/sh\nexit 0\n");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("a mode");
+        let writer = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("a writer");
+        let bound = std::time::Duration::from_millis(200);
+        let started = std::time::Instant::now();
+        let stopped = std::panic::catch_unwind(|| run_when_free(&path, "held-stand-in", bound));
+        let took = started.elapsed();
+        let message = stopped
+            .unwrap_err()
+            .downcast_ref::<String>()
+            .cloned()
+            .unwrap_or_default();
+        assert!(message.contains("held-stand-in"), "{message}");
+        assert!(took >= bound, "{took:?}");
+        drop(writer);
+        run_when_free(&path, "held-stand-in", bound);
+    }
+
     /// KR-REQ-03.29, LP-9: a regular file is read whole, and a path with no file at it reads as no
     /// bytes, which is what an empty payload is.
     #[test]
