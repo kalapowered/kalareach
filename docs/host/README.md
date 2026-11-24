@@ -1528,11 +1528,11 @@ The worker also feeds the components it registered. The terminal's read loop and
 reader push what a component may observe onto a 4 MiB lane and carry on, and a task of the worker's
 link makes the calls, so nothing on the terminal waits for a component. What a ready component
 misses is counted, and it is asked for a fresh snapshot before it is offered anything else. The
-link takes a component's state when it has been quiet for two seconds, a minute has passed or it
-has never been asked, keeps it in memory only, and restores it when the runtime has been replaced.
-Privacy mode drops that state and stops it being asked for, and a component that was handed anything
-made while it was on is not asked again until it starts again. `docs/plugins/runtime.md` has the
-calls, the bounds and the order.
+worker takes no state from a component and restores nothing into one. A component that is registered
+again, after the runtime was replaced for example, is a new instance: the worker gives it each
+request the broker still holds as pending, once each, in the order the broker recorded them, and
+queues the requests nobody decoded to be decoded again. `docs/plugins/runtime.md` has the calls, the
+bounds and the order.
 
 The worker also asks a component to decode the native requests it records, for a binding whose
 package ships a component and is trusted to decode the request's method; the connector's table reads

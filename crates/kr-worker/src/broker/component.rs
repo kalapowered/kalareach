@@ -690,6 +690,9 @@ mod tests {
         );
     }
 
+    /// What a long outage usually says leaves room for the notes before and after it. The words
+    /// with a clause for every way a request is left out, and every count at its widest, can pass
+    /// the bound by themselves: the next case.
     #[test]
     fn what_a_long_outage_says_does_not_cut_the_notes_that_follow_it() {
         let notes = ComponentNotes {
@@ -711,6 +714,41 @@ mod tests {
             !was_cut,
             "{} bytes of {MAX_REPORT_DETAIL_BYTES}: {text}",
             text.len()
+        );
+    }
+
+    /// The longest form of the restart's words, a clause for every way a request is left out and
+    /// every count at its widest, passes the report's bound by itself. It is cut from its last
+    /// clauses, the decode counts first, and flagged; what the component was given and what was
+    /// left out come before it.
+    #[test]
+    fn the_longest_form_of_the_restart_words_is_cut_from_its_last_clauses_and_flagged() {
+        let words = Recovery::with_every_clause().words();
+        let notes = ComponentNotes {
+            recovery: Some(words.clone()),
+            ..ComponentNotes::default()
+        };
+        let text = notes.text(false).expect("the notes say something");
+        assert_eq!(text, words);
+        assert!(
+            text.len() > MAX_REPORT_DETAIL_BYTES,
+            "the longest form is {} bytes of {MAX_REPORT_DETAIL_BYTES}",
+            text.len()
+        );
+        let (shown, was_cut) = cut(&text);
+        assert!(was_cut, "the cut is flagged");
+        assert!(shown.len() <= MAX_REPORT_DETAIL_BYTES);
+        assert!(text.starts_with(&shown), "a prefix, with no marker added");
+        for kept in [
+            "the worker gave it 64 pending requests from its own records",
+            "could not be given because the worker could not use their bytes",
+            "while the plugin runtime was away the worker passed over",
+        ] {
+            assert!(shown.contains(kept), "{kept}: {shown}");
+        }
+        assert!(
+            !shown.contains("because the decode queue was full"),
+            "the decode counts are the last clause, and it is cut: {shown}"
         );
     }
 

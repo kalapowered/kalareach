@@ -303,8 +303,8 @@ impl Recovery {
     #[must_use]
     pub fn words(&self) -> String {
         let mut parts = vec![
-            "started again after the plugin runtime was lost, without its saved state or earlier \
-             history"
+            "started again after the plugin runtime was lost, with no state or history from \
+             before the loss"
                 .to_owned(),
         ];
         if self.baseline {
@@ -381,6 +381,20 @@ impl Recovery {
         }
     }
 
+    /// A restart's words with a clause for every way a request is left out, and every count at its
+    /// widest: the longest the words can be. For the cases that bound a report.
+    #[cfg(test)]
+    pub(super) fn with_every_clause() -> Self {
+        Self {
+            unavailable: 99_999,
+            oversized: 64,
+            over_cap: 99_999,
+            refused: 64,
+            unanswered: 64,
+            ..Self::after_a_long_outage()
+        }
+    }
+
     fn baseline_words(&self, parts: &mut Vec<String>) {
         let left_out =
             self.unavailable + self.oversized + self.over_cap + self.refused + self.unanswered;
@@ -409,10 +423,10 @@ impl Recovery {
         let request = |count: u64| noun(count, "request", "requests");
         if self.unavailable > 0 {
             parts.push(format!(
-                "{} pending {} could not be given because the worker no longer holds {}",
+                "{} pending {} could not be given because the worker could not use {}",
                 self.unavailable,
                 request(self.unavailable),
-                noun(self.unavailable, "its frame", "their frames")
+                noun(self.unavailable, "its bytes", "their bytes")
             ));
         }
         if self.oversized > 0 {
@@ -426,7 +440,7 @@ impl Recovery {
         if self.over_cap > 0 {
             parts.push(format!(
                 "{} pending {} {} not given because the worker gives at most {} requests or 4 MiB \
-                 at a time",
+                 when a component starts again",
                 self.over_cap,
                 request(self.over_cap),
                 noun(self.over_cap, "was", "were"),
@@ -444,7 +458,8 @@ impl Recovery {
         }
         if self.unanswered > 0 {
             parts.push(format!(
-                "{} pending {} {} not given because the plugin runtime did not answer",
+                "{} pending {} {} not confirmed as given because the plugin runtime did not \
+                 answer",
                 self.unanswered,
                 request(self.unanswered),
                 noun(self.unanswered, "was", "were")
@@ -470,8 +485,8 @@ mod tests {
         .words();
         assert_eq!(
             words,
-            "started again after the plugin runtime was lost, without its saved state or earlier \
-             history; the worker had no pending request to give it"
+            "started again after the plugin runtime was lost, with no state or history from \
+             before the loss; the worker had no pending request to give it"
         );
     }
 
@@ -484,8 +499,8 @@ mod tests {
         .words();
         assert_eq!(
             words,
-            "started again after the plugin runtime was lost, without its saved state or earlier \
-             history"
+            "started again after the plugin runtime was lost, with no state or history from \
+             before the loss"
         );
     }
 
@@ -501,8 +516,8 @@ mod tests {
         .words();
         assert_eq!(
             words,
-            "started again after the plugin runtime was lost, without its saved state or earlier \
-             history; the worker gave it 1 pending request from its own records, oldest first, \
+            "started again after the plugin runtime was lost, with no state or history from \
+             before the loss; the worker gave it 1 pending request from its own records, oldest first, \
              already read as an approval; while the plugin runtime was away the worker passed over \
              2 upstream frames (310 bytes), which the component was never given"
         );
@@ -551,12 +566,12 @@ mod tests {
         }
         .words();
         for clause in [
-            "1 pending request could not be given because the worker no longer holds its frame",
+            "1 pending request could not be given because the worker could not use its bytes",
             "2 pending requests could not be given because they are too large for one event",
             "3 pending requests were not given because the worker gives at most 64 requests or 4 \
-             MiB at a time",
+             MiB when a component starts again",
             "1 pending request was not given because the plugin runtime refused it",
-            "2 pending requests were not given because the plugin runtime did not answer",
+            "2 pending requests were not confirmed as given because the plugin runtime did not answer",
         ] {
             assert!(words.contains(clause), "{clause}: {words}");
         }
@@ -625,7 +640,7 @@ mod tests {
         }
         .words();
         for clause in [
-            "1 pending request could not be given because the worker no longer holds its frame",
+            "1 pending request could not be given because the worker could not use its bytes",
             "1 pending request was not given because the worker gives at most 64 requests",
         ] {
             assert!(words.contains(clause), "{clause}: {words}");
@@ -645,10 +660,25 @@ mod tests {
     }
 
     #[test]
-    fn what_a_long_outage_says_leaves_room_in_the_report_for_the_other_notes() {
-        let words = Recovery::after_a_long_outage().words();
-        // The report is cut at the bound: a restart's words must leave room for how the component
-        // was registered and for what it has failed to decode and to write.
-        assert!(words.len() <= 700, "{} bytes: {words}", words.len());
+    fn the_longest_form_of_a_restart_says_every_clause() {
+        let words = Recovery::with_every_clause().words();
+        for clause in [
+            "the worker gave it 64 pending requests from its own records, oldest first, 64 of them \
+             already read as approvals",
+            "99999 pending requests could not be given because the worker could not use their bytes",
+            "64 pending requests could not be given because they are too large for one event",
+            "99999 pending requests were not given because the worker gives at most 64 requests or 4 \
+             MiB when a component starts again",
+            "64 pending requests were not given because the plugin runtime refused them",
+            "64 pending requests were not confirmed as given because the plugin runtime did not \
+             answer",
+            "99999 upstream frames (99999999 bytes) and 99999 terminal spans (99999999 bytes)",
+            "99999 observations (9999999 bytes) were dropped because the worker's queue was full",
+            "8 pending requests were queued to be decoded again",
+            "56 pending requests could not be queued to be decoded again because the decode queue \
+             was full",
+        ] {
+            assert!(words.contains(clause), "{clause}: {words}");
+        }
     }
 }

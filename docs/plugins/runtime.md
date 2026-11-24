@@ -681,7 +681,7 @@ broker still holds as pending, once each, in the order the broker recorded them.
 come from its decoder entry, which keeps the original whole, and any other request's from the frame
 the broker retained; nothing is read from the terminal, the semantic log or a screen. A request that
 is answered, claimed or recorded under an earlier generation is not given, and neither is one the
-broker no longer holds the bytes of. A request given this way is not offered again from the queue. A binding whose component decodes requests has the requests nobody decoded
+broker no longer holds the bytes of. A request given this way, or left out of it, is not offered again from the queue. A binding whose component decodes requests has the requests nobody decoded
 queued to be decoded again when it is registered, up to the decode queue's own limit. A component
 registered for the first time starts from the live point and is given nothing.
 
@@ -699,7 +699,9 @@ report; no screen shows the report yet. Of a restart it says, as counts and neve
 requests the component was given and how many of those were already read as approvals, why any
 could not be given, how many upstream frames and spans of terminal output the worker passed over
 while the runtime was away (and how many bytes they held), how many observations the worker's queue dropped for
-want of room, and how many requests were queued to be decoded again.
+want of room, and how many requests were queued to be decoded again. A request the worker's queue
+refused while the runtime was away is counted among the observations dropped, and is still given
+from the broker's records.
 
 Privacy mode does not stop observation for live use. A component is marked before a hand-over of anything the worker had while privacy mode was on,
 including something that waited in the lane and was handed over after privacy mode ended, and
@@ -843,7 +845,7 @@ one operation its action declared.
 
 The broker lives in `crates/kr-worker/src/broker`. Its way to a component is the plugin host,
 through the client in `crates/kr-plugin-service`: register a binding, offer events to its queue,
-make a call, take a checkpoint, unbind. `docs/host/README.md` has its whole contract; from this side
+make a call, ask for a snapshot, unbind. `docs/host/README.md` has its whole contract; from this side
 the order is what counts:
 
 1. The broker records the opaque native request **before** it forwards it, and forwards it whether

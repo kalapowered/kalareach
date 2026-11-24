@@ -710,9 +710,8 @@ async fn kr_req_24_24_a_request_frame_in_the_lane_carries_the_place_the_broker_r
 /// the connector table's own decision response, for a binding trusted to decode it, and is in its
 /// broker with the decoder's record. Neither the runtime nor its component holds any of them. (The
 /// binding that decodes ships no component, so the connector's table reads the request, as it does
-/// for every package whose bindings ship none.) The runtime is killed with `SIGKILL` after the
-/// worker has taken its component's state, and the daemon starts another on the worker's asking. The three are read again, and are
-/// equal; the person's answer to the approval goes to the upstream once, through the native
+/// for every package whose bindings ship none.) The runtime is killed with `SIGKILL`, and the daemon
+/// starts another on the worker's asking. The three are read again, and are equal; the person's answer to the approval goes to the upstream once, through the native
 /// terminal, and the person's answer to the question is taken. The component in the replacement
 /// is a new one with no state, so it has seen the approval and nothing before it.
 ///
@@ -816,8 +815,8 @@ async fn kr_req_24_06_a_plugin_runtime_that_is_killed_leaves_the_receipt_the_app
     let reason = world.reason(1);
     assert!(
         reason.contains(
-            "started again after the plugin runtime was lost, without its saved state or earlier \
-             history; the worker gave it 1 pending request from its own records, oldest first, \
+            "started again after the plugin runtime was lost, with no state or history from \
+             before the loss; the worker gave it 1 pending request from its own records, oldest first, \
              already read as an approval"
         ),
         "the report says what the component was given: {reason}"
@@ -1063,8 +1062,8 @@ async fn kr_req_24_24_a_component_that_starts_again_is_given_the_pending_request
     let reason = world.reason(1);
     assert!(
         reason.contains(
-            "started again after the plugin runtime was lost, without its saved state or earlier \
-             history; the worker gave it 9 pending requests from its own records, oldest first, 9 \
+            "started again after the plugin runtime was lost, with no state or history from \
+             before the loss; the worker gave it 9 pending requests from its own records, oldest first, 9 \
              of them already read as approvals"
         ),
         "{reason}"
@@ -1847,7 +1846,7 @@ async fn kr_req_24_24_the_worker_gives_at_most_what_it_holds_and_says_what_it_co
     let reason = world.reason(1);
     for clause in [
         "the worker gave it 64 pending requests from its own records, oldest first",
-        "6 pending requests could not be given because the worker no longer holds their frames",
+        "6 pending requests could not be given because the worker could not use their bytes",
     ] {
         assert!(reason.contains(clause), "{clause}: {reason}");
     }

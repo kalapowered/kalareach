@@ -315,8 +315,8 @@ async fn kr_req_11_26_a_request_answered_natively_while_its_decode_is_held_is_no
 /// made in it, however long the request waited and whatever privacy mode is when it is decoded.
 ///
 /// A request made outside privacy mode marks nothing. A request recorded in it, whose decode is
-/// held until privacy mode has ended, marks the component's view as holding content made in it,
-/// which is what keeps its state from being taken afterwards.
+/// held until privacy mode has ended, withholds the runtime's words once the component has been
+/// handed it, whenever it is decoded.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn kr_req_24_27_a_request_made_in_privacy_mode_marks_the_component_whenever_it_is_decoded() {
     let Some(world) =

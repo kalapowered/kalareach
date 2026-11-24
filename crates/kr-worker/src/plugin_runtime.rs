@@ -173,8 +173,8 @@ const PRIVACY_RETRY: Duration = Duration::from_secs(1);
 /// in the order they were made; it reads the state and the connection fresh each time round and
 /// sends what it finds when either differs from what the runtime was last told, then looks again,
 /// since either may have moved while the request was out. A telling that fails is forgotten and
-/// tried again, and the worker's own drop of documents, words and checkpoints in privacy mode does
-/// not wait for it.
+/// tried again, and the worker's own drop of documents and words in privacy mode does not wait
+/// for it.
 async fn privacy_sync(broker: Weak<Broker>) {
     let Some((lane, calls)) = broker
         .upgrade()
