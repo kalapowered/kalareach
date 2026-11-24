@@ -320,6 +320,14 @@ async fn a_stock_shell_is_labelled_rather_than_claiming_the_managed_contract() {
 fn a_managed_session_launches_the_package_binary_with_the_arguments_its_record_declares() {
     let packages = tempfile::tempdir().expect("a directory");
     install_package(packages.path(), ShellKind::Zsh);
+    // The record declares flags that are not section 7's, so that a host with a table of its own
+    // would answer with the table and not with the record.
+    declare_flags(
+        packages.path(),
+        ShellKind::Zsh,
+        &["--declared-interactive"],
+        &["--declared-login", "-x"],
+    );
     let set = PackageSet::discover(packages.path()).expect("reads the package");
     let package = set.select(Some("zsh")).expect("qualified");
     assert_eq!(
@@ -330,11 +338,13 @@ fn a_managed_session_launches_the_package_binary_with_the_arguments_its_record_d
     // The arguments are the record's own, per startup mode. Section 7 gives macOS the login
     // startup and Linux the interactive one, so what this asserts is the mode rather than one
     // platform's answer.
-    let declared = kr_shell_integration::host::package::PackageFlags::section_seven(ShellKind::Zsh);
-    assert_eq!(package.arguments(StartupMode::Login), declared.login);
+    assert_eq!(
+        package.arguments(StartupMode::Login),
+        ["--declared-login", "-x"]
+    );
     assert_eq!(
         package.arguments(StartupMode::Interactive),
-        declared.interactive
+        ["--declared-interactive"]
     );
     assert_eq!(
         package.interactive_flags(),
@@ -345,6 +355,20 @@ fn a_managed_session_launches_the_package_binary_with_the_arguments_its_record_d
     assert_eq!(identity.upstream_version, "5.9");
     assert_eq!(identity.editor_abi, "zle-5.9");
     assert_eq!(identity.integration_version, "1");
+}
+
+/// Gives the installed package of `kind` a record that declares `interactive` and `login` as its
+/// flags, in place of the ones the fixture wrote.
+fn declare_flags(root: &Path, kind: ShellKind, interactive: &[&str], login: &[&str]) {
+    let record = root
+        .join(kind.as_str())
+        .join("identity-1")
+        .join(MANIFEST_BASENAME);
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&record).expect("reads the record"))
+            .expect("a record");
+    manifest["flags"] = serde_json::json!({ "interactive": interactive, "login": login });
+    std::fs::write(&record, manifest.to_string()).expect("writes the record");
 }
 
 /// Installs a Zsh package whose shell records the arguments it was started with and then ends, and
@@ -364,12 +388,7 @@ fn install_recording_package(root: &Path, report: &Path, interactive: &[&str], l
             report.display()
         ),
     );
-    let record = directory.join(MANIFEST_BASENAME);
-    let mut manifest: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&record).expect("reads the record"))
-            .expect("a record");
-    manifest["flags"] = serde_json::json!({ "interactive": interactive, "login": login });
-    std::fs::write(&record, manifest.to_string()).expect("writes the record");
+    declare_flags(root, ShellKind::Zsh, interactive, login);
 }
 
 /// Records an install of Zsh's startup entry in `home`, as `kr shell install` leaves it: the entry
@@ -1888,7 +1907,170 @@ fn worker_beside_this_test() -> std::path::PathBuf {
          `cargo build -p kr-worker`, or run the whole workspace's tests, which build it",
         worker.display()
     );
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    if let Some(why) = built_from_another_tree(&worker, &repository) {
+        panic!(
+            "{} was not built from this tree: {why}; build it again with `cargo build --locked -p \
+             kr-worker`",
+            worker.display()
+        );
+    }
     worker
+}
+
+/// Why `worker`, built into a target directory, is not one built from the checkout at `repository`
+/// as it is now, or `None` when it is.
+///
+/// A build of a program by name (`cargo build -p ...`) writes beside it a file that lists each source
+/// it was built from. A worker older than any of them was built before the tree changed, as one left
+/// in a target directory by an earlier run is, and a worker whose list names the worker crate's
+/// sources in another checkout was built there: a session started with either would run what this
+/// tree does not. This is Cargo's own rule for a stale build, applied before a case relies on the
+/// program.
+///
+/// What it does not judge: a worker with no such list, or with a list older than the program. A run
+/// that builds the programs only to test writes no list of its own, so there is nothing to tell that
+/// worker by and it is used as it is.
+fn built_from_another_tree(worker: &Path, repository: &Path) -> Option<String> {
+    let listing = worker.with_extension("d");
+    let text = match std::fs::read_to_string(&listing) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(error) => return Some(format!("{} cannot be read: {error}", listing.display())),
+    };
+    let modified = |path: &Path| std::fs::metadata(path).and_then(|about| about.modified());
+    let built = match modified(worker) {
+        Ok(built) => built,
+        Err(error) => return Some(format!("its time cannot be read: {error}")),
+    };
+    // Cargo writes the list after the program it describes, so the list of the same build is never
+    // the older of the two.
+    if modified(&listing).is_ok_and(|listed| listed < built) {
+        return None;
+    }
+    // Makefile syntax: the program, a colon, then each source, a space escaped with a backslash.
+    let Some((_, after)) = text.split_once(": ") else {
+        return Some(format!("{} is not a dependency file", listing.display()));
+    };
+    let after = after.replace("\\\n", " ").replace("\\ ", "\u{0}");
+    let own = Path::new("crates/kr-worker/src");
+    let here = std::fs::canonicalize(repository.join(own)).unwrap_or(repository.join(own));
+    let mut found = false;
+    for source in after
+        .split_whitespace()
+        .map(|source| source.replace('\u{0}', " "))
+    {
+        let path = Path::new(&source);
+        let changed = match modified(path) {
+            Ok(changed) => changed,
+            // A source that is listed and cannot be looked at is one the tree no longer has.
+            Err(error) => return Some(format!("{source} cannot be looked at: {error}")),
+        };
+        let named = source.replace('\\', "/");
+        if named.contains("crates/kr-worker/src/") {
+            let there = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+            if !there.starts_with(&here) {
+                return Some(format!("it was built from the sources at {source}"));
+            }
+            found = true;
+        }
+        if changed > built {
+            return Some(format!("{source} has changed since it was built"));
+        }
+    }
+    (!found).then(|| {
+        format!(
+            "{} lists none of the sources of kr-worker",
+            listing.display()
+        )
+    })
+}
+
+/// A worker is told apart by its build list: one built before a source it lists changed, or from
+/// the worker's sources in another checkout, is not one built from this tree, and one with no list
+/// or with a list older than itself is used as it is.
+#[test]
+fn a_worker_built_before_the_tree_changed_or_elsewhere_is_told_apart() {
+    use std::time::{Duration, SystemTime};
+
+    let directory = tempfile::tempdir().expect("a directory");
+    let place = |path: &Path| {
+        std::fs::create_dir_all(path.parent().expect("a parent")).expect("a directory");
+        std::fs::write(path, "x").expect("a file");
+    };
+    let dated = |path: &Path, time: SystemTime| {
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .expect("opens the file")
+            .set_modified(time)
+            .expect("sets the time");
+    };
+    let repository = directory.path().join("repository");
+    let source = repository.join("crates/kr-worker/src/main.rs");
+    let elsewhere = directory.path().join("other/crates/kr-worker/src/main.rs");
+    let unrelated = directory.path().join("repository/crates/kr-ipc/src/lib.rs");
+    let worker = directory.path().join("target/kr-worker");
+    for path in [&source, &elsewhere, &unrelated, &worker] {
+        place(path);
+    }
+    let listing = worker.with_extension("d");
+    let list = |sources: &[&Path]| {
+        let sources: Vec<String> = sources
+            .iter()
+            .map(|source| source.display().to_string().replace(' ', "\\ "))
+            .collect();
+        std::fs::write(
+            &listing,
+            format!("{}: {}\n", worker.display(), sources.join(" ")),
+        )
+        .expect("writes the list");
+    };
+    let now = SystemTime::now();
+    let earlier = now - Duration::from_secs(3600);
+    let later = now + Duration::from_secs(3600);
+    for path in [&source, &elsewhere, &unrelated] {
+        dated(path, earlier);
+    }
+    dated(&worker, now);
+
+    assert_eq!(
+        built_from_another_tree(&worker, &repository),
+        None,
+        "a worker with no list is used as it is"
+    );
+
+    list(&[&source, &unrelated]);
+    dated(&listing, later);
+    assert_eq!(
+        built_from_another_tree(&worker, &repository),
+        None,
+        "sources as old as the build are this tree's"
+    );
+
+    dated(&source, later);
+    let why = built_from_another_tree(&worker, &repository).expect("a source changed since");
+    assert!(why.contains("has changed since it was built"), "{why}");
+
+    dated(&listing, earlier);
+    assert_eq!(
+        built_from_another_tree(&worker, &repository),
+        None,
+        "a list older than the program is the list of an earlier build"
+    );
+
+    list(&[&elsewhere]);
+    dated(&listing, later);
+    let why = built_from_another_tree(&worker, &repository).expect("another checkout");
+    assert!(why.contains("it was built from the sources at"), "{why}");
+
+    list(&[&unrelated]);
+    dated(&listing, later);
+    let why = built_from_another_tree(&worker, &repository).expect("no source of the worker");
+    assert!(
+        why.contains("lists none of the sources of kr-worker"),
+        "{why}"
+    );
 }
 
 // --------------------------------------------------------------------------------------------
