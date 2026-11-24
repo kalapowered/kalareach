@@ -4990,6 +4990,10 @@ async fn a_stored_apply_node_is_admitted_across_an_update_and_a_rollback() {
 /// answers to the moment it serves the device, and serves the same device. An update again opens
 /// the store, finds the row as it was left, and the host holds the device under the same action
 /// until the same moment.
+///
+/// The registry is not what the case asks about: it is put back to the version the release before
+/// writes, since a rollback to the release before is refused for the registry at the version this
+/// release writes.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_voice_start_hold_is_kept_across_a_rollback_and_an_update() {
     use kr_controller::voice_start_holds::{Decision, Record, VOICE_START_HOLDS_RECORD};
@@ -5047,6 +5051,7 @@ async fn a_voice_start_hold_is_kept_across_a_rollback_and_an_update() {
     let before = standing("before the rollback");
 
     // The rollback is not refused, and the release before serves the device and leaves the store.
+    updated.puts_the_registry_back_for_the_release_before();
     let (output, said) = host.kr_json(&["host", "rollback", "--json"]);
     assert_eq!(
         output.status.code(),
