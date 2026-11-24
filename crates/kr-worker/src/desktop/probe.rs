@@ -1422,10 +1422,12 @@ mod platform {
         operation: &Operation,
     ) -> Ran {
         let Program::Tool(tool) = &operation.program else {
-            // The program this route names is not on this host, or the route has none to run.
+            // The program this route names is not on this host, or the route has none to run. The
+            // record names the path it would be installed at, where the route has one, so that a
+            // later reading sees the file once it is.
             return Ran {
                 check,
-                facility: None,
+                facility: operation.program.named_path().map(str::to_owned),
                 outcome: Outcome::FacilityMissing,
             };
         };
@@ -3177,6 +3179,45 @@ mod tests {
             before,
             "the record names the program as it was before the operation"
         );
+    }
+
+    /// KR-REQ-03.29, R9: a route whose program is not installed keeps the absolute path it would be
+    /// installed at in its record, with no digest, so that a later reading sees the file once it
+    /// is there.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_tool_that_is_not_installed_keeps_its_path_in_its_record() {
+        let route = |check: Check, _: &DesktopContext, _: Option<&std::ffi::OsStr>| {
+            Some(Operation {
+                check,
+                route: MACOS,
+                program: Program::Absent(Some("/nonexistent/the-tool".to_owned())),
+                target: None,
+            })
+        };
+        let source = Readings::of(vec![surroundings(desktop())]);
+        let records = report_timed(
+            &[Check::AccessibleElement],
+            &subject(),
+            &source,
+            revision(),
+            &Plan::in_directory("."),
+            &Platform,
+            &Seams {
+                time_of: &time_of,
+                routes: &route,
+            },
+        );
+        assert_eq!(
+            state_of(&records, Check::AccessibleElement),
+            CapabilityState::MissingInstallation
+        );
+        assert_eq!(
+            records[0].identity.binary.as_ref().map(String::as_str),
+            Some("/nonexistent/the-tool"),
+            "the record names the path the tool would be installed at"
+        );
+        assert!(!records[0].identity.version.is_present(), "and no digest");
     }
 
     /// KR-REQ-03.29, S-8: what a check reads of its own files, an image and what a facility printed,

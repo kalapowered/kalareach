@@ -9,8 +9,10 @@
 //!
 //! What ends the findings is what the records themselves list ([`probe::stale`]): the worker that
 //! performed them is gone or replaced, a new login moved the desktop's generation, the execution
-//! profile changed, or a tool they use was installed, removed or replaced. A change of permission
-//! is not something this host can read; it is found by performing the checks again.
+//! profile changed, or a tool the worker ran was replaced, or a tool it did not find at an
+//! absolute path was installed there. A tool it looked for by a bare name and did not find is not
+//! seen: that it is installed shows when the checks run again. A change of permission is not
+//! something this host can read either; it is found by performing the checks again.
 
 use std::sync::{Arc, PoisonError};
 use std::time::Duration;
@@ -171,7 +173,9 @@ impl Checks {
 
     /// Notes that the run ended with these findings.
     ///
-    /// They are held against what the desktop, the tools and the worker were when the run began.
+    /// They are held against the desktop and the worker as they were when the run began, and
+    /// against the tools the worker's answer names: the files it ran, and the absolute path of a
+    /// tool it did not find.
     fn succeeded(&mut self, finished_at_ms: TimestampMs, records: Vec<CapabilityRecord>) {
         let Some(running) = self.running.take() else {
             return;
@@ -316,15 +320,15 @@ pub(super) fn identities_now(records: &[CapabilityRecord]) -> String {
     })
 }
 
-/// What the desktop, the tools and the worker are, for a fingerprint of this moment.
+/// What the desktop and the worker are, for a fingerprint of this moment.
 ///
 /// The host agent is the worker that performed the checks, by the identity the kernel records for
 /// its process: a replaced worker is another agent. Its build is the release the worker a run is
 /// performed in states, so that the agent is updated when that worker is of another release, and
 /// not when another session of the same release starts. `worker` is the one the findings were
 /// taken in, and `target` is the one a run asked for now would be performed in. The generation and
-/// the profile are the desktop's. The tools are the ones the checks use, read from the machine as [`tools_of`] reads
-/// them, so a lock does not change them and an installed, removed or replaced tool does.
+/// the profile are the desktop's. The tools are not in it: they are the ones the worker ran,
+/// which its answer names, and [`identities_now`] reads them at those paths.
 pub(super) fn fingerprint_of(
     context: &DesktopContext,
     worker: Option<&KnownWorker>,
@@ -1197,6 +1201,35 @@ mod tests {
             "a login that changed ends them"
         );
         assert_eq!(checks.view().state, CapabilityChecksState::Stale);
+    }
+
+    /// KR-REQ-03.29, R9: a finding that a tool was not installed names the absolute path it would
+    /// be installed at, so that it ends once the tool is there.
+    #[cfg(unix)]
+    #[test]
+    fn a_not_installed_finding_ends_when_the_tool_is_installed() {
+        let directory = std::env::temp_dir().join(format!("kr-absent-{}", kr_ipc::new_uuid()));
+        std::fs::create_dir_all(&directory).expect("a directory of this test's own");
+        let tool = directory.join("the-tool");
+        let mut finding = screen_finding();
+        finding.state = CapabilityState::MissingInstallation;
+        finding.identity.binary = Nullable::some(tool.display().to_string());
+        finding.identity.schema = Nullable::some("a-route".to_owned());
+        let taken = fingerprint_of(&context(), None);
+        let mut checks = Checks::new();
+        checks.begin(TimestampMs::new(10), session(), taken.clone());
+        checks.succeeded(TimestampMs::new(20), vec![finding]);
+        assert_eq!(
+            standing_now(&mut checks, &taken).len(),
+            1,
+            "with the tool still not there"
+        );
+        std::fs::write(&tool, b"installed since").expect("the tool is installed");
+        assert!(
+            standing_now(&mut checks, &taken).is_empty(),
+            "a finding that the tool was not installed outlived its installation"
+        );
+        std::fs::remove_dir_all(&directory).expect("removes the test's directory");
     }
 
     /// KR-REQ-03.29, R9: a fingerprint holds no tool of the daemon's own. What the findings are

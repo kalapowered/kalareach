@@ -46,13 +46,28 @@ pub struct Route {
 pub enum Program {
     /// A program the platform installs, found at this absolute path.
     Tool(String),
-    /// A program the route names that this host does not have.
-    Absent,
+    /// A program the route names that this host does not have. A route that names an absolute path
+    /// keeps it, where the program would be installed, so that a record can name the path and a
+    /// later reading sees the file once it is. A route that names a bare name has no path to keep:
+    /// the search that found nothing is the worker's own.
+    Absent(Option<String>),
     /// This worker program's own helper. A record names it by its route and carries no digest: the
     /// helper is the worker program, which the host agent's own identity already covers.
     Helper,
     /// A route that is recorded as what it is and never performed, in its own words.
     NotPerformed(&'static str),
+}
+
+impl Program {
+    /// The absolute path of the program, where there is one: where it is, or where it would be.
+    #[must_use]
+    pub fn named_path(&self) -> Option<&str> {
+        match self {
+            Self::Tool(path) => Some(path),
+            Self::Absent(path) => path.as_deref(),
+            Self::Helper | Self::NotPerformed(_) => None,
+        }
+    }
 }
 
 /// One check, resolved to the route that performs it on this desktop.
@@ -132,7 +147,16 @@ pub fn resolve(
         .map(|row| Operation {
             check,
             route: row.route,
-            program: installed_in(row.tool, search).map_or(Program::Absent, Program::Tool),
+            program: installed_in(row.tool, search).map_or_else(
+                || {
+                    Program::Absent(
+                        std::path::Path::new(row.tool)
+                            .is_absolute()
+                            .then(|| row.tool.to_owned()),
+                    )
+                },
+                Program::Tool,
+            ),
             target: row.target,
         })
 }
