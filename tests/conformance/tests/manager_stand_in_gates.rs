@@ -1,7 +1,7 @@
 //! The rule that a test run's stand-in service manager has no way round it, read from the sources.
 //!
 //! Product code starts `launchctl` through three runners only: the command line's
-//! (`run_within`), the desktop reader's (`run`) and the control daemon's (`command_within`). Four
+//! (`run_within`), the desktop reader's (`run`) and the control daemon's (`command_within`). Five
 //! readings, each by tokens, so that a name inside a comment is not a use:
 //!
 //! 1. Each runner calls the seam's refusal before it starts a program, and a runner that has a
@@ -15,7 +15,8 @@
 //!    `Running` (a `kr` that has been started) wait for a program without a bound.
 //! 4. The helpers that place a program for a test (`place_program` and `place_script`) and the
 //!    one that starts it once (`place_and_start_once`) wait with a bound.
-//! 5. In the startup suite's support module, `spawning` waits for its turn with a bound.
+//! 5. In the startup suite's support module, `spawning` and `spawning_before`, which takes the turn
+//!    for it, wait for it with a bound.
 //!
 //! What the readings cannot see: a program named by a string a macro builds, a path made at run
 //! time, a command inside shell text, and a call of `systemctl`: on Linux the control daemon's
@@ -23,9 +24,11 @@
 //! third reading reads the case, its steps, four free helpers and the methods of `Running` of the
 //! startup suite, and not the methods of the host that they call: a program a method of the host
 //! starts and a wait it hides are outside it. The fourth reads three placing helpers, and not the
-//! copier they start. The fifth reads one function. The behaviour of each runner is shown by its
-//! own cases, each in a child of its own with the variable and the marker in the state the case
-//! names.
+//! copier they start. The fifth reads two functions, `spawning` and `spawning_before`. The helpers
+//! in which the bounds take effect are read by none: `kill_and_collect` and `bounded` of the
+//! startup suite's support module, and `copier_ended_within` of kr-ipc's `testing` module. The
+//! behaviour of each runner is shown by its own cases, each in a child of its own with the variable
+//! and the marker in the state the case names.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -802,29 +805,39 @@ fn the_placing_reading_finds_each_wait_with_no_bound_and_only_those() {
 /// started.
 const SUPPORT_FILE: &str = "crates/kr-cli/tests/support/user_manager.rs";
 
-/// What is wrong with the support module of `source`: `spawning` missing, and `spawning` taking
-/// its turn with a lock that waits for as long as another start takes.
+/// The functions of the support module that wait for the turn at which a process is started:
+/// `spawning`, and `spawning_before`, which takes the turn for it and for the helper that runs a
+/// call within a bound.
+const TURN_TAKERS: [&str; 2] = ["spawning", "spawning_before"];
+
+/// What is wrong with the support module of `source`: a function of [`TURN_TAKERS`] missing, and
+/// one of them taking its turn with a lock that waits for as long as another start takes.
 fn support_problems(source: &str) -> Vec<String> {
     let tokens = code_tokens(source);
-    let Some(spawning) = functions(&tokens)
-        .into_iter()
-        .find(|function| function.name == "spawning")
-    else {
-        return vec!["spawning is not a function of this source".to_owned()];
-    };
-    spawning
-        .body
-        .filter(|&at| {
-            tokens[at].is_punct('.')
-                && tokens.get(at + 1).and_then(Token::ident) == Some("lock")
-                && tokens.get(at + 2).is_some_and(|token| token.is_punct('('))
-        })
-        .map(|_| "spawning waits for its turn with lock() and no bound".to_owned())
-        .collect()
+    let all = functions(&tokens);
+    let mut problems = Vec::new();
+    for name in TURN_TAKERS {
+        let Some(function) = all.iter().find(|function| function.name == name) else {
+            problems.push(format!("{name} is not a function of this source"));
+            continue;
+        };
+        problems.extend(
+            function
+                .body
+                .clone()
+                .filter(|&at| {
+                    tokens[at].is_punct('.')
+                        && tokens.get(at + 1).and_then(Token::ident) == Some("lock")
+                        && tokens.get(at + 2).is_some_and(|token| token.is_punct('('))
+                })
+                .map(|_| format!("{name} waits for its turn with lock() and no bound")),
+        );
+    }
+    problems
 }
 
-/// `spawning` takes its turn within a bound, so that a start that never gives the turn up fails the
-/// test that waits for it and does not hold it for ever.
+/// `spawning` and `spawning_before` take their turn within a bound, so that a start that never
+/// gives the turn up fails the test that waits for it and does not hold it for ever.
 #[test]
 fn the_support_helper_that_takes_the_turn_to_start_a_process_waits_for_it_with_a_bound() {
     let text = std::fs::read_to_string(repository().join(SUPPORT_FILE))
@@ -836,16 +849,36 @@ fn the_support_helper_that_takes_the_turn_to_start_a_process_waits_for_it_with_a
     );
 }
 
-/// The support reading finds a lock that waits and a missing function, and not a lock that does not
-/// wait, or one in another function.
+/// The support reading finds a lock that waits in either function and a missing function, and not a
+/// lock that does not wait, or one in another function.
 #[test]
 fn the_support_reading_finds_a_wait_for_the_turn_with_no_bound_and_only_that() {
     assert!(
-        support_problems("fn spawning() { S.try_lock(); } fn other() { S.lock(); }").is_empty()
+        support_problems(
+            "fn spawning() { S.try_lock(); } fn spawning_before() { S.try_lock(); } \
+             fn other() { S.lock(); }"
+        )
+        .is_empty()
+    );
+    let in_spawning =
+        support_problems("fn spawning() { S.lock().unwrap(); } fn spawning_before() {}");
+    assert_eq!(
+        in_spawning,
+        ["spawning waits for its turn with lock() and no bound"]
+    );
+    let in_spawning_before =
+        support_problems("fn spawning() {} fn spawning_before() { S.lock().unwrap(); }");
+    assert_eq!(
+        in_spawning_before,
+        ["spawning_before waits for its turn with lock() and no bound"]
     );
     assert_eq!(
-        support_problems("fn spawning() { S.lock().unwrap(); }").len(),
-        1
+        support_problems("fn spawning() {}"),
+        ["spawning_before is not a function of this source"]
     );
-    assert_eq!(support_problems("fn other() {}").len(), 1);
+    assert_eq!(
+        support_problems("fn spawning_before() {}"),
+        ["spawning is not a function of this source"]
+    );
+    assert_eq!(support_problems("fn other() {}").len(), 2);
 }
