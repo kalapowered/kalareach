@@ -18,10 +18,11 @@
 //! # What a loss costs
 //!
 //! What a ready component is not offered is a loss, and a loss is numbered. A request frame skipped
-//! because its request was answered or left behind while it waited is not offered, and is not a
-//! loss. A binding that has lost something is owed a snapshot, and gets one before it is offered
-//! anything else: the snapshot is requested for the number of the loss current when it is asked for
-//! and discharges that number, so a loss that arrives while it runs asks for another. What the component has missed is put in the
+//! because its request was answered, taken by the native client, marked as sent, or left behind by
+//! its source while it waited is not offered, and is not a loss. A binding that has lost something
+//! is owed a snapshot, and gets one before it is offered anything else: the snapshot is requested
+//! for the number of the loss current when it is asked for and discharges that number, so a loss
+//! that arrives while it runs asks for another. What the component has missed is put in the
 //! binding's component report, where a person reads it, as counts and never as content.
 //!
 //! The lane gives the pump a loss with the first entry that is newer than it, and all of what it lost

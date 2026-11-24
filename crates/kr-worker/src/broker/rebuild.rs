@@ -408,8 +408,9 @@ impl Recovery {
     }
 
     /// A restart's words with a clause for every way a request is left out, and every tally of what
-    /// was passed over and dropped at `u64::MAX`, which its counters can reach: the longest the words
-    /// can be. For the cases that bound a report.
+    /// was passed over and dropped at `u64::MAX`, which its counters can reach. The counts of
+    /// requests have five digits by assumption, since nothing limits how many requests the broker
+    /// holds. For the cases that bound a report.
     #[cfg(test)]
     pub(super) fn with_every_clause() -> Self {
         let widest = Tally {
@@ -418,7 +419,7 @@ impl Recovery {
         };
         Self {
             unavailable: 99_999,
-            oversized: 64,
+            oversized: 99_999,
             over_cap: 99_999,
             refused: 64,
             unanswered: 64,

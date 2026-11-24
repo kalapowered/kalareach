@@ -1170,7 +1170,8 @@ async fn kr_req_24_27_a_reply_read_after_its_connection_was_replaced_is_still_wi
 /// Privacy mode standing on the connection withholds the words by itself, so the case does not tell
 /// that from the withholding of the hand-over of the action's arguments. No case covers that
 /// hand-over alone: one made in privacy mode, with privacy mode ended and the runtime replaced
-/// before the answer comes back.
+/// after the privacy read and before `propose` takes its client. A replacement after that point
+/// is withheld because the client is no longer current, whatever the hand-over did.
 ///
 /// The control is first: outside privacy mode the refusal carries what the component said.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
