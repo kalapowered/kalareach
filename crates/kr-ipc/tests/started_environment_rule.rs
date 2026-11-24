@@ -549,6 +549,18 @@ const SNAPSHOTS: &[Counted] = &[
         removal: INVISIBLE_CREATE_REMOVAL,
         holds: |text| text.contains("Presentation::Invisible"),
     },
+    Counted {
+        file: "crates/kr-controller/tests/desktop_checks_host_agent.rs",
+        places: 1,
+        reason: "its place is an invisible create, which the daemon refuses when it carries a variable (a session started with the host's environment carries none), so each session takes the host's environment of its file's daemon: `Hosted::run`, which `Hosted::start` and the restart both call, starts the daemon and calls `set_host_environment` with the helper's variables, so the home is inside the case's own tree",
+        removal: INVISIBLE_CREATE_REMOVAL,
+        holds: |text| {
+            text.contains("Presentation::Invisible")
+                && text.contains(
+                    ".set_host_environment(StartedEnvironment::within(self.tree.root()).host_variables())",
+                )
+        },
+    },
 ];
 
 /// Why a source starts a daemon in a child program: the child's own environment is the helper's.
