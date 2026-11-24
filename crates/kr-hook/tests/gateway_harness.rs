@@ -109,6 +109,21 @@ fn a_group_ends_a_launch_when_it_is_dropped() {
     });
 }
 
+/// Whether the process is the `ping` the harness's command starts.
+#[cfg(windows)]
+fn is_ping(pid: u32) -> bool {
+    use kr_ipc::identity::{ProcessReading, read_process};
+
+    process_start_identity(pid)
+        .ok()
+        .is_some_and(|identity| match read_process(&identity) {
+            ProcessReading::Running(facts) => facts
+                .name
+                .is_some_and(|name| name.eq_ignore_ascii_case("ping.exe")),
+            _ => false,
+        })
+}
+
 /// The job a launch runs in holds what the launch started, wherever it is below it, and ends
 /// all of it with the group.
 #[cfg(windows)]
@@ -124,6 +139,13 @@ fn a_groups_job_holds_what_a_launch_started_and_ends_it() {
     assert!(
         members.contains(&launched.id()),
         "the job holds the launch itself: {members:?}"
+    );
+    eventually(
+        "the job holds the `ping` that the command started below the launch",
+        || {
+            members = group.members();
+            members.iter().any(|pid| is_ping(*pid))
+        },
     );
     let identities: Vec<_> = members
         .iter()
