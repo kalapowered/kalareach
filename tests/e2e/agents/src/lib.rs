@@ -72,12 +72,16 @@
 pub mod account;
 #[cfg(unix)]
 pub mod build;
+#[cfg(all(unix, test))]
+mod committed;
 #[cfg(unix)]
 pub mod confine;
 #[cfg(unix)]
 pub mod conversation;
 #[cfg(unix)]
 pub mod detect;
+#[cfg(unix)]
+pub mod entry;
 #[cfg(unix)]
 pub mod held;
 #[cfg(unix)]
