@@ -753,6 +753,53 @@ fn kr_req_07_64_a_probe_not_collected_within_the_bound_is_collected_later() {
     );
 }
 
+/// KR-REQ-07.64: a probe that moved itself to another process group is ended all the same.
+///
+/// The stand-in joins the group of the process that made it, which is in the same session, writes
+/// the number of its group and runs on. The thread must end it within the cleanup bound, though the
+/// kill of the group it was started in no longer reaches it.
+#[cfg(unix)]
+#[test]
+fn kr_req_07_64_a_probe_that_left_its_process_group_is_ended_by_its_own_number() {
+    let here = directory();
+    let standin = Standin::running(
+        r#"exec perl -e 'setpgrp(0, getpgrp(getppid())); open(F, ">main.pid"); print F $$; close(F); open(G, ">group.txt"); print G getpgrp(0); close(G); sleep 12'"#,
+        "",
+    );
+    let deadline = start_allowance();
+    let probed = probe::run_within(
+        &standin.program,
+        &standin.probe(&[]),
+        &[],
+        here.path(),
+        &given(&[]),
+        &ProbeRun::within(deadline),
+        probe::MAX_OUTPUT_BYTES,
+    );
+    assert!(probed.late, "{probed:?}");
+    let pid = written_pid(here.path(), "main.pid").expect("main.pid was written");
+    let group = written_pid(here.path(), "group.txt").expect("group.txt was written");
+    assert_ne!(
+        group, pid,
+        "the premise: the stand-in left its own group (its group {group}, its number {pid})"
+    );
+    let end = thread_end(&probed);
+    assert!(
+        end.collected_in_bound,
+        "the probe that left its group was ended and collected within the cleanup bound: {end:?}"
+    );
+    assert!(
+        end.took <= deadline + probe::CLEANUP_BOUND + SLACK,
+        "the thread's total, cleanup included: {:?}",
+        end.took
+    );
+    let left = survivors(here.path(), &["main.pid"]);
+    assert!(
+        left.is_empty(),
+        "left running after the thread ended: {left:?}"
+    );
+}
+
 /// KR-REQ-07.64: a start that fails after the process was created, and cannot end it, gives up on
 /// ending it within the cleanup bound and not after the launch's own longer wait.
 ///

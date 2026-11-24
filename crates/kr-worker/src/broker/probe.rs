@@ -544,6 +544,8 @@ impl Process {
             // outcome wanted.
             let _ = rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
         }
+        // A probe that left its group is ended by its process number as well.
+        let _ = self.child.kill();
         while !self.collected() {
             if Instant::now() >= until {
                 return false;
