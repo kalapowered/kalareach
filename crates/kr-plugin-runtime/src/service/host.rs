@@ -2641,8 +2641,8 @@ fn pieces_of(binding_id: BindingId, event: BindingEvent, shape: Shape) -> Vec<Pi
     match event {
         BindingEvent::Gap(gap) => {
             let beyond = Beyond {
-                first: gap.first.clone().filter(|_| open),
-                last: gap.last.clone().filter(|_| open),
+                first: gap.first_bound().filter(|_| open),
+                last: gap.last_bound().filter(|_| open),
                 ..Beyond::default()
             };
             plain(notices_of(binding_id, BindingEvent::Gap(gap)), &beyond)
@@ -2865,6 +2865,7 @@ fn inside_packages(root: &Path, named: &str) -> Result<PathBuf, String> {
 #[cfg(test)]
 mod tests {
     use kr_plugin_sdk::digest::PayloadDigest;
+    use kr_plugin_service::notices::Bound;
     use kr_plugin_service::protocol::WireSourceEvent;
 
     use super::*;
@@ -2887,13 +2888,17 @@ mod tests {
         let binding = BindingId::new(Uuid::from_bytes([6; 16]));
         let handle =
             |text: &str| kr_protocol::ids::SourceEventHandle::new(text).expect("a bounded handle");
+        let placed = |text: &str, place: u64| Bound {
+            handle: handle(text),
+            place,
+        };
         let dropped = || BindingEvent::PresentationDropped {
             documents: 3,
-            first: Some(handle("se-2")),
-            last: Some(handle("se-9")),
+            first: Some(placed("se-2", 2)),
+            last: Some(placed("se-9", 9)),
         };
         for (writer_open, expected) in [
-            (true, (Some(handle("se-2")), Some(handle("se-9")))),
+            (true, (Some(placed("se-2", 2)), Some(placed("se-9", 9)))),
             (false, (None, None)),
         ] {
             let shape = Shape {

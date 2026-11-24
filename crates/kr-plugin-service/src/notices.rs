@@ -108,9 +108,9 @@ impl Origin {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Beyond {
     /// For a gap: the first event lost, in the order the events were offered to the binding.
-    pub first: Option<SourceEventHandle>,
+    pub first: Option<Bound>,
     /// For a gap: the last event lost, in that order.
-    pub last: Option<SourceEventHandle>,
+    pub last: Option<Bound>,
     /// For a fault: the event whose `observe` trapped, where the call was one.
     pub event: Option<SourceEventHandle>,
     /// For a fault: the generation the next call runs under.
@@ -120,11 +120,61 @@ pub struct Beyond {
 impl Beyond {
     /// What the handles of this record cost of the queue.
     fn bytes(&self) -> u64 {
-        [&self.first, &self.last, &self.event]
+        let bounds = [&self.first, &self.last]
             .into_iter()
             .flatten()
-            .map(|handle| handle.as_str().len() as u64)
-            .sum()
+            .map(|bound| bound.handle.as_str().len() as u64)
+            .sum::<u64>();
+        bounds
+            + self
+                .event
+                .as_ref()
+                .map_or(0, |handle| handle.as_str().len() as u64)
+    }
+}
+
+/// An event that bounds a loss, and the place it held among the events offered to its binding.
+///
+/// Losses reach a queue in the order their producers report them, which is not always the order
+/// their events were offered in: a request is never evicted, so one that was offered early can be
+/// observed, and lost, after a later observation was evicted and reported. The place is what lets
+/// the queue keep the earliest and the latest event of every loss it folds, whatever order the
+/// losses came in. It is the binding's own count and is never written.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Bound {
+    /// The event.
+    pub handle: SourceEventHandle,
+    /// Where it stood among the events offered, counted from one.
+    pub place: u64,
+}
+
+impl Bound {
+    /// Returns the one of two bounds that stood earlier, where there is one.
+    #[must_use]
+    pub fn earlier(this: Option<Self>, other: Option<Self>) -> Option<Self> {
+        match (this, other) {
+            (Some(this), Some(other)) => Some(if other.place < this.place {
+                other
+            } else {
+                this
+            }),
+            (this, None) => this,
+            (None, other) => other,
+        }
+    }
+
+    /// Returns the one of two bounds that stood later, where there is one.
+    #[must_use]
+    pub fn later(this: Option<Self>, other: Option<Self>) -> Option<Self> {
+        match (this, other) {
+            (Some(this), Some(other)) => Some(if other.place > this.place {
+                other
+            } else {
+                this
+            }),
+            (this, None) => this,
+            (None, other) => other,
+        }
     }
 }
 
@@ -219,10 +269,10 @@ struct Loss {
     events: u32,
     bytes: u64,
     documents: u64,
-    /// The first event lost, as the oldest loss folded into this record names it.
-    first: Option<SourceEventHandle>,
-    /// The last event lost, as the newest loss folded into this record names it.
-    last: Option<SourceEventHandle>,
+    /// The earliest event any loss folded into this record names, by the place it was offered at.
+    first: Option<Bound>,
+    /// The latest event any loss folded into this record names, by the place it was offered at.
+    last: Option<Bound>,
 }
 
 /// One registration of a binding, which is whose records the queue keeps.
@@ -817,8 +867,9 @@ impl Queued {
 
     /// Adds one loss to a record this queue already holds, and says whether it did.
     ///
-    /// The record keeps the first event of the oldest loss folded into it and the last event of the
-    /// newest one that names any, so the positions bound everything the record counts.
+    /// The record keeps the earliest first event and the latest last event of every loss folded into
+    /// it, by the place each was offered at and not by when its loss arrived, so the positions bound
+    /// everything the record counts.
     fn merge(&mut self, subject: Subject, loss: &Loss) -> bool {
         let Some(held) = self.lost.get_mut(&subject) else {
             return false;
@@ -826,12 +877,8 @@ impl Queued {
         held.events = held.events.saturating_add(loss.events);
         held.bytes = held.bytes.saturating_add(loss.bytes);
         held.documents = held.documents.saturating_add(loss.documents);
-        if held.first.is_none() {
-            held.first.clone_from(&loss.first);
-        }
-        if loss.last.is_some() {
-            held.last.clone_from(&loss.last);
-        }
+        held.first = Bound::earlier(held.first.take(), loss.first.clone());
+        held.last = Bound::later(held.last.take(), loss.last.clone());
         self.dropped = self.dropped.saturating_add(loss.documents);
         true
     }
@@ -1678,6 +1725,13 @@ mod tests {
         }
     }
 
+    fn placed(number: u32) -> Bound {
+        Bound {
+            handle: handle(number),
+            place: u64::from(number),
+        }
+    }
+
     fn four(stream: &mut NoticeStream) -> Vec<Delivery> {
         std::iter::from_fn(|| stream.try_recv_four()).collect()
     }
@@ -1687,8 +1741,8 @@ mod tests {
         let (sink, mut stream) = channel();
         let origin = Origin::new(1);
         let lost = |first: u32, last: u32| Beyond {
-            first: Some(handle(first)),
-            last: Some(handle(last)),
+            first: Some(placed(first)),
+            last: Some(placed(last)),
             ..Beyond::default()
         };
         sink.send_from_with(origin, gap(binding(1), 2), lost(3, 4));
@@ -1717,8 +1771,37 @@ mod tests {
                 ..
             }
         ));
-        assert_eq!(delivered.beyond.first, Some(handle(3)), "the oldest first");
-        assert_eq!(delivered.beyond.last, Some(handle(9)), "the newest last");
+        assert_eq!(delivered.beyond.first, Some(placed(3)), "the oldest first");
+        assert_eq!(delivered.beyond.last, Some(placed(9)), "the newest last");
+    }
+
+    /// The order the losses arrive in is not the order their events were offered in.
+    #[test]
+    fn kr_req_24_24_a_gap_keeps_the_earliest_and_the_latest_event_whatever_order_the_losses_came_in()
+     {
+        let (sink, mut stream) = channel();
+        let origin = Origin::new(1);
+        let lost = |first: u32, last: u32| Beyond {
+            first: Some(placed(first)),
+            last: Some(placed(last)),
+            ..Beyond::default()
+        };
+        // The later observation was evicted and reported first, and the earlier request trapped
+        // after it.
+        sink.send_from_with(origin, gap(binding(1), 1), lost(9, 9));
+        sink.send_from_with(origin, gap(binding(1), 1), lost(3, 3));
+        let taken = four(&mut stream);
+        let Some(Delivery::Notice(delivered)) = taken.first() else {
+            panic!("a gap was expected");
+        };
+        assert_eq!(
+            (
+                delivered.beyond.first.clone(),
+                delivered.beyond.last.clone()
+            ),
+            (Some(placed(3)), Some(placed(9))),
+            "the record bounds both losses, the earlier event first"
+        );
     }
 
     #[test]

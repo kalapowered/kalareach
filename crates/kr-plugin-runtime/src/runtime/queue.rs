@@ -35,6 +35,7 @@
 use std::collections::VecDeque;
 
 use kr_plugin_sdk::limits::OBSERVATION_QUEUE_BYTES;
+use kr_plugin_service::notices::Bound;
 use kr_plugin_service::vocabulary::{Admission, ScopedSourceEvent};
 use kr_protocol::ids::SourceEventHandle;
 
@@ -66,6 +67,33 @@ impl ObservationGap {
     fn absorb(&mut self, events: u32, bytes: u64) {
         self.events = self.events.saturating_add(events);
         self.bytes = self.bytes.saturating_add(bytes);
+    }
+
+    /// Returns the first lost event with the place it was offered at.
+    #[must_use]
+    pub fn first_bound(&self) -> Option<Bound> {
+        self.first.clone().map(|handle| Bound {
+            handle,
+            place: self.first_order,
+        })
+    }
+
+    /// Returns the last lost event with the place it was offered at.
+    #[must_use]
+    pub fn last_bound(&self) -> Option<Bound> {
+        self.last.clone().map(|handle| Bound {
+            handle,
+            place: self.last_order,
+        })
+    }
+
+    /// Widens `first` and `last` to take in the events this gap lost.
+    ///
+    /// By the place each event was offered at and not by the order the gaps were reported in: a
+    /// request is never evicted, so a gap reported later can name an event that was offered earlier.
+    pub fn widen(&self, first: &mut Option<Bound>, last: &mut Option<Bound>) {
+        *first = Bound::earlier(first.take(), self.first_bound());
+        *last = Bound::later(last.take(), self.last_bound());
     }
 
     /// Records that the event offered `order`th was lost, which moves the bounds of the gap.
@@ -752,6 +780,39 @@ mod tests {
             .map(|e| e.handle)
             .collect();
         assert!(kept.contains(&SourceEventHandle::new("se-1").expect("a handle")));
+    }
+
+    /// A gap reported later can name an event that was offered earlier, and the bounds of what was
+    /// lost are the earliest and the latest event by when they were offered.
+    #[test]
+    fn gaps_widen_the_bounds_by_the_place_events_were_offered_at_and_not_the_order_they_are_told_in()
+     {
+        let mut queue = ObservationQueue::with_capacity(500);
+        queue.push(request("se-0", "rq-0", 100));
+        for index in 1..=5 {
+            queue.push(scrape(&format!("se-{index}"), 100));
+        }
+        // Two observations were evicted for room, and are reported first.
+        let later = queue.take_gap().expect("a gap");
+        // The request that stood before them is observed next, and is lost.
+        let taken = queue.take_one().expect("the request");
+        queue.taken_event_was_lost(&taken);
+        let earlier = queue.take_gap().expect("a second gap");
+
+        let (mut first, mut last) = (None, None);
+        later.widen(&mut first, &mut last);
+        earlier.widen(&mut first, &mut last);
+        assert_eq!(
+            (
+                first.map(|bound| bound.handle),
+                last.map(|bound| bound.handle)
+            ),
+            (
+                SourceEventHandle::new("se-0").ok(),
+                SourceEventHandle::new("se-2").ok()
+            ),
+            "the request that was offered first bounds the loss from the front"
+        );
     }
 
     impl ObservationGap {

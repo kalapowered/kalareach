@@ -55,6 +55,7 @@ use std::sync::{Arc, Mutex};
 
 use kr_ipc::clock::{SharedClock, SystemSharedClock};
 use kr_plugin_sdk::identity::PluginIdentity;
+use kr_plugin_service::notices::Bound;
 use kr_plugin_service::protocol4::Through;
 use kr_plugin_service::vocabulary::{
     Admission, AttachmentFact, BindingFacts, BindingId, ScopedSourceEvent, SourceProvenance,
@@ -176,10 +177,10 @@ pub enum BindingEvent {
     PresentationDropped {
         /// How many documents went, the gaps among them included.
         documents: u32,
-        /// The first event lost, as the oldest gap that went named it.
-        first: Option<SourceEventHandle>,
-        /// The last event lost, as the newest gap that went named it.
-        last: Option<SourceEventHandle>,
+        /// The earliest event lost, among the events the gaps that went named.
+        first: Option<Bound>,
+        /// The latest event lost, among them.
+        last: Option<Bound>,
     },
     /// A call failed, and the binding survived it.
     Fault {
@@ -1587,8 +1588,8 @@ struct BindingWorker {
     events: tokio::sync::mpsc::Sender<BindingEvent>,
     dropped_documents: u32,
     /// The first and the last event lost, as the gaps among the dropped presentations named them.
-    dropped_first: Option<SourceEventHandle>,
-    dropped_last: Option<SourceEventHandle>,
+    dropped_first: Option<Bound>,
+    dropped_last: Option<Bound>,
     /// How many documents this binding has drawn, which is what numbers the next one.
     documents: u64,
     /// How many calls into the component have finished, for a caller that wants to know whether
@@ -2253,12 +2254,7 @@ impl BindingWorker {
     fn drop_presentation(&mut self, event: &BindingEvent) {
         self.dropped_documents = self.dropped_documents.saturating_add(1);
         if let BindingEvent::Gap(gap) = event {
-            if self.dropped_first.is_none() {
-                self.dropped_first.clone_from(&gap.first);
-            }
-            if gap.last.is_some() {
-                self.dropped_last.clone_from(&gap.last);
-            }
+            gap.widen(&mut self.dropped_first, &mut self.dropped_last);
         }
         if let Ok(mut queue) = self.queue.lock() {
             queue.require_snapshot();
