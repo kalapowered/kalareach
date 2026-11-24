@@ -240,17 +240,6 @@ pub enum Outcome {
         /// its class and its length.
         detail: Sentence,
     },
-    /// The desktop's portal refused the request for want of a permission, and named which.
-    ///
-    /// A portal answers each request on the desktop's behalf, so the permission is the portal's to
-    /// grant to a request and is not one held per signed application.
-    PortalRefused {
-        /// The permission the portal named, in its own words.
-        permission: &'static str,
-        /// What the portal said, as this check read it: what the portal printed is said as its
-        /// class and its length.
-        detail: Sentence,
-    },
     /// The permissions on the file or on a folder above it refused it.
     ///
     /// A permission a person could grant is named by [`Outcome::PermissionRefused`]. This is the
@@ -362,21 +351,6 @@ pub fn judge(
                     .stated(". ")
                     .stated(permission)
                     .stated(" is granted per signed application, and this one does not hold it"),
-            ),
-        ),
-        Outcome::PortalRefused { permission, detail } => (
-            CapabilityState::PermissionRequired,
-            CapabilityEvidenceSource::DisclosedProbe,
-            Some(
-                Sentence::new()
-                    .stated(
-                        "this context asked the desktop's portal for the operation and the \
-                         portal refused it: ",
-                    )
-                    .sentence(detail)
-                    .stated(". ")
-                    .stated(permission)
-                    .stated(" is the portal's to grant, and it did not grant it to this request"),
             ),
         ),
         Outcome::FilesystemRefused { detail } => (
@@ -1873,17 +1847,15 @@ mod tests {
         );
     }
 
-    /// KR-REQ-03.29: a refusal is said in the scope of its own platform. macOS keeps its permission
-    /// granted per signed application; the desktop's portal says that the portal grants it and
-    /// never says a signed application holds it.
+    /// KR-REQ-03.29: a refusal of a macOS permission is said in that platform's scope: the
+    /// permission is granted per signed application, and this application does not hold it.
     #[test]
-    fn kr_req_03_29_a_refusal_is_said_in_the_scope_of_its_own_platform() {
-        let detail = || Sentence::new().stated("it produced no image");
+    fn kr_req_03_29_a_macos_refusal_says_the_permission_is_granted_per_signed_application() {
         let (state, evidence, reason) = judge(
             Check::ScreenImage,
             &Outcome::PermissionRefused {
                 permission: "Screen & System Audio Recording",
-                detail: detail(),
+                detail: Sentence::new().stated("it produced no image"),
             },
         );
         assert_eq!(state, CapabilityState::PermissionRequired);
@@ -1894,23 +1866,6 @@ mod tests {
              produced no image. Screen & System Audio Recording is granted per signed \
              application, and this one does not hold it"
         );
-        let (state, evidence, reason) = judge(
-            Check::ScreenImage,
-            &Outcome::PortalRefused {
-                permission: "Screenshots",
-                detail: detail(),
-            },
-        );
-        assert_eq!(state, CapabilityState::PermissionRequired);
-        assert_eq!(evidence, CapabilityEvidenceSource::DisclosedProbe);
-        let reason = reason.expect("a reason");
-        assert_eq!(
-            reason.as_str(),
-            "this context asked the desktop's portal for the operation and the portal refused \
-             it: it produced no image. Screenshots is the portal's to grant, and it did not \
-             grant it to this request"
-        );
-        assert!(!reason.as_str().contains("signed application"));
     }
 
     #[test]
