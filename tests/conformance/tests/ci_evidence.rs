@@ -2319,10 +2319,10 @@ fn matrix_legs(job: &str) -> Vec<Leg> {
 /// Whether a step runs on the leg `part`, read from the step's own `if`: a step with none runs on
 /// every leg, and one with a condition holds it as `&&` of `!cancelled()`, `success()`,
 /// `always()`, `matrix.part == '<part>'`,
-/// `startsWith(matrix.part, '<prefix>')` and a result of an earlier step
-/// (`steps.<id>.outcome == 'failure'`), which every leg may have, so it counts. Any other
-/// condition is one this reading does not hold, and fails, so that a step is never counted or left
-/// out by a guess.
+/// `startsWith(matrix.part, '<prefix>')`, a push to `main` (`github.ref == 'refs/heads/main'`) and
+/// a result of an earlier step (`steps.<id>.outcome == 'failure'`), which every leg may have, so it
+/// counts; with or without the `${{ }}` around it. Any other condition is one this reading does not
+/// hold, and fails, so that a step is never counted or left out by a guess.
 fn runs_on_leg(step: &str, part: &str) -> bool {
     let Some(condition) = step_condition(step) else {
         return true;
@@ -2330,12 +2330,14 @@ fn runs_on_leg(step: &str, part: &str) -> bool {
     let inner = condition
         .strip_prefix("${{")
         .and_then(|rest| rest.strip_suffix("}}"))
-        .unwrap_or_else(|| panic!("a step's condition the case cannot read: {condition}"));
+        .unwrap_or(&condition);
     let atoms: Vec<bool> = inner
         .split("&&")
         .map(|atom| {
-            if matches!(atom, "!cancelled()" | "success()" | "always()")
-                || atom.starts_with("steps.")
+            if matches!(
+                atom,
+                "!cancelled()" | "success()" | "always()" | "github.ref=='refs/heads/main'"
+            ) || atom.starts_with("steps.")
             {
                 true
             } else if let Some(named) = atom
@@ -2356,6 +2358,34 @@ fn runs_on_leg(step: &str, part: &str) -> bool {
     atoms.iter().all(|runs| *runs)
 }
 
+/// The minutes a job keeps over its steps' limits for the set-up and clean-up that no step limit
+/// counts.
+const SET_UP_AND_CLEAN_UP_MINUTES: u32 = 3;
+
+/// The minutes at which GitHub ends a hosted job that has no limit of its own.
+const HOSTED_JOB_MINUTES: u32 = 360;
+
+/// The limit a step gives itself, in minutes, if it has one: its `timeout-minutes`, which on a test
+/// leg is the `minutes` of the leg's entry.
+fn step_limit(step: &str, leg: Option<&Leg>) -> Option<u32> {
+    let limit = value_at(step, 8, "timeout-minutes")?;
+    if compact(&limit) == "${{matrix.minutes}}" {
+        let leg = leg.unwrap_or_else(|| {
+            panic!("a step takes its limit from a matrix its job has not:\n{step}")
+        });
+        Some(
+            leg.minutes
+                .unwrap_or_else(|| panic!("the {} leg has no minutes", leg.part)),
+        )
+    } else {
+        Some(
+            limit
+                .parse()
+                .unwrap_or_else(|_| panic!("a step's limit that is no number: {limit}")),
+        )
+    }
+}
+
 /// The macOS job of the landing workflow runs each leg of its matrix on a runner of its own, and a
 /// leg runs the steps that apply to its `part`. A leg whose steps' limits add up to more than the
 /// job's limit can have the job end in the middle of a later step, or before its evidence upload,
@@ -2365,7 +2395,6 @@ fn runs_on_leg(step: &str, part: &str) -> bool {
 /// from the `minutes` of its entry.
 #[test]
 fn every_leg_of_the_landing_workflows_macos_job_has_step_limits_that_fit_in_the_jobs_limit() {
-    const SET_UP_AND_CLEAN_UP_MINUTES: u32 = 3;
     let workflow = fs::read_to_string(repository().join(".github/workflows/core-ci.yml"))
         .expect("the landing workflow");
     let text = job(&workflow, "macos");
@@ -2394,16 +2423,8 @@ fn every_leg_of_the_landing_workflows_macos_job_has_step_limits_that_fit_in_the_
             .iter()
             .filter(|step| runs_on_leg(step, &leg.part))
             .map(|step| {
-                let limit = value_at(step, 8, "timeout-minutes")
-                    .unwrap_or_else(|| panic!("a step of the macOS job has no limit:\n{step}"));
-                if compact(&limit) == "${{matrix.minutes}}" {
-                    leg.minutes
-                        .unwrap_or_else(|| panic!("the {} leg has no minutes", leg.part))
-                } else {
-                    limit
-                        .parse()
-                        .unwrap_or_else(|_| panic!("a step's limit that is no number: {limit}"))
-                }
+                step_limit(step, Some(leg))
+                    .unwrap_or_else(|| panic!("a step of the macOS job has no limit:\n{step}"))
             })
             .sum();
         assert!(
@@ -2411,6 +2432,91 @@ fn every_leg_of_the_landing_workflows_macos_job_has_step_limits_that_fit_in_the_
             "the {} leg of the macOS job has steps whose limits add up to {total} minutes, which with the \
              {SET_UP_AND_CLEAN_UP_MINUTES} for the set-up and clean-up pass the job's {job_limit}",
             leg.part
+        );
+    }
+}
+
+/// The workflows that the gate runs and whose steps carry limits of their own: the landing workflow
+/// and the conformance workflow. The other workflows' steps have none, except the baseline floors'
+/// few, which sit far under their jobs'.
+const WORKFLOWS_WITH_STEP_LIMITS: [&str; 2] = ["core-ci.yml", "conformance.yml"];
+
+/// A job that stops at its own limit ends in the middle of a later step, or before its evidence
+/// upload, when the limits of its steps add up to more than it, although every step stayed inside
+/// its own. So in every job of these workflows, and on every leg of one that names its legs, the
+/// explicit limits of the steps that run, with the same 3 minutes over for the set-up and clean-up
+/// as the macOS legs have, fit in the job's limit; a job with none has the 360 minutes at which
+/// GitHub ends a hosted job. A step with no limit adds nothing, and a job whose matrix names no
+/// `part` counts every step it has.
+#[test]
+fn every_job_of_the_workflows_the_gate_runs_has_step_limits_that_fit_in_the_jobs_limit() {
+    let mut seen = Vec::new();
+    let mut misses = Vec::new();
+    for file in WORKFLOWS_WITH_STEP_LIMITS {
+        let workflow = fs::read_to_string(repository().join(".github/workflows").join(file))
+            .expect("a workflow");
+        for name in job_names(&workflow) {
+            let text = job(&workflow, &name);
+            let job_limit = value_at(&header(&text), 4, "timeout-minutes").map_or(
+                HOSTED_JOB_MINUTES,
+                |value| {
+                    value
+                        .parse::<u32>()
+                        .unwrap_or_else(|_| panic!("the {name} job's limit is no number: {value}"))
+                },
+            );
+            assert!(
+                job_limit <= HOSTED_JOB_MINUTES,
+                "the {name} job's limit of {job_limit} minutes is over the {HOSTED_JOB_MINUTES} GitHub ends a hosted job at"
+            );
+            let steps = steps_of(&text);
+            let matrix = matrix_legs(&text);
+            let totals: Vec<(String, u32)> = if matrix.is_empty() {
+                vec![(
+                    name.clone(),
+                    steps.iter().filter_map(|step| step_limit(step, None)).sum(),
+                )]
+            } else {
+                matrix
+                    .iter()
+                    .map(|leg| {
+                        let total = steps
+                            .iter()
+                            .filter(|step| runs_on_leg(step, &leg.part))
+                            .filter_map(|step| step_limit(step, Some(leg)))
+                            .sum();
+                        (format!("{name} ({} leg)", leg.part), total)
+                    })
+                    .collect()
+            };
+            for (label, total) in totals {
+                if total + SET_UP_AND_CLEAN_UP_MINUTES > job_limit {
+                    misses.push(format!(
+                        "{file}: the {label} job has steps whose limits add up to {total} minutes, which with the \
+                         {SET_UP_AND_CLEAN_UP_MINUTES} for the set-up and clean-up pass the job's {job_limit}"
+                    ));
+                }
+            }
+            seen.push(name);
+        }
+    }
+    assert!(misses.is_empty(), "{}", misses.join("\n"));
+    // A reading that finds no jobs would pass for every job: the jobs that must be read are named.
+    for name in [
+        "rust",
+        "shipped-hold",
+        "contract-tests",
+        "android-app",
+        "ios",
+        "macos",
+        "macos-shipped-hold",
+        "macos-reference",
+        "linux",
+        "windows",
+    ] {
+        assert!(
+            seen.iter().any(|read| read == name),
+            "the {name} job was not read"
         );
     }
 }
