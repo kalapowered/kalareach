@@ -3390,6 +3390,132 @@ fn kr_req_11_17_a_program_that_execs_other_code_has_its_evidence_withdrawn() {
     let _ = finish(child);
 }
 
+/// A launched program whose channel relayed an approval, with the record the product's channel
+/// writer made for it. The program stays until [`Launched::release`].
+struct Launched {
+    child: std::process::Child,
+    instance: ApplicationInstanceId,
+    record: kr_protocol::broker::InstanceCapabilityRecord,
+    hold: PathBuf,
+    channel_end: PathBuf,
+}
+
+impl Launched {
+    /// Lets the program and its channel end.
+    fn release(self) {
+        std::fs::write(&self.hold, "").expect("the program may end");
+        std::fs::write(&self.channel_end, "").expect("the channel may end");
+        let _ = finish(self.child);
+    }
+}
+
+/// Launches the program the shell's connector qualifies, has its channel relay an approval, and
+/// reads the record the writer made once it stands. It holds no case's assertion: each case reads
+/// what it is about from the record.
+fn launched_with_evidence(shell: &Shell, name: &str) -> Launched {
+    let hook = shell.placed.forwarder.display().to_string();
+    let root = shell.placed.host.root().to_path_buf();
+    let hold = root.join(format!("hold-{name}"));
+    let channel_end = root.join(format!("end-channel-{name}"));
+    let mut env = vec![
+        ("HOOK", hook),
+        ("HOOK_EVENT", SESSION_START.to_owned()),
+        ("HOLD_UNTIL", hold.display().to_string()),
+        ("CHANNEL_END", channel_end.display().to_string()),
+    ];
+    env.extend(channel_variables());
+    let env: Vec<(&str, &str)> = env
+        .iter()
+        .map(|(variable, value)| (*variable, value.as_str()))
+        .collect();
+    let answer = shell.establish();
+    let child = shell.launch(&answer, name, &env);
+    let instance = instance_of(&shell.report(name));
+    hooked(shell, name);
+    eventually(
+        "the channel's relayed approval is recorded as evidence",
+        || approval_record(shell, instance).is_some_and(|record| record.state.is_usable()),
+    );
+    let record = approval_record(shell, instance).expect("the evidence is held");
+    Launched {
+        child,
+        instance,
+        record,
+        hold,
+        channel_end,
+    }
+}
+
+/// KR-REQ-11.17, the schema: the record the channel's writer makes for a launched program names the
+/// version a signed record gives the program's digest, which is the version the launch read once,
+/// when it started. The evidence is about the protocol the program was qualified at, and nothing
+/// reads another version while the program lives.
+#[test]
+fn kr_req_11_17_a_launched_programs_record_names_the_version_its_digest_was_qualified_at() {
+    let shell = Shell::qualified();
+    let launched = launched_with_evidence(&shell, "schema");
+    assert_eq!(
+        launched
+            .record
+            .identity
+            .schema_version
+            .0
+            .as_ref()
+            .map(|version| version.0.as_str()),
+        Some(fixture::QUALIFIED_VERSION),
+        "the record names the version the launch read"
+    );
+    launched.release();
+}
+
+/// KR-REQ-11.17, the launch profile: the record the channel's writer makes for a launched program
+/// names the profile the instance was launched under, the one the broker holds for it, and an
+/// instance has one launch.
+#[test]
+fn kr_req_11_17_a_launched_programs_record_names_the_profile_it_was_launched_under() {
+    let shell = Shell::qualified();
+    let launched = launched_with_evidence(&shell, "profile");
+    let profile = shell
+        .broker
+        .profile_of(launched.instance)
+        .expect("the instance's launch profile is held");
+    assert_eq!(
+        launched.record.identity.profile_id.0.as_ref(),
+        Some(&profile.profile_id),
+        "the record names the profile the instance was launched under"
+    );
+    launched.release();
+}
+
+/// KR-REQ-11.17, the desktop generation: a session that closes because its login was lost ends the
+/// instances it launched, and the broker forgets the evidence they held. The close is the one a
+/// lost login makes (`DesktopLost`) and the evidence is what the product's writer recorded for a
+/// real launch, read before the close and found gone after it, while the program still runs.
+#[test]
+fn kr_req_11_17_a_session_that_closes_with_its_login_lost_leaves_the_broker_no_evidence() {
+    let shell = Shell::qualified_viewed();
+    let view = shell.view.as_ref().expect("a view");
+    let launched = launched_with_evidence(&shell, "login");
+    assert!(
+        launched.record.state.is_usable(),
+        "the evidence stands before the close"
+    );
+
+    let _ = view
+        .runtime
+        .session()
+        .begin_close(kr_protocol::session::ClosureReason::DesktopLost);
+    assert!(
+        shell
+            .broker
+            .capabilities(launched.instance)
+            .records
+            .is_empty(),
+        "the close ended the instance, and the broker forgot its evidence"
+    );
+    launched.release();
+}
+
 /// KR-REQ-11.17: an installed upgrade of the executable while the program runs leaves the evidence
 /// of the running program as it was, on Linux and on macOS: the running process keeps the identity
 /// it was pinned to, so no bridge of it is refused and nothing is withdrawn.
