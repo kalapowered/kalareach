@@ -1,7 +1,8 @@
 name: companion-bundle
 
 # Builds the companion's desktop bundle on Windows the way a person builds it (`pnpm desktop build`),
-# and reads what that makes: the link of the application and both installers.
+# and reads what that makes: the link of the application and both installers. It also compares the
+# third-party notice that each installer places with the committed text.
 #
 # The application links the static C runtime, through the `crt-static` target feature that the
 # workspace's configuration gives the MSVC targets, so it imports no runtime library. The Tauri

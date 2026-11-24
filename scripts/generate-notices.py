@@ -1118,7 +1118,7 @@ def javascript_record(config):
                 fail(f"pnpm lists {item['name']} with {len(item['versions'])} versions and {len(item['paths'])} folders")
             for version, path in zip(item["versions"], item["paths"]):
                 if not os.path.isdir(path):
-                    fail(f"{item['name']} {version} is not installed, which pnpm needs to name its licence files: {COMPANION_REPAIR}")
+                    fail(f"{item['name']} {version} is not installed, which the generator needs to read its licence files: {COMPANION_REPAIR}")
                 key = (item["name"], version, "npm")
                 recorded = chosen(item["name"], version, item.get("license") or expression, accepted)
                 answers[key] = {"authors": [item["author"]] if item.get("author") else [], "source": None,

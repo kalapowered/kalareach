@@ -14,6 +14,10 @@
 //! closure out of both its entries and that list is refused. A dependency added to the lock fails
 //! the check until the notice is made again. A text that still holds the placeholder of a licence
 //! template, where a crate's copyright line belongs, is refused too.
+//!
+//! The companion application has a notice of its own, `docs/releases/companion-third-party-notices.txt`,
+//! which its installers and store bundles carry; `held_companion` holds it to the lock over the package
+//! that `scripts/companion-notice.json` names.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -380,9 +384,11 @@ fn reached(checkout: &Path, product: Product) -> Result<BTreeSet<Identity>> {
             .map(|(index, _)| index)
             .collect();
         if roots.is_empty() {
-            refuse!(
-                "the lock holds no package {name}, which the notice of this product is made for"
-            );
+            let list = match product {
+                Product::Programs => "scripts/release-programs.json",
+                Product::Companion => "scripts/companion-notice.json",
+            };
+            refuse!("the lock holds no package {name}, which {list} names");
         }
         stack.extend(roots);
     }
