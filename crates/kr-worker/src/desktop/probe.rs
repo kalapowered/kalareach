@@ -1365,7 +1365,7 @@ enum FirstBlock {
 }
 
 /// Runs one filesystem question on a thread and waits for it with a clock.
-pub(super) fn on_a_thread<T: Send + 'static>(
+fn on_a_thread<T: Send + 'static>(
     path: &Path,
     bound: Duration,
     ask: impl FnOnce(std::path::PathBuf) -> std::io::Result<T> + Send + 'static,
