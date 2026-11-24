@@ -8,8 +8,10 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
+use kr_ipc::identity::{ProcessState, process_state, started_process_identity};
 use kr_ipc::testing::PrivateTempDir;
 use kr_ipc::testing::manager_stand_in::{PROGRAM_NAME, place_installation};
+use kr_protocol::identity::ProcessStartIdentity;
 
 /// A test tree and an installation beside it, both of this case's own.
 struct Fixture {
@@ -74,7 +76,23 @@ impl Fixture {
     /// The definition `kr` writes for a daemon `program` run in `directory`, as its `render` writes
     /// it: the same keys in the same order.
     fn plist(&self, label: &str, program: &Path, directory: &Path, extra: &str) -> String {
+        let arguments = [
+            program.display().to_string(),
+            "--runtime-dir".to_owned(),
+            self.tree.path().join("r").display().to_string(),
+            "--state-dir".to_owned(),
+            self.tree.path().join("state").display().to_string(),
+        ];
+        self.plist_of(label, &arguments, directory, extra)
+    }
+
+    /// The same definition with the program and the arguments `arguments`, the program first.
+    fn plist_of(&self, label: &str, arguments: &[String], directory: &Path, extra: &str) -> String {
         let log = directory.join("daemon.log");
+        let arguments: String = arguments
+            .iter()
+            .map(|argument| format!("\t\t<string>{argument}</string>\n"))
+            .collect();
         format!(
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
              <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \
@@ -82,9 +100,7 @@ impl Fixture {
              <!-- The KalaReach control daemon. -->\n\
              <plist version=\"1.0\">\n<dict>\n\
              \t<key>Label</key>\n\t<string>{label}</string>\n\
-             \t<key>ProgramArguments</key>\n\t<array>\n\
-             \t\t<string>{}</string>\n\t\t<string>--runtime-dir</string>\n\t\t<string>{}</string>\n\
-             \t\t<string>--state-dir</string>\n\t\t<string>{}</string>\n\t</array>\n\
+             \t<key>ProgramArguments</key>\n\t<array>\n{arguments}\t</array>\n\
              \t<key>RunAtLoad</key>\n\t<false/>\n\t<key>KeepAlive</key>\n\t<false/>\n\
              \t<key>LimitLoadToSessionType</key>\n\t<string>Background</string>\n\
              \t<key>ProcessType</key>\n\t<string>Interactive</string>\n\
@@ -92,9 +108,6 @@ impl Fixture {
              \t<key>Umask</key>\n\t<integer>63</integer>\n{extra}\
              \t<key>StandardOutPath</key>\n\t<string>{}</string>\n\
              \t<key>StandardErrorPath</key>\n\t<string>{}</string>\n</dict>\n</plist>\n",
-            program.display(),
-            self.tree.path().join("r").display(),
-            self.tree.path().join("state").display(),
             directory.display(),
             log.display(),
             log.display(),
@@ -114,6 +127,57 @@ impl Fixture {
         let loaded = self.call(&["bootstrap", &self.domain(), plist.to_str().expect("text")]);
         (plist, loaded)
     }
+
+    /// The record of the job `label`, which a start that was never recorded leaves behind: the job is
+    /// loaded and marked as a start that began.
+    fn mark_pending(&self, label: &str) {
+        let record = self
+            .tree
+            .path()
+            .join(format!("state/manager-stand-in/jobs/{label}.json"));
+        let mut job: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&record).expect("the record"))
+                .expect("json");
+        job["pending"] = serde_json::Value::Bool(true);
+        std::fs::write(&record, job.to_string()).expect("a pending record");
+    }
+
+    /// Starts the shell command `line` in `directory` with the variables `environment` added, as the
+    /// system's first process holds a daemon whose starter has gone, and returns its identity.
+    fn detached(
+        &self,
+        line: &str,
+        directory: &Path,
+        environment: &[(&str, &str)],
+    ) -> ProcessStartIdentity {
+        let started = Command::new("/bin/sh")
+            .args([
+                "-c",
+                &format!("{line} </dev/null >/dev/null 2>&1 & echo $!"),
+            ])
+            .current_dir(directory)
+            .envs(environment.iter().copied())
+            .stdin(Stdio::null())
+            .output()
+            .expect("a process of the start");
+        let pid: u32 = text(&started.stdout)
+            .trim()
+            .parse()
+            .expect("a process number");
+        started_process_identity(pid).expect("the process is there")
+    }
+}
+
+/// Whether the process `identity` has ended within ten seconds.
+fn ended(identity: &ProcessStartIdentity) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        if process_state(identity) == ProcessState::Ended {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    process_state(identity) == ProcessState::Ended
 }
 
 fn text(output: &[u8]) -> String {
@@ -378,94 +442,111 @@ fn the_daemon_starts_as_the_definition_says_survives_its_exec_and_ends_by_identi
     );
 }
 
-/// A start that was never recorded is found by the token in its environment and ended: the stand-in
-/// or the test died between the start and the record.
+/// A start that was never recorded is found by proof that it is the job's and ended: its arguments
+/// end with the definition's, whole word for whole word, it runs a program inside the test's
+/// folders, and its working directory is the definition's. The process is the wrapper as the system's
+/// shell reads it, which `ps` shows as the interpreter, the program and the arguments.
 #[test]
-fn a_start_that_was_never_recorded_is_found_by_its_token_and_ended() {
-    let fixture = Fixture::new();
-    let (_, loaded) = fixture.load("kr-controller-h", "#!/bin/sh\nexit 0\n", "");
-    assert_eq!(loaded.status.code(), Some(0), "{}", text(&loaded.stderr));
-    let record = fixture
-        .tree
-        .path()
-        .join("state/manager-stand-in/jobs/kr-controller-h.json");
-    let mut job: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(&record).expect("the record")).expect("json");
-    job["pending"] = serde_json::Value::String("00ff00ff".to_owned());
-    std::fs::write(&record, job.to_string()).expect("a pending record");
-    // The shell ends at once, so the process it started belongs to the system's own first process,
-    // which collects it, as it would a daemon the stand-in started. A copy of the program is
-    // started, since the system shows no environment of a program of its own.
-    let own_sleep = fixture.installation.path().join("sleep");
-    kr_ipc::testing::place_program(Path::new("/bin/sleep"), &own_sleep);
-    let started = Command::new("/bin/sh")
-        .args([
-            "-c",
-            &format!(
-                "{} 120 </dev/null >/dev/null 2>&1 & echo $!",
-                own_sleep.display()
-            ),
-        ])
-        .env("KR_MANAGER_STAND_IN_JOB", "kr-controller-h/00ff00ff")
-        .stdin(Stdio::null())
-        .output()
-        .expect("a process of the start");
-    let pid = text(&started.stdout).trim().to_owned();
-    let target = format!("{}/kr-controller-h", fixture.domain());
-    let ended = fixture.call(&["bootout", &target]);
-    assert_eq!(ended.status.code(), Some(0), "{}", text(&ended.stderr));
-    let gone = Command::new("/bin/ps")
-        .args(["-o", "pid=", "-p", &pid])
-        .output()
-        .expect("ps runs");
-    assert!(
-        text(&gone.stdout).trim().is_empty(),
-        "the process {pid} was found by its token and ended"
-    );
-}
-
-/// A start whose process still shows the arguments of the definition and no token, as the wrapper
-/// does while the system's shell reads it, is found by those arguments and ended.
-#[test]
-fn a_start_that_was_never_recorded_is_found_by_its_arguments_and_ended() {
+fn a_start_that_was_never_recorded_is_found_by_its_arguments_program_and_directory_and_ended() {
     let fixture = Fixture::new();
     let script = "#!/bin/sh\nwhile :; do sleep 1; done\n";
     let (_, loaded) = fixture.load("kr-controller-i", script, "");
     assert_eq!(loaded.status.code(), Some(0), "{}", text(&loaded.stderr));
-    let record = fixture
+    fixture.mark_pending("kr-controller-i");
+    let state = fixture.tree.path().join("state");
+    let program = fixture.installation.path().join("kr-daemon");
+    let wrapper = fixture.detached(
+        &format!(
+            "{} --runtime-dir {} --state-dir {}",
+            program.display(),
+            fixture.tree.path().join("r").display(),
+            state.display()
+        ),
+        &state,
+        &[],
+    );
+    let target = format!("{}/kr-controller-i", fixture.domain());
+    let ended_job = fixture.call(&["bootout", &target]);
+    assert_eq!(
+        ended_job.status.code(),
+        Some(0),
+        "{}",
+        text(&ended_job.stderr)
+    );
+    assert!(
+        ended(&wrapper),
+        "the wrapper was found by its arguments, program and directory, and ended"
+    );
+}
+
+/// A start that was never recorded is not confused with any other process, whatever text the other
+/// holds: a program outside the test's folders, a program inside them in another directory, and a
+/// program inside them in the right directory whose last argument only starts with the definition's
+/// are all left running, though every one of them holds the definition's arguments in its own
+/// arguments or its environment.
+#[test]
+fn a_start_that_was_never_recorded_is_not_confused_with_processes_that_only_hold_the_same_text() {
+    let fixture = Fixture::new();
+    let program = fixture.installation.path().join("kr-daemon");
+    kr_ipc::testing::place_script(&program, "#!/bin/sh\nexit 0\n");
+    let state = fixture.tree.path().join("state");
+    let arguments = [program.display().to_string(), "30".to_owned()];
+    let plist = fixture
         .tree
         .path()
-        .join("state/manager-stand-in/jobs/kr-controller-i.json");
-    let mut job: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(&record).expect("the record")).expect("json");
-    job["pending"] = serde_json::Value::String("00ff00fe".to_owned());
-    std::fs::write(&record, job.to_string()).expect("a pending record");
-    let program = fixture.installation.path().join("kr-daemon");
-    let started = Command::new("/bin/sh")
-        .args([
-            "-c",
-            &format!(
-                "{} --runtime-dir {} --state-dir {} </dev/null >/dev/null 2>&1 & echo $!",
-                program.display(),
-                fixture.tree.path().join("r").display(),
-                fixture.tree.path().join("state").display()
+        .join("home/Library/LaunchAgents/kr-controller-n.plist");
+    std::fs::write(
+        &plist,
+        fixture.plist_of("kr-controller-n", &arguments, &state, ""),
+    )
+    .expect("a plist");
+    let loaded = fixture.call(&[
+        "bootstrap",
+        &fixture.domain(),
+        plist.to_str().expect("text"),
+    ]);
+    assert_eq!(loaded.status.code(), Some(0), "{}", text(&loaded.stderr));
+    fixture.mark_pending("kr-controller-n");
+    // A program of the installation that waits as long as its first argument says. The system shows
+    // it as the shell, the script and the argument.
+    let idle = fixture.installation.path().join("idle");
+    kr_ipc::testing::place_script(&idle, "#!/bin/sh\nsleep \"$1\"\n");
+    let same_text = format!("{} 30", program.display());
+    let environment = [("SAME_TEXT", same_text.as_str())];
+    let others = [
+        (
+            "a program outside the folders, in the right directory",
+            fixture.detached("/bin/sleep 30", &state, &environment),
+        ),
+        (
+            "a program inside the folders, in another directory",
+            fixture.detached(
+                &format!("{} 30", idle.display()),
+                fixture.tree.path(),
+                &environment,
             ),
-        ])
-        .stdin(Stdio::null())
-        .output()
-        .expect("a process of the start");
-    let pid = text(&started.stdout).trim().to_owned();
-    let target = format!("{}/kr-controller-i", fixture.domain());
-    let ended = fixture.call(&["bootout", &target]);
-    assert_eq!(ended.status.code(), Some(0), "{}", text(&ended.stderr));
-    let gone = Command::new("/bin/ps")
-        .args(["-o", "pid=", "-p", &pid])
-        .output()
-        .expect("ps runs");
-    assert!(
-        text(&gone.stdout).trim().is_empty(),
-        "the process {pid} was found by its arguments and ended"
+        ),
+        (
+            "a program inside the folders and the right directory whose last argument only starts \
+             with the definition's",
+            fixture.detached(&format!("{} 300", idle.display()), &state, &environment),
+        ),
+    ];
+    let target = format!("{}/kr-controller-n", fixture.domain());
+    let ended_job = fixture.call(&["bootout", &target]);
+    assert_eq!(
+        ended_job.status.code(),
+        Some(0),
+        "{}",
+        text(&ended_job.stderr)
     );
+    for (what, identity) in &others {
+        assert_eq!(
+            process_state(identity),
+            ProcessState::Running,
+            "{what} was taken for the job's and ended"
+        );
+    }
 }
 
 /// What a definition may name is bounded after every link is resolved: a plist, a log or a working

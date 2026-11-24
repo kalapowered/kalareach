@@ -31,10 +31,6 @@ use plist::Definition;
 /// The variable that names this program to the processes it starts.
 pub const VARIABLE: &str = "KR_MANAGER_STAND_IN";
 
-/// The variable of the daemon's environment that ties its process to the job and the start that
-/// made it, so that a start that was never recorded can still be found by what its environment says.
-pub const JOB_VARIABLE: &str = "KR_MANAGER_STAND_IN_JOB";
-
 /// The status of a command the stand-in refuses.
 pub const REFUSED: i32 = 64;
 
@@ -87,8 +83,8 @@ pub struct Job {
     pub starts: u32,
     /// The daemon's process, once started.
     pub identity: Option<ProcessStartIdentity>,
-    /// The nonce of a start whose process was not recorded yet.
-    pub pending: Option<String>,
+    /// Whether a start began and its process was not recorded yet.
+    pub pending: bool,
 }
 
 /// What a call knows of where it runs.
@@ -167,6 +163,29 @@ impl Context {
                 path.display()
             ))
         }
+    }
+
+    /// Whether `words`, the arguments of a process as `ps` prints them, are those of the job's
+    /// program: they end with the arguments the definition gives after its program, whole word for
+    /// whole word, and one of the two words before them is a path inside the roots (the second
+    /// where an interpreter reads the program as a script).
+    fn runs_the_program_of(&self, job: &Job, words: &[&str]) -> bool {
+        let given = &job.arguments[1..];
+        let Some(before) = words
+            .len()
+            .checked_sub(given.len())
+            .filter(|count| *count >= 1)
+        else {
+            return false;
+        };
+        let (leading, tail) = words.split_at(before);
+        tail.iter()
+            .zip(given)
+            .all(|(word, argument)| word == argument)
+            && leading
+                .iter()
+                .take(2)
+                .any(|word| self.bounded(Path::new(word)).is_ok())
     }
 
     /// The path of the record of the job `label`.
@@ -495,25 +514,12 @@ fn bootstrap(context: &Context, domain: &str, plist: &Path) -> Answer {
         environment_keys: Vec::new(),
         starts: 0,
         identity: None,
-        pending: None,
+        pending: false,
     };
     match context.keep(&job) {
         Ok(()) => Answer::said(String::new()),
         Err(why) => Answer::refused(why),
     }
-}
-
-/// A fresh random token, as hexadecimal text.
-fn nonce() -> String {
-    let mut bytes = [0_u8; 16];
-    let read = std::fs::File::open("/dev/urandom").and_then(|mut file| {
-        use std::io::Read as _;
-        file.read_exact(&mut bytes)
-    });
-    if read.is_err() {
-        bytes = u128::from(std::process::id()).to_le_bytes();
-    }
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 /// `kickstart -p`: starts the loaded job once as its definition says and prints the process; a job
@@ -544,19 +550,18 @@ fn kickstart(context: &Context, target: &str) -> Answer {
         Ok(definition) => definition,
         Err(why) => return Answer::refused(why),
     };
-    let token = nonce();
-    job.pending = Some(token.clone());
+    job.pending = true;
     if let Err(why) = context.keep(&job) {
         return Answer::refused(why);
     }
-    match start(context, &definition, label, &token) {
+    match start(context, &definition) {
         Err(why) => Answer::refused(why),
         Ok((identity, keys)) => {
             let pid = identity.pid.get();
             job.identity = Some(identity);
             job.environment_keys = keys;
             job.starts += 1;
-            job.pending = None;
+            job.pending = false;
             match context.keep(&job) {
                 Ok(()) => Answer::said(format!("{pid}\n")),
                 Err(why) => Answer::refused(why),
@@ -568,12 +573,10 @@ fn kickstart(context: &Context, target: &str) -> Answer {
 /// Starts the daemon as `definition` says: its arguments, its directory, its mask, its log as both
 /// outputs, no input, a session and a process group of its own, and exactly launchd's defaults for
 /// the environment (the test's home and temporary directory, the system path), the definition's
-/// own entries, the name of this program, and the token that ties the process to this start.
+/// own entries and the name of this program.
 fn start(
     context: &Context,
     definition: &Definition,
-    label: &str,
-    token: &str,
 ) -> Result<(ProcessStartIdentity, Vec<String>), String> {
     // A session of its own, so that the daemon has no controlling terminal whatever started the
     // test; where this process already leads one, it already has none to give.
@@ -597,7 +600,6 @@ fn start(
             VARIABLE.to_owned(),
             context.own.join("kr-manager-stand-in").into(),
         ),
-        (JOB_VARIABLE.to_owned(), format!("{label}/{token}").into()),
     ];
     // The caller's own directories ride along, so that the daemon's own reads of the service
     // manager reach this program's record of the same tree.
@@ -658,17 +660,21 @@ fn ended_within(identity: &ProcessStartIdentity) -> bool {
     process_state(identity) == ProcessState::Ended
 }
 
-/// The processes of a start that was never recorded: those whose environment holds its token, which
-/// is what a daemon holds once the wrapper that started it has run, and those whose command line
-/// holds the arguments of the definition after its program, which are the paths of this test's own
-/// tree and are what a process is still given while the platform's own shell reads the wrapper (an
-/// environment that the system keeps from a program of its own is not shown).
-fn found_unrecorded(label: &str, token: &str, arguments: &[String]) -> Vec<u32> {
-    let needle = format!("{JOB_VARIABLE}={label}/{token}");
-    let given = arguments.get(1..).unwrap_or_default().join(" ");
+/// The processes of a start that was never recorded.
+///
+/// `ps` prints a process's arguments as one line, so a line that holds the same text proves nothing.
+/// A process is the job's only on proof, each part read apart from the text around it: its
+/// arguments, taken as whole words, end with the arguments the definition gives after its program;
+/// the program it runs is a file inside the test's folders; and its working directory is the
+/// definition's. A process that fails any of the three is not the job's, whatever else its line or
+/// its environment holds.
+fn found_unrecorded(context: &Context, job: &Job) -> Vec<u32> {
+    let Ok(working) = context.bounded(Path::new(&job.working_directory)) else {
+        return Vec::new();
+    };
     let Ok(output) = Command::new("/bin/ps")
-        // Twice `w`: a line is not cut at a width, and the environment is the end of it.
-        .args(["-axEww", "-o", "pid=,command="])
+        // Twice `w`, so that a line is not cut at a width. No `E`: the environment is no proof.
+        .args(["-axww", "-o", "pid=,args="])
         .stdin(Stdio::null())
         .output()
     else {
@@ -676,15 +682,35 @@ fn found_unrecorded(label: &str, token: &str, arguments: &[String]) -> Vec<u32> 
     };
     String::from_utf8_lossy(&output.stdout)
         .lines()
-        .filter(|line| line.contains(&needle) || (!given.is_empty() && line.contains(&given)))
-        .filter_map(|line| line.split_whitespace().next()?.parse().ok())
-        .filter(|pid| *pid != std::process::id())
+        .filter_map(|line| {
+            let (pid, arguments) = line.trim_start().split_once(char::is_whitespace)?;
+            let words: Vec<&str> = arguments.split_whitespace().collect();
+            let pid: u32 = pid.parse().ok()?;
+            (pid != std::process::id()
+                && context.runs_the_program_of(job, &words)
+                && working_directory_of(pid).as_deref() == Some(working.as_path()))
+            .then_some(pid)
+        })
         .collect()
 }
 
+/// The working directory of the process `pid`, as `lsof` reads it, or `None` where it reads none.
+fn working_directory_of(pid: u32) -> Option<PathBuf> {
+    let output = Command::new("/usr/sbin/lsof")
+        .args(["-a", "-d", "cwd", "-Fn", "-p", &pid.to_string()])
+        .stdin(Stdio::null())
+        .output()
+        .ok()?;
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .find_map(|line| line.strip_prefix('n'))
+        .map(PathBuf::from)
+}
+
 /// `bootout`: ends the daemon by the identity recorded for it, asking first and then making sure,
-/// and unloads the job. A start that was not recorded is found by its token or its arguments. The identity is checked
-/// by the signalling itself, so a number that belongs to another process now is left alone.
+/// and unloads the job. A start that was not recorded is found by what proves a process the job's.
+/// The identity is checked by the signalling itself, so a number that belongs to another process now
+/// is left alone.
 fn bootout(context: &Context, target: &str) -> Answer {
     let Some((_, label)) = split_target(target) else {
         return Answer::failed(
@@ -703,8 +729,8 @@ fn bootout(context: &Context, target: &str) -> Answer {
         Ok(Some(job)) => job,
     };
     let mut identities: Vec<ProcessStartIdentity> = job.identity.clone().into_iter().collect();
-    if let Some(token) = &job.pending {
-        for pid in found_unrecorded(label, token, &job.arguments) {
+    if job.pending {
+        for pid in found_unrecorded(context, &job) {
             if let Ok(identity) = started_process_identity(pid) {
                 identities.push(identity);
             }
@@ -731,5 +757,95 @@ fn bootout(context: &Context, target: &str) -> Answer {
     match std::fs::remove_file(context.job_path(label)) {
         Ok(()) => Answer::said(String::new()),
         Err(error) => Answer::refused(format!("the record of {label} cannot be removed: {error}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kr_ipc::testing::PrivateTempDir;
+
+    /// The arguments of a process are the job's only as whole words after a program inside the
+    /// roots: the program run as it is, run by its interpreter, or handed over to with arguments of
+    /// its own first; a word that only starts or ends like the definition's, a program outside, a
+    /// program too far from the arguments, and no arguments at all are not.
+    #[test]
+    fn the_arguments_of_a_process_are_the_jobs_only_as_whole_words_after_a_program_inside_the_roots()
+     {
+        let folder = PrivateTempDir::create();
+        let root = folder.path().canonicalize().expect("a folder");
+        let program = root.join("kr-controller");
+        std::fs::write(&program, "").expect("a program");
+        let program = program.display().to_string();
+        let context = Context {
+            own: root.clone(),
+            roots: vec![root.clone()],
+            store: root.join("store"),
+            uid: 0,
+        };
+        let job = Job {
+            arguments: [&program, "--runtime-dir", "/r", "--state-dir", "/s"]
+                .map(str::to_owned)
+                .to_vec(),
+            ..Job::default()
+        };
+        let is_the_jobs = |words: &[&str]| context.runs_the_program_of(&job, words);
+        assert!(is_the_jobs(&[
+            &program,
+            "--runtime-dir",
+            "/r",
+            "--state-dir",
+            "/s"
+        ]));
+        assert!(is_the_jobs(&[
+            "/bin/sh",
+            &program,
+            "--runtime-dir",
+            "/r",
+            "--state-dir",
+            "/s"
+        ]));
+        assert!(is_the_jobs(&[
+            &program,
+            "--secret-store",
+            "file",
+            "--runtime-dir",
+            "/r",
+            "--state-dir",
+            "/s"
+        ]));
+        assert!(!is_the_jobs(&[
+            &program,
+            "--runtime-dir",
+            "/r",
+            "--state-dir",
+            "/s2"
+        ]));
+        assert!(!is_the_jobs(&[
+            &program,
+            "--runtime-dir",
+            "/r",
+            "--state-dir",
+            "/"
+        ]));
+        assert!(!is_the_jobs(&[
+            "/bin/sh",
+            "--runtime-dir",
+            "/r",
+            "--state-dir",
+            "/s"
+        ]));
+        assert!(!is_the_jobs(&[
+            "/bin/echo",
+            "x",
+            &program,
+            "--runtime-dir",
+            "/r",
+            "--state-dir",
+            "/s"
+        ]));
+        assert!(!is_the_jobs(&["--runtime-dir", "/r", "--state-dir", "/s"]));
+        assert!(!is_the_jobs(&[&program]));
+        assert!(!is_the_jobs(&[]));
     }
 }
