@@ -1871,10 +1871,18 @@ async fn a_program_the_fixture_created_ends_with_the_launcher_when_the_backend_n
     }
     let directory = setup.directory.clone();
     drop(setup);
-    assert!(
-        !directory.exists(),
-        "the case removed what it made in the temporary folder"
-    );
+    // The backend lets go of the file it holds as its tasks end, which is after the setup has closed
+    // it, so the folder is removed when they have.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while directory.exists() {
+        if let Err(error) = std::fs::remove_dir_all(&directory) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the case removed what it made in the temporary folder: {error}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
 }
 
 /// A program that was created held and has no job yet is ended and collected when what holds it is
