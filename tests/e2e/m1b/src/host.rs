@@ -642,40 +642,19 @@ impl<'r> Host<'r> {
         self.daemon_said_since(0)
     }
 
-    /// What this run's session workers said to their own standard error, for a failure message:
-    /// the last forty lines of each worker's diagnostics file (`jobs/<label>.diagnostics` in the
-    /// state directory), each cleaned and cut as a worker cuts a refusal's reason. A launch refused
-    /// before its credential authenticates leaves only its line there.
+    /// What the worker of `session_id` said to its own standard error, for a failure message: the
+    /// last forty lines of its diagnostics file (`jobs/<label>.diagnostics` in the state directory),
+    /// each cleaned and cut as a worker cuts a refusal's reason. A launch refused before its
+    /// credential authenticates leaves only its line there.
     ///
-    /// Each file is read through the run's handles ([`read_tail_below`]), as the daemon's log is.
+    /// The label is the one the run kept while the worker ran ([`Run::worker_of`]), so a worker that
+    /// has ended is read too, and no other session's file is. The file is read through the run's
+    /// handles ([`read_tail_below`]), as the daemon's log is.
     #[must_use]
-    pub fn worker_said(&self) -> String {
-        if let Err(why) = self.run.learn_jobs() {
-            return worker_diagnostics_text(Err(why));
-        }
-        let jobs = match self.environment.jobs_dir().strip_prefix(self.run.root()) {
-            Ok(jobs) => jobs.to_path_buf(),
-            Err(_) => {
-                return worker_diagnostics_text(Err(
-                    "the jobs directory is not below the run's directory".to_owned(),
-                ));
-            }
-        };
-        let said: Vec<String> = self
-            .run
-            .proposed_labels()
-            .iter()
-            .map(|label| {
-                let place = jobs.join(format!("{label}.diagnostics"));
-                let read = read_tail_below(self.run.root(), self.run.pin(), &place, 0)
-                    .map_err(|why| why.to_string());
-                format!("{label}:\n{}", worker_diagnostics_text(read))
-            })
-            .collect();
-        if said.is_empty() {
-            worker_diagnostics_text(Ok(None))
-        } else {
-            said.join("\n")
+    pub fn worker_said(&self, session_id: &str) -> String {
+        match self.environment.jobs_dir().strip_prefix(self.run.root()) {
+            Ok(jobs) => worker_diagnostics_of(self.run, jobs, session_id),
+            Err(_) => diagnostics_not_read("the jobs directory is not below the run's directory"),
         }
     }
 
@@ -1183,14 +1162,17 @@ pub fn quoted(path: &Path) -> String {
     format!("'{text}'")
 }
 
-/// The most bytes of one diagnostics line a report keeps: what a worker cuts a refusal's reason to.
-const WORKER_LINE_AT_MOST: usize = 512;
+/// What a worker puts before a line it says to its standard error.
+const WORKER_LINE_PREFIX: &str = "kr-worker: a launch was not admitted: ";
+
+/// The most bytes of one diagnostics line a report keeps: the prefix of a refused launch's line and
+/// what a worker cuts a refusal's reason to.
+const WORKER_LINE_AT_MOST: usize = WORKER_LINE_PREFIX.len() + 512;
 
 /// The last forty lines of a worker's diagnostics file, each with its control characters replaced
-/// by spaces and cut to [`WORKER_LINE_AT_MOST`] bytes at a character boundary, as a worker cuts a
-/// refusal's reason.
-#[must_use]
-pub fn worker_lines(bytes: &[u8]) -> Vec<String> {
+/// by spaces and cut to [`WORKER_LINE_AT_MOST`] bytes at a character boundary, so that the whole of
+/// a reason a worker cut to 512 bytes is there.
+fn worker_lines(bytes: &[u8]) -> Vec<String> {
     let text = String::from_utf8_lossy(bytes);
     let lines: Vec<&str> = text.lines().collect();
     let start = lines.len().saturating_sub(40);
@@ -1219,22 +1201,37 @@ pub fn worker_lines(bytes: &[u8]) -> Vec<String> {
         .collect()
 }
 
-/// What a report says of one worker's diagnostics file: its last lines, `(none)` where it holds
-/// none or does not exist, or why it was not read.
-#[must_use]
-pub fn worker_diagnostics_text(read: Result<Option<Vec<u8>>, String>) -> String {
+/// What a report says of the diagnostics file of the worker with `label`: its last lines, or that
+/// there is no file, or that it is empty, or why it was not read.
+fn worker_diagnostics_text(label: &str, read: Result<Option<Vec<u8>>, String>) -> String {
     match read {
         Ok(Some(bytes)) => {
             let lines = worker_lines(&bytes);
             if lines.is_empty() {
-                "(none)".to_owned()
+                "(the file is empty)".to_owned()
             } else {
                 lines.join("\n")
             }
         }
-        Ok(None) => "(none)".to_owned(),
-        Err(why) => format!("(the worker's diagnostics were not read: {why})"),
+        Ok(None) => format!("(no file at jobs/{label}.diagnostics)"),
+        Err(why) => diagnostics_not_read(&why),
     }
+}
+
+/// What a report says when a worker's diagnostics could not be read.
+fn diagnostics_not_read(why: &str) -> String {
+    format!("(the worker's diagnostics were not read: {why})")
+}
+
+/// What a report says of the diagnostics of the worker of `session_id`: its label's file below
+/// `jobs` (relative to the run's directory), or that the run has no such worker.
+fn worker_diagnostics_of(run: &Run, jobs: &Path, session_id: &str) -> String {
+    let Some(label) = run.worker_label_of(session_id) else {
+        return "(no worker of this run is in the process table)".to_owned();
+    };
+    let place = jobs.join(format!("{label}.diagnostics"));
+    let read = read_tail_below(run.root(), run.pin(), &place, 0).map_err(|why| why.to_string());
+    format!("{label}:\n{}", worker_diagnostics_text(&label, read))
 }
 
 /// What the lines of a worker's diagnostics file read as in a report.
@@ -1242,22 +1239,36 @@ pub fn worker_diagnostics_text(read: Result<Option<Vec<u8>>, String>) -> String 
 mod worker_diagnostics_tests {
     use super::*;
 
+    fn scratch(name: &str) -> PathBuf {
+        let directory = std::fs::canonicalize(std::env::temp_dir())
+            .expect("the temporary directory")
+            .join(format!("kr-host-{name}-{}", kr_ipc::new_uuid()));
+        std::fs::create_dir_all(&directory).expect("a scratch directory");
+        directory
+    }
+
     #[test]
     fn the_last_forty_lines_are_kept_each_cleaned_and_cut() {
+        let whole = format!("{WORKER_LINE_PREFIX}{}", "a".repeat(512));
         let mut file = String::new();
         for number in 0..45 {
             file.push_str(&format!("line {number}\n"));
         }
+        file.push_str(&format!("{whole}\n"));
         file.push_str(&format!(
-            "a launch was not admitted: the file\u{1b}[31m\tcould not {}\n",
+            "{WORKER_LINE_PREFIX}the file\u{1b}[31m\tcould not {}\n",
             "\u{e9}".repeat(600)
         ));
         let lines = worker_lines(file.as_bytes());
         assert_eq!(lines.len(), 40, "the last forty");
-        assert_eq!(lines[0], "line 6", "the earlier lines are dropped");
+        assert_eq!(lines[0], "line 7", "the earlier lines are dropped");
+        assert_eq!(
+            lines[38], whole,
+            "a reason cut to 512 bytes is kept whole after its prefix"
+        );
         let last = lines.last().expect("a last line");
         assert!(
-            last.starts_with("a launch was not admitted: the file [31m could not "),
+            last.starts_with(&format!("{WORKER_LINE_PREFIX}the file [31m could not ")),
             "{last}"
         );
         assert!(last.len() <= WORKER_LINE_AT_MOST, "{}", last.len());
@@ -1265,17 +1276,67 @@ mod worker_diagnostics_tests {
     }
 
     #[test]
-    fn an_unread_diagnostics_file_is_said_not_read() {
+    fn a_missing_an_empty_and_an_unread_diagnostics_file_are_said_apart() {
+        let label = "kr-worker-00000001-0000-4000-8000-000000000001";
         assert_eq!(
-            worker_diagnostics_text(Err("no such file".to_owned())),
+            worker_diagnostics_text(label, Ok(None)),
+            format!("(no file at jobs/{label}.diagnostics)")
+        );
+        assert_eq!(
+            worker_diagnostics_text(label, Ok(Some(Vec::new()))),
+            "(the file is empty)"
+        );
+        assert_eq!(
+            worker_diagnostics_text(label, Err("no such file".to_owned())),
             "(the worker's diagnostics were not read: no such file)"
         );
-        assert_eq!(worker_diagnostics_text(Ok(None)), "(none)");
-        assert_eq!(worker_diagnostics_text(Ok(Some(Vec::new()))), "(none)");
         assert_eq!(
-            worker_diagnostics_text(Ok(Some(b"one\ntwo\n".to_vec()))),
+            worker_diagnostics_text(label, Ok(Some(b"one\ntwo\n".to_vec()))),
             "one\ntwo"
         );
+    }
+
+    /// A worker that has ended is read through the label kept for its session while it ran, and
+    /// another session's file is not read in its place; a session the run never met has no worker.
+    #[test]
+    fn an_ended_worker_is_read_through_the_label_kept_for_its_session() {
+        let root = scratch("worker-said");
+        let run = Run::over(&root);
+        let reservation = |n: u8| format!("{n:08x}-0000-4000-8000-{n:012x}");
+        let program = run.binary("kr-worker");
+        let command = |n: u8, session: &str| {
+            format!(
+                "{} --reservation {} --session {session}",
+                program.display(),
+                reservation(n)
+            )
+        };
+        // Both workers are met while they run; neither is in the process table when it is read.
+        run.note_workers_from([
+            command(1, "session-a").as_str(),
+            command(2, "session-b").as_str(),
+        ]);
+        std::fs::create_dir_all(root.join("jobs")).expect("the jobs directory");
+        let said = |n: u8| format!("{WORKER_LINE_PREFIX}the reason of worker {n}");
+        for n in [1_u8, 2] {
+            std::fs::write(
+                root.join(format!("jobs/kr-worker-{}.diagnostics", reservation(n))),
+                format!("{}\n", said(n)),
+            )
+            .expect("a diagnostics file");
+        }
+        for (n, session) in [(1_u8, "session-a"), (2, "session-b")] {
+            assert_eq!(
+                worker_diagnostics_of(&run, Path::new("jobs"), session),
+                format!("kr-worker-{}:\n{}", reservation(n), said(n)),
+                "{session} reads its own worker's file and no other"
+            );
+        }
+        assert_eq!(
+            worker_diagnostics_of(&run, Path::new("jobs"), "session-c"),
+            "(no worker of this run is in the process table)"
+        );
+        std::fs::remove_dir_all(&root).expect("clean up");
     }
 }
 

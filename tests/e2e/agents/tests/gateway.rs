@@ -6546,7 +6546,7 @@ fn gateway_a_launch_whose_first_presentation_carries_a_forged_credential_is_refu
                     &seen,
                     &ctx.polls.text(),
                     &session.host.daemon_said(),
-                    &session.host.worker_said()
+                    &session.host.worker_said(&session.session_id().to_string())
                 )
             );
             // (d) the program did not run as typed: the stand-in's marker is absent; the real

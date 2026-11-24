@@ -271,7 +271,8 @@ struct Backend {
     /// It belongs to the backend and not to an instance: a launch that failed before its program
     /// was shown has no instance, and what a launcher declined survives the launch's rollback. A
     /// later refusal replaces it, including one for a second launcher that came while another
-    /// launch held the backend.
+    /// launch held the backend. A launch that fails after its admission at a step that keeps no
+    /// reason leaves the record as it was.
     launch_failure: Mutex<Option<String>>,
     /// Set when the backend is retired, so a reading of the executable in progress stops.
     stopped: Arc<AtomicBool>,
@@ -1304,7 +1305,8 @@ impl CommandBackends {
     /// It belongs to the backend and not to an instance: a launch that failed before its program was
     /// shown has no instance, and what a launcher declined or what the worker refused is kept here
     /// after the launch is given back. A later refusal replaces it, including one for a second
-    /// launcher that came while another launch held the backend.
+    /// launcher that came while another launch held the backend. A launch that fails after its
+    /// admission at a step that keeps no reason leaves the record as it was.
     #[must_use]
     pub fn launch_failure_of(&self, prompt_generation: PromptGeneration) -> Option<String> {
         self.backends

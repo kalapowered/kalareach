@@ -113,6 +113,9 @@ pub struct Run {
     /// the reservation each was started with: a command line only proposes a label, and a job is
     /// this run's only when the service manager itself says it runs this run's worker program.
     job_labels: Mutex<Vec<String>>,
+    /// Each session of this run with the label its worker's job has, kept from the worker's command
+    /// line while the worker ran: a worker that has ended still has its label here.
+    session_labels: Mutex<Vec<(String, String)>>,
     /// The targets (a domain and a proposed label) whose job, as the service manager prints it, is
     /// not the worker this run placed. They are left alone: nothing is asked of the service manager
     /// about them again. A decoy under a label in one domain says nothing about the other domain.
@@ -171,6 +174,7 @@ impl Run {
             system_programs: Mutex::new(Vec::new()),
             undiscovered: Mutex::new(Vec::new()),
             job_labels: Mutex::new(Vec::new()),
+            session_labels: Mutex::new(Vec::new()),
             jobs_left_alone: Mutex::new(Vec::new()),
             placed: Mutex::new(Vec::new()),
             mark: kr_ipc::new_uuid().to_string(),
@@ -217,6 +221,7 @@ impl Run {
             system_programs: Mutex::new(Vec::new()),
             undiscovered: Mutex::new(Vec::new()),
             job_labels: Mutex::new(Vec::new()),
+            session_labels: Mutex::new(Vec::new()),
             jobs_left_alone: Mutex::new(Vec::new()),
             placed: Mutex::new(Vec::new()),
             mark: kr_ipc::new_uuid().to_string(),
@@ -488,7 +493,11 @@ impl Run {
                 .unwrap_or_default()
                 .into_iter()
                 .filter(|(_, command)| worker_session(command, &program) == Some(session_id))
-                .find_map(|(pid, _)| self.record_worker(pid, "the session's worker", session_id))
+                .find_map(|(pid, command)| {
+                    let identity = self.record_worker(pid, "the session's worker", session_id)?;
+                    self.note_workers_from([command.as_str()]);
+                    Some(identity)
+                })
             {
                 return identity;
             }
@@ -787,12 +796,57 @@ impl Run {
     }
 
     /// The labels the run's workers' command lines proposed.
-    #[must_use]
-    pub fn proposed_labels(&self) -> Vec<String> {
+    #[cfg(test)]
+    pub(crate) fn proposed_labels(&self) -> Vec<String> {
         self.job_labels
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
+    }
+
+    /// Records the session and the label each command line of this run's worker names, and
+    /// proposes the label ([`Run::propose_jobs_from`]).
+    pub(crate) fn note_workers_from<'a>(&self, commands: impl IntoIterator<Item = &'a str>) {
+        let program = self.binary("kr-worker");
+        for command in commands {
+            self.propose_jobs_from([command]);
+            let (Some(session), Some(label)) =
+                (worker_session(command, &program), proposed_label(command))
+            else {
+                continue;
+            };
+            let mut kept = self
+                .session_labels
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if !kept.iter().any(|(known, _)| known == session) {
+                kept.push((session.to_owned(), label));
+            }
+        }
+    }
+
+    /// The label the job of the worker of `session_id` has: the one kept while the worker ran, or,
+    /// for a worker the run has not met, the one its command line in the process table names now.
+    #[must_use]
+    pub fn worker_label_of(&self, session_id: &str) -> Option<String> {
+        let kept = |run: &Self| {
+            run.session_labels
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .iter()
+                .find(|(session, _)| session == session_id)
+                .map(|(_, label)| label.clone())
+        };
+        if let Some(label) = kept(self) {
+            return Some(label);
+        }
+        let commands: Vec<String> = processes_under(&self.root)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(_, command)| command)
+            .collect();
+        self.note_workers_from(commands.iter().map(String::as_str));
+        kept(self)
     }
 
     /// The targets (a domain and a label) left alone, which the closing check says.
