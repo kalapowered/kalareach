@@ -51,7 +51,8 @@ and a crate added to the lock stops a release until this runs again.
 as above, and the production JavaScript packages of the interface, which `pnpm licenses` lists from the
 packages that `pnpm install --frozen-lockfile --prod --filter "@kalareach/companion..."` installed. A
 JavaScript package is recorded under the first of its licences that `about.toml` lists, and its texts
-are chosen as a crate's are. An entry of `scripts/notice-texts.json` is for the release programs' notice
+are chosen as a crate's are. A package under MPL-2.0 names the repository field of its package.json as its
+source. An entry of `scripts/notice-texts.json` is for the release programs' notice
 unless it lists `"products": ["companion"]`, or both.
 
 `about.toml` says which licences a crate may be used under and which one a crate that offers
@@ -1110,7 +1111,31 @@ def javascript_record(config):
         fail(f"pnpm says '{said}' and the notice is made with pnpm {wanted}")
     listing = json.loads(run(["pnpm", "licenses", "list", "--prod", "--json", "--long",
                               "--filter", config["javascript"] + "..."], cwd=ROOT).stdout)
-    accepted = accepted_licences()
+    return javascript_answers(listing, accepted_licences(), config["javascript"])
+
+
+def javascript_source(name, version, recorded, folder):
+    """Where the source of a JavaScript package is, for the entry of a package under MPL-2.0: the repository
+    field of its package.json, in the form `entry_line` prints for a crate from Git. None for any other package."""
+    if recorded != "MPL-2.0":
+        return None
+    with open(os.path.join(folder, "package.json"), encoding="utf-8") as source:
+        field = json.load(source).get("repository")
+    given = field.get("url") if isinstance(field, dict) else field
+    if not given:
+        fail(f"{name} {version} is under MPL-2.0, and its package.json names no repository, which the entry needs as the "
+             f"address of its source: take a release of the package that names one")
+    address = given[len("git+"):] if given.startswith("git+") else given
+    address = address[:-len(".git")] if address.endswith(".git") else address
+    if not address.startswith("https://"):
+        fail(f"{name} {version} is under MPL-2.0, and the repository field of its package.json, {given}, is not an https "
+             f"address, which the entry needs to name as its source")
+    return "git+" + address
+
+
+def javascript_answers(listing, accepted, package):
+    """The record `gather` takes, from what `pnpm licenses` lists: one entry for each version, with the folder
+    of its installed package."""
     answers, roots_, declared = {}, {}, {}
     for expression, group in sorted(listing.items()):
         for item in group:
@@ -1121,12 +1146,13 @@ def javascript_record(config):
                     fail(f"{item['name']} {version} is not installed, which the generator needs to read its licence files: {COMPANION_REPAIR}")
                 key = (item["name"], version, "npm")
                 recorded = chosen(item["name"], version, item.get("license") or expression, accepted)
-                answers[key] = {"authors": [item["author"]] if item.get("author") else [], "source": None,
+                answers[key] = {"authors": [item["author"]] if item.get("author") else [],
+                                "source": javascript_source(item["name"], version, recorded, path),
                                 "licences": [(recorded, recorded, "", False)]}
                 roots_[key] = path
                 declared[key] = item.get("license") or expression
     if not answers:
-        fail(f"pnpm lists no production package of {config['javascript']}")
+        fail(f"pnpm lists no production package of {package}")
     return {"name": JAVASCRIPT_ORIGIN, "listed": set(answers), "answers": answers, "roots": roots_,
             "declared": declared, "paths": set(), "members": {}}
 
@@ -1672,6 +1698,35 @@ for path in paths:
     write(os.path.join(app, "src"), "value.ts", "import {\n  v\n} from 'dev-only/sub'\n")
     refuses("a package that the interface imports and its dependencies do not hold is refused",
             lambda: check_imports(app, "@x/app", "app"), "app/src imports dev-only")
+
+    def listed(name, folder_, expression):
+        return {expression: [{"name": name, "versions": ["1.0.0"], "paths": [folder_], "license": expression, "author": "An Author"}]}
+
+    mozilla = ["MPL-2.0", "MIT"]
+    package_json = os.path.join(scratch, "mpl-string")
+    write(package_json, "package.json", json.dumps({"name": "m", "repository": "git+https://github.com/x/m.git"}))
+    write(package_json, "LICENSE", licence_text("MPL-2.0"))
+    answered = made(lambda: javascript_answers(listed("m", package_json, "MPL-2.0"), mozilla, "x"))
+    text = rendered([answered], nothing, {}) if answered else ""
+    expect("an MPL-2.0 JavaScript package names the address of its source from its repository field",
+           "  - m 1.0.0 | javascript | An Author | source https://github.com/x/m\n" in text)
+    package_object = os.path.join(scratch, "mpl-object")
+    write(package_object, "package.json", json.dumps({"name": "m", "repository": {"type": "git", "url": "git+https://github.com/x/m.git"}}))
+    expect("an MPL-2.0 JavaScript package whose repository field is an object names its url",
+           made(lambda: javascript_source("m", "1.0.0", "MPL-2.0", package_object)) == "git+https://github.com/x/m")
+    package_bare = os.path.join(scratch, "mpl-bare")
+    write(package_bare, "package.json", json.dumps({"name": "m"}))
+    refuses("an MPL-2.0 JavaScript package with no repository field is refused",
+            lambda: javascript_source("m", "1.0.0", "MPL-2.0", package_bare), "names no repository")
+    package_git = os.path.join(scratch, "mpl-git")
+    write(package_git, "package.json", json.dumps({"name": "m", "repository": "git://github.com/x/m.git"}))
+    refuses("an MPL-2.0 JavaScript package whose repository is not an https address is refused",
+            lambda: javascript_source("m", "1.0.0", "MPL-2.0", package_git), "is not an https address")
+    package_mit = os.path.join(scratch, "mit-with-repository")
+    write(package_mit, "package.json", json.dumps({"name": "m", "repository": "git+https://github.com/x/m.git"}))
+    expect("a JavaScript package under another licence names no source",
+           made(lambda: javascript_answers(listed("m", package_mit, "MIT"), mozilla, "x"))
+           .get("answers", {}).get(("m", "1.0.0", "npm"), {}).get("source", "none read") is None)
 
     accepted = ["MIT", "ISC", "Apache-2.0"]
     expect("a package under an OR is recorded under the first licence that about.toml lists",
