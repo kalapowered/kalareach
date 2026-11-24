@@ -17,7 +17,7 @@ use kr_plugin_service::protocol4::{
     BindingRegistration4, Checkpointed, Consumed, Frame4, Notice4, RecordState, Request4,
     RequestBody4, ResponseBody4, Through,
 };
-use kr_plugin_service::vocabulary::wire_event;
+use kr_plugin_service::vocabulary::{MAX_NODE_BYTES, wire_event};
 use kr_protocol::ids::SourceEventHandle;
 
 use super::{HANG_GUARD, Raw, Served, components, reached};
@@ -479,6 +479,70 @@ async fn kr_req_24_24_an_event_refused_before_the_queue_clears_clean_for_what_fo
         Some(false),
         "what the instance consumed after the refused event was said to follow it"
     );
+}
+
+/// A restore whose state is over the bound is a request this host refuses, with its writer open or
+/// closed, and the instance is as it was.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_24_24_a_restore_with_a_state_over_the_bound_is_refused_and_changes_nothing() {
+    for open in [true, false] {
+        let served = Served::start_dual(open).await;
+        let Some(component) = recording(&served) else {
+            return;
+        };
+        let mut four = Raw4::connect(served.endpoint4()).await;
+        let request = components::request("recording", if open { 37 } else { 38 });
+        four.register(&request, &component, 7).await;
+        four.event(&request, "se-1", "x").await;
+        let before = if open {
+            loop {
+                let saved = four.checkpoint(&request).await;
+                if saved
+                    .consumed
+                    .as_ref()
+                    .is_some_and(|consumed| consumed.terminal == Some(handle("se-1")))
+                {
+                    break Some(saved);
+                }
+                tokio::task::yield_now().await;
+            }
+        } else {
+            None
+        };
+        let over = vec![0_u8; usize::try_from(MAX_NODE_BYTES).expect("a usize bound") + 1];
+        let refused = four
+            .restore(
+                &request,
+                7,
+                over,
+                Some(Through {
+                    native: None,
+                    terminal: Some(handle("se-1")),
+                }),
+            )
+            .await;
+        assert!(
+            matches!(
+                refused,
+                ResponseBody4::Refused {
+                    disabled: false,
+                    ..
+                }
+            ),
+            "a restore of a state over the bound was answered with {refused:?} (open: {open})"
+        );
+        if let Some(before) = before {
+            let after = four.checkpoint(&request).await;
+            assert_eq!(
+                (after.state, after.consumed),
+                (before.state, before.consumed),
+                "the refused restore changed the instance"
+            );
+        }
+        // The binding still runs: an event is consumed after the refusal.
+        four.event(&request, "se-2", "y").await;
+        four.unbind(&request).await;
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
