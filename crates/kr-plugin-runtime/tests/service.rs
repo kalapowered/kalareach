@@ -5929,8 +5929,20 @@ mod recorded_session {
         .await
         .expect("the writer never took the document off the queue");
         client.privacy(true).await.expect("privacy mode is set");
+        // Privacy mode ends once the writer is past the document it held. A writer that took the
+        // connection after the end would write that document, no loss would be told, and no fresh
+        // document would follow.
+        let past = served.host.hold_after_notice_writes();
         hold.release();
+        tokio::time::timeout(HANG_GUARD, async {
+            while !past.parked() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the writer never got past the document it held");
         client.privacy(false).await.expect("privacy mode ends");
+        past.release();
         tokio::time::timeout(HANG_GUARD, async {
             let mut told = false;
             loop {
