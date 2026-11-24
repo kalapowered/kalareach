@@ -35,9 +35,10 @@ export function setupLinkFor(platform: SetupPlatform | null): string {
 /**
  * The platform this application runs on, from one reading of its identity when the window opens.
  *
- * It is the same command the setup page reads, because the platform has no other source. It is
- * read once: an application does not change platform while it runs. A reading that fails leaves it
- * unknown, and the setup page reads the identity itself and shows the failure there.
+ * It is the same command the setup page reads, because no other command names the platform, and
+ * one source keeps the side bar and the page in step. It is read once: an application does not
+ * change platform while it runs. A reading that fails leaves it unknown, and the setup page reads
+ * the identity itself and shows the failure there.
  */
 export function usePlatform(port: HostPort): SetupPlatform | null {
   const [platform, setPlatform] = useState<SetupPlatform | null>(null)
