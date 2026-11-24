@@ -141,6 +141,10 @@ pub struct ConsumedReport {
     pub native: Option<SourceEventHandle>,
     /// The last terminal event whose `observe` returned.
     pub terminal: Option<SourceEventHandle>,
+    /// How many restores the binding had taken in when the report was made. A writer drops a
+    /// report that names fewer than the binding has taken in since: it describes a state a restore
+    /// replaced.
+    pub restores: u32,
 }
 
 /// A notice taken from the queue, and the registration it came from.
@@ -1670,6 +1674,7 @@ mod tests {
             clean: true,
             native: Some(handle(native)),
             terminal: None,
+            restores: 0,
         }
     }
 

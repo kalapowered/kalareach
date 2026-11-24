@@ -443,6 +443,11 @@ pub enum Notice4 {
     /// The instance has consumed events: sent at the end of a pass that returned at least one,
     /// after any gap or fault that pass raised, and coalesced to one pending for each binding. A
     /// host with its writer closed never sends it.
+    ///
+    /// A restore that was answered replaces the state a report describes. A report of the state it
+    /// replaced is never written after its answer, and one written between the request and its
+    /// answer may describe either state, so a reader takes the position the restore carried and
+    /// ignores what came in between.
     Consumed {
         /// The binding.
         binding_id: Uuid,

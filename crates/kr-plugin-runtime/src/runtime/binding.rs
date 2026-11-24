@@ -49,7 +49,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
@@ -228,6 +228,9 @@ pub struct Consumed {
     pub native: Option<SourceEventHandle>,
     /// The last terminal event whose `observe` returned, where one has.
     pub terminal: Option<SourceEventHandle>,
+    /// How many restores the binding has taken in. A report made before one describes a state the
+    /// restore replaced, and this is what tells it from a report made after.
+    pub restores: u32,
 }
 
 impl Consumed {
@@ -237,6 +240,7 @@ impl Consumed {
             clean: true,
             native: None,
             terminal: None,
+            restores: 0,
         }
     }
 
@@ -1034,6 +1038,8 @@ pub struct BindingHandle {
     /// Whether the worker owed the caller a report the last time it came to wait.
     #[cfg(feature = "testing")]
     report_owed: Arc<AtomicBool>,
+    /// How many restores the binding has taken in, which its thread raises before it answers one.
+    restores: Arc<AtomicU32>,
     pending: Arc<PendingUpdates>,
     outstanding: Arc<AtomicUsize>,
     calls: Arc<AtomicU64>,
@@ -1072,6 +1078,7 @@ impl BindingHandle {
         let pump_stop = Arc::new(Mutex::new(None));
         #[cfg(feature = "testing")]
         let report_owed = Arc::new(AtomicBool::new(false));
+        let restores = Arc::new(AtomicU32::new(0));
         let pending = Arc::new(PendingUpdates::default());
         let outstanding = Arc::new(AtomicUsize::new(0));
         let calls = Arc::new(AtomicU64::new(0));
@@ -1105,6 +1112,7 @@ impl BindingHandle {
             pump_stop: Arc::clone(&pump_stop),
             #[cfg(feature = "testing")]
             report_owed: Arc::clone(&report_owed),
+            restores: Arc::clone(&restores),
             pending: Arc::clone(&pending),
             outstanding: Arc::clone(&outstanding),
             commands: commands.clone(),
@@ -1137,6 +1145,7 @@ impl BindingHandle {
             pump_stop,
             #[cfg(feature = "testing")]
             report_owed,
+            restores,
             pending,
             outstanding,
             calls,
@@ -1243,6 +1252,15 @@ impl BindingHandle {
     #[must_use]
     pub fn report_owed(&self) -> bool {
         self.report_owed.load(Ordering::Acquire)
+    }
+
+    /// Returns how many restores the binding has taken in.
+    ///
+    /// A report of what the instance consumed that names fewer is about a state a restore has
+    /// replaced since, and is not one to tell anyone.
+    #[must_use]
+    pub fn restores(&self) -> u32 {
+        self.restores.load(Ordering::Acquire)
     }
 
     /// Says the component's view is stale and a fresh snapshot is owed.
@@ -1584,6 +1602,7 @@ struct BindingWorker {
     pump_stop: Arc<Mutex<Option<PumpStopSide>>>,
     #[cfg(feature = "testing")]
     report_owed: Arc<AtomicBool>,
+    restores: Arc<AtomicU32>,
     pending: Arc<PendingUpdates>,
     outstanding: Arc<AtomicUsize>,
     commands: mpsc::Sender<Command>,
@@ -1747,6 +1766,11 @@ impl BindingWorker {
                         // The state was replaced, and what was owed described the one it replaced:
                         // the answer to the restore is what the caller reads now.
                         self.consumed_owed = None;
+                        // Raised before the answer goes, so a report made earlier is told from one
+                        // made after by anything that looks once the answer is in hand.
+                        self.consumed.restores = self.consumed.restores.saturating_add(1);
+                        self.restores
+                            .store(self.consumed.restores, Ordering::Release);
                         match through {
                             Some(through) => {
                                 self.consumed.native = through.native;

@@ -2049,6 +2049,12 @@ async fn write_notices_four(
                     let Some(registration) = registration_behind(&registered, origin) else {
                         return Ok(());
                     };
+                    // Looked at under the writer, which the answer to a restore is written under:
+                    // a restore that has completed is before its answer is written, so a report of
+                    // the state it replaced is either written before that answer or not at all.
+                    if replaced_by_a_restore(&registered, origin, &report) {
+                        return Ok(());
+                    }
                     consumed_notice4_of(report, registration)
                 }
             };
@@ -2070,6 +2076,22 @@ async fn write_notices_four(
 fn registration_behind(registered: &Registered, origin: Option<Origin>) -> Option<u64> {
     let held = registered.lock().ok()?;
     held.registration_number(origin?)
+}
+
+/// Says whether a restore has replaced the state a report describes, so the report is not one to
+/// write: the binding has taken in more restores than the report was made after.
+fn replaced_by_a_restore(
+    registered: &Registered,
+    origin: Option<Origin>,
+    report: &ConsumedReport,
+) -> bool {
+    let Ok(held) = registered.lock() else {
+        return true;
+    };
+    held.standing_binding(report.binding_id)
+        .is_some_and(|binding| {
+            Some(origin_of(binding.incarnation())) == origin && binding.restores() > report.restores
+        })
 }
 
 /// Says whether the notice writer, holding the connection's writer, leaves a notice unwritten.
@@ -2671,6 +2693,7 @@ fn pieces_of(binding_id: BindingId, event: BindingEvent, shape: Shape) -> Vec<Pi
             clean: consumed.clean,
             native: consumed.native,
             terminal: consumed.terminal,
+            restores: consumed.restores,
         })],
         other => plain(notices_of(binding_id, other), &Beyond::default()),
     }
