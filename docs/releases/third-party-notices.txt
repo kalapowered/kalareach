@@ -11,12 +11,13 @@ code, each as the pinned fish archive has it.
 The list covers every platform a release is built for, so the list for one archive is a subset of
 it. A crate that is offered under several licences is recorded under the one this project takes it
 under. Each block lists the crates that use a text and then gives the text, under the licence it is. A
-file that holds the texts of two licences is one block under a heading that names both, and a file
-that names a licence and holds none of its text has a heading that says so. An entry gives the crate, its
-version, whether the programs, the fish package or both are built from it, and the authors its
-package names. The entry of a crate under the Mozilla Public License 2.0, or taken from a Git
-repository, names where its source is. Where a package ships no licence text, the entry names the
-upstream file that the text comes from.
+file that holds the texts of several licences is one block under a heading that names all of them, and
+a file that names a licence and holds none of its text, or only a header of it, has a heading that says
+so. An entry gives the crate, its version, whether the programs, the fish package or both are built
+from it, and the authors its package names. The entry of a crate under the Mozilla Public License 2.0,
+or taken from a Git repository, names where its source is. Where a package ships no text of a licence
+it is recorded under, the notice carries the upstream text beside the package's own files, and the
+entry names the upstream file.
 
 ====================================================================================================
 Licence: 0BSD (BSD Zero Clause License)
@@ -2396,61 +2397,6 @@ ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
 WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
 ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
 OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
-
-====================================================================================================
-Licence: Apache-2.0 and MIT (Apache License 2.0 and MIT License, in one file)
-====================================================================================================
-
-Used by:
-
-  - atomic-waker 1.1.2 | programs | Stjepan Glavina <stjepang@gmail.com>, Contributors to futures-rs
-  - futures-lite 2.6.1 | programs | Stjepan Glavina <stjepang@gmail.com>, Contributors to futures-rs
-
-===============================================================================
-
-Copyright (c) 2016 Alex Crichton
-Copyright (c) 2017 The Tokio Authors
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-	http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-
-===============================================================================
-
-Copyright (c) 2016 Alex Crichton
-Copyright (c) 2017 The Tokio Authors
-
-Permission is hereby granted, free of charge, to any
-person obtaining a copy of this software and associated
-documentation files (the "Software"), to deal in the
-Software without restriction, including without
-limitation the rights to use, copy, modify, merge,
-publish, distribute, sublicense, and/or sell copies of
-the Software, and to permit persons to whom the Software
-is furnished to do so, subject to the following
-conditions:
-
-The above copyright notice and this permission notice
-shall be included in all copies or substantial portions
-of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
-ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
-TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
-PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
-SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
-CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
-OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
-IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
-DEALINGS IN THE SOFTWARE.
 
 ====================================================================================================
 Licence: Apache-2.0 and MIT (Apache License 2.0 and MIT License, in one file)
@@ -7101,6 +7047,7 @@ Licence: MIT (MIT License)
 
 Used by:
 
+  - YaRN code in ops.cpp of llama.cpp e79e4bf660e1 | programs |  | bundled in llama-cpp-sys-2 0.1.156, text https://raw.githubusercontent.com/spdx/license-list-data/31ba1a50e5397e00a304dbadc76531740e89ee48/text/MIT.txt without its copyright line
   - acto 0.8.2 | programs | Roland Kuhn <rk@rkuhn.info> | text https://raw.githubusercontent.com/spdx/license-list-data/31ba1a50e5397e00a304dbadc76531740e89ee48/text/MIT.txt without its copyright line
   - block2 0.6.2 | programs | Mads Marquart <mads@marquart.dk> | text https://raw.githubusercontent.com/spdx/license-list-data/31ba1a50e5397e00a304dbadc76531740e89ee48/text/MIT.txt without its copyright line
   - dispatch2 0.3.1 | programs | Mads Marquart <mads@marquart.dk>, Mary <mary@mary.zone> | text https://raw.githubusercontent.com/spdx/license-list-data/31ba1a50e5397e00a304dbadc76531740e89ee48/text/MIT.txt without its copyright line
@@ -7863,6 +7810,61 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+====================================================================================================
+Licence: MIT (MIT License)
+====================================================================================================
+
+Used by:
+
+  - atomic-waker 1.1.2 | programs | Stjepan Glavina <stjepang@gmail.com>, Contributors to futures-rs
+  - futures-lite 2.6.1 | programs | Stjepan Glavina <stjepang@gmail.com>, Contributors to futures-rs
+
+===============================================================================
+
+Copyright (c) 2016 Alex Crichton
+Copyright (c) 2017 The Tokio Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+	http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
+===============================================================================
+
+Copyright (c) 2016 Alex Crichton
+Copyright (c) 2017 The Tokio Authors
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
 
 ====================================================================================================
 Licence: MIT (MIT License)
@@ -12114,7 +12116,7 @@ Licence: MIT (MIT License)
 
 Used by:
 
-  - llamafile sgemm.cpp of llama.cpp e79e4bf660e1 | programs |  | bundled in llama-cpp-sys-2 0.1.156, text https://raw.githubusercontent.com/ggml-org/llama.cpp/e79e4bf660e19f2ad851e06c6913f7a8c5852621/ggml/src/ggml-cpu/llamafile/sgemm.cpp, lines 1 to 18
+  - llamafile sgemm.cpp of llama.cpp e79e4bf660e1 | programs |  | bundled in llama-cpp-sys-2 0.1.156, text https://raw.githubusercontent.com/ggml-org/llama.cpp/e79e4bf660e19f2ad851e06c6913f7a8c5852621/ggml/src/ggml-cpu/llamafile/sgemm.cpp, lines 1 to 21
 
 // Copyright 2024 Mozilla Foundation
 //
@@ -12134,6 +12136,9 @@ Used by:
 // MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
 // NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
 // BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
+// ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+// CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
 
 ====================================================================================================
 Licence: MIT (MIT License)
@@ -17720,61 +17725,6 @@ is licensed under:
 at your option.
 
 ====================================================================================================
-Notice file: Notice file (LICENSE-THIRD-PARTY)
-====================================================================================================
-
-Used by:
-
-  - atomic-waker 1.1.2 | programs | Stjepan Glavina <stjepang@gmail.com>, Contributors to futures-rs
-  - futures-lite 2.6.1 | programs | Stjepan Glavina <stjepang@gmail.com>, Contributors to futures-rs
-
-===============================================================================
-
-Copyright (c) 2016 Alex Crichton
-Copyright (c) 2017 The Tokio Authors
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-	http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-
-===============================================================================
-
-Copyright (c) 2016 Alex Crichton
-Copyright (c) 2017 The Tokio Authors
-
-Permission is hereby granted, free of charge, to any
-person obtaining a copy of this software and associated
-documentation files (the "Software"), to deal in the
-Software without restriction, including without
-limitation the rights to use, copy, modify, merge,
-publish, distribute, sublicense, and/or sell copies of
-the Software, and to permit persons to whom the Software
-is furnished to do so, subject to the following
-conditions:
-
-The above copyright notice and this permission notice
-shall be included in all copies or substantial portions
-of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
-ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
-TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
-PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
-SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
-CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
-OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
-IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
-DEALINGS IN THE SOFTWARE.
-
-====================================================================================================
 Notice file: Notice file (COPYRIGHT)
 ====================================================================================================
 
@@ -17887,43 +17837,6 @@ is licensed under:
    <http://opensource.org/licenses/MIT>,
 
 at your option.
-
-====================================================================================================
-Notice file: Notice file (NOTICES.md)
-====================================================================================================
-
-Used by:
-
-  - cfg_aliases 0.1.1 | programs | Zicklag <zicklag@katharostech.com>
-  - cfg_aliases 0.2.1 | fish | Zicklag <zicklag@katharostech.com>
-  - cfg_aliases 0.2.2 | programs | Zicklag <zicklag@katharostech.com>
-
-# 3rd Party Notices
-
-The `cfg_aliases!` macro uses a lot of the code from [`tectonic_cfg_support::target_cfg!`] macro which is under the following license:
-
-[`tectonic_cfg_support::target_cfg!`]: https://github.com/tectonic-typesetting/tectonic/blob/f2439b936470ad27bdf92882064bc4702ee01899/cfg_support/src/lib.rs#L166
-
-    tectonic_cfg_support is licensed under the MIT License.
-
-    Permission is hereby granted, free of charge, to any person obtaining a copy
-    of this software and associated documentation files (the “Software”), to deal
-    in the Software without restriction, including without limitation the rights
-    to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-    copies of the Software, and to permit persons to whom the Software is
-    furnished to do so, subject to the following conditions:
-
-    The above copyright notice and this permission notice shall be included in all
-    copies or substantial portions of the Software.
-
-    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-    AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-    OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-    SOFTWARE.
----
 
 ====================================================================================================
 Notice file: Notice file (COPYRIGHT)
@@ -19470,6 +19383,73 @@ Used by:
   - typenum 1.20.1 | fish and programs |
 
 MIT OR Apache-2.0
+
+====================================================================================================
+Licence statement: LICENSE-APACHE (this file names a licence and holds none of its text)
+====================================================================================================
+
+Used by:
+
+  - rle-decode-fast 1.0.3 | programs | Moritz Wanzenböck <moritz@wanzenbug.xyz>
+
+Copyright 2019 Moritz "WanzenBug" Wanzenböck
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
+====================================================================================================
+Licence statement: LICENSE-APACHE (this file names a licence and holds none of its text)
+====================================================================================================
+
+Used by:
+
+  - serial2 0.2.38 | programs |
+
+Copyright 2021, Maarten de Vries <maarten@de-vri.es>
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+	http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
+====================================================================================================
+Licence statement: LICENSE-APACHE (this file names a licence and holds none of its text)
+====================================================================================================
+
+Used by:
+
+  - shlex 1.3.0 | programs | comex <comexk@gmail.com>, Fenhl <fenhl@fenhl.net>, Adrian Taylor <adetaylor@chromium.org>, Alex Touchet <alextouchet@outlook.com>, Daniel Parks <dp+git@oxidized.org>, Garrett Berg <googberg@gmail.com>
+  - shlex 2.0.1 | fish and programs | comex <comexk@gmail.com>, Fenhl <fenhl@fenhl.net>, Adrian Taylor <adetaylor@chromium.org>, Alex Touchet <alextouchet@outlook.com>, Daniel Parks <dp+git@oxidized.org>, Garrett Berg <googberg@gmail.com>
+
+Copyright 2015 Nicholas Allegra (comex).
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
 
 ====================================================================================================
 Licence statement: LICENSE.md (this file names a licence and holds none of its text)
