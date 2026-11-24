@@ -176,7 +176,10 @@ impl ProfileStore {
     /// # Errors
     ///
     /// Returns [`BrokerError::Launch`] when the boundary is not the idle root shell, because a
-    /// launch intent is only ever submitted against that boundary.
+    /// launch intent is only ever submitted against that boundary, and
+    /// [`BrokerError::InvalidArgument`] when a live instance holds a profile of the same
+    /// identifier: a profile does not change while its instance lives, so what a record names
+    /// about the launch stays what the launch was.
     pub fn prepare(
         &self,
         profile: LaunchProfile,
@@ -185,6 +188,17 @@ impl ProfileStore {
     ) -> Result<LaunchIntent> {
         if !against.is_idle() {
             return Err(BrokerError::Launch(LaunchRefusal::ForegroundChanged));
+        }
+        if self
+            .instances
+            .values()
+            .any(|held| *held == profile.profile_id)
+        {
+            return Err(BrokerError::invalid(format!(
+                "profile {} is held by a live instance, and a profile is not replaced while its \
+                 instance lives",
+                profile.profile_id
+            )));
         }
         Ok(LaunchIntent {
             profile,
@@ -746,7 +760,10 @@ mod tests {
 
         let second = store
             .prepare(
-                profile(IntegrationMode::Gateway),
+                LaunchProfile {
+                    profile_id: LaunchProfileId::new("lp-2").expect("valid"),
+                    ..profile(IntegrationMode::Gateway)
+                },
                 ForegroundMark::idle(4),
                 Some("thread-7".to_owned()),
             )

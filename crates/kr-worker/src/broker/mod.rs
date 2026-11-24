@@ -3017,8 +3017,9 @@ impl Broker {
     ///
     /// # Errors
     ///
-    /// Returns [`BrokerError::Launch`] when the boundary is not the idle root shell, and
-    /// [`BrokerError::LedgerUnavailable`] when the profile cannot be recorded.
+    /// Returns [`BrokerError::Launch`] when the boundary is not the idle root shell,
+    /// [`BrokerError::InvalidArgument`] when a live instance holds a profile of the same
+    /// identifier, and [`BrokerError::LedgerUnavailable`] when the profile cannot be recorded.
     pub fn prepare_launch(
         &self,
         profile: LaunchProfile,

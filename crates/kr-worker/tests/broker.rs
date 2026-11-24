@@ -132,9 +132,13 @@ fn projection() -> DecodedProjection {
     }
 }
 
+/// A launch profile under an identifier no earlier call made: a live instance holds its profile, so
+/// a second launch under the same identifier is refused.
 fn profile(mode: IntegrationMode, digest: [u8; 32], version: &str) -> LaunchProfile {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let number = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     LaunchProfile {
-        profile_id: LaunchProfileId::new("lp-1").expect("valid"),
+        profile_id: LaunchProfileId::new(format!("lp-{number}")).expect("valid"),
         environment_id: EnvironmentId::new(Uuid::from_bytes([1; 16])),
         binary: BinaryIdentity {
             resolved_path: "/usr/local/bin/codex".to_owned(),
@@ -3093,6 +3097,47 @@ fn a_launch_holds_its_identifier_until_its_guard_finishes() {
     );
 }
 
+/// KR-REQ-11.17, the launch profile: the profile an instance was launched under does not change
+/// while the instance lives. A second preparation that reuses the identifier of a live instance's
+/// profile is refused, and the broker goes on reading the first profile for that instance, so what
+/// a record names about the launch stays what the launch was.
+#[test]
+fn kr_req_11_17_a_live_instances_launch_profile_is_not_replaced_by_a_second_preparation() {
+    let broker = Broker::open(None, session(), JournalHealth::shared()).expect("the broker opens");
+    let first = profile(IntegrationMode::Gateway, [3; 32], "0.9.1");
+    let intent = broker
+        .prepare_launch(first.clone(), ForegroundMark::idle(4), None)
+        .expect("the launch is prepared");
+    broker
+        .execute_launch(&intent, &ForegroundMark::idle(4), instance(2))
+        .expect("the launch runs")
+        .register(IntegrationMode::Gateway, Some(managed(instance(2))))
+        .expect("the instance is registered")
+        .commit();
+    assert_eq!(
+        broker.profile_of(instance(2)),
+        Some(first.clone()),
+        "the instance reads the profile it was launched under"
+    );
+
+    // Another preparation under the same identifier, naming another binary and other arguments.
+    let mut replacement = profile(IntegrationMode::Gateway, [4; 32], "0.9.2");
+    replacement.profile_id = first.profile_id.clone();
+    replacement.arguments = vec!["codex".to_owned(), "--other".to_owned()];
+    let refusal = broker
+        .prepare_launch(replacement, ForegroundMark::idle(4), None)
+        .expect_err("a live instance's profile is not replaced");
+    assert!(
+        matches!(refusal, BrokerError::InvalidArgument(_)),
+        "{refusal:?}"
+    );
+    assert_eq!(
+        broker.profile_of(instance(2)),
+        Some(first),
+        "and the instance still reads the profile it was launched under"
+    );
+}
+
 /// A reservation registers on the broker that made it, and giving one back touches that broker
 /// alone.
 #[test]
@@ -3710,14 +3755,15 @@ fn kr_req_11_16_evidence_names_the_package_publisher_schema_and_binary_it_was_ga
     );
 }
 
-/// KR-REQ-12.02 and KR-REQ-11.35: a launch the fence refuses leaves the profile it would have
-/// replaced.
+/// KR-REQ-12.02 and KR-REQ-11.35: a launch the fence refuses leaves the profile of the instance
+/// that runs.
 ///
 /// A launch's profile is written before it is kept. While the journal is faulted nothing can be
-/// written, so a preparation under a profile identifier this host already knows is refused before
-/// anything changes, and the instance launched under that identifier still reads the profile it
-/// was launched with. Of that profile only the version is read here; not shown here: the
-/// executable, the distribution, the arguments, the authentication state and the mode.
+/// written, so a preparation is refused before anything changes, and the instance launched earlier
+/// still reads the profile it was launched with. Of that profile only the version is read here;
+/// not shown here: the executable, the distribution, the arguments, the authentication state and
+/// the mode. A preparation under the identifier of a live instance's profile is refused before the
+/// journal is asked, and another case holds that.
 #[test]
 fn kr_req_12_02_a_launch_the_fence_refuses_leaves_the_profile_it_would_have_replaced() {
     let mut store = common::SharedStore::open();
