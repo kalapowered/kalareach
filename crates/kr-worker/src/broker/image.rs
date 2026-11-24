@@ -1165,8 +1165,11 @@ mod tests {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn another_process_executes_the_shell_it_was_started_from() {
+        // The shell waits on its own input, a builtin: a command it started would be another process
+        // that outlives the shell this case ends, with the case's output open.
         let mut child = std::process::Command::new("/bin/bash")
-            .args(["-c", "sleep 5; exit 0"])
+            .args(["-c", "read -r _"])
+            .stdin(std::process::Stdio::piped())
             .spawn()
             .expect("bash starts");
         let process =

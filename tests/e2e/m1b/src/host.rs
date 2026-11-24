@@ -1698,8 +1698,16 @@ mod shutdown_tests {
                 .arg0(directory.join("b/kr-worker"))
                 .args(["-c", "/bin/sleep 30; true", "--session", session])
                 .stdin(Stdio::null())
+                // A group of its own: the shell's `sleep` is another process, and ending the shell
+                // alone leaves it running with the case's output open.
+                .process_group(0)
                 .spawn()
                 .expect("a process standing for a worker")
+        };
+        let end_group = |stand_in: &std::process::Child| {
+            let _ = Command::new("/bin/kill")
+                .args(["-KILL", "--", &format!("-{}", stand_in.id())])
+                .status();
         };
         let (own_session, foreign_session) = (
             kr_ipc::new_uuid().to_string(),
@@ -1744,8 +1752,10 @@ mod shutdown_tests {
             foreign.try_wait().expect("the other worker").is_none(),
             "the other host's worker still runs after this run's host was dropped"
         );
+        end_group(&foreign);
         let _ = foreign.kill();
         let _ = foreign.wait();
+        end_group(&own);
         let _ = own.wait();
         drop(run);
         std::fs::remove_dir_all(&root).expect("clean up");
