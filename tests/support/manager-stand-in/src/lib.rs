@@ -1351,7 +1351,7 @@ mod tests {
      {
         let folder = PrivateTempDir::create();
         let root = folder.path().canonicalize().expect("a folder");
-        let program = root.join("kr-controller");
+        let program = root.join("kr-daemon");
         std::fs::write(&program, "").expect("a program");
         let program = program.display().to_string();
         let context = Context {

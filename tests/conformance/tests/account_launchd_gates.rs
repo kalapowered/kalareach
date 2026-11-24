@@ -103,11 +103,18 @@ const NAMED_NOT_RUN: [(&str, &[Entry]); 6] = [
     ),
     (
         "tests/conformance/tests/manager_stand_in_gates.rs",
-        &[(
-            "names_launchctl",
-            2,
-            "the two spellings of the program's name that the stand-in gate looks for in sources, which runs nothing",
-        )],
+        &[
+            (
+                "names_launchctl",
+                2,
+                "the two spellings of the program's name that the stand-in gate looks for in sources, which runs nothing",
+            ),
+            (
+                "startup_problems",
+                1,
+                "the name of the host's one method that may call the account's command, which the reading of the startup suite looks for and never runs",
+            ),
+        ],
     ),
 ];
 
