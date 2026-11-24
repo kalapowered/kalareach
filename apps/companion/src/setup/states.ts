@@ -18,6 +18,9 @@
 
 import type { CapabilityRecord } from '@kalareach/protocol'
 
+import type { SetupPlatform } from '../host/port'
+import { guidesPermissions } from './platform'
+
 /** What one capability is shown as. */
 export type DisplayState =
   | 'ready'
@@ -106,7 +109,8 @@ export const STATE_TONE: Readonly<
  */
 export function stateMeaning(
   state: DisplayState,
-  evidence: CapabilityRecord['evidence_source']
+  evidence: CapabilityRecord['evidence_source'],
+  platform: SetupPlatform | null
 ): string {
   const probed = evidence === 'disclosed_probe'
   switch (state) {
@@ -115,6 +119,11 @@ export function stateMeaning(
         ? 'This machine did the thing and it worked.'
         : 'The operating system says nothing stands in the way. Nothing has done it yet.'
     case 'permission_required':
+      // Off macOS the only refusal a person can undo is the file's own: no grant is filed under
+      // an application there, so the macOS sentence would send somebody to a switch that is not.
+      if (!guidesPermissions(platform)) {
+        return "The file's own access settings refused it. Changing them is yours to do."
+      }
       return probed
         ? 'macOS refused it. The grant is yours to give.'
         : 'This needs a grant macOS has not given. The grant is yours to give.'

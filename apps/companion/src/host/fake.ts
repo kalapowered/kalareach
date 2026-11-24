@@ -560,6 +560,9 @@ export interface FakeSyncService {
   holdNextRead(): () => void
 }
 
+/** The desktops the fake host can stand on; macOS is where it starts. */
+export type FakeDesktop = 'macos' | 'x11' | 'wayland' | 'windows'
+
 /** What the fake host can be told to do before a test drives the interface. */
 export interface FakeHostControls {
   /** The account. */
@@ -866,6 +869,11 @@ export interface FakeHostControls {
   setFileNominated(nominated: boolean): void
   /** Makes this build's identity an unstable one, or a stable one again. */
   setIdentityStable(stable: boolean): void
+  /**
+   * Moves the host to another desktop: the platform setup reads, the desktop's own context and the
+   * records for what it can do. macOS is where the host starts.
+   */
+  setDesktop(desktop: FakeDesktop): void
   /** The settings panes the interface asked the platform to open, in order. */
   readonly openedPanes: string[]
   /**
@@ -1502,6 +1510,7 @@ export function fakeHost(
   let chosenFile: string | null = null
   let dialogAnswer: string | null = 'notes.txt'
   let identityStable = true
+  let standingOn: FakeDesktop = 'macos'
   const granted = new Set<string>([
     'desktop.application_launch',
     'desktop.authorised_file_read',
@@ -2235,7 +2244,9 @@ export function fakeHost(
       if (asked && asked !== ENVIRONMENT) {
         refuse('NOT_FOUND', 'This host does not own that environment.')
       }
-      return Promise.resolve(capabilities(granted, capabilityRevision, checks, fileNominated))
+      return Promise.resolve(
+        capabilities(granted, capabilityRevision, checks, standingOn, fileNominated)
+      )
     },
 
     environmentCapabilitiesCheck: (params) => {
@@ -2282,7 +2293,7 @@ export function fakeHost(
       }),
     onAuthorisedFileChanged: () => registering.then(() => () => undefined),
 
-    setupIdentity: () => Promise.resolve(setupIdentity(identityStable, connected)),
+    setupIdentity: () => Promise.resolve(setupIdentity(identityStable, connected, standingOn)),
 
     openSettingsPane: (pane) => {
       const found = SETTINGS_PANES.find((each) => each.id === pane)
@@ -4363,6 +4374,9 @@ export function fakeHost(
     setIdentityStable(stable) {
       identityStable = stable
     },
+    setDesktop(desktop) {
+      standingOn = desktop
+    },
     openedPanes,
     setVoiceBrokerReachable(reachable) {
       voice.brokerReachable = reachable
@@ -6005,8 +6019,39 @@ const SETTINGS_PANES: readonly SettingsPane[] = [
 ]
 
 /** The identity this host reports for the application asking. */
-function setupIdentity(stable: boolean, connected: boolean): SetupIdentity {
+function setupIdentity(stable: boolean, connected: boolean, desktop: FakeDesktop): SetupIdentity {
+  if (desktop !== 'macos') {
+    // Where there is no signing tool the application reads no signature, and says why.
+    return {
+      platform: desktop === 'windows' ? 'windows' : 'linux',
+      application_id: 'to.kala.reach',
+      application_version: '0.1.0',
+      executable: desktop === 'windows' ? 'C:\\Program Files\\KalaReach\\kalareach-companion.exe' : '/opt/kalareach/kalareach-companion',
+      bundled: false,
+      signature: {
+        read: false,
+        authority: null,
+        team: null,
+        identifier: null,
+        ad_hoc: false,
+        valid: false,
+        refusal: 'this platform has no signing tool this application reads'
+      },
+      stable: false,
+      instability:
+        'The signature on this application could not be read. A permission the operating system ' +
+        'grants is filed against a signed application, so what a grant given now would be filed ' +
+        'under is not established.',
+      unverified:
+        'This reads the identity a grant is filed under, and the signature on it. It cannot tell ' +
+        'you a permission has been granted: on this platform the only way to establish that is to ' +
+        'perform the operation the permission guards.',
+      helper_build: connected ? 'kr-controller 0.1.0+2fe00021' : null,
+      helper_environment: connected ? ENVIRONMENT : null
+    }
+  }
   return {
+    platform: 'macos',
     application_id: 'to.kala.reach',
     application_version: '0.1.0',
     executable: stable
@@ -6118,13 +6163,98 @@ function noFileNominated(revision: number): CapabilityRecord {
   }
 }
 
-/** What this host answers `environment.capabilities` with. */
-function capabilities(
+/**
+ * One record on a desktop that is not macOS.
+ *
+ * Nothing there is a grant a person gives, so a record is either established, refused by the
+ * file's own access settings (the one refusal a person can undo), or not checked, and the reason
+ * says which route the host found.
+ */
+function otherRecord(
+  capability: string,
+  revision: number,
+  detail: {
+    readonly state: CapabilityRecord['state']
+    readonly reason: string
+    readonly binary: string | null
+  }
+): CapabilityRecord {
+  const probed = detail.state === 'qualified_available' || detail.state === 'permission_required'
+  return {
+    capability,
+    version: '1',
+    subject: {
+      environment_id: ENVIRONMENT,
+      desktop_session_id: 'linux_logind:user=sam:uid=1000:session=2:generation=7:boot=abcd',
+      session_id: null,
+      application: null,
+      terminal: null
+    },
+    revision: String(revision),
+    state: detail.state,
+    evidence_source: probed ? 'disclosed_probe' : 'platform_query',
+    identity: {
+      binary: detail.binary,
+      version: null,
+      package: null,
+      schema: null,
+      profile: 'desktop_bound'
+    },
+    invalidation: ['binary_identity', 'desktop_generation', 'worker_profile'],
+    disabled_reason: detail.reason,
+    observed_at_ms: String(FAKE_NOW_MS)
+  }
+}
+
+/** The records of a desktop that is not macOS, in the host's own words for each route. */
+function otherRecords(
+  desktop: Exclude<FakeDesktop, 'macos'>,
+  granted: ReadonlySet<string>,
+  revision: number
+): CapabilityRecord[] {
+  const fileRead = granted.has('desktop.authorised_file_read')
+    ? otherRecord('desktop.authorised_file_read', revision, {
+        state: 'qualified_available',
+        reason: 'this context opened the file and read its first bytes',
+        binary: null
+      })
+    : otherRecord('desktop.authorised_file_read', revision, {
+        state: 'permission_required',
+        reason: "this context tried to open the file and the file's own access settings refused it",
+        binary: null
+      })
+  const route: Record<Exclude<FakeDesktop, 'macos'>, string> = {
+    x11: 'this process holds no X11 display; a worker’s own context is what a check reads',
+    wayland: 'no route to the screen is established for this compositor',
+    windows: 'no route to the screen is established on this platform'
+  }
+  const notChecked = (capability: string, reason: string): CapabilityRecord =>
+    otherRecord(capability, revision, { state: 'not_tested', reason, binary: null })
+  return [
+    notChecked('desktop.accessibility', 'no route to the accessibility tree is established here'),
+    notChecked('desktop.application_launch', 'not checked: nothing has started an application here'),
+    fileRead,
+    otherRecord('desktop.display_server', revision, {
+      state: 'qualified_available',
+      reason: 'a graphical login session is present',
+      binary: null
+    }),
+    notChecked(
+      'desktop.input_injection',
+      'this check delivers one keystroke to an application, so it runs only inside a test ' +
+        'context of its own. None was supplied, so it was not run'
+    ),
+    notChecked('desktop.screen_capture', route[desktop])
+  ]
+}
+
+/** The desktop context and the records of one fake desktop. */
+function desktopOf(
+  desktop: FakeDesktop,
   granted: ReadonlySet<string>,
   revision: number,
-  checks: CapabilityChecks,
   fileNominated: boolean
-): EnvironmentCapabilitiesResult {
+): EnvironmentCapabilitiesResult['desktop'] {
   const record = (
     capability: string,
     permission: string,
@@ -6132,40 +6262,75 @@ function capabilities(
     probed = true
   ): CapabilityRecord =>
     capabilityRecord(capability, granted.has(capability), revision, { permission, binary, probed })
-
-  return {
-    environment_id: ENVIRONMENT,
-    default_worker_profile: 'desktop_bound',
-    desktop: {
+  if (desktop !== 'macos') {
+    const windows = desktop === 'windows'
+    return {
       desktop: {
-        desktop_session_id:
-          'macos_security_session:user=sam:uid=501:session=100019:generation=42:boot=abcd',
-        kind: 'macos_security_session',
-        platform_session: '100019',
-        login_generation: '42',
-        generation_source: 'macos_session_creator',
+        desktop_session_id: windows
+          ? 'windows_interactive:user=sam:session=1:generation=3:boot=abcd'
+          : 'linux_logind:user=sam:uid=1000:session=2:generation=7:boot=abcd',
+        kind: windows ? 'windows_interactive' : 'linux_logind',
+        platform_session: windows ? '1' : '2',
+        login_generation: windows ? '3' : '7',
+        generation_source: windows ? 'windows_session_logon' : 'linux_session_leader',
         os_user: 'sam',
-        uid: '501',
-        boot_identity: { source: 'macos_boot_session_uuid', value: 'q80=' },
+        uid: windows ? null : '1000',
+        boot_identity: { source: windows ? 'boot_time' : 'linux_boot_id', value: 'q80=' },
         graphic_access: true,
         remote: false,
         availability: 'available',
         container: 'host',
-        display_server: 'quartz',
-        compositor: 'Aqua',
+        display_server: windows ? 'windows_desktop' : desktop,
+        compositor: windows ? null : desktop === 'x11' ? 'gnome-shell' : 'sway',
         worker_profile: 'desktop_bound'
       },
-      records: [
-        record('desktop.accessibility', 'Accessibility', '/usr/bin/osascript'),
-        record('desktop.application_launch', 'nothing', '/usr/bin/open'),
-        fileNominated
-          ? record('desktop.authorised_file_read', 'Full Disk Access', null)
-          : noFileNominated(revision),
-        record('desktop.display_server', 'nothing', 'Aqua'),
-        record('desktop.input_injection', 'Accessibility', '/usr/bin/osascript', false),
-        record('desktop.screen_capture', 'Screen & System Audio Recording', '/usr/sbin/screencapture')
-      ]
+      records: otherRecords(desktop, granted, revision)
+    }
+  }
+  return {
+    desktop: {
+      desktop_session_id:
+        'macos_security_session:user=sam:uid=501:session=100019:generation=42:boot=abcd',
+      kind: 'macos_security_session',
+      platform_session: '100019',
+      login_generation: '42',
+      generation_source: 'macos_session_creator',
+      os_user: 'sam',
+      uid: '501',
+      boot_identity: { source: 'macos_boot_session_uuid', value: 'q80=' },
+      graphic_access: true,
+      remote: false,
+      availability: 'available',
+      container: 'host',
+      display_server: 'quartz',
+      compositor: 'Aqua',
+      worker_profile: 'desktop_bound'
     },
+    records: [
+      record('desktop.accessibility', 'Accessibility', '/usr/bin/osascript'),
+      record('desktop.application_launch', 'nothing', '/usr/bin/open'),
+      fileNominated
+        ? record('desktop.authorised_file_read', 'Full Disk Access', null)
+        : noFileNominated(revision),
+      record('desktop.display_server', 'nothing', 'Aqua'),
+      record('desktop.input_injection', 'Accessibility', '/usr/bin/osascript', false),
+      record('desktop.screen_capture', 'Screen & System Audio Recording', '/usr/sbin/screencapture')
+    ]
+  }
+}
+
+/** What this host answers `environment.capabilities` with. */
+function capabilities(
+  granted: ReadonlySet<string>,
+  revision: number,
+  checks: CapabilityChecks,
+  desktop: FakeDesktop,
+  fileNominated: boolean
+): EnvironmentCapabilitiesResult {
+  return {
+    environment_id: ENVIRONMENT,
+    default_worker_profile: 'desktop_bound',
+    desktop: desktopOf(desktop, granted, revision, fileNominated),
     persistence: [
       {
         profile: 'desktop_bound',

@@ -32,7 +32,7 @@ import type { CapabilityRecord, EnvironmentCapabilitiesResult } from '@kalareach
 
 import { Badge, Banner, Button, Card, Sheet, Switch } from '../components/ui'
 import { useApp } from '../app/state'
-import { failureMessage, watch, type SetupIdentity } from '../host/port'
+import { failureMessage, watch, type SetupIdentity, type SetupPlatform } from '../host/port'
 import {
   INSTALLABLES,
   NO_ACCOUNT_NEEDED,
@@ -60,6 +60,14 @@ import {
   type PermissionCategory
 } from './permissions'
 import {
+  checksNote,
+  disclosedChecks,
+  routeOf,
+  runningLine,
+  type DisclosedCheck
+} from './disclosure'
+import { grantWasOffered, guidesPermissions, headingFor, stepsFor } from './platform'
+import {
   capabilityLabel,
   displayState,
   EVIDENCE_LABEL,
@@ -71,45 +79,6 @@ import {
   tallyLine
 } from './states'
 import './setup.css'
-
-/** The checks, and exactly what each one does, shown before any of them is asked for. */
-const DISCLOSED_CHECKS: readonly {
-  readonly name: string
-  readonly performs: string
-  readonly effect: string
-  /** The check reads a file the person chooses, so its entry offers the file dialog. */
-  readonly chooses?: true
-}[] = [
-  {
-    name: 'Read a file you authorised',
-    performs: 'Opens a file you chose and reads the first few thousand bytes of it.',
-    effect:
-      'Reads that file and writes nothing. With no file chosen it reads nothing and says so.',
-    chooses: true
-  },
-  {
-    name: 'Take a screen image',
-    performs: 'Takes one image of the desktop and measures it.',
-    effect: "Writes the image into the check's own directory and removes it before answering."
-  },
-  {
-    name: 'Find an element',
-    performs: 'Asks the accessibility tree for the name of one element.',
-    effect: 'Reads the tree. Selects nothing, moves nothing, clicks nothing.'
-  },
-  {
-    name: 'Open an application',
-    performs: 'Starts one new background instance of an application and ends the one it started.',
-    effect: 'Touches nothing you already have open.'
-  },
-  {
-    name: 'Send a keystroke',
-    performs: 'Delivers one keystroke.',
-    effect:
-      'This one changes something, so it runs only inside a test context of its own. Without ' +
-      'one it is not run at all, and nothing is claimed about it either way.'
-  }
-]
 
 /**
  * How often the host is asked where the checks stand while they run.
@@ -133,15 +102,6 @@ const CHECKS_FAILURE: Readonly<Record<string, string>> = {
     "The session's worker answered with something this application cannot use. Run the checks " +
     'again.'
 }
-
-/** The five steps, in order. */
-const STEPS = [
-  { id: 'identity', title: 'This application', question: 'Which application is macOS granting to?' },
-  { id: 'permissions', title: 'Permissions', question: 'What does macOS have to allow?' },
-  { id: 'capabilities', title: 'What this machine can do', question: 'And how is that known?' },
-  { id: 'host', title: 'How KalaReach runs here', question: 'What should be installed?' },
-  { id: 'ready', title: 'Ready', question: 'What did this cost you?' }
-] as const
 
 /**
  * One line of the host's own words, as a sentence.
@@ -464,19 +424,15 @@ export function Setup(): ReactNode {
     [port, reads, say]
   )
 
+  // What this application runs on, from its own reading. Until that reading ends, or when it fails,
+  // it is not known, and a platform that is not known shows nothing that belongs to macOS.
+  const platform = identity?.platform ?? null
+  const steps = stepsFor(platform)
   const records = useMemo(() => capabilities?.desktop.records ?? [], [capabilities])
-  const offered = useCallback((capability: string) => {
-    const governing = categoriesFor(capability)
-    // Every grant that governs it, not any one of them: a person who granted Accessibility is
-    // still waiting on Automation, and telling them to restart would send them the wrong way.
-    return (
-      governing.length > 0 &&
-      governing.every((category) => {
-        const at = visited[category.pane]
-        return at !== undefined && at < reads
-      })
-    )
-  }, [visited, reads])
+  const offered = useCallback(
+    (capability: string) => grantWasOffered(platform, capability, visited, reads),
+    [platform, visited, reads]
+  )
   const counted = useMemo(
     () =>
       tally(
@@ -489,17 +445,34 @@ export function Setup(): ReactNode {
     [records]
   )
 
-  const current = STEPS[step] ?? STEPS[0]
+  const current = steps[step] ?? steps[0]
+  const route = routeOf(platform, capabilities?.desktop.desktop.display_server ?? null)
+  const listed = disclosedChecks(route)
+
+  // Nothing is worded for a platform before the application has been read, because nothing says
+  // which platform that is.
+  if (!loaded) {
+    return (
+      <div className="setup" data-testid="setup">
+        <header className="setup-heading">
+          <h1>{headingFor(null)}</h1>
+        </header>
+        <div data-testid="setup-panel-reading">
+          <UnreadCard failure={failure} loaded={loaded} />
+        </div>
+      </div>
+    )
+  }
 
   return (
     <div className="setup" data-testid="setup">
       <header className="setup-heading">
-        <h1>Set up KalaReach on this Mac</h1>
+        <h1>{headingFor(platform)}</h1>
         <p>{current.question}</p>
       </header>
 
       <ol className="setup-rail" aria-label="Setup steps">
-        {STEPS.map((each, index) => (
+        {steps.map((each, index) => (
           <li key={each.id}>
             <button
               type="button"
@@ -529,7 +502,11 @@ export function Setup(): ReactNode {
         <Banner
           tone="warning"
           title="No host is answering on this machine"
-          detail={`${sentence(failure)} The steps below still say what this Mac will be asked for.`}
+          detail={
+            guidesPermissions(platform)
+              ? `${sentence(failure)} The steps below still say what this Mac will be asked for.`
+              : sentence(failure)
+          }
         />
       ) : null}
 
@@ -537,7 +514,7 @@ export function Setup(): ReactNode {
         {current.id === 'identity' ? (
           <IdentityStep identity={identity} failure={failure} loaded={loaded} />
         ) : null}
-        {current.id === 'permissions' ? (
+        {current.id === 'permissions' && guidesPermissions(platform) ? (
           <PermissionsStep
             records={records}
             offered={offered}
@@ -549,9 +526,21 @@ export function Setup(): ReactNode {
             }}
           />
         ) : null}
+        {current.id === 'permissions' && !guidesPermissions(platform) ? (
+          <ChecksStep
+            identity={identity}
+            failure={failure}
+            loaded={loaded}
+            listed={listed}
+            records={records}
+            offered={offered}
+            platform={platform}
+          />
+        ) : null}
         {current.id === 'capabilities' ? (
           <CapabilitiesStep
             capabilities={capabilities}
+            platform={platform}
             offered={offered}
             reading={reading}
             loaded={loaded}
@@ -589,10 +578,10 @@ export function Setup(): ReactNode {
         </Button>
         <Button
           tone="primary"
-          disabled={step === STEPS.length - 1}
+          disabled={step === steps.length - 1}
           data-testid="setup-next"
           onClick={() => {
-            setStep((index) => Math.min(STEPS.length - 1, index + 1))
+            setStep((index) => Math.min(steps.length - 1, index + 1))
           }}
           data-wraps
         >
@@ -634,7 +623,7 @@ export function Setup(): ReactNode {
         }
       >
         <ul className="setup-effects" data-testid="setup-effects">
-          {DISCLOSED_CHECKS.map((check) => (
+          {listed.map((check) => (
             <li key={check.name}>
               <strong>{check.name}</strong>
               <p>{check.performs}</p>
@@ -660,10 +649,8 @@ export function Setup(): ReactNode {
             </li>
           ))}
         </ul>
-        <p className="faint small">
-          None of them sends input to an application you did not ask about, and none of them
-          changes anything you own. macOS may ask you to allow something while they run, and a run
-          can take about two minutes.
+        <p className="faint small" data-testid="setup-effects-note">
+          {checksNote(platform)}
         </p>
       </Sheet>
     </div>
@@ -688,6 +675,25 @@ function signatureLine(signature: SetupIdentity['signature']): string {
   return signature.team ? `${signature.authority} (${signature.team})` : signature.authority
 }
 
+/** What the page says while the application has not been read, or could not be. */
+function UnreadCard({
+  failure,
+  loaded
+}: {
+  readonly failure: string | null
+  readonly loaded: boolean
+}): ReactNode {
+  return (
+    <Card>
+      <div className="card-body">
+        <p className="faint">
+          {loaded ? (failure ?? 'This application could not be read.') : 'Reading this application…'}
+        </p>
+      </div>
+    </Card>
+  )
+}
+
 function IdentityStep({
   identity,
   failure,
@@ -697,31 +703,28 @@ function IdentityStep({
   readonly failure: string | null
   readonly loaded: boolean
 }): ReactNode {
-  if (!identity) {
-    return (
-      <Card>
-        <div className="card-body">
-          <p className="faint">
-            {loaded ? (failure ?? 'This application could not be read.') : 'Reading this application…'}
-          </p>
-        </div>
-      </Card>
-    )
-  }
+  if (!identity) return <UnreadCard failure={failure} loaded={loaded} />
+  // The signature, the bundle and what a grant is filed under are macOS's: on another platform no
+  // grant is filed under this application, so the card says which application this is and no more.
+  const filed = guidesPermissions(identity.platform)
   return (
     <>
       <Card data-testid="setup-identity">
         <header className="card-header">
           <h2>{identity.application_id}</h2>
-          <Badge tone={identity.stable ? 'success' : 'warning'}>
-            {identity.stable ? 'Stable identity' : 'Identity moves between launches'}
-          </Badge>
+          {filed ? (
+            <Badge tone={identity.stable ? 'success' : 'warning'}>
+              {identity.stable ? 'Stable identity' : 'Identity moves between launches'}
+            </Badge>
+          ) : null}
         </header>
         <div className="card-body">
-          <p>
-            macOS files every permission under a signed application, not under you and not under a
-            path. This is the application it would file them under.
-          </p>
+          {filed ? (
+            <p>
+              macOS files every permission under a signed application, not under you and not under
+              a path. This is the application it would file them under.
+            </p>
+          ) : null}
           <dl className="detail-list">
             <div>
               <dt>Version</dt>
@@ -731,16 +734,20 @@ function IdentityStep({
               <dt>Running from</dt>
               <dd className="mono small">{identity.executable ?? 'not known'}</dd>
             </div>
-            <div>
-              <dt>Inside an application bundle</dt>
-              <dd>{identity.bundled ? 'yes' : 'no'}</dd>
-            </div>
-            <div>
-              <dt>Signed by</dt>
-              <dd data-testid="setup-signature">{signatureLine(identity.signature)}</dd>
-            </div>
+            {filed ? (
+              <>
+                <div>
+                  <dt>Inside an application bundle</dt>
+                  <dd>{identity.bundled ? 'yes' : 'no'}</dd>
+                </div>
+                <div>
+                  <dt>Signed by</dt>
+                  <dd data-testid="setup-signature">{signatureLine(identity.signature)}</dd>
+                </div>
+              </>
+            ) : null}
           </dl>
-          {identity.instability ? (
+          {filed && identity.instability ? (
             <Banner
               tone="warning"
               title="Grants given now would have to be given again"
@@ -775,9 +782,11 @@ function IdentityStep({
         </div>
       </Card>
 
-      <p className="faint small" data-testid="setup-ceiling-identity">
-        {identity.unverified}
-      </p>
+      {filed ? (
+        <p className="faint small" data-testid="setup-ceiling-identity">
+          {identity.unverified}
+        </p>
+      ) : null}
     </>
   )
 }
@@ -918,10 +927,71 @@ function PermissionCard({
   )
 }
 
+/**
+ * Step 2 where setup guides nobody through a permission pane: each check, what it does on this
+ * desktop, and what the host says about the capability it is evidence for.
+ *
+ * Nothing here opens a settings pane and nothing is asked for. The host's reason is shown as it
+ * was written, because it is what says whether this desktop has a route for the check at all; the
+ * page does not read a route out of it.
+ */
+function ChecksStep({
+  identity,
+  failure,
+  loaded,
+  listed,
+  records,
+  offered,
+  platform
+}: {
+  readonly identity: SetupIdentity | null
+  readonly failure: string | null
+  readonly loaded: boolean
+  readonly listed: readonly DisclosedCheck[]
+  readonly records: readonly CapabilityRecord[]
+  readonly offered: (capability: string) => boolean
+  readonly platform: SetupPlatform | null
+}): ReactNode {
+  if (!identity) return <UnreadCard failure={failure} loaded={loaded} />
+  return (
+    <>
+      <p className="faint small" data-testid="setup-checks-note">
+        {checksNote(platform)}
+      </p>
+      {listed.map((check) => {
+        const record = records.find((each) => each.capability === check.capability)
+        const state = record ? displayState(record, { grantWasOffered: offered(check.capability) }) : null
+        return (
+          <Card key={check.capability} data-testid={`setup-disclosed-${check.capability}`}>
+            <header className="card-header">
+              <h2>{check.name}</h2>
+              {state ? (
+                <Badge tone={STATE_TONE[state]} data-testid={`setup-disclosed-state-${check.capability}`}>
+                  {STATE_LABEL[state]}
+                </Badge>
+              ) : null}
+            </header>
+            <div className="card-body">
+              <p>{check.performs}</p>
+              <p className="faint small">{check.effect}</p>
+              {record?.disabled_reason ? (
+                <p className="faint small" data-testid={`setup-disclosed-reason-${check.capability}`}>
+                  {record.disabled_reason}
+                </p>
+              ) : null}
+            </div>
+          </Card>
+        )
+      })}
+    </>
+  )
+}
+
 /* ---- Step 3: what this machine can do -------------------------------------------------------- */
 
 function CapabilitiesStep({
   capabilities,
+  platform,
   offered,
   reading,
   loaded,
@@ -929,6 +999,7 @@ function CapabilitiesStep({
   onRunChecks
 }: {
   readonly capabilities: EnvironmentCapabilitiesResult | null
+  readonly platform: SetupPlatform | null
   readonly offered: (capability: string) => boolean
   readonly reading: boolean
   readonly loaded: boolean
@@ -977,7 +1048,7 @@ function CapabilitiesStep({
             Being in this desktop is not evidence that anything can be done on it. Each answer
             below was established on its own.
           </p>
-          <ChecksLine checks={capabilities.checks} />
+          <ChecksLine checks={capabilities.checks} platform={platform} />
         </div>
         <footer className="card-footer setup-route">
           <Button onClick={onRead} disabled={reading} data-testid="setup-recheck" data-wraps>
@@ -1007,6 +1078,7 @@ function CapabilitiesStep({
         <CapabilityCard
           key={recordKey(record)}
           record={record}
+          platform={platform}
           offered={offered(record.capability)}
         />
       ))}
@@ -1016,9 +1088,11 @@ function CapabilitiesStep({
 
 /** Where the checks stand, in one line under the desktop. */
 function ChecksLine({
-  checks
+  checks,
+  platform
 }: {
   readonly checks: EnvironmentCapabilitiesResult['checks']
+  readonly platform: SetupPlatform | null
 }): ReactNode {
   let line: string
   switch (checks.state) {
@@ -1034,9 +1108,7 @@ function ChecksLine({
         </p>
       )
     case 'running':
-      line =
-        "The checks are running in a session's worker. macOS may ask you to allow something " +
-        'while they do, and they can take about two minutes.'
+      line = runningLine(platform)
       break
     case 'current':
       line = `The checks ran at ${timeOf(checks.finished_at_ms)}.`
@@ -1069,9 +1141,11 @@ function timeOf(milliseconds: string | null): string {
 
 function CapabilityCard({
   record,
+  platform,
   offered
 }: {
   readonly record: CapabilityRecord
+  readonly platform: SetupPlatform | null
   readonly offered: boolean
 }): ReactNode {
   const [showEvidence, setShowEvidence] = useState(false)
@@ -1092,7 +1166,7 @@ function CapabilityCard({
             {about}
           </p>
         ) : null}
-        <p>{stateMeaning(state, record.evidence_source)}</p>
+        <p>{stateMeaning(state, record.evidence_source, platform)}</p>
         {record.disabled_reason ? (
           <p className="faint small" data-testid={`setup-reason-${record.capability}`}>
             {record.disabled_reason}

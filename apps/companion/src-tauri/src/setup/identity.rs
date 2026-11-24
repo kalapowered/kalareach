@@ -22,9 +22,48 @@
 
 use serde::Serialize;
 
+/// The operating system this application is running on, as setup tells its page.
+///
+/// The page shows a macOS permission card only on macOS, and picks the list of what each check does
+/// from this, so it is a closed set and not the operating system's own name for itself. It is
+/// internal to the companion: it travels from this command to the page and goes nowhere else.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Platform {
+    /// macOS, where a privacy grant belongs to a signed application.
+    Macos,
+    /// Linux.
+    Linux,
+    /// Windows.
+    Windows,
+    /// Any other operating system this application is built for.
+    Other,
+}
+
+impl Platform {
+    /// The platform a build runs on, from the name the standard library gives its target.
+    #[must_use]
+    pub fn of(operating_system: &str) -> Self {
+        match operating_system {
+            "macos" => Self::Macos,
+            "linux" => Self::Linux,
+            "windows" => Self::Windows,
+            _ => Self::Other,
+        }
+    }
+
+    /// The platform this process is running on.
+    #[must_use]
+    pub fn current() -> Self {
+        Self::of(std::env::consts::OS)
+    }
+}
+
 /// What the operating system would record a permission against.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct Identity {
+    /// The operating system this application runs on.
+    pub platform: Platform,
     /// The bundle identifier this build declares. This is the name a grant is filed under.
     pub application_id: String,
     /// The version this build declares.
@@ -129,6 +168,7 @@ pub fn read(
         None => (None, None),
     };
     Identity {
+        platform: Platform::current(),
         application_id: application_id.to_owned(),
         application_version: application_version.to_owned(),
         executable,
@@ -586,5 +626,35 @@ mod tests {
         );
         assert_eq!(identity.helper_build.as_deref(), Some("build-7"));
         assert_eq!(identity.helper_environment.as_deref(), Some("env-1"));
+    }
+
+    /// KR-REQ-03.29: only the operating system named macOS is macOS, so the page shows a macOS
+    /// permission card on no other platform, and a name this application does not know is `other`.
+    #[test]
+    fn only_macos_is_named_macos() {
+        assert_eq!(Platform::of("macos"), Platform::Macos);
+        assert_eq!(Platform::of("linux"), Platform::Linux);
+        assert_eq!(Platform::of("windows"), Platform::Windows);
+        for other in ["ios", "android", "freebsd", "darwin", "macOS", ""] {
+            assert_eq!(Platform::of(other), Platform::Other, "{other:?}");
+        }
+    }
+
+    /// KR-REQ-03.29: the identity tells the page which platform this process runs on, in the words
+    /// the page reads, and what it says is what this build was compiled for.
+    #[test]
+    fn the_identity_names_the_platform_this_process_runs_on() {
+        let identity = read("to.kala.reach", "0.1.0", None);
+        let said = serde_json::to_value(&identity).expect("the identity serialises");
+        let expected = if cfg!(target_os = "macos") {
+            "macos"
+        } else if cfg!(target_os = "linux") {
+            "linux"
+        } else if cfg!(target_os = "windows") {
+            "windows"
+        } else {
+            "other"
+        };
+        assert_eq!(said["platform"], expected);
     }
 }

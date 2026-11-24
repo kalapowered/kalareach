@@ -397,8 +397,17 @@ export interface OpenRequest {
  * recorded against, and opens a settings pane the person asked for.
  */
 
+/**
+ * The operating system this application runs on. Setup shows a macOS permission card on macOS only
+ * and picks what it says each check does from this; `other` is any system the application is built
+ * for that has no list of its own yet.
+ */
+export type SetupPlatform = 'macos' | 'linux' | 'windows' | 'other'
+
 /** The identity an operating system would record a permission against. */
 export interface SetupIdentity {
+  /** The operating system this application runs on. */
+  readonly platform: SetupPlatform
   /** The bundle identifier this build declares, which is what a grant is filed under. */
   readonly application_id: string
   /** The version this build declares. */
