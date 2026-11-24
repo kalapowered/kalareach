@@ -6,7 +6,7 @@
 //! order, a right refuses to travel. `kr-protocol-gen --check` compares the shapes. This compares
 //! the rules, three ways, and is a regression net and not a proof:
 //!
-//! * **Sources.** Each rule is a root in [`ROOTS`]. The walker follows everything the root names in
+//! * **Sources.** Each rule is a root in [`roots`]. The walker follows everything the root names in
 //!   the workspace's crates and digests it, so a change in a helper moves the digest of every root
 //!   that reaches the helper. A level records the digests its release had
 //!   (`retained/<level>/sources.json`).
