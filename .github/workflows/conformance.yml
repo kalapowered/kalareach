@@ -142,6 +142,12 @@ jobs:
         # standard library of its target.
         run: rustup target add wasm32-wasip2 x86_64-pc-windows-gnu
 
+      # The narrower reading in `kr-cli`'s retained_surface suite resolves every target's packages
+      # offline, and this job builds for Linux alone, so the registry is filled for every target.
+      - name: Fetch the crates of every target
+        timeout-minutes: 10
+        run: cargo fetch --locked
+
       - name: Install pnpm
         timeout-minutes: 3
         uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v4.4.0
@@ -399,6 +405,12 @@ jobs:
         # which also builds its fixture trees for x86_64-pc-windows-gnu, and a cross check needs the
         # standard library of its target.
         run: rustup target add wasm32-wasip2 x86_64-pc-windows-gnu
+
+      # The narrower reading in `kr-cli`'s retained_surface suite resolves every target's packages
+      # offline, and this job builds for macOS alone, so the registry is filled for every target.
+      - name: Fetch the crates of every target
+        timeout-minutes: 10
+        run: cargo fetch --locked
 
       # The iOS unit tests of the phones group build the library that opens a sealed notification
       # preview for the simulator, in a build phase of the test scheme that runs cargo for this

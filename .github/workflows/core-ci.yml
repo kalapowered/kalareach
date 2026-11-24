@@ -196,6 +196,12 @@ jobs:
         with:
           name: linux
 
+      # The narrower reading in `kr-cli`'s retained_surface suite resolves every target's packages
+      # offline, and this job builds for Linux alone, so the registry is filled for every target.
+      - name: Fetch the crates of every target
+        timeout-minutes: 10
+        run: cargo fetch --locked
+
       # A level is one surface: this commit has the surface of every release at its level, taken
       # from origin's complete list of release tags, which have to be this checkout's. A commit
       # that moves the level runs the cut's own check here too; any other commit runs
@@ -3193,6 +3199,14 @@ jobs:
           # as `macos`, of the same settings, so a run that finds no entry of its own starts from that
           # one. Remove this line, and the input in the action, once that run has saved both entries.
           fallback-name: macos
+
+      # The narrower reading in `kr-cli`'s retained_surface suite resolves every target's packages
+      # offline, and this job builds for macOS alone, so the registry is filled for every target.
+      # `kr-cli` is in `tests-2` only.
+      - name: Fetch the crates of every target
+        if: ${{ matrix.part == 'tests-2' }}
+        timeout-minutes: 10
+        run: cargo fetch --locked
 
       # The release profile's third-party output apart from the debug profile's, which the two test
       # legs save: this leg is the one that builds in release, and an entry of its own keeps the
