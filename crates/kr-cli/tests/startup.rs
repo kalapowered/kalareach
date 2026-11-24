@@ -1110,12 +1110,9 @@ fn working_directory(pid: u32) -> PathBuf {
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let listed = spawning(|| {
-            Command::new("/usr/sbin/lsof")
-                .args(["-a", "-d", "cwd", "-Fn", "-p", &pid.to_string()])
-                .output()
-        })
-        .expect("lists its working directory");
+        let mut lsof = Command::new("/usr/sbin/lsof");
+        lsof.args(["-a", "-d", "cwd", "-Fn", "-p", &pid.to_string()]);
+        let listed = bounded(lsof, STREAMS_DEADLINE).expect("lists its working directory");
         String::from_utf8_lossy(&listed.stdout)
             .lines()
             .find_map(|line| line.strip_prefix('n'))
@@ -3808,11 +3805,9 @@ fn stand_in_installation() -> &'static Path {
         // The operating system checks a program the first time it is started from a new file; here
         // it is started once, with no state directory, which it refuses at once and records
         // nowhere, so that no case's first call pays for it.
-        let first = Command::new(&program)
-            .env_clear()
-            .stdin(Stdio::null())
-            .output()
-            .expect("the stand-in starts");
+        let mut first_start = Command::new(&program);
+        first_start.env_clear();
+        let first = bounded(first_start, TEARDOWN_BOUND).expect("the stand-in starts");
         assert_eq!(
             first.status.code(),
             Some(64),
@@ -3910,8 +3905,9 @@ fn the_service_daemon_script_hands_over_in_a_folder_whose_name_holds_a_quote_and
 /// The parent of a process of this user's, and the parent's name.
 fn parent_of(pid: u32) -> (u32, String) {
     let asked = |arguments: &[&str]| {
-        let output =
-            spawning(|| Command::new("/bin/ps").args(arguments).output()).expect("runs ps");
+        let mut ps = Command::new("/bin/ps");
+        ps.args(arguments);
+        let output = bounded(ps, STREAMS_DEADLINE).expect("runs ps");
         String::from_utf8_lossy(&output.stdout).trim().to_owned()
     };
     let parent: u32 = asked(&["-o", "ppid=", "-p", &pid.to_string()])
@@ -4933,12 +4929,9 @@ fn the_stand_in_started_the_daemon(
 /// The command line of a process of this user's, as `ps` shows it.
 #[cfg(target_os = "macos")]
 fn arguments_of(pid: u32) -> String {
-    let output = spawning(|| {
-        Command::new("/bin/ps")
-            .args(["-o", "args=", "-p", &pid.to_string()])
-            .output()
-    })
-    .expect("runs ps");
+    let mut ps = Command::new("/bin/ps");
+    ps.args(["-o", "args=", "-p", &pid.to_string()]);
+    let output = bounded(ps, STREAMS_DEADLINE).expect("runs ps");
     String::from_utf8_lossy(&output.stdout).trim().to_owned()
 }
 

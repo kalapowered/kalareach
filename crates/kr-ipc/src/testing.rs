@@ -544,6 +544,40 @@ fn copying_program() -> PathBuf {
     );
 }
 
+/// How long the program that copies a program into place is given to end.
+#[cfg(unix)]
+const COPIER_BOUND: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Waits for `copier`, a child of this process, for at most `bound`, and ends it when it has not
+/// ended. Returns what it ended with, or `None` for a copier that outlasted its bound.
+#[cfg(unix)]
+fn copier_ended_within(
+    copier: &mut std::process::Child,
+    bound: std::time::Duration,
+) -> Option<std::process::ExitStatus> {
+    let deadline = std::time::Instant::now() + bound;
+    loop {
+        match copier.try_wait() {
+            Ok(Some(status)) => return Some(status),
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            Ok(None) | Err(_) => {
+                // The copier is this process's own child, not collected yet, so the number is
+                // still its.
+                let _ = copier.kill();
+                let ended = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                while copier.try_wait().is_ok_and(|status| status.is_none())
+                    && std::time::Instant::now() < ended
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                return None;
+            }
+        }
+    }
+}
+
 /// Places a program where a test can start it, and leaves nothing holding it open for writing.
 ///
 /// A test binary runs its cases on several threads. The moment one thread starts a child process,
@@ -569,10 +603,10 @@ pub fn place_program(source: &Path, destination: &Path) {
         use std::os::unix::fs::PermissionsExt as _;
 
         let copier = copying_program();
-        let status = std::process::Command::new(&copier)
+        let mut copying = std::process::Command::new(&copier)
             .arg(source)
             .arg(destination)
-            .status()
+            .spawn()
             .unwrap_or_else(|error| {
                 panic!(
                     "{} could not be started to place the program at {} at {}: {error}",
@@ -581,6 +615,14 @@ pub fn place_program(source: &Path, destination: &Path) {
                     destination.display()
                 )
             });
+        let status = copier_ended_within(&mut copying, COPIER_BOUND).unwrap_or_else(|| {
+            panic!(
+                "{} did not place the program at {} at {} within {COPIER_BOUND:?}",
+                copier.display(),
+                source.display(),
+                destination.display()
+            )
+        });
         assert!(
             status.success(),
             "{} did not place the program at {} at {}: {status}",
@@ -794,6 +836,32 @@ mod tests {
             super::descriptors_a_started_program_holds().contains(&number),
             "a socket without the mark is handed to a program"
         );
+    }
+
+    /// The program that places a program is waited for within a bound: a copier that does not end is
+    /// ended and gives no status, and one that ends in time gives the status it ended with.
+    #[cfg(unix)]
+    #[test]
+    fn a_copier_that_does_not_end_is_ended_when_its_bound_has_passed() {
+        let mut kept = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .expect("a process that runs");
+        let begun = std::time::Instant::now();
+        assert!(super::copier_ended_within(&mut kept, Duration::from_millis(200)).is_none());
+        assert!(
+            begun.elapsed() < Duration::from_secs(10),
+            "the copier was waited for past its bound"
+        );
+        assert!(
+            kept.try_wait().expect("its state").is_some(),
+            "the copier that outlasted its bound was left running"
+        );
+        let mut quick = std::process::Command::new("/usr/bin/true")
+            .spawn()
+            .expect("a process that ends");
+        let status = super::copier_ended_within(&mut quick, Duration::from_secs(60));
+        assert!(status.is_some_and(|status| status.success()));
     }
 
     /// A private directory is made only where nothing is. A name that is already taken is another

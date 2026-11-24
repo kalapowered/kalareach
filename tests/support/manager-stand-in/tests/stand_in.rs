@@ -314,6 +314,7 @@ fn no_command_of_the_cases_is_waited_for_without_a_bound() {
         [".out", "put()"].concat(),
         [".sta", "tus()"].concat(),
         [".wa", "it()"].concat(),
+        [".wait_with_", "output()"].concat(),
     ] {
         assert!(
             !source.contains(&call),

@@ -1,7 +1,7 @@
 //! The rule that a test run's stand-in service manager has no way round it, read from the sources.
 //!
 //! Product code starts `launchctl` through three runners only: the command line's
-//! (`run_within`), the desktop reader's (`run`) and the control daemon's (`command_within`). Two
+//! (`run_within`), the desktop reader's (`run`) and the control daemon's (`command_within`). Four
 //! readings, each by tokens, so that a name inside a comment is not a use:
 //!
 //! 1. Each runner calls the seam's refusal before it starts a program, and a runner that has a
@@ -9,12 +9,21 @@
 //! 2. Every source outside a test folder that names `launchctl` as a program stands on a list by
 //!    function, and the list says which of those functions are the runners: a new site is refused
 //!    until it is listed, and a listed one that names none is refused too.
+//! 3. In the startup suite, the host builds the account's launchd command in one function; the
+//!    case that runs on the stand-in and its steps build no command and name nothing of the
+//!    account's launchd; and neither they nor four helpers they call wait for a program without a
+//!    bound.
+//! 4. The helpers that place a program for a test (`place_program` and `place_script`) wait for
+//!    their copier with a bound.
 //!
 //! What the readings cannot see: a program named by a string a macro builds, a path made at run
 //! time, a command inside shell text, and a call of `systemctl`: on Linux the control daemon's
 //! desktop agent runs `systemctl --user show-environment`, a read, outside the three runners. The
-//! behaviour of each runner is shown by its own cases,
-//! each in a child of its own with the variable and the marker in the state the case names.
+//! third reading reads the case, its steps and four free helpers of the startup suite, and not the
+//! methods of the host that they call: a program a method starts and a wait a method hides are
+//! outside it. The fourth reads the two placing helpers, and not the copier they start. The
+//! behaviour of each runner is shown by its own cases, each in a child of its own with the variable
+//! and the marker in the state the case names.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -458,14 +467,41 @@ fn the_command_reading_finds_each_command_and_no_comment() {
 /// case that runs on it.
 const STARTUP_FILE: &str = "crates/kr-cli/tests/startup.rs";
 
-/// The case that runs on the stand-in and the steps it calls, none of which may start a program or
-/// name the account's launchd.
+/// The case that runs on the stand-in and the steps it calls, none of which may build a command,
+/// name the account's launchd or wait for a program without a bound.
 const CASE_FUNCTIONS: [&str; 4] = [
     "the_headless_host_case",
     "the_stand_in_saw_the_install",
     "the_stand_in_started_the_daemon",
     "the_stand_in_saw_nothing_end",
 ];
+
+/// The free functions the case and its steps call to start `ps`, `lsof` and the stand-in itself,
+/// none of which may wait for a program without a bound.
+const CASE_HELPERS: [&str; 4] = [
+    "stand_in_installation",
+    "parent_of",
+    "working_directory",
+    "arguments_of",
+];
+
+/// The methods of a child or a command that wait for a program with no bound.
+const UNBOUNDED_WAITS: [&str; 4] = ["output", "status", "wait", "wait_with_output"];
+
+/// The name of each call of an unbounded wait (`.output(`, `.status(`, `.wait(`,
+/// `.wait_with_output(`) in the tokens `range` of `tokens`.
+fn unbounded_waits(tokens: &[Token], range: &std::ops::Range<usize>) -> Vec<&'static str> {
+    range
+        .clone()
+        .filter_map(|at| {
+            let name = tokens.get(at + 1).and_then(Token::ident)?;
+            (tokens[at].is_punct('.')
+                && tokens.get(at + 2).is_some_and(|token| token.is_punct('(')))
+            .then_some(())?;
+            UNBOUNDED_WAITS.into_iter().find(|wait| *wait == name)
+        })
+        .collect()
+}
 
 /// The index range of the tokens between the braces of `impl <name> {`.
 fn impl_block(tokens: &[Token], name: &str) -> Option<std::ops::Range<usize>> {
@@ -498,8 +534,9 @@ fn account_launchd_paths(
 }
 
 /// What is wrong with the startup suite's source: the account's launchd is reached by one function
-/// of `impl ServiceHost` for its command and one for its program path, and the case and its steps
-/// start no program and name nothing of it.
+/// of `impl ServiceHost` for its command and one for its program path, the case and its steps build
+/// no command and name nothing of it, and neither they nor their helpers wait for a program without
+/// a bound.
 fn startup_problems(source: &str) -> Vec<String> {
     let tokens = code_tokens(source);
     let all = functions(&tokens);
@@ -531,11 +568,19 @@ fn startup_problems(source: &str) -> Vec<String> {
         }
     }
     let builders = command_builders(source);
-    for name in CASE_FUNCTIONS {
+    for name in CASE_FUNCTIONS.into_iter().chain(CASE_HELPERS) {
         let Some(found) = all.iter().find(|function| function.name == name) else {
             problems.push(format!("{name} is not a function of this source"));
             continue;
         };
+        for wait in unbounded_waits(&tokens, &found.body) {
+            problems.push(format!(
+                "{name} waits for a program with {wait}() and no bound"
+            ));
+        }
+        if !CASE_FUNCTIONS.contains(&name) {
+            continue;
+        }
         if builders.iter().any(|builder| builder == name) {
             problems.push(format!("{name} builds a command"));
         }
@@ -547,8 +592,8 @@ fn startup_problems(source: &str) -> Vec<String> {
 }
 
 /// The startup suite reaches the account's own launchd in one place for its command and one for its
-/// program path, and the headless-host case and its steps on the stand-in neither start a program
-/// nor name the account's launchd, so that no step can bypass the host's one `launchctl`.
+/// program path, and the headless-host case, its steps and their helpers build no command that names
+/// it and wait for no program without a bound, so that no step can bypass the host's one `launchctl`.
 #[test]
 fn the_startup_suite_reaches_the_accounts_launchd_only_where_the_host_chooses_it() {
     let text = std::fs::read_to_string(repository().join(STARTUP_FILE))
@@ -561,11 +606,16 @@ fn the_startup_suite_reaches_the_accounts_launchd_only_where_the_host_chooses_it
 }
 
 /// The startup reading finds a use in the wrong function, a use that is missing, a command built in
-/// the case or one of its steps, and a mention of the account's launchd there, and nothing else.
+/// the case or one of its steps, a mention of the account's launchd there, and a wait with no bound
+/// in a step or a helper, and nothing else.
 #[test]
 fn the_startup_reading_finds_each_wrong_place_and_only_those() {
+    let helpers = "fn stand_in_installation() {} fn parent_of() {} fn working_directory() {} \
+                   fn arguments_of() {}";
     let steps = "fn the_headless_host_case() {} fn the_stand_in_saw_the_install() {} \
-                 fn the_stand_in_started_the_daemon() {} fn the_stand_in_saw_nothing_end() {}";
+                 fn the_stand_in_started_the_daemon() {} fn the_stand_in_saw_nothing_end() {} \
+                 fn stand_in_installation() {} fn parent_of() {} fn working_directory() {} \
+                 fn arguments_of() {}";
     let host = "impl ServiceHost { fn create() { account_launchd::LAUNCHCTL; } \
                 fn launchctl() { account_launchd::command(a); } }";
     assert!(startup_problems(&format!("{host} {steps}")).is_empty());
@@ -586,14 +636,103 @@ fn the_startup_reading_finds_each_wrong_place_and_only_those() {
     assert_eq!(startup_problems(&format!("{moot} {steps}")).len(), 2);
     let builds = "fn the_headless_host_case() { Command::new(a); } fn the_stand_in_saw_the_install() {} \
                   fn the_stand_in_started_the_daemon() {} fn the_stand_in_saw_nothing_end() {}";
-    assert_eq!(startup_problems(&format!("{host} {builds}")).len(), 1);
+    assert_eq!(
+        startup_problems(&format!("{host} {builds} {helpers}")).len(),
+        1
+    );
     let names = "fn the_headless_host_case() {} fn the_stand_in_saw_the_install() {} \
                  fn the_stand_in_started_the_daemon() { x(kr_ipc::testing::account_launchd::VARIABLE); } \
                  fn the_stand_in_saw_nothing_end() {}";
-    assert_eq!(startup_problems(&format!("{host} {names}")).len(), 1);
+    assert_eq!(
+        startup_problems(&format!("{host} {names} {helpers}")).len(),
+        1
+    );
+    let waits_in_a_step = "fn the_headless_host_case() { a.output(); } \
+                           fn the_stand_in_saw_the_install() { b.status().ok(); } \
+                           fn the_stand_in_started_the_daemon() { c.wait(); } \
+                           fn the_stand_in_saw_nothing_end() { d.wait_with_output(); }";
+    assert_eq!(
+        startup_problems(&format!("{host} {waits_in_a_step} {helpers}")).len(),
+        4
+    );
+    let waits_in_a_helper = "fn the_headless_host_case() {} fn the_stand_in_saw_the_install() {} \
+                             fn the_stand_in_started_the_daemon() {} \
+                             fn the_stand_in_saw_nothing_end() {} \
+                             fn stand_in_installation() { Command::new(a).output(); } \
+                             fn parent_of() { spawning(|| ps.output()); } \
+                             fn working_directory() { x.status.code(); } \
+                             fn arguments_of() { bounded(c, d).output_like(); }";
+    assert_eq!(
+        startup_problems(&format!("{host} {waits_in_a_helper}")).len(),
+        2,
+        "a wait inside a closure is found, a field and a longer method name are not"
+    );
     let comment = "impl ServiceHost { fn create() { account_launchd::LAUNCHCTL; } \
                    fn launchctl() { account_launchd::command(a); } \
                    fn other() { // account_launchd::command(b)\n } }";
     assert!(startup_problems(&format!("{comment} {steps}")).is_empty());
     assert_eq!(startup_problems("fn other() {}").len(), 1);
+}
+
+/// The source of the testing helpers that place a program for a test to start.
+const PLACING_FILE: &str = "crates/kr-ipc/src/testing.rs";
+
+/// The helpers that start a copier to place a program, and so wait for it.
+const PLACERS: [&str; 2] = ["place_program", "place_script"];
+
+/// What is wrong with the placing helpers of `source`: a helper that is missing, and a helper that
+/// waits for its copier with a call that has no bound.
+fn placing_problems(source: &str) -> Vec<String> {
+    let tokens = code_tokens(source);
+    let all = functions(&tokens);
+    let mut problems = Vec::new();
+    for name in PLACERS {
+        let found: Vec<&Function> = all
+            .iter()
+            .filter(|function| function.name == name)
+            .collect();
+        if found.is_empty() {
+            problems.push(format!("{name} is not a function of this source"));
+        }
+        for function in found {
+            for wait in unbounded_waits(&tokens, &function.body) {
+                problems.push(format!(
+                    "{name} waits for its copier with {wait}() and no bound"
+                ));
+            }
+        }
+    }
+    problems
+}
+
+/// The helpers that place a program for a test wait for their copier with a bound, so that a test
+/// that places a program cannot wait for ever on a copier that does not end.
+#[test]
+fn the_helpers_that_place_a_program_wait_for_their_copier_with_a_bound() {
+    let text = std::fs::read_to_string(repository().join(PLACING_FILE))
+        .unwrap_or_else(|error| panic!("{PLACING_FILE}: {error}"));
+    let problems = placing_problems(&text);
+    assert!(
+        problems.is_empty(),
+        "{PLACING_FILE} waits for a program where it must not: {problems:#?}"
+    );
+}
+
+/// The placing reading finds a wait with no bound and a missing helper, and not a bounded wait.
+#[test]
+fn the_placing_reading_finds_each_wait_with_no_bound_and_only_those() {
+    assert!(
+        placing_problems("fn place_program() { c.try_wait(); } fn place_script() { x(); }")
+            .is_empty()
+    );
+    assert_eq!(
+        placing_problems("fn place_program() { c.status(); } fn place_script() {}").len(),
+        1
+    );
+    assert_eq!(
+        placing_problems("fn place_program() { c.output(); } fn place_script() { d.wait(); }")
+            .len(),
+        2
+    );
+    assert_eq!(placing_problems("fn place_program() {}").len(), 1);
 }
