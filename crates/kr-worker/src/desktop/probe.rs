@@ -3191,6 +3191,17 @@ mod tests {
             CapabilityState::TemporarilyUnavailable,
             "a success nothing could confirm stands"
         );
+        // Where the program's file can be read, the digest taken after the time is gone refuses the
+        // answer too, in other words, so the state alone does not show which of the two refused it.
+        let reason = records[0]
+            .disabled_reason
+            .as_ref()
+            .map(|sentence| sentence.as_str().to_owned())
+            .unwrap_or_default();
+        assert_eq!(
+            reason, "the check did not finish within its time limit. It established no result.",
+            "the answer was refused for another reason than the time that was gone"
+        );
     }
 
     /// What the stand-in does to its program while the operation runs.
