@@ -55,6 +55,9 @@ fn place(dir: &Path, name: &str, body: &str) {
 
 /// Runs the script on `host` and returns what it printed, its exit code and the commands the
 /// stand-ins were given, one a line.
+///
+/// The script writes each command's output to a file in its target directory and reads it back,
+/// and the cases of this file run side by side, so each run has a target directory of its own.
 fn run(host: &Host) -> (String, Option<i32>, Vec<String>) {
     let dir = tempfile::tempdir().expect("a folder for the stand-ins");
     let calls = dir.path().join("calls");
@@ -75,6 +78,7 @@ fn run(host: &Host) -> (String, Option<i32>, Vec<String>) {
     let output = Command::new("/bin/bash")
         .arg(script())
         .env("PATH", format!("{}:/usr/bin:/bin", dir.path().display()))
+        .env("CARGO_TARGET_DIR", dir.path().join("target"))
         .output()
         .expect("bash runs the script");
     let text = format!(
