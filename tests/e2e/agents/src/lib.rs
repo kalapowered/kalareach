@@ -102,6 +102,8 @@ pub mod stage;
 #[cfg(unix)]
 pub mod stub;
 #[cfg(unix)]
+pub mod subject;
+#[cfg(unix)]
 pub mod transfer;
 
 /// The variable naming the JSON file that describes the build under test.
