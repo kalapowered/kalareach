@@ -2692,6 +2692,14 @@ file = 'scripts/service-manager-cases.sh'
 line = 'step cargo test --locked -p kr-worker --test host -- --ignored --exact a_session_in_a_service_rests_on_a_control_group_and_a_close_ends_what_left_its_tree'
 
 [[ignored_run]]
+package = 'kr-worker'
+target = '--lib'
+cases = ['desktop::wayland::tests::a_headless_sway_and_grim_perform_the_screen_copy']
+[ignored_run.runs]
+kind = 'by_hand'
+why = '''it needs `sway` and `grim` installed: it starts a headless sway of its own, and it runs with `--include-ignored` on a Linux host that has both, such as the build box; where either is missing it fails with "not run"'''
+
+[[ignored_run]]
 package = 'companion-tauri'
 target = '--test windows_hello'
 [ignored_run.runs]
