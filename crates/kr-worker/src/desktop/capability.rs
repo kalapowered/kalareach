@@ -828,7 +828,9 @@ const MAX_IDENTIFIED: u64 = 64 * 1024 * 1024;
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
     use super::super::probe::Check;
+    #[cfg(unix)]
     use super::super::routes::resolve;
     use super::*;
     use kr_protocol::desktop::{ContainerEnvironment, DesktopGenerationSource, DesktopSessionKind};
