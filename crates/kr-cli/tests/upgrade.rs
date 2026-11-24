@@ -54,6 +54,7 @@ mod plugin_host_frames;
 
 include!("support/update_harness.rs");
 
+use kr_plugin_service::protocol::HostProtocol;
 use serde_json::json;
 
 /// The release before this one, built from its commit.
@@ -3256,6 +3257,73 @@ fn assert_runs_the_host_of(
     );
 }
 
+/// The file name of the endpoint a descriptor names.
+fn endpoint_name(endpoint: &str) -> Option<&str> {
+    Path::new(endpoint)
+        .file_name()
+        .and_then(|name| name.to_str())
+}
+
+/// Asserts that a host is published under both protocols: each descriptor names its protocol and
+/// its own endpoint, and both name one process.
+fn assert_a_host_of_both_protocols(
+    three: &kr_plugin_service::protocol::HostDescriptor,
+    four: &kr_plugin_service::protocol4::HostDescriptor4,
+) {
+    assert_eq!(three.protocol, HostProtocol::V3.name);
+    assert_eq!(four.protocol, HostProtocol::V4.name);
+    assert_eq!(
+        endpoint_name(&three.endpoint),
+        Some(HostProtocol::V3.endpoint),
+        "the descriptor of the third protocol names the endpoint of the third: {}",
+        three.endpoint
+    );
+    assert_eq!(
+        endpoint_name(&four.endpoint),
+        Some(HostProtocol::V4.endpoint),
+        "the descriptor of the fourth protocol names the endpoint of the fourth: {}",
+        four.endpoint
+    );
+    assert_eq!(
+        three.process_start_identity, four.process_start_identity,
+        "both descriptors name one process"
+    );
+}
+
+/// A session of a release whose terminal runs the program the package recognises, so that its
+/// worker is bound to the plugin host.
+struct BoundSession {
+    display: String,
+    worker: kr_protocol::identity::ProcessStartIdentity,
+    terminal: terminal::Terminal,
+    program: kr_protocol::identity::ProcessStartIdentity,
+}
+
+impl BoundSession {
+    /// Creates a session through `kr` and starts the program in it.
+    async fn start(host: &Host, kr: &Path, agent: &Path) -> Self {
+        let (display, session) = host.new_session(kr);
+        let worker = host.worker_process(session);
+        let terminal = terminal_for(host, kr, &["attach", &display]);
+        terminal.ready().await;
+        let program = start_agent(host, &terminal, agent).await;
+        Self {
+            display,
+            worker,
+            terminal,
+            program,
+        }
+    }
+
+    /// Ends the program, then the session and its worker.
+    async fn end(self, host: &Host, kr: &Path) {
+        end_program(&self.program);
+        drop(self.terminal);
+        host.close(kr, &self.display);
+        host.worker_ended(&self.worker).await;
+    }
+}
+
 /// KR-REQ-05.06, KR-REQ-26.06, KR-REQ-20.23, KR-ACC-035: the plugin host the release before started
 /// outlives the update and serves the sessions of both releases. A session of this release binds
 /// a component and gets the process the release before started, not another, and so does a session
@@ -3356,7 +3424,9 @@ async fn a_plugin_host_the_release_before_started_serves_the_sessions_of_both_re
 /// package recognises, started in the session of the release before after the update, makes its
 /// worker ask the daemon of this release for the plugin runtime. The daemon starts this release's
 /// own host, the worker registers with it, and when the host ends under the running program the
-/// daemon starts another of this release's.
+/// daemon starts another of this release's. Each host serves both protocols, each on an endpoint
+/// of its own and under a descriptor of its own: the worker of the release before reads the third's
+/// alone, speaks the third protocol on its endpoint and its observation arrives (U2).
 #[tokio::test(flavor = "multi_thread")]
 async fn a_session_of_the_release_before_gets_the_plugin_host_this_releases_daemon_starts() {
     let updated = Updated::prepare(Setup {
@@ -3377,17 +3447,24 @@ async fn a_session_of_the_release_before_gets_the_plugin_host_this_releases_daem
     old.ready().await;
     let program = start_agent(host, &old, &agent).await;
 
-    // First use: the daemon starts this release's host.
+    // First use: the daemon starts this release's host, and publishes it under both protocols.
+    let first = host.plugin_host_published().await;
+    let (three, four) = host.descriptors_of(&first).await;
+    assert_a_host_of_both_protocols(&three, &four);
     host.plugin_holding(1).await;
-    let first = host
-        .plugin_host()
-        .expect("the daemon started a host for the worker of the release before");
     assert_runs_the_host_of(&first, updated.two.name());
+    assert_eq!(
+        host.observed_protocol().await,
+        Ok(HostProtocol::V4),
+        "a client of this release meets the host on the fourth protocol"
+    );
 
     // The host ends under the program still running; the worker asks again and gets another of
-    // this release's.
+    // this release's, which is published under both protocols too.
     host.end_the_plugin_host().await;
     let second = host.another_plugin_host(&first).await;
+    let (three, four) = host.descriptors_of(&second).await;
+    assert_a_host_of_both_protocols(&three, &four);
     assert_runs_the_host_of(&second, updated.two.name());
     host.plugin_holding(1).await;
 
@@ -3405,6 +3482,13 @@ async fn a_session_of_the_release_before_gets_the_plugin_host_this_releases_daem
 /// session of this release (exit 9, naming it) and then goes on. The plugin host this release's
 /// daemon started survives it, running and published, and a session the release before's daemon
 /// then creates binds a component and is served by that host, which the daemon adopts.
+///
+/// The host is published under both protocols, and the daemon of the release before knows the
+/// third's alone. When the host ends and that daemon starts one of its own, the descriptor of the
+/// fourth protocol is left naming a process that is gone, and a client of this release reads past
+/// it and speaks the third protocol (U3). The sessions of this release cannot be kept across the
+/// rollback, which waits for them, so a client of this release stands in for a worker's next
+/// connection.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_rollback_leaves_the_plugin_host_of_this_release_for_the_release_before_to_adopt() {
     let updated = Updated::prepare(Setup {
@@ -3492,14 +3576,467 @@ async fn a_rollback_leaves_the_plugin_host_of_this_release_for_the_release_befor
     host.plugin_holding(1).await;
     assert_eq!(
         host.plugin_host(),
-        Some(this_host),
+        Some(this_host.clone()),
         "the release before's daemon adopted the host this release's daemon started"
+    );
+    let (three, four) = host.descriptors_of(&this_host).await;
+    assert_a_host_of_both_protocols(&three, &four);
+    assert_eq!(
+        host.observed_protocol().await,
+        Ok(HostProtocol::V4),
+        "while the host lives, a client of this release meets it on the fourth protocol"
+    );
+
+    // The host ends; the daemon of the release before starts a host of its own, which speaks the
+    // third protocol alone and publishes its descriptor alone.
+    host.end_the_plugin_host().await;
+    let next = host.another_plugin_host(&this_host).await;
+    assert_runs_the_host_of(&next, updated.one.name());
+    host.plugin_holding(1).await;
+    assert_eq!(
+        host.plugin_descriptor4()
+            .map(|stale| stale.process_start_identity),
+        Some(this_host.clone()),
+        "the release before's daemon leaves the descriptor of the fourth protocol alone"
+    );
+    assert_eq!(
+        kr_ipc::identity::process_state(&this_host),
+        kr_ipc::identity::ProcessState::Ended,
+        "the process the descriptor of the fourth protocol names is gone"
+    );
+    assert_eq!(
+        host.observed_protocol().await,
+        Ok(HostProtocol::V3),
+        "a client of this release reads past the stale descriptor and uses the third protocol"
     );
 
     end_program(&third_program);
     drop(third);
     host.close(&updated.kr_before(), &third_display);
     host.worker_ended(&third_worker).await;
+    host.close(&updated.kr_before(), &updated.display);
+    host.worker_ended(&updated.worker).await;
+    host.end_the_plugin_host().await;
+}
+
+/// A position of the kind a worker's cursor holds: the last terminal event a state covers.
+fn a_position() -> kr_plugin_service::protocol4::Through {
+    kr_plugin_service::protocol4::Through {
+        native: None,
+        terminal: Some(kr_protocol::ids::SourceEventHandle::new("se-1").expect("a bounded handle")),
+    }
+}
+
+/// KR-REQ-05.06, KR-REQ-26.06, KR-REQ-20.23, KR-ACC-035 (U1): a plugin host the release before
+/// started speaks the third protocol alone and publishes no descriptor of the fourth. After the
+/// update the daemon of this release adopts it, a client of this release meets it on the third
+/// protocol, and a session of this release binds a component in it. When it ends under both
+/// sessions' programs the daemon starts this release's own host, and a client of this release
+/// meets that one on the fourth. A client of this release stands in for the worker's next
+/// connection, because the protocol a worker speaks cannot be seen from outside its process.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_plugin_host_of_the_third_protocol_alone_is_met_on_it_and_the_next_host_on_the_fourth() {
+    let prepared = Updated::prepare(Setup {
+        plugin: true,
+        ..Setup::default()
+    })
+    .await;
+    let agent = prepared.host.plugin_agent();
+    let first = terminal_for(
+        &prepared.host,
+        &prepared.kr_before(),
+        &["attach", &prepared.display],
+    );
+    first.ready().await;
+    let first_program = start_agent(&prepared.host, &first, &agent).await;
+    prepared.host.plugin_holding(1).await;
+    let old_host = prepared
+        .host
+        .plugin_host()
+        .expect("the release before started a plugin host");
+    assert_runs_the_host_of(&old_host, prepared.one.name());
+
+    let updated = prepared.update().await;
+    let host = &updated.host;
+    assert_eq!(
+        host.plugin_host(),
+        Some(old_host.clone()),
+        "the update left the release before's host alone"
+    );
+    assert_eq!(
+        host.plugin_descriptor4(),
+        None,
+        "a host of the third protocol alone publishes no descriptor of the fourth"
+    );
+    assert_eq!(
+        host.observed_protocol().await,
+        Ok(HostProtocol::V3),
+        "a client of this release meets the host of the release before on the third protocol"
+    );
+
+    // A session of this release binds a component and is served by the same host.
+    let second = BoundSession::start(host, &updated.kr_now(), &agent).await;
+    host.plugin_holding(2).await;
+    assert_eq!(
+        host.plugin_host(),
+        Some(old_host.clone()),
+        "the daemon adopted the host and started no other"
+    );
+    assert_eq!(
+        host.plugin_descriptor4(),
+        None,
+        "adopting the host publishes no descriptor of the fourth protocol for it"
+    );
+    assert_eq!(host.observed_protocol().await, Ok(HostProtocol::V3));
+
+    // The host ends under both programs; the daemon starts this release's own, which serves both
+    // protocols.
+    host.end_the_plugin_host().await;
+    let next = host.another_plugin_host(&old_host).await;
+    assert_runs_the_host_of(&next, updated.two.name());
+    let (three, four) = host.descriptors_of(&next).await;
+    assert_a_host_of_both_protocols(&three, &four);
+    host.plugin_holding(2).await;
+    assert_eq!(
+        host.observed_protocol().await,
+        Ok(HostProtocol::V4),
+        "the next session meets this release's host on the fourth protocol"
+    );
+
+    updated.the_worker_is_as_it_was().await;
+    end_program(&first_program);
+    second.end(host, &updated.kr_now()).await;
+    drop(first);
+    host.close(&updated.kr_before(), &updated.display);
+    host.worker_ended(&updated.worker).await;
+    host.end_the_plugin_host().await;
+}
+
+/// KR-REQ-24.24, KR-REQ-26.06, KR-ACC-035 (U4h, the host half): a plugin host that replaces one
+/// that crashed, started by the daemon of this release, answers a restore that carries a position
+/// as not set, and a checkpoint of either host names no position.
+///
+/// This build's host writes no consumed positions, because a level it retains does not speak the
+/// fourth protocol (`replay_writer_open`). So a first host's checkpoint holds no position to carry
+/// to the next, and the answer the plan names for this case, a set record and a checkpoint that
+/// names the same events, is not reachable from this suite today: the case holds what is true
+/// with the writer closed, and fails where the writer opens, so that the half it cannot hold yet
+/// is built beside it. The worker's side of the case, a held state trusted across connections, is
+/// the worker's own.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_host_that_replaces_a_crashed_one_answers_a_restore_with_a_position_as_not_set_today() {
+    assert!(
+        !kr_protocol::retained::replay_writer_open(),
+        "this build's host writes consumed positions: build the half of U4h that sets the record"
+    );
+    let updated = Updated::prepare(Setup {
+        plugin: true,
+        ..Setup::default()
+    })
+    .await
+    .update()
+    .await;
+    let host = &updated.host;
+    let agent = host.plugin_agent();
+    let session = BoundSession::start(host, &updated.kr_now(), &agent).await;
+    let first = host.plugin_host_published().await;
+    let four = host.plugin_descriptor4_of(&first).await;
+    host.plugin_holding(1).await;
+
+    // The first host holds an instance of its own: a host with its writer closed names no
+    // position for it, so there is none to carry to the next host.
+    let mut raw = plugin_hosts::FourConnection::open(&four).await;
+    raw.register(0x41, 1, &host.component_for(&first)).await;
+    let saved = raw.checkpoint(0x41).await;
+    assert!(
+        saved.consumed.is_none(),
+        "a host with its writer closed names no position: {:?}",
+        saved.consumed
+    );
+    drop(raw);
+
+    // The host crashes and the daemon starts another.
+    host.end_the_plugin_host().await;
+    let second = host.another_plugin_host(&first).await;
+    let four = host.plugin_descriptor4_of(&second).await;
+    host.plugin_holding(1).await;
+    let mut raw = plugin_hosts::FourConnection::open(&four).await;
+    raw.register(0x42, 2, &host.component_for(&second)).await;
+    let record = raw
+        .restore(0x42, 2, saved.state.clone(), Some(a_position()))
+        .await;
+    assert_eq!(
+        record,
+        Some(kr_plugin_service::protocol4::RecordState::NotSet),
+        "a host with its writer closed does not set a record from a position"
+    );
+    let after = raw.checkpoint(0x42).await;
+    assert!(
+        after.consumed.is_none(),
+        "the replacing host names no position either: {:?}",
+        after.consumed
+    );
+    drop(raw);
+
+    updated.the_worker_is_as_it_was().await;
+    session.end(host, &updated.kr_now()).await;
+    host.close(&updated.kr_before(), &updated.display);
+    host.worker_ended(&updated.worker).await;
+    host.end_the_plugin_host().await;
+}
+
+/// KR-REQ-24.24, KR-REQ-26.06, KR-ACC-035 (U5h, the host half): a plugin host of both protocols
+/// with its writer closed, adopted by the next daemon, names no position in a checkpoint, and a
+/// restore that carries one is answered as not set and leaves the instance as it was.
+///
+/// The plan's host is one an older release's daemon started; no release before this one starts a
+/// host of the fourth protocol, so the host here is this release's, adopted by a daemon that
+/// starts again. The worker's reset after the answer is the worker's own.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_host_the_next_daemon_adopts_answers_a_restore_with_a_position_as_not_set_and_keeps_its_instance()
+ {
+    assert!(
+        !kr_protocol::retained::replay_writer_open(),
+        "this build's host writes consumed positions: build the half of U5h that sets the record"
+    );
+    let mut updated = Updated::prepare(Setup {
+        plugin: true,
+        ..Setup::default()
+    })
+    .await
+    .update()
+    .await;
+    let agent = updated.host.plugin_agent();
+    let session = BoundSession::start(&updated.host, &updated.kr_now(), &agent).await;
+    let process = updated.host.plugin_host_published().await;
+    updated.host.plugin_descriptor4_of(&process).await;
+    updated.host.plugin_holding(1).await;
+
+    // The daemon stops and starts again, and adopts the host.
+    assert!(
+        updated.host.stop_the_daemon().await,
+        "no daemon serves the host"
+    );
+    let controller = updated.host.store.stable(Program::Controller);
+    updated.host.start_daemon(&controller).await;
+    let host = &updated.host;
+    assert_eq!(
+        host.plugin_host(),
+        Some(process.clone()),
+        "the daemon adopted the host and started no other"
+    );
+    host.plugin_holding(1).await;
+    let four = host.plugin_descriptor4_of(&process).await;
+
+    let mut raw = plugin_hosts::FourConnection::open(&four).await;
+    raw.register(0x51, 1, &host.component_for(&process)).await;
+    let before = raw.checkpoint(0x51).await;
+    assert!(
+        before.consumed.is_none(),
+        "a host with its writer closed names no position: {:?}",
+        before.consumed
+    );
+    // A state another instance of the component wrote, with a position.
+    let elsewhere = b"kalareach/well-behaved|7|elsewhere".to_vec();
+    assert_ne!(elsewhere, before.state);
+    let record = raw.restore(0x51, 1, elsewhere, Some(a_position())).await;
+    assert_eq!(
+        record,
+        Some(kr_plugin_service::protocol4::RecordState::NotSet),
+        "a host with its writer closed does not set a record from a position"
+    );
+    let after = raw.checkpoint(0x51).await;
+    assert_eq!(
+        after.state, before.state,
+        "the restore that carried a position left the instance as it was"
+    );
+    assert!(after.consumed.is_none(), "{:?}", after.consumed);
+    drop(raw);
+
+    updated.the_worker_is_as_it_was().await;
+    session.end(host, &updated.kr_now()).await;
+    host.close(&updated.kr_before(), &updated.display);
+    host.worker_ended(&updated.worker).await;
+    host.end_the_plugin_host().await;
+}
+
+/// KR-REQ-24.24, KR-REQ-26.06, KR-ACC-035 (U6h, the host half): a worker of this release is
+/// served over the fourth protocol by a host whose writer is closed, across a kill of the host. The
+/// host the worker recovers on writes no consumed position, so the worker has none to read.
+///
+/// The worker's side of the case, a worker with its gate closed that reads every member of a host
+/// with its writer open and uses none, needs a host with its writer open, which this build does
+/// not start, and the worker's own use of a position. Neither is in this build, so the case holds
+/// what is true today: a host with a closed writer names no position to a worker that asks.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_worker_recovers_on_the_fourth_protocol_across_a_kill_and_the_host_names_no_position_today()
+ {
+    assert!(
+        !kr_protocol::retained::replay_writer_open(),
+        "this build's host writes consumed positions: build the half of U6h that reads them"
+    );
+    let updated = Updated::prepare(Setup {
+        plugin: true,
+        ..Setup::default()
+    })
+    .await
+    .update()
+    .await;
+    let host = &updated.host;
+    let agent = host.plugin_agent();
+    let session = BoundSession::start(host, &updated.kr_now(), &agent).await;
+    let first = host.plugin_host_published().await;
+    host.plugin_descriptor4_of(&first).await;
+    host.plugin_holding(1).await;
+    assert_eq!(host.observed_protocol().await, Ok(HostProtocol::V4));
+
+    // The host is killed under the running program; the worker asks again and binds on the next.
+    host.end_the_plugin_host().await;
+    let second = host.another_plugin_host(&first).await;
+    let four = host.plugin_descriptor4_of(&second).await;
+    host.plugin_holding(1).await;
+    assert_eq!(
+        host.observed_protocol().await,
+        Ok(HostProtocol::V4),
+        "the next session meets the host on the fourth protocol"
+    );
+    let mut raw = plugin_hosts::FourConnection::open(&four).await;
+    raw.register(0x61, 1, &host.component_for(&second)).await;
+    let checkpoint = raw.checkpoint(0x61).await;
+    assert!(
+        checkpoint.consumed.is_none(),
+        "a host with its writer closed names no position to a worker that asks: {:?}",
+        checkpoint.consumed
+    );
+    drop(raw);
+
+    updated.the_worker_is_as_it_was().await;
+    session.end(host, &updated.kr_now()).await;
+    host.close(&updated.kr_before(), &updated.display);
+    host.worker_ended(&updated.worker).await;
+    host.end_the_plugin_host().await;
+}
+
+/// KR-REQ-05.06, KR-REQ-26.06, KR-REQ-20.23, KR-ACC-035 (U7, the Unix half): a plugin host of both
+/// protocols that outlives its daemon is adopted by the next one as the process it is. Both
+/// descriptors are left as they were, nothing is started or published again, a client of this
+/// release meets the host on the fourth protocol, and a session that binds afterwards is served by
+/// the same process. The Windows half, the two pipes, is in `kr-controller`'s
+/// `plugin_runtime_service`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_plugin_host_of_both_protocols_is_adopted_by_the_next_daemon_as_the_process_it_is() {
+    let mut updated = Updated::prepare(Setup {
+        plugin: true,
+        ..Setup::default()
+    })
+    .await
+    .update()
+    .await;
+    let agent = updated.host.plugin_agent();
+    let first = BoundSession::start(&updated.host, &updated.kr_now(), &agent).await;
+    let process = updated.host.plugin_host_published().await;
+    let (three, four) = updated.host.descriptors_of(&process).await;
+    assert_a_host_of_both_protocols(&three, &four);
+    updated.host.plugin_holding(1).await;
+    let published = updated.host.plugin_descriptor_files();
+    assert!(
+        published.0.is_some() && published.1.is_some(),
+        "both descriptor files are on disk"
+    );
+
+    assert!(
+        updated.host.stop_the_daemon().await,
+        "no daemon serves the host"
+    );
+    let controller = updated.host.store.stable(Program::Controller);
+    updated.host.start_daemon(&controller).await;
+    let host = &updated.host;
+    assert_eq!(
+        host.plugin_host(),
+        Some(process.clone()),
+        "the next daemon names the host the last one started"
+    );
+    assert_eq!(
+        host.plugin_descriptor_files(),
+        published,
+        "the next daemon published nothing"
+    );
+    host.plugin_holding(1).await;
+    assert_eq!(host.observed_protocol().await, Ok(HostProtocol::V4));
+
+    // A session that binds after the adoption is served by the same process.
+    let second = BoundSession::start(host, &updated.kr_now(), &agent).await;
+    host.plugin_holding(2).await;
+    assert_eq!(
+        host.plugin_host(),
+        Some(process.clone()),
+        "the daemon adopted the host and asked for no other"
+    );
+    assert_eq!(
+        host.plugin_descriptor_files(),
+        published,
+        "no host was started: the descriptors are as they were"
+    );
+    assert_eq!(
+        kr_ipc::identity::process_state(&process),
+        kr_ipc::identity::ProcessState::Running,
+        "the host runs until it is ended"
+    );
+    assert_eq!(host.observed_protocol().await, Ok(HostProtocol::V4));
+
+    updated.the_worker_is_as_it_was().await;
+    second.end(host, &updated.kr_now()).await;
+    first.end(host, &updated.kr_now()).await;
+    host.close(&updated.kr_before(), &updated.display);
+    host.worker_ended(&updated.worker).await;
+    host.end_the_plugin_host().await;
+}
+
+/// KR-REQ-05.06, KR-REQ-26.06, KR-REQ-20.23, KR-ACC-035 (U8, the Unix half): the daemon of this
+/// release starts the plugin host beside itself, from its own release, and publishes it under both
+/// protocols. A client of this release meets it on the fourth protocol, a kill is recovered by
+/// another host of the same release, published under both again, and the worker binds on it. The
+/// layout with no release store, where the host is the program beside the daemon too, is in
+/// `kr-controller`'s `plugin_runtime_service`; the suite always has a store.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_plugin_host_the_daemon_starts_is_published_under_both_protocols_and_a_kill_is_recovered()
+{
+    let updated = Updated::prepare(Setup {
+        plugin: true,
+        ..Setup::default()
+    })
+    .await
+    .update()
+    .await;
+    let host = &updated.host;
+    assert_eq!(
+        host.plugin_host(),
+        None,
+        "no program has wanted a plugin host yet"
+    );
+    let agent = host.plugin_agent();
+    let session = BoundSession::start(host, &updated.kr_now(), &agent).await;
+    let first = host.plugin_host_published().await;
+    let (three, four) = host.descriptors_of(&first).await;
+    assert_a_host_of_both_protocols(&three, &four);
+    host.plugin_holding(1).await;
+    assert_runs_the_host_of(&first, updated.two.name());
+    assert_eq!(
+        host.observed_protocol().await,
+        Ok(HostProtocol::V4),
+        "a client of this release meets the host on the fourth protocol"
+    );
+
+    host.end_the_plugin_host().await;
+    let second = host.another_plugin_host(&first).await;
+    let (three, four) = host.descriptors_of(&second).await;
+    assert_a_host_of_both_protocols(&three, &four);
+    host.plugin_holding(1).await;
+    assert_runs_the_host_of(&second, updated.two.name());
+    assert_eq!(host.observed_protocol().await, Ok(HostProtocol::V4));
+
+    updated.the_worker_is_as_it_was().await;
+    session.end(host, &updated.kr_now()).await;
     host.close(&updated.kr_before(), &updated.display);
     host.worker_ended(&updated.worker).await;
     host.end_the_plugin_host().await;
