@@ -123,13 +123,12 @@ async function hiddenOf(page: Page, controls: readonly Locator[], covered = 0): 
  * The most a control may lack of being whole in view: 1 px, which nobody sees of a 44 px target.
  *
  * What lacks it is the field, above a keyboard, and nothing else; every button stands whole to the
- * pixel. The view rests the field on the keyboard's top edge and leaves it within half a pixel of
- * it (`TOLERANCE` in `keyboard.ts`): 0.3 to 0.4 px is what 360 by 800 and 320 by 640 show. At 320 by
- * 568 in WebKit it is 0.94 px, and that is not the tolerance: the field's edge falls at a fraction
- * of a pixel (the bar under the session is 85.5 px), WebKit keeps a scroll position in whole pixels
- * and leaves 36 of the 36.94 it is given (Chromium rounds to 37, and lacks 0.06 px), and the lift
- * that would close the rest cannot raise the field, because the conversation is at its floor of
- * three lines: the page grows by what is added instead, which the view's four passes confirm.
+ * pixel. The view scrolls the field onto the keyboard's top edge and adds lift only for what is left
+ * beyond a pixel (`LIFT_STOPS_WITHIN` in `MobileSession.tsx`), so the field may lie that far from
+ * the edge: 0.3 to 0.4 px is what 360 by 800 and 320 by 640 show. At 320 by 568 in WebKit it is
+ * 0.94 px: the field's edge falls at a fraction of a pixel (the bar under the session is 85.5 px),
+ * and WebKit keeps a scroll position in whole pixels and leaves 36 of the 36.94 it is given
+ * (Chromium rounds to 37, and lacks 0.06 px). No lift closes that rest, so the view adds none for it.
  */
 const SHORT_OF_VIEW = 1
 
