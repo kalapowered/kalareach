@@ -118,3 +118,32 @@ test-group = 'host-cases'
 [[profile.default.overrides]]
 filter = 'package(kr-cli) & (binary(update) | binary(admit))'
 success-output = "final"
+
+# These cases start first: the case that runs alone, the ten cases that ran past 360 s in the shadow run, and the
+# host cases (about 800 s at four at a time). A run that starts them last ends on them.
+[[profile.default.overrides]]
+filter = 'package(kr-worker) & binary(ownership) & test(~an_idle_sessions_observation_reads_no_process_outside_its_own_tree)'
+priority = 100
+
+[[profile.default.overrides]]
+filter = '''
+  (binary_id(kr-cli::retained_surface) & test(=the_entries_of_the_narrower_table_hold))
+  | (binary_id(kr-controller::grants) & (
+      test(=a_delegation_tree_takes_no_grant_past_the_limit)
+      | test(=a_tree_over_the_limit_redeems_no_invitation)
+      | test(=a_withdrawal_larger_than_one_message_is_read_back_and_its_fence_settled)
+  ))
+  | (binary_id(kr-controller::network_delegation) & test(=kr_req_10_45_a_device_cannot_delegate_past_the_limit_of_a_tree))
+  | (binary_id(kr-describe-model::prompt_budget) & test(=an_answer_the_output_bound_stops_is_ended_inside_its_activity_text))
+  | (binary_id(kr-controller) & (
+      test(=service::one_barrier_for_every_restriction::a_device_revocation_is_one_barrier_whether_or_not_what_it_names_fits_a_notice)
+      | test(=service::one_barrier_for_every_restriction::a_revocation_of_a_tree_at_the_limit_is_named_in_full_and_names_nothing_else)
+      | test(=service::the_end_of_a_write_is_told_under_its_authority::a_device_revocation_at_the_most_a_notice_names_is_not_shown_when_another_withdrawal_follows)
+      | test(=service::the_end_of_a_write_is_told_under_its_authority::a_device_revocation_at_the_most_a_notice_names_is_told_though_it_withdrew_the_whole_host)
+  ))
+'''
+priority = 90
+
+[[profile.default.overrides]]
+filter = 'package(kr-cli) & (binary(update) | binary(admit))'
+priority = 80
