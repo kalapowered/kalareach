@@ -9,12 +9,12 @@
 nextest-version = "0.9.146"
 
 # The two `harness = false` binaries of the companion do not answer `--list`: `navigation` prints a line and
-# `host_events` starts Xvfb and its whole window check. They stay under `cargo test -p companion-tauri --test
+# `host_events` starts Xvfb and its whole window check. They stay under `cargo test --workspace --test
 # navigation --test host_events`, as do the doctests (`cargo test --doc --workspace`), which nextest does not run.
 
 [profile.default]
 # Which cases run when no filter is given (see the note above on the two harness = false binaries).
-default-filter = "not (binary(navigation) | binary(host_events))"
+default-filter = "not (binary_id(companion-tauri::navigation) | binary_id(companion-tauri::host_events))"
 # A rerun is not a fix: a case that fails once fails.
 retries = 0
 fail-fast = false
