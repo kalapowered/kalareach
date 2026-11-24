@@ -449,7 +449,7 @@ pub(super) mod tests {
 
     /// A stand-in program that stays held open for writing stops its case after the bound, and the
     /// panic names the stand-in.
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_stand_in_held_open_for_writing_stops_its_case_after_the_bound_and_names_it() {
         use std::os::unix::fs::PermissionsExt as _;
