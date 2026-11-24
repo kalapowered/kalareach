@@ -1267,6 +1267,8 @@ pub struct Controller {
     /// The desktop this host has, as last read, and the capability revision that reading is
     /// evidence for.
     desktop: Mutex<DesktopReading>,
+    /// Where the desktop is read from: the platform, or a scripted source in a case.
+    desktop_source: std::sync::Mutex<Arc<dyn crate::desktop::DesktopSource>>,
     /// The disclosed checks a person asked for: whether a run is in progress, how the latest ended,
     /// and the findings while nothing has ended them.
     checks: std::sync::Mutex<capability_checks::Checks>,

@@ -27,7 +27,7 @@ use kr_protocol::ids::{ActorId, EnvironmentId, RequestId, SessionId};
 use kr_protocol::local::ControllerConnectionRole;
 use kr_protocol::retained::Level;
 use kr_protocol::scalars::{Nullable, TimestampMs};
-use kr_worker::desktop::capability::{context_refuses, tools_of};
+use kr_worker::desktop::capability::{context_refuses, facility_identity, tools_of};
 use kr_worker::desktop::probe::{Fingerprint, stale};
 
 use crate::authority::AdmittedMutation;
@@ -183,8 +183,13 @@ impl Checks {
             session_id: Nullable::some(running.session_id),
             failure: Nullable::null(),
         };
+        // What they are about is what the worker ran, as its answer names it, and not what this
+        // daemon would find on its own search path before the run: the two can be different tools.
         self.held = Some(Held {
-            fingerprint: running.taken,
+            fingerprint: Fingerprint {
+                facility: Some(identities_held(&records)),
+                ..running.taken
+            },
             records,
         });
         self.ended = false;
@@ -217,15 +222,21 @@ impl Checks {
     /// record lists ends the record. The triggers are the same for every record of one run, so one
     /// ended is all ended, and they are not kept to be served again if a reading recovers.
     ///
-    /// `now` is the desktop, the tools and the worker as they are at this reading.
+    /// `now` is the desktop and the worker as they are at this reading. The tools are the ones the
+    /// worker ran, read again at the paths its answer named, so that a tool replaced under the
+    /// worker ends the findings and one it never ran does not.
     pub(super) fn standing(&mut self, now: &Fingerprint) -> Vec<CapabilityRecord> {
         let Some(held) = self.held.as_ref() else {
             return Vec::new();
         };
+        let now = Fingerprint {
+            facility: Some(identities_now(&held.records)),
+            ..now.clone()
+        };
         let ended = held
             .records
             .iter()
-            .any(|record| !stale(record, &held.fingerprint, now).is_empty());
+            .any(|record| !stale(record, &held.fingerprint, &now).is_empty());
         if ended {
             self.held = None;
             self.ended = true;
@@ -245,6 +256,54 @@ impl Checks {
             .and_then(|record| record.subject.session_id.0);
         (session, self.generation)
     }
+}
+
+/// What the findings name as run, one line: for each record its capability, the route it took, the
+/// program it ran and the digest the answer gave for it. A route that ran no program of its own
+/// names none and has no digest.
+fn identities(
+    records: &[CapabilityRecord],
+    version: impl Fn(&CapabilityRecord) -> String,
+) -> String {
+    let mut lines: Vec<String> = records
+        .iter()
+        .map(|record| {
+            format!(
+                "{}|{}|{}|{}",
+                record.capability.as_str(),
+                record.identity.schema.as_ref().map_or("", String::as_str),
+                record.identity.binary.as_ref().map_or("", String::as_str),
+                version(record)
+            )
+        })
+        .collect();
+    lines.sort();
+    lines.join(";")
+}
+
+/// The identities the worker's answer gave.
+fn identities_held(records: &[CapabilityRecord]) -> String {
+    identities(records, |record| {
+        record
+            .identity
+            .version
+            .as_ref()
+            .map(|identity| identity.as_str().to_owned())
+            .unwrap_or_default()
+    })
+}
+
+/// The identities of the same programs at the same paths as they are now.
+fn identities_now(records: &[CapabilityRecord]) -> String {
+    identities(records, |record| {
+        record
+            .identity
+            .binary
+            .as_ref()
+            .and_then(|path| facility_identity(path))
+            .map(|identity| identity.as_str().to_owned())
+            .unwrap_or_default()
+    })
 }
 
 /// What the desktop, the tools and the worker are, for a fingerprint of this moment.
@@ -646,6 +705,9 @@ async fn exchange(
 
 #[cfg(test)]
 mod tests {
+    use crate::service::capabilities::resolved_desktop;
+    use kr_protocol::identity::BootIdentity;
+
     use kr_protocol::desktop::{
         CapabilityEvidenceSource, CapabilityIdentity, CapabilityState, CapabilitySubject,
     };
@@ -954,17 +1016,9 @@ mod tests {
         checks.succeeded(TimestampMs::new(20), vec![screen_finding()]);
         assert_eq!(checks.view().state, CapabilityChecksState::Current);
         assert_eq!(checks.standing(&taken).len(), 1, "nothing moved");
-        // A tool installed, removed or replaced, the worker gone, a new login and another profile
-        // each end them.
+        // The worker gone, a new login and another profile each end them. A tool the worker ran
+        // replaced ends them too, which the cases of the worker's tools below show.
         for moved in [
-            Fingerprint {
-                facility: Some("other tools".to_owned()),
-                ..taken.clone()
-            },
-            Fingerprint {
-                facility: Some(String::new()),
-                ..taken.clone()
-            },
             Fingerprint {
                 host_agent: None,
                 ..taken.clone()
@@ -994,6 +1048,129 @@ mod tests {
             // And they are gone: a reading that recovers does not bring them back.
             assert!(checks.standing(&taken).is_empty());
         }
+    }
+
+    /// A finding that names the program the worker ran, by path and with the digest it read.
+    #[cfg(unix)]
+    fn finding_naming(path: &std::path::Path) -> CapabilityRecord {
+        let mut finding = screen_finding();
+        finding.identity.binary = Nullable::some(path.display().to_string());
+        finding.identity.version = Nullable(facility_identity(&path.display().to_string()));
+        finding.identity.schema = Nullable::some("a-route".to_owned());
+        finding
+    }
+
+    /// KR-REQ-03.29, S-4: the findings are held against the tool the worker ran. With a search
+    /// path of the controller's own that finds another tool, replacing the worker's tool ends
+    /// them, and replacing the controller's candidate, which the worker never ran, does not.
+    #[cfg(unix)]
+    #[test]
+    fn a_worker_and_a_controller_with_different_search_paths_hold_the_workers_tool() {
+        let directory = std::env::temp_dir().join(format!("kr-held-{}", kr_ipc::new_uuid()));
+        std::fs::create_dir_all(&directory).expect("a directory of this test's own");
+        let worker_tool = directory.join("the-workers-tool");
+        let controller_candidate = directory.join("the-controllers-candidate");
+        std::fs::write(&worker_tool, b"the first build").expect("the worker's tool");
+        std::fs::write(&controller_candidate, b"the first build").expect("the candidate");
+        // What the controller's own reading of the tools was before the run: another tool.
+        let taken = Fingerprint {
+            facility: Some("what the controller found on its own search path".to_owned()),
+            host_agent: Some("worker".to_owned()),
+            desktop_generation: Some(2),
+            profile: Some(WorkerProfile::DesktopBound),
+        };
+        let held = || {
+            let mut checks = Checks::new();
+            checks.begin(TimestampMs::new(10), session(), taken.clone());
+            checks.succeeded(TimestampMs::new(20), vec![finding_naming(&worker_tool)]);
+            checks
+        };
+        assert_eq!(held().standing(&taken).len(), 1, "nothing moved");
+
+        std::fs::write(&controller_candidate, b"the second build").expect("the replacement");
+        assert_eq!(
+            held().standing(&taken).len(),
+            1,
+            "a tool the worker never ran is not what the findings are about"
+        );
+
+        let mut checks = held();
+        std::fs::write(&worker_tool, b"the second build").expect("the replacement");
+        assert!(
+            checks.standing(&taken).is_empty(),
+            "the worker's own tool was replaced"
+        );
+        assert_eq!(checks.view().state, CapabilityChecksState::Stale);
+        std::fs::remove_dir_all(&directory).expect("removes the test's directory");
+    }
+
+    /// KR-REQ-03.29, S-12: what a permission withdrawn since the first run comes to. A second run
+    /// that is refused replaces the first finding, and with no second run the first stands, which
+    /// is the limit the words state.
+    #[test]
+    fn a_repeat_run_finds_a_permission_withdrawn_since() {
+        let taken = Fingerprint {
+            facility: None,
+            host_agent: Some("worker".to_owned()),
+            desktop_generation: Some(2),
+            profile: Some(WorkerProfile::DesktopBound),
+        };
+        let mut checks = Checks::new();
+        checks.begin(TimestampMs::new(10), session(), taken.clone());
+        checks.succeeded(TimestampMs::new(20), vec![screen_finding()]);
+        let read = |checks: &mut Checks| {
+            let mut records = platform();
+            merge(&mut records, &checks.standing(&taken), &context());
+            records
+                .into_iter()
+                .find(|record| record.capability.as_str() == capabilities::SCREEN_CAPTURE)
+                .expect("the screen record")
+                .state
+        };
+        assert_eq!(read(&mut checks), CapabilityState::QualifiedAvailable);
+        assert_eq!(
+            read(&mut checks),
+            CapabilityState::QualifiedAvailable,
+            "with no second run the first finding stands"
+        );
+        let mut refused = screen_finding();
+        refused.state = CapabilityState::PermissionRequired;
+        checks.begin(TimestampMs::new(30), session(), taken.clone());
+        checks.succeeded(TimestampMs::new(40), vec![refused]);
+        assert_eq!(
+            read(&mut checks),
+            CapabilityState::PermissionRequired,
+            "the second run found the permission withdrawn"
+        );
+    }
+
+    /// KR-REQ-03.29, S-13: findings held against a login go stale when the login changes, through
+    /// the controller's own reading of the desktop, which here is scripted.
+    #[test]
+    fn held_findings_go_stale_when_the_login_changes() {
+        struct Scripted(std::sync::atomic::AtomicU64);
+        impl crate::desktop::DesktopSource for Scripted {
+            fn current(&self, _boot: BootIdentity) -> DesktopContext {
+                let mut desktop = context();
+                desktop.login_generation =
+                    Nullable::some(U64::new(self.0.load(std::sync::atomic::Ordering::SeqCst)));
+                desktop
+            }
+        }
+        let source = Scripted(std::sync::atomic::AtomicU64::new(2));
+        let boot = context().boot_identity;
+        let read = || fingerprint_of(&resolved_desktop(None, &boot, &source).1, None);
+        let mut checks = Checks::new();
+        checks.begin(TimestampMs::new(10), session(), read());
+        checks.succeeded(TimestampMs::new(20), vec![screen_finding()]);
+        assert_eq!(checks.standing(&read()).len(), 1, "the same login");
+        assert_eq!(checks.view().state, CapabilityChecksState::Current);
+        source.0.store(3, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            checks.standing(&read()).is_empty(),
+            "a login that changed ends them"
+        );
+        assert_eq!(checks.view().state, CapabilityChecksState::Stale);
     }
 
     #[test]

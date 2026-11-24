@@ -489,6 +489,7 @@ names | kr_worker::config::effective_value
 names | kr_worker::config::load
 names | kr_worker::config::lock
 names | kr_worker::desktop::capability::context_refuses
+names | kr_worker::desktop::capability::facility_identity
 names | kr_worker::desktop::capability::report
 names | kr_worker::desktop::capability::tools_of
 names | kr_worker::desktop::context

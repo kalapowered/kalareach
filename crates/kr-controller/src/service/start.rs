@@ -767,7 +767,10 @@ impl Controller {
             )
             .await?,
         );
-        let (initial_desktop, initial_evidence) = resolved_desktop(in_force.worker_profile, &boot);
+        let desktop_source: Arc<dyn crate::desktop::DesktopSource> =
+            Arc::new(crate::desktop::PlatformDesktop);
+        let (initial_desktop, initial_evidence) =
+            resolved_desktop(in_force.worker_profile, &boot, desktop_source.as_ref());
         let device_keys = net::host_device_keys(&*secret_store, setup.environment_id)?;
         let host_authorisation_key = *device_keys.authorisation.public();
         // The owner authority is the host's, not the network's: the clock is established through
@@ -1469,6 +1472,7 @@ impl Controller {
                 records: Vec::new(),
                 read_at: std::time::Instant::now(),
             }),
+            desktop_source: std::sync::Mutex::new(desktop_source),
             checks: std::sync::Mutex::new(super::capability_checks::Checks::new()),
             capability_answers,
             voice_start_holds,

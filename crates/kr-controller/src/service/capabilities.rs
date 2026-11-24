@@ -77,8 +77,16 @@ impl Controller {
     pub(super) async fn desktop(&self) -> (DesktopContext, CapabilityRevision) {
         let mut reading = self.desktop.lock().await;
         if reading.read_at.elapsed() >= DESKTOP_REREAD_INTERVAL {
-            let (context, evidence) =
-                resolved_desktop(self.in_force().worker_profile, &self.boot_identity);
+            let source = self
+                .desktop_source
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            let (context, evidence) = resolved_desktop(
+                self.in_force().worker_profile,
+                &self.boot_identity,
+                source.as_ref(),
+            );
             reading.context = context;
             reading.evidence = evidence;
             reading.read_at = std::time::Instant::now();
@@ -267,8 +275,9 @@ impl Controller {
 pub(super) fn resolved_desktop(
     chosen: Option<kr_protocol::identity::WorkerProfile>,
     boot: &BootIdentity,
+    source: &dyn crate::desktop::DesktopSource,
 ) -> (DesktopContext, DesktopContext) {
-    let mut physical = crate::desktop::current(boot.clone());
+    let mut physical = source.current(boot.clone());
     let platform = crate::desktop::default_profile(&physical);
     // The product default is the platform's own answer, established here; the rungs above it were
     // read when the configuration was accepted, so this is not a second reading of the document.

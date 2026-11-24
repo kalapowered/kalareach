@@ -51,6 +51,25 @@ pub fn current(boot: BootIdentity) -> DesktopContext {
     kr_worker::desktop::context(WorkerProfile::DesktopBound, boot)
 }
 
+/// Where the control daemon reads the desktop from.
+///
+/// The platform in production; a case scripts it, so that a login that changes can be made to
+/// happen and the daemon's reaction to it can be shown.
+pub trait DesktopSource: Send + Sync {
+    /// Reads the desktop this host has now.
+    fn current(&self, boot: BootIdentity) -> DesktopContext;
+}
+
+/// The platform's own reading.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PlatformDesktop;
+
+impl DesktopSource for PlatformDesktop {
+    fn current(&self, boot: BootIdentity) -> DesktopContext {
+        current(boot)
+    }
+}
+
 /// Returns the profile this host creates sessions with when the request does not choose one.
 ///
 /// A graphical login means the desktop's own context. Anything else — an SSH-only host, a
