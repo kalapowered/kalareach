@@ -144,7 +144,9 @@ fn appends_to_record(
         .is_some();
     if !there {
         let made = OpenOptions::new()
-            .access_mode(FILE_APPEND_DATA | WRITE_DAC | SYNCHRONIZE)
+            .access_mode(
+                FILE_APPEND_DATA | FILE_READ_ATTRIBUTES | READ_CONTROL | WRITE_DAC | SYNCHRONIZE,
+            )
             .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
             .write(true)
             .create_new(true)
