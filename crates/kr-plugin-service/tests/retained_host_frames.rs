@@ -40,9 +40,10 @@ fn the_frames_of_the_plugin_host_of_the_release_before_read_here_and_encode_back
     let record: Value = serde_json::from_str(RECORD).expect("the record");
     let limits = StreamKind::Control.cbor_limits();
     let retained = &kr_protocol::retained::RETAINED[0];
-    assert_eq!(
-        retained.plugin_host.trim(),
-        HostProtocol::THIS.name,
+    assert!(
+        retained
+            .plugin_host_names()
+            .contains(&HostProtocol::THIS.name),
         "the level records the protocol its host speaks"
     );
     assert_eq!(

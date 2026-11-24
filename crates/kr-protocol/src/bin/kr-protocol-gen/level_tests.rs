@@ -273,13 +273,23 @@ impl Repo {
             .iter()
             .map(|root| format!("    \"{root}\",\n"))
             .collect();
+        // One name is stated as a name, as every release before the list does; more are a list.
+        let host = if tree.host.contains(',') {
+            let names: String = tree
+                .host
+                .split(',')
+                .map(|name| format!("\"{name}\", "))
+                .collect();
+            format!("pub const PLUGIN_HOST_PROTOCOLS: &[&str] = &[{names}];\n")
+        } else {
+            format!(
+                "pub const PLUGIN_HOST_PROTOCOL: &str = \"{}\";\n",
+                tree.host
+            )
+        };
         self.write(
             "crates/kr-protocol/src/retained.rs",
-            &format!(
-                "pub const PLUGIN_HOST_PROTOCOL: &str = \"{}\";\n\
-                 pub const SURFACE_ROOTS: &[&str] = &[\n{roots}];\n",
-                tree.host
-            ),
+            &format!("{host}pub const SURFACE_ROOTS: &[&str] = &[\n{roots}];\n"),
         );
         let table = "crates/kr-protocol/worker-surface.json";
         match &tree.worker {
@@ -334,7 +344,7 @@ impl Repo {
                     .to_string(),
             )
             .expect("a table"),
-            plugin_host: tree.host.to_owned(),
+            plugin_host: tree.host.split(',').map(str::to_owned).collect(),
             public_majors: tree.majors.to_owned(),
             sections: tree
                 .sections
@@ -1511,18 +1521,35 @@ fn a_kept_release_of_a_retained_level_is_compared_over_both_root_lists_and_both_
     // The same: nothing differs.
     let same = release_of(&kept_tree, "the same", false);
     assert!(
-        kept_release_differences(&repo.directory, &same, &kept, majors, "kr-plugin-host/3")
+        kept_release_differences(&repo.directory, &same, &kept, majors, &["kr-plugin-host/3"])
             .expect("compared")
             .is_empty()
+    );
+    // The level kept a name more than this release lists: what a release lists is inside it.
+    assert!(
+        kept_release_differences(
+            &repo.directory,
+            &same,
+            &kept,
+            majors,
+            &["kr-plugin-host/3", "kr-plugin-host/4"]
+        )
+        .expect("compared")
+        .is_empty()
     );
 
     // A root the release declares that the kept surface does not have, and a difference in it.
     let mut more = kept_tree.clone();
     more.roots = vec!["ControlFrame", "PeerParams"];
     let extra = release_of(&more, "a root of its own", false);
-    let found =
-        kept_release_differences(&repo.directory, &extra, &kept, majors, "kr-plugin-host/3")
-            .expect("compared");
+    let found = kept_release_differences(
+        &repo.directory,
+        &extra,
+        &kept,
+        majors,
+        &["kr-plugin-host/3"],
+    )
+    .expect("compared");
     assert!(
         found.iter().any(|line| line.contains("PeerParams")),
         "{found:?}"
@@ -1532,8 +1559,9 @@ fn a_kept_release_of_a_retained_level_is_compared_over_both_root_lists_and_both_
     let mut misspelled = kept_tree.clone();
     misspelled.roots = vec!["ControlFrame", "ControlFrme"];
     let bad = release_of(&misspelled, "a misspelled root", false);
-    let error = kept_release_differences(&repo.directory, &bad, &kept, majors, "kr-plugin-host/3")
-        .expect_err("refused");
+    let error =
+        kept_release_differences(&repo.directory, &bad, &kept, majors, &["kr-plugin-host/3"])
+            .expect_err("refused");
     assert!(error.contains("ControlFrme"), "{error}");
 
     // A root of the kept surface that the release's own schema does not define: removed.
@@ -1550,7 +1578,7 @@ fn a_kept_release_of_a_retained_level_is_compared_over_both_root_lists_and_both_
         &lacking,
         &kept_wide,
         majors,
-        "kr-plugin-host/3",
+        &["kr-plugin-host/3"],
     )
     .expect("compared");
     assert!(
@@ -1574,7 +1602,7 @@ fn a_kept_release_of_a_retained_level_is_compared_over_both_root_lists_and_both_
         &beside,
         &kept,
         other_majors,
-        "kr-plugin-host/3",
+        &["kr-plugin-host/3"],
     )
     .expect("compared");
     assert_eq!(found.len(), 2, "{found:?}");
@@ -1709,6 +1737,123 @@ fn the_plugin_host_protocol_is_read_from_the_code() {
         .expect("none"),
         None
     );
+}
+
+/// The plugin host protocols are read from the code as one name or as a list, and a source that
+/// states both, an empty list, a name twice or an entry that is no plain name is refused.
+#[test]
+fn the_plugin_host_protocol_list_is_read_from_the_code_and_refused_when_it_is_ambiguous() {
+    use crate::retained::plugin_host_from_source as read;
+    let one = "PLUGIN_HOST_PROTOCOL";
+    let many = Some("PLUGIN_HOST_PROTOCOLS");
+    let source = "// pub const PLUGIN_HOST_PROTOCOLS: &[&str] = &[\"kr-plugin-host/1\"];\n\
+                  pub const PLUGIN_HOST_PROTOCOLS: &[&str] = &[\n    \"kr-plugin-host/3\",\n    \"kr-plugin-host/4\",\n];\n";
+    assert_eq!(
+        read(source, one, many).expect("read"),
+        Some(vec![
+            "kr-plugin-host/3".to_owned(),
+            "kr-plugin-host/4".to_owned()
+        ])
+    );
+    assert_eq!(read("fn f() {}", one, many).expect("none"), None);
+    for (what, text) in [
+        (
+            "a name and a list",
+            "pub const PLUGIN_HOST_PROTOCOL: &str = \"kr-plugin-host/3\";\n\
+             pub const PLUGIN_HOST_PROTOCOLS: &[&str] = &[\"kr-plugin-host/3\"];",
+        ),
+        (
+            "an empty list",
+            "pub const PLUGIN_HOST_PROTOCOLS: &[&str] = &[];",
+        ),
+        (
+            "a name twice",
+            "pub const PLUGIN_HOST_PROTOCOLS: &[&str] = &[\"kr-plugin-host/3\", \"kr-plugin-host/3\"];",
+        ),
+        (
+            "a computed entry",
+            "pub const PLUGIN_HOST_PROTOCOLS: &[&str] = &[THREE];",
+        ),
+        (
+            "another keyword",
+            "static PLUGIN_HOST_PROTOCOLS: &[&str] = &[\"kr-plugin-host/3\"];",
+        ),
+        (
+            "an escape",
+            "pub const PLUGIN_HOST_PROTOCOLS: &[&str] = &[\"kr-plugin-host/\\u{33}\"];",
+        ),
+        (
+            "a list twice",
+            "pub const PLUGIN_HOST_PROTOCOLS: &[&str] = &[\"a\"];\n\
+             pub const PLUGIN_HOST_PROTOCOLS: &[&str] = &[\"b\"];",
+        ),
+    ] {
+        assert!(read(text, one, many).is_err(), "{what}");
+    }
+    let twice = read(
+        "pub const PLUGIN_HOST_PROTOCOLS: &[&str] = &[\"kr-plugin-host/3\", \"kr-plugin-host/3\"];",
+        one,
+        many,
+    )
+    .expect_err("a name twice");
+    assert!(
+        twice.contains("kr-plugin-host/3 is listed twice"),
+        "{twice}"
+    );
+    // Another constant that ends in the name is not it.
+    assert_eq!(
+        read(
+            "pub const OTHER_PLUGIN_HOST_PROTOCOLS: &[&str] = &[\"x\"];",
+            one,
+            many
+        )
+        .expect("none"),
+        None
+    );
+}
+
+/// A tag that states the protocol as a name and a tag that states it as a list read to one type, in
+/// one history, and a source that has no list form never reads one.
+#[test]
+fn both_forms_of_the_plugin_host_protocol_read_to_the_same_type() {
+    use crate::retained::plugin_host_in;
+    let repo = Repo::new("host-forms");
+    let named = repo.commit(&Tree::the_level(), "a release that states a name");
+    let listed = repo.commit(
+        &Tree {
+            host: "kr-plugin-host/3,kr-plugin-host/4",
+            ..Tree::the_level()
+        },
+        "a release that states a list",
+    );
+    let first: Vec<String> = plugin_host_in(&repo.directory, &named).expect("the name reads");
+    let second: Vec<String> = plugin_host_in(&repo.directory, &listed).expect("the list reads");
+    assert_eq!(first, vec!["kr-plugin-host/3".to_owned()]);
+    assert_eq!(
+        second,
+        vec!["kr-plugin-host/3".to_owned(), "kr-plugin-host/4".to_owned()]
+    );
+}
+
+/// The head may serve a plugin host protocol that no release of its level listed, since a name
+/// joins the list inside a level, and it may not lack one that a release listed.
+#[test]
+fn the_head_may_serve_a_plugin_host_protocol_more_than_its_level_listed_and_not_one_less() {
+    let now = Tree::the_level();
+    let both = Tree {
+        host: "kr-plugin-host/3,kr-plugin-host/4",
+        ..now.clone()
+    };
+    // The head serves a name more than every release of the level listed.
+    let level = whole_level("host-more", &both);
+    run(&level, &both).expect("the head serves what the level listed and a name more");
+    // Two releases of the level listed a second name, and the head does not serve it.
+    let level = released("host-less", &now, &both);
+    let error = run(&level, &now).expect_err("a name the head does not serve");
+    assert!(error.contains("kr-plugin-host/4"), "{error}");
+    assert!(error.contains(&level.first.0), "{error}");
+    assert!(error.contains(&level.second.0), "{error}");
+    assert!(!error.contains(&level.last.0), "{error}");
 }
 
 /// A root a revision declares that its own schema does not define is refused, and is not cut around:
@@ -1885,8 +2030,9 @@ fn literals_that_look_like_code_do_not_change_what_is_read() {
 /// and not at the next release, whose tag cannot change.
 #[test]
 fn this_trees_retained_source_reads_as_the_build_has_it() {
-    use crate::public_majors::{string_const, string_list};
-    use kr_protocol::retained::{PLUGIN_HOST_PROTOCOL, SURFACE_ROOTS};
+    use crate::public_majors::string_list;
+    use crate::retained::plugin_host_from_source;
+    use kr_protocol::retained::{PLUGIN_HOST_PROTOCOLS, SURFACE_ROOTS};
     let source = include_str!("../../retained.rs");
     assert_eq!(
         string_list(source, "SURFACE_ROOTS").expect("read"),
@@ -1898,10 +2044,18 @@ fn this_trees_retained_source_reads_as_the_build_has_it() {
         )
     );
     assert_eq!(
-        string_const(source, "PLUGIN_HOST_PROTOCOL")
-            .expect("read")
-            .as_deref(),
-        Some(PLUGIN_HOST_PROTOCOL)
+        plugin_host_from_source(
+            source,
+            "PLUGIN_HOST_PROTOCOL",
+            Some("PLUGIN_HOST_PROTOCOLS")
+        )
+        .expect("read"),
+        Some(
+            PLUGIN_HOST_PROTOCOLS
+                .iter()
+                .map(|name| (*name).to_owned())
+                .collect()
+        )
     );
 }
 

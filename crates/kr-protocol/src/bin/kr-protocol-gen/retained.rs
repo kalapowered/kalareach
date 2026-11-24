@@ -22,7 +22,9 @@
 use std::path::{Path, PathBuf};
 
 use kr_protocol::hello::PACKAGE_VERSION;
-use kr_protocol::retained::{RETAINED, RETAINED_WORKER_LEVELS, SURFACE_ROOTS, Surface};
+use kr_protocol::retained::{
+    RETAINED, RETAINED_WORKER_LEVELS, SURFACE_ROOTS, Surface, host_names_outside,
+};
 
 use crate::{in_level, predecessor, public_majors, releases};
 
@@ -131,7 +133,7 @@ pub fn kept_release_differences(
     release: &releases::Release,
     kept: &Surface,
     kept_majors: Option<&str>,
-    kept_host: &str,
+    kept_host: &[&str],
 ) -> Result<Vec<String>, String> {
     let schema_text = releases::git_in(
         repository,
@@ -166,9 +168,12 @@ pub fn kept_release_differences(
         ));
     }
     let host = plugin_host_in(repository, &release.commit)?;
-    if host != kept_host {
+    let listed: Vec<&str> = host.iter().map(String::as_str).collect();
+    for name in host_names_outside(&listed, kept_host) {
         found.push(format!(
-            "the plugin host protocol is {host} there and {kept_host} kept"
+            "the plugin host protocol {name} is listed by {} and is not in the kept record ({})",
+            release.tag,
+            kept_host.join(", ")
         ));
     }
     Ok(found)
@@ -227,7 +232,7 @@ pub fn retain(level: &str, commit: &str) -> Result<(), String> {
             &full[..12]
         ),
     )?;
-    write("PLUGIN_HOST", format!("{plugin_host}\n"))?;
+    write("PLUGIN_HOST", format!("{}\n", plugin_host.join("\n")))?;
     write("PUBLIC_MAJORS", public_majors)?;
     write("frames.json", "[]\n".to_owned())?;
     println!("wrote {}", target.display());
@@ -253,32 +258,75 @@ pub fn expected_public_majors_in(repository: &Path, commit: &str) -> Result<Stri
     }
 }
 
-/// The protocol name the plugin host speaks at `commit`, read from that commit's source and not
-/// from this build's: where the name is kept moved, and a level records what its own release spoke.
-fn plugin_host_at(commit: &str) -> Result<String, String> {
+/// The protocol names the plugin host speaks at `commit`, read from that commit's source and not
+/// from this build's: where the names are kept moved, and a level records what its own release
+/// spoke.
+fn plugin_host_at(commit: &str) -> Result<Vec<String>, String> {
     plugin_host_in(&repository(), commit)
 }
 
 /// As [`plugin_host_at`], in the repository at `repository`.
-pub fn plugin_host_in(repository: &Path, commit: &str) -> Result<String, String> {
-    for (path, name) in [
-        ("crates/kr-protocol/src/retained.rs", "PLUGIN_HOST_PROTOCOL"),
-        ("crates/kr-plugin-service/src/protocol.rs", "PROTOCOL"),
+pub fn plugin_host_in(repository: &Path, commit: &str) -> Result<Vec<String>, String> {
+    for (path, one, many) in [
+        (
+            "crates/kr-protocol/src/retained.rs",
+            "PLUGIN_HOST_PROTOCOL",
+            Some("PLUGIN_HOST_PROTOCOLS"),
+        ),
+        ("crates/kr-plugin-service/src/protocol.rs", "PROTOCOL", None),
     ] {
         let Some(source) = releases::file_at(repository, commit, path)
             .map_err(|error| format!("{path} at {commit} cannot be read: {error}"))?
         else {
             continue;
         };
-        if let Some(text) = public_majors::string_const(&source, name)
-            .map_err(|error| format!("{name} at {commit} ({path}): {error}"))?
+        if let Some(names) = plugin_host_from_source(&source, one, many)
+            .map_err(|error| format!("{one} at {commit} ({path}): {error}"))?
         {
-            return Ok(text);
+            return Ok(names);
         }
     }
     Err(format!(
         "the source at {commit} does not state the plugin host protocol"
     ))
+}
+
+/// The plugin host protocol names one source states: the one name `one` (`pub const NAME: &str`)
+/// of every release before the list, or the list `many` (`pub const NAME: &[&str]`) of every release
+/// after it; none where the source states neither.
+///
+/// # Errors
+///
+/// When the source states both, a list that is empty or names a protocol twice, or either in a form
+/// the reader does not read.
+pub fn plugin_host_from_source(
+    source: &str,
+    one: &str,
+    many: Option<&str>,
+) -> Result<Option<Vec<String>>, String> {
+    let name = public_majors::string_const(source, one)?;
+    let list = match many {
+        Some(many) => public_majors::name_list(source, many)?,
+        None => None,
+    };
+    match (name, list) {
+        (Some(_), Some(_)) => {
+            Err("the source states the plugin host protocol as a name and as a list".to_owned())
+        }
+        (Some(name), None) => Ok(Some(vec![name])),
+        (None, Some(names)) => {
+            if names.is_empty() {
+                return Err("the list of plugin host protocols is empty".to_owned());
+            }
+            for (at, name) in names.iter().enumerate() {
+                if names[..at].contains(name) {
+                    return Err(format!("the plugin host protocol {name} is listed twice"));
+                }
+            }
+            Ok(Some(names))
+        }
+        (None, None) => Ok(None),
+    }
 }
 
 /// The level, full commit and tag of the release before this one, as one line of text. It fails
@@ -353,7 +401,7 @@ pub fn release_commit(level: &str, commit: &str) -> Result<(), String> {
             release,
             retained.surface(),
             retained.public_majors,
-            retained.plugin_host.trim(),
+            &retained.plugin_host_names(),
         )?;
         if !found.is_empty() {
             let mut lines = vec![format!(

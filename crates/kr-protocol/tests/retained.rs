@@ -1193,3 +1193,41 @@ fn a_definition_named_like_the_roots_place_is_refused() {
         );
     }
 }
+
+/// A level records the plugin host protocol names its builds use, and the build serves every one of
+/// them: it may serve more than a level recorded, and it may not serve fewer.
+#[test]
+fn a_build_serves_every_plugin_host_protocol_a_level_recorded_and_may_serve_more() {
+    use kr_protocol::retained::{host_names, host_names_outside, host_problems};
+    let level = CompatibilityLevel::of(PackageVersion::new(0, 77, 0));
+    let three = "kr-plugin-host/3";
+    let four = "kr-plugin-host/4";
+    assert_eq!(
+        host_problems(level, &[three], &[three]),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        host_problems(level, &[three], &[three, four]),
+        Vec::<String>::new(),
+        "a build that serves one more is a superset of the level"
+    );
+    assert_eq!(
+        host_problems(level, &[three, four], &[three, four]),
+        Vec::<String>::new()
+    );
+    let found = host_problems(level, &[three, four], &[three]);
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!(found[0].contains(four), "{found:?}");
+    assert!(
+        !host_problems(level, &[], &[three]).is_empty(),
+        "a level that records no name is refused"
+    );
+
+    assert_eq!(host_names("kr-plugin-host/3\n"), vec![three]);
+    assert_eq!(
+        host_names("kr-plugin-host/3\n\n  kr-plugin-host/4  \n"),
+        vec![three, four]
+    );
+    assert_eq!(host_names_outside(&[three, four], &[three]), vec![four]);
+    assert!(host_names_outside(&[three], &[four, three]).is_empty());
+}

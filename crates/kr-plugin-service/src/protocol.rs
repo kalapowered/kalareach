@@ -53,7 +53,7 @@ pub struct HostProtocol {
 impl HostProtocol {
     /// The protocol this build's plugin host and client speak, and the names it is found under.
     pub const THIS: Self = Self {
-        name: kr_protocol::retained::PLUGIN_HOST_PROTOCOL,
+        name: "kr-plugin-host/3",
         endpoint: "p3.sock",
         descriptor: "plugin-host-3.json",
     };
@@ -969,7 +969,7 @@ mod tests {
         let binding_id = kr_protocol::scalars::Uuid::from_bytes([3; 16]);
         for body in [
             RequestBody::Hello {
-                protocol: kr_protocol::retained::PLUGIN_HOST_PROTOCOL.to_owned(),
+                protocol: HostProtocol::THIS.name.to_owned(),
             },
             RequestBody::Verify {
                 nonce: Nonce256::from_bytes([4; 32]),
@@ -1197,6 +1197,11 @@ mod tests {
     #[test]
     fn the_names_a_surviving_host_is_found_under_are_the_ones_this_protocol_publishes() {
         assert_eq!(HostProtocol::THIS.name, "kr-plugin-host/3");
+        assert_eq!(
+            kr_protocol::retained::PLUGIN_HOST_PROTOCOLS,
+            &[HostProtocol::THIS.name],
+            "the list the levels are held to names the protocols this build serves"
+        );
         assert_eq!(HostProtocol::THIS.endpoint, "p3.sock");
         assert_eq!(HostProtocol::THIS.descriptor, "plugin-host-3.json");
     }
