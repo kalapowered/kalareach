@@ -1463,14 +1463,18 @@ fn the_real_proxy_cases_run_in_a_job_that_fails_without_squid_and_without_the_ca
 /// scripts in that build that compile C look for `x86_64-w64-mingw32-gcc`, and the companion
 /// application's looks for `x86_64-w64-mingw32-windres`; no hosted runner image has them, so
 /// without them the suite's Windows build fails. Each job that runs the suite installs them before
-/// its test step, by one step that is not disabled and runs on every leg that runs the suite: in
-/// the landing workflow, the rust job and the macOS job's `tests-2` leg, which holds `kr-cli`; in
-/// the conformance workflow, the linux and macos jobs, whose plan runs the workspace's tests. The
-/// package-release workflow's release job needs none: its cut's check sets `KR_RELEASE_TREE`, so
-/// the suite reads the release's source and builds nothing for Windows.
+/// its test step, by one step that is not disabled and runs on every leg that runs the suite. Some
+/// jobs run it as part of the workspace's tests, which hold it without naming it, so those are
+/// listed: in the landing workflow, the rust job and the macOS job's `tests-2` leg, which holds
+/// `kr-cli`; in the conformance workflow, the linux and macos jobs, whose plan runs the workspace's
+/// tests. The others are found by what their steps run, in every workflow: a `cargo test` of the
+/// suite's target, or the contract script's `fast` mode, which runs the suite. The package-release
+/// workflow's release job needs none: its cut's check sets `KR_RELEASE_TREE`, so the suite reads
+/// the release's source and builds nothing for Windows.
 #[test]
 fn the_jobs_that_run_the_retained_surface_suite_install_the_windows_cross_compiler_first() {
-    for (file, name, tests, package, when) in [
+    // The jobs that run the workspace's tests: the command that starts them, which holds the suite.
+    let mut jobs: Vec<(String, String, Option<&str>, &str, Option<&str>)> = [
         (
             "core-ci.yml",
             "rust",
@@ -1499,11 +1503,65 @@ fn the_jobs_that_run_the_retained_surface_suite_install_the_windows_cross_compil
             "brew install mingw-w64",
             None,
         ),
-    ] {
-        let workflow = fs::read_to_string(repository().join(".github/workflows").join(file))
+    ]
+    .into_iter()
+    .map(|(file, name, tests, package, when)| {
+        (file.to_owned(), name.to_owned(), Some(tests), package, when)
+    })
+    .collect();
+
+    // The jobs that name the suite in what they run, in every workflow. The contract script's `fast`
+    // mode runs it, and the script is read so that a mode that stopped running it finds no job.
+    let script = fs::read_to_string(repository().join("scripts/contract-cases.sh"))
+        .expect("the script that runs the contract cases");
+    assert!(
+        contract_commands(&script)
+            .iter()
+            .any(|(mode, words)| mode == "fast" && runs_target(words, "kr-cli", "retained_surface")),
+        "the contract script's fast mode does not run the retained_surface suite"
+    );
+    let mut named = 0;
+    let mut files: Vec<String> = fs::read_dir(repository().join(".github/workflows"))
+        .expect("the workflows")
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|file| file.ends_with(".yml"))
+        .collect();
+    files.sort();
+    for file in files {
+        let workflow = fs::read_to_string(repository().join(".github/workflows").join(&file))
             .unwrap_or_else(|error| panic!("{file}: {error}"));
-        let text = job(&workflow, name);
-        let installs = steps_holding(&text, package);
+        for name in job_names(&workflow) {
+            let text = job(&workflow, &name);
+            if position_of_line(&text, names_the_retained_surface_suite).is_none()
+                || jobs.iter().any(|(f, n, ..)| *f == file && *n == name)
+            {
+                continue;
+            }
+            let runner = value_at(&header(&text), 4, "runs-on").expect("the job's runner");
+            let package = if runner.starts_with("ubuntu-") {
+                "gcc-mingw-w64-x86-64"
+            } else if runner.starts_with("macos-") {
+                "brew install mingw-w64"
+            } else {
+                panic!(
+                    "{file}: the {name} job runs the suite on {runner}, for which no cross compiler is known"
+                )
+            };
+            named += 1;
+            jobs.push((file.clone(), name, None, package, None));
+        }
+    }
+    assert!(named > 0, "no job names the suite in what it runs");
+
+    for (file, name, tests, package, when) in jobs {
+        let workflow = fs::read_to_string(repository().join(".github/workflows").join(&file))
+            .unwrap_or_else(|error| panic!("{file}: {error}"));
+        let text = job(&workflow, &name);
+        let installs: Vec<String> = steps_of(&text)
+            .into_iter()
+            .filter(|step| step.contains(package))
+            .collect();
         assert_eq!(
             installs.len(),
             1,
@@ -1522,7 +1580,11 @@ fn the_jobs_that_run_the_retained_surface_suite_install_the_windows_cross_compil
             .iter()
             .position(|step| *step == installs[0])
             .expect("the install step is a step of the job");
-        let tested = position_of_tool(&text, tests).expect("the step that runs the tests");
+        let tested = match tests {
+            Some(tests) => position_of_tool(&text, tests),
+            None => position_of_line(&text, names_the_retained_surface_suite),
+        }
+        .expect("the step that runs the tests");
         assert!(
             installed < tested,
             "{file}: the {name} job runs its tests before it installs the cross compiler"
@@ -1557,6 +1619,23 @@ fn the_jobs_that_run_the_retained_surface_suite_install_the_windows_cross_compil
         installing, holding,
         "the legs of the macOS job that install the cross compiler are not the legs whose packages hold `-p kr-cli`"
     );
+}
+
+/// Where in the job's steps the first step stands that has a line `runs` accepts.
+fn position_of_line(job: &str, runs: fn(&str) -> bool) -> Option<usize> {
+    steps_of(job).iter().position(|step| step.lines().any(runs))
+}
+
+/// Whether a line of a step runs the retained_surface suite by naming it: a `cargo test` of its test
+/// target, or the contract script's `fast` mode. A step that runs the workspace's tests does not
+/// name it.
+fn names_the_retained_surface_suite(line: &str) -> bool {
+    let words: Vec<&str> = line.split_whitespace().collect();
+    starts(line, "scripts/contract-cases.sh fast")
+        || (runs_cargo_test(line)
+            && words
+                .windows(2)
+                .any(|pair| pair == ["--test", "retained_surface"]))
 }
 
 /// The commands `scripts/contract-cases.sh` runs through `expect`, each as its words, by the
