@@ -1052,10 +1052,46 @@ def package_manager():
         return json.load(source)["packageManager"].split("@", 1)[1]
 
 
+IMPORT = re.compile(r"""(?:^|\n)[ \t]*(?:import|export)\s+(type\s+)?(?:[^;'"]*?\bfrom\s+)?['"]([^'"\n]+)['"]"""
+                    r"""|\bimport\(\s*['"]([^'"\n]+)['"]\s*\)""")
+SOURCE_FILE = re.compile(r"\.(ts|tsx|js|jsx|mjs)$")
+
+
+def package_of(specifier):
+    """The package a module specifier names: none for a relative path or a module of Node."""
+    if specifier.startswith((".", "/", "node:")):
+        return None
+    parts = specifier.split("/")
+    return "/".join(parts[:2]) if specifier.startswith("@") else parts[0]
+
+
+def check_imports(folder, name, label):
+    """The packages that the interface's own sources import, which the build ships (a type-only import is
+    erased and not counted). Each has to be among the `dependencies` of the interface's package.json, which
+    is what the notice lists. Returns the packages imported."""
+    with open(os.path.join(folder, "package.json"), encoding="utf-8") as source:
+        manifest = json.load(source)
+    if manifest["name"] != name:
+        fail(f"{label}/package.json is the package {manifest['name']}, and scripts/companion-notice.json names {name}")
+    held = set(manifest.get("dependencies", {}))
+    imported = set()
+    for directory, _, files in os.walk(os.path.join(folder, "src")):
+        for file_name in files:
+            if SOURCE_FILE.search(file_name):
+                for found in IMPORT.finditer(read_text(os.path.join(directory, file_name))):
+                    package = None if found.group(1) else package_of(found.group(2) or found.group(3))
+                    if package:
+                        imported.add(package)
+    for package in sorted(imported - held):
+        fail(f"{label}/src imports {package}, which is not among the dependencies of {label}/package.json, so the notice would not list it")
+    return imported
+
+
 def javascript_record(config):
     """What `pnpm licenses` lists for the production packages of the interface and of the workspace
     packages it is built from, as the record `gather` takes: one entry for each version, with the folder
     of its installed package."""
+    check_imports(os.path.join(ROOT, "apps", "companion"), config["javascript"], "apps/companion")
     wanted = package_manager()
     said = run(["pnpm", "--version"], cwd=ROOT).stdout.strip()
     if said != wanted:
@@ -1610,6 +1646,15 @@ for path in paths:
     text = render(fish_blocks)
     expect("fish's licence file for the rest of its code is carried whole",
            "Notice file: doc_src/license.rst of the fish package\n" in text and "Alpine.js" in text)
+
+    app = os.path.join(scratch, "app")
+    write(app, "package.json", json.dumps({"name": "@x/app", "dependencies": {"held": "1.0.0"}, "devDependencies": {"dev-only": "1.0.0"}}))
+    write(os.path.join(app, "src"), "main.ts", "import { a } from 'held'\nimport type { T } from 'dev-only'\nimport './local'\nexport { x } from 'held/sub'\n")
+    expect("a type-only import of a package that its dependencies do not hold is not refused",
+           made(lambda: check_imports(app, "@x/app", "app")) == {"held"})
+    write(os.path.join(app, "src"), "value.ts", "import {\n  v\n} from 'dev-only/sub'\n")
+    refuses("a package that the interface imports and its dependencies do not hold is refused",
+            lambda: check_imports(app, "@x/app", "app"), "app/src imports dev-only")
 
     accepted = ["MIT", "ISC", "Apache-2.0"]
     expect("a package under an OR is recorded under the first licence that about.toml lists",
