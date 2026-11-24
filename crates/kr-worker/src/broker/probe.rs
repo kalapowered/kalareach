@@ -232,6 +232,8 @@ pub fn run_within(
         cap,
         end: Arc::clone(&thread),
     };
+    #[cfg(feature = "testing")]
+    seams::thread_started(directory);
     let _ = std::thread::spawn(move || operate(&work, &sender));
     let waited = run.by.saturating_duration_since(Instant::now());
     #[cfg(feature = "testing")]
@@ -401,6 +403,25 @@ pub mod seams {
     static DELAYS: Mutex<Vec<(Point, PathBuf, Duration)>> = Mutex::new(Vec::new());
 
     static COLLECTION_HOLD: Mutex<Option<(PathBuf, Duration)>> = Mutex::new(None);
+
+    static STARTED: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+    /// How many threads the probe has started for `directory`.
+    pub fn threads_started(directory: &Path) -> usize {
+        STARTED
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .filter(|here| *here == directory)
+            .count()
+    }
+
+    pub(super) fn thread_started(directory: &Path) {
+        STARTED
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(directory.to_path_buf());
+    }
 
     /// Makes a probe that is to run in `directory` wait this long at `point`, or stops doing so.
     pub fn delay_at(point: Point, directory: &Path, delay: Option<Duration>) {

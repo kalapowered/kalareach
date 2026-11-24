@@ -624,6 +624,13 @@ fn kr_req_07_64_the_total_time_is_bounded_by_the_deadline_plus_the_cleanup_bound
     );
     let run = ProbeRun::within(Duration::from_millis(200));
     std::thread::sleep(Duration::from_millis(400));
+    // Any thread that started is held back before its create, so it cannot end before the check: only
+    // the count of started threads can show it.
+    probe::seams::delay_at(
+        probe::seams::Point::Create,
+        queued.path(),
+        Some(Duration::from_secs(3)),
+    );
     let probed = probe::run_within(
         &standin.program,
         &standin.probe(&[]),
@@ -633,11 +640,12 @@ fn kr_req_07_64_the_total_time_is_bounded_by_the_deadline_plus_the_cleanup_bound
         &run,
         probe::MAX_OUTPUT_BYTES,
     );
+    probe::seams::delay_at(probe::seams::Point::Create, queued.path(), None);
     assert!(probed.late, "{probed:?}");
-    std::thread::sleep(Duration::from_secs(if cfg!(windows) { 6 } else { 2 }));
-    assert!(
-        probed.thread.get().is_none(),
-        "a call whose deadline passed in the queue started a thread, and so a process"
+    assert_eq!(
+        probe::seams::threads_started(queued.path()),
+        0,
+        "a call whose deadline passed in the queue started a thread"
     );
 }
 
