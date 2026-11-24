@@ -146,14 +146,21 @@ fn consumed() -> Consumed {
     }
 }
 
-fn round_trip<T>(value: &T)
-where
-    T: Serialize + DeserializeOwned + PartialEq + core::fmt::Debug,
-{
-    let bytes = kr_cbor::to_canonical_vec(value).expect("the frame encodes");
-    let decoded: T = kr_cbor::from_canonical_slice(&bytes, &StreamKind::Control.cbor_limits())
-        .expect("the frame decodes");
-    assert_eq!(&decoded, value);
+/// Decodes `bytes` as the type of `like`.
+fn decoded_like<T: DeserializeOwned + Serialize>(bytes: &[u8], _like: &T) -> T {
+    kr_cbor::from_canonical_slice(bytes, &StreamKind::Control.cbor_limits())
+        .expect("the frame decodes")
+}
+
+/// Checks that a value reads back as it was written. A macro, so that the assertion is in the case
+/// that calls it.
+macro_rules! round_trip {
+    ($value:expr) => {{
+        let value = $value;
+        let bytes = kr_cbor::to_canonical_vec(value).expect("the frame encodes");
+        let decoded = decoded_like(&bytes, value);
+        assert_eq!(&decoded, value);
+    }};
 }
 
 fn descriptor(build: LocalBuild) -> HostDescriptor4 {
@@ -250,7 +257,7 @@ fn every_request_of_the_protocol_round_trips() {
         },
         RequestBody4::Privacy { private: true },
     ] {
-        round_trip(&Request4 {
+        round_trip!(&Request4 {
             request_id: 9,
             body: body.clone(),
         });
@@ -368,7 +375,7 @@ fn every_answer_and_every_notice_of_the_protocol_round_trips() {
             disabled: false,
         },
     ] {
-        round_trip(&Frame4::Response {
+        round_trip!(&Frame4::Response {
             reply_to: 9,
             body: body.clone(),
         });
@@ -427,7 +434,7 @@ fn every_answer_and_every_notice_of_the_protocol_round_trips() {
     ] {
         assert_eq!(notice.binding_id(), binding_id);
         assert_eq!(notice.registration(), 11);
-        round_trip(&Frame4::Notice(notice));
+        round_trip!(&Frame4::Notice(notice));
     }
 }
 
@@ -458,11 +465,11 @@ fn refused_with_a_member<T: Serialize + DeserializeOwned>(value: &T, what: &str)
     );
 }
 
-/// Checks that a record of the cursor, which a reader of any format may read, is closed itself.
-///
-/// The codec refuses any member its target drops, because the value it reads back differs from the
-/// one it was given, so only a read through serde shows the record's own `deny_unknown_fields`.
-fn closed_in_serde<T>(value: &T, what: &str)
+/// The record of `value` as a document, read back as the same type, and with a member added at
+/// `place` (a JSON pointer; empty for the record itself). The reading is by serde itself, which
+/// shows the record's own `deny_unknown_fields`: the codec refuses any member its target drops, so it
+/// shows nothing of the attribute.
+fn read_with_a_member<T>(value: &T, place: &str) -> Result<T, serde_json::Error>
 where
     T: Serialize + DeserializeOwned + PartialEq + core::fmt::Debug,
 {
@@ -470,13 +477,24 @@ where
     let read: T = serde_json::from_value(document.clone()).expect("the record reads back");
     assert_eq!(&read, value);
     document
+        .pointer_mut(place)
+        .expect("the place is in the record")
         .as_object_mut()
-        .expect("a record is an object")
+        .expect("the place is an object")
         .insert("added".to_owned(), serde_json::Value::Null);
-    assert!(
-        serde_json::from_value::<T>(document).is_err(),
-        "{what} reads a member it does not have in serde"
-    );
+    serde_json::from_value(document)
+}
+
+/// Checks that serde refuses a member the record or variant at `place` does not have. A macro, so
+/// that the assertion is in the case that calls it.
+macro_rules! closed_in_serde {
+    ($value:expr, $place:expr, $what:expr) => {
+        assert!(
+            read_with_a_member($value, $place).is_err(),
+            "{} reads a member it does not have in serde",
+            $what
+        )
+    };
 }
 
 /// F-closed: a record of the protocol is closed, and refuses a member it does not have.
@@ -484,8 +502,37 @@ where
 fn a_member_a_record_does_not_have_is_refused() {
     refused_with_a_member(&through(), "Through");
     refused_with_a_member(&consumed(), "Consumed");
-    closed_in_serde(&through(), "Through");
-    closed_in_serde(&consumed(), "Consumed");
+    closed_in_serde!(&through(), "", "Through");
+    closed_in_serde!(&consumed(), "", "Consumed");
+    // The struct variants of the four enums, read in the byte-free frames.
+    let gap = Notice4::Gap {
+        binding_id: binding_id(),
+        registration: 1,
+        events: 1,
+        bytes: 1,
+        documents: 0,
+        first: None,
+        last: None,
+    };
+    closed_in_serde!(&Frame4::Notice(gap), "/notice/gap", "Notice4");
+    let called = Frame4::Response {
+        reply_to: 1,
+        body: ResponseBody4::Called {
+            value: None,
+            fault: Some("declined".to_owned()),
+            document: None,
+            record: None,
+        },
+    };
+    closed_in_serde!(&called, "/response", "Frame4");
+    closed_in_serde!(&called, "/response/body/called", "ResponseBody4");
+    let unbind = Request4 {
+        request_id: 1,
+        body: RequestBody4::Unbind {
+            binding_id: binding_id(),
+        },
+    };
+    closed_in_serde!(&unbind, "/body/unbind", "RequestBody4");
     refused_with_a_member(
         &Checkpointed {
             state: b"s".to_vec(),

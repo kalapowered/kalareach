@@ -96,7 +96,7 @@ pub struct Through {
 
 /// The closed set of things a worker may ask for.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum RequestBody4 {
     /// Opens the connection and names the protocol.
     Hello {
@@ -224,7 +224,7 @@ impl RequestBody4 {
 
 /// What a plugin host sends back.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum Frame4 {
     /// An answer to a request.
     Response {
@@ -293,15 +293,16 @@ pub enum RecordState {
     /// The host's writer is open and the restore carried a `through`: the record now holds it, at
     /// the instance's own registration and generation, and is `clean`.
     Set,
-    /// The record is as it was. A restore with no `through` restores the state plainly. A host with
-    /// its writer closed answers `NotSet` to a restore that carries a `through` and leaves the
-    /// instance as it was.
+    /// The record was not set from a position. A restore with no `through` restores the state
+    /// plainly: what the instance consumed stays, and is no longer clean. A host with its writer
+    /// closed answers `NotSet` to a restore that carries a `through` and leaves the instance as it
+    /// was.
     NotSet,
 }
 
 /// The closed set of answers.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum ResponseBody4 {
     /// The connection is open.
     Hello {
@@ -375,7 +376,7 @@ pub enum ResponseBody4 {
 
 /// Something a binding produced without being asked.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum Notice4 {
     /// A component emitted document nodes.
     Document {
