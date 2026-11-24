@@ -1170,8 +1170,8 @@ mod tests {
         );
     }
 
-    /// KR-REQ-03.29, S-13: findings held against a login go stale when the login changes, through
-    /// the controller's own reading of the desktop, which here is scripted.
+    /// KR-REQ-03.29, KR-REQ-11.17, S-13: findings held against a login go stale when the login
+    /// changes, through the controller's own reading of the desktop, which here is scripted.
     #[test]
     fn held_findings_go_stale_when_the_login_changes() {
         struct Scripted(std::sync::atomic::AtomicU64);

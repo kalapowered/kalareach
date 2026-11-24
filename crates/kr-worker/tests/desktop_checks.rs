@@ -629,8 +629,9 @@ async fn a_real_finding(host: &Host) -> kr_protocol::desktop::CapabilityRecord {
 ///
 /// The record comes from the worker's own run over its checks connection. The generations are
 /// values of this test's own, given to the detector with the record: this checks the record's
-/// trigger list and the detector's filter, and not the controller withdrawing held evidence after
-/// a graphical login.
+/// trigger list and the detector's filter. The controller withdrawing held evidence after a
+/// graphical login is shown by `held_findings_go_stale_when_the_login_changes` in the controller's
+/// own checks.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_11_17_a_finding_ends_when_the_desktop_generation_it_was_taken_in_changes() {
     let host = host().await;
