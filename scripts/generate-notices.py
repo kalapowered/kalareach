@@ -417,11 +417,16 @@ def normal(text):
     return text.replace("\r\n", "\n").strip("\n") + "\n"
 
 
+# The one file of a package that is not UTF-8: rav1e's PATENTS has Windows-1252 quotation marks.
+ENCODINGS = {"rav1e-0.8.1/PATENTS": "cp1252"}
+
+
 def read_text(path):
     with open(path, "rb") as source:
         data = source.read()
+    encoding = ENCODINGS.get(os.path.join(os.path.basename(os.path.dirname(path)), os.path.basename(path)), "utf-8")
     try:
-        return normal(data.decode("utf-8"))
+        return normal(data.decode(encoding))
     except UnicodeDecodeError:
         fail(f"{path} is not UTF-8 text")
 
