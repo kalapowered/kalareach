@@ -978,6 +978,68 @@ mod tests {
         }
     }
 
+    /// A tool that makes what is at its output path with `making`, a shell line that may use
+    /// `"$last"` for the output path and `"$here"` for the tool's own folder, and exits with
+    /// success.
+    fn making_tool(folder: &Path, making: &str) {
+        program(
+            folder,
+            "maim",
+            &format!(
+                "#!/bin/sh\n\
+                 here=$(dirname \"$0\")\n\
+                 for last do :; done\n\
+                 {making}\n"
+            ),
+        );
+    }
+
+    /// KR-REQ-03.29, LX-13: the image is read as a regular file and nothing else. A link at the
+    /// image path is not followed and what it points at is not touched, and a pipe there is not
+    /// waited for.
+    #[test]
+    fn kr_req_03_29_what_is_at_the_image_path_is_read_only_if_it_is_a_regular_file() {
+        let tools = folder();
+        let elsewhere = tools.path().join("elsewhere.png");
+        std::fs::write(&elsewhere, png_of(1280, 800, 8, 6, 5969)).expect("an image elsewhere");
+        for (name, making) in [
+            ("link", "ln -s \"$here/elsewhere.png\" \"$last\""),
+            ("pipe", "mkfifo \"$last\""),
+        ] {
+            making_tool(tools.path(), making);
+            let scratch = folder();
+            let (path, tools_path) = (scratch.path().to_path_buf(), tools.path().to_path_buf());
+            let (sender, receiver) = std::sync::mpsc::channel();
+            // On a thread of its own, so that a read that waits for a writer fails this case
+            // instead of stopping it.
+            std::thread::spawn(move || {
+                let plan = Plan::in_directory(&path);
+                let ran = perform_with(&plan, &tools_path, &variables(":7"), &tools_path);
+                let _ = sender.send((matches!(ran.outcome, Outcome::Performed { .. }), said(&ran)));
+            });
+            let (performed, words) = receiver
+                .recv_timeout(Duration::from_secs(20))
+                .unwrap_or_else(|_| panic!("{name}: the read waited for the image"));
+            assert!(!performed, "{name}: {words}");
+            assert!(
+                words.contains("left no usable image: something that is not a regular file"),
+                "{name}: {words}"
+            );
+            assert!(
+                elsewhere.exists(),
+                "{name}: what the link points at was removed"
+            );
+            assert!(
+                scratch
+                    .path()
+                    .join("capture.png")
+                    .symlink_metadata()
+                    .is_err(),
+                "{name}: the link or pipe was left in the check's own directory"
+            );
+        }
+    }
+
     /// KR-REQ-03.29, LX-4: a refusal of the display's authority is told from a display that cannot
     /// be reached by two independent facts, the worker's own connection to the socket and the line
     /// the client library prints. The four fixtures are the error output the four tools gave on an
