@@ -1686,15 +1686,24 @@ fn a_second_commitment_that_repeats_a_device_is_refused(same_device: bool) {
     let outcome = rows.commit(&before, &next, &repeated);
     if same_device {
         // The store's uniqueness of the device identity refuses it, and reports a failure, not a
-        // refusal: the invitation is fenced for it.
+        // refusal.
         assert!(
-            outcome.is_err(),
-            "a commitment that repeats a device is refused"
+            matches!(
+                &outcome,
+                Err(PairingError::Store { reason })
+                    if reason.contains("UNIQUE constraint failed: network_devices.device_id")
+            ),
+            "a commitment that repeats a device identity is refused by the store's uniqueness: {outcome:?}"
         );
     } else {
         assert!(
-            matches!(outcome, Ok(TransitionOutcome::Refused(_))),
-            "a commitment that repeats a device is refused"
+            matches!(
+                &outcome,
+                Ok(TransitionOutcome::Refused(PairingError::Refused { code, reason }))
+                    if *code == ErrorCode::PermissionDenied
+                        && reason.contains("still lists this device")
+            ),
+            "a commitment from an endpoint on record is refused by the endpoint's claim: {outcome:?}"
         );
     }
     assert_eq!(
@@ -1717,7 +1726,7 @@ fn a_second_commitment_that_repeats_a_device_is_refused(same_device: bool) {
 
 /// KR-REQ-10.29: a device identity names one device. A commitment that repeats the identity of a
 /// device on record, from another endpoint, is refused and writes nothing. The store's uniqueness
-/// of the device identity refuses it, as a failure that fences the invitation, not as a refusal.
+/// of the device identity refuses it, and the store reports that as a failure, not as a refusal.
 #[test]
 fn a_commitment_whose_device_identity_is_on_record_is_refused() {
     a_second_commitment_that_repeats_a_device_is_refused(true);
