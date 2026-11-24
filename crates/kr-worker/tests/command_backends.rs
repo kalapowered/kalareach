@@ -1679,11 +1679,17 @@ const RAN: &str = "ran";
 #[cfg(windows)]
 const HELD_FOR: std::time::Duration = std::time::Duration::from_secs(1);
 
+/// How long the backend is held after it has read `going`, so that the commit comes after a time
+/// the case chose.
+#[cfg(windows)]
+const BACKEND_PAUSE: std::time::Duration = std::time::Duration::from_millis(500);
+
 /// The launcher fixture connects to the backend's launch record address, presents itself with an
 /// environment, is admitted, creates a program held and names it in `going`, and reads the backend's
-/// commit under its own clock, counted from before `going` was written. The program has not run
-/// when the commit is read, runs once the fixture starts it, and the launcher, which waits for it,
-/// ends when it does.
+/// commit under its own clock, counted from before `going` was written. The backend is held for a
+/// time the case chose after it reads `going`, and the clock counts that time. The program has not
+/// run when the commit is read, runs once the fixture starts it, and the launcher, which waits for
+/// it, ends when it does.
 #[cfg(windows)]
 #[tokio::test]
 async fn the_fixture_reads_a_commit_on_the_launchers_clock() {
@@ -1711,8 +1717,17 @@ async fn the_fixture_reads_a_commit_on_the_launchers_clock() {
     ]);
     let mark = setup.directory.join(RAN);
 
+    // The backend is held after it reads `going`, and let go after a time the case chose.
+    let (arrived, release) = setup.backends.pause_before_showing();
     let mut launcher = Launcher::start(&launch);
-    let played = launcher.played().await;
+    let pause = async {
+        arrived
+            .await
+            .expect("the launch reaches the backend and waits there");
+        tokio::time::sleep(BACKEND_PAUSE).await;
+        release.send(()).expect("the backend is let go");
+    };
+    let (played, ()) = tokio::join!(launcher.played(), pause);
     assert_eq!(played.admission, Admission::Admitted, "{played:?}");
     assert_eq!(
         played.answer,
@@ -1721,8 +1736,8 @@ async fn the_fixture_reads_a_commit_on_the_launchers_clock() {
         setup.backends.launch_failure_of(PromptGeneration::new(1))
     );
     assert!(
-        played.after >= std::time::Duration::from_millis(1),
-        "the count began before `going` was written, so the commit took time on it: {played:?}"
+        played.after >= BACKEND_PAUSE,
+        "the launcher's clock counted the time the backend was held: {played:?}"
     );
     assert!(
         played.in_time(),
