@@ -1088,7 +1088,8 @@ fn not_in_the_state_it_needs(check: Check, facility: Option<String>) -> Ran {
 /// changes and at no other time.
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct Fingerprint {
-    /// The facility's own identity, as [`facility_identity`] reads it.
+    /// The facility's own identity, as [`facility_identity`](super::capability::facility_identity)
+    /// reads it.
     pub facility: Option<String>,
     /// The host agent's own identity: the process of the worker the findings were taken in.
     pub host_agent: Option<String>,
