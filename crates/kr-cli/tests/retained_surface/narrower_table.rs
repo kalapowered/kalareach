@@ -172,7 +172,7 @@ pub const NARROWER: &[Narrower] = &[
                         Item {
                             krate: "companion_tauri",
                             name: "NAMED_COMMANDS",
-                            now: "5bdb9205ab3d1d7508b8debd33ed317606231681742fcef15eae45f581197c79",
+                            now: "16d6956228dc3d902dd13aca1542ce4ca39458c42d9253ff2551076d5a0c7771",
                             across: &[
                                 (
                                     "absent",
@@ -300,6 +300,10 @@ pub const NARROWER: &[Narrower] = &[
                                 ),
                                 (
                                     "5bdb9205ab3d1d7508b8debd33ed317606231681742fcef15eae45f581197c79",
+                                    "Names the host's commands and the method each sends; all six are among them. It builds no request, and each of those commands takes its target from its parameters.",
+                                ),
+                                (
+                                    "16d6956228dc3d902dd13aca1542ce4ca39458c42d9253ff2551076d5a0c7771",
                                     "Names the host's commands and the method each sends; all six are among them. It builds no request, and each of those commands takes its target from its parameters.",
                                 ),
                             ],
@@ -782,8 +786,8 @@ pub const NARROWER: &[Narrower] = &[
                 krate: "kr_cli",
                 name: "run",
                 kinds: &[SightKind::Target],
-                now: "767e87eb5a5b4031c689d94c040120863ab92c8268ac7f025169e8ca5d221dbe",
-                why: "Builds or carries the request of a `kr` command for sessions, grants, shares, pairing, transfers or a bridge; no text of `kr_cli` names one of the six, and none sets an application instance.",
+                now: "dac77ba41d7407f8f4f143f23743def2f9fcc68922118dbf10d2e96f9c72118a",
+                why: "Builds or carries the request of a `kr` command for sessions, grants, shares, pairing, transfers, a bridge or the desktop checks; no text of `kr_cli` names one of the six, and none sets an application instance.",
             },
             Account {
                 krate: "kr_cli",
@@ -1083,15 +1087,15 @@ pub const NARROWER: &[Narrower] = &[
                 krate: "companion_tauri",
                 name: "send",
                 kinds: &[SightKind::Target],
-                now: "877ce1017a4da2bec9af232541b83f416ec8c1372fe1198d2eb31c41f83573ea",
+                now: "8d39829b399d5aa3f9b8d102235b17c2f934bff7d580058c42b57ad3236b2907",
                 why: "Builds or tags the request of a command that is none of the six (sessions, questions, pairing, sharing, transfers, the terminal); its text names none of the six and sets no application instance.",
             },
             Account {
                 krate: "companion_tauri",
                 name: "settle",
                 kinds: &[SightKind::Target],
-                now: "9d5f4064e6bda81c849adf4268cd7ee478befce033b6c9249b40445eee0a1ff0",
-                why: "Builds or tags the request of a command that is none of the six (sessions, questions, pairing, sharing, transfers, the terminal); its text names none of the six and sets no application instance.",
+                now: "ce8471e116debb3b1eb8ad45fdebc9e6bf875a8c39a7da1bbf168ae04a0ffaa2",
+                why: "Builds or tags the request of a command that is none of the six (sessions, questions, pairing, sharing, transfers, the terminal), or closes a file dialog and builds no request; its text names none of the six and sets no application instance.",
             },
             Account {
                 krate: "companion_tauri",
@@ -1314,7 +1318,7 @@ pub const NARROWER: &[Narrower] = &[
                 krate: "companion_tauri",
                 name: "Deletions::finish",
                 kinds: &[SightKind::Target],
-                now: "d61e8f2628fcf078e4695d77b9a314f0f7f0c01b944e3e945a5722c2a2cfaad5",
+                now: "732e35bbce686b8294006b0bb6ea7c48b9977fa7b4236799a227d8daac6c7767",
                 why: "Builds or tags the request of a command that is none of the six (sessions, questions, pairing, sharing, transfers, the terminal); its text names none of the six and sets no application instance.",
             },
             Account {
@@ -1398,7 +1402,7 @@ pub const NARROWER: &[Narrower] = &[
                 krate: "companion_tauri",
                 name: "Desk::restart",
                 kinds: &[SightKind::Target],
-                now: "c2db2f21679a8d482eb78f662b09f5e284eebde49af6d716621520f5bcbd8c1d",
+                now: "6b1c9cd6d343d01c079ca833fbf6f4c76c0907d838c85d616c6af7269cf5187a",
                 why: "Builds or tags the request of a command that is none of the six (sessions, questions, pairing, sharing, transfers, the terminal); its text names none of the six and sets no application instance.",
             },
         ],
