@@ -1,0 +1,531 @@
+{
+  "texts": [
+    {
+      "id": "MIT-spdx-3.29.0-without-copyright-line",
+      "licence": "MIT",
+      "source": "https://raw.githubusercontent.com/spdx/license-list-data/31ba1a50e5397e00a304dbadc76531740e89ee48/text/MIT.txt",
+      "sha256": "9645fb6e878aebd5e959be648a71973a108d4aa0d18eee478d0579066ad99958",
+      "name": "the standard MIT text without a copyright line, for crates whose packages ship no complete MIT text",
+      "edit": {
+        "removed": "the copyright line and the blank line after it",
+        "from_sha256": "b05785f9f18e6716bab63424b11454513b9943a222595b70411009202fc592b5"
+      }
+    },
+    {
+      "id": "QR-Code-generator-720f62bddb72-Readme.markdown",
+      "licence": "MIT",
+      "source": "https://raw.githubusercontent.com/nayuki/QR-Code-generator/720f62bddb7226106071d4728c292cb1df519ceb/Readme.markdown",
+      "sha256": "0f8441b248157c13e43c8963ffe1af9eabb3287e24871303c8b16395b6cb7a01",
+      "lines": [
+        69,
+        91
+      ]
+    },
+    {
+      "id": "Rust-CUDA-aaa3f92fbad8-LICENSE-MIT",
+      "licence": "MIT",
+      "source": "https://raw.githubusercontent.com/Rust-GPU/Rust-CUDA/aaa3f92fbad80afc6c6021fb2b58b6d13c00fc43/LICENSE-MIT",
+      "sha256": "b47387386076db46382e2e37ca7d4fbbc85b77a5464a1666314a4a6eda6dd8a5"
+    },
+    {
+      "id": "fluent-langneg-rs-7fdc590466ea-LICENSE-MIT",
+      "licence": "MIT",
+      "source": "https://raw.githubusercontent.com/projectfluent/fluent-langneg-rs/7fdc590466ea63ca2367ac10fb1b881fe561f1a8/LICENSE-MIT",
+      "sha256": "016fcc02048817d628b04b140c54db290fd9d29a5e8a55b77871194e810716ac"
+    },
+    {
+      "id": "iroh-9139ea0efa1b-LICENSE-MIT",
+      "licence": "MIT",
+      "source": "https://raw.githubusercontent.com/kalapowered/iroh/9139ea0efa1bea32dc73a0b80868963cf026178d/LICENSE-MIT",
+      "sha256": "f169adb8124d3b005416d8485d00777c9a7bdd9099982c52a4493f9732e6d050"
+    },
+    {
+      "id": "iroh-address-lookups-a0cc9dbfc292-LICENSE-MIT",
+      "licence": "MIT",
+      "source": "https://raw.githubusercontent.com/n0-computer/iroh-address-lookups/a0cc9dbfc292ba338216a5df42bceba87c5fe541/LICENSE-MIT",
+      "sha256": "33616ec4c88b6e00de66e6c06f1a55d80bb32a9d7939f3aa83d28e673a1adcae"
+    },
+    {
+      "id": "iroh-metrics-a9afb7cd49bb-LICENSE-MIT",
+      "licence": "MIT",
+      "source": "https://raw.githubusercontent.com/n0-computer/iroh-metrics/a9afb7cd49bb3804fffefec61647993851f9b8c8/LICENSE-MIT",
+      "sha256": "339060c99d5c80c2742cae417f765980afe6b0149a78f959bbf2a79f19ab3af5"
+    },
+    {
+      "id": "libsodium-1.0.22-LICENSE",
+      "licence": "ISC",
+      "source": "https://raw.githubusercontent.com/jedisct1/libsodium/77e1ce5d6dee871c49ef211222ba18ef0c486bda/LICENSE",
+      "sha256": "508a76d186356c0dd807a670ef510964f8724557024796a2c426c6c0e19ab683"
+    },
+    {
+      "id": "llama-cpp-rs-63e549708237-LICENSE-MIT",
+      "licence": "MIT",
+      "source": "https://raw.githubusercontent.com/utilityai/llama-cpp-rs/63e549708237b16b39018288582655539e0a9d5b/LICENSE-MIT",
+      "sha256": "763912bd05f42956dbfa900bd1a2f8037c704f5c64d778c623ec5952454e24aa"
+    },
+    {
+      "id": "llama.cpp-e79e4bf660e1-LICENSE",
+      "licence": "MIT",
+      "source": "https://raw.githubusercontent.com/ggml-org/llama.cpp/e79e4bf660e19f2ad851e06c6913f7a8c5852621/LICENSE",
+      "sha256": "94f29bbed6a22c35b992c5c6ebf0e7c92f13b836b90f36f461c9cf2f0f1d010d"
+    },
+    {
+      "id": "n0-error-596f41139187-LICENSE-MIT",
+      "licence": "MIT",
+      "source": "https://raw.githubusercontent.com/n0-computer/n0-error/596f4113918712d545cbb25b7fa12c7153706f54/LICENSE-MIT",
+      "sha256": "339060c99d5c80c2742cae417f765980afe6b0149a78f959bbf2a79f19ab3af5"
+    },
+    {
+      "id": "net-tools-0030e57fc709-LICENSE-MIT",
+      "licence": "MIT",
+      "source": "https://raw.githubusercontent.com/n0-computer/net-tools/0030e57fc70981895bb86212ff0f059cc41c8a4e/LICENSE-MIT",
+      "sha256": "33616ec4c88b6e00de66e6c06f1a55d80bb32a9d7939f3aa83d28e673a1adcae"
+    },
+    {
+      "id": "objc2-8852b424193c-LICENSE.md",
+      "licence": "MIT",
+      "source": "https://raw.githubusercontent.com/madsmtm/objc2/8852b424193ca41602281b3d7540d7c8ed51e49a/LICENSE.md",
+      "sha256": "7f976f7e9cb2d87df7230606feb932c3f21ac0e664045a775b600046ff850c54",
+      "name": "the licensing statement of the objc2 repository, which holds no licence text"
+    },
+    {
+      "id": "pcre2-10.43-LICENCE",
+      "licence": "BSD-3-Clause",
+      "source": "https://raw.githubusercontent.com/PCRE2Project/pcre2/3864abdb713f78831dd12d898ab31bbb0fa630b6/LICENCE",
+      "sha256": "030087e2e8dd7c1bdd26057d25d4ded8f45bbf01ad458d68665ad04b8b0fbedf",
+      "name": "the PCRE2 licence, BSD-3-Clause with its exemption for binary library-like packages"
+    },
+    {
+      "id": "pluralrules-d0715d5b7cca-LICENSE-MIT",
+      "licence": "MIT",
+      "source": "https://raw.githubusercontent.com/zbraniecki/pluralrules/d0715d5b7cca72e228d6e6c4de154bd30dfdd06a/intl_pluralrules/LICENSE-MIT",
+      "sha256": "23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3"
+    },
+    {
+      "id": "profiling-8271551172eb-LICENSE-MIT",
+      "licence": "MIT",
+      "source": "https://raw.githubusercontent.com/aclysma/profiling/8271551172eb6fa4cba47369aedd93790c623df9/LICENSE-MIT",
+      "sha256": "c8167fdeeed46d3f244d3f85c5bf998ce889343691c32be2c61a8bc4b5c08333"
+    },
+    {
+      "id": "pulp-5eb07fd7b68e-LICENSE",
+      "licence": "MIT",
+      "source": "https://raw.githubusercontent.com/sarah-quinones/pulp/5eb07fd7b68edf0a5e19f71737d315f72a510295/LICENSE",
+      "sha256": "d64f878c89bd5f1e5ada7e4aad57690b122727cf5229b7b87ea1980c188da1d9"
+    },
+    {
+      "id": "simd_helpers-82040194cd05-LICENSE",
+      "licence": "MIT",
+      "source": "https://raw.githubusercontent.com/lu-zero/simd_helpers/82040194cd05affb060bf94d6f19f82a771d07fb/LICENSE",
+      "sha256": "d69f24ad84ec2ade64c0b68bdb31b41170e997b158370342056918329cc9af1e"
+    },
+    {
+      "id": "typed-path-c0ea3281bccb-LICENSE-MIT",
+      "licence": "MIT",
+      "source": "https://raw.githubusercontent.com/chipsenkbeil/typed-path/c0ea3281bccbdd2b97891dcededd4995f0f81400/LICENSE-MIT",
+      "sha256": "23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3"
+    },
+    {
+      "id": "wasmtime-6d94ceb1b955-LICENSE",
+      "licence": "Apache-2.0",
+      "source": "https://raw.githubusercontent.com/bytecodealliance/wasmtime/6d94ceb1b955f52bafbe0892836b2a91a0bb6649/LICENSE",
+      "sha256": "268872b9816f90fd8e85db5a28d33f8150ebb8dd016653fb39ef1f94f2686bc5"
+    },
+    {
+      "id": "wezterm-f3227b5b1678-LICENSE.md",
+      "licence": "MIT",
+      "source": "https://raw.githubusercontent.com/kalapowered/wezterm/f3227b5b167844e03ca588ad7093b3975602d287/LICENSE.md",
+      "sha256": "37db33bbbd7348969eda397b89a16f252d56c1ca7481b6ccaf56ccdcbab5dcca"
+    },
+    {
+      "id": "zune-image-69502ce83fdf-LICENSE.md",
+      "licence": "MIT",
+      "source": "https://raw.githubusercontent.com/etemesi254/zune-image/69502ce83fdfecdd0beefd677e2abb3781b29d98/LICENSE.md",
+      "sha256": "e870d7fd7819a9f0453c62798cb52ae95d148a8c91dc2de1d983f997143c72de",
+      "name": "the licence header of the zune-image repository"
+    }
+  ],
+  "crates": [
+    {
+      "name": "acto",
+      "version": "0.8.2",
+      "texts": [
+        "MIT-spdx-3.29.0-without-copyright-line"
+      ]
+    },
+    {
+      "name": "block2",
+      "version": "0.6.2",
+      "texts": [
+        "objc2-8852b424193c-LICENSE.md",
+        "MIT-spdx-3.29.0-without-copyright-line"
+      ]
+    },
+    {
+      "name": "cranelift-assembler-x64",
+      "version": "0.135.9",
+      "texts": [
+        "wasmtime-6d94ceb1b955-LICENSE"
+      ]
+    },
+    {
+      "name": "cranelift-assembler-x64-meta",
+      "version": "0.135.9",
+      "texts": [
+        "wasmtime-6d94ceb1b955-LICENSE"
+      ]
+    },
+    {
+      "name": "cranelift-bitset",
+      "version": "0.135.9",
+      "texts": [
+        "wasmtime-6d94ceb1b955-LICENSE"
+      ]
+    },
+    {
+      "name": "cranelift-isle",
+      "version": "0.135.9",
+      "texts": [
+        "wasmtime-6d94ceb1b955-LICENSE"
+      ]
+    },
+    {
+      "name": "cranelift-srcgen",
+      "version": "0.135.9",
+      "texts": [
+        "wasmtime-6d94ceb1b955-LICENSE"
+      ]
+    },
+    {
+      "name": "dispatch2",
+      "version": "0.3.1",
+      "texts": [
+        "objc2-8852b424193c-LICENSE.md",
+        "MIT-spdx-3.29.0-without-copyright-line"
+      ]
+    },
+    {
+      "name": "enum-assoc",
+      "version": "1.4.1",
+      "texts": [
+        "MIT-spdx-3.29.0-without-copyright-line"
+      ]
+    },
+    {
+      "name": "find_cuda_helper",
+      "version": "0.2.0",
+      "texts": [
+        "Rust-CUDA-aaa3f92fbad8-LICENSE-MIT"
+      ]
+    },
+    {
+      "name": "fluent-langneg",
+      "version": "0.13.1",
+      "texts": [
+        "fluent-langneg-rs-7fdc590466ea-LICENSE-MIT"
+      ]
+    },
+    {
+      "name": "intl_pluralrules",
+      "version": "7.0.2",
+      "texts": [
+        "pluralrules-d0715d5b7cca-LICENSE-MIT"
+      ]
+    },
+    {
+      "name": "iroh",
+      "version": "1.4.1",
+      "repository": "https://github.com/kalapowered/iroh",
+      "texts": [
+        "iroh-9139ea0efa1b-LICENSE-MIT"
+      ]
+    },
+    {
+      "name": "iroh-base",
+      "version": "1.4.1",
+      "repository": "https://github.com/kalapowered/iroh",
+      "texts": [
+        "iroh-9139ea0efa1b-LICENSE-MIT"
+      ]
+    },
+    {
+      "name": "iroh-dns",
+      "version": "1.4.1",
+      "repository": "https://github.com/kalapowered/iroh",
+      "texts": [
+        "iroh-9139ea0efa1b-LICENSE-MIT"
+      ]
+    },
+    {
+      "name": "iroh-mainline-address-lookup",
+      "version": "0.5.0",
+      "texts": [
+        "iroh-address-lookups-a0cc9dbfc292-LICENSE-MIT"
+      ]
+    },
+    {
+      "name": "iroh-mdns-address-lookup",
+      "version": "0.5.0",
+      "texts": [
+        "iroh-address-lookups-a0cc9dbfc292-LICENSE-MIT"
+      ]
+    },
+    {
+      "name": "iroh-metrics-derive",
+      "version": "1.0.1",
+      "texts": [
+        "iroh-metrics-a9afb7cd49bb-LICENSE-MIT"
+      ]
+    },
+    {
+      "name": "iroh-relay",
+      "version": "1.4.1",
+      "repository": "https://github.com/kalapowered/iroh",
+      "texts": [
+        "iroh-9139ea0efa1b-LICENSE-MIT"
+      ]
+    },
+    {
+      "name": "llama-cpp-2",
+      "version": "0.1.156",
+      "texts": [
+        "llama-cpp-rs-63e549708237-LICENSE-MIT"
+      ]
+    },
+    {
+      "name": "memfd",
+      "version": "0.6.6",
+      "texts": [
+        "MIT-spdx-3.29.0-without-copyright-line"
+      ]
+    },
+    {
+      "name": "n0-error-macros",
+      "version": "1.0.1",
+      "texts": [
+        "n0-error-596f41139187-LICENSE-MIT"
+      ]
+    },
+    {
+      "name": "netwatch",
+      "version": "0.19.3",
+      "texts": [
+        "net-tools-0030e57fc709-LICENSE-MIT"
+      ]
+    },
+    {
+      "name": "objc2",
+      "version": "0.6.4",
+      "texts": [
+        "objc2-8852b424193c-LICENSE.md",
+        "MIT-spdx-3.29.0-without-copyright-line"
+      ]
+    },
+    {
+      "name": "objc2-core-foundation",
+      "version": "0.3.2",
+      "texts": [
+        "objc2-8852b424193c-LICENSE.md",
+        "MIT-spdx-3.29.0-without-copyright-line"
+      ]
+    },
+    {
+      "name": "objc2-encode",
+      "version": "4.1.0",
+      "texts": [
+        "objc2-8852b424193c-LICENSE.md",
+        "MIT-spdx-3.29.0-without-copyright-line"
+      ]
+    },
+    {
+      "name": "objc2-security",
+      "version": "0.3.2",
+      "texts": [
+        "objc2-8852b424193c-LICENSE.md",
+        "MIT-spdx-3.29.0-without-copyright-line"
+      ]
+    },
+    {
+      "name": "objc2-system-configuration",
+      "version": "0.3.2",
+      "texts": [
+        "objc2-8852b424193c-LICENSE.md",
+        "MIT-spdx-3.29.0-without-copyright-line"
+      ]
+    },
+    {
+      "name": "portmapper",
+      "version": "0.19.3",
+      "texts": [
+        "net-tools-0030e57fc709-LICENSE-MIT"
+      ]
+    },
+    {
+      "name": "profiling",
+      "version": "1.0.18",
+      "texts": [
+        "profiling-8271551172eb-LICENSE-MIT"
+      ]
+    },
+    {
+      "name": "profiling-procmacros",
+      "version": "1.0.18",
+      "texts": [
+        "profiling-8271551172eb-LICENSE-MIT"
+      ]
+    },
+    {
+      "name": "pulley-interpreter",
+      "version": "48.0.9",
+      "texts": [
+        "wasmtime-6d94ceb1b955-LICENSE"
+      ]
+    },
+    {
+      "name": "pulley-macros",
+      "version": "48.0.9",
+      "texts": [
+        "wasmtime-6d94ceb1b955-LICENSE"
+      ]
+    },
+    {
+      "name": "pulp-wasm-simd-flag",
+      "version": "0.1.1",
+      "texts": [
+        "pulp-5eb07fd7b68e-LICENSE"
+      ]
+    },
+    {
+      "name": "qrcodegen",
+      "version": "1.8.0",
+      "texts": [
+        "QR-Code-generator-720f62bddb72-Readme.markdown"
+      ]
+    },
+    {
+      "name": "simd_helpers",
+      "version": "0.1.0",
+      "texts": [
+        "simd_helpers-82040194cd05-LICENSE"
+      ]
+    },
+    {
+      "name": "typed-path",
+      "version": "0.9.3",
+      "texts": [
+        "typed-path-c0ea3281bccb-LICENSE-MIT"
+      ]
+    },
+    {
+      "name": "wasmtime-internal-component-macro",
+      "version": "48.0.9",
+      "texts": [
+        "wasmtime-6d94ceb1b955-LICENSE"
+      ]
+    },
+    {
+      "name": "wasmtime-internal-component-util",
+      "version": "48.0.9",
+      "texts": [
+        "wasmtime-6d94ceb1b955-LICENSE"
+      ]
+    },
+    {
+      "name": "wasmtime-internal-core",
+      "version": "48.0.9",
+      "texts": [
+        "wasmtime-6d94ceb1b955-LICENSE"
+      ]
+    },
+    {
+      "name": "wasmtime-internal-jit-icache-coherence",
+      "version": "48.0.9",
+      "texts": [
+        "wasmtime-6d94ceb1b955-LICENSE"
+      ]
+    },
+    {
+      "name": "wasmtime-internal-versioned-export-macros",
+      "version": "48.0.9",
+      "texts": [
+        "wasmtime-6d94ceb1b955-LICENSE"
+      ]
+    },
+    {
+      "name": "wasmtime-internal-wit-bindgen",
+      "version": "48.0.9",
+      "texts": [
+        "wasmtime-6d94ceb1b955-LICENSE"
+      ]
+    },
+    {
+      "name": "wezterm-cell",
+      "version": "0.1.0",
+      "repository": "https://github.com/kalapowered/wezterm",
+      "texts": [
+        "wezterm-f3227b5b1678-LICENSE.md"
+      ]
+    },
+    {
+      "name": "wezterm-char-props",
+      "version": "0.1.3",
+      "repository": "https://github.com/kalapowered/wezterm",
+      "texts": [
+        "wezterm-f3227b5b1678-LICENSE.md"
+      ]
+    },
+    {
+      "name": "wezterm-escape-parser",
+      "version": "0.1.0",
+      "repository": "https://github.com/kalapowered/wezterm",
+      "texts": [
+        "wezterm-f3227b5b1678-LICENSE.md"
+      ]
+    },
+    {
+      "name": "wezterm-surface",
+      "version": "0.1.0",
+      "repository": "https://github.com/kalapowered/wezterm",
+      "texts": [
+        "wezterm-f3227b5b1678-LICENSE.md"
+      ]
+    },
+    {
+      "name": "zune-inflate",
+      "version": "0.2.54",
+      "texts": [
+        "zune-image-69502ce83fdf-LICENSE.md",
+        "MIT-spdx-3.29.0-without-copyright-line"
+      ]
+    }
+  ],
+  "works": [
+    {
+      "name": "libsodium",
+      "version": "1.0.22",
+      "carried_by": {
+        "name": "libsodium-sys-stable",
+        "version": "1.24.0"
+      },
+      "text": "libsodium-1.0.22-LICENSE"
+    },
+    {
+      "name": "llama.cpp",
+      "version": "e79e4bf660e1",
+      "carried_by": {
+        "name": "llama-cpp-sys-2",
+        "version": "0.1.156"
+      },
+      "text": "llama.cpp-e79e4bf660e1-LICENSE"
+    },
+    {
+      "name": "PCRE2",
+      "version": "10.43",
+      "carried_by": {
+        "name": "pcre2-sys",
+        "version": "0.2.9"
+      },
+      "text": "pcre2-10.43-LICENCE"
+    }
+  ]
+}
