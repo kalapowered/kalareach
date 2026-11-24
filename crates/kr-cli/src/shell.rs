@@ -904,9 +904,10 @@ mod tests {
         not understood: it was too long, or it was not two full paths in the form that this host \
         asked for, so nothing was written for PowerShell";
     #[cfg(unix)]
-    const PROFILES_UNANSWERED: &str = "PowerShell did not say where its profiles are: it did not \
-        answer in time, could not start or ended with an error, so nothing was written for \
-        PowerShell";
+    const PROFILES_FAILED: &str = "PowerShell did not say where its profiles are: it ended with \
+        exit code 1, so nothing was written for PowerShell; if PowerShell was updated since its \
+        package was published, run Publish-KalaReachQualification in PowerShell to qualify the \
+        one this account runs";
 
     /// An install where PowerShell is found and ends without an answer, or with one that is not two
     /// paths, says so in one line and writes nothing for PowerShell: no startup file and no record.
@@ -920,7 +921,7 @@ mod tests {
                 system_program("true"),
                 PROFILES_NOT_UNDERSTOOD,
             ),
-            ("code 1", system_program("false"), PROFILES_UNANSWERED),
+            ("code 1", system_program("false"), PROFILES_FAILED),
         ] {
             for dry_run in [true, false] {
                 let home = tempfile::tempdir().expect("a directory");
@@ -1100,6 +1101,10 @@ mod tests {
             Refusal::PlacementOutsideTheProfile,
             Refusal::CheckNotUnderstood,
             Refusal::ProfilesUnanswered,
+            Refusal::ProfilesNotStarted {
+                program: std::path::PathBuf::from("/opt/pwsh/pwsh"),
+            },
+            Refusal::ProfilesFailed { code: 126 },
             Refusal::ProfilesNotUnderstood,
         ];
         let counted = |refusal: &Refusal| match refusal {
@@ -1125,9 +1130,11 @@ mod tests {
             | Refusal::PlacementOutsideTheProfile
             | Refusal::CheckNotUnderstood
             | Refusal::ProfilesUnanswered
+            | Refusal::ProfilesNotStarted { .. }
+            | Refusal::ProfilesFailed { .. }
             | Refusal::ProfilesNotUnderstood => 1,
         };
-        assert_eq!(classes.iter().map(counted).sum::<usize>(), 23);
+        assert_eq!(classes.iter().map(counted).sum::<usize>(), 25);
         for refusal in classes {
             let said = startup_failure(Some(file), &refusal.clone().into()).to_string();
             assert!(

@@ -173,8 +173,10 @@ impl HomeLayout {
     ///
     /// # Errors
     ///
-    /// Returns [`Refusal::ProfilesUnanswered`] when the shell did not answer in time, could not
-    /// start or ended with an error, and [`Refusal::ProfilesNotUnderstood`] when its answer was too
+    /// Returns [`Refusal::ProfilesNotStarted`] when the shell could not be started and
+    /// [`Refusal::ProfilesFailed`] when it ended with an error, each with the command that
+    /// publishes its package again, [`Refusal::ProfilesUnanswered`] when it did not answer in time
+    /// or a signal ended it, and [`Refusal::ProfilesNotUnderstood`] when its answer was too
     /// long or was not two full paths in the form that this host asked for: nothing, a different
     /// number of lines, a line that does not decode to text and a path that is not full are that.
     /// Both are refusals of this host ([`Refusal::of`]). Where this host could not prepare the
@@ -532,7 +534,7 @@ fn ask_with<T>(
     }
     let Ok(mut child) = command.spawn() else {
         let _ = std::fs::remove_dir_all(&directory);
-        return Ending::NotStarted;
+        return Ending::NotStarted(program.executable.clone());
     };
     let deadline = std::time::Instant::now() + allowed;
     let waited = loop {
@@ -561,8 +563,7 @@ fn ask_with<T>(
         }
         // A successful one is read up to a bound.
         Ok(Some(status)) if status.success() => read_answer(&said, understand),
-        Ok(Some(status)) if status.code().is_some() => Ending::Failed,
-        Ok(Some(_)) => Ending::Signalled,
+        Ok(Some(status)) => status.code().map_or(Ending::Signalled, Ending::Failed),
     };
     let _ = std::fs::remove_dir_all(&directory);
     ending
@@ -5314,23 +5315,42 @@ mod tests {
             assert_eq!(refused.to_string(), not_understood, "{what}");
         }
         // Another end: a code other than 0, a program that cannot start, a signal.
-        for (what, shell) in [
+        let advice = "if PowerShell was updated since its package was published, run \
+                      Publish-KalaReachQualification in PowerShell to qualify the one this \
+                      account runs";
+        let missing = root.path().join("no-such-program");
+        for (what, shell, refusal, said) in [
             (
                 "ends with code 1",
                 PowerShell::plain(system_program("false")),
+                Refusal::ProfilesFailed { code: 1 },
+                format!(
+                    "PowerShell did not say where its profiles are: it ended with exit code 1, so \
+                     nothing was written for PowerShell; {advice}"
+                ),
             ),
             (
                 "cannot start",
-                PowerShell::plain(root.path().join("no-such-program")),
+                PowerShell::plain(missing.clone()),
+                Refusal::ProfilesNotStarted {
+                    program: missing.clone(),
+                },
+                format!(
+                    "PowerShell did not say where its profiles are: its program {} could not be \
+                     started, so nothing was written for PowerShell; {advice}",
+                    missing.display()
+                ),
             ),
             (
                 "ends by a signal",
                 program_that(root.path(), "pwsh-killed", "kill -9 $$"),
+                Refusal::ProfilesUnanswered,
+                asked_in_vain.to_owned(),
             ),
         ] {
             let refused = what_the_profile_question_refuses(shell);
-            assert_eq!(refused, Refusal::ProfilesUnanswered, "{what}");
-            assert_eq!(refused.to_string(), asked_in_vain, "{what}");
+            assert_eq!(refused, refusal, "{what}");
+            assert_eq!(refused.to_string(), said, "{what}");
         }
         // No PowerShell at all is no refusal: there is nothing to ask and nothing to write.
         assert!(
@@ -5339,6 +5359,40 @@ mod tests {
                 .expect("no refusal where there is no PowerShell")
                 .is_empty()
         );
+    }
+
+    /// A PowerShell package whose host was removed by an update of PowerShell is refused with what
+    /// happened and the command that publishes the package again: a package that names a host
+    /// that is gone cannot be started, and one whose start-up program runs a host that is gone
+    /// ends with an error.
+    #[cfg(unix)]
+    #[test]
+    fn a_package_whose_host_is_gone_is_refused_with_its_cause_and_the_command_that_publishes_it_again()
+     {
+        use crate::host::package::PUBLISH_COMMAND;
+
+        let root = tempfile::tempdir().expect("a directory");
+        let gone = root.path().join("host-that-is-gone");
+        let wrapper = program_that(
+            root.path(),
+            "pwsh-wrapper",
+            &format!("exec '{}' \"$@\"", gone.display()),
+        );
+        let not_started = what_the_profile_question_refuses(PowerShell::plain(gone.clone()));
+        let said = not_started.to_string();
+        assert!(
+            said.contains(&gone.display().to_string()),
+            "the program that could not be started is named: {said}"
+        );
+        assert!(said.contains(PUBLISH_COMMAND), "{said}");
+        let ended = what_the_profile_question_refuses(wrapper);
+        let said = ended.to_string();
+        assert!(said.contains("exit code"), "the end is named: {said}");
+        assert!(said.contains(PUBLISH_COMMAND), "{said}");
+        // A signal is not an update: it names no command.
+        let signalled = program_that(root.path(), "pwsh-signalled", "kill -9 $$");
+        let said = what_the_profile_question_refuses(signalled).to_string();
+        assert!(!said.contains(PUBLISH_COMMAND), "{said}");
     }
 
     /// A shell that answered, where this host then could not read its own answer file, did not
@@ -5569,8 +5623,8 @@ mod tests {
                 "not_text" => Ending::NotText,
                 "wrong_form" => Ending::WrongForm,
                 "timed_out" => Ending::TimedOut,
-                "not_started" => Ending::NotStarted,
-                "failed" => Ending::Failed,
+                "not_started" => Ending::NotStarted(root.path().join("not-there")),
+                "failed" => Ending::Failed(1),
                 "signalled" => Ending::Signalled,
                 "unread" => Ending::Unread(HostFault::new(
                     PathBuf::from("said"),

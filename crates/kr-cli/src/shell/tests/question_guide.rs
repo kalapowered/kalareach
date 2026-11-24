@@ -158,6 +158,9 @@ fn kind(row: &Row) -> &'static str {
     } else if row
         .text
         .contains("did not answer in time, could not start or ended with an error")
+        || row
+            .text
+            .starts_with("PowerShell did not say where its profiles are: ")
     {
         "unanswered"
     } else if row.text.starts_with("(nothing is said") {
@@ -332,13 +335,17 @@ fn claims() -> Vec<Claim> {
             ],
             holds: |facts| {
                 facts.of(&["profiles"], &UNANSWERED).all(|row| {
-                    row.text.contains("did not say where its profiles are")
-                        && says_so(
+                    row.text
+                        .starts_with("PowerShell did not say where its profiles are: ")
+                        && row.text.contains(", so nothing was written for PowerShell")
+                }) && facts
+                    .of(&["profiles"], &["timed_out", "signalled"])
+                    .all(|row| {
+                        says_so(
                             row,
                             "it did not answer in time, could not start or ended with an error",
                         )
-                        && row.text.ends_with("so nothing was written for PowerShell")
-                })
+                    })
             },
             doctors: &[
                 |facts| {
@@ -377,6 +384,53 @@ fn claims() -> Vec<Claim> {
                     row.text = row
                         .text
                         .replace(", so nothing was written for PowerShell", "");
+                },
+            ],
+        },
+        Claim {
+            name: "where PowerShell's program could not be started, or ended with a code other than 0, the first of these names the program or the code, and the command that qualifies the one this account runs",
+            texts: &[
+                "Where PowerShell's program could not be started, the first of these names the program, and where it ended with a code other than 0 it names the code; each adds that, if PowerShell was updated since its package was published, running `Publish-KalaReachQualification` in PowerShell qualifies the one this account runs.",
+            ],
+            holds: |facts| {
+                let advice = "if PowerShell was updated since its package was published, run \
+                              Publish-KalaReachQualification in PowerShell to qualify the one \
+                              this account runs";
+                facts.row("profiles", "not_started").text
+                    == format!(
+                        "PowerShell did not say where its profiles are: its program \
+                         /tmp/walk/not-there could not be started, so nothing was written for \
+                         PowerShell; {advice}"
+                    )
+                    && facts.row("profiles", "failed").text
+                        == format!(
+                            "PowerShell did not say where its profiles are: it ended with exit \
+                             code 1, so nothing was written for PowerShell; {advice}"
+                        )
+                    && facts
+                        .of(&["profiles"], &["timed_out", "signalled"])
+                        .all(|row| !row.text.contains("Publish-KalaReachQualification"))
+            },
+            doctors: &[
+                |facts| {
+                    let row = facts.row_mut("profiles", "not_started");
+                    row.text = row
+                        .text
+                        .replace("Publish-KalaReachQualification", "Publish");
+                },
+                |facts| {
+                    let row = facts.row_mut("profiles", "not_started");
+                    row.text = row.text.replace("/tmp/walk/not-there", "it");
+                },
+                |facts| {
+                    let row = facts.row_mut("profiles", "failed");
+                    row.text = row.text.replace("exit code 1", "an error");
+                },
+                |facts| {
+                    facts
+                        .row_mut("profiles", "signalled")
+                        .text
+                        .push_str("; run Publish-KalaReachQualification");
                 },
             ],
         },
@@ -677,10 +731,10 @@ fn the_kept_texts_stand_in_the_order_of_the_passage() {
             .replacen("@@first@@", second, 1)
     };
     // A claim's sentence moved after the sentence that follows it.
-    let (same, last) = (claims[1].texts[0], claims[7].texts[0]);
+    let (same, last) = (claims[1].texts[0], claims[8].texts[0]);
     let third = claims[2].texts[0];
     assert!(in_order(&swap(same, third)).is_err());
-    assert!(in_order(&swap(last, claims[8].texts[0])).is_err());
+    assert!(in_order(&swap(last, claims[9].texts[0])).is_err());
     // A text that claims nothing moved away from the sentence that it follows.
     let kept = NO_CLAIM[1].text;
     assert!(in_order(&swap(kept, third)).is_err());

@@ -73,8 +73,8 @@ fn way_name(way: &Ending<()>) -> &'static str {
         Ending::NotText => "not_text",
         Ending::WrongForm => "wrong_form",
         Ending::TimedOut => "timed_out",
-        Ending::NotStarted => "not_started",
-        Ending::Failed => "failed",
+        Ending::NotStarted(_) => "not_started",
+        Ending::Failed(_) => "failed",
         Ending::Signalled => "signalled",
         Ending::WaitFailed(_) => "wait_failed",
         Ending::NotPrepared(_) => "not_prepared",
@@ -95,9 +95,11 @@ fn way_after(way: &Ending<()>) -> Option<Ending<()>> {
         Ending::TooLong => Ending::NotText,
         Ending::NotText => Ending::WrongForm,
         Ending::WrongForm => Ending::TimedOut,
-        Ending::TimedOut => Ending::NotStarted,
-        Ending::NotStarted => Ending::Failed,
-        Ending::Failed => Ending::Signalled,
+        // The program that the walk does not find, and the code that its stand-in ends with: the
+        // walk's own, as `as_the_table_says` spells them.
+        Ending::TimedOut => Ending::NotStarted(PathBuf::from("/tmp/walk/not-there")),
+        Ending::NotStarted(_) => Ending::Failed(1),
+        Ending::Failed(_) => Ending::Signalled,
         Ending::Signalled => Ending::WaitFailed(a_failure_of_this_host("/tmp/walk/pwsh", 10)),
         Ending::WaitFailed(_) => {
             Ending::NotPrepared(a_failure_of_this_host("/tmp/kr-shell-ask-ID", 20))

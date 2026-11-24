@@ -95,8 +95,22 @@ pub enum Refusal {
     /// PowerShell's check of the profile with the entry in it was not understood.
     CheckNotUnderstood,
     /// PowerShell, which was found, did not say where its profiles are: it did not answer in time,
-    /// could not start or ended with an error.
+    /// or an outside signal ended it.
     ProfilesUnanswered,
+    /// PowerShell, which was found, did not say where its profiles are, because its program could
+    /// not be started. After an update of PowerShell that removed the program a package names,
+    /// this is what the install says.
+    ProfilesNotStarted {
+        /// The program that could not be started, as the package names it.
+        program: std::path::PathBuf,
+    },
+    /// PowerShell, which was found, did not say where its profiles are, because it ended with a
+    /// code other than 0. A package whose start-up program runs a host that an update removed ends
+    /// this way.
+    ProfilesFailed {
+        /// The code it ended with.
+        code: i32,
+    },
     /// PowerShell, which was found, ended with code 0 and an answer that is too long, or that is
     /// not two full paths in the form this host asked for: nothing, a different number of lines, a
     /// line that does not decode to text, or a path that is not full.
@@ -191,9 +205,21 @@ impl Refusal {
             | Self::PlacementOutsideTheProfile
             | Self::CheckNotUnderstood
             | Self::ProfilesUnanswered
+            | Self::ProfilesNotStarted { .. }
+            | Self::ProfilesFailed { .. }
             | Self::ProfilesNotUnderstood => return None,
         })
     }
+}
+
+/// What a PowerShell that cannot be started, or ends with an error, may owe to an update of it: the
+/// package it is run from names the host it was published for.
+fn republish_advice() -> String {
+    format!(
+        "if PowerShell was updated since its package was published, run {} in PowerShell to \
+         qualify the one this account runs",
+        crate::host::package::PUBLISH_COMMAND
+    )
 }
 
 impl fmt::Display for Refusal {
@@ -246,6 +272,19 @@ impl fmt::Display for Refusal {
             Self::ProfilesUnanswered => formatter.write_str(
                 "PowerShell did not say where its profiles are: it did not answer in time, could \
                  not start or ended with an error, so nothing was written for PowerShell",
+            ),
+            Self::ProfilesNotStarted { program } => write!(
+                formatter,
+                "PowerShell did not say where its profiles are: its program {} could not be \
+                 started, so nothing was written for PowerShell; {REPUBLISH}",
+                program.display(),
+                REPUBLISH = republish_advice()
+            ),
+            Self::ProfilesFailed { code } => write!(
+                formatter,
+                "PowerShell did not say where its profiles are: it ended with exit code {code}, \
+                 so nothing was written for PowerShell; {REPUBLISH}",
+                REPUBLISH = republish_advice()
             ),
             Self::ProfilesNotUnderstood => formatter.write_str(
                 "PowerShell's answer about where its profiles are was not understood: it was too \
@@ -324,6 +363,13 @@ mod tests {
             (Refusal::PlacementOutsideTheProfile, None),
             (Refusal::CheckNotUnderstood, None),
             (Refusal::ProfilesUnanswered, None),
+            (
+                Refusal::ProfilesNotStarted {
+                    program: std::path::PathBuf::from("/opt/pwsh/pwsh"),
+                },
+                None,
+            ),
+            (Refusal::ProfilesFailed { code: 126 }, None),
             (Refusal::ProfilesNotUnderstood, None),
         ]
     }

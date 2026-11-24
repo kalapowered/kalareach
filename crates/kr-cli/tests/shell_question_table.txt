@@ -25,8 +25,8 @@ question=profiles way=too_long -> PowerShell's answer about where its profiles a
 question=profiles way=not_text -> PowerShell's answer about where its profiles are was not understood: it was too long, or it was not two full paths in the form that this host asked for, so nothing was written for PowerShell
 question=profiles way=wrong_form -> PowerShell's answer about where its profiles are was not understood: it was too long, or it was not two full paths in the form that this host asked for, so nothing was written for PowerShell
 question=profiles way=timed_out -> PowerShell did not say where its profiles are: it did not answer in time, could not start or ended with an error, so nothing was written for PowerShell
-question=profiles way=not_started -> PowerShell did not say where its profiles are: it did not answer in time, could not start or ended with an error, so nothing was written for PowerShell
-question=profiles way=failed -> PowerShell did not say where its profiles are: it did not answer in time, could not start or ended with an error, so nothing was written for PowerShell
+question=profiles way=not_started -> PowerShell did not say where its profiles are: its program /tmp/walk/not-there could not be started, so nothing was written for PowerShell; if PowerShell was updated since its package was published, run Publish-KalaReachQualification in PowerShell to qualify the one this account runs
+question=profiles way=failed -> PowerShell did not say where its profiles are: it ended with exit code 1, so nothing was written for PowerShell; if PowerShell was updated since its package was published, run Publish-KalaReachQualification in PowerShell to qualify the one this account runs
 question=profiles way=signalled -> PowerShell did not say where its profiles are: it did not answer in time, could not start or ended with an error, so nothing was written for PowerShell
 question=profiles way=wait_failed -> /tmp/walk/pwsh: uncategorized error (os error 10)
 question=profiles way=not_prepared -> /tmp/kr-shell-ask-ID: not a directory (os error 20)

@@ -81,10 +81,10 @@ pub enum Ending<T> {
     WrongForm,
     /// The program did not end in time: this host ended it, reaped it and read no answer.
     TimedOut,
-    /// The program could not be started.
-    NotStarted,
-    /// The program ended with a code other than 0.
-    Failed,
+    /// The program could not be started: this is the program.
+    NotStarted(PathBuf),
+    /// The program ended with a code other than 0: this is the code.
+    Failed(i32),
     /// The program was ended by a signal.
     Signalled,
     /// This host could not prepare the call: its folder, the file for the answer, a file for an
@@ -121,15 +121,19 @@ pub fn conclude<T>(question: Question, ending: Ending<T>) -> std::io::Result<T> 
         (Check, Ending::TooLong | Ending::NotText | Ending::WrongForm) => {
             Err(Refusal::CheckNotUnderstood.into())
         }
-        (Profiles, Ending::TimedOut | Ending::NotStarted | Ending::Failed | Ending::Signalled) => {
-            Err(Refusal::ProfilesUnanswered.into())
+        (Profiles, Ending::NotStarted(program)) => {
+            Err(Refusal::ProfilesNotStarted { program }.into())
         }
-        (Placement, Ending::TimedOut | Ending::NotStarted | Ending::Failed | Ending::Signalled) => {
-            Err(Refusal::PlacementUnanswered.into())
-        }
-        (Check, Ending::TimedOut | Ending::NotStarted | Ending::Failed | Ending::Signalled) => {
-            Err(Refusal::CheckUnanswered.into())
-        }
+        (Profiles, Ending::Failed(code)) => Err(Refusal::ProfilesFailed { code }.into()),
+        (Profiles, Ending::TimedOut | Ending::Signalled) => Err(Refusal::ProfilesUnanswered.into()),
+        (
+            Placement,
+            Ending::TimedOut | Ending::NotStarted(_) | Ending::Failed(_) | Ending::Signalled,
+        ) => Err(Refusal::PlacementUnanswered.into()),
+        (
+            Check,
+            Ending::TimedOut | Ending::NotStarted(_) | Ending::Failed(_) | Ending::Signalled,
+        ) => Err(Refusal::CheckUnanswered.into()),
         (
             Profiles | Placement | Check,
             Ending::NotPrepared(fault) | Ending::WaitFailed(fault) | Ending::Unread(fault),
