@@ -173,10 +173,16 @@ pub enum BindingEvent {
     /// Documents were dropped because the caller was too far behind, and a fresh snapshot follows.
     ///
     /// A gap is one of the presentations that go, and what it said of the loss is kept here, so the
-    /// loss is still bounded when the caller learns of it.
+    /// loss is still bounded and counted when the caller learns of it.
     PresentationDropped {
-        /// How many documents went, the gaps among them included.
+        /// How many presentations went, the gaps among them included.
         documents: u32,
+        /// How many of them were gaps.
+        gaps: u32,
+        /// How many events those gaps lost.
+        events: u32,
+        /// How many bytes those events held.
+        bytes: u64,
         /// The earliest event lost, among the events the gaps that went named.
         first: Option<Bound>,
         /// The latest event lost, among them.
@@ -1101,6 +1107,9 @@ impl BindingHandle {
             faults,
             events,
             dropped_documents: 0,
+            dropped_gaps: 0,
+            dropped_events: 0,
+            dropped_bytes: 0,
             dropped_first: None,
             dropped_last: None,
             documents: 0,
@@ -1597,6 +1606,10 @@ struct BindingWorker {
     faults: FaultCounter,
     events: tokio::sync::mpsc::Sender<BindingEvent>,
     dropped_documents: u32,
+    /// What the gaps among the dropped presentations counted: how many, and their events and bytes.
+    dropped_gaps: u32,
+    dropped_events: u32,
+    dropped_bytes: u64,
     /// The first and the last event lost, as the gaps among the dropped presentations named them.
     dropped_first: Option<Bound>,
     dropped_last: Option<Bound>,
@@ -2247,11 +2260,17 @@ impl BindingWorker {
         }
         let dropped = BindingEvent::PresentationDropped {
             documents: self.dropped_documents,
+            gaps: self.dropped_gaps,
+            events: self.dropped_events,
+            bytes: self.dropped_bytes,
             first: self.dropped_first.clone(),
             last: self.dropped_last.clone(),
         };
         if self.events.try_send(dropped).is_ok() {
             self.dropped_documents = 0;
+            self.dropped_gaps = 0;
+            self.dropped_events = 0;
+            self.dropped_bytes = 0;
             self.dropped_first = None;
             self.dropped_last = None;
         }
@@ -2264,6 +2283,9 @@ impl BindingWorker {
     fn drop_presentation(&mut self, event: &BindingEvent) {
         self.dropped_documents = self.dropped_documents.saturating_add(1);
         if let BindingEvent::Gap(gap) = event {
+            self.dropped_gaps = self.dropped_gaps.saturating_add(1);
+            self.dropped_events = self.dropped_events.saturating_add(gap.events);
+            self.dropped_bytes = self.dropped_bytes.saturating_add(gap.bytes);
             gap.widen(&mut self.dropped_first, &mut self.dropped_last);
         }
         if let Ok(mut queue) = self.queue.lock() {
