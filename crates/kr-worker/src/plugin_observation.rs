@@ -89,6 +89,14 @@ const HAND_OFF_BARRIER: Duration = Duration::from_secs(1);
 /// What an event costs beyond its bytes on the wire: its envelope, handle and identifier.
 const EVENT_ENVELOPE_BYTES: u64 = 1024;
 
+/// Returns true when an event of `bytes` bytes, for the request `request_id` where it is one, is
+/// too large for the plugin runtime to take in one event.
+#[must_use]
+pub(crate) fn exceeds_one_event(bytes: usize, request_id: Option<&str>) -> bool {
+    bytes as u64 + EVENT_ENVELOPE_BYTES + request_id.map_or(0, |id| id.len() as u64)
+        > MAX_OFFERED_EVENT_BYTES
+}
+
 /// The runtime's name for a binding.
 pub fn service_id(binding_id: BrokerBindingId) -> BindingId {
     BindingId::new(binding_id.get())
@@ -381,6 +389,7 @@ async fn rebuild(
         boundary = read.boundary;
         recovery.baseline = true;
         recovery.unavailable = read.unavailable;
+        recovery.oversized = read.oversized;
         recovery.over_cap = read.over_cap;
         let audience = Audience::Native {
             instance: read.instance,
@@ -395,17 +404,6 @@ async fn rebuild(
             }
             // Answered, or left behind by the source, while an earlier request was handed over.
             if !broker.still_pending(given.resource_id, given.generation) {
-                continue;
-            }
-            let carried = given.event.bytes.len() as u64
-                + EVENT_ENVELOPE_BYTES
-                + given
-                    .event
-                    .request_id
-                    .as_ref()
-                    .map_or(0, |id| id.len() as u64);
-            if carried > MAX_OFFERED_EVENT_BYTES {
-                recovery.oversized += 1;
                 continue;
             }
             // The connection's words are withheld before the hand-over, not after the answer, and
@@ -482,10 +480,7 @@ async fn deliver_frame(
     let Some(handle) = frame.handle.clone().or_else(fresh_handle) else {
         return;
     };
-    let carried = frame.bytes.len() as u64
-        + EVENT_ENVELOPE_BYTES
-        + frame.request_id.as_ref().map_or(0, |id| id.len() as u64);
-    if carried > MAX_OFFERED_EVENT_BYTES {
+    if exceeds_one_event(frame.bytes.len(), frame.request_id.as_deref()) {
         lost(
             broker,
             lane,

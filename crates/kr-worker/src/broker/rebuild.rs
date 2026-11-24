@@ -20,6 +20,8 @@ use kr_protocol::ids::{
     ApplicationInstanceId, BrokerBindingId, PendingResourceId, SourceEventHandle, SourceGeneration,
 };
 
+use crate::plugin_observation::exceeds_one_event;
+
 use super::encode::source_event_of;
 use super::observation::{Audience, Tally};
 use super::{Broker, MAX_RETAINED_FRAME_BYTES, MAX_RETAINED_FRAMES, PackageIdentity};
@@ -55,6 +57,9 @@ pub struct Rebuild {
     /// Requests the worker could not read: no retained frame, a decoder entry from another
     /// generation or that the store could not read.
     pub unavailable: u64,
+    /// Requests too large for the plugin runtime to take in one event: they take no place against
+    /// the bound on what is given at once.
+    pub oversized: u64,
     /// Requests left out for the bound on what is given at once.
     pub over_cap: u64,
 }
@@ -125,6 +130,7 @@ impl Broker {
             boundary,
             offers: fill.offers,
             unavailable: fill.unavailable,
+            oversized: fill.oversized,
             over_cap: fill.over_cap,
         })
     }
@@ -157,13 +163,15 @@ struct Fill {
     offers: Vec<Offer>,
     bytes: usize,
     unavailable: u64,
+    oversized: u64,
     over_cap: u64,
 }
 
 impl Fill {
     /// Takes what reading one request came to. A request counts against the bounds only when it
-    /// could be given: another package's request is not this component's at all, and one whose
-    /// bytes could not be read is counted as that, however many have been given before it.
+    /// could be given: another package's request is not this component's at all, one whose bytes
+    /// could not be read is counted as that, and one too large for one event is counted as that,
+    /// however many have been given before it.
     fn add(
         &mut self,
         resource_id: PendingResourceId,
@@ -179,6 +187,10 @@ impl Fill {
             }
             Read::Given(event, approval) => (event, approval),
         };
+        if exceeds_one_event(event.bytes.len(), event.request_id.as_deref()) {
+            self.oversized += 1;
+            return;
+        }
         if self.offers.len() >= MAX_RETAINED_FRAMES
             || self.bytes.saturating_add(event.bytes.len()) > MAX_RETAINED_FRAME_BYTES
         {
@@ -675,17 +687,46 @@ mod tests {
             "{words}"
         );
 
-        // The bound on bytes: two requests of two MiB fit, a third does not.
+        // A request too large for one event takes no place: four of them, a request that could be
+        // given after them, and the sixty-four places and the 4 MiB are still free.
         let mut fill = Fill::default();
-        for byte in 0..3 {
+        let too_large = usize::try_from(kr_plugin_service::client::MAX_OFFERED_EVENT_BYTES)
+            .expect("the bound is a size");
+        for byte in 0..4 {
             fill.add(
                 id(byte),
                 generation,
                 false,
-                Read::Given(event(2 * 1024 * 1024), false),
+                Read::Given(event(too_large), false),
             );
         }
-        assert_eq!((fill.offers.len(), fill.over_cap), (2, 1));
+        for byte in 10..74 {
+            fill.add(id(byte), generation, false, Read::Given(event(10), true));
+        }
+        assert_eq!(
+            fill.oversized, 4,
+            "a request too large for one event is counted as that"
+        );
+        assert_eq!(
+            (fill.offers.len(), fill.over_cap),
+            (64, 0),
+            "a request that cannot be given in one event took a place or bytes from those that can"
+        );
+
+        // The bound on bytes: four requests of a million bytes fit, a fifth does not.
+        let mut fill = Fill::default();
+        for byte in 0..5 {
+            fill.add(
+                id(byte),
+                generation,
+                false,
+                Read::Given(event(1_000_000), false),
+            );
+        }
+        assert_eq!(
+            (fill.oversized, fill.offers.len(), fill.over_cap),
+            (0, 4, 1)
+        );
     }
 
     #[test]
