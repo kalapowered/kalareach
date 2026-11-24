@@ -1390,8 +1390,9 @@ mod tests {
     /// notice of it and the host's reading of the declaration as a part of its own, apart from the
     /// publisher's words that come before it, so the page can caption each by who wrote it. The
     /// publisher's words are a bridge's, and the integration's own where the host writes them; a
-    /// host that writes none (an older one) sends the reading alone. A grant that holds a native
-    /// bridge too carries both notices, and a grant with only the integration claims no bridge.
+    /// host that writes none (an older one) sends no words of the integration's own before the
+    /// reading. A grant that holds a native bridge too carries both notices, and a grant with only
+    /// the integration claims no bridge.
     #[test]
     fn an_installation_with_a_command_integration_shows_the_hosts_notice_for_it_alone() {
         use kr_protocol::confirmation::{
