@@ -74,7 +74,7 @@ use crate::broker::component::ComponentNote;
 #[cfg(feature = "testing")]
 use crate::broker::observation::Pause;
 use crate::broker::observation::{
-    Audience, Entry, LaneLoss, NativeFrame, ObservationLane, PIECE_BYTES, Source, Tally,
+    Audience, Entry, LaneLoss, NativeFrame, ObservationLane, PIECE_BYTES, Source, Tally, View,
 };
 use crate::broker::rebuild::Recovery;
 
@@ -121,9 +121,6 @@ pub async fn pump(broker: Weak<Broker>) {
         snapshots(&strong, &lane).await;
         match taken.entry {
             Some(entry) => {
-                for binding in strong.retaining(entry.audience()) {
-                    lane.count_passed(binding, &entry);
-                }
                 offer(&strong, &lane, &entry).await;
                 lane.finish(&entry);
             }
@@ -268,28 +265,16 @@ async fn written(client: &PluginClient) -> bool {
 /// Whether a binding may be offered it is read again before each hand-over, and so is the
 /// connection to the runtime: a call that waited for an answer may have been made while a grant was
 /// withdrawn or the runtime was lost.
+///
+/// A binding whose component is not offered the entry because the plugin runtime is away, or
+/// because it is owed its baseline, is counted as passed over at that decision, from what is read
+/// then: a wait for an earlier binding's hand-over may have lasted past a loss.
 async fn offer(broker: &Broker, lane: &ObservationLane, entry: &Entry) {
-    for binding in broker.observing(entry.audience()) {
-        // The connection is taken before the view is read: a view read first may be one of a
-        // registration the connection has since replaced, and the entry would go to the component
-        // of the next one, which was made ready from a later entry.
-        let Some(client) = broker.component_calls().client() else {
-            return;
-        };
-        let Some(view) = lane
-            .view(binding)
-            .filter(|view| view.ready && entry.seq() >= view.ready_from)
-        else {
+    for binding in broker.retaining(entry.audience()) {
+        let Some((client, view)) = offerable(broker, lane, binding, entry) else {
+            lane.count_passed(binding, entry);
             continue;
         };
-        if !broker.observing(entry.audience()).contains(&binding) {
-            continue;
-        }
-        // Owed its baseline: what it is given is what the broker holds, and this entry is counted
-        // as passed over.
-        if view.rebuild_owed {
-            continue;
-        }
         // A request recorded before the baseline was read was given with it or left out of it.
         if let Source::Native(frame) = &entry.source
             && frame
@@ -338,7 +323,33 @@ async fn offer(broker: &Broker, lane: &ObservationLane, entry: &Entry) {
                 offer_terminal(broker, lane, &client, binding, bytes, entry);
             }
         }
+        #[cfg(feature = "testing")]
+        lane.paused_at(Pause::OfferedTo(binding)).await;
     }
+}
+
+/// Returns the connection to the runtime and the view a binding is offered `entry` through, read
+/// now, or nothing where it is not offered it: the runtime is away, the component is not registered
+/// and ready, the entry is older than its view, or it is owed its baseline (what it is given then is
+/// what the broker holds).
+///
+/// The connection is taken before the view is read: a view read first may be one of a registration
+/// the connection has since replaced, and the entry would go to the component of the next one,
+/// which was made ready from a later entry.
+fn offerable(
+    broker: &Broker,
+    lane: &ObservationLane,
+    binding: BrokerBindingId,
+    entry: &Entry,
+) -> Option<(Arc<PluginClient>, View)> {
+    let client = broker.component_calls().client()?;
+    let view = lane
+        .view(binding)
+        .filter(|view| view.ready && entry.seq() >= view.ready_from && !view.rebuild_owed)?;
+    broker
+        .observing(entry.audience())
+        .contains(&binding)
+        .then_some((client, view))
 }
 
 /// Gives a binding's component, which started again, the requests the broker holds for it, and puts

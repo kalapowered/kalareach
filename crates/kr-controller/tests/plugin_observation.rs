@@ -1123,6 +1123,60 @@ async fn kr_req_24_24_a_request_answered_after_the_baseline_was_read_is_not_give
     assert_eq!(account.observes, 1, "{account:?}");
 }
 
+/// KR-REQ-24.24: a frame that a binding was not offered because the plugin runtime was lost while an
+/// earlier binding was handed it is counted as passed over for that binding.
+///
+/// Two bindings observe. The pump is stopped once it has handed a notification to the first, the
+/// runtime is lost, and the pump goes on: the second binding's component is away, and the frame is
+/// counted for it and for no other. Both components are then registered again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_24_24_a_frame_not_offered_because_the_runtime_was_lost_during_an_earlier_hand_over_is_counted()
+ {
+    let Some(world) = Observing::start(Options::with(vec![
+        Spec::semantic_only(1),
+        Spec::semantic_only(2),
+    ]))
+    .await
+    else {
+        return;
+    };
+    world.until_ready(1).await;
+    world.until_ready(2).await;
+    let lane = world.broker().observation();
+    let frame = notification("counted");
+    let each = frame.to_string().len() as u64;
+    let pause = lane.pause_at(Pause::OfferedTo(binding(1)));
+    world.send(&frame);
+    until("the pump to stop after the first hand-over", || async {
+        pause.parked().then_some(())
+    })
+    .await;
+
+    lose_the_runtime(&world).await;
+    pause.release();
+    until("the pump to have finished with the frame", || async {
+        (lane.waiting() == 0 && lane.in_flight() == 0).then_some(())
+    })
+    .await;
+    world.let_the_compiles_go();
+    until_started_again(&world, 1).await;
+    until_started_again(&world, 2).await;
+
+    let second = world.reason(2);
+    assert!(
+        second.contains(&format!(
+            "while the plugin runtime was away the worker passed over 1 upstream frame ({each} \
+             bytes), which the component was never given"
+        )),
+        "the frame the second binding was not offered is not counted: {second}"
+    );
+    let first = world.reason(1);
+    assert!(
+        !first.contains("passed over"),
+        "the first binding was handed the frame: {first}"
+    );
+}
+
 /// Starts a world whose binding 1 reads requests into approvals and whose binding 2 observes, and
 /// sends three requests that binding 1 reads and binding 2 has observed.
 ///
