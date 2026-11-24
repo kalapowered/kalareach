@@ -1962,6 +1962,92 @@ mod tests {
             ) != Some(Reach::Silent)
     }
 
+    /// A display's lock file, made here exclusively with a process number and removed when this
+    /// value is dropped. A lock file that exists is never taken, because a server may have made it
+    /// a moment ago.
+    #[cfg(target_os = "linux")]
+    struct LockFile(PathBuf);
+
+    #[cfg(target_os = "linux")]
+    impl LockFile {
+        fn make(number: u32, holder: u32) -> Option<Self> {
+            let path = PathBuf::from(format!("/tmp/.X{number}-lock"));
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .ok()?;
+            writeln!(file, "{holder:>10}").ok()?;
+            Some(Self(path))
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for LockFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    /// A display number that this process holds, until the value is dropped.
+    #[cfg(target_os = "linux")]
+    struct Reserved {
+        number: u32,
+        _lock: LockFile,
+    }
+
+    /// Reserves the first display number from `from` up that no server holds. Its lock file names
+    /// this process, so another run's choice of a number skips it and an X server that is started
+    /// on it exits, until this value is dropped.
+    #[cfg(target_os = "linux")]
+    fn reserve(from: u32) -> Option<Reserved> {
+        (from..from + 100).find_map(|number| {
+            if held(number) {
+                return None;
+            }
+            let lock = LockFile::make(number, std::process::id())?;
+            Some(Reserved {
+                number,
+                _lock: lock,
+            })
+        })
+    }
+
+    /// KR-REQ-03.29, LX-18: a display number that a case reserves stays held from its choice to
+    /// its use. Its lock file names this process, and a number whose lock file already exists is
+    /// not taken.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn kr_req_03_29_a_reserved_display_number_stays_held_and_an_existing_lock_file_is_not_taken() {
+        let from = 600 + std::process::id() % 300;
+        let first = reserve(from).expect("a display number nobody holds");
+        assert_eq!(
+            lock_holder(first.number),
+            Some(std::process::id()),
+            "{}: the reserved number is not held by this process",
+            first.number
+        );
+        assert!(
+            held(first.number),
+            "{}: the reserved number is not held by this process",
+            first.number
+        );
+        let second = reserve(from).expect("a display number nobody holds");
+        assert_ne!(
+            second.number, first.number,
+            "a number whose lock file exists was taken"
+        );
+        let stale = (from + 50..from + 150)
+            .find(|number| !held(*number))
+            .expect("a display number nobody holds");
+        let _left = LockFile::make(stale, u32::MAX).expect("a lock file");
+        let third = reserve(stale).expect("a display number nobody holds");
+        assert!(
+            third.number > stale,
+            "a number whose lock file exists was taken"
+        );
+    }
+
     /// Starts an `Xvfb` that holds one cookie, on a display number nobody on this machine holds.
     #[cfg(target_os = "linux")]
     fn start_server(folder: &Path) -> Server {
@@ -2122,11 +2208,10 @@ mod tests {
                     said(&ran)
                 );
             }
-            // The first number above the server's that no server holds.
-            let free = (number + 1..number + 100)
-                .find(|n| !held(*n))
-                .expect("a display number nobody holds");
-            let ran = run(&with(&format!(":{free}"), &server.authority));
+            // A number above the server's that no server holds and that no other run can take
+            // until this case is done with it.
+            let free = reserve(number + 1).expect("a display number nobody holds");
+            let ran = run(&with(&format!(":{}", free.number), &server.authority));
             assert!(
                 said(&ran).contains("the display cannot be reached"),
                 "{name}: {}",
