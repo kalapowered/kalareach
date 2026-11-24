@@ -437,7 +437,8 @@ class Reader:
     """Says which licences a text is. It runs askalono over the SPDX licence list at one revision, offline
     once the list is fetched. askalono reads each text normalised for case, punctuation and white space,
     so a line break inside a phrase changes nothing. One run names one licence in a text, so the reader
-    blanks the lines that run matched and reads what is left, until nothing that is left matches."""
+    blanks the lines that run matched and reads what is left, until nothing that is left matches. A match
+    is the licence's text only when askalono's kind for it is `original`; a header match is a statement."""
 
     def __init__(self, program, work):
         said = run([program, "--version"]).stdout.strip()
@@ -507,7 +508,8 @@ class Reader:
             names.append(name)
         for index, result in enumerate(self.batch(["-m"], names)):
             if result is not None:
-                found[index] |= {part["license"]["name"] for part in result["containing"] if part["score"] >= MATCH_SCORE}
+                found[index] |= {part["license"]["name"] for part in result["containing"]
+                                 if part["score"] >= MATCH_SCORE and is_text(part)}
         pending = list(range(len(texts)))
         for _ in range(READ_PASSES):
             if not pending:
@@ -519,17 +521,24 @@ class Reader:
             for index, result in zip(pending, self.batch(["--optimize"], [names[index] for index in pending])):
                 if result is None:
                     continue
-                if result["license"] is not None and result["score"] >= MATCH_SCORE:
+                if result["license"] is not None and result["score"] >= MATCH_SCORE and is_text(result):
                     found[index].add(result["license"]["name"])
                 inside = [part for part in result["containing"] if part["score"] >= MATCH_SCORE]
                 for part in inside:
-                    found[index].add(part["license"]["name"])
+                    if is_text(part):
+                        found[index].add(part["license"]["name"])
                     first, last = part["line_range"]
                     lines[index][first:last + 1] = [""] * (last + 1 - first)
                 if inside:
                     again.append(index)
             pending = again
         return [frozenset(names) for names in found]
+
+
+def is_text(match):
+    """Whether askalono's match is the text of a licence (its kind is `original`) and not a header of it,
+    which names the licence and holds none of its terms."""
+    return match["license"]["kind"] == "original"
 
 
 def refine(found, text):
@@ -748,7 +757,11 @@ def gather(records, kept, files, reader):
             required = sorted({i.split(" WITH ")[0] for i, _, _, _ in answer["licences"]})
             item, taken, owned = plans[(each["name"], key)]
             carried = alone(owned, required, declared_tokens(each["declared"][key]), reader)
-            carried += [(None, t) for t in taken if t not in {text for _, text in carried}]
+            notices = [(n, read_text(os.path.join(folder, n))) for n in files_named(folder, NOTICE_FILE)]
+            named = {}
+            for n, t in notices:
+                named.setdefault(t, n)
+            carried += [(named.get(t), t) for t in taken if t not in {text for _, text in carried}]
             missing = lacking(required, [t for _, t in carried], reader)
             if item is not None and not missing:
                 fail(f"scripts/notice-texts.json keeps a text for {name} {version}, whose package ships the licence text itself")
@@ -772,8 +785,9 @@ def gather(records, kept, files, reader):
                 still = lacking(required, [t for t in covered], reader)
                 if still:
                     fail(f"scripts/notice-texts.json keeps texts for {name} {version} that are not the text of {' and '.join(still)}")
-            for file_name in files_named(folder, NOTICE_FILE):
-                blocks.add("notice", "Notice file", file_name, read_text(os.path.join(folder, file_name)), crate, *args)
+            for file_name, notice_text in notices:
+                if notice_text not in {text for _, text in carried}:
+                    blocks.add("notice", "Notice file", file_name, notice_text, crate, *args)
         for name in sorted(each["paths"]):
             if each["name"] == "fish":
                 fish_member(blocks, name, each["members"][name])
@@ -978,6 +992,12 @@ def self_checks(scratch, reader):
             text = json.load(source)["licenseText"]
         return normal(re.sub(r"<(copyright holders|owner)>", "A Person", text.replace("<year>", "2020")))
 
+    def licence_header(identifier):
+        """The SPDX list's standard header of a licence, with a holder where the header has a placeholder."""
+        with open(os.path.join(reader.directory, "spdx-list", "json", "details", f"{identifier}.json"), encoding="utf-8") as source:
+            header = json.load(source)["standardLicenseHeader"]
+        return normal(header.replace("[yyyy] [name of copyright owner]", "2020 A Person"))
+
     def write(folder, name, text):
         os.makedirs(folder, exist_ok=True)
         with open(os.path.join(folder, name), "w", encoding="utf-8", newline="\n") as target:
@@ -1122,6 +1142,22 @@ def self_checks(scratch, reader):
     text = rendered([made_up([synthetic("stated", "1.0.0", licences=licences(template, False), folder=stated)])], kept, files)
     expect("a statement is carried as one beside the kept text of the licence",
            "Licence statement: COPYING (" + STATEMENT + ")" in text and "Copyright (c) 2025 N0, INC." in text)
+
+    # A header of a licence is a statement: it names the licence and holds none of its terms.
+    header = licence_header("Apache-2.0")
+    reader.prepare([header, header + "\n" + mit])
+    expect("a file that holds only the header of a licence is a statement", reader.of(header) == frozenset())
+    headed = os.path.join(scratch, "headed-1.0.0")
+    write(headed, "LICENSE", header)
+    refuses("a crate under Apache-2.0 whose only file is the Apache header is refused until a text is kept for it",
+            lambda: gather([made_up([synthetic("headed", "1.0.0", licences=[("Apache-2.0", "Apache License 2.0", "", False)],
+                                                    folder=headed, declared="Apache-2.0")])], nothing, {}, reader),
+            "headed 1.0.0 ships no text of Apache-2.0, its recorded licence, only LICENSE (no licence text)")
+    third = os.path.join(scratch, "third-1.0.0")
+    write(third, "LICENSE-THIRD-PARTY", header + "\n" + mit)
+    text = rendered([made_up([synthetic("third", "1.0.0", licences=licences(header + "\n" + mit), folder=third)])], nothing, {})
+    expect("a text that a notice file and a licence answer share is carried once",
+           text.count("Permission is hereby granted") == 1 and "Licence: MIT (MIT License)\n" in text and "Notice file" not in text)
 
     # No licence of an AND is dropped, a file with two licences stays whole, and a file for an
     # alternative that is not taken goes.
