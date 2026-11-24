@@ -1198,7 +1198,10 @@ fn a_notice_with_a_licence_template_placeholder_is_refused() {
             .expect_err("a notice with a template placeholder is refused");
         let first = placeholder.split(' ').next().expect("a word");
         assert!(
-            refused.to_string().to_lowercase().contains(&first.to_lowercase()),
+            refused
+                .to_string()
+                .to_lowercase()
+                .contains(&first.to_lowercase()),
             "{placeholder}: {refused}"
         );
     }
