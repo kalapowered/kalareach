@@ -6,19 +6,43 @@
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
-use kr_ipc::identity::{ProcessState, process_state, started_process_identity};
+use kr_ipc::identity::{ProcessState, Stop, process_state, started_process_identity, stop_process};
 use kr_ipc::testing::PrivateTempDir;
 use kr_ipc::testing::manager_stand_in::{PROGRAM_NAME, place_installation};
 use kr_protocol::identity::ProcessStartIdentity;
 
 /// A test tree and an installation beside it, both of this case's own.
+///
+/// When the fixture is dropped, which is when a case ends whether it passed or failed, it ends every
+/// process the case started, each by the identity it was recorded with: those the case started
+/// itself through [`Fixture::detached`] and the daemons the stand-in recorded in its jobs.
 struct Fixture {
     tree: PrivateTempDir,
     installation: PrivateTempDir,
     program: PathBuf,
     uid: u32,
+    /// The processes the case started itself.
+    started: Mutex<Vec<ProcessStartIdentity>>,
+}
+
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        let mut identities = std::mem::take(
+            self.started
+                .get_mut()
+                .unwrap_or_else(PoisonError::into_inner),
+        );
+        identities.extend(self.recorded_daemons());
+        for identity in &identities {
+            let _ = stop_process(identity, Stop::Kill);
+        }
+        for identity in &identities {
+            let _ = ended(identity);
+        }
+    }
 }
 
 impl Fixture {
@@ -41,7 +65,22 @@ impl Fixture {
             installation,
             program,
             uid,
+            started: Mutex::new(Vec::new()),
         }
+    }
+
+    /// The processes the stand-in recorded as the daemons of its jobs.
+    fn recorded_daemons(&self) -> Vec<ProcessStartIdentity> {
+        let Ok(entries) = std::fs::read_dir(self.tree.path().join("state/manager-stand-in/jobs"))
+        else {
+            return Vec::new();
+        };
+        entries
+            .filter_map(Result::ok)
+            .filter_map(|entry| std::fs::read_to_string(entry.path()).ok())
+            .filter_map(|record| serde_json::from_str::<kr_manager_stand_in::Job>(&record).ok())
+            .filter_map(|job| job.identity)
+            .collect()
     }
 
     /// The stand-in run with `arguments`, from a caller that names this tree's state directory.
@@ -143,7 +182,8 @@ impl Fixture {
     }
 
     /// Starts the shell command `line` in `directory` with the variables `environment` added, as the
-    /// system's first process holds a daemon whose starter has gone, and returns its identity.
+    /// system's first process holds a daemon whose starter has gone, and returns its identity. The
+    /// fixture ends the process when the case ends.
     fn detached(
         &self,
         line: &str,
@@ -164,7 +204,12 @@ impl Fixture {
             .trim()
             .parse()
             .expect("a process number");
-        started_process_identity(pid).expect("the process is there")
+        let identity = started_process_identity(pid).expect("the process is there");
+        self.started
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(identity.clone());
+        identity
     }
 }
 
@@ -547,6 +592,93 @@ fn a_start_that_was_never_recorded_is_not_confused_with_processes_that_only_hold
             "{what} was taken for the job's and ended"
         );
     }
+}
+
+/// Ends the processes it holds when it is dropped, by their identities, independently of the fixture.
+struct Leftovers(Vec<ProcessStartIdentity>);
+
+impl Drop for Leftovers {
+    fn drop(&mut self) {
+        for leftover in &self.0 {
+            let _ = stop_process(leftover, Stop::Kill);
+        }
+    }
+}
+
+/// The variable that names the file in which the case that fails on purpose lists what it started.
+const LIST_VARIABLE: &str = "KR_STAND_IN_TEST_STARTED_LIST";
+
+/// A case that fails before its own cleanup leaves nothing it started alive: the fixture ends every
+/// process of the case, as it does when the case passes. The case that fails on purpose runs in a
+/// child test process, and lists the processes it started (its own unbounded loop and the daemon
+/// the stand-in started) before it fails.
+#[test]
+fn a_case_that_fails_before_its_own_cleanup_leaves_nothing_alive() {
+    let folder = PrivateTempDir::create();
+    let list = folder.path().join("started.json");
+    let child = Command::new(std::env::current_exe().expect("this test program"))
+        .args([
+            "--ignored",
+            "--exact",
+            "a_case_that_fails_on_purpose_before_its_own_cleanup",
+            "--test-threads=1",
+        ])
+        .env(LIST_VARIABLE, &list)
+        .stdin(Stdio::null())
+        .output()
+        .expect("the child test process runs");
+    let said = text(&child.stdout);
+    let started: Vec<ProcessStartIdentity> =
+        serde_json::from_str(&std::fs::read_to_string(&list).expect("the list of what it started"))
+            .expect("a list");
+    // Whatever the fixture did, no process of the failed case outlives this one.
+    let leftovers = Leftovers(started.clone());
+    assert!(
+        said.contains("this case fails on purpose") && child.status.code() == Some(101),
+        "the child case fails on purpose and for no other reason: {said}"
+    );
+    assert_eq!(started.len(), 2, "the loop and the daemon: {started:?}");
+    for identity in &started {
+        assert!(
+            ended(identity),
+            "a process the failed case started is still alive: {identity:?}"
+        );
+    }
+    drop(leftovers);
+}
+
+/// Run by the case above, in a child test process: it starts an unbounded loop and a daemon, lists
+/// them, and fails before it ends either.
+#[test]
+#[ignore = "run by the case that shows a failed case leaves nothing alive"]
+fn a_case_that_fails_on_purpose_before_its_own_cleanup() {
+    let Some(list) = std::env::var_os(LIST_VARIABLE) else {
+        return;
+    };
+    let fixture = Fixture::new();
+    let script = "#!/bin/sh\nwhile :; do sleep 1; done\n";
+    let (_, loaded) = fixture.load("kr-controller-q", script, "");
+    assert_eq!(loaded.status.code(), Some(0), "{}", text(&loaded.stderr));
+    let target = format!("{}/kr-controller-q", fixture.domain());
+    let started = fixture.call(&["kickstart", "-p", &target]);
+    assert_eq!(started.status.code(), Some(0), "{}", text(&started.stderr));
+    let state = fixture.tree.path().join("state");
+    let own_loop = fixture.detached(
+        &format!(
+            "/bin/sh -c 'while :; do sleep 1; done' x {}",
+            state.display()
+        ),
+        &state,
+        &[],
+    );
+    let mut identities = fixture.recorded_daemons();
+    identities.push(own_loop);
+    std::fs::write(
+        list,
+        serde_json::to_string(&identities).expect("the identities as text"),
+    )
+    .expect("the list is written");
+    panic!("this case fails on purpose, before it ends anything it started");
 }
 
 /// What a definition may name is bounded after every link is resolved: a plist, a log or a working
