@@ -3506,10 +3506,10 @@ async fn a_rollback_leaves_the_plugin_host_of_this_release_for_the_release_befor
     let second = terminal_for(host, &updated.kr_now(), &["attach", &second_display]);
     second.ready().await;
     let second_program = start_agent(host, &second, &agent).await;
+    let this_host = host.plugin_host_published().await;
+    let (three, four) = host.descriptors_of(&this_host).await;
+    assert_a_host_of_both_protocols(&three, &four);
     host.plugin_holding(1).await;
-    let this_host = host
-        .plugin_host()
-        .expect("this release's daemon started a host");
     assert_runs_the_host_of(&this_host, updated.two.name());
 
     // The session of this release holds the rollback.
@@ -4018,15 +4018,18 @@ async fn a_plugin_host_the_daemon_starts_is_published_under_both_protocols_and_a
     let agent = host.plugin_agent();
     let session = BoundSession::start(host, &updated.kr_now(), &agent).await;
     let first = host.plugin_host_published().await;
-    let (three, four) = host.descriptors_of(&first).await;
-    assert_a_host_of_both_protocols(&three, &four);
+    // The launcher publishes `/4` before the worker is told the host is ready, so once the worker
+    // holds a binding a client of this release meets the host on `/4`; the check comes before the
+    // wait for the descriptor so that a launcher that publishes none fails here and not in a wait.
     host.plugin_holding(1).await;
-    assert_runs_the_host_of(&first, updated.two.name());
     assert_eq!(
         host.observed_protocol().await,
         Ok(HostProtocol::V4),
         "a client of this release meets the host on the fourth protocol"
     );
+    let (three, four) = host.descriptors_of(&first).await;
+    assert_a_host_of_both_protocols(&three, &four);
+    assert_runs_the_host_of(&first, updated.two.name());
 
     host.end_the_plugin_host().await;
     let second = host.another_plugin_host(&first).await;
