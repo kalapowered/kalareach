@@ -48,7 +48,8 @@ module-build = { max-threads = 1 }
 # static PLACES, crates/kr-controller/tests/network_project.rs: CASES_AT_ONCE (4) case bodies at once.
 network-project = { max-threads = 4 }
 # static PLACES, crates/kr-cli/tests/support/update_harness.rs: HOST_CASES_AT_ONCE (4 on Linux) hosts at once
-# for each binary that includes the harness; cargo test runs one of those binaries at a time, so 4 in all.
+# for each binary that starts hosts; cargo test runs one of those binaries at a time, so 4 in all.
+# `kr-conformance::account_launchd_gates` reads the harness as text and starts no host, so it is not in the group.
 host-cases = { max-threads = 4 }
 
 [[profile.default.overrides]]
@@ -103,8 +104,5 @@ filter = 'package(kr-controller) & binary(network_project)'
 test-group = 'network-project'
 
 [[profile.default.overrides]]
-filter = '''
-  (package(kr-cli) & (binary(update) | binary(admit)))
-  | (package(kr-conformance) & binary(account_launchd_gates))
-'''
+filter = 'package(kr-cli) & (binary(update) | binary(admit))'
 test-group = 'host-cases'
