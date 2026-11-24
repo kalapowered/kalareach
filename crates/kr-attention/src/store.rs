@@ -113,8 +113,10 @@ use crate::visit::{Change, Omitted, SessionLog, Visit};
 /// carries none. Version 11 adds the approvals source to the values a row's `source` or
 /// `record_source` holds, which a build that does not know it reads as a row it cannot read.
 /// Version 12 adds the authority source and the rule that tells the owner an authority feed
-/// removed the host, which a build that does not know them reads the same way.
-pub const SCHEMA_VERSION: i64 = 12;
+/// removed the host, which a build that does not know them reads the same way. Version 13 adds the
+/// rule for an action whose upstream result is unknown, which a build that does not know it reads
+/// the same way too.
+pub const SCHEMA_VERSION: i64 = 13;
 
 /// The oldest schema this build brings forward rather than refusing: see `migrate_forward`.
 pub const OLDEST_SCHEMA_VERSION: i64 = 9;
@@ -551,7 +553,7 @@ fn file_control<T>(connection: &Connection, question: i32, answer: *mut T) -> Re
     })
 }
 
-/// Brings a store written under schema 9, 10 or 11 forward to this build's, in one transaction.
+/// Brings a store written under schema 9, 10, 11 or 12 forward to this build's, in one transaction.
 ///
 /// From schema 9, what changed is three columns on the items: the time the announcement an item
 /// last made was first decided, and the privacy generation and mode it was decided under, none of
@@ -567,6 +569,9 @@ fn file_control<T>(connection: &Connection, question: i32, answer: *mut T) -> Re
 /// From schema 11, nothing in the tables changes: the authority source has no cursor until the
 /// host first notes its feed having removed it, and no row names the rule that tells the owner so
 /// until then.
+///
+/// From schema 12, nothing in the tables changes: no row names the rule for an action whose
+/// upstream result is unknown until a later release raises an item of it.
 ///
 /// Remove the step from schema 9, with its column check, once no supported upgrade starts from a
 /// store written under schema 9; `OLDEST_SCHEMA_VERSION` then moves up to 10.

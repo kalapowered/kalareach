@@ -2,8 +2,9 @@
 //!
 //! Section 25 names eight rules, gives them stable identifiers and fixes the de-duplication window
 //! at sixty seconds; its automation paragraph, with section 17's workflow limits, adds a ninth for
-//! a workflow or a causal chain its own limits paused, and a tenth tells the owner that the
-//! authority feed a host reads removed it. [`RULES`] is that table, one entry per
+//! a workflow or a causal chain its own limits paused, a tenth tells the owner that the
+//! authority feed a host reads removed it, and an eleventh is for an action whose upstream result
+//! is unknown. [`RULES`] is that table, one entry per
 //! identifier, and [`rule`] is the only way to reach an entry, so a rule's policy cannot be decided
 //! twice in two places.
 //!
@@ -182,6 +183,19 @@ pub static RULES: &[Rule] = &[
         trusted: true,
         droppable: false,
     },
+    // An action whose upstream result is unknown: the host cannot say whether it took effect. The
+    // person is told once and has nothing to answer here, so it is notable and does not climb. It
+    // is the host's own record of the action, so it is trusted. It is not the bound's to let go
+    // of, because it stands until a later result settles it. No code of this release raises it.
+    Rule {
+        id: AttentionRule::ReceiptUncertain,
+        initial: AttentionLevel::Notable,
+        steps: &[],
+        repeat_ms: None,
+        dedup_window_ms: DEDUPLICATION_WINDOW_MS,
+        trusted: true,
+        droppable: false,
+    },
 ];
 
 /// Returns the rule with this identifier.
@@ -258,6 +272,7 @@ mod tests {
                     | AttentionRule::HostContactLost
                     | AttentionRule::AutomationPaused
                     | AttentionRule::AuthorityFeedRemoved
+                    | AttentionRule::ReceiptUncertain
             );
             assert_eq!(
                 rule.droppable, !waiting,
@@ -265,6 +280,34 @@ mod tests {
                 rule.id
             );
         }
+    }
+
+    #[test]
+    fn an_unknown_upstream_result_is_a_notable_item_that_stands_until_it_is_resolved() {
+        let entry = RULES
+            .iter()
+            .find(|rule| rule.id.as_str() == "attention.receipt_uncertain")
+            .copied();
+        assert_eq!(
+            entry.map(|rule| (
+                rule.initial,
+                rule.steps.len(),
+                rule.repeat_ms,
+                rule.dedup_window_ms,
+                rule.trusted,
+                rule.droppable
+            )),
+            Some((
+                AttentionLevel::Notable,
+                0,
+                None,
+                DEDUPLICATION_WINDOW_MS,
+                true,
+                false
+            )),
+            "an uncertain receipt starts notable, climbs no ladder, is announced once, is the \
+             host's own record, and is never dropped to keep the inbox within its bound"
+        );
     }
 
     #[test]

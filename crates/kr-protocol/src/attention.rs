@@ -187,6 +187,8 @@ wire_enum! {
             "A workflow revision or a causal chain was paused by one of its own limits.";
         AuthorityFeedRemoved => "attention.authority_feed_removed",
             "The authority feed this host reads removed it, so it learns no revocation from it.";
+        ReceiptUncertain => "attention.receipt_uncertain",
+            "An action's upstream result is unknown, so the host cannot say whether it took effect.";
     }
 }
 
@@ -1256,8 +1258,22 @@ mod tests {
             assert!(rule.as_str().starts_with("attention."));
         }
         // Section 25's eight, the one its automation paragraph and section 17's workflow limits
-        // add, and the one that tells the owner a host's authority feed was removed.
-        assert_eq!(AttentionRule::ALL.len(), 10);
+        // add, the one that tells the owner a host's authority feed was removed, and the one a
+        // later release raises for an action whose upstream result is unknown.
+        assert_eq!(AttentionRule::ALL.len(), 11);
+    }
+
+    #[test]
+    fn the_rule_for_an_unknown_upstream_result_is_the_last_word_of_the_set() {
+        assert!(
+            AttentionRule::from_wire("attention.receipt_uncertain").is_some(),
+            "attention.receipt_uncertain is a rule word"
+        );
+        assert_eq!(
+            AttentionRule::ALL.last().map(|rule| rule.as_str()),
+            Some("attention.receipt_uncertain"),
+            "attention.receipt_uncertain comes after the words an earlier release wrote"
+        );
     }
 
     #[test]

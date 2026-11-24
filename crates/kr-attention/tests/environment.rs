@@ -2363,6 +2363,192 @@ fn a_store_from_before_the_time_of_decision_was_kept_is_brought_forward_once() {
     ));
 }
 
+/// A store written under schema 12, which does not read the rule for an action whose upstream
+/// result is unknown, differs from schema 13 in no table. It is brought forward once as it opens,
+/// keeping what it holds, and a store of any schema after this build's is refused rather than read.
+#[test]
+fn a_store_from_before_the_receipt_rule_was_read_is_brought_forward_once() {
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    let path = directory.path().join("attention.db");
+    let mut attention =
+        Attention::open(&path, reading(0), &opener()).expect("the feature store opens");
+    attention
+        .apply(&approval(session(1), 1, "req-1"), reading(1_000))
+        .expect("the store records the decision");
+    drop(attention);
+    let stored_version = || -> i64 {
+        rusqlite::Connection::open(&path)
+            .expect("the file opens")
+            .query_row("SELECT version FROM attention_schema", [], |row| row.get(0))
+            .expect("a version")
+    };
+    let set_version = |version: i64| {
+        rusqlite::Connection::open(&path)
+            .expect("the file opens")
+            .execute("UPDATE attention_schema SET version = ?1", [version])
+            .expect("a schema");
+    };
+
+    set_version(12);
+    let opened = Attention::open(&path, reading(2_000), &opener());
+    assert!(
+        opened.is_ok(),
+        "a store of schema 12 opens: {:?}",
+        opened.as_ref().err()
+    );
+    let attention = opened.expect("the previous schema opens");
+    assert_eq!(
+        only_item(&attention).rule,
+        AttentionRule::PendingApproval,
+        "the item it held is kept"
+    );
+    drop(attention);
+    assert_eq!(
+        stored_version(),
+        13,
+        "a store of schema 12 is brought forward to schema 13 as it opens"
+    );
+
+    set_version(13);
+    drop(Attention::open(&path, reading(3_000), &opener()).expect("a store of schema 13 opens"));
+    assert_eq!(stored_version(), 13, "and stays there");
+
+    set_version(14);
+    assert!(
+        matches!(
+            Attention::open(&path, reading(4_000), &opener()),
+            Err(kr_attention::Error::StoreUnreadable {
+                field: "schema version"
+            })
+        ),
+        "a store of a schema after this build's is refused rather than read"
+    );
+    assert_eq!(stored_version(), 14, "and is left as it was");
+}
+
+/// A bringing forward that cannot record the schema it reached is refused whole: what it made
+/// before it failed goes with it, the store stays at the schema it was, and once nothing refuses
+/// the write the same store is brought forward.
+#[test]
+fn a_bringing_forward_that_cannot_record_its_schema_is_rolled_back_whole() {
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    let path = directory.path().join("attention.db");
+    drop(Attention::open(&path, reading(0), &opener()).expect("the feature store opens"));
+    // The store as schema 12 wrote it, with a table the bringing forward makes again, and a
+    // trigger that refuses the write of the schema it reaches.
+    let raw = rusqlite::Connection::open(&path).expect("the file opens");
+    raw.execute_batch(
+        "DROP TABLE attention_actions;
+         UPDATE attention_schema SET version = 12;
+         CREATE TRIGGER refuse_the_schema BEFORE UPDATE ON attention_schema
+         BEGIN SELECT RAISE(ABORT, 'refused'); END;",
+    )
+    .expect("the previous shape");
+    drop(raw);
+    let table_is_there = || -> bool {
+        let count: i64 = rusqlite::Connection::open(&path)
+            .expect("the file opens")
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name = 'attention_actions'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("a count");
+        count == 1
+    };
+    let stored_version = || -> i64 {
+        rusqlite::Connection::open(&path)
+            .expect("the file opens")
+            .query_row("SELECT version FROM attention_schema", [], |row| row.get(0))
+            .expect("a version")
+    };
+
+    let refused = Attention::open(&path, reading(1_000), &opener());
+    assert!(
+        refused.is_err(),
+        "a bringing forward whose schema cannot be recorded is refused"
+    );
+    drop(refused);
+    assert_eq!(stored_version(), 12, "the store is still at schema 12");
+    assert!(
+        !table_is_there(),
+        "what the refused bringing forward made is not kept"
+    );
+
+    rusqlite::Connection::open(&path)
+        .expect("the file opens")
+        .execute_batch("DROP TRIGGER refuse_the_schema;")
+        .expect("nothing refuses the write now");
+    drop(Attention::open(&path, reading(2_000), &opener()).expect("the store is brought forward"));
+    assert_eq!(
+        stored_version(),
+        13,
+        "the same store is brought forward once nothing refuses the write"
+    );
+    assert!(table_is_there(), "and it has the table the step makes");
+}
+
+/// A store of schema 13 that holds an item of the rule for an action whose upstream result is
+/// unknown, which a later release raises, is read by this build: it opens, lists the item with the
+/// rule's word, and every opening writes the whole state again without losing it.
+#[test]
+fn a_store_that_holds_an_item_of_the_receipt_rule_is_read_listed_and_kept() {
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    let path = directory.path().join("attention.db");
+    let mut attention =
+        Attention::open(&path, reading(0), &opener()).expect("the feature store opens");
+    attention
+        .apply(&failed(1, 1_000), reading(1_000))
+        .expect("the store records the decision");
+    drop(attention);
+    // What a later release writes: the item of the rule it raises, in a store at schema 13.
+    let raw = rusqlite::Connection::open(&path).expect("the file opens");
+    raw.execute_batch(
+        "UPDATE attention_items SET
+             rule = 'attention.receipt_uncertain',
+             key = 'attention.receipt_uncertain|'
+                 || substr(key, length('attention.command_failed|') + 1);",
+    )
+    .expect("the item of the later rule");
+    drop(raw);
+
+    for opening in 1..=2 {
+        let opened = Attention::open(&path, reading(1_000 * (opening + 1)), &opener());
+        assert!(
+            opened.is_ok(),
+            "opening {opening} of a store that holds an item of the receipt rule: {:?}",
+            opened.as_ref().err()
+        );
+        let attention = opened.expect("the store opens");
+        let listed: Vec<String> = owner_inbox(&attention)
+            .iter()
+            .map(|item| item.rule.as_str().to_owned())
+            .collect();
+        assert_eq!(
+            listed,
+            ["attention.receipt_uncertain"],
+            "opening {opening} lists the item with the receipt rule's word"
+        );
+        drop(attention);
+        let stored: Vec<String> = {
+            let raw = rusqlite::Connection::open(&path).expect("the file opens");
+            let mut statement = raw
+                .prepare("SELECT rule FROM attention_items")
+                .expect("a statement");
+            statement
+                .query_map([], |row| row.get(0))
+                .expect("the rows")
+                .collect::<Result<_, _>>()
+                .expect("the rules")
+        };
+        assert_eq!(
+            stored,
+            ["attention.receipt_uncertain"],
+            "the write of opening {opening} keeps the item and its word"
+        );
+    }
+}
+
 /// A failed command in session one at `sequence`, seen at `at_ms`: the same condition each time.
 fn failed(sequence: u64, at_ms: u64) -> SourceEvent {
     in_session(
