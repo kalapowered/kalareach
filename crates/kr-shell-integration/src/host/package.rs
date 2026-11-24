@@ -18,6 +18,7 @@ use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::hostinfo::configuration::{host_owns_variable, platform_variable_name};
 use serde::{Deserialize, Serialize};
 
+use super::quoting::quote;
 use crate::contract::qualification::ShellKind;
 use crate::contract::transport::{ModuleEntry, PatchRevision, ShellIdentity};
 
@@ -193,8 +194,8 @@ pub struct ShellPackage {
 impl ShellPackage {
     /// Reads the one package installed in a directory.
     ///
-    /// The directory is an identity directory a build wrote, which is what a controller records
-    /// when it resolves a create request's package: the worker then launches exactly the package
+    /// The directory is an identity directory, one a build wrote or one an installed release holds,
+    /// which is what a controller records when it resolves a create request's package: the worker then launches exactly the package
     /// its daemon qualified rather than resolving one of its own from its own environment. The
     /// same ownership rule applies as for a discovered package: a record naming paths outside the
     /// directory it sits in describes some other installation.
@@ -206,17 +207,15 @@ impl ShellPackage {
     /// [`PackageFault::MissingExecutable`] when the executable it names is not installed.
     pub fn read(directory: &Path) -> Result<Self, PackageFault> {
         let candidate = directory.join(MANIFEST_BASENAME);
-        // An identity directory is two levels under the root a build wrote it in.
+        // An identity directory is two levels under the root that holds it.
         let root = directory
             .parent()
             .and_then(Path::parent)
             .unwrap_or(directory);
-        let package =
-            read_manifest(&candidate, None, directory, Home::Built(root))?.ok_or_else(|| {
-                PackageFault::Unreadable {
-                    path: candidate.display().to_string(),
-                    detail: "this directory holds no identity record".to_owned(),
-                }
+        let package = read_manifest(&candidate, None, directory, Home::Directory(root))?
+            .ok_or_else(|| PackageFault::Unreadable {
+                path: candidate.display().to_string(),
+                detail: "this directory holds no identity record".to_owned(),
             })?;
         if !package.executable().is_file() {
             return Err(PackageFault::MissingExecutable {
@@ -702,25 +701,57 @@ enum Home<'a> {
     /// Any other root: the one a build wrote to, which is the platform's package directory or the
     /// one [`PACKAGE_ROOT_VARIABLE`] names.
     Built(&'a Path),
+    /// A single identity directory read by itself, where the root two levels above it is a build's
+    /// root or an installed release's `shells` folder and nothing says which.
+    Directory(&'a Path),
 }
 
 /// The words for a record that declares no flags, which say what writes a new one for the
 /// package's own shell and home.
+///
+/// Each step is a command that runs: the build is named with the shell it builds, `--force` because
+/// a build keeps a record whose identity is installed, and the root the record was read from; the
+/// publish is named with that root, because the publisher's own default is not this host's.
 fn flags_missing(kind: ShellKind, home: Home<'_>) -> String {
     let said = "the record declares no flags";
+    let build = |root: &Path| {
+        format!(
+            "scripts/build-shells.sh --{} --force --prefix {}",
+            kind.as_str(),
+            quote(ShellKind::Bash, &root.display().to_string())
+        )
+    };
+    let publish = |root: Option<&Path>| {
+        let prefix = root.map_or_else(String::new, |root| {
+            format!(
+                " -Prefix {}",
+                quote(ShellKind::PowerShell, &root.display().to_string())
+            )
+        });
+        format!(
+            "import the current KalaReach.ShellBridge module from a package that has its \
+             manifest.json beside the module folder, and run {PUBLISH_COMMAND}{prefix} in PowerShell"
+        )
+    };
     match (kind, home) {
         // A PowerShell package is only ever published by the person it is for, wherever it is.
-        (ShellKind::PowerShell, _) => format!(
-            "{said}; import the current KalaReach.ShellBridge module from a package that has its \
-             manifest.json beside the module folder, and run {PUBLISH_COMMAND} in PowerShell"
-        ),
+        (ShellKind::PowerShell, Home::Release) => format!("{said}; {}", publish(None)),
+        (ShellKind::PowerShell, Home::Built(root) | Home::Directory(root)) => {
+            format!("{said}; {}", publish(Some(root)))
+        }
         (_, Home::Release) => {
             format!("{said}; it is in an installed release, so replace the installed release")
         }
-        (_, Home::Built(root)) => format!(
-            "{said}; build the package again from current sources with scripts/build-shells.sh \
-             --prefix {}",
-            root.display()
+        (_, Home::Built(root)) => {
+            format!(
+                "{said}; build the package again from current sources with {}",
+                build(root)
+            )
+        }
+        (_, Home::Directory(root)) => format!(
+            "{said}; if this package is a build, build it again from current sources with {}; if \
+             it is in an installed release, replace the installed release",
+            build(root)
         ),
     }
 }
@@ -905,7 +936,9 @@ impl PackageSet {
     /// Reads every package in the `shells` folder of an installed release.
     ///
     /// As [`Self::discover`], for the one root whose packages the release came with: a record in it
-    /// that cannot be used is mended by replacing the release, and not by a build or a publish.
+    /// that cannot be used is mended by replacing the release, and not by a build. A PowerShell
+    /// record is the one exception: a signed release holds no PowerShell package, so a record of one
+    /// in this folder is a person's own publication, and a publish mends it.
     ///
     /// # Errors
     ///
@@ -1669,45 +1702,66 @@ mod tests {
     }
 
     /// KR-REQ-07.16: the package a build wrote that declares no flags is refused, and what writes a
-    /// new one is the build again from current sources, into the root this host read it from.
+    /// new one is the build again from current sources: the step is a command that runs, for the
+    /// shell the record says, with the root this host read it from.
     #[test]
     fn a_built_package_that_declares_no_flags_is_refused_and_the_build_at_its_root_is_named() {
         let root = tempfile::tempdir().expect("a directory");
-        install_without_flags(root.path(), &[ShellKind::Zsh, ShellKind::Bash]);
-        let set = PackageSet::discover(root.path()).expect("reads what it can");
-        for kind in [ShellKind::Zsh, ShellKind::Bash] {
-            let said = refusal(&set, kind);
+        let spaced = root.path().join("a root");
+        for (path, written) in [
+            (root.path().to_path_buf(), root.path().display().to_string()),
+            (spaced.clone(), format!("'{}'", spaced.display())),
+        ] {
+            install_without_flags(&path, &[ShellKind::Zsh, ShellKind::Bash, ShellKind::Fish]);
+            let set = PackageSet::discover(&path).expect("reads what it can");
+            for kind in [ShellKind::Zsh, ShellKind::Bash, ShellKind::Fish] {
+                let said = refusal(&set, kind);
+                assert!(
+                    said.contains(&format!(
+                        "build the package again from current sources with scripts/build-shells.sh \
+                         --{} --force --prefix {written}",
+                        kind.as_str()
+                    )),
+                    "{kind:?}: {said}"
+                );
+                assert!(
+                    !said.contains("replace the installed release"),
+                    "{kind:?}: {said}"
+                );
+                assert!(!said.contains(PUBLISH_COMMAND), "{kind:?}: {said}");
+            }
             assert!(
-                said.contains(&format!(
-                    "build the package again from current sources with scripts/build-shells.sh \
-                     --prefix {}",
-                    root.path().display()
-                )),
-                "{kind:?}: {said}"
+                set.select(Some("bash")).is_err(),
+                "and so is a request for it"
             );
-            assert!(
-                !said.contains("replace the installed release"),
-                "{kind:?}: {said}"
-            );
-            assert!(!said.contains(PUBLISH_COMMAND), "{kind:?}: {said}");
         }
-        assert!(
-            set.select(Some("bash")).is_err(),
-            "and so is a request for it"
-        );
     }
 
     /// KR-REQ-07.16: the PowerShell package a person published that declares no flags is refused,
     /// wherever this host reads it, and what writes a new one is a publish from the current module
-    /// with its manifest beside it: the publisher of an older module cannot add the field.
+    /// with its manifest beside it: the publisher of an older module cannot add the field. The step
+    /// is a command that runs, with the root this host read it from where that is a build's root,
+    /// because the publisher's own default is not this host's.
     #[test]
     fn a_published_powershell_package_that_declares_no_flags_is_refused_and_a_new_publish_is_named()
     {
         let root = tempfile::tempdir().expect("a directory");
+        let spaced = root.path().join("a root");
         install_without_flags(root.path(), &[ShellKind::PowerShell]);
-        for set in [
-            PackageSet::discover(root.path()).expect("reads what it can"),
-            PackageSet::discover_release(root.path()).expect("reads what it can"),
+        install_without_flags(&spaced, &[ShellKind::PowerShell]);
+        for (set, prefix) in [
+            (
+                PackageSet::discover(root.path()).expect("reads what it can"),
+                Some(format!("-Prefix {}", root.path().display())),
+            ),
+            (
+                PackageSet::discover(&spaced).expect("reads what it can"),
+                Some(format!("-Prefix '{}'", spaced.display())),
+            ),
+            (
+                PackageSet::discover_release(root.path()).expect("reads what it can"),
+                None,
+            ),
         ] {
             let said = refusal(&set, ShellKind::PowerShell);
             assert!(
@@ -1717,13 +1771,58 @@ mod tests {
                 ),
                 "{said}"
             );
-            assert!(
-                said.contains(&format!("run {PUBLISH_COMMAND} in PowerShell")),
-                "{said}"
-            );
+            match prefix {
+                Some(prefix) => assert!(
+                    said.contains(&format!("run {PUBLISH_COMMAND} {prefix} in PowerShell")),
+                    "{said}"
+                ),
+                None => assert!(
+                    said.contains(&format!("run {PUBLISH_COMMAND} in PowerShell")),
+                    "{said}"
+                ),
+            }
             assert!(!said.contains("build-shells.sh"), "{said}");
             assert!(!said.contains("replace the installed release"), "{said}");
         }
+    }
+
+    /// KR-REQ-07.16: a package read from its identity directory alone is not known to be a build's
+    /// or an installed release's, and its refusal names the step of each. The step is a command
+    /// that runs, with the root two levels above the directory.
+    #[test]
+    fn a_package_read_by_its_directory_that_declares_no_flags_names_the_step_of_each_home() {
+        let root = tempfile::tempdir().expect("a directory");
+        install_without_flags(
+            root.path(),
+            &[ShellKind::Zsh, ShellKind::Fish, ShellKind::PowerShell],
+        );
+        for kind in [ShellKind::Zsh, ShellKind::Fish] {
+            let directory = root.path().join(kind.as_str()).join("identity-1");
+            let said = ShellPackage::read(&directory)
+                .expect_err("the record is refused")
+                .to_string();
+            assert!(
+                said.contains(&format!(
+                    "the record declares no flags; if this package is a build, build it again from \
+                     current sources with scripts/build-shells.sh --{} --force --prefix {}; if it \
+                     is in an installed release, replace the installed release",
+                    kind.as_str(),
+                    root.path().display()
+                )),
+                "{kind:?}: {said}"
+            );
+        }
+        let directory = root.path().join("powershell").join("identity-1");
+        let said = ShellPackage::read(&directory)
+            .expect_err("the record is refused")
+            .to_string();
+        assert!(
+            said.contains(&format!(
+                "run {PUBLISH_COMMAND} -Prefix {} in PowerShell",
+                root.path().display()
+            )),
+            "{said}"
+        );
     }
 
     /// KR-REQ-07.16: the step a refusal names is the one for the folder the record is in, as that
