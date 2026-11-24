@@ -2739,24 +2739,18 @@ async fn a_step_of_the_platform_that_fails_is_told_by_the_class_of_its_failure()
 
 /// KR-REQ-18.11, the part about connection diagnostics, for a container runtime that is on the path
 /// and cannot be run: the refresh says that the step could not be started, with what the operating
-/// system said as its class and length, in `--json` and in the lines.
+/// system said as its class and length, in `--json` and in the lines. On Linux the runtime is a link
+/// that leads to itself, and on a Mac a file that is not executable: on each, only that form stops
+/// the search of the path at a runtime that cannot be run.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_container_runtime_that_cannot_be_started_is_told_by_its_step_and_the_length_of_the_reason()
  {
-    use std::os::unix::fs::PermissionsExt;
     let _turn = CONTAINER_RUNTIME_TURN.lock().await;
     let world = world_whose_destination_answers().await;
     enrolled_and_answering(&world, "box", "container", STAND_IN_CONTAINER_NAME);
-    let runtime = world.tools.join("podman");
-    let mode = std::fs::metadata(&runtime)
-        .expect("the runtime")
-        .permissions()
-        .mode();
-    std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o644))
-        .expect("the runtime is made unrunnable");
+    let put_back = made_unrunnable(&world.tools.join("podman"));
     let told = refreshed_both_ways(&world, "box");
-    std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(mode))
-        .expect("the runtime is made runnable");
+    put_back();
     let said = told.document["connection"].as_str().expect("a sentence");
     let prefix = "the container runtime (podman) could not be started: [message withheld, ";
     assert!(
@@ -2765,7 +2759,50 @@ async fn a_container_runtime_that_cannot_be_started_is_told_by_its_step_and_the_
     );
     assert_eq!(told.lines[1].trim_start(), said, "{told:?}");
     assert_eq!(told.document["row"]["status"], "stale", "{told:?}");
-    assert!(!told.everything.contains("ermission denied"), "{told:?}");
+    for printed in ["Too many levels", "ermission denied"] {
+        assert!(!told.everything.contains(printed), "{told:?}");
+    }
+}
+
+/// Makes the stand-in runtime a program that the search of the path finds and cannot run, and
+/// returns what puts it back. A Linux host stops its search at a link that leads to itself, and
+/// goes on past a file that is not executable; a Mac goes on past the link, and reports the file
+/// that is not executable when nothing further along the path runs, so the case on a Mac needs a
+/// path that holds no other `podman`.
+fn made_unrunnable(runtime: &Path) -> Box<dyn FnOnce()> {
+    use std::os::unix::fs::PermissionsExt;
+    let runtime = runtime.to_path_buf();
+    if cfg!(target_os = "linux") {
+        let set_aside = runtime.with_file_name("podman-set-aside");
+        std::fs::rename(&runtime, &set_aside).expect("the runtime is set aside");
+        std::os::unix::fs::symlink("podman", &runtime).expect("a link that leads to itself");
+        Box::new(move || {
+            std::fs::remove_file(&runtime).expect("the link is removed");
+            std::fs::rename(&set_aside, &runtime).expect("the runtime is put back");
+        })
+    } else {
+        // The daemon's path is the stand-in's directory and then this program's path.
+        let search = std::env::var_os("PATH").unwrap_or_default();
+        for directory in std::env::split_paths(&search) {
+            let other = directory.join("podman");
+            assert!(
+                !other.is_file(),
+                "the path the daemon gets has another podman at {}, which the search would run \
+                 where the stand-in cannot run; take it off the PATH of this run",
+                other.display()
+            );
+        }
+        let mode = std::fs::metadata(&runtime)
+            .expect("the runtime")
+            .permissions()
+            .mode();
+        std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o644))
+            .expect("the runtime is made unrunnable");
+        Box::new(move || {
+            std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(mode))
+                .expect("the runtime is made runnable");
+        })
+    }
 }
 
 /// KR-REQ-18.11, the part about connection diagnostics, for an SSH host whose refresh cannot be
