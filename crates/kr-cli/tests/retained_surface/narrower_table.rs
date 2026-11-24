@@ -901,7 +901,7 @@ pub const NARROWER: &[Narrower] = &[
                 krate: "kr_cli",
                 name: "forget",
                 kinds: &[SightKind::Target],
-                now: "015cec5c3c15bd1aa0d572af81b8760b48232dcea0b57ccee8251c3d8d32c881",
+                now: "1d753bba2da86cb8b9318366e9bf333ebef0a5b8578c539d0323af3672f300f3",
                 why: "Builds or carries the request of a `kr` command for sessions, grants, shares, pairing, transfers or a bridge; no text of `kr_cli` names one of the six, and none sets an application instance.",
             },
             Account {
