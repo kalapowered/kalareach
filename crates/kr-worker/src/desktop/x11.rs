@@ -22,9 +22,7 @@ use kr_protocol::hostinfo::export::Sentence;
 
 use super::capability::installed_in;
 use super::payload::{self, Fault};
-use super::probe::{
-    Check, Deadline, Exit, Outcome, Plan, Ran, Setting, bounded_with, on_a_thread,
-};
+use super::probe::{Check, Deadline, Exit, Outcome, Plan, Ran, Setting, bounded_with, on_a_thread};
 use super::routes::{Asking, Operation, Program, Route, Variables};
 
 /// The programs a screen image is taken with on X11, in the order they are looked for.
@@ -226,14 +224,15 @@ fn perform_in(plan: &Plan, setting: &Setting<'_>, operation: &Operation, sockets
                 }),
         },
         // A check with no time left to try the socket in does not guess at why the tool failed.
-        Exit::Failed(_) => Err(
-            reach(number, sockets, setting.deadline).map_or(Outcome::TimedOut, |reach| {
+        Exit::Failed(_) => Err(reach(number, sockets, setting.deadline).map_or(
+            Outcome::TimedOut,
+            |reach| {
                 outcome_of(told_by(
                     ran.error_output.as_deref().unwrap_or_default(),
                     reach,
                 ))
-            }),
-        ),
+            },
+        )),
         Exit::Unfinished(outcome) => Err(outcome),
     };
     // Removed whatever happened: an image outliving the check is the one thing this must not leave
@@ -262,8 +261,7 @@ fn perform_in(plan: &Plan, setting: &Setting<'_>, operation: &Operation, sockets
 }
 
 /// The words of a display that this check does not try, as it answers before any tool starts.
-const NETWORK_DISPLAY: &str =
-    "the display is reached over the network, which this check does not test, so no tool was started";
+const NETWORK_DISPLAY: &str = "the display is reached over the network, which this check does not test, so no tool was started";
 
 /// The words of a display name that names no display on this machine.
 const NO_SUCH_DISPLAY: &str = "the X11 display name this worker holds names no display on this \
@@ -1109,10 +1107,7 @@ mod tests {
         let address = SocketAddr::from_abstract_name(name.as_os_str().as_bytes()).expect("a name");
         let _listening = UnixListener::bind_addr(&address).expect("an abstract socket");
         let deadline = Deadline::after(Duration::from_secs(5));
-        assert_eq!(
-            reach(9, sockets.path(), &deadline),
-            Some(Reach::Connects)
-        );
+        assert_eq!(reach(9, sockets.path(), &deadline), Some(Reach::Connects));
         assert_eq!(reach(10, sockets.path(), &deadline), Some(Reach::Silent));
     }
 
@@ -1147,12 +1142,7 @@ mod tests {
         let seen = tools.path().join("seen");
         let scratch = folder();
         let plan = Plan::in_directory(scratch.path());
-        let ran = perform_with(
-            &plan,
-            tools.path(),
-            &variables(":7"),
-            tools.path(),
-        );
+        let ran = perform_with(&plan, tools.path(), &variables(":7"), tools.path());
         assert!(
             matches!(ran.outcome, Outcome::Performed { .. }),
             "a display on this machine: {ran:?}"
@@ -1166,12 +1156,7 @@ mod tests {
             (" :0", "names no display on this machine"),
         ] {
             let _ = std::fs::remove_file(&seen);
-            let ran = perform_with(
-                &plan,
-                tools.path(),
-                &variables(display),
-                tools.path(),
-            );
+            let ran = perform_with(&plan, tools.path(), &variables(display), tools.path());
             assert!(
                 matches!(ran.outcome, Outcome::NotAttempted { .. }),
                 "{display:?}: {ran:?}"
