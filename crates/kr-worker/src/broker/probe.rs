@@ -403,7 +403,7 @@ pub mod seams {
 
     static DELAYS: Mutex<Vec<(Point, PathBuf, Duration)>> = Mutex::new(Vec::new());
 
-    static COLLECTION_HOLD: Mutex<Option<(PathBuf, Duration)>> = Mutex::new(None);
+    static COLLECTION_HOLD: Mutex<Vec<(PathBuf, Duration)>> = Mutex::new(Vec::new());
 
     static STARTED: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
 
@@ -434,22 +434,26 @@ pub mod seams {
     }
 
     /// Makes the collection of a probe that is to run in `directory` wait this long after its
-    /// creation, as one the kernel does not let go of would, or stops doing so.
+    /// creation, as one the kernel does not let go of would, or stops doing so. Each directory is
+    /// held on its own.
     pub fn hold_collection(directory: &Path, hold: Option<Duration>) {
-        *COLLECTION_HOLD
+        let mut holds = COLLECTION_HOLD
             .lock()
-            .unwrap_or_else(PoisonError::into_inner) =
-            hold.map(|hold| (directory.to_path_buf(), hold));
+            .unwrap_or_else(PoisonError::into_inner);
+        holds.retain(|(here, _)| here != directory);
+        if let Some(hold) = hold {
+            holds.push((directory.to_path_buf(), hold));
+        }
     }
 
     #[cfg(unix)]
     pub(super) fn collection_held_until(directory: &Path) -> Option<std::time::Instant> {
-        let held = COLLECTION_HOLD
+        COLLECTION_HOLD
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .clone();
-        held.filter(|(held, _)| held == directory)
-            .map(|(_, hold)| std::time::Instant::now() + hold)
+            .iter()
+            .find(|(here, _)| here == directory)
+            .map(|(_, hold)| std::time::Instant::now() + *hold)
     }
 
     pub(super) fn pause_at(point: Point, directory: &Path) {

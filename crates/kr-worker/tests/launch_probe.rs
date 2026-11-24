@@ -716,6 +716,9 @@ fn kr_req_07_64_a_probe_not_collected_within_the_bound_is_collected_later() {
     let deadline = Duration::from_secs(2);
     let hold = Duration::from_secs(4);
     probe::seams::hold_collection(here.path(), Some(hold));
+    // A second directory is held too: setting it must not release this one.
+    let other = directory();
+    probe::seams::hold_collection(other.path(), Some(hold));
     let run = ProbeRun::within(deadline);
     let probed = probe::run_within(
         &standin.program,
@@ -727,6 +730,7 @@ fn kr_req_07_64_a_probe_not_collected_within_the_bound_is_collected_later() {
         probe::MAX_OUTPUT_BYTES,
     );
     probe::seams::hold_collection(here.path(), None);
+    probe::seams::hold_collection(other.path(), None);
     assert!(probed.late, "{probed:?}");
     assert!(
         probed.took >= deadline && probed.took <= deadline + probe::CLEANUP_BOUND + SLACK,
@@ -811,7 +815,9 @@ fn kr_req_07_64_a_probe_that_left_its_process_group_is_ended_by_its_own_number()
 fn kr_req_07_64_a_start_that_fails_after_the_create_gives_up_within_the_cleanup_bound() {
     let here = directory();
     let standin = Standin::running("", "Start-Sleep 600");
-    kr_worker::windows::launch::seams::fail_start_in(Some(here.path()));
+    kr_worker::windows::launch::seams::fail_start_in(here.path(), true);
+    let other = directory();
+    kr_worker::windows::launch::seams::fail_start_in(other.path(), true);
     let probed = probe::run_within(
         &standin.program,
         &standin.probe(&[]),
@@ -821,7 +827,8 @@ fn kr_req_07_64_a_start_that_fails_after_the_create_gives_up_within_the_cleanup_
         &ProbeRun::within(start_allowance()),
         probe::MAX_OUTPUT_BYTES,
     );
-    kr_worker::windows::launch::seams::fail_start_in(None);
+    kr_worker::windows::launch::seams::fail_start_in(here.path(), false);
+    kr_worker::windows::launch::seams::fail_start_in(other.path(), false);
     let why = probed.unread.as_deref().unwrap_or_default();
     assert!(
         why.contains("could not be ended either"),

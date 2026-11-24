@@ -1160,7 +1160,7 @@ mod platform {
         type Shared = Arc<dyn Fn(&str) + Send + Sync>;
 
         static NAME: Mutex<Option<String>> = Mutex::new(None);
-        static FAILING_START: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
+        static FAILING_START: Mutex<Vec<std::path::PathBuf>> = Mutex::new(Vec::new());
         static AFTER_SERVER_CREATE: Mutex<Option<Shared>> = Mutex::new(None);
 
         /// Makes every pipe the next starts make have this name, or not.
@@ -1177,19 +1177,22 @@ mod platform {
         }
 
         /// Makes a start in `directory` fail after its process was created, and be unable to end
-        /// it, or stops doing so. Unlike the other seams it is keyed by the directory, so the cases
-        /// that use it need not run alone.
-        pub fn fail_start_in(directory: Option<&std::path::Path>) {
-            *FAILING_START.lock().unwrap_or_else(PoisonError::into_inner) =
-                directory.map(std::path::Path::to_path_buf);
+        /// it, or stops doing so. Each directory is set on its own, so the cases that use it need
+        /// not run alone.
+        pub fn fail_start_in(directory: &std::path::Path, fails: bool) {
+            let mut failing = FAILING_START.lock().unwrap_or_else(PoisonError::into_inner);
+            failing.retain(|here| here != directory);
+            if fails {
+                failing.push(directory.to_path_buf());
+            }
         }
 
         pub(super) fn fails_in(directory: &std::path::Path) -> bool {
             FAILING_START
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
-                .as_deref()
-                == Some(directory)
+                .iter()
+                .any(|here| here == directory)
         }
 
         pub(super) fn fixed_name() -> Option<String> {
