@@ -242,8 +242,8 @@ describe('which platform the page is shown for', () => {
     expect(run).toBeDisabled()
     expect(run).toHaveAttribute('aria-describedby', 'setup-run-unavailable')
     expect(screen.getByTestId('setup-run-unavailable').textContent).toBe(
-      'The checks cannot run until this app has read which system it runs on, because what they ' +
-        'do depends on it. Use “Read again” to try once more.'
+      'No run can start here until this application has read which system it runs on, because ' +
+        'what the checks do depends on it. Use “Read again” to try once more.'
     )
     // Reading again is still on offer, and once the application is read the list is the whole one.
     expect(screen.getByTestId('setup-recheck')).toBeEnabled()

@@ -1115,8 +1115,8 @@ function CapabilitiesStep({
           <ChecksLine checks={capabilities.checks} platform={platform} />
           {!runnable ? (
             <p className="faint small" id="setup-run-unavailable" data-testid="setup-run-unavailable">
-              The checks cannot run until this app has read which system it runs on, because what
-              they do depends on it. Use “Read again” to try once more.
+              No run can start here until this application has read which system it runs on,
+              because what the checks do depends on it. Use “Read again” to try once more.
             </p>
           ) : null}
         </div>
