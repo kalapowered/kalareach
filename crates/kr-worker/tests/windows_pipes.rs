@@ -180,6 +180,15 @@ fn a_competing_client_in_the_window_refuses_the_start() {
         .expect("a slot")
         .take()
         .expect("the competitor ran");
+    // The runtime closes a dropped server end when its driver next runs, so the case runs it until
+    // the competitor has read the end of the file.
+    runtime
+        .block_on(tokio::time::timeout(PATIENCE, async {
+            while !reader.is_finished() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }))
+        .expect("the worker's end is closed once the runtime runs");
     assert_eq!(
         reader.join().expect("the competitor ends"),
         0,
@@ -255,7 +264,8 @@ fn the_child_reports_its_pipe_handles() {
         let end = if flags & 1 == 0 { "client" } else { "server" };
         lines.push_str(&format!("PIPE {value} {end}\n"));
     }
-    print!("{lines}");
+    // A line of its own, because the harness has written the case's name on the line before.
+    print!("\n{lines}");
 }
 
 /// KR-REQ-07.45: this worker's ends are private and the agent holds three client ends and no other
