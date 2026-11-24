@@ -263,3 +263,118 @@ async fn kr_req_24_24_a_client_over_the_fourth_protocol_reads_every_member_and_u
     .await
     .expect("the documents never arrived");
 }
+
+/// Registers `request`'s binding over `client`, with the component installed on `served`.
+async fn register_over(
+    client: &PluginClient,
+    request: &BindingRequest,
+    source: &ComponentSource,
+) -> kr_plugin_service::error::ServiceResult<kr_plugin_service::client::Registration> {
+    client
+        .register(
+            request.binding_id,
+            &request.identity,
+            &request.facts,
+            &request.executable,
+            source,
+        )
+        .await
+}
+
+/// A host refuses a second registration of a binding that has one, and keeps the first. The client
+/// keeps the first too: its notices are read and its restores name it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_24_24_a_refused_duplicate_registration_leaves_the_registration_the_host_holds_the_clients()
+ {
+    let Some(component) = components::component("recording") else {
+        return;
+    };
+    let served = Served::start_dual(true).await;
+    publish_three(&served);
+    publish_four(&served, &descriptor4_of(&served));
+    let client = connected(&served).await;
+    assert_eq!(client.protocol(), HostProtocol::V4);
+    let (path, digest, bytes) = served.install("recording", &component);
+    let source = ComponentSource {
+        path,
+        digest,
+        bytes,
+    };
+    let request: BindingRequest = components::request("recording", 63);
+    register_over(&client, &request, &source)
+        .await
+        .expect("the binding registers");
+    let duplicate = register_over(&client, &request, &source).await;
+    assert!(
+        duplicate.is_err(),
+        "the host registered a binding that it already held"
+    );
+
+    let deadline = core::time::Duration::from_secs(20);
+    let state = client
+        .checkpoint(request.binding_id, deadline)
+        .await
+        .expect("the checkpoint runs")
+        .state
+        .expect("the state came back");
+    let restored = client.restore(request.binding_id, state, deadline).await;
+    assert!(
+        restored.is_ok(),
+        "a restore after a refused duplicate was refused: {restored:?}"
+    );
+    client
+        .deliver(request.binding_id, &components::scrape("se-1", "x"))
+        .await
+        .expect("the event is offered");
+    let read = tokio::time::timeout(HANG_GUARD, client.notice())
+        .await
+        .expect("the notice never arrived");
+    assert!(
+        matches!(read, Some(Notice::Document { .. })),
+        "the notices of the registration the host holds were dropped: {read:?}"
+    );
+}
+
+/// A binding that is registered, removed and registered again is read under its new registration
+/// each time, and a removal leaves the client holding nothing for it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_24_24_a_binding_registered_and_removed_again_is_read_under_each_new_registration() {
+    let Some(component) = components::component("recording") else {
+        return;
+    };
+    let served = Served::start_dual(true).await;
+    publish_three(&served);
+    publish_four(&served, &descriptor4_of(&served));
+    let client = connected(&served).await;
+    assert_eq!(client.protocol(), HostProtocol::V4);
+    let (path, digest, bytes) = served.install("recording", &component);
+    let source = ComponentSource {
+        path,
+        digest,
+        bytes,
+    };
+    let request: BindingRequest = components::request("recording", 64);
+    for round in 0..3 {
+        register_over(&client, &request, &source)
+            .await
+            .unwrap_or_else(|error| panic!("round {round}: the binding registers: {error:?}"));
+        client
+            .deliver(
+                request.binding_id,
+                &components::scrape(&format!("se-{round}"), "x"),
+            )
+            .await
+            .expect("the event is offered");
+        let read = tokio::time::timeout(HANG_GUARD, client.notice())
+            .await
+            .expect("the notice never arrived");
+        assert!(
+            matches!(read, Some(Notice::Document { .. })),
+            "round {round}: the binding's notices were dropped: {read:?}"
+        );
+        assert!(
+            client.unbind(request.binding_id).await.expect("unbinds"),
+            "round {round}: the host held the registration"
+        );
+    }
+}
