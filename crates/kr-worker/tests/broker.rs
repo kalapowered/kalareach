@@ -3138,6 +3138,100 @@ fn kr_req_11_17_a_live_instances_launch_profile_is_not_replaced_by_a_second_prep
     );
 }
 
+/// KR-REQ-11.17, the launch profile: two launches prepared under one identifier before either
+/// executed both pass the preparation's check, and the second to execute is refused, so the profile
+/// of the first instance and its recorded row are whole: nothing replaced either.
+#[test]
+fn kr_req_11_17_a_second_launch_under_a_live_profiles_identifier_is_refused_when_it_executes() {
+    let store = common::SharedStore::open();
+    let broker =
+        Broker::open(Some(&store.path), session(), store.health()).expect("the broker opens");
+    let first = profile(IntegrationMode::Gateway, [3; 32], "0.9.1");
+    let mut second = profile(IntegrationMode::Gateway, [4; 32], "0.9.2");
+    second.profile_id = first.profile_id.clone();
+    let first_intent = broker
+        .prepare_launch(first.clone(), ForegroundMark::idle(4), None)
+        .expect("the first launch is prepared");
+    let second_intent = broker
+        .prepare_launch(second, ForegroundMark::idle(4), None)
+        .expect("no live instance holds the identifier yet");
+    broker
+        .execute_launch(&first_intent, &ForegroundMark::idle(4), instance(2))
+        .expect("the first launch runs")
+        .register(IntegrationMode::Gateway, Some(managed(instance(2))))
+        .expect("the instance is registered")
+        .commit();
+
+    let refusal = broker
+        .execute_launch(&second_intent, &ForegroundMark::idle(4), instance(3))
+        .expect_err("a live instance's profile is not replaced by a second launch");
+    assert!(
+        matches!(refusal, BrokerError::InvalidArgument(_)),
+        "{refusal:?}"
+    );
+    assert_eq!(
+        broker.profile_of(instance(2)),
+        Some(first.clone()),
+        "the first instance still reads the profile it was launched under"
+    );
+    assert!(
+        broker.profile_of(instance(3)).is_none(),
+        "and the refused launch holds no profile"
+    );
+    let recorded = Ledger::open(Some(&store.path), store.health())
+        .expect("the ledger reopens")
+        .profiles()
+        .expect("the profiles read");
+    assert_eq!(
+        recorded,
+        vec![first],
+        "the recorded row is the first launch's"
+    );
+}
+
+/// KR-REQ-11.17, the launch profile: an adoption under the identifier of a live instance's profile
+/// is refused, and the live instance's profile and its recorded row are whole.
+#[test]
+fn kr_req_11_17_an_adoption_under_a_live_profiles_identifier_is_refused() {
+    let store = common::SharedStore::open();
+    let broker =
+        Broker::open(Some(&store.path), session(), store.health()).expect("the broker opens");
+    let first = profile(IntegrationMode::Gateway, [3; 32], "0.9.1");
+    let intent = broker
+        .prepare_launch(first.clone(), ForegroundMark::idle(4), None)
+        .expect("the launch is prepared");
+    broker
+        .execute_launch(&intent, &ForegroundMark::idle(4), instance(2))
+        .expect("the launch runs")
+        .register(IntegrationMode::Gateway, Some(managed(instance(2))))
+        .expect("the instance is registered")
+        .commit();
+
+    let mut observed = profile(IntegrationMode::NativeTerminal, [4; 32], "1.0.0");
+    observed.profile_id = first.profile_id.clone();
+    let refusal = broker
+        .adopt_instance(observed, instance(3), process_identity(45, 904), None)
+        .expect_err("a live instance's profile is not replaced by an adoption");
+    assert!(
+        matches!(refusal, BrokerError::InvalidArgument(_)),
+        "{refusal:?}"
+    );
+    assert_eq!(
+        broker.profile_of(instance(2)),
+        Some(first.clone()),
+        "the launched instance still reads the profile it was launched under"
+    );
+    assert!(
+        broker.binding_state(instance(3)).is_err(),
+        "and nothing of the refused adoption is held"
+    );
+    let recorded = Ledger::open(Some(&store.path), store.health())
+        .expect("the ledger reopens")
+        .profiles()
+        .expect("the profiles read");
+    assert_eq!(recorded, vec![first], "the recorded row is the launch's");
+}
+
 /// A reservation registers on the broker that made it, and giving one back touches that broker
 /// alone.
 #[test]

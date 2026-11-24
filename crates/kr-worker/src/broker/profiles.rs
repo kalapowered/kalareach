@@ -189,22 +189,31 @@ impl ProfileStore {
         if !against.is_idle() {
             return Err(BrokerError::Launch(LaunchRefusal::ForegroundChanged));
         }
-        if self
-            .instances
-            .values()
-            .any(|held| *held == profile.profile_id)
-        {
-            return Err(BrokerError::invalid(format!(
-                "profile {} is held by a live instance, and a profile is not replaced while its \
-                 instance lives",
-                profile.profile_id
-            )));
-        }
+        self.check_profile_unheld(&profile.profile_id)?;
         Ok(LaunchIntent {
             profile,
             prepared_against: against,
             saved_conversation,
         })
+    }
+
+    /// Refuses a profile whose identifier a live instance holds: a profile does not change while
+    /// its instance lives, so what a record names about the launch stays what the launch was.
+    ///
+    /// A preparation, an execution and an adoption each put a profile in force, so each asks this
+    /// before it writes anything.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::InvalidArgument`] when a live instance holds the identifier.
+    pub fn check_profile_unheld(&self, profile_id: &LaunchProfileId) -> Result<()> {
+        if self.instances.values().any(|held| held == profile_id) {
+            return Err(BrokerError::invalid(format!(
+                "profile {profile_id} is held by a live instance, and a profile is not replaced \
+                 while its instance lives"
+            )));
+        }
+        Ok(())
     }
 
     /// Keeps a profile whose record has been written.
@@ -264,8 +273,9 @@ impl ProfileStore {
     ///
     /// # Errors
     ///
-    /// Returns [`BrokerError::InvalidArgument`] when the instance was already launched, and
-    /// [`BrokerError::Launch`] with the refusal that applies otherwise.
+    /// Returns [`BrokerError::InvalidArgument`] when the instance was already launched or a live
+    /// instance holds a profile of the intent's identifier, and [`BrokerError::Launch`] with the
+    /// refusal that applies otherwise.
     pub fn check_executable(
         &self,
         intent: &LaunchIntent,
@@ -279,6 +289,9 @@ impl ProfileStore {
                 "{application_instance_id} was already launched, and one instance runs one launch"
             )));
         }
+        // Two intents prepared under one identifier before either executed both passed the
+        // preparation's check, so the execution asks again, under the same lock as its write.
+        self.check_profile_unheld(&intent.profile.profile_id)?;
         if !now.is_idle() {
             return Err(BrokerError::Launch(LaunchRefusal::ForegroundChanged));
         }

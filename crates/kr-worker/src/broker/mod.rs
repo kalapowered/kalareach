@@ -1353,8 +1353,9 @@ impl Broker {
     ///
     /// # Errors
     ///
-    /// Returns [`BrokerError::InvalidArgument`] when the identifier is already held, and
-    /// [`BrokerError::LedgerUnavailable`] when the profile cannot be recorded.
+    /// Returns [`BrokerError::InvalidArgument`] when the identifier is already held or a live
+    /// instance holds a profile of the same identifier, and [`BrokerError::LedgerUnavailable`]
+    /// when the profile cannot be recorded.
     pub fn adopt_instance(
         &self,
         profile: LaunchProfile,
@@ -1365,6 +1366,7 @@ impl Broker {
         let semantic = crate::broker::semantic::SemanticLog::new(Arc::clone(&self.observation));
         let mut state = self.state();
         state.check_unheld(application_instance_id)?;
+        state.profiles.check_profile_unheld(&profile.profile_id)?;
         state.stored(kr_ipc::now_ms(), "a launch profile", |ledger| {
             ledger.put_profile(&profile, Some(application_instance_id))
         })?;
@@ -3046,7 +3048,8 @@ impl Broker {
     /// # Errors
     ///
     /// Returns [`BrokerError::Launch`] with the refusal that applies, and
-    /// [`BrokerError::InvalidArgument`] when the identifier is already held.
+    /// [`BrokerError::InvalidArgument`] when the identifier is already held or a live instance
+    /// holds a profile of the intent's identifier.
     pub fn execute_launch(
         &self,
         intent: &LaunchIntent,
