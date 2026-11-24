@@ -1597,6 +1597,56 @@ fn the_version_of_an_attention_store_that_holds_a_value_naming_the_receipt_rule_
     }
 }
 
+/// The version of an attention store that is not at 13 is not written back, whether it is below or
+/// above 13.
+#[test]
+fn the_version_of_an_attention_store_that_is_not_at_13_is_not_written_back() {
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    let store = directory.path().join("attention.sqlite3");
+    let boot = kr_attention::time::BootMark::from_bytes([7; 16]);
+    let reading = kr_attention::HostReading::new(boot, 0, 12 * 60 * 60 * 1_000, true);
+    let unknown = |_: &kr_protocol::identity::ProcessStartIdentity| kr_attention::Liveness::Unknown;
+    let opener = kr_attention::Claimant::new(
+        kr_protocol::identity::ProcessStartIdentity::new(
+            1,
+            kr_protocol::identity::ProcessStartSource::LinuxProcStat,
+            1_001,
+        ),
+        &unknown,
+    );
+    drop(kr_attention::Attention::open(&store, reading, &opener).expect("the store opens"));
+    let version_of = |path: &Path| -> i64 {
+        rusqlite::Connection::open(path)
+            .expect("the attention store")
+            .query_row("SELECT version FROM attention_schema", [], |row| row.get(0))
+            .expect("the version")
+    };
+
+    for at in [12, 14] {
+        let copy = directory.path().join(format!("at-{at}.sqlite3"));
+        std::fs::copy(&store, &copy).expect("a copy of the store");
+        rusqlite::Connection::open(&copy)
+            .expect("the copy")
+            .execute("UPDATE attention_schema SET version = ?1", [at])
+            .expect("the copy");
+        let refused = std::panic::catch_unwind(|| write_the_attention_version_back(&copy));
+        assert!(
+            refused.is_err(),
+            "the version is not written back while the store is at {at}"
+        );
+        let said = refused
+            .unwrap_err()
+            .downcast_ref::<String>()
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            said.contains("only version 13 is written back"),
+            "the refusal names the one version that is written back"
+        );
+        assert_eq!(version_of(&copy), at, "the store is as it was found");
+    }
+}
+
 /// KR-REQ-26.10, KR-REQ-26.08: a rollback to the release before goes on while only its session is
 /// live, and waits, exit 9, naming the session, while a session of this release is live.
 ///
