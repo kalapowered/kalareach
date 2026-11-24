@@ -1072,6 +1072,102 @@ async fn kr_req_24_24_a_component_that_starts_again_is_given_the_pending_request
     );
 }
 
+/// KR-REQ-24.24: a request whose answer is being written is not given to a component that starts
+/// again: the request is claimed, and is no longer one the broker holds as pending.
+///
+/// Three requests are read into approvals. The runtime is lost and an answer to the second is
+/// admitted, which claims it; the answer is not written. The component that starts again is given
+/// the other two, and its report says two.
+///
+/// The binding that reads the requests is the first of its package, since that is the one the
+/// worker asks whether the package may answer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_24_24_a_request_whose_answer_is_being_written_is_not_given_to_a_component_that_starts_again()
+ {
+    let Some(world) = Observing::start(Options::with(vec![
+        Spec::interpreter(1),
+        Spec::semantic_only(2),
+    ]))
+    .await
+    else {
+        return;
+    };
+    world.until_ready(2).await;
+    let sent = [1_u64, 2, 3];
+    for id in sent {
+        world.send(&request(id));
+    }
+    until("every request to be read into an approval", || async {
+        (world
+            .broker()
+            .pending_resources()
+            .iter()
+            .filter(|resource| {
+                resource.kind == PendingKind::Approval && resource.interpretation_verified
+            })
+            .count()
+            == sent.len())
+        .then_some(())
+    })
+    .await;
+    world
+        .until_account(2, "the component to have observed them all", |account| {
+            account.requests.len() == sent.len()
+        })
+        .await;
+
+    lose_the_runtime(&world).await;
+    let second = until_recorded(&world, 2).await;
+    let revision = world
+        .broker()
+        .binding_state(instance())
+        .expect("the instance is bound")
+        .binding_revision;
+    let caller = kr_worker::broker::Caller {
+        actor_id: kr_protocol::ids::ActorId::new("device-1").expect("an actor"),
+        grant_id: None,
+        ingress: kr_protocol::actor::ActorIngress::LocalIpc,
+        device_id: None,
+    };
+    // Held until the end of the case: the answer is admitted and never written, so the request
+    // stays claimed.
+    let _answer = world
+        .broker()
+        .admit_approval(
+            &caller,
+            &kr_protocol::agent::AgentApprovalRespondParams {
+                target: kr_protocol::agent::AgentMutationTarget {
+                    subject: kr_worker::broker::subject(world.hosted.session_id, instance()),
+                    binding_revision: revision,
+                },
+                resource_id: second.resource_id,
+                option_id: "allow".to_owned(),
+            },
+            kr_ipc::now_ms(),
+        )
+        .expect("the answer is admitted");
+    assert_eq!(
+        until_recorded(&world, 2).await.state,
+        PendingState::Claimed,
+        "the admitted answer claims the request"
+    );
+    world.let_the_compiles_go();
+    until_started_again(&world, 2).await;
+
+    let account = world.account(2).await.expect("the component answers");
+    assert_eq!(
+        account.requests,
+        ["1", "3"],
+        "the claimed request was given, or another was left out: {account:?}"
+    );
+    assert_eq!(account.observes, 2, "{account:?}");
+    let reason = world.reason(2);
+    assert!(
+        reason.contains("the worker gave it 2 pending requests from its own records"),
+        "{reason}"
+    );
+}
+
 /// KR-REQ-24.24: what the worker passed over while the plugin runtime was away is counted, whether
 /// the pump took it while the runtime was away or after the component was registered again, and told
 /// in the component's report with its bytes.
@@ -1324,6 +1420,75 @@ async fn kr_req_24_24_a_request_made_in_privacy_mode_is_given_as_one_and_a_reque
     assert!(
         decoding.contains("1 pending request was queued to be decoded again"),
         "{decoding}"
+    );
+}
+
+/// KR-REQ-24.27 and KR-REQ-24.24: a request made in privacy mode while the runtime was away is still
+/// one after it was decoded again and the runtime is lost a second time.
+///
+/// The runtime is lost, privacy mode is turned on, a request arrives for a decoder that is away, its
+/// queued decode is dropped, and privacy mode is turned off. The component that starts again is
+/// given the request and the decoder reads it. The runtime is lost again, and the component that
+/// starts the second time is given the approval as a request made in privacy mode: it is marked as
+/// handed it, as the first was.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_24_24_a_request_made_in_privacy_mode_while_the_runtime_was_away_is_still_one_when_the_runtime_is_lost_again()
+ {
+    let Some(world) = Observing::start(Options::with(vec![
+        Spec::semantic_only(1),
+        Spec::decoder(2, "hostile-decoder"),
+    ]))
+    .await
+    else {
+        return;
+    };
+    world.until_ready(1).await;
+    world.until_ready(2).await;
+    let lane = world.broker().observation();
+    let mut authority = world
+        .hosted
+        .daemon_connection(ControllerConnectionRole::Authority)
+        .await;
+
+    lose_the_runtime(&world).await;
+    world.tell_privacy(&mut authority, 1, true).await;
+    world.send(&request_noting(63, "!answer"));
+    until_recorded(&world, 63).await;
+    let queue = world.broker().decode_queue();
+    until("the request to be queued for its decode", || async {
+        (queue.len() == 1).then_some(())
+    })
+    .await;
+    let (taken, dropped) = queue.take(|_| Verdict::Drop(NotDecoded::NotRegistered));
+    assert!(taken.is_none() && dropped.len() == 1, "{dropped:?}");
+    world.tell_privacy(&mut authority, 2, false).await;
+    assert!(!lane.is_private());
+
+    world.let_the_compiles_go();
+    until_started_again(&world, 1).await;
+    until(
+        "the request sent while the runtime was away to be decoded again",
+        || async { until_decoded(&world, 63).then_some(()) },
+    )
+    .await;
+    assert!(
+        lane.is_marked(binding(1)),
+        "the component that started again was given a request made in privacy mode and is not marked"
+    );
+
+    lose_the_runtime(&world).await;
+    world.let_the_compiles_go();
+    until_started_again(&world, 1).await;
+    let account = world.account(1).await.expect("the component answers");
+    assert_eq!(
+        account.requests,
+        ["63"],
+        "the component that started the second time was not given the request: {account:?}"
+    );
+    assert!(
+        lane.is_marked(binding(1)),
+        "the component that started the second time was given a request made in privacy mode and \
+         is not marked"
     );
 }
 
