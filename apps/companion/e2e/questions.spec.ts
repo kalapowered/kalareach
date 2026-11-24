@@ -106,7 +106,7 @@ for (const surface of ['ios', 'android'] as const) {
       const count = await controls.count()
       expect(count, 'controls found on the question').toBeGreaterThan(0)
       for (let index = 0; index < count; index += 1) {
-        await controls.nth(index).click({ trial: true, timeout: 2_000 })
+        await controls.nth(index).click({ trial: true, timeout: PRESENTATION_DEADLINE })
       }
 
       // No press needed the sheet to be scrolled: a finger could not have done it.

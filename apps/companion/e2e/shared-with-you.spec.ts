@@ -214,9 +214,9 @@ async function unreachable(page: Page, scope: string): Promise<string[]> {
       .slice(0, 40)
     await framesDrawn(page)
     try {
-      await control.click({ trial: true, timeout: 2_000 })
+      await control.click({ trial: true, timeout: PRESENTATION_DEADLINE })
     } catch (failure) {
-      found.push(`${label}: ${String(failure).split('\n')[0]}`)
+      found.push(`${label}: ${String(failure)}`)
     }
   }
   return found

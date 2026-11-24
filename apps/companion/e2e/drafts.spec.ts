@@ -11,6 +11,7 @@ import { Buffer } from 'node:buffer'
 
 import { expect, test, type Page } from '@playwright/test'
 
+import { PRESENTATION_DEADLINE } from './bounds'
 import { overrunning, stopWrapping } from './layout'
 
 const SESSION = '8a7b6c50-22bb-4c3d-8e4f-000000000101'
@@ -125,7 +126,7 @@ for (const surface of ['ios', 'android'] as const) {
       const count = await controls.count()
       expect(count, 'controls found on the kept draft').toBeGreaterThan(0)
       for (let index = 0; index < count; index += 1) {
-        await controls.nth(index).click({ trial: true, timeout: 2_000 })
+        await controls.nth(index).click({ trial: true, timeout: PRESENTATION_DEADLINE })
       }
 
       // The control: with the text kept from wrapping, the same measure sees it run out of its box.
@@ -172,7 +173,7 @@ for (const surface of ['ios', 'android'] as const) {
       await expect(page.locator('.toast')).toHaveCount(0)
       await page
         .getByRole('button', { name: /^Remove .* from this draft$/ })
-        .click({ trial: true, timeout: 2_000 })
+        .click({ trial: true, timeout: PRESENTATION_DEADLINE })
 
       // The controls, one for each root: with its text kept from wrapping, the same measure sees it
       // run out of its boxes.

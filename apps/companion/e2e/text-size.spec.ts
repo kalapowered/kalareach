@@ -359,7 +359,9 @@ test.describe('at the largest text size on a screen 320 points wide', () => {
 
         // What a person can touch: the enabled controls the page shows, inside the dialog when one
         // is open. Each is scrolled to, and pressed in a trial that stops short of the press: it
-        // fails where something else would take the touch.
+        // fails where something else would take the touch. How long the page takes to answer is the
+        // machine's, so the trial is bounded by the liveness limit and not by an estimate of how
+        // long a press takes: a page that stalls for a few seconds still answers it.
         const scope = open !== null && name.startsWith('the settings') ? page.getByRole('dialog') : page.locator('body')
         const controls = scope.locator(
           'button:visible:not([disabled]), a[href]:visible, textarea:visible:not([disabled]), input:visible:not([disabled]), [role="tab"]:visible'
@@ -377,9 +379,9 @@ test.describe('at the largest text size on a screen 320 points wide', () => {
             .trim()
             .slice(0, 40)
           try {
-            await control.click({ trial: true, timeout: 2_000 })
+            await control.click({ trial: true, timeout: PRESENTATION_DEADLINE })
           } catch (failure) {
-            unreachable.push(`${label || 'a control with no name'}: ${String(failure).split('\n')[0]}`)
+            unreachable.push(`${label || 'a control with no name'}: ${String(failure)}`)
           }
         }
         expect(unreachable, 'controls a touch cannot reach').toEqual([])
@@ -969,7 +971,7 @@ test.describe('a passing message', () => {
         'controls of the message that are out of view'
       ).toEqual([])
       expect(layout?.controls.map((control) => control.name)).toEqual(['Dismiss'])
-      await toast.getByRole('button', { name: 'Dismiss' }).click({ trial: true, timeout: 2_000 })
+      await toast.getByRole('button', { name: 'Dismiss' }).click({ trial: true, timeout: PRESENTATION_DEADLINE })
 
       // The words reach their last line by scrolling the box, and the control stays where it is.
       const before = await toast.getByRole('button', { name: 'Dismiss' }).boundingBox()
@@ -1066,7 +1068,7 @@ test.describe('a passing message', () => {
         expect(layout?.scrolls).toBe(true)
       }
       for (const control of ['Review', 'Dismiss']) {
-        await toast.getByRole('button', { name: control }).click({ trial: true, timeout: 2_000 })
+        await toast.getByRole('button', { name: control }).click({ trial: true, timeout: PRESENTATION_DEADLINE })
       }
     })
   }
@@ -1164,7 +1166,7 @@ test.describe('a passing message on the phone, above the bar and the keyboard', 
               return now !== null && now.bottom <= now.bar + 0.5
             }, 'the message ends above the tab bar')
             .toBe(true)
-          await toast.getByRole('button', { name: 'Dismiss' }).click({ trial: true, timeout: 2_000 })
+          await toast.getByRole('button', { name: 'Dismiss' }).click({ trial: true, timeout: PRESENTATION_DEADLINE })
 
           // The platform's inset under the bar grows (a device turned, a home indicator): the bar is
           // taller by it, and the message stays above the bar.
@@ -1198,7 +1200,7 @@ test.describe('a passing message on the phone, above the bar and the keyboard', 
             bar: document.querySelector('.m-topbar')?.getBoundingClientRect().bottom ?? 0
           }))
           expect(bars.top, 'the message starts below the top bar').toBeGreaterThanOrEqual(bars.bar - 0.5)
-          await toast.getByRole('button', { name: 'Dismiss' }).click({ trial: true, timeout: 2_000 })
+          await toast.getByRole('button', { name: 'Dismiss' }).click({ trial: true, timeout: PRESENTATION_DEADLINE })
           await page.screenshot({ path: screenshotPath(`kr-text-size-toast-keyboard-${surface}-${size}-${String(width)}-${test.info().project.name}`) })
 
           // The keyboard goes, and the message comes back down to the bar.
@@ -1282,7 +1284,7 @@ test.describe('a passing message on a short phone with a keyboard up', () => {
           (now?.line ?? 0) + 1
         )
       }
-      await toast.getByRole('button', { name: 'Dismiss' }).click({ trial: true, timeout: 2_000 })
+      await toast.getByRole('button', { name: 'Dismiss' }).click({ trial: true, timeout: PRESENTATION_DEADLINE })
     })
   }
 })
