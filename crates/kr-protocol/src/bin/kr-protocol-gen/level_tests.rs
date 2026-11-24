@@ -1501,13 +1501,15 @@ fn a_kept_release_of_a_retained_level_is_compared_over_both_root_lists_and_both_
     use crate::retained::kept_release_differences;
     use kr_protocol::retained::Surface;
 
-    // The releases of a level other than the one the record is taken from.
+    // The releases of a level other than the one the record is taken from: the record is taken
+    // from a commit none of them is at.
+    let elsewhere = "0".repeat(40);
     let not_source = |repository: &std::path::Path,
                       release: &crate::releases::Release,
                       kept: &Surface,
                       majors: Option<&str>,
                       host: &[&str]| {
-        kept_release_differences(repository, release, kept, majors, host, false)
+        kept_release_differences(repository, release, kept, majors, host, &elsewhere)
     };
 
     let kept_tree = Tree::the_level();
@@ -1554,7 +1556,7 @@ fn a_kept_release_of_a_retained_level_is_compared_over_both_root_lists_and_both_
         &kept,
         majors,
         &["kr-plugin-host/3", "kr-plugin-host/4"],
-        true,
+        &same.commit,
     )
     .expect("compared");
     assert!(
@@ -1568,7 +1570,7 @@ fn a_kept_release_of_a_retained_level_is_compared_over_both_root_lists_and_both_
             &kept,
             majors,
             &["kr-plugin-host/3"],
-            true
+            &same.commit
         )
         .expect("compared")
         .is_empty()

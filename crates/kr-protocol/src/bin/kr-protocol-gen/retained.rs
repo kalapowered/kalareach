@@ -124,6 +124,9 @@ pub fn problems(directory: &Path) -> Vec<String> {
 /// over both revisions' roots (the kept surface's, and the ones the release's own source declares),
 /// the table of public majors and the plugin host protocol. Each is a line.
 ///
+/// `source_commit` is the release the level's record is taken from: the record lists exactly what
+/// that release lists, and what every other release of the level lists is inside it.
+///
 /// # Errors
 ///
 /// When the release's schema or sources cannot be read, or its declared roots are not definitions of
@@ -134,7 +137,7 @@ pub fn kept_release_differences(
     kept: &Surface,
     kept_majors: Option<&str>,
     kept_host: &[&str],
-    source: bool,
+    source_commit: &str,
 ) -> Result<Vec<String>, String> {
     let schema_text = releases::git_in(
         repository,
@@ -177,8 +180,9 @@ pub fn kept_release_differences(
             kept_host.join(", ")
         ));
     }
-    // The record is taken from this release, so it lists what the release lists and no name more.
-    if source {
+    // The record is taken from the release at `source_commit`, so it lists what that release lists
+    // and no name more; every other release of the level lists some of the record's names.
+    if release.commit == source_commit {
         for name in host_names_outside(kept_host, &listed) {
             found.push(format!(
                 "the plugin host protocol {name} is in the kept record ({}) and is not listed by {}, the release the record is taken from",
@@ -413,7 +417,7 @@ pub fn release_commit(level: &str, commit: &str) -> Result<(), String> {
             retained.surface(),
             retained.public_majors,
             &retained.plugin_host_names(),
-            release.commit == full,
+            &full,
         )?;
         if !found.is_empty() {
             let mut lines = vec![format!(
