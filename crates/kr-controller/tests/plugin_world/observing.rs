@@ -48,6 +48,11 @@ pub fn instance() -> ApplicationInstanceId {
     ApplicationInstanceId::new(Uuid::from_bytes([2; 16]))
 }
 
+/// The second instance of the package, for the cases that need one.
+pub fn second_instance() -> ApplicationInstanceId {
+    ApplicationInstanceId::new(Uuid::from_bytes([3; 16]))
+}
+
 /// The package whose table the connection reads.
 pub fn package() -> PluginId {
     PluginId::new("kalareach.codex").expect("a plugin identifier")
@@ -87,6 +92,8 @@ pub struct Spec {
     pub interpreting: bool,
     /// Whether its package declares an action that answers an approval.
     pub answering: bool,
+    /// Whether it is bound to the world's second instance, which has a connection of its own.
+    pub second_instance: bool,
 }
 
 impl Spec {
@@ -104,6 +111,7 @@ impl Spec {
             component: Some("recording"),
             interpreting: false,
             answering: false,
+            second_instance: false,
         }
     }
 
@@ -121,6 +129,7 @@ impl Spec {
             component: None,
             interpreting: true,
             answering: false,
+            second_instance: false,
         }
     }
 
@@ -166,6 +175,13 @@ impl Spec {
     #[must_use]
     pub const fn shipping(mut self, component: &'static str) -> Self {
         self.component = Some(component);
+        self
+    }
+
+    /// Bound to the second instance of the package.
+    #[must_use]
+    pub const fn on_the_second_instance(mut self) -> Self {
+        self.second_instance = true;
         self
     }
 
@@ -354,6 +370,98 @@ impl Terminal {
     }
 }
 
+/// One instance's connection to the upstream and to the native terminal.
+pub struct Connection {
+    sender: tokio::sync::mpsc::UnboundedSender<String>,
+    /// What the worker forwards to the native terminal.
+    pub terminal: Arc<Terminal>,
+    /// The frames the worker wrote to the upstream.
+    pub written: Arc<Mutex<Vec<String>>>,
+    owner: Arc<kr_worker::broker::Duplex>,
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+}
+
+/// Pins an instance's table and reading, authenticates its native connection with `credential`, and
+/// carries the production transport over two socket pairs for it.
+fn connect(
+    hosted: &Hosted,
+    instance: ApplicationInstanceId,
+    process: &ProcessStartIdentity,
+    credential: [u8; 32],
+    connection: u64,
+) -> Connection {
+    let broker = hosted._service.broker();
+    broker
+        .pin_table(instance, installed(), table(), rich())
+        .expect("the installed tables are pinned");
+    broker
+        .pin_reading(instance, &package(), reading())
+        .expect("the reading is pinned");
+    broker
+        .open_native_connection(instance, &credential, process, &package(), "1")
+        .expect("the native connection is authenticated");
+    let (here, there) = wire();
+    let (upstream_reads, upstream_writes) = tokio::io::split(here);
+    let (client_here, client_there) = wire();
+    let (client_reads, client_writes) = tokio::io::split(client_here);
+    let (owner, writes) = kr_worker::broker::Duplex::new(
+        Arc::clone(broker),
+        kr_protocol::ids::GatewayConnectionId::new(connection),
+        kr_worker::broker::Framing::new(kr_protocol::gateway::NativeFraming::JsonLines),
+        upstream_writes,
+        client_writes,
+        hosted.environment_id,
+        "agent-user",
+    );
+    let carrying = owner.dispatch().expect("it carries operations") as Arc<dyn UpstreamDispatch>;
+    // The transport carries the operations of the instance, and the answers to the requests
+    // asked on this connection.
+    broker.bind_connection_dispatch(
+        kr_protocol::ids::GatewayConnectionId::new(connection),
+        Arc::clone(&carrying),
+    );
+    broker
+        .bind_dispatch(instance, carrying)
+        .expect("the transport is bound");
+    let written = Arc::new(Mutex::new(Vec::new()));
+    let (sender, injected) = tokio::sync::mpsc::unbounded_channel();
+    let mut tasks = vec![
+        tokio::spawn(upstream(there, Arc::clone(&written), injected)),
+        tokio::spawn(writes),
+        tokio::spawn({
+            let owner = Arc::clone(&owner);
+            async move { owner.serve(upstream_reads, true).await }
+        }),
+        tokio::spawn({
+            let owner = Arc::clone(&owner);
+            async move { owner.serve(client_reads, false).await }
+        }),
+    ];
+    let (reads, terminal_writes) = tokio::io::split(client_there);
+    let terminal = Arc::new(Terminal {
+        lines: Mutex::new(Vec::new()),
+        arrived: tokio::sync::Notify::new(),
+        writes: tokio::sync::Mutex::new(terminal_writes),
+    });
+    tasks.push(tokio::spawn({
+        let terminal = Arc::clone(&terminal);
+        async move {
+            let mut lines = tokio::io::BufReader::new(reads).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                terminal.lines.lock().expect("not poisoned").push(line);
+                terminal.arrived.notify_waiters();
+            }
+        }
+    }));
+    Connection {
+        sender,
+        terminal,
+        written,
+        owner,
+        tasks,
+    }
+}
+
 /// The world.
 pub struct Observing {
     /// What a case sends the worker as the upstream.
@@ -364,6 +472,8 @@ pub struct Observing {
     pub written: Arc<Mutex<Vec<String>>>,
     _owner: Arc<kr_worker::broker::Duplex>,
     _tasks: Vec<tokio::task::JoinHandle<()>>,
+    /// The second instance's connection, where a binding is bound to it.
+    pub second: Option<Connection>,
     // Declared last: the directory is removed after every field above has let go of its files.
     pub hosted: Hosted,
 }
@@ -411,8 +521,37 @@ impl Observing {
                 )),
             )
             .expect("the instance is registered");
+        let second_wanted = options.bindings.iter().any(|spec| spec.second_instance);
+        let second_process =
+            ProcessStartIdentity::new(42, ProcessStartSource::MacosProcBsdInfo, 901);
+        if second_wanted {
+            broker
+                .register_instance(
+                    second_instance(),
+                    IntegrationMode::Gateway,
+                    None,
+                    Some(ManagedProcess::new(
+                        second_instance(),
+                        second_process.clone(),
+                        TransportHandle {
+                            transport: BrokerTransport::PrivateSocket,
+                            application_instance_id: second_instance(),
+                            executable_digest: Digest256::from_bytes([3; 32]),
+                            process: second_process.clone(),
+                        },
+                        Credential::from_bytes([10; 32]),
+                        TimestampMs::new(1),
+                    )),
+                )
+                .expect("the second instance is registered");
+        }
 
         for spec in &options.bindings {
+            let bound_to = if spec.second_instance {
+                second_instance()
+            } else {
+                instance()
+            };
             let (plugin, digest_byte) = if spec.own_package {
                 (package(), 5)
             } else {
@@ -449,7 +588,7 @@ impl Observing {
             broker
                 .bind_descriptor(
                     binding(spec.number),
-                    instance(),
+                    bound_to,
                     plugin.clone(),
                     PublisherId::new("kalareach").expect("a publisher"),
                     Digest256::from_bytes([digest_byte; 32]),
@@ -504,72 +643,18 @@ impl Observing {
                 .expect("the binding ships its component");
         }
 
-        // The production transport over two socket pairs: the upstream's, which a case sends
-        // frames into and which answers the terminal's requests, and the native terminal's, which
-        // collects every frame the worker forwards to it.
-        broker
-            .pin_table(instance(), installed(), table(), rich())
-            .expect("the installed tables are pinned");
-        broker
-            .pin_reading(instance(), &package(), reading())
-            .expect("the reading is pinned");
-        broker
-            .open_native_connection(instance(), &[9; 32], &process, &package(), "1")
-            .expect("the native connection is authenticated");
-        let (here, there) = wire();
-        let (upstream_reads, upstream_writes) = tokio::io::split(here);
-        let (client_here, client_there) = wire();
-        let (client_reads, client_writes) = tokio::io::split(client_here);
-        let (owner, writes) = kr_worker::broker::Duplex::new(
-            Arc::clone(broker),
-            kr_protocol::ids::GatewayConnectionId::new(1),
-            kr_worker::broker::Framing::new(kr_protocol::gateway::NativeFraming::JsonLines),
-            upstream_writes,
-            client_writes,
-            hosted.environment_id,
-            "agent-user",
-        );
-        let carrying =
-            owner.dispatch().expect("it carries operations") as Arc<dyn UpstreamDispatch>;
-        // The transport carries the operations of the instance, and the answers to the requests
-        // asked on this connection.
-        broker.bind_connection_dispatch(
-            kr_protocol::ids::GatewayConnectionId::new(1),
-            Arc::clone(&carrying),
-        );
-        broker
-            .bind_dispatch(instance(), carrying)
-            .expect("the transport is bound");
-        let written = Arc::new(Mutex::new(Vec::new()));
-        let (sender, injected) = tokio::sync::mpsc::unbounded_channel();
-        let mut tasks = vec![
-            tokio::spawn(upstream(there, Arc::clone(&written), injected)),
-            tokio::spawn(writes),
-            tokio::spawn({
-                let owner = Arc::clone(&owner);
-                async move { owner.serve(upstream_reads, true).await }
-            }),
-            tokio::spawn({
-                let owner = Arc::clone(&owner);
-                async move { owner.serve(client_reads, false).await }
-            }),
-        ];
-        let (reads, terminal_writes) = tokio::io::split(client_there);
-        let terminal = Arc::new(Terminal {
-            lines: Mutex::new(Vec::new()),
-            arrived: tokio::sync::Notify::new(),
-            writes: tokio::sync::Mutex::new(terminal_writes),
-        });
-        tasks.push(tokio::spawn({
-            let terminal = Arc::clone(&terminal);
-            async move {
-                let mut lines = tokio::io::BufReader::new(reads).lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    terminal.lines.lock().expect("not poisoned").push(line);
-                    terminal.arrived.notify_waiters();
-                }
-            }
-        }));
+        // The production transport over two socket pairs for each instance: the upstream's, which a
+        // case sends frames into and which answers the terminal's requests, and the native
+        // terminal's, which collects every frame the worker forwards to it.
+        let Connection {
+            sender,
+            terminal,
+            written,
+            owner,
+            mut tasks,
+        } = connect(&hosted, instance(), &process, [9; 32], 1);
+        let second = second_wanted
+            .then(|| connect(&hosted, second_instance(), &second_process, [10; 32], 2));
         // The worker's own link asks the daemon for the plugin runtime, registers each component
         // and feeds it, as it does for a package a person installed.
         tasks.push(tokio::spawn(kr_worker::plugin_runtime::link(
@@ -592,7 +677,18 @@ impl Observing {
             written,
             _owner: owner,
             _tasks: tasks,
+            second,
         })
+    }
+
+    /// Sends the worker one frame, as the upstream of the second instance.
+    pub fn send_to_the_second_instance(&self, frame: &serde_json::Value) {
+        self.second
+            .as_ref()
+            .expect("the world has a second instance")
+            .sender
+            .send(frame.to_string())
+            .expect("the upstream is running");
     }
 
     /// The broker.

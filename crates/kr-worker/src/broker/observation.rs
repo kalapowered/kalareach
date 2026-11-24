@@ -466,6 +466,8 @@ pub struct ObservationLane {
     hold: Mutex<Option<Arc<HoldState>>>,
     #[cfg(feature = "testing")]
     pause: Mutex<Option<Arc<PauseState>>>,
+    #[cfg(feature = "testing")]
+    held_pushes: Mutex<Option<Vec<(NativeFrame, u64)>>>,
 }
 
 /// The two halves of a hold on the pump, for this host's own tests: a signal that the pump has
@@ -519,6 +521,42 @@ impl PauseHold {
     }
 }
 
+/// A hold on the pushes of the frames the broker recorded a request for: while it lasts the lane is
+/// pushed none of them, as when a producer is slow to push what the broker has recorded. For this
+/// host's own tests.
+#[cfg(feature = "testing")]
+#[derive(Debug)]
+pub struct PushHold {
+    lane: Arc<ObservationLane>,
+}
+
+#[cfg(feature = "testing")]
+impl PushHold {
+    /// Returns how many pushes are held.
+    #[must_use]
+    pub fn held(&self) -> usize {
+        self.lane
+            .held_pushes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map_or(0, Vec::len)
+    }
+
+    /// Pushes what is held, in the order it was given, and lets later pushes through.
+    pub fn release(&self) {
+        let held = self
+            .lane
+            .held_pushes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        for (frame, at_ms) in held.into_iter().flatten() {
+            let _pushed = self.lane.push_native(frame, at_ms);
+        }
+    }
+}
+
 /// A hold on the pump. While it is held the pump takes nothing off the lane. It is for this host's
 /// own tests, the way a pause before a marker is.
 #[cfg(feature = "testing")]
@@ -569,6 +607,8 @@ impl ObservationLane {
             hold: Mutex::new(None),
             #[cfg(feature = "testing")]
             pause: Mutex::new(None),
+            #[cfg(feature = "testing")]
+            held_pushes: Mutex::new(None),
         }
     }
 
@@ -614,6 +654,17 @@ impl ObservationLane {
     pub fn push_native(&self, frame: NativeFrame, at_ms: u64) -> Option<Pushed> {
         if !self.wants_native() {
             return None;
+        }
+        #[cfg(feature = "testing")]
+        if let Some(held) = self
+            .held_pushes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_mut()
+            && frame.recorded.is_some()
+        {
+            held.push((frame, at_ms));
+            return Some(Pushed::Kept);
         }
         let bytes = frame.bytes.len() as u64;
         Some(self.push(Source::Native(frame), bytes, at_ms))
@@ -1253,6 +1304,19 @@ impl ObservationLane {
         }
         state.parked.store(true, Ordering::Release);
         true
+    }
+
+    /// Holds the pushes of the frames the broker recorded a request for, until the returned hold is
+    /// released. For this host's own tests.
+    #[cfg(feature = "testing")]
+    pub fn hold_pushes(self: &Arc<Self>) -> PushHold {
+        *self
+            .held_pushes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Vec::new());
+        PushHold {
+            lane: Arc::clone(self),
+        }
     }
 
     /// Stops the pump the next time it reaches `at`, and until the returned hold is released. For

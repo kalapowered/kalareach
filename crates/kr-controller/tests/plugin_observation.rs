@@ -735,6 +735,7 @@ async fn kr_req_24_06_a_plugin_runtime_that_is_killed_leaves_the_receipt_the_app
     let (question_id, caller_token) = world.ask();
     world.send(&notification("before"));
     world.send(&request(7));
+    world.send(&request(8));
     let approval = until("the request to be read into an approval", || async {
         world
             .broker()
@@ -754,8 +755,8 @@ async fn kr_req_24_06_a_plugin_runtime_that_is_killed_leaves_the_receipt_the_app
     world
         .until_account(
             1,
-            "the component to have observed the three frames",
-            |account| account.observes >= 3,
+            "the component to have observed the four frames",
+            |account| account.observes >= 4,
         )
         .await;
     let before = world
@@ -776,7 +777,12 @@ async fn kr_req_24_06_a_plugin_runtime_that_is_killed_leaves_the_receipt_the_app
         .expect("the ledger reads")
         .expect("the interpretation is recorded with its decoder");
 
-    // The runtime is killed, and the daemon starts another on the worker's asking.
+    // The runtime is killed, and the daemon starts another on the worker's asking. The pump is
+    // stopped once the component that starts again has been given the first request.
+    let hold = world
+        .broker()
+        .observation()
+        .pause_at(Pause::BaselineGiven(1));
     let host = world.hosted.published().expect("the runtime is published");
     plugin_world::kill(&host);
     until("the runtime to have ended", || async {
@@ -798,8 +804,18 @@ async fn kr_req_24_06_a_plugin_runtime_that_is_killed_leaves_the_receipt_the_app
         "the daemon started one replacement"
     );
 
+    // A person answers the other request through the native terminal while the baseline waits: the
+    // upstream is given the answer once, and the component is never given the request.
+    until(
+        "the baseline to be held after its first request",
+        || async { hold.parked().then_some(()) },
+    )
+    .await;
+    answer_natively(&world, 8).await;
+    hold.release();
+
     // The component is registered in it again, with no state, and given what the broker holds: the
-    // approval, and not the two notifications.
+    // approval, and not the two notifications nor the request answered meanwhile.
     until_started_again(&world, 1).await;
     let account = world.account(1).await.expect("the component answers");
     assert_eq!(
@@ -812,6 +828,7 @@ async fn kr_req_24_06_a_plugin_runtime_that_is_killed_leaves_the_receipt_the_app
         "it was given the pending request and nothing else: {account:?}"
     );
     assert_eq!(account.requests, ["7"]);
+    assert_eq!(answers_to(&world, 8), 1, "the answer to 8 went once");
     let reason = world.reason(1);
     assert!(
         reason.contains(
@@ -1335,6 +1352,48 @@ async fn kr_req_24_24_a_request_claimed_while_an_earlier_hand_over_waits_is_stil
     world.broker().abandon(&answer);
 }
 
+/// KR-REQ-24.24: a request that is answered while an earlier request is handed over is not given.
+///
+/// Three requests are read into approvals, and the baseline is held once it has given the first.
+/// The second is answered through the native terminal and the baseline goes on: the component is
+/// given the first and the third, and the upstream is written one answer to the second.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_24_24_a_request_answered_while_an_earlier_hand_over_waits_is_not_given() {
+    let Some(world) = three_requests_read_into_approvals().await else {
+        return;
+    };
+    let lane = world.broker().observation();
+    let hold = lane.pause_at(Pause::BaselineGiven(1));
+    lose_the_runtime(&world).await;
+    world.let_the_compiles_go();
+    until(
+        "the baseline to be held after its first request",
+        || async { hold.parked().then_some(()) },
+    )
+    .await;
+    answer_natively(&world, 2).await;
+    hold.release();
+    until_started_again(&world, 1).await;
+
+    let account = world.account(1).await.expect("the component answers");
+    assert_eq!(
+        account.requests,
+        ["1", "3"],
+        "the request answered while the first was handed over was given: {account:?}"
+    );
+    assert_eq!(account.observes, 2, "{account:?}");
+    assert_eq!(
+        answers_to(&world, 2),
+        1,
+        "the upstream was written one answer"
+    );
+    let reason = world.reason(1);
+    assert!(
+        reason.contains("the worker gave it 2 pending requests from its own records"),
+        "{reason}"
+    );
+}
+
 /// Starts a world whose binding 1 observes and whose binding 2 reads requests, and sends three
 /// requests that binding 2 reads into approvals and binding 1 has observed.
 async fn three_requests_read_into_approvals() -> Option<Observing> {
@@ -1491,12 +1550,10 @@ async fn kr_req_24_24_what_the_worker_passed_over_while_the_runtime_was_away_is_
 
     lose_the_runtime(&world).await;
     for _ in 0..3 {
-        world.send(&frame);
+        world.send_and_wait_for_the_terminal(&frame).await;
     }
-    until("the pump to have counted the first three", || async {
-        lane.view(binding(1))
-            .is_some_and(|view| view.outage.passed.events == 3)
-            .then_some(())
+    until("the pump to have finished with the first three", || async {
+        (lane.waiting() == 0 && lane.in_flight() == 0).then_some(())
     })
     .await;
 
@@ -1582,72 +1639,191 @@ async fn kr_req_24_24_observations_dropped_while_the_runtime_was_away_are_told_a
     assert_eq!(account.snapshots, 0, "a snapshot was taken: {account:?}");
 }
 
-/// Holds the pump, kills the plugin runtime, and waits until the component is registered in the
-/// replacement and owed its baseline, which the held pump cannot give yet.
-async fn replace_the_runtime_with_the_pump_held(
-    world: &Observing,
-) -> kr_worker::broker::observation::PumpHold {
-    let lane = world.broker().observation();
-    let hold = lane.hold_pump();
-    until("the pump to stop at the hold", || async {
-        hold.parked().then_some(())
-    })
-    .await;
-    let host = world.hosted.published().expect("the runtime is published");
-    plugin_world::kill(&host);
-    until_owed_its_baseline(world, 1).await;
-    hold
+/// Says that `dropped` observations were told as dropped for want of room while the runtime was
+/// away, and that no snapshot was owed for them.
+fn told_as_dropped_while_the_runtime_was_away(world: &Observing, dropped: u64) {
+    let reason = world.reason(1);
+    assert!(
+        reason.contains(&format!("{dropped} observations (")) && reason.contains(
+            " were dropped because the worker's queue was full while the plugin runtime was away"
+        ),
+        "{dropped} were dropped: {reason}"
+    );
+    assert!(!reason.contains("fresh snapshot"), "{reason}");
 }
 
-/// KR-REQ-24.24: a request is given to the component once, whether the producer pushed it to the
-/// lane before or after the broker's read of what it holds, and one answered before that read is
-/// never given.
+/// KR-REQ-24.24: the frames the worker's queue dropped while the plugin runtime was away are counted
+/// when the pump takes them with the runtime still away, and not only once the component is
+/// registered again.
 ///
-/// The pump is held while the runtime is replaced, so the component is registered and owed its
-/// baseline when a request arrives: the baseline gives it, and the lane's entry for it, which comes
-/// after, is not offered again. A second request arrives in the same window and is answered through
-/// the native terminal before the pump is released: the baseline leaves it out, and its entry is not
-/// offered either.
+/// The lane is filled past its bound while the pump is held. The pump is released with the runtime
+/// away and finishes with the lane before the component is registered again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn kr_req_24_24_a_request_is_given_once_whenever_the_lane_offers_it_and_an_answered_one_never()
+async fn kr_req_24_24_frames_dropped_while_the_runtime_was_away_are_counted_when_the_pump_takes_them_then()
  {
     let Some(world) = Observing::start(Options::with(vec![Spec::semantic_only(1)])).await else {
         return;
     };
     world.until_ready(1).await;
     let lane = world.broker().observation();
-    let hold = replace_the_runtime_with_the_pump_held(&world).await;
-    world.send(&request(9));
-    until_recorded(&world, 9).await;
-    until("the lane to hold the request", || async {
-        (lane.waiting() == 1).then_some(())
+
+    lose_the_runtime(&world).await;
+    let hold = lane.hold_pump();
+    until("the pump to stop at the hold", || async {
+        hold.parked().then_some(())
     })
     .await;
+    for _ in 0..40 {
+        world
+            .send_and_wait_for_the_terminal(&large_notification())
+            .await;
+    }
+    let dropped = lane.account().evicted.events;
+    assert!(
+        dropped > 0,
+        "the lane dropped nothing: {:?}",
+        lane.account()
+    );
     hold.release();
+    until("the pump to have finished with the lane", || async {
+        (lane.waiting() == 0 && lane.in_flight() == 0).then_some(())
+    })
+    .await;
+    world.let_the_compiles_go();
     until_started_again(&world, 1).await;
-    let account = world
-        .until_account(1, "the component to have the request", |account| {
-            !account.requests.is_empty()
-        })
-        .await;
-    assert_eq!(account.requests, ["9"], "{account:?}");
 
-    let hold = replace_the_runtime_with_the_pump_held(&world).await;
+    told_as_dropped_while_the_runtime_was_away(&world, dropped);
+}
+
+/// KR-REQ-24.24: the terminal output the worker's queue dropped while the plugin runtime was away is
+/// counted when the pump takes it with the runtime still away.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_24_24_terminal_output_dropped_while_the_runtime_was_away_is_counted_when_the_pump_takes_it_then()
+ {
+    let Some(world) = Observing::start(Options::with(vec![Spec::terminal_only(1)])).await else {
+        return;
+    };
+    world.until_ready(1).await;
+    let lane = world.broker().observation();
+
+    lose_the_runtime(&world).await;
+    let hold = lane.hold_pump();
+    until("the pump to stop at the hold", || async {
+        hold.parked().then_some(())
+    })
+    .await;
+    for _ in 0..20 {
+        lane.push_terminal(&std::sync::Arc::new(vec![b'x'; 256 * 1024]), 1);
+    }
+    let dropped = lane.account().evicted.events;
+    assert!(
+        dropped > 0,
+        "the lane dropped nothing: {:?}",
+        lane.account()
+    );
+    hold.release();
+    until("the pump to have finished with the lane", || async {
+        (lane.waiting() == 0 && lane.in_flight() == 0).then_some(())
+    })
+    .await;
+    world.let_the_compiles_go();
+    until_started_again(&world, 1).await;
+
+    told_as_dropped_while_the_runtime_was_away(&world, dropped);
+}
+
+/// KR-REQ-24.24: a request is given to the component once when the producer pushes it to the lane
+/// after the broker has read what it holds.
+///
+/// The runtime is lost and the producers' pushes are held. A request arrives and is recorded, and its
+/// push waits. The component is registered again and is given the request from the broker's records.
+/// The push is then made, and a notification follows: the component observes the notification and
+/// is not given the request a second time.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_24_24_a_request_recorded_before_the_baseline_was_read_and_pushed_after_it_is_given_once()
+ {
+    let Some(world) = Observing::start(Options::with(vec![Spec::semantic_only(1)])).await else {
+        return;
+    };
+    world.until_ready(1).await;
+    let lane = world.broker().observation();
+    lose_the_runtime(&world).await;
+    let pushes = lane.hold_pushes();
+    world.send(&request(9));
+    until_recorded(&world, 9).await;
+    until("the push of the request to be held", || async {
+        (pushes.held() == 1).then_some(())
+    })
+    .await;
+    world.let_the_compiles_go();
+    until_started_again(&world, 1).await;
+    let account = world.account(1).await.expect("the component answers");
+    assert_eq!(
+        account.requests,
+        ["9"],
+        "the baseline did not give the request: {account:?}"
+    );
+
+    pushes.release();
+    world.send(&notification("after"));
+    let account = world
+        .until_account(
+            1,
+            "the component to have observed the notification",
+            |account| account.observes >= 2,
+        )
+        .await;
+    assert_eq!(
+        account.requests,
+        ["9"],
+        "the request was given again when the lane offered it: {account:?}"
+    );
+    assert_eq!(account.observes, 2, "{account:?}");
+}
+
+/// KR-REQ-24.24: a request that was answered before the baseline was read is not given when the
+/// producer pushes it to the lane after.
+///
+/// The runtime is lost and the producers' pushes are held. A request arrives, is recorded, and is
+/// answered through the native terminal. The component is registered again and is given nothing; the
+/// push is then made and a notification follows: the component observes the notification and was
+/// never given the request.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_24_24_a_request_answered_before_the_baseline_was_read_and_pushed_after_it_is_never_given()
+ {
+    let Some(world) = Observing::start(Options::with(vec![Spec::semantic_only(1)])).await else {
+        return;
+    };
+    world.until_ready(1).await;
+    let lane = world.broker().observation();
+    lose_the_runtime(&world).await;
+    let pushes = lane.hold_pushes();
     world.send(&request(11));
     until_recorded(&world, 11).await;
-    until("the lane to hold the request", || async {
-        (lane.waiting() == 1).then_some(())
+    until("the push of the request to be held", || async {
+        (pushes.held() == 1).then_some(())
     })
     .await;
     answer_natively(&world, 11).await;
-    hold.release();
+    world.let_the_compiles_go();
     until_started_again(&world, 1).await;
+    let account = world.account(1).await.expect("the component answers");
+    assert!(account.requests.is_empty(), "{account:?}");
+
+    pushes.release();
+    world.send(&notification("after"));
     let account = world
-        .until_account(1, "the component to have the request", |account| {
-            !account.requests.is_empty()
-        })
+        .until_account(
+            1,
+            "the component to have observed the notification",
+            |account| account.observes >= 1,
+        )
         .await;
-    assert_eq!(account.requests, ["9"], "{account:?}");
+    assert!(
+        account.requests.is_empty(),
+        "the component was given a request answered before the baseline was read: {account:?}"
+    );
+    assert_eq!(account.observes, 1, "{account:?}");
     assert_eq!(
         answers_to(&world, 11),
         1,
@@ -1796,6 +1972,210 @@ async fn kr_req_24_24_a_request_made_in_privacy_mode_while_the_runtime_was_away_
     );
 }
 
+/// Holds the decode queue, records a request in privacy mode (`authority` tells privacy mode on with
+/// the number `first` and off with the next) and passes its queued decode over, as a decode is when
+/// the plugin runtime is away. Privacy mode is off again when this returns, and the request is
+/// recorded and not decoded.
+async fn record_in_privacy_mode_and_pass_its_decode_over(
+    world: &Observing,
+    authority: &mut kr_ipc::client::BoundLink,
+    id: u64,
+) {
+    let lane = world.broker().observation();
+    let queue = world.broker().decode_queue();
+    let hold = queue.hold();
+    world.tell_privacy(authority, 1, true).await;
+    world.send(&request_noting(id, "!answer"));
+    until("the request to be queued for its decode", || async {
+        (queue.len() == 1).then_some(())
+    })
+    .await;
+    let (taken, dropped) = queue.take(|_| Verdict::Drop(NotDecoded::NotRegistered));
+    assert!(taken.is_none() && dropped.len() == 1, "{dropped:?}");
+    world.tell_privacy(authority, 2, false).await;
+    assert!(!lane.is_private());
+    hold.release();
+    assert!(
+        !until_decoded(world, id),
+        "a request nobody can decode is read by nobody"
+    );
+}
+
+/// KR-REQ-24.27 and KR-REQ-24.24: the runtime's words stay withheld once a component has decoded
+/// again a request made in privacy mode, when that decode is all the component was handed.
+///
+/// Only a decoder is bound. A request is recorded in privacy mode and its decode is passed over;
+/// privacy mode ends. The runtime is then lost, and the connection the link makes has not stood
+/// under privacy mode. The component that starts again decodes the request, and is handed something
+/// made in privacy mode on that connection.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_24_24_a_request_made_in_privacy_mode_withholds_the_runtimes_words_when_it_is_decoded_again()
+ {
+    let Some(world) =
+        Observing::start(Options::with(vec![Spec::decoder(1, "hostile-decoder")])).await
+    else {
+        return;
+    };
+    world.until_ready(1).await;
+    let lane = world.broker().observation();
+    let mut authority = world
+        .hosted
+        .daemon_connection(ControllerConnectionRole::Authority)
+        .await;
+    record_in_privacy_mode_and_pass_its_decode_over(&world, &mut authority, 64).await;
+
+    lose_the_runtime(&world).await;
+    assert!(
+        !lane.words_withheld(),
+        "the connection the link made has stood under privacy mode"
+    );
+    world.let_the_compiles_go();
+    until_started_again(&world, 1).await;
+    until("the request to be decoded again", || async {
+        until_decoded(&world, 64).then_some(())
+    })
+    .await;
+    assert!(
+        lane.words_withheld(),
+        "the component decoded again a request made in privacy mode, and the words are not withheld"
+    );
+}
+
+/// KR-REQ-24.27 and KR-REQ-24.24: a request made outside privacy mode and decoded again while it
+/// stands is one made in it from then on: the component that starts again after a second loss is
+/// handed it as such.
+///
+/// A request is recorded outside privacy mode while the runtime is away and its queued decode is
+/// passed over. Privacy mode is turned on before the component starts again, and the request is
+/// decoded again under it. Privacy mode ends and the runtime is lost a second time; the connection
+/// the link makes has not stood under privacy mode, and the component that starts again is given
+/// the approval and is handed something made in privacy mode.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_24_24_a_request_decoded_again_in_privacy_mode_is_one_made_in_it_when_the_runtime_is_lost_again()
+ {
+    let Some(world) = Observing::start(Options::with(vec![
+        Spec::semantic_only(1),
+        Spec::decoder(2, "hostile-decoder"),
+    ]))
+    .await
+    else {
+        return;
+    };
+    world.until_ready(1).await;
+    world.until_ready(2).await;
+    let lane = world.broker().observation();
+    let mut authority = world
+        .hosted
+        .daemon_connection(ControllerConnectionRole::Authority)
+        .await;
+
+    lose_the_runtime(&world).await;
+    world.send(&request_noting(65, "!answer"));
+    until_recorded(&world, 65).await;
+    let queue = world.broker().decode_queue();
+    until("the request to be queued for its decode", || async {
+        (queue.len() == 1).then_some(())
+    })
+    .await;
+    let (taken, dropped) = queue.take(|_| Verdict::Drop(NotDecoded::NotRegistered));
+    assert!(taken.is_none() && dropped.len() == 1, "{dropped:?}");
+    world.tell_privacy(&mut authority, 1, true).await;
+
+    world.let_the_compiles_go();
+    until_started_again(&world, 1).await;
+    until(
+        "the request to be decoded again under privacy mode",
+        || async { until_decoded(&world, 65).then_some(()) },
+    )
+    .await;
+    world.tell_privacy(&mut authority, 2, false).await;
+    assert!(!lane.is_private());
+
+    lose_the_runtime(&world).await;
+    assert!(
+        !lane.words_withheld(),
+        "the connection the link made has stood under privacy mode"
+    );
+    world.let_the_compiles_go();
+    until_started_again(&world, 1).await;
+    let account = world.account(1).await.expect("the component answers");
+    assert_eq!(account.requests, ["65"], "{account:?}");
+    assert!(
+        lane.words_withheld(),
+        "the component was given a request decoded again under privacy mode, and the words are not \
+         withheld"
+    );
+}
+
+/// KR-REQ-24.24: a component is given the requests of its own instance and none of another instance
+/// of its package, whether the broker holds them as interpretations or not.
+///
+/// Two instances run the package. A request is sent to each and read into an approval. The runtime
+/// is lost, and the component of each instance that starts again is given the request of its own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_24_24_a_component_is_given_no_request_of_another_instance_of_its_package() {
+    let Some(world) = Observing::start(Options::with(vec![
+        Spec::semantic_only(1),
+        Spec::interpreter(2),
+        Spec::semantic_only(3).on_the_second_instance(),
+        Spec::interpreter(4).on_the_second_instance(),
+    ]))
+    .await
+    else {
+        return;
+    };
+    world.until_ready(1).await;
+    world.until_ready(3).await;
+    world.send(&request(1));
+    world.send_to_the_second_instance(&request(5));
+    until("both requests to be read into approvals", || async {
+        (world
+            .broker()
+            .pending_resources()
+            .iter()
+            .filter(|resource| {
+                resource.kind == PendingKind::Approval && resource.interpretation_verified
+            })
+            .count()
+            == 2)
+            .then_some(())
+    })
+    .await;
+    world
+        .until_account(
+            1,
+            "the first component to have its own request",
+            |account| account.requests == ["1"],
+        )
+        .await;
+    world
+        .until_account(
+            3,
+            "the second component to have its own request",
+            |account| account.requests == ["5"],
+        )
+        .await;
+
+    lose_the_runtime(&world).await;
+    world.let_the_compiles_go();
+    until_started_again(&world, 1).await;
+    until_started_again(&world, 3).await;
+    let first = world.account(1).await.expect("the component answers");
+    assert_eq!(
+        first.requests,
+        ["1"],
+        "the component was given the request of another instance: {first:?}"
+    );
+    assert_eq!(first.observes, 1, "{first:?}");
+    let second = world.account(3).await.expect("the component answers");
+    assert_eq!(
+        second.requests,
+        ["5"],
+        "the component was given the request of another instance: {second:?}"
+    );
+    assert_eq!(second.observes, 1, "{second:?}");
+}
+
 /// Returns true once the request the upstream gave `id` is an approval.
 fn until_decoded(world: &Observing, id: u64) -> bool {
     let wanted = id.to_string();
@@ -1813,8 +2193,9 @@ fn until_decoded(world: &Observing, id: u64) -> bool {
 ///
 /// Seventy requests arrive while the runtime is away and the decoder is down. The worker retains
 /// sixty-four of the frames, so six requests cannot be given; the decode queue takes eight of the
-/// sixty-four it is asked to queue again. A request the worker cannot give can still be answered
-/// through the native terminal, once.
+/// sixty-four it is asked to queue again. One of the six is answered through the native terminal
+/// while the runtime is away, and is not counted: five cannot be given. A request the worker cannot
+/// give can still be answered through the native terminal, once.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn kr_req_24_24_the_worker_gives_at_most_what_it_holds_and_says_what_it_could_not_give() {
     let Some(world) = Observing::start(Options::with(vec![
@@ -1840,13 +2221,15 @@ async fn kr_req_24_24_the_worker_gives_at_most_what_it_holds_and_says_what_it_co
         .decode_queue()
         .take(|_| Verdict::Drop(NotDecoded::NotRegistered));
     assert!(taken.is_none() && dropped.len() == 8, "{dropped:?}");
+    answer_natively(&world, 2).await;
     world.let_the_compiles_go();
     until_started_again(&world, 1).await;
+    until_started_again(&world, 2).await;
 
     let reason = world.reason(1);
     for clause in [
         "the worker gave it 64 pending requests from its own records, oldest first",
-        "6 pending requests could not be given because the worker could not use their bytes",
+        "5 pending requests could not be given because the worker could not use their bytes",
     ] {
         assert!(reason.contains(clause), "{clause}: {reason}");
     }
