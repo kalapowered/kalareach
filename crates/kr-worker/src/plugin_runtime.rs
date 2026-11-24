@@ -626,21 +626,7 @@ impl Link {
                         );
                     }
                     report(broker, want.binding_id, ComponentState::Registered, None);
-                    if let Err(error) = self.make_ready(broker, want, connection).await {
-                        let reason = error.to_string();
-                        #[cfg(feature = "testing")]
-                        link_trace::lost(link_trace::Why::of(&error));
-                        self.lose(broker, &reason);
-                        for want in wants {
-                            report(
-                                broker,
-                                want.binding_id,
-                                ComponentState::Unavailable,
-                                Some(&reason),
-                            );
-                        }
-                        return Some(self.pace.remaining(tokio::time::Instant::now()));
-                    }
+                    self.make_ready(broker, want.binding_id, connection);
                 }
                 // The runtime answered and said no: this component, not the runtime. The reason is
                 // the binding's, and it is offered again after a wait that grows.
@@ -966,83 +952,27 @@ impl Link {
         }
     }
 
-    /// Makes a binding ready to be offered observations: its held checkpoint restored where it has
-    /// one.
+    /// Makes a binding ready to be offered observations.
     ///
-    /// The observations between the checkpoint and this registration were not replayed, so a
-    /// restore is a loss: it is numbered, and the pump takes the snapshot it owes before it offers
-    /// the component anything. A restore the component does not answer is a loss too, since the
-    /// component may hold some of the state it was given, and the snapshot rebuilds its view from
-    /// whatever it holds.
+    /// A binding that has been ready before is a component that started again after the plugin
+    /// runtime was lost: it holds nothing, and the worker gives it nothing it saved. It is made
+    /// ready owed what the broker holds for it, which the pump gives it (see
+    /// [`crate::plugin_observation`]), and the requests nobody has interpreted are queued to be
+    /// decoded by it. A binding that has not been ready before starts from the live point.
     ///
     /// `connection` is the one the registration was made on: a component handed something made in
     /// privacy mode on it stays marked as having been, and a mark of an earlier connection goes.
-    ///
-    /// # Errors
-    ///
-    /// Returns the failure when the runtime cannot be reached.
-    async fn make_ready(
-        &mut self,
-        broker: &Weak<Broker>,
-        want: &ComponentWant,
-        connection: u64,
-    ) -> Result<(), ServiceError> {
-        let Some(client) = self.client.clone() else {
-            return Ok(());
-        };
-        let binding = want.binding_id;
-        // The generation the source has reached now, not the one the registration began under: it
-        // may have moved while the registration was under way.
-        let generation = broker
-            .upgrade()
-            .and_then(|broker| broker.component_generation(binding))
-            .unwrap_or(want.generation);
-        let held = self
-            .lane
-            .take_held(binding, want.package_digest, generation);
-        if let Some(held) = held {
-            // The component is given state that belongs to this generation.
-            self.registered.insert(binding, generation);
-            #[cfg(feature = "testing")]
-            let began = link_trace::began(
-                link_trace::Call::Restore,
-                Some(binding),
-                CALL_WAIT + kr_plugin_service::client::ROUND_TRIP_ALLOWANCE,
-            );
-            let restored = client
-                .restore(service_id(binding), held.state, CALL_WAIT)
-                .await;
-            #[cfg(feature = "testing")]
-            link_trace::ended(
-                began,
-                match &restored {
-                    Ok(called) if !called.answered() => link_trace::Outcome::Faulted,
-                    _ => link_trace::Outcome::of(&restored),
-                },
-            );
-            let note = match restored {
-                Ok(called) if called.answered() => {
-                    "the component's state was restored from a checkpoint, and the observations \
-                     since it was taken were not replayed"
-                }
-                Err(ServiceError::Unavailable { detail }) => {
-                    return Err(ServiceError::Unavailable { detail });
-                }
-                Ok(_) | Err(_) => {
-                    "the component's state could not be restored from a checkpoint, and the \
-                     observations since it was taken were not replayed"
-                }
-            };
-            self.lane.lose_unready(binding, note.to_owned());
-            if let Some(strong) = broker.upgrade() {
-                strong.note_component(
-                    binding,
-                    ComponentNote::Loss(format!("{note}; a fresh snapshot is owed")),
-                );
-            }
+    fn make_ready(&self, broker: &Weak<Broker>, binding: BrokerBindingId, connection: u64) {
+        if self.lane.has_been_ready(binding) {
+            let decoded = broker
+                .upgrade()
+                .map(|broker| broker.redecode(binding))
+                .unwrap_or_default();
+            self.lane
+                .set_ready_for_rebuild(binding, connection, decoded.queued, decoded.full);
+        } else {
+            self.lane.set_ready(binding, connection);
         }
-        self.lane.set_ready(binding, connection);
-        Ok(())
     }
 
     /// Tells each registered binding's component what its bound execution is now, where that is

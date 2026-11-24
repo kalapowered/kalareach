@@ -33,8 +33,9 @@ use kr_plugin_service::error::ServiceError;
 use kr_plugin_service::protocol::{WireMethodClass, WireRequestSnapshot};
 use kr_plugin_service::vocabulary::{BindingId, ScopedSourceEvent, SourceProvenance};
 use kr_protocol::agent::AgentMutationTarget;
+use kr_protocol::broker::DecoderLedgerEntry;
 use kr_protocol::gateway::NativeMethodClass;
-use kr_protocol::ids::{BrokerBindingId, PendingResourceId};
+use kr_protocol::ids::{BrokerBindingId, PendingResourceId, SourceEventHandle};
 use kr_protocol::scalars::TimestampMs;
 
 use crate::broker::connectors::component_schema;
@@ -117,6 +118,22 @@ pub struct Encoded {
     pub binding_id: BrokerBindingId,
     /// The bytes the component returned, which nothing has sent and nothing has checked.
     pub bytes: std::result::Result<Vec<u8>, NotEncoded>,
+}
+
+/// The request a decoder entry keeps whole, as a component is given it: under the handle the broker
+/// holds the request by, with the bytes the upstream sent and the identifier it gave.
+pub(super) fn source_event_of(
+    handle: SourceEventHandle,
+    received_at: u64,
+    entry: &DecoderLedgerEntry,
+) -> ScopedSourceEvent {
+    ScopedSourceEvent::new(
+        handle,
+        SourceProvenance::NativeProtocol,
+        received_at,
+        Some(entry.upstream_request_id.as_str().to_owned()),
+        std::sync::Arc::<[u8]>::from(entry.source_bytes.as_slice()),
+    )
 }
 
 impl BrokerState {
@@ -203,7 +220,7 @@ impl BrokerState {
         let received_at = pending.resource.recorded_at.get();
         let request_id = entry.upstream_request_id.as_str().to_owned();
         let snapshot = WireRequestSnapshot {
-            request_id: request_id.clone(),
+            request_id,
             handle: handle.clone(),
             method: pending.resource.method.as_str().to_owned(),
             class: match pending.resource.classification.class {
@@ -226,13 +243,7 @@ impl BrokerState {
                 .collect(),
             binding_revision: instance.binding_revision.get(),
         };
-        let event = ScopedSourceEvent::new(
-            handle,
-            SourceProvenance::NativeProtocol,
-            received_at,
-            Some(request_id),
-            std::sync::Arc::<[u8]>::from(entry.source_bytes.as_slice()),
-        );
+        let event = source_event_of(handle, received_at, &entry);
         Ok(Some(EncodeRequest {
             binding_id,
             resource_id,

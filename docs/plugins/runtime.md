@@ -652,10 +652,11 @@ seconds, then for twice as long after each failure up to two minutes, and each e
 counted. The two sources have no order between them, and each keeps the order it was pushed in.
 
 Whatever a ready component does not get is a numbered loss: an entry the lane pushed out or refused,
-one the pump passed over, one the host's queue refused. What was pushed before a binding became
-ready, or while the worker had no connection to the runtime, predates the binding's view and is not
-a loss. The pump offers a binding nothing while it owes the binding a snapshot, so a component is
-asked for a fresh snapshot before anything later is handed to it. The snapshot waits, for up to a
+one the pump passed over, one the host's queue refused. What was pushed before a binding first
+became ready predates the binding's view and is not a loss. What was pushed while the runtime was
+lost is counted for a binding that had been ready, and its component is told when it starts again
+(see below); the worker owes the component no snapshot of it. The pump offers a binding nothing
+while it owes the binding a snapshot, so a component is asked for a fresh snapshot before anything later is handed to it. The snapshot waits, for up to a
 second, until the client has written every event it was handed, an event being counted until its
 write is over; if it has not, the binding is passed over and asked again after a wait that grows.
 The snapshot request is then written after those events, and the runtime reads them in that order.
@@ -677,12 +678,17 @@ last asked for and has then been left alone for two seconds, or its last request
 there has been none, the link asks it for a checkpoint. The worker keeps checkpoints in memory only,
 at most 8 MiB in all, under the package's digest and the source generation the component was
 registered in, so state taken in one generation of the instance's source is never restored into
-another. When a binding is registered again, after the runtime was replaced for example, the link
-restores the checkpoint it holds and makes the binding ready, owing a snapshot that the pump takes
-before it offers the binding anything. The observations between the checkpoint and the new
-registration are not replayed, and the component's report says so. A restore the component does not
-answer is reported the same way, and the snapshot rebuilds its view from whatever it holds. A
-component registered with no checkpoint to restore starts from the live point.
+another. When a binding is registered again, after the runtime was replaced for example, its
+component is a new instance with no state, and the worker restores nothing into it: the state is
+opaque to the worker, and a state of unknown coverage cannot be made to hold exactly the requests
+the broker holds unresolved. The pump gives the component, before anything else, each request the
+broker still holds as pending, once each, in the order the broker recorded them. An approval's bytes
+come from its decoder entry, which keeps the original whole, and any other request's from the frame
+the broker retained; nothing is read from the terminal, the semantic log or a screen. A request that
+is answered, claimed or recorded under an earlier generation is not given, and neither is one the
+broker no longer holds the bytes of. A request given this way is not offered again from the queue. A binding whose component decodes requests has the requests nobody decoded
+queued to be decoded again when it is registered, up to the decode queue's own limit. A component
+registered for the first time starts from the live point and is given nothing.
 
 Every thirty seconds the link asks the runtime what it is doing. Two answers in a row that do not
 come count as losing the runtime: the bindings are reported unavailable with the reason, and the link
@@ -691,7 +697,14 @@ seconds means the runtime has stopped reading, and the client's writer ends the 
 the link treats the same way.
 
 A component's report carries how it was registered (compiled, with the time it took, or loaded from
-the compiled-code cache), what it last missed, and its last fault, in the words the runtime gave.
+the compiled-code cache), that it started again after the runtime was lost and what the worker gave
+and passed over then, what it last missed, and its last fault, in the words the runtime gave. The
+worker puts these words in the component's report, which it sends to the daemon with the admission
+report; no screen shows the report yet. Of a restart it says, as counts and never as content, how many pending
+requests the component was given and how many of those were already read as approvals, why any
+could not be given, how many upstream frames and spans of terminal output the worker passed over
+while the runtime was away (and how many bytes they held), how many observations the worker's queue dropped for
+want of room, and how many requests were queued to be decoded again.
 
 Privacy mode does not stop observation for live use. While it is on, the worker asks for no
 component state, and it holds none that was asked for before privacy mode was turned on or off.

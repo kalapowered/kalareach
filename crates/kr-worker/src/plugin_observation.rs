@@ -28,6 +28,19 @@
 //! what is lost while that runs, or is newer than the entry because the lane lost it while a
 //! request waited, is applied with a later entry.
 //!
+//! # A component that starts again
+//!
+//! A component registered again after the plugin runtime was lost is a new instance with no state,
+//! and the worker gives it none: what it holds is what the broker holds. Between the loss and the
+//! registration the pump takes entries off the lane for such a binding and counts them as passed
+//! over, and what the lane drops for it is counted as dropped: neither is a loss that owes a snapshot,
+//! since the component holds nothing of them. When it is registered the binding is owed its baseline,
+//! the requests the broker still holds as pending for it, in the order it recorded them
+//! ([`crate::broker::Broker::rebuild_of`]). The pump gives the baseline once every entry older than
+//! the registration has been taken and counted, and before the first entry at or after it is
+//! offered; a request the baseline gave, or left out, is not offered again from the lane. What the
+//! component was given and what it was not is put in its report.
+//!
 //! Between the two sources there is no order, and none is claimed. Within a source the order is the
 //! order produced, and a snapshot is asked for after a loss and before any later entry is handed to
 //! the binding.
@@ -61,6 +74,7 @@ use crate::broker::component::ComponentNote;
 use crate::broker::observation::{
     Audience, Entry, LaneLoss, NativeFrame, ObservationLane, PIECE_BYTES, Source, Tally,
 };
+use crate::broker::rebuild::Recovery;
 
 /// How long a snapshot is given to reach its component.
 pub const CALL_WAIT: Duration = Duration::from_secs(5);
@@ -96,9 +110,18 @@ pub async fn pump(broker: Weak<Broker>) {
         if let Some(loss) = taken.loss {
             apply_loss(&strong, &lane, &loss);
         }
+        // A baseline is read after every entry older than the component's view has been taken and
+        // counted, and before the first entry at or after it is offered.
+        let at = taken.entry.as_ref().map(Entry::seq);
+        for binding in lane.rebuilds_due(at, Instant::now()) {
+            rebuild(&strong, &lane, binding).await;
+        }
         snapshots(&strong, &lane).await;
         match taken.entry {
             Some(entry) => {
+                for binding in strong.retaining(entry.audience()) {
+                    lane.count_passed(binding, &entry);
+                }
                 offer(&strong, &lane, &entry).await;
                 lane.finish(&entry);
             }
@@ -122,7 +145,8 @@ pub async fn pump(broker: Weak<Broker>) {
 ///
 /// A binding is told what it would have been offered and nothing else: the terminal's output if it
 /// takes the terminal, and the frames of the one package whose table read them if it is that
-/// package's binding.
+/// package's binding. A binding whose component started again, and has not been given its baseline
+/// yet, is told what it was not given by the baseline's words and not as a loss.
 fn apply_loss(broker: &Broker, lane: &ObservationLane, loss: &LaneLoss) {
     let mut owed: BTreeMap<BrokerBindingId, Tally> = BTreeMap::new();
     let mut add = |binding: BrokerBindingId, tally: Tally| {
@@ -131,12 +155,12 @@ fn apply_loss(broker: &Broker, lane: &ObservationLane, loss: &LaneLoss) {
         total.bytes = total.bytes.saturating_add(tally.bytes);
     };
     if loss.terminal.events > 0 {
-        for binding in broker.observing(Audience::Terminal) {
+        for binding in broker.retaining(Audience::Terminal) {
             add(binding, loss.terminal);
         }
     }
     for native in &loss.native {
-        for binding in broker.observing(Audience::Native {
+        for binding in broker.retaining(Audience::Native {
             instance: native.instance,
             package: Some(&native.package),
         }) {
@@ -144,6 +168,11 @@ fn apply_loss(broker: &Broker, lane: &ObservationLane, loss: &LaneLoss) {
         }
     }
     for (binding, tally) in owed {
+        // A component whose runtime is away, or that is owed its baseline, holds nothing of what the
+        // lane dropped: it is counted in its outage and owes no snapshot.
+        if lane.count_dropped(binding, tally) {
+            continue;
+        }
         lost(
             broker,
             lane,
@@ -254,6 +283,19 @@ async fn offer(broker: &Broker, lane: &ObservationLane, entry: &Entry) {
         if !broker.observing(entry.audience()).contains(&binding) {
             continue;
         }
+        // Owed its baseline: what it is given is what the broker holds, and this entry is counted
+        // as passed over.
+        if view.rebuild_owed {
+            continue;
+        }
+        // A request recorded before the baseline was read was given with it or left out of it.
+        if let Source::Native(frame) = &entry.source
+            && frame
+                .recorded
+                .is_some_and(|place| place < view.recorded_from)
+        {
+            continue;
+        }
         if view.is_silent(Instant::now()) {
             lost(
                 broker,
@@ -287,6 +329,100 @@ async fn offer(broker: &Broker, lane: &ObservationLane, entry: &Entry) {
             }
         }
     }
+}
+
+/// Gives a binding's component, which started again, the requests the broker holds for it, and puts
+/// in its report what it was given and what it was not.
+///
+/// Everything is read again before each request is handed over, and no wait is made while the
+/// broker's lock is held. A runtime that cannot be reached leaves the baseline owed to the
+/// registration that follows; any other answer ends it, and what was not given is counted.
+async fn rebuild(broker: &Broker, lane: &ObservationLane, binding: BrokerBindingId) {
+    let mut recovery = Recovery::default();
+    let mut boundary = 0;
+    if let Some(read) = broker.rebuild_of(binding) {
+        boundary = read.boundary;
+        recovery.baseline = true;
+        recovery.unavailable = read.unavailable;
+        recovery.over_cap = read.over_cap;
+        let audience = Audience::Native {
+            instance: read.instance,
+            package: Some(&read.package),
+        };
+        let mut offers = read.offers.into_iter();
+        while let Some(given) = offers.next() {
+            let Some(client) = broker.component_calls().client() else {
+                return;
+            };
+            let on_it = lane.view(binding).is_some_and(|view| {
+                view.ready && view.rebuild_owed && view.connection == lane.connection()
+            });
+            if !on_it || !broker.observing(audience).contains(&binding) {
+                return;
+            }
+            // Answered, or left behind by the source, while an earlier request was handed over.
+            if !broker.still_pending(given.resource_id, given.generation) {
+                continue;
+            }
+            let carried = given.event.bytes.len() as u64
+                + EVENT_ENVELOPE_BYTES
+                + given
+                    .event
+                    .request_id
+                    .as_ref()
+                    .map_or(0, |id| id.len() as u64);
+            if carried > MAX_OFFERED_EVENT_BYTES {
+                recovery.oversized += 1;
+                continue;
+            }
+            // Marked before the hand-over, not after the answer, and for the privacy state the
+            // request was recorded in.
+            lane.expose(binding, given.private);
+            let answer = client.deliver(service_id(binding), &given.event).await;
+            if !current(broker, &client) {
+                return;
+            }
+            let left = offers.len() as u64;
+            match answer {
+                Ok(Admission::Queued | Admission::QueuedWithGap { .. }) => {
+                    recovery.given += 1;
+                    recovery.approvals += u64::from(given.approval);
+                    lane.offered(binding, Instant::now());
+                    lane.answered(binding);
+                }
+                Ok(Admission::Refused { .. }) => {
+                    recovery.refused += 1 + left;
+                    break;
+                }
+                Err(ServiceError::CallerDeadline { .. }) => {
+                    recovery.unanswered += 1 + left;
+                    lane.go_silent(binding, Instant::now());
+                    break;
+                }
+                Err(ServiceError::Unavailable { .. }) => return,
+                Err(ServiceError::Disabled { .. }) => {
+                    lane.forget(binding);
+                    return;
+                }
+                Err(_) => {
+                    recovery.refused += 1 + left;
+                    break;
+                }
+            }
+        }
+    }
+    let Some(outage) = lane.finish_rebuild(binding, boundary) else {
+        return;
+    };
+    let told = Recovery {
+        passed: outage.passed,
+        terminal: outage.terminal,
+        dropped: outage.dropped,
+        decode_queued: outage.decode_queued,
+        decode_full: outage.decode_full,
+        ..recovery
+    };
+    broker.note_component(binding, ComponentNote::Recovery(told.words()));
 }
 
 fn fresh_handle() -> Option<SourceEventHandle> {

@@ -1,11 +1,221 @@
 //! What a component that starts again is given, and what the worker tells of it.
 //!
 //! When the plugin runtime is lost, every component on it is lost with it, and the component the
-//! link registers afterwards is a new instance with no state. The worker tells a person what that
-//! component was given and what it was not: counts, never content.
+//! link registers afterwards is a new instance with no state. The worker does not give it a state it
+//! saved before the loss: the state is opaque to the worker, and a state of unknown coverage cannot
+//! be made to hold exactly the requests the broker holds unresolved (a request answered since stays
+//! in it, and a request it holds is held twice when the worker gives it again). The worker gives it
+//! what the broker holds instead: every request that is still pending, once each, in the order the
+//! broker recorded them, under the handle the broker holds each by. An interpreted request's bytes
+//! come from its decoder entry, which keeps the original whole after the retained frame is
+//! released; an uninterpreted request's come from the retained frame. Nothing comes from a terminal
+//! span, the semantic log or a screen: none of them can say what is still pending.
+//!
+//! [`Broker::rebuild_of`] reads under the broker's lock and calls no mutator. Every wait is made by
+//! the pump (`crate::plugin_observation`) after the lock is dropped. The worker then tells a person
+//! what the component was given and what it was not: counts, never content.
 
-use super::MAX_RETAINED_FRAMES;
-use super::observation::Tally;
+use kr_plugin_service::vocabulary::{ScopedSourceEvent, SourceProvenance};
+use kr_protocol::gateway::PendingState;
+use kr_protocol::ids::{
+    ApplicationInstanceId, BrokerBindingId, PendingResourceId, SourceEventHandle, SourceGeneration,
+};
+
+use super::encode::source_event_of;
+use super::observation::{Audience, Outage, Tally};
+use super::{Broker, MAX_RETAINED_FRAME_BYTES, MAX_RETAINED_FRAMES, PackageIdentity};
+
+/// One pending request, as a component that starts again is given it.
+#[derive(Debug)]
+pub struct Offer {
+    /// The request.
+    pub resource_id: PendingResourceId,
+    /// The source generation the request was recorded under: it is given only while the instance is
+    /// still at it.
+    pub generation: SourceGeneration,
+    /// The request as the upstream sent it, under the handle the broker holds it by.
+    pub event: ScopedSourceEvent,
+    /// True when the broker already holds the request as a verified interpretation.
+    pub approval: bool,
+    /// Whether privacy mode stood when the request was recorded.
+    pub private: bool,
+}
+
+/// What the broker holds of one binding's pending requests, to be given to its component.
+#[derive(Debug)]
+pub struct Rebuild {
+    /// The instance the binding is bound to.
+    pub instance: ApplicationInstanceId,
+    /// The package the binding runs: the only package whose requests it is given.
+    pub package: PackageIdentity,
+    /// Where the broker's recording stood when this was read: a request recorded before it is in
+    /// `offers` or is not given, and one recorded after it is offered live.
+    pub boundary: u64,
+    /// The requests to give, oldest first.
+    pub offers: Vec<Offer>,
+    /// Requests the worker could not read: no retained frame, a decoder entry from another
+    /// generation or that the store could not read.
+    pub unavailable: u64,
+    /// Requests left out for the bound on what is given at once.
+    pub over_cap: u64,
+}
+
+impl Broker {
+    /// Reads the requests the broker holds for a binding's component that starts again.
+    ///
+    /// Returns nothing for a binding that is not offered the connector's upstream frames: it has no
+    /// requests to be given. A request is read only when it is still pending, was recorded under the
+    /// instance's current source generation, is of a kind a component may be offered, belongs to the
+    /// binding's package, and is held by handle. Requests are read in the order the broker recorded
+    /// them. At most [`MAX_RETAINED_FRAMES`] are read and [`MAX_RETAINED_FRAME_BYTES`] of event
+    /// bytes, which are the broker's own bounds on what it holds; the rest are counted.
+    #[must_use]
+    pub fn rebuild_of(&self, binding_id: BrokerBindingId) -> Option<Rebuild> {
+        let state = self.state();
+        let binding = state.bindings.get(&binding_id)?;
+        let instance_id = binding.application_instance_id;
+        let package = binding.package();
+        let audience = Audience::Native {
+            instance: instance_id,
+            package: Some(&package),
+        };
+        if !state.retains(binding, audience, false) {
+            return None;
+        }
+        let instance = state.instances.get(&instance_id)?;
+        let mut rebuild = Rebuild {
+            instance: instance_id,
+            package: package.clone(),
+            boundary: state.arbitration.next_recorded(),
+            offers: Vec::new(),
+            unavailable: 0,
+            over_cap: 0,
+        };
+        let mut bytes = 0usize;
+        for pending in state.arbitration.in_recorded_order() {
+            let resource = &pending.resource;
+            // Pending only: a request that is claimed is being answered, and one the host performs
+            // itself is claimed when it is recorded and was never offered to a component.
+            if resource.application_instance_id != instance_id
+                || resource.state != PendingState::Pending
+                || resource.source_generation != instance.source_generation
+                || !resource.classification.declared
+                || resource.classification.carries_credentials()
+            {
+                continue;
+            }
+            let Some(handle) = pending.source.as_ref() else {
+                continue;
+            };
+            if rebuild.offers.len() >= MAX_RETAINED_FRAMES {
+                rebuild.over_cap += 1;
+                continue;
+            }
+            let read = if resource.interpretation_verified {
+                interpreted(
+                    &state.ledger,
+                    resource,
+                    handle,
+                    &package,
+                    instance.source_generation,
+                )
+            } else {
+                uninterpreted(instance, resource, handle, &package)
+            };
+            let (event, approval) = match read {
+                Read::Given(event, approval) => (event, approval),
+                Read::OtherPackage => continue,
+                Read::Unavailable => {
+                    rebuild.unavailable += 1;
+                    continue;
+                }
+            };
+            if bytes.saturating_add(event.bytes.len()) > MAX_RETAINED_FRAME_BYTES {
+                rebuild.over_cap += 1;
+                continue;
+            }
+            bytes += event.bytes.len();
+            rebuild.offers.push(Offer {
+                resource_id: resource.resource_id,
+                generation: resource.source_generation,
+                event,
+                approval,
+                private: pending.made_in_privacy,
+            });
+        }
+        Some(rebuild)
+    }
+
+    /// Returns true while a request is still pending and the instance is still at the source
+    /// generation it was recorded under: asked before each request is given, since a request can be
+    /// answered, or its frames can be left behind, while an earlier one is being delivered.
+    #[must_use]
+    pub fn still_pending(
+        &self,
+        resource_id: PendingResourceId,
+        generation: SourceGeneration,
+    ) -> bool {
+        let state = self.state();
+        state.arbitration.get(resource_id).is_some_and(|pending| {
+            pending.resource.state == PendingState::Pending
+                && state
+                    .instances
+                    .get(&pending.resource.application_instance_id)
+                    .is_some_and(|instance| instance.source_generation == generation)
+        })
+    }
+}
+
+/// What reading one request came to.
+enum Read {
+    /// The event to give, and whether the broker already holds the request as an approval.
+    Given(ScopedSourceEvent, bool),
+    /// The request belongs to another package.
+    OtherPackage,
+    /// The bytes could not be read.
+    Unavailable,
+}
+
+/// Reads a request the broker holds as a verified interpretation, from its decoder entry.
+fn interpreted(
+    ledger: &super::ledger::Ledger,
+    resource: &kr_protocol::gateway::PendingResource,
+    handle: &SourceEventHandle,
+    package: &PackageIdentity,
+    generation: SourceGeneration,
+) -> Read {
+    match ledger.decoding(resource.resource_id) {
+        Ok(Some(entry)) if PackageIdentity::of_entry(&entry) != *package => Read::OtherPackage,
+        Ok(Some(entry)) if entry.source_generation == generation => Read::Given(
+            source_event_of(handle.clone(), resource.recorded_at.get(), &entry),
+            true,
+        ),
+        _ => Read::Unavailable,
+    }
+}
+
+/// Reads a request nothing has interpreted, from the frame the instance retained.
+fn uninterpreted(
+    instance: &super::Instance,
+    resource: &kr_protocol::gateway::PendingResource,
+    handle: &SourceEventHandle,
+    package: &PackageIdentity,
+) -> Read {
+    match instance.frames.get(handle) {
+        Some(held) if held.recorder.as_ref() != Some(package) => Read::OtherPackage,
+        Some(held) if held.frame.generation == instance.source_generation => Read::Given(
+            ScopedSourceEvent::new(
+                handle.clone(),
+                SourceProvenance::NativeProtocol,
+                held.frame.received_at.get(),
+                Some(resource.request.upstream.as_str().to_owned()),
+                held.frame.shared(),
+            ),
+            false,
+        ),
+        _ => Read::Unavailable,
+    }
+}
 
 /// Everything the worker tells of one binding's component starting again.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -45,6 +255,20 @@ const fn noun(count: u64, one: &'static str, many: &'static str) -> &'static str
 }
 
 impl Recovery {
+    /// What a restart came to, from what was counted while the runtime was away, before what the
+    /// baseline gave is added.
+    #[must_use]
+    pub fn after(outage: Outage) -> Self {
+        Self {
+            passed: outage.passed,
+            terminal: outage.terminal,
+            dropped: outage.dropped,
+            decode_queued: outage.decode_queued,
+            decode_full: outage.decode_full,
+            ..Self::default()
+        }
+    }
+
     /// The words a binding's report carries: counts, never content.
     #[must_use]
     pub fn words(&self) -> String {

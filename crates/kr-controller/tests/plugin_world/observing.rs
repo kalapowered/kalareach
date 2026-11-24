@@ -648,6 +648,18 @@ impl Observing {
             .exists()
     }
 
+    /// Closes the gate again: the compiles the plugin host queues from now on wait for
+    /// [`Self::let_the_compiles_go`], and [`Self::a_compile_is_held`] says false until one does.
+    pub fn hold_the_compiles(&self) {
+        let directory = self.hosted.environment().state_dir().to_path_buf();
+        match std::fs::remove_file(directory.join(COMPILE_GATE_REACHED)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => panic!("the mark of a held compile is not cleared: {error}"),
+        }
+        std::fs::write(directory.join(COMPILE_GATE), b"closed").expect("the gate is closed");
+    }
+
     /// Opens the gate: the compiles the plugin host queued go on.
     pub fn let_the_compiles_go(&self) {
         let gate = self.hosted.environment().state_dir().join(COMPILE_GATE);

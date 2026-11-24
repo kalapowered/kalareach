@@ -963,16 +963,6 @@ impl ObservationLane {
         Some(seq)
     }
 
-    /// Records a loss for a binding whether or not it is ready yet. A restore uses this: the
-    /// observations between a checkpoint and the registration that follows it were not replayed.
-    pub fn lose_unready(&self, binding: BrokerBindingId, what: String) -> u64 {
-        let mut inner = self.inner();
-        let view = inner.views.entry(binding).or_default();
-        view.lost_seq = view.lost_seq.saturating_add(1);
-        view.loss_note = Some(what);
-        view.lost_seq
-    }
-
     /// Records that a snapshot requested for loss number `through` has been answered, and returns
     /// what the component last missed, for the note a person reads.
     pub fn snapshot_answered(&self, binding: BrokerBindingId, through: u64) -> Option<String> {

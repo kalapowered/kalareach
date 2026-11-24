@@ -427,7 +427,7 @@ pub struct Instance {
     pub stream: stream::StreamState,
     /// What carries a prepared operation to this instance's upstream, where anything does.
     dispatch: Option<std::sync::Arc<dyn crate::broker::methods::UpstreamDispatch>>,
-    /// What this instance has been observed doing, and the cursor an adapter replays from.
+    /// What this instance has been observed doing, and the cursor a reader replays from.
     semantic: crate::broker::semantic::SemanticLog,
     /// The commands the upstream advertises.
     commands: Vec<kr_protocol::agent::AgentCommand>,
@@ -4307,10 +4307,10 @@ impl Broker {
             .map_err(BrokerError::from)
     }
 
-    /// Replays what an adapter has not consumed, through the actor's own history filter, in a
+    /// Replays what a reader has not consumed, through the actor's own history filter, in a
     /// part whose entries encode to at most `max_bytes` ([`SemanticLog::replay`]).
     ///
-    /// An adapter's replay is not a part of a snapshot, so nothing is carried before it.
+    /// A reader's replay is not a part of a snapshot, so nothing is carried before it.
     ///
     /// # Errors
     ///

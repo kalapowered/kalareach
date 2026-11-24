@@ -283,6 +283,12 @@ impl DecodeQueue {
     pub fn push(&self, job: DecodeJob) -> bool {
         {
             let mut jobs = self.jobs();
+            // A request waits once for a binding, however often it is asked for.
+            if jobs.iter().any(|waiting| {
+                waiting.binding_id == job.binding_id && waiting.resource_id == job.resource_id
+            }) {
+                return true;
+            }
             let theirs = jobs
                 .iter()
                 .filter(|waiting| waiting.binding_id == job.binding_id)
@@ -364,6 +370,15 @@ impl DecodeQueue {
     pub async fn pause(&self) {
         self.hold.pause().await;
     }
+}
+
+/// What queueing the requests a component that started again is to decode again came to.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Redecoded {
+    /// Requests the queue took, or already held for the binding.
+    pub queued: u64,
+    /// Requests the queue could not take because it was full.
+    pub full: u64,
 }
 
 /// What decides who decodes a request.
@@ -486,6 +501,56 @@ impl Broker {
                 Ok(None)
             }
         }
+    }
+
+    /// Queues, for a binding whose component started again, the pending requests nobody has
+    /// interpreted that it is to decode, oldest first, and says how many the queue took.
+    ///
+    /// A request is queued only when its frame is still held, since the task that asks the component
+    /// reads the bytes from it. A request that already waits for the binding counts as taken. The
+    /// requests the queue could not take are counted, and are not decoded.
+    pub fn redecode(&self, binding_id: BrokerBindingId) -> Redecoded {
+        let private = self.observation.is_private();
+        let jobs: Vec<DecodeJob> = {
+            let state = self.state();
+            state
+                .arbitration
+                .in_recorded_order()
+                .into_iter()
+                .filter(|pending| {
+                    pending.resource.state == PendingState::Pending
+                        && !pending.resource.interpretation_verified
+                })
+                .filter(|pending| {
+                    pending.source.as_ref().is_some_and(|handle| {
+                        state
+                            .instances
+                            .get(&pending.resource.application_instance_id)
+                            .is_some_and(|instance| instance.frames.contains_key(handle))
+                    })
+                })
+                .filter_map(|pending| {
+                    match state.choose_decoder(pending.resource.resource_id) {
+                        // Privacy mode standing now adds to what the request was made in, and never
+                        // takes from it.
+                        Ok(Chosen::Component(mut job)) if job.binding_id == binding_id => {
+                            job.private = job.private || private;
+                            Some(job)
+                        }
+                        _ => None,
+                    }
+                })
+                .collect()
+        };
+        let mut redecoded = Redecoded::default();
+        for job in jobs {
+            if self.decoding.push(job) {
+                redecoded.queued += 1;
+            } else {
+                redecoded.full += 1;
+            }
+        }
+        redecoded
     }
 
     /// Says where each of these bindings' components stands for a decode.

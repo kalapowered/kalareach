@@ -1,5 +1,5 @@
-//! The semantic entries an adapter observes, the replay a reader asks for from a cursor it holds,
-//! and the gap an eviction leaves.
+//! The semantic entries the broker records of an instance, the replay a reader asks for from a
+//! cursor it holds, and the gap an eviction leaves.
 //!
 //! Section 24: "If the range was evicted, rebuild from verified native state and show a history
 //! gap for anything unavailable. A grid image or transcript file cannot reconstruct an unobserved
