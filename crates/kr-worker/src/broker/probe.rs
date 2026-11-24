@@ -59,7 +59,7 @@ pub struct ProbeRun {
     /// The deadline: the call gives its answer, or says it is late, no later than this.
     pub by: Instant,
     /// Set by the caller that gives up before the probe has ended. The thread sees it when it
-    /// creates, reads and ends, and ends what it owns.
+    /// creates, reads and ends, and ends what it owns. Once it is set, no answer counts as in time.
     pub cancel: Arc<AtomicBool>,
 }
 
@@ -79,9 +79,10 @@ impl ProbeRun {
         self.cancel.load(Ordering::SeqCst) || Instant::now() >= self.by
     }
 
-    /// Whether an answer that was complete at `at` was complete before the deadline.
+    /// Whether an answer that was complete at `at` is in time: `at` is before the deadline, and the
+    /// caller has not given up.
     fn complete_in_time(&self, at: Instant) -> bool {
-        at < self.by
+        at < self.by && !self.cancel.load(Ordering::SeqCst)
     }
 }
 
