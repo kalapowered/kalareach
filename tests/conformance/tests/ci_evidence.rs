@@ -1837,8 +1837,9 @@ fn the_contract_cases_for_installed_apps_live_workers_and_plugins_run_in_jobs_of
 /// passes only when every test program reports passed cases and no failed one, and a command that
 /// names several cases with `--exact` passes only when as many passed as it names, because cargo
 /// exits 0 for a name that matches nothing. A failed command does not stop the commands after it,
-/// and the script then exits 1. This runs the script against a `cargo` that reports what each case
-/// asks of it.
+/// and the script then exits 1. The upgrade suite reads test components that the repository does not
+/// hold, so the script builds them first; the fake `cargo` fails that suite when they are absent.
+/// This runs the script against a `cargo` that reports what each case asks of it.
 #[test]
 fn the_contract_script_fails_a_command_whose_cases_did_not_all_run_and_pass() {
     let tools = TempDir::new().expect("a directory");
@@ -1848,6 +1849,14 @@ fn the_contract_script_fails_a_command_whose_cases_did_not_all_run_and_pass() {
         r#"#!/bin/sh
 # A build builds, whatever the cases do.
 if [ "$1" = build ]; then exit 0; fi
+# The upgrade suite panics where the test component has not been built.
+case " $* " in
+  *" --test upgrade "*)
+    if [ ! -e "$FAKE_COMPONENT" ]; then
+      echo "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.0s"
+      exit 101
+    fi ;;
+esac
 named=0
 seen=0
 for word in "$@"; do
@@ -1882,12 +1891,25 @@ esac
         tools.path().display(),
         std::env::var("PATH").expect("a PATH")
     );
+    // The script runs from a copy beside a stand-in for the build of the test components, which
+    // makes the file that the fake `cargo` looks for.
+    let script = tools.path().join("contract-cases.sh");
+    fs::copy(repository().join("scripts/contract-cases.sh"), &script)
+        .expect("a copy of the script");
+    fs::write(
+        tools.path().join("build-plugin-fixtures.sh"),
+        "#!/bin/sh\ntouch \"$FAKE_COMPONENT\"\n",
+    )
+    .expect("a stand-in for the component build");
+    let component = tools.path().join("component");
     let run = |mode: &str, fake: &str| {
+        let _ = fs::remove_file(&component);
         let output = Command::new("bash")
-            .arg(repository().join("scripts/contract-cases.sh"))
+            .arg(&script)
             .arg(mode)
             .env("PATH", &path)
             .env("FAKE_CARGO", fake)
+            .env("FAKE_COMPONENT", &component)
             .current_dir(repository())
             .output()
             .expect("bash runs");
@@ -1897,6 +1919,11 @@ esac
         )
     };
 
+    assert_eq!(
+        run("upgrade", "right").0,
+        Some(0),
+        "the upgrade suite ran before the test components it reads were built"
+    );
     for mode in ["fast", "upgrade", "windows"] {
         assert_eq!(run(mode, "right").0, Some(0), "{mode}: every case passed");
         for fake in ["none", "failed", "silent"] {

@@ -792,7 +792,7 @@ jobs:
   # the retained surface's cases took 7 minutes and the upgrade suite's 51 cases 8.5 minutes; a
   # hosted runner has a quarter of the threads and builds everything from nothing, twice for the
   # upgrade suite, which builds the release before in a tree of its own. The fast step has 90
-  # minutes and the upgrade suite 180, each about twice what it is expected to take.
+  # minutes and the upgrade suite 190, each about twice what it is expected to take.
   contract-tests:
     name: contract tests for installed apps, live workers and plugins
     runs-on: ubuntu-24.04
@@ -836,9 +836,10 @@ jobs:
         timeout-minutes: 90
         run: bash scripts/contract-cases.sh fast
 
+      # The limit includes 10 minutes for the build of the test components.
       - name: The upgrade suite
         if: ${{ !cancelled() }}
-        timeout-minutes: 180
+        timeout-minutes: 190
         run: bash scripts/contract-cases.sh upgrade
 
       - name: What the disk has left

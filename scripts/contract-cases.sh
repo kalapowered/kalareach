@@ -15,6 +15,7 @@
 set -euo pipefail
 
 mode="${1:-}"
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 failed=0
 commands=0
 
@@ -96,6 +97,9 @@ build_programs() {
 # The upgrade suite builds the release before from its commit and assembles this tree's release from
 # the programs built beside the test.
 upgrade() {
+  # The suite writes plugin packages around the test components, which the repository does not hold,
+  # so a fresh checkout builds them first.
+  bash "$here/build-plugin-fixtures.sh"
   build_programs
   expect cargo test --locked -p kr-cli --features upgrade-suite --test upgrade -- --nocapture
   # A plugin host that cannot bind beside the daemon of the release before: the suite leaves this
