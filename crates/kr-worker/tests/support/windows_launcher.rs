@@ -76,8 +76,6 @@ pub struct Launch {
     /// vector without its first element and with the record's gateway address in place of
     /// `{gateway}`, as the launcher does.
     pub program_arguments: Option<Vec<String>>,
-    /// Whether the launcher starts the program once the backend has committed, and says so.
-    pub resume: bool,
 }
 
 impl Launch {
@@ -93,7 +91,6 @@ impl Launch {
             environment: process_environment(),
             directory: std::env::current_dir().expect("this process's directory"),
             program_arguments: None,
-            resume: false,
         }
     }
 }
@@ -150,8 +147,6 @@ pub struct Played {
     /// How long after the launcher began counting, which is before it wrote `going`, the answer was
     /// read. It is how long the launcher waited, where there was none.
     pub after: Duration,
-    /// Whether the launcher started the program afterwards.
-    pub resumed: bool,
 }
 
 impl Played {
@@ -186,7 +181,6 @@ impl Launcher {
             "environment": launch.environment.iter().cloned().collect::<BTreeMap<_, _>>(),
             "directory": launch.directory.to_str().expect("a text path"),
             "program_arguments": launch.program_arguments,
-            "resume": launch.resume,
         });
         let mut process = Command::new(std::env::current_exe().expect("this test's program"))
             .args(["--exact", ROLE_CASE, "--nocapture", "--test-threads=1"])
@@ -218,7 +212,7 @@ impl Launcher {
     }
 
     /// Waits for the launcher to play to its end, and returns what it saw: until it has read an
-    /// answer, or been refused.
+    /// answer, or been refused. The program it created is held until [`Launcher::resume`].
     ///
     /// # Panics
     ///
@@ -229,7 +223,6 @@ impl Launcher {
             program: None,
             answer: None,
             after: Duration::ZERO,
-            resumed: false,
         };
         loop {
             let said = tokio::time::timeout(LIVENESS, self.lines.recv())
@@ -263,15 +256,34 @@ impl Launcher {
                         _ => Answer::Other(text(&said, "read")),
                     });
                     played.after = Duration::from_micros(said["after_us"].as_u64().unwrap_or(0));
-                    if played.answer != Some(Answer::Committed) || !self_resumes(&said) {
-                        return played;
-                    }
-                }
-                "resumed" => {
-                    played.resumed = true;
                     return played;
                 }
                 _ => {}
+            }
+        }
+    }
+
+    /// Asks the launcher to start the program it created, and waits until it has started it and
+    /// told the backend so.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the launcher has been let go, or does not say it started the program in time.
+    pub async fn resume(&mut self) {
+        let input = self
+            .input
+            .as_mut()
+            .expect("the launcher has not been let go");
+        writeln!(input, "resume")
+            .and_then(|()| input.flush())
+            .expect("the launcher is asked to start the program");
+        loop {
+            let said = tokio::time::timeout(LIVENESS, self.lines.recv())
+                .await
+                .expect("the launcher said it started the program in time")
+                .expect("the launcher went on until it started the program");
+            if said["event"] == "resumed" {
+                return;
             }
         }
     }
@@ -299,20 +311,16 @@ impl Drop for Launcher {
     }
 }
 
-/// Whether the launcher that said this was to start the program, which it says on its answer.
-fn self_resumes(answer: &serde_json::Value) -> bool {
-    answer["resumes"].as_bool().unwrap_or(false)
-}
-
 fn text(value: &serde_json::Value, name: &str) -> String {
     value[name].as_str().unwrap_or_default().to_owned()
 }
 
 /// Plays the launcher when this program was started to, and returns at once when it was not.
 ///
-/// It reports each step to its standard output, one line each, for [`Launcher`] to read; it ends
-/// when its standard input is closed, and the program it created ends with it. The program has no
-/// standard input and no output of its own.
+/// It reports each step to its standard output, one line each, for [`Launcher`] to read. It starts
+/// the program it created when a line comes in on its standard input, and ends when that input is
+/// closed, and the program it created ends with it. The program has no standard input and no output
+/// of its own.
 ///
 /// # Panics
 ///
@@ -483,13 +491,22 @@ async fn play(plan: &serde_json::Value) {
         ),
         _ => (kind, None),
     };
-    let resumes = plan["resume"] == true && answer == "committed";
     report(serde_json::json!({
         "event": "answer", "answer": answer, "reason": reason, "read": read,
         "after_us": u64::try_from(after.as_micros()).unwrap_or(u64::MAX),
-        "resumes": resumes,
     }));
-    if resumes {
+    // The program stays held until the case asks for it to be started, with the connection open, as
+    // a launcher waits for its program. A line on this process's input is that ask, and closing the
+    // input is the case letting go.
+    let (asks, mut asked) = tokio::sync::mpsc::unbounded_channel();
+    std::thread::spawn(move || {
+        for line in std::io::stdin().lock().lines() {
+            if line.is_err() || asks.send(()).is_err() {
+                return;
+            }
+        }
+    });
+    if asked.recv().await.is_some() {
         kr_ipc::memory_limit::resume(std::os::windows::io::AsHandle::as_handle(&program))
             .expect("the program is started");
         writer
@@ -498,14 +515,8 @@ async fn play(plan: &serde_json::Value) {
             .expect("resumed is written");
         let _ = writer.flush().await;
         report(serde_json::json!({"event": "resumed"}));
+        while asked.recv().await.is_some() {}
     }
-    // Held until the case lets go, with the connection open and the program alive, as a launcher
-    // waits for its program. Closing this process's input is the case letting go.
-    let _ = tokio::task::spawn_blocking(|| {
-        let mut sink = Vec::new();
-        std::io::Read::read_to_end(&mut std::io::stdin(), &mut sink)
-    })
-    .await;
     // The job ends the program with this process.
     drop(job);
     let _ = program.wait();

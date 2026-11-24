@@ -1670,10 +1670,20 @@ fn the_launcher_fixture_plays_its_role() {
     windows_launcher::play_when_asked();
 }
 
+/// The file the program a launcher fixture creates leaves in its directory when it runs.
+#[cfg(windows)]
+const RAN: &str = "ran";
+
+/// How long a held program is watched for a sign that it has run, which has to stay well inside the
+/// backend's own wait for the launcher to say it started the program.
+#[cfg(windows)]
+const HELD_FOR: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// The launcher fixture connects to the backend's launch record address, presents itself with an
 /// environment, is admitted, creates a program held and names it in `going`, and reads the backend's
-/// commit under its own clock, counted from before `going` was written. The program is held until
-/// the fixture starts it, and ends with the launcher that created it.
+/// commit under its own clock, counted from before `going` was written. The program has not run
+/// when the commit is read, runs once the fixture starts it, and ends with the launcher that created
+/// it.
 #[cfg(windows)]
 #[tokio::test]
 async fn the_fixture_reads_a_commit_on_the_launchers_clock() {
@@ -1693,6 +1703,13 @@ async fn the_fixture_reads_a_commit_on_the_launchers_clock() {
     launch
         .environment
         .push(("KR_FIXTURE_PRESENTED".to_owned(), "yes".to_owned()));
+    // When it runs, the program leaves a file in its directory and then goes on for a minute.
+    launch.program_arguments = Some(vec![
+        "/d".to_owned(),
+        "/c".to_owned(),
+        format!("copy NUL {RAN} & ping -n 60 127.0.0.1 > NUL"),
+    ]);
+    let mark = setup.directory.join(RAN);
 
     let mut launcher = Launcher::start(&launch);
     let played = launcher.played().await;
@@ -1711,12 +1728,8 @@ async fn the_fixture_reads_a_commit_on_the_launchers_clock() {
         played.in_time(),
         "the commit was read within the launcher's {COMMIT_DEADLINE:?}: {played:?}"
     );
-    assert!(
-        !played.resumed,
-        "the fixture was not asked to start the program"
-    );
 
-    // The program the fixture created and named is held, and has not run.
+    // The program the fixture created and named is held: it exists, and it has not run.
     let program = played.program.expect("the fixture named a program");
     let identity = kr_ipc::identity::process_start_identity(program).expect("a process");
     assert_eq!(
@@ -1724,6 +1737,25 @@ async fn the_fixture_reads_a_commit_on_the_launchers_clock() {
         kr_ipc::identity::ProcessState::Running,
         "the program was created and is held, so it has not ended"
     );
+    let watched = std::time::Instant::now() + HELD_FOR;
+    while std::time::Instant::now() < watched {
+        assert!(
+            !mark.exists(),
+            "the program ran before the launcher started it, so it was not held"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    // It runs once the launcher starts it.
+    launcher.resume().await;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while !mark.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the program ran after the launcher started it"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
 
     // And it ends with the launcher that made it.
     launcher.end().await;
