@@ -78,9 +78,12 @@ export function applicationName(session: SessionListResult['sessions'][number]):
   return session.application_state === 'shell_ready' ? 'Shell' : null
 }
 
-/** A directory's own name: its last component, which every host can say of a session. */
-export function directoryName(cwd: string): string {
-  return cwd.split('/').filter(Boolean).pop() ?? cwd
+/**
+ * A directory's own name: its last component, which every host can say of a session. The root has
+ * none, as the host also finds, and the host names such a session by its number.
+ */
+export function directoryName(cwd: string): string | null {
+  return cwd.split('/').filter(Boolean).pop() ?? null
 }
 
 /** The title a row shows: the host's, or the directory's own name until the host has answered. */

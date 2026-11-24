@@ -59,11 +59,12 @@ export function describeApplicationState(session: Session): {
 }
 
 /**
- * The name a session shows until the host has described it: the directory's own name. The host
- * derives every other; this never invents one.
+ * The name a session shows until the host has described it: the directory's own name, or the
+ * session's number where the directory has none, as the host names it. The host derives every other;
+ * this never invents one.
  */
 export function sessionDescription(session: Session): string {
-  return directoryName(session.cwd)
+  return directoryName(session.cwd) ?? `Session ${session.display_number}`
 }
 
 /** The list of sessions. */

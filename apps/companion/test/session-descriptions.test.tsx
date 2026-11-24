@@ -42,6 +42,17 @@ function describedHost() {
   return host
 }
 
+/** The same host, whose sessions all run in the root directory, which has no name of its own. */
+function inTheRootDirectory(port: HostPort): HostPort {
+  return {
+    ...port,
+    sessionList: async (params) => {
+      const listed = await port.sessionList(params)
+      return { ...listed, sessions: listed.sessions.map((session) => ({ ...session, cwd: '/' })) }
+    }
+  }
+}
+
 afterEach(() => {
   vi.useRealTimers()
 })
@@ -146,6 +157,16 @@ describe("the desktop session list shows each session's description", () => {
       setTimeout(resolve, 20)
     })
     expect(within(kept).getByRole('heading', { level: 3 })).toHaveTextContent('kalareach-web')
+  })
+
+  it('names a session in the root directory as the host does until it has answered, and not by a slash', async () => {
+    const { port, controls } = describedHost()
+    controls.hold('sessionDescribe')
+    open(inTheRootDirectory(port), { view: 'sessions' })
+    const row = await screen.findByTestId('session-row-2')
+    const title = within(row).getByRole('heading', { level: 3 })
+    expect(title).toHaveTextContent('Session 2')
+    expect(title).not.toHaveTextContent('/')
   })
 
   // Section 22: a description that has aged is shown as aged. A screen left open is read again at
@@ -388,6 +409,25 @@ describe("the phone's session list shows each session's description", () => {
       'Checks the code-entry flow and host approval screen'
     )
     expect(screen.getByTestId('description-freshness')).toHaveTextContent('Out of date')
+  })
+
+  it('names a session in the root directory as the host does until it has answered, and not by a slash', async () => {
+    const { port, controls } = describedHost()
+    controls.hold('sessionDescribe')
+    render(
+      <AppProvider port={inTheRootDirectory(port)}>
+        <MobileSessions surface="ios" onOpen={() => undefined} />
+      </AppProvider>
+    )
+    await waitFor(() => {
+      expect(screen.getAllByTestId('description-title').map((row) => row.textContent?.trim())).toEqual([
+        'Session 1',
+        'Session 2',
+        'Session 3'
+      ])
+    })
+    // The directory is still said once, on its own line.
+    expect(screen.getAllByText('/')).toHaveLength(3)
   })
 
   // KR-REQ-13.10: a row shows the application, as the desktop's list does.

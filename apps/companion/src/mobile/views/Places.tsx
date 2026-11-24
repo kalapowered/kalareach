@@ -38,8 +38,11 @@ import { SharedWithYou, hasShares } from './SharedWithYou'
 interface Row {
   readonly id: string
   readonly title: string
-  /** The directory's own name, which a row says until the host has described its session. */
-  readonly directory?: string
+  /**
+   * The directory's own name, which a row says until the host has described its session. The root has
+   * none, and the row says its title.
+   */
+  readonly directory?: string | null
   readonly where: string
   readonly detail: string
   readonly tone: 'muted' | 'success' | 'warning'
@@ -232,7 +235,7 @@ export function MobileSessions({
                 >
                   <span className="m-row-title">{row.title}</span>
                   <span className="m-row-description" data-testid="description-title">
-                    {shownTitle(row.directory ?? row.where, described)}
+                    {shownTitle(row.directory ?? row.title, described)}
                     {label ? (
                       <span className="m-row-label" data-testid="description-source">
                         {' '}
