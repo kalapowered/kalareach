@@ -458,6 +458,50 @@ describe('the route each check has on this desktop', () => {
     )
   })
 
+  // A capability has one record for each subject it was established about, so a check can have
+  // several, and each says what the host said of its own subject.
+  it('shows every record the host holds for one check, each with its own state and reason', async () => {
+    const second = 'a second tool was run, and the screen came back'
+    start('x11', (port) => ({
+      ...port,
+      environmentCapabilities: async (request) => {
+        const answer = await port.environmentCapabilities(request)
+        const records = answer.desktop.records.flatMap((record) =>
+          record.capability === 'desktop.screen_capture'
+            ? [
+                record,
+                {
+                  ...record,
+                  state: 'qualified_available' as const,
+                  evidence_source: 'disclosed_probe' as const,
+                  disabled_reason: second,
+                  identity: { ...record.identity, binary: '/usr/bin/maim' }
+                }
+              ]
+            : [record]
+        )
+        return { ...answer, desktop: { ...answer.desktop, records } }
+      }
+    }))
+    await screen.findByTestId('setup-identity')
+    await goTo('permissions')
+    const card = screen.getByTestId('setup-disclosed-desktop.screen_capture')
+    expect(
+      within(card)
+        .getAllByTestId('setup-disclosed-state-desktop.screen_capture')
+        .map((badge) => badge.textContent)
+    ).toEqual(['Not checked', 'Ready'])
+    expect(
+      within(card)
+        .getAllByTestId('setup-disclosed-reason-desktop.screen_capture')
+        .map((reason) => reason.textContent)
+    ).toEqual(['this process holds no X11 display; a worker’s own context is what a check reads', second])
+    expect(card.textContent).toMatch(/\/usr\/bin\/maim/)
+    // A check with one record keeps its single badge and reason.
+    const file = screen.getByTestId('setup-disclosed-desktop.authorised_file_read')
+    expect(within(file).getAllByTestId('setup-disclosed-state-desktop.authorised_file_read')).toHaveLength(1)
+  })
+
   it('still shows every record the host holds, each on its own card, on the next step', async () => {
     start('x11')
     await screen.findByTestId('setup-identity')

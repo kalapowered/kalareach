@@ -76,7 +76,8 @@ import {
   stateMeaning,
   STATE_TONE,
   tally,
-  tallyLine
+  tallyLine,
+  type DisplayState
 } from './states'
 import './setup.css'
 
@@ -981,25 +982,60 @@ function ChecksStep({
         {checksNote(platform)}
       </p>
       {listed.map((check) => {
-        const record = records.find((each) => each.capability === check.capability)
-        const state = record ? displayState(record, { grantWasOffered: offered(check.capability) }) : null
+        // A capability can have more than one record, one for each subject it was established
+        // about, and the page says what the host said of each of them.
+        const found = records.filter((each) => each.capability === check.capability)
+        const only = found.length === 1 ? found[0] : undefined
+        const stateOf = (record: CapabilityRecord): DisplayState =>
+          displayState(record, { grantWasOffered: offered(check.capability) })
         return (
           <Card key={check.capability} data-testid={`setup-disclosed-${check.capability}`}>
             <header className="card-header">
               <h2>{check.name}</h2>
-              {state ? (
-                <Badge tone={STATE_TONE[state]} data-testid={`setup-disclosed-state-${check.capability}`}>
-                  {STATE_LABEL[state]}
+              {only ? (
+                <Badge
+                  tone={STATE_TONE[stateOf(only)]}
+                  data-testid={`setup-disclosed-state-${check.capability}`}
+                >
+                  {STATE_LABEL[stateOf(only)]}
                 </Badge>
               ) : null}
             </header>
             <div className="card-body">
               <p>{check.performs}</p>
               <p className="faint small">{check.effect}</p>
-              {record?.disabled_reason ? (
+              {only?.disabled_reason ? (
                 <p className="faint small" data-testid={`setup-disclosed-reason-${check.capability}`}>
-                  {record.disabled_reason}
+                  {only.disabled_reason}
                 </p>
+              ) : null}
+              {found.length > 1 ? (
+                <ul className="setup-governs">
+                  {found.map((record) => {
+                    const about = aboutLine(record)
+                    return (
+                      <li key={recordKey(record)}>
+                        <span>
+                          {about ? <span className="mono small faint setup-about">{about}</span> : null}
+                          {record.disabled_reason ? (
+                            <span
+                              className="small faint setup-about"
+                              data-testid={`setup-disclosed-reason-${check.capability}`}
+                            >
+                              {record.disabled_reason}
+                            </span>
+                          ) : null}
+                        </span>
+                        <Badge
+                          tone={STATE_TONE[stateOf(record)]}
+                          data-testid={`setup-disclosed-state-${check.capability}`}
+                        >
+                          {STATE_LABEL[stateOf(record)]}
+                        </Badge>
+                      </li>
+                    )
+                  })}
+                </ul>
               ) : null}
             </div>
           </Card>
