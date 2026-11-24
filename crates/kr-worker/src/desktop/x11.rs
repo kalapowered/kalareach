@@ -449,10 +449,16 @@ pub(super) fn validate(image: Image, bytes: &[u8]) -> Result<(), Fault> {
     }
 }
 
-/// An XWD: a header of at least 100 bytes at version 7 with a width and a height, and a file that
-/// holds the header, the colour map it names and every row of pixels. Every field is big-endian.
+/// An XWD: its header size and its version first, then a file that holds the header, the colour
+/// map it names and every row of pixels. Every field is big-endian.
+///
+/// The header size and the version say whether the bytes are this format, so they are read before
+/// any length is judged: fewer than eight bytes that nothing in them contradicts are cut short, and
+/// anything else is not an XWD. A row of no bytes, or no rows, is a header with no pixels, and a
+/// size that cannot be added up is a file that cannot be whole.
 fn xwd(bytes: &[u8]) -> Result<(), Fault> {
-    const FIXED: usize = 100;
+    /// The 25 words of the header, which is all of it but the name of the window.
+    const FIXED: u64 = 100;
     let field = |offset: usize| -> Option<u64> {
         let word = bytes.get(offset..offset + 4)?;
         Some(u64::from(u32::from_be_bytes([
@@ -462,13 +468,16 @@ fn xwd(bytes: &[u8]) -> Result<(), Fault> {
     if bytes.is_empty() {
         return Err(Fault::Empty);
     }
-    if bytes.len() < FIXED {
-        return Err(Fault::CutShort);
-    }
     let (Some(header), Some(version)) = (field(0), field(4)) else {
-        return Err(Fault::CutShort);
+        let version_fits = [0, 0, 0, 7].starts_with(bytes.get(4..).unwrap_or_default());
+        let header_fits = field(0).is_none_or(|header| header >= FIXED);
+        return Err(if header_fits && version_fits {
+            Fault::CutShort
+        } else {
+            Fault::NotThisFormat
+        });
     };
-    if header < FIXED as u64 || version != 7 {
+    if header < FIXED || version != 7 {
         return Err(Fault::NotThisFormat);
     }
     let (Some(width), Some(height), Some(row), Some(colours)) =
@@ -476,15 +485,20 @@ fn xwd(bytes: &[u8]) -> Result<(), Fault> {
     else {
         return Err(Fault::CutShort);
     };
-    if width == 0 || height == 0 {
+    if width == 0 || height == 0 || row == 0 {
         return Err(Fault::NoPixels);
     }
-    // A colour map entry is 12 bytes. The sums cannot overflow: every term is below 2^32.
-    let needed = header + colours * 12 + row * height;
-    if (bytes.len() as u64) < needed {
-        return Err(Fault::CutShort);
+    // A colour map entry is 12 bytes. The rows and the map are below 2^64 each, and their sum with
+    // the header may not be.
+    let map = colours.checked_mul(12);
+    let pixels = row.checked_mul(height);
+    let needed = map
+        .zip(pixels)
+        .and_then(|(map, pixels)| header.checked_add(map)?.checked_add(pixels));
+    match needed {
+        Some(needed) if u64::try_from(bytes.len()).is_ok_and(|length| length >= needed) => Ok(()),
+        _ => Err(Fault::CutShort),
     }
-    Ok(())
 }
 
 // The cases run stand-in programs and sockets of a unix system, which is every system that has an
@@ -698,6 +712,81 @@ mod tests {
         let mut old = xwd_of(1280, 800, 0);
         old[7] = 6;
         assert_eq!(validate(Image::Xwd, &old), Err(Fault::NotThisFormat));
+    }
+
+    /// Sets one big-endian word of an XWD header.
+    fn set_word(bytes: &mut [u8], word: usize, value: u32) {
+        bytes[word * 4..word * 4 + 4].copy_from_slice(&value.to_be_bytes());
+    }
+
+    /// KR-REQ-03.29, LX-14: an XWD is whole only with its header, its colour map and every row. The
+    /// header's size and version are read before any length is judged, a row of no bytes is no
+    /// pixels, and a size that cannot be added up is cut short and no panic.
+    #[test]
+    fn kr_req_03_29_an_xwd_is_whole_only_with_its_header_its_colour_map_and_every_row() {
+        let whole = xwd_of(64, 4, 0);
+        assert_eq!(validate(Image::Xwd, &whole), Ok(()), "whole");
+        // The colour map left out: the bytes are the header and the pixels and nothing between.
+        let mut no_map = whole.clone();
+        no_map.drain(107..107 + 256 * 12);
+        assert_eq!(
+            validate(Image::Xwd, &no_map),
+            Err(Fault::CutShort),
+            "no colour map"
+        );
+        assert_eq!(
+            validate(Image::Xwd, &xwd_of(64, 4, 1)),
+            Err(Fault::CutShort),
+            "one byte of the last row missing"
+        );
+        // A header whose rows are of no bytes and whose colour map is empty is a header alone.
+        let mut header_alone = xwd_of(64, 4, 0)[..107].to_vec();
+        set_word(&mut header_alone, 12, 0);
+        set_word(&mut header_alone, 19, 0);
+        assert_eq!(
+            validate(Image::Xwd, &header_alone),
+            Err(Fault::NoPixels),
+            "a header alone"
+        );
+        // Sizes that add up to 2^64 + 9: a file of the header's own 100 bytes is not whole.
+        let mut overflowing = vec![0_u8; 100];
+        for (word, value) in [
+            (0, 100),
+            (1, 7),
+            (4, 1),
+            (5, u32::MAX),
+            (12, u32::MAX),
+            (19, 715_827_875),
+        ] {
+            set_word(&mut overflowing, word, value);
+        }
+        assert_eq!(
+            validate(Image::Xwd, &overflowing),
+            Err(Fault::CutShort),
+            "a size that wraps"
+        );
+        // The header size and the version are read before any length: a short file of another
+        // format is not an XWD cut short, and a start that fits the format is.
+        assert_eq!(
+            validate(Image::Xwd, b"%!PS-Adobe-3.0\n"),
+            Err(Fault::NotThisFormat),
+            "a short file of another format"
+        );
+        assert_eq!(
+            validate(Image::Xwd, &[0, 0, 0]),
+            Err(Fault::CutShort),
+            "three bytes"
+        );
+        assert_eq!(
+            validate(Image::Xwd, &[0, 0, 0, 107, 0, 0, 0]),
+            Err(Fault::CutShort),
+            "the start of a header"
+        );
+        assert_eq!(
+            validate(Image::Xwd, &[0, 0, 0, 107, 0, 0, 1]),
+            Err(Fault::NotThisFormat),
+            "a start whose version is not 7"
+        );
     }
 
     /// KR-REQ-03.29, LX-2: each tool is asked in the vector discovery fixed, with its quiet
