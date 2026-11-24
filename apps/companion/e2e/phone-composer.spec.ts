@@ -266,6 +266,30 @@ for (const phone of PHONES) {
       await page.screenshot({ path: shot(`slash-all-keyboard-${phone.surface}-${phone.width}`) })
     })
 
+    test('keeps the field in view and every one of the three commands reachable when the list opens on a keyboard that has been up a while', async ({
+      page
+    }) => {
+      const field = page.getByLabel('Message this session')
+      await field.focus()
+      await keyboard(page, phone.keyboard)
+      // Past the time the view takes to settle after a keyboard, so the list opening is the only change
+      // left to move the field. A slow machine gets here by itself; this case does not wait for one.
+      await page.waitForTimeout(SETTLE_MS * 4)
+      await field.fill('/')
+      await expectCommandsReachable(page, phone, phone.keyboard)
+      const first = await liftOf(page)
+      // The list closes and opens again over the same layout: the lift is taken back as well as added, so the same layout has the same lift.
+      await field.fill('')
+      await expect(page.getByTestId('slash-commands'), 'the list of commands once the field is empty').toBeHidden()
+      await expectInView(page, [field], phone.keyboard)
+      await field.fill('/')
+      await expectCommandsReachable(page, phone, phone.keyboard)
+      expect(
+        Math.abs((await liftOf(page)) - first),
+        'pixels by which the lift under the composer differs between the second opening of the list and the first'
+      ).toBeLessThanOrEqual(1)
+    })
+
     test('keeps the lift under the composer the same when the field is worked out again over the same keyboard', async ({
       page
     }) => {

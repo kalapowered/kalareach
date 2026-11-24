@@ -763,6 +763,12 @@ export function MobileSession({
     cover()
     const resized = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(() => cover())
     resized?.observe(element)
+    // What the composer holds changes after the keyboard has settled: the list of commands opens above
+    // the field when a slash is typed. The field's rest is worked out again for that, as it is for the
+    // keyboard. The body is watched, not the composer: the lift is the composer's own padding, so
+    // working the rest out never changes what is watched.
+    const body = element.querySelector('.m-composer-body')
+    if (body !== null) resized?.observe(body)
     // The keyboard's measure is written on the document's own style.
     const written = new MutationObserver(() => cover())
     written.observe(root, { attributes: true, attributeFilter: ['style'] })
