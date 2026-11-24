@@ -2142,11 +2142,12 @@ fn bounded(
         }
         None => {
             // Only this check's own child and its own group, by the handle and the group it holds:
-            // nothing here looks a process up by name. Collecting it is bounded as well, because a
-            // child that will not go is not a reason for a diagnostic to stop answering.
+            // nothing here looks a process up by name. Collecting it is bounded as well, and a child
+            // that is not collected by then is collected on a thread of its own, because a child
+            // that will not go is not a reason for a diagnostic to stop answering.
             super::children::end_group(&child);
             let _ = child.kill();
-            let stopped = super::children::collect_within(&mut child, super::children::COLLECT);
+            let stopped = super::children::collect_by(child, super::children::COLLECT);
             Exit::Unfinished(Outcome::NotAnswered {
                 waited: started.elapsed(),
                 stopped,

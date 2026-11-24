@@ -48,8 +48,8 @@ pub(super) const COLLECT: Duration = Duration::from_secs(2);
 /// Collects a child that was ended, for at most `bound`, and says whether it was collected.
 ///
 /// A child that cannot be collected at once, one that the system has not finished taking down, is
-/// not a reason for the call that ended it to stop answering: it is left to the process table and
-/// the call goes on.
+/// not a reason for the call that ended it to stop answering: the call gives up waiting and says
+/// so, and the caller decides what becomes of the child.
 #[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
 pub(super) fn collect_within(child: &mut Child, bound: Duration) -> bool {
     let until = Instant::now() + bound;
@@ -61,6 +61,27 @@ pub(super) fn collect_within(child: &mut Child, bound: Duration) -> bool {
             Ok(None) => std::thread::sleep(Duration::from_millis(10)),
         }
     }
+}
+
+/// Collects a child that was ended: within `bound` where the system has taken it down by then, and
+/// otherwise on a thread of its own, which waits for it for as long as it takes.
+///
+/// The caller answers within `bound` either way, and a child that was not collected by then is
+/// still collected once the system has finished with it, so none is left in the process table. It
+/// says whether the child was collected within `bound`.
+#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
+pub(super) fn collect_by(mut child: Child, bound: Duration) -> bool {
+    if collect_within(&mut child, bound) {
+        return true;
+    }
+    // A thread that cannot be started leaves the child to the process table, as a child that was
+    // never waited for would be.
+    let _ = std::thread::Builder::new()
+        .name("kr-desktop-collect".to_owned())
+        .spawn(move || {
+            let _ = child.wait();
+        });
+    false
 }
 
 /// Ends the child's whole group, the child and everything it started.
@@ -183,6 +204,68 @@ mod tests {
         assert!(
             took < Duration::from_secs(2),
             "the call took {took:?} for a bound of 300 ms"
+        );
+    }
+
+    /// KR-REQ-03.29, S-8: a child that stays uncollected past the bound is handed on: the call
+    /// answers by the bound, and the child is collected after it, not left in the process table.
+    #[test]
+    fn a_child_still_uncollected_at_the_bound_is_collected_after_the_call_has_answered() {
+        // A child that is still running is one that cannot be collected: the wait has nothing to
+        // return until it ends.
+        let mut command = Command::new("/bin/sleep");
+        command
+            .arg("120")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        in_a_group_of_its_own(&mut command);
+        let child = command.spawn().expect("the stand-in starts");
+        let group = i32::try_from(child.id())
+            .ok()
+            .and_then(rustix::process::Pid::from_raw)
+            .expect("a process number");
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let began = Instant::now();
+            let collected = collect_by(child, Duration::from_millis(300));
+            let _ = sender.send((collected, began.elapsed()));
+        });
+        let answered = receiver.recv_timeout(Duration::from_secs(5));
+        if answered.is_err() {
+            // The case's own cleanup: a wait that did not give up leaves nothing running.
+            let _ = rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
+        }
+        let (collected_at_the_bound, took) =
+            answered.expect("the call gave up at its bound and answered");
+        assert!(
+            !collected_at_the_bound,
+            "a child that was still running was not collected at the bound"
+        );
+        assert!(
+            took < Duration::from_secs(2),
+            "the call took {took:?} for a bound of 300 ms"
+        );
+        assert!(
+            rustix::process::test_kill_process(group).is_ok(),
+            "the child was still there when the call answered"
+        );
+        // The system finishes taking the child down now. A zombie still takes a signal and a
+        // collected child does not, so the number's absence is the child's collection.
+        let _ = rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
+        let until = Instant::now() + Duration::from_secs(5);
+        let collected = loop {
+            if rustix::process::test_kill_process(group) == Err(rustix::io::Errno::SRCH) {
+                break true;
+            }
+            if Instant::now() >= until {
+                break false;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert!(
+            collected,
+            "the child that was not collected at the bound stayed in the process table"
         );
     }
 

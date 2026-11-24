@@ -310,12 +310,12 @@ fn run(program: &str, arguments: &[&str]) -> Printed {
     };
     if !ended {
         // Terminated and collected: a child left running would outlive every probe after it. The
-        // group goes with it. A child that cannot be collected at once is waited for only within a
-        // bound and then left to the process table, because a reading that waited for it would
-        // stop answering with it.
+        // group goes with it. A child that cannot be collected at once is waited for only within
+        // what is left of the reading's time and then on a thread of its own, because a reading
+        // that waited longer would answer late.
         super::children::end_group(&child);
         let _ = child.kill();
-        let _ = super::children::collect_within(&mut child, super::children::COLLECT);
+        super::children::collect_by(child, collection_bound());
     }
     let Some(status) = status else {
         // Nothing is read from a command that did not finish. A descendant it left behind can
@@ -386,6 +386,20 @@ fn reading_is_over() -> bool {
     READING_ENDS
         .with(std::cell::Cell::get)
         .is_some_and(|ends| std::time::Instant::now() >= ends)
+}
+
+/// How long a command that was ended is waited for before it is collected on a thread of its own:
+/// what is left of the reading's time, and never more than [`super::children::COLLECT`].
+///
+/// A reading that has no deadline of its own is held to the second bound alone.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn collection_bound() -> std::time::Duration {
+    READING_ENDS
+        .with(std::cell::Cell::get)
+        .map_or(super::children::COLLECT, |ends| {
+            ends.saturating_duration_since(std::time::Instant::now())
+                .min(super::children::COLLECT)
+        })
 }
 
 /// Returns the two files one reading captures into, in a directory of its own.
@@ -1648,6 +1662,30 @@ mod tests {
             !super::reading_is_over(),
             "the instant of a reading that ended in a panic was left on the thread"
         );
+    }
+
+    /// KR-REQ-03.29, S-8: a command that was ended is waited for no longer than the reading has
+    /// left, and no longer than its own collection bound where the reading has more.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn a_command_that_was_ended_is_waited_for_no_longer_than_the_reading_has_left() {
+        use std::time::Duration;
+
+        let collect = super::super::children::COLLECT;
+        assert_eq!(
+            super::collection_bound(),
+            collect,
+            "a reading with no deadline"
+        );
+        let near = super::within(Duration::from_millis(300), super::collection_bound);
+        assert!(
+            near <= Duration::from_millis(300),
+            "a reading with 300 ms left waited {near:?} for a command"
+        );
+        let gone = super::within(Duration::ZERO, super::collection_bound);
+        assert_eq!(gone, Duration::ZERO, "a reading whose time is gone");
+        let far = super::within(Duration::from_secs(60), super::collection_bound);
+        assert_eq!(far, collect, "a reading with much time left");
     }
 
     /// KR-REQ-03.29, S-8: the commands of a reading that has a deadline stop at it, whatever bound
