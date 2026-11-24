@@ -1056,8 +1056,8 @@ pub struct Asked {
     /// not read, or may start the daemon again: a unit's drop-in can set `Restart`, and launchd can
     /// hold a job that was loaded with `KeepAlive`. A unit that another unit starts by name is not
     /// read, and neither are the other launchd keys that start a job (`StartInterval`,
-    /// `StartCalendarInterval`, `WatchPaths`, `QueueDirectories`, `Sockets`, `MachServices`,
-    /// `LaunchEvents`).
+    /// `StartCalendarInterval`, `StartOnMount`, `WatchPaths`, `QueueDirectories`, `Sockets`,
+    /// `MachServices`, `LaunchEvents`).
     pub no_restart: bool,
 }
 
