@@ -15,11 +15,11 @@
 
 pub mod plist;
 
-use std::io::Write as _;
+use std::io::{Read as _, Write as _};
 use std::os::unix::fs::MetadataExt as _;
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 use kr_ipc::identity::{ProcessState, Stop, process_state, started_process_identity, stop_process};
@@ -46,6 +46,16 @@ const ALREADY_LOADED: i32 = 5;
 
 /// How long a daemon is given to end after it is asked to, and again after it is made to.
 const END_BOUND: Duration = Duration::from_secs(15);
+
+/// How long a call waits for the lock on its record. A call that holds it can take two
+/// [`END_BOUND`]s to end a daemon, so this is longer than both.
+const LOCK_BOUND: Duration = Duration::from_secs(60);
+
+/// How long a command this program runs (`ps`, `lsof`) is given to end.
+const COMMAND_BOUND: Duration = Duration::from_secs(20);
+
+/// How much a command is read for on each stream. A listing of every process is far below it.
+const OUTPUT_LIMIT: usize = 8 * 1024 * 1024;
 
 /// The variables the definition may not set: the harness's own.
 const PROTECTED: [&str; 6] = [
@@ -317,7 +327,7 @@ pub fn run(arguments: &[String]) -> i32 {
             return REFUSED;
         }
     };
-    if let Err(error) = rustix::fs::flock(&lock, rustix::fs::FlockOperation::LockExclusive) {
+    if let Err(error) = lock_within(&lock, LOCK_BOUND) {
         let _ = writeln!(
             std::io::stderr(),
             "the stand-in cannot lock its record: {error}"
@@ -332,6 +342,123 @@ pub fn run(arguments: &[String]) -> i32 {
     answer.status
 }
 
+/// Takes the exclusive lock on `lock`, waiting for it at most `bound`.
+fn lock_within(lock: &std::fs::File, bound: Duration) -> Result<(), String> {
+    let deadline = Instant::now() + bound;
+    loop {
+        match rustix::fs::flock(lock, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
+            Ok(()) => return Ok(()),
+            Err(rustix::io::Errno::WOULDBLOCK) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => return Err(format!("not taken within {bound:?}: {error}")),
+        }
+    }
+}
+
+/// Waits for `child` to end for at most `bound`, and says whether it was seen to.
+pub fn reap_within(child: &mut Child, bound: Duration) -> bool {
+    let deadline = Instant::now() + bound;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return true,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
+            Ok(None) | Err(_) => return false,
+        }
+    }
+}
+
+/// Ends `child` and says what came of it, for a command that `name` started.
+fn ended_after(child: &mut Child, name: &str, why: &str) -> String {
+    let _ = child.kill();
+    if reap_within(child, END_BOUND) {
+        format!("{name} {why}, and was ended")
+    } else {
+        format!("{name} {why}, and was not seen to end")
+    }
+}
+
+/// Reads `stream` on a thread of its own, for at most [`OUTPUT_LIMIT`] bytes and one more, which
+/// shows that there was more.
+fn read_aside(
+    stream: Option<impl std::io::Read + Send + 'static>,
+) -> std::sync::mpsc::Receiver<std::io::Result<Vec<u8>>> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut held = Vec::new();
+        let read = match stream {
+            Some(stream) => stream
+                .take(OUTPUT_LIMIT as u64 + 1)
+                .read_to_end(&mut held)
+                .map(|_| held),
+            None => Ok(held),
+        };
+        let _ = sender.send(read);
+    });
+    receiver
+}
+
+/// Runs `command` with no input and returns what it printed. The command is given `bound` to end
+/// and is ended when it does not, and each stream is read for at most [`OUTPUT_LIMIT`] bytes. A
+/// command that cannot be started, outlasts its bound, leaves its output open, or prints more than
+/// the limit is an error, and an error never leaves the command unended without saying so.
+///
+/// # Errors
+///
+/// Says why the command did not give a bounded answer.
+pub fn bounded_output(command: &mut Command, bound: Duration) -> Result<Output, String> {
+    let name = command.get_program().to_string_lossy().into_owned();
+    let deadline = Instant::now() + bound;
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("{name} cannot be started: {error}"))?;
+    let out = read_aside(child.stdout.take());
+    let err = read_aside(child.stderr.take());
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
+            Ok(None) => {
+                return Err(ended_after(
+                    &mut child,
+                    &name,
+                    &format!("did not end within {bound:?}"),
+                ));
+            }
+            Err(error) => {
+                return Err(ended_after(
+                    &mut child,
+                    &name,
+                    &format!("cannot be waited for: {error}"),
+                ));
+            }
+        }
+    };
+    let collect = |receiver: std::sync::mpsc::Receiver<std::io::Result<Vec<u8>>>, what: &str| {
+        let left = deadline
+            .saturating_duration_since(Instant::now())
+            .max(Duration::from_secs(1));
+        let held = receiver
+            .recv_timeout(left)
+            .map_err(|_| format!("{name}: its {what} was not closed in time"))?
+            .map_err(|error| format!("{name}: its {what} cannot be read: {error}"))?;
+        if held.len() > OUTPUT_LIMIT {
+            return Err(format!(
+                "{name} printed more than {OUTPUT_LIMIT} bytes on its {what}"
+            ));
+        }
+        Ok(held)
+    };
+    Ok(Output {
+        status,
+        stdout: collect(out, "output")?,
+        stderr: collect(err, "error output")?,
+    })
+}
+
 /// Writes one line of the call log: its number, who called, the exact arguments and the status.
 fn record(context: &Context, arguments: &[String], status: i32) {
     let Ok(log) = context.in_store("calls.jsonl") else {
@@ -343,12 +470,12 @@ fn record(context: &Context, arguments: &[String], status: i32) {
     };
     let number = std::fs::read_to_string(&log).map_or(1, |text| text.lines().count() + 1);
     let parent = rustix::process::getppid().map_or(0, |pid| pid.as_raw_nonzero().get());
-    let program = Command::new("/bin/ps")
-        .args(["-o", "comm=", "-p", &parent.to_string()])
-        .stdin(Stdio::null())
-        .output()
-        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
-        .unwrap_or_default();
+    let program = bounded_output(
+        Command::new("/bin/ps").args(["-o", "comm=", "-p", &parent.to_string()]),
+        COMMAND_BOUND,
+    )
+    .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+    .unwrap_or_default();
     let mut keys: Vec<String> = std::env::vars_os()
         .filter_map(|(name, _)| name.into_string().ok())
         .collect();
@@ -710,9 +837,13 @@ fn start(
         Err(error) => {
             // The process is this program's own child, so ending it needs no identity.
             let _ = child.kill();
-            let _ = child.wait();
+            let seen = if reap_within(&mut child, END_BOUND) {
+                "and was ended"
+            } else {
+                "and was killed, but not seen to end"
+            };
             return Err(format!(
-                "the process {} cannot be identified, and was ended: {error}",
+                "the process {} cannot be identified, {seen}: {error}",
                 child.id()
             ));
         }
@@ -840,12 +971,12 @@ fn found_unrecorded(context: &Context, job: &Job, ps: &Path) -> Result<Vec<u32>,
         ));
     }
     let working = context.bounded(Path::new(&job.working_directory))?;
-    let output = match Command::new(ps)
-        // Twice `w`, so that a line is not cut at a width. No `E`: the environment is no proof.
-        .args(["-axww", "-o", "pid=,args="])
-        .stdin(Stdio::null())
-        .output()
-    {
+    let output = match bounded_output(
+        Command::new(ps)
+            // Twice `w`, so that a line is not cut at a width. No `E`: the environment is no proof.
+            .args(["-axww", "-o", "pid=,args="]),
+        COMMAND_BOUND,
+    ) {
         Ok(output) if output.status.success() => output,
         Ok(output) => {
             return Err(format!(
@@ -878,11 +1009,11 @@ fn found_unrecorded(context: &Context, job: &Job, ps: &Path) -> Result<Vec<u32>,
 /// read: `lsof` lists nothing for a process that has ended since it was found. Any other failure is
 /// an error.
 fn working_directory_of(pid: u32) -> Result<Option<PathBuf>, String> {
-    let output = Command::new("/usr/sbin/lsof")
-        .args(["-a", "-d", "cwd", "-Fn", "-p", &pid.to_string()])
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|error| format!("the directory of the process {pid} cannot be read: {error}"))?;
+    let output = bounded_output(
+        Command::new("/usr/sbin/lsof").args(["-a", "-d", "cwd", "-Fn", "-p", &pid.to_string()]),
+        COMMAND_BOUND,
+    )
+    .map_err(|error| format!("the directory of the process {pid} cannot be read: {error}"))?;
     let listed = String::from_utf8_lossy(&output.stdout)
         .lines()
         .find_map(|line| line.strip_prefix('n'))
@@ -1031,8 +1162,92 @@ mod tests {
     impl Drop for Held {
         fn drop(&mut self) {
             let _ = self.0.kill();
-            let _ = self.0.wait();
+            let _ = reap_within(&mut self.0, Duration::from_secs(10));
         }
+    }
+
+    /// Runs `call` on a thread of its own and gives it `limit` to return, or says that it did not.
+    fn within<T: Send + 'static>(
+        limit: Duration,
+        call: impl FnOnce() -> T + Send + 'static,
+    ) -> Option<T> {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(call());
+        });
+        receiver.recv_timeout(limit).ok()
+    }
+
+    /// A command that outlasts its bound is ended and is an error, within the bound and a little
+    /// more, and a command that ends in time gives what it printed.
+    #[test]
+    fn a_command_that_outlasts_its_bound_is_ended_and_is_an_error() {
+        let started = Instant::now();
+        let slow = bounded_output(
+            Command::new("/bin/sleep").arg("5"),
+            Duration::from_millis(300),
+        );
+        assert!(
+            slow.as_ref()
+                .is_err_and(|why| why.contains("did not end within")),
+            "{slow:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "the command was given its bound and no more"
+        );
+        let quick = bounded_output(
+            Command::new("/bin/echo").arg("said"),
+            Duration::from_secs(20),
+        )
+        .expect("a command that ends in time");
+        assert_eq!(String::from_utf8_lossy(&quick.stdout).trim(), "said");
+    }
+
+    /// A command that prints more than the limit is an error, and is not read without end.
+    #[test]
+    fn a_command_that_prints_past_the_limit_is_an_error() {
+        let flood = bounded_output(&mut Command::new("/usr/bin/yes"), Duration::from_secs(20));
+        assert!(
+            flood.as_ref().is_err_and(|why| why.contains("more than")),
+            "{:?}",
+            flood.map(|output| output.stdout.len())
+        );
+    }
+
+    /// A lock that another holder keeps is an error within the bound, and a free lock is taken.
+    #[test]
+    fn a_lock_that_is_kept_is_an_error_within_its_bound() {
+        let folder = PrivateTempDir::create();
+        let path = folder.path().join("lock");
+        let kept = std::fs::File::create(&path).expect("a lock file");
+        rustix::fs::flock(&kept, rustix::fs::FlockOperation::LockExclusive).expect("a lock");
+        let other = std::fs::File::open(&path).expect("the lock file again");
+        let waited = within(Duration::from_secs(10), move || {
+            lock_within(&other, Duration::from_millis(300))
+        });
+        match waited {
+            None => panic!("the wait for the lock has no bound"),
+            Some(taken) => assert!(taken.is_err(), "a lock that is kept was taken"),
+        }
+        drop(kept);
+        let free = std::fs::File::open(&path).expect("the lock file once more");
+        assert_eq!(lock_within(&free, Duration::from_secs(10)), Ok(()));
+    }
+
+    /// A child that has not ended is waited for at most its bound, and is not ended by the wait.
+    #[test]
+    fn a_child_that_does_not_end_is_waited_for_within_its_bound_only() {
+        let mut held = Held(
+            Command::new("/bin/sleep")
+                .arg("3")
+                .spawn()
+                .expect("a process that runs"),
+        );
+        let started = Instant::now();
+        assert!(!reap_within(&mut held.0, Duration::from_millis(200)));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(held.0.try_wait().expect("its state"), None, "still running");
     }
 
     /// A process whose state is not known is not an end: ending it is an error, and nothing was

@@ -5,7 +5,7 @@
 
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Command, Output};
 use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -85,7 +85,7 @@ impl Fixture {
 
     /// The stand-in run with `arguments`, from a caller that names this tree's state directory.
     fn call(&self, arguments: &[&str]) -> Output {
-        Command::new(&self.program)
+        run(Command::new(&self.program)
             .args(arguments)
             .env_clear()
             .env("HOME", self.tree.path().join("home"))
@@ -93,10 +93,7 @@ impl Fixture {
             .env(
                 kr_ipc::paths::STATE_DIR_VARIABLE,
                 self.tree.path().join("state"),
-            )
-            .stdin(Stdio::null())
-            .output()
-            .expect("the stand-in runs")
+            ))
     }
 
     fn domain(&self) -> String {
@@ -190,16 +187,13 @@ impl Fixture {
         directory: &Path,
         environment: &[(&str, &str)],
     ) -> ProcessStartIdentity {
-        let started = Command::new("/bin/sh")
+        let started = run(Command::new("/bin/sh")
             .args([
                 "-c",
                 &format!("{line} </dev/null >/dev/null 2>&1 & echo $!"),
             ])
             .current_dir(directory)
-            .envs(environment.iter().copied())
-            .stdin(Stdio::null())
-            .output()
-            .expect("a process of the start");
+            .envs(environment.iter().copied()));
         let pid: u32 = text(&started.stdout)
             .trim()
             .parse()
@@ -228,6 +222,31 @@ fn ended(identity: &ProcessStartIdentity) -> bool {
         std::thread::sleep(Duration::from_millis(50));
     }
     process_state(identity) == ProcessState::Ended
+}
+
+/// How long a command of a case is given to end.
+const CASE_BOUND: Duration = Duration::from_secs(120);
+
+/// Runs `command` as the cases need it: with no input, for at most [`CASE_BOUND`], and returns what
+/// it printed. A command that outlasts the bound is ended and fails the case.
+fn run(command: &mut Command) -> Output {
+    kr_manager_stand_in::bounded_output(command, CASE_BOUND).unwrap_or_else(|why| panic!("{why}"))
+}
+
+/// No command of the cases is waited for without a bound: each one goes through `run`.
+#[test]
+fn no_command_of_the_cases_is_waited_for_without_a_bound() {
+    let source = include_str!("stand_in.rs");
+    for call in [
+        [".out", "put()"].concat(),
+        [".sta", "tus()"].concat(),
+        [".wa", "it()"].concat(),
+    ] {
+        assert!(
+            !source.contains(&call),
+            "a case waits for a command with {call}, and no bound"
+        );
+    }
 }
 
 fn text(output: &[u8]) -> String {
@@ -480,10 +499,7 @@ fn the_daemon_starts_as_the_definition_says_survives_its_exec_and_ends_by_identi
     assert!(job.contains("\"starts\": 1"), "{job}");
     let ended = fixture.call(&["bootout", &target]);
     assert_eq!(ended.status.code(), Some(0), "{}", text(&ended.stderr));
-    let gone = Command::new("/bin/ps")
-        .args(["-o", "pid=", "-p", &pid.to_string()])
-        .output()
-        .expect("ps runs");
+    let gone = run(Command::new("/bin/ps").args(["-o", "pid=", "-p", &pid.to_string()]));
     assert!(text(&gone.stdout).trim().is_empty(), "the daemon was ended");
     assert_eq!(
         fixture.call(&["print", &target]).status.code(),
@@ -787,17 +803,16 @@ const LIST_VARIABLE: &str = "KR_STAND_IN_TEST_STARTED_LIST";
 fn a_case_that_fails_before_its_own_cleanup_leaves_nothing_alive() {
     let folder = PrivateTempDir::create();
     let list = folder.path().join("started.json");
-    let child = Command::new(std::env::current_exe().expect("this test program"))
-        .args([
-            "--ignored",
-            "--exact",
-            "a_case_that_fails_on_purpose_before_its_own_cleanup",
-            "--test-threads=1",
-        ])
-        .env(LIST_VARIABLE, &list)
-        .stdin(Stdio::null())
-        .output()
-        .expect("the child test process runs");
+    let child = run(
+        Command::new(std::env::current_exe().expect("this test program"))
+            .args([
+                "--ignored",
+                "--exact",
+                "a_case_that_fails_on_purpose_before_its_own_cleanup",
+                "--test-threads=1",
+            ])
+            .env(LIST_VARIABLE, &list),
+    );
     let said = text(&child.stdout);
     let started: Vec<ProcessStartIdentity> =
         serde_json::from_str(&std::fs::read_to_string(&list).expect("the list of what it started"))
