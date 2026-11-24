@@ -864,8 +864,7 @@ fn report_timed(
                     },
                 );
                 let after = source.read(&deadline);
-                let replaced = program
-                    .is_some_and(|path| facility_identity_within(path, &deadline) != identity);
+                let again = program.map(|path| facility_identity_within(path, &deadline));
                 if deadline.expired() {
                     // A success whose desktop could not be read again in time is not one that
                     // stands.
@@ -873,10 +872,15 @@ fn report_timed(
                 } else if !unchanged(&before, &after) {
                     stopped = true;
                     not_in_the_state_it_needs(*check, ran.facility)
-                } else if replaced {
-                    replaced_while_running(*check, ran.facility)
                 } else {
-                    ran
+                    match again
+                        .as_ref()
+                        .map(|again| held(identity.as_ref(), again.as_ref()))
+                    {
+                        None | Some(Held::Same) => ran,
+                        Some(Held::Replaced) => replaced_while_running(*check, ran.facility),
+                        Some(Held::Unconfirmed) => program_not_confirmed(*check, ran.facility),
+                    }
                 }
             };
             record(
@@ -943,6 +947,40 @@ fn unchanged(before: &Surroundings, after: &Surroundings) -> bool {
     before.desktop.availability == after.desktop.availability
         && before.desktop.login_generation == after.desktop.login_generation
         && before.desktop.is_same_desktop(&after.desktop)
+}
+
+/// What the digests of a program, taken before and after its operation, say about it.
+enum Held {
+    /// They agree, or neither could be read and the record carries no digest.
+    Same,
+    /// Both were read and they differ.
+    Replaced,
+    /// One of them could not be read, so whether the program changed is not known.
+    Unconfirmed,
+}
+
+/// Compares the digest of a program before its operation with the one after it.
+fn held(before: Option<&Sentence>, after: Option<&Sentence>) -> Held {
+    match (before, after) {
+        (Some(before), Some(after)) if before != after => Held::Replaced,
+        (Some(_), None) | (None, Some(_)) => Held::Unconfirmed,
+        _ => Held::Same,
+    }
+}
+
+/// What a check came to when the digest of the program it ran could not be compared before and
+/// after it ran: a refusal, as for a replacement, without saying that it was replaced.
+fn program_not_confirmed(check: Check, facility: Option<String>) -> Ran {
+    Ran {
+        check,
+        facility,
+        outcome: Outcome::NotAttempted {
+            detail: Sentence::new().stated(
+                "the program it ran could not be read both before and after it ran, so it is \
+                 not known whether it was replaced while it ran",
+            ),
+        },
+    }
 }
 
 /// What a check came to when the program it ran was replaced while it ran.
@@ -3139,17 +3177,34 @@ mod tests {
         );
     }
 
-    /// A stand-in that runs a program of this test's own and, where asked, replaces its file while
+    /// What the stand-in does to its program while the operation runs.
+    #[derive(Clone, Copy)]
+    enum During {
+        /// Nothing.
+        Nothing,
+        /// It writes another build over the file.
+        Replacing,
+        /// It removes the file, so the program cannot be read again.
+        Removing,
+    }
+
+    /// A stand-in that runs a program of this test's own and, where asked, changes its file while
     /// the operation is running.
     struct Running {
         program: std::path::PathBuf,
-        replace: bool,
+        during: During,
     }
 
     impl Facilities for Running {
         fn perform(&self, check: Check, _plan: &Plan, _setting: &Setting<'_>) -> Ran {
-            if self.replace {
-                std::fs::write(&self.program, b"the second build").expect("the replacement");
+            match self.during {
+                During::Nothing => {}
+                During::Replacing => {
+                    std::fs::write(&self.program, b"the second build").expect("the replacement");
+                }
+                During::Removing => {
+                    std::fs::remove_file(&self.program).expect("the removal");
+                }
             }
             Ran {
                 check,
@@ -3161,10 +3216,10 @@ mod tests {
         }
     }
 
-    /// KR-REQ-03.29, R9: the digest an answer carries is the program's before the operation, and an
-    /// answer about a program that was replaced while it ran establishes nothing.
-    #[test]
-    fn a_program_replaced_during_its_operation_establishes_nothing() {
+    /// Runs the accessibility check against a program of this test's own, which the operation
+    /// changes as `during` says, and gives the program's digest from before the operation and the
+    /// records.
+    fn run_around_a_program(during: During) -> (Option<Sentence>, Vec<CapabilityRecord>) {
         let root = kr_ipc::testing::PrivateTempDir::create();
         let program = root.path().join("the-tool");
         let named = program.display().to_string();
@@ -3176,29 +3231,30 @@ mod tests {
                 target: None,
             })
         };
-        let run = |replace: bool| {
-            std::fs::write(&program, b"the first build").expect("the program");
-            let before = facility_identity(&named);
-            let source = Readings::of(vec![surroundings(desktop())]);
-            let records = report_timed(
-                &[Check::AccessibleElement],
-                &subject(),
-                &source,
-                revision(),
-                &Plan::in_directory("."),
-                &Running {
-                    program: program.clone(),
-                    replace,
-                },
-                &Seams {
-                    first: &first_of(&source),
-                    time_of: &time_of,
-                    routes: &route,
-                },
-            );
-            (before, records)
-        };
-        let (before, records) = run(false);
+        std::fs::write(&program, b"the first build").expect("the program");
+        let before = facility_identity(&named);
+        let source = Readings::of(vec![surroundings(desktop())]);
+        let records = report_timed(
+            &[Check::AccessibleElement],
+            &subject(),
+            &source,
+            revision(),
+            &Plan::in_directory("."),
+            &Running { program, during },
+            &Seams {
+                first: &first_of(&source),
+                time_of: &time_of,
+                routes: &route,
+            },
+        );
+        (before, records)
+    }
+
+    /// KR-REQ-03.29, R9: the digest an answer carries is the program's before the operation, and an
+    /// answer about a program that was replaced while it ran establishes nothing.
+    #[test]
+    fn a_program_replaced_during_its_operation_establishes_nothing() {
+        let (before, records) = run_around_a_program(During::Nothing);
         assert_eq!(
             state_of(&records, Check::AccessibleElement),
             CapabilityState::QualifiedAvailable,
@@ -3209,7 +3265,7 @@ mod tests {
             before,
             "the digest of the program as it was"
         );
-        let (before, records) = run(true);
+        let (before, records) = run_around_a_program(During::Replacing);
         assert_eq!(
             state_of(&records, Check::AccessibleElement),
             CapabilityState::TemporarilyUnavailable,
@@ -3221,6 +3277,35 @@ mod tests {
                 .as_ref()
                 .map(|sentence| sentence.as_str()),
             Some("this check established nothing: the program it ran was replaced while it ran")
+        );
+        assert_eq!(
+            records[0].identity.version.as_ref().cloned(),
+            before,
+            "the record names the program as it was before the operation"
+        );
+    }
+
+    /// KR-REQ-03.29, R9: a program whose digest cannot be read after the operation is not said to
+    /// have been replaced: the answer is refused in words of its own, and the record still names
+    /// the program as it was before.
+    #[test]
+    fn a_program_that_cannot_be_read_after_its_operation_is_not_called_replaced() {
+        let (before, records) = run_around_a_program(During::Removing);
+        assert_eq!(
+            state_of(&records, Check::AccessibleElement),
+            CapabilityState::TemporarilyUnavailable,
+            "the answer stood about a program nobody could read again"
+        );
+        assert_eq!(
+            records[0]
+                .disabled_reason
+                .as_ref()
+                .map(|sentence| sentence.as_str()),
+            Some(
+                "this check established nothing: the program it ran could not be read both before \
+                 and after it ran, so it is not known whether it was replaced while it ran"
+            ),
+            "a digest that could not be read is not a replacement"
         );
         assert_eq!(
             records[0].identity.version.as_ref().cloned(),
