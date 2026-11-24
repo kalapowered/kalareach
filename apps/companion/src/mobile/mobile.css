@@ -956,10 +956,12 @@
   flex: 1 1 0;
   inline-size: auto;
   /*
-   * With the text large enough that the field would be left a few letters wide beside Send, Send goes
-   * under it. At twice the base size and below the field keeps the room it always had.
+   * With the text large enough that the field would be left less than 4.5rem beside Send and
+   * Interrupt, Interrupt goes to the row above the line: 4.5rem holds a short command in a wide system
+   * font at twice the base size. With larger text still, Send leaves the line as well. At twice the
+   * base size and below, the field and Send keep their line.
    */
-  min-inline-size: min(3.5rem, 100%);
+  min-inline-size: min(4.5rem, 100%);
   min-block-size: var(--target);
   padding-block: var(--gap-2);
 }
