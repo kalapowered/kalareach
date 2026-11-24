@@ -985,6 +985,7 @@ mod tests {
             .args(["--exact", &name, "--nocapture", "--test-threads=1"])
             .env("DISPLAY", ":8")
             .env("WAYLAND_DISPLAY", "wayland-9")
+            .env("XAUTHORITY", "/inherited/authority")
             .env("TMPDIR", "/inherited/temporary")
             .env("MAGICK_TEMPORARY_PATH", "/inherited/magick")
             .env(INNER, folder.path())
@@ -1011,6 +1012,10 @@ mod tests {
             std::env::var("TMPDIR").as_deref(),
             Ok("/inherited/temporary")
         );
+        assert_eq!(
+            std::env::var("XAUTHORITY").as_deref(),
+            Ok("/inherited/authority")
+        );
         recording_tool(&folder);
         let scratch = folder.join("run");
         let plan = Plan::in_directory(&scratch);
@@ -1034,7 +1039,8 @@ mod tests {
                  MAGICK_TEMPORARY_PATH={run_directory}\n"
             )
         );
-        // A worker that holds no authority gives the tool none.
+        // A worker that holds no authority gives the tool none, and not the one that the process
+        // that runs the check holds.
         let variables = Variables {
             authority: None,
             ..variables
@@ -1042,21 +1048,29 @@ mod tests {
         let _ = perform_with(&plan, &folder, &variables, &folder);
         let seen = std::fs::read_to_string(folder.join("seen")).expect("what the tool saw");
         assert!(seen.contains("XAUTHORITY=unset"), "{seen}");
-        // And with no display, no tool starts.
-        std::fs::remove_file(folder.join("seen")).expect("the earlier reading");
-        let variables = Variables {
-            display: None,
-            ..variables
-        };
-        let ran = perform_with(&plan, &folder, &variables, &folder);
-        assert!(
-            matches!(ran.outcome, Outcome::NotAttempted { .. }),
-            "{ran:?}"
-        );
-        assert!(
-            !folder.join("seen").exists(),
-            "a tool started with no display"
-        );
+        // And with no display, an empty one or a blank one, no tool starts, and the words say that
+        // this worker holds no display.
+        for display in [None, Some(""), Some("  ")] {
+            std::fs::remove_file(folder.join("seen")).expect("the earlier reading");
+            let variables = Variables {
+                display: display.map(str::to_owned),
+                ..variables.clone()
+            };
+            let ran = perform_with(&plan, &folder, &variables, &folder);
+            assert!(
+                matches!(ran.outcome, Outcome::NotAttempted { .. }),
+                "{display:?}: {ran:?}"
+            );
+            assert!(
+                said(&ran).contains("this worker holds no X11 display, so no tool was started"),
+                "{display:?}: {}",
+                said(&ran)
+            );
+            assert!(
+                !folder.join("seen").exists(),
+                "{display:?}: a tool started with no display"
+            );
+        }
         println!("the environment was as the worker holds it");
     }
 
@@ -1252,13 +1266,14 @@ mod tests {
         std::fs::File::open(&file).is_err()
     }
 
-    /// The record the report makes of the screen image on an X11 desktop that names `display`,
-    /// with the tools in `tools` and `scratch` as the check's own directory.
-    fn asked(
+    /// The records the report makes of `checks` on an X11 desktop that names `display`, with the
+    /// tools in `tools` and `scratch` as the check's own directory.
+    fn report_of(
         tools: &Path,
         display: &str,
         scratch: &Path,
-    ) -> kr_protocol::desktop::CapabilityRecord {
+        checks: &[Check],
+    ) -> Vec<kr_protocol::desktop::CapabilityRecord> {
         use kr_protocol::desktop::CapabilitySubject;
         use kr_protocol::ids::{CapabilityRevision, EnvironmentId, SessionId};
         use kr_protocol::scalars::Uuid;
@@ -1281,15 +1296,24 @@ mod tests {
             application: Nullable::null(),
             terminal: Nullable::null(),
         };
-        let mut records = probe::report(
+        probe::report(
             &surroundings,
-            &[Check::ScreenImage],
+            checks,
             &subject,
             &source,
             CapabilityRevision::new(3),
             &Plan::in_directory(scratch),
             &probe::Platform,
-        );
+        )
+    }
+
+    /// The one record the report makes of the screen image on an X11 desktop that names `display`.
+    fn asked(
+        tools: &Path,
+        display: &str,
+        scratch: &Path,
+    ) -> kr_protocol::desktop::CapabilityRecord {
+        let mut records = report_of(tools, display, scratch, &[Check::ScreenImage]);
         assert_eq!(records.len(), 1, "{records:?}");
         records.remove(0)
     }
@@ -1351,6 +1375,44 @@ mod tests {
             "{words}"
         );
         assert!(!words.contains("kept none of it"), "{words}");
+    }
+
+    /// KR-REQ-03.29, LX-17: only the screen image has a row on X11. The accessibility check and the
+    /// launch of an application, run through the report on an X11 desktop with the tools installed,
+    /// give no record and start no tool.
+    #[test]
+    fn kr_req_03_29_an_x11_report_of_accessibility_and_launch_starts_no_tool() {
+        let tools = folder();
+        let whole = png_of(1280, 800, 8, 6, 5969);
+        std::fs::write(tools.path().join("whole.png"), whole).expect("an image");
+        let program_started = tools.path().join("started");
+        for name in PROGRAMS {
+            program(
+                tools.path(),
+                name,
+                "#!/bin/sh\n\
+                 here=$(dirname \"$0\")\n\
+                 echo started > \"$here/started\"\n\
+                 for last do :; done\n\
+                 cp \"$here/whole.png\" \"$last\"\n",
+            );
+        }
+        let scratch = folder();
+        let records = report_of(
+            tools.path(),
+            ":7",
+            scratch.path(),
+            &[Check::AccessibleElement, Check::ApplicationLaunch],
+        );
+        assert!(records.is_empty(), "{records:?}");
+        assert!(!program_started.exists(), "a tool was started");
+        // The same report with the screen image starts one, so the stand-ins do start.
+        let records = report_of(tools.path(), ":7", scratch.path(), &[Check::ScreenImage]);
+        assert_eq!(records.len(), 1, "{records:?}");
+        assert!(
+            program_started.exists(),
+            "no tool started for the screen image"
+        );
     }
 
     /// KR-REQ-03.29, LX-4: a refusal of the display's authority is told from a display that cannot
@@ -1991,7 +2053,15 @@ mod tests {
                     said(&ran)
                 );
             }
-            let ran = run(&with(&format!(":{}", number + 1), &server.authority));
+            // The first number above the server's with no socket that accepts and no lock file.
+            let free = (number + 1..number + 100)
+                .find(|n| {
+                    !Path::new(&format!("/tmp/.X{n}-lock")).exists()
+                        && reach(*n, sockets, &Deadline::after(Duration::from_secs(2)))
+                            == Some(Reach::Silent)
+                })
+                .expect("a display number nobody holds");
+            let ran = run(&with(&format!(":{free}"), &server.authority));
             assert!(
                 said(&ran).contains("the display cannot be reached"),
                 "{name}: {}",
