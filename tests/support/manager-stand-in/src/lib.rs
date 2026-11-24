@@ -7,7 +7,8 @@
 //! record of each job, and writes down every call with its status. A command it does not know, a key
 //! of the definition it does not apply (it accepts `ProcessType` as `Interactive` and applies none),
 //! and a path outside the test's own folders are refused with status 64. A call is not written down
-//! when the path of its record lies outside the test's own folders.
+//! when the caller names no state directory, when the store cannot be made, when the lock on it is
+//! not taken within a minute, or when the path of its record lies outside the test's own folders.
 //!
 //! Each process it starts is written down with the label of its job, as soon as it is started and
 //! before the record that names it is kept. `bootout` ends every process written down for the job,
@@ -991,6 +992,10 @@ fn group_of(identity: &ProcessStartIdentity) -> Result<Pid, String> {
 /// holds the number. Once both have ended, another process can be given it and lead a group of its
 /// own, so the number is read before the list and after it: where another process holds it, the
 /// group has ended, and nothing in the list is the leader's to end.
+///
+/// A limit: a number that another process took, whose leader then ended and left members, passes
+/// both readings, and those members are read as the group's. It takes a wrap of the counter of
+/// process numbers, a new group leader and its end, all inside one reading.
 fn members_of(
     leader: &ProcessStartIdentity,
     group: Pid,
