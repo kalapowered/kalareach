@@ -24,6 +24,8 @@
 
 use std::time::Duration;
 
+use kr_ipc::endpoint::Listener;
+use kr_ipc::paths::{Endpoint, EnvironmentPaths};
 use kr_plugin_sdk::identity::PluginIdentity;
 use kr_plugin_sdk::ids::RepositoryGeneration;
 use kr_plugin_sdk::version::PackageVersion;
@@ -31,6 +33,7 @@ use kr_plugin_service::client::{PluginClient, new_binding_id};
 use kr_plugin_service::launcher;
 use kr_plugin_service::protocol::{ComponentSource, HostProtocol};
 use kr_plugin_service::vocabulary::{BindingActivity, BindingFacts};
+use kr_protocol::admission::PluginRuntimeState;
 use kr_protocol::ids::PluginId;
 
 mod plugin_world;
@@ -305,6 +308,66 @@ async fn a_daemon_keeps_the_identity_of_the_host_it_verified_when_the_fourth_des
         "the daemon kept the identity of the process the failed descriptor named, and did not replace the host that ended: {state:?}"
     );
     assert_ne!(hosted.published(), Some(host));
+}
+
+/// An endpoint of this environment's own that no host serves, for a listener a test holds.
+fn silent_endpoint(environment: &EnvironmentPaths) -> Endpoint {
+    #[cfg(windows)]
+    {
+        Endpoint::from_name(format!(
+            "kalareach-{}-silent",
+            kr_ipc::paths::short_prefix(environment.environment_id())
+        ))
+        .expect("a name")
+    }
+    #[cfg(not(windows))]
+    {
+        Endpoint::from_path(environment.runtime_dir().join("silent.sock")).expect("a path")
+    }
+}
+
+/// KR-REQ-05.06: a daemon whose fourth descriptor names an endpoint that takes the connection and
+/// never answers still adopts the host through the third's descriptor. The attempt over the fourth
+/// takes at most half of the daemon's look, which leaves the third its time.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_fourth_endpoint_that_never_answers_leaves_the_third_protocol_its_time_to_adopt_the_host()
+{
+    let Some(wasm) = well_behaved() else {
+        return;
+    };
+    let mut hosted = hosted().await;
+    let environment = hosted.environment();
+    install(&environment, &wasm);
+    let runtime = hosted.runtime().await;
+    assert_eq!(hosted.started(), 1);
+    let host = hosted.published().expect("the host is published");
+    // A live process that is not the host, at an endpoint where a listener accepts and says nothing.
+    let endpoint = silent_endpoint(&environment);
+    let listener = Listener::bind(&endpoint).expect("the silent endpoint is bound");
+    let silent = tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((connection, _peer)) = listener.accept().await {
+            held.push(connection);
+        }
+    });
+    let mut stuck = launcher::read_descriptor4(&environment)
+        .expect("the descriptor reads")
+        .expect("the fourth protocol's descriptor is published");
+    stuck.process_start_identity =
+        kr_ipc::identity::process_start_identity(std::process::id()).expect("an identity");
+    stuck.endpoint = endpoint.as_text();
+    drop(runtime);
+    launcher::publish_descriptor4(&environment, &stuck).expect("the descriptor is published");
+
+    hosted.restart().await;
+    let state = hosted.ask().await;
+    assert!(
+        matches!(state, PluginRuntimeState::Running),
+        "a daemon whose fourth protocol's endpoint never answers did not adopt the host through the third: {state:?}"
+    );
+    assert_eq!(hosted.started(), 0, "the restarted daemon started a host");
+    assert_eq!(hosted.published(), Some(host));
+    silent.abort();
 }
 
 /// The process group a process is in, as the operating system reports it.
