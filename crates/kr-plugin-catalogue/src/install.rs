@@ -160,11 +160,11 @@ impl Installation {
     ///
     /// A native bridge runs under the application's own permissions, outside the plugin sandbox,
     /// and a command integration changes how the application starts. The owner is shown the
-    /// publisher's statement of the bridge, or the host's reading of the integration, and the
-    /// host's notice of it when the release is installed with a grant. A grant that only changes
-    /// an installation later shows neither. So for a release that asks for a bridge it only
-    /// narrows, and for a release that asks for a command integration it never adds that
-    /// capability: adding is the install's.
+    /// publisher's statement of the bridge, or the publisher's statement of the integration and the
+    /// host's reading of it, and the host's notice of it when the release is installed with a
+    /// grant. A grant that only changes an installation later shows neither. So for a release that
+    /// asks for a bridge it only narrows, and for a release that asks for a command integration it
+    /// never adds that capability: adding is the install's.
     #[must_use]
     pub fn widening_for_a_statement(
         &self,

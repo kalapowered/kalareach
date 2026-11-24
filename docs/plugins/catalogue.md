@@ -492,7 +492,7 @@ refuses with `PLUGIN_GRANT_REQUIRED`, names `plugin.install`, and spends no conf
 the host's notice that it runs outside the plugin sandbox. Narrowing such a grant stays allowed. Nor
 does it add `command_integration.launch` to an installed release. `plugin.install` is where the
 owner is shown the host's exact reading of what the integration does, after a label that marks it as
-the host's, apart from the publisher's words about a bridge.
+the host's, apart from the publisher's words.
 
 This matters most for the packages the host seeds from its bundle, which are installed with an empty
 grant. The first grant of a seeded bridge is `plugin.install` of the installed release, with the
@@ -510,9 +510,9 @@ digest the confirmation covers, so a confirmation shown one statement cannot ins
 manifest says another. It is shown on the owner device apart from the host's own notice that the
 bridge runs under the application's permissions, outside the plugin sandbox. For an installation
 that grants `command_integration.launch`, it also shows the host's own exact reading of the
-integration the manifest declares, written after a label that marks it as the host's. Since a
-bridge's statement cannot hold that label, the owner device tells where the publisher's statement
-ends and the host's reading begins. The host's second notice, that the package changes how a
+integration the manifest declares, written after a label that marks it as the host's. Since
+neither a bridge's statement nor the integration's own words can hold that label, the owner device
+tells where the publisher's words end and the host's reading begins. The host's second notice, that the package changes how a
 command starts, is shown apart from both. The terminal signs nothing. When you run
 `kr plugin install` or `kr plugin repo add`, the command asks the host for the challenge that
 names the exact request, an owner device answers it, and the repeated request spends that one

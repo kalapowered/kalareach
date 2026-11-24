@@ -2094,9 +2094,9 @@ impl CatalogueModule {
                 // A release that asks for a native bridge is granted to only by installing it, and
                 // so is the command integration of one that asks for that: the owner is shown the
                 // publisher's statement of the bridge, or the publisher's statement and the host's
-                // reading of the integration, and the host's notice of it. This refuses before the owner's proof is spent, so
-                // a refused widening consumes no confirmation; the catalogue refuses it again
-                // inside the commit.
+                // reading of the integration, and the host's notice of it. This refuses before the
+                // owner's proof is spent, so a refused widening consumes no confirmation; the
+                // catalogue refuses it again inside the commit.
                 if let Some(added) = installed.widening_for_a_statement(&grant) {
                     return Err(ProtocolError::from(CatalogueError::GrantRequired {
                         capability: added,

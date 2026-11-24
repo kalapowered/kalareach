@@ -1660,8 +1660,9 @@ budgets and its ceiling. For an installation it is the repository's ceiling, the
 package hash and the grant, and, if the grant holds `native_bridge.install`, the publisher's
 statement from the verified manifest of that exact package hash. If the grant holds
 `command_integration.launch`, it also includes the host's own exact reading of the integration the
-manifest declares, written after a label that marks it as the host's. A bridge's statement cannot
-hold that label, so the first label in the text is always the host's. The host then sets the
+manifest declares, written after a label that marks it as the host's. Neither a bridge's statement
+nor the integration's own words can hold that label, so the first label in the text is always the
+host's. The host then sets the
 challenge to the digest of the plan the effect builds from the same request, which covers everything
 shown on the owner device. The owner device builds the same plan again from what it is shown, and
 signs only when the digest matches the one sent by the host. The host's own notices are separate
