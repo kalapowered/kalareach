@@ -32,7 +32,9 @@ files. A kept text for a crate from Git names the package's source and revision.
 that ships its own, or for a crate no release build compiles, stops the run, and so does a kept text that
 is not the licence the listing says it is. The same file names the licences of the works that a crate
 bundles and builds in (libsodium, llama.cpp and ggml, PCRE2). An excerpt of a source file names `file`,
-its path in the package that carries the work, and ends where the file's licence comment ends. fish's `COPYING`, its `doc_src/license.rst`
+its path in the package that carries the work, and ends where the file's licence comment ends. A
+bundled work names the source of the crate that carries it when that crate comes from Git, and stops the
+run when the source moves. fish's `COPYING`, its `doc_src/license.rst`
 and the licence file of each of its workspace crates are read from its pinned archive. A text that holds
 a template's placeholder stops the run.
 
@@ -751,7 +753,7 @@ def gather(records, kept, files, reader):
             answer = each["answers"][key]
             name, version, where = key
             folder = each["roots"][key]
-            compiled_crates.setdefault((name, version), {})[each["name"]] = folder
+            compiled_crates.setdefault((name, version, where), {})[each["name"]] = folder
             crate = (name, version, where)
             args = (answer["authors"], each["name"], answer["source"])
             required = sorted({i.split(" WITH ")[0] for i, _, _, _ in answer["licences"]})
@@ -798,8 +800,13 @@ def gather(records, kept, files, reader):
             fail(f"scripts/notice-texts.json keeps a text for {item['name']} {item['version']} from {item.get('package') or 'crates.io'}, "
                  f"which no release build compiles" + (f"; the lock has it from {', '.join(now)}" if now else ""))
     for work in kept["works"]:
-        carrier = (work["carried_by"]["name"], work["carried_by"]["version"])
+        carried_by = work["carried_by"]
+        carrier = (carried_by["name"], carried_by["version"], carried_by.get("package"))
         if carrier not in compiled_crates:
+            now = sorted({k[2] or "crates.io" for k in compiled_crates if k[:2] == carrier[:2]})
+            if now:
+                fail(f"{work['name']} {work['version']} is bundled in {carrier[0]} {carrier[1]} from {carrier[2] or 'crates.io'}, "
+                     f"and the lock has that crate from {', '.join(now)}")
             fail(f"{work['name']} {work['version']} is bundled in {carrier[0]} {carrier[1]}, which no release build compiles")
         text = files[work["text"]]
         used_texts.add(work["text"])
@@ -1186,6 +1193,18 @@ def self_checks(scratch, reader):
     refuses("a kept text for a Git package that has moved to another revision is refused",
             lambda: gather([made_up([new])], kept, files, reader),
             "keeps a text for this crate from https://example.org/forked?rev=abcdef0123456789#abcdef01, not from https://example.org/forked?rev=1234567890abcdef#12345678")
+
+    # A bundled work is bound to the source and the revision of the crate that carries it.
+    old_carrier = synthetic("forked", "0.1.0", REPOSITORY, licences=licences(mit))
+    new_carrier = synthetic("forked", "0.1.0", moved, licences=licences(mit))
+    forked_work = {"name": "libx", "version": "1.0", "carried_by": {"name": "forked", "version": "0.1.0", "package": package}, "text": "n0-MIT"}
+    kept, files = keep([item], [], [forked_work])
+    expect("a bundled work answers the carrier at the revision it names",
+           "bundled in forked 0.1.0, text https://example.org/n0/LICENSE-MIT" in made(lambda: render(gather([made_up([old_carrier])], kept, files, reader))))
+    refuses("a bundled work whose carrier has moved to another revision is refused",
+            lambda: gather([made_up([new_carrier])], kept, files, reader),
+            "libx 1.0 is bundled in forked 0.1.0 from https://example.org/forked?rev=abcdef0123456789#abcdef01, "
+            "and the lock has that crate from https://example.org/forked?rev=1234567890abcdef#12345678")
 
     def archive(name, member):
         path = os.path.join(scratch, name)

@@ -569,7 +569,8 @@
       "version": "10.43",
       "carried_by": {
         "name": "pcre2-sys",
-        "version": "0.2.9"
+        "version": "0.2.9",
+        "package": "https://github.com/fish-shell/rust-pcre2?tag=0.2.9-utf32#85b7afba"
       },
       "text": "pcre2-10.43-LICENCE"
     },
