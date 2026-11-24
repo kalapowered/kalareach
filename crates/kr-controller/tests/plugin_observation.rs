@@ -1397,12 +1397,21 @@ async fn kr_req_24_24_a_request_answered_while_an_earlier_hand_over_waits_is_not
 /// Starts a world whose binding 1 observes and whose binding 2 reads requests, and sends three
 /// requests that binding 2 reads into approvals and binding 1 has observed.
 async fn three_requests_read_into_approvals() -> Option<Observing> {
-    let world = Observing::start(Options::with(vec![
-        Spec::semantic_only(1),
-        Spec::interpreter(2),
-    ]))
-    .await?;
-    world.until_ready(1).await;
+    three_requests_read_into_approvals_for(vec![Spec::semantic_only(1), Spec::interpreter(2)]).await
+}
+
+/// Starts a world of `specs` and sends three requests that its interpreter reads into approvals and
+/// that every one of its observers has observed.
+async fn three_requests_read_into_approvals_for(specs: Vec<Spec>) -> Option<Observing> {
+    let observers: Vec<u8> = specs
+        .iter()
+        .filter(|spec| spec.observation)
+        .map(|spec| spec.number)
+        .collect();
+    let world = Observing::start(Options::with(specs)).await?;
+    for number in &observers {
+        world.until_ready(*number).await;
+    }
     for id in 1..=3_u64 {
         world.send(&request(id));
     }
@@ -1419,11 +1428,15 @@ async fn three_requests_read_into_approvals() -> Option<Observing> {
             .then_some(())
     })
     .await;
-    world
-        .until_account(1, "the component to have observed them all", |account| {
-            account.requests.len() == 3
-        })
-        .await;
+    for number in observers {
+        world
+            .until_account(
+                number,
+                "the component to have observed them all",
+                |account| account.requests.len() == 3,
+            )
+            .await;
+    }
     Some(world)
 }
 
@@ -1529,6 +1542,64 @@ async fn kr_req_24_24_a_second_loss_before_a_baseline_ends_leaves_the_replacemen
         "the first baseline ended the second registration's baseline: {account:?}"
     );
     assert_eq!(account.observes, 3, "{account:?}");
+}
+
+/// KR-REQ-24.24: a baseline is given only to the registration its binding was due on, for every
+/// binding that is due with others. The pump reads every due binding with its connection at one time
+/// and gives their baselines one after another, so a runtime lost during the first binding's
+/// baseline is replaced before the second binding's baseline takes its client, and the client is the
+/// replacement's. The second binding's component in the replacement is given every pending request
+/// once, from its own baseline.
+///
+/// Two observers and an interpreter. The pump is held until both observers are owed their baseline,
+/// and the first observer's baseline is held after its first request. The runtime is lost again, both
+/// observers are registered in the third runtime, and the baseline goes on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_24_24_a_second_loss_during_one_bindings_baseline_leaves_the_next_binding_every_request_once()
+ {
+    let Some(world) = three_requests_read_into_approvals_for(vec![
+        Spec::semantic_only(1),
+        Spec::semantic_only(2),
+        Spec::interpreter(3),
+    ])
+    .await
+    else {
+        return;
+    };
+    let lane = world.broker().observation();
+    let pump = lane.hold_pump();
+    let hold = lane.pause_at(Pause::BaselineGiven(1));
+
+    lose_the_runtime(&world).await;
+    world.let_the_compiles_go();
+    until_owed_its_baseline(&world, 1).await;
+    until_owed_its_baseline(&world, 2).await;
+    let first = lane.view(binding(2)).expect("a view").connection;
+    pump.release();
+    until(
+        "the first baseline to be held after its first request",
+        || async { hold.parked().then_some(()) },
+    )
+    .await;
+
+    lose_the_runtime(&world).await;
+    world.let_the_compiles_go();
+    until_registered_on_a_later_connection(&world, 1, first).await;
+    until_registered_on_a_later_connection(&world, 2, first).await;
+    hold.release();
+    until_started_again(&world, 1).await;
+    until_started_again(&world, 2).await;
+
+    for number in [1, 2] {
+        let account = world.account(number).await.expect("the component answers");
+        assert_eq!(account.binds, 1, "binding {number}: {account:?}");
+        assert_eq!(
+            account.requests,
+            ["1", "2", "3"],
+            "binding {number}'s component was given the first baseline's requests, or not every \
+             request once: {account:?}"
+        );
+    }
 }
 
 /// KR-REQ-24.24: what the worker passed over while the plugin runtime was away is counted, whether

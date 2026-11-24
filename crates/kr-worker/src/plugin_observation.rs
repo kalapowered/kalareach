@@ -355,12 +355,16 @@ fn offerable(
 /// Gives a binding's component, which started again, the requests the broker holds for it, and puts
 /// in its report what it was given and what it was not.
 ///
-/// The baseline is given to one registration: the connection to the runtime it began on, and the
-/// registration made on it, are taken once, before the first request is handed over, and every
-/// request goes through them. Everything else is read again before each request is handed over, and
-/// no wait is made while the broker's lock is held. A runtime that cannot be reached, or that was
-/// replaced while a request was handed over, leaves the baseline owed to the registration that
-/// follows; any other answer ends it, and what was not given is counted.
+/// The baseline is given to one registration: the one made on `connection`, which the pump read when
+/// it found the baseline due. The client is taken here, once, before the first request is handed
+/// over, and every request goes through it. The two are read at different times: a runtime lost
+/// and replaced after `connection` was read, and before the client is taken here, is the new
+/// runtime's client with the old registration's connection. So each request is checked against
+/// both, the client for a runtime replaced since it was taken and the connection for a binding
+/// registered again since it was read. Everything else is read again before each request is handed
+/// over, and no wait is made while the broker's lock is held. A runtime that cannot be reached, or
+/// that was replaced while a request was handed over, leaves the baseline owed to the registration
+/// that follows; any other answer ends it, and what was not given is counted.
 async fn rebuild(
     broker: &Broker,
     lane: &ObservationLane,
