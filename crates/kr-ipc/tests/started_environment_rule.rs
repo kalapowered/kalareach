@@ -269,6 +269,11 @@ const KEPT: &[Row] = &[
         removal: NAMES_ONLY_REMOVAL,
     },
     Row {
+        file: "tests/conformance/tests/ci_evidence.rs",
+        reason: NAMES_ONLY,
+        removal: NAMES_ONLY_REMOVAL,
+    },
+    Row {
         file: "tests/conformance/tests/detach_status.rs",
         reason: "it names `kr()` only inside the text of a control that its scan reads, and the one \
                  program it starts is `git`, to list the files the repository tracks",
