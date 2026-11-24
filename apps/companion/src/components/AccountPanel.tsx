@@ -38,6 +38,7 @@ import {
 } from '../model/account'
 import { ENTRY_NOTE } from '../model/deletion'
 import { DeleteAccount, useDeletion } from './DeleteAccount'
+import { Notices } from './Notices'
 import { SyncPanel } from './SyncPanel'
 import { Button, Card } from './ui'
 
@@ -297,6 +298,8 @@ export function AccountPanel({
             </Card>
           </>
         ) : null}
+
+        <Notices target={target} />
       </div>
 
       {deletion.open ? <DeleteAccount flow={deletion} surface={surface} /> : null}

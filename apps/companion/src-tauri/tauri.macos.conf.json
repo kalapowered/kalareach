@@ -1,0 +1,7 @@
+{
+  "bundle": {
+    "resources": {
+      "../../../docs/releases/companion-third-party-notices.txt": "THIRD-PARTY-NOTICES.txt"
+    }
+  }
+}

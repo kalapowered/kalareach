@@ -1438,6 +1438,31 @@ textarea::placeholder {
   color: var(--faint);
 }
 
+/*
+ * The third-party notices: a long plain text in a region that scrolls inside the card. It takes
+ * focus so the keyboard scrolls it, keeps its scrolling from passing to the page behind it, and
+ * moves nothing when it opens.
+ */
+.account-notices {
+  margin: var(--gap-2) 0 0;
+  padding: var(--gap-3);
+  max-block-size: min(60vh, 32rem);
+  overflow: auto;
+  overscroll-behavior: contain;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--muted);
+  font: 0.75rem / 1.5 var(--font-mono);
+}
+
+.account-notices:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
 .account-services {
   display: grid;
   gap: var(--gap-2);
