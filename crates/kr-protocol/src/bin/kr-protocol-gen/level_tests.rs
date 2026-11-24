@@ -1501,6 +1501,15 @@ fn a_kept_release_of_a_retained_level_is_compared_over_both_root_lists_and_both_
     use crate::retained::kept_release_differences;
     use kr_protocol::retained::Surface;
 
+    // The releases of a level other than the one the record is taken from.
+    let not_source = |repository: &std::path::Path,
+                      release: &crate::releases::Release,
+                      kept: &Surface,
+                      majors: Option<&str>,
+                      host: &[&str]| {
+        kept_release_differences(repository, release, kept, majors, host, false)
+    };
+
     let kept_tree = Tree::the_level();
     let repo = Repo::new("kept-release");
     let base = repo.commit(&kept_tree, "the release the level was cut from");
@@ -1521,13 +1530,13 @@ fn a_kept_release_of_a_retained_level_is_compared_over_both_root_lists_and_both_
     // The same: nothing differs.
     let same = release_of(&kept_tree, "the same", false);
     assert!(
-        kept_release_differences(&repo.directory, &same, &kept, majors, &["kr-plugin-host/3"])
+        not_source(&repo.directory, &same, &kept, majors, &["kr-plugin-host/3"])
             .expect("compared")
             .is_empty()
     );
     // The level kept a name more than this release lists: what a release lists is inside it.
     assert!(
-        kept_release_differences(
+        not_source(
             &repo.directory,
             &same,
             &kept,
@@ -1537,12 +1546,39 @@ fn a_kept_release_of_a_retained_level_is_compared_over_both_root_lists_and_both_
         .expect("compared")
         .is_empty()
     );
+    // The release the record is taken from is listed exactly: a name more in the kept record is a
+    // difference there, and the same list is not.
+    let found = kept_release_differences(
+        &repo.directory,
+        &same,
+        &kept,
+        majors,
+        &["kr-plugin-host/3", "kr-plugin-host/4"],
+        true,
+    )
+    .expect("compared");
+    assert!(
+        found.iter().any(|line| line.contains("kr-plugin-host/4")),
+        "{found:?}"
+    );
+    assert!(
+        kept_release_differences(
+            &repo.directory,
+            &same,
+            &kept,
+            majors,
+            &["kr-plugin-host/3"],
+            true
+        )
+        .expect("compared")
+        .is_empty()
+    );
 
     // A root the release declares that the kept surface does not have, and a difference in it.
     let mut more = kept_tree.clone();
     more.roots = vec!["ControlFrame", "PeerParams"];
     let extra = release_of(&more, "a root of its own", false);
-    let found = kept_release_differences(
+    let found = not_source(
         &repo.directory,
         &extra,
         &kept,
@@ -1559,9 +1595,8 @@ fn a_kept_release_of_a_retained_level_is_compared_over_both_root_lists_and_both_
     let mut misspelled = kept_tree.clone();
     misspelled.roots = vec!["ControlFrame", "ControlFrme"];
     let bad = release_of(&misspelled, "a misspelled root", false);
-    let error =
-        kept_release_differences(&repo.directory, &bad, &kept, majors, &["kr-plugin-host/3"])
-            .expect_err("refused");
+    let error = not_source(&repo.directory, &bad, &kept, majors, &["kr-plugin-host/3"])
+        .expect_err("refused");
     assert!(error.contains("ControlFrme"), "{error}");
 
     // A root of the kept surface that the release's own schema does not define: removed.
@@ -1573,7 +1608,7 @@ fn a_kept_release_of_a_retained_level_is_compared_over_both_root_lists_and_both_
         .expect("definitions")
         .remove("PeerResult");
     let lacking = release_of(&narrower, "without a root the level kept", false);
-    let found = kept_release_differences(
+    let found = not_source(
         &repo.directory,
         &lacking,
         &kept_wide,
@@ -1597,7 +1632,7 @@ fn a_kept_release_of_a_retained_level_is_compared_over_both_root_lists_and_both_
     let beside = release_of(&aside, "on a branch", true);
     let other_majors =
         Some("major=1 versions=1.0,1.1 replaced=- supported_until=- retired=false\n");
-    let found = kept_release_differences(
+    let found = not_source(
         &repo.directory,
         &beside,
         &kept,
@@ -1826,12 +1861,18 @@ fn both_forms_of_the_plugin_host_protocol_read_to_the_same_type() {
         },
         "a release that states a list",
     );
-    let first: Vec<String> = plugin_host_in(&repo.directory, &named).expect("the name reads");
-    let second: Vec<String> = plugin_host_in(&repo.directory, &listed).expect("the list reads");
-    assert_eq!(first, vec!["kr-plugin-host/3".to_owned()]);
     assert_eq!(
-        second,
-        vec!["kr-plugin-host/3".to_owned(), "kr-plugin-host/4".to_owned()]
+        plugin_host_in(&repo.directory, &named),
+        Ok(vec!["kr-plugin-host/3".to_owned()]),
+        "the one-name form reads as a list of one"
+    );
+    assert_eq!(
+        plugin_host_in(&repo.directory, &listed),
+        Ok(vec![
+            "kr-plugin-host/3".to_owned(),
+            "kr-plugin-host/4".to_owned()
+        ]),
+        "the list form reads as the list"
     );
 }
 
