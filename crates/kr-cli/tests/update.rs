@@ -5919,6 +5919,85 @@ async fn a_rollback_is_refused_naming_a_store_the_older_release_cannot_read() {
     );
 }
 
+/// KR-REQ-26.10, KR-REQ-26.13: a rollback over a host whose daemon, of this build, wrote the attention
+/// store is refused by a release that lists that store at version 12, naming the store and the version
+/// it is at, and nothing is switched; a release that lists version 13 goes back. The release lists
+/// every other store as this build does, so the attention store is all either answer can be about, and
+/// the store stays at version 13 either way.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rollback_over_the_attention_store_at_version_13_is_refused_by_a_release_that_lists_version_12()
+ {
+    for listed_at in [12, 13] {
+        let mut host = Host::bare();
+        let two = Assembled::at_this_level("0.2.0+bbbbbbbbbbbb", 2);
+        host.install(&two);
+        let controller = host.store.stable(Program::Controller);
+        host.start_daemon(&controller).await;
+        assert!(
+            host.stop_the_daemon().await,
+            "the daemon is stopped through its own door"
+        );
+        let store = host
+            .tree
+            .environment()
+            .state_dir()
+            .join("attention.sqlite3");
+        let version = || -> i64 {
+            rusqlite::Connection::open_with_flags(
+                &store,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                    | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            )
+            .expect("the attention store")
+            .query_row("SELECT version FROM attention_schema", [], |row| row.get(0))
+            .expect("the version")
+        };
+        assert_eq!(
+            version(),
+            kr_attention::store::SCHEMA_VERSION,
+            "a daemon of this build wrote the store at the version it writes"
+        );
+        let lowest = u32::try_from(kr_attention::store::OLDEST_SCHEMA_VERSION).expect("small");
+        let one = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1).reading(reading_a_store_at(
+            "attention",
+            lowest,
+            listed_at,
+        ));
+        host.put(&one);
+
+        let (output, said) = host.roll_back_to(&one);
+        if listed_at == 13 {
+            assert!(
+                output.status.success(),
+                "a release that lists version 13 goes back: {said} {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                host.store.current().expect("reads"),
+                Some(one.name().clone())
+            );
+        } else {
+            assert_eq!(output.status.code(), Some(1), "{said}");
+            let message = said["message"].as_str().unwrap_or_default();
+            assert!(
+                message.contains("attention")
+                    && message.contains(&host.tree.environment_id().to_string())
+                    && message.contains("schema version 13")
+                    && message.contains(&format!("versions {lowest} to 12"))
+                    && !message.contains("registry"),
+                "the refusal names the attention store and the version it is at, and no other store: {said}"
+            );
+            assert_eq!(
+                host.store.current().expect("reads"),
+                Some(two.name().clone()),
+                "nothing was switched"
+            );
+        }
+        assert_eq!(version(), 13, "the store is as it was found");
+    }
+}
+
 /// A transfers journal as a build that kept each draft's binding revision in a column of the journal
 /// wrote it: at schema version 6, with a draft that names an application under revision 7, and with no
 /// store of binding revisions beside it.
