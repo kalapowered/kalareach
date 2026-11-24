@@ -3271,8 +3271,9 @@ jobs:
           - name: macos-demonstrations
             part: demonstrations
             cache: macos-tests-2
-    # Every step has a limit of its own, and the limits add up to less than this one, so a step that
-    # hangs is ended and the steps after it still report. A step that builds or runs tests, other
+    # Every step has a limit of its own, and the limits of the steps a leg runs add up to at least 3
+    # minutes less than this one, for the set-up and clean-up that no step limit counts, so a step
+    # that hangs is ended and the steps after it still report. A step that builds or runs tests, other
     # than the measurement step and the Test step of the two test legs, has a limit of at least
     # twice the longest it has taken, so that its work can grow before the limit is reached. The
     # measurement step's limit is set by its own waits, and the Test step's by the budget its own
@@ -3583,11 +3584,13 @@ jobs:
       # its gateway suites start. `tests-2` builds the control daemon, its held build and its
       # stub inference process, which `kr-cli`'s suites start, and the forwarder that the
       # end-to-end suites start, and the stand-in service manager that its service-start cases
-      # start. The limit of 45 minutes is a guess: no run has measured the step,
-      # and the first run on a hosted runner without a cache sets it.
+      # start. The limit of 20 minutes is more than twice the longest the step took in the 21
+      # hosted runs that measured it, before the stand-in service manager joined the `tests-2`
+      # build: 7.7 minutes in `tests-1` and 5.2 in `tests-2`. A run with no cache to restore builds
+      # every package here, as run 45081081831 did in 5.2 minutes, and the step ends it at the limit.
       - name: Build the programs the suites of this leg start
         if: ${{ !cancelled() && matrix.part == 'tests-1' }}
-        timeout-minutes: 45
+        timeout-minutes: 20
         run: >-
           cargo build --locked --workspace --exclude kr-sync-integration --examples
           --bin kr-worker --bin kr-plugin-host
@@ -3595,7 +3598,7 @@ jobs:
 
       - name: Build the programs the suites of this leg start
         if: ${{ !cancelled() && matrix.part == 'tests-2' }}
-        timeout-minutes: 45
+        timeout-minutes: 20
         run: >-
           cargo build --locked --workspace --exclude kr-sync-integration --examples
           --bin kr-controller --bin kr-controller-held
@@ -3620,8 +3623,8 @@ jobs:
       # restored: 117 minutes for `tests-1` and 104 for `tests-2`. They are estimates, not bounds: a
       # leg builds with other features than the whole workspace did, its programs are built in a
       # step of their own, and no run has measured a leg or a build with no cache. The limits are
-      # 174 and 158 minutes, about half as much again, and each leg's limits, with the 45 minutes
-      # of its program build and its other steps, add up to 335 and 354 of the job's 355 minutes.
+      # 174 and 158 minutes, about half as much again, and each leg's limits, with the 20 minutes
+      # of its program build and its other steps, add up to 310 and 349 of the job's 355 minutes.
       - name: Test
         if: ${{ !cancelled() && startsWith(matrix.part, 'tests') }}
         timeout-minutes: ${{ matrix.minutes }}
@@ -3673,8 +3676,8 @@ jobs:
       # Test step have built, and the stub starts nothing and asks no launchd. The step builds
       # `kr-cli` with the features of that package alone, so it compiles more than the leg's Test
       # step did, as the rust job's teardown step does after its workspace build: that step took
-      # 2.4 minutes and this leg's documentation step 3.5. The limit of 9 minutes is what the leg's
-      # other limits leave of the job's 355: they add up to 354 with it.
+      # 2.4 minutes and this leg's documentation step 3.5. The limit of 9 minutes is 3.5 minutes
+      # above the longest the step took in 11 hosted runs, 5.5 minutes.
       - name: A standalone start says why a stub daemon ended
         if: ${{ !cancelled() && matrix.part == 'tests-2' }}
         timeout-minutes: 9
@@ -4000,7 +4003,7 @@ jobs:
   # The PowerShell package's cases on the macOS runner. The package's reader counts the input the
   # runtime has taken through .NET internals that differ by platform, and the shell-packages job
   # runs these cases on Linux only. They take far longer than the macos job has left to give: the
-  # limits of its legs add up to 335 to 351 of its 355 minutes. So they run here, in a job that has
+  # limits of its legs add up to 310 to 351 of its 355 minutes. So they run here, in a job that has
   # the Rust toolchain and PowerShell and nothing else of that one. PowerShell is the release the
   # shell-packages job pins, from the macOS archive and checked against the digest its release
   # publishes: the package refuses a release that a published advisory affects, and the .NET
@@ -4131,7 +4134,7 @@ jobs:
   # shell-packages job runs these cases on Linux only, and how an editor draws and how a terminal
   # answers depend on the platform's C library, so a change to a package or to its bridge is run
   # on macOS at the landing and not first at a release. The cases are not steps of the macos job:
-  # its legs are the longest jobs of the run, and their limits add up to 335 to 351 of 355 minutes.
+  # its legs are the longest jobs of the run, and their limits add up to 310 to 351 of 355 minutes.
   # This job holds one runner for the length of its own steps and takes nothing from that budget.
   # Every step has a limit of its own, and the limits add up to less than the job's.
   #

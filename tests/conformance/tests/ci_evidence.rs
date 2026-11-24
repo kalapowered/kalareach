@@ -2025,6 +2025,142 @@ esac
     assert_eq!(run("neither", "right").0, Some(2), "an unknown mode ran");
 }
 
+/// One leg of a job's matrix: its `part`, and the `minutes` its Test step is limited to when the
+/// entry has them.
+struct Leg {
+    part: String,
+    minutes: Option<u32>,
+}
+
+/// The legs of a job's matrix, in the order they are written: each entry from its `- name:` line
+/// to the line after it that stands further left than the entry's keys.
+fn matrix_legs(job: &str) -> Vec<Leg> {
+    let lines: Vec<&str> = job.lines().collect();
+    let starts: Vec<usize> = (0..lines.len())
+        .filter(|&index| {
+            lines[index].starts_with("          - name:")
+                && lines
+                    .get(index + 1)
+                    .is_some_and(|next| next.trim_start().starts_with("part:"))
+        })
+        .collect();
+    starts
+        .iter()
+        .map(|&start| {
+            let end = lines[start + 1..]
+                .iter()
+                .position(|line| {
+                    !line.trim().is_empty() && line.len() - line.trim_start().len() < 12
+                })
+                .map_or(lines.len(), |offset| start + 1 + offset);
+            let entry = lines[start..end].join("\n");
+            Leg {
+                part: value_at(&entry, 12, "part").expect("a leg names its part"),
+                minutes: value_at(&entry, 12, "minutes").and_then(|value| value.parse().ok()),
+            }
+        })
+        .collect()
+}
+
+/// Whether a step runs on the leg `part`, read from the step's own `if`: a step with none runs on
+/// every leg, and one with a condition holds it as `&&` of `!cancelled()`, `success()`,
+/// `always()`, `matrix.part == '<part>'`,
+/// `startsWith(matrix.part, '<prefix>')` and a result of an earlier step
+/// (`steps.<id>.outcome == 'failure'`), which every leg may have, so it counts. Any other
+/// condition is one this reading does not hold, and fails, so that a step is never counted or left
+/// out by a guess.
+fn runs_on_leg(step: &str, part: &str) -> bool {
+    let Some(condition) = step_condition(step) else {
+        return true;
+    };
+    let inner = condition
+        .strip_prefix("${{")
+        .and_then(|rest| rest.strip_suffix("}}"))
+        .unwrap_or_else(|| panic!("a step's condition the case cannot read: {condition}"));
+    let atoms: Vec<bool> = inner
+        .split("&&")
+        .map(|atom| {
+            if matches!(atom, "!cancelled()" | "success()" | "always()")
+                || atom.starts_with("steps.")
+            {
+                true
+            } else if let Some(named) = atom
+                .strip_prefix("matrix.part=='")
+                .and_then(|rest| rest.strip_suffix('\''))
+            {
+                named == part
+            } else if let Some(prefix) = atom
+                .strip_prefix("startsWith(matrix.part,'")
+                .and_then(|rest| rest.strip_suffix("')"))
+            {
+                part.starts_with(prefix)
+            } else {
+                panic!("a step's condition the case cannot read: {condition}")
+            }
+        })
+        .collect();
+    atoms.iter().all(|runs| *runs)
+}
+
+/// The macOS job of the landing workflow runs each leg of its matrix on a runner of its own, and a
+/// leg runs the steps that apply to its `part`. A leg whose steps' limits add up to more than the
+/// job's limit can have the job end in the middle of a later step, or before its evidence upload,
+/// although every step stayed inside its own limit. So each leg's steps' limits, with 3 minutes
+/// over for the set-up and clean-up that no step limit counts, fit in the job's limit, which is
+/// under the 360 minutes at which GitHub ends a hosted job; a test leg's Test step takes its limit
+/// from the `minutes` of its entry.
+#[test]
+fn every_leg_of_the_landing_workflows_macos_job_has_step_limits_that_fit_in_the_jobs_limit() {
+    const SET_UP_AND_CLEAN_UP_MINUTES: u32 = 3;
+    let workflow = fs::read_to_string(repository().join(".github/workflows/core-ci.yml"))
+        .expect("the landing workflow");
+    let text = job(&workflow, "macos");
+    let job_limit = value_at(&header(&text), 4, "timeout-minutes")
+        .and_then(|value| value.parse::<u32>().ok())
+        .expect("the macOS job has a limit of its own");
+    assert!(
+        job_limit < 360,
+        "the macOS job's limit of {job_limit} minutes is not under the 360 GitHub ends a hosted job at"
+    );
+    let matrix = matrix_legs(&text);
+    assert_eq!(
+        matrix
+            .iter()
+            .map(|leg| leg.part.clone())
+            .collect::<Vec<_>>(),
+        legs(&text),
+        "the macOS job's matrix is not read as the legs it names"
+    );
+    assert!(
+        matrix.len() >= 3,
+        "the macOS job's matrix has fewer than the three legs it is meant to have"
+    );
+    for leg in &matrix {
+        let total: u32 = steps_of(&text)
+            .iter()
+            .filter(|step| runs_on_leg(step, &leg.part))
+            .map(|step| {
+                let limit = value_at(step, 8, "timeout-minutes")
+                    .unwrap_or_else(|| panic!("a step of the macOS job has no limit:\n{step}"));
+                if compact(&limit) == "${{matrix.minutes}}" {
+                    leg.minutes
+                        .unwrap_or_else(|| panic!("the {} leg has no minutes", leg.part))
+                } else {
+                    limit
+                        .parse()
+                        .unwrap_or_else(|_| panic!("a step's limit that is no number: {limit}"))
+                }
+            })
+            .sum();
+        assert!(
+            total + SET_UP_AND_CLEAN_UP_MINUTES <= job_limit,
+            "the {} leg of the macOS job has steps whose limits add up to {total} minutes, which with the \
+             {SET_UP_AND_CLEAN_UP_MINUTES} for the set-up and clean-up pass the job's {job_limit}",
+            leg.part
+        );
+    }
+}
+
 /// The names of the jobs of a workflow, in the order they are written.
 fn job_names(workflow: &str) -> Vec<String> {
     let mut in_jobs = false;
