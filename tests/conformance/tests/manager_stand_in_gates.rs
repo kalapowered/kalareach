@@ -451,3 +451,147 @@ fn the_command_reading_finds_each_command_and_no_comment() {
     assert_eq!(command_builders("static X: C = Command::new(a);"), [""]);
     assert!(command_builders("fn command() { // Command::new(a)\n run(); }").is_empty());
 }
+
+/// The source of the startup suite, which holds the host on the service manager and the steps of the
+/// case that runs on it.
+const STARTUP_FILE: &str = "crates/kr-cli/tests/startup.rs";
+
+/// The case that runs on the stand-in and the steps it calls, none of which may start a program or
+/// name the account's launchd.
+const CASE_FUNCTIONS: [&str; 4] = [
+    "the_headless_host_case",
+    "the_stand_in_saw_the_install",
+    "the_stand_in_started_the_daemon",
+    "the_stand_in_saw_nothing_end",
+];
+
+/// The index range of the tokens between the braces of `impl <name> {`.
+fn impl_block(tokens: &[Token], name: &str) -> Option<std::ops::Range<usize>> {
+    (0..tokens.len()).find_map(|at| {
+        let opens = tokens[at].ident() == Some("impl")
+            && tokens.get(at + 1).and_then(Token::ident) == Some(name)
+            && tokens.get(at + 2).is_some_and(|token| token.is_punct('{'));
+        opens.then(|| at + 3..closing_brace(tokens, at + 2))
+    })
+}
+
+/// The index of each `account_launchd::<item>` in `range`, followed by `(` where `call` is set. With
+/// no item it is each `account_launchd::`.
+fn account_launchd_paths(
+    tokens: &[Token],
+    range: &std::ops::Range<usize>,
+    item: Option<&str>,
+    call: bool,
+) -> Vec<usize> {
+    range
+        .clone()
+        .filter(|&at| {
+            tokens[at].ident() == Some("account_launchd")
+                && tokens.get(at + 1).is_some_and(|token| token.is_punct(':'))
+                && tokens.get(at + 2).is_some_and(|token| token.is_punct(':'))
+                && item.is_none_or(|item| tokens.get(at + 3).and_then(Token::ident) == Some(item))
+                && (!call || tokens.get(at + 4).is_some_and(|token| token.is_punct('(')))
+        })
+        .collect()
+}
+
+/// What is wrong with the startup suite's source: the account's launchd is reached by one function
+/// of `impl ServiceHost` for its command and one for its program path, and the case and its steps
+/// start no program and name nothing of it.
+fn startup_problems(source: &str) -> Vec<String> {
+    let tokens = code_tokens(source);
+    let all = functions(&tokens);
+    let mut problems = Vec::new();
+    let Some(host) = impl_block(&tokens, "ServiceHost") else {
+        return vec!["there is no `impl ServiceHost` in this source".to_owned()];
+    };
+    for (item, call, only) in [
+        ("command", true, "launchctl"),
+        ("LAUNCHCTL", false, "create"),
+    ] {
+        let uses = account_launchd_paths(&tokens, &host, Some(item), call);
+        if uses.is_empty() {
+            problems.push(format!(
+                "`impl ServiceHost` never uses account_launchd::{item}, so this reading is moot"
+            ));
+        }
+        for at in uses {
+            let holder = all
+                .iter()
+                .filter(|function| function.body.contains(&at))
+                .min_by_key(|function| function.body.len())
+                .map_or("", |function| function.name.as_str());
+            if holder != only {
+                problems.push(format!(
+                    "{holder:?} uses account_launchd::{item}, and only {only} may"
+                ));
+            }
+        }
+    }
+    let builders = command_builders(source);
+    for name in CASE_FUNCTIONS {
+        let Some(found) = all.iter().find(|function| function.name == name) else {
+            problems.push(format!("{name} is not a function of this source"));
+            continue;
+        };
+        if builders.iter().any(|builder| builder == name) {
+            problems.push(format!("{name} builds a command"));
+        }
+        if !account_launchd_paths(&tokens, &found.body, None, false).is_empty() {
+            problems.push(format!("{name} names the account's launchd"));
+        }
+    }
+    problems
+}
+
+/// The startup suite reaches the account's own launchd in one place for its command and one for its
+/// program path, and the headless-host case and its steps on the stand-in neither start a program
+/// nor name the account's launchd, so that no step can bypass the host's one `launchctl`.
+#[test]
+fn the_startup_suite_reaches_the_accounts_launchd_only_where_the_host_chooses_it() {
+    let text = std::fs::read_to_string(repository().join(STARTUP_FILE))
+        .unwrap_or_else(|error| panic!("{STARTUP_FILE}: {error}"));
+    let problems = startup_problems(&text);
+    assert!(
+        problems.is_empty(),
+        "{STARTUP_FILE} reaches the account's launchd where it must not: {problems:#?}"
+    );
+}
+
+/// The startup reading finds a use in the wrong function, a use that is missing, a command built in
+/// the case or one of its steps, and a mention of the account's launchd there, and nothing else.
+#[test]
+fn the_startup_reading_finds_each_wrong_place_and_only_those() {
+    let steps = "fn the_headless_host_case() {} fn the_stand_in_saw_the_install() {} \
+                 fn the_stand_in_started_the_daemon() {} fn the_stand_in_saw_nothing_end() {}";
+    let host = "impl ServiceHost { fn create() { account_launchd::LAUNCHCTL; } \
+                fn launchctl() { account_launchd::command(a); } }";
+    assert!(startup_problems(&format!("{host} {steps}")).is_empty());
+    let wrong_command = "impl ServiceHost { fn create() { account_launchd::LAUNCHCTL; } \
+                         fn kr_from() { account_launchd::command(a); } \
+                         fn launchctl() { account_launchd::command(a); } }";
+    assert_eq!(
+        startup_problems(&format!("{wrong_command} {steps}")).len(),
+        1
+    );
+    let wrong_program = "impl ServiceHost { fn create() { account_launchd::LAUNCHCTL; } \
+                         fn launchctl() { account_launchd::command(a); account_launchd::LAUNCHCTL; } }";
+    assert_eq!(
+        startup_problems(&format!("{wrong_program} {steps}")).len(),
+        1
+    );
+    let moot = "impl ServiceHost { fn create() {} fn launchctl() {} }";
+    assert_eq!(startup_problems(&format!("{moot} {steps}")).len(), 2);
+    let builds = "fn the_headless_host_case() { Command::new(a); } fn the_stand_in_saw_the_install() {} \
+                  fn the_stand_in_started_the_daemon() {} fn the_stand_in_saw_nothing_end() {}";
+    assert_eq!(startup_problems(&format!("{host} {builds}")).len(), 1);
+    let names = "fn the_headless_host_case() {} fn the_stand_in_saw_the_install() {} \
+                 fn the_stand_in_started_the_daemon() { x(kr_ipc::testing::account_launchd::VARIABLE); } \
+                 fn the_stand_in_saw_nothing_end() {}";
+    assert_eq!(startup_problems(&format!("{host} {names}")).len(), 1);
+    let comment = "impl ServiceHost { fn create() { account_launchd::LAUNCHCTL; } \
+                   fn launchctl() { account_launchd::command(a); } \
+                   fn other() { // account_launchd::command(b)\n } }";
+    assert!(startup_problems(&format!("{comment} {steps}")).is_empty());
+    assert_eq!(startup_problems("fn other() {}").len(), 1);
+}

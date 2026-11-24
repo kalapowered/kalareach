@@ -4687,12 +4687,19 @@ fn service_settings_in(document: &Value) -> Vec<&'static str> {
         .collect()
 }
 
+/// The name of the variable that asks for the account's own launchd, which no process of a host on
+/// the stand-in has. It is named here once, so that the steps of the case name no part of the
+/// account's launchd.
+#[cfg(target_os = "macos")]
+const ASK_VARIABLE: &str = kr_ipc::testing::account_launchd::VARIABLE;
+
 /// What the stand-in's calls came to after the install: the one change to the manager is the load
 /// of the definition `kr` wrote, into the user domain, with no ask in it; every read is one of
 /// three; `kr`'s own read of the desktop reached the stand-in, which said the graphical domain is
-/// absent; and the job is loaded as the file says and started none.
+/// absent; and the job is loaded as the file says and started none. It returns how many calls the
+/// stand-in had taken by then, which is where the calls of the next step begin.
 #[cfg(target_os = "macos")]
-fn the_stand_in_saw_the_install(host: &ServiceHost, stand_in: &manager_stand_in::StandIn) {
+fn the_stand_in_saw_the_install(host: &ServiceHost, stand_in: &manager_stand_in::StandIn) -> usize {
     let log = stand_in.log();
     let calls = stand_in.calls();
     let (gui, domain) = (
@@ -4746,18 +4753,21 @@ fn the_stand_in_saw_the_install(host: &ServiceHost, stand_in: &manager_stand_in:
         "the stand-in loaded the file kr wrote, as it is: {job}"
     );
     assert_eq!(job["umask"], 63, "{job}");
+    calls.len()
 }
 
 /// What the stand-in's calls and its job say once the first session has started the daemon: the
 /// changes are the load and one start, both from `kr`; the job runs the process the host's own
-/// question names, as its definition says; the daemon read the desktop through the stand-in too;
-/// and no call came from a worker.
+/// question names, as its definition says; `kr` and the daemon each read the desktop through the
+/// stand-in in this step, after the `boundary` that the install's calls ended at; and no call came
+/// from a worker.
 #[cfg(target_os = "macos")]
 fn the_stand_in_started_the_daemon(
     host: &ServiceHost,
     stand_in: &manager_stand_in::StandIn,
     daemon: u32,
     created: &Value,
+    boundary: usize,
 ) {
     let log = stand_in.log();
     let calls = stand_in.calls();
@@ -4779,8 +4789,15 @@ fn the_stand_in_started_the_daemon(
             .any(|call| call.arguments == ["kickstart", "-p", target.as_str()]),
         "the start names the job's target {target}:\n{log}"
     );
+    let this_step = &calls[boundary..];
     assert!(
-        calls.iter().any(|call| call.caller == "kr-controller"
+        this_step.iter().any(|call| call.caller == "kr"
+            && call.arguments == ["print", gui.as_str()]
+            && call.status == 112),
+        "kr's read of the desktop in this step reached the stand-in again:\n{log}"
+    );
+    assert!(
+        this_step.iter().any(|call| call.caller == "kr-controller"
             && call.arguments == ["print", gui.as_str()]
             && call.status == 112),
         "the daemon's own read of the desktop reached the stand-in:\n{log}"
@@ -4820,7 +4837,7 @@ fn the_stand_in_started_the_daemon(
         .filter_map(Value::as_str)
         .collect();
     assert!(
-        !keys.contains(&kr_ipc::testing::account_launchd::VARIABLE),
+        !keys.contains(&ASK_VARIABLE),
         "the daemon has no ask for the account's launchd: {keys:?}"
     );
     for kept in ["HOME", "PATH", kr_ipc::testing::manager_stand_in::VARIABLE] {
@@ -4930,9 +4947,9 @@ fn the_headless_host_case(host: &ServiceHost) {
         "the install selects no managed service: {written}"
     );
     #[cfg(target_os = "macos")]
-    if let Some(stand_in) = host.stand_in() {
-        the_stand_in_saw_the_install(host, stand_in);
-    }
+    let boundary = host
+        .stand_in()
+        .map(|stand_in| the_stand_in_saw_the_install(host, stand_in));
 
     // The first session starts the daemon through the manager.
     let output = start(host.new_session()).finish("kr new");
@@ -4958,8 +4975,8 @@ fn the_headless_host_case(host: &ServiceHost) {
         .daemon()
         .expect("the service manager reports the daemon it started");
     #[cfg(target_os = "macos")]
-    if let Some(stand_in) = host.stand_in() {
-        the_stand_in_started_the_daemon(host, stand_in, daemon, &created);
+    if let (Some(stand_in), Some(boundary)) = (host.stand_in(), boundary) {
+        the_stand_in_started_the_daemon(host, stand_in, daemon, &created, boundary);
     } else {
         host.assert_started_by_the_manager(daemon);
     }
