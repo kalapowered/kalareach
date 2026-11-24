@@ -77,7 +77,7 @@ use crate::broker::observation::Pause;
 use crate::broker::observation::{
     Audience, Entry, LaneLoss, NativeFrame, ObservationLane, PIECE_BYTES, Source, Tally, View,
 };
-use crate::broker::rebuild::Recovery;
+use crate::broker::rebuild::{Recovery, Stop};
 
 /// How long a snapshot is given to reach its component.
 pub const CALL_WAIT: Duration = Duration::from_secs(5);
@@ -373,7 +373,8 @@ fn offerable(
 /// registered again since it was read. Everything else is read again before each request is handed
 /// over, and no wait is made while the broker's lock is held. A runtime that cannot be reached, or
 /// that was replaced while a request was handed over, leaves the baseline owed to the registration
-/// that follows; any other answer ends it, and what was not given is counted.
+/// that follows; any other answer ends it, and what was not given is counted: the request the
+/// runtime refused or did not answer about under its own cause, and those after it as not offered.
 async fn rebuild(
     broker: &Broker,
     lane: &ObservationLane,
@@ -423,11 +424,11 @@ async fn rebuild(
                     lane.paused_at(Pause::BaselineGiven(recovery.given)).await;
                 }
                 Ok(Admission::Refused { .. }) => {
-                    recovery.refused += 1 + left;
+                    recovery.stop(Stop::Refused, left);
                     break;
                 }
                 Err(ServiceError::CallerDeadline { .. }) => {
-                    recovery.unanswered += 1 + left;
+                    recovery.stop(Stop::Unanswered, left);
                     lane.go_silent(binding, Instant::now());
                     break;
                 }
@@ -437,7 +438,7 @@ async fn rebuild(
                     return;
                 }
                 Err(_) => {
-                    recovery.refused += 1 + left;
+                    recovery.stop(Stop::Refused, left);
                     break;
                 }
             }

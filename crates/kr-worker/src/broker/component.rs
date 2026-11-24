@@ -731,13 +731,16 @@ mod tests {
     /// faults and the counts, so they are cut last.
     #[test]
     fn notes_that_pass_the_report_bound_are_cut_from_their_last_clauses_and_flagged() {
-        let recovery = Recovery::with_every_clause().words();
+        // The longest restart words and the longest registration note leave a few bytes of the bound,
+        // so it falls in the ASCII words of the clause after them. The words of a long outage leave
+        // room for the runtime's text, which is where the bound is set to fall inside a character.
+        let recovery = Recovery::after_a_long_outage().words();
         // The runtime's words come in any length and any script: two-byte characters here, set so
         // that the bound falls inside one.
-        let whole_with = |detail: String| {
+        let whole_with = |recovery: &str, detail: String| {
             let notes = ComponentNotes {
                 registration: Some(the_longest_registration_note()),
-                recovery: Some(recovery.clone()),
+                recovery: Some(recovery.to_owned()),
                 fault: Some(FaultNote {
                     call: "decode".to_owned(),
                     detail: Some(detail),
@@ -755,9 +758,9 @@ mod tests {
             };
             notes.text(false).expect("the notes say something")
         };
-        let mut whole = whole_with("é".repeat(600));
+        let mut whole = whole_with(&recovery, "é".repeat(600));
         if whole.is_char_boundary(MAX_REPORT_DETAIL_BYTES) {
-            whole = whole_with(format!("x{}", "é".repeat(600)));
+            whole = whole_with(&recovery, format!("x{}", "é".repeat(600)));
         }
         assert!(
             !whole.is_char_boundary(MAX_REPORT_DETAIL_BYTES),
@@ -783,6 +786,21 @@ mod tests {
         assert!(
             !shown.contains("answers were not written"),
             "the last clause goes first"
+        );
+
+        // The longest restart words are cut last too: they stay whole, and what follows them goes.
+        let longest = Recovery::with_every_clause().words();
+        let whole = whole_with(&longest, "é".repeat(600));
+        let (shown, was_cut) = cut(&whole);
+        assert!(was_cut, "the cut is flagged");
+        assert!(
+            shown.len() <= MAX_REPORT_DETAIL_BYTES && whole.starts_with(&shown),
+            "{} bytes of {MAX_REPORT_DETAIL_BYTES}",
+            shown.len()
+        );
+        assert!(
+            shown.contains(&longest),
+            "the restart's longest words are cut last"
         );
 
         let (at_the_bound, was_cut) = cut(&"a".repeat(MAX_REPORT_DETAIL_BYTES));

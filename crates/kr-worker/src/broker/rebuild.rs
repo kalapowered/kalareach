@@ -259,6 +259,15 @@ fn uninterpreted(
     }
 }
 
+/// How the runtime ended the hand-over of a binding's requests.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Stop {
+    /// It refused a request.
+    Refused,
+    /// It did not answer about a request.
+    Unanswered,
+}
+
 /// Everything the worker tells of one binding's component starting again.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Recovery {
@@ -275,10 +284,13 @@ pub struct Recovery {
     pub oversized: u64,
     /// Requests left out for the bound on what is given at once.
     pub over_cap: u64,
-    /// Requests the plugin runtime refused.
+    /// Requests the plugin runtime refused: the one it refused, and no other.
     pub refused: u64,
-    /// Requests the plugin runtime did not answer about: they may have been given.
+    /// Requests the plugin runtime did not answer about, which may have been given: the one it did
+    /// not answer about, and no other.
     pub unanswered: u64,
+    /// Requests that came after a refused or an unanswered one, which the worker did not offer.
+    pub not_offered: u64,
     /// Upstream frames the worker passed over while the plugin runtime was away, with their bytes.
     pub passed: Tally,
     /// Spans of terminal output the worker passed over, with their bytes.
@@ -297,6 +309,16 @@ const fn noun(count: u64, one: &'static str, many: &'static str) -> &'static str
 }
 
 impl Recovery {
+    /// Counts the end of a hand-over: the one request the runtime refused or did not answer about
+    /// under its own cause, and the `left` requests after it, which are not offered, under theirs.
+    pub fn stop(&mut self, why: Stop, left: u64) {
+        match why {
+            Stop::Refused => self.refused += 1,
+            Stop::Unanswered => self.unanswered += 1,
+        }
+        self.not_offered += left;
+    }
+
     /// The words a binding's report carries: counts, never content.
     #[must_use]
     pub fn words(&self) -> String {
@@ -400,6 +422,7 @@ impl Recovery {
             over_cap: 99_999,
             refused: 64,
             unanswered: 64,
+            not_offered: 64,
             passed: widest,
             terminal: widest,
             dropped: widest,
@@ -408,8 +431,12 @@ impl Recovery {
     }
 
     fn baseline_words(&self, parts: &mut Vec<String>) {
-        let left_out =
-            self.unavailable + self.oversized + self.over_cap + self.refused + self.unanswered;
+        let left_out = self.unavailable
+            + self.oversized
+            + self.over_cap
+            + self.refused
+            + self.not_offered
+            + self.unanswered;
         if self.given == 0 && left_out == 0 {
             parts.push("the worker had no pending request to give it".to_owned());
         }
@@ -432,8 +459,9 @@ impl Recovery {
             }
             parts.push(text);
         }
-        // One sentence, one count for each cause. A request the runtime did not answer about may
-        // have been given, so it is not among those left out.
+        // One sentence, one count for each cause. The requests after a refused or an unanswered one
+        // are not offered, so they are left out under a cause of their own. A request the runtime
+        // did not answer about may have been given, so it is not among those left out.
         let mut causes = Vec::new();
         if self.unavailable > 0 {
             causes.push(format!(
@@ -452,6 +480,12 @@ impl Recovery {
         }
         if self.refused > 0 {
             causes.push(format!("{} refused by the runtime", self.refused));
+        }
+        if self.not_offered > 0 {
+            causes.push(format!(
+                "{} not offered after an earlier one failed",
+                self.not_offered
+            ));
         }
         if let Some((last, earlier)) = causes.split_last() {
             let list = if earlier.is_empty() {
@@ -570,6 +604,7 @@ mod tests {
             oversized: 2,
             over_cap: 3,
             refused: 1,
+            not_offered: 4,
             unanswered: 2,
             ..Recovery::default()
         }
@@ -577,23 +612,55 @@ mod tests {
         assert!(
             words.ends_with(
                 "; pending requests left out: 1 whose bytes could not be used, 2 too large for \
-                 one event, 3 over the limit of 64 requests or 4 MiB and 1 refused by the \
-                 runtime; 2 not confirmed as given because the runtime did not answer"
+                 one event, 3 over the limit of 64 requests or 4 MiB, 1 refused by the runtime \
+                 and 4 not offered after an earlier one failed; 2 not confirmed as given \
+                 because the runtime did not answer"
             ),
             "{words}"
         );
         assert!(!words.contains("had no pending request"), "{words}");
     }
 
+    /// The runtime refuses or does not answer about one request; the requests after it are not
+    /// offered and are counted under their own cause, so each of the three counts holds only what
+    /// its words say.
+    #[test]
+    fn a_hand_over_that_stops_counts_the_request_it_stopped_at_apart_from_those_after_it() {
+        let counts =
+            |recovery: &Recovery| (recovery.refused, recovery.unanswered, recovery.not_offered);
+        let mut refused = Recovery::default();
+        refused.stop(Stop::Refused, 3);
+        assert_eq!(
+            counts(&refused),
+            (1, 0, 3),
+            "one request refused, and the three after it not offered"
+        );
+        let mut unanswered = Recovery::default();
+        unanswered.stop(Stop::Unanswered, 2);
+        assert_eq!(
+            counts(&unanswered),
+            (0, 1, 2),
+            "one request not answered about, and the two after it not offered"
+        );
+        let mut last = Recovery::default();
+        last.stop(Stop::Refused, 0);
+        assert_eq!(
+            counts(&last),
+            (1, 0, 0),
+            "the last request refused leaves none not offered"
+        );
+    }
+
     #[test]
     fn the_requests_left_out_are_one_sentence_with_a_count_for_each_cause_that_has_one() {
-        let words_of = |unavailable, oversized, over_cap, refused, unanswered| {
+        let words_of = |unavailable, oversized, over_cap, refused, not_offered, unanswered| {
             Recovery {
                 baseline: true,
                 unavailable,
                 oversized,
                 over_cap,
                 refused,
+                not_offered,
                 unanswered,
                 ..Recovery::default()
             }
@@ -602,19 +669,33 @@ mod tests {
         let after = "started again after the plugin runtime was lost, with no state or history from \
                      before the loss; ";
         assert_eq!(
-            words_of(1, 0, 0, 0, 0),
+            words_of(1, 0, 0, 0, 0, 0),
             format!("{after}pending requests left out: 1 whose bytes could not be used")
         );
         assert_eq!(
-            words_of(0, 4, 0, 2, 0),
+            words_of(0, 4, 0, 2, 0, 0),
             format!(
                 "{after}pending requests left out: 4 too large for one event and 2 refused by the \
                  runtime"
             )
         );
         assert_eq!(
-            words_of(0, 0, 0, 0, 3),
+            words_of(0, 0, 0, 0, 0, 3),
             format!("{after}3 not confirmed as given because the runtime did not answer")
+        );
+        assert_eq!(
+            words_of(0, 0, 0, 1, 5, 0),
+            format!(
+                "{after}pending requests left out: 1 refused by the runtime and 5 not offered \
+                 after an earlier one failed"
+            )
+        );
+        assert_eq!(
+            words_of(0, 0, 0, 0, 2, 1),
+            format!(
+                "{after}pending requests left out: 2 not offered after an earlier one failed; 1 \
+                 not confirmed as given because the runtime did not answer"
+            )
         );
     }
 
@@ -743,8 +824,9 @@ mod tests {
             "the worker gave it 64 pending requests from its own records, oldest first, 64 of them \
              already read as approvals",
             "pending requests left out: 99999 whose bytes could not be used, 64 too large for one \
-             event, 99999 over the limit of 64 requests or 4 MiB and 64 refused by the \
-             runtime; 64 not confirmed as given because the runtime did not answer",
+             event, 99999 over the limit of 64 requests or 4 MiB, 64 refused by the runtime and \
+             64 not offered after an earlier one failed; 64 not confirmed as given because the \
+             runtime did not answer",
             away.as_str(),
             "8 pending requests were queued to be decoded again",
             "56 pending requests could not be queued to be decoded again because the decode queue \
