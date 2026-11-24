@@ -3466,14 +3466,19 @@ mod consumed {
             let _ = received.try_recv();
         }
         let mut dropped = None;
+        let mut counted = None;
         loop {
             match next_event(&mut received, LIVENESS).await {
                 Some(BindingEvent::PresentationDropped {
                     documents,
+                    gaps,
+                    events,
+                    bytes,
                     first,
                     last,
                 }) => {
                     assert!(documents >= 2, "the two gaps went: {documents}");
+                    counted = Some((gaps, events, bytes));
                     dropped = Some((
                         first.map(|bound| bound.handle),
                         last.map(|bound| bound.handle),
@@ -3489,6 +3494,12 @@ mod consumed {
             dropped,
             Some((Some(handle("se-7")), Some(handle("se-8")))),
             "the loss was told before the report, with the first and the last event lost"
+        );
+        let each = components::scrape("se-7", "!trap").queue_bytes();
+        assert_eq!(
+            counted,
+            Some((2, 2, 2 * each)),
+            "the gaps that went were told with the events and bytes they counted"
         );
     }
 

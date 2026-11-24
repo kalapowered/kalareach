@@ -2664,20 +2664,36 @@ fn pieces_of(binding_id: BindingId, event: BindingEvent, shape: Shape) -> Vec<Pi
         }
         BindingEvent::PresentationDropped {
             documents,
+            gaps,
+            events,
+            bytes,
             first,
             last,
         } => {
+            // Where the writer is open the loss is told as it was: the events and bytes the gaps
+            // counted, and the documents apart from them. Where it is closed it is told as `/3`
+            // tells it, which counts every presentation that went as a document.
+            let notice = if open {
+                Notice::Gap {
+                    binding_id: binding_id.get(),
+                    events,
+                    bytes,
+                    documents: u64::from(documents.saturating_sub(gaps)),
+                }
+            } else {
+                Notice::Gap {
+                    binding_id: binding_id.get(),
+                    events: 0,
+                    bytes: 0,
+                    documents: u64::from(documents),
+                }
+            };
             let beyond = Beyond {
-                first: first.clone().filter(|_| open),
-                last: last.clone().filter(|_| open),
+                first: first.filter(|_| open),
+                last: last.filter(|_| open),
                 ..Beyond::default()
             };
-            let dropped = BindingEvent::PresentationDropped {
-                documents,
-                first,
-                last,
-            };
-            plain(notices_of(binding_id, dropped), &beyond)
+            vec![Piece::Notice(notice, beyond)]
         }
         BindingEvent::Fault {
             call,
@@ -2909,12 +2925,19 @@ mod tests {
         };
         let dropped = || BindingEvent::PresentationDropped {
             documents: 3,
+            gaps: 2,
+            events: 7,
+            bytes: 900,
             first: Some(placed("se-2", 2)),
             last: Some(placed("se-9", 9)),
         };
-        for (writer_open, expected) in [
-            (true, (Some(placed("se-2", 2)), Some(placed("se-9", 9)))),
-            (false, (None, None)),
+        for (writer_open, expected, told) in [
+            (
+                true,
+                (Some(placed("se-2", 2)), Some(placed("se-9", 9))),
+                (7, 900, 1),
+            ),
+            (false, (None, None), (0, 0, 3)),
         ] {
             let shape = Shape {
                 dialect: Dialect::Four,
@@ -2929,12 +2952,13 @@ mod tests {
                 matches!(
                     notice,
                     Notice::Gap {
-                        events: 0,
-                        documents: 3,
+                        events,
+                        bytes,
+                        documents,
                         ..
-                    }
+                    } if (events, bytes, documents) == told
                 ),
-                "{notice:?}"
+                "open: {writer_open}: {notice:?}"
             );
             assert_eq!((beyond.first, beyond.last), expected, "open: {writer_open}");
         }
