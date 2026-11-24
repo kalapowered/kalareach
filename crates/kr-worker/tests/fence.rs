@@ -10752,6 +10752,8 @@ fn releasing(
                     session_id,
                     attachment_id,
                     epoch,
+                    after_input: None,
+                    fenced_report: false,
                 },
             )
             .await

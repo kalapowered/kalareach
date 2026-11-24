@@ -253,6 +253,10 @@ impl ControlTransport for Scripted {
 
     fn revoke_streams(&self) {}
 
+    fn host_states_placement_reading(&self) -> bool {
+        false
+    }
+
     fn close(&self) {
         if !self.closed.swap(true, Ordering::AcqRel) {
             self.log.lock().expect("log").push("closed");

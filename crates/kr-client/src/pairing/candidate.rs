@@ -3168,6 +3168,10 @@ mod tests {
                 *self.closed.lock().expect("the count") += 1;
             }
         }
+
+        fn is_closed(&self) -> bool {
+            self.sender.lock().expect("the sender").is_none()
+        }
     }
 
     /// A fresh connection a scripted network lets open: from `from` on, a dial reaches the host at

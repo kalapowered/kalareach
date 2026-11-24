@@ -2245,6 +2245,10 @@ pub mod tests {
         fn close(&self) {
             self.closed.store(true, Ordering::SeqCst);
         }
+
+        fn is_closed(&self) -> bool {
+            self.closed.load(Ordering::SeqCst)
+        }
     }
 
     /// A connection of its own, and the flag that says its transport was closed.

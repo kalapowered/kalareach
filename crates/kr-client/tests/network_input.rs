@@ -548,6 +548,9 @@ impl ControlTransport for Floored {
     fn revoke_streams(&self) {
         self.inner.revoke_streams();
     }
+    fn host_states_placement_reading(&self) -> bool {
+        self.inner.host_states_placement_reading()
+    }
     fn close(&self) {
         self.inner.close();
     }
@@ -3283,6 +3286,9 @@ mod local {
             })
         }
         fn revoke_streams(&self) {}
+        fn host_states_placement_reading(&self) -> bool {
+            false
+        }
         fn close(&self) {
             self.closed.store(true, Ordering::Release);
         }

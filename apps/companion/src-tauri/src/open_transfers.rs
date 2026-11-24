@@ -3801,6 +3801,10 @@ mod tests {
             fn revoke_streams(&self) {}
 
             fn close(&self) {}
+
+            fn is_closed(&self) -> bool {
+                false
+            }
         }
 
         Arc::new(

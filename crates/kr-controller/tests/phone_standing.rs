@@ -753,6 +753,7 @@ async fn press(
                 ),
                 expected_prompt_generation: PromptGeneration::new(numbers.prompt_generation),
                 expected_buffer_revision: EditorBufferRevision::new(numbers.buffer_revision),
+                after_input: None,
             },
         )
         .await
