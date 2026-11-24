@@ -109,19 +109,23 @@ fn a_group_ends_a_launch_when_it_is_dropped() {
     });
 }
 
-/// Whether the process is the `ping` the harness's command starts.
+/// Whether one of `members` is the `ping` the harness's command starts, by the image name the
+/// system's own process list gives: the identity module reads no image name on Windows.
 #[cfg(windows)]
-fn is_ping(pid: u32) -> bool {
-    use kr_ipc::identity::{ProcessReading, read_process};
-
-    process_start_identity(pid)
-        .ok()
-        .is_some_and(|identity| match read_process(&identity) {
-            ProcessReading::Running(facts) => facts
-                .name
-                .is_some_and(|name| name.eq_ignore_ascii_case("ping.exe")),
-            _ => false,
-        })
+fn ping_among(members: &[u32]) -> bool {
+    let tasklist = Path::new(&std::env::var_os("SystemRoot").expect("a system directory"))
+        .join("System32")
+        .join("tasklist.exe");
+    let listed = Command::new(tasklist)
+        .args(["/FO", "CSV", "/NH"])
+        .output()
+        .expect("the system lists its processes");
+    String::from_utf8_lossy(&listed.stdout).lines().any(|line| {
+        let mut fields = line.trim_start_matches('"').split("\",\"");
+        let name = fields.next().unwrap_or_default();
+        let number = fields.next().and_then(|number| number.parse::<u32>().ok());
+        name.eq_ignore_ascii_case("ping.exe") && number.is_some_and(|pid| members.contains(&pid))
+    })
 }
 
 /// The job a launch runs in holds what the launch started, wherever it is below it, and ends
@@ -144,7 +148,7 @@ fn a_groups_job_holds_what_a_launch_started_and_ends_it() {
         "the job holds the `ping` that the command started below the launch",
         || {
             members = group.members();
-            members.iter().any(|pid| is_ping(*pid))
+            ping_among(&members)
         },
     );
     let identities: Vec<_> = members
