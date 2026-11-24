@@ -14,7 +14,7 @@
 //! server refuses the connection.
 
 use std::ffi::OsStr;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Duration;
 
 use kr_protocol::desktop::{DesktopContext, DisplayServer};
@@ -22,9 +22,7 @@ use kr_protocol::hostinfo::export::Sentence;
 
 use super::capability::installed_in;
 use super::payload::{self, Fault};
-use super::probe::{
-    Check, Deadline, Exit, Outcome, Plan, Ran, Setting, bounded_with, failed, on_a_thread,
-};
+use super::probe::{Check, Deadline, Exit, Outcome, Plan, Ran, Setting, bounded_with, failed};
 use super::routes::{Asking, Operation, Program, Route, Variables};
 
 /// The programs a screen image is taken with on X11, in the order they are looked for.
@@ -37,9 +35,8 @@ pub(super) const PROGRAMS: &[&str] = &PROGRAM_NAMES;
 /// The folder the X server's own sockets are in.
 const SOCKETS: &str = "/tmp/.X11-unix";
 
-/// How long the worker waits for a display's socket to accept a connection: it is a local socket,
-/// so a second is far more than an answer takes.
-const CONNECT_BOUND: Duration = Duration::from_secs(1);
+/// How long the worker waits before it tries again a socket whose queue of connections is full.
+const TRY_AGAIN: Duration = Duration::from_millis(10);
 
 /// What a tool writes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -417,51 +414,113 @@ fn outcome_of(told: Told, said: &str) -> Outcome {
 
 /// Whether this worker can connect to the display's socket, as `number` names it.
 ///
-/// `None` is the deadline having no time left to try in, which says nothing about the display.
+/// `None` is the deadline having no time left to try in, which says nothing about the display. Each
+/// connection is made without waiting, so no thread is left behind by one that would not return:
+/// a socket whose queue of connections is full is tried again until the deadline, and a deadline
+/// that ends first is a time-out and not a display that is silent. Nothing is tried after it.
 fn reach(number: u32, sockets: &Path, deadline: &Deadline) -> Option<Reach> {
-    if deadline.expired() {
-        return None;
+    let path = sockets.join(format!("X{number}"));
+    for abstract_name in NAMES {
+        loop {
+            if deadline.expired() {
+                return None;
+            }
+            match attempt(&path, abstract_name) {
+                Attempt::Connected => return Some(Reach::Connects),
+                Attempt::Refused => break,
+                Attempt::Busy => std::thread::sleep(TRY_AGAIN),
+            }
+        }
     }
-    Some(if connects(&sockets.join(format!("X{number}")), deadline) {
-        Reach::Connects
-    } else {
-        Reach::Silent
-    })
+    Some(Reach::Silent)
 }
 
-/// Whether a connection to the socket is accepted: the file system name first, then the abstract
-/// name an X server on Linux listens on as well.
-fn connects(path: &Path, deadline: &Deadline) -> bool {
-    let bound = |deadline: &Deadline| deadline.left().min(CONNECT_BOUND);
-    on_a_thread(path, bound(deadline), connect_to_file).is_some_and(|result| result.is_ok())
-        || on_a_thread(path, bound(deadline), connect_to_abstract)
-            .is_some_and(|result| result.is_ok())
+/// The names a display's socket has, as whether each is the abstract one: the file system name
+/// first, then the abstract name an X server on Linux listens on as well.
+#[cfg(target_os = "linux")]
+const NAMES: [bool; 2] = [false, true];
+
+#[cfg(not(target_os = "linux"))]
+const NAMES: [bool; 1] = [false];
+
+/// How one connection to a socket ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Attempt {
+    /// The socket accepted the connection.
+    Connected,
+    /// There is no socket by that name, or it refused.
+    Refused,
+    /// The socket's queue of connections is full, so the connection did not complete.
+    Busy,
 }
 
+/// Connects to the socket at `path`, or to the abstract socket of that name, without waiting.
 #[cfg(unix)]
-fn connect_to_file(path: PathBuf) -> std::io::Result<()> {
-    std::os::unix::net::UnixStream::connect(path).map(drop)
+fn attempt(path: &Path, abstract_name: bool) -> Attempt {
+    use rustix::io::Errno;
+    use rustix::net::{AddressFamily, SocketAddrUnix, SocketType};
+
+    let address = if abstract_name {
+        abstract_address(path)
+    } else {
+        SocketAddrUnix::new(path)
+    };
+    let Ok(address) = address else {
+        return Attempt::Refused;
+    };
+    let Ok(socket) = nonblocking_socket(AddressFamily::UNIX, SocketType::STREAM) else {
+        return Attempt::Refused;
+    };
+    match rustix::net::connect(&socket, &address) {
+        Ok(()) => Attempt::Connected,
+        Err(Errno::AGAIN) => Attempt::Busy,
+        Err(_) => Attempt::Refused,
+    }
 }
 
 #[cfg(not(unix))]
-fn connect_to_file(_path: PathBuf) -> std::io::Result<()> {
-    Err(std::io::ErrorKind::Unsupported.into())
+fn attempt(_path: &Path, _abstract_name: bool) -> Attempt {
+    Attempt::Refused
+}
+
+/// A socket that does not wait: not for a connection, and not for anything else.
+#[cfg(all(unix, not(target_vendor = "apple")))]
+fn nonblocking_socket(
+    family: rustix::net::AddressFamily,
+    kind: rustix::net::SocketType,
+) -> rustix::io::Result<rustix::fd::OwnedFd> {
+    use rustix::net::SocketFlags;
+
+    rustix::net::socket_with(
+        family,
+        kind,
+        SocketFlags::NONBLOCK | SocketFlags::CLOEXEC,
+        None,
+    )
+}
+
+#[cfg(target_vendor = "apple")]
+fn nonblocking_socket(
+    family: rustix::net::AddressFamily,
+    kind: rustix::net::SocketType,
+) -> rustix::io::Result<rustix::fd::OwnedFd> {
+    let socket = rustix::net::socket(family, kind, None)?;
+    rustix::fs::fcntl_setfl(&socket, rustix::fs::OFlags::NONBLOCK)?;
+    rustix::io::fcntl_setfd(&socket, rustix::io::FdFlags::CLOEXEC)?;
+    Ok(socket)
 }
 
 /// The abstract name is the file system name with no file behind it.
 #[cfg(target_os = "linux")]
-fn connect_to_abstract(path: PathBuf) -> std::io::Result<()> {
-    use std::os::linux::net::SocketAddrExt as _;
+fn abstract_address(path: &Path) -> rustix::io::Result<rustix::net::SocketAddrUnix> {
     use std::os::unix::ffi::OsStrExt as _;
-    use std::os::unix::net::{SocketAddr, UnixStream};
 
-    let address = SocketAddr::from_abstract_name(path.as_os_str().as_bytes())?;
-    UnixStream::connect_addr(&address).map(drop)
+    rustix::net::SocketAddrUnix::new_abstract_name(path.as_os_str().as_bytes())
 }
 
-#[cfg(not(target_os = "linux"))]
-fn connect_to_abstract(_path: PathBuf) -> std::io::Result<()> {
-    Err(std::io::ErrorKind::Unsupported.into())
+#[cfg(all(unix, not(target_os = "linux")))]
+fn abstract_address(_path: &Path) -> rustix::io::Result<rustix::net::SocketAddrUnix> {
+    Err(rustix::io::Errno::AFNOSUPPORT)
 }
 
 /// Whether the bytes are a whole image of the format.
@@ -533,6 +592,7 @@ fn xwd(bytes: &[u8]) -> Result<(), Fault> {
 mod tests {
     use std::io::Write as _;
     use std::os::unix::fs::PermissionsExt as _;
+    use std::path::PathBuf;
 
     use kr_protocol::desktop::{
         CapabilityEvidenceSource, CapabilityState, ContainerEnvironment, DesktopAvailability,
@@ -1490,6 +1550,44 @@ mod tests {
         }
     }
 
+    /// KR-REQ-03.29, LX-16: the worker's connection to a display's socket does not wait. A socket
+    /// whose queue of connections is full is tried again until the deadline and then is a time-out,
+    /// not a display that is silent, and it returns with the deadline and no thread behind it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn kr_req_03_29_a_display_socket_with_a_full_queue_is_a_time_out_and_not_silence() {
+        use rustix::net::{AddressFamily, SocketAddrUnix, SocketType};
+
+        let sockets = folder();
+        let path = sockets.path().join("X5");
+        let _listening = std::os::unix::net::UnixListener::bind(&path).expect("a socket");
+        // Connections that nobody accepts, until the socket's queue holds no more.
+        let address = SocketAddrUnix::new(&path).expect("an address");
+        let mut waiting = Vec::new();
+        loop {
+            let socket =
+                nonblocking_socket(AddressFamily::UNIX, SocketType::STREAM).expect("a socket");
+            match rustix::net::connect(&socket, &address) {
+                Ok(()) => waiting.push(socket),
+                Err(rustix::io::Errno::AGAIN) => break,
+                Err(error) => panic!("the queue was never full: {error}"),
+            }
+            assert!(waiting.len() < 100_000, "the queue was never full");
+        }
+        let started = std::time::Instant::now();
+        let reached = reach(
+            5,
+            sockets.path(),
+            &Deadline::after(Duration::from_millis(300)),
+        );
+        assert_eq!(reached, None, "a full queue is a time-out");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the connection waited {:?}",
+            started.elapsed()
+        );
+    }
+
     /// KR-REQ-03.29, LX-6: the rows are chosen by the display server of the context. A Wayland
     /// session resolves no X11 row, however many tools are installed, and an X11 session whose
     /// tool is not installed resolves the route that names none.
@@ -1733,10 +1831,11 @@ mod tests {
             let started = std::time::Instant::now();
             while started.elapsed() < Duration::from_secs(10) {
                 if Path::new(&format!("/tmp/.X11-unix/X{number}")).exists()
-                    && connects(
-                        &Path::new("/tmp/.X11-unix").join(format!("X{number}")),
+                    && reach(
+                        number,
+                        Path::new("/tmp/.X11-unix"),
                         &Deadline::after(Duration::from_secs(2)),
-                    )
+                    ) == Some(Reach::Connects)
                 {
                     return server;
                 }
