@@ -1043,6 +1043,10 @@ impl kr_client::transport::ControlTransport for HeldReader {
         self.inner.revoke_streams();
     }
 
+    fn host_states_placement_reading(&self) -> bool {
+        self.inner.host_states_placement_reading()
+    }
+
     fn close(&self) {
         self.inner.close();
     }
