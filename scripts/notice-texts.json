@@ -1,6 +1,13 @@
 {
   "texts": [
     {
+      "id": "Apache-2.0-spdx-3.29.0",
+      "licence": "Apache-2.0",
+      "source": "https://raw.githubusercontent.com/spdx/license-list-data/31ba1a50e5397e00a304dbadc76531740e89ee48/text/Apache-2.0.txt",
+      "sha256": "074e6e32c86a4c0ef8b3ed25b721ca23aca83df277cd88106ef7177c354615ff",
+      "name": "the standard Apache-2.0 text, for a package whose repository holds only the header of the licence"
+    },
+    {
       "id": "MIT-spdx-3.29.0-without-copyright-line",
       "licence": "MIT",
       "source": "https://raw.githubusercontent.com/spdx/license-list-data/31ba1a50e5397e00a304dbadc76531740e89ee48/text/MIT.txt",
@@ -133,6 +140,12 @@
       "name": "the PCRE2 licence, BSD-3-Clause with its exemption for binary library-like packages"
     },
     {
+      "id": "plugins-workspace-6aa2854f3144-LICENSE_MIT",
+      "licence": "MIT",
+      "source": "https://raw.githubusercontent.com/tauri-apps/plugins-workspace/6aa2854f314481a459be1189b02c65a2450789ab/LICENSE_MIT",
+      "sha256": "89ff9689dcf9dd53968785d05a26f7898bb169dbfcada8d032b3e68cf0d55607"
+    },
+    {
       "id": "pluralrules-d0715d5b7cca-LICENSE-MIT",
       "licence": "MIT",
       "source": "https://raw.githubusercontent.com/zbraniecki/pluralrules/d0715d5b7cca72e228d6e6c4de154bd30dfdd06a/intl_pluralrules/LICENSE-MIT",
@@ -145,16 +158,10 @@
       "sha256": "c8167fdeeed46d3f244d3f85c5bf998ce889343691c32be2c61a8bc4b5c08333"
     },
     {
-      "id": "webview2-rs-edc2caf88617-LICENSE",
+      "id": "pulp-5eb07fd7b68e-LICENSE",
       "licence": "MIT",
-      "source": "https://raw.githubusercontent.com/wravery/webview2-rs/edc2caf886175ccaebe86078c9cfe1ae2a187328/LICENSE",
-      "sha256": "0dcf41516e608bbcb6cdc5229feb7b86fe4a643b85e7df251133c93408fdac73"
-    },
-    {
-      "id": "tauri-6f6ab1207bb3-LICENSE_MIT",
-      "licence": "MIT",
-      "source": "https://raw.githubusercontent.com/tauri-apps/tauri/6f6ab1207bb3923c2721fbc67d2fdb1c8deb0c7a/LICENSE_MIT",
-      "sha256": "9dd42ea92cff2ede5cd477cbfcce051b2d0115c0ac7f368ee88cb545055dff1d"
+      "source": "https://raw.githubusercontent.com/sarah-quinones/pulp/5eb07fd7b68edf0a5e19f71737d315f72a510295/LICENSE",
+      "sha256": "d64f878c89bd5f1e5ada7e4aad57690b122727cf5229b7b87ea1980c188da1d9"
     },
     {
       "id": "rustls-platform-verifier-252e25161a91-LICENSE-MIT",
@@ -163,16 +170,16 @@
       "sha256": "1c7cf76689c837a68ed8d704994e52a0f2940c087958f860d17f3186afbdcc0c"
     },
     {
-      "id": "pulp-5eb07fd7b68e-LICENSE",
-      "licence": "MIT",
-      "source": "https://raw.githubusercontent.com/sarah-quinones/pulp/5eb07fd7b68edf0a5e19f71737d315f72a510295/LICENSE",
-      "sha256": "d64f878c89bd5f1e5ada7e4aad57690b122727cf5229b7b87ea1980c188da1d9"
-    },
-    {
       "id": "simd_helpers-82040194cd05-LICENSE",
       "licence": "MIT",
       "source": "https://raw.githubusercontent.com/lu-zero/simd_helpers/82040194cd05affb060bf94d6f19f82a771d07fb/LICENSE",
       "sha256": "d69f24ad84ec2ade64c0b68bdb31b41170e997b158370342056918329cc9af1e"
+    },
+    {
+      "id": "tauri-6f6ab1207bb3-LICENSE_MIT",
+      "licence": "MIT",
+      "source": "https://raw.githubusercontent.com/tauri-apps/tauri/6f6ab1207bb3923c2721fbc67d2fdb1c8deb0c7a/LICENSE_MIT",
+      "sha256": "9dd42ea92cff2ede5cd477cbfcce051b2d0115c0ac7f368ee88cb545055dff1d"
     },
     {
       "id": "typed-path-c0ea3281bccb-LICENSE-MIT",
@@ -185,6 +192,12 @@
       "licence": "Apache-2.0",
       "source": "https://raw.githubusercontent.com/bytecodealliance/wasmtime/6d94ceb1b955f52bafbe0892836b2a91a0bb6649/LICENSE",
       "sha256": "268872b9816f90fd8e85db5a28d33f8150ebb8dd016653fb39ef1f94f2686bc5"
+    },
+    {
+      "id": "webview2-rs-edc2caf88617-LICENSE",
+      "licence": "MIT",
+      "source": "https://raw.githubusercontent.com/wravery/webview2-rs/edc2caf886175ccaebe86078c9cfe1ae2a187328/LICENSE",
+      "sha256": "0dcf41516e608bbcb6cdc5229feb7b86fe4a643b85e7df251133c93408fdac73"
     },
     {
       "id": "wezterm-f3227b5b1678-LICENSE.md",
@@ -232,6 +245,17 @@
   ],
   "crates": [
     {
+      "name": "@tauri-apps/plugin-dialog",
+      "version": "2.7.3",
+      "package": "npm",
+      "texts": [
+        "plugins-workspace-6aa2854f3144-LICENSE_MIT"
+      ],
+      "products": [
+        "companion"
+      ]
+    },
+    {
       "name": "acto",
       "version": "0.8.2",
       "texts": [
@@ -251,6 +275,17 @@
       ],
       "products": [
         "programs",
+        "companion"
+      ]
+    },
+    {
+      "name": "cborg",
+      "version": "6.1.2",
+      "package": "npm",
+      "texts": [
+        "Apache-2.0-spdx-3.29.0"
+      ],
+      "products": [
         "companion"
       ]
     },
@@ -843,6 +878,10 @@
       "version": "1.0.3",
       "texts": [
         "MIT-spdx-3.29.0-without-copyright-line"
+      ],
+      "products": [
+        "programs",
+        "companion"
       ]
     },
     {

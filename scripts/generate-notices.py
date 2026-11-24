@@ -29,7 +29,8 @@ holds none of its text. A crate under several licences that all apply has the te
 package holds no text of a licence it is recorded under (a file that only names the licence is not a
 text of it), or a file holds a template's placeholder, the upstream text that `scripts/notice-texts.json`
 keeps in `docs/releases/notice-texts/`, with its source and digest, is carried beside the package's own
-files. A kept text for a crate from Git names the package's source and revision. A kept text for a crate
+files. A kept text for a crate from Git names the package's source and revision, and one for a
+JavaScript package names `npm`. A kept text for a crate
 that ships its own, or for a crate no release build compiles, stops the run, and so does a kept text that
 is not the licence the listing says it is. The same file names the licences of the works that a crate
 bundles and builds in (libsodium, llama.cpp and ggml, PCRE2). An excerpt of a source file names `file`,
@@ -776,7 +777,8 @@ def in_scope(item, product):
 
 def pinned_for(kept, name, version, where, product):
     """The kept entry for a crate, or None. An entry for a crate taken from Git names the package's
-    source as cargo tree gives it, the repository and the first eight letters of its revision."""
+    source as cargo tree gives it, the repository and the first eight letters of its revision. An
+    entry for a JavaScript package names `npm`."""
     for item in kept["crates"]:
         if in_scope(item, product) and item["name"] == name and item["version"] == version and item.get("package") == where:
             return item
@@ -870,7 +872,7 @@ def gather(records, kept, files, reader, product="programs"):
             if item is not None and not missing:
                 fail(f"scripts/notice-texts.json keeps a text for {name} {version}, whose package ships the licence text itself")
             if missing and item is None:
-                elsewhere = sorted(c.get("package") or "crates.io" for c in kept["crates"] if (c["name"], c["version"]) == (name, version))
+                elsewhere = sorted(c.get("package") or "crates.io" for c in kept["crates"] if in_scope(c, product) and (c["name"], c["version"]) == (name, version))
                 note = f" (it keeps a text for this crate from {', '.join(elsewhere)}, not from {where or 'crates.io'})" if elsewhere else ""
                 if carried:
                     held = ", ".join(f"{f or 'a file cargo-about took'} ({' and '.join(sorted(reader.of(t))) or 'no licence text'})" for f, t in carried)
