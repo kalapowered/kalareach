@@ -9,11 +9,12 @@
 //! 3. Bind the owner-only endpoint workers will use, and hold it. Binding it before reporting in
 //!    means a worker acting on the descriptor the daemon publishes always finds a listener; holding
 //!    it through the report means there is no moment between claiming the endpoint and answering on
-//!    it during which another process could take it.
+//!    it during which another process could take it. The endpoint of the fourth protocol is bound
+//!    beside it, and a host that cannot bind that one serves the third protocol only.
 //! 4. Present the startup claim on the connection of step 1, signed with that key, and wait for the
 //!    daemon to say it accepted the claim. A host that started serving before that would be
 //!    answering workers as a process the daemon might still refuse.
-//! 5. Serve workers on the listener from step 3 until a termination signal arrives.
+//! 5. Serve workers on the listeners from step 3 until a termination signal arrives.
 //!
 //! A host that cannot do step 2 or 3 says why on the connection of step 1, waits for the launcher
 //! to take it and close, and exits without serving; one that cannot do step 1 or 4 exits without
@@ -60,16 +61,42 @@ pub async fn run(options: Options) -> LaunchResult<()> {
         &prepared.endpoint,
     )
     .await?;
-    prepared
-        .host
-        .serve_on(prepared.listener, HostProtocol::V3, termination())
-        .await
+    // One signal stops both endpoints.
+    let (stop, stopped) = tokio::sync::watch::channel(false);
+    tokio::spawn(async move {
+        termination().await;
+        let _ = stop.send(true);
+    });
+    let third = Arc::clone(&prepared.host).serve_on(
+        prepared.listener,
+        HostProtocol::V3,
+        stopped_by(stopped.clone()),
+    );
+    let fourth = async {
+        match prepared.listener4 {
+            Some(listener) => {
+                prepared
+                    .host
+                    .serve_on(listener, HostProtocol::V4, stopped_by(stopped))
+                    .await
+            }
+            None => Ok(()),
+        }
+    };
+    tokio::try_join!(third, fourth).map(|((), ())| ())
+}
+
+/// Resolves when the signal that stops the host has arrived.
+async fn stopped_by(mut stopped: tokio::sync::watch::Receiver<bool>) {
+    let _ = stopped.wait_for(|stop| *stop).await;
 }
 
 /// What a start has made when it is ready to report in.
 struct Prepared {
     /// The endpoint workers use, held from the bind until the host serves on it.
     listener: Listener,
+    /// The endpoint of the fourth protocol, where it could be bound.
+    listener4: Option<Listener>,
     host: Arc<PluginHost>,
     /// The endpoint's text, as the claim names it.
     endpoint: String,
@@ -157,6 +184,17 @@ fn prepare(options: &Options) -> Result<Prepared, Box<StartFailure>> {
     // published would name the process that lost.
     let listener = Listener::bind(&endpoint)
         .map_err(|error| StartFailure::bind(&endpoint.as_text(), error))?;
+    // A host that cannot bind the endpoint of the fourth protocol still serves the third: the
+    // daemon publishes a descriptor of the fourth only for a host that answers there.
+    let listener4 = host_endpoint(&environment, &HostProtocol::V4)
+        .map_err(|error| error.to_string())
+        .and_then(|endpoint4| Listener::bind(&endpoint4).map_err(|error| error.to_string()))
+        .map_err(|reason| {
+            eprintln!(
+                "kr-plugin-host: serving protocol 3 only, because the endpoint of protocol 4 could not be bound: {reason}"
+            );
+        })
+        .ok();
 
     let config = HostConfig {
         endpoint: endpoint.clone(),
@@ -174,6 +212,7 @@ fn prepare(options: &Options) -> Result<Prepared, Box<StartFailure>> {
     let host = Arc::new(host.map_err(|error| StartFailure::at(Step::Host, error))?);
     Ok(Prepared {
         listener,
+        listener4,
         host,
         endpoint: endpoint.as_text(),
     })

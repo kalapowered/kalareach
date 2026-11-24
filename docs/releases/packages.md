@@ -322,7 +322,7 @@ because a release tags a commit after it lands. Fetch the tags first with the co
 procedure above, which also removes a tag that origin no longer has; delete a tag that only this
 checkout has with `git tag -d`.
 
-The check does not see the frames of `kr-plugin-host/3`, which have no schema, the types a
+The check does not see the frames of `kr-plugin-host/3` and `kr-plugin-host/4`, which have no schema, the types a
 daemon-served method names only in its description, rules that live in code, the hand-written
 TypeScript exports, the rest of `package-contract.json` (it reads the SDK version and the table of
 arrivals) and the component interface. A difference it fails on

@@ -359,9 +359,11 @@ impl PluginRuntime {
                     if !ended {
                         return PluginRuntimeState::Running;
                     }
-                    // Its job goes with it the next time a runtime is started; the descriptor
-                    // goes now, so no worker connects to the address of a process that is gone.
-                    let _ = launcher::retire_descriptor(&self.paths, &HostProtocol::V3);
+                    // Its job goes with it the next time a runtime is started; the descriptors
+                    // go now, so no worker connects to the address of a process that is gone. The
+                    // fourth protocol's goes first: a reader that finds it after the third's is
+                    // gone has found the descriptor of a host that is not there.
+                    self.retire_descriptors();
                     *state = State::Idle;
                 }
                 State::Starting(attempt) => {
@@ -499,32 +501,69 @@ impl PluginRuntime {
         let _ = finished.send(Some(answer));
     }
 
+    /// Takes away the descriptors of a host that is gone, the fourth protocol's first.
+    fn retire_descriptors(&self) {
+        let _ = launcher::retire_descriptor(&self.paths, &HostProtocol::V4);
+        let _ = launcher::retire_descriptor(&self.paths, &HostProtocol::V3);
+    }
+
     /// Looks for a runtime a previous daemon started.
+    ///
+    /// The descriptor of the fourth protocol is read first and the third's second: a host of this
+    /// release publishes both, and one a daemon of the release before started publishes the
+    /// third's alone. Either one adopts the host, which a worker then reaches over the newest
+    /// protocol its descriptor lets it verify.
     async fn look(&self) -> Found {
-        let descriptor = match launcher::read_descriptor(&self.paths, &HostProtocol::V3) {
-            Ok(Some(descriptor)) => descriptor,
-            Ok(None) => return Found::Nothing,
-            // A descriptor whose content this build refuses (another protocol, another
-            // environment, not a descriptor) is not one a worker could use either. Taking it away
-            // is what lets a runtime be started; if one is in fact running behind it, it holds its
-            // endpoint and the new one fails to report itself.
-            Err(LaunchError::Refused { .. }) => {
-                let _ = launcher::retire_descriptor(&self.paths, &HostProtocol::V3);
-                return Found::Nothing;
+        let descriptor = match launcher::read_descriptor4(&self.paths) {
+            Ok(Some(descriptor))
+                if !matches!(
+                    kr_ipc::identity::process_state(&descriptor.process_start_identity),
+                    kr_ipc::identity::ProcessState::Ended
+                ) =>
+            {
+                Some(descriptor.proven_members())
             }
-            // A descriptor that could not be read at all may be a runtime's, and taking it away
-            // would lose it for as long as that runtime lives.
+            // The host of this descriptor has ended: another release's later host may have left
+            // the third's descriptor, which is read next, and a descriptor the fourth protocol's
+            // reader refuses is not one a worker could use either.
+            Ok(Some(_)) | Err(LaunchError::Refused { .. }) => {
+                let _ = launcher::retire_descriptor(&self.paths, &HostProtocol::V4);
+                None
+            }
+            Ok(None) => None,
             Err(error) => {
                 return Found::Silent(cut(&format!(
                     "the published plugin runtime could not be looked at: {error}"
                 )));
             }
         };
+        let descriptor = match descriptor {
+            Some(descriptor) => descriptor,
+            None => match launcher::read_descriptor(&self.paths, &HostProtocol::V3) {
+                Ok(Some(descriptor)) => descriptor,
+                Ok(None) => return Found::Nothing,
+                // A descriptor whose content this build refuses (another protocol, another
+                // environment, not a descriptor) is not one a worker could use either. Taking it
+                // away is what lets a runtime be started; if one is in fact running behind it, it
+                // holds its endpoint and the new one fails to report itself.
+                Err(LaunchError::Refused { .. }) => {
+                    self.retire_descriptors();
+                    return Found::Nothing;
+                }
+                // A descriptor that could not be read at all may be a runtime's, and taking it
+                // away would lose it for as long as that runtime lives.
+                Err(error) => {
+                    return Found::Silent(cut(&format!(
+                        "the published plugin runtime could not be looked at: {error}"
+                    )));
+                }
+            },
+        };
         if matches!(
             kr_ipc::identity::process_state(&descriptor.process_start_identity),
             kr_ipc::identity::ProcessState::Ended
         ) {
-            let _ = launcher::retire_descriptor(&self.paths, &HostProtocol::V3);
+            self.retire_descriptors();
             return Found::Nothing;
         }
         // The runtime is looked at the way a worker connects to it.

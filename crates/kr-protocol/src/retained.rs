@@ -162,7 +162,7 @@ pub const FROZEN_VARIANTS: &[&str] = &[
 ///
 /// Every entry is a string literal, because the generator reads the list from the source of each
 /// release (`kr-protocol-gen`).
-pub const PLUGIN_HOST_PROTOCOLS: &[&str] = &["kr-plugin-host/3"];
+pub const PLUGIN_HOST_PROTOCOLS: &[&str] = &["kr-plugin-host/3", "kr-plugin-host/4"];
 
 /// The first level whose builds speak the fourth plugin host protocol, `kr-plugin-host/4`.
 pub const FIRST_HOST_4_LEVEL: CompatibilityLevel =

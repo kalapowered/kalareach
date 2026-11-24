@@ -155,6 +155,101 @@ async fn the_plugin_host_is_started_by_the_platform_when_the_worker_asks_and_rep
     assert_eq!(hosted.published(), Some(replacement));
 }
 
+/// KR-REQ-05.06: the host a daemon starts serves the third protocol and the fourth and is published
+/// for both; a worker of this release reaches it over the fourth; a daemon that starts again adopts
+/// the same host through the fourth's descriptor, through the third's alone and through the
+/// fourth's alone, and starts none; and a host that ends is replaced by one published for both.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn the_daemon_adopts_a_host_of_both_protocols_through_either_descriptor() {
+    let Some(wasm) = well_behaved() else {
+        return;
+    };
+    let mut hosted = hosted().await;
+    let component = install(&hosted.environment(), &wasm);
+    let environment = hosted.environment();
+
+    let runtime = hosted.runtime().await;
+    assert_eq!(hosted.started(), 1);
+    assert_eq!(
+        runtime.protocol(),
+        HostProtocol::V4,
+        "a worker of this release speaks the fourth protocol to the host the daemon started"
+    );
+    register_and_snapshot(&runtime, &component).await;
+    let host = hosted.published().expect("the host is published");
+    let third = launcher::read_descriptor(&environment, &HostProtocol::V3)
+        .expect("the descriptor reads")
+        .expect("the third protocol's descriptor is published");
+    let fourth = launcher::read_descriptor4(&environment)
+        .expect("the descriptor reads")
+        .expect("the fourth protocol's descriptor is published beside the third's");
+    assert_eq!(fourth.process_start_identity, host);
+    assert_eq!(
+        fourth.endpoint,
+        launcher::host_endpoint(&environment, &HostProtocol::V4)
+            .expect("an endpoint")
+            .as_text(),
+        "the host publishes the endpoint the fourth protocol names"
+    );
+
+    // Adopted through the fourth's descriptor, with both published.
+    drop(runtime);
+    hosted.restart().await;
+    let runtime = hosted.runtime().await;
+    assert_eq!(hosted.started(), 0, "the restarted daemon started a host");
+    assert_eq!(hosted.published(), Some(host.clone()));
+    assert_eq!(runtime.protocol(), HostProtocol::V4);
+
+    // Adopted through the fourth's descriptor alone.
+    drop(runtime);
+    launcher::retire_descriptor(&environment, &HostProtocol::V3).expect("the third's is removed");
+    hosted.restart().await;
+    let runtime = hosted.runtime().await;
+    assert_eq!(
+        hosted.started(),
+        0,
+        "a daemon that finds the fourth protocol's descriptor alone started a host"
+    );
+    assert_eq!(runtime.protocol(), HostProtocol::V4);
+    register_and_snapshot(&runtime, &component).await;
+
+    // Adopted through the third's descriptor alone, as a host a daemon of the release before left.
+    drop(runtime);
+    launcher::publish_descriptor(&environment, &HostProtocol::V3, &third)
+        .expect("the third's descriptor is published again");
+    launcher::retire_descriptor(&environment, &HostProtocol::V4).expect("the fourth's is removed");
+    hosted.restart().await;
+    let runtime = hosted.runtime().await;
+    assert_eq!(
+        hosted.started(),
+        0,
+        "a daemon that finds the third protocol's descriptor alone started a host"
+    );
+    assert_eq!(
+        runtime.protocol(),
+        HostProtocol::V3,
+        "a worker that finds no descriptor of the fourth protocol speaks the third"
+    );
+    register_and_snapshot(&runtime, &component).await;
+
+    // The host ends. The next request starts a host that is published for both.
+    kill(&host);
+    until("the host to end", || async {
+        (kr_ipc::identity::process_state(&host) == ProcessState::Ended).then_some(())
+    })
+    .await;
+    drop(runtime);
+    let runtime = hosted.runtime().await;
+    assert_eq!(hosted.started(), 1);
+    let replacement = hosted.published().expect("the replacement is published");
+    assert_ne!(replacement, host);
+    assert_eq!(runtime.protocol(), HostProtocol::V4);
+    let fourth = launcher::read_descriptor4(&environment)
+        .expect("the descriptor reads")
+        .expect("the replacement is published for the fourth protocol too");
+    assert_eq!(fourth.process_start_identity, replacement);
+}
+
 /// The process group a process is in, as the operating system reports it.
 #[cfg(unix)]
 fn group_of(pid: u64) -> u32 {

@@ -1210,7 +1210,7 @@ mod tests {
         assert_eq!(HostProtocol::V3.name, "kr-plugin-host/3");
         assert_eq!(
             kr_protocol::retained::PLUGIN_HOST_PROTOCOLS,
-            &[HostProtocol::V3.name],
+            &[HostProtocol::V3.name, HostProtocol::V4.name],
             "the list the levels are held to names the protocols this build serves"
         );
         assert_eq!(HostProtocol::V3.endpoint, "p3.sock");

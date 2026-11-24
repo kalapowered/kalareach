@@ -455,6 +455,8 @@ in `plugin-host-3.json`, the file `kr-plugin-host/3` names. A worker reads the d
 challenges the process behind the endpoint, and talks to that process directly. Nothing in the
 descriptor is acted on before the challenge: a filename and a process identifier are hints.
 
+A host also serves `kr-plugin-host/4` on a second endpoint, `p4.sock`, bound beside the first. Once the host serves, the launcher asks it on that endpoint for a `hello` and a challenge. It publishes `plugin-host-4.json` after the first descriptor, and only when the hello names `kr-plugin-host/4`, describes the process that made the claim and states the build of a plugin host, and the answer to the challenge verifies with the key of the claim for that endpoint. The file records the build as well. A host that cannot bind the second endpoint, or does not answer on it in that way, serves `kr-plugin-host/3` only, and the start succeeds without the file. A worker that finds no descriptor of the fourth protocol, or one it cannot verify, speaks the third.
+
 ### What a worker sends
 
 The wire carries KR-CBOR-1 objects in the host's own length-delimited frames, one closed union in
@@ -541,7 +543,8 @@ descriptor (`kr-plugin-host/3`; the request that prepares an action came with th
 and the third has the requests the second has and the five that decode, encode, revise a binding's
 facts and attachments and tell the host about privacy mode). A host of another protocol is refused at
 the handshake, by name, because a host ends the connection, and every binding on it, over a request
-it does not know.
+it does not know. A host serves each of its protocols on an endpoint of its own, and every connection
+on an endpoint speaks that endpoint's protocol.
 
 ### What is fixed with a protocol
 
@@ -582,12 +585,15 @@ own deadline. The rules are these.
 
 ### One host for every level
 
-A host process speaks one protocol, fixed by the program that runs, and publishes under the names
-the protocol has: `kr-plugin-host/3` uses `p3.sock` and `plugin-host-3.json`. This release and the
-release before speak it, so both find a host under the same names, and the control daemon holds one
-plugin runtime for the workers of every level it speaks to. A worker asks the daemon for the
+A host process serves the protocols of the program that runs, and publishes under the names each
+protocol has: `kr-plugin-host/3` uses `p3.sock` and `plugin-host-3.json`, and `kr-plugin-host/4` uses
+`p4.sock` and `plugin-host-4.json`. This release and the release before both speak
+`kr-plugin-host/3`, so both find a host under its names, and the control daemon holds one plugin
+runtime for the workers of every level it speaks to. A worker asks the daemon for the
 runtime, and the daemon answers the same way for a worker of either release.
 
+- The daemon looks for `plugin-host-4.json` first and `plugin-host-3.json` second, adopts the same
+  host through either, and removes the descriptor of the fourth protocol before the third's.
 - When a host runs, the daemon adopts it. A host that a daemon of the other release started
   outlives an update and a rollback, because a host ends only with the login session, a restart of
   the machine or a crash.
