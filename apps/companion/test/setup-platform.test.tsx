@@ -19,6 +19,7 @@ import type { HostPort, SetupPlatform } from '../src/host/port'
 import { disclosedChecks, routeOf } from '../src/setup/disclosure'
 import { grantWasOffered, setupLinkFor } from '../src/setup/platform'
 import setupStylesheet from '../src/setup/setup.css?raw'
+import baseStylesheet from '../src/styles/base.css?raw'
 import { stateMeaning } from '../src/setup/states'
 
 /** The page the desktop shell loads, on one desktop, with the host's identity read as given. */
@@ -47,6 +48,33 @@ async function goTo(step: string): Promise<void> {
  */
 function pageText(): string {
   return document.body.textContent
+}
+
+const STEP_IDS = ['identity', 'permissions', 'capabilities', 'host', 'ready'] as const
+
+/** Tab until the element has focus, and say whether it ever did. */
+async function reachByKeyboard(testId: string): Promise<boolean> {
+  for (let presses = 0; presses < 80; presses += 1) {
+    if (document.activeElement === screen.getByTestId(testId)) return true
+    await userEvent.tab()
+  }
+  return document.activeElement === screen.getByTestId(testId)
+}
+
+/** The rules inside the first reduced-motion media query of a stylesheet, without comments. */
+function reducedMotionRules(source: string): string {
+  const css = source.replace(/\/\*[\s\S]*?\*\//g, '')
+  const opened = css.indexOf('@media (prefers-reduced-motion: reduce)')
+  if (opened < 0) return ''
+  const from = css.indexOf('{', opened) + 1
+  let depth = 1
+  let index = from
+  while (depth > 0 && index < css.length) {
+    if (css[index] === '{') depth += 1
+    if (css[index] === '}') depth -= 1
+    index += 1
+  }
+  return css.slice(from, index - 1)
 }
 
 const OTHER_DESKTOPS: readonly FakeDesktop[] = ['x11', 'wayland', 'windows']
@@ -112,6 +140,32 @@ describe('which platform the page is shown for', () => {
     await goTo('permissions')
     expect(document.querySelector('[data-testid^="setup-permission-"]')).toBeNull()
     expect(pageText()).not.toMatch(/macOS|Mac\b|System Settings/)
+  })
+
+  it('shows nothing of any platform while the application is being read, then its own page', async () => {
+    let release: () => void = () => undefined
+    const held = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    start('macos', (port) => ({
+      ...port,
+      setupIdentity: async () => {
+        await held
+        return port.setupIdentity()
+      }
+    }))
+    expect(await screen.findByText('Reading this application…')).toBeInTheDocument()
+    expect(screen.getByRole('heading', { level: 1 }).textContent).toBe('Set up KalaReach')
+    expect(screen.queryByTestId('setup-step-permissions')).toBeNull()
+    expect(screen.queryByTestId('setup-next')).toBeNull()
+    expect(document.querySelector('[data-testid^="setup-permission-"]')).toBeNull()
+    expect(pageText()).not.toMatch(/macOS|Mac\b|System Settings/)
+    release()
+    expect(await screen.findByTestId('setup-identity')).toBeInTheDocument()
+    expect(screen.getByRole('heading', { level: 1 }).textContent).toBe(
+      'Set up KalaReach on this Mac'
+    )
+    expect(screen.getByTestId('setup-step-permissions').textContent).toMatch(/Permissions/)
   })
 
   it('names the side bar’s setup link for this Mac on macOS and plainly everywhere else', () => {
@@ -231,14 +285,57 @@ describe('what each check says it does, before it is run', () => {
     expect(controls.checkRuns).toEqual([])
   })
 
-  it('keeps the macOS lines and its note exactly as they were', async () => {
+  // The words of the macOS checks as the page said them before the lines moved into a table per
+  // platform: a person on a Mac reads exactly these, and a check added for another platform must not
+  // change one of them.
+  const MACOS_CHECKS = [
+    {
+      name: 'Read a file you authorised',
+      performs: 'Opens a file you chose and reads the first few thousand bytes of it.',
+      effect: 'Reads that file and writes nothing. With no file chosen it reads nothing and says so.'
+    },
+    {
+      name: 'Take a screen image',
+      performs: 'Takes one image of the desktop and measures it.',
+      effect: "Writes the image into the check's own directory and removes it before answering."
+    },
+    {
+      name: 'Find an element',
+      performs: 'Asks the accessibility tree for the name of one element.',
+      effect: 'Reads the tree. Selects nothing, moves nothing, clicks nothing.'
+    },
+    {
+      name: 'Open an application',
+      performs: 'Starts one new background instance of an application and ends the one it started.',
+      effect: 'Touches nothing you already have open.'
+    },
+    {
+      name: 'Send a keystroke',
+      performs: 'Delivers one keystroke.',
+      effect:
+        'This one changes something, so it runs only inside a test context of its own. Without ' +
+        'one it is not run at all, and nothing is claimed about it either way.'
+    }
+  ] as const
+
+  it('keeps every macOS line and its note exactly as they were', async () => {
+    expect(
+      disclosedChecks('macos').map(({ name, performs, effect }) => ({ name, performs, effect }))
+    ).toEqual(MACOS_CHECKS)
     start('macos')
     await screen.findByTestId('setup-identity')
     await goTo('capabilities')
     await userEvent.click(screen.getByTestId('setup-run-checks'))
     const effects = await screen.findByTestId('setup-effects')
-    expect(effects.textContent).toMatch(/Takes one image of the desktop and measures it/)
-    expect(effects.textContent).toMatch(/Asks the accessibility tree for the name of one element/)
+    // What the person reads on the sheet, entry by entry: the name, what it does, what it touches.
+    const read = within(effects)
+      .getAllByRole('listitem')
+      .map((entry) => ({
+        name: entry.querySelector('strong')?.textContent,
+        performs: entry.querySelectorAll('p')[0]?.textContent,
+        effect: entry.querySelectorAll('p')[1]?.textContent
+      }))
+    expect(read).toEqual(MACOS_CHECKS)
     expect(screen.getByTestId('setup-effects-note').textContent).toBe(
       'None of them sends input to an application you did not ask about, and none of them ' +
         'changes anything you own. macOS may ask you to allow something while they run, and a ' +
@@ -464,20 +561,25 @@ describe('what asks for a restart', () => {
 // KR-REQ-03.29: the keyboard path, the announcements and the motion rules of the page are the
 // same on every platform.
 describe('what stays the same off macOS', () => {
-  it('reaches each step with the keyboard alone', async () => {
+  it('reaches each step, and moves through them all, with the keyboard alone', async () => {
     start('x11')
     await screen.findByTestId('setup-identity')
-    let reached = false
-    for (let presses = 0; presses < 30 && !reached; presses += 1) {
-      await userEvent.tab()
-      reached = document.activeElement === screen.getByTestId('setup-step-permissions')
+    // Each step from the rail, in order, then back again.
+    for (const id of [...STEP_IDS, ...[...STEP_IDS].reverse()]) {
+      expect(await reachByKeyboard(`setup-step-${id}`), id).toBe(true)
+      await userEvent.keyboard('{Enter}')
+      expect(await screen.findByTestId(`setup-panel-${id}`)).toBeInTheDocument()
+      expect(screen.getByTestId(`setup-step-${id}`)).toHaveAttribute('aria-current', 'step')
     }
-    expect(reached).toBe(true)
+    // Then forward from the first step with Continue alone.
+    expect(await reachByKeyboard('setup-step-identity')).toBe(true)
     await userEvent.keyboard('{Enter}')
-    expect(await screen.findByTestId('setup-panel-permissions')).toBeInTheDocument()
-    expect(screen.getByTestId('setup-step-permissions')).toHaveAttribute('aria-current', 'step')
-    await userEvent.click(screen.getByTestId('setup-next'))
-    expect(await screen.findByTestId('setup-panel-capabilities')).toBeInTheDocument()
+    for (const id of STEP_IDS.slice(1)) {
+      expect(await reachByKeyboard('setup-next'), id).toBe(true)
+      await userEvent.keyboard('{Enter}')
+      expect(await screen.findByTestId(`setup-panel-${id}`)).toBeInTheDocument()
+      expect(screen.getByTestId(`setup-step-${id}`)).toHaveAttribute('aria-current', 'step')
+    }
   })
 
   it('announces where the checks stand, politely, in each state', async () => {
@@ -494,19 +596,26 @@ describe('what stays the same off macOS', () => {
     }
   })
 
-  it('moves nothing of its own on a step that has no macOS card', async () => {
+  it('removes the travel of what the page moves under reduced motion and keeps the fade', async () => {
     start('x11')
     await screen.findByTestId('setup-identity')
     await goTo('permissions')
-    // The step adds no motion of its own: what it moves is the shared panel arrival and the
-    // evidence row, and the stylesheet takes both out for a person who asked for less motion.
-    const panel = screen.getByTestId('setup-panel-permissions')
-    expect(panel.querySelectorAll('[style]')).toHaveLength(0)
-    const reduced = setupStylesheet.slice(
-      setupStylesheet.indexOf('@media (prefers-reduced-motion: reduce)')
+    // The step adds no motion of its own: nothing on it carries an inline style.
+    expect(screen.getByTestId('setup-panel-permissions').querySelectorAll('[style]')).toHaveLength(0)
+    // What the page moves is the panel's arrival, an animation, and the evidence row's grid rows.
+    const outside = setupStylesheet.slice(setupStylesheet.indexOf('@media (prefers-reduced-motion'))
+    const moving = setupStylesheet.replace(outside, '')
+    expect(moving.match(/^\s*animation:/gm)).toHaveLength(1)
+    expect(moving).toMatch(/\.setup-body \{[^}]*animation: setup-step-in/)
+    expect(moving).toMatch(/\.setup-evidence \{[^}]*transition:\s+grid-template-rows/)
+    // The shared rule takes every animation away, and wins over a class's own animation only
+    // because it is `!important`.
+    expect(reducedMotionRules(baseStylesheet)).toMatch(/\*,[^{]*\{[^}]*animation: none !important;/)
+    // The evidence row keeps its fade and loses its travel.
+    const reduced = reducedMotionRules(setupStylesheet)
+    expect(reduced).toMatch(
+      /\.setup-evidence\[data-open='true'\] \{\s+transition: opacity var\(--state\) var\(--ease-out\);\s+\}/
     )
-    expect(reduced.slice(0, reduced.indexOf('\n}\n'))).toMatch(
-      /\.setup-evidence\[data-open='true'\] \{\s+transition: opacity var\(--state\) var\(--ease-out\);/
-    )
+    expect(reduced).not.toMatch(/grid-template-rows|transform|translate|scale|animation/)
   })
 })
