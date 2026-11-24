@@ -333,7 +333,8 @@ fn read_output(process: &mut Process, work: &Work) -> Answer {
     let shown = work.executable.display();
     let mut printed = Vec::new();
     let mut chunk = [0_u8; 8192];
-    loop {
+    // None is the end of the file; anything else is what stopped the reading before it.
+    let stopped = loop {
         if work.run.expired() {
             return Answer::Late;
         }
@@ -346,39 +347,41 @@ fn read_output(process: &mut Process, work: &Work) -> Answer {
             Ok(Readable::NotYet) => continue,
             Ok(Readable::Ready) => {}
             Err(error) => {
-                return Answer::Unread(format!("what {shown} printed could not be read: {error}"));
+                break Some(Answer::Unread(format!(
+                    "what {shown} printed could not be read: {error}"
+                )));
             }
         }
         // One byte past the cap is read, and says that the cap was passed.
         let room = (work.cap + 1 - printed.len()).min(chunk.len());
         match process.read(&mut chunk[..room]) {
-            Ok(0) => {
-                #[cfg(feature = "testing")]
-                seams::pause_at(seams::Point::FinalRead, &work.directory);
-                // The output has ended. The moment it did is noted, and an answer that was complete
-                // after the deadline is late, whenever it is read.
-                let complete = Instant::now();
-                return if work.run.complete_in_time(complete) {
-                    Answer::Printed {
-                        bytes: printed,
-                        complete,
-                    }
-                } else {
-                    Answer::Late
-                };
-            }
+            Ok(0) => break None,
             Ok(read) => {
                 printed.extend_from_slice(&chunk[..read]);
                 if printed.len() > work.cap {
-                    return Answer::TooMuch;
+                    break Some(Answer::TooMuch);
                 }
             }
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
             Err(error) => {
-                return Answer::Unread(format!("what {shown} printed could not be read: {error}"));
+                break Some(Answer::Unread(format!(
+                    "what {shown} printed could not be read: {error}"
+                )));
             }
         }
+    };
+    #[cfg(feature = "testing")]
+    seams::pause_at(seams::Point::FinalRead, &work.directory);
+    // The loop has ended. Whatever ended it, an answer read after the deadline, or once the caller
+    // has given up, is late.
+    let complete = Instant::now();
+    if !work.run.complete_in_time(complete) {
+        return Answer::Late;
     }
+    stopped.unwrap_or(Answer::Printed {
+        bytes: printed,
+        complete,
+    })
 }
 
 /// The seam the cases of the probe's deadline stand in; it does not exist in a shipped build.

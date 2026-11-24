@@ -950,3 +950,63 @@ fn kr_req_07_64_an_answer_that_ended_after_the_caller_gave_up_is_late_before_the
     );
     assert_eq!(probed.mode, None, "{probed:?}");
 }
+
+/// KR-REQ-07.64: a program that prints more than the cap, and whose output the thread reads after the
+/// deadline, is late, as output that ended after the deadline is.
+///
+/// A control run under the same deadline records that the program printed too much. Then the thread
+/// is held back after its final read, past the deadline, and the call is held back before it waits,
+/// so that the call has the answer in hand. The answer is late all the same.
+#[test]
+fn kr_req_07_64_output_past_the_cap_that_is_read_after_the_deadline_is_late() {
+    let here = directory();
+    let standin = Standin::running(
+        "printf 'abcdefghijklmnopqrstuvwxyz'",
+        "[Console]::Out.Write('abcdefghijklmnopqrstuvwxyz')",
+    );
+    let deadline = if cfg!(windows) {
+        start_allowance()
+    } else {
+        Duration::from_secs(2)
+    };
+    let cap = 8;
+    let within = || {
+        probe::run_within(
+            &standin.program,
+            &standin.probe(&[]),
+            &[],
+            here.path(),
+            &given(&[]),
+            &ProbeRun::within(deadline),
+            cap,
+        )
+    };
+    let control = within();
+    assert!(
+        !control.late
+            && control
+                .unread
+                .as_deref()
+                .is_some_and(|why| why.contains("more than 8 bytes")),
+        "the premise: the program prints more than the cap within the deadline: {control:?}"
+    );
+
+    probe::seams::delay_at(
+        probe::seams::Point::FinalRead,
+        here.path(),
+        Some(deadline + Duration::from_millis(300)),
+    );
+    probe::seams::delay_at(
+        probe::seams::Point::Receive,
+        here.path(),
+        Some(deadline + Duration::from_millis(100)),
+    );
+    let probed = within();
+    probe::seams::delay_at(probe::seams::Point::FinalRead, here.path(), None);
+    probe::seams::delay_at(probe::seams::Point::Receive, here.path(), None);
+    assert!(
+        probed.late,
+        "output past the cap that was read after the deadline is late: {probed:?}"
+    );
+    assert_eq!(probed.mode, None, "{probed:?}");
+}
