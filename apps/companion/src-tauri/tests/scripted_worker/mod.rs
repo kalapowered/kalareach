@@ -651,6 +651,7 @@ fn session_read_of(descriptor: &WorkerDescriptor) -> kr_protocol::session::Sessi
         last_command_block: Nullable::null(),
         outstanding_launches: Nullable::null(),
         metrics: None,
+        held: false,
     }
 }
 

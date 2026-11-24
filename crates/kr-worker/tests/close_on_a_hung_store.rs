@@ -2377,7 +2377,7 @@ async fn a_closed_session_publishes_its_closure() {
     let closer = host.client().await;
     let _slot = send_close(&host, closer);
     let began = Instant::now();
-    while closure.try_recv().is_err() {
+    while closure.closed.try_recv().is_err() {
         assert!(
             began.elapsed() < CLOSURE_WAIT,
             "the closure was not recorded within {CLOSURE_WAIT:?}"
