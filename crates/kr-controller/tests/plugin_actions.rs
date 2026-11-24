@@ -1165,8 +1165,12 @@ async fn kr_req_24_27_a_reply_read_after_its_connection_was_replaced_is_still_wi
 
 /// KR-REQ-24.27: what a component says when it declines an action it was handed arguments for is
 /// made of what it was handed, and in privacy mode, or once privacy mode has stood on the
-/// connection, a person is not told its words; the connection withholds them, because a component
-/// on it was handed something made in privacy mode.
+/// connection, a person is not told its words.
+///
+/// Privacy mode standing on the connection withholds the words by itself, so the case does not tell
+/// that from the withholding of the hand-over of the action's arguments. No case covers that
+/// hand-over alone: one made in privacy mode, with privacy mode ended and the runtime replaced
+/// before the answer comes back.
 ///
 /// The control is first: outside privacy mode the refusal carries what the component said.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]

@@ -310,8 +310,11 @@ async fn kr_req_11_26_a_request_answered_natively_while_its_decode_is_held_is_no
 /// made in it, however long the request waited and whatever privacy mode is when it is decoded.
 ///
 /// A request made outside privacy mode withholds nothing. A request recorded in it, whose decode is
-/// held until privacy mode has ended, withholds the runtime's words once the component has been
-/// handed it, whenever it is decoded.
+/// held until privacy mode has ended, leaves the runtime's words withheld whenever it is decoded.
+/// Privacy mode has stood on the connection by then, and that withholds them by itself, so this
+/// case does not tell the hand-over's own withholding from it. Other cases of this file and of
+/// `plugin_observation.rs`, and the lane case, hand the request over where privacy mode has not
+/// stood on the connection.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn kr_req_24_27_a_request_made_in_privacy_mode_withholds_the_runtimes_words_whenever_it_is_decoded()
  {
