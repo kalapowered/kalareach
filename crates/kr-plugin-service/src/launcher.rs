@@ -2843,6 +2843,9 @@ mod tests {
         ProvesForAnotherEndpoint,
         /// Reads the hello and says nothing.
         IsSilent,
+        /// Answers as a plugin host of `/4` does, after a later launch has published its own
+        /// descriptor of `/3`.
+        IsReplacedWhileItAnswers,
     }
 
     /// The build an honest host of these cases states.
@@ -2857,6 +2860,29 @@ mod tests {
     struct Seen {
         third: bool,
         fourth: bool,
+    }
+
+    /// Publishes the descriptor of `/3` for a launch that comes after the one being accepted, as
+    /// that launch's own acceptance does.
+    fn publish_a_later_launch(environment: &EnvironmentPaths) {
+        let turn = publication_turn(environment.environment_id());
+        let later = {
+            let newest = turn.lock().expect("the publication turn");
+            *newest + 1
+        };
+        let identity = HostIdentity::generate(environment.environment_id()).expect("an identity");
+        let endpoint = host_endpoint(environment, &HostProtocol::V3)
+            .expect("an endpoint")
+            .as_text();
+        publish_in_turn(
+            &turn,
+            later,
+            &core::sync::atomic::AtomicBool::new(false),
+            environment,
+            &HostProtocol::V3,
+            &descriptor_of(&identity, &endpoint),
+        )
+        .expect("the later launch publishes");
     }
 
     /// Binds the endpoint of `/4` and serves one connection on it as `behaviour` says.
@@ -2900,6 +2926,9 @@ mod tests {
                             fourth: read_descriptor4(&environment)
                                 .is_ok_and(|found| found.is_some()),
                         };
+                        if behaviour == FourHost::IsReplacedWhileItAnswers {
+                            publish_a_later_launch(&environment);
+                        }
                         let mut hello = described.clone();
                         let mut spoken = HostProtocol::V4.name.to_owned();
                         match behaviour {
@@ -3107,6 +3136,26 @@ mod tests {
                 "{behaviour:?}: a descriptor of the fourth protocol was published"
             );
         }
+    }
+
+    /// A launch whose host answers on the endpoint of `/4` after a later launch has published
+    /// writes no descriptor of `/4`: its publication is fenced by the number the launch took for
+    /// `/3`.
+    #[tokio::test]
+    async fn a_launch_replaced_while_its_host_is_asked_on_the_fourth_endpoint_publishes_no_fourth_descriptor()
+     {
+        let (third, fourth, _seen, claimed) = launch_beside(
+            Some(FourHost::IsReplacedWhileItAnswers),
+            false,
+            core::time::Duration::from_secs(10),
+        )
+        .await;
+        let third = third.expect("the third protocol's descriptor");
+        assert_ne!(third, claimed, "the descriptor of the later launch stands");
+        assert_eq!(
+            fourth, None,
+            "a descriptor of the fourth protocol was published for a launch that a later launch had replaced"
+        );
     }
 
     /// A descriptor of the fourth protocol that an earlier host left is taken away when a new host
