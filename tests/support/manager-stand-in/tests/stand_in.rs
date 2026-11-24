@@ -1184,6 +1184,57 @@ fn a_case_that_loses_a_daemons_record_and_fails() {
     panic!("this case fails on purpose, after its daemon's record was lost");
 }
 
+/// A `bootout` that fails keeps the job: a start that was never recorded cannot be searched for when
+/// the working directory its record names lies outside the test's folders, so the answer is a
+/// failure, and the job is still loaded.
+#[test]
+fn a_bootout_that_fails_keeps_the_job_loaded() {
+    let fixture = Fixture::new();
+    let program = fixture.installation.path().join("kr-daemon");
+    kr_ipc::testing::place_script(&program, "#!/bin/sh\nexit 0\n");
+    let directory = fixture.tree.path().join("state");
+    let arguments = [program.display().to_string(), "30".to_owned()];
+    let plist = fixture
+        .tree
+        .path()
+        .join("home/Library/LaunchAgents/kr-controller-f.plist");
+    std::fs::write(
+        &plist,
+        fixture.plist_of("kr-controller-f", &arguments, &directory, ""),
+    )
+    .expect("a plist");
+    let loaded = fixture.call(&[
+        "bootstrap",
+        &fixture.domain(),
+        plist.to_str().expect("text"),
+    ]);
+    assert_eq!(loaded.status.code(), Some(0), "{}", text(&loaded.stderr));
+    fixture.mark_pending("kr-controller-f");
+    let record = fixture
+        .tree
+        .path()
+        .join("state/manager-stand-in/jobs/kr-controller-f.json");
+    let mut job: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&record).expect("the record")).expect("json");
+    job["working_directory"] = serde_json::Value::String("/".to_owned());
+    std::fs::write(&record, job.to_string()).expect("a record that names a directory outside");
+    let target = format!("{}/kr-controller-f", fixture.domain());
+    let failed = fixture.call(&["bootout", &target]);
+    assert_eq!(
+        failed.status.code(),
+        Some(64),
+        "a bootout that cannot search for the start fails: {}",
+        text(&failed.stderr)
+    );
+    let listed = fixture.call(&["print", &target]);
+    assert_eq!(
+        listed.status.code(),
+        Some(0),
+        "the job of a bootout that failed is still loaded: {}",
+        text(&listed.stderr)
+    );
+}
+
 /// What a definition may name is bounded after every link is resolved: a plist, a log or a working
 /// directory behind a link that leads outside the test's folders, or a link that leads nowhere, is
 /// refused.
