@@ -652,7 +652,10 @@ seconds, then for twice as long after each failure up to two minutes, and each e
 counted. The two sources have no order between them, and each keeps the order it was pushed in.
 
 Whatever a ready component does not get is a numbered loss: an entry the lane pushed out or refused,
-one the pump passed over, one the host's queue refused. What was pushed before a binding first
+one the pump passed over, one the host's queue refused. A request frame is the exception: the pump
+asks the broker again before it offers one, and skips it, with no loss, when the request was
+answered, taken by the native client, marked as sent, or left behind by its source while it waited.
+What was pushed before a binding first
 became ready predates the binding's view and is not a loss. What was pushed while the runtime was
 lost is counted for a binding that had been ready, and its component is told when it starts again
 (see below); the worker owes the component no snapshot of it. The pump offers a binding nothing
@@ -679,8 +682,10 @@ component and restores nothing into one: the state is opaque to the worker, and 
 coverage cannot be made to hold exactly the requests the broker holds unresolved. The pump gives the component, before anything else, each request the
 broker still holds as pending, once each, in the order the broker recorded them. An approval's bytes
 come from its decoder entry, which keeps the original whole, and any other request's from the frame
-the broker retained; nothing is read from the terminal, the semantic log or a screen. A request that
-is answered, claimed or recorded under an earlier generation is not given, and neither is one the
+the broker retained; nothing is read from the terminal, the semantic log or a screen. A request is given
+while it is pending, and while a rich answer holds it under a claim that nothing marks as sent,
+since that claim can go back. A request that is answered, taken by the native client or by this
+host, marked as sent, or recorded under an earlier generation is not given, and neither is one the
 broker no longer holds the bytes of. A request given this way, or left out of it, is not offered again from the queue. A binding whose component decodes requests has the requests nobody decoded
 queued to be decoded again when it is registered, up to the decode queue's own limit. A component
 registered for the first time starts from the live point and is given nothing.
@@ -700,8 +705,8 @@ requests the component was given and how many of those were already read as appr
 could not be given, how many upstream frames and spans of terminal output the worker passed over
 while the runtime was away (and how many bytes they held), how many observations the worker's queue dropped for
 want of room, and how many requests were queued to be decoded again. A request the worker's queue
-refused while the runtime was away is counted among the observations dropped, and is still given
-from the broker's records.
+refused while the runtime was away is counted among the observations dropped, and is given from
+the broker's records only if it is still unanswered and within the limits on what is given.
 
 Privacy mode does not stop observation for live use. The runtime's words in a fault, and in the reason a component is disabled for, are withheld from the
 report once privacy mode has been on at any time since the worker made the connection to the runtime

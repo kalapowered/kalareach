@@ -1530,7 +1530,8 @@ link makes the calls, so nothing on the terminal waits for a component. What a r
 misses is counted, and it is asked for a fresh snapshot before it is offered anything else. The
 worker takes no state from a component and restores nothing into one. A component that is registered
 again, after the runtime was replaced for example, is a new instance: the worker gives it each
-request the broker still holds as pending, once each, in the order the broker recorded them, and
+request the broker still holds as unanswered (pending, or claimed for a rich answer that nothing
+marks as sent), once each, in the order the broker recorded them, and
 queues the requests nobody decoded to be decoded again. `docs/plugins/runtime.md` has the calls, the
 bounds and the order.
 
