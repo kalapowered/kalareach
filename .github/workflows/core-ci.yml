@@ -736,11 +736,13 @@ jobs:
   # job holds what the step needs of that job's setup: the disk freed, the pinned toolchain, and
   # the desktop packages that the workspace's release build links, from the same archives. It
   # restores no cargo cache: the builds go in a new directory, which no restored output serves.
-  # The steps' limits add up to 209 of the job's 210 minutes.
+  # The steps' limits add up to 209 of the job's 212 minutes, and 3 are kept for the set-up and
+  # clean-up that no step limit counts. The check's limit of 150 minutes is 1.45 times the longest
+  # it took in 12 hosted runs of 21 to 24 November, 103.5 minutes, in the rust job (run 45309576267).
   shipped-hold:
     name: shipped-hold
     runs-on: ubuntu-24.04
-    timeout-minutes: 210
+    timeout-minutes: 212
     steps:
       - name: Free the disk the build needs
         timeout-minutes: 6
@@ -2663,10 +2665,18 @@ jobs:
   #
   # No cache is saved: the repository's caches are at their limit, and a cache saved here would
   # take the room of one every other job restores. The job's time is the cost of that.
+  #
+  # Each step that installs or builds has a limit of twice the longest it took in the 59 to 65
+  # hosted runs of 16 to 24 November, all of them with no cache, since the job restores none,
+  # rounded up, and of at least 5 minutes: the NDK, emulator and system image 5 (1.6 at most), the
+  # debug build 26 (13.0, run 45345872273), the run on the emulator 10 (4.7) and the minified build
+  # 47 (23.2, run 44759162215). With the 2 of the last reading of the disk they add up to 90, and
+  # the job's limit of 93 keeps 3 for the set-up and clean-up that no step limit counts. The whole
+  # job took 42.4 minutes at most (run 45051604117).
   android-app:
     name: android-app
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    timeout-minutes: 93
     steps:
       # The runner arrives with toolchains this project never uses; the Android SDK stays, with the
       # emulator and a system image to be added to it.
@@ -2708,7 +2718,7 @@ jobs:
       # use. The versions installed are printed, since the SDK manager is given no pin for the
       # emulator and the image.
       - name: Install the Android NDK, the emulator and a system image
-        timeout-minutes: 20
+        timeout-minutes: 5
         run: |
           manager="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
           if [ ! -x "$manager" ]; then
@@ -2739,7 +2749,7 @@ jobs:
       # the system resolves by name, among them the Tauri plugin, and the application identifier in
       # the manifest, the code and the libraries.
       - name: Build the debug application
-        timeout-minutes: 60
+        timeout-minutes: 26
         run: pnpm -C apps/companion android --debug --apk --target aarch64 x86_64
 
       # GitHub's documented way to give a hosted Linux runner's user the virtual machine device.
@@ -2755,7 +2765,7 @@ jobs:
       # on the x86-64 architecture the emulator runs, then the application started and looked at.
       # Both run whatever the other did, and the log of the device is kept either way.
       - name: Run the native library and start the application on the emulator
-        timeout-minutes: 30
+        timeout-minutes: 10
         run: |
           set -uo pipefail
           export PATH="$ANDROID_HOME/platform-tools:$PATH"
@@ -2822,7 +2832,7 @@ jobs:
       # It runs whatever the emulator step did, so that each answer is read on its own.
       - name: Build the minified application and read its libraries back
         if: ${{ !cancelled() }}
-        timeout-minutes: 60
+        timeout-minutes: 47
         env:
           KR_GOOGLE_SERVICES_JSON: ${{ runner.temp }}/google-services.json
         run: |
@@ -2874,6 +2884,13 @@ jobs:
   # shipped-programs, PowerShell, shell-package and reference jobs, the companion's and this one.
   #
   # As the Android job, it saves no cache, and its time is the cost of that.
+  #
+  # Each step that lints or builds has a limit of twice the longest it took in the 45 or 46 hosted
+  # runs of 16 to 24 November, all of them with no cache, since the job restores none, rounded up:
+  # the lint 21 (10.1 at most, run 44746966889), the build 31 (15.4, run 44320859061) and the run
+  # in the simulator 9 (4.2, run 44858502241). With the other steps' 20 they add up to 81 of the
+  # job's 90 minutes, which keeps 3 for the set-up and clean-up that no step limit counts. The
+  # whole job took 38.9 minutes at most (run 44746966889).
   ios:
     name: ios
     # Skipped, and shown as skipped, only in a manual run that turns off both the macOS jobs and this one.
@@ -2937,7 +2954,7 @@ jobs:
       # What Xcode's build gives the Swift package it builds from the Rust side is the application's
       # minimum system, which a lint outside Xcode has to be given the same way.
       - name: Lint the companion's Rust for the iPhone
-        timeout-minutes: 40
+        timeout-minutes: 21
         env:
           IPHONEOS_DEPLOYMENT_TARGET: "17.0"
         run: cargo clippy --locked --lib -p companion-tauri --target aarch64-apple-ios -- -D warnings
@@ -2956,7 +2973,7 @@ jobs:
       # packages installed under other settings, and stopped to ask a terminal that is not there
       # before it removed them.
       - name: Build the application for the simulator
-        timeout-minutes: 60
+        timeout-minutes: 31
         run: |
           set -euo pipefail
           team="$(sed -n 's/^ *DEVELOPMENT_TEAM: *\([A-Z0-9]\{10\}\) *$/\1/p' apps/companion/src-tauri/gen/apple/project.yml)"
@@ -2998,7 +3015,7 @@ jobs:
 
       # The same cases as on the emulator, on the architecture the simulator runs.
       - name: Run the native library in the simulator
-        timeout-minutes: 30
+        timeout-minutes: 9
         run: bash scripts/native-library-tests.sh ios --udid "$KR_SIMULATOR"
 
       - name: Start the application in the simulator
@@ -3737,7 +3754,7 @@ jobs:
       # leg builds with other features than the whole workspace did, its programs are built in a
       # step of their own, and no run has measured a leg or a build with no cache. The limits are
       # 174 and 158 minutes, about half as much again, and each leg's limits, with the 20 minutes
-      # of its program build and its other steps, add up to 310 and 349 of the job's 355 minutes.
+      # of its program build and its other steps, add up to 310 and 351 of the job's 355 minutes.
       - name: Test
         if: ${{ !cancelled() && startsWith(matrix.part, 'tests') }}
         timeout-minutes: ${{ matrix.minutes }}
@@ -3789,11 +3806,12 @@ jobs:
       # Test step have built, and the stub starts nothing and asks no launchd. The step builds
       # `kr-cli` with the features of that package alone, so it compiles more than the leg's Test
       # step did, as the rust job's teardown step does after its workspace build: that step took
-      # 2.4 minutes and this leg's documentation step 3.5. The limit of 9 minutes is 3.5 minutes
-      # above the longest the step took in 11 hosted runs, 5.5 minutes.
+      # 2.4 minutes and this leg's documentation step 3.5. The limit of 11 minutes is twice the
+      # longest the step took in the 7 hosted runs that have run it (22 to 24 November), 5.5
+      # minutes (run 45081081831, which found no cache to restore).
       - name: A standalone start says why a stub daemon ended
         if: ${{ !cancelled() && matrix.part == 'tests-2' }}
-        timeout-minutes: 9
+        timeout-minutes: 11
         run: env -u XDG_RUNTIME_DIR -u DBUS_SESSION_BUS_ADDRESS cargo test --locked -p kr-cli --test startup -- --nocapture --ignored --exact a_standalone_start_whose_daemon_ended_with_a_listen_line_says_why a_listener_that_accepts_and_stays_silent_does_not_hide_the_end_of_the_daemon a_restart_whose_started_daemon_ended_with_a_listen_line_says_no_requested_daemon_may_still_start
 
       # The cases that put another filesystem in or beside a tree: a disk image attached inside a
@@ -4044,11 +4062,13 @@ jobs:
   # after another), and reads the bytes of all of them. The check stands in a job of its own because
   # it did not fit at the end of the macos-demonstrations leg: after the demonstrations, the release
   # build of the measurements (37 minutes) and the measurements, the 90 minutes it had there ran out
-  # on a hosted runner (07:25 to 08:55 UTC on 21 November). Here it needs no other job, and in three
-  # runs on hosted runners (21 and 22 November) it ran to its end in 126 to 137 minutes. Like each
-  # macOS job of a run, it can still wait for one of the hosted macOS runners that the account can
-  # use at one time. The step has a limit of 300 minutes, and every step has a limit of its own:
-  # they add up to 329 of this job's 330 minutes, under the 360 at which GitHub ends a hosted job.
+  # on a hosted runner (07:25 to 08:55 UTC on 21 November). Here it needs no other job, and in
+  # eleven runs on hosted runners (21 to 24 November) it ran to its end in 82 to 147 minutes. Like
+  # each macOS job of a run, it can still wait for one of the hosted macOS runners that the account
+  # can use at one time. The step has a limit of 300 minutes, twice the longest it took in those
+  # runs (147.1 minutes, run 45043176780), and every step has a limit of its own: they add up to 326
+  # of this job's 330 minutes, which keeps 3 for the set-up and clean-up that no step limit counts,
+  # under the 360 at which GitHub ends a hosted job.
   # It restores no cache: the release builds go in a new directory, which no restored output serves,
   # and the one debug build, of kr-ipc's test, is small.
   macos-shipped-hold:
@@ -4075,7 +4095,7 @@ jobs:
       # to show what was left.
       - name: Free the disk the build needs
         continue-on-error: true
-        timeout-minutes: 8
+        timeout-minutes: 5
         run: bash scripts/free-simulator-runtimes.sh
 
       - name: What the disk holds with the runtimes cleared
@@ -4391,9 +4411,13 @@ jobs:
     # first of its first two commands took from 47 to 120 minutes, the longest on two runners of one
     # run, and the second had run 40 more without ending; the third builds one test program and
     # compiles again the crates whose features its dev-dependencies change. Every step has a limit
-    # of its own, and the limits add up to less than this one: the build's 240 minutes, twice the
-    # 120, and the other steps' 118 make 358, and this limit of 359 is under the 360 at which
-    # GitHub ends a hosted job.
+    # of its own, and the limits add up to less than this one: the build's 240 minutes and the
+    # other steps' 113 make 353, which keeps 3 for the set-up and clean-up that no step limit
+    # counts, and this limit of 359 is under the 360 at which GitHub ends a hosted job. The build
+    # took 185.1 minutes with no cache (run 45081806255), so its 240 are 1.3 times that, and twice
+    # that would not fit in this job's limit. The cache save has 10 of the 113, 3.8 times the
+    # longest it took in 45 hosted runs of 16 to 24 November, 2.6 minutes (run 44194834495); the run
+    # that found no cache to restore (run 45081081831) saved in 0.9.
     timeout-minutes: 359
     # The launchd checks and the daemons the workspace's tests, the demonstrations and the
     # measurements start load jobs into the account's own launchd, and stand down with a printed
@@ -4441,10 +4465,13 @@ jobs:
           name: macos-reference
 
       # Everything the script below builds before it measures, so that the script has as little
-      # left to build as it can. Its limit is twice the 120 minutes the first command took with no
-      # cache on a slow runner, so that a build with no cache still ends here and is saved below,
-      # where one that is cut leaves the next run as cold as this one. The last command builds the
-      # whole-reconnect case, so that its step below has only to run it.
+      # left to build as it can. Its limit is 1.3 times the 185.1 minutes that the three commands
+      # took with no cache on a slow runner (run 45081806255), so that a build with no cache still
+      # ends here and is saved below, where one that is cut leaves the next run as cold as this
+      # one. Twice that does not fit in the job's limit. The step reached this limit once, at 240.2
+      # minutes on 20 November (run 44705027824); that run's restore took 0.8 minutes, so it is not
+      # known whether it had a cache. The last command builds the whole-reconnect case, so that its
+      # step below has only to run it.
       - name: Build what the measurements run
         id: build
         timeout-minutes: 240
@@ -4535,7 +4562,7 @@ jobs:
       # because it takes this workspace's own output out of the build directory, which they run.
       - name: Save the cargo cache
         if: ${{ always() && steps.build.outcome == 'success' }}
-        timeout-minutes: 15
+        timeout-minutes: 10
         uses: ./.github/actions/cargo-cache-save
         with:
           primary-key: ${{ steps.cargo-cache.outputs.primary-key }}
