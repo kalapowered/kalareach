@@ -303,6 +303,40 @@ describe('recovery', () => {
     expect(controls.recovery.settled).toBe(0)
   })
 
+  it('takes the failure line away when a step that ended by itself changes where recovery stands', async () => {
+    const { person, controls, sheet } = await openSheet()
+    act(() => {
+      controls.account.set(SIGNED_IN)
+    })
+    const recovery = await within(sheet).findByTestId('recovery')
+    const lost =
+      'the service named for the recovery bundle did not answer the write to it, so it is not known whether it landed. Settle it before anything else is written'
+    controls.recovery.loseNextTurnOn(lost)
+    await person.click(within(recovery).getByTestId('recovery-turn-on'))
+    await waitFor(() => {
+      expect(recovery).toHaveAttribute('data-state', 'unsettled')
+    })
+    expect(within(recovery).getByTestId('recovery-said')).toHaveTextContent(lost)
+
+    // A read the person did not ask for that finds recovery standing where it did keeps the line.
+    act(() => {
+      controls.recovery.changeByItself({ kept_at: 'elsewhere.example' })
+    })
+    await within(recovery).findByTestId('recovery-stays-at')
+    expect(recovery).toHaveAttribute('data-state', 'unsettled')
+    expect(within(recovery).getByTestId('recovery-said')).toHaveTextContent(lost)
+
+    // The step the lost write wanted ended it by itself, and the card was told: it stands at on, and
+    // a line that says to settle the write first would no longer agree with it.
+    act(() => {
+      controls.recovery.changeByItself({ state: 'on' })
+    })
+    await waitFor(() => {
+      expect(recovery).toHaveAttribute('data-state', 'on')
+    })
+    expect(within(recovery).queryByTestId('recovery-said')).toBeNull()
+  })
+
   it('covers the host on this computer, says why it cannot, and replaces a setup only on a second, confirmed choice', async () => {
     const { person, controls, sheet } = await openSheet()
     act(() => {

@@ -478,6 +478,11 @@ export interface FakeRecovery {
    */
   holdTurnOn(): () => void
   /**
+   * Has the next turn-on write the bundle and get no answer: it refuses with `OUTCOME_UNKNOWN` and
+   * these words, and recovery stands at `unsettled` from then on, as the backend leaves it.
+   */
+  loseNextTurnOn(message: string): void
+  /**
    * Holds the answer of the next read of recovery until the returned function is called, as a
    * backend does that waits for another companion's step to end.
    */
@@ -1656,6 +1661,7 @@ export function fakeHost(
   let archives: readonly RecoveryArchive[] = []
   const exportsMade: { readonly path: string; readonly archive: string | null }[] = []
   let heldTurnOn: Promise<void> | null = null
+  let lostTurnOn: string | null = null
   let heldRecoveryRead: Promise<void> | null = null
   let heldSyncServiceRead: Promise<void> | null = null
   let syncServiceKeepFails: string | null = null
@@ -3682,6 +3688,12 @@ export function fakeHost(
         recovery = { ...recovery, state: 'on', kept_at: syncService.host }
         return recoveryView()
       }
+      if (lostTurnOn !== null) {
+        const message = lostTurnOn
+        lostTurnOn = null
+        recovery = { ...recovery, state: 'unsettled', kept_at: syncService.host }
+        return refused('OUTCOME_UNKNOWN', message)
+      }
       if (heldTurnOn !== null) {
         const waiting = heldTurnOn
         heldTurnOn = null
@@ -3789,6 +3801,9 @@ export function fakeHost(
       },
       failReads(message) {
         recoveryReadFails = message
+      },
+      loseNextTurnOn(message) {
+        lostTurnOn = message
       },
       holdTurnOn() {
         let release: () => void = () => undefined

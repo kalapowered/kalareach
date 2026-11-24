@@ -155,17 +155,29 @@ export function SyncPanel({
   // A sign-in that changes what the account may do changes what stops recovery, so it is read again.
   const standing = account?.state === 'signed_in' ? account.generation : (account?.state ?? null)
 
-  /** Reads recovery again, and shows what it answers or why it could not. */
+  // Where the card last read recovery to stand, so that a read the person did not ask for can tell
+  // whether it changed.
+  const recoveryStood = useRef<RecoveryView['state'] | null>(null)
+
+  /**
+   * Reads recovery again, and shows what it answers or why it could not. A read the person did not
+   * ask for that finds recovery standing somewhere else takes away the line of a step that failed:
+   * it was true of where recovery stood, and may not be of where it stands now.
+   */
   const readRecovery = useCallback(
-    (): Promise<void> =>
+    (asked = true): Promise<void> =>
       desktop
         ? port
             .recoveryView()
             .then((view) => {
+              const moved = recoveryStood.current !== view.state
+              recoveryStood.current = view.state
               setRecovery(view)
               setRecoveryProblem(null)
+              if (!asked && moved) setSaid((was) => (was?.place === 'recovery' ? null : was))
             })
             .catch((error: unknown) => {
+              recoveryStood.current = null
               setRecovery(null)
               setRecoveryProblem(failureMessage(error))
             })
@@ -217,7 +229,7 @@ export function SyncPanel({
     let ended = false
     port
       .onRecovery(() => {
-        void readRecovery()
+        void readRecovery(false)
       })
       .then(
         (unlisten) => {
