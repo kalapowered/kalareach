@@ -642,6 +642,43 @@ impl<'r> Host<'r> {
         self.daemon_said_since(0)
     }
 
+    /// What this run's session workers said to their own standard error, for a failure message:
+    /// the last forty lines of each worker's diagnostics file (`jobs/<label>.diagnostics` in the
+    /// state directory), each cleaned and cut as a worker cuts a refusal's reason. A launch refused
+    /// before its credential authenticates leaves only its line there.
+    ///
+    /// Each file is read through the run's handles ([`read_tail_below`]), as the daemon's log is.
+    #[must_use]
+    pub fn worker_said(&self) -> String {
+        if let Err(why) = self.run.learn_jobs() {
+            return worker_diagnostics_text(Err(why));
+        }
+        let jobs = match self.environment.jobs_dir().strip_prefix(self.run.root()) {
+            Ok(jobs) => jobs.to_path_buf(),
+            Err(_) => {
+                return worker_diagnostics_text(Err(
+                    "the jobs directory is not below the run's directory".to_owned(),
+                ));
+            }
+        };
+        let said: Vec<String> = self
+            .run
+            .proposed_labels()
+            .iter()
+            .map(|label| {
+                let place = jobs.join(format!("{label}.diagnostics"));
+                let read = read_tail_below(self.run.root(), self.run.pin(), &place, 0)
+                    .map_err(|why| why.to_string());
+                format!("{label}:\n{}", worker_diagnostics_text(read))
+            })
+            .collect();
+        if said.is_empty() {
+            worker_diagnostics_text(Ok(None))
+        } else {
+            said.join("\n")
+        }
+    }
+
     /// The identity of the worker process that serves `session_id`: the process running this run's
     /// copy of `kr-worker` for that session ([`Run::worker_of`]).
     ///
@@ -1144,6 +1181,102 @@ pub fn quoted(path: &Path) -> String {
         "a quoted path has no quote in it: {text}"
     );
     format!("'{text}'")
+}
+
+/// The most bytes of one diagnostics line a report keeps: what a worker cuts a refusal's reason to.
+const WORKER_LINE_AT_MOST: usize = 512;
+
+/// The last forty lines of a worker's diagnostics file, each with its control characters replaced
+/// by spaces and cut to [`WORKER_LINE_AT_MOST`] bytes at a character boundary, as a worker cuts a
+/// refusal's reason.
+#[must_use]
+pub fn worker_lines(bytes: &[u8]) -> Vec<String> {
+    let text = String::from_utf8_lossy(bytes);
+    let lines: Vec<&str> = text.lines().collect();
+    let start = lines.len().saturating_sub(40);
+    lines[start..]
+        .iter()
+        .map(|line| {
+            let mut cleaned: String = line
+                .chars()
+                .map(|character| {
+                    if character.is_control() {
+                        ' '
+                    } else {
+                        character
+                    }
+                })
+                .collect();
+            if cleaned.len() > WORKER_LINE_AT_MOST {
+                let mut end = WORKER_LINE_AT_MOST;
+                while !cleaned.is_char_boundary(end) {
+                    end -= 1;
+                }
+                cleaned.truncate(end);
+            }
+            cleaned
+        })
+        .collect()
+}
+
+/// What a report says of one worker's diagnostics file: its last lines, `(none)` where it holds
+/// none or does not exist, or why it was not read.
+#[must_use]
+pub fn worker_diagnostics_text(read: Result<Option<Vec<u8>>, String>) -> String {
+    match read {
+        Ok(Some(bytes)) => {
+            let lines = worker_lines(&bytes);
+            if lines.is_empty() {
+                "(none)".to_owned()
+            } else {
+                lines.join("\n")
+            }
+        }
+        Ok(None) => "(none)".to_owned(),
+        Err(why) => format!("(the worker's diagnostics were not read: {why})"),
+    }
+}
+
+/// What the lines of a worker's diagnostics file read as in a report.
+#[cfg(test)]
+mod worker_diagnostics_tests {
+    use super::*;
+
+    #[test]
+    fn the_last_forty_lines_are_kept_each_cleaned_and_cut() {
+        let mut file = String::new();
+        for number in 0..45 {
+            file.push_str(&format!("line {number}\n"));
+        }
+        file.push_str(&format!(
+            "a launch was not admitted: the file\u{1b}[31m\tcould not {}\n",
+            "\u{e9}".repeat(600)
+        ));
+        let lines = worker_lines(file.as_bytes());
+        assert_eq!(lines.len(), 40, "the last forty");
+        assert_eq!(lines[0], "line 6", "the earlier lines are dropped");
+        let last = lines.last().expect("a last line");
+        assert!(
+            last.starts_with("a launch was not admitted: the file [31m could not "),
+            "{last}"
+        );
+        assert!(last.len() <= WORKER_LINE_AT_MOST, "{}", last.len());
+        assert!(last.chars().all(|character| !character.is_control()));
+    }
+
+    #[test]
+    fn an_unread_diagnostics_file_is_said_not_read() {
+        assert_eq!(
+            worker_diagnostics_text(Err("no such file".to_owned())),
+            "(the worker's diagnostics were not read: no such file)"
+        );
+        assert_eq!(worker_diagnostics_text(Ok(None)), "(none)");
+        assert_eq!(worker_diagnostics_text(Ok(Some(Vec::new()))), "(none)");
+        assert_eq!(
+            worker_diagnostics_text(Ok(Some(b"one\ntwo\n".to_vec()))),
+            "one\ntwo"
+        );
+    }
 }
 
 /// What the host's shutdown helpers do with a tree that holds links the agent under test left.

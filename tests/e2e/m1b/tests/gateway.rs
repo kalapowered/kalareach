@@ -848,18 +848,17 @@ impl Person {
     }
 
     /// Types `line`, which runs through the integration, and waits until the launcher says the
-    /// backend refused the launch and ran the program as typed.
+    /// backend refused the launch for the claim on the conversation and ran the program as typed.
     ///
-    /// The launcher says that when the worker answered the presentation with a refusal and its
-    /// reason, and for no other cause than a refusal the worker made: a worker that answered late,
-    /// or a launcher out of time, is told apart by what it prints (the reason is in the
-    /// parentheses). A line the shell ran as typed before the worker answered (its bound for the
-    /// answer is one second) says nothing of the launch and is typed again, as
-    /// [`Person::types_until_it_shows`] does. A line a gateway serves fails the case at once,
-    /// where waiting for the refusal would only time out. What the worker refused it for is the
-    /// caller's to establish: the claim, in a session whose worker has served.
+    /// The launcher prints the worker's own reason in the parentheses, and this waits for the
+    /// claim's reason, so a launcher out of time, an answer it could not read and a worker that
+    /// closed without a word are not taken for the refusal. A line the shell ran as typed before
+    /// the worker answered (its bound for the answer is one second) says nothing of the launch and
+    /// is typed again, as [`Person::types_until_it_shows`] does. A line a gateway serves fails the
+    /// case at once, where waiting for the refusal would only time out. The caller establishes
+    /// that the claim is held: in a session whose worker has served.
     fn types_until_the_launch_is_refused(&self, line: &str, why: &str) -> Vec<String> {
-        const REFUSED: &str = "did not admit this launch (";
+        const REFUSED: &str = "did not admit this launch (this saved conversation is still held";
         let started = Instant::now();
         loop {
             self.clears_the_screen();
@@ -1259,14 +1258,13 @@ fn server_besides(
 /// still reading it, or a launcher out of time, is not taken for one.
 ///
 /// What the worker refuses a launch for is told to the launcher, whose line carries the reason in
-/// its parentheses. The case still shows the claim is the reason by what the refusal follows, so
-/// that a refusal for another cause does not pass for it. A conversation nothing runs against,
-/// whose claim the test itself holds and lets go of, is refused to the second session each time it
-/// is typed while the test holds the claim, and served each time it is typed while the test does
-/// not, over two rounds. A refusal for any
-/// other cause (a read of the executable that outlasted its bound, a launch refused on its own
-/// grounds) does not follow the claim's being held and let go of, and a worker that does not check
-/// the claim serves the line while it is held.
+/// its parentheses, and the helper waits for the claim's own reason. The case also shows the claim
+/// is the reason by what the refusal follows: a conversation nothing runs against, whose claim the
+/// test itself holds and lets go of, is refused to the second session each time it is typed while
+/// the test holds the claim, and served each time it is typed while the test does not, over two
+/// rounds. A refusal for any other cause (a read of the executable that outlasted its bound, a
+/// launch refused on its own grounds) does not follow the claim's being held and let go of, and a
+/// worker that does not check the claim serves the line while it is held.
 ///
 /// The host is the real daemon with two real workers, the shell is the managed zsh, the
 /// application is the Codex stand-in, and the person is `kr` on two terminals. Not claimed:

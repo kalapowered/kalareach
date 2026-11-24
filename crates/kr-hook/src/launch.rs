@@ -30,9 +30,9 @@
 //! without them.
 //!
 //! A backend that refuses a launch after the credential authenticated says why, in the frame it
-//! answers a launch it cannot commit with, and the launcher repeats the reason. A refusal with no
-//! reason (the connection closes without a word) is what a presentation gets whose credential did
-//! not authenticate, and the launcher says only that the backend refused it.
+//! answers a launch it cannot commit with, and the launcher repeats the reason. A presentation
+//! refused before its credential authenticates, or closed without an answer, gets a refusal with no
+//! reason, and the launcher says only that the backend refused it.
 
 use std::ffi::OsString;
 #[cfg(unix)]

@@ -265,10 +265,13 @@ struct Backend {
     /// It is taken where the directory is opened, and let go of when the backend is retired.
     #[cfg(windows)]
     pinned: Arc<Mutex<Option<crate::windows::pin::Pin>>>,
-    /// Why the last launch this backend took did not go, where one did not.
+    /// Why the newest failed launch of this backend did not go: it was refused after its credential
+    /// authenticated, or the worker could not carry it through.
     ///
     /// It belongs to the backend and not to an instance: a launch that failed before its program
-    /// was shown has no instance, and what a launcher declined survives the launch's rollback.
+    /// was shown has no instance, and what a launcher declined survives the launch's rollback. A
+    /// later refusal replaces it, including one for a second launcher that came while another
+    /// launch held the backend.
     launch_failure: Mutex<Option<String>>,
     /// Set when the backend is retired, so a reading of the executable in progress stops.
     stopped: Arc<AtomicBool>,
@@ -1294,11 +1297,14 @@ impl CommandBackends {
             .map(|backend| backend.lifecycle.state.borrow().clone())
     }
 
-    /// Returns why the last launch the backend of one line took did not go, where one did not.
+    /// Returns why the newest failed launch of one line's backend did not go (refused after its
+    /// credential authenticated, or not carried through by the worker), or nothing when no launch
+    /// failed.
     ///
     /// It belongs to the backend and not to an instance: a launch that failed before its program was
     /// shown has no instance, and what a launcher declined or what the worker refused is kept here
-    /// after the launch is given back.
+    /// after the launch is given back. A later refusal replaces it, including one for a second
+    /// launcher that came while another launch held the backend.
     #[must_use]
     pub fn launch_failure_of(&self, prompt_generation: PromptGeneration) -> Option<String> {
         self.backends
@@ -2208,11 +2214,11 @@ async fn admit_launch(
     } = presented;
     let process = match authenticate_presentation(backend, &peer, &credential, &launch) {
         Ok(process) => process,
-        Err(error) => return Err(deny(backend, &mut stream, false, error).await),
+        Err(error) => return Err(deny(&backend.launch_failure, &mut stream, false, error).await),
     };
     let identity = match vet_presentation(backend, &launch).await {
         Ok(identity) => identity,
-        Err(error) => return Err(deny(backend, &mut stream, true, error).await),
+        Err(error) => return Err(deny(&backend.launch_failure, &mut stream, true, error).await),
     };
     // Unbound to launching, or refused: one launch per backend.
     let claimed = backend.lifecycle.state.send_if_modified(|state| {
@@ -2225,7 +2231,7 @@ async fn admit_launch(
     });
     if !claimed {
         let error = BrokerError::denied("this backend is not waiting for a launch");
-        return Err(deny(backend, &mut stream, true, error).await);
+        return Err(deny(&backend.launch_failure, &mut stream, true, error).await);
     }
     #[cfg(not(windows))]
     return continue_launch(
@@ -2374,7 +2380,7 @@ async fn continue_launch(
     let registered = match admitted {
         Ok(registered) => registered,
         Err(error) => {
-            let error = deny(backend, &mut stream, true, error).await;
+            let error = deny(&backend.launch_failure, &mut stream, true, error).await;
             backend.roll_back();
             return Err(error);
         }
@@ -2555,8 +2561,12 @@ fn is_resumed(frame: &[u8]) -> bool {
 
 /// Records why a launch did not go, on the backend that took it.
 fn record_failure(backend: &Backend, why: String) {
-    *backend
-        .launch_failure
+    keep_failure(&backend.launch_failure, why);
+}
+
+/// Keeps `why` in a backend's record of why its launch did not go, in place of what was there.
+fn keep_failure(record: &Mutex<Option<String>>, why: String) {
+    *record
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(why);
 }
@@ -2576,7 +2586,7 @@ const DENIAL_WRITE_BUDGET: std::time::Duration = std::time::Duration::from_milli
 /// anything: a connection that does not hold the credential learns nothing of the backend, and
 /// cannot replace the reason of the launch that does.
 async fn deny(
-    backend: &Backend,
+    record: &Mutex<Option<String>>,
     stream: &mut BridgeStream,
     authenticated: bool,
     error: BrokerError,
@@ -2584,7 +2594,7 @@ async fn deny(
     let why = said_to_launcher(&error.to_string());
     crate::diagnostics::tell(format_args!("a launch was not admitted: {why}"));
     if authenticated {
-        record_failure(backend, why.clone());
+        keep_failure(record, why.clone());
         write_refusal(stream, &why, DENIAL_WRITE_BUDGET).await;
     }
     error
@@ -2779,13 +2789,14 @@ async fn continue_launch(
     let reservation = match reserved {
         Ok(reservation) => reservation,
         Err(error) => {
-            let error = deny(backend, &mut stream, true, error).await;
+            let error = deny(&backend.launch_failure, &mut stream, true, error).await;
             backend.roll_back();
             return Err(error);
         }
     };
     if let Err(error) = stream.write_frame(&admission()).await {
         drop(reservation);
+        let error = deny(&backend.launch_failure, &mut stream, true, error).await;
         backend.roll_back();
         return Err(error);
     }
@@ -3751,6 +3762,76 @@ mod tests {
         });
         assert!(long.len() <= MAX_REFUSAL_BYTES, "{}", long.len());
         assert!(long.starts_with("the gateway did not start: "), "{long}");
+    }
+
+    /// KR-REQ-12.07: the reason a refused launch is kept and told with is one line of at most
+    /// [`MAX_REFUSAL_BYTES`] bytes, whatever the refusal's own text holds, and a presentation
+    /// whose credential did not authenticate is neither kept nor told.
+    #[tokio::test]
+    async fn a_refused_launch_s_reason_is_one_cut_line_where_it_is_kept_and_told() {
+        use kr_protocol::gateway::NativeFraming;
+        use tokio::io::AsyncReadExt as _;
+
+        let stream_of = || {
+            let (here, there) = tokio::io::duplex(1 << 16);
+            let (reader, writer) = tokio::io::split(here);
+            (
+                BridgeStream::new(
+                    Box::new(reader),
+                    Box::new(writer),
+                    Vec::new(),
+                    Framing::new(NativeFraming::JsonLines),
+                ),
+                there,
+            )
+        };
+        let own = format!(
+            "the file\ncould not be read\u{1b}[31m: {}",
+            "\u{e9}".repeat(600)
+        );
+
+        let (mut stream, mut there) = stream_of();
+        let record = Mutex::new(None);
+        let returned = deny(&record, &mut stream, true, BrokerError::denied(own.clone())).await;
+        assert_eq!(returned.to_string(), own, "the refusal itself is returned");
+        let kept = record
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .expect("the reason is kept");
+        assert!(kept.len() <= MAX_REFUSAL_BYTES, "{}", kept.len());
+        assert!(kept.starts_with("the file could not be read "), "{kept}");
+        assert!(
+            kept.chars().all(|character| !character.is_control()),
+            "{kept:?}"
+        );
+        drop(stream);
+        let mut written = Vec::new();
+        there.read_to_end(&mut written).await.expect("the frame");
+        let line = written.strip_suffix(b"\n").expect("one line");
+        assert!(!line.contains(&b'\n'), "one line");
+        let frame: serde_json::Value = serde_json::from_slice(line).expect("a frame");
+        assert_eq!(frame["kr_launch"]["committed"], false, "{frame}");
+        assert_eq!(
+            frame["kr_launch"]["failed"],
+            kept.as_str(),
+            "the same words"
+        );
+
+        let (mut stream, mut there) = stream_of();
+        let record = Mutex::new(None);
+        deny(&record, &mut stream, false, BrokerError::denied(own)).await;
+        assert!(
+            record
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_none(),
+            "nothing is kept for a credential that did not authenticate"
+        );
+        drop(stream);
+        let mut written = Vec::new();
+        there.read_to_end(&mut written).await.expect("the end");
+        assert!(written.is_empty(), "and nothing is told: {written:?}");
     }
 
     /// KR-REQ-12.07: a refusal that the connection takes whole is written whole, and one that it

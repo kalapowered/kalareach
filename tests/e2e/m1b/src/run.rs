@@ -787,8 +787,8 @@ impl Run {
     }
 
     /// The labels the run's workers' command lines proposed.
-    #[cfg(test)]
-    pub(crate) fn proposed_labels(&self) -> Vec<String> {
+    #[must_use]
+    pub fn proposed_labels(&self) -> Vec<String> {
         self.job_labels
             .lock()
             .unwrap_or_else(PoisonError::into_inner)

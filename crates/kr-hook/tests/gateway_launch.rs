@@ -1113,6 +1113,11 @@ fn kr_req_12_07_a_second_launch_of_a_claimed_backend_is_told_why() {
         &[("STAND_IN", "stay"), ("STAND_IN_COMMAND", COMMAND)],
     );
     first.prints("TUI: turn/completed");
+    let servers = shell.servers();
+    assert_eq!(servers.len(), 1, "{servers:?}");
+    let server = servers[0].clone();
+    let registration = PathBuf::from(&answer.environment[0].value);
+    assert!(registration.exists(), "the first launch is registered");
     let mut second = shell.launch(&answer, "the-second", &[]);
     let status = second.ends();
     let said = second.said();
@@ -1129,9 +1134,13 @@ fn kr_req_12_07_a_second_launch_of_a_claimed_backend_is_told_why() {
         Some("this backend is not waiting for a launch"),
         "the backend's record says why"
     );
+    assert!(
+        registration.exists(),
+        "the first launch is still registered: {said}"
+    );
     assert_eq!(
-        shell.servers().len(),
-        1,
+        kr_ipc::identity::process_state(&server),
+        kr_ipc::identity::ProcessState::Running,
         "the first launch's server runs on"
     );
     let _ = first.child.kill();

@@ -73,18 +73,26 @@ impl Seen {
 
 /// What a launch case that found no instance served through the gateway says about the launch:
 /// the steps and when each was first seen, the host's reads of its instances, the terminal's text
-/// since the typing and what the daemon wrote.
+/// since the typing, what the daemon wrote and what the session worker said to its diagnostics.
 ///
-/// `reads` is the case's own text of the host's reads, each with the time it was made.
+/// `reads` is the case's own text of the host's reads, each with the time it was made; `worker` is
+/// the host's text of the worker's diagnostics lines.
 #[must_use]
-pub fn launch_report(terminal: &str, seen: &Seen, reads: &str, daemon: &str) -> String {
+pub fn launch_report(
+    terminal: &str,
+    seen: &Seen,
+    reads: &str,
+    daemon: &str,
+    worker: &str,
+) -> String {
     format!(
         "the launch's steps, as first seen from the typing:\n{}\n\
          the host's list of application instances as the device read it, each read with its time \
          after the case began:\n{reads}\n\
          the terminal's text since the typing, control characters as escapes:\n{}\n\
-         what the daemon wrote (the worker keeps its reason for a refused launch in memory only, so \
-         the launcher's own line above is where the reason is, where the host sent one):\n{daemon}",
+         what the daemon wrote:\n{daemon}\n\
+         the worker's diagnostics (a refusal before the credential leaves only its line here):\n\
+         {worker}",
         steps(seen),
         terminal_text(terminal, TERMINAL_AT_MOST),
     )
@@ -157,7 +165,7 @@ mod tests {
     fn the_report_repeats_the_launchers_own_line_from_the_terminal() {
         let terminal =
             format!("kr-e2e-forge: pid 7 start 9 forged presentation refused\r\n{REFUSAL}\r\n");
-        let report = launch_report(&terminal, &all_seen(), "(no read)", "(daemon)");
+        let report = launch_report(&terminal, &all_seen(), "(no read)", "(daemon)", "(worker)");
         assert!(report.contains(REFUSAL), "the launcher's line: {report}");
         assert!(
             report.contains("forged presentation refused\n"),
@@ -168,7 +176,7 @@ mod tests {
 
     #[test]
     fn the_report_gives_the_time_each_step_was_first_seen_and_says_which_was_not_seen() {
-        let report = launch_report("", &all_seen(), "(no read)", "(daemon)");
+        let report = launch_report("", &all_seen(), "(no read)", "(daemon)", "(worker)");
         assert!(
             report.contains("the forging helper's line: +250 ms"),
             "{report}"
@@ -185,20 +193,26 @@ mod tests {
             report.contains("the first instance served through the gateway: not seen"),
             "{report}"
         );
-        let nothing = launch_report("", &Seen::default(), "(no read)", "(daemon)");
+        let nothing = launch_report("", &Seen::default(), "(no read)", "(daemon)", "(worker)");
         assert_eq!(nothing.matches(": not seen").count(), 4, "{nothing}");
     }
 
     #[test]
     fn the_report_holds_the_hosts_reads_of_its_instances_with_their_times() {
         let reads = "+14210 ms AgentInstanceList { sequence: U64(1) }\n+14240 ms AgentInstanceList { sequence: U64(1) }";
-        let report = launch_report("", &all_seen(), reads, "(daemon)");
+        let report = launch_report("", &all_seen(), reads, "(daemon)", "(worker)");
         assert!(report.contains(reads), "the reads: {report}");
     }
 
     #[test]
     fn the_report_holds_what_the_daemon_wrote() {
-        let report = launch_report("", &all_seen(), "(no read)", "the daemon's last line");
+        let report = launch_report(
+            "",
+            &all_seen(),
+            "(no read)",
+            "the daemon's last line",
+            "(worker)",
+        );
         assert!(
             report.contains("the daemon's last line"),
             "the daemon's text: {report}"
@@ -206,9 +220,23 @@ mod tests {
     }
 
     #[test]
+    fn the_report_holds_the_workers_diagnostics_line_of_a_forged_presentation() {
+        let line = "a launch was not admitted: this connection did not present this backend's \
+                    credential";
+        let report = launch_report("", &all_seen(), "(no read)", "(daemon)", line);
+        assert!(
+            report.contains(&format!(
+                "the worker's diagnostics (a refusal before the credential leaves only its line \
+                 here):\n{line}"
+            )),
+            "the worker's line: {report}"
+        );
+    }
+
+    #[test]
     fn the_terminals_text_is_cut_at_the_bound_and_its_control_characters_are_escapes() {
         let long = format!("\u{1b}[31m{}", "é".repeat(TERMINAL_AT_MOST));
-        let report = launch_report(&long, &Seen::default(), "(no read)", "(daemon)");
+        let report = launch_report(&long, &Seen::default(), "(no read)", "(daemon)", "(worker)");
         assert!(
             report.contains("\\u{1b}[31m"),
             "the escape is named: {report}"

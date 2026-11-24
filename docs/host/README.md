@@ -9001,10 +9001,10 @@ word, in lower-case hexadecimal, and `.lock`. The control daemon plays no part: 
 cannot take the lock refuses the launch before it starts anything, and the kernel lets go of the
 locks of a worker that ends, whichever way it ends. A second launch of a held conversation, in this
 session or another, is not served a second server: its program runs as typed and nothing of the
-launch is left published. The launcher prints its own reason for the refusal. The host keeps a
-reason of its own for diagnostics: it names the instance when one of this session's instances
-holds the conversation, and says only that an execution of this session or another, or the server
-it started, still holds it when the claim refused the launch.
+launch is left published. The launcher prints the host's reason for the refusal, and the host keeps
+the same reason in its record for diagnostics: it names the instance when one of this session's
+instances holds the conversation, and says only that an execution of this session or another, or
+the server it started, still holds it when the claim refused the launch.
 
 A claim lasts until what runs against the conversation is gone. When the program ends, its
 instance ends with it and its server is retired: the input is closed, the server is asked to

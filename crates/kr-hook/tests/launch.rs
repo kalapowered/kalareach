@@ -1802,6 +1802,13 @@ fn kr_req_12_07_an_undelivered_admission_gives_the_launch_back_before_the_regist
                 )
         },
     );
+    assert!(
+        shell
+            .backends
+            .launch_failure_of(answer.prompt_generation)
+            .is_some_and(|why| !why.is_empty()),
+        "the backend's record keeps why the admission was not delivered"
+    );
     let child = shell.launch(&answer, "again", &[]);
     assert_eq!(
         shell.report("again")["registered"],
