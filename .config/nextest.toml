@@ -36,7 +36,9 @@ store-failure-output = true
 
 [test-groups]
 # static CONTAINER_RUNTIME_TURN, crates/kr-cli/tests/bridged_session.rs: `podman exec` stalled on the box
-# whenever two cases called the runtime at once.
+# whenever two cases called the runtime at once. The group also holds every case of `kr-cli::container` and
+# `kr-controller::container`: their real-runtime cases start containers in the same account's runtime, and cargo test
+# never ran those binaries beside bridged_session.
 container-runtime = { max-threads = 1 }
 # static TURN, crates/kr-worker/tests/ownership.rs: each case holds it for as long as its process tree lives.
 worker-ownership = { max-threads = 1 }
@@ -51,9 +53,8 @@ host-cases = { max-threads = 4 }
 
 [[profile.default.overrides]]
 filter = '''
-  package(kr-cli) & binary(bridged_session) & (
-      test(=__none__)
-      | test(=a_container_is_enrolled_by_name_and_a_refresh_of_it_starts_nothing)
+  (package(kr-cli) & binary(bridged_session) & (
+      test(=a_container_is_enrolled_by_name_and_a_refresh_of_it_starts_nothing)
       | test(=a_container_probe_that_fails_outside_kr_exits_as_an_outside_failure)
       | test(=a_connection_that_fails_claims_nothing_for_an_ssh_host_or_a_container)
       | test(=a_helper_that_exits_before_the_environment_answers_is_told_with_its_program_and_its_code)
@@ -70,7 +71,9 @@ filter = '''
       | test(=a_refresh_that_answers_or_finds_the_environment_stopped_says_so_in_words)
       | test(=an_enrolled_container_answers_a_bridge_and_a_session_made_through_it_lives_there)
       | test(=a_stopped_container_is_started_by_a_create_and_keeps_its_identity)
-  )
+  ))
+  | binary_id(kr-cli::container)
+  | binary_id(kr-controller::container)
 '''
 test-group = 'container-runtime'
 
