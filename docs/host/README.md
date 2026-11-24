@@ -2470,18 +2470,22 @@ started outside the job survives the session's closure.
 A function whose only caller is `#[cfg(unix)]` is dead code on Windows, and neither a Linux build
 nor a macOS one notices: both compile the caller. Twice in two days that reached `main` and turned
 the `windows` job red on a line no host but Windows could see. The check that would have caught
-both runs anywhere, needs no linker and no Windows machine:
+both runs anywhere, needs no linker and no Windows machine, only the MinGW-w64 cross compiler:
 
 ```
 cargo clippy --workspace --exclude kr-describe-model --all-targets \
   --target x86_64-pc-windows-gnu -- -D warnings
 ```
 
-It is a strict superset of compiling the four platform crates' libraries for that target: every
-other crate, every test target, and `-D warnings`, which is where dead code is reported.
+The cross compiler is for C and for Windows resources: the build scripts of `ring`, `aws-lc-sys`,
+`libsqlite3-sys` and the companion application call `x86_64-w64-mingw32-gcc` and
+`x86_64-w64-mingw32-windres`. Ubuntu's `gcc-mingw-w64-x86-64` and Homebrew's `mingw-w64` give both.
+
+The check is a strict superset of compiling the four platform crates' libraries for that target:
+every other crate, every test target, and `-D warnings`, which is where dead code is reported.
 `kr-describe-model` is left out because its inference runtime vendors C and C++ sources, and
-building those for Windows needs a Windows C toolchain that a macOS or Linux host has no reason to
-carry; that crate's Windows build is what the `windows` job above compiles natively. The
+building those for Windows needs a C++ cross compiler as well, which a macOS or Linux host has no
+reason to carry; that crate's Windows build is what the `windows` job above compiles natively. The
 description service it builds on, `kr-describe`, holds no model and is checked with the rest.
 `.cargo/config.toml` sets link flags for the two MSVC targets alone, so the GNU target takes nothing
 from them.

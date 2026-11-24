@@ -92,10 +92,10 @@ jobs:
       # and the window toolkit. A workspace-wide check needs them present before it can compile.
       # The login item's cases read the autostart entry kr writes with the desktop file validator
       # and GLib's own shell parser, which these two packages from the runner's distribution give.
-      # The packages come to 70 MB. This job's apt steps, this one and the four below, install
+      # The packages come to 70 MB. This job's apt steps, this one and the five below, install
       # through scripts/apt-install.sh, because apt has no rate below which it gives up on a slow
       # mirror: the script retries the update and the download, each under a bound, until a deadline
-      # and installs from what it fetched. The deadlines are 30, 5, 5, 5 and 10 minutes, 55 in all,
+      # and installs from what it fetched. The deadlines are 30, 5, 5, 5, 15 and 10 minutes, 70 in all,
       # and the ssh, tmux and fuse3 steps usually run no apt at all. A run whose Test step takes its
       # 225 minutes and whose mirror is slow in every step can reach the job's 360-minute bound
       # before the steps after the Test step end. This step's deadline is 30 minutes. The companion
@@ -189,6 +189,21 @@ jobs:
       # cross check needs the standard library of its target.
       - name: Install the component target
         run: rustup target add wasm32-wasip2 x86_64-pc-windows-gnu
+
+      # `kr-cli`'s retained_surface suite checks the workspace for x86_64-pc-windows-gnu. The build
+      # scripts of `ring`, `aws-lc-sys`, `libsqlite3-sys` and the companion application need
+      # `x86_64-w64-mingw32-gcc` and `x86_64-w64-mingw32-windres`, which the runner image lacks, so
+      # the suite's build fails without them. The packages come to 90 MB; the install's deadline is
+      # 15 minutes.
+      - name: Install the Windows cross compiler
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          if ! command -v x86_64-w64-mingw32-gcc > /dev/null; then
+            bash scripts/apt-install.sh --deadline 900 gcc-mingw-w64-x86-64
+          fi
+          x86_64-w64-mingw32-gcc --version
+          x86_64-w64-mingw32-windres --version
 
       - name: Restore the cargo cache
         id: cargo-cache
@@ -3168,6 +3183,21 @@ jobs:
       - name: Install the component target
         timeout-minutes: 5
         run: rustup target add wasm32-wasip2 x86_64-pc-windows-gnu
+
+      # `kr-cli`'s retained_surface suite, which `tests-2` runs, checks the workspace for
+      # x86_64-pc-windows-gnu, and the build scripts of `ring`, `aws-lc-sys`, `libsqlite3-sys` and the
+      # companion application need `x86_64-w64-mingw32-gcc` and `x86_64-w64-mingw32-windres`. The
+      # runner image has neither; Homebrew's mingw-w64 gives both. `kr-cli` is in `tests-2` only.
+      - name: Install the Windows cross compiler
+        if: ${{ matrix.part == 'tests-2' }}
+        timeout-minutes: 10
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+          HOMEBREW_NO_INSTALL_CLEANUP: "1"
+        run: |
+          brew install mingw-w64
+          x86_64-w64-mingw32-gcc --version
+          x86_64-w64-mingw32-windres --version
 
       # The worker's pseudo-terminal suite starts each shell section 3 names as a session's root
       # shell. The runner has Bash and Zsh; Fish is installed here, and the test step names all

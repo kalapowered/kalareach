@@ -1459,6 +1459,58 @@ fn the_real_proxy_cases_run_in_a_job_that_fails_without_squid_and_without_the_ca
     }
 }
 
+/// `kr-cli`'s retained_surface suite checks the workspace for x86_64-pc-windows-gnu. The build
+/// scripts in that build that compile C look for `x86_64-w64-mingw32-gcc`, and the companion
+/// application's looks for `x86_64-w64-mingw32-windres`; no hosted runner image has them, so
+/// without them the suite's Windows build fails. Each job that runs the suite installs them before
+/// its test step, by one step that is not disabled and runs on every leg that runs the suite: in
+/// the landing workflow, the rust job and the macOS job's `tests-2` leg, which holds `kr-cli`.
+#[test]
+fn the_jobs_that_run_the_retained_surface_suite_install_the_windows_cross_compiler_first() {
+    let landing = fs::read_to_string(repository().join(".github/workflows/core-ci.yml"))
+        .expect("the landing workflow");
+    for (name, tests, package, when) in [
+        (
+            "rust",
+            "cargo test --locked --workspace",
+            "gcc-mingw-w64-x86-64",
+            None,
+        ),
+        (
+            "macos",
+            "cargo test --locked ${{ matrix.packages }} --no-fail-fast --",
+            "brew install mingw-w64",
+            Some("${{ matrix.part == 'tests-2' }}"),
+        ),
+    ] {
+        let text = job(&landing, name);
+        let installs = steps_holding(&text, package);
+        assert_eq!(
+            installs.len(),
+            1,
+            "the {name} job has not one step that installs the cross compiler"
+        );
+        assert!(
+            !is_disabled(&installs[0]),
+            "the {name} job's step that installs the cross compiler is disabled or lets its failure pass"
+        );
+        assert_eq!(
+            step_condition(&installs[0]),
+            when.map(compact),
+            "the {name} job's step that installs the cross compiler runs under a condition other than {when:?}"
+        );
+        let installed = steps_of(&text)
+            .iter()
+            .position(|step| *step == installs[0])
+            .expect("the install step is a step of the job");
+        let tested = position_of_tool(&text, tests).expect("the step that runs the tests");
+        assert!(
+            installed < tested,
+            "the {name} job runs its tests before it installs the cross compiler"
+        );
+    }
+}
+
 /// The names of the jobs of a workflow, in the order they are written.
 fn job_names(workflow: &str) -> Vec<String> {
     let mut in_jobs = false;
