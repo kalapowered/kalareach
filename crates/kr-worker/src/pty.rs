@@ -906,6 +906,66 @@ mod tests {
         assert_eq!(exit.code, 0);
     }
 
+    /// A shell the worker starts does not inherit the signals the worker's own process ignores: a
+    /// process started with hangup, interrupt and quit ignored (as a background job of a
+    /// non-interactive shell is) gives its shell the default dispositions.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_shell_does_not_inherit_the_signals_the_worker_ignores() {
+        const HANGUP_INTERRUPT_QUIT: u64 = 0b111;
+        const INSIDE: &str = "KR_PTY_SIGNAL_CASE_INSIDE";
+        const NAME: &str = "pty::tests::a_shell_does_not_inherit_the_signals_the_worker_ignores";
+        fn ignored(line: &str) -> u64 {
+            u64::from_str_radix(line.trim().trim_start_matches("SigIgn:").trim(), 16)
+                .expect("the ignored signals are a hexadecimal mask")
+        }
+        if std::env::var_os(INSIDE).is_none() {
+            let status = std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg(format!(
+                    "trap '' HUP INT QUIT; exec \"$0\" --exact {NAME} --nocapture"
+                ))
+                .arg(std::env::current_exe().expect("this test's executable"))
+                .env(INSIDE, "1")
+                .status()
+                .expect("the test starts again with those signals ignored");
+            assert!(status.success(), "the case inside ended with {status}");
+            return;
+        }
+        let own = std::fs::read_to_string("/proc/self/status").expect("this process's status");
+        let own = own
+            .lines()
+            .find(|line| line.starts_with("SigIgn:"))
+            .expect("the status names the ignored signals");
+        assert_eq!(
+            ignored(own) & HANGUP_INTERRUPT_QUIT,
+            HANGUP_INTERRUPT_QUIT,
+            "the test process ignores hangup, interrupt and quit before the shell starts"
+        );
+        let mut pty = Pty::open(Dimensions::new(80, 24)).expect("opens");
+        let mut reader = pty.reader().expect("a reader");
+        let mut shell = pty
+            .launch(
+                &crate::testing::posix_script(
+                    "while IFS= read -r line; do case $line in SigIgn:*) printf '%s\\n' \"$line\" ;; esac; \
+                     done < /proc/$$/status; printf ENDED",
+                ),
+                |_| Ok(()),
+            )
+            .expect("launches");
+        let seen = String::from_utf8_lossy(&read_until(&pty, &mut reader, b"ENDED")).into_owned();
+        shell.wait().expect("waits");
+        let line = seen
+            .lines()
+            .find(|line| line.contains("SigIgn:"))
+            .expect("the shell reported its ignored signals");
+        assert_eq!(
+            ignored(line) & HANGUP_INTERRUPT_QUIT,
+            0,
+            "the shell the worker started ignores none of hangup, interrupt and quit: {line}"
+        );
+    }
+
     #[test]
     fn the_environment_is_replaced_rather_than_inherited() {
         // The worker's own process has this set and the launch environment does not carry it, so
