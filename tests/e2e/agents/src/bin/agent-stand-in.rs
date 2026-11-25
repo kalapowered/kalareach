@@ -37,6 +37,9 @@
 //! - A script or a wheel is started through its runtime, which is this program, with the script as
 //!   its first argument; for those launches that argument is not taken for a command.
 //! - It shows the entry's first screen text and its composer text, and no sign-in screen.
+//! - On a terminal it takes each key as it is typed and echoes it itself, as a full-screen agent
+//!   does: a part of a line that is typed and not sent is the agent's, and is not left in the
+//!   terminal when the agent ends.
 //! - The conversation file is `rollout-<time>-<uuid>.jsonl` below the entry's `conversations`
 //!   (`{date}` as `YYYY/MM/DD`) in the directory the entry's configuration variable names, else
 //!   in the home. A prompt is a line that holds the entry's prompt mark, after a line that holds
@@ -230,6 +233,7 @@ mod stand_in {
                 conversation,
                 std::slice::from_ref(&entry.ready),
                 &entry.composer,
+                true,
             ),
             None => composer(
                 conversation,
@@ -239,6 +243,7 @@ mod stand_in {
                     "╰──────────────────────────────────────╯".to_owned(),
                 ],
                 COMPOSER,
+                false,
             ),
         }
     }
@@ -469,21 +474,136 @@ mod stand_in {
             .next_back()
     }
 
+    /// What the terminal on the input was set to before the stand-in changed it.
+    type Saved = rustix::termios::Termios;
+
+    /// Sets the terminal on the input to deliver each key as it is typed, with no echo by the
+    /// terminal, as a full-screen agent does; the stand-in echoes the keys itself. None where the
+    /// input is no terminal.
+    fn keys_as_typed() -> Option<Saved> {
+        use rustix::termios::{
+            LocalModes, OptionalActions, SpecialCodeIndex, tcgetattr, tcsetattr,
+        };
+        let stdin = std::io::stdin();
+        let saved = tcgetattr(&stdin).ok()?;
+        let mut modes = saved.clone();
+        modes
+            .local_modes
+            .remove(LocalModes::ICANON | LocalModes::ECHO);
+        modes.special_codes[SpecialCodeIndex::VMIN] = 1;
+        modes.special_codes[SpecialCodeIndex::VTIME] = 0;
+        tcsetattr(&stdin, OptionalActions::Now, &modes).ok()?;
+        Some(saved)
+    }
+
+    /// Where a read of keys is in an escape sequence.
+    enum Escape {
+        /// Outside one.
+        None,
+        /// After the escape byte.
+        Opened,
+        /// After `[`, until the sequence's last byte.
+        Csi,
+    }
+
+    /// Reads one line of keys a terminal delivers as they are typed, and echoes each printable key
+    /// as it comes; the backspace and the line-kill key take back what was echoed. Escape sequences
+    /// are kept in the line and not echoed. None where the terminal closes.
+    fn line_of_keys(input: &mut impl Read) -> Option<Vec<u8>> {
+        let mut out = std::io::stdout();
+        let mut line: Vec<u8> = Vec::new();
+        let mut escape = Escape::None;
+        let mut key = [0u8; 1];
+        loop {
+            if input.read(&mut key).ok()? == 0 {
+                return None;
+            }
+            let key = key[0];
+            match escape {
+                Escape::Opened => {
+                    line.push(key);
+                    escape = if key == b'[' {
+                        Escape::Csi
+                    } else {
+                        Escape::None
+                    };
+                    continue;
+                }
+                Escape::Csi => {
+                    line.push(key);
+                    if (0x40..=0x7e).contains(&key) {
+                        escape = Escape::None;
+                    }
+                    continue;
+                }
+                Escape::None => {}
+            }
+            match key {
+                0x1b => {
+                    line.push(key);
+                    escape = Escape::Opened;
+                }
+                b'\r' | b'\n' => {
+                    let _ = out.write_all(b"\r\n");
+                    let _ = out.flush();
+                    return Some(line);
+                }
+                0x04 if line.is_empty() => return None,
+                0x7f | 0x08 | 0x15 => {
+                    // Takes back the last character, or with the line-kill key the whole line.
+                    let mut erased = 0;
+                    while let Some(byte) = line.pop() {
+                        if byte & 0xc0 != 0x80 {
+                            erased += 1;
+                            if key != 0x15 {
+                                break;
+                            }
+                        }
+                    }
+                    let _ = out.write_all("\x08 \x08".repeat(erased).as_bytes());
+                    let _ = out.flush();
+                }
+                _ => {
+                    line.push(key);
+                    if key >= 0x20 {
+                        let _ = out.write_all(&[key]);
+                        let _ = out.flush();
+                    }
+                }
+            }
+        }
+    }
+
     /// Shows `banner` and the composer and answers prompts, a line at a time, until the terminal
-    /// closes.
-    fn composer(mut conversation: Conversation, banner: &[String], composer: &str) {
+    /// closes. With `keys_typed` on a terminal, the stand-in takes each key as it is typed and echoes
+    /// it, as a full-screen agent does, so that a part of a line typed and not yet sent is the
+    /// agent's and not left in the terminal when the agent ends.
+    fn composer(
+        mut conversation: Conversation,
+        banner: &[String],
+        composer: &str,
+        keys_typed: bool,
+    ) {
         for line in banner {
             println!("{line}");
         }
         println!();
         println!("› {composer}");
         let stdin = std::io::stdin();
+        let saved = keys_typed.then(keys_as_typed).flatten();
         let mut line = Vec::new();
         loop {
             line.clear();
-            match stdin.lock().read_until(b'\n', &mut line) {
-                Ok(0) | Err(_) => return,
-                Ok(_) => {}
+            if saved.is_some() {
+                match line_of_keys(&mut stdin.lock()) {
+                    Some(keys) => line = keys,
+                    None => break,
+                }
+            } else {
+                match stdin.lock().read_until(b'\n', &mut line) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
             }
             let raw = String::from_utf8_lossy(&line).into_owned();
             let prompt = raw
@@ -498,6 +618,10 @@ mod stand_in {
             println!("• {reply}");
             println!();
             println!("› {composer}");
+        }
+        if let Some(saved) = saved {
+            let _ =
+                rustix::termios::tcsetattr(&stdin, rustix::termios::OptionalActions::Now, &saved);
         }
     }
 

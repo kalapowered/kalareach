@@ -31,9 +31,8 @@ use kr_protocol::ids::{EnvironmentId, PluginId};
 use kr_protocol::scalars::Nullable;
 
 use super::staged_a::{BY_HAND, HandAgent, detects, launched};
-use super::{
-    Chosen, Context, ISOLATION_UNPROVEN, Session, Setup, generations, run_case_with, shells,
-};
+use super::stand_in::native_entry;
+use super::{Chosen, Context, ISOLATION_UNPROVEN, Session, Setup, generations, run_case_for};
 
 /// The one match rule of a written package: the executable named `command`, in any directory,
 /// whatever distribution it came from. A command is a name, never a path: the stand-in is placed
@@ -299,15 +298,10 @@ pub fn release(into: &Path, plugin: &str, command: &str, shape: Shape) {
     std::fs::write(&path, text).expect("the release's manifest");
 }
 
-/// A build list entry for `plugin`, typed as `command`.
+/// A build list entry for `plugin`, typed as `command`, with the first screen and the record the
+/// terminal stand-in made from it shows.
 pub fn entry(plugin: &str, command: &str) -> kr_e2e_agents::build::Build {
-    serde_json::from_value(serde_json::json!({
-        "package": plugin, "application": "a", "version": "1", "prefix": "/p",
-        "pinned": format!("bin/{command}"), "sha256": "00", "command": command,
-        "launch": "native", "ready": "r", "harmless": { "input": "h", "shows": "h" },
-        "transcript": "t", "missing": {}
-    }))
-    .expect("an entry")
+    native_entry(plugin, command)
 }
 
 /// A directory of this case's own below the system's temporary one, empty.
@@ -404,35 +398,15 @@ fn by_hand_on(
     test: &str,
     body: impl FnOnce(&Context, &Session<'_>) -> serde_json::Value,
 ) {
-    if kr_ipc::testing::account_launchd::stands_down("the host start") {
-        return;
-    }
-    let shell = match shells::managed_zsh() {
-        Ok(shell) => shell,
-        Err(why) if shells::required() => panic!("the package leg's managed shell: {why}"),
-        Err(why) => {
-            eprintln!("skipping: the package leg: {why}");
-            return;
-        }
-    };
-    run_case_with(
+    run_case_for(
+        subject,
         Setup {
             manual: true,
             no_login: true,
             ..Setup::default()
         },
-        "package",
-        "package",
-        test,
+        ("package", "package", test),
         "by-hand",
-        (
-            shell,
-            Chosen {
-                subject,
-                generation: None,
-            },
-            false,
-        ),
         body,
     );
 }
@@ -505,9 +479,16 @@ fn starts_by_hand(
         session.host.agent_is_a_stand_in();
     }
     session.host.agent_starts();
+    // The stand-in made from an entry shows the entry's first screen, and Codex's by-hand stand-in
+    // its own first row.
+    let shows = ctx
+        .subject
+        .entry()
+        .filter(|_| executable == ctx.executable)
+        .map_or(BY_HAND, |build| build.ready.as_str());
     let _ = session
         .person
-        .types_until_it_shows(typed, BY_HAND, what, checks);
+        .types_until_it_shows(typed, shows, what, checks);
     HandAgent::running(ctx, session, executable)
 }
 
@@ -554,7 +535,8 @@ fn the_host_detects_a_program_typed_as_the_command_of_the_package_it_installed()
 const OTHER_NAME: &str = "kr-other-name";
 
 /// The host that installed a written package does not detect a program that runs under another name
-/// than the entry's command, though the program is a copy of the one it detects.
+/// than the entry's command. The program is a copy of Codex's by-hand stand-in, and no rule of the
+/// package recognises its name.
 #[test]
 fn the_host_does_not_detect_a_program_run_under_another_name_than_the_entrys_command() {
     const TEST: &str =

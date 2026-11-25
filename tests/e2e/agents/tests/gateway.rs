@@ -190,6 +190,14 @@ const BUILD_VARIABLE: &str = "KR_AGENTS_GATEWAY_BUILD";
 /// which the entry's set for the newer build is written.
 const PROBE_ONLY_VARIABLE: &str = "KR_AGENTS_GATEWAY_PROBE_ONLY";
 
+/// The variable naming the build list entry the terminal stand-in stands for on the stand-in route.
+/// It is set beside [`STAND_IN_MANIFEST_VARIABLE`] and never beside [`BUILD_VARIABLE`].
+const STAND_IN_ENTRY_VARIABLE: &str = "KR_AGENTS_STAND_IN_ENTRY";
+
+/// The variable naming the `plugin.json` of the release the stand-in route writes its package from,
+/// for the entry [`STAND_IN_ENTRY_VARIABLE`] names.
+const STAND_IN_MANIFEST_VARIABLE: &str = "KR_AGENTS_STAND_IN_MANIFEST";
+
 /// What the session's shell prompts with, so a case knows it is reading.
 const PROMPT: &str = "kr-session$ ";
 
@@ -339,19 +347,33 @@ struct Chosen {
 }
 
 impl Chosen {
-    /// The agent the environment names: the build list entry that [`BUILD_VARIABLE`] names, or the
-    /// stand-in's Codex where it names none.
+    /// The agent the environment names: the entry the terminal stand-in stands for
+    /// ([`STAND_IN_ENTRY_VARIABLE`], with the manifest of its package), the build list entry that
+    /// [`BUILD_VARIABLE`] names, or the stand-in's Codex where it names none.
     ///
     /// # Panics
     ///
-    /// Panics when a real agent is asked for and the key scan names no file, the generation is not
-    /// one, the entry is one a real start refuses ([`entry::refuse_real_start`]), or the package's
-    /// manifest cannot be read: nothing has started.
+    /// Panics when the two stand-in variables are not a pair that names one agent
+    /// ([`stand_in::stand_in_chosen`]), or when a real agent is asked for and the key scan names no
+    /// file, the generation is not one, the entry is one a real start refuses
+    /// ([`entry::refuse_real_start`]), or the package's manifest cannot be read: nothing has
+    /// started.
     fn from_environment() -> Self {
-        let Some(path) = std::env::var_os(BUILD_VARIABLE)
-            .filter(|value| !value.is_empty())
-            .map(PathBuf::from)
-        else {
+        let named = |variable: &str| {
+            std::env::var_os(variable)
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+        };
+        if let Some(chosen) = stand_in::stand_in_chosen(
+            named(STAND_IN_ENTRY_VARIABLE).as_deref(),
+            named(STAND_IN_MANIFEST_VARIABLE).as_deref(),
+            named(BUILD_VARIABLE).is_some(),
+        )
+        .unwrap_or_else(|why| panic!("{why}"))
+        {
+            return chosen;
+        }
+        let Some(path) = named(BUILD_VARIABLE) else {
             return Self {
                 subject: Subject::codex(),
                 generation: None,
@@ -1551,6 +1573,16 @@ impl Context {
         }
     }
 
+    /// The programs the stand-in route places for the agent and for its newer build: the terminal
+    /// stand-in for an entry of the build list, and the application stand-in for Codex.
+    fn stand_in_programs(&self) -> (&'static str, &'static str) {
+        if self.subject.entry().is_some() {
+            ("agent-stand-in", "agent-stand-in-newer")
+        } else {
+            ("codex-stand-in", "codex-stand-in-newer")
+        }
+    }
+
     /// Places the forwarder and the agent in the run, and checks the entry. A failure here is a
     /// failure of the case, which ends as every case does.
     fn place(&mut self) {
@@ -1584,6 +1616,14 @@ impl Context {
         let mut newer_placed = None;
         let mut newer_prefix = None;
         let command = self.subject.command();
+        let (pinned_program, newer_program) = self.stand_in_programs();
+        if let (Route::StandIn, Some(build)) = (&self.route, self.subject.entry()) {
+            std::fs::write(
+                stand_in_entry_file(run),
+                stand_in::stand_in_file(build).to_string(),
+            )
+            .expect("the file of the entry the terminal stand-in stands for");
+        }
         let (executable, bin) = match &self.route {
             Route::StandIn if self.upgrade => {
                 // Two installed builds behind the link `agent/current`: the pinned stand-in and the
@@ -1595,12 +1635,8 @@ impl Context {
                         .expect("a directory for the programs");
                 }
                 let program = format!("bin/{command}");
-                run.place_built("codex-stand-in", &first.join(&program), &["--version"]);
-                run.place_built(
-                    "codex-stand-in-newer",
-                    &second.join(&program),
-                    &["--version"],
-                );
+                run.place_built(pinned_program, &first.join(&program), &["--version"]);
+                run.place_built(newer_program, &second.join(&program), &["--version"]);
                 for relative in [format!("t/a/{program}"), format!("t/b/{program}")] {
                     run.note_placed(Path::new(&relative))
                         .unwrap_or_else(|why| panic!("{ISOLATION_UNPROVEN} {why}"));
@@ -1617,7 +1653,7 @@ impl Context {
                 let tools = run.root().join("t");
                 kr_ipc::paths::create_private_tree(run.root(), &tools)
                     .expect("a directory for the programs");
-                run.place_built("codex-stand-in", &tools.join(command), &["--version"]);
+                run.place_built(pinned_program, &tools.join(command), &["--version"]);
                 // The shell finds the stand-in by its name on a search path, as it finds the build.
                 let place = self.subject.place();
                 run.note_placed(Path::new(&place))
@@ -1860,7 +1896,7 @@ impl Context {
     fn stand_in_variables(&self, variants: &str, more: &[(&str, String)]) -> Vec<(String, String)> {
         given_variables(
             matches!(self.route, Route::StandIn).then(|| {
-                vec![
+                let mut variables = vec![
                     ("STAND_IN".to_owned(), variants.to_owned()),
                     (
                         "STAND_IN_RELEASE".to_owned(),
@@ -1871,7 +1907,14 @@ impl Context {
                         received_by(self).display().to_string(),
                     ),
                     ("STAND_IN_COMMAND".to_owned(), command(&self.bin)),
-                ]
+                ];
+                if self.subject.entry().is_some() {
+                    variables.push((
+                        "STAND_IN_ENTRY".to_owned(),
+                        stand_in_entry_file(&self.run).display().to_string(),
+                    ));
+                }
+                variables
             }),
             more,
         )
@@ -3387,6 +3430,12 @@ fn releases(ctx: &Context) {
         .unwrap_or_else(|why| panic!("the release: {why}"));
 }
 
+/// The file of the names and texts of the entry the terminal stand-in stands for, in the run's
+/// directory.
+fn stand_in_entry_file(run: &Run) -> PathBuf {
+    run.root().join("stand-in-entry.json")
+}
+
 /// The file the stand-in's server notes the frames it received in.
 fn received_by(ctx: &Context) -> PathBuf {
     ctx.run.root().join("received")
@@ -4643,6 +4692,44 @@ fn run_case_in(
         test,
         variants,
         (shell, chosen, probe_only),
+        body,
+    );
+}
+
+/// [`run_case_in`] on the stand-in route for `subject`, an entry the terminal stand-in stands for,
+/// whatever the environment names.
+fn run_case_for(
+    subject: Subject,
+    setup: Setup,
+    (leg, case, test): (&str, &str, &str),
+    variants: &str,
+    body: impl FnOnce(&Context, &Session<'_>) -> serde_json::Value,
+) {
+    if kr_ipc::testing::account_launchd::stands_down("the host start") {
+        return;
+    }
+    let shell = match shells::managed_zsh() {
+        Ok(shell) => shell,
+        Err(why) if shells::required() => panic!("the {leg} leg's managed shell: {why}"),
+        Err(why) => {
+            eprintln!("skipping: the {leg} leg: {why}");
+            return;
+        }
+    };
+    run_case_with(
+        setup,
+        leg,
+        case,
+        test,
+        variants,
+        (
+            shell,
+            Chosen {
+                subject,
+                generation: None,
+            },
+            false,
+        ),
         body,
     );
 }

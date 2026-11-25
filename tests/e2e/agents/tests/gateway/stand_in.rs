@@ -2,16 +2,25 @@
 //!
 //! `agent-stand-in` takes the names and texts of the entry it stands for from a file the driver
 //! makes ([`stand_in_file`]) and never a path to run. The three synthetic entries here are a script
-//! launch, a wheel launch and a native entry with texts of its own. The cases in this file start the
-//! program alone, with a home of its own, and read what it printed and what it recorded.
+//! launch, a wheel launch and a native entry with texts of its own. Some cases in this file start the
+//! program alone, with a home of its own, and read what it printed and what it recorded. The others
+//! choose the entry that the stand-in route stands in for ([`stand_in_chosen`]) and run the staged
+//! parts that start no model turn for the stand-in made from it.
 
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use kr_e2e_agents::build::Build;
+use kr_e2e_agents::build::{Build, Launch, read_build};
 use kr_e2e_agents::held::{conversations_relative_in, turns_recorded};
+use kr_e2e_agents::subject::Subject;
 use kr_e2e_m1b::run::RootPin;
+use kr_plugin_sdk::package::MANIFEST_FILE;
+
+use super::package::{Shape, release};
+use super::staged_a::{part_2b, part_2c, part_5a, part_6a, part_8a, part_14_03a};
+use super::{BUILD_VARIABLE, Chosen, STAND_IN_ENTRY_VARIABLE, STAND_IN_MANIFEST_VARIABLE};
 
 /// The pinned program and the newer one: one source, two programs.
 const PROGRAM: &str = env!("CARGO_BIN_EXE_agent-stand-in");
@@ -40,23 +49,46 @@ const MEMBERS: [&str; 12] = [
 pub struct Synthetic {
     /// What a failure says the entry is.
     pub name: &'static str,
+    /// The entry as the file the build list holds it in.
+    pub file: serde_json::Value,
     /// The entry.
     pub build: Build,
 }
 
+impl Synthetic {
+    /// The entry [`entry_json`] makes from the rest.
+    fn of(
+        name: &'static str,
+        package: &str,
+        shape: (&str, &str, &[&str], &str),
+        texts: (&str, &str),
+        marks: [&str; 4],
+    ) -> Self {
+        let file = entry_json(package, shape, texts, marks);
+        let build = serde_json::from_value(file.clone()).expect("an entry");
+        Self { name, file, build }
+    }
+}
+
+/// The text a harmless keystroke types at the composer of every synthetic entry, which the
+/// composer shows once the terminal has echoed it.
+const HARMLESS: &str = "kr-harmless";
+
 /// An entry that is typed as `command`, launched as `launch`, shows `ready` and `composer`, and
-/// whose record holds its lines under the marks `marks` (prompt, reply, turn, image).
-fn entry(
+/// whose record holds its lines under the marks `marks` (prompt, reply, turn, image), as the file
+/// the build list holds it in.
+fn entry_json(
     package: &str,
     (command, launch, runtime, pinned): (&str, &str, &[&str], &str),
     (ready, composer): (&str, &str),
     marks: [&str; 4],
-) -> Build {
-    serde_json::from_value(serde_json::json!({
+) -> serde_json::Value {
+    serde_json::json!({
         "package": package, "application": "a", "version": "1.2.3", "prefix": "/real/prefix",
         "pinned": pinned, "sha256": "00", "command": command, "launch": launch,
-        "runtime": runtime, "ready": ready, "harmless": { "input": "h", "shows": "h" },
-        "transcript": "t", "missing": {},
+        "runtime": runtime, "ready": ready,
+        "harmless": { "input": HARMLESS, "shows": HARMLESS },
+        "transcript": "sessions/{cwd_slug}/{session}.jsonl", "missing": {},
         "newer": {
             "version": "1.3.0", "prefix": "/real/newer", "pinned": pinned, "sha256": "00",
             "ready": ready
@@ -71,66 +103,78 @@ fn entry(
             "resume": ["resume", "{conversation}"], "image": "paste",
             "turn_line": marks[2], "image_line": marks[3]
         }
-    }))
-    .expect("an entry")
+    })
+}
+
+/// The marks the record of a native entry's lines holds.
+const NATIVE_MARKS: [&str; 4] = [
+    "\"role\":\"user\"",
+    "\"role\":\"assistant\"",
+    "\"kind\":\"turn_started\"",
+    "\"kind\":\"image\"",
+];
+
+/// A native entry for `plugin` typed as `command`, whose first screen and composer show the
+/// command's name.
+pub fn native_entry(plugin: &str, command: &str) -> Build {
+    Synthetic::of(
+        "a native entry",
+        plugin,
+        (command, "native", &[], &format!("bin/{command}")),
+        (
+            &format!("{command} ready"),
+            &format!("{command}> type here"),
+        ),
+        NATIVE_MARKS,
+    )
+    .build
 }
 
 /// The three synthetic entries: a script launch, a wheel launch and a native entry whose texts and
 /// marks are not Codex's.
 pub fn synthetic() -> [Synthetic; 3] {
     [
-        Synthetic {
-            name: "the script launch",
-            build: entry(
-                "kalareach/gemini-cli",
-                (
-                    "gemini",
-                    "script",
-                    &["/real/node/bin/node"],
-                    "lib/gemini.js",
-                ),
-                ("Script agent ready", "script> type here"),
-                [
-                    "\"type\":\"user\"",
-                    "\"type\":\"reply\"",
-                    "\"type\":\"turn_started\"",
-                    "\"type\":\"inline_image\"",
-                ],
+        Synthetic::of(
+            "the script launch",
+            "kalareach/gemini-cli",
+            (
+                "gemini",
+                "script",
+                &["/real/node/bin/node"],
+                "lib/gemini.js",
             ),
-        },
-        Synthetic {
-            name: "the wheel launch",
-            build: entry(
-                "kalareach/kimi-cli",
-                (
-                    "kimi",
-                    "wheel",
-                    &["/real/python/bin/python3"],
-                    "wheel/kimi-1.2.3-py3-none-any.whl",
-                ),
-                ("Wheel agent ready", "wheel> type here"),
-                [
-                    "\"speaker\":\"you\"",
-                    "\"speaker\":\"agent\"",
-                    "\"event\":\"turn\"",
-                    "\"attachment\":\"image\"",
-                ],
+            ("Script agent ready", "script> type here"),
+            [
+                "\"type\":\"user\"",
+                "\"type\":\"reply\"",
+                "\"type\":\"turn_started\"",
+                "\"type\":\"inline_image\"",
+            ],
+        ),
+        Synthetic::of(
+            "the wheel launch",
+            "kalareach/kimi-cli",
+            (
+                "kimi",
+                "wheel",
+                &["/real/python/bin/python3"],
+                "wheel/kimi-1.2.3-py3-none-any.whl",
             ),
-        },
-        Synthetic {
-            name: "the native entry with texts of its own",
-            build: entry(
-                "kalareach/claude-code",
-                ("claude", "native", &[], "bin/claude"),
-                ("Native agent ready", "native> type here"),
-                [
-                    "\"role\":\"user\"",
-                    "\"role\":\"assistant\"",
-                    "\"kind\":\"turn_started\"",
-                    "\"kind\":\"image\"",
-                ],
-            ),
-        },
+            ("Wheel agent ready", "wheel> type here"),
+            [
+                "\"speaker\":\"you\"",
+                "\"speaker\":\"agent\"",
+                "\"event\":\"turn\"",
+                "\"attachment\":\"image\"",
+            ],
+        ),
+        Synthetic::of(
+            "the native entry with texts of its own",
+            "kalareach/claude-code",
+            ("claude", "native", &[], "bin/claude"),
+            ("Native agent ready", "native> type here"),
+            NATIVE_MARKS,
+        ),
     ]
 }
 
@@ -161,6 +205,76 @@ pub fn stand_in_file(build: &Build) -> serde_json::Value {
         "turn_line": account.turn_line,
         "image_line": account.image_line,
     })
+}
+
+/// The agent the stand-in route stands in for that the environment names: the build list entry the
+/// file `entry` holds, with the package whose release has the manifest `manifest`. None where it
+/// names neither. `real` says that [`BUILD_VARIABLE`] names an entry too.
+///
+/// # Errors
+///
+/// Returns why the two are refused: one is named without the other, a real build is named beside
+/// them, the manifest is not a file named `plugin.json`, the entry has no account, or the entry and
+/// the release are not one agent's.
+///
+/// # Panics
+///
+/// Panics where the file of the entry cannot be read or is not an entry ([`read_build`]).
+pub fn stand_in_chosen(
+    entry: Option<&Path>,
+    manifest: Option<&Path>,
+    real: bool,
+) -> Result<Option<Chosen>, String> {
+    if real && (entry.is_some() || manifest.is_some()) {
+        let named = if entry.is_some() {
+            STAND_IN_ENTRY_VARIABLE
+        } else {
+            STAND_IN_MANIFEST_VARIABLE
+        };
+        return Err(format!(
+            "{named} and {BUILD_VARIABLE} both name an agent: a run stands in for an entry or \
+             starts a real one, not both"
+        ));
+    }
+    let (entry, manifest) = match (entry, manifest) {
+        (None, None) => return Ok(None),
+        (Some(_), None) => {
+            return Err(format!(
+                "{STAND_IN_ENTRY_VARIABLE} names the build list entry the terminal stand-in \
+                 stands for, and {STAND_IN_MANIFEST_VARIABLE} names no manifest of its package: \
+                 set both or neither"
+            ));
+        }
+        (None, Some(_)) => {
+            return Err(format!(
+                "{STAND_IN_MANIFEST_VARIABLE} names the manifest of the package the terminal \
+                 stand-in is installed from, and {STAND_IN_ENTRY_VARIABLE} names no entry: set \
+                 both or neither"
+            ));
+        }
+        (Some(entry), Some(manifest)) => (entry, manifest),
+    };
+    if manifest.file_name() != Some(OsStr::new(MANIFEST_FILE)) {
+        return Err(format!(
+            "{STAND_IN_MANIFEST_VARIABLE} names {}, which is not a file named {MANIFEST_FILE}",
+            manifest.display()
+        ));
+    }
+    let build = read_build(entry);
+    if build.account.is_none() {
+        return Err(format!(
+            "{STAND_IN_ENTRY_VARIABLE} names an entry with no account, which gives the terminal \
+             stand-in no composer text and no record marks"
+        ));
+    }
+    let release = manifest.parent().unwrap_or_else(|| Path::new(""));
+    let subject = Subject::from_release(&build, release).map_err(|why| {
+        format!("{STAND_IN_ENTRY_VARIABLE} and {STAND_IN_MANIFEST_VARIABLE} do not name one agent: {why}")
+    })?;
+    Ok(Some(Chosen {
+        subject,
+        generation: None,
+    }))
 }
 
 /// A directory of this case's own below the system's temporary one, empty.
@@ -554,4 +668,269 @@ fn the_file_made_for_the_stand_in_names_no_program_to_run_and_one_that_does_is_r
         }
         let _ = std::fs::remove_dir_all(&base);
     }
+}
+
+/// The file of the entry of `synthetic` and the manifest of a release of its package, written below
+/// `base`.
+fn named(base: &Path, synthetic: &Synthetic) -> (PathBuf, PathBuf) {
+    let entry = base.join("entry.json");
+    std::fs::write(&entry, synthetic.file.to_string()).expect("the entry's file");
+    let directory = base.join("release");
+    release(
+        &directory,
+        &synthetic.build.package,
+        &synthetic.build.command,
+        Shape::Backend,
+    );
+    (entry, directory.join(MANIFEST_FILE))
+}
+
+/// The reason a choice was refused; fails where it was not.
+fn refused(choice: Result<Option<Chosen>, String>, what: &str) -> String {
+    match choice {
+        Err(why) => why,
+        Ok(_) => panic!("{what} is refused"),
+    }
+}
+
+/// With neither variable the stand-in route is Codex's, and with both it is the entry, as a
+/// subject whose package is the release the manifest belongs to.
+#[test]
+fn the_stand_in_route_is_codex_with_no_entry_named_and_the_entry_named_with_its_manifest() {
+    assert!(
+        stand_in_chosen(None, None, false)
+            .expect("neither is named")
+            .is_none(),
+        "no entry named leaves the stand-in route Codex's"
+    );
+    assert!(
+        stand_in_chosen(None, None, true)
+            .expect("neither is named")
+            .is_none(),
+        "a real build named alone is not the stand-in route's to choose"
+    );
+    for synthetic in synthetic() {
+        let base = scratch("chosen");
+        let (entry, manifest) = named(&base, &synthetic);
+        let chosen = stand_in_chosen(Some(&entry), Some(&manifest), false)
+            .unwrap_or_else(|why| panic!("{}: {why}", synthetic.name))
+            .unwrap_or_else(|| {
+                panic!(
+                    "{}: an entry and its manifest name an agent",
+                    synthetic.name
+                )
+            });
+        let name = synthetic.name;
+        assert_eq!(
+            chosen.subject.entry().map(|build| build.command.as_str()),
+            Some(synthetic.build.command.as_str()),
+            "{name}: the agent is the entry's"
+        );
+        assert_eq!(
+            chosen.subject.selected_release(),
+            manifest.parent(),
+            "{name}: the package is the release the manifest belongs to"
+        );
+        assert!(
+            chosen.generation.is_none(),
+            "{name}: the stand-in route names no generation of a real agent"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+}
+
+/// One of the two variables named alone, and either beside a real build, is refused with the
+/// sentence that says so.
+#[test]
+fn an_entry_or_a_manifest_named_alone_for_the_stand_in_route_is_refused_and_so_is_one_beside_a_real_build()
+ {
+    let base = scratch("alone");
+    let [synthetic, ..] = synthetic();
+    let (entry, manifest) = named(&base, &synthetic);
+    assert_eq!(
+        refused(
+            stand_in_chosen(Some(&entry), None, false),
+            "an entry with no manifest"
+        ),
+        "KR_AGENTS_STAND_IN_ENTRY names the build list entry the terminal stand-in stands for, \
+         and KR_AGENTS_STAND_IN_MANIFEST names no manifest of its package: set both or neither"
+    );
+    assert_eq!(
+        refused(
+            stand_in_chosen(None, Some(&manifest), false),
+            "a manifest with no entry"
+        ),
+        "KR_AGENTS_STAND_IN_MANIFEST names the manifest of the package the terminal stand-in is \
+         installed from, and KR_AGENTS_STAND_IN_ENTRY names no entry: set both or neither"
+    );
+    let with_entry = "KR_AGENTS_STAND_IN_ENTRY and KR_AGENTS_GATEWAY_BUILD both name an agent: a \
+                      run stands in for an entry or starts a real one, not both";
+    let with_manifest = "KR_AGENTS_STAND_IN_MANIFEST and KR_AGENTS_GATEWAY_BUILD both name an \
+                         agent: a run stands in for an entry or starts a real one, not both";
+    assert_eq!(
+        refused(
+            stand_in_chosen(Some(&entry), Some(&manifest), true),
+            "an entry and its manifest beside a real build"
+        ),
+        with_entry
+    );
+    assert_eq!(
+        refused(
+            stand_in_chosen(Some(&entry), None, true),
+            "an entry beside a real build"
+        ),
+        with_entry
+    );
+    assert_eq!(
+        refused(
+            stand_in_chosen(None, Some(&manifest), true),
+            "a manifest beside a real build"
+        ),
+        with_manifest
+    );
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// A manifest that is not a file named `plugin.json` is refused, naming it.
+#[test]
+fn a_manifest_for_the_stand_in_route_that_is_not_named_plugin_json_is_refused() {
+    let base = scratch("manifest-name");
+    let [synthetic, ..] = synthetic();
+    let (entry, manifest) = named(&base, &synthetic);
+    let renamed = manifest.with_file_name("manifest.json");
+    std::fs::copy(&manifest, &renamed).expect("the manifest under another name");
+    assert_eq!(
+        refused(
+            stand_in_chosen(Some(&entry), Some(&renamed), false),
+            "a manifest not named plugin.json"
+        ),
+        format!(
+            "KR_AGENTS_STAND_IN_MANIFEST names {}, which is not a file named plugin.json",
+            renamed.display()
+        )
+    );
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// An entry with no account, and an entry with the release of another package, are refused.
+#[test]
+fn an_entry_with_no_account_or_a_manifest_of_another_package_is_refused_for_the_stand_in_route() {
+    let base = scratch("not-one-agent");
+    let [first, second, ..] = synthetic();
+    let (entry, manifest) = named(&base, &first);
+    let mut bare = first.file.clone();
+    bare.as_object_mut()
+        .expect("an entry")
+        .remove("account")
+        .expect("the entry's account");
+    std::fs::write(&entry, bare.to_string()).expect("the entry without an account");
+    assert_eq!(
+        refused(
+            stand_in_chosen(Some(&entry), Some(&manifest), false),
+            "an entry with no account"
+        ),
+        "KR_AGENTS_STAND_IN_ENTRY names an entry with no account, which gives the terminal \
+         stand-in no composer text and no record marks"
+    );
+    let (entry, _) = named(&base, &first);
+    let other = base.join("other");
+    release(
+        &other,
+        &second.build.package,
+        &second.build.command,
+        Shape::Backend,
+    );
+    let why = refused(
+        stand_in_chosen(Some(&entry), Some(&other.join(MANIFEST_FILE)), false),
+        "an entry with the release of another package",
+    );
+    assert!(
+        why.starts_with(
+            "KR_AGENTS_STAND_IN_ENTRY and KR_AGENTS_STAND_IN_MANIFEST do not name one agent: "
+        ) && why.contains(&first.build.package)
+            && why.contains(&second.build.package),
+        "the refusal names the two packages: {why}"
+    );
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// The entries the stand-in is placed for in the parts below: the native ones.
+fn placed_for() -> Vec<Synthetic> {
+    synthetic()
+        .into_iter()
+        .filter(|synthetic| synthetic.build.launch == Launch::Native)
+        .collect()
+}
+
+/// Runs `part`, one of the staged parts that start no model turn, as `test`, for the stand-in made
+/// from each of the entries it is placed for, installed from a release of the entry's package.
+fn for_each_entry(test: &str, part: fn(Option<Subject>, &str)) {
+    for synthetic in placed_for() {
+        let base = scratch("part");
+        let directory = base.join("release");
+        release(
+            &directory,
+            &synthetic.build.package,
+            &synthetic.build.command,
+            Shape::Backend,
+        );
+        let subject = Subject::from_release(&synthetic.build, &directory)
+            .unwrap_or_else(|why| panic!("{}: {why}", synthetic.name));
+        part(Some(subject), test);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+}
+
+/// Part 2b for the stand-in made from each entry: the host detects it as the entry's agent, offers
+/// it only observation and the terminal, and refuses every typed action.
+#[test]
+fn a_stand_in_for_an_entry_on_its_terminal_route_is_advertised_no_typed_capability_and_every_typed_action_is_refused()
+ {
+    const TEST: &str = "a_stand_in_for_an_entry_on_its_terminal_route_is_advertised_no_typed_capability_and_every_typed_action_is_refused";
+    for_each_entry(TEST, part_2b);
+}
+
+/// Part 2c for the stand-in made from each entry: under a binding the host permits a supported
+/// action and refuses an unsupported one.
+#[test]
+fn under_a_binding_a_stand_in_for_an_entry_is_permitted_a_supported_action_and_refused_an_unsupported_one()
+ {
+    const TEST: &str = "under_a_binding_a_stand_in_for_an_entry_is_permitted_a_supported_action_and_refused_an_unsupported_one";
+    for_each_entry(TEST, part_2c);
+}
+
+/// Part 5a for the stand-in made from each entry: a crash of the control daemon leaves the stand-in
+/// and its local terminal running.
+#[test]
+fn a_control_daemon_crash_leaves_a_stand_in_for_an_entry_and_its_local_terminal_running() {
+    const TEST: &str =
+        "a_control_daemon_crash_leaves_a_stand_in_for_an_entry_and_its_local_terminal_running";
+    for_each_entry(TEST, part_5a);
+}
+
+/// Part 6a for the stand-in made from each entry: a running stand-in keeps its build through an
+/// upgrade, and the newer build gets the terminal route.
+#[test]
+fn a_running_stand_in_for_an_entry_keeps_its_build_through_an_upgrade_and_the_newer_build_gets_the_terminal_route()
+ {
+    const TEST: &str = "a_running_stand_in_for_an_entry_keeps_its_build_through_an_upgrade_and_the_newer_build_gets_the_terminal_route";
+    for_each_entry(TEST, part_6a);
+}
+
+/// Part 8a for the stand-in made from each entry: forged titles, transcripts, identifiers and hook
+/// input leave the host unchanged.
+#[test]
+fn forged_titles_transcripts_identifiers_and_hook_input_leave_the_host_unchanged_for_a_stand_in_for_an_entry()
+ {
+    const TEST: &str = "forged_titles_transcripts_identifiers_and_hook_input_leave_the_host_unchanged_for_a_stand_in_for_an_entry";
+    for_each_entry(TEST, part_8a);
+}
+
+/// Part 14.03a for the stand-in made from each entry: a path typed at the stand-in is terminal
+/// input that reaches its composer.
+#[test]
+fn a_path_typed_at_a_stand_in_for_an_entry_is_terminal_input_that_reaches_its_composer() {
+    const TEST: &str =
+        "a_path_typed_at_a_stand_in_for_an_entry_is_terminal_input_that_reaches_its_composer";
+    for_each_entry(TEST, part_14_03a);
 }

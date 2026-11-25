@@ -7,8 +7,9 @@
 //! run recorded, a daemon is started again with no `kr` and the device connects to it, and what
 //! needs a command line (the second device's share, 8a) is done before the agent starts. No case
 //! sends a prompt, so none charges a turn. On the stand-in route the agent is the application
-//! stand-in started by hand (`by-hand`: a composer and nothing to serve); on a real route it is the
-//! pinned build with no login, which shows the build's first screen.
+//! stand-in started by hand (`by-hand`: a composer and nothing to serve), or, for an entry of the
+//! build list, the terminal stand-in made from the entry; on a real route it is the pinned build
+//! with no login, which shows the build's first screen.
 
 use super::*;
 
@@ -51,26 +52,25 @@ fn arm(ctx: &Context) -> &'static str {
     }
 }
 
-/// A case that starts its agent by hand and takes no login.
+/// A case that starts its agent by hand and takes no login: the agent the environment names where
+/// `subject` is none, and the stand-in made from the entry of `subject` where it is some.
 fn by_hand_case(
+    subject: Option<Subject>,
     part: &str,
     test: &str,
     setup: Setup,
     body: impl FnOnce(&Context, &Session<'_>) -> serde_json::Value,
 ) {
     let leg = format!("staged-{}", part.replace('.', "-"));
-    run_case_in(
-        Setup {
-            manual: true,
-            no_login: true,
-            ..setup
-        },
-        &leg,
-        part,
-        test,
-        "by-hand",
-        body,
-    );
+    let setup = Setup {
+        manual: true,
+        no_login: true,
+        ..setup
+    };
+    match subject {
+        None => run_case_in(setup, &leg, part, test, "by-hand", body),
+        Some(subject) => run_case_for(subject, setup, (&leg, part, test), "by-hand", body),
+    }
 }
 
 /// The actions of the package the host installed for `subject` in `environment`, as the manifest
@@ -84,7 +84,10 @@ pub(super) fn package_actions(subject: &Subject, environment: &EnvironmentPaths)
 /// it arrived.
 fn harmless(ctx: &Context) -> (String, String) {
     match &ctx.route {
-        Route::StandIn => ("kr-harmless".to_owned(), "> kr-harmless".to_owned()),
+        Route::StandIn => ctx.subject.entry().map_or_else(
+            || ("kr-harmless".to_owned(), "> kr-harmless".to_owned()),
+            |build| (build.harmless.input.clone(), build.harmless.shows.clone()),
+        ),
         Route::Real(real) => (
             real.build.harmless.input.clone(),
             real.build.harmless.shows.clone(),
@@ -103,7 +106,13 @@ impl HandAgent {
     /// Types the agent's name in the session's shell, waits until the host announces an instance
     /// for it, and records the worker and the process that maps the pinned program below it.
     pub(super) fn starts(ctx: &Context, session: &Session<'_>) -> Self {
-        let _ = session.starts_the_agent_showing(BY_HAND, &[], None, &[]);
+        // The stand-in made from an entry shows the entry's first screen, and Codex's by-hand
+        // stand-in its own first row.
+        let shows = ctx
+            .subject
+            .entry()
+            .map_or(BY_HAND, |build| build.ready.as_str());
+        let _ = session.starts_the_agent_showing(shows, &[], None, &[]);
         Self::running(ctx, session, &ctx.executable)
     }
 
@@ -516,7 +525,13 @@ fn judges_a_forwarder_answer(
 fn gateway_an_agent_on_its_terminal_route_is_advertised_no_typed_capability_and_every_typed_action_is_refused()
  {
     const TEST: &str = "gateway_an_agent_on_its_terminal_route_is_advertised_no_typed_capability_and_every_typed_action_is_refused";
-    by_hand_case("2b", TEST, Setup::default(), |ctx, session| {
+    part_2b(None, TEST);
+}
+
+/// Part 2b as the case `test`, for the agent the environment names, or for the stand-in made from
+/// the entry of `subject`.
+pub(super) fn part_2b(subject: Option<Subject>, test: &str) {
+    by_hand_case(subject, "2b", test, Setup::default(), |ctx, session| {
         let session_id = session.session_id();
         let agent = HandAgent::starts(ctx, session);
         let shown = detects(ctx, &session.remote, session_id);
@@ -612,7 +627,13 @@ fn a_typed_prompt_that_reached_the_agents_screen_fails_the_check_of_2b() {
 fn gateway_under_a_binding_a_supported_action_is_permitted_and_an_unsupported_one_is_refused() {
     const TEST: &str =
         "gateway_under_a_binding_a_supported_action_is_permitted_and_an_unsupported_one_is_refused";
-    by_hand_case("2c", TEST, Setup::default(), |ctx, session| {
+    part_2c(None, TEST);
+}
+
+/// Part 2c as the case `test`, for the agent the environment names, or for the stand-in made from
+/// the entry of `subject`.
+pub(super) fn part_2c(subject: Option<Subject>, test: &str) {
+    by_hand_case(subject, "2c", test, Setup::default(), |ctx, session| {
         let session_id = session.session_id();
         let agent = HandAgent::starts(ctx, session);
         let shown = detects(ctx, &session.remote, session_id);
@@ -719,7 +740,13 @@ fn a_presentation_action_that_is_refused_or_an_upstream_one_that_is_admitted_fai
 fn gateway_a_control_daemon_crash_leaves_the_agent_and_its_local_terminal_running() {
     const TEST: &str =
         "gateway_a_control_daemon_crash_leaves_the_agent_and_its_local_terminal_running";
-    by_hand_case("5a", TEST, Setup::default(), |ctx, session| {
+    part_5a(None, TEST);
+}
+
+/// Part 5a as the case `test`, for the agent the environment names, or for the stand-in made from
+/// the entry of `subject`.
+pub(super) fn part_5a(subject: Option<Subject>, test: &str) {
+    by_hand_case(subject, "5a", test, Setup::default(), |ctx, session| {
         assert!(
             matches!(ctx.route, Route::StandIn),
             "the daemon-crash part runs on the stand-in route only"
@@ -808,9 +835,16 @@ fn the_survival_check_of_5a_fails_for_a_process_that_ended() {
 fn gateway_a_running_agent_keeps_its_build_through_an_upgrade_and_the_newer_build_gets_the_terminal_route()
  {
     const TEST: &str = "gateway_a_running_agent_keeps_its_build_through_an_upgrade_and_the_newer_build_gets_the_terminal_route";
+    part_6a(None, TEST);
+}
+
+/// Part 6a as the case `test`, for the agent the environment names, or for the stand-in made from
+/// the entry of `subject`.
+pub(super) fn part_6a(subject: Option<Subject>, test: &str) {
     by_hand_case(
+        subject,
         "6a",
-        TEST,
+        test,
         Setup {
             upgrade: true,
             ..Setup::default()
@@ -857,7 +891,22 @@ fn gateway_a_running_agent_keeps_its_build_through_an_upgrade_and_the_newer_buil
                 );
             }
             let (typed, shows) = match &ctx.route {
-                Route::StandIn => (ctx.subject.typed_line(&[]), RAN_AS_TYPED.to_owned()),
+                Route::StandIn => (
+                    ctx.subject.typed_line(&[]),
+                    // The stand-in made from an entry shows the newer build's first screen as the
+                    // entry gives it; the application stand-in says it ran as typed.
+                    ctx.subject.entry().map_or_else(
+                        || RAN_AS_TYPED.to_owned(),
+                        |build| {
+                            build
+                                .newer
+                                .as_ref()
+                                .expect("the entry names a newer build")
+                                .ready
+                                .clone()
+                        },
+                    ),
+                ),
                 Route::Real(real) => (
                     real.typed(&[]),
                     real.build
@@ -1310,9 +1359,16 @@ fn a_forged_transcript_is_written_only_below_the_run_and_never_through_a_link() 
 fn gateway_forged_titles_transcripts_identifiers_and_hook_input_leave_the_host_unchanged() {
     const TEST: &str =
         "gateway_forged_titles_transcripts_identifiers_and_hook_input_leave_the_host_unchanged";
+    part_8a(None, TEST);
+}
+
+/// Part 8a as the case `test`, for the agent the environment names, or for the stand-in made from
+/// the entry of `subject`.
+pub(super) fn part_8a(subject: Option<Subject>, test: &str) {
     by_hand_case(
+        subject,
         "8a",
-        TEST,
+        test,
         Setup {
             second: true,
             ..Setup::default()
@@ -1446,7 +1502,10 @@ fn gateway_forged_titles_transcripts_identifiers_and_hook_input_leave_the_host_u
             // (b) A transcript at the vendor's own place for the agent's working directory.
             let work = ctx.run.work().display().to_string();
             let template = match &ctx.route {
-                Route::StandIn => ".codex/sessions/{cwd_slug}/{session}.jsonl".to_owned(),
+                Route::StandIn => ctx.subject.entry().map_or_else(
+                    || ".codex/sessions/{cwd_slug}/{session}.jsonl".to_owned(),
+                    |build| build.transcript.clone(),
+                ),
                 Route::Real(real) => real.build.transcript.clone(),
             };
             let in_the_home = transcript_place(&template, &work, &target)
@@ -1802,7 +1861,13 @@ fn a_forged_channel_that_declares_a_capability_or_writes_after_a_stop_fails_the_
 fn gateway_a_path_typed_at_the_agent_is_terminal_input_that_reaches_its_composer() {
     const TEST: &str =
         "gateway_a_path_typed_at_the_agent_is_terminal_input_that_reaches_its_composer";
-    by_hand_case("14.03a", TEST, Setup::default(), |ctx, session| {
+    part_14_03a(None, TEST);
+}
+
+/// Part 14.03a as the case `test`, for the agent the environment names, or for the stand-in made
+/// from the entry of `subject`.
+pub(super) fn part_14_03a(subject: Option<Subject>, test: &str) {
+    by_hand_case(subject, "14.03a", test, Setup::default(), |ctx, session| {
         // A build that shows no composer before an account is signed in has nothing to type at:
         // the part is not run, and nothing is started for it.
         let composer = match &ctx.route {
@@ -1834,7 +1899,9 @@ fn gateway_a_path_typed_at_the_agent_is_terminal_input_that_reaches_its_composer
         let mut keys = keyboard(ctx, session, false);
         let control = match keys.type_text(&session.remote, &ctx.runtime, &typed) {
             Err(refusal) if refusal.code == Some(ErrorCode::LeaseLost) => refusal.detail,
-            Err(refusal) => panic!("input without the lease is refused with LEASE_LOST: {refusal}"),
+            Err(refusal) => {
+                panic!("input without the lease is refused with LEASE_LOST: {refusal}")
+            }
             Ok(written) => panic!("input without the lease is refused: {written:?}"),
         };
         shows_no_trace(&session.person.window.screen(), SHOT)
