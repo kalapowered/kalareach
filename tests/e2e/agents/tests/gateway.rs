@@ -6487,17 +6487,18 @@ fn asked_up_to(person: &Person, mark: usize, count: usize) -> Result<(), String>
 /// reads of its instance, its binding and the request are refused as a closed session's, so the
 /// comparison above is not one that anything passes.
 ///
-/// KR-REQ-12.10, KR-REQ-11.27 (the daemon-reconnect leg). Stand-in route only. Not claimed: a
+/// KR-REQ-12.10, KR-REQ-11.27 (the daemon-reconnect leg). Declares its restart
+/// ([`Restart::Declared`]). Not claimed: a
 /// kill made during a write (KR-ACC-006), keyboard input to a real terminal while the daemon is
 /// dead, and that a real server saw one answer.
 #[test]
 fn gateway_a_daemon_killed_with_a_request_pending_leaves_the_agent_and_the_restarted_daemon_serves_the_same_request()
  {
-    a_daemon_killed_with_a_request_pending_leaves_the_agent(Restart::Off);
+    a_daemon_killed_with_a_request_pending_leaves_the_agent(Restart::Declared);
 }
 
-/// Part 5b's restart case, with what it declares of its restart: [`Restart::Survey`] for the
-/// survey of the files a restart changes.
+/// Part 5b's restart case, with what it declares of its restart: [`Restart::Declared`] for the
+/// case itself and [`Restart::Survey`] for the survey of the files a restart changes.
 fn a_daemon_killed_with_a_request_pending_leaves_the_agent(restart: Restart) {
     const TEST: &str = "gateway_a_daemon_killed_with_a_request_pending_leaves_the_agent_and_the_restarted_daemon_serves_the_same_request";
     run_case_in(
@@ -6510,10 +6511,6 @@ fn a_daemon_killed_with_a_request_pending_leaves_the_agent(restart: Restart) {
         TEST,
         "leave-unanswered,tick,ping-when-released,stay",
         |ctx, session| {
-            assert!(
-                matches!(ctx.route, Route::StandIn),
-                "the restart case runs on the stand-in route only"
-            );
             let session_id = session.session_id();
             // What the terminal is asked is counted in its byte stream from here, before the agent
             // starts, and not from the screen, which scrolls.
@@ -6772,15 +6769,15 @@ fn a_daemon_killed_with_a_request_pending_leaves_the_agent(restart: Restart) {
 /// refused as a closed session's: a pending request is lost with its worker, so the comparison of
 /// one that the restart case makes is not one that anything passes.
 ///
-/// KR-REQ-12.10, KR-REQ-11.27. Stand-in route only, at no charge.
+/// KR-REQ-12.10, KR-REQ-11.27. Declares its restart ([`Restart::Declared`]).
 #[test]
 fn gateway_a_second_request_pending_when_the_daemon_and_then_the_worker_are_killed_is_refused_as_a_closed_sessions()
  {
-    a_second_request_pending_when_the_daemon_and_then_the_worker_are_killed(Restart::Off);
+    a_second_request_pending_when_the_daemon_and_then_the_worker_are_killed(Restart::Declared);
 }
 
-/// Part 5b's control, with what it declares of its restart: [`Restart::Survey`] for the survey of
-/// the files a restart changes.
+/// Part 5b's control, with what it declares of its restart: [`Restart::Declared`] for the case
+/// itself and [`Restart::Survey`] for the survey of the files a restart changes.
 fn a_second_request_pending_when_the_daemon_and_then_the_worker_are_killed(restart: Restart) {
     const TEST: &str = "gateway_a_second_request_pending_when_the_daemon_and_then_the_worker_are_killed_is_refused_as_a_closed_sessions";
     run_case_in(
@@ -6793,10 +6790,6 @@ fn a_second_request_pending_when_the_daemon_and_then_the_worker_are_killed(resta
         TEST,
         "leave-unanswered,tick,two-approvals,stay",
         |ctx, session| {
-            assert!(
-                matches!(ctx.route, Route::StandIn),
-                "the control runs on the stand-in route only"
-            );
             let session_id = session.session_id();
             let mark = session.person.window.collected().mark();
             let instance = session.starts_the_agent(&[], None, &[]);

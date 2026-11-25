@@ -755,7 +755,7 @@ fn a_presentation_action_that_is_refused_or_an_upstream_one_that_is_admitted_fai
 }
 
 // ---------------------------------------------------------------------------------------------
-// Part 5a: a daemon's crash leaves the agent and its terminal running (stand-in arm only).
+// Part 5a: a daemon's crash leaves the agent and its terminal running.
 // ---------------------------------------------------------------------------------------------
 
 /// KR-REQ-12.32, case 5, part 5a (KR-REQ-12.10): killing the control daemon leaves the agent's
@@ -763,15 +763,18 @@ fn a_presentation_action_that_is_refused_or_an_upstream_one_that_is_admitted_fai
 /// daemon started again on the same host serves the session to the device, which sees the same
 /// instance at the same revision. The control ends the agent, and the same check then fails.
 ///
-/// The stand-in route only: a live agent can write the state a restarted daemon reads, which this
-/// harness does not guard, so the part's result names its arm (`"arm": "stand-in only"`).
+/// A live agent can write the state a restarted daemon reads, so the case declares its restart
+/// ([`Restart::Declared`]): on a real agent the host compares the run's tree with the record made
+/// when the agent started, at each kill and before the attempt, and ends the leg as not run where
+/// the restart is refused or cannot go on.
 #[test]
 fn gateway_a_control_daemon_crash_leaves_the_agent_and_its_local_terminal_running() {
-    a_control_daemon_crash_leaves_the_agent_and_its_local_terminal_running(Restart::Off);
+    a_control_daemon_crash_leaves_the_agent_and_its_local_terminal_running(Restart::Declared);
 }
 
-/// Part 5a, with what the case declares of its restart: [`Restart::Survey`] for the survey of the
-/// files a restart changes ([`survey_the_files_a_restart_of_the_control_daemon_changes`]).
+/// Part 5a, with what the case declares of its restart: [`Restart::Declared`] for the case itself
+/// and [`Restart::Survey`] for the survey of the files a restart changes
+/// ([`survey_the_files_a_restart_of_the_control_daemon_changes`]).
 fn a_control_daemon_crash_leaves_the_agent_and_its_local_terminal_running(restart: Restart) {
     const TEST: &str =
         "gateway_a_control_daemon_crash_leaves_the_agent_and_its_local_terminal_running";
@@ -783,7 +786,7 @@ fn a_control_daemon_crash_leaves_the_agent_and_its_local_terminal_running(restar
 ///
 /// Where `placed` is some, the part calls it with the run's context before it starts anything.
 pub(super) fn part_5a(subject: Option<Subject>, test: &str, placed: Option<&dyn Fn(&Context)>) {
-    part_5a_declaring(subject, test, placed, Restart::Off);
+    part_5a_declaring(subject, test, placed, Restart::Declared);
 }
 
 /// Part 5a with what the case declares of its restart: [`Restart::Survey`] for the survey of the
@@ -799,10 +802,6 @@ fn part_5a_declaring(
         ..Setup::default()
     };
     by_hand_case(subject, "5a", test, placed, setup, |ctx, session| {
-        assert!(
-            matches!(ctx.route, Route::StandIn),
-            "the daemon-crash part runs on the stand-in route only"
-        );
         let session_id = session.session_id();
         let agent = HandAgent::starts(ctx, session);
         let shown = detects(ctx, &session.remote, session_id);
@@ -847,8 +846,7 @@ fn part_5a_declaring(
             "the survival check fails once the agent has ended"
         );
         serde_json::json!({
-            "arm": "stand-in only",
-            "route": arm(ctx),
+            "arm": arm(ctx),
             "agent_processes": ["the worker", "the agent"],
             "local_terminal_input": shows,
             "detection": shown.detection.evidence(),
