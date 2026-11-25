@@ -9,7 +9,8 @@
 //! - the files the build list says must not exist before the agent starts ([`absent_paths`]);
 //! - the search of a run's directory for the keys, its removal and the record of both
 //!   ([`RunScan`]), which a driver makes on every outcome;
-//! - the guard over the person's own agent files, by metadata alone ([`MetaGuard`]);
+//! - the guard over the person's own agent files, by metadata alone, as each entry's lists call for
+//!   it ([`PersonPlan`]): a whole tree ([`MetaGuard`]) or the entry's named files ([`FileGuard`]);
 //! - the count of the turns the agent's own record holds ([`turns_recorded`]), against the turns
 //!   charged to the ledger.
 
@@ -1392,6 +1393,283 @@ impl MetaGuard {
             })
             .collect();
         (stops, json!({ "trees": seen }))
+    }
+}
+
+/// How an entry's run guards the person's own agent files, and so whether another process of the
+/// agent refuses the run.
+///
+/// An agent that keeps a directory of the person's own, which a run is held to leave whole (Codex's
+/// `.codex`), is guarded by [`MetaGuard`]: it compares the whole tree and cannot tell a write of
+/// another process from the run's, so another process of the agent refuses the run. An entry that
+/// names files of the person's home ([`Account::guarded`], [`Account::shared`]) is guarded by
+/// [`FileGuard`]: those files and no others, so another process of the agent, a session of the
+/// person's among them, may run beside the run.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PersonPlan {
+    /// The trees, each a path relative to the person's home, whose every entry is compared.
+    Trees(&'static [&'static str]),
+    /// The files no process may change, and the files that must not come to name the run.
+    Files {
+        /// The files no process may change, as paths relative to the person's home.
+        guarded: Vec<String>,
+        /// The files the person's own sessions also write, as paths relative to the person's home.
+        shared: Vec<String>,
+    },
+}
+
+impl PersonPlan {
+    /// The guard of the build list entry for `application`, from the entry's own lists.
+    ///
+    /// # Errors
+    ///
+    /// Returns why the entry has no guard: it names no person tree and no guarded file, and a run
+    /// of it would leave the person's files unwatched.
+    pub fn of(application: &str, guarded: &[String], shared: &[String]) -> Result<Self, String> {
+        if application == "codex" {
+            return Ok(Self::Trees(&[".codex"]));
+        }
+        if guarded.is_empty() {
+            return Err(format!(
+                "the entry for {application} names no person tree and no guarded file, so nothing \
+                 would guard the person's own agent files and no real run of it starts"
+            ));
+        }
+        Ok(Self::Files {
+            guarded: guarded.to_vec(),
+            shared: shared.to_vec(),
+        })
+    }
+
+    /// The processes of this user that are the agent called `agent` outside the run whose directory
+    /// is `run_root`, where there is a run ([`other_agent_processes`]): none, and no listing made,
+    /// for an entry guarded by its files, which a process of the agent beside the run cannot
+    /// mislead.
+    ///
+    /// # Errors
+    ///
+    /// Returns why the listing is not known.
+    pub fn other_agents(&self, agent: &str, run_root: Option<&Path>) -> Result<Vec<u32>, String> {
+        match self {
+            Self::Trees(_) => other_agent_processes(agent, run_root),
+            Self::Files { .. } => Ok(Vec::new()),
+        }
+    }
+
+    /// Takes the guard: the trees as they stand, or the files as `lstat` shows them.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a tree or a file cannot be looked at, for any reason other than its not being
+    /// there.
+    #[must_use]
+    pub fn take(self, home: &Path) -> PersonGuard {
+        let watch = match &self {
+            Self::Trees(trees) => Watch::Trees(MetaGuard::take(home, trees)),
+            Self::Files { guarded, shared } => Watch::Files(FileGuard::take(home, guarded, shared)),
+        };
+        PersonGuard { plan: self, watch }
+    }
+}
+
+/// What a taken guard compares.
+#[derive(Clone, Debug)]
+enum Watch {
+    Trees(MetaGuard),
+    Files(FileGuard),
+}
+
+/// The person's own agent files as an entry's [`PersonPlan`] guards them, and the check that none
+/// of them changed.
+#[derive(Clone, Debug)]
+pub struct PersonGuard {
+    plan: PersonPlan,
+    watch: Watch,
+}
+
+impl PersonGuard {
+    /// [`PersonPlan::other_agents`] of the plan this guard was taken from.
+    ///
+    /// # Errors
+    ///
+    /// Returns why the listing is not known.
+    pub fn other_agents(&self, agent: &str, run_root: Option<&Path>) -> Result<Vec<u32>, String> {
+        self.plan.other_agents(agent, run_root)
+    }
+
+    /// Looks again by metadata alone and says what stops the driver, with what was seen; never a
+    /// value, and no file is read.
+    #[must_use]
+    pub fn compare(&self) -> (Vec<Stop>, Value) {
+        match &self.watch {
+            Watch::Trees(guard) => guard.compare(),
+            Watch::Files(guard) => guard.compare(&[]),
+        }
+    }
+
+    /// [`PersonGuard::compare`] at the end of the run, where an entry's shared files are read once
+    /// for `needles`, the run's directory name and mark, and nothing of what is read is kept.
+    #[must_use]
+    pub fn compare_at_the_end(&self, needles: &[&str]) -> (Vec<Stop>, Value) {
+        match &self.watch {
+            Watch::Trees(guard) => guard.compare(),
+            Watch::Files(guard) => guard.compare(needles),
+        }
+    }
+}
+
+/// What `lstat` says of one file, apart from its owner: its kind and permissions, identity, size
+/// and times.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Stamp {
+    mode: u32,
+    inode: u64,
+    size: u64,
+    changed: (i64, i64),
+    modified: (i64, i64),
+}
+
+/// One file as `lstat` showed it: its [`Stamp`], and its owner, which is compared on its own, since
+/// the digest of a tree has no owner in it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Seen {
+    stamp: Stamp,
+    owner: u32,
+}
+
+/// How `path` stands by `lstat` alone: none where it is not there. No link is followed at its last
+/// name and nothing of the file is read, so a file the user cannot read is looked at all the same.
+fn seen_by_lstat(path: &Path) -> std::io::Result<Option<Seen>> {
+    use std::os::unix::fs::MetadataExt as _;
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(Some(Seen {
+            stamp: Stamp {
+                mode: metadata.mode(),
+                inode: metadata.ino(),
+                size: metadata.size(),
+                changed: (metadata.ctime(), metadata.ctime_nsec()),
+                modified: (metadata.mtime(), metadata.mtime_nsec()),
+            },
+            owner: metadata.uid(),
+        })),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+/// An entry's named files of the person's home, as `lstat` showed them before a driver started
+/// anything, and the check that none of the guarded ones changed. A guarded file is looked at by
+/// `lstat` alone, never read: its kind, permissions, inode, size and times are compared, and its
+/// owner on its own. A shared file, which the person's own sessions also write, is not looked at
+/// until the end of the run, and is then read once for the run's directory name and mark; nothing
+/// of what is read is kept. A write to a file that is not named, a transcript below
+/// `~/.claude/projects` among them, is not seen. What is said is the path the entry names and
+/// whether it changed, never a value.
+#[derive(Clone, Debug)]
+pub struct FileGuard {
+    home: PathBuf,
+    guarded: Vec<(String, Option<Seen>)>,
+    shared: Vec<String>,
+}
+
+impl FileGuard {
+    /// Takes the guarded files, each a path relative to `home`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a guarded file cannot be looked at, for any reason other than its not being
+    /// there: a file whose state is not known cannot be shown unchanged.
+    fn take(home: &Path, guarded: &[String], shared: &[String]) -> Self {
+        Self {
+            home: home.to_path_buf(),
+            guarded: guarded
+                .iter()
+                .map(|relative| {
+                    let seen = seen_by_lstat(&home.join(relative)).unwrap_or_else(|error| {
+                        panic!("the person's file ~/{relative} cannot be looked at: {error}")
+                    });
+                    (relative.clone(), seen)
+                })
+                .collect(),
+            shared: shared.to_vec(),
+        }
+    }
+
+    /// Looks at each guarded file again, and, where `needles` names something, reads each shared
+    /// file once for it.
+    fn compare(&self, needles: &[&str]) -> (Vec<Stop>, Value) {
+        let (mut stops, files) =
+            self.compared(&|relative| seen_by_lstat(&self.home.join(relative)));
+        let mut shared: Vec<Value> = Vec::new();
+        if needles.iter().any(|needle| !needle.is_empty()) {
+            for relative in &self.shared {
+                let (holding, unread) = account::which_hold(&[self.home.join(relative)], needles);
+                if !unread.is_empty() {
+                    stops.push((
+                        "person_file_unreadable",
+                        format!(
+                            "~/{relative} cannot be read after the run, so it is not known whether \
+                             it holds the run's directory name or mark"
+                        ),
+                    ));
+                } else if !holding.is_empty() {
+                    stops.push((
+                        "guarded_file_changed",
+                        format!("~/{relative} now holds the run's directory name or mark"),
+                    ));
+                }
+                shared.push(json!({
+                    "path": format!("~/{relative}"),
+                    "unreadable": !unread.is_empty(),
+                    "holds_the_run": !holding.is_empty(),
+                }));
+            }
+        }
+        (stops, json!({ "files": files, "shared": shared }))
+    }
+
+    /// The guarded files against what `look` shows of each now.
+    fn compared(
+        &self,
+        look: &dyn Fn(&str) -> std::io::Result<Option<Seen>>,
+    ) -> (Vec<Stop>, Vec<Value>) {
+        let mut stops: Vec<Stop> = Vec::new();
+        let mut files: Vec<Value> = Vec::new();
+        for (relative, before) in &self.guarded {
+            match look(relative) {
+                Ok(after) => {
+                    let owner_changed = matches!(
+                        (before, &after),
+                        (Some(first), Some(second)) if first.owner != second.owner
+                    );
+                    let changed = before.map(|seen| seen.stamp) != after.map(|seen| seen.stamp);
+                    if owner_changed {
+                        stops.push((
+                            "guarded_file_changed",
+                            format!("~/{relative} has another owner than when the run started"),
+                        ));
+                    } else if changed {
+                        stops.push((
+                            "guarded_file_changed",
+                            format!("~/{relative} changed while the run ran"),
+                        ));
+                    }
+                    files.push(json!({
+                        "path": format!("~/{relative}"),
+                        "changed": changed,
+                        "owner_changed": owner_changed,
+                    }));
+                }
+                Err(error) => {
+                    stops.push((
+                        "person_file_unreadable",
+                        format!("~/{relative} cannot be looked at after the run: {error}"),
+                    ));
+                    files.push(json!({ "path": format!("~/{relative}"), "unreadable": true }));
+                }
+            }
+        }
+        (stops, files)
     }
 }
 
@@ -3729,5 +4007,401 @@ mod tests {
         assert!(theirs, "the file on the volume is still there");
         std::fs::remove_dir_all(&run).expect("clean up");
         std::fs::remove_dir_all(&images).expect("clean up");
+    }
+
+    /// The files the claude-code entry guards, relative to the person's home.
+    const CLAUDE_GUARDED: [&str; 3] = [
+        ".claude/.credentials.json",
+        ".claude/.device-keys.json",
+        ".claude/settings.json",
+    ];
+
+    /// The name a run's directory has in the tests below, and the run's mark.
+    const RUN_NAME: &str = "krm-3f9a61c2";
+    const RUN_MARK: &str = "mark-77d0e5b4";
+
+    /// A home of the test's own that holds the files the claude-code entry names, the one it shares
+    /// and a transcript.
+    fn claude_home(name: &str) -> PathBuf {
+        let home = scratch(name);
+        std::fs::create_dir_all(home.join(".claude/projects/-w")).expect("directories");
+        for file in CLAUDE_GUARDED {
+            std::fs::write(home.join(file), b"one").expect("a file");
+        }
+        std::fs::write(home.join(".claude/projects/-w/session.jsonl"), b"{}\n")
+            .expect("a transcript");
+        std::fs::write(home.join(".claude.json"), br#"{"theme":"dark"}"#).expect("a file");
+        home
+    }
+
+    /// The plan the claude-code entry's lists give.
+    fn claude_plan() -> PersonPlan {
+        let guarded: Vec<String> = CLAUDE_GUARDED
+            .iter()
+            .map(|file| (*file).to_owned())
+            .collect();
+        PersonPlan::of("claude-code", &guarded, &[".claude.json".to_owned()]).expect("a plan")
+    }
+
+    /// The stops of a guard taken from `home` and compared at the end for the run's name and mark.
+    fn stops_at_the_end(guard: &PersonGuard) -> Vec<Stop> {
+        guard.compare_at_the_end(&[RUN_NAME, RUN_MARK]).0
+    }
+
+    #[test]
+    fn an_entry_is_guarded_by_its_own_person_tree_or_its_own_guarded_files() {
+        assert_eq!(
+            PersonPlan::of("codex", &[], &[]),
+            Ok(PersonPlan::Trees(&[".codex"]))
+        );
+        assert_eq!(
+            claude_plan(),
+            PersonPlan::Files {
+                guarded: CLAUDE_GUARDED
+                    .iter()
+                    .map(|file| (*file).to_owned())
+                    .collect(),
+                shared: vec![".claude.json".to_owned()],
+            }
+        );
+        let refused = PersonPlan::of("qoder-cli", &[], &[]).expect_err("no guard");
+        assert!(
+            refused.contains("qoder-cli") && refused.contains("no person tree"),
+            "{refused}"
+        );
+    }
+
+    #[test]
+    fn a_write_to_a_guarded_file_by_another_process_stops_the_run() {
+        let home = claude_home("files-write");
+        let guard = claude_plan().take(&home);
+        let (stops, evidence) = guard.compare();
+        assert!(stops.is_empty(), "{stops:?}");
+        assert_eq!(evidence["files"][2]["changed"], json!(false));
+        // A process of another program appends to one of the three files.
+        let status = std::process::Command::new("/bin/sh")
+            .args(["-c", r#"printf more >> "$1""#, "sh"])
+            .arg(home.join(".claude/settings.json"))
+            .status()
+            .expect("a shell");
+        assert!(status.success());
+        let (stops, evidence) = guard.compare();
+        assert_eq!(stops.len(), 1, "{stops:?}");
+        assert_eq!(stops[0].0, "guarded_file_changed");
+        assert_eq!(
+            stops[0].1,
+            "~/.claude/settings.json changed while the run ran"
+        );
+        assert_eq!(evidence["files"][2]["changed"], json!(true));
+        assert_eq!(evidence["files"][0]["changed"], json!(false));
+        // The end of the run sees it too.
+        assert_eq!(stops_at_the_end(&guard).len(), 1);
+        std::fs::remove_dir_all(&home).expect("clean up");
+    }
+
+    #[test]
+    fn a_transcript_written_below_the_projects_directory_does_not_stop_the_run() {
+        let home = claude_home("files-transcript");
+        let guard = claude_plan().take(&home);
+        // A whole-tree guard over the same directory sees every one of these writes.
+        let whole = MetaGuard::take(&home, &[".claude"]);
+        let projects = home.join(".claude/projects");
+        std::fs::create_dir_all(projects.join("-another")).expect("a directory");
+        std::fs::write(projects.join("-another/new.jsonl"), b"{}\n").expect("a new transcript");
+        std::fs::write(projects.join("-w/session.jsonl"), b"{}\n{}\n").expect("an appended one");
+        assert!(!whole.compare().0.is_empty(), "the writes are changes");
+        let (stops, evidence) = guard.compare();
+        assert!(stops.is_empty(), "{stops:?}");
+        assert!(
+            evidence["files"]
+                .as_array()
+                .expect("a list")
+                .iter()
+                .all(|file| file["changed"] == json!(false)),
+            "{evidence}"
+        );
+        assert!(stops_at_the_end(&guard).is_empty());
+        std::fs::remove_dir_all(&home).expect("clean up");
+    }
+
+    #[test]
+    fn a_guarded_file_replaced_removed_or_changed_in_mode_stops_the_run() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let file = ".claude/settings.json";
+        // Replaced by another file of the same size, which has another inode.
+        let home = claude_home("files-replaced");
+        let guard = claude_plan().take(&home);
+        std::fs::write(home.join("other"), b"one").expect("another file");
+        std::fs::rename(home.join("other"), home.join(file)).expect("a replacement");
+        assert_eq!(guard.compare().0.len(), 1);
+        // Removed, and a file that was not there made.
+        let guard = claude_plan().take(&home);
+        std::fs::remove_file(home.join(file)).expect("removed");
+        assert_eq!(guard.compare().0.len(), 1);
+        let guard = claude_plan().take(&home);
+        std::fs::write(home.join(file), b"back").expect("a new file");
+        assert_eq!(guard.compare().0.len(), 1);
+        // The permissions of a file changed, which moves neither its size nor its content.
+        let guard = claude_plan().take(&home);
+        let mode = std::fs::metadata(home.join(file))
+            .expect("a look")
+            .permissions()
+            .mode();
+        std::fs::set_permissions(
+            home.join(file),
+            std::fs::Permissions::from_mode(mode ^ 0o001),
+        )
+        .expect("a mode");
+        assert_eq!(guard.compare().0.len(), 1);
+        // Nothing done, nothing seen.
+        let guard = claude_plan().take(&home);
+        assert!(guard.compare().0.is_empty());
+        std::fs::remove_dir_all(&home).expect("clean up");
+    }
+
+    #[test]
+    fn a_change_of_the_shared_file_that_names_the_runs_directory_or_mark_stops_the_run() {
+        let home = claude_home("shared-names");
+        let guard = claude_plan().take(&home);
+        // What the agent writes for a folder it was started in, and a field the test plants to see
+        // that nothing of the file is kept.
+        let planted = "PLANTED-TEXT-OF-THE-FILE";
+        std::fs::write(
+            home.join(".claude.json"),
+            format!(r#"{{"projects":{{"/private/tmp/{RUN_NAME}/w":{{}}}},"note":"{planted}"}}"#),
+        )
+        .expect("a write");
+        // The metadata look, before a charge, reads no shared file: the one read is at the end.
+        assert!(guard.compare().0.is_empty());
+        let (stops, evidence) = guard.compare_at_the_end(&[RUN_NAME, RUN_MARK]);
+        assert_eq!(stops.len(), 1, "{stops:?}");
+        assert_eq!(stops[0].0, "guarded_file_changed");
+        assert_eq!(
+            stops[0].1,
+            "~/.claude.json now holds the run's directory name or mark"
+        );
+        assert_eq!(evidence["shared"][0]["holds_the_run"], json!(true));
+        let said = format!("{stops:?}{evidence}");
+        assert!(!said.contains(planted), "{said}");
+        // The mark alone does the same.
+        std::fs::write(
+            home.join(".claude.json"),
+            format!(r#"{{"id":"{RUN_MARK}"}}"#),
+        )
+        .expect("a write");
+        assert_eq!(stops_at_the_end(&guard).len(), 1);
+        std::fs::remove_dir_all(&home).expect("clean up");
+    }
+
+    #[test]
+    fn a_change_of_the_shared_file_that_names_neither_does_not_stop_the_run() {
+        let home = claude_home("shared-neither");
+        let guard = claude_plan().take(&home);
+        std::fs::write(
+            home.join(".claude.json"),
+            br#"{"projects":{"/home/person/work":{}},"numStartups":99}"#,
+        )
+        .expect("a write");
+        let (stops, evidence) = guard.compare_at_the_end(&[RUN_NAME, RUN_MARK]);
+        assert!(stops.is_empty(), "{stops:?}");
+        assert_eq!(evidence["shared"][0]["holds_the_run"], json!(false));
+        assert_eq!(evidence["shared"][0]["unreadable"], json!(false));
+        // A person with no such file has nothing to hold the run's name.
+        std::fs::remove_file(home.join(".claude.json")).expect("removed");
+        assert!(stops_at_the_end(&guard).is_empty());
+        std::fs::remove_dir_all(&home).expect("clean up");
+    }
+
+    #[test]
+    fn an_owner_change_of_a_guarded_file_stops_the_run() {
+        let home = claude_home("files-owner");
+        let guard = claude_plan().take(&home);
+        let Watch::Files(files) = &guard.watch else {
+            panic!("a claude-code plan guards files");
+        };
+        let look = |relative: &str| seen_by_lstat(&home.join(relative));
+        // As things stand, nothing is said.
+        assert!(files.compared(&look).0.is_empty());
+        // The same file, to the last time and byte, under another owner: only the owner differs.
+        let another_owner = |relative: &str| {
+            look(relative).map(|seen| {
+                seen.map(|mut seen| {
+                    if relative == ".claude/.credentials.json" {
+                        seen.owner += 1;
+                    }
+                    seen
+                })
+            })
+        };
+        let (stops, evidence) = files.compared(&another_owner);
+        assert_eq!(stops.len(), 1, "{stops:?}");
+        assert_eq!(stops[0].0, "guarded_file_changed");
+        assert_eq!(
+            stops[0].1,
+            "~/.claude/.credentials.json has another owner than when the run started"
+        );
+        assert_eq!(evidence[0]["owner_changed"], json!(true));
+        assert_eq!(evidence[0]["changed"], json!(false));
+        std::fs::remove_dir_all(&home).expect("clean up");
+    }
+
+    /// Runs `work` on a thread of its own and returns what it returned, or none where it did not
+    /// finish within `seconds`: a read of a file that has no writer does not.
+    fn within<T: Send + 'static>(
+        seconds: u64,
+        work: impl FnOnce() -> T + Send + 'static,
+    ) -> Option<T> {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(work());
+        });
+        receiver
+            .recv_timeout(std::time::Duration::from_secs(seconds))
+            .ok()
+    }
+
+    /// A named pipe at `path`: opening it to read waits until another process opens it to write.
+    fn make_pipe(path: &Path) {
+        let status = std::process::Command::new("/usr/bin/mkfifo")
+            .arg(path)
+            .status()
+            .expect("mkfifo runs");
+        assert!(status.success(), "a named pipe");
+    }
+
+    #[test]
+    fn the_guard_reads_no_content_of_a_guarded_file_and_none_of_the_shared_file_before_the_end() {
+        use std::os::unix::fs::PermissionsExt as _;
+        // A guarded file that is a named pipe, which a read of would wait on for ever, and one the
+        // user cannot read: both are looked at, taken and compared to the end.
+        let home = claude_home("no-read");
+        let pipe = home.join(".claude/.credentials.json");
+        std::fs::remove_file(&pipe).expect("removed");
+        make_pipe(&pipe);
+        std::fs::set_permissions(
+            home.join(".claude/.device-keys.json"),
+            std::fs::Permissions::from_mode(0o000),
+        )
+        .expect("no access");
+        let plan = claude_plan();
+        let looked = within(20, {
+            let (home, plan) = (home.clone(), plan);
+            move || {
+                let guard = plan.take(&home);
+                let mut stops = guard.compare().0;
+                stops.extend(guard.compare_at_the_end(&[RUN_NAME, RUN_MARK]).0);
+                stops
+            }
+        });
+        assert_eq!(
+            looked,
+            Some(Vec::new()),
+            "the guard did not finish: it read a guarded file, or stopped on one it could not read"
+        );
+        // The shared file as a named pipe: taken, and compared before the end, with no read of it.
+        std::fs::remove_file(home.join(".claude.json")).expect("removed");
+        make_pipe(&home.join(".claude.json"));
+        let looked = within(20, {
+            let (home, plan) = (home.clone(), claude_plan());
+            move || plan.take(&home).compare().0
+        });
+        assert_eq!(
+            looked,
+            Some(Vec::new()),
+            "the guard did not finish: it read the shared file before the end"
+        );
+        std::fs::remove_dir_all(&home).expect("clean up");
+    }
+
+    /// A process of this user that waits, called `name`: a copy of this test program that runs the
+    /// one test that waits.
+    fn waiting_agent(directory: &Path, name: &str) -> std::process::Child {
+        let path = directory.join(name);
+        std::fs::copy(std::env::current_exe().expect("this program"), &path)
+            .expect("a program called as the agent");
+        let mut command = std::process::Command::new(&path);
+        command
+            .args([
+                "--ignored",
+                "--exact",
+                "held::tests::a_process_that_waits_to_be_listed",
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        spawn_retrying_when_busy(&mut command).expect("it starts")
+    }
+
+    /// The processes the listing of the agent `agent` shows once it shows `id`, or after twenty
+    /// seconds.
+    fn listed_with(id: u32, agent: &str) -> Vec<u32> {
+        let started = std::time::Instant::now();
+        loop {
+            let seen = other_agent_processes(agent, None).expect("a listing");
+            if seen.contains(&id) || started.elapsed() > std::time::Duration::from_secs(20) {
+                return seen;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+
+    #[test]
+    fn another_claude_process_does_not_refuse_a_claude_code_run() {
+        let directory = scratch("claude-beside");
+        let root = scratch("claude-beside-run");
+        let mut running = waiting_agent(&directory, "claude");
+        let id = running.id();
+        let seen = listed_with(id, "claude");
+        let plan = claude_plan();
+        let at_the_start = plan.other_agents("claude", None);
+        let at_the_charge = plan.other_agents("claude", Some(&root));
+        let home = claude_home("claude-beside-home");
+        let by_the_guard = plan.take(&home).other_agents("claude", Some(&root));
+        running.kill().expect("ended by its own handle");
+        running.wait().expect("reaped");
+        std::fs::remove_dir_all(&directory).expect("clean up");
+        std::fs::remove_dir_all(&root).expect("clean up");
+        std::fs::remove_dir_all(&home).expect("clean up");
+        // The process is there to be found, and the claude-code entry is not refused for it, at
+        // the start (no run's root) or at the charge (the run's root).
+        assert!(
+            seen.contains(&id),
+            "the listing did not count the process ({} counted)",
+            seen.len()
+        );
+        assert_eq!(at_the_start, Ok(Vec::new()));
+        assert_eq!(at_the_charge, Ok(Vec::new()));
+        assert_eq!(by_the_guard, Ok(Vec::new()));
+    }
+
+    #[test]
+    fn a_codex_process_still_refuses_a_codex_run_at_the_start_and_at_the_charge() {
+        let directory = scratch("codex-beside");
+        let root = scratch("codex-beside-run");
+        let mut running = waiting_agent(&directory, "codex");
+        let id = running.id();
+        let seen = listed_with(id, "codex");
+        let plan = PersonPlan::of("codex", &[], &[]).expect("a plan");
+        let at_the_start = plan.other_agents("codex", None).expect("a listing");
+        let at_the_charge = plan.other_agents("codex", Some(&root)).expect("a listing");
+        running.kill().expect("ended by its own handle");
+        running.wait().expect("reaped");
+        std::fs::remove_dir_all(&directory).expect("clean up");
+        std::fs::remove_dir_all(&root).expect("clean up");
+        // A failure says how many were counted, not which.
+        assert!(
+            seen.contains(&id),
+            "the listing did not count the process ({} counted)",
+            seen.len()
+        );
+        assert!(
+            at_the_start.contains(&id),
+            "the start did not count the process ({} counted)",
+            at_the_start.len()
+        );
+        assert!(
+            at_the_charge.contains(&id),
+            "the charge did not count the process ({} counted)",
+            at_the_charge.len()
+        );
     }
 }
