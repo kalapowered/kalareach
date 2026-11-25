@@ -2939,6 +2939,12 @@ async fn a_devices_destination_ends_when_its_grant_runs_out_while_the_daemon_run
         credentials.held(sender).is_none()
     })
     .await;
+    // `HeldCredentials::forget` lets go of the credential in memory before it deletes the item in
+    // the secret store, so the case waits for both.
+    until("the secret store giving the bearer up", || {
+        !secret_store_holds(&environment, bytes_of(&credential))
+    })
+    .await;
     assert!(
         !secret_store_holds(&environment, bytes_of(&credential)),
         "the secret store gave the bearer up"
