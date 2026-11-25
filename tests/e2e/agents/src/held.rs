@@ -1692,9 +1692,9 @@ fn open_shared(
     Ok(Some(file))
 }
 
-/// Whether `source` holds one of `needles`, read a piece at a time: no more than `limit` bytes, and
-/// none after `deadline`. Nothing is kept but the last bytes that a needle split across two pieces
-/// needs.
+/// Whether `source` holds one of `needles`, read a piece at a time. It asks for at most `limit`
+/// bytes and one more, and refuses a source that gives the one more; it starts no read after
+/// `deadline`. Nothing is kept but the last bytes that a needle split across two pieces needs.
 fn scan(
     source: &mut dyn std::io::Read,
     needles: &[&[u8]],
@@ -1710,7 +1710,11 @@ fn scan(
         if std::time::Instant::now() > deadline {
             return Err(Unread::TooSlow);
         }
-        match source.read(&mut piece) {
+        // Ask for no more than what is left up to one byte past the limit; that is always at least
+        // one byte.
+        let room =
+            usize::try_from(limit.saturating_add(1) - taken).map_or(PIECE, |left| left.min(PIECE));
+        match source.read(&mut piece[..room]) {
             Ok(0) => return Ok(false),
             Ok(count) => {
                 taken += count as u64;
@@ -1735,7 +1739,8 @@ fn scan(
 }
 
 /// Runs `work` on a thread of its own and waits `bound` for its answer: the error where it gave
-/// none in time, or the thread ended without one. A thread still waiting is left to end by itself.
+/// none in time, or the thread ended without one. A thread still waiting is not cancelled: it keeps
+/// its descriptor and its buffers until the call it waits in returns.
 fn bounded<T: Send + 'static>(
     bound: std::time::Duration,
     work: impl FnOnce() -> T + Send + 'static,
@@ -5151,6 +5156,32 @@ mod tests {
         assert_eq!(scan(&mut source, needle, 1000, far_off()), Ok(false));
         let mut source = std::io::Cursor::new(b"aaaazzzaaaa".to_vec());
         assert_eq!(scan(&mut source, needle, 1000, far_off()), Ok(true));
+    }
+
+    #[test]
+    fn a_read_asks_for_one_byte_past_the_limit_and_no_more() {
+        /// Gives bytes without end, and counts those it gave.
+        struct Endless(u64);
+        impl std::io::Read for Endless {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                buffer.fill(b'a');
+                self.0 += buffer.len() as u64;
+                Ok(buffer.len())
+            }
+        }
+        let needle: &[&[u8]] = &[b"zzz"];
+        // A limit of several pieces, and one that is less than a piece.
+        for limit in [200_000_u64, 5] {
+            let mut source = Endless(0);
+            assert_eq!(
+                scan(&mut source, needle, limit, far_off()),
+                Err(Unread::TooLarge)
+            );
+            assert_eq!(source.0, limit + 1, "bytes given for a limit of {limit}");
+        }
+        // A source of exactly the limit's size is read to its end.
+        let mut source = std::io::Cursor::new(vec![b'a'; 200_000]);
+        assert_eq!(scan(&mut source, needle, 200_000, far_off()), Ok(false));
     }
 
     #[test]
