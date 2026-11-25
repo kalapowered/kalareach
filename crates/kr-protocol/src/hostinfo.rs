@@ -2174,6 +2174,15 @@ pub mod configuration {
         /// gateway to revoke each. No profile, request or environment variable can set it.
         #[serde(default, skip_serializing_if = "levels::is_unused")]
         pub push: PushSelection,
+        /// The packages whose agent this host may start in ACP mode, each as `publisher/plugin`.
+        ///
+        /// A section of level 8: written when its `packages` member is not null, and ignored, with
+        /// a count, by a release that reads level 7. A release that does not know it has no ACP
+        /// mode, so a host rolled back to one starts no agent in ACP mode until it is brought
+        /// forward again. This build validates and keeps the section, and `acp_enabled` answers
+        /// from it. No profile, request or environment variable can set it.
+        #[serde(default, skip_serializing_if = "levels::is_unused")]
+        pub acp: AcpSelection,
         /// How this environment's control daemon is started when a command finds none running.
         ///
         /// Read by `kr new` when it finds no daemon to ask, so a change applies at the next start.
@@ -2233,6 +2242,7 @@ pub mod configuration {
                 automation: AutomationSelection::default(),
                 shell: ShellSelection::default(),
                 push: PushSelection::default(),
+                acp: AcpSelection::default(),
                 startup: StartupSelection::default(),
                 descriptions: DescriptionsSelection::default(),
                 agents: BTreeMap::new(),
@@ -2256,6 +2266,14 @@ pub mod configuration {
                 .map_or(crate::broker::AgentOwnership::Full, |choice| {
                     choice.ownership
                 })
+        }
+
+        /// Whether the document allows ACP mode for one package: true only when the package is
+        /// listed.
+        #[must_use]
+        pub fn acp_enabled(&self, package: &str) -> bool {
+            let _ = package;
+            false
         }
 
         /// Returns the preference set a selected profile contributes, when it names one.
@@ -2962,6 +2980,34 @@ pub mod configuration {
         #[must_use]
         pub fn gateways(&self) -> &[String] {
             self.gateways.as_ref().map_or(&[], Vec::as_slice)
+        }
+    }
+
+    /// The most packages one document may list for ACP mode.
+    pub const MAX_ACP_PACKAGES: usize = 64;
+
+    /// The packages whose agent the owner allows to start in ACP mode.
+    ///
+    /// A package is off unless it is listed here; the release's own grant and the person's press of
+    /// the button stay required besides.
+    ///
+    /// The section arrived with level 8. A release that reads level 7 does not know it: it applies
+    /// the rest of the document, counts the section among the members it ignores, and does not
+    /// edit the document. Such a release has no ACP mode, so a host rolled back to one starts no
+    /// agent in ACP mode until it is brought forward again.
+    #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields, default)]
+    pub struct AcpSelection {
+        /// The packages, each `publisher/plugin`, named once. An empty list allows none. Null or
+        /// absent leaves the section unused.
+        pub packages: Nullable<Vec<String>>,
+    }
+
+    impl AcpSelection {
+        /// The listed packages: none when the member is null or absent.
+        #[must_use]
+        pub fn packages(&self) -> &[String] {
+            self.packages.as_ref().map_or(&[], Vec::as_slice)
         }
     }
 

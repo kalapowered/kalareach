@@ -168,6 +168,42 @@ const BEFORE_PUSH: Release = Release {
     ],
 };
 
+/// A release that reads level 7 and predates the acp section: it takes the section for a member of
+/// a newer release.
+const BEFORE_ACP: Release = Release {
+    level: 7,
+    levelled: &[
+        Levelled {
+            member: "authority",
+            level: 2,
+        },
+        Levelled {
+            member: "mailbox",
+            level: 3,
+        },
+        Levelled {
+            member: "relay",
+            level: 4,
+        },
+        Levelled {
+            member: "automation",
+            level: 5,
+        },
+        Levelled {
+            member: "shell",
+            level: 6,
+        },
+        Levelled {
+            member: "push",
+            level: 7,
+        },
+        Levelled {
+            member: "acp",
+            level: 8,
+        },
+    ],
+};
+
 const BROKER: &str = "https://broker.example.com";
 
 const FEED: &str = "https://reach.example.com";
@@ -1649,4 +1685,286 @@ fn the_report_lists_the_gateways_in_force_and_says_they_apply_at_once() {
     let emptied = push_row(&[], Some(&cleared), "/state/configuration.json");
     assert_eq!(emptied.source, ValueSource::HostConfiguration);
     assert_eq!(emptied.value(), "none");
+}
+
+/// Two packages whose agent the owner allows to start in ACP mode.
+const ACP_PACKAGES: [&str; 2] = ["kalareach/gemini-cli", "kalareach/qoder-cli"];
+
+/// A document that lists packages for ACP mode, as this build writes it.
+fn with_acp_packages() -> ConfigurationDocument {
+    let mut document = ConfigurationDocument::empty();
+    document.acp.packages = Nullable::some(
+        ACP_PACKAGES
+            .iter()
+            .map(|&package| package.to_owned())
+            .collect(),
+    );
+    document.ceilings.session_limit = Nullable::some(4);
+    document
+}
+
+/// The acp section is a section of level 8, and a writer stamps the highest level among the
+/// sections the document holds. A document that lists no package, or whose list is null, is
+/// written without the section and below level 8; an empty list is held, because it says that no
+/// package may start in ACP mode.
+#[test]
+fn a_document_that_lists_no_acp_package_is_stamped_below_the_sections_level() {
+    let mut push_only = ConfigurationDocument::empty();
+    push_only.push.gateways = Nullable::some(vec![GATEWAYS[0].to_owned()]);
+    let written = contents_in(&push_only, &THIS_RELEASE);
+    assert_eq!(json(&written)["level"], 7, "{written}");
+    assert!(json(&written).get("acp").is_none(), "{written}");
+
+    let mut both = push_only;
+    both.acp.packages = Nullable::some(vec![ACP_PACKAGES[0].to_owned()]);
+    let written = contents_in(&both, &THIS_RELEASE);
+    assert_eq!(json(&written)["level"], 8, "{written}");
+    assert_eq!(
+        json(&written)["acp"]["packages"][0],
+        ACP_PACKAGES[0],
+        "{written}"
+    );
+    assert_eq!(
+        json(&written)["push"]["gateways"][0],
+        GATEWAYS[0],
+        "{written}"
+    );
+
+    let mut empty_list = ConfigurationDocument::empty();
+    empty_list.acp.packages = Nullable::some(Vec::new());
+    let written = contents_in(&empty_list, &THIS_RELEASE);
+    assert_eq!(
+        json(&written)["level"],
+        8,
+        "an empty list is held: {written}"
+    );
+    assert_eq!(
+        json(&written)["acp"]["packages"],
+        serde_json::json!([]),
+        "{written}"
+    );
+}
+
+/// A package is on only when the document lists it: an unset section, an empty list and another
+/// package's name each leave it off, and a name that merely starts with a listed one is not it.
+#[test]
+fn a_listed_acp_package_is_on_and_every_other_is_off() {
+    let unset = ConfigurationDocument::empty();
+    assert!(
+        !unset.acp_enabled(ACP_PACKAGES[0]),
+        "an unset section is off"
+    );
+
+    let mut empty_list = ConfigurationDocument::empty();
+    empty_list.acp.packages = Nullable::some(Vec::new());
+    assert!(
+        !empty_list.acp_enabled(ACP_PACKAGES[0]),
+        "an empty list allows none"
+    );
+
+    let mut one = ConfigurationDocument::empty();
+    one.acp.packages = Nullable::some(vec![ACP_PACKAGES[0].to_owned()]);
+    assert!(one.acp_enabled(ACP_PACKAGES[0]), "a listed package is on");
+    assert!(
+        !one.acp_enabled(ACP_PACKAGES[1]),
+        "a package that is not listed is off"
+    );
+    assert!(
+        !one.acp_enabled("kalareach/gemini-cli-next"),
+        "a name that starts with a listed one is another package"
+    );
+    assert!(
+        !one.acp_enabled(""),
+        "no package is not a package that is listed"
+    );
+
+    let two = with_acp_packages();
+    assert!(two.acp_enabled(ACP_PACKAGES[0]) && two.acp_enabled(ACP_PACKAGES[1]));
+}
+
+/// A release that reads level 7 takes the acp section for a section of a newer release: it applies
+/// every member it knows, leaves the section out, counts and names it, does not fail closed, and
+/// does not edit the document.
+#[test]
+fn a_release_at_level_7_ignores_the_acp_section_and_applies_the_rest() {
+    let mut document = with_acp_packages();
+    document.push.gateways = Nullable::some(vec![GATEWAYS[0].to_owned()]);
+    let written = contents_in(&document, &THIS_RELEASE);
+    assert_eq!(json(&written)["level"], 8, "{written}");
+
+    let loaded = load_in(Some(written.as_bytes()), &BEFORE_ACP);
+    assert_eq!(
+        loaded.status.state,
+        DocumentState::Loaded,
+        "{:?}",
+        loaded.status
+    );
+    assert!(!loaded.fails_closed());
+    assert_eq!(
+        loaded.newer,
+        Some(Newer {
+            declared: 8,
+            count: 1,
+            names: vec!["acp".to_owned()]
+        })
+    );
+    let used = loaded.document.as_ref().expect("the document is used");
+    assert_eq!(used.ceilings.session_limit.0, Some(4));
+    assert_eq!(
+        used.push.gateways(),
+        &[GATEWAYS[0].to_owned()],
+        "level 7 is still read"
+    );
+    assert!(
+        used.acp.packages().is_empty() && !used.acp_enabled(ACP_PACKAGES[0]),
+        "the section is left out"
+    );
+    assert!(matches!(
+        edit_in(&loaded, &Change::SessionLimit(Some(2)), &BEFORE_ACP),
+        Err(EditRefused::NotOurs(_))
+    ));
+}
+
+/// The positive control of omission, and the round trip of an active value: a document that lists
+/// no package is read, and edited, by a release at level 7 as it was before the section existed;
+/// once packages are listed the next write is at level 8 and keeps every other member, and the list
+/// survives the file, the typed document and the registry's copy.
+#[test]
+fn a_listed_acp_package_survives_the_file_and_the_registrys_copy() {
+    let mut earlier = ConfigurationDocument::empty();
+    earlier.push.gateways = Nullable::some(vec![GATEWAYS[0].to_owned()]);
+    earlier.ceilings.session_limit = Nullable::some(4);
+    let before = contents_in(&earlier, &THIS_RELEASE);
+    let read = load_in(Some(before.as_bytes()), &BEFORE_ACP);
+    assert_eq!(read.status.state, DocumentState::Loaded);
+    assert!(
+        read.newer.is_none(),
+        "a document at the level is read strictly"
+    );
+
+    let mut document = load_in(Some(before.as_bytes()), &THIS_RELEASE)
+        .document
+        .expect("used");
+    document.acp = with_acp_packages().acp;
+    let written = contents_in(&document, &THIS_RELEASE);
+    assert_eq!(json(&written)["level"], 8, "{written}");
+    assert_eq!(json(&written)["ceilings"]["session_limit"], 4, "{written}");
+    assert_eq!(
+        json(&written)["push"]["gateways"][0],
+        GATEWAYS[0],
+        "{written}"
+    );
+
+    let read = load_in(Some(written.as_bytes()), &THIS_RELEASE);
+    assert_eq!(
+        read.status.state,
+        DocumentState::Loaded,
+        "{:?}",
+        read.status
+    );
+    let typed = read.document.expect("used");
+    assert_eq!(typed.acp.packages(), ACP_PACKAGES);
+    assert_eq!(typed.level, 8);
+    let copy = contents_in(&typed, &THIS_RELEASE);
+    assert_eq!(
+        load_in(Some(copy.as_bytes()), &THIS_RELEASE)
+            .document
+            .as_ref(),
+        Some(&typed)
+    );
+    assert_eq!(
+        copy, written,
+        "the copy is the file's reading written again"
+    );
+
+    // The section is as strict as any other.
+    for stray in [
+        r#"{"version": 3, "level": 8, "acp": {"packages": [], "fallback": true}}"#,
+        r#"{"version": 3, "level": 8, "acp": {"packages": "kalareach/gemini-cli"}}"#,
+    ] {
+        assert_eq!(
+            load_in(Some(stray.as_bytes()), &THIS_RELEASE).status.state,
+            DocumentState::Invalid,
+            "{stray}"
+        );
+    }
+}
+
+/// An entry of the list is a package's `publisher/plugin` identifier as every other list of
+/// packages in the document has it, it is named once, and no more than sixty-four are named. Each
+/// refusal says its own reason, and a document that holds the section but states a level below 8 is
+/// refused by name as well, so a hand-written document cannot slip a list past a release that
+/// would ignore it.
+#[test]
+fn the_acp_list_is_refused_with_its_own_reason_when_an_entry_is_not_one_package() {
+    let many: Vec<String> = (0..=64).map(|n| format!("kalareach/agent-{n}")).collect();
+    let refused: Vec<(&str, Vec<String>, String)> = vec![
+        (
+            "no publisher",
+            vec!["codex".to_owned()],
+            "acp.packages names [name withheld, 5 bytes], which is not a package's \
+             publisher/plugin identifier"
+                .to_owned(),
+        ),
+        (
+            "upper case",
+            vec!["Kalareach/Codex".to_owned()],
+            "acp.packages names [name withheld, 15 bytes], which is not a package's \
+             publisher/plugin identifier"
+                .to_owned(),
+        ),
+        (
+            "empty",
+            vec![String::new()],
+            "acp.packages names [name withheld, 0 bytes], which is not a package's \
+             publisher/plugin identifier"
+                .to_owned(),
+        ),
+        (
+            "a duplicate",
+            vec![
+                ACP_PACKAGES[0].to_owned(),
+                ACP_PACKAGES[1].to_owned(),
+                ACP_PACKAGES[0].to_owned(),
+            ],
+            "acp.packages names [name withheld, 20 bytes] more than once".to_owned(),
+        ),
+        (
+            "sixty-five",
+            many,
+            "acp.packages names 65 packages, more than the 64 a document may list".to_owned(),
+        ),
+    ];
+    for (why, list, message) in refused {
+        let mut document = ConfigurationDocument::empty();
+        document.acp.packages = Nullable::some(list.clone());
+        document.level = 8;
+        let text = serde_json::to_string(&document).expect("serialises");
+        let loaded = load_in(Some(text.as_bytes()), &THIS_RELEASE);
+        assert_eq!(loaded.status.state, DocumentState::Invalid, "{why}");
+        let said = loaded.status.detail.to_string();
+        assert!(said.contains(&message), "{why}: {said}");
+    }
+
+    // The control: the same document with listed packages is read.
+    let accepted = r#"{"version": 3, "level": 8, "acp": {"packages": ["kalareach/gemini-cli", "kalareach/qoder-cli"]}}"#;
+    assert_eq!(
+        load_in(Some(accepted.as_bytes()), &THIS_RELEASE)
+            .status
+            .state,
+        DocumentState::Loaded
+    );
+    // A level below the section's is refused by name, an empty list included.
+    for low in [
+        r#"{"version": 3, "level": 7, "acp": {"packages": ["kalareach/gemini-cli"]}}"#,
+        r#"{"version": 3, "acp": {"packages": []}}"#,
+    ] {
+        let loaded = load_in(Some(low.as_bytes()), &THIS_RELEASE);
+        assert_eq!(loaded.status.state, DocumentState::Invalid, "{low}");
+        assert!(
+            loaded.status.detail.to_string().contains("acp"),
+            "{low}: {:?}",
+            loaded.status
+        );
+    }
 }
