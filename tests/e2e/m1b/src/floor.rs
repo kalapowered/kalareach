@@ -1,7 +1,11 @@
-//! H's watch on the clock floor. When the agent starts the host maps the floor and keeps the
-//! mapping and a descriptor of the file. At each kill the words are compared with those at the
-//! start, and before the attempt with those at the kill: the moving words through the mapping's
-//! atomic loads in the order owed, recorded, floor, everything else through the descriptor. The
+//! H's watch on the clock floor. When the agent starts the host maps the floor, keeps the mapping
+//! to ask whether the floor's name still names the file it mapped, and keeps a descriptor of the
+//! file. At each kill the words are compared with those at the start, and before the attempt with
+//! those at the kill. Every byte is read through the descriptor and none through the mapping,
+//! which a truncation by the agent would end in a signal: a file shorter than the floor is refused
+//! first, and each moving word is read by an aligned read of eight bytes, in the order owed,
+//! recorded, floor, twice, and accepted when the two reads are equal. Two equal reads show no
+//! tear; a write between them that restores the value, or a tear that repeats, is not seen. The
 //! check refuses and never passes: a word moved forward inside the limit is not seen, which is the
 //! stated residual.
 
@@ -11,13 +15,26 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use kr_ipc::clock::{SharedClock as _, SystemSharedClock};
-use kr_ipc::floor::SharedFloor;
+use kr_ipc::floor::{FLOOR_FILE_LEN, SharedFloor};
 use kr_protocol::ids::{BootEpoch, EnvironmentId};
 
 use crate::run::{RootPin, open_file_below};
 
 /// How far above what H's own readings allow a floor word that rose may stand, in milliseconds.
 pub const ALLOWANCE_MS: u64 = 60_000;
+
+/// Where the floor word stands in the file.
+const FLOOR_AT: u64 = 64;
+
+/// Where the owed word stands in the file.
+const OWED_AT: u64 = 72;
+
+/// Where the recorded word stands in the file.
+const RECORDED_AT: u64 = 80;
+
+/// How many times a word is read again while two reads differ, before the look says that the word
+/// does not stand still.
+const READ_TRIES: usize = 5;
 
 /// Where the floor's words begin: the header and the bytes up to here are fixed.
 const WORDS_FROM: usize = 64;
@@ -125,7 +142,7 @@ impl Watch {
             .map_err(|why| said(&why))?
             .map(File::from)
             .ok_or_else(|| said(&"it is not there"))?;
-        let at_the_start = look(&mapping, &file).map_err(|why| said(&why))?;
+        let at_the_start = look(&file).map_err(|why| said(&why))?;
         for (word, value) in [
             ("owed", at_the_start.owed),
             ("recorded", at_the_start.recorded),
@@ -209,7 +226,7 @@ impl Watch {
         attempt: bool,
     ) -> (Vec<String>, Option<State>) {
         self.greatest_wall = self.greatest_wall.max(now.wall_ms);
-        let found = match look(&self.mapping, &self.file) {
+        let found = match look(&self.file) {
             Ok(found) => found,
             Err(why) => return (vec![format!("the clock floor cannot be read: {why}")], None),
         };
@@ -275,21 +292,25 @@ impl Watch {
     }
 }
 
-/// Reads the floor: the moving words by the mapping's atomic loads in the order owed, recorded,
-/// floor, then the file through the descriptor.
-fn look(mapping: &SharedFloor, file: &File) -> Result<State, String> {
-    let owed = mapping.owed();
-    let recorded = mapping.recorded();
-    let floor = mapping.load();
+/// Reads the floor through the descriptor and loads nothing from the mapping, so that a truncation
+/// while the floor is read ends in an error and not in a signal: the length first, which must be
+/// the floor's at least, then the moving words in the order owed, recorded, floor, then the whole
+/// file.
+fn look(file: &File) -> Result<State, String> {
     let length = file.metadata().map_err(|why| why.to_string())?.len();
+    if length < FLOOR_FILE_LEN as u64 {
+        return Err(format!(
+            "the file is {length} bytes, shorter than the floor's {FLOOR_FILE_LEN}"
+        ));
+    }
+    let owed = word(file, OWED_AT)?;
+    let recorded = word(file, RECORDED_AT)?;
+    let floor = word(file, FLOOR_AT)?;
     let mut bytes = vec![0_u8; usize::try_from(length.min(READ_AT_MOST)).unwrap_or(0)];
     file.read_exact_at(&mut bytes, 0)
         .map_err(|why| why.to_string())?;
     if length > READ_AT_MOST {
         bytes.extend_from_slice(&length.to_be_bytes());
-    }
-    if bytes.len() < WORDS_TO {
-        return Err("the file is shorter than the floor's words".to_owned());
     }
     let mut fixed = bytes[..WORDS_FROM].to_vec();
     fixed.extend_from_slice(&bytes[WORDS_TO..]);
@@ -302,19 +323,43 @@ fn look(mapping: &SharedFloor, file: &File) -> Result<State, String> {
     })
 }
 
+/// One word of the floor, by reads of eight bytes at the aligned offset `at`.
+fn word(file: &File, at: u64) -> Result<u64, String> {
+    settled(at, || {
+        let mut bytes = [0_u8; 8];
+        file.read_exact_at(&mut bytes, at)
+            .map_err(|why| why.to_string())?;
+        Ok(u64::from_ne_bytes(bytes))
+    })
+}
+
+/// The value that two successive calls of `read` give, at the offset `at`, tried again while they
+/// differ, up to [`READ_TRIES`] times.
+fn settled(at: u64, mut read: impl FnMut() -> Result<u64, String>) -> Result<u64, String> {
+    let mut before = read()?;
+    for _ in 0..READ_TRIES {
+        let after = read()?;
+        if after == before {
+            return Ok(after);
+        }
+        before = after;
+    }
+    Err(format!(
+        "the word at byte {at} did not stand still over {READ_TRIES} reads"
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::Write as _;
     use std::os::unix::fs::PermissionsExt as _;
     use std::path::PathBuf;
+    use std::time::{Duration, Instant};
 
     use kr_ipc::paths::HostPaths;
 
     use super::*;
 
-    const FLOOR_AT: u64 = 64;
-    const OWED_AT: u64 = 72;
-    const RECORDED_AT: u64 = 80;
     const ESTABLISHED_AT: u64 = 88;
 
     /// The readings the watch is anchored at, and the same readings a moment later.
@@ -341,16 +386,27 @@ mod tests {
         other: SharedFloor,
     }
 
-    fn world(name: &str, floor_ms: u64) -> World {
-        let base = if cfg!(target_os = "macos") {
+    /// The directory the cases make their runs' directories in.
+    fn base() -> PathBuf {
+        if cfg!(target_os = "macos") {
             PathBuf::from("/private/tmp")
         } else {
             std::fs::canonicalize(std::env::temp_dir()).expect("the temporary directory")
-        };
-        let root = base.join(format!(
-            "kf-{name}-{}",
-            &kr_ipc::new_uuid().to_string()[..8]
-        ));
+        }
+    }
+
+    fn world(name: &str, floor_ms: u64) -> World {
+        world_at(
+            base().join(format!(
+                "kf-{name}-{}",
+                &kr_ipc::new_uuid().to_string()[..8]
+            )),
+            floor_ms,
+        )
+    }
+
+    /// A world whose run's directory is `root`.
+    fn world_at(root: PathBuf, floor_ms: u64) -> World {
         for directory in ["r", "s"] {
             std::fs::create_dir_all(root.join(directory)).expect("a root");
             std::fs::set_permissions(root.join(directory), std::fs::Permissions::from_mode(0o700))
@@ -412,6 +468,121 @@ mod tests {
             drop(self.other);
             std::fs::remove_dir_all(&self.root).expect("clean up");
         }
+    }
+
+    /// The environment variable that tells the test program, started again by the case below, that
+    /// it is the child and where its directory is.
+    const TRUNCATION_CHILD: &str = "KR_FLOOR_TRUNCATION_CHILD";
+
+    /// The child of the case below: it keeps a watch on a floor, truncates the floor's file to
+    /// nothing from another thread, and looks at the floor until a look refuses. It says the
+    /// refusal, looks once more at the floor, which is truncated by then, says that refusal too,
+    /// and removes its directory.
+    fn look_while_the_floor_is_truncated(root: PathBuf) {
+        let world = world_at(root, 1_000_000);
+        let watch = world.watch();
+        let path = world.path.clone();
+        let refusal = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                std::thread::sleep(Duration::from_millis(30));
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&path)
+                    .and_then(|file| file.set_len(0))
+                    .expect("the floor is truncated");
+            });
+            let started = Instant::now();
+            loop {
+                if let Err(why) = look(&watch.file) {
+                    break why;
+                }
+                assert!(
+                    started.elapsed() < Duration::from_secs(20),
+                    "no look refused within 20 s of the truncation"
+                );
+            }
+        });
+        println!("the look refused: {refusal}");
+        let after = look(&watch.file).expect_err("a look at the truncated floor");
+        println!("a look after the truncation refused: {after}");
+        drop(watch);
+        world.clean();
+    }
+
+    /// A floor that the agent truncates while H reads it gives a refusal, and the test program
+    /// that reads it ends and cleans up as it would otherwise: a load from a mapping of the
+    /// truncated file would end it with a signal, and so would a look at a floor that is already
+    /// truncated. The case runs itself again as a child to see the end of the program.
+    #[test]
+    fn a_floor_that_is_truncated_while_it_is_read_gives_a_refusal_and_not_a_signal() {
+        if let Ok(root) = std::env::var(TRUNCATION_CHILD) {
+            look_while_the_floor_is_truncated(PathBuf::from(root));
+            return;
+        }
+        let root = base().join(format!(
+            "kf-truncated-{}",
+            &kr_ipc::new_uuid().to_string()[..8]
+        ));
+        let output = std::process::Command::new(std::env::current_exe().expect("this program"))
+            .args([
+                "--exact",
+                "floor::tests::a_floor_that_is_truncated_while_it_is_read_gives_a_refusal_and_not_a_signal",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(TRUNCATION_CHILD, &root)
+            .output()
+            .expect("the child ran");
+        let said = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "the child ended with {:?}, signal {:?}: {said} {}",
+            output.status,
+            std::os::unix::process::ExitStatusExt::signal(&output.status),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            said.contains("the look refused: "),
+            "the child said a refusal: {said}"
+        );
+        assert!(
+            said.contains("a look after the truncation refused: "),
+            "the child said the refusal of the look after the truncation: {said}"
+        );
+        assert!(!root.exists(), "the child removed its directory");
+    }
+
+    /// A file shorter than the floor is refused before any word is read, and a word that does not
+    /// stand still over the tries is refused, while a word that settles is accepted.
+    #[test]
+    fn a_short_floor_and_a_word_that_does_not_stand_still_are_refused() {
+        let world = world("short", 1_000_000);
+        let file = File::open(&world.path).expect("the floor");
+        assert!(look(&file).is_ok(), "the floor as made");
+        let short = world.root.join("short");
+        std::fs::write(&short, vec![0_u8; 200]).expect("a short file");
+        let why = look(&File::open(&short).expect("a file")).expect_err("a short file");
+        assert_eq!(
+            why,
+            format!("the file is 200 bytes, shorter than the floor's {FLOOR_FILE_LEN}")
+        );
+        let mut reads = [1_u64, 2, 2].into_iter();
+        assert_eq!(
+            settled(72, || Ok(reads.next().expect("a read"))),
+            Ok(2),
+            "a word that moved between the first two reads and then stood still"
+        );
+        let mut moving = 0_u64;
+        let why = settled(72, || {
+            moving += 1;
+            Ok(moving)
+        })
+        .expect_err("a word that always moves");
+        assert_eq!(
+            why,
+            format!("the word at byte 72 did not stand still over {READ_TRIES} reads")
+        );
+        world.clean();
     }
 
     /// A floor that cannot be opened as the daemon opens it, and one that holds a word above its
