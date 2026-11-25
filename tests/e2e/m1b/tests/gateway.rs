@@ -357,6 +357,7 @@ impl Context {
             &Preparation {
                 command_integrations: vec![codex().to_string()],
                 stable_address: true,
+                application: None,
             },
             |environment| {
                 self.runtime.block_on(install_codex(

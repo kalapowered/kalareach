@@ -1894,6 +1894,7 @@ impl Context {
                     vec![self.subject.plugin().to_string()]
                 },
                 stable_address: true,
+                application: None,
             },
             |environment| {
                 let (distribution, version) = self.qualified_as();

@@ -98,6 +98,19 @@ impl Outside<'_> {
     }
 }
 
+/// One line for each directory of `search_path` after the first that holds a file named `name`.
+/// The recipe reads every file of that name on the daemon's path, and is refused unless a signed
+/// record names each one.
+#[must_use]
+pub fn second_programs(search_path: &str, name: &str) -> Vec<String> {
+    search_path
+        .split(':')
+        .skip(1)
+        .filter(|directory| Path::new(directory).join(name).is_file())
+        .map(|directory| format!("the daemon's search path finds a second {name}, in {directory}"))
+        .collect()
+}
+
 /// Whether the account can write the file at `path` or the directory that holds it.
 fn writable(path: &Path) -> bool {
     let can = |place: &Path| rustix::fs::access(place, Access::WRITE_OK).is_ok();
@@ -337,6 +350,49 @@ mod tests {
         assert_eq!(
             refusals(&root, &pin, "/usr/bin:/bin", &[], None),
             said("the file has more than one name, which is refused and read through by nothing")
+        );
+        clean(&root);
+    }
+
+    /// The program under test is found in the first directory of the search path and in no other:
+    /// a file of its name in a later directory is refused, and the first directory's own is not a
+    /// second.
+    #[test]
+    fn a_second_program_of_the_name_on_the_search_path_is_refused() {
+        let (root, _pin) = world("second");
+        for directory in ["t", "u"] {
+            std::fs::create_dir_all(root.join(directory)).expect("a directory");
+            std::fs::write(root.join(directory).join("claude"), b"claude").expect("a program");
+        }
+        std::fs::create_dir_all(root.join("v/claude")).expect("a directory of the name");
+        let refused = |search_path: &str| second_programs(search_path, "claude");
+        let first = root.join("t");
+        let second = root.join("u");
+        assert_eq!(
+            refused(&format!("{}:/usr/bin:/bin", first.display())),
+            Vec::<String>::new(),
+            "the program in the first directory is the one the daemon finds"
+        );
+        assert_eq!(
+            refused(&format!(
+                "{}:{}:/usr/bin:/bin",
+                first.display(),
+                second.display()
+            )),
+            vec![format!(
+                "the daemon's search path finds a second claude, in {}",
+                second.display()
+            )],
+            "a second program of the name is refused"
+        );
+        assert_eq!(
+            refused(&format!(
+                "{}:{}:/usr/bin:/bin",
+                first.display(),
+                root.join("v").display()
+            )),
+            Vec::<String>::new(),
+            "a directory of the name is not a program"
         );
         clean(&root);
     }

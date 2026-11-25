@@ -33,10 +33,10 @@ use crate::LIVENESS;
 use crate::compare::{self, Class, Interval, Layout};
 use crate::floor::{FLOOR_OPEN, Opening, Readings, Watch};
 use crate::index::{self, Looked};
-use crate::outside::Outside;
+use crate::outside::{Outside, second_programs};
 use crate::run::{
-    HARNESS_PROGRAM, Run, binary_place, built_directory, ended_within, output_within,
-    processes_under, read_tail_below, running, signal, socket_below, worker_session,
+    HARNESS_PROGRAM, PlacedDirectory, Run, binary_place, built_directory, ended_within,
+    output_within, processes_under, read_tail_below, running, signal, socket_below, worker_session,
 };
 use crate::tables::{self, Tables};
 use crate::tree::{Entry, OPTIONAL_ROOTS, REQUIRED_ROOTS, RUNTIME_ROOT, Record, STATE_ROOT};
@@ -44,6 +44,11 @@ use crate::worker::Place;
 
 /// The daemon's log, in the run's directory.
 const DAEMON_LOG: &str = "controller.log";
+
+/// The directories of the system that the daemon's search path names after the directory of the
+/// program under test, where the host has one, and the whole search path of every `kr` program the
+/// host starts.
+const SYSTEM_PATH: &str = "/usr/bin:/bin";
 
 /// How long the daemon is given to stop once it has been interrupted.
 const DAEMON_STOP: Duration = Duration::from_secs(20);
@@ -221,6 +226,80 @@ pub struct Preparation {
     /// Whether the host keeps the loopback address a device dials across a restart of its daemon,
     /// by binding a port chosen once instead of one the system chooses at each start.
     pub stable_address: bool,
+    /// The program under test, where the host's daemon must find it by its name.
+    pub application: Option<Application>,
+}
+
+/// A program under test that the daemon finds by its name on its search path, and the directory
+/// where that program's registrations are written.
+///
+/// The host makes the configuration directory before its daemon starts, records the directory
+/// that holds the program and the program itself as they were placed, and gives the daemon a
+/// search path that names that directory first and the system's own after it. Each start of the
+/// daemon checks both again.
+#[derive(Clone, Debug)]
+pub struct Application {
+    /// The program, below the run's directory: the program's name is the last component, and the
+    /// directory that holds it is the first directory of the daemon's search path. The leg places
+    /// the program there before the host is started, and the directory holds nothing else.
+    pub program: PathBuf,
+    /// The directory below the run's home where the program keeps its configuration, and the
+    /// daemon writes the program's registrations.
+    pub configuration: PathBuf,
+}
+
+/// What the host holds of its application: the program and the directory that holds it, as the leg
+/// placed them.
+#[derive(Debug)]
+struct Placed {
+    /// The program, below the run's directory.
+    program: PathBuf,
+    /// The program's name.
+    name: String,
+    /// The directory that holds the program, as it was placed.
+    directory: PlacedDirectory,
+}
+
+/// Makes the application's configuration directory and records its program and the directory that
+/// holds it as they stand.
+///
+/// # Panics
+///
+/// Panics when the configuration directory cannot be made, or the program is not a file of the run
+/// with one name that sits directly in a directory of the run.
+fn prepare_application(run: &Run, application: &Application) -> Placed {
+    kr_ipc::paths::create_private_tree(run.root(), &run.home().join(&application.configuration))
+        .unwrap_or_else(|error| {
+            panic!(
+                "the directory {} of the application's configuration cannot be made: {error}",
+                application.configuration.display()
+            )
+        });
+    let directory = application
+        .program
+        .parent()
+        .filter(|directory| !directory.as_os_str().is_empty())
+        .unwrap_or_else(|| {
+            panic!(
+                "the program {} is not in a directory of the run",
+                application.program.display()
+            )
+        });
+    let name = application
+        .program
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_else(|| panic!("the program {} has no name", application.program.display()))
+        .to_owned();
+    let directory = PlacedDirectory::record(run.root(), run.pin(), directory)
+        .unwrap_or_else(|why| panic!("{why}"));
+    run.note_placed(&application.program)
+        .unwrap_or_else(|why| panic!("{why}"));
+    Placed {
+        program: application.program.clone(),
+        name,
+        directory,
+    }
 }
 
 /// What a case says of a restart of the control daemon after its agent has started
@@ -526,6 +605,8 @@ enum Failed {
     /// The daemon neither exited nor answered in time: what it was last heard to say, and what it
     /// wrote.
     Silent { heard: String, said: String },
+    /// The daemon was not started: what its search path would name is not as it was placed.
+    Refused(String),
 }
 
 /// Ends the leg as not run with `said`: the unwinding carries the text to the end of the case.
@@ -557,6 +638,8 @@ pub struct Host<'r> {
     /// The wall clock and the continuous clock, read before the host's first daemon start: the
     /// anchor of the clock floor's limit.
     anchor: Readings,
+    /// The program under test the daemon finds by its name, where the host was prepared with one.
+    application: Option<Placed>,
 }
 
 #[derive(Debug)]
@@ -600,6 +683,12 @@ impl<'r> Host<'r> {
             .expect("the environment's identity");
         let environment = paths.environment(environment_id);
         environment.create().expect("the environment's directories");
+        // Before the seed and the daemon: the recipe's executor writes into a directory that is
+        // there and makes none.
+        let application = preparation
+            .application
+            .as_ref()
+            .map(|application| prepare_application(run, application));
         let mut port = if preparation.stable_address {
             free_loopback_port()
         } else {
@@ -619,6 +708,7 @@ impl<'r> Host<'r> {
             kr_after_start: Arc::default(),
             restarts: Mutex::default(),
             anchor: Readings::now(),
+            application,
         };
         // The port was free when it was chosen, and it is bound when the daemon starts: other legs
         // choose theirs meanwhile, on this machine and on a shared one, and two can choose alike.
@@ -758,6 +848,32 @@ impl<'r> Host<'r> {
             Err(Failed::Silent { heard, said }) => {
                 panic!("the control daemon did not answer within {LIVENESS:?} ({heard}): {said}")
             }
+            Err(Failed::Refused(why)) => panic!("the control daemon was not started: {why}"),
+        }
+    }
+
+    /// The daemon's search path: the system's own where the host has no application, and where it
+    /// has one the directory that holds the program, then the system's. The program is looked at
+    /// as it was placed and the directory is reached by its identity, each time, and no other
+    /// directory of the path holds a file of the program's name.
+    ///
+    /// # Errors
+    ///
+    /// Returns what is not as it was placed, or the second program the path would find.
+    fn daemon_path(&self) -> Result<String, String> {
+        let Some(placed) = &self.application else {
+            return Ok(SYSTEM_PATH.to_owned());
+        };
+        let directory = placed
+            .directory
+            .place_for_a_start(self.run.root(), self.run.pin())?;
+        self.run.placed_as_it_was(&placed.program)?;
+        let path = format!("{}:{SYSTEM_PATH}", directory.display());
+        let second = second_programs(&path, &placed.name);
+        if second.is_empty() {
+            Ok(path)
+        } else {
+            Err(second.join("; "))
         }
     }
 
@@ -769,6 +885,7 @@ impl<'r> Host<'r> {
         liveness: Duration,
     ) -> Result<(), Failed> {
         kr_ipc::testing::account_launchd::require("the host start");
+        let search_path = self.daemon_path().map_err(Failed::Refused)?;
         *self.control.lock().unwrap_or_else(PoisonError::into_inner) = None;
         // What the log holds before this start is an earlier start's, and is not this one's to say.
         let earlier = std::fs::metadata(self.daemon_log()).map_or(0, |log| log.len());
@@ -788,7 +905,7 @@ impl<'r> Host<'r> {
             .arg("--worker")
             .arg(self.run.binary("kr-worker"))
             .env_clear()
-            .env("PATH", "/usr/bin:/bin")
+            .env("PATH", &search_path)
             .env("HOME", self.run.home())
             .env(self.run.mark().0, self.run.mark().1)
             .current_dir(self.run.root())
@@ -1228,7 +1345,7 @@ impl<'r> Host<'r> {
     #[must_use]
     pub fn variables(&self) -> Vec<(String, String)> {
         let mut variables = vec![
-            ("PATH".to_owned(), "/usr/bin:/bin".to_owned()),
+            ("PATH".to_owned(), SYSTEM_PATH.to_owned()),
             ("TERM".to_owned(), "xterm-256color".to_owned()),
             ("HOME".to_owned(), self.run.home().display().to_string()),
             (
@@ -1636,15 +1753,24 @@ impl<'r> Host<'r> {
             ),
         ];
         let log = self.daemon_log();
-        Outside {
-            run_root: self.run.root(),
-            pin: self.run.pin(),
-            search_path: "/usr/bin:/bin",
-            inherited: &inherited,
-            shell_packages: self.shell_packages.as_deref(),
-            log: log.strip_prefix(self.run.root()).unwrap_or(&log),
-        }
-        .refusals()
+        // A path that cannot be made is a refusal of its own, and the system's path is read for
+        // the rest.
+        let (search_path, mut refused) = match self.daemon_path() {
+            Ok(path) => (path, Vec::new()),
+            Err(why) => (SYSTEM_PATH.to_owned(), vec![why]),
+        };
+        refused.extend(
+            Outside {
+                run_root: self.run.root(),
+                pin: self.run.pin(),
+                search_path: &search_path,
+                inherited: &inherited,
+                shell_packages: self.shell_packages.as_deref(),
+                log: log.strip_prefix(self.run.root()).unwrap_or(&log),
+            }
+            .refusals(),
+        );
+        refused
     }
 
     /// At a kill of a real agent's host: compares the tree with the record made at the start and
@@ -1827,6 +1953,9 @@ impl<'r> Host<'r> {
             Err(Failed::Silent { heard, said }) => leg_not_run(format!(
                 "the control daemon did not start after the kill: it did not answer within \
                  {liveness:?} ({heard}): {said}"
+            )),
+            Err(Failed::Refused(why)) => leg_not_run(format!(
+                "the control daemon was not started after the kill: {why}"
             )),
         }
     }
@@ -2278,6 +2407,7 @@ mod shutdown_tests {
             kr_after_start: Arc::default(),
             restarts: Mutex::default(),
             anchor: Readings::now(),
+            application: None,
         }
     }
 
@@ -3761,6 +3891,204 @@ mod shutdown_tests {
         host.agent_starts();
         host.kill_daemon();
         host
+    }
+
+    /// A run whose `kr-controller` records, before it counts its start, the search path it was
+    /// given in the run's home as `path`, and as `configuration` whether the directory `.claude`
+    /// below the home was there when it started; then it stays running.
+    fn run_with_a_recording_controller(root: &Path) -> Run {
+        let run = run_with_a_controller(root);
+        std::fs::write(
+            root.join("b/kr-controller"),
+            "#!/bin/sh\nprintf '%s' \"$PATH\" > \"$HOME/path\"\nif [ -d \"$HOME/.claude\" ]; then\n  \
+             echo there > \"$HOME/configuration\"\nfi\necho started >> \"$HOME/starts\"\n\
+             exec sleep 30\n",
+        )
+        .expect("a recording controller");
+        run
+    }
+
+    /// The program under test as a leg places it: a file `claude` alone in the run's directory
+    /// `t`, with the configuration directory `.claude` below the home. The run's directory is
+    /// private to the account, as a run's is.
+    fn an_application(root: &Path) -> Application {
+        for private in [root.to_path_buf(), root.join("h")] {
+            std::fs::set_permissions(
+                &private,
+                std::os::unix::fs::PermissionsExt::from_mode(0o700),
+            )
+            .expect("a private run directory");
+        }
+        std::fs::create_dir_all(root.join("t")).expect("a directory for the program");
+        std::fs::write(root.join("t/claude"), b"claude\n").expect("a program");
+        std::fs::set_permissions(
+            root.join("t/claude"),
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .expect("executable");
+        Application {
+            program: PathBuf::from("t/claude"),
+            configuration: PathBuf::from(".claude"),
+        }
+    }
+
+    /// A host over the run's tree that was prepared with `application`: no daemon is started.
+    fn host_prepared_with<'r>(run: &'r Run, application: &Application) -> Host<'r> {
+        let mut host = host_over(run);
+        host.application = Some(prepare_application(run, application));
+        host
+    }
+
+    /// Why the host refuses to start its daemon, where it does.
+    fn refused_start(host: &Host<'_>, root: &Path) -> String {
+        match host.start_once(&started(root, 1), Duration::from_secs(10)) {
+            Err(Failed::Refused(why)) => why,
+            Err(_) => panic!("the daemon was started and failed, and was not refused"),
+            Ok(()) => panic!("the daemon was started"),
+        }
+    }
+
+    /// The directory below the home that the program keeps its configuration in is there, and
+    /// private to the account, when the daemon starts: the recipe's executor makes none.
+    #[test]
+    fn the_configuration_directory_is_there_and_private_when_the_daemon_starts() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = scratch("configuration");
+        let run = run_with_a_recording_controller(&root);
+        let application = an_application(&root);
+        let host = host_prepared_with(&run, &application);
+        assert!(
+            host.start_once(&started(&root, 1), Duration::from_secs(10))
+                .is_ok(),
+            "the start"
+        );
+        assert!(
+            root.join("h/configuration").is_file(),
+            "the configuration directory was not there when the daemon started"
+        );
+        assert_eq!(
+            std::fs::metadata(root.join("h/.claude"))
+                .expect("the configuration directory")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700,
+            "the configuration directory is private to the account"
+        );
+        drop(host);
+        drop(run);
+        std::fs::remove_dir_all(&root).expect("clean up");
+    }
+
+    /// The daemon's search path names the directory of the program first and the system's two
+    /// directories after it.
+    #[test]
+    fn the_daemon_is_given_the_directory_of_the_program_first_and_the_systems_path_after_it() {
+        let root = scratch("path");
+        let run = run_with_a_recording_controller(&root);
+        let application = an_application(&root);
+        let host = host_prepared_with(&run, &application);
+        assert!(
+            host.start_once(&started(&root, 1), Duration::from_secs(10))
+                .is_ok(),
+            "the start"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("h/path")).expect("the path the daemon was given"),
+            format!(
+                "{}:/usr/bin:/bin",
+                std::fs::canonicalize(root.join("t"))
+                    .expect("the directory")
+                    .display()
+            )
+        );
+        drop(host);
+        drop(run);
+        std::fs::remove_dir_all(&root).expect("clean up");
+    }
+
+    /// A host with no application gives its daemon the system's search path and makes no
+    /// configuration directory.
+    #[test]
+    fn a_host_with_no_application_gives_its_daemon_the_systems_path_and_makes_no_directory() {
+        let root = scratch("no-application");
+        let run = run_with_a_recording_controller(&root);
+        let host = host_over(&run);
+        assert!(
+            host.start_once(&started(&root, 1), Duration::from_secs(10))
+                .is_ok(),
+            "the start"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("h/path")).expect("the path the daemon was given"),
+            "/usr/bin:/bin"
+        );
+        assert!(
+            !root.join("h/.claude").exists(),
+            "no configuration directory was made"
+        );
+        drop(host);
+        drop(run);
+        std::fs::remove_dir_all(&root).expect("clean up");
+    }
+
+    /// A directory put where the program's directory was, another directory or a link, is not the
+    /// directory that was placed: the daemon is not started over it.
+    #[test]
+    fn a_directory_that_is_not_the_one_placed_is_refused_at_the_next_start() {
+        for form in ["another directory", "a link"] {
+            let root = scratch("directory");
+            let run = run_with_a_recording_controller(&root);
+            let application = an_application(&root);
+            let host = host_prepared_with(&run, &application);
+            let kept = root.join("kept");
+            std::fs::rename(root.join("t"), &kept).expect("the placed directory moved");
+            if form == "a link" {
+                std::os::unix::fs::symlink(&kept, root.join("t")).expect("a link");
+            } else {
+                std::fs::create_dir_all(root.join("t")).expect("another directory");
+                std::fs::write(root.join("t/claude"), b"claude\n").expect("a program");
+            }
+            let why = refused_start(&host, &root);
+            assert!(why.contains("is not as the run placed it"), "{form}: {why}");
+            assert_eq!(starts(&root), 0, "{form}: no daemon was started");
+            drop(host);
+            drop(run);
+            std::fs::remove_dir_all(&root).expect("clean up");
+        }
+    }
+
+    /// A program whose bytes were rewritten since it was placed is not the file that was placed:
+    /// the daemon is not started with it on its path.
+    #[test]
+    fn a_program_rewritten_since_it_was_placed_is_refused_at_the_next_start() {
+        let root = scratch("program");
+        let run = run_with_a_recording_controller(&root);
+        let application = an_application(&root);
+        let host = host_prepared_with(&run, &application);
+        std::fs::write(root.join("t/claude"), b"theirs\n").expect("rewritten");
+        let why = refused_start(&host, &root);
+        assert!(why.contains("not the file that was placed"), "{why}");
+        assert_eq!(starts(&root), 0, "no daemon was started");
+        drop(host);
+        drop(run);
+        std::fs::remove_dir_all(&root).expect("clean up");
+    }
+
+    /// A program placed as a link is not recorded as placed, so the host is not prepared with it.
+    #[test]
+    fn a_program_placed_as_a_link_is_not_taken() {
+        let root = scratch("link");
+        let run = run_with_a_recording_controller(&root);
+        let application = an_application(&root);
+        std::fs::rename(root.join("t/claude"), root.join("t/real")).expect("moved");
+        std::os::unix::fs::symlink(root.join("t/real"), root.join("t/claude")).expect("a link");
+        let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = prepare_application(&run, &application);
+        }));
+        assert!(refused.is_err(), "a program that is a link was taken");
+        drop(run);
+        std::fs::remove_dir_all(&root).expect("clean up");
     }
 
     /// The reason a leg that ends as not run gives.
