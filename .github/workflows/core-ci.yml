@@ -3320,10 +3320,13 @@ jobs:
       # window the shell opens and the menu bar it gives the application, operated through the
       # accessibility interface of the hosted runner's desktop and held to the state the window
       # reports. The built executable is the one that was just linked, so a build that failed leaves
-      # nothing to operate and the failure is the build's alone.
+      # nothing to operate and the failure is the build's alone. The step has 20 minutes: its script
+      # waits up to five deadlines of 180 seconds, 900 in all, and a run that waits that long should
+      # still reach its own error line; the step took 0.2 minutes at most in 38 hosted runs (run
+      # 45170429337).
       - name: Operate the desktop application's native window controls
         if: ${{ !cancelled() && runner.os == 'macOS' && steps.desktop-build.outcome == 'success' }}
-        timeout-minutes: 10
+        timeout-minutes: 20
         run: |
           . scripts/lib/artifacts-dir.sh
           kr_artifacts_dir
