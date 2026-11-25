@@ -4581,9 +4581,14 @@ const fn route_label(real_route: bool) -> &'static str {
 }
 
 /// Why a case has nothing to run on `subject`, found before anything of a real route is acquired:
-/// a case that drives the gateway for an agent with no gateway ([`Subject::gateway_not_run`]).
-fn nothing_to_run(subject: &Subject, manual: bool, probe_only: bool) -> Option<String> {
-    subject.gateway_not_run(manual, probe_only)
+/// a case that drives the gateway for an agent with no gateway ([`Subject::gateway_not_run`]), or
+/// one that reads a field the entry lists as missing ([`entry::missing_for`]).
+fn nothing_to_run(subject: &Subject, case: &str, manual: bool, probe_only: bool) -> Option<String> {
+    subject.gateway_not_run(manual, probe_only).or_else(|| {
+        subject
+            .entry()
+            .and_then(|build| entry::missing_for(build, case, probe_only))
+    })
 }
 
 /// The outcome of a case that has nothing to run, ended before a route, a run, a host or a session
@@ -4625,7 +4630,7 @@ fn run_case_with(
     body: impl FnOnce(&Context, &Session<'_>) -> serde_json::Value,
 ) {
     let real_route = chosen.generation.is_some();
-    if let Some(why) = nothing_to_run(&chosen.subject, setup.manual, probe_only) {
+    if let Some(why) = nothing_to_run(&chosen.subject, case, setup.manual, probe_only) {
         if let Some(path) = std::env::var_os(RESULT_VARIABLE).filter(|value| !value.is_empty()) {
             not_run_outcome(case, test, &why, real_route, &chosen.subject).append(Path::new(&path));
         }
@@ -9609,6 +9614,11 @@ fn a_generation_gives_the_manifest_its_index_names_for_a_package_and_refuses_ano
 
 /// A subject whose package declares no command integration, and so no gateway.
 fn subject_with_no_gateway() -> Subject {
+    subject_with_no_gateway_listing(&serde_json::json!({}))
+}
+
+/// [`subject_with_no_gateway`], whose entry lists `missing` as the fields it lacks.
+fn subject_with_no_gateway_listing(missing: &serde_json::Value) -> Subject {
     let mut manifest: serde_json::Value = serde_json::from_slice(
         &std::fs::read(
             Subject::codex()
@@ -9627,7 +9637,8 @@ fn subject_with_no_gateway() -> Subject {
     let build: Build = serde_json::from_value(serde_json::json!({
         "package": "kalareach/other", "application": "a", "version": "1", "prefix": "/p",
         "pinned": "bin/other", "sha256": "00", "command": "other", "launch": "native",
-        "ready": "r", "harmless": { "input": "h", "shows": "h" }, "transcript": "t"
+        "ready": "r", "harmless": { "input": "h", "shows": "h" }, "transcript": "t",
+        "missing": missing
     }))
     .expect("an entry");
     Subject::from_build(
@@ -9676,12 +9687,65 @@ fn a_case_that_drives_the_gateway_for_an_agent_with_no_gateway_ends_before_its_b
     );
 }
 
+/// A case that reads a field its entry lists as missing ends as not run before the route's account,
+/// ledger and keys are looked at, and before its body runs.
+#[test]
+fn a_case_that_reads_a_field_its_entry_lists_as_missing_ends_before_its_body_runs() {
+    let shell = match shells::managed_zsh() {
+        Ok(shell) => shell,
+        Err(why) => {
+            eprintln!("skipping: {why}");
+            return;
+        }
+    };
+    let subject = subject_with_no_gateway_listing(
+        &serde_json::json!({ "composer": "no composer was found", "newer.isolated": "no probe" }),
+    );
+    let why = nothing_to_run(&subject, "14.03a", true, false).expect("a reason");
+    assert!(why.contains("composer (no composer was found)"), "{why}");
+    assert_eq!(nothing_to_run(&subject, "2b", true, false), None);
+    assert!(nothing_to_run(&subject, "6a", true, false).is_some());
+    assert_eq!(
+        nothing_to_run(&subject, "6a", true, true),
+        None,
+        "a probe-only run produces newer.isolated, and is not stopped for it"
+    );
+    let ran = std::sync::atomic::AtomicBool::new(false);
+    let chosen = Chosen {
+        subject,
+        generation: Some(PathBuf::from("/no/generation")),
+    };
+    let ended = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        run_case_with(
+            Setup {
+                manual: true,
+                no_login: true,
+                ..Setup::default()
+            },
+            "staged-14-03a",
+            "14.03a",
+            "a test",
+            "by-hand",
+            (shell, chosen, false),
+            |_, _| {
+                ran.store(true, std::sync::atomic::Ordering::SeqCst);
+                serde_json::json!({})
+            },
+        );
+    }));
+    assert!(ended.is_ok(), "the case ended as not run, without a panic");
+    assert!(
+        !ran.load(std::sync::atomic::Ordering::SeqCst),
+        "the body of a case ran that reads a field its entry lists as missing"
+    );
+}
+
 /// The outcome of a case with nothing to run is not run, with the reason, the route it would have
 /// had and no run, like the outcome every other case ends with.
 #[test]
 fn a_case_with_nothing_to_run_is_recorded_as_not_run_with_the_evidence_of_every_outcome() {
     let subject = subject_with_no_gateway();
-    let why = nothing_to_run(&subject, false, false).expect("a reason");
+    let why = nothing_to_run(&subject, "5b", false, false).expect("a reason");
     let outcome = not_run_outcome("5b", "a test", &why, true, &subject);
     assert_eq!(outcome.outcome, "not_run");
     assert_eq!(outcome.reason.as_deref(), Some(why.as_str()));

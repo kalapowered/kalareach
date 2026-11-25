@@ -300,6 +300,32 @@ pub fn check(build: &Build) -> Report {
     report
 }
 
+/// Why the case `case` has nothing to read on `build`: it reads fields that the entry lists as
+/// missing, and a missing field is never read as empty. Names each field with the entry's reason;
+/// none where the case reads no field the entry lists; the probe-only run, which produces
+/// `newer.isolated`, is not stopped for that field.
+#[must_use]
+pub fn missing_for(build: &Build, case: &str, probe_only: bool) -> Option<String> {
+    let missing = build.missing.as_ref()?;
+    let listed: Vec<String> = NEEDS
+        .iter()
+        .filter(|(part, _)| *part == case)
+        .flat_map(|(_, fields)| fields.iter())
+        .filter(|field| !(probe_only && **field == "newer.isolated"))
+        .filter_map(|field| {
+            missing
+                .get(*field)
+                .map(|reason| format!("{field} ({reason})"))
+        })
+        .collect();
+    (!listed.is_empty()).then(|| {
+        format!(
+            "part {case} reads fields that the entry lists as missing, so it is not run: {}",
+            listed.join("; ")
+        )
+    })
+}
+
 /// Refuses a real start of `build` with every reason [`check`] gives, joined; nothing where it
 /// gives none.
 ///
@@ -534,6 +560,86 @@ mod tests {
         let mut codex = build_of("kalareach/codex");
         codex.missing = None;
         assert_eq!(refuse_real_start(&codex), Ok(()));
+    }
+
+    /// A case that reads a field the entry lists as missing is stopped, naming the field and the
+    /// entry's reason; a case that reads none the entry lists, and one that no table names, is not.
+    /// The probe-only run, which produces `newer.isolated`, is not stopped for that field.
+    #[test]
+    fn a_case_that_reads_a_field_the_entry_lists_as_missing_is_stopped_naming_the_field_and_its_reason()
+     {
+        let listed: [(&str, &str, &[&str]); 5] = [
+            (
+                "kalareach/opencode",
+                "account.draft",
+                &["1", "2a", "3", "4", "7", "7f"],
+            ),
+            (
+                "kalareach/gemini-cli",
+                "account.resume_refused",
+                &["7", "7f"],
+            ),
+            ("kalareach/gemini-cli", "account.fork", &["7f"]),
+            (
+                "kalareach/gemini-cli",
+                "account.commands.fork",
+                &["gateway-3"],
+            ),
+            ("kalareach/qoder-cli", "composer", &["14.03a"]),
+        ];
+        for (package, field, cases) in listed {
+            let build = build_of(package);
+            let reason = build
+                .missing
+                .as_ref()
+                .and_then(|missing| missing.get(field))
+                .unwrap_or_else(|| panic!("{package} does not list {field} as missing"))
+                .clone();
+            for case in cases {
+                let why = missing_for(&build, case, false).unwrap_or_else(|| {
+                    panic!("{package}'s part {case} reads {field}, not stopped")
+                });
+                assert!(
+                    why.starts_with(&format!(
+                        "part {case} reads fields that the entry lists as missing"
+                    )) && why.contains(&format!("{field} ({reason})")),
+                    "{why}"
+                );
+            }
+        }
+        let opencode = build_of("kalareach/opencode");
+        assert_eq!(
+            missing_for(&opencode, "6a", false),
+            None,
+            "reads no listed field"
+        );
+        assert_eq!(
+            missing_for(&opencode, "5b", false),
+            None,
+            "named by no table"
+        );
+        let mut upgrade = build_of("kalareach/codex");
+        upgrade
+            .missing
+            .as_mut()
+            .expect("a missing member")
+            .insert("newer.isolated".to_owned(), "no probe was found".to_owned());
+        assert!(
+            missing_for(&upgrade, "6a", false)
+                .is_some_and(|why| why.contains("newer.isolated (no probe was found)")),
+            "an upgrade case reads newer.isolated"
+        );
+        assert_eq!(
+            missing_for(&upgrade, "6a", true),
+            None,
+            "the probe-only run produces newer.isolated"
+        );
+        upgrade
+            .missing
+            .as_mut()
+            .expect("a missing member")
+            .insert("account.draft".to_owned(), "none was found".to_owned());
+        assert_eq!(missing_for(&upgrade, "6a", true), None, "6a reads no draft");
     }
 
     /// A real start is refused for a pinned or newer build that the entry does not digest.
