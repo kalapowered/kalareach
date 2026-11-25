@@ -251,6 +251,18 @@ struct Agent<W: Write> {
     cancelled: bool,
 }
 
+/// Reads `script` as the stand-in reads the file of its working directory, so that a case finds a
+/// script it wrote wrong before any agent starts.
+///
+/// # Errors
+///
+/// Returns why the value is not a script.
+pub fn check_script(script: &Value) -> Result<(), String> {
+    serde_json::from_value::<Script>(script.clone())
+        .map(drop)
+        .map_err(|why| why.to_string())
+}
+
 /// Runs the stand-in to the end of the client's stream or to an `exit` step, and returns the exit
 /// code.
 ///

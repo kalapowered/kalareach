@@ -680,3 +680,310 @@ fn the_judge_of_a_late_request_names_its_red_when_the_request_is_left_pending() 
         "an answer that chooses an option is not the cancelled answer"
     );
 }
+
+/// 5b-14: the stand-in aborted the call and the prompt after the answer was dispatched, with no
+/// evidence that it took the answer, so the receipt reads `unknown`.
+pub fn an_abort_leaves_the_receipt_unknown(receipt: &str) -> Result<(), Red> {
+    ensure(receipt == "unknown", "5b-14")
+}
+
+/// What the host holds of an answered request of a turn of the agent's own after the deadline of
+/// 300 seconds, with no traffic and a live agent.
+#[derive(Debug)]
+pub struct AtTheDeadline {
+    /// The receipt of the answer.
+    pub receipt: String,
+    /// The host still holds the bytes of the request the answer was made from.
+    pub source_bytes_remain: bool,
+    /// The agent's process still runs.
+    pub agent_runs: bool,
+}
+
+/// 5b-20: at the deadline the receipt reads `unknown`, the source bytes are gone and the agent
+/// still runs.
+pub fn the_deadline_leaves_the_receipt_unknown(held: &AtTheDeadline) -> Result<(), Red> {
+    ensure(
+        held.receipt == "unknown" && !held.source_bytes_remain && held.agent_runs,
+        "5b-20",
+    )
+}
+
+/// 5b-21: after a decline and the call's `failed` update the receipt reads `unknown`.
+pub fn a_failed_update_leaves_a_decline_unknown(receipt: &str) -> Result<(), Red> {
+    ensure(receipt == "unknown", "5b-21")
+}
+
+/// 5b-22: the receipt read `unknown` after the deadline, and `applied` after the late update.
+pub fn a_late_update_moves_unknown_to_applied(before: &str, after: &str) -> Result<(), Red> {
+    ensure(before == "unknown" && after == "applied", "5b-22")
+}
+
+/// 5b-23 and 5b-23g, by `id`: a `completed` update that arrived after a cancel left the receipt
+/// `applied`.
+pub fn an_allow_stays_applied_after_a_cancel(id: &str, receipt: &str) -> Result<(), Red> {
+    ensure(receipt == "applied", id)
+}
+
+impl Hosted {
+    /// Waits until the host lists a pending request.
+    pub fn waits_for_a_request(&mut self) {
+        match *self {}
+    }
+
+    /// Advances the service's clock by `seconds` and gives the host time to act on it.
+    pub fn advance_clock(&mut self, _seconds: u64) {
+        match *self {}
+    }
+
+    /// The receipt of the answered request once it reads `wanted`, or what it reads after five
+    /// seconds when it never does.
+    pub fn receipt_becoming(&mut self, _wanted: &str) -> String {
+        match *self {}
+    }
+
+    /// Whether the host still holds the bytes of the request the answered request was made from.
+    pub fn source_bytes_remain(&mut self) -> bool {
+        match *self {}
+    }
+
+    /// Whether the agent's process still runs.
+    pub fn agent_runs(&mut self) -> bool {
+        match *self {}
+    }
+}
+
+/// The script of an agent that asks for a call and, after the answer, aborts the call and the turn
+/// of its prompt: it sends the call's `cancelled` update and then the prompt's reply with the stop
+/// reason `cancelled`.
+pub fn abort_script() -> Value {
+    serde_json::json!({
+        "turns": [[
+            { "call": { "id": "c1", "kind": "execute" } },
+            { "ask": "c1" },
+            { "update": { "call": "c1", "status": "cancelled" } },
+            { "end": "cancelled" },
+        ]],
+    })
+}
+
+/// The script of a turn of the agent's own that asks for a call and then sends nothing.
+pub fn silent_script() -> Value {
+    serde_json::json!({
+        "own": [{ "after": "go", "steps": [
+            { "say": "own" },
+            { "call": { "id": "c1", "kind": "execute" } },
+            { "ask": "c1" },
+            { "hold": "never" },
+        ] }],
+    })
+}
+
+/// The script of a turn of the agent's own that sends the call's `failed` update after a decline.
+pub fn failed_script() -> Value {
+    serde_json::json!({
+        "own": [{ "after": "go", "steps": [
+            { "call": { "id": "c1", "kind": "execute" } },
+            { "ask": "c1" },
+            { "when": { "outcome": "declined", "then": [
+                { "update": { "call": "c1", "status": "failed" } },
+            ] } },
+            { "hold": "never" },
+        ] }],
+    })
+}
+
+/// The script of a turn of the agent's own that sends the call's `in_progress` update only when
+/// the file `late` appears after an allow.
+pub fn late_update_script() -> Value {
+    serde_json::json!({
+        "own": [{ "after": "go", "steps": [
+            { "call": { "id": "c1", "kind": "execute" } },
+            { "ask": "c1" },
+            { "when": { "outcome": "allowed", "then": [
+                { "hold": "late" },
+                { "update": { "call": "c1", "status": "in_progress" } },
+            ] } },
+            { "hold": "never" },
+        ] }],
+    })
+}
+
+/// The script of an agent that is cancelled after an allow and sends the call's `completed` update
+/// only when the file `done` appears, after the cancel ended its turn.
+pub fn completed_after_a_cancel_script() -> Value {
+    serde_json::json!({
+        "turns": [[
+            { "call": { "id": "c1", "kind": "execute" } },
+            { "ask": "c1" },
+            { "hold": "never" },
+        ]],
+        "on_cancel": [
+            { "hold": "done" },
+            { "update": { "call": "c1", "status": "completed" } },
+        ],
+    })
+}
+
+/// Case 5b-14: the agent aborts the call after the answer.
+pub fn an_abort_after_the_answer(host: &mut Hosted) -> Result<(), Red> {
+    host.answer_next("allow-once");
+    an_abort_leaves_the_receipt_unknown(&host.receipt_becoming("unknown"))
+}
+
+/// Case 5b-20: an answered request of a turn of the agent's own, and 300 seconds with no traffic.
+pub fn an_answer_and_three_hundred_seconds(host: &mut Hosted) -> Result<(), Red> {
+    host.release("go");
+    host.waits_for_a_request();
+    host.answer_next("allow-once");
+    host.advance_clock(300);
+    let receipt = host.receipt_becoming("unknown");
+    the_deadline_leaves_the_receipt_unknown(&AtTheDeadline {
+        receipt,
+        source_bytes_remain: host.source_bytes_remain(),
+        agent_runs: host.agent_runs(),
+    })
+}
+
+/// Case 5b-21: a decline in a turn of the agent's own, and the call's `failed` update.
+pub fn a_decline_and_a_failed_update(host: &mut Hosted) -> Result<(), Red> {
+    host.release("go");
+    host.waits_for_a_request();
+    host.answer_next("reject-once");
+    a_failed_update_leaves_a_decline_unknown(&host.receipt_becoming("unknown"))
+}
+
+/// Case 5b-22: an allow in a turn of the agent's own, the deadline, and then an `in_progress`
+/// update.
+pub fn an_allow_a_deadline_and_a_late_update(host: &mut Hosted) -> Result<(), Red> {
+    host.release("go");
+    host.waits_for_a_request();
+    host.answer_next("allow-once");
+    host.advance_clock(301);
+    let before = host.receipt_becoming("unknown");
+    host.release("late");
+    a_late_update_moves_unknown_to_applied(&before, &host.receipt_becoming("applied"))
+}
+
+/// Case 5b-23: an allow, the person's cancel, and then the call's `completed` update.
+pub fn a_completed_update_after_a_cancel(host: &mut Hosted) -> Result<(), Red> {
+    host.answer_next("allow-once");
+    host.cancel();
+    host.release("done");
+    an_allow_stays_applied_after_a_cancel("5b-23", &host.receipt_becoming("applied"))
+}
+
+/// Every script of the cases in this file.
+#[cfg(test)]
+fn scripts() -> Vec<(&'static str, Value)> {
+    vec![
+        ("restart_script", restart_script()),
+        ("exit_script", exit_script()),
+        ("race_script", race_script()),
+        ("late_request_script", late_request_script()),
+        ("abort_script", abort_script()),
+        ("silent_script", silent_script()),
+        ("failed_script", failed_script()),
+        ("late_update_script", late_update_script()),
+        (
+            "completed_after_a_cancel_script",
+            completed_after_a_cancel_script(),
+        ),
+    ]
+}
+
+#[test]
+fn the_scripts_of_the_cases_are_scripts_the_stand_in_reads() {
+    for (name, script) in scripts() {
+        if let Err(why) = kr_e2e_agents::acp_agent::check_script(&script) {
+            panic!("{name} is not a script of the stand-in: {why}");
+        }
+    }
+}
+
+#[test]
+fn the_judge_of_an_abort_names_its_red_when_the_receipt_reads_applied() {
+    assert_eq!(an_abort_leaves_the_receipt_unknown("unknown"), Ok(()));
+    assert_eq!(
+        an_abort_leaves_the_receipt_unknown("applied"),
+        Err(red("5b-14")),
+        "the reply or the cancelled update was counted as evidence"
+    );
+    assert_eq!(
+        an_abort_leaves_the_receipt_unknown("dispatching"),
+        Err(red("5b-14")),
+        "the abort did not settle the answer"
+    );
+}
+
+#[test]
+fn the_judge_of_the_deadline_names_its_red_when_the_answer_waits_for_the_agents_exit() {
+    let held = |receipt: &str, source_bytes_remain: bool, agent_runs: bool| AtTheDeadline {
+        receipt: receipt.to_owned(),
+        source_bytes_remain,
+        agent_runs,
+    };
+    assert_eq!(
+        the_deadline_leaves_the_receipt_unknown(&held("unknown", false, true)),
+        Ok(())
+    );
+    assert_eq!(
+        the_deadline_leaves_the_receipt_unknown(&held("dispatching", true, true)),
+        Err(red("5b-20")),
+        "the answer waits for the agent's exit"
+    );
+    assert_eq!(
+        the_deadline_leaves_the_receipt_unknown(&held("unknown", true, true)),
+        Err(red("5b-20")),
+        "the receipt moved but the source bytes remain"
+    );
+    assert_eq!(
+        the_deadline_leaves_the_receipt_unknown(&held("unknown", false, false)),
+        Err(red("5b-20")),
+        "the agent was ended to settle the answer"
+    );
+}
+
+#[test]
+fn the_judge_of_a_failed_update_names_its_red_when_the_receipt_stays_dispatching() {
+    assert_eq!(a_failed_update_leaves_a_decline_unknown("unknown"), Ok(()));
+    assert_eq!(
+        a_failed_update_leaves_a_decline_unknown("dispatching"),
+        Err(red("5b-21")),
+        "the terminal result of the call is ignored"
+    );
+}
+
+#[test]
+fn the_judge_of_a_late_update_names_its_red_when_the_receipt_stays_unknown() {
+    assert_eq!(
+        a_late_update_moves_unknown_to_applied("unknown", "applied"),
+        Ok(())
+    );
+    assert_eq!(
+        a_late_update_moves_unknown_to_applied("unknown", "unknown"),
+        Err(red("5b-22")),
+        "the late update is ignored"
+    );
+    assert_eq!(
+        a_late_update_moves_unknown_to_applied("dispatching", "applied"),
+        Err(red("5b-22")),
+        "the deadline did not settle the answer first"
+    );
+}
+
+#[test]
+fn the_judge_of_a_completed_update_names_its_red_when_the_receipt_reads_unknown() {
+    assert_eq!(
+        an_allow_stays_applied_after_a_cancel("5b-23", "applied"),
+        Ok(())
+    );
+    assert_eq!(
+        an_allow_stays_applied_after_a_cancel("5b-23", "unknown"),
+        Err(red("5b-23")),
+        "every update after a cancel is ignored"
+    );
+    assert_eq!(
+        an_allow_stays_applied_after_a_cancel("5b-23", "dispatching"),
+        Err(red("5b-23"))
+    );
+}

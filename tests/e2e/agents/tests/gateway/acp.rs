@@ -645,7 +645,11 @@ fn acp_a_gemini_decline_stays_dispatching_until_the_next_request_the_reply_or_th
 #[test]
 #[ignore = "waits for ACP-4"]
 fn acp_an_abort_that_settles_a_call_without_taking_the_answer_leaves_the_receipt_unknown() {
-    unwritten("5b-14");
+    run_case(
+        "5b-14",
+        &controls::abort_script(),
+        controls::an_abort_after_the_answer,
+    );
 }
 
 /// Control 5b-15.
@@ -689,28 +693,44 @@ fn acp_a_prompt_sent_five_seconds_after_a_cancel_shows_its_approval() {
 #[test]
 #[ignore = "waits for ACP-4"]
 fn acp_an_answered_approval_of_a_turn_of_the_agents_own_reads_unknown_at_three_hundred_seconds() {
-    unwritten("5b-20");
+    run_case(
+        "5b-20",
+        &controls::silent_script(),
+        controls::an_answer_and_three_hundred_seconds,
+    );
 }
 
 /// Control 5b-21.
 #[test]
 #[ignore = "waits for ACP-4"]
 fn acp_a_decline_in_a_turn_of_the_agents_own_reads_unknown_at_the_calls_failed_update() {
-    unwritten("5b-21");
+    run_case(
+        "5b-21",
+        &controls::failed_script(),
+        controls::a_decline_and_a_failed_update,
+    );
 }
 
 /// Control 5b-22.
 #[test]
 #[ignore = "waits for ACP-4"]
 fn acp_a_late_in_progress_update_moves_an_allow_from_unknown_to_applied() {
-    unwritten("5b-22");
+    run_case(
+        "5b-22",
+        &controls::late_update_script(),
+        controls::an_allow_a_deadline_and_a_late_update,
+    );
 }
 
 /// Control 5b-23.
 #[test]
 #[ignore = "waits for ACP-4"]
 fn acp_a_completed_update_after_a_cancel_leaves_an_allow_applied_for_a_qoder_shaped_agent() {
-    unwritten("5b-23");
+    run_case(
+        "5b-23",
+        &controls::completed_after_a_cancel_script(),
+        controls::a_completed_update_after_a_cancel,
+    );
 }
 
 /// Control 5b-23g.

@@ -9,7 +9,7 @@ use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::time::Duration;
 
-use kr_e2e_agents::acp_agent::{RECORD_FILE, SCRIPT_FILE};
+use kr_e2e_agents::acp_agent::{RECORD_FILE, SCRIPT_FILE, check_script};
 use serde_json::{Value, json};
 
 /// How long a test waits for a frame that must come.
@@ -575,4 +575,15 @@ fn the_agent_records_what_it_asked_and_how_each_call_and_turn_ended() {
     );
     assert_eq!(sent(&agent, "update")[0]["status"], "completed");
     assert_eq!(sent(&agent, "reply")[0]["stop"], "end_turn");
+}
+
+#[test]
+fn a_script_with_a_step_the_stand_in_does_not_know_is_refused_before_any_agent_starts() {
+    assert_eq!(
+        check_script(&json!({ "turns": [[{ "say": "text" }]] })),
+        Ok(())
+    );
+    let why = check_script(&json!({ "turns": [[{ "sya": "text" }]] }))
+        .expect_err("a step with a misspelt name is no script");
+    assert!(why.contains("sya"), "the refusal names the step: {why}");
 }
