@@ -137,25 +137,40 @@ const NEEDS: [(&str, &[&str]); 10] = [
 /// The keys of `missing` that the isolation contract reads and no part does.
 const ISOLATION_KEYS: [&str; 1] = ["isolation.startup"];
 
-/// Whether the entry gives a value for `field`, a dotted path of [`NEEDS`]. An empty list is a
-/// value: the entry says each rests on a positive finding.
-fn given(build: &Build, field: &str) -> bool {
+/// Whether the entry gives members for `field`: a value that is not empty.
+fn has_members(build: &Build, field: &str) -> bool {
     let account = build.account.as_ref();
     match field {
         "account.image_line" => account.is_some_and(|account| account.image_line.is_some()),
         "account.turn_line" => account.is_some_and(|account| account.turn_line.is_some()),
-        "account.draft" | "account.resume_refused" | "account.fork" => account.is_some(),
+        "account.draft" => account.is_some_and(|account| !account.draft.is_empty()),
+        "account.resume_refused" => {
+            account.is_some_and(|account| !account.resume_refused.is_empty())
+        }
+        "account.fork" => account.is_some_and(|account| !account.fork.is_empty()),
         "account.commands.fork" | "account.commands.new" | "account.commands.quit" => account
             .zip(field.rsplit('.').next())
             .is_some_and(|(account, command)| account.commands.contains_key(command)),
-        // An entry with an account reaches its composer by the account's own steps.
-        "composer" => build.composer.is_some() || account.is_some(),
+        "composer" => build.composer.is_some(),
         "newer.isolated" => build
             .newer
             .as_ref()
             .is_some_and(|newer| !newer.isolated.is_empty()),
         _ => false,
     }
+}
+
+/// Whether the entry gives a value for `field`, a dotted path of [`NEEDS`]. An empty list is a
+/// value: the entry states that the list is empty, and that statement rests on a positive finding.
+fn given(build: &Build, field: &str) -> bool {
+    has_members(build, field)
+        // An entry with an account states its lists, and reaches its composer by the account's own
+        // steps.
+        || (build.account.is_some()
+            && matches!(
+                field,
+                "account.draft" | "account.resume_refused" | "account.fork" | "composer"
+            ))
 }
 
 /// Whether `text` is a SHA-256 digest in hexadecimal.
@@ -228,10 +243,7 @@ pub fn check(build: &Build) -> Report {
             report.refusals.push(Refusal::Contradiction(format!(
                 "the entry lists {field} as missing, and no part reads it"
             )));
-        } else if (matches!(field.as_str(), "account.turn_line" | "account.image_line")
-            && given(build, field))
-            || (field == "composer" && build.composer.is_some())
-        {
+        } else if has_members(build, field) {
             report.refusals.push(Refusal::Contradiction(format!(
                 "the entry lists {field} as missing and gives it"
             )));
@@ -540,6 +552,67 @@ mod tests {
         assert!(check(&build).refusals.iter().any(|refusal| matches!(
             refusal, Refusal::Contradiction(text) if text.contains("account.nonsense")
         )));
+    }
+
+    /// A field the entry lists as missing and gives members for is refused, whichever field it is.
+    #[test]
+    fn a_field_listed_as_missing_and_given_is_refused_for_every_field() {
+        let contradicts = |build: &Build, field: &str| {
+            check(build).refusals.iter().any(|refusal| {
+                matches!(refusal, Refusal::Contradiction(text)
+                    if text.contains(&format!("lists {field} as missing and gives it")))
+            })
+        };
+        let list = |build: &mut Build, field: &str| {
+            build
+                .missing
+                .as_mut()
+                .expect("a missing member")
+                .insert(field.to_owned(), "listed".to_owned());
+        };
+        let words = || vec!["a text".to_owned()];
+        let mut build = build_of("kalareach/opencode");
+        build.account.as_mut().expect("an account").draft = words();
+        assert!(contradicts(&build, "account.draft"), "draft");
+        let mut build = build_of("kalareach/gemini-cli");
+        build.account.as_mut().expect("an account").resume_refused = words();
+        assert!(
+            contradicts(&build, "account.resume_refused"),
+            "resume_refused"
+        );
+        let mut build = build_of("kalareach/gemini-cli");
+        build.account.as_mut().expect("an account").fork = words();
+        assert!(contradicts(&build, "account.fork"), "fork");
+        let mut build = build_of("kalareach/gemini-cli");
+        build
+            .account
+            .as_mut()
+            .expect("an account")
+            .commands
+            .insert("fork".to_owned(), "/fork".to_owned());
+        assert!(
+            contradicts(&build, "account.commands.fork"),
+            "commands.fork"
+        );
+        let mut build = build_of("kalareach/kimi-code-cli");
+        build.account.as_mut().expect("an account").image_line = Some("\"image\"".to_owned());
+        assert!(contradicts(&build, "account.image_line"), "image_line");
+        let mut build = build_of("kalareach/kimi-code-cli");
+        list(&mut build, "composer");
+        assert!(contradicts(&build, "composer"), "composer");
+        let mut build = build_of("kalareach/codex");
+        list(&mut build, "newer.isolated");
+        let probes = build.account.as_ref().expect("an account").isolated.clone();
+        build.newer.as_mut().expect("a newer build").isolated = probes;
+        assert!(contradicts(&build, "newer.isolated"), "newer.isolated");
+        let alone = build_of("kalareach/gemini-cli");
+        assert!(
+            !check(&alone)
+                .refusals
+                .iter()
+                .any(|refusal| matches!(refusal, Refusal::Contradiction(_))),
+            "an entry that lists fields it does not give is not contradictory"
+        );
     }
 
     /// A real start is refused for an entry that lacks the isolation contract, naming what it lacks:
