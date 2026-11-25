@@ -12742,6 +12742,7 @@ export interface CollectionKeyWrapContext {
  * One versioned per-user host configuration document.
  */
 export interface ConfigurationDocument {
+  acp?: AcpSelection
   /**
    * What the owner or an administrator wrote down for the agents of each package
    * (`publisher/plugin`).
@@ -12805,6 +12806,22 @@ export interface ConfigurationDocument {
    */
   version?: number
   voice?: VoiceSelection
+}
+/**
+ * The packages whose agent this host may start in ACP mode, each as `publisher/plugin`.
+ *
+ * A section of level 8: written when its `packages` member is not null, and ignored, with
+ * a count, by a release that reads level 7. A release that does not know it has no ACP
+ * mode, so a host rolled back to one starts no agent in ACP mode until it is brought
+ * forward again. This build validates and keeps the section, and `acp_enabled` answers
+ * from it. No profile, request or environment variable can set it.
+ */
+export interface AcpSelection {
+  /**
+   * The packages, each `publisher/plugin`, named once. An empty list allows none. Null or
+   * absent leaves the section unused.
+   */
+  packages?: string[] | null
 }
 /**
  * What the document records for one agent's launches.

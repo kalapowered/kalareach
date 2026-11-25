@@ -322,6 +322,28 @@
       "description": "Parameters of `account.status`. The environment is the one the connection reaches.",
       "type": "object"
     },
+    "AcpSelection": {
+      "additionalProperties": false,
+      "description": "The packages whose agent the owner allows to start in ACP mode.\n\nA package is off unless it is listed here; the release's own grant and the person's press of\nthe button stay required besides.\n\nThe section arrived with level 8. A release that reads level 7 does not know it: it applies\nthe rest of the document, counts the section among the members it ignores, and does not\nedit the document. Such a release has no ACP mode, so a host rolled back to one starts no\nagent in ACP mode until it is brought forward again.",
+      "properties": {
+        "packages": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "The packages, each `publisher/plugin`, named once. An empty list allows none. Null or\nabsent leaves the section unused."
+        }
+      },
+      "type": "object"
+    },
     "ActionCancelParams": {
       "additionalProperties": false,
       "description": "What `action.cancel` names.",
@@ -9634,6 +9656,10 @@
       "additionalProperties": false,
       "description": "One versioned per-user host configuration document.",
       "properties": {
+        "acp": {
+          "$ref": "#/$defs/AcpSelection",
+          "description": "The packages whose agent this host may start in ACP mode, each as `publisher/plugin`.\n\nA section of level 8: written when its `packages` member is not null, and ignored, with\na count, by a release that reads level 7. A release that does not know it has no ACP\nmode, so a host rolled back to one starts no agent in ACP mode until it is brought\nforward again. This build validates and keeps the section, and `acp_enabled` answers\nfrom it. No profile, request or environment variable can set it."
+        },
         "agents": {
           "additionalProperties": {
             "$ref": "#/$defs/AgentChoice"
