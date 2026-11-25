@@ -303,18 +303,19 @@ jobs:
       # hold the runner for the job's six hours and every branch's checks behind it, so the step is
       # given a little over twice those 110 minutes and no more: 225, which is 1.35 times the
       # longest of the seven. The job has no limit of its own, so it has GitHub's 360 minutes. The
-      # explicit limits of its steps add up to 305: this step's 225, the pairing leg's 30 (a push to
-      # main, or a manual run that sets `deployment_legs`), 10 for each of the fetch of the crates of
-      # every target, the advisory check and the two stub-daemon steps, and 2 for each of the five
-      # steps that use the archive hosts or the Actions cache (the host change, and the restore and
-      # the save of the desktop packages' archives and of the cross compiler's). The steps that
-      # install packages have deadlines instead, 70 minutes in all, and some steps have neither, so
-      # the limits do not bound the job: with the deadlines they come to 375, past the 360. The
-      # release gate, whose 150 minutes were the step that the job's end cut, stands in the job of
-      # its own below, `shipped-hold`, which is what gave the job its margin. What the steps took in
-      # those seven runs: the steps before this one 12 to 21 minutes, and 42 once, 26 of them for
-      # the desktop packages' install; the steps after it, the two stub-daemon steps apart, 17 to 25
-      # minutes; those two steps 4.4 minutes together in the one run that had them.
+      # explicit limits of its steps add up to 315: this step's 225, the pairing leg's 30 (a push to
+      # main, or a manual run that sets `deployment_legs`), 10 for each of the fetch of the crates
+      # of every target, the advisory check and the first stub-daemon step, 20 for the second
+      # stub-daemon step, and 2 for each of the five steps that use the archive hosts or the
+      # Actions cache (the host change, and the restore and the save of the desktop packages'
+      # archives and of the cross compiler's). The steps that install packages have deadlines
+      # instead, 70 minutes in all, and some steps have neither, so the limits do not bound the
+      # job: with the deadlines they come to 385, past the 360. The release gate, whose 150 minutes
+      # were the step that the job's end cut, stands in the job of its own below, `shipped-hold`,
+      # which is what gave the job its margin. What the steps took in those seven runs: the steps
+      # before this one 12 to 21 minutes, and 42 once, 26 of them for the desktop packages'
+      # install; the steps after it, the two stub-daemon steps apart, 17 to 25 minutes; those two
+      # steps 4.4 minutes together in the one run that had them.
       - name: Test
         timeout-minutes: 225
         env:
@@ -343,9 +344,15 @@ jobs:
       # The cases that start a daemon through test trees made without a service manager are ignored
       # in the run above, which has this runner's account and so its own user manager. Each checks
       # that neither the account's runtime directory nor its message bus is in its environment, so
-      # these steps remove both, and no call can reach the account's manager. Each has a limit of 10
-      # minutes, about four times the longest either took, 2.4 minutes, in the one run that had
-      # them.
+      # these steps remove both, and no call can reach the account's manager. The first has a limit
+      # of 10 minutes, about four times the longest either took, 2.4 minutes, in the one run that
+      # had them.
+      #
+      # The second runs after a failed step too, so it does not count on the run above having built
+      # what its cases start: `kr-cli`'s startup suite looks for the held daemon and the worker
+      # beside its test program, and `cargo test -p kr-cli` builds neither, so the step builds them
+      # first. Its limit is 20 minutes, about three times the 6.4 that those builds and the suite's
+      # own took from nothing on the build box with four build jobs.
       - name: A test tree made without a service manager calls none
         if: ${{ !cancelled() }}
         timeout-minutes: 10
@@ -353,8 +360,11 @@ jobs:
 
       - name: A standalone start says why a stub daemon ended
         if: ${{ !cancelled() }}
-        timeout-minutes: 10
-        run: env -u XDG_RUNTIME_DIR -u DBUS_SESSION_BUS_ADDRESS cargo test --locked -p kr-cli --test startup -- --nocapture --ignored --exact a_standalone_start_whose_daemon_ended_with_a_listen_line_says_why a_listener_that_accepts_and_stays_silent_does_not_hide_the_end_of_the_daemon a_daemon_that_ended_with_the_held_line_while_the_winner_starts_is_waited_for a_restart_whose_started_daemon_ended_with_a_listen_line_says_no_requested_daemon_may_still_start
+        timeout-minutes: 20
+        run: |
+          cargo build --locked -p kr-controller --features testing --bin kr-controller-held
+          cargo build --locked -p kr-worker
+          env -u XDG_RUNTIME_DIR -u DBUS_SESSION_BUS_ADDRESS cargo test --locked -p kr-cli --test startup -- --nocapture --ignored --exact a_standalone_start_whose_daemon_ended_with_a_listen_line_says_why a_listener_that_accepts_and_stays_silent_does_not_hide_the_end_of_the_daemon a_daemon_that_ended_with_the_held_line_while_the_winner_starts_is_waited_for a_restart_whose_started_daemon_ended_with_a_listen_line_says_no_requested_daemon_may_still_start
 
       # Documentation is built with warnings refused, so a link that resolves to nothing, or to an
       # item its reader cannot see, fails here rather than going unnoticed. These are the crates

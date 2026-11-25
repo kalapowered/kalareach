@@ -1626,6 +1626,82 @@ fn the_jobs_that_run_the_retained_surface_suite_install_the_windows_cross_compil
     );
 }
 
+/// The programs `kr-cli`'s startup suite looks for beside its test program, by name, each once, in
+/// the order it first names them. A `cargo test -p kr-cli` builds none of them, and the suite fails
+/// when one is not there.
+fn programs_the_startup_suite_looks_for() -> Vec<String> {
+    let suite = fs::read_to_string(repository().join("crates/kr-cli/tests/startup.rs"))
+        .expect("the startup suite");
+    let mut programs: Vec<String> = Vec::new();
+    for line in suite.lines() {
+        let Some(name) = line.trim().strip_prefix("beside_this_test(\"") else {
+            continue;
+        };
+        let name = name.split('"').next().unwrap_or_default().to_owned();
+        if !programs.contains(&name) {
+            programs.push(name);
+        }
+    }
+    programs
+}
+
+/// The rust job's step that runs `kr-cli`'s stub-daemon cases by name runs after a failed step too,
+/// so it cannot count on the test step before it having built what the cases start: the suite looks
+/// for the held daemon and the worker beside its test program, and `cargo test -p kr-cli` builds
+/// neither. The step builds each program the suite looks for, by the command the suite's own
+/// message gives, in the same step and before the command that runs the cases.
+#[test]
+fn the_rust_jobs_stub_daemon_step_builds_the_programs_its_cases_start_before_it_runs_them() {
+    let builds = [
+        (
+            "kr-controller-held",
+            "cargo build --locked -p kr-controller --features testing --bin kr-controller-held",
+        ),
+        ("kr-worker", "cargo build --locked -p kr-worker"),
+    ];
+    assert_eq!(
+        programs_the_startup_suite_looks_for(),
+        builds.map(|(program, _)| program),
+        "the startup suite looks for other programs than the step builds"
+    );
+    let workflow = fs::read_to_string(repository().join(".github/workflows/core-ci.yml"))
+        .expect("the landing workflow");
+    let text = job(&workflow, "rust");
+    let steps: Vec<String> = steps_of(&text)
+        .into_iter()
+        .filter(|step| {
+            step.lines().any(|line| {
+                runs_cargo_test(line)
+                    && line
+                        .split_whitespace()
+                        .collect::<Vec<_>>()
+                        .windows(2)
+                        .any(|pair| pair == ["--test", "startup"])
+            })
+        })
+        .collect();
+    assert_eq!(
+        steps.len(),
+        1,
+        "the rust job has not one step that runs the startup suite"
+    );
+    assert!(
+        !is_disabled(&steps[0]),
+        "the rust job's step that runs the startup suite is disabled or lets its failure pass"
+    );
+    let lines: Vec<&str> = steps[0].lines().map(str::trim).collect();
+    let runs = lines
+        .iter()
+        .position(|line| line.contains("--test startup"))
+        .expect("the line that runs the startup suite");
+    for (program, command) in builds {
+        assert!(
+            lines[..runs].contains(&command),
+            "{program}: the rust job's step that runs the startup suite does not build it first, by `{command}`"
+        );
+    }
+}
+
 /// Where in the job's steps the first step stands that has a line `runs` accepts.
 fn position_of_line(job: &str, runs: fn(&str) -> bool) -> Option<usize> {
     steps_of(job).iter().position(|step| step.lines().any(runs))

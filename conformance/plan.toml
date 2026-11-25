@@ -2519,7 +2519,7 @@ cases = [
 [ignored_run.runs]
 kind = 'command'
 file = '.github/workflows/core-ci.yml'
-line = 'run: env -u XDG_RUNTIME_DIR -u DBUS_SESSION_BUS_ADDRESS cargo test --locked -p kr-cli --test startup -- --nocapture --ignored --exact a_standalone_start_whose_daemon_ended_with_a_listen_line_says_why a_listener_that_accepts_and_stays_silent_does_not_hide_the_end_of_the_daemon a_daemon_that_ended_with_the_held_line_while_the_winner_starts_is_waited_for a_restart_whose_started_daemon_ended_with_a_listen_line_says_no_requested_daemon_may_still_start'
+line = 'env -u XDG_RUNTIME_DIR -u DBUS_SESSION_BUS_ADDRESS cargo test --locked -p kr-cli --test startup -- --nocapture --ignored --exact a_standalone_start_whose_daemon_ended_with_a_listen_line_says_why a_listener_that_accepts_and_stays_silent_does_not_hide_the_end_of_the_daemon a_daemon_that_ended_with_the_held_line_while_the_winner_starts_is_waited_for a_restart_whose_started_daemon_ended_with_a_listen_line_says_no_requested_daemon_may_still_start'
 
 [[ignored_run]]
 package = 'kr-cli'
