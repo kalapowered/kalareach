@@ -2,7 +2,9 @@
 //! cuts or replaces the file while the product maps it ends this program and not the test program
 //! that asked. It takes the file's path and the environment's id, opens the floor as the daemon
 //! does for this boot, and exits 0 when the floor opens. It exits 2, with why on standard error,
-//! when it does not. It runs on Unix only, as the floor does.
+//! when it does not. Its only argument may be `--version`, which ends it at once with exit 0 and
+//! touches nothing: the host starts it once in this way, where nothing is timed, when it places the
+//! program in the run. It runs on Unix only, as the floor does.
 
 use std::process::ExitCode;
 
@@ -26,17 +28,18 @@ fn open_floor(_: &std::ffi::OsStr, _: &std::ffi::OsStr) -> Result<(), String> {
 }
 
 fn main() -> ExitCode {
-    let mut arguments = std::env::args_os().skip(1);
-    let (Some(path), Some(environment), None) =
-        (arguments.next(), arguments.next(), arguments.next())
-    else {
-        eprintln!("the floor opener takes the floor's path and the environment's id");
-        return ExitCode::from(2);
-    };
-    match open_floor(&path, &environment) {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(why) => {
-            eprintln!("{why}");
+    let arguments: Vec<_> = std::env::args_os().skip(1).collect();
+    match arguments.as_slice() {
+        [version] if version == "--version" => ExitCode::SUCCESS,
+        [path, environment] => match open_floor(path, environment) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(why) => {
+                eprintln!("{why}");
+                ExitCode::from(2)
+            }
+        },
+        _ => {
+            eprintln!("the floor opener takes the floor's path and the environment's id");
             ExitCode::from(2)
         }
     }

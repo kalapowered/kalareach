@@ -12,7 +12,9 @@
 //! The floor's open once more, before the attempt, maps no file in this program: the floor's bytes
 //! are read through the descriptor, written to a file in a directory of the harness's own, and the
 //! product's open runs on that file in a program of its own, `kr-e2e-m1b-floor-open`, whose end is
-//! read. An agent that finds the file can cut it, which ends that program with a signal that the
+//! read. The host places that program in the run's `b/` with the others before it records the
+//! run's tree, and starts it with an empty environment, only while it is the file that was placed.
+//! An agent that finds the file can cut it, which ends that program with a signal that the
 //! harness reads as a refusal, or replace it after the directory is checked, which can make the
 //! product open another regular file that the agent names, of the floor's length, of the account
 //! and closed to others; the open writes nothing. The program is not bounded in time, because its
@@ -34,8 +36,7 @@ use kr_protocol::ids::{BootEpoch, EnvironmentId};
 use rustix::fs::{AtFlags, Mode, OFlags};
 
 use crate::run::{
-    Removal, RootPin, built_directory, make_root, open_directory, open_file_below,
-    remove_run_directory, run_base,
+    Removal, RootPin, make_root, open_directory, open_file_below, remove_run_directory, run_base,
 };
 
 /// How far above what H's own readings allow a floor word that rose may stand, in milliseconds.
@@ -270,14 +271,15 @@ impl Watch {
     /// Opens the floor once more as the daemon does, and requires that its name still names the
     /// file held since the start. The file held is read through its descriptor, shown to be a
     /// regular file of the account that no other user can read or write, of the floor's length, and
-    /// the product's open runs on a copy of its bytes in the harness's own directory, in a program
-    /// of its own: this program maps no file.
+    /// the product's open runs on a copy of its bytes in the harness's own directory, in the
+    /// program at `program`, which the caller has shown to be the file that was placed: this
+    /// program maps no file.
     ///
     /// # Errors
     ///
     /// Returns why the open fails, including that the program that ran it was ended by a signal,
     /// or that the name no longer names the file held.
-    pub fn open_again(&self, environment: EnvironmentId) -> Result<(), String> {
+    pub fn open_again(&self, program: &Path, environment: EnvironmentId) -> Result<(), String> {
         let said = |why: &dyn std::fmt::Display| {
             format!("the clock floor cannot be opened again before the attempt: {why}")
         };
@@ -287,9 +289,8 @@ impl Watch {
             ));
         }
         let bytes = held_bytes(&self.file).map_err(|why| said(&why))?;
-        let program = built_directory().join(FLOOR_OPEN);
         self.scratch
-            .with(&bytes, |copy| product_opens(&program, copy, environment))
+            .with(&bytes, |copy| product_opens(program, copy, environment))
             .map_err(|why| said(&why))
     }
 
@@ -378,12 +379,13 @@ impl Watch {
     }
 }
 
-/// The name of the program that runs the product's open of the floor.
-const FLOOR_OPEN: &str = "kr-e2e-m1b-floor-open";
+/// The name of the program that runs the product's open of the floor, as the host places it in the
+/// run's `b/`.
+pub(crate) const FLOOR_OPEN: &str = "kr-e2e-m1b-floor-open";
 
-/// Runs `program` on the floor's copy at `copy` for `environment`, and reads how it ended: the open
-/// when it exits 0, a refusal with its text when it exits 2, and a refusal that names the signal
-/// when a signal ends it, as the cut of the copy by an agent does.
+/// Runs `program` with an empty environment on the floor's copy at `copy` for `environment`, and
+/// reads how it ended: the open when it exits 0, a refusal with its text when it exits 2, and a
+/// refusal that names the signal when a signal ends it, as the cut of the copy by an agent does.
 fn product_opens(program: &Path, copy: &Path, environment: EnvironmentId) -> Result<(), String> {
     use std::os::unix::process::ExitStatusExt as _;
     if !program.is_file() {
@@ -394,6 +396,7 @@ fn product_opens(program: &Path, copy: &Path, environment: EnvironmentId) -> Res
         ));
     }
     let output = std::process::Command::new(program)
+        .env_clear()
         .arg(copy)
         .arg(environment.to_string())
         .stdin(std::process::Stdio::null())
@@ -507,8 +510,15 @@ mod tests {
     use kr_ipc::paths::HostPaths;
 
     use super::*;
+    use crate::run::built_directory;
 
     const ESTABLISHED_AT: u64 = 88;
+
+    /// The floor's opener as this build made it, beside the test program: the cases that have no
+    /// run to place it in start it from here.
+    fn opener() -> PathBuf {
+        built_directory().join(FLOOR_OPEN)
+    }
 
     /// The readings the watch is anchored at, and the same readings a moment later.
     const START: Readings = Readings {
@@ -727,7 +737,7 @@ mod tests {
             let started = Instant::now();
             let (mut opened, mut refused) = (0_u32, 0_u32);
             while started.elapsed() < Duration::from_secs(3) {
-                match watch.open_again(world.environment) {
+                match watch.open_again(&opener(), world.environment) {
                     Ok(()) => opened += 1,
                     Err(_) => refused += 1,
                 }
@@ -803,7 +813,7 @@ mod tests {
             let started = Instant::now();
             let (mut opened, mut refused, mut signalled) = (0_u32, 0_u32, 0_u32);
             while started.elapsed() < Duration::from_secs(5) {
-                match watch.open_again(world.environment) {
+                match watch.open_again(&opener(), world.environment) {
                     Ok(()) => opened += 1,
                     Err(why) if why.contains("was ended by the signal") => signalled += 1,
                     Err(_) => refused += 1,
@@ -858,7 +868,8 @@ mod tests {
 
     /// The end of the program that runs the product's open is read: an open where it exits 0, its
     /// text where it exits 2, its code where it exits with another, the signal where a signal ends
-    /// it, and where the program is not there, how to build it.
+    /// it, and where the program is not there, how to build it. The program is started with an
+    /// empty environment.
     #[test]
     fn the_end_of_the_program_that_opens_the_floor_is_read_as_an_open_or_a_refusal() {
         let world = world("open-ends", 1_000_000);
@@ -898,11 +909,80 @@ mod tests {
         assert!(why.contains("ended with the code 3: odd"), "{why}");
         let why = ends(&script("ended-by-a-signal", "kill -BUS $$")).expect_err("a signal");
         assert!(why.contains("was ended by the signal "), "{why}");
+        assert_eq!(
+            ends(&script(
+                "empty-environment",
+                "if [ -n \"${HOME:-}\" ]; then echo 'HOME reached the program' >&2; exit 2; fi"
+            )),
+            Ok(()),
+            "the program is started with an empty environment"
+        );
         let why = ends(&world.root.join("absent")).expect_err("no program");
         assert!(
             why.contains("is not at") && why.contains("--features legs --bins"),
             "{why}"
         );
+        world.clean();
+    }
+
+    /// The floor's opener ends at once, with nothing said, when its only argument is `--version`,
+    /// which is how the host starts it once, where nothing is timed, when it places the program in
+    /// the run; with another argument beside `--version` it is not that start.
+    #[test]
+    fn the_floor_opener_ends_at_once_when_its_only_argument_is_version() {
+        let program = opener();
+        let started = |arguments: &[&str]| {
+            std::process::Command::new(&program)
+                .args(arguments)
+                .stdin(std::process::Stdio::null())
+                .output()
+                .expect("the floor's opener starts")
+        };
+        let alone = started(&["--version"]);
+        assert!(
+            alone.status.success() && alone.stderr.is_empty(),
+            "--version alone ends the opener with exit 0 and nothing said: {:?} {}",
+            alone.status,
+            String::from_utf8_lossy(&alone.stderr)
+        );
+        let beside = started(&["--version", "another"]);
+        assert_eq!(
+            beside.status.code(),
+            Some(2),
+            "--version beside another argument is not the start that ends at once"
+        );
+    }
+
+    /// The floor opened again is opened by the program it is given, which the host has shown to be
+    /// the file that was placed: that program's refusal is the refusal.
+    #[test]
+    fn the_floor_opened_again_is_opened_by_the_program_it_is_given() {
+        let world = world("open-again-program", 1_000_000);
+        let watch = world.watch();
+        let program = world.root.join("the-given-program");
+        std::fs::write(
+            &program,
+            "#!/bin/sh\necho 'the given program ran' >&2\nexit 2\n",
+        )
+        .expect("a program");
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700))
+            .expect("runnable");
+        // A program written a moment ago is busy while a child that another test starts holds the
+        // descriptor it was written through, until that child runs its own program: asked again.
+        let mut why = watch
+            .open_again(&program, world.environment)
+            .expect_err("the given program refuses");
+        for _ in 0..100 {
+            if !why.contains("Text file busy") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+            why = watch
+                .open_again(&program, world.environment)
+                .expect_err("the given program refuses");
+        }
+        assert!(why.ends_with("the given program ran"), "{why}");
+        drop(watch);
         world.clean();
     }
 
@@ -914,7 +994,7 @@ mod tests {
     fn a_copy_replaced_after_the_directory_check_is_refused_and_a_pipe_does_not_hold_the_open() {
         let world = world("copy-replaced", 1_000_000);
         let watch = world.watch();
-        let program = built_directory().join(FLOOR_OPEN);
+        let program = opener();
         let bytes = held_bytes(&watch.file).expect("the floor's bytes");
         let attacked = |what: &str, attack: &dyn Fn(&Path)| {
             let started = Instant::now();
@@ -972,14 +1052,14 @@ mod tests {
     fn the_floor_opened_again_is_refused_for_a_replaced_directory_a_mode_and_a_length() {
         let world = world("open-again-checks", 1_000_000);
         let watch = world.watch();
-        assert_eq!(watch.open_again(world.environment), Ok(()));
+        assert_eq!(watch.open_again(&opener(), world.environment), Ok(()));
         let moved = watch.scratch.root.with_extension("moved");
         std::fs::rename(&watch.scratch.root, &moved).expect("moved away");
         std::fs::create_dir(&watch.scratch.root).expect("another directory");
         std::fs::set_permissions(&watch.scratch.root, std::fs::Permissions::from_mode(0o700))
             .expect("owner only");
         let why = watch
-            .open_again(world.environment)
+            .open_again(&opener(), world.environment)
             .expect_err("another directory in the place of the copy's");
         assert!(
             why.ends_with(
@@ -992,7 +1072,7 @@ mod tests {
         std::fs::set_permissions(&world.path, std::fs::Permissions::from_mode(0o644))
             .expect("readable by others");
         let why = watch
-            .open_again(world.environment)
+            .open_again(&opener(), world.environment)
             .expect_err("a floor that others can read");
         assert!(
             why.ends_with("the clock floor file may be read or written by another user"),
@@ -1000,14 +1080,14 @@ mod tests {
         );
         std::fs::set_permissions(&world.path, std::fs::Permissions::from_mode(0o600))
             .expect("owner only");
-        assert_eq!(watch.open_again(world.environment), Ok(()));
+        assert_eq!(watch.open_again(&opener(), world.environment), Ok(()));
         std::fs::OpenOptions::new()
             .write(true)
             .open(&world.path)
             .and_then(|file| file.set_len(100))
             .expect("a short floor");
         let why = watch
-            .open_again(world.environment)
+            .open_again(&opener(), world.environment)
             .expect_err("a floor of another length");
         assert!(
             why.ends_with("the clock floor file is not the length this build writes"),
@@ -1319,11 +1399,11 @@ mod tests {
     fn the_floor_opens_again_while_its_name_names_the_file_held_and_says_why_it_cannot() {
         let world = world("open-again", 1_000_000);
         let watch = world.watch();
-        assert_eq!(watch.open_again(world.environment), Ok(()));
+        assert_eq!(watch.open_again(&opener(), world.environment), Ok(()));
         // The file held is still at the name, and the daemon would refuse it: another environment's.
         let another = EnvironmentId::new(kr_ipc::new_uuid());
         assert_eq!(
-            watch.open_again(another),
+            watch.open_again(&opener(), another),
             Err(
                 "the clock floor cannot be opened again before the attempt: the clock floor file \
                  belongs to another environment"
@@ -1336,7 +1416,7 @@ mod tests {
         std::fs::copy(&world.path, &staging).expect("a copy");
         std::fs::rename(&staging, &world.path).expect("renamed over");
         assert_eq!(
-            watch.open_again(world.environment),
+            watch.open_again(&opener(), world.environment),
             Err(
                 "the clock floor cannot be opened again before the attempt: its name no longer \
                  names the file held since the start"

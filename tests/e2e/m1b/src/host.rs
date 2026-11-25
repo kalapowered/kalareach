@@ -31,12 +31,12 @@ use serde_json::Value;
 
 use crate::LIVENESS;
 use crate::compare::{self, Class, Interval, Layout};
-use crate::floor::{Opening, Readings, Watch};
+use crate::floor::{FLOOR_OPEN, Opening, Readings, Watch};
 use crate::index::{self, Looked};
 use crate::outside::Outside;
 use crate::run::{
-    HARNESS_PROGRAM, Run, binary_place, ended_within, output_within, processes_under,
-    read_tail_below, running, signal, socket_below, worker_session,
+    HARNESS_PROGRAM, Run, binary_place, built_directory, ended_within, output_within,
+    processes_under, read_tail_below, running, signal, socket_below, worker_session,
 };
 use crate::tables::{self, Tables};
 use crate::tree::{Entry, OPTIONAL_ROOTS, REQUIRED_ROOTS, RUNTIME_ROOT, Record, STATE_ROOT};
@@ -867,11 +867,22 @@ impl<'r> Host<'r> {
     /// [`Host::agent_is_a_stand_in`] comes before this call), except for the survey
     /// ([`Restart::Survey`]), which records on the stand-in too.
     ///
+    /// Where the agent is not the stand-in, the program that runs the product's second open of the
+    /// clock floor is placed in the run's `b/` first ([`FLOOR_OPEN`]), so that the record holds it
+    /// and a restart starts it only while it is the file that was placed. The stand-in never opens
+    /// the floor again, and places none.
+    ///
     /// # Panics
     ///
     /// Unwinds with a [`LegNotRun`] when the record cannot be made: the leg ends as not run before
-    /// the agent is launched.
+    /// the agent is launched. Panics when the floor's opener this build should have produced is
+    /// missing or cannot be placed.
     pub fn agent_starts(&self) {
+        self.agent_starts_from(&built_directory());
+    }
+
+    /// [`Host::agent_starts`], with the floor's opener taken from the directory `built`.
+    fn agent_starts_from(&self, built: &Path) {
         self.agent_started.store(true, Ordering::SeqCst);
         let made = {
             let mut restarts = self.restarts.lock().unwrap_or_else(PoisonError::into_inner);
@@ -882,6 +893,9 @@ impl<'r> Host<'r> {
             };
             if !records || restarts.record.is_some() {
                 return;
+            }
+            if !self.stand_in.load(Ordering::SeqCst) {
+                self.place_the_floors_opener(built);
             }
             self.standing().and_then(|(indexes, record)| {
                 index::known(&indexes)?;
@@ -905,6 +919,30 @@ impl<'r> Host<'r> {
             eprintln!("{said}");
             std::panic::resume_unwind(Box::new(LegNotRun(said)));
         }
+    }
+
+    /// Places the floor's opener, which this build made in `built`, in the run's `b/`, starts it
+    /// once where nothing is timed, and records it as placed ([`Run::note_placed`]).
+    ///
+    /// # Panics
+    ///
+    /// Panics when the program is missing, saying how to build it, or cannot be placed or started.
+    fn place_the_floors_opener(&self, built: &Path) {
+        let source = built.join(FLOOR_OPEN);
+        assert!(
+            source.is_file(),
+            "the clock floor's opener is not at {}; build it with `cargo build -p kr-e2e-m1b \
+             --features legs --bins`",
+            source.display()
+        );
+        kr_ipc::testing::place_and_start_once(
+            &source,
+            &self.run.binary(FLOOR_OPEN),
+            &["--version"],
+        );
+        self.run
+            .note_placed(&binary_place(FLOOR_OPEN))
+            .unwrap_or_else(|why| panic!("{why}"));
     }
 
     /// The record of the run's tree as it stands: the host's two roots, the run's programs and the
@@ -1700,7 +1738,16 @@ impl<'r> Host<'r> {
             Class::Floor,
             watch.before_the_attempt(readings),
         ));
-        if let Err(why) = watch.open_again(self.environment.environment_id()) {
+        if let Err(why) = self
+            .run
+            .placed_as_it_was(&binary_place(FLOOR_OPEN))
+            .and_then(|()| {
+                watch.open_again(
+                    &self.run.binary(FLOOR_OPEN),
+                    self.environment.environment_id(),
+                )
+            })
+        {
             refused.push(Refused {
                 class: Class::Floor,
                 line: why,
@@ -2869,6 +2916,93 @@ mod shutdown_tests {
             again.get(Path::new("s/later")).is_none(),
             "the record is made once, at the first start"
         );
+        drop(host);
+        drop(run);
+        std::fs::remove_dir_all(&root).expect("clean up");
+    }
+
+    /// The program that runs the product's second open of the clock floor is placed in the run's
+    /// programs, with the others, before the record of a real agent is made: the record holds it,
+    /// and it is the file that was placed. The stand-in path of a survey never opens the floor
+    /// again, and places none.
+    #[test]
+    fn the_floors_opener_is_placed_in_the_run_before_the_record_of_a_real_agent() {
+        let opener = Path::new("b/kr-e2e-m1b-floor-open");
+        let root = scratch("opener-placed");
+        let (run, _mark) = host_with_a_kr(&root);
+        let host = host_over(&run);
+        host.declares_a_restart(Restart::Declared);
+        host.agent_starts();
+        let held = recorded(&host).expect("the tree is recorded");
+        assert!(
+            held.get(opener).is_some(),
+            "the floor's opener is in the record of the run's tree"
+        );
+        assert_eq!(
+            run.placed_as_it_was(opener),
+            Ok(()),
+            "the floor's opener is the file that was placed"
+        );
+        drop(host);
+        drop(run);
+        std::fs::remove_dir_all(&root).expect("clean up");
+
+        let root = scratch("opener-not-placed");
+        let (run, _mark) = host_with_a_kr(&root);
+        let host = host_over(&run);
+        host.declares_a_restart(Restart::Survey);
+        host.agent_is_a_stand_in();
+        host.agent_starts();
+        let held = recorded(&host).expect("the survey records the tree");
+        assert!(
+            held.get(opener).is_none(),
+            "the stand-in path places no floor's opener"
+        );
+        drop(host);
+        drop(run);
+        std::fs::remove_dir_all(&root).expect("clean up");
+    }
+
+    /// The floor's opener that a restart starts is the file in the run's `b/`, and it is started
+    /// only while it is the file that was placed: an opener that was placed again is started, and
+    /// one that was rewritten since is not, and the restart is refused with that reason.
+    #[test]
+    fn a_floors_opener_is_started_only_while_it_is_the_file_that_was_placed() {
+        let opener = Path::new("b/kr-e2e-m1b-floor-open");
+        let root = scratch("opener-rewritten");
+        let run = run_with_a_controller(&root);
+        let marker = root.join("h/opener-ran");
+        let runs = || std::fs::read_to_string(&marker).map_or(0, |text| text.lines().count());
+        let host = killed_host(&run, |_| {}, || {});
+        let counting = format!("#!/bin/sh\necho ran >> '{}'\n", marker.display());
+        std::fs::write(root.join(opener), &counting).expect("the opener is rewritten");
+        run.note_placed(opener)
+            .expect("the rewritten opener is recorded as placed");
+        // The tree compare refuses the restart, since a program of the run changed after the
+        // start; the opener is the file that was placed, and it is started.
+        let _ = not_run(|| {
+            host.restart_after_a_real_agent(&started(&root, 2), QUICKLY, Duration::from_secs(10));
+        });
+        assert_eq!(
+            runs(),
+            1,
+            "the opener that was placed is the program that is started"
+        );
+        std::fs::write(root.join(opener), format!("{counting}echo again\n"))
+            .expect("the opener is rewritten again");
+        let said = not_run(|| {
+            host.restart_after_a_real_agent(&started(&root, 2), QUICKLY, Duration::from_secs(10));
+        });
+        assert!(
+            said.contains("is not the file that was placed"),
+            "the refusal says that the opener is not the file that was placed: {said}"
+        );
+        assert_eq!(
+            runs(),
+            1,
+            "the opener that was rewritten after it was placed is not started"
+        );
+        assert_eq!(starts(&root), 1, "no start was tried");
         drop(host);
         drop(run);
         std::fs::remove_dir_all(&root).expect("clean up");

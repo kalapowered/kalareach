@@ -57,8 +57,11 @@ pub struct Owned {
     pub what: String,
 }
 
-/// The program the harness itself starts once the agent under test has run: the rest are started
-/// by the daemon before the agent does, or by the programs themselves.
+/// The program the harness runs only while it is the file that was placed in the run
+/// ([`Run::placed_as_it_was`]): `kr`, which it starts before the agent under test starts and never
+/// after. The one program it starts after the agent has run is the floor's opener (`FLOOR_OPEN` in
+/// `floor`), placed and checked the same way. The restarted daemon and its workers are started from
+/// the run's tree with no such check.
 pub const HARNESS_PROGRAM: &str = "kr";
 
 /// The place of a copied binary below the run's directory.
