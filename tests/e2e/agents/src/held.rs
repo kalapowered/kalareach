@@ -5613,7 +5613,15 @@ mod tests {
         );
         let (stops, _) =
             files_of(&guard).compare_with(&lstat_in(&home), &reading, &[RUN_NAME, RUN_MARK]);
-        assert_refused_as_unlooked(&stops);
+        assert!(
+            files_of(&guard).known().unlooked,
+            "the failed look of the worker was not kept in the cell"
+        );
+        let said: Vec<&str> = stops.iter().map(|(_, why)| why.as_str()).collect();
+        assert!(
+            said.contains(&not_read(UNLOOKED).as_str()),
+            "the first read went on after the failed look of the worker: {said:?}"
+        );
         // The path recovers, and a file that names the run is at the shared name.
         std::fs::write(
             home.join(".claude.json"),
@@ -5622,13 +5630,26 @@ mod tests {
         .expect("a write");
         let (stops, _) =
             files_of(&guard).compare_with(&lstat_in(&home), &reading, &[RUN_NAME, RUN_MARK]);
-        assert_refused_as_unlooked(&stops);
+        assert!(
+            files_of(&guard).known().unlooked,
+            "the failed look of the worker was no longer kept at the later end compare"
+        );
+        let said: Vec<&str> = stops.iter().map(|(_, why)| why.as_str()).collect();
+        assert!(
+            said.contains(&not_read(UNLOOKED).as_str()),
+            "the later end compare read a file after the failed look of the worker: {said:?}"
+        );
+        assert!(
+            !said.iter().any(|why| why.contains("now holds")),
+            "the later end compare found the run's name in a file it read: {said:?}"
+        );
         assert_eq!(begun(&reading), 0, "a shared file was read");
         std::fs::remove_dir_all(&home).expect("clean up");
     }
 
     #[test]
     fn a_file_that_the_worker_saw_at_a_guarded_name_is_not_read_at_a_later_shared_name() {
+        use std::os::unix::fs::MetadataExt as _;
         let home = claude_home("worker-saw-a-file");
         // The credentials file is not there at the take and at the end's first look.
         std::fs::remove_file(home.join(".claude/.credentials.json")).expect("removed");
@@ -5657,6 +5678,16 @@ mod tests {
         );
         let (stops, _) =
             files_of(&guard).compare_with(&lstat_in(&home), &reading, &[RUN_NAME, RUN_MARK]);
+        // The cell holds the identity of the file that the worker saw, now at the second shared
+        // name.
+        let moved = std::fs::metadata(home.join(".claude2.json")).expect("a look");
+        assert!(
+            files_of(&guard)
+                .known()
+                .seen
+                .contains(&(moved.dev(), moved.ino())),
+            "the file that the worker saw at a guarded name was not kept in the cell"
+        );
         let said: Vec<&str> = stops.iter().map(|(_, why)| why.as_str()).collect();
         assert_eq!(
             said,
