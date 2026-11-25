@@ -11212,9 +11212,11 @@ fn lease_bytes_the_terminal_has_taken(wired: &Wired) -> usize {
         .sum()
 }
 
-/// KR-REQ-07.77, KR-REQ-07.79, KR-REQ-07.83: a batch whose authority ends on the continuous clock
-/// while the writer waits for room in a terminal that has none is given up: nothing more of it is
-/// written, what it still owed is settled, and its lease is left owing nothing for it.
+/// KR-REQ-07.77, KR-REQ-07.79, KR-REQ-07.83, KR-REQ-23.36: a batch whose authority ends on the
+/// continuous clock while the writer waits for room in a terminal that has none is given up: nothing
+/// more of it is written, what it still owed is settled, and its lease ends. Typing the session
+/// accepted is never discarded with no word, so the end of the lease counts what the terminal had
+/// not taken of the batch, and whoever takes the keys next is told how many bytes that was.
 ///
 /// The batch carries no UTC end, so the writer makes no look at storage, and no lease changes, so
 /// no fence ends the batch. The one thing that can end it while it waits is the end of its authority
@@ -11237,7 +11239,6 @@ async fn a_batch_whose_authority_ends_while_the_writer_waits_for_room_is_given_u
         .session()
         .attach(&params, params.requested.clone(), challenger)
         .expect("attaches");
-    let owed_against_the_lease = wired.runtime.input().lock().queued_lease_bytes();
     let sent = more_than_the_terminal_takes().len();
 
     // The clock reads zero, so the batch has a minute of authority left while the writer waits.
@@ -11257,16 +11258,22 @@ async fn a_batch_whose_authority_ends_while_the_writer_waits_for_room_is_given_u
     );
 
     // The end of the authority passes with the writer waiting for room. The writer gives the batch
-    // up at its next look at the end, and the last thing it does then is give back what the batch
-    // still owed against the lease, so that is what the case waits for.
+    // up at its next look at the end and asks for its lease to end, so the case waits for the lease
+    // to have no holder.
     clock.advance(Duration::from_millis(AUTHORITY_ENDS_AT_MS + 1_000));
     let settled = std::time::Instant::now() + SOON;
-    while owed_against_the_lease.load() != 0 && std::time::Instant::now() < settled {
+    while wired.runtime.session().lease().holder.is_present() && std::time::Instant::now() < settled
+    {
         std::thread::sleep(Duration::from_millis(5));
     }
+    assert!(
+        !wired.runtime.session().lease().holder.is_present(),
+        "the writer gave the batch up once its authority had ended while it waited for room, and its lease ended"
+    );
     let handed = lease_bytes_the_terminal_has_taken(&wired);
 
-    // A takeover reports what the lease left unwritten: nothing, if the writer gave the batch up.
+    // A takeover reports what the ended lease left unwritten: the bytes of the batch that the
+    // terminal had not taken, which the lease's end kept and did not forget.
     let acquired = wired
         .runtime
         .session()
@@ -11274,8 +11281,8 @@ async fn a_batch_whose_authority_ends_while_the_writer_waits_for_room_is_given_u
         .expect("the takeover takes the keys");
     assert_eq!(
         acquired.discarded_bytes.get(),
-        0,
-        "the writer gave the batch up once its authority had ended while it waited for room, so the lease has none of it unwritten"
+        u64::try_from(sent - handed).expect("a count"),
+        "the lease that ended with the batch's authority reports what the terminal had not taken of the batch, so that typing the session accepted is not discarded with no word"
     );
     assert_eq!(
         handed, taken,
