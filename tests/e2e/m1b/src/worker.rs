@@ -473,14 +473,21 @@ impl Judge<'_> {
         if now.size < was.size || !matches!(held, Ok(Some(digest)) if Some(digest) == was.digest) {
             self.refuse(path, W12);
         } else if now.size > was.size {
-            let added = appended(self.place, path, was.size, now.size).map_or_else(
-                |why| format!("they could not be read: {why}"),
-                |bytes| format!("{:?}", String::from_utf8_lossy(&bytes)),
-            );
+            let total = now.size - was.size;
+            let kept = match appended(self.place, path, was.size, now.size) {
+                Ok(bytes) if u64::try_from(bytes.len()) == Ok(total) => {
+                    format!(": b\"{}\"", bytes.escape_ascii())
+                }
+                Ok(bytes) => format!(
+                    "; the first {} of them are kept: b\"{}\"",
+                    bytes.len(),
+                    bytes.escape_ascii()
+                ),
+                Err(why) => format!(": they could not be read: {why}"),
+            };
             self.judged.notes.push(format!(
-                "{}: {} bytes were added to the worker's diagnostics: {added}",
-                path.display(),
-                now.size - was.size
+                "{}: {total} bytes were added to the worker's diagnostics{kept}",
+                path.display()
             ));
         }
     }
@@ -591,6 +598,7 @@ mod tests {
     use std::os::unix::fs::PermissionsExt as _;
     use std::os::unix::net::UnixListener;
 
+    use super::NOTE_BYTES;
     use crate::compare::tests::{World, world};
     use crate::compare::{Class, Interval};
 
@@ -1117,7 +1125,7 @@ mod tests {
         assert_eq!(notes.len(), 1, "{notes:#?}");
         assert!(
             notes[0].ends_with(
-                "15 bytes were added to the worker's diagnostics: \"kr-worker: two\\n\""
+                "15 bytes were added to the worker's diagnostics: b\"kr-worker: two\\n\""
             ),
             "{notes:#?}"
         );
@@ -1137,6 +1145,63 @@ mod tests {
             std::fs::set_permissions(file(w), std::fs::Permissions::from_mode(0o644))
                 .expect("readable");
         });
+    }
+
+    /// The notes of a diagnostics file that held one line and gained `added`, with nothing refused.
+    fn notes_of_a_diagnostics_file_that_gained(name: &str, added: &[u8]) -> Vec<String> {
+        let file = |w: &World| w.state("jobs/kr-worker-r1.diagnostics");
+        let (refused, notes) = outcome(
+            name,
+            |w| w.put(&file(w), b"kr-worker: one\n"),
+            |w| {
+                let mut bytes = b"kr-worker: one\n".to_vec();
+                bytes.extend_from_slice(added);
+                std::fs::write(file(w), bytes).expect("grown");
+            },
+        );
+        assert_eq!(refused, Vec::<String>::new(), "{name}");
+        notes
+    }
+
+    /// The bytes a diagnostics file gained are kept as they were written, one escaped byte at a
+    /// time, and not as the characters that a lossy reading puts in the place of bytes that are
+    /// not UTF-8: a quote and a backslash are escaped, so each reads as itself.
+    #[test]
+    fn a_diagnostics_note_keeps_every_byte_added_even_where_the_bytes_are_not_text() {
+        let notes = notes_of_a_diagnostics_file_that_gained("not-text", b"a\xff\xfe\n\"q\\");
+        assert_eq!(notes.len(), 1, "{notes:#?}");
+        assert!(
+            notes[0].ends_with(
+                r#": 7 bytes were added to the worker's diagnostics: b"a\xff\xfe\n\"q\\""#
+            ),
+            "{notes:#?}"
+        );
+    }
+
+    /// A write above the most that a note keeps says how many bytes were added, how many of them
+    /// are kept and that the kept ones are the first; a write of exactly that many is kept whole
+    /// and says no cut.
+    #[test]
+    fn a_diagnostics_note_says_how_much_was_added_and_how_much_of_it_is_kept() {
+        let kept = "z".repeat(NOTE_BYTES);
+        let notes = notes_of_a_diagnostics_file_that_gained("cut", &vec![b'z'; NOTE_BYTES + 100]);
+        assert_eq!(notes.len(), 1, "{notes:#?}");
+        assert!(
+            notes[0].ends_with(&format!(
+                ": {} bytes were added to the worker's diagnostics; the first {NOTE_BYTES} of \
+                 them are kept: b\"{kept}\"",
+                NOTE_BYTES + 100
+            )),
+            "{notes:#?}"
+        );
+        let notes = notes_of_a_diagnostics_file_that_gained("whole", &vec![b'z'; NOTE_BYTES]);
+        assert_eq!(notes.len(), 1, "{notes:#?}");
+        assert!(
+            notes[0].ends_with(&format!(
+                ": {NOTE_BYTES} bytes were added to the worker's diagnostics: b\"{kept}\""
+            )),
+            "{notes:#?}"
+        );
     }
 
     /// A session journal's main file may change in place and its `-wal` and `-shm` may be made,

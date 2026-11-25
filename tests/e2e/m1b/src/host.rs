@@ -3420,7 +3420,7 @@ mod shutdown_tests {
                 .iter()
                 .filter_map(Value::as_str)
                 .any(|said| said.ends_with(
-                    "14 bytes were added to the worker's diagnostics: \"a second line\\n\""
+                    "14 bytes were added to the worker's diagnostics: b\"a second line\\n\""
                 )),
             "{evidence:#}"
         );
