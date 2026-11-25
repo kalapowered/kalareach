@@ -7,7 +7,9 @@
 //! choose the entry that the stand-in route stands in for ([`stand_in_chosen`]) and run the staged
 //! parts that start no model turn for the stand-in made from it. The route places the stand-in as
 //! the entry is launched ([`placing_of`]): a script or a wheel as the program under the runtime's
-//! name and a script that names it, which a person types as the command.
+//! name and a script that names it, which a person types as the command. The parts run with a
+//! marker at every place the entry names a program to run ([`marked`]), because the route places
+//! only the program the harness built: a part fails if a marker ran.
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -1027,11 +1029,72 @@ fn the_package_written_for_a_script_or_a_wheel_recognises_the_command_and_the_ru
     }
 }
 
+/// The entry of `synthetic` with a marker at every place it names a program to run: its pinned file
+/// below its prefix, its newer build's pinned file below the newer prefix, and each file of its
+/// runtime, all in folders of `base`. A marker is a script that appends its own path to the mark
+/// file, the second value returned, which exists only once a marker has run. The stand-in route
+/// places the stand-in program the harness built and runs nothing the entry names.
+///
+/// # Panics
+///
+/// Panics where the entry names no newer build, where a runtime file has no name, or where a
+/// marker cannot be written.
+fn marked(base: &Path, synthetic: &Synthetic) -> (Synthetic, PathBuf) {
+    let mark = base.join("mark");
+    let (prefix, newer) = (base.join("prefix"), base.join("newer"));
+    let runtime: Vec<PathBuf> = synthetic
+        .build
+        .runtime
+        .iter()
+        .map(|file| {
+            base.join("runtime")
+                .join(file.file_name().expect("the file name of a runtime file"))
+        })
+        .collect();
+    let newer_pinned = &synthetic
+        .build
+        .newer
+        .as_ref()
+        .expect("the entry's newer build")
+        .pinned;
+    let markers = runtime.iter().cloned().chain([
+        prefix.join(&synthetic.build.pinned),
+        newer.join(newer_pinned),
+    ]);
+    for marker in markers {
+        std::fs::create_dir_all(marker.parent().expect("the folder of a marker"))
+            .expect("a folder for a marker");
+        std::fs::write(
+            &marker,
+            format!("#!/bin/sh\necho \"$0\" >> '{}'\n", mark.display()),
+        )
+        .expect("a marker");
+        std::fs::set_permissions(&marker, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .expect("an executable marker");
+    }
+    let mut file = synthetic.file.clone();
+    file["prefix"] = serde_json::json!(prefix);
+    file["newer"]["prefix"] = serde_json::json!(newer);
+    file["runtime"] = serde_json::json!(runtime);
+    let build = serde_json::from_value(file.clone()).expect("an entry");
+    (
+        Synthetic {
+            name: synthetic.name,
+            file,
+            build,
+        },
+        mark,
+    )
+}
+
 /// Runs `part`, one of the staged parts that start no model turn, as `test`, for the stand-in made
-/// from each synthetic entry, installed from a release of the entry's package.
+/// from each synthetic entry, installed from a release of the entry's package. Every program the
+/// entry names is a marker ([`marked`]) in a folder of the case, outside the run's directory, and
+/// the case fails once the part has ended if one of them ran.
 fn for_each_entry(test: &str, part: fn(Option<Subject>, &str)) {
     for synthetic in synthetic() {
         let base = scratch("part");
+        let (synthetic, mark) = marked(&base, &synthetic);
         let directory = base.join("release");
         release(
             &directory,
@@ -1042,6 +1105,13 @@ fn for_each_entry(test: &str, part: fn(Option<Subject>, &str)) {
         let subject = Subject::from_release(&synthetic.build, &directory)
             .unwrap_or_else(|why| panic!("{}: {why}", synthetic.name));
         part(Some(subject), test);
+        assert!(
+            !mark.exists(),
+            "{}: the part ran a program that the entry names and the harness did not build; each \
+             such program wrote its path to the mark file:\n{}",
+            synthetic.name,
+            std::fs::read_to_string(&mark).unwrap_or_default()
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 }
