@@ -22,7 +22,7 @@ the forwarder :: cargo test --locked -p kr-hook -- --show-output
 the launch endpoint, the registration and the credential :: cargo test --locked -p kr-worker --test windows_endpoint -- --show-output
 the listener, the transport and the broker over the launch endpoint :: cargo test --locked -p kr-worker --test listener --test transport --test broker --test gateway -- --show-output
 the agent mutations through the dispatch path :: cargo test --locked -p kr-worker --test agent_service -- --show-output
-which handles a started process holds :: cargo test --locked -p kr-worker --test windows_inheritance -- --show-output
+which handles a started process holds :: cargo test --locked -p kr-worker --test windows_inheritance --test windows_environment --test windows_pipes -- --show-output
 the connector the worker reads from an installed package :: cargo test --locked -p kr-worker --test connectors -- --show-output
 what a launch reads of its application's mode :: cargo test --locked -p kr-worker --test launch_probe -- --show-output
 the command backends :: cargo test --locked -p kr-worker --test command_backends -- --show-output

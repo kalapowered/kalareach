@@ -773,7 +773,7 @@ group = 'rust'
 what = 'which handles a started process holds'
 platforms = ['windows']
 reading = 'cargo'
-command = ['cargo', 'test', '--locked', '-p', 'kr-worker', '--test', 'windows_inheritance']
+command = ['cargo', 'test', '--locked', '-p', 'kr-worker', '--test', 'windows_inheritance', '--test', 'windows_environment', '--test', 'windows_pipes']
 
 [[step]]
 id = 'rust-the-connector-the-worker-reads-from-an-installed-package'
