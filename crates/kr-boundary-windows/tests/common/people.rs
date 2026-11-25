@@ -11,6 +11,8 @@ use windows_sys::Win32::System::Threading::{
     OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, SetThreadToken,
 };
 
+use kr_boundary_windows::manifest::{Manifest, ObjectKind};
+use kr_boundary_windows::win::admission::Probes;
 use kr_boundary_windows::win::client::ClientIdentity;
 use kr_boundary_windows::win::ffi::{Handle, Sid};
 use kr_boundary_windows::win::rights::ImpersonationToken;
@@ -146,4 +148,39 @@ pub fn acting_as<T: Send>(token: Option<&Handle>, work: impl FnOnce() -> T + Sen
             .join()
             .expect("the work did not panic")
     })
+}
+
+/// The two boundary accounts of a case, one for each class, and the manifest that records them.
+pub struct Siblings {
+    pub checkout: Boundary,
+    pub connect: Boundary,
+    pub manifest: Manifest,
+}
+
+impl Siblings {
+    pub fn new() -> Siblings {
+        let checkout = Boundary::new("krsca");
+        let connect = Boundary::new("krscn");
+        let mut manifest = Manifest::begin();
+        manifest.record(
+            ObjectKind::Account,
+            "krb-checkout",
+            Some(&checkout.sid.to_text().unwrap()),
+        );
+        manifest.record(
+            ObjectKind::Account,
+            "krb-connect",
+            Some(&connect.sid.to_text().unwrap()),
+        );
+        Siblings {
+            checkout,
+            connect,
+            manifest,
+        }
+    }
+
+    /// The probe tokens, made now: a group that an account joined before this call is in its token.
+    pub fn probes(&self) -> Probes {
+        Probes::new(&self.manifest).expect("the probe tokens are made")
+    }
 }

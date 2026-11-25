@@ -31,12 +31,11 @@ use kr_boundary_windows::win::hold::{
 
 use kr_boundary_windows::filekey::FileKey;
 use kr_boundary_windows::frame::Class;
-use kr_boundary_windows::manifest::{Manifest, ObjectKind};
 use kr_boundary_windows::refusal::Refusal;
 use kr_boundary_windows::win::admission::{
     ADMISSION_FAILED_WORDS, Admitted, CASE_SENSITIVE_WORDS, CLOUD_WORDS, DRIVE_WORDS,
     ENCRYPTED_WORDS, Expected, HARD_LINK_WORDS, LABEL_WORDS, LIMITS, LINK_WORDS, Limits,
-    NESTED_WORDS, Names, OPEN_WORDS, OWNER_WORDS, PERSON_LACKS_WORDS, PROFILE_WORDS, Probes,
+    NESTED_WORDS, Names, OPEN_WORDS, OWNER_WORDS, PERSON_LACKS_WORDS, PROFILE_WORDS,
     RECHECK_LINKS_WORDS, RULE_CASE_SENSITIVE, RULE_CLOUD, RULE_DRIVE, RULE_ENCRYPTED,
     RULE_HARD_LINK, RULE_LABEL, RULE_LINK, RULE_NESTED, RULE_OPEN, RULE_OWNER, RULE_PERSON_LACKS,
     RULE_PROFILE, RULE_SIBLING, RULE_STALE, RULE_SYSTEM_LACKS, RULE_TOO_LARGE, RULE_WRITER,
@@ -49,7 +48,7 @@ use kr_boundary_windows::win::sd::descriptor_from_text;
 use kr_boundary_windows::win::walk::INSPECT;
 
 use common::disk::Disk;
-use common::people::{Boundary, Person, acting_as, prepare, runs_as_the_system};
+use common::people::{Person, Siblings, acting_as, prepare, runs_as_the_system};
 use common::project::{Project, repository_at};
 use common::{Scratch, file_described, hostile_file, privileged, run};
 
@@ -290,41 +289,6 @@ fn broker_admission_every_spelling_of_one_tree_gives_one_chain_and_one_slot() {
 // ---------------------------------------------------------------------------------------------
 // The rights of every object
 // ---------------------------------------------------------------------------------------------
-
-/// The two boundary accounts of a case, one for each class, and the manifest that records them.
-struct Siblings {
-    checkout: Boundary,
-    connect: Boundary,
-    manifest: Manifest,
-}
-
-impl Siblings {
-    fn new() -> Siblings {
-        let checkout = Boundary::new("krsca");
-        let connect = Boundary::new("krscn");
-        let mut manifest = Manifest::begin();
-        manifest.record(
-            ObjectKind::Account,
-            "krb-checkout",
-            Some(&checkout.sid.to_text().unwrap()),
-        );
-        manifest.record(
-            ObjectKind::Account,
-            "krb-connect",
-            Some(&connect.sid.to_text().unwrap()),
-        );
-        Siblings {
-            checkout,
-            connect,
-            manifest,
-        }
-    }
-
-    /// The probe tokens, made now: a group that an account joined before this call is in its token.
-    fn probes(&self) -> Probes {
-        Probes::new(&self.manifest).expect("the probe tokens are made")
-    }
-}
 
 /// Holds the project's tree and asks for its admission.
 fn admit_project(

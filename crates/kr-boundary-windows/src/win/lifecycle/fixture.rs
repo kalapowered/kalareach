@@ -1,7 +1,8 @@
-//! A fixed tree for the guest cases of the lifecycle: one project, one whole-tree lock, no held
-//! directories. It stands in for the tree's hold, its slot, its grant and its release, so that the
-//! phases and the ending function run for real on a machine before those modules exist. No
-//! production path uses it: it is built only with the `testing` feature.
+//! Trees for the guest cases of the lifecycle. [`FixtureTrees`] is a fixed tree: one project, one
+//! whole-tree lock, no held directories. [`HeldTrees`] holds the project the request names, admits
+//! it and takes its slot in the real table. Both stand in for the tree's grant and its release, so
+//! that the phases and the ending function run for real on a machine before those modules exist. No
+//! production path uses them: they are built only with the `testing` feature.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -14,8 +15,12 @@ use crate::journal::rows::{Label, ObjectKind, Row, Rule};
 use crate::lifecycle::{self as facts, Left};
 use crate::refusal::Refusal;
 
+use crate::slot::{SlotGuard, SlotTable};
+
+use super::super::admission::{Probes, admit};
 use super::super::client::ClientIdentity;
 use super::super::ffi::{Sid, locked};
+use super::super::hold::{TreeHold as Held, hold_tree};
 use super::super::root::PrivateRoot;
 use super::{Blocked, ChildPlan, EndCheck, Release, Slot, TreeHold, Trees};
 
@@ -291,5 +296,121 @@ impl Trees for FixtureTrees {
             }
         }
         Ok(Box::new(self.tree(to_release, Some(recorded))))
+    }
+}
+
+/// The projects as the broker serves them: the directory the request names is held, admitted
+/// against the boundary accounts and given its slot in the real table, so a request for a tree
+/// that an earlier end left closed is refused as the broker refuses it. The grant, the end check
+/// and the release do nothing: a case reads what the hold, the admission and the slot do.
+pub struct HeldTrees {
+    slots: SlotTable,
+    probes: Probes,
+    primary: Arc<Plan>,
+}
+
+impl HeldTrees {
+    /// Trees whose primary child is the program `primary` plans, admitted against `probes`.
+    #[must_use]
+    pub fn new(probes: Probes, primary: Plan) -> HeldTrees {
+        HeldTrees {
+            slots: SlotTable::new(),
+            probes,
+            primary: Arc::new(primary),
+        }
+    }
+}
+
+/// A project that [`HeldTrees`] resolved: its hold keeps the directories of the chain and the
+/// `config` open until the tree is let go.
+struct HeldTree {
+    hold: Held,
+    primary: Arc<Plan>,
+}
+
+impl TreeHold for HeldTree {
+    fn tree_path(&self) -> String {
+        self.hold.path.clone()
+    }
+
+    fn chain(&self) -> Vec<FileKey> {
+        self.hold.identity.chain.clone()
+    }
+
+    fn initial_snapshot(&self) -> Option<Row> {
+        None
+    }
+
+    fn grant(
+        &mut self,
+        _group: &Sid,
+        rows: &mut dyn FnMut(Row) -> Result<(), String>,
+    ) -> Result<(), Refusal> {
+        rows(Row::GrantComplete { count: 0 }).map_err(|why| facts::not_started(&why))
+    }
+
+    fn reader(&self, _root: &PrivateRoot) -> Result<Option<ChildPlan>, String> {
+        Ok(None)
+    }
+
+    fn child(&self, root: &PrivateRoot) -> Result<ChildPlan, String> {
+        (self.primary)(root)
+    }
+
+    fn pre_resume_check(&self) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn end_check(&mut self) -> Result<EndCheck, String> {
+        Ok(EndCheck::Same)
+    }
+
+    fn release(&mut self, _rows: &mut dyn FnMut(Row) -> Result<(), String>) -> Release {
+        Release::default()
+    }
+
+    fn close(self: Box<Self>) {}
+}
+
+struct HeldSlot(SlotGuard);
+
+impl Slot for HeldSlot {
+    fn free(self: Box<Self>) {
+        self.0.free_after_clean_release();
+    }
+
+    fn keep(self: Box<Self>, blocked: Blocked, hold: Option<Box<dyn TreeHold>>) {
+        let kept: Option<Box<dyn Send>> = hold.map(|tree| -> Box<dyn Send> { tree });
+        self.0.keep(blocked, kept);
+    }
+}
+
+impl Trees for HeldTrees {
+    fn resolve(
+        &self,
+        request: &OperateRequest,
+        client: &ClientIdentity,
+    ) -> Result<(Box<dyn TreeHold>, Box<dyn Slot>), Refusal> {
+        let hold = hold_tree(&request.directory, client)?;
+        admit(&hold, client, &self.probes)?;
+        let guard = self.slots.try_acquire(&hold.identity)?;
+        Ok((
+            Box::new(HeldTree {
+                hold,
+                primary: Arc::clone(&self.primary),
+            }),
+            Box::new(HeldSlot(guard)),
+        ))
+    }
+
+    fn reserve(&self, chain: &[FileKey], blocked: Blocked) -> Box<dyn Slot> {
+        let identity = crate::slot::TreeIdentity {
+            chain: chain.to_vec(),
+        };
+        Box::new(HeldSlot(self.slots.reserve(&identity, blocked)))
+    }
+
+    fn reopen(&self, _recorded: &Invocation) -> Result<Box<dyn TreeHold>, String> {
+        Err("a held tree is not reopened after a restart".to_owned())
     }
 }
