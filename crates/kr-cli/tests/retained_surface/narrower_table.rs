@@ -541,7 +541,7 @@ pub const NARROWER: &[Narrower] = &[
                         Item {
                             krate: "kr_client",
                             name: "Session::submit_composed",
-                            now: "b5ab18b349500774635cd9ed26228f8c924e5d35b291b8b64c2d4e5986162199",
+                            now: "5d43ccc7a188ecab2a32ad8b8c935b5bc919bf4d9f6f7bb04b86cacc14a7b364",
                             across: &[
                                 (
                                     "absent",
@@ -567,6 +567,25 @@ pub const NARROWER: &[Narrower] = &[
                                     "b5ab18b349500774635cd9ed26228f8c924e5d35b291b8b64c2d4e5986162199",
                                     "Submits a composed request as it was composed; the instance and the revision are those it was composed with.",
                                 ),
+                                (
+                                    "5d43ccc7a188ecab2a32ad8b8c935b5bc919bf4d9f6f7bb04b86cacc14a7b364",
+                                    "Submits a composed request as it was composed; the instance and the revision are those it was composed with.",
+                                ),
+                            ],
+                        },
+                        Item {
+                            krate: "kr_client",
+                            name: "Session::submit_written",
+                            now: "df871f8518425550c0bcc7cfdb287150103a7ad8ee18451c39726d0c18440380",
+                            across: &[
+                                (
+                                    "absent",
+                                    "The release has no item of this name, so nothing of it builds or carries a request.",
+                                ),
+                                (
+                                    "df871f8518425550c0bcc7cfdb287150103a7ad8ee18451c39726d0c18440380",
+                                    "Sends a composed request as it was composed and returns once the frame is written, with the future of the host's answer; the instance and the revision are those it was composed with.",
+                                ),
                             ],
                         },
                     ],
@@ -574,7 +593,7 @@ pub const NARROWER: &[Narrower] = &[
             },
             Sender {
                 class: "a device's mutation relayed by the daemon",
-                sends: "The daemon copies a device's decoded mutation to the worker's link and constructs none: it reads and changes neither the application instance nor the binding revision of the envelope, so a device's envelope reaches the worker as the device built it.",
+                sends: "When the daemon forwards one of these six methods, it copies the device's mutation without changing its parameters or target. It constructs no application target and changes neither the application instance nor the binding revision. It acts on them only for a prompt that names a draft: it refuses a draft written for another instance or revision than the parameters name.",
                 evidence: Evidence::Relays {
                     items: &[
                         Item {
@@ -628,7 +647,13 @@ pub const NARROWER: &[Narrower] = &[
                         Item {
                             krate: "kr_controller",
                             name: "RemoteConnection::proxied_mutation",
-                            now: "f8d3ed7f71784d2311f79d0b812aace9a5b683d22239d03ed6e1b6c3588e4e8a",
+                            now: "ab9446c67fdc7b7204e5e2f717f578d36eb0014d51e0796d6b658c6c21a8af5c",
+                            across: &[],
+                        },
+                        Item {
+                            krate: "kr_controller",
+                            name: "RemoteConnection::forwarded_mutation",
+                            now: "4b2fb38f808e1e6ae9bbde3a14e0bfc7b800d04ce5ca35f26292e85920ec4539",
                             across: &[],
                         },
                     ],
