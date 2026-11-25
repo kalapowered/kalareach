@@ -2,9 +2,10 @@
 //! signed-in agent with no account and no model: it signs in nowhere, answers three kinds of
 //! question from its own text, and keeps a conversation file of the shape the real agent keeps.
 //!
-//! It is started as the build list's command, placed under the command's name, with the arguments
-//! the build list gives the real agent. Flags that take a value are skipped; the first word after
-//! them is the subcommand: `resume <id>` or `fork <id>`, or none.
+//! It is started as the build list's command, with the arguments the build list gives the real
+//! agent: placed under the command's name for a native entry, and for a script or a wheel under the
+//! runtime's file name, with a script named for the command that names it. Flags that take a value
+//! are skipped; the first word after them is the subcommand: `resume <id>` or `fork <id>`, or none.
 //!
 //! - `--version` prints a version line.
 //! - It answers "What is A plus B" with the sum, "What code did I ask you to remember" with the
@@ -36,7 +37,13 @@
 //!   release prints the entry's newer version.
 //! - A script or a wheel is started through its runtime, which is this program, with the script as
 //!   its first argument; for those launches that argument is not taken for a command.
-//! - It shows the entry's first screen text and its composer text, and no sign-in screen.
+//! - It shows the entry's first screen text (the newer program shows the entry's newer first
+//!   screen text) and, where the entry has an account, its composer text, and no sign-in screen.
+//! - It shows the text of the entry's harmless key once it has read that key.
+//! - An entry with no account has no composer text and no record: the program shows the first
+//!   screen, answers prompts and keeps no conversation file.
+//! - It shows no approval dialog: the part whose staged case answers an approval on the terminal
+//!   stand-in adds it.
 //! - On a terminal it takes each key as it is typed and echoes it itself, as a full-screen agent
 //!   does: a part of a line that is typed and not sent is the agent's, and is not left in the
 //!   terminal when the agent ends.

@@ -11,6 +11,12 @@
 //! platforms stay the release's, so the host registers the actions the release declares, and the
 //! installation's grant is what the release asks for that the repository's ceiling does not
 //! already allow.
+//!
+//! The host recognises a by-hand launch by its running image alone, and the image of a launch of a
+//! script or a wheel is its runtime. No rule of a real package for such an agent recognises the
+//! runtime, so the host adopts no real by-hand launch of one until it adopts a by-hand launch that
+//! an interpreter runs. The stand-in is adopted through the second rule this package writes, so a
+//! pass of the stand-in for a script or a wheel is a test of the harness only.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};

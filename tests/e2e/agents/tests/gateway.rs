@@ -9,10 +9,13 @@
 //! generation with its integration's grant confirmed, as the published development generation will
 //! be once a record passes every part.
 //!
-//! One switch picks the agent, and every case runs either way:
+//! The environment picks the agent, and every case runs whichever it is:
 //!
-//! - Without `KR_AGENTS_GATEWAY_BUILD` the agent is the application stand-in
-//!   (`tests/support/codex-stand-in`) placed as `codex`. A case runs offline and spends no turn.
+//! - Without `KR_AGENTS_GATEWAY_BUILD` the agent is a stand-in, and a case runs offline and spends
+//!   no turn. With neither `KR_AGENTS_STAND_IN_ENTRY` nor `KR_AGENTS_STAND_IN_MANIFEST` it is the
+//!   application stand-in (`tests/support/codex-stand-in`) placed as `codex`. With both, naming a
+//!   build list entry and the manifest of a release of its package, it is the terminal stand-in
+//!   (`agent-stand-in`) made from that entry and placed as the entry is launched.
 //! - With it, naming a build list entry as the agents harness reads it, the agent is that entry's
 //!   pinned native executable, in a home of the run's own, with the entry's configuration directory
 //!   and its login variable. The command integration serves a launch that types the command alone,
@@ -290,7 +293,8 @@ fn executable_name(command: &str) -> String {
 
 /// The agent a run is given.
 enum Route {
-    /// The application stand-in, placed as `codex`: offline, no turn.
+    /// A stand-in: the application stand-in placed as `codex`, or the terminal stand-in made from a
+    /// build list entry and placed as the entry is launched. Offline, no turn.
     StandIn,
     /// The pinned native build of a build list entry, with its login.
     Real(Box<Real>),
@@ -4791,7 +4795,9 @@ fn run_case_for(
     );
 }
 
-/// The route label of an outcome's evidence.
+/// The route label of an outcome's evidence. The label of the stand-in route is the application
+/// stand-in's, whichever stand-in the route places: the part that records each outcome's subject
+/// gives the terminal stand-in its own.
 const fn route_label(real_route: bool) -> &'static str {
     if real_route {
         "the pinned build"
