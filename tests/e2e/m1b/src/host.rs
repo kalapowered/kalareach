@@ -2624,6 +2624,7 @@ mod shutdown_tests {
             owner: 1,
             mode: 0o600,
             target: None,
+            content: None,
         }
     }
 

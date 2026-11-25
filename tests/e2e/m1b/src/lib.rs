@@ -91,6 +91,8 @@ pub mod tree;
 pub mod view;
 #[cfg(all(unix, feature = "legs"))]
 pub mod window;
+#[cfg(all(unix, feature = "legs"))]
+pub mod worker;
 
 /// The variable naming the deployed origin the checkpoint runs against.
 pub const ORIGIN_VARIABLE: &str = "KR_M1B_ORIGIN";

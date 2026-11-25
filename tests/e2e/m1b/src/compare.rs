@@ -26,7 +26,8 @@ use std::path::{Path, PathBuf};
 
 use kr_ipc::paths::EnvironmentPaths;
 
-use crate::tree::{APPLICATION_ROOT, Change, Kind, PROGRAMS_ROOT, Record};
+use crate::tree::{APPLICATION_ROOT, Change, Kind, PROGRAMS_ROOT, Record, STATE_ROOT};
+use crate::worker::{self, Place};
 
 /// Where the host's directories are, relative to the run's directory.
 #[derive(Clone, Debug)]
@@ -41,6 +42,8 @@ pub struct Layout {
     pub application: PathBuf,
     /// The clock floor's file (utc-floor), relative to the run's directory.
     pub floor: PathBuf,
+    /// The state root of the host (s), where the conversation claims directory is.
+    pub state_root: PathBuf,
 }
 
 impl Layout {
@@ -62,6 +65,7 @@ impl Layout {
             programs: PathBuf::from(PROGRAMS_ROOT),
             application: PathBuf::from(APPLICATION_ROOT),
             floor: below(&environment.utc_floor_file()),
+            state_root: PathBuf::from(STATE_ROOT),
         }
     }
 }
@@ -432,17 +436,27 @@ impl std::fmt::Display for Refusal {
     }
 }
 
+/// What the compare found: the changes no row allows, and the notes the rows keep as evidence.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Compared {
+    /// The changes no row allows.
+    pub refusals: Vec<Refusal>,
+    /// What the rows allowed and keep as evidence.
+    pub notes: Vec<String>,
+}
+
 /// Compares the tree `now` with the record `base`, and returns each change that no row allows.
 ///
 /// `uid` is the account's: a new entry of a daemon row must be owned by it.
 #[must_use]
 pub fn compare(
     layout: &Layout,
+    place: Place<'_>,
     base: &Record,
     now: &Record,
     interval: Interval,
     uid: u32,
-) -> Vec<Refusal> {
+) -> Compared {
     let rows = daemon_rows(layout);
     let changes = base.changes_to(now);
     let mut by_path: BTreeMap<&Path, Vec<&Change>> = BTreeMap::new();
@@ -451,6 +465,9 @@ pub fn compare(
     }
     let mut refusals = Vec::new();
     for (path, changes) in by_path {
+        if worker::covers(layout, path) {
+            continue;
+        }
         let said = if path.starts_with(&layout.programs) {
             Some(
                 "the run's programs may not change: no name is added, and no program is changed, \
@@ -493,11 +510,16 @@ pub fn compare(
             });
         }
     }
-    refusals
+    let judged = worker::judge(layout, place, base, now, uid);
+    refusals.extend(judged.refusals);
+    Compared {
+        refusals,
+        notes: judged.notes,
+    }
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::os::unix::fs::PermissionsExt as _;
     use std::os::unix::net::UnixListener;
 
@@ -511,15 +533,15 @@ mod tests {
     const ATTEMPT: Interval = Interval::BeforeTheAttempt;
 
     /// A host's two roots in a run directory of this test's own, short enough for a socket.
-    struct World {
-        root: PathBuf,
-        pin: RootPin,
+    pub(crate) struct World {
+        pub(crate) root: PathBuf,
+        pub(crate) pin: RootPin,
         paths: HostPaths,
         environment: EnvironmentPaths,
-        layout: Layout,
+        pub(crate) layout: Layout,
     }
 
-    fn world(name: &str) -> World {
+    pub(crate) fn world(name: &str) -> World {
         let base = if cfg!(target_os = "macos") {
             PathBuf::from("/private/tmp")
         } else {
@@ -553,47 +575,62 @@ mod tests {
     }
 
     impl World {
-        fn state(&self, name: &str) -> PathBuf {
+        pub(crate) fn state(&self, name: &str) -> PathBuf {
             self.environment.state_dir().join(name)
         }
 
-        fn runtime(&self, name: &str) -> PathBuf {
+        pub(crate) fn runtime(&self, name: &str) -> PathBuf {
             self.environment.runtime_dir().join(name)
         }
 
         /// Writes an owner-only file at `path`, making its directories.
-        fn put(&self, path: &Path, bytes: &[u8]) {
+        pub(crate) fn put(&self, path: &Path, bytes: &[u8]) {
             std::fs::create_dir_all(path.parent().expect("a parent")).expect("a directory");
             std::fs::write(path, bytes).expect("a file");
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).expect("mode");
         }
 
-        fn record(&self) -> Record {
+        pub(crate) fn record(&self) -> Record {
             Record::of(&self.root, &self.pin, &["r", "s", "b"], &["h/.claude"]).expect("a record")
         }
 
         /// What the compare refuses between `before` and the tree now, one line each.
         fn refused(&self, before: &Record, interval: Interval) -> Vec<String> {
-            compare(
+            self.compared(before, interval).0
+        }
+
+        /// What the compare refuses and notes between `before` and the tree now, one line each.
+        pub(crate) fn compared(
+            &self,
+            before: &Record,
+            interval: Interval,
+        ) -> (Vec<String>, Vec<String>) {
+            let place = Place {
+                root: &self.root,
+                pin: &self.pin,
+            };
+            let compared = compare(
                 &self.layout,
+                place,
                 before,
                 &self.record(),
                 interval,
                 rustix::process::getuid().as_raw(),
+            );
+            (
+                compared.refusals.iter().map(ToString::to_string).collect(),
+                compared.notes,
             )
-            .iter()
-            .map(ToString::to_string)
-            .collect()
         }
 
         /// Puts another object, with the same bytes or others, in the place of the file at `path`.
-        fn replace(&self, path: &Path, bytes: &[u8]) {
+        pub(crate) fn replace(&self, path: &Path, bytes: &[u8]) {
             let staging = path.with_extension("replacing");
             self.put(&staging, bytes);
             std::fs::rename(&staging, path).expect("renamed over");
         }
 
-        fn clean(self) {
+        pub(crate) fn clean(self) {
             std::fs::remove_dir_all(&self.root).expect("clean up");
         }
     }

@@ -43,6 +43,9 @@ pub const REQUIRED_ROOTS: [&str; 3] = [RUNTIME_ROOT, STATE_ROOT, PROGRAMS_ROOT];
 /// The roots a record holds where they are there.
 pub const OPTIONAL_ROOTS: [&str; 1] = [APPLICATION_ROOT];
 
+/// The most bytes of a file that the record keeps beside its digest.
+const SMALL: usize = 64;
+
 /// The kind of an entry, as the walk tells them apart.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
@@ -89,6 +92,8 @@ pub struct Entry {
     pub mode: RawMode,
     /// Where a link points.
     pub target: Option<PathBuf>,
+    /// The bytes of a file of at most 64 bytes.
+    pub content: Option<Vec<u8>>,
 }
 
 impl Entry {
@@ -413,6 +418,7 @@ fn entry_of(
         owner: looked.st_uid,
         mode: looked.st_mode & 0o7777,
         target,
+        content: None,
     }
 }
 
@@ -542,10 +548,13 @@ fn walk(
                 entry_of(&looked, Kind::Directory, 0, None, None)
             }
             FileType::RegularFile => {
-                let Some((size, digest)) = read_file(directory, name, &looked, &path)? else {
+                let Some((size, digest, content)) = read_file(directory, name, &looked, &path)?
+                else {
                     continue;
                 };
-                entry_of(&looked, Kind::File, size, Some(digest), None)
+                let mut entry = entry_of(&looked, Kind::File, size, Some(digest), None);
+                entry.content = content;
+                entry
             }
             FileType::Symlink => {
                 let target = match rustix::fs::readlinkat(directory, name, Vec::new()) {
@@ -565,15 +574,44 @@ fn walk(
     Ok(())
 }
 
-/// The size and the digest of the regular file `name` in `directory`, opened with no link followed
-/// and no wait for a writer, and checked to be the file `looked` described; `None` where it is
-/// removed before it is opened.
+/// The digest of the first `length` bytes of the regular file `relative` below the run's directory
+/// `root`, opened through the run's handles; `None` where the file holds fewer bytes.
+///
+/// # Errors
+///
+/// Returns why the file cannot be read.
+pub fn prefix_digest(
+    root: &Path,
+    pin: &RootPin,
+    relative: &Path,
+    length: u64,
+) -> Result<Option<[u8; 32]>, String> {
+    use std::os::unix::fs::FileExt as _;
+    let said =
+        |why: &dyn std::fmt::Display| format!("{} cannot be read: {why}", relative.display());
+    let file = crate::run::open_file_below(root, pin, relative)
+        .map_err(|why| said(&why))?
+        .ok_or_else(|| said(&"it is gone"))?;
+    let mut bytes = vec![0_u8; usize::try_from(length).map_err(|why| said(&why))?];
+    match std::fs::File::from(file).read_exact_at(&mut bytes, 0) {
+        Ok(()) => Ok(Some(kr_cbor::sha256(&bytes))),
+        Err(why) if why.kind() == std::io::ErrorKind::UnexpectedEof => Ok(None),
+        Err(why) => Err(said(&why)),
+    }
+}
+
+/// What a read of a file gives: its size, its digest and, for a small file, its bytes.
+type FileRead = (u64, [u8; 32], Option<Vec<u8>>);
+
+/// The size, the digest and, for a small file, the bytes of the regular file `name` in `directory`,
+/// opened with no link followed and no wait for a writer, and checked to be the file `looked`
+/// described; `None` where it is removed before it is opened.
 fn read_file(
     directory: &OwnedFd,
     name: &std::ffi::CStr,
     looked: &rustix::fs::Stat,
     path: &Path,
-) -> Result<Option<(u64, [u8; 32])>, String> {
+) -> Result<Option<FileRead>, String> {
     let file = match rustix::fs::openat(
         directory,
         name,
@@ -598,9 +636,11 @@ fn read_file(
     std::fs::File::from(file)
         .read_to_end(&mut bytes)
         .map_err(|error| format!("{} cannot be read: {error}", path.display()))?;
+    let content = (bytes.len() <= SMALL).then(|| bytes.clone());
     Ok(Some((
         u64::try_from(bytes.len()).unwrap_or(u64::MAX),
         kr_cbor::sha256(&bytes),
+        content,
     )))
 }
 
@@ -648,6 +688,7 @@ mod tests {
             owner: 501,
             mode: 0o600,
             target: None,
+            content: None,
         };
         let link = Entry {
             kind: Kind::Link,
@@ -658,6 +699,7 @@ mod tests {
             owner: 501,
             mode: 0o777,
             target: Some(PathBuf::from("/etc")),
+            content: None,
         };
         let path = || PathBuf::from("s/x");
         let said = |change: Change| change.to_string();
@@ -1014,6 +1056,29 @@ mod tests {
         std::os::unix::fs::symlink(root.join("s"), root.join("h")).expect("a link at a component");
         let why = Record::of(&root, &pin, &["r", "s"], &["h/.app"]).expect_err("a link");
         assert!(why.contains("h is not a directory of the run"), "{why}");
+        clean(&root);
+    }
+
+    /// A small file keeps its bytes in the record and a larger one does not; the digest of a prefix
+    /// is read through the pin, none for a file that is shorter, and a link is refused.
+    #[test]
+    fn a_small_file_keeps_its_bytes_and_a_prefix_is_read_through_the_pin() {
+        let (root, pin) = run_directory("prefix");
+        write(&root.join("s/small"), b"12345");
+        write(&root.join("s/large"), &[7_u8; 65]);
+        let held = record(&root, &pin);
+        let content = |path: &str| {
+            held.get(Path::new(path))
+                .and_then(|entry| entry.content.clone())
+        };
+        assert_eq!(content("s/small"), Some(b"12345".to_vec()));
+        assert_eq!(content("s/large"), None);
+        let digest = |length: u64| prefix_digest(&root, &pin, Path::new("s/small"), length);
+        assert_eq!(digest(3), Ok(Some(kr_cbor::sha256(b"123"))));
+        assert_eq!(digest(5), Ok(Some(kr_cbor::sha256(b"12345"))));
+        assert_eq!(digest(6), Ok(None));
+        std::os::unix::fs::symlink(root.join("s/small"), root.join("s/link")).expect("a link");
+        assert!(prefix_digest(&root, &pin, Path::new("s/link"), 3).is_err());
         clean(&root);
     }
 
