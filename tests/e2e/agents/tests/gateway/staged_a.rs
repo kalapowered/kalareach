@@ -75,11 +75,7 @@ fn by_hand_case(
 
 /// The actions of the package the host installed for `subject`, as its manifest declares them.
 pub(super) fn package_actions(subject: &Subject, environment: &EnvironmentPaths) -> Vec<Action> {
-    let manifest: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(super::package::installed(subject, environment).join("plugin.json"))
-            .expect("the package's manifest"),
-    )
-    .expect("a manifest");
+    let manifest = super::package::installed_manifest(subject, environment);
     serde_json::from_value(manifest["actions"].clone()).expect("the package's actions")
 }
 

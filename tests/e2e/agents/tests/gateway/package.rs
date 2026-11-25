@@ -12,12 +12,14 @@
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use kr_e2e_agents::build::Build;
 use kr_e2e_agents::detect::check_detected;
 use kr_e2e_agents::subject::Subject;
 use kr_ipc::paths::{EnvironmentPaths, HostPaths};
-use kr_plugin_catalogue::CatalogueError;
+use kr_plugin_catalogue::transport::RepositoryTransport;
+use kr_plugin_catalogue::{Catalogue, CatalogueError, Installation};
 use kr_plugin_sdk::capability::PluginCapability;
 use kr_plugin_sdk::digest::PayloadDigest;
 use kr_plugin_sdk::ids::PluginName;
@@ -139,21 +141,71 @@ pub fn written_place(environment: &EnvironmentPaths) -> PathBuf {
     super::generation_source(environment).join("package")
 }
 
-/// The directory of the package the host installed for `subject`: the one written from its release,
-/// or else the package this crate keeps.
+/// The manifest of the package the host installed for `subject` in `environment`, as the
+/// environment's catalogue holds it, in the bytes the installation's digest names.
 ///
 /// # Panics
 ///
-/// Panics where the subject has no package.
-pub fn installed(subject: &Subject, environment: &EnvironmentPaths) -> PathBuf {
-    if subject.selected_release().is_some() {
-        written_place(environment)
-    } else {
-        subject
-            .package()
-            .expect("the subject's package")
-            .to_path_buf()
-    }
+/// Panics where the environment's catalogue holds no installation of the subject's package, or
+/// holds a manifest of other bytes than its digest names.
+pub fn installed_manifest(subject: &Subject, environment: &EnvironmentPaths) -> serde_json::Value {
+    let plugin = subject.plugin();
+    let (catalogue, installation) = installation_of(subject, environment);
+    let bytes = catalogue
+        .store_of(&installation)
+        .installed_manifest(installation.package_digest)
+        .unwrap_or_else(|why| panic!("the manifest of the installed package {plugin}: {why}"))
+        .unwrap_or_else(|| {
+            panic!(
+                "the manifest of the installed package {plugin} is not the digest {} the installation names",
+                installation.package_digest
+            )
+        });
+    serde_json::from_slice(&bytes)
+        .unwrap_or_else(|why| panic!("the manifest of the installed package {plugin}: {why}"))
+}
+
+/// The installation of the package of `subject` in `environment`, with the catalogue that holds it.
+///
+/// # Panics
+///
+/// Panics where the environment's catalogue cannot be read or holds no installation of the package.
+fn installation_of(subject: &Subject, environment: &EnvironmentPaths) -> (Catalogue, Installation) {
+    let plugin = subject.plugin();
+    let catalogue = Catalogue::open(
+        &environment.state_dir().join("catalogue"),
+        Arc::new(RepositoryTransport::local_only(
+            "this test reads its catalogue from disk",
+        )),
+    )
+    .unwrap_or_else(|why| {
+        panic!(
+            "the catalogue of the environment {}: {why}",
+            environment.environment_id()
+        )
+    });
+    let installation = catalogue
+        .installation(environment.environment_id(), &plugin)
+        .unwrap_or_else(|why| panic!("the installation of {plugin}: {why}"))
+        .unwrap_or_else(|| {
+            panic!(
+                "the host installed no package {plugin} in the environment {}",
+                environment.environment_id()
+            )
+        });
+    (catalogue, installation)
+}
+
+/// The directory the environment's catalogue holds the package the host installed for `subject` in.
+///
+/// # Panics
+///
+/// Panics where the environment's catalogue holds no installation of the subject's package.
+pub fn installed_directory(subject: &Subject, environment: &EnvironmentPaths) -> PathBuf {
+    let (catalogue, installation) = installation_of(subject, environment);
+    catalogue
+        .store_of(&installation)
+        .package_dir(installation.package_digest)
 }
 
 /// What a synthetic release declares, for the cases that write a package from one.
@@ -555,26 +607,42 @@ fn installs(
     grant: &[PluginCapability],
     attempt: &str,
 ) -> Result<PayloadDigest, CatalogueError> {
+    install_in(
+        &base.join(format!("state-{attempt}")),
+        EnvironmentId::new(kr_ipc::new_uuid()),
+        &base.join(format!("generation-{attempt}")),
+        (directory, manifest),
+        grant,
+    )
+}
+
+/// Installs the package written into `directory`, whose manifest is `manifest`, with `grant`, in
+/// `environment` of the catalogue below `state`, from a generation built in `home`.
+fn install_in(
+    state: &Path,
+    environment: EnvironmentId,
+    home: &Path,
+    (directory, manifest): (&Path, &PluginManifest),
+    grant: &[PluginCapability],
+) -> Result<PayloadDigest, CatalogueError> {
     let runtime = super::runtime();
-    let home = base.join(format!("generation-{attempt}"));
-    std::fs::create_dir_all(&home).expect("a directory for the generation");
+    std::fs::create_dir_all(home).expect("a directory for the generation");
     let generation = runtime.block_on(generations::Generation::build(
-        &home,
+        home,
         generations::GenerationSpec {
             package: Some(directory.to_path_buf()),
             ..generations::GenerationSpec::default()
         },
     ));
-    let state = base.join(format!("state-{attempt}"));
-    std::fs::create_dir_all(&state).expect("a directory for the catalogue");
+    std::fs::create_dir_all(state).expect("a directory for the catalogue");
     let plugin = PluginId::new(format!(
         "{}/{}",
         manifest.publisher_id, manifest.plugin_name
     ))
     .expect("a plugin identifier");
     runtime.block_on(super::install_published(
-        &state,
-        EnvironmentId::new(kr_ipc::new_uuid()),
+        state,
+        environment,
         (
             generations::directory_url(&generation.metadata_dir()),
             generations::directory_url(&generation.targets_dir()),
@@ -711,12 +779,13 @@ fn the_actions_of_a_subject_made_from_a_release_are_the_releases_own() {
         let base = scratch("actions");
         let subject = selected_subject(&base.join("release"), plugin, command, shape);
         let environment = environment_in(&base);
-        write(
+        let written = write(
             &subject,
             &base.join("release"),
             &written_place(&environment),
         )
         .unwrap_or_else(|why| panic!("{plugin}: {why}"));
+        install_written(&environment, &base, &written);
         let released: PluginManifest = serde_json::from_slice(
             &std::fs::read(base.join("release").join(MANIFEST_FILE)).expect("the release"),
         )
@@ -758,6 +827,7 @@ fn the_actions_the_staged_parts_read_are_those_of_the_written_package_whatever_i
             &written_place(&environment),
         )
         .unwrap_or_else(|why| panic!("{plugin}: {why}"));
+        install_written(&environment, &base, &written);
         let kept: Vec<String> = written
             .actions
             .iter()
@@ -783,6 +853,164 @@ fn the_actions_the_staged_parts_read_are_those_of_the_written_package_whatever_i
         );
         let _ = std::fs::remove_dir_all(&base);
     }
+}
+
+/// Installs the package written into the place of `environment`, whose manifest is `manifest`, in
+/// `environment`, with the grant its own manifest asks for, from a generation built below `base`.
+fn install_written(environment: &EnvironmentPaths, base: &Path, manifest: &PluginManifest) {
+    install_in(
+        environment.state_dir(),
+        environment.environment_id(),
+        &base.join("generation-installed"),
+        (&written_place(environment), manifest),
+        &grant_of(manifest),
+    )
+    .unwrap_or_else(|why| panic!("the install of {}: {why}", manifest.plugin_name));
+}
+
+/// The actions of the package the host installed are what the two staged parts read where the
+/// package this crate keeps for the Codex subject declares others.
+#[test]
+fn the_staged_parts_read_the_actions_of_the_installed_package_where_the_kept_one_declares_others() {
+    let base = scratch("installed-codex");
+    let subject = Subject::codex();
+    let kept: PluginManifest = serde_json::from_slice(
+        &std::fs::read(
+            subject
+                .package()
+                .expect("the package this crate keeps")
+                .join(MANIFEST_FILE),
+        )
+        .expect("the kept package's manifest"),
+    )
+    .expect("a manifest");
+    let environment = environment_in(&base);
+    super::generations::copy_tree(
+        subject.package().expect("the package this crate keeps"),
+        &written_place(&environment),
+    );
+    let path = written_place(&environment).join(MANIFEST_FILE);
+    let mut json: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).expect("the copied manifest"))
+            .expect("a manifest");
+    // The presentation invokes each of the three actions, so the installed package declares a
+    // fourth, which no node of it invokes.
+    let mut added = json["actions"][1].clone();
+    added["id"] = serde_json::json!("thread.reload");
+    added["label"] = serde_json::json!("Refresh again");
+    json["actions"].as_array_mut().expect("actions").push(added);
+    std::fs::write(&path, serde_json::to_vec_pretty(&json).expect("a manifest"))
+        .expect("the changed manifest");
+    let installed: PluginManifest =
+        serde_json::from_slice(&std::fs::read(&path).expect("the changed manifest"))
+            .expect("a manifest");
+    let (kept_ids, installed_ids) = (manifest_actions(&kept), manifest_actions(&installed));
+    assert_ne!(
+        kept_ids, installed_ids,
+        "the case needs a kept and an installed package that declare different actions"
+    );
+    install_written(&environment, &base, &installed);
+    assert_eq!(
+        action_ids(super::staged_a::package_actions(&subject, &environment)),
+        installed_ids,
+        "staged A does not read the installed package's actions"
+    );
+    assert_eq!(
+        action_ids(super::staged_c::package_actions(&subject, &environment)),
+        installed_ids,
+        "staged C does not read the installed package's actions"
+    );
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// The identifiers of the actions `manifest` declares, in order.
+fn manifest_actions(manifest: &PluginManifest) -> Vec<String> {
+    manifest
+        .actions
+        .iter()
+        .map(|action| action.id.to_string())
+        .collect()
+}
+
+/// The actions the two staged parts read for an entry of another package than Codex's, which a real
+/// route makes from its build list and which keeps no package of its own, are those of the package
+/// the host installed.
+#[test]
+fn the_staged_parts_read_the_actions_of_the_installed_package_for_an_entry_that_keeps_none() {
+    for (plugin, command, shape) in SYNTHETIC {
+        let base = scratch("installed-entry");
+        let subject = subject_of(&base.join("release"), plugin, command, shape);
+        let environment = environment_in(&base);
+        let written = write(
+            &subject,
+            &base.join("release"),
+            &written_place(&environment),
+        )
+        .unwrap_or_else(|why| panic!("{plugin}: {why}"));
+        install_written(&environment, &base, &written);
+        let installed = manifest_actions(&written);
+        assert_eq!(
+            read_by(&subject, &environment, super::staged_a::package_actions),
+            Ok(installed.clone()),
+            "{plugin}: staged A"
+        );
+        assert_eq!(
+            read_by(&subject, &environment, super::staged_c::package_actions),
+            Ok(installed),
+            "{plugin}: staged C"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+}
+
+/// What a staged part reads of the package the host installed: its actions.
+type Reader = fn(&Subject, &EnvironmentPaths) -> Vec<kr_e2e_agents::build::Action>;
+
+/// The identifiers of the actions that `reader` reads for `subject` in `environment`, or the words
+/// of the panic that ended the read.
+fn read_by(
+    subject: &Subject,
+    environment: &EnvironmentPaths,
+    reader: Reader,
+) -> Result<Vec<String>, String> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        action_ids(reader(subject, environment))
+    }))
+    .map_err(|panic| kr_e2e_agents::held::panic_text(&*panic))
+}
+
+/// A manifest that the catalogue holds in other bytes than its installation names is not read: the
+/// staged parts refuse it, naming the package.
+#[test]
+fn the_staged_parts_refuse_a_manifest_that_is_not_the_digest_the_installation_names() {
+    let (plugin, command, shape) = SYNTHETIC[1];
+    let base = scratch("installed-digest");
+    let subject = subject_of(&base.join("release"), plugin, command, shape);
+    let environment = environment_in(&base);
+    let written = write(
+        &subject,
+        &base.join("release"),
+        &written_place(&environment),
+    )
+    .unwrap_or_else(|why| panic!("{plugin}: {why}"));
+    install_written(&environment, &base, &written);
+    let held = installed_directory(&subject, &environment).join(MANIFEST_FILE);
+    let mut bytes = std::fs::read(&held).expect("the manifest the catalogue holds");
+    bytes.extend_from_slice(b" ");
+    std::fs::remove_file(&held).expect("the manifest the catalogue holds");
+    std::fs::write(&held, bytes).expect("the changed manifest");
+    let readers: [(&str, Reader); 2] = [
+        ("A", super::staged_a::package_actions),
+        ("C", super::staged_c::package_actions),
+    ];
+    for (part, reader) in readers {
+        let refused = read_by(&subject, &environment, reader);
+        assert!(
+            matches!(&refused, Err(why) if why.contains("digest") && why.contains(plugin)),
+            "staged {part} did not refuse a manifest of other bytes than the installation names: {refused:?}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&base);
 }
 
 /// The entry and the generation a run names for the real-package check, given the values of the
