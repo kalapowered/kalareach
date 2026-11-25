@@ -8122,7 +8122,8 @@ fn gateway_an_agent_that_rewrote_the_hosts_state_is_not_obeyed_when_the_host_is_
 /// whether the case's program ever ran. The first start is the control: it went through the same
 /// check over the files as they were placed. The agent is Codex's application stand-in where
 /// `subject` is none; where it is some, it is the terminal stand-in made from that entry, started
-/// by hand, which runs the program when it reads the first prompt the case types.
+/// by hand, which runs the program when it reads the first prompt the case types, and which is
+/// ended by its identity before the second start.
 fn an_agent_replaces_a_placed_file_and_is_started_again(
     subject: Option<Subject>,
     replaced: &str,
@@ -8164,7 +8165,9 @@ fn an_agent_replaces_a_placed_file_and_is_started_again(
 /// case's program ever ran. The first start is the control: it went through the same checks over
 /// the run as it was placed. The agent is Codex's application stand-in where `subject` is none;
 /// where it is some, it is the terminal stand-in made from that entry, started by hand, which runs
-/// the program when it reads the first prompt the case types.
+/// the program when it reads the first prompt the case types. That stand-in is ended by the
+/// identity recorded when it started before the second start, so the line typed then reaches the
+/// shell and not its composer.
 fn an_agent_leaves_a_change_and_is_started_again(
     subject: Option<Subject>,
     forge: bool,
@@ -8230,10 +8233,38 @@ fn an_agent_leaves_a_change_and_is_started_again(
         None => session.starts_the_agent(&[], not, &[]),
     };
     let first = start(None);
+    // The terminal stand-in runs from the file the case changes, so it is known by the identity
+    // recorded now, while that file is as it was placed.
+    let stand_in = ctx
+        .subject
+        .entry()
+        .map(|_| staged_a::HandAgent::running(&ctx, &session, &ctx.executable));
     if let Some(build) = ctx.subject.entry() {
         session.person.types(&build.harmless.input);
     }
     changed(&ctx, &scratch);
+    if let (Some(stand_in), Some(build)) = (&stand_in, ctx.subject.entry()) {
+        // The first stand-in still runs and would read the line the second start types at its
+        // composer: it is ended by its identity, and the shell shows none of its text before that
+        // line is typed.
+        stand_in.ends();
+        session.person.clears_the_screen();
+        let ended = Instant::now();
+        while session
+            .person
+            .window
+            .screen()
+            .iter()
+            .any(|row| row.contains(&build.ready))
+        {
+            assert!(
+                ended.elapsed() < LIVENESS,
+                "the shell still shows the first stand-in's text {:?} after {LIVENESS:?}",
+                build.ready
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
     let second = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| start(Some(first))));
     let said = match second {
         Ok(_) => "the second start went through".to_owned(),
@@ -8294,7 +8325,7 @@ fn gateway_a_stand_in_the_agent_replaced_is_not_run_by_the_next_start() {
         }
         assert!(
             said.contains(ISOLATION_UNPROVEN) && said.contains("symbolic link"),
-            "{place}: the next start was refused as a replaced file: {said}"
+            "{place}: the next start was refused as a replaced file (the replacement ran: {ran}): {said}"
         );
         assert!(!ran, "{place}: the program the replaced file names ran");
         true
@@ -8313,6 +8344,33 @@ fn gateway_a_stand_in_the_agent_replaced_is_not_run_by_the_next_start() {
         {
             not_run(Some(subject.clone()), &format!("t/{name}"));
         }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+}
+
+/// The control of the case above: a stand-in made from each synthetic entry that replaced nothing is
+/// ended by its identity and started again in the same shell, so the second start goes through and
+/// no program of the case runs. The path the case above uses can start a stand-in again.
+#[test]
+fn a_stand_in_ended_by_its_identity_is_started_again_in_the_same_shell_for_each_entry() {
+    for synthetic in stand_in::synthetic() {
+        let base = stand_in::scratch("restarted");
+        let subject = stand_in::subject_for(&synthetic, &base);
+        let (said, ran) = an_agent_leaves_a_change_and_is_started_again(
+            Some(subject),
+            false,
+            &|_, _, _| "#!/bin/sh\n".to_owned(),
+            &|_, _| {},
+        );
+        if said.is_empty() {
+            return;
+        }
+        assert_eq!(
+            said, "the second start went through",
+            "{}: the stand-in ended by its identity is started again",
+            synthetic.name
+        );
+        assert!(!ran, "{}: no program of the case ran", synthetic.name);
         let _ = std::fs::remove_dir_all(&base);
     }
 }
