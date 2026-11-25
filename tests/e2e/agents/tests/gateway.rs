@@ -9006,8 +9006,14 @@ fn a_cut_row_does_not_adopt_a_probe_that_is_refused_for_another_reason() {
     };
     let record = record_of(&probe, &text, &not_kept, whole);
     assert_eq!(
-        record["cut_rows"][0]["read_whole_in"],
-        serde_json::Value::Null
+        record["cut_rows"],
+        serde_json::json!([{
+            "line": 2,
+            "characters": 3_995,
+            "cut_to": RECORDED_ROW_CHARS,
+            "read_whole_in": null,
+        }]),
+        "{record}"
     );
     assert_eq!(record["adoptable"], false, "{record}");
 
@@ -9034,10 +9040,24 @@ fn a_cut_row_does_not_adopt_a_probe_that_is_refused_for_another_reason() {
         "the sandbox is read-only\n".repeat(RECORDED_ROWS)
     );
     let record = record_of(&probe, &many, &kept, whole);
-    assert_eq!(record["truncated"], true);
+    assert_eq!(
+        record["truncated_because"],
+        serde_json::json!([
+            "a row of 3995 characters was cut to 240",
+            "more than 400 relevant rows"
+        ]),
+        "{record}"
+    );
     assert_eq!(record["adoptable"], false, "{record}");
+    // The bound leaves no room for the long row: no row is kept and none is reported as cut.
     let record = record_of(&probe, &text, &kept, RECORDED_ROW_CHARS - 1);
-    assert_eq!(record["truncated"], true);
+    assert_eq!(record["relevant_rows"], serde_json::json!([]), "{record}");
+    assert_eq!(record["cut_rows"], serde_json::json!([]), "{record}");
+    assert_eq!(
+        record["truncated_because"],
+        serde_json::json!(["the bound for all the probes' rows together was reached"]),
+        "{record}"
+    );
     assert_eq!(record["adoptable"], false, "{record}");
 
     // The feature list with a row left out, and the same list with none.
@@ -9059,9 +9079,10 @@ fn a_cut_row_does_not_adopt_a_probe_that_is_refused_for_another_reason() {
     assert_eq!(record["truncated"], true);
     assert_eq!(record["adoptable"], false, "{record}");
 
-    // A probe that gave no answer is named in the verdict.
+    // A probe that gave no answer is named in the verdict by its own arguments, not by the
+    // adopted probe's.
     let silent = serde_json::json!({
-        "arguments": ["debug", "prompt-input"],
+        "arguments": ["features", "list"],
         "answered": false,
         "why": "it did not start",
         "adoptable": false,
@@ -9070,7 +9091,7 @@ fn a_cut_row_does_not_adopt_a_probe_that_is_refused_for_another_reason() {
         adoption_of(&[record_of(&probe, &text, &kept, whole), silent]),
         serde_json::json!({
             "allowed": false,
-            "refused_because": ["probe [\"debug\",\"prompt-input\"]: evidence incomplete"],
+            "refused_because": ["probe [\"features\",\"list\"]: evidence incomplete"],
         })
     );
 }
