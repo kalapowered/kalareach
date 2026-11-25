@@ -3265,7 +3265,8 @@ mod shutdown_tests {
     /// row covers although the refusal does not say so; a journal that cannot be copied or read is a
     /// failed look; a change of the clock floor's bytes is the clock floor's. None of them says "no
     /// row of the live daemon's files covers this entry", which is all that a text check of the
-    /// lines would have found.
+    /// lines would have found. The list of gaps that the whole process keeps, which the survey test
+    /// reads, holds each gap that the host shows.
     #[test]
     fn the_survey_names_the_class_of_each_refusal_it_shows() {
         let root = scratch("survey-classes");
@@ -3313,6 +3314,13 @@ mod shutdown_tests {
             assert!(
                 refused_as(&gaps, class, text),
                 "{class} ({text}): {gaps:#?}"
+            );
+        }
+        let shown = survey_gaps();
+        for gap in &gaps {
+            assert!(
+                shown.contains(gap),
+                "the process's list of gaps lacks {gap:?}: {shown:#?}"
             );
         }
         let lines = surveyed_by(&host);
