@@ -1,11 +1,11 @@
 //! What a build list entry gives, what it lacks, and what a real start of it refuses.
 //!
 //! A case reads fields of its entry. A field the entry lists in `missing` is missing, and a case
-//! that reads it stops: it is never read as empty. [`check`] names, for each case, the fields it
-//! reads that the entry lacks, and says whose gap each is. It lists what a real start of the entry
-//! refuses: an entry with no isolation contract, an entry of a package other than Codex's with no
-//! `missing` member, an entry with an account and no `turn_line`, and a build the entry does not
-//! name or digest.
+//! that reads it stops where [`NEEDS`] names the case for that field: it is never read as empty.
+//! [`check`] names, for each case, the fields it reads that the entry lacks, and says whose gap
+//! each is. It lists what a real start of the entry refuses: an entry with no isolation contract, an
+//! entry of a package other than Codex's with no `missing` member, an entry with an account and no
+//! `turn_line`, and a build the entry does not name or digest.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -158,32 +158,43 @@ pub const HARNESS_VALUES: [(&str, &str, &str, &str); 6] = [
     ),
 ];
 
-/// The fields each case reads, by the case's name: the parts of the qualification, and the thread
-/// case of the gateway, which only Codex's entry fills. `account.draft` is read by every case that
-/// starts the agent with the person's login: parts 1, 3 and 4 through the gateway, and 2a, 7 and 7f
-/// by hand. `account.turn_line` is also read by every real case of an entry with an account.
-const NEEDS: [(&str, &[&str]); 10] = [
+/// The fields each case reads, by the case's name: the parts of the qualification, and the cases of
+/// the gateway (`gateway-3` is the thread case, which only Codex's entry fills). `account.draft` is
+/// read by every case that starts the agent with the person's login: parts 1, 2a, 3, 4, 6b, 7 and
+/// 7f, and the gateway cases `gateway-1` to `gateway-5`. The probe-only run of 6b starts no agent
+/// and does not read it. `account.turn_line` is also read by every real case of an entry with an
+/// account.
+const NEEDS: [(&str, &[&str]); 14] = [
     ("1", &["account.image_line", "account.draft"]),
     ("2a", &["account.draft"]),
     ("3", &["account.draft"]),
     ("4", &["account.turn_line", "account.draft"]),
     ("6a", &["newer.isolated"]),
-    ("6b", &["newer.isolated"]),
+    ("6b", &["newer.isolated", "account.draft"]),
     ("7", &["account.draft", "account.resume_refused"]),
     (
         "7f",
         &["account.draft", "account.resume_refused", "account.fork"],
     ),
+    ("gateway-1", &["account.draft"]),
+    ("gateway-2", &["account.draft"]),
     (
         "gateway-3",
         &[
+            "account.draft",
             "account.commands.fork",
             "account.commands.new",
             "account.commands.quit",
         ],
     ),
+    ("gateway-4", &["account.draft"]),
+    ("gateway-5", &["account.draft"]),
     ("14.03a", &["composer"]),
 ];
+
+/// The fields the probe-only run does not read: it produces `newer.isolated`, and it starts no
+/// agent, so it reads no start draft.
+const PROBE_ONLY_SKIPS: [&str; 2] = ["newer.isolated", "account.draft"];
 
 /// The keys of `missing` that the isolation contract reads and no part does.
 const ISOLATION_KEYS: [&str; 1] = ["isolation.startup"];
@@ -408,7 +419,7 @@ pub fn check(build: &Build) -> Report {
 /// Why the case `case` has nothing to read on `build`: it reads fields that the entry lists as
 /// missing, and a missing field is never read as empty. Names each field with the entry's reason;
 /// none where the case reads no field the entry lists; the probe-only run, which produces
-/// `newer.isolated`, is not stopped for that field.
+/// `newer.isolated` and starts no agent, is not stopped for that field or for `account.draft`.
 #[must_use]
 pub fn missing_for(build: &Build, case: &str, probe_only: bool) -> Option<String> {
     let missing = build.missing.as_ref()?;
@@ -416,7 +427,7 @@ pub fn missing_for(build: &Build, case: &str, probe_only: bool) -> Option<String
         .iter()
         .filter(|(part, _)| *part == case)
         .flat_map(|(_, fields)| fields.iter())
-        .filter(|field| !(probe_only && **field == "newer.isolated"))
+        .filter(|field| !(probe_only && PROBE_ONLY_SKIPS.contains(*field)))
         .filter_map(|field| {
             missing
                 .get(*field)
@@ -497,9 +508,14 @@ mod tests {
             ("2a", "account", ProductGap),
             ("3", "account", ProductGap),
             ("4", "account", ProductGap),
+            ("6b", "account", ProductGap),
             ("7", "account", ProductGap),
             ("7f", "account", ProductGap),
+            ("gateway-1", "account", ProductGap),
+            ("gateway-2", "account", ProductGap),
             ("gateway-3", "account", ProductGap),
+            ("gateway-4", "account", ProductGap),
+            ("gateway-5", "account", ProductGap),
         ];
         let upgrade = [
             ("6a", "newer.isolated", EntryField),
@@ -542,11 +558,17 @@ mod tests {
                 ("2a", "account.draft", EntryField),
                 ("3", "account.draft", EntryField),
                 ("4", "account.draft", EntryField),
+                ("6b", "account.draft", EntryField),
                 ("7", "account.draft", EntryField),
                 ("7", "account.resume_refused", EntryField),
                 ("7f", "account.draft", EntryField),
                 ("7f", "account.resume_refused", EntryField),
                 ("7f", "account.fork", EntryField),
+                ("gateway-1", "account.draft", EntryField),
+                ("gateway-2", "account.draft", EntryField),
+                ("gateway-3", "account.draft", EntryField),
+                ("gateway-4", "account.draft", EntryField),
+                ("gateway-5", "account.draft", EntryField),
             ])
         );
         assert_eq!(
@@ -556,11 +578,17 @@ mod tests {
                 ("2a", "account.draft", EntryField),
                 ("3", "account.draft", EntryField),
                 ("4", "account.draft", EntryField),
+                ("6b", "account.draft", EntryField),
                 ("7", "account.draft", EntryField),
                 ("7", "account.resume_refused", EntryField),
                 ("7f", "account.draft", EntryField),
                 ("7f", "account.resume_refused", EntryField),
+                ("gateway-1", "account.draft", EntryField),
+                ("gateway-2", "account.draft", EntryField),
                 ("gateway-3", "account.commands.fork", EntryField),
+                ("gateway-3", "account.draft", EntryField),
+                ("gateway-4", "account.draft", EntryField),
+                ("gateway-5", "account.draft", EntryField),
             ])
         );
         let mut qoder = accountless.to_vec();
@@ -790,7 +818,20 @@ mod tests {
             (
                 "kalareach/opencode",
                 "account.draft",
-                &["1", "2a", "3", "4", "7", "7f"],
+                &[
+                    "1",
+                    "2a",
+                    "3",
+                    "4",
+                    "6b",
+                    "7",
+                    "7f",
+                    "gateway-1",
+                    "gateway-2",
+                    "gateway-3",
+                    "gateway-4",
+                    "gateway-5",
+                ],
             ),
             (
                 "kalareach/gemini-cli",
@@ -858,6 +899,16 @@ mod tests {
             .expect("a missing member")
             .insert("account.draft".to_owned(), "none was found".to_owned());
         assert_eq!(missing_for(&upgrade, "6a", true), None, "6a reads no draft");
+        assert!(
+            missing_for(&upgrade, "6b", false)
+                .is_some_and(|why| why.contains("account.draft (none was found)")),
+            "6b stops on a listed draft"
+        );
+        assert_eq!(
+            missing_for(&upgrade, "6b", true),
+            None,
+            "the probe-only run of 6b is not stopped for a listed draft"
+        );
     }
 
     /// A real start is refused for a pinned or newer build that the entry does not digest.
