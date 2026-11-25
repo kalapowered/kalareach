@@ -17,6 +17,14 @@ pub(super) const CLAUDE_PLACE: &str = "t/claude";
 /// host's daemon writes the recipe.
 pub(super) const CLAUDE_CONFIGURATION: &str = ".claude";
 
+/// The program built here that is placed as `claude` where a case starts no agent: the stand-in of
+/// the Codex route, which is a native program that starts.
+const CLAUDE_PROGRAM: &str = "codex-stand-in";
+
+/// The program built here that is placed as `claude` where a person types the command: it says the
+/// arguments it was started with.
+const TYPED_PROGRAM: &str = "argv-stand-in";
+
 /// The version the generation lists the placed program as: the one the pinned build reports.
 pub(super) const CLAUDE_VERSION: &str = "2.1.278";
 
@@ -64,6 +72,31 @@ pub(super) struct Variant {
     script: bool,
     /// The capabilities the installation is given beyond the repository's ceiling.
     grants: Vec<PluginCapability>,
+    /// Whether a person types `claude` in a managed shell of the host: the program placed is the one
+    /// that says its arguments, and the host's configuration turns the package's command
+    /// integration on.
+    typed: bool,
+    /// The capabilities the installation holds once the owner has changed it after the install,
+    /// where the owner took some of them away.
+    after_install: Option<Vec<PluginCapability>>,
+}
+
+impl Variant {
+    /// A variant whose installation was given every capability the release asks for, and whose
+    /// owner then withdrew `capability`.
+    fn withdrawn(capability: PluginCapability) -> Self {
+        let installed = Self::default();
+        let after_install = installed
+            .grants
+            .iter()
+            .copied()
+            .filter(|held| *held != capability)
+            .collect();
+        Self {
+            after_install: Some(after_install),
+            ..installed
+        }
+    }
 }
 
 impl Default for Variant {
@@ -78,6 +111,8 @@ impl Default for Variant {
                 PluginCapability::ApprovalRespond,
                 PluginCapability::UpstreamAction,
             ],
+            after_install: None,
+            typed: false,
         }
     }
 }
@@ -177,6 +212,25 @@ async fn install_claude_code(
         .expect("enabled");
 }
 
+/// Replaces the grant of the claude-code installation with `grants`, as the owner's change of that
+/// installation does.
+fn narrow_claude_code(environment: &EnvironmentPaths, grants: Vec<PluginCapability>) {
+    let mut catalogue = Catalogue::open(
+        &environment.state_dir().join("catalogue"),
+        Arc::new(RepositoryTransport::local_only(
+            "this test reads its repository from disk",
+        )),
+    )
+    .expect("an openable catalogue");
+    catalogue
+        .set_grant(
+            environment.environment_id(),
+            &claude_code(),
+            InstallationGrant::with(grants),
+        )
+        .expect("the grant is replaced");
+}
+
 /// The program as a leg places it for the host: the directory below the run's home where the
 /// recipe is written and the program the daemon finds by its name.
 fn claude_application() -> Application {
@@ -206,6 +260,11 @@ pub(super) fn host<'a>(ctx: &'a Context, variant: &Variant) -> Host<'a> {
         },
         &Preparation {
             application: Some(claude_application()),
+            command_integrations: if variant.typed {
+                vec![claude_code().to_string()]
+            } else {
+                Vec::new()
+            },
             ..Preparation::default()
         },
         |environment| {
@@ -218,6 +277,9 @@ pub(super) fn host<'a>(ctx: &'a Context, variant: &Variant) -> Host<'a> {
                 &qualified,
                 variant.grants.clone(),
             ));
+            if let Some(held) = &variant.after_install {
+                narrow_claude_code(environment, held.clone());
+            }
         },
     )
 }
@@ -237,7 +299,11 @@ fn in_a_host(case: &str, variant: &Variant, body: impl FnOnce(&Context, &Host<'_
         }
     };
     let mut ctx = Context::new(shell, Route::StandIn, Run::start(case), runtime());
-    ctx.claude_code = true;
+    ctx.claude_code = Some(if variant.typed {
+        TYPED_PROGRAM
+    } else {
+        CLAUDE_PROGRAM
+    });
     ctx.place();
     if variant.script {
         std::fs::write(&ctx.executable, "#!/bin/sh\nexit 0\n").expect("a script as the program");
@@ -276,6 +342,9 @@ fn files_below(directory: &Path) -> Vec<String> {
 /// What the doctor says where it names a bridge the host refused.
 const REFUSED: &str = "was refused, and nothing of it is in place";
 
+/// What the doctor says where no package has a bridge in place on the host.
+const NONE_IN_PLACE: &str = "no package has put a native bridge in place on this host";
+
 /// What the doctor says where it names a bridge the host applied.
 const APPLIED: &str = "is applied";
 
@@ -297,51 +366,57 @@ fn forwarders(ctx: &Context) -> Vec<String> {
         .collect()
 }
 
+/// The recipe is in place below the run's home: exactly its three files beside the person's
+/// settings, the one key set and every other setting as it was, and the registration names the
+/// forwarder the host placed.
+fn assert_the_recipe_is_in_place(ctx: &Context) {
+    let configuration = ctx.run.home().join(CLAUDE_CONFIGURATION);
+    let mut expected: Vec<String> = RECIPE_FILES.iter().map(|file| (*file).to_owned()).collect();
+    expected.push("settings.json".to_owned());
+    expected.sort();
+    assert_eq!(
+        files_below(&configuration),
+        expected,
+        "the recipe wrote exactly its three files beside the person's settings"
+    );
+    let mut settings: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(configuration.join("settings.json")).expect("the settings"),
+    )
+    .expect("settings in JSON");
+    assert_eq!(
+        settings["enabledPlugins"][RECIPE_KEY],
+        serde_json::Value::Bool(true),
+        "the recipe's key is set"
+    );
+    settings["enabledPlugins"]
+        .as_object_mut()
+        .expect("the plugins")
+        .remove(RECIPE_KEY);
+    assert_eq!(
+        settings,
+        serde_json::from_str::<serde_json::Value>(SEEDED_SETTINGS).expect("the seed"),
+        "every other setting is as it was"
+    );
+    let registration: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(configuration.join(RECIPE_FILES[1])).expect("the registration"),
+    )
+    .expect("a registration in JSON");
+    let forwarder = registration["mcpServers"]["kalareach"]["command"]
+        .as_str()
+        .expect("the forwarder the registration starts");
+    assert!(
+        Path::new(forwarder).is_file() && forwarder.ends_with("b/kr-hook"),
+        "the registration names the forwarder the host placed, not {forwarder}"
+    );
+}
+
 /// A stand-in whose digest a signed record names has the recipe applied: exactly the three files
 /// and the one settings key, with every other setting as it was, and the registration names the
 /// forwarder the host placed.
 #[test]
 fn gateway_claude_recipe_a_stand_in_a_record_names_has_the_recipe_applied() {
     in_a_host("claude-recipe-named", &Variant::default(), |ctx, host| {
-        let configuration = ctx.run.home().join(CLAUDE_CONFIGURATION);
-        let mut expected: Vec<String> =
-            RECIPE_FILES.iter().map(|file| (*file).to_owned()).collect();
-        expected.push("settings.json".to_owned());
-        expected.sort();
-        assert_eq!(
-            files_below(&configuration),
-            expected,
-            "the recipe wrote exactly its three files beside the person's settings"
-        );
-        let mut settings: serde_json::Value = serde_json::from_slice(
-            &std::fs::read(configuration.join("settings.json")).expect("the settings"),
-        )
-        .expect("settings in JSON");
-        assert_eq!(
-            settings["enabledPlugins"][RECIPE_KEY],
-            serde_json::Value::Bool(true),
-            "the recipe's key is set"
-        );
-        settings["enabledPlugins"]
-            .as_object_mut()
-            .expect("the plugins")
-            .remove(RECIPE_KEY);
-        assert_eq!(
-            settings,
-            serde_json::from_str::<serde_json::Value>(SEEDED_SETTINGS).expect("the seed"),
-            "every other setting is as it was"
-        );
-        let registration: serde_json::Value = serde_json::from_slice(
-            &std::fs::read(configuration.join(RECIPE_FILES[1])).expect("the registration"),
-        )
-        .expect("a registration in JSON");
-        let forwarder = registration["mcpServers"]["kalareach"]["command"]
-            .as_str()
-            .expect("the forwarder the registration starts");
-        assert!(
-            Path::new(forwarder).is_file() && forwarder.ends_with("b/kr-hook"),
-            "the registration names the forwarder the host placed, not {forwarder}"
-        );
+        assert_the_recipe_is_in_place(ctx);
         let said = bridges_said(host);
         assert!(
             said.contains(APPLIED),
@@ -464,6 +539,112 @@ fn gateway_claude_recipe_the_removal_leaves_the_settings_as_they_were() {
             std::fs::read_to_string(configuration.join("settings.json")).expect("the settings"),
             SEEDED_SETTINGS,
             "the person's settings are the bytes they were"
+        );
+    });
+}
+
+/// An installation whose owner withdrew `native_bridge.install` has nothing written under the
+/// configuration directory, the person's settings are the bytes they were, and no forwarder runs.
+#[test]
+fn gateway_claude_recipe_an_installation_that_withdrew_the_bridge_grant_writes_nothing() {
+    let variant = Variant::withdrawn(PluginCapability::NativeBridgeInstall);
+    in_a_host("claude-recipe-no-bridge-grant", &variant, |ctx, host| {
+        let configuration = ctx.run.home().join(CLAUDE_CONFIGURATION);
+        assert_eq!(
+            files_below(&configuration),
+            ["settings.json"],
+            "nothing was written beside the person's settings"
+        );
+        assert_eq!(
+            std::fs::read_to_string(configuration.join("settings.json")).expect("the settings"),
+            SEEDED_SETTINGS,
+            "the person's settings are the bytes they were"
+        );
+        assert_eq!(forwarders(ctx), Vec::<String>::new(), "no forwarder runs");
+        let said = bridges_said(host);
+        assert!(
+            said.contains(NONE_IN_PLACE),
+            "the doctor says no package has a bridge in place: {said}"
+        );
+    });
+}
+
+/// An installation whose owner withdrew `command_integration.launch` has the recipe applied as one
+/// that holds it does: the launch grant is not the bridge's.
+#[test]
+fn gateway_claude_recipe_an_installation_that_withdrew_the_launch_grant_has_the_recipe_applied() {
+    let variant = Variant::withdrawn(PluginCapability::CommandIntegrationLaunch);
+    in_a_host("claude-recipe-no-launch-grant", &variant, |ctx, host| {
+        assert_the_recipe_is_in_place(ctx);
+        let said = bridges_said(host);
+        assert!(
+            said.contains(APPLIED),
+            "the doctor says the bridge is applied: {said}"
+        );
+    });
+}
+
+/// What the program that says its arguments prints before each one.
+const ARGUMENT: &str = "argv-stand-in: argument ";
+
+/// What the program that says its arguments prints when it has said them all.
+const SAID_THEM_ALL: &str = "argv-stand-in: ends";
+
+/// The words the package's command integration adds to a typed `claude`.
+const DEVELOPMENT_FLAG: [&str; 2] = [
+    "--dangerously-load-development-channels",
+    "plugin:kalareach-channels@skills-dir",
+];
+
+/// The arguments the program placed as `claude` says it was started with, where a person types
+/// `claude` and nothing else in a managed shell of the host.
+fn typed_arguments(ctx: &Context, host: &Host<'_>) -> Vec<String> {
+    let person = Person::enters(ctx, host, &[], &[]);
+    person.types("claude");
+    person
+        .sees(
+            SAID_THEM_ALL,
+            "the program started by its name says its arguments",
+        )
+        .iter()
+        .filter_map(|row| row.trim().strip_prefix(ARGUMENT))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// A typed `claude` is given the development flag and the plugin it names where the installation
+/// holds `command_integration.launch`.
+#[test]
+fn gateway_claude_recipe_a_typed_claude_is_given_the_development_flag_where_the_launch_grant_is_held()
+ {
+    let variant = Variant {
+        typed: true,
+        ..Variant::default()
+    };
+    in_a_host("claude-recipe-typed", &variant, |ctx, host| {
+        assert_the_recipe_is_in_place(ctx);
+        assert_eq!(
+            typed_arguments(ctx, host),
+            DEVELOPMENT_FLAG,
+            "the program was given the flag and the plugin the package declares"
+        );
+    });
+}
+
+/// A typed `claude` is given no flag where the installation withdrew `command_integration.launch`,
+/// and the recipe is in place all the same.
+#[test]
+fn gateway_claude_recipe_a_typed_claude_is_given_no_flag_where_the_launch_grant_was_withdrawn() {
+    let variant = Variant {
+        typed: true,
+        ..Variant::withdrawn(PluginCapability::CommandIntegrationLaunch)
+    };
+    in_a_host("claude-recipe-typed-no-launch", &variant, |ctx, host| {
+        assert_the_recipe_is_in_place(ctx);
+        assert_eq!(
+            typed_arguments(ctx, host),
+            Vec::<String>::new(),
+            "the program was given nothing the person did not type"
         );
     });
 }

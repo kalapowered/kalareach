@@ -1560,9 +1560,9 @@ struct Context {
     /// The programs of the stand-in route that every typed launch may run, by their place below
     /// the run's directory, each recorded when it was placed.
     placed_files: Vec<PathBuf>,
-    /// Whether the agent is the stand-in placed under the name `claude`, for a case that applies
-    /// the claude-code package's recipe (stand-in route).
-    claude_code: bool,
+    /// The program built by this workspace that is placed under the name `claude`, for a case that
+    /// applies the claude-code package's recipe (stand-in route); none for every other case.
+    claude_code: Option<&'static str>,
 }
 
 impl Context {
@@ -1597,7 +1597,7 @@ impl Context {
             newer_prefix: None,
             package_digest: std::sync::Mutex::new(None),
             placed_files: Vec::new(),
-            claude_code: false,
+            claude_code: None,
         }
     }
 
@@ -1737,13 +1737,17 @@ impl Context {
                 newer_prefix = Some(second);
                 (executable, bin)
             }
-            Route::StandIn if self.claude_code => {
+            Route::StandIn if self.claude_code.is_some() => {
                 // The host's daemon finds the program by its name on a search path of its own, and
                 // the recipe reads it there: the directory holds nothing else.
                 let tools = run.root().join("t");
                 kr_ipc::paths::create_private_tree(run.root(), &tools)
                     .expect("a directory for the programs");
-                run.place_built("codex-stand-in", &tools.join("claude"), &["--version"]);
+                run.place_built(
+                    self.claude_code.expect("the program placed as claude"),
+                    &tools.join("claude"),
+                    &["--version"],
+                );
                 run.note_placed(Path::new(claude_recipe::CLAUDE_PLACE))
                     .unwrap_or_else(|why| panic!("{ISOLATION_UNPROVEN} {why}"));
                 placed_files.push(PathBuf::from(claude_recipe::CLAUDE_PLACE));
@@ -1889,7 +1893,7 @@ impl Context {
     /// The distribution and version the generation lists the executable as.
     fn qualified_as(&self) -> (&'static str, String) {
         match &self.route {
-            Route::StandIn if self.claude_code => {
+            Route::StandIn if self.claude_code.is_some() => {
                 ("test stand-in", claude_recipe::CLAUDE_VERSION.to_owned())
             }
             Route::StandIn => (
@@ -1906,7 +1910,7 @@ impl Context {
     /// A host whose catalogue holds the package installed and whose configuration turns its
     /// integration on, with the address devices dial kept across a restart of its daemon.
     fn host(&self) -> Host<'_> {
-        if self.claude_code {
+        if self.claude_code.is_some() {
             return claude_recipe::host(self, &claude_recipe::Variant::default());
         }
         Host::start_prepared(
@@ -1962,7 +1966,7 @@ impl Context {
                     "SHELL".to_owned(),
                     self.shell.executable.display().to_string(),
                 ));
-                if self.claude_code {
+                if self.claude_code.is_some() {
                     // Claude Code reads its configuration from the directory this names, which is
                     // the directory the daemon wrote the recipe in.
                     variables.push((
