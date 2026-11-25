@@ -869,10 +869,11 @@ impl<'r> Host<'r> {
     /// [`Host::agent_is_a_stand_in`] comes before this call), except for the survey
     /// ([`Restart::Survey`]), which records on the stand-in too.
     ///
-    /// Where the agent is not the stand-in, the program that runs the product's second open of the
-    /// clock floor is placed in the run's `b/` first (`FLOOR_OPEN`), so that the record holds it
-    /// and a restart starts it only while it is the file that was placed. The stand-in never opens
-    /// the floor again, and places none.
+    /// Whenever a record is made, the program that runs the product's second open of the clock
+    /// floor is placed in the run's `b/` first (`FLOOR_OPEN`), so that the record holds it and a
+    /// restart starts it only while it is the file that was placed. The survey places it on the
+    /// stand-in too, since it checks the floor's second open before each attempt; a case that makes
+    /// no record places none.
     ///
     /// # Panics
     ///
@@ -896,12 +897,7 @@ impl<'r> Host<'r> {
             if !records || restarts.record.is_some() {
                 return;
             }
-            let placed = if self.stand_in.load(Ordering::SeqCst) {
-                Ok(())
-            } else {
-                self.place_the_floors_opener(built)
-            };
-            placed
+            self.place_the_floors_opener(built)
                 .and_then(|()| self.standing())
                 .and_then(|(indexes, record)| {
                     index::known(&indexes)?;
@@ -2931,11 +2927,10 @@ mod shutdown_tests {
     }
 
     /// The program that runs the product's second open of the clock floor is placed in the run's
-    /// programs, with the others, before the record of a real agent is made: the record holds it,
-    /// and it is the file that was placed. The stand-in path of a survey never opens the floor
-    /// again, and places none.
+    /// programs, with the others, whenever a record of the run's tree is made, the survey's on the
+    /// stand-in included: the record holds it, and it is the file that was placed.
     #[test]
-    fn the_floors_opener_is_placed_in_the_run_before_the_record_of_a_real_agent() {
+    fn the_floors_opener_is_placed_in_the_run_before_every_record_of_the_tree() {
         let opener = Path::new("b/kr-e2e-m1b-floor-open");
         let root = scratch("opener-placed");
         let (run, _mark) = host_with_a_kr(&root);
@@ -2956,7 +2951,7 @@ mod shutdown_tests {
         drop(run);
         std::fs::remove_dir_all(&root).expect("clean up");
 
-        let root = scratch("opener-not-placed");
+        let root = scratch("opener-placed-stand-in");
         let (run, _mark) = host_with_a_kr(&root);
         let host = host_over(&run);
         host.declares_a_restart(Restart::Survey);
@@ -2964,19 +2959,25 @@ mod shutdown_tests {
         host.agent_starts();
         let held = recorded(&host).expect("the survey records the tree");
         assert!(
-            held.get(opener).is_none(),
-            "the stand-in path places no floor's opener"
+            held.get(opener).is_some(),
+            "the survey on the stand-in records the floor's opener"
+        );
+        assert_eq!(
+            run.placed_as_it_was(opener),
+            Ok(()),
+            "the floor's opener of the survey is the file that was placed"
         );
         drop(host);
         drop(run);
         std::fs::remove_dir_all(&root).expect("clean up");
     }
 
-    /// A real agent whose floor's opener this build did not make ends the leg as not run before the
-    /// agent starts, and the reason says how to build the program; the stand-in, which never opens
-    /// the floor again, needs none.
+    /// A leg that records its tree, whose floor's opener this build did not make, ends as not run
+    /// before the agent starts, and the reason says how to build the program: a real agent's leg and
+    /// the survey's leg on the stand-in alike.
     #[test]
-    fn a_real_agent_whose_floors_opener_is_not_built_ends_the_leg_before_it_starts() {
+    fn a_leg_that_records_its_tree_ends_before_its_agent_starts_when_the_floors_opener_is_not_built()
+     {
         let root = scratch("opener-not-built");
         let (run, _mark) = host_with_a_kr(&root);
         let nothing_built = root.join("nothing-built");
@@ -3007,12 +3008,21 @@ mod shutdown_tests {
         let host = host_over(&run);
         host.declares_a_restart(Restart::Survey);
         host.agent_is_a_stand_in();
-        let unwinding = unwound(|| host.agent_starts_from(&root.join("nothing-built")));
+        let Some(unwinding) = unwound(|| host.agent_starts_from(&root.join("nothing-built")))
+        else {
+            panic!("the survey on the stand-in does not start with no opener to place");
+        };
         assert!(
-            unwinding.is_none(),
-            "the stand-in needs no opener: {:?}",
-            unwinding.as_deref().map(said_by)
+            unwinding.is::<LegNotRun>(),
+            "the survey on the stand-in ends as not run with no opener to place: {}",
+            said_by(&*unwinding)
         );
+        assert!(
+            said_by(&*unwinding).contains("the clock floor's opener is not at"),
+            "the reason says where the opener is not: {}",
+            said_by(&*unwinding)
+        );
+        assert!(recorded(&host).is_none(), "no record was made");
         drop(host);
         drop(run);
         std::fs::remove_dir_all(&root).expect("clean up");
@@ -3291,7 +3301,8 @@ mod shutdown_tests {
 
     /// The survey says each entry that changed between the record made when the agent started and
     /// the kill, and each that changed between the kill and the attempt; what changed before the
-    /// kill is not said again at the attempt.
+    /// kill is not said again at the attempt. The floor's opener is recorded as placed on the
+    /// stand-in too, so no line says that a program was not.
     #[test]
     fn the_survey_says_what_changed_at_the_kill_and_what_changed_after_it() {
         let root = scratch("survey-lists");
@@ -3335,6 +3346,10 @@ mod shutdown_tests {
                  kill to the attempt; the files of the index and the journals stood still"
             ),
             "{lines:#?}"
+        );
+        assert!(
+            !said("was not recorded when it was placed"),
+            "the floor's opener of a survey on the stand-in is recorded as placed: {lines:#?}"
         );
         drop(host);
         drop(run);
