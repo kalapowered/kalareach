@@ -401,6 +401,22 @@ fn selected_subject(
         .expect("a subject of the release")
 }
 
+/// [`selected_subject`] for an entry with no account, which a route that reads the account before
+/// it refuses the subject stops at.
+fn selected_subject_without_account(
+    release_directory: &Path,
+    plugin: &str,
+    command: &str,
+    shape: Shape,
+) -> Subject {
+    release(release_directory, plugin, command, shape);
+    Subject::from_release(
+        &super::stand_in::native_entry_without_account(plugin, command),
+        release_directory,
+    )
+    .expect("a subject of the release")
+}
+
 /// Runs `body` on a host that has the package written for `subject` installed, with the agent
 /// started by hand and no login, on the stand-in route.
 fn by_hand_on(
@@ -1238,12 +1254,13 @@ fn refusal_of(outcome: Result<(), Box<dyn std::any::Any + Send>>) -> String {
 }
 
 /// A subject made from a release is not given a signed generation: the route is refused before it
-/// looks at any account, key or file of the person.
+/// looks at any account, key or file of the person. The subject's entry has no account, so a route
+/// that reads the account first stops for another reason.
 #[test]
 fn a_subject_made_from_a_release_is_refused_a_generation_when_the_route_is_acquired() {
     let (plugin, command, shape) = SYNTHETIC[1];
     let base = scratch("release-and-generation-route");
-    let subject = selected_subject(&base.join("release"), plugin, command, shape);
+    let subject = selected_subject_without_account(&base.join("release"), plugin, command, shape);
     let chosen = Chosen {
         subject,
         generation: Some(base.join("generation")),
@@ -1260,12 +1277,13 @@ fn a_subject_made_from_a_release_is_refused_a_generation_when_the_route_is_acqui
     let _ = std::fs::remove_dir_all(&base);
 }
 
-/// The package of a subject made from a release is not installed from a signed generation.
+/// The package of a subject made from a release is not installed from a signed generation. The
+/// subject's entry has no account.
 #[test]
 fn a_subject_made_from_a_release_is_refused_a_generation_when_its_package_is_installed() {
     let (plugin, command, shape) = SYNTHETIC[1];
     let base = scratch("release-and-generation-install");
-    let subject = selected_subject(&base.join("release"), plugin, command, shape);
+    let subject = selected_subject_without_account(&base.join("release"), plugin, command, shape);
     let environment = environment_in(&base);
     let generation = base.join("generation");
     let runtime = super::runtime();

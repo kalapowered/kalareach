@@ -148,7 +148,7 @@ const NATIVE_MARKS: [&str; 4] = [
 
 /// A native entry for `plugin` typed as `command`, whose first screen and composer show the
 /// command's name.
-pub fn native_entry(plugin: &str, command: &str) -> Build {
+fn native_synthetic(plugin: &str, command: &str) -> Synthetic {
     Synthetic::of(
         "a native entry",
         plugin,
@@ -159,7 +159,19 @@ pub fn native_entry(plugin: &str, command: &str) -> Build {
         ),
         NATIVE_MARKS,
     )
-    .build
+}
+
+/// A native entry for `plugin` typed as `command`, whose first screen and composer show the
+/// command's name.
+pub fn native_entry(plugin: &str, command: &str) -> Build {
+    native_synthetic(plugin, command).build
+}
+
+/// The entry [`native_entry`] makes, with no account.
+pub fn native_entry_without_account(plugin: &str, command: &str) -> Build {
+    native_synthetic(plugin, command)
+        .without_account("a native entry with no account")
+        .build
 }
 
 /// The four synthetic entries of an agent that has an account: a script launch, a wheel launch, a
