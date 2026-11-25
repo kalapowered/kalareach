@@ -107,6 +107,50 @@ pub const HARNESS_GAPS: [(&str, &str, &str); 2] = [
     ),
 ];
 
+/// The reader of images: it decodes the text after `base64,` in the record's line.
+const IMAGE_UNREADABLE: &str = "the image reader decodes the text after `base64,` in the record's line, and this record holds the image in a `data` member";
+
+/// The values that an entry gives and the driver cannot read yet: a field of a package, with what
+/// the driver lacks.
+pub const HARNESS_VALUES: [(&str, &str, &str, &str); 6] = [
+    (
+        "kalareach/claude-code",
+        "1",
+        "account.image_line",
+        IMAGE_UNREADABLE,
+    ),
+    (
+        "kalareach/gemini-cli",
+        "1",
+        "account.image_line",
+        IMAGE_UNREADABLE,
+    ),
+    (
+        "kalareach/gemini-cli",
+        "8a",
+        "transcript",
+        "the agent names the record's folder by its own registry of projects, a short name with a number added where the name is taken, which the place's two placeholders cannot give",
+    ),
+    (
+        "kalareach/gemini-cli",
+        "1",
+        "account.prompt_line",
+        "the line also marks a tool's answer and the lines that rewrite the message list, so a count by it needs reader rules the driver does not have",
+    ),
+    (
+        "kalareach/gemini-cli",
+        "2a",
+        "account.prompt_line",
+        "the line also marks a tool's answer and the lines that rewrite the message list, so a count by it needs reader rules the driver does not have",
+    ),
+    (
+        "kalareach/gemini-cli",
+        "4",
+        "account.prompt_line",
+        "the line also marks a tool's answer and the lines that rewrite the message list, so a count by it needs reader rules the driver does not have",
+    ),
+];
+
 /// The fields each case reads, by the case's name: the parts of the qualification, and the thread
 /// case of the gateway, which only Codex's entry fills. `account.draft` is read by every case that
 /// starts the agent with the person's login: parts 1, 3 and 4 through the gateway, and 2a, 7 and 7f
@@ -152,6 +196,8 @@ fn has_members(build: &Build, field: &str) -> bool {
             .zip(field.rsplit('.').next())
             .is_some_and(|(account, command)| account.commands.contains_key(command)),
         "composer" => build.composer.is_some(),
+        "account.prompt_line" => account.is_some_and(|account| !account.prompt_line.is_empty()),
+        "transcript" => !build.transcript.is_empty(),
         "newer.isolated" => build
             .newer
             .as_ref()
@@ -221,6 +267,16 @@ pub fn check(build: &Build) -> Report {
                 reason: listed.cloned().unwrap_or_else(|| {
                     "the entry gives no value and does not list it as missing".to_owned()
                 }),
+            });
+        }
+    }
+    for (package, part, field, reason) in HARNESS_VALUES {
+        if package == build.package && has_members(build, field) {
+            report.gaps.push(Gap {
+                part,
+                field: field.to_owned(),
+                class: Class::HarnessGap,
+                reason: reason.to_owned(),
             });
         }
     }
@@ -441,11 +497,19 @@ mod tests {
         assert_eq!(found("kalareach/codex"), with_upgrade(&[]));
         assert_eq!(
             found("kalareach/claude-code"),
-            with_upgrade(&[("4", "account.turn_line", EntryField)])
+            with_upgrade(&[
+                ("1", "account.image_line", HarnessGap),
+                ("4", "account.turn_line", EntryField),
+            ])
         );
         assert_eq!(
             found("kalareach/gemini-cli"),
             with_upgrade(&[
+                ("1", "account.image_line", HarnessGap),
+                ("1", "account.prompt_line", HarnessGap),
+                ("2a", "account.prompt_line", HarnessGap),
+                ("4", "account.prompt_line", HarnessGap),
+                ("8a", "transcript", HarnessGap),
                 ("4", "account.turn_line", HarnessGap),
                 ("7", "account.resume_refused", EntryField),
                 ("7f", "account.resume_refused", EntryField),
@@ -830,6 +894,17 @@ mod tests {
                     .missing
                     .is_some_and(|missing| missing.contains_key(field)),
                 "{package} does not list {field} as missing"
+            );
+        }
+    }
+
+    /// Every value the table of unreadable values names is one the list gives for that package.
+    #[test]
+    fn every_unreadable_value_names_a_field_the_list_gives_for_that_package() {
+        for (package, _, field, _) in HARNESS_VALUES {
+            assert!(
+                has_members(&build_of(package), field),
+                "{package} does not give {field}"
             );
         }
     }
