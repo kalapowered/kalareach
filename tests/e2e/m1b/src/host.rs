@@ -241,7 +241,8 @@ pub struct Preparation {
 pub struct Application {
     /// The program, below the run's directory: the program's name is the last component, and the
     /// directory that holds it is the first directory of the daemon's search path. The leg places
-    /// the program there before the host is started, and the directory holds nothing else.
+    /// the program there before the host is started, and the directory holds nothing else, which
+    /// each start of the daemon checks.
     pub program: PathBuf,
     /// The directory below the run's home where the program keeps its configuration, and the
     /// daemon writes the program's registrations.
@@ -608,7 +609,9 @@ enum Failed {
     /// The daemon neither exited nor answered in time: what it was last heard to say, and what it
     /// wrote.
     Silent { heard: String, said: String },
-    /// The daemon was not started: what its search path would name is not as it was placed.
+    /// The daemon was not started: what its search path would name is not as it was placed, the
+    /// path holds a second program of the name, or the program's directory holds another name
+    /// beside it.
     Refused(String),
 }
 
@@ -855,14 +858,35 @@ impl<'r> Host<'r> {
         }
     }
 
+    /// The names in the program's directory besides the program's, each quoted, listed through the
+    /// held handle of the directory as it was placed.
+    fn names_beside_the_program(&self, placed: &Placed) -> Result<Vec<String>, String> {
+        let handle = placed.directory.open(self.run.root(), self.run.pin())?;
+        let mut beside = Vec::new();
+        for entry in rustix::fs::Dir::read_from(&handle)
+            .map_err(|error| format!("the program's directory cannot be listed: {error}"))?
+        {
+            let entry = entry
+                .map_err(|error| format!("the program's directory cannot be listed: {error}"))?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name != "." && name != ".." && name != placed.name {
+                beside.push(format!("{name:?}"));
+            }
+        }
+        beside.sort();
+        Ok(beside)
+    }
+
     /// The daemon's search path: the system's own where the host has no application, and where it
     /// has one the directory that holds the program, then the system's. The program is looked at
     /// as it was placed and the directory is reached by its identity, each time, and no other
-    /// directory of the path holds a file of the program's name.
+    /// directory of the path holds a file of the program's name, and the program's directory
+    /// holds no name but the program's.
     ///
     /// # Errors
     ///
-    /// Returns what is not as it was placed, or the second program the path would find.
+    /// Returns what is not as it was placed, the second program the path would find, or a name
+    /// beside the program.
     fn daemon_path(&self) -> Result<String, String> {
         let Some(placed) = &self.application else {
             return Ok(SYSTEM_PATH.to_owned());
@@ -870,6 +894,17 @@ impl<'r> Host<'r> {
         let directory = placed
             .directory
             .place_for_a_start(self.run.root(), self.run.pin())?;
+        let beside = self.names_beside_the_program(placed)?;
+        if !beside.is_empty() {
+            return Err(format!(
+                "the directory {} of the program holds {}, and nothing but the program may be there",
+                placed
+                    .program
+                    .parent()
+                    .map_or_else(String::new, |directory| directory.display().to_string()),
+                beside.join(", ")
+            ));
+        }
         self.run.placed_as_it_was(&placed.program)?;
         let path = format!("{}:{SYSTEM_PATH}", directory.display());
         let second = second_programs(&path, &placed.name);
@@ -4100,6 +4135,39 @@ mod shutdown_tests {
             let _ = prepare_application(&run, &application);
         }));
         assert!(refused.is_err(), "a program that is a link was taken");
+        drop(run);
+        std::fs::remove_dir_all(&root).expect("clean up");
+    }
+
+    /// A name beside the program in its directory refuses the start, whether it is a file, a link or
+    /// a directory: the daemon, and each session it makes, finds a name on its path in that
+    /// directory first, and the program under test may have left it there.
+    #[test]
+    fn a_name_beside_the_program_in_its_directory_is_refused_at_the_next_start() {
+        let root = scratch("beside");
+        let run = run_with_a_recording_controller(&root);
+        let application = an_application(&root);
+        let host = host_prepared_with(&run, &application);
+        let place = root.join("t/other");
+        for kind in ["a file", "a link", "a directory"] {
+            match kind {
+                "a file" => std::fs::write(&place, b"x\n").expect("a file"),
+                "a link" => std::os::unix::fs::symlink("/usr/bin/true", &place).expect("a link"),
+                _ => std::fs::create_dir(&place).expect("a directory"),
+            }
+            let why = refused_start(&host, &root);
+            assert!(
+                why.contains("\"other\"") && why.contains("nothing but the program may be there"),
+                "{kind}: {why}"
+            );
+            assert_eq!(starts(&root), 0, "{kind}: no daemon was started");
+            if kind == "a directory" {
+                std::fs::remove_dir(&place).expect("the directory goes");
+            } else {
+                std::fs::remove_file(&place).expect("the name goes");
+            }
+        }
+        drop(host);
         drop(run);
         std::fs::remove_dir_all(&root).expect("clean up");
     }
