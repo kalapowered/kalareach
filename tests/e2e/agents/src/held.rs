@@ -1481,10 +1481,17 @@ impl PersonPlan {
     /// After `{person}/` or `{ancestors}/` the path must be a plain relative path and not one of
     /// those files. A path that starts with `/` is refused when its last parts are the parts of one
     /// of those files, with the empty and `.` parts dropped and each `..` taking away the part
-    /// before it. A path that reaches a guarded name another way, through a link or by climbing out
-    /// of the run's directories, is not seen here. What protects a guarded name from a path of the
+    /// before it, whatever comes before those parts: `/etc/x/.claude.json` is refused as well as a
+    /// path in a home.
+    ///
+    /// The check is lexical, and a path can pass it and still name one of those files: a
+    /// placeholder after the first part (`{person}/{ancestors}/.claude.json`), a relative path
+    /// (a look takes it from the test's working directory), a change of letter case
+    /// (`{person}/.Claude.json`) on a volume that ignores case, and a link on the way to a path
+    /// outside the run, which the look follows. Inside the run the look refuses a `..` part and a
+    /// link on the way, and keeps the refusal. What protects a guarded name from a path of the
     /// list that reaches it is the write of [`PersonGuard::absent_below`], which keeps every look
-    /// that does not show the path absent; this check is a second line.
+    /// that does not show the path absent; this check only comes second.
     ///
     /// # Errors
     ///
@@ -1597,7 +1604,8 @@ impl PersonGuard {
     /// Looks at a path of the entry's absent list. Where the entry has guarded files, every look
     /// that does not show the path absent is kept as a failed look: a path found present, whether
     /// a file, a directory or a link, and a look that failed for any reason other than the name's
-    /// not being there, a link on the way included. The path may reach a guarded name, and the
+    /// not being there (for a path in the run a link on the way is such a failure; for another
+    /// path the look follows it). The path may reach a guarded name, and the
     /// look keeps no identity of what it found, so every shared read after it is refused. The
     /// caller still stops the case on a path found present. A path shown absent keeps nothing,
     /// and a look never reads a file. This write is what protects a guarded name from a path of
@@ -1760,7 +1768,8 @@ impl Looks {
         self.state().seen.insert(identity);
     }
 
-    /// Keeps that a look failed, saw a link or gave no answer in time.
+    /// Keeps that a look failed, saw a link or gave no answer in time, or that an absence look did
+    /// not show its path absent.
     fn lost(&self) {
         self.state().unlooked = true;
     }
@@ -5856,8 +5865,9 @@ mod tests {
         // The credentials file is not there at the take.
         std::fs::remove_file(home.join(".claude/.credentials.json")).expect("removed");
         let guard = claude_plan().take(&home);
-        // Another process makes it, and the absence look of a spelling of its name that the plan
-        // did not refuse finds it.
+        // Another process makes it, and the absence look of a spelling of its name finds it. The
+        // plan here has no absent list, so this case tests the guard's write apart from the
+        // plan's check, which refuses this spelling.
         make_the_credentials(&home);
         assert_eq!(
             guard.absent_below(&root, &pin, &home.join(".claude/./.credentials.json")),
@@ -5892,7 +5902,8 @@ mod tests {
         std::fs::remove_file(home.join(".claude/.credentials.json")).expect("removed");
         let guard = claude_plan().take(&home);
         // A link to a file that names the run is put at the guarded name, and the absence look of
-        // a spelling of that name that the plan did not refuse finds it: a link is an entry.
+        // a spelling of that name finds it: a link is an entry. The plan has no absent list here
+        // either, so this case tests the guard's write apart from the plan's check.
         std::fs::write(home.join("target"), format!(r#"{{"id":"{RUN_NAME}"}}"#)).expect("a write");
         std::os::unix::fs::symlink(home.join("target"), home.join(".claude/.credentials.json"))
             .expect("a link");
