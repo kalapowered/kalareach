@@ -54,6 +54,49 @@ pub fn lingering(mut script: Value) -> Value {
     script
 }
 
+/// The integration mode and the launch profile of an agent that the ACP launch started.
+pub const ACP: &str = "acp";
+
+/// What the host says of the agent a case started: the integration mode of its instance and the
+/// launch profile that was recorded for it.
+#[derive(Debug)]
+pub struct Launch {
+    /// The instance's integration mode.
+    pub mode: String,
+    /// The launch profile recorded for the instance.
+    pub profile: String,
+}
+
+/// Says why the agent a case started was not started through the ACP launch, or returns none when
+/// it was: its instance has the ACP mode and the ACP launch profile, and its record holds the
+/// `initialize` request and then the `session/new` request.
+pub fn why_not_an_acp_launch(launch: &Launch, record: &[Value]) -> Option<String> {
+    if launch.mode != ACP {
+        return Some(format!(
+            "the instance's mode is `{}`, not `{ACP}`",
+            launch.mode
+        ));
+    }
+    if launch.profile != ACP {
+        return Some(format!(
+            "the instance's launch profile is `{}`, not `{ACP}`",
+            launch.profile
+        ));
+    }
+    let methods: Vec<&str> = record
+        .iter()
+        .filter(|line| line["received"] == "request")
+        .filter_map(|line| line["method"].as_str())
+        .collect();
+    let at = |method: &str| methods.iter().position(|held| *held == method);
+    match (at("initialize"), at("session/new")) {
+        (Some(first), Some(second)) if first < second => None,
+        (None, _) => Some("the record holds no `initialize` request".to_owned()),
+        (_, None) => Some("the record holds no `session/new` request".to_owned()),
+        _ => Some("the record holds `session/new` before `initialize`".to_owned()),
+    }
+}
+
 /// The lines of the stand-in's record that are responses to its requests.
 fn responses(record: &[Value]) -> Vec<&Value> {
     record
@@ -143,6 +186,11 @@ impl Hosted {
     /// starts the turn and sends the prompts it needs.
     pub fn start(_shape: Shape, _source: Source, _script: &Value) -> Result<Self, &'static str> {
         Err(super::NO_HOST)
+    }
+
+    /// The integration mode and the launch profile the host lists for the instance.
+    pub fn launch(&mut self) -> Launch {
+        match *self {}
     }
 
     /// The four reads of the instance and its pending request.
@@ -955,6 +1003,48 @@ fn scripts() -> Vec<(&'static str, Value)> {
             prompt_after_a_cancel_script(),
         ),
     ]
+}
+
+#[test]
+fn the_check_of_the_launch_names_what_makes_a_start_no_acp_launch() {
+    let launch = |mode: &str, profile: &str| Launch {
+        mode: mode.to_owned(),
+        profile: profile.to_owned(),
+    };
+    let request = |method: &str| serde_json::json!({ "received": "request", "method": method });
+    let record = [request("initialize"), request("session/new")];
+    assert_eq!(why_not_an_acp_launch(&launch(ACP, ACP), &record), None);
+    let why = |launch: &Launch, record: &[Value]| why_not_an_acp_launch(launch, record);
+    assert_eq!(
+        why(&launch("terminal", ACP), &record).as_deref(),
+        Some("the instance's mode is `terminal`, not `acp`")
+    );
+    assert_eq!(
+        why(&launch(ACP, "default"), &record).as_deref(),
+        Some("the instance's launch profile is `default`, not `acp`")
+    );
+    assert_eq!(
+        why(&launch(ACP, ACP), &record[1..]).as_deref(),
+        Some("the record holds no `initialize` request")
+    );
+    assert_eq!(
+        why(&launch(ACP, ACP), &record[..1]).as_deref(),
+        Some("the record holds no `session/new` request")
+    );
+    let reversed = [request("session/new"), request("initialize")];
+    assert_eq!(
+        why(&launch(ACP, ACP), &reversed).as_deref(),
+        Some("the record holds `session/new` before `initialize`")
+    );
+    let not_a_request = [
+        request("initialize"),
+        serde_json::json!({ "received": "notification", "method": "session/new" }),
+    ];
+    assert_eq!(
+        why(&launch(ACP, ACP), &not_a_request).as_deref(),
+        Some("the record holds no `session/new` request"),
+        "a notification is no request"
+    );
 }
 
 #[test]

@@ -74,7 +74,8 @@ enum Source {
 }
 
 /// Starts the stand-in that the table names for control `id`, with `script`, through the launch and
-/// runs `body` on the host. It fails with the red the body returns.
+/// runs `body` on the host. It fails first when the agent did not come through the ACP launch, unless
+/// the control's row names a harness start, and then with the red the body returns.
 fn run_case(
     id: &str,
     script: &Value,
@@ -94,6 +95,11 @@ fn run_case_from(
     match controls::Hosted::start(control_of(id).shape, source, script) {
         Err(why) => panic!("{id}: {why}"),
         Ok(mut host) => {
+            if control_of(id).harness_start.is_none()
+                && let Some(why) = controls::why_not_an_acp_launch(&host.launch(), &host.record())
+            {
+                panic!("{id}: the agent was not started through the ACP launch: {why}");
+            }
             if let Err(red) = body(&mut host) {
                 panic!("{red}");
             }
@@ -130,6 +136,9 @@ struct Control {
     mutation: &'static str,
     /// What the case sees when it does.
     red: &'static str,
+    /// Why the case starts the stand-in by the harness's own control start and not through the ACP
+    /// launch, for the one control that does; none for every other control.
+    harness_start: Option<&'static str>,
 }
 
 /// The parts that can own a test: the launch and the ending of the agent, the decoder and the
@@ -150,6 +159,7 @@ const CONTROLS: [Control; 33] = [
         shows: "after only the daemon is killed and started again, the instance, the binding, the capability identity and the pending request read field for field as before",
         mutation: "the worker drops its pending request when the daemon's connection ends",
         red: "the read after the restart differs",
+        harness_start: None,
     },
     Control {
         id: "5b-2",
@@ -160,6 +170,7 @@ const CONTROLS: [Control; 33] = [
         shows: "the request resolves once through the restarted daemon: the stand-in saw one reply, with the chosen id",
         mutation: "the answer is forwarded twice",
         red: "the stand-in's count of replies is 2",
+        harness_start: None,
     },
     Control {
         id: "5b-3",
@@ -170,6 +181,7 @@ const CONTROLS: [Control; 33] = [
         shows: "with the daemon killed and then the worker, the restarted daemon refuses the instance and the request as a closed session's",
         mutation: "the daemon keeps the request",
         red: "the answer is accepted",
+        harness_start: None,
     },
     Control {
         id: "5b-11",
@@ -180,6 +192,7 @@ const CONTROLS: [Control; 33] = [
         shows: "closing the session after the restart ends the agent through its owned root",
         mutation: "the owned-root record is not used to end the agent",
         red: "the agent keeps running",
+        harness_start: None,
     },
     Control {
         id: "5b-4",
@@ -190,6 +203,7 @@ const CONTROLS: [Control; 33] = [
         shows: "two concurrent answers to one request, and a retry after the daemon reconnects, reach the agent once",
         mutation: "the claim in arbitration is skipped",
         red: "both answers reach the stand-in",
+        harness_start: None,
     },
     Control {
         id: "5b-5",
@@ -200,6 +214,7 @@ const CONTROLS: [Control; 33] = [
         shows: "a cancel and an answer that race on one approval have one winner, and the other is told",
         mutation: "the cancel does not answer the pending approval",
         red: "the stand-in's tool call never settles, or both the cancel and the answer are accepted",
+        harness_start: None,
     },
     Control {
         id: "5b-6",
@@ -210,6 +225,7 @@ const CONTROLS: [Control; 33] = [
         shows: "a permission request that the stand-in sends after `session/cancel` is answered cancelled",
         mutation: "the late request is left pending",
         red: "the stand-in blocks and its turn never ends",
+        harness_start: None,
     },
     Control {
         id: "5b-6g",
@@ -220,6 +236,7 @@ const CONTROLS: [Control; 33] = [
         shows: "a permission request that the stand-in sends after `session/cancel` is answered cancelled",
         mutation: "the late request is left pending",
         red: "the stand-in blocks and its turn never ends",
+        harness_start: None,
     },
     Control {
         id: "5b-7",
@@ -230,6 +247,7 @@ const CONTROLS: [Control; 33] = [
         shows: "the same request id in a second instance, or on a second connection, is a second pending request",
         mutation: "requests are keyed by the id alone",
         red: "one request, not two",
+        harness_start: None,
     },
     Control {
         id: "5b-8",
@@ -240,6 +258,7 @@ const CONTROLS: [Control; 33] = [
         shows: "a fresh permission request after a daemon restart is listed as a pending request",
         mutation: "the new request is dropped",
         red: "no request appears",
+        harness_start: None,
     },
     Control {
         id: "5b-9",
@@ -250,6 +269,7 @@ const CONTROLS: [Control; 33] = [
         shows: "an agent that exits before the answer is dispatched leaves its request cancelled",
         mutation: "the exit leaves the request pending",
         red: "the request is still pending",
+        harness_start: None,
     },
     Control {
         id: "5b-10",
@@ -260,6 +280,7 @@ const CONTROLS: [Control; 33] = [
         shows: "an agent that exits after the answer is dispatched leaves the receipt unknown when no evidence was seen, and leaves it applied when evidence that the agent used the answer was seen first",
         mutation: "the exit rewrites every answered request to unknown, or none",
         red: "the confirmed answer changes, or the unproved one reads applied",
+        harness_start: None,
     },
     Control {
         id: "5b-10g",
@@ -270,6 +291,7 @@ const CONTROLS: [Control; 33] = [
         shows: "an agent that exits after the answer is dispatched leaves the receipt unknown when no evidence was seen, and leaves it applied when evidence that the agent used the answer was seen first",
         mutation: "the exit rewrites every answered request to unknown, or none",
         red: "the confirmed answer changes, or the unproved one reads applied",
+        harness_start: None,
     },
     Control {
         id: "5b-12",
@@ -280,6 +302,7 @@ const CONTROLS: [Control; 33] = [
         shows: "the launcher ends the agent when the worker's connection ends; the case closes the worker's end and restarts no daemon, because a daemon restart does not close that connection",
         mutation: "the launcher ignores the closed connection",
         red: "the agent keeps running",
+        harness_start: None,
     },
     Control {
         id: "5b-13",
@@ -290,6 +313,7 @@ const CONTROLS: [Control; 33] = [
         shows: "a decline sends the Gemini-shaped agent's client no update, so the receipt stays dispatching until the next request, the reply or the deadline of 300 seconds",
         mutation: "a decline counted as applied at dispatch, or the next request and the reply not taken as evidence of a decline",
         red: "the receipt reads applied at dispatch, or the receipts at the boundaries do not read unknown, applied and applied",
+        harness_start: None,
     },
     Control {
         id: "5b-14",
@@ -300,6 +324,7 @@ const CONTROLS: [Control; 33] = [
         shows: "an abort that settles a call without taking the answer, with no cancel window of ours, leaves the receipt unknown: the stand-in aborts the tool after the answer was dispatched, sends the call's cancelled update and then replies to the prompt with the stop reason cancelled",
         mutation: "the reply, or the cancelled update, is counted as evidence",
         red: "the receipt reads applied, not unknown",
+        harness_start: None,
     },
     Control {
         id: "5b-15",
@@ -310,6 +335,7 @@ const CONTROLS: [Control; 33] = [
         shows: "after an update of the agent's own turn and a permission request, then no traffic for 11 seconds by the injected clock, the person's Cancel reaches the stand-in as `session/cancel` and the pending approval is answered cancelled",
         mutation: "a quiet period of 10 seconds closes the turn and the cancel is refused as stale",
         red: "the stand-in's count of `session/cancel` is 0",
+        harness_start: None,
     },
     Control {
         id: "5b-16",
@@ -320,6 +346,7 @@ const CONTROLS: [Control; 33] = [
         shows: "with no prompt of ours in flight and steady traffic, the cancel window closes 30 seconds after the cancel by the injected clock: an approval at 29 seconds is answered cancelled and one at 31 seconds shows",
         mutation: "the window stays open while traffic goes on",
         red: "the approval at 31 seconds is answered cancelled",
+        harness_start: None,
     },
     Control {
         id: "5b-17",
@@ -330,6 +357,7 @@ const CONTROLS: [Control; 33] = [
         shows: "with a prompt of ours in flight the window closes at that prompt's reply and not at 30 seconds: an approval at 31 seconds, before the reply, is answered cancelled, and a message sent meanwhile is refused",
         mutation: "the window is capped at 30 seconds",
         red: "the approval at 31 seconds shows",
+        harness_start: None,
     },
     Control {
         id: "5b-18",
@@ -340,6 +368,7 @@ const CONTROLS: [Control; 33] = [
         shows: "a prompt of ours that waits behind a turn of the agent's own and is answered cancelled at once does not close the window: a request of the old turn 3 seconds later is answered cancelled",
         mutation: "the window closes at our prompt's reply",
         red: "the request at 3 seconds shows and is not answered cancelled",
+        harness_start: None,
     },
     Control {
         id: "5b-19",
@@ -350,6 +379,7 @@ const CONTROLS: [Control; 33] = [
         shows: "a prompt sent 5 seconds after a Cancel closes the window: the worker dispatches it, the stand-in sends an approval for it, and the approval shows",
         mutation: "the window ignores the dispatch and stays open to 30 seconds",
         red: "the approval is answered cancelled",
+        harness_start: None,
     },
     Control {
         id: "5b-20",
@@ -360,6 +390,7 @@ const CONTROLS: [Control; 33] = [
         shows: "an answered approval of a turn of the agent's own, then no traffic and a live agent: at 300 seconds by the injected clock the receipt reads unknown, the source bytes are gone and the agent still runs",
         mutation: "the answer waits for the agent's exit",
         red: "the receipt still reads dispatching and the source bytes remain",
+        harness_start: None,
     },
     Control {
         id: "5b-21",
@@ -370,6 +401,7 @@ const CONTROLS: [Control; 33] = [
         shows: "a decline in a turn of the agent's own, then the call's failed update: the receipt reads unknown at that update",
         mutation: "the terminal result of the call is ignored",
         red: "the receipt stays dispatching",
+        harness_start: None,
     },
     Control {
         id: "5b-22",
@@ -380,6 +412,7 @@ const CONTROLS: [Control; 33] = [
         shows: "an allow in a turn of the agent's own whose in-progress update arrives after the deadline (the clock at 301 seconds, then the update) reads unknown and then applied",
         mutation: "the late update is ignored",
         red: "the receipt stays unknown",
+        harness_start: None,
     },
     Control {
         id: "5b-23",
@@ -390,6 +423,7 @@ const CONTROLS: [Control; 33] = [
         shows: "the answer is dispatched, the person cancels, and the call's completed update arrives: the receipt reads applied",
         mutation: "every update after a cancel is ignored",
         red: "the receipt reads unknown, not applied",
+        harness_start: None,
     },
     Control {
         id: "5b-23g",
@@ -400,6 +434,7 @@ const CONTROLS: [Control; 33] = [
         shows: "the answer is dispatched, the person cancels, and the call's completed update arrives: the receipt reads applied",
         mutation: "every update after a cancel is ignored",
         red: "the receipt reads unknown, not applied",
+        harness_start: None,
     },
     Control {
         id: "6b-1",
@@ -410,6 +445,7 @@ const CONTROLS: [Control; 33] = [
         shows: "after the installation's file is replaced in place, the process identity, the executable's digest and the copy's digest equal those before, and the installation's digest differs",
         mutation: "the launch runs the installation's file, not the copy",
         red: "the digests after the upgrade differ from those before",
+        harness_start: None,
     },
     Control {
         id: "6b-2",
@@ -420,6 +456,7 @@ const CONTROLS: [Control; 33] = [
         shows: "the agent asks a fresh permission request after the upgrade; its decoded options equal those decoded before, and it is answered with the pinned table's ids",
         mutation: "the host decodes the fresh request with the table of the upgraded installation",
         red: "the decoded options differ from those before the upgrade",
+        harness_start: None,
     },
     Control {
         id: "6b-3",
@@ -430,6 +467,7 @@ const CONTROLS: [Control; 33] = [
         shows: "a start of a build outside the range `=1.1.63` is refused, and the launcher prints a message that names the range",
         mutation: "the range is not checked, or the refusal's message leaves the range out",
         red: "the second start is admitted, or its message does not name the range",
+        harness_start: None,
     },
     Control {
         id: "6b-3g",
@@ -440,6 +478,7 @@ const CONTROLS: [Control; 33] = [
         shows: "a start of a build outside the range `=0.60.0` is refused, and the launcher prints a message that names the range",
         mutation: "the range is not checked, or the refusal's message leaves the range out",
         red: "the second start is admitted, or its message does not name the range",
+        harness_start: None,
     },
     Control {
         id: "6b-4",
@@ -450,6 +489,7 @@ const CONTROLS: [Control; 33] = [
         shows: "the version the agent reports equals the binding's, and a start whose version differs from the hashed build is refused",
         mutation: "the reported version is not compared with the hashed build",
         red: "a start with another version is admitted",
+        harness_start: None,
     },
     Control {
         id: "6b-5",
@@ -460,6 +500,7 @@ const CONTROLS: [Control; 33] = [
         shows: "the package's chunk is replaced in place after the first permission request is answered, and the stand-in's later import still reads the copy's chunk: the marker holds the original chunk's bytes",
         mutation: "the launch runs the installation's package, not the copy",
         red: "the marker holds the replaced chunk's bytes",
+        harness_start: None,
     },
     Control {
         id: "6b-6",
@@ -470,6 +511,9 @@ const CONTROLS: [Control; 33] = [
         shows: "started from the installation's folder with no copy, which only the harness does, the same upgrade makes the stand-in load the new chunk; the case fails unless the two starts differ",
         mutation: "the chunk that is replaced is not the one the stand-in imports",
         red: "the start without the copy loads the original chunk, so the control shows no difference",
+        harness_start: Some(
+            "the control start of 6b: the harness runs the stand-in from the installation's folder with no copy, which no launch does, so the check of the ACP launch would fail it by design",
+        ),
     },
 ];
 
@@ -918,6 +962,26 @@ fn the_acp_table_names_owner_mutation_and_red_of_every_control() {
             control.test
         );
     }
+}
+
+/// Only the control that starts the stand-in from the installation with no copy names a harness
+/// start, and it says why.
+#[test]
+fn the_acp_table_names_the_one_harness_start_and_its_reason() {
+    let starts: Vec<(&str, &str)> = CONTROLS
+        .iter()
+        .filter_map(|control| control.harness_start.map(|why| (control.id, why)))
+        .collect();
+    let ids: Vec<&str> = starts.iter().map(|(id, _)| *id).collect();
+    assert_eq!(
+        ids,
+        ["6b-6"],
+        "the controls that name a harness start (left) and the one control that starts with no copy (right)"
+    );
+    assert!(
+        starts.iter().all(|(_, why)| !why.is_empty()),
+        "a harness start names its reason"
+    );
 }
 
 /// The table and this file agree: a test the table says waits is ignored for the same part, a
