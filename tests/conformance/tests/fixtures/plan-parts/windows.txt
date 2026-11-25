@@ -53,11 +53,11 @@ the plugin host's launcher :: cargo test --locked -p kr-plugin-service --lib lau
 the compile budget's reading of a thread's processor time :: cargo test --locked -p kr-plugin-runtime --test execution kr_req_11_41_the_budget_counts_the_compiling_threads_own_processor_time -- --show-output
 the plugin runtime's library :: cargo test --locked -p kr-plugin-runtime --lib -- --show-output
 the plugin runtime running real components :: cargo test --locked -p kr-plugin-runtime --test execution -- --show-output --skip kr_req_11_41_the_budget_counts_the_compiling_threads_own_processor_time
+the plugin runtime's service over a pipe :: cargo test --locked -p kr-plugin-runtime --test service -- --show-output
 part 2/2
 the control daemon, the worker, the forwarder and the plugin host the suites start, and the release tool whose header a case reads :: cargo build --locked -p kr-controller -p kr-worker -p kr-hook -p kr-plugin-host -p kr-release
 the control daemon the suites start, built with the testing feature :: cargo build --locked -p kr-controller --features testing --bin kr-controller-held
 the description process the update suite assembles into releases :: cargo build --locked -p kr-describe-model --bin kr-describe-inference
-the plugin runtime's service over a pipe :: cargo test --locked -p kr-plugin-runtime --test service -- --show-output
 the control daemon started through the environment's scheduled task :: cargo test --locked -p kr-cli --test startup_windows -- --ignored --skip a_task_the_task_scheduler_does_not_start --show-output
 the attention store :: cargo test --locked -p kr-attention -- --show-output
 the client's stores and their directory flush :: cargo test --locked -p kr-client --lib -- --show-output
