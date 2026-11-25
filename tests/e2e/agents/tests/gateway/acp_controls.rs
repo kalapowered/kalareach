@@ -229,6 +229,12 @@ impl Hosted {
         match *self {}
     }
 
+    /// The stand-in's record, read after five seconds, so that a second forward of an answer that
+    /// arrives late is in it.
+    pub fn record_after_quiet(&mut self) -> Vec<Value> {
+        match *self {}
+    }
+
     /// Closes the session and says whether the agent still runs once the close has finished.
     pub fn closes_the_session(&mut self) -> bool {
         match *self {}
@@ -291,7 +297,7 @@ pub fn a_daemon_killed_with_a_request_pending(host: &mut Hosted) -> Result<(), R
     host.restart_daemon();
     reads_equal_after_a_restart(&before, &host.reads())?;
     host.answer("proceed_once");
-    one_reply_with_the_chosen_id(&host.record(), "proceed_once")?;
+    one_reply_with_the_chosen_id(&host.record_after_quiet(), "proceed_once")?;
     requires(
         "5b-11",
         host.agent_runs(),
@@ -308,7 +314,7 @@ pub fn two_answers_at_once(host: &mut Hosted) -> Result<(), Red> {
     host.kill_daemon();
     host.restart_daemon();
     host.answer("proceed_once");
-    one_answer_wins(accepted, &host.record())
+    one_answer_wins(accepted, &host.record_after_quiet())
 }
 
 /// Case 5b-7: a second instance whose first request carries the id of the first instance's.
