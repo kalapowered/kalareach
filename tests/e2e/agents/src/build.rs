@@ -814,6 +814,12 @@ pub struct Account {
     /// own and `{work}` the working directory.
     #[serde(default)]
     pub absent: Vec<String>,
+    /// Files below the run's configuration directory that the agent's own use writes beside what
+    /// the harness put there, such as its records of a session. Each is `{config}/` and a path
+    /// whose parts are names, a lone `*` for any one name, and a last `**` for every file below
+    /// its directory ([`Account::allowed_below_config`]).
+    #[serde(default)]
+    pub allowed: Vec<String>,
     /// The switches that stop the agent updating itself or installing a package of its own accord,
     /// each of which the entry must give the agent (`installs_are_off`).
     #[serde(default)]
@@ -1205,6 +1211,42 @@ where
 }
 
 impl Account {
+    /// The entry's allowed files as paths below the configuration directory, `{config}/` taken off.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first pattern that does not begin with `{config}/`, or that holds an empty
+    /// part, `.` or `..`, a template, a `*` inside a name, or a `**` that is not the last part.
+    pub fn allowed_below_config(&self) -> Result<Vec<String>, String> {
+        self.allowed
+            .iter()
+            .map(|pattern| {
+                let Some(below) = pattern.strip_prefix("{config}/") else {
+                    return Err(format!(
+                        "the allowed file {pattern:?} does not begin with `{{config}}/`"
+                    ));
+                };
+                let parts: Vec<&str> = below.split('/').collect();
+                for (index, part) in parts.iter().enumerate() {
+                    let last = index + 1 == parts.len();
+                    let fine = match *part {
+                        "" | "." | ".." => false,
+                        "**" => last,
+                        "*" => true,
+                        name => !name.contains(['*', '{', '}']),
+                    };
+                    if !fine {
+                        return Err(format!(
+                            "the allowed file {pattern:?} holds {part:?}, and a part is a name, a lone \
+                             `*`, or a last `**`"
+                        ));
+                    }
+                }
+                Ok(below.to_owned())
+            })
+            .collect()
+    }
+
     /// The words the entry types after the command and gives on its command line (its arguments,
     /// then its switches, `{run}` and `{work}` filled in) as keys of the agent's configuration file,
     /// each a dotted key and the text of its value: `-c key=value` is that key and value, `--disable
@@ -1839,6 +1881,53 @@ mod tests {
                 "variables": variables
             }
         })
+    }
+
+    /// The allowed files of an entry are patterns below the configuration directory, and one of
+    /// another shape is refused with the part that is wrong.
+    #[test]
+    fn the_allowed_files_of_an_entry_are_patterns_below_the_configuration_directory() {
+        let allowed = |list: serde_json::Value| -> Result<Vec<String>, String> {
+            let mut entry = entry_json(&serde_json::json!({}), &serde_json::json!({}));
+            entry["account"]["allowed"] = list;
+            serde_json::from_value::<Build>(entry)
+                .expect("an entry")
+                .account
+                .expect("an account")
+                .allowed_below_config()
+        };
+        assert_eq!(
+            allowed(serde_json::json!([])),
+            Ok(Vec::new()),
+            "an entry that names none allows none"
+        );
+        assert_eq!(
+            allowed(serde_json::json!([
+                "{config}/.claude.json",
+                "{config}/projects/**",
+                "{config}/plugins/*/x"
+            ])),
+            Ok(vec![
+                ".claude.json".to_owned(),
+                "projects/**".to_owned(),
+                "plugins/*/x".to_owned()
+            ])
+        );
+        for (bad, part) in [
+            ("/home/.claude.json", ""),
+            ("{config}/../x", ".."),
+            ("{config}/a*b", "a*b"),
+            ("{config}/**/x", "**"),
+            ("{config}/{home}/x", "{home}"),
+            ("{config}/a//b", ""),
+            ("{config}/", ""),
+        ] {
+            let why = allowed(serde_json::json!([bad])).expect_err(bad);
+            assert!(
+                why.contains(&format!("{bad:?}")) && (part.is_empty() || why.contains(part)),
+                "{bad}: {why}"
+            );
+        }
     }
 
     /// An entry that sets a variable the host's worker drops from every session (its own prefix,

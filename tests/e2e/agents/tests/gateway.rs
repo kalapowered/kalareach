@@ -102,9 +102,9 @@ use kr_e2e_agents::entry;
 use kr_e2e_agents::held::{
     Absent, Audit, CONFIG_DIRECTORY, HeldKeys, ISOLATION_UNPROVEN, NEWER_CONFIG_DIRECTORY,
     PersonGuard, PersonPlan, Recorded, RunScan, Stop, absent_paths, absent_paths_in, audit_turns,
-    conversations_relative, conversations_relative_in, folder_of, grouped_output, kept_panic_text,
-    new_turns, other_agents_refusal, panic_text, person_home, read_record, turns_recorded,
-    unchanged_before_the_charge,
+    conversations_relative, conversations_relative_in, folder_of, grouped_output,
+    is_agents_own_record, kept_panic_text, new_turns, other_agents_refusal, panic_text,
+    person_home, read_record, turns_recorded, unchanged_before_the_charge,
 };
 use kr_e2e_agents::launch_report::{Seen, launch_report};
 use kr_e2e_agents::outcome::{Failure, Outcome};
@@ -813,11 +813,14 @@ impl Real {
     /// each path in the run is looked at by a walk from the run's pinned directory that follows no
     /// link at any component. A look that finds a path present, or does not show the absence, is
     /// kept by the person's guard as a failed look, so that no shared file is read for the rest of
-    /// the run; a path shown absent keeps nothing.
+    /// the run; a path shown absent keeps nothing. A file that is one of the agent's own records
+    /// the entry allows is not one that loads the person's settings: a probe makes the agent write
+    /// it.
     fn checks_absent(&self, run: &Run, absent: &[PathBuf]) {
         for path in absent {
             match self.person.absent_below(run.root(), run.pin(), path) {
                 Ok(true) => {}
+                Ok(false) if is_agents_own_record(&self.account, run.root(), path) => {}
                 Ok(false) => panic!(
                     "{ISOLATION_UNPROVEN} {} exists, which would load the person's own settings, \
                      hooks or servers into the agent, or which it would remove",

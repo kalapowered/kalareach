@@ -542,6 +542,126 @@ fn absent_below(root: &Path, pin: &kr_e2e_m1b::run::RootPin, path: &Path) -> Res
     }
 }
 
+/// Whether `relative`, the path of a file below the configuration directory, is one the allowed
+/// patterns name: each part is a name or a lone `*`, which is any one name, and a last `**` is every
+/// file below its directory. The patterns are [`Account::allowed_below_config`]'s.
+#[must_use]
+pub fn is_allowed(patterns: &[String], relative: &str) -> bool {
+    let names: Vec<&str> = relative.split('/').collect();
+    patterns.iter().any(|pattern| {
+        let parts: Vec<&str> = pattern.split('/').collect();
+        let mut taken = 0;
+        for (index, part) in parts.iter().enumerate() {
+            if *part == "**" && index + 1 == parts.len() {
+                return names.len() > taken;
+            }
+            match names.get(taken) {
+                Some(name) if *part == "*" || part == name => taken += 1,
+                _ => return false,
+            }
+        }
+        taken == names.len()
+    })
+}
+
+/// Whether `path`, below either of the run's two configuration directories, is one of the agent's
+/// own records the entry allows.
+///
+/// # Panics
+///
+/// Panics when a pattern of the entry's allowed files is not one the harness reads.
+#[must_use]
+pub fn is_agents_own_record(account: &Account, run_root: &Path, path: &Path) -> bool {
+    let patterns = account
+        .allowed_below_config()
+        .unwrap_or_else(|why| panic!("{ISOLATION_UNPROVEN} {why}"));
+    [CONFIG_DIRECTORY, NEWER_CONFIG_DIRECTORY]
+        .iter()
+        .filter_map(|directory| path.strip_prefix(run_root.join(directory)).ok())
+        .filter_map(|relative| relative.to_str())
+        .any(|relative| is_allowed(&patterns, relative))
+}
+
+/// Compares what stands below the run's configuration directory `config` at the end of a part with
+/// what the harness and the agent may have put there: every file is one of the recipe's files
+/// (`recipe_files`, by their path below `config`), or `settings.json` holding exactly the one key
+/// the recipe sets (`settings_key`, in `enabledPlugins`, set to `true`), or one the allowed
+/// patterns name. A link is matched by its name as a file is, and `settings.json` as a link is
+/// not the recipe's.
+///
+/// # Errors
+///
+/// Returns a line for each file that is none of these, and for a `settings.json` that holds more
+/// than the key, in the order of their names.
+pub fn end_compare(
+    config: &Path,
+    recipe_files: &[&str],
+    settings_key: &str,
+    allowed: &[String],
+) -> Result<(), String> {
+    let mut refused = Vec::new();
+    let mut pending = vec![(config.to_path_buf(), String::new())];
+    while let Some((directory, prefix)) = pending.pop() {
+        let entries = match std::fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(error) => {
+                refused.push(format!("{} cannot be listed: {error}", directory.display()));
+                continue;
+            }
+        };
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    refused.push(format!("{} cannot be listed: {error}", directory.display()));
+                    continue;
+                }
+            };
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let relative = if prefix.is_empty() {
+                name
+            } else {
+                format!("{prefix}/{name}")
+            };
+            if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                pending.push((entry.path(), relative));
+            } else if relative == "settings.json" {
+                if let Err(why) = settings_hold_only(&entry.path(), settings_key) {
+                    refused.push(why);
+                }
+            } else if !recipe_files.contains(&relative.as_str()) && !is_allowed(allowed, &relative)
+            {
+                refused.push(format!(
+                    "{relative} is not one of the recipe's files, and the entry does not allow it"
+                ));
+            }
+        }
+    }
+    refused.sort();
+    if refused.is_empty() {
+        Ok(())
+    } else {
+        Err(refused.join("; "))
+    }
+}
+
+/// Whether the file `settings` is a regular file that holds exactly the one key the recipe sets.
+fn settings_hold_only(settings: &Path, key: &str) -> Result<(), String> {
+    if !std::fs::symlink_metadata(settings).is_ok_and(|found| found.is_file()) {
+        return Err("settings.json is not a file of the run's own".to_owned());
+    }
+    let held: Option<Value> = std::fs::read(settings)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok());
+    if held == Some(json!({ "enabledPlugins": { key: true } })) {
+        Ok(())
+    } else {
+        Err(format!(
+            "settings.json does not hold exactly the recipe's key {key}"
+        ))
+    }
+}
+
 /// What stops a driver, as a class and the words that say it.
 pub type Stop = (&'static str, String);
 
@@ -3096,6 +3216,174 @@ mod tests {
             "turn_line": "\"type\":\"task_started\""
         }))
         .expect("an account")
+    }
+
+    /// The recipe's files below a configuration directory, and the key it sets.
+    const RECIPE: [&str; 2] = ["skills/p/.mcp.json", "skills/p/hooks/hooks.json"];
+    const KEY: &str = "p@skills-dir";
+
+    /// A configuration directory that holds the recipe's files and `settings.json` with its key.
+    fn configured(name: &str) -> PathBuf {
+        let config = scratch(name);
+        for file in RECIPE {
+            let path = config.join(file);
+            std::fs::create_dir_all(path.parent().expect("a directory")).expect("directories");
+            std::fs::write(path, b"{}").expect("a recipe file");
+        }
+        std::fs::write(
+            config.join("settings.json"),
+            format!(r#"{{"enabledPlugins":{{"{KEY}":true}}}}"#),
+        )
+        .expect("the settings");
+        config
+    }
+
+    fn patterns(list: &[&str]) -> Vec<String> {
+        list.iter().map(|pattern| (*pattern).to_owned()).collect()
+    }
+
+    /// With no allowed set, the recipe's files and the settings with the recipe's key are all the
+    /// end compare finds.
+    #[test]
+    fn the_recipes_files_and_its_key_are_all_the_end_compare_finds_below_the_configuration_directory()
+     {
+        let config = configured("end-recipe");
+        assert_eq!(end_compare(&config, &RECIPE, KEY, &[]), Ok(()));
+    }
+
+    /// A file that is not the recipe's and that no pattern names is named, and one that a pattern
+    /// names is not.
+    #[test]
+    fn a_file_beyond_the_recipe_and_the_allowed_set_is_named_by_the_end_compare() {
+        let config = configured("end-beyond");
+        std::fs::write(config.join(".claude.json"), b"{}").expect("a file");
+        std::fs::create_dir_all(config.join("projects/a")).expect("directories");
+        std::fs::write(config.join("projects/a/t.jsonl"), b"x").expect("a file");
+        assert_eq!(
+            end_compare(&config, &RECIPE, KEY, &patterns(&["projects/**"])),
+            Err(
+                ".claude.json is not one of the recipe's files, and the entry does not allow it"
+                    .to_owned()
+            )
+        );
+    }
+
+    /// A `settings.json` that holds another key, or the recipe's key set to false, is named, and an
+    /// allowed pattern that names it does not excuse it.
+    #[test]
+    fn a_settings_file_that_holds_more_than_the_recipes_key_is_named_by_the_end_compare() {
+        let config = configured("end-settings");
+        for held in [
+            format!(r#"{{"enabledPlugins":{{"{KEY}":true,"other@x":true}}}}"#),
+            format!(r#"{{"enabledPlugins":{{"{KEY}":false}}}}"#),
+            format!(r#"{{"theme":"dark","enabledPlugins":{{"{KEY}":true}}}}"#),
+            "not json".to_owned(),
+        ] {
+            std::fs::write(config.join("settings.json"), &held).expect("the settings");
+            assert_eq!(
+                end_compare(&config, &RECIPE, KEY, &patterns(&["settings.json"])),
+                Err(format!(
+                    "settings.json does not hold exactly the recipe's key {KEY}"
+                )),
+                "{held}"
+            );
+        }
+    }
+
+    /// The files a signed-in run writes beside the recipe pass when the entry names them.
+    #[test]
+    fn a_name_in_the_allowed_set_passes_the_end_compare() {
+        let config = configured("end-allowed");
+        for file in [
+            ".claude.json",
+            "plugins/installed_plugins.json",
+            "plugins/data/p/x/y.json",
+            "projects/one/s.jsonl",
+        ] {
+            let path = config.join(file);
+            std::fs::create_dir_all(path.parent().expect("a directory")).expect("directories");
+            std::fs::write(path, b"{}").expect("a file");
+        }
+        let allowed = patterns(&[
+            ".claude.json",
+            "plugins/installed_plugins.json",
+            "plugins/data/p/**",
+            "projects/*/s.jsonl",
+        ]);
+        assert_eq!(end_compare(&config, &RECIPE, KEY, &allowed), Ok(()));
+    }
+
+    /// A `*` is one name and a last `**` is every file below its directory, and neither is the
+    /// directory itself, a longer path than a `*` leaves, or a file of another name.
+    #[test]
+    fn a_star_is_one_name_and_a_last_double_star_is_every_file_below() {
+        let allowed = patterns(&["a/*/c", "d/**", "e.json"]);
+        for named in ["a/b/c", "a/x/c", "d/f", "d/f/g/h", "e.json"] {
+            assert!(is_allowed(&allowed, named), "{named} is allowed");
+        }
+        for refused in [
+            "a/c", "a/b/c/d", "a/b", "d", "e.json/x", "x/e.json", "D/f", "",
+        ] {
+            assert!(!is_allowed(&allowed, refused), "{refused} is not allowed");
+        }
+    }
+
+    /// A link is matched by its name, as a file is; a `settings.json` that is a link is not the
+    /// recipe's.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_in_the_configuration_directory_is_matched_by_its_name_as_a_file_is() {
+        let config = configured("end-link");
+        let outside = scratch("end-link-outside").join("somewhere");
+        std::fs::write(&outside, b"{}").expect("a file outside");
+        std::os::unix::fs::symlink(&outside, config.join("link")).expect("a link");
+        assert_eq!(
+            end_compare(&config, &RECIPE, KEY, &[]),
+            Err(
+                "link is not one of the recipe's files, and the entry does not allow it".to_owned()
+            )
+        );
+        assert_eq!(
+            end_compare(&config, &RECIPE, KEY, &patterns(&["link"])),
+            Ok(())
+        );
+        std::fs::remove_file(config.join("settings.json")).expect("the settings go");
+        std::os::unix::fs::symlink(&outside, config.join("settings.json")).expect("a link");
+        assert_eq!(
+            end_compare(&config, &RECIPE, KEY, &patterns(&["link"])),
+            Err("settings.json is not a file of the run's own".to_owned())
+        );
+    }
+
+    /// A file below either of the run's configuration directories is the agent's own record where
+    /// the entry's allowed set names it, and no file elsewhere in the run is.
+    #[test]
+    fn a_path_below_either_configuration_directory_is_the_agents_own_record_where_the_entry_allows_it()
+     {
+        let mut account = account();
+        account.allowed = patterns(&["{config}/.claude.json", "{config}/projects/**"]);
+        let root = Path::new("/run");
+        for own in [
+            "agent-config/.claude.json",
+            "agent-config/projects/a/b.jsonl",
+            "agent-config-newer/.claude.json",
+        ] {
+            assert!(
+                is_agents_own_record(&account, root, &root.join(own)),
+                "{own} is the agent's own record"
+            );
+        }
+        for other in [
+            "agent-config/settings.json",
+            "agent-config/projects",
+            "h/.claude.json",
+            "w/.claude.json",
+        ] {
+            assert!(
+                !is_agents_own_record(&account, root, &root.join(other)),
+                "{other} is not the agent's own record"
+            );
+        }
     }
 
     #[test]
