@@ -990,6 +990,14 @@ pub fn placed_as_the_entry_says(ctx: &Context) {
             == std::fs::read(PROGRAM).expect("the terminal stand-in the harness built"),
         "{command}: the program placed as the agent is the terminal stand-in the harness built"
     );
+    if let Some((newer, _)) = &ctx.newer {
+        assert!(
+            std::fs::read(newer).expect("the program placed as the newer build")
+                == std::fs::read(NEWER).expect("the newer terminal stand-in the harness built"),
+            "{command}: the program placed as the newer build is the newer terminal stand-in the \
+             harness built"
+        );
+    }
     if scripted {
         let typed = ctx.bin.join(command);
         let text = std::fs::read_to_string(&typed).unwrap_or_default();
@@ -1249,10 +1257,11 @@ fn an_entry_whose_command_runtime_or_wheel_is_not_one_file_name_places_nothing_a
 }
 
 /// The entry of `synthetic` with a marker at every place it names a program to run: its pinned file
-/// below its prefix, its newer build's pinned file below the newer prefix, and each file of its
-/// runtime, all in folders of `base`. A marker is a script that appends its own path to the mark
-/// file, the second value returned, which exists only once a marker has run. The stand-in route
-/// places the stand-in program the harness built and runs nothing the entry names.
+/// and the command's file in the `bin` directory below its prefix, its newer build's pinned file and
+/// the command's file in the `bin` directory below the newer prefix, and each file of its runtime,
+/// all in folders of `base`. A marker is a script that appends its own path to the mark file, the
+/// second value returned, which exists only once a marker has run. The stand-in route places the
+/// stand-in program the harness built and runs nothing the entry names.
 ///
 /// # Panics
 ///
@@ -1276,9 +1285,12 @@ fn marked(base: &Path, synthetic: &Synthetic) -> (Synthetic, PathBuf) {
         .as_ref()
         .expect("the entry's newer build")
         .pinned;
+    let command = &synthetic.build.command;
     let markers = runtime.iter().cloned().chain([
         prefix.join(&synthetic.build.pinned),
+        prefix.join("bin").join(command),
         newer.join(newer_pinned),
+        newer.join("bin").join(command),
     ]);
     for marker in markers {
         std::fs::create_dir_all(marker.parent().expect("the folder of a marker"))
@@ -1324,23 +1336,33 @@ pub fn subject_for(synthetic: &Synthetic, base: &Path) -> Subject {
         .unwrap_or_else(|why| panic!("{}: {why}", synthetic.name))
 }
 
+/// Fails the case if a marker ([`marked`]) of the entry `name` ran: `mark` is the mark file, which
+/// exists only once one has.
+///
+/// # Panics
+///
+/// Panics where the mark file exists, with the paths of the markers that ran.
+fn assert_no_program_the_entry_names_ran(name: &str, mark: &Path) {
+    assert!(
+        !mark.exists(),
+        "{name}: the part ran a program that the entry names and the harness did not build; each \
+         such program wrote its path to the mark file:\n{}",
+        std::fs::read_to_string(mark).unwrap_or_default()
+    );
+}
+
 /// Runs `part`, one of the staged parts that start no model turn, as `test`, for the stand-in made
 /// from each synthetic entry, installed from a release of the entry's package. Every program the
 /// entry names is a marker ([`marked`]) in a folder of the case, outside the run's directory, and
-/// the case fails once the part has ended if one of them ran.
+/// the case fails once the part has ended if one of them ran
+/// ([`assert_no_program_the_entry_names_ran`]).
 fn for_each_entry(test: &str, part: fn(Option<Subject>, &str)) {
     for synthetic in synthetic() {
         let base = scratch("part");
         let (synthetic, mark) = marked(&base, &synthetic);
         let subject = subject_for(&synthetic, &base);
         part(Some(subject), test);
-        assert!(
-            !mark.exists(),
-            "{}: the part ran a program that the entry names and the harness did not build; each \
-             such program wrote its path to the mark file:\n{}",
-            synthetic.name,
-            std::fs::read_to_string(&mark).unwrap_or_default()
-        );
+        assert_no_program_the_entry_names_ran(synthetic.name, &mark);
         let _ = std::fs::remove_dir_all(&base);
     }
 }
