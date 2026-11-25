@@ -1556,12 +1556,14 @@ impl PersonGuard {
         self.plan.other_agents(agent, run_root)
     }
 
-    /// [`absent_below`] for a path of the entry's absent list. A look that does not show the
-    /// absence, for any reason other than the name's not being there, a link on the way included,
-    /// is kept as a failed look where the entry has guarded files: the path may reach a guarded
-    /// name through a link, and every shared read after it is refused. A file that is present is no
-    /// failed look; the caller stops the case. A look that succeeds shows a file as present or
-    /// absent and never reads it.
+    /// [`absent_below`] for a path of the entry's absent list. Where the entry has guarded files,
+    /// every look that does not show the path absent is kept as a failed look: a path found
+    /// present, whether a file, a directory or a link, and a look that failed for any reason other
+    /// than the name's not being there, a link on the way included. The path may reach a guarded
+    /// name, and the look keeps no identity of what it found, so every shared read after it is
+    /// refused. The caller still stops the case on a path found present. A path shown absent keeps
+    /// nothing, and a look never reads a file. This write is what protects a guarded name from a
+    /// path of the list that reaches it; the check of [`PersonPlan::of`] is a second line.
     ///
     /// # Errors
     ///
@@ -1573,7 +1575,8 @@ impl PersonGuard {
         path: &Path,
     ) -> Result<bool, String> {
         let looked = absent_below(root, pin, path);
-        if let (Err(_), Watch::Files(files)) = (&looked, &self.watch) {
+        let shown_absent = looked == Ok(true);
+        if let (false, Watch::Files(files)) = (shown_absent, &self.watch) {
             files.looks.lost();
         }
         looked
@@ -1958,17 +1961,17 @@ fn shared_names_the_run(
 /// guarded file moved or linked over the shared name is refused even when its guarded name is
 /// gone or holds another file. A look of a guarded name that fails, for any reason other than the
 /// name's not being there, a look that sees a link at the name, and a shared read that gives no
-/// answer in time are kept for the rest of the run, wherever they are made, a failed look of the
-/// entry's absent list among them, and every shared read after them is refused; so is a read at
-/// which a guarded name cannot be looked at. What no look saw can be read, where no saved or
-/// current identity matches it: a file that was at no guarded name at any look, put there and then
-/// moved over the shared name between two looks; the target of a link put at a guarded name after
-/// the take, when no look of the guard observed the link, since the worker's `stat` follows a link
-/// and does not see one at the name itself; and a file on a file system that gives a file another
-/// device and inode when it is renamed or linked, which defeats a saved identity where no current
-/// guarded name matches it. A write to a file that is not named, a transcript below
-/// `~/.claude/projects` among them, is not seen. What is said is the path the entry names and
-/// whether it changed, never a value.
+/// answer in time are kept for the rest of the run, wherever they are made, a look of the entry's
+/// absent list that finds the path present or fails among them, and every shared read after them is
+/// refused; so is a read at which a guarded name cannot be looked at. What no look saw can be read,
+/// where no saved or current identity matches it: a file that was at no guarded name at any look,
+/// put there and then moved over the shared name between two looks; the target of a link put at a
+/// guarded name after the take, when no look of the guard observed the link, since the worker's
+/// `stat` follows a link and does not see one at the name itself; and a file on a file system that
+/// gives a file another device and inode when it is renamed or linked, which defeats a saved
+/// identity where no current guarded name matches it. A write to a file that is not named, a
+/// transcript below `~/.claude/projects` among them, is not seen. What is said is the path the
+/// entry names and whether it changed, never a value.
 #[derive(Debug)]
 pub struct FileGuard {
     home: PathBuf,
@@ -5733,21 +5736,12 @@ mod tests {
     }
 
     #[test]
-    fn an_absence_look_that_fails_is_a_failed_look_of_the_guard_and_a_present_file_is_not() {
+    fn an_absence_look_that_fails_is_a_failed_look_of_the_guard() {
         let home = claude_home("absence-look");
         let root = home.join("run");
         std::fs::create_dir_all(root.join("w")).expect("a directory of the run");
         let pin = pinned(&root);
         let guard = claude_plan().take(&home);
-        // A guarded file that is present is a stop for the caller, and no failed look.
-        assert_eq!(
-            guard.absent_below(&root, &pin, &home.join(".claude/settings.json")),
-            Ok(false)
-        );
-        assert!(
-            !files_of(&guard).known().unlooked,
-            "a present file was kept as a failed look"
-        );
         // The agent makes a folder of the run a link to the person's `.claude`: the look of a path
         // through it is refused, and it is a failed look.
         std::os::unix::fs::symlink(home.join(".claude"), root.join("w/.claude")).expect("a link");
@@ -5766,6 +5760,75 @@ mod tests {
         let (stops, _) =
             files_of(&guard).compare_with(&lstat_in(&home), &reading, &[RUN_NAME, RUN_MARK]);
         assert_refused_as_unlooked(&stops);
+        assert_eq!(begun(&reading), 0, "a shared file was read");
+        std::fs::remove_dir_all(&home).expect("clean up");
+    }
+
+    #[test]
+    fn an_absence_look_that_finds_a_file_is_kept_as_a_failed_look_of_the_guard() {
+        let home = claude_home("absence-look-finds-a-file");
+        let root = home.join("run");
+        std::fs::create_dir_all(root.join("w")).expect("a directory of the run");
+        let pin = pinned(&root);
+        // The credentials file is not there at the take.
+        std::fs::remove_file(home.join(".claude/.credentials.json")).expect("removed");
+        let guard = claude_plan().take(&home);
+        // Another process makes it, and the absence look of a spelling of its name that the plan
+        // did not refuse finds it.
+        make_the_credentials(&home);
+        assert_eq!(
+            guard.absent_below(&root, &pin, &home.join(".claude/./.credentials.json")),
+            Ok(false)
+        );
+        assert!(
+            files_of(&guard).known().unlooked,
+            "a file that an absence look found was not kept as a failed look"
+        );
+        // The file moves over the shared name, and no look at the end sees it at a guarded name.
+        std::fs::rename(
+            home.join(".claude/.credentials.json"),
+            home.join(".claude.json"),
+        )
+        .expect("a move");
+        let reading = Reading::real();
+        let (stops, _) =
+            files_of(&guard).compare_with(&lstat_in(&home), &reading, &[RUN_NAME, RUN_MARK]);
+        let said: Vec<&str> = stops.iter().map(|(_, why)| why.as_str()).collect();
+        assert!(said.contains(&not_read(UNLOOKED).as_str()), "{said:?}");
+        assert_eq!(begun(&reading), 0, "a shared file was read");
+        std::fs::remove_dir_all(&home).expect("clean up");
+    }
+
+    #[test]
+    fn an_absence_look_that_finds_a_link_is_kept_as_a_failed_look_of_the_guard() {
+        let home = claude_home("absence-look-finds-a-link");
+        let root = home.join("run");
+        std::fs::create_dir_all(root.join("w")).expect("a directory of the run");
+        let pin = pinned(&root);
+        // The credentials file is not there at the take.
+        std::fs::remove_file(home.join(".claude/.credentials.json")).expect("removed");
+        let guard = claude_plan().take(&home);
+        // A link to a file that names the run is put at the guarded name, and the absence look of
+        // a spelling of that name that the plan did not refuse finds it: a link is an entry.
+        std::fs::write(home.join("target"), format!(r#"{{"id":"{RUN_NAME}"}}"#)).expect("a write");
+        std::os::unix::fs::symlink(home.join("target"), home.join(".claude/.credentials.json"))
+            .expect("a link");
+        assert_eq!(
+            guard.absent_below(&root, &pin, &home.join(".claude/./.credentials.json")),
+            Ok(false)
+        );
+        assert!(
+            files_of(&guard).known().unlooked,
+            "a link that an absence look found was not kept as a failed look"
+        );
+        // The link goes, and its target is moved over the shared name.
+        std::fs::remove_file(home.join(".claude/.credentials.json")).expect("removed");
+        std::fs::rename(home.join("target"), home.join(".claude.json")).expect("a move");
+        let reading = Reading::real();
+        let (stops, _) =
+            files_of(&guard).compare_with(&lstat_in(&home), &reading, &[RUN_NAME, RUN_MARK]);
+        let said: Vec<&str> = stops.iter().map(|(_, why)| why.as_str()).collect();
+        assert!(said.contains(&not_read(UNLOOKED).as_str()), "{said:?}");
         assert_eq!(begun(&reading), 0, "a shared file was read");
         std::fs::remove_dir_all(&home).expect("clean up");
     }
