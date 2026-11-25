@@ -479,6 +479,12 @@ impl Route {
         let (Some(build), Some(generation)) = (subject.entry().cloned(), generation) else {
             return Self::StandIn;
         };
+        // A package that installs a native bridge needs the entry to say how the agent runs with
+        // one in place: every leg is asked here, once, for the package its entry names, before any
+        // host is started.
+        build
+            .integrated_for(generation_entry(&generation, &subject.plugin()).installs_a_bridge)
+            .unwrap_or_else(|why| panic!("{ISOLATION_UNPROVEN} {why}"));
         let account = build.account.clone().unwrap_or_else(|| {
             panic!("{BUILD_VARIABLE} names an entry with no login, which no case may start")
         });
@@ -1913,6 +1919,10 @@ impl Context {
     /// integration on, with the address devices dial kept across a restart of its daemon.
     fn host(&self) -> Host<'_> {
         if self.claude_code.is_some() {
+            assert!(
+                matches!(self.route, Route::StandIn),
+                "the claude-code recipe cases run on the stand-in route only"
+            );
             return claude_recipe::host(self, &claude_recipe::Variant::default());
         }
         Host::start_prepared(
@@ -1943,10 +1953,6 @@ impl Context {
                     &builds,
                     distribution,
                     generation,
-                    match &self.route {
-                        Route::StandIn => None,
-                        Route::Real(real) => Some(&real.build),
-                    },
                 ));
                 *self
                     .package_digest
@@ -2413,17 +2419,15 @@ fn generation_source(environment: &EnvironmentPaths) -> PathBuf {
 /// of `executable` as the one build it qualifies, and installs and enables it in the environment
 /// with the grants it asks for, as the owner's confirmation of that exact installation does.
 ///
-/// On a real route, where `build` is the leg's entry, it first refuses the leg when the generation's
-/// entry for the package asks for the capability that installs a native bridge and the build list's
-/// entry does not say how the agent runs with one in place ([`Build::integrated_for`]): every leg
-/// installs its package here, so that none can go on without it.
+/// On a real route the package is the signed generation's. The check of how the agent runs with a
+/// native bridge in place is made once for each leg, where the route is acquired
+/// ([`Route::acquire`]), for the package the entry names.
 async fn install_agent(
     subject: &Subject,
     environment: &EnvironmentPaths,
     executables: &[(PathBuf, String)],
     distribution: &str,
     generation: Option<&Path>,
-    build: Option<&Build>,
 ) -> [u8; 32] {
     if let Some(why) = release_with_generation(subject, generation) {
         panic!("{why}");
@@ -2460,15 +2464,6 @@ async fn install_agent(
     {
         let wanted = generation_entry(directory, &plugin);
         let grant = wanted.grant.clone();
-        if let Some(build) = build {
-            build
-                .integrated_for(
-                    wanted
-                        .grant
-                        .contains(&PluginCapability::NativeBridgeInstall),
-                )
-                .unwrap_or_else(|why| panic!("{ISOLATION_UNPROVEN} {why}"));
-        }
         (
             generations::directory_url(&directory.join("metadata")),
             generations::directory_url(&directory.join("targets")),
@@ -2612,6 +2607,9 @@ struct GenerationEntry {
     manifest_digest: String,
     /// The capabilities the entry requests that the repository's ceiling does not already allow.
     grant: Vec<PluginCapability>,
+    /// Whether the entry requests the capability that installs a native bridge, whatever the
+    /// repository's ceiling allows.
+    installs_a_bridge: bool,
 }
 
 /// Reads the entry of the package `plugin` in the generation at `directory`.
@@ -2639,16 +2637,22 @@ fn generation_entry(directory: &Path, plugin: &PluginId) -> GenerationEntry {
     );
     let entry = named[0];
     let text = |value: &serde_json::Value| value.as_str().unwrap_or_default().to_owned();
-    let grant = beyond_the_ceiling(entry["capabilities"].as_array().into_iter().flatten().map(
-        |request| {
+    let requested: Vec<PluginCapability> = entry["capabilities"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|request| {
             serde_json::from_value::<PluginCapability>(request["capability"].clone())
                 .expect("a capability of the vocabulary")
-        },
-    ));
+        })
+        .collect();
+    let installs_a_bridge = requested.contains(&PluginCapability::NativeBridgeInstall);
+    let grant = beyond_the_ceiling(requested.iter().copied());
     GenerationEntry {
         version: text(&entry["version"]),
         manifest_digest: text(&entry["manifest_digest"]),
         grant,
+        installs_a_bridge,
     }
 }
 
@@ -9918,6 +9922,49 @@ fn a_generation_index_that_names_the_codex_package_twice_is_refused() {
     assert!(
         said.contains("names the package kalareach/codex once"),
         "{said}"
+    );
+}
+
+/// The entry of a generation is the one of the package asked for, and it says whether that package
+/// asks for the capability that installs a native bridge, whatever the repository's ceiling allows.
+#[test]
+fn a_generation_entry_is_the_one_of_the_package_asked_for_and_says_whether_it_installs_a_bridge() {
+    let directory = kr_ipc::testing::PrivateTempDir::create();
+    let place = std::fs::canonicalize(directory.path()).expect("the directory");
+    std::fs::create_dir_all(place.join("targets")).expect("the targets directory");
+    let claude = PluginId::new("kalareach/claude-code").expect("a plugin identifier");
+    let request = |capability: PluginCapability| serde_json::json!({ "capability": serde_json::to_value(capability).expect("a capability") });
+    let entries = serde_json::json!([
+        {
+            "plugin_id": Subject::codex().plugin().to_string(), "version": "1.0.0", "manifest_digest": "aa",
+            "capabilities": [request(PluginCapability::ApprovalRespond)],
+        },
+        {
+            "plugin_id": claude.to_string(), "version": "2.0.0", "manifest_digest": "bb",
+            "capabilities": [
+                request(PluginCapability::ApprovalRespond),
+                request(PluginCapability::NativeBridgeInstall),
+            ],
+        },
+    ]);
+    std::fs::write(
+        place.join("targets/index.json"),
+        serde_json::json!({ "entries": entries }).to_string(),
+    )
+    .expect("the index");
+    let codex_entry = generation_entry(&place, &Subject::codex().plugin());
+    assert_eq!(
+        (codex_entry.version.as_str(), codex_entry.installs_a_bridge),
+        ("1.0.0", false)
+    );
+    let claude_entry = generation_entry(&place, &claude);
+    assert_eq!(
+        (
+            claude_entry.version.as_str(),
+            claude_entry.manifest_digest.as_str(),
+            claude_entry.installs_a_bridge
+        ),
+        ("2.0.0", "bb", true)
     );
 }
 
