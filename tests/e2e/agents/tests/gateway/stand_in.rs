@@ -23,6 +23,7 @@ use kr_e2e_agents::held::{conversations_relative_in, turns_recorded};
 use kr_e2e_agents::subject::Subject;
 use kr_e2e_m1b::run::{RootPin, Run};
 use kr_e2e_m1b::shells;
+use kr_e2e_m1b::window::Window;
 use kr_plugin_sdk::package::MANIFEST_FILE;
 
 use super::package::{Shape, release, write};
@@ -777,6 +778,65 @@ fn the_stand_in_for_an_entry_with_no_account_shows_its_first_screen_answers_and_
     }
 }
 
+/// On a terminal the stand-in for an entry takes each key as it is typed, which leaves the terminal
+/// out of line mode with echo, and shows the text of the entry's harmless key once it has read that
+/// key. The line that follows the key is answered in either mode, so the case waits for the answer
+/// and then holds the screen and the terminal's mode to what the entry says.
+#[test]
+fn the_stand_in_for_an_entry_takes_each_key_as_typed_and_shows_the_text_of_its_harmless_key() {
+    let run = Run::start("gateway-stand-in-keys");
+    for synthetic in synthetic().into_iter().chain(without_account()) {
+        let (name, build) = (synthetic.name, &synthetic.build);
+        let base = scratch("keys");
+        let home = base.join("home");
+        std::fs::create_dir_all(&home).expect("a home for the program");
+        let entry_file = base.join("entry.json");
+        std::fs::write(&entry_file, stand_in_file(build).to_string())
+            .expect("the file of the entry");
+        let mut window = Window::open(
+            &run,
+            name,
+            Path::new(PROGRAM),
+            &[],
+            &base,
+            &[
+                ("HOME".to_owned(), home.display().to_string()),
+                (
+                    "STAND_IN_ENTRY".to_owned(),
+                    entry_file.display().to_string(),
+                ),
+            ],
+        );
+        let _ = window.wait_for_screen("›", &format!("{name}: the stand-in shows its composer"));
+        window.type_text(format!("{}\r", build.harmless.input).as_bytes());
+        let rows = window.wait_for_screen(
+            "• ",
+            &format!("{name}: the stand-in answers the line that holds the key"),
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.contains(build.harmless.shows.as_str())),
+            "{name}: the screen shows the text of the harmless key, {:?}, once the stand-in has \
+             read the key:\n{}",
+            build.harmless.shows,
+            rows.join("\n")
+        );
+        assert!(
+            !window.in_line_mode(),
+            "{name}: the stand-in takes each key as it is typed, so the terminal is not in line \
+             mode with echo"
+        );
+        window.type_text(&[0x04]);
+        assert_eq!(
+            window.exit_code(WITHIN),
+            0,
+            "{name}: the stand-in ends well when the terminal closes its input"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+    run.closing_check().expect("nothing runs");
+}
+
 /// The file made for an entry that names real executables holds none of them, and the stand-in
 /// refuses a file that names a program to run.
 #[test]
@@ -822,14 +882,6 @@ fn named(base: &Path, synthetic: &Synthetic) -> (PathBuf, PathBuf) {
         Shape::Backend,
     );
     (entry, directory.join(MANIFEST_FILE))
-}
-
-/// The reason a choice was refused; fails where it was not.
-fn refused(choice: Result<Option<Chosen>, String>, what: &str) -> String {
-    match choice {
-        Err(why) => why,
-        Ok(_) => panic!("{what} is refused"),
-    }
 }
 
 /// With neither variable the stand-in route is Codex's, and with both it is the entry, as a
@@ -886,19 +938,19 @@ fn an_entry_or_a_manifest_named_alone_for_the_stand_in_route_is_refused_and_so_i
     let base = scratch("alone");
     let [synthetic, ..] = synthetic();
     let (entry, manifest) = named(&base, &synthetic);
+    let Err(why) = stand_in_chosen(Some(&entry), None, false) else {
+        panic!("an entry with no manifest is refused");
+    };
     assert_eq!(
-        refused(
-            stand_in_chosen(Some(&entry), None, false),
-            "an entry with no manifest"
-        ),
+        why,
         "KR_AGENTS_STAND_IN_ENTRY names the build list entry the terminal stand-in stands for, \
          and KR_AGENTS_STAND_IN_MANIFEST names no manifest of its package: set both or neither"
     );
+    let Err(why) = stand_in_chosen(None, Some(&manifest), false) else {
+        panic!("a manifest with no entry is refused");
+    };
     assert_eq!(
-        refused(
-            stand_in_chosen(None, Some(&manifest), false),
-            "a manifest with no entry"
-        ),
+        why,
         "KR_AGENTS_STAND_IN_MANIFEST names the manifest of the package the terminal stand-in is \
          installed from, and KR_AGENTS_STAND_IN_ENTRY names no entry: set both or neither"
     );
@@ -906,27 +958,18 @@ fn an_entry_or_a_manifest_named_alone_for_the_stand_in_route_is_refused_and_so_i
                       run stands in for an entry or starts a real one, not both";
     let with_manifest = "KR_AGENTS_STAND_IN_MANIFEST and KR_AGENTS_GATEWAY_BUILD both name an \
                          agent: a run stands in for an entry or starts a real one, not both";
-    assert_eq!(
-        refused(
-            stand_in_chosen(Some(&entry), Some(&manifest), true),
-            "an entry and its manifest beside a real build"
-        ),
-        with_entry
-    );
-    assert_eq!(
-        refused(
-            stand_in_chosen(Some(&entry), None, true),
-            "an entry beside a real build"
-        ),
-        with_entry
-    );
-    assert_eq!(
-        refused(
-            stand_in_chosen(None, Some(&manifest), true),
-            "a manifest beside a real build"
-        ),
-        with_manifest
-    );
+    let Err(why) = stand_in_chosen(Some(&entry), Some(&manifest), true) else {
+        panic!("an entry and its manifest beside a real build is refused");
+    };
+    assert_eq!(why, with_entry);
+    let Err(why) = stand_in_chosen(Some(&entry), None, true) else {
+        panic!("an entry beside a real build is refused");
+    };
+    assert_eq!(why, with_entry);
+    let Err(why) = stand_in_chosen(None, Some(&manifest), true) else {
+        panic!("a manifest beside a real build is refused");
+    };
+    assert_eq!(why, with_manifest);
     let _ = std::fs::remove_dir_all(&base);
 }
 
@@ -938,11 +981,11 @@ fn a_manifest_for_the_stand_in_route_that_is_not_named_plugin_json_is_refused() 
     let (entry, manifest) = named(&base, &synthetic);
     let renamed = manifest.with_file_name("manifest.json");
     std::fs::copy(&manifest, &renamed).expect("the manifest under another name");
+    let Err(why) = stand_in_chosen(Some(&entry), Some(&renamed), false) else {
+        panic!("a manifest not named plugin.json is refused");
+    };
     assert_eq!(
-        refused(
-            stand_in_chosen(Some(&entry), Some(&renamed), false),
-            "a manifest not named plugin.json"
-        ),
+        why,
         format!(
             "KR_AGENTS_STAND_IN_MANIFEST names {}, which is not a file named plugin.json",
             renamed.display()
@@ -961,9 +1004,11 @@ fn an_entry_with_no_account_is_accepted_for_the_stand_in_route_and_refused_where
     for synthetic in without_account() {
         let name = synthetic.name;
         let (entry, manifest) = named(&base, &synthetic);
-        let chosen = stand_in_chosen(Some(&entry), Some(&manifest), false)
-            .unwrap_or_else(|why| panic!("{name}: an entry with no account is accepted: {why}"))
-            .unwrap_or_else(|| panic!("{name}: the entry is the agent the stand-in stands for"));
+        let chosen = match stand_in_chosen(Some(&entry), Some(&manifest), false) {
+            Ok(Some(chosen)) => chosen,
+            Ok(None) => panic!("{name}: the entry is the agent the stand-in stands for"),
+            Err(why) => panic!("{name}: an entry with no account is accepted: {why}"),
+        };
         assert_eq!(
             chosen.subject.command(),
             synthetic.build.command,
@@ -994,10 +1039,9 @@ fn a_manifest_of_another_package_is_refused_for_the_stand_in_route() {
         &second.build.command,
         Shape::Backend,
     );
-    let why = refused(
-        stand_in_chosen(Some(&entry), Some(&other.join(MANIFEST_FILE)), false),
-        "an entry with the release of another package",
-    );
+    let Err(why) = stand_in_chosen(Some(&entry), Some(&other.join(MANIFEST_FILE)), false) else {
+        panic!("an entry with the release of another package is refused");
+    };
     assert!(
         why.starts_with(
             "KR_AGENTS_STAND_IN_ENTRY and KR_AGENTS_STAND_IN_MANIFEST do not name one agent: "
@@ -1366,7 +1410,9 @@ fn an_entry_whose_command_runtime_or_wheel_is_not_one_file_name_is_refused_for_t
             with_members(&synthetics[index], &members).to_string(),
         )
         .expect("the entry whose names are not file names");
-        let why = refused(stand_in_chosen(Some(&entry), Some(&manifest), false), &what);
+        let Err(why) = stand_in_chosen(Some(&entry), Some(&manifest), false) else {
+            panic!("{what} is refused");
+        };
         assert!(
             why.starts_with(
                 "KR_AGENTS_STAND_IN_ENTRY names an entry the terminal stand-in cannot be placed for: "
