@@ -265,6 +265,18 @@ struct Placed {
     configuration_placed: PlacedDirectory,
 }
 
+/// Why the program's directory may not hold `beside`, the names in it besides the program's.
+fn holds_a_name_beside_the_program(placed: &Placed, beside: &[String]) -> String {
+    format!(
+        "the directory {} of the program holds {}, and nothing but the program may be there",
+        placed
+            .program
+            .parent()
+            .map_or_else(String::new, |directory| directory.display().to_string()),
+        beside.join(", ")
+    )
+}
+
 /// Makes the application's configuration directory and records it, its program and the directory
 /// that holds the program as they stand.
 ///
@@ -908,14 +920,7 @@ impl<'r> Host<'r> {
             .place_for_a_start(self.run.root(), self.run.pin())?;
         let beside = self.names_beside_the_program(placed)?;
         if !beside.is_empty() {
-            return Err(format!(
-                "the directory {} of the program holds {}, and nothing but the program may be there",
-                placed
-                    .program
-                    .parent()
-                    .map_or_else(String::new, |directory| directory.display().to_string()),
-                beside.join(", ")
-            ));
+            return Err(holds_a_name_beside_the_program(placed, &beside));
         }
         self.run.placed_as_it_was(&placed.program)?;
         let path = format!("{}:{SYSTEM_PATH}", directory.display());
@@ -1544,12 +1549,35 @@ impl<'r> Host<'r> {
         })
     }
 
-    /// Closes every live session, waits for its worker and job to go, then stops the daemon.
+    /// Closes every live session, waits for its worker and job to go, then stops the daemon, and
+    /// lists the program's directory last, since no start finds a name that the agent left beside
+    /// the program after the daemon's last start.
     ///
     /// # Errors
     ///
-    /// Returns what did not end as it should. The daemon is stopped whatever happened before.
+    /// Returns what did not end as it should, and a name beside the program in its directory where
+    /// the host has an application. The daemon is stopped whatever happened before.
     pub fn stop(&self) -> Result<(), String> {
+        let ended = self.end_the_run();
+        let Some(placed) = &self.application else {
+            return ended;
+        };
+        let listed = self.names_beside_the_program(placed).and_then(|beside| {
+            if beside.is_empty() {
+                Ok(())
+            } else {
+                Err(holds_a_name_beside_the_program(placed, &beside))
+            }
+        });
+        match (ended, listed) {
+            (Ok(()), listed) => listed,
+            (Err(ended), Ok(())) => Err(ended),
+            (Err(ended), Err(listed)) => Err(format!("{ended}; {listed}")),
+        }
+    }
+
+    /// What [`Host::stop`] ends before it lists the program's directory.
+    fn end_the_run(&self) -> Result<(), String> {
         self.record_workers();
         if self.agent_started.load(Ordering::SeqCst) {
             return self.end_by_identity();
@@ -4185,6 +4213,28 @@ mod shutdown_tests {
         assert!(
             host_over(&run).application_directory_as_placed().is_none(),
             "a host with no application gives none"
+        );
+        drop(host);
+        drop(run);
+        std::fs::remove_dir_all(&root).expect("clean up");
+    }
+
+    /// A name beside the program in its directory is found when the host stops after its agent
+    /// started: it is one more thing that did not end as it should, and a host with nothing beside
+    /// the program stops with no such problem.
+    #[test]
+    fn a_name_beside_the_program_is_found_when_the_host_stops() {
+        let root = scratch("beside-stop");
+        let run = run_with_a_recording_controller(&root);
+        let application = an_application(&root);
+        let host = host_prepared_with(&run, &application);
+        host.agent_starts();
+        assert_eq!(host.stop(), Ok(()), "nothing beside the program");
+        std::fs::write(root.join("t/other"), b"x\n").expect("a name beside the program");
+        let why = host.stop().expect_err("a name beside the program");
+        assert!(
+            why.contains("\"other\"") && why.contains("nothing but the program may be there"),
+            "{why}"
         );
         drop(host);
         drop(run);
