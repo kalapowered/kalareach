@@ -1,0 +1,555 @@
+//! A stand-in for an agent that speaks the Agent Client Protocol, version 1, over its standard input
+//! and output, one JSON object to a line. It stands in for the two agents the host starts in ACP
+//! mode, and each of the two has its own [`Shape`].
+//!
+//! The stand-in reads a script from [`SCRIPT_FILE`] in its working directory and appends one line
+//! to [`RECORD_FILE`] there for each frame it receives, for each tick it sends and for the end of
+//! its input, so a case reads what the agent saw and did. It reads no environment name: the
+//! launcher passes the agent the names of an allowlist and no others.
+//!
+//! A script is `{"turns": [...], "ticks": [...], "exit_after": "name"}`. The k-th prompt of the
+//! client runs the k-th turn, which is a list of steps; a prompt with no turn left is answered at
+//! once with the stop reason `end_turn`. A tick is `{"after": "name", "say": "text"}`: when the
+//! file `name` appears in the working directory the agent sends an update that says `text`, once,
+//! whatever its turn does. When the file `exit_after` names appears the agent ends with the code 0,
+//! whatever its turn waits for.
+//!
+//! | Step | What the stand-in does |
+//! | --- | --- |
+//! | `{"say": "text"}` | sends an `agent_message_chunk` update |
+//! | `{"call": {"id": "c1", "kind": "execute"}}` | sends a `tool_call` update for a call, pending |
+//! | `{"ask": "c1"}` | sends `session/request_permission` for the call and waits for the response, offering `allow-once`, `allow-always` and `reject-once` |
+//! | `{"update": {"call": "c1", "status": "in_progress"}}` | sends a `tool_call_update` |
+//! | `{"when": {"outcome": "allowed", "then": [...]}}` | runs its steps if the last answer to a request was `allowed`, `declined` or `cancelled` |
+//! | `{"hold": "name"}` | waits until the file `name` exists in the working directory |
+//! | `{"end": "end_turn"}` | answers the prompt with that stop reason |
+//! | `{"exit": 0}` | ends the program with that code |
+
+use std::collections::{BTreeMap, VecDeque};
+use std::fs::OpenOptions;
+use std::io::{BufRead, Write};
+use std::path::{Path, PathBuf};
+use std::sync::mpsc;
+use std::time::Duration;
+
+use serde::Deserialize;
+use serde_json::{Value, json};
+
+/// The file of the working directory that holds the script.
+pub const SCRIPT_FILE: &str = "acp-stand-in.json";
+
+/// The file of the working directory that the stand-in appends its record to.
+pub const RECORD_FILE: &str = "acp-stand-in.record";
+
+/// How often a step that waits looks again.
+const POLL: Duration = Duration::from_millis(20);
+
+/// The two agents the stand-in can be shaped like.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Shape {
+    /// The native program shaped like Qoder CLI.
+    Qoder,
+    /// The script package shaped like Gemini CLI.
+    Gemini,
+}
+
+impl Shape {
+    /// The version the agent reports in `initialize`: the build the host's table pins.
+    #[must_use]
+    pub fn version(self) -> &'static str {
+        match self {
+            Self::Qoder => "1.1.63",
+            Self::Gemini => "0.60.0",
+        }
+    }
+
+    /// The name the agent reports in `initialize`.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Qoder => "qoder-stand-in",
+            Self::Gemini => "gemini-stand-in",
+        }
+    }
+}
+
+/// What the client's last answer to a permission request meant.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum Outcome {
+    /// The client chose an option that allows the call.
+    Allowed,
+    /// The client chose an option that rejects the call.
+    Declined,
+    /// The client answered that the request was cancelled.
+    Cancelled,
+}
+
+/// One step of a turn.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+enum Step {
+    /// An `agent_message_chunk` update.
+    Say(String),
+    /// A `tool_call` update.
+    Call {
+        /// The call's identifier.
+        id: String,
+        /// The call's kind.
+        kind: String,
+    },
+    /// A permission request for a call.
+    Ask(String),
+    /// A `tool_call_update`.
+    Update {
+        /// The call's identifier.
+        call: String,
+        /// The call's status.
+        status: String,
+    },
+    /// Steps that run only after one kind of answer.
+    When {
+        /// The answer.
+        outcome: Outcome,
+        /// What runs after it.
+        then: Vec<Step>,
+    },
+    /// A wait for a file of the working directory.
+    Hold(String),
+    /// The prompt's reply.
+    End(String),
+    /// The end of the program.
+    Exit(i32),
+}
+
+/// The script of a run.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Script {
+    /// The turns, one for each prompt of the client in order.
+    #[serde(default)]
+    turns: Vec<Vec<Step>>,
+    /// The updates the agent sends of its own accord, each when its file appears.
+    #[serde(default)]
+    ticks: Vec<Tick>,
+    /// The agent ends with the code 0 when this file appears, whatever its turn waits for.
+    #[serde(default)]
+    exit_after: Option<String>,
+}
+
+/// An update the agent sends once, when a file of the working directory appears, whatever its turn
+/// does: the agent's own traffic while the client's daemon is down.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Tick {
+    /// The file that releases the tick.
+    after: String,
+    /// The text of the update.
+    say: String,
+}
+
+/// What a running turn waits for before its next step.
+#[derive(Debug)]
+enum Waiting {
+    /// Nothing: the next step runs.
+    Nothing,
+    /// The response to the request of the agent's with this number.
+    Response(u64),
+    /// A file of the working directory.
+    File(PathBuf),
+}
+
+/// The turn that a prompt of the client started.
+#[derive(Debug)]
+struct Turn {
+    /// The prompt's request identifier, as the client wrote it.
+    prompt: Value,
+    /// The steps that remain.
+    steps: VecDeque<Step>,
+    /// What the turn waits for.
+    waiting: Waiting,
+}
+
+/// What the reading thread passes on.
+enum Input {
+    /// One line of the client's.
+    Line(String),
+    /// The client's end of the stream closed.
+    Closed,
+}
+
+/// The stand-in's state.
+struct Agent<W: Write> {
+    /// The shape of the agent.
+    shape: Shape,
+    /// The working directory.
+    directory: PathBuf,
+    /// The standard output.
+    output: W,
+    /// The script.
+    script: Script,
+    /// How many prompts the client has sent.
+    prompts: usize,
+    /// The number the next request of the agent's carries; both agents count from 0.
+    next_request: u64,
+    /// The turn that runs.
+    turn: Option<Turn>,
+    /// The kind of each option offered, by identifier.
+    outcomes: BTreeMap<String, Outcome>,
+    /// The last answer to a permission request.
+    last_answer: Option<Outcome>,
+    /// How many ticks have been sent: they go in the order the script lists them.
+    ticked: usize,
+}
+
+/// Runs the stand-in to the end of the client's stream or to an `exit` step, and returns the exit
+/// code.
+///
+/// # Errors
+///
+/// Returns why the script could not be read.
+pub fn run(
+    shape: Shape,
+    directory: &Path,
+    input: impl BufRead + Send + 'static,
+    output: impl Write,
+) -> Result<i32, String> {
+    let script = match std::fs::read(directory.join(SCRIPT_FILE)) {
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .map_err(|why| format!("the script {SCRIPT_FILE} is not a script: {why}"))?,
+        Err(why) if why.kind() == std::io::ErrorKind::NotFound => Script::default(),
+        Err(why) => return Err(format!("the script {SCRIPT_FILE}: {why}")),
+    };
+    let (lines, received) = mpsc::channel();
+    std::thread::spawn(move || {
+        for line in input.lines() {
+            let Ok(line) = line else { break };
+            if lines.send(Input::Line(line)).is_err() {
+                return;
+            }
+        }
+        let _ = lines.send(Input::Closed);
+    });
+    let mut agent = Agent {
+        shape,
+        directory: directory.to_path_buf(),
+        output,
+        script,
+        prompts: 0,
+        next_request: 0,
+        turn: None,
+        outcomes: BTreeMap::new(),
+        last_answer: None,
+        ticked: 0,
+    };
+    loop {
+        match received.recv_timeout(POLL) {
+            Ok(Input::Line(line)) => {
+                if let Some(code) = agent.receive(&line) {
+                    return Ok(code);
+                }
+            }
+            Ok(Input::Closed) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                agent.record(&json!({ "received": "end of input" }));
+                return Ok(0);
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+        agent.tick();
+        if agent.is_told_to_exit() {
+            return Ok(0);
+        }
+        if let Some(code) = agent.advance() {
+            return Ok(code);
+        }
+    }
+}
+
+impl<W: Write> Agent<W> {
+    /// Appends one line to the record.
+    fn record(&self, line: &Value) {
+        if let Ok(mut file) = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.directory.join(RECORD_FILE))
+        {
+            let _ = writeln!(file, "{line}");
+        }
+    }
+
+    /// Writes one frame and flushes it.
+    fn write(&mut self, frame: &str) {
+        let _ = writeln!(self.output, "{frame}");
+        let _ = self.output.flush();
+    }
+
+    /// Sends a response. Both agents write the keys of a response in the order `jsonrpc`, `id`,
+    /// `result`.
+    fn answer(&mut self, id: &Value, result: &Value) {
+        self.write(&format!(
+            r#"{{"jsonrpc":"2.0","id":{id},"result":{result}}}"#
+        ));
+    }
+
+    /// Sends an error response.
+    fn refuse(&mut self, id: &Value, code: i64, message: &str) {
+        let error = json!({ "code": code, "message": message });
+        self.write(&format!(r#"{{"jsonrpc":"2.0","id":{id},"error":{error}}}"#));
+    }
+
+    /// Sends a notification, with the keys in the order both agents write them: `jsonrpc`,
+    /// `method`, `params`.
+    fn notify(&mut self, method: &str, params: &Value) {
+        self.write(&format!(
+            r#"{{"jsonrpc":"2.0","method":"{method}","params":{params}}}"#
+        ));
+    }
+
+    /// Sends a request and returns its number, with the keys in the order `jsonrpc`, `id`,
+    /// `method`, `params`.
+    fn ask(&mut self, method: &str, params: &Value) -> u64 {
+        let id = self.next_request;
+        self.next_request += 1;
+        self.write(&format!(
+            r#"{{"jsonrpc":"2.0","id":{id},"method":"{method}","params":{params}}}"#
+        ));
+        id
+    }
+
+    /// Sends a `session/update` with `update` as its update.
+    fn update(&mut self, update: &Value) {
+        self.notify(
+            "session/update",
+            &json!({ "sessionId": SESSION, "update": update }),
+        );
+    }
+
+    /// Takes one line of the client's. Returns the exit code if the program ends.
+    fn receive(&mut self, line: &str) -> Option<i32> {
+        let Ok(frame) = serde_json::from_str::<Value>(line) else {
+            self.record(&json!({ "received": "a line that is not json" }));
+            return None;
+        };
+        let id = frame.get("id").cloned();
+        let method = frame.get("method").and_then(Value::as_str);
+        match (method, id) {
+            (Some(method), Some(id)) => {
+                let mut line = json!({ "received": "request", "id": id, "method": method });
+                if method == "session/prompt" {
+                    line["prompt"] = frame["params"]["prompt"].clone();
+                }
+                self.record(&line);
+                self.request(method, &id);
+            }
+            (Some(method), None) => {
+                self.record(&json!({ "received": "notification", "method": method }));
+            }
+            (None, Some(id)) => self.response(&id, &frame),
+            (None, None) => self.record(&json!({ "received": "a frame of no kind" })),
+        }
+        None
+    }
+
+    /// Answers a request of the client's.
+    fn request(&mut self, method: &str, id: &Value) {
+        match method {
+            "initialize" => {
+                let result = json!({
+                    "protocolVersion": 1,
+                    "agentCapabilities": { "loadSession": false },
+                    "agentInfo": {
+                        "name": self.shape.name(),
+                        "title": self.shape.name(),
+                        "version": self.shape.version(),
+                    },
+                    "authMethods": [],
+                });
+                self.answer(id, &result);
+            }
+            "session/new" => self.answer(id, &json!({ "sessionId": SESSION })),
+            "session/prompt" => self.prompt(id),
+            _ => self.refuse(id, -32601, "method not found"),
+        }
+    }
+
+    /// Starts the turn of a prompt of the client's.
+    fn prompt(&mut self, id: &Value) {
+        if self.turn.is_some() {
+            self.refuse(id, -32000, "a prompt is running");
+            return;
+        }
+        let steps = self
+            .script
+            .turns
+            .get(self.prompts)
+            .cloned()
+            .unwrap_or_else(|| vec![Step::End("end_turn".to_owned())]);
+        self.prompts += 1;
+        self.turn = Some(Turn {
+            prompt: id.clone(),
+            steps: steps.into(),
+            waiting: Waiting::Nothing,
+        });
+    }
+
+    /// Takes the client's response to a request of the agent's.
+    fn response(&mut self, id: &Value, frame: &Value) {
+        let outcome = frame["result"]["outcome"]["outcome"].as_str();
+        let option = frame["result"]["outcome"]["optionId"].as_str();
+        let answer = match (outcome, option) {
+            (Some("cancelled"), _) => Some(Outcome::Cancelled),
+            (Some("selected"), Some(option)) => self.outcomes.get(option).copied(),
+            _ => None,
+        };
+        self.record(&json!({
+            "received": "response",
+            "id": id,
+            "outcome": outcome,
+            "option": option,
+        }));
+        let waits = matches!(
+            self.turn.as_ref().map(|turn| &turn.waiting),
+            Some(Waiting::Response(number)) if Some(*number) == id.as_u64()
+        );
+        if waits {
+            self.last_answer = answer;
+            if let Some(turn) = &mut self.turn {
+                turn.waiting = Waiting::Nothing;
+            }
+        }
+    }
+
+    /// Whether the file that ends the agent has appeared. It records the exit when it has.
+    fn is_told_to_exit(&self) -> bool {
+        let Some(name) = &self.script.exit_after else {
+            return false;
+        };
+        let told = self.directory.join(name).exists();
+        if told {
+            self.record(&json!({ "sent": "exit" }));
+        }
+        told
+    }
+
+    /// Sends the next tick whose file has appeared.
+    fn tick(&mut self) {
+        let Some(tick) = self.script.ticks.get(self.ticked) else {
+            return;
+        };
+        if !self.directory.join(&tick.after).exists() {
+            return;
+        }
+        let text = tick.say.clone();
+        self.ticked += 1;
+        self.update(&json!({
+            "sessionUpdate": "agent_message_chunk",
+            "content": { "type": "text", "text": text },
+        }));
+        self.record(&json!({ "sent": "tick", "text": text }));
+    }
+
+    /// Takes steps of the running turn until one waits. Returns the exit code if the program ends.
+    fn advance(&mut self) -> Option<i32> {
+        loop {
+            let turn = self.turn.as_mut()?;
+            match &turn.waiting {
+                Waiting::Nothing => {}
+                Waiting::Response(_) => return None,
+                Waiting::File(name) => {
+                    if !self.directory.join(name).exists() {
+                        return None;
+                    }
+                    turn.waiting = Waiting::Nothing;
+                }
+            }
+            let step = turn.steps.pop_front()?;
+            if let Some(code) = self.take(step) {
+                return Some(code);
+            }
+        }
+    }
+
+    /// Takes one step.
+    fn take(&mut self, step: Step) -> Option<i32> {
+        match step {
+            Step::Say(text) => self.update(&json!({
+                "sessionUpdate": "agent_message_chunk",
+                "content": { "type": "text", "text": text },
+            })),
+            Step::Call { id, kind } => self.update(&json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": id,
+                "title": id,
+                "kind": kind,
+                "status": "pending",
+            })),
+            Step::Ask(call) => self.ask_for(&call),
+            Step::Update { call, status } => self.update(&json!({
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": call,
+                "status": status,
+            })),
+            Step::When { outcome, then } => {
+                if self.last_answer == Some(outcome)
+                    && let Some(turn) = &mut self.turn
+                {
+                    for step in then.into_iter().rev() {
+                        turn.steps.push_front(step);
+                    }
+                }
+            }
+            Step::Hold(name) => {
+                if let Some(turn) = &mut self.turn {
+                    turn.waiting = Waiting::File(PathBuf::from(name));
+                }
+            }
+            Step::End(reason) => {
+                if let Some(turn) = self.turn.take() {
+                    self.answer(&turn.prompt, &json!({ "stopReason": reason }));
+                }
+            }
+            Step::Exit(code) => return Some(code),
+        }
+        None
+    }
+
+    /// Sends a permission request for `call` and makes the turn wait for its response.
+    fn ask_for(&mut self, call: &str) {
+        let options = [
+            ("allow-once", "Allow once", "allow_once", Outcome::Allowed),
+            (
+                "allow-always",
+                "Always allow",
+                "allow_always",
+                Outcome::Allowed,
+            ),
+            ("reject-once", "Reject", "reject_once", Outcome::Declined),
+        ];
+        self.outcomes = options
+            .iter()
+            .map(|(id, _, _, outcome)| ((*id).to_owned(), *outcome))
+            .collect();
+        let number = self.ask(
+            "session/request_permission",
+            &json!({
+                "sessionId": SESSION,
+                "toolCall": {
+                    "toolCallId": call,
+                    "title": call,
+                    "kind": "execute",
+                    "status": "pending",
+                },
+                "options": options
+                    .iter()
+                    .map(|(id, name, kind, _)| json!({ "optionId": id, "name": name, "kind": kind }))
+                    .collect::<Vec<_>>(),
+            }),
+        );
+        if let Some(turn) = &mut self.turn {
+            turn.waiting = Waiting::Response(number);
+        }
+    }
+}
+
+/// The identifier of the one session the stand-in serves.
+const SESSION: &str = "stand-in-session";

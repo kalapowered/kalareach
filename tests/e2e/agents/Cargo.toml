@@ -65,6 +65,8 @@ jiff.workspace = true
 kr-hook = { path = "../../../crates/kr-hook" }
 kr-plugin-catalogue = { workspace = true, features = ["testing"] }
 kr-worker = { workspace = true, features = ["testing"] }
+# The working directory each pipe test starts a stand-in program in.
+tempfile.workspace = true
 tough.workspace = true
 url.workspace = true
 

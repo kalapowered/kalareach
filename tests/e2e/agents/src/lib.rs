@@ -70,6 +70,7 @@
 
 #[cfg(unix)]
 pub mod account;
+pub mod acp_agent;
 #[cfg(unix)]
 pub mod build;
 #[cfg(all(unix, test))]
