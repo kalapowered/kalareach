@@ -134,6 +134,9 @@ const NEEDS: [(&str, &[&str]); 10] = [
     ("14.03a", &["composer"]),
 ];
 
+/// The keys of `missing` that the isolation contract reads and no part does.
+const ISOLATION_KEYS: [&str; 1] = ["isolation.startup"];
+
 /// Whether the entry gives a value for `field`, a dotted path of [`NEEDS`]. An empty list is a
 /// value: the entry says each rests on a positive finding.
 fn given(build: &Build, field: &str) -> bool {
@@ -211,7 +214,17 @@ pub fn check(build: &Build) -> Report {
         .flat_map(|(_, fields)| fields.iter().copied())
         .collect();
     for field in build.missing.iter().flat_map(BTreeMap::keys) {
-        if !read.contains(&field.as_str()) {
+        if ISOLATION_KEYS.contains(&field.as_str()) {
+            if build
+                .isolation
+                .as_ref()
+                .is_some_and(|isolation| !isolation.startup.is_empty())
+            {
+                report.refusals.push(Refusal::Contradiction(format!(
+                    "the entry lists {field} as missing and gives startup controls"
+                )));
+            }
+        } else if !read.contains(&field.as_str()) {
             report.refusals.push(Refusal::Contradiction(format!(
                 "the entry lists {field} as missing, and no part reads it"
             )));
@@ -268,6 +281,14 @@ pub fn check(build: &Build) -> Report {
             isolation.map(|isolation| isolation.absent.len()),
         ) {
             lacking.push("absent");
+        }
+        let stated = build
+            .missing
+            .as_ref()
+            .and_then(|missing| missing.get("isolation.startup"))
+            .is_some_and(|reason| !reason.trim().is_empty());
+        if !stated && isolation.is_none_or(|isolation| isolation.startup.is_empty()) {
+            lacking.push("startup");
         }
         if !lacking.is_empty() {
             report.refusals.push(Refusal::NoIsolation(lacking));
@@ -522,15 +543,15 @@ mod tests {
     }
 
     /// A real start is refused for an entry that lacks the isolation contract, naming what it lacks:
-    /// the trees for an entry with an account, and every member for one with none. The Codex entry
-    /// keeps its own.
+    /// the trees and the startup controls for an entry with an account, and every member for one
+    /// with none. The Codex entry keeps its own.
     #[test]
     fn a_real_start_is_refused_for_an_entry_with_no_isolation_contract() {
         let mut opencode = build_of("kalareach/opencode");
         opencode.isolation = None;
         assert_eq!(
             check(&opencode).refusals,
-            vec![Refusal::NoIsolation(vec!["person_trees"])]
+            vec![Refusal::NoIsolation(vec!["person_trees", "startup"])]
         );
         let mut attach = build_of("kalareach/opencode-attach");
         attach.isolation = None;
@@ -539,12 +560,56 @@ mod tests {
             vec![Refusal::NoIsolation(vec![
                 "person_trees",
                 "installs_off",
-                "absent"
+                "absent",
+                "startup"
             ])]
         );
         let mut codex = build_of("kalareach/codex");
         codex.isolation = None;
         assert_eq!(check(&codex).refusals, Vec::new());
+    }
+
+    /// A real start is refused for a non-Codex entry that gives no startup controls, unless the
+    /// entry states why in `missing`: the stated reason is accepted, and an empty one is not.
+    #[test]
+    fn a_real_start_is_refused_for_an_entry_with_no_startup_controls_unless_it_states_why() {
+        let mut opencode = build_of("kalareach/opencode");
+        opencode
+            .isolation
+            .as_mut()
+            .expect("isolation")
+            .startup
+            .clear();
+        assert_eq!(
+            check(&opencode).refusals,
+            vec![Refusal::NoIsolation(vec!["startup"])]
+        );
+        let stated = |reason: &str| {
+            let mut build = opencode.clone();
+            build
+                .missing
+                .as_mut()
+                .expect("a missing member")
+                .insert("isolation.startup".to_owned(), reason.to_owned());
+            check(&build).refusals
+        };
+        assert_eq!(stated("the agent starts nothing of its own"), Vec::new());
+        assert_eq!(
+            stated("  "),
+            vec![Refusal::NoIsolation(vec!["startup"])],
+            "an empty reason is not one"
+        );
+        let mut both = build_of("kalareach/opencode");
+        both.missing
+            .as_mut()
+            .expect("a missing member")
+            .insert("isolation.startup".to_owned(), "no controls".to_owned());
+        assert!(
+            check(&both).refusals.iter().any(|refusal| matches!(
+                refusal, Refusal::Contradiction(text) if text.contains("isolation.startup")
+            )),
+            "an entry that gives startup controls and lists them as missing contradicts itself"
+        );
     }
 
     /// An entry of another package than Codex's with no `missing` member is refused for a real
