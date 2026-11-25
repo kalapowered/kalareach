@@ -433,8 +433,37 @@ fn a_release_file_without_the_digest_its_manifest_names_is_not_written() {
     let _ = std::fs::remove_dir_all(&base);
 }
 
+/// Starts the program `executable` by hand: the shell's environment is read, the host expects an
+/// agent, and the person types `typed` until the program shows its first row. Unlike
+/// `Session::starts_the_agent_showing` it does not wait for the host to announce an instance. `what`
+/// names the start in a failure, and `checks` runs while the person waits.
+fn starts_by_hand(
+    ctx: &Context,
+    session: &Session<'_>,
+    typed: &str,
+    executable: &Path,
+    (what, checks): (&str, &dyn Fn()),
+) -> HandAgent {
+    if !session.environment_read.replace(true) {
+        session
+            .person
+            .reads_the_environment(&session.person.expected)
+            .unwrap_or_else(|why| panic!("{why}"));
+    }
+    if session.stand_in_leaves_the_tree {
+        session.host.agent_is_a_stand_in();
+    }
+    session.host.agent_starts();
+    let _ = session
+        .person
+        .types_until_it_shows(typed, BY_HAND, what, checks);
+    HandAgent::running(ctx, session, executable)
+}
+
 /// The host that installed the package written for each synthetic entry detects a program that is
-/// typed under the entry's command, as one live instance of that package.
+/// typed under the entry's command, as one live instance of that package. The case starts the
+/// program itself and does not wait for an instance, so a host that detects nothing fails the
+/// case's own check.
 #[test]
 fn the_host_detects_a_program_typed_as_the_command_of_the_package_it_installed() {
     const TEST: &str =
@@ -443,11 +472,26 @@ fn the_host_detects_a_program_typed_as_the_command_of_the_package_it_installed()
         let base = scratch("detects");
         let subject = selected_subject(&base.join("release"), plugin, command, shape);
         by_hand_on(subject, TEST, |ctx, session| {
-            let agent = HandAgent::starts(ctx, session);
+            let agent = starts_by_hand(
+                ctx,
+                session,
+                &ctx.subject.typed_line(&[]),
+                &ctx.executable,
+                ("the program typed as the entry's command starts", &|| {
+                    ctx.checks_the_placed_files()
+                }),
+            );
             let shown = detects(ctx, &session.remote, session.session_id());
-            check_detected(&launched(ctx, &agent), &shown).unwrap_or_else(|why| {
-                panic!("{plugin}: the host did not detect a program typed as {command}: {why}")
-            });
+            let checked = check_detected(&launched(ctx, &agent), &shown);
+            assert!(
+                checked.is_ok(),
+                "{plugin}: the host did not detect a program typed as {command}: {}",
+                checked
+                    .as_ref()
+                    .err()
+                    .map(ToString::to_string)
+                    .unwrap_or_default()
+            );
             agent.ends();
             serde_json::json!({ "plugin": plugin, "detection": shown.detection.evidence() })
         });
@@ -475,29 +519,18 @@ fn the_host_does_not_detect_a_program_run_under_another_name_than_the_entrys_com
         ctx.run
             .note_placed(Path::new(&place))
             .unwrap_or_else(|why| panic!("{ISOLATION_UNPROVEN} {why}"));
-        // The program is started as `starts_the_agent_showing` starts the entry's own command.
-        if !session.environment_read.replace(true) {
-            session
-                .person
-                .reads_the_environment(&session.person.expected)
-                .unwrap_or_else(|why| panic!("{why}"));
-        }
-        if session.stand_in_leaves_the_tree {
-            session.host.agent_is_a_stand_in();
-        }
-        session.host.agent_starts();
-        let _ = session.person.types_until_it_shows(
+        let agent = starts_by_hand(
+            ctx,
+            session,
             OTHER_NAME,
-            BY_HAND,
-            "the program placed under another name starts",
-            &|| {
+            &other,
+            ("the program placed under another name starts", &|| {
                 ctx.checks_the_placed_files();
                 ctx.run
                     .placed_as_it_was(Path::new(&place))
                     .unwrap_or_else(|why| panic!("{ISOLATION_UNPROVEN} {why}"));
-            },
+            }),
         );
-        let agent = HandAgent::running(ctx, session, &other);
         let shown = detects(ctx, &session.remote, session.session_id());
         assert!(
             shown.detection.instances.is_empty(),
