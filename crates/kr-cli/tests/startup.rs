@@ -3798,9 +3798,9 @@ fn stand_in_installation() -> &'static Path {
         let worker = directory.join("daemon").join("kr-worker");
         assert!(
             holds_the_marker_name(&worker),
-            "the kr-worker placed in the stand-in installation was built without the `testing` \
-             feature, so it does not read the marker; build it with \
-             `cargo build -p kr-worker --features testing`"
+            "the kr-worker placed in the stand-in installation was built without the \
+             `manager-stand-in` feature, so it does not read the marker; build it with \
+             `cargo build -p kr-worker --features manager-stand-in`"
         );
         let program = kr_ipc::testing::manager_stand_in::place_installation(&directory);
         kr_ipc::testing::place_program(&stand_in, &program);
@@ -3820,8 +3820,8 @@ fn stand_in_installation() -> &'static Path {
     })
 }
 
-/// Whether a program holds the name of the marker file. Only a build with the `testing` feature
-/// does, because only its seam looks for the marker.
+/// Whether a program holds the name of the marker file. Only a build with the `manager-stand-in`
+/// feature does, because only its seam looks for the marker.
 #[cfg(target_os = "macos")]
 fn holds_the_marker_name(program: &Path) -> bool {
     let name = kr_ipc::testing::manager_stand_in::MARKER_NAME.as_bytes();
@@ -3839,7 +3839,7 @@ fn place_service_installation(name: &str) -> PathBuf {
             "the kr-controller-held and kr-worker executables are not built beside this test, \
              so this check cannot run; a workspace test run builds them, and so do \
              `cargo build -p kr-controller --features testing --bin kr-controller-held` \
-             and `cargo build -p kr-worker --features testing`"
+             and `cargo build -p kr-worker --features manager-stand-in`"
         );
     };
     let directory = support::command_binaries().join(name);

@@ -93,14 +93,16 @@ url.workspace = true
 # The pause the host's own tests use to stand between an attention action's admission and its
 # store write, the hooks that place the description process, its clock and the conditions it reads,
 # the stub that stands in for the description process, and the bound a test gives the project
-# service's Git reads, and the hold a suite puts on the end of a network connection. It compiles to
-# nothing without this feature, and no shipped build enables it.
+# service's Git reads, and the hold a suite puts on the end of a network connection. The worker's
+# stand-in seam goes with it, so that a test build of the daemon and one of the desktop reader
+# follow one rule for a service manager. It compiles to nothing without this feature, and no
+# shipped build enables it.
 testing = [
     "kr-describe/testing",
     "kr-ipc/testing",
     "kr-transport/testing",
     "kr-voice/testing",
-    "kr-worker/testing",
+    "kr-worker/manager-stand-in",
     "kr-project/git-fixtures",
 ]
 

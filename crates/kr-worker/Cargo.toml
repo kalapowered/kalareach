@@ -93,12 +93,23 @@ sysinfo.workspace = true
 # the broker's admission of the same mutation, and the record of the processes this worker creates
 # that a test reads. Both compile to nothing without this feature, and no shipped build enables it.
 testing = ["kr-ipc/testing", "kr-plugin-service/testing"]
+# The desktop reader's use of a run's stand-in service manager. In a run that names a stand-in, the
+# reader starts that program in the place of `launchctl`, and in a run that names one or in a marked
+# installation it refuses a command of any other service-manager program. This is a feature of its
+# own, and `testing` does not turn it on: the fault harness depends on this crate with `testing` as
+# a normal dependency, so a build of the whole workspace compiles `testing` into the worker program,
+# and the seam's strings would go in with it. Only the `testing` feature of `kr-controller` and this
+# crate's own development dependency turn it on. No release build has it, and
+# `scripts/shipped-hold-gate.sh` reads the programs of both release builds for the seam's strings
+# and fails when one holds any.
+manager-stand-in = ["testing"]
 
 [dev-dependencies]
 # This crate's own tests, with the pause above compiled in. A test cannot otherwise stand inside
 # the interval the dispatch marker divides, because every other seam a test controls is called
 # under the broker's own lock.
-kr-worker = { path = ".", features = ["testing"] }
+# The desktop reader's cases run a stand-in in the place of `launchctl`, through `manager-stand-in`.
+kr-worker = { path = ".", features = ["testing", "manager-stand-in"] }
 # The terminal engine's constructors that the projection's and the renderer's tests build cells with.
 kr-term = { workspace = true, features = ["testing"] }
 # The reference bridge the fence and local-owner tests drive the worker's endpoint with.

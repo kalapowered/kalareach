@@ -249,12 +249,13 @@ fn run(program: &str, arguments: &[&str]) -> Printed {
     let started = {
         #[cfg(feature = "testing")]
         let program = probe_program(program);
-        // A build with the `testing` feature starts a run's stand-in service manager in the place
-        // of `launchctl` when the run names one, and then refuses a command of any service-manager
-        // program in a run that names a stand-in or in a marked installation: a substitution that
-        // did not happen reaches that second check with the real program, so such a run never reads
-        // the account's own manager here. A refused reading is one that was not run.
-        #[cfg(feature = "testing")]
+        // A build with the `manager-stand-in` feature starts a run's stand-in service manager in
+        // the place of `launchctl` when the run names one, and then refuses a command of any
+        // service-manager program in a run that names a stand-in or in a marked installation: a
+        // substitution that did not happen reaches that second check with the real program, so
+        // such a run never reads the account's own manager here. A refused reading is one that
+        // was not run.
+        #[cfg(feature = "manager-stand-in")]
         let program =
             match kr_ipc::testing::manager_stand_in::substituted(std::path::Path::new(&program)) {
                 Ok(program) => program,
@@ -263,7 +264,7 @@ fn run(program: &str, arguments: &[&str]) -> Printed {
                     return Printed::NotRun;
                 }
             };
-        #[cfg(feature = "testing")]
+        #[cfg(feature = "manager-stand-in")]
         {
             if kr_ipc::testing::manager_stand_in::refusal_after(&program).is_some() {
                 let _ = std::fs::remove_dir_all(&directory);
