@@ -325,8 +325,7 @@ impl Launcher {
     /// Ends the launcher at once, as if it had died: the job it holds ends the program it created.
     pub fn kill(&mut self) {
         drop(self.input.take());
-        let _ = self.process.kill();
-        let _ = self.process.wait();
+        end_and_collect(&mut self.process);
     }
 
     /// Lets the launcher go: it ends the program it created and itself.
@@ -339,14 +338,29 @@ impl Launcher {
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        let _ = self.process.kill();
-        let _ = self.process.wait();
+        end_and_collect(&mut self.process);
     }
 }
 
 impl Drop for Launcher {
     fn drop(&mut self) {
         self.kill();
+    }
+}
+
+/// How long a program that has been told to end is waited for.
+const END_BOUND: Duration = Duration::from_secs(10);
+
+/// Ends `child` and collects it, waiting at most [`END_BOUND`] for it to end: a termination that
+/// the system refuses leaves the process, and does not leave the case waiting for it.
+fn end_and_collect(child: &mut Child) {
+    let _ = child.kill();
+    let until = Instant::now() + END_BOUND;
+    while Instant::now() < until {
+        if !matches!(child.try_wait(), Ok(None)) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(10));
     }
 }
 
@@ -393,8 +407,7 @@ impl HeldProgram {
 impl Drop for HeldProgram {
     fn drop(&mut self) {
         if let Some(mut program) = self.0.take() {
-            let _ = program.kill();
-            let _ = program.wait();
+            end_and_collect(&mut program);
         }
     }
 }

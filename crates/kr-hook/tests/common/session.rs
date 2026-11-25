@@ -115,8 +115,7 @@ impl LaunchGroup {
         self.job.assign(held.id())?;
         let mut child = held.placed();
         if let Err(error) = kr_ipc::memory_limit::resume(child.as_handle()) {
-            let _ = child.kill();
-            let _ = child.wait();
+            end_and_collect(&mut child);
             return Err(std::io::Error::other(error));
         }
         Ok(child)
@@ -130,6 +129,24 @@ impl LaunchGroup {
     #[must_use]
     pub fn members(&self) -> Vec<u32> {
         self.job.process_ids().expect("the job's members are read")
+    }
+}
+
+/// How long a program that has been told to end is waited for.
+#[cfg(windows)]
+const END_BOUND: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Ends `child` and collects it, waiting at most [`END_BOUND`] for it to end: a termination that
+/// the system refuses leaves the process, and does not leave the case waiting for it.
+#[cfg(windows)]
+pub fn end_and_collect(child: &mut std::process::Child) {
+    let _ = child.kill();
+    let until = std::time::Instant::now() + END_BOUND;
+    while std::time::Instant::now() < until {
+        if !matches!(child.try_wait(), Ok(None)) {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
     }
 }
 
@@ -179,8 +196,7 @@ impl HeldChild {
 impl Drop for HeldChild {
     fn drop(&mut self) {
         if let Some(mut program) = self.0.take() {
-            let _ = program.kill();
-            let _ = program.wait();
+            end_and_collect(&mut program);
         }
     }
 }
