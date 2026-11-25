@@ -1962,6 +1962,17 @@ impl Context {
                     "SHELL".to_owned(),
                     self.shell.executable.display().to_string(),
                 ));
+                if self.claude_code {
+                    // Claude Code reads its configuration from the directory this names, which is
+                    // the directory the daemon wrote the recipe in.
+                    variables.push((
+                        "CLAUDE_CONFIG_DIR".to_owned(),
+                        host.application_directory()
+                            .expect("the host was prepared with the program")
+                            .display()
+                            .to_string(),
+                    ));
+                }
                 variables
             }
             Route::Real(real) => {

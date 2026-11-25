@@ -401,3 +401,26 @@ fn gateway_claude_recipe_a_stand_in_that_is_a_script_is_refused() {
         );
     });
 }
+
+/// The variable a session is given for Claude Code's configuration directory names the directory
+/// the recipe was written in, so that Claude Code reads the registration the daemon wrote.
+#[test]
+fn gateway_claude_recipe_the_sessions_configuration_variable_names_the_directory_the_recipe_was_written_in()
+ {
+    in_a_host(
+        "claude-recipe-directory",
+        &Variant::default(),
+        |ctx, host| {
+            let named = ctx
+                .prepare_variables(host)
+                .into_iter()
+                .find(|(name, _)| name == "CLAUDE_CONFIG_DIR")
+                .map(|(_, value)| value)
+                .expect("the session is given the variable");
+            assert!(
+                Path::new(&named).join(RECIPE_FILES[1]).is_file(),
+                "the directory CLAUDE_CONFIG_DIR names holds the registration the recipe wrote: {named}"
+            );
+        },
+    );
+}

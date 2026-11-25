@@ -258,6 +258,8 @@ struct Placed {
     name: String,
     /// The directory that holds the program, as it was placed.
     directory: PlacedDirectory,
+    /// The directory below the run's home where the program keeps its configuration.
+    configuration: PathBuf,
 }
 
 /// Makes the application's configuration directory and records its program and the directory that
@@ -299,6 +301,7 @@ fn prepare_application(run: &Run, application: &Application) -> Placed {
         program: application.program.clone(),
         name,
         directory,
+        configuration: run.home().join(&application.configuration),
     }
 }
 
@@ -1336,6 +1339,16 @@ impl<'r> Host<'r> {
             }
         }
         Ok(())
+    }
+
+    /// The directory where the host's application keeps its configuration and where the daemon
+    /// writes its registrations: the value that a session's configuration variable must have. None
+    /// where the host was prepared with no application.
+    #[must_use]
+    pub fn application_directory(&self) -> Option<PathBuf> {
+        self.application
+            .as_ref()
+            .map(|placed| placed.configuration.clone())
     }
 
     /// The environment every `kr` this host runs is given, and nothing else.
