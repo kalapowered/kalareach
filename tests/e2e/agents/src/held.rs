@@ -1720,8 +1720,9 @@ impl Unread {
             Self::ManyNames => "has more than one name and is not read".to_owned(),
             Self::GuardedFile => "is the same file as a guarded file and is not read".to_owned(),
             Self::Unlooked => "is not read, because a look of a guarded name has failed, has seen \
-                               a link or has not answered in time since the run started, and \
-                               this file may be the one it names"
+                               a link or has not answered in time, or a look of a path that \
+                               must not exist has found it or has failed, since the run \
+                               started, and this file may be the one it names"
                 .to_owned(),
             Self::TooLarge => format!("is larger than {SHARED_LIMIT} bytes and is not read"),
             Self::TooSlow => format!("was not read within {} seconds", SHARED_BOUND.as_secs()),
@@ -1737,7 +1738,8 @@ struct Known {
     /// The device and inode of every file a look saw at a guarded name.
     seen: BTreeSet<(u64, u64)>,
     /// Whether a look of a guarded name failed for any reason other than the name's not being
-    /// there, saw a link at the name, or gave no answer in time. It is never cleared.
+    /// there, saw a link at the name or gave no answer in time, or a look of a path that must not
+    /// exist found the path or failed. It is never cleared.
     unlooked: bool,
 }
 
@@ -1843,8 +1845,10 @@ fn refusal_of(file: &std::fs::Metadata, seen: &BTreeSet<(u64, u64)>) -> Option<U
 /// Opens the shared file at `path` with no link followed and no wait, and checks the handle before
 /// a byte is read: a regular file, with one name, that is no guarded file (by the device and inode
 /// of any file the guard saw at a guarded name, as `looks` holds them now, or by the guarded names
-/// now) and is within the byte limit; and none is read where a look of a guarded name has failed
-/// since the take, as `looks` says now. None where the file is not there.
+/// now) and is within the byte limit; and none is read where `looks` says now that a look has
+/// failed since the take: a look of a guarded name that failed, a look that saw a link at one, a
+/// read that gave no answer in time, or a look of a path that must not exist that found the path or
+/// failed. None where the file is not there.
 fn open_shared(
     path: &Path,
     guarded: &[PathBuf],
@@ -5022,10 +5026,20 @@ mod tests {
     }
 
     /// What the end read says after the path of a shared file when a look of a guarded name has
-    /// failed, has seen a link or has not answered in time.
+    /// failed, has seen a link or has not answered in time, or a look of a path that must not exist
+    /// has found it or has failed.
     const UNLOOKED: &str = "is not read, because a look of a guarded name has failed, has seen a \
-                            link or has not answered in time since the run started, and this \
+                            link or has not answered in time, or a look of a path that must not \
+                            exist has found it or has failed, since the run started, and this \
                             file may be the one it names";
+
+    #[test]
+    fn the_unlooked_refusal_names_each_look_that_causes_it() {
+        assert_eq!(
+            format!("~/.claude.json {}", Unread::Unlooked.said()),
+            not_read(UNLOOKED)
+        );
+    }
 
     /// What the take refuses a shared file with, for `reason`: the end read's text, after the
     /// person's file.

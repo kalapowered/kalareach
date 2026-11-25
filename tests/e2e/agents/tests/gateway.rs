@@ -806,8 +806,9 @@ impl Real {
 
     /// Fails the case when a file of `absent`, the entry's list ([`Real::absent_list`]), exists:
     /// each path in the run is looked at by a walk from the run's pinned directory that follows no
-    /// link at any component. A look that does not show the absence is kept by the person's guard
-    /// as a failed look.
+    /// link at any component. A look that finds a path present, or does not show the absence, is
+    /// kept by the person's guard as a failed look, so that no shared file is read for the rest of
+    /// the run; a path shown absent keeps nothing.
     fn checks_absent(&self, run: &Run, absent: &[PathBuf]) {
         for path in absent {
             match self.person.absent_below(run.root(), run.pin(), path) {
