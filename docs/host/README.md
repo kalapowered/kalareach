@@ -1881,7 +1881,7 @@ can put about itself. So the checks perform the operations:
 | Check | What it does | What it touches |
 | --- | --- | --- |
 | Read a file you authorised | opens the file you nominated and reads its first few thousand bytes | that file, and nothing else on the filesystem |
-| Take a screen image | takes one image of the desktop and measures it | writes the image into the check's own directory and removes it before answering |
+| Take a screen image | takes one image of the desktop and measures it | writes the image into the check's own directory and removes it before answering; on Linux it tries to remove it, and if it cannot, the answer names the file |
 | Find an element | asks the accessibility tree for the name of one element | reads the tree; selects nothing, moves nothing, clicks nothing |
 | Open an application | starts one new hidden instance of the platform's own calculator, and ends the instance it started | nothing you already have open: the application it starts has no documents to reopen |
 | Send a keystroke | delivers one keystroke | this one changes something, so it runs only inside a test context that owns the application the keystroke lands in, and this build has none |

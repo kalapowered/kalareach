@@ -303,9 +303,10 @@ The worker will read the owner's nominated file in each context. The setup page 
 the platform's own file dialog: the application keeps the chosen path, sends it with the next
 request and no other, and tells the page only the file's name. `kr host desktop-checks --file`
 nominates a file too, by a path the person types, and runs the checks from the command line. With no
-file nominated, the read check reads nothing and says so. The worker takes an image of the screen,
-reads the accessibility tree and starts an application only on macOS, and only where the platform
-doesn't refuse the capability. The platform refuses in a container, in contexts without a graphical
+file nominated, the read check reads nothing and says so. The worker takes an image of the screen
+on macOS, X11 and Wayland compositors that have the screen-copy protocol, and reads the
+accessibility tree and starts an application only on macOS, each only where the platform doesn't
+refuse it. The platform refuses in a container, in contexts without a graphical
 login, when the desktop is locked and when it has ended. The worker will never perform synthetic
 input, that record is kept by the platform.
 
@@ -314,7 +315,9 @@ The worker's findings replace the platform's record of each capability in
 no platform record, so its record is added. The findings are valid until the worker goes away (or is
 replaced), a new login occurs (new desktop generation), the execution profile changes or a tool
 the checks use is installed, removed or replaced. When any of those things happen the findings are
-dropped and the state will report `stale`. The checks won't be run automatically again. One thing
+dropped and the state will report `stale`. On X11 and Wayland the image's tool is found by its name,
+so a finding that none is installed stands until the next run of the checks, which finds a tool
+installed since. The checks won't be run automatically again. One thing
 they can't detect is a change in permission, so the user needs to request a check again if that
 happens. A grant that macOS gives only to a process when it starts reaches the next session's
 worker. A daemon restart also loses the findings.
