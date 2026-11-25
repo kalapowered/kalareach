@@ -2521,6 +2521,128 @@ fn every_job_of_the_workflows_the_gate_runs_has_step_limits_that_fit_in_the_jobs
     }
 }
 
+/// The number that starts `text`, if it starts with digits.
+fn leading_number(text: &str) -> Option<u32> {
+    text.chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>()
+        .parse()
+        .ok()
+}
+
+/// The seconds of waiting that the lines of a step declare in the two forms this reading knows: a
+/// loop that gives up when `SECONDS - <start>` passes a number (`-gt 600`), and a `sleep` on a line
+/// of its own. Any other wait is not read.
+fn waits_in_lines(text: &str) -> u32 {
+    text.lines()
+        .map(|line| {
+            let line = without_comment(line).trim();
+            if let Some(seconds) = line.strip_prefix("sleep ") {
+                return leading_number(seconds.trim()).unwrap_or(0);
+            }
+            line.split_once("SECONDS - ")
+                .and_then(|(_, after)| after.split_once(" -gt "))
+                .and_then(|(_, number)| leading_number(number))
+                .unwrap_or(0)
+        })
+        .sum()
+}
+
+/// The seconds a script declares that it may wait, in the forms this reading knows: its deadline
+/// (`deadline="${NAME:-240}"`) once for each `wait_for` call and once for each factor of a
+/// `$((deadline * 4))`, and a deadline it counts from its own start (`deadline=$((SECONDS + 300))`).
+/// A script that declares none gives 0.
+fn waits_in_script(script: &str) -> u32 {
+    let deadline = script.lines().find_map(|line| {
+        let value = line.trim().strip_prefix("deadline=\"${")?;
+        leading_number(value.split_once(":-")?.1)
+    });
+    let counted = deadline.map_or(0, |deadline| {
+        let calls = script
+            .lines()
+            .filter(|line| line.trim_start().starts_with("wait_for \""))
+            .count();
+        let factors: u32 = script
+            .match_indices("$((deadline * ")
+            .filter_map(|(at, marker)| leading_number(&script[at + marker.len()..]))
+            .sum();
+        deadline * (u32::try_from(calls).expect("a few calls") + factors)
+    });
+    let from_start: u32 = script
+        .lines()
+        .filter_map(|line| leading_number(line.trim().strip_prefix("deadline=$((SECONDS + ")?))
+        .sum();
+    counted + from_start
+}
+
+/// The scripts under `scripts/` that a step names, each once.
+fn scripts_named_by(step: &str) -> Vec<String> {
+    let mut names: Vec<String> = step
+        .split_whitespace()
+        .map(|word| word.trim_matches(['"', '\'', '(', ')', ';']))
+        .filter(|word| word.starts_with("scripts/") && word.ends_with(".sh"))
+        .map(str::to_owned)
+        .collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// The seconds of waiting a step declares: its own lines' and those of each script it names.
+fn declared_waits(step: &str) -> u32 {
+    waits_in_lines(step)
+        + scripts_named_by(step)
+            .iter()
+            .map(|name| {
+                waits_in_script(&fs::read_to_string(repository().join(name)).unwrap_or_default())
+            })
+            .sum::<u32>()
+}
+
+/// The scripts whose waits this reading must find, so that a reading that finds none, because a
+/// script changed the way it states its deadline, is not taken for a step with nothing to wait for.
+const SCRIPTS_THAT_WAIT: [&str; 4] = [
+    "scripts/android-app-launch.sh",
+    "scripts/ios-app-launch.sh",
+    "scripts/free-simulator-runtimes.sh",
+    "scripts/desktop-controls-macos.sh",
+];
+
+/// A step that waits for a device, a boot or a window and gives up with an error line of its own,
+/// and keeps the device's log after it, can only do that if its limit lets it reach the end of its
+/// waits: a step that GitHub ends first has no error line and no log. So the limit of every step of
+/// these workflows that has one is more than the seconds of waiting that the step and the scripts it
+/// names declare, where this reading can read them.
+#[test]
+fn every_step_with_a_limit_has_more_time_than_the_waits_it_and_its_scripts_declare() {
+    for script in SCRIPTS_THAT_WAIT {
+        let text = fs::read_to_string(repository().join(script)).expect("a script");
+        assert!(waits_in_script(&text) > 0, "no wait is read in {script}");
+    }
+    let mut misses = Vec::new();
+    for file in WORKFLOWS_WITH_STEP_LIMITS {
+        let workflow = fs::read_to_string(repository().join(".github/workflows").join(file))
+            .expect("a workflow");
+        for name in job_names(&workflow) {
+            for step in steps_of(&job(&workflow, &name)) {
+                let Some(limit) = value_at(&step, 8, "timeout-minutes")
+                    .and_then(|value| value.parse::<u32>().ok())
+                else {
+                    continue;
+                };
+                let waits = declared_waits(&step);
+                if waits >= limit * 60 {
+                    misses.push(format!(
+                        "{file}: the step \"{}\" of the {name} job has {limit} minutes, which is not more than the {waits} seconds of waiting that it and its scripts declare",
+                        value_at(&step, 8, "name").unwrap_or_default()
+                    ));
+                }
+            }
+        }
+    }
+    assert!(misses.is_empty(), "{}", misses.join("\n"));
+}
+
 /// The names of the jobs of a workflow, in the order they are written.
 fn job_names(workflow: &str) -> Vec<String> {
     let mut in_jobs = false;
