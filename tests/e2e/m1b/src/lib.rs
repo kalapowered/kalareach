@@ -57,6 +57,8 @@ pub mod catalogue;
 #[cfg(all(unix, feature = "legs"))]
 pub mod ceremony;
 #[cfg(all(unix, feature = "legs"))]
+pub mod compare;
+#[cfg(all(unix, feature = "legs"))]
 pub mod device;
 #[cfg(all(unix, feature = "legs"))]
 pub mod host;
