@@ -1699,6 +1699,14 @@ fn the_launcher_fixture_plays_its_role() {
 #[cfg(windows)]
 const RAN: &str = "ran";
 
+/// The file the program leaves when it has been released and has ended on its own.
+#[cfg(windows)]
+const DONE: &str = "done";
+
+/// The file the case makes to release the program, which goes on until it is there.
+#[cfg(windows)]
+const RELEASE: &str = "release";
+
 /// How long a held program is watched for a sign that it has run, which has to stay well inside the
 /// backend's own wait for the launcher to say it started the program.
 #[cfg(windows)]
@@ -1713,8 +1721,8 @@ const BACKEND_PAUSE: std::time::Duration = std::time::Duration::from_millis(500)
 /// environment, is admitted, creates a program held and names it in `going`, and reads the backend's
 /// commit under its own clock, counted from before `going` was written. The backend is held for a
 /// time the case chose after it reads `going`, and the clock counts that time. The program has not
-/// run when the commit is read, runs once the fixture starts it, and the launcher, which waits for
-/// it, ends when it does.
+/// run when the commit is read, runs once the fixture starts it, goes on until the case releases
+/// it, and the launcher, which waits for it, ends when it does.
 #[cfg(windows)]
 #[tokio::test]
 async fn the_fixture_reads_a_commit_on_the_launchers_clock() {
@@ -1734,13 +1742,18 @@ async fn the_fixture_reads_a_commit_on_the_launchers_clock() {
     launch
         .environment
         .push(("KR_FIXTURE_PRESENTED".to_owned(), "yes".to_owned()));
-    // When it runs, the program leaves a file in its directory and then goes on for a second.
+    // When it runs, the program leaves a file in its directory, goes on until the case makes the
+    // release file, and then leaves a second file.
     launch.program_arguments = Some(vec![
         "/d".to_owned(),
         "/c".to_owned(),
-        format!("copy NUL {RAN} & ping -n 2 127.0.0.1 > NUL"),
+        format!(
+            "copy NUL {RAN} & (for /L %i in (1,1,600) do @if not exist {RELEASE} ping -n 2 127.0.0.1 > NUL) & copy NUL {DONE}"
+        ),
     ]);
     let mark = setup.directory.join(RAN);
+    let released = setup.directory.join(RELEASE);
+    let done = setup.directory.join(DONE);
 
     // The backend is held after it reads `going`, and let go after a time the case chose.
     let (arrived, release) = setup.backends.pause_before_showing();
@@ -1803,6 +1816,17 @@ async fn the_fixture_reads_a_commit_on_the_launchers_clock() {
         !launcher.has_ended(),
         "the launcher waits for the program it started"
     );
+
+    // The case releases the program, which ends on its own, and the launcher ends when it does.
+    std::fs::write(&released, b"").expect("the program is released");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while !done.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the program ended on its own once it was released"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     while !launcher.has_ended() {
         assert!(
