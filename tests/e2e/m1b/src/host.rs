@@ -292,12 +292,14 @@ pub const RESTART_RESIDUALS: [&str; 14] = [
     "SQLite reads each database from an image that the harness builds in memory from the main file, \
      the -wal and the -journal it read through the run's handles, and opens no path; the image holds \
      the bytes that the agent left at the instant of the copy.",
-    "The product's second open of the clock floor runs in a program of its own on a copy of the \
-     floor's bytes in a directory of the harness's own; an agent that finds the copy can cut it, \
-     which ends that program with a signal that the harness reads as a refusal, or replace it, \
-     which can make the product open another regular file that the agent names, of the floor's \
-     length, of the account and closed to others; the open writes nothing, and it ends for every \
-     file the agent can put there.",
+    "The product's second open of the clock floor runs in a program of its own, placed in the run's \
+     programs and started only while it is the file that was placed, on a copy of the floor's \
+     bytes in a directory of the harness's own; an agent that finds the copy can cut it, which \
+     ends that program with a signal that the harness reads as a refusal, or replace it after the \
+     directory is checked, which can make the product open another regular file that the agent \
+     names, of the floor's length, of the account and closed to others, and the open then gives \
+     its result for the agent's file; the open writes nothing, and it ends for every file the \
+     agent can put there except a regular file on a file system that stops answering.",
 ];
 
 /// What a survey shows that fails a run which wants none of it: a refusal of a compare, with the
@@ -3594,13 +3596,23 @@ mod shutdown_tests {
                 && said.contains("the bytes that the agent left at the instant of the copy")),
             "what a copy holds and that SQLite opens no path: {residuals:#?}"
         );
-        assert!(
-            residuals.iter().any(
-                |said| said.contains("runs in a program of its own on a copy")
-                    && said.contains("reads as a refusal")
-            ),
-            "the second open of the floor: {residuals:#?}"
-        );
+        let second_open = residuals
+            .iter()
+            .find(|said| said.starts_with("The product's second open of the clock floor"))
+            .expect("the second open of the floor is a residual");
+        for clause in [
+            "runs in a program of its own, placed in the run's programs and started only while it \
+             is the file that was placed,",
+            "reads as a refusal",
+            "or replace it after the directory is checked",
+            "and the open then gives its result for the agent's file",
+            "except a regular file on a file system that stops answering",
+        ] {
+            assert!(
+                second_open.contains(clause),
+                "the second open of the floor says \"{clause}\": {second_open}"
+            );
+        }
         let notes = evidence["notes"].as_array().expect("a list of notes");
         assert!(
             notes
