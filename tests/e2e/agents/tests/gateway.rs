@@ -6493,8 +6493,18 @@ fn asked_up_to(person: &Person, mark: usize, count: usize) -> Result<(), String>
 #[test]
 fn gateway_a_daemon_killed_with_a_request_pending_leaves_the_agent_and_the_restarted_daemon_serves_the_same_request()
  {
+    a_daemon_killed_with_a_request_pending_leaves_the_agent(Restart::Off);
+}
+
+/// Part 5b's restart case, with what it declares of its restart: [`Restart::Survey`] for the
+/// survey of the files a restart changes.
+fn a_daemon_killed_with_a_request_pending_leaves_the_agent(restart: Restart) {
     const TEST: &str = "gateway_a_daemon_killed_with_a_request_pending_leaves_the_agent_and_the_restarted_daemon_serves_the_same_request";
-    run_case(
+    run_case_in(
+        Setup {
+            restart,
+            ..Setup::default()
+        },
         "gateway-restart",
         "5b",
         TEST,
@@ -6766,8 +6776,18 @@ fn gateway_a_daemon_killed_with_a_request_pending_leaves_the_agent_and_the_resta
 #[test]
 fn gateway_a_second_request_pending_when_the_daemon_and_then_the_worker_are_killed_is_refused_as_a_closed_sessions()
  {
+    a_second_request_pending_when_the_daemon_and_then_the_worker_are_killed(Restart::Off);
+}
+
+/// Part 5b's control, with what it declares of its restart: [`Restart::Survey`] for the survey of
+/// the files a restart changes.
+fn a_second_request_pending_when_the_daemon_and_then_the_worker_are_killed(restart: Restart) {
     const TEST: &str = "gateway_a_second_request_pending_when_the_daemon_and_then_the_worker_are_killed_is_refused_as_a_closed_sessions";
-    run_case(
+    run_case_in(
+        Setup {
+            restart,
+            ..Setup::default()
+        },
         "gateway-restart-pending",
         "5b",
         TEST,

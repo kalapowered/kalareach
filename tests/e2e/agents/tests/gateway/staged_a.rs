@@ -767,9 +767,15 @@ fn a_presentation_action_that_is_refused_or_an_upstream_one_that_is_admitted_fai
 /// harness does not guard, so the part's result names its arm (`"arm": "stand-in only"`).
 #[test]
 fn gateway_a_control_daemon_crash_leaves_the_agent_and_its_local_terminal_running() {
+    a_control_daemon_crash_leaves_the_agent_and_its_local_terminal_running(Restart::Off);
+}
+
+/// Part 5a, with what the case declares of its restart: [`Restart::Survey`] for the survey of the
+/// files a restart changes ([`survey_the_files_a_restart_of_the_control_daemon_changes`]).
+fn a_control_daemon_crash_leaves_the_agent_and_its_local_terminal_running(restart: Restart) {
     const TEST: &str =
         "gateway_a_control_daemon_crash_leaves_the_agent_and_its_local_terminal_running";
-    part_5a(None, TEST, None);
+    part_5a_declaring(None, TEST, None, restart);
 }
 
 /// Part 5a as the case `test`, for the agent the environment names, or for the stand-in made from
@@ -777,70 +783,117 @@ fn gateway_a_control_daemon_crash_leaves_the_agent_and_its_local_terminal_runnin
 ///
 /// Where `placed` is some, the part calls it with the run's context before it starts anything.
 pub(super) fn part_5a(subject: Option<Subject>, test: &str, placed: Option<&dyn Fn(&Context)>) {
-    by_hand_case(
-        subject,
-        "5a",
-        test,
-        placed,
-        Setup::default(),
-        |ctx, session| {
-            assert!(
-                matches!(ctx.route, Route::StandIn),
-                "the daemon-crash part runs on the stand-in route only"
-            );
-            let session_id = session.session_id();
-            let agent = HandAgent::starts(ctx, session);
-            let shown = detects(ctx, &session.remote, session_id);
-            let held = Held::of(&shown).expect("the agent is detected with a binding");
-            let survives = |what: &str| {
-                agent.runs().unwrap_or_else(|why| panic!("{what}: {why}"));
-            };
-            // Only the daemon is killed. The agent and its terminal go on, and the local terminal
-            // drives the agent with no daemon to carry what it writes.
-            session.host.kill_daemon();
-            survives("the daemon's crash left the rest");
-            let (input, shows) = harmless(ctx);
-            session.person.window.type_text(input.as_bytes());
-            let _ = session.person.sees(
-                &shows,
-                "the local terminal drives the agent without a daemon",
-            );
-            // A daemon is started again, and the device connects to it; nothing runs `kr`.
-            let remote = restarts_the_daemon(ctx, session);
-            let served = ctx.instances_within(
-                &remote,
-                session_id,
-                "the restarted daemon serves the instance",
-                |read| !read.agent_instances.instances.is_empty(),
-            );
-            assert!(served.is_ok(), "the restarted daemon serves: {served:?}");
-            survives("after the restart");
-            // The worker's view of the agent outlives the daemon: the same instance at the same
-            // revision, and still only observation and the terminal.
-            let restarted = shown_now(ctx, &remote, session_id);
-            check_unchanged(Some(held), &restarted)
-                .unwrap_or_else(|why| panic!("across the daemon's crash and restart: {why}"));
-            let (offered, _) = surface(ctx, session, &remote, session_id, &restarted);
-            check_observation_only(&offered)
-                .unwrap_or_else(|why| panic!("after the restart, only observation: {why}"));
-            // The control: the property broken on purpose. The agent is ended, and the same check has
-            // to say so.
-            agent.ends();
-            let control = agent.runs();
-            assert!(
-                control.is_err(),
-                "the survival check fails once the agent has ended"
-            );
-            serde_json::json!({
-                "arm": "stand-in only",
-                "route": arm(ctx),
-                "agent_processes": ["the worker", "the agent"],
-                "local_terminal_input": shows,
-                "detection": shown.detection.evidence(),
-                "after_restart": { "detection": restarted.detection.evidence(), "surface": offered.evidence() },
-                "control": { "what": "the agent ended by its recorded identity", "breaks_property": true, "check": control.err() },
-            })
-        },
+    part_5a_declaring(subject, test, placed, Restart::Off);
+}
+
+/// Part 5a with what the case declares of its restart: [`Restart::Survey`] for the survey of the
+/// files a restart changes ([`survey_the_files_a_restart_of_the_control_daemon_changes`]).
+fn part_5a_declaring(
+    subject: Option<Subject>,
+    test: &str,
+    placed: Option<&dyn Fn(&Context)>,
+    restart: Restart,
+) {
+    let setup = Setup {
+        restart,
+        ..Setup::default()
+    };
+    by_hand_case(subject, "5a", test, placed, setup, |ctx, session| {
+        assert!(
+            matches!(ctx.route, Route::StandIn),
+            "the daemon-crash part runs on the stand-in route only"
+        );
+        let session_id = session.session_id();
+        let agent = HandAgent::starts(ctx, session);
+        let shown = detects(ctx, &session.remote, session_id);
+        let held = Held::of(&shown).expect("the agent is detected with a binding");
+        let survives = |what: &str| {
+            agent.runs().unwrap_or_else(|why| panic!("{what}: {why}"));
+        };
+        // Only the daemon is killed. The agent and its terminal go on, and the local terminal
+        // drives the agent with no daemon to carry what it writes.
+        session.host.kill_daemon();
+        survives("the daemon's crash left the rest");
+        let (input, shows) = harmless(ctx);
+        session.person.window.type_text(input.as_bytes());
+        let _ = session.person.sees(
+            &shows,
+            "the local terminal drives the agent without a daemon",
+        );
+        // A daemon is started again, and the device connects to it; nothing runs `kr`.
+        let remote = restarts_the_daemon(ctx, session);
+        let served = ctx.instances_within(
+            &remote,
+            session_id,
+            "the restarted daemon serves the instance",
+            |read| !read.agent_instances.instances.is_empty(),
+        );
+        assert!(served.is_ok(), "the restarted daemon serves: {served:?}");
+        survives("after the restart");
+        // The worker's view of the agent outlives the daemon: the same instance at the same
+        // revision, and still only observation and the terminal.
+        let restarted = shown_now(ctx, &remote, session_id);
+        check_unchanged(Some(held), &restarted)
+            .unwrap_or_else(|why| panic!("across the daemon's crash and restart: {why}"));
+        let (offered, _) = surface(ctx, session, &remote, session_id, &restarted);
+        check_observation_only(&offered)
+            .unwrap_or_else(|why| panic!("after the restart, only observation: {why}"));
+        // The control: the property broken on purpose. The agent is ended, and the same check has
+        // to say so.
+        agent.ends();
+        let control = agent.runs();
+        assert!(
+            control.is_err(),
+            "the survival check fails once the agent has ended"
+        );
+        serde_json::json!({
+            "arm": "stand-in only",
+            "route": arm(ctx),
+            "agent_processes": ["the worker", "the agent"],
+            "local_terminal_input": shows,
+            "detection": shown.detection.evidence(),
+            "after_restart": { "detection": restarted.detection.evidence(), "surface": offered.evidence() },
+            "control": { "what": "the agent ended by its recorded identity", "breaks_property": true, "check": control.err() },
+        })
+    });
+}
+
+/// The survey of the files a restart of the control daemon changes, by a run: the stand-in's
+/// daemon-crash case (5a) and both restart cases of 5b (the restart case with two kills and its
+/// control with one) run with the host in survey mode, which records the run's tree when the agent
+/// starts, at each kill and before each attempt to start the daemon again, and says each entry that
+/// changed. It waits after each kill for the files the worker's maintenance writes to stand still.
+/// A run with `--nocapture` shows the lines, each beginning `survey:`.
+#[test]
+#[ignore = "takes about ten minutes: run it with --ignored --exact staged_a::survey_the_files_a_restart_of_the_control_daemon_changes"]
+fn survey_the_files_a_restart_of_the_control_daemon_changes() {
+    if kr_ipc::testing::account_launchd::stands_down("the host start") {
+        return;
+    }
+    a_control_daemon_crash_leaves_the_agent_and_its_local_terminal_running(Restart::Survey);
+    a_daemon_killed_with_a_request_pending_leaves_the_agent(Restart::Survey);
+    a_second_request_pending_when_the_daemon_and_then_the_worker_are_killed(Restart::Survey);
+    let lines = kr_e2e_m1b::host::surveyed();
+    if lines.is_empty() {
+        eprintln!("skipping: no case ran, so nothing was surveyed");
+        return;
+    }
+    let summaries: Vec<&String> = lines
+        .iter()
+        .filter(|line| line.contains(" change(s) from the agent's start to the kill and "))
+        .collect();
+    let incomplete = summaries
+        .iter()
+        .filter(|line| line.contains("so this list is incomplete"))
+        .count();
+    eprintln!(
+        "survey: {} kills surveyed, {incomplete} of them with an incomplete list",
+        summaries.len()
+    );
+    assert_eq!(
+        summaries.len(),
+        4,
+        "5a kills the daemon once, the 5b restart case twice and its control once: {lines:#?}"
     );
 }
 

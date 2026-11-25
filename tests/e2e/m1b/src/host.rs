@@ -34,7 +34,7 @@ use crate::run::{
     HARNESS_PROGRAM, Run, binary_place, ended_within, output_within, processes_under,
     read_tail_below, running, signal, socket_below, worker_session,
 };
-use crate::tree::Record;
+use crate::tree::{Entry, Record};
 
 /// The daemon's log, in the run's directory.
 const DAEMON_LOG: &str = "controller.log";
@@ -244,6 +244,82 @@ pub enum Restart {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LegNotRun(pub String);
 
+/// The lines every survey host ([`Restart::Survey`]) has said in this process, in the order they
+/// were said.
+static SURVEYED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// The lines every survey host has said so far in this process.
+#[must_use]
+pub fn surveyed() -> Vec<String> {
+    SURVEYED
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone()
+}
+
+/// How the survey waits after a kill, and how it looks for the files that the worker's
+/// maintenance writes to stand still.
+#[derive(Clone, Copy, Debug)]
+struct SurveyTiming {
+    /// The wait after a kill before the first look: two maintenance intervals of the worker, so
+    /// that a pass has had its beat after the kill (a pass is put on the session's beat and can
+    /// follow its last by more than one interval).
+    after_the_kill: Duration,
+    /// The time between two looks.
+    apart: Duration,
+    /// How long after the kill the looks go on.
+    at_most: Duration,
+}
+
+impl Default for SurveyTiming {
+    fn default() -> Self {
+        Self {
+            after_the_kill: 2 * kr_worker::service::HOST_MAINTENANCE,
+            apart: Duration::from_secs(5),
+            at_most: Duration::from_secs(180),
+        }
+    }
+}
+
+/// What the survey of a restart has done so far.
+#[derive(Debug, Default)]
+struct Survey {
+    timing: SurveyTiming,
+    /// The kills surveyed.
+    kills: usize,
+    /// The record made at the latest kill, and the moment of the kill.
+    at_the_kill: Option<(Instant, Record)>,
+    /// How many entries differ between the record made when the agent started and the latest kill.
+    changes_to_the_kill: usize,
+    /// The lines this host has said.
+    lines: Vec<String>,
+}
+
+impl Survey {
+    /// Says `lines`: prints each and keeps it.
+    fn say(&mut self, lines: Vec<String>) {
+        for line in lines {
+            eprintln!("{line}");
+            SURVEYED
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(line.clone());
+            self.lines.push(line);
+        }
+    }
+}
+
+/// Whether the survey watches the entry at `path` for standing still: the output-time index and
+/// the session journals, which the worker's maintenance pass writes while no daemon runs.
+fn survey_watches(path: &Path) -> bool {
+    path.components().any(|component| {
+        matches!(
+            component.as_os_str().to_str(),
+            Some("output-times" | "sessions")
+        )
+    })
+}
+
 /// What a host holds of a restart: what the case declared and the record made when its agent
 /// started.
 #[derive(Debug, Default)]
@@ -251,6 +327,7 @@ struct Restarts {
     declared: Restart,
     /// The record of the run's tree, made once at the first start of the agent.
     record: Option<Record>,
+    survey: Survey,
 }
 
 /// A running host.
@@ -396,6 +473,7 @@ impl<'r> Host<'r> {
              harness's own stand-in: the start acts on the run's tree, which a live agent may have \
              changed"
         );
+        self.survey_before_the_attempt();
         let kept = self
             .configured_address()
             .filter(|address| address.port() != 0);
@@ -1066,6 +1144,134 @@ impl<'r> Host<'r> {
             "the control daemon did not end within {DAEMON_STOP:?} of being killed"
         );
         let _ = daemon.child.wait();
+        self.survey_the_kill();
+    }
+
+    /// The survey's look at the tree at a kill ([`Restart::Survey`]): the record at the kill, and
+    /// what differs between it and the record made when the agent started, said in one line for
+    /// each entry. Nothing is refused.
+    fn survey_the_kill(&self) {
+        let mut restarts = self.restarts.lock().unwrap_or_else(PoisonError::into_inner);
+        if restarts.declared != Restart::Survey {
+            return;
+        }
+        let Some(start) = restarts.record.clone() else {
+            return;
+        };
+        restarts.survey.kills += 1;
+        let kill = restarts.survey.kills;
+        let killed = Instant::now();
+        match Record::of(self.run.root(), self.run.pin(), &[RUNTIME_ROOT, STATE_ROOT]) {
+            Ok(now) => {
+                let changes = start.changes_to(&now);
+                let lines = changes
+                    .iter()
+                    .map(|change| format!("survey: kill {kill}, at the kill: {change}"))
+                    .collect();
+                restarts.survey.changes_to_the_kill = changes.len();
+                restarts.survey.at_the_kill = Some((killed, now));
+                restarts.survey.say(lines);
+            }
+            Err(why) => {
+                restarts.survey.at_the_kill = None;
+                restarts.survey.say(vec![format!(
+                    "survey: kill {kill}: the record at the kill could not be made: {why}"
+                )]);
+            }
+        }
+    }
+
+    /// The survey's look at the tree before the attempt to start the daemon ([`Restart::Survey`]):
+    /// it waits until the worker's maintenance has had its beats and the files it writes stand
+    /// still, or the bound passes, and then says what differs between the record made at the kill
+    /// and the tree. Nothing is refused.
+    fn survey_before_the_attempt(&self) {
+        let (timing, kill, killed, at_the_kill, to_the_kill) = {
+            let restarts = self.restarts.lock().unwrap_or_else(PoisonError::into_inner);
+            if restarts.declared != Restart::Survey {
+                return;
+            }
+            let Some((killed, record)) = restarts.survey.at_the_kill.clone() else {
+                return;
+            };
+            (
+                restarts.survey.timing,
+                restarts.survey.kills,
+                killed,
+                record,
+                restarts.survey.changes_to_the_kill,
+            )
+        };
+        let stood_still = self.survey_waits(timing, killed);
+        let lines = match Record::of(self.run.root(), self.run.pin(), &[RUNTIME_ROOT, STATE_ROOT]) {
+            Ok(now) => {
+                let changes = at_the_kill.changes_to(&now);
+                let state = match stood_still {
+                    Some(at) => format!(
+                        "the files of the index and the journals stood still {} s after the kill; \
+                         whether the worker's maintenance pass completed was not observed",
+                        at.as_secs()
+                    ),
+                    None => format!(
+                        "the files of the index and the journals did not stand still within {} s \
+                         after the kill, so this list is incomplete; whether the worker's \
+                         maintenance pass completed was not observed",
+                        timing.at_most.as_secs()
+                    ),
+                };
+                let mut lines: Vec<String> = changes
+                    .iter()
+                    .map(|change| format!("survey: kill {kill}, before the attempt: {change}"))
+                    .collect();
+                lines.push(format!(
+                    "survey: kill {kill}: {to_the_kill} change(s) from the agent's start to the \
+                     kill and {} from the kill to the attempt; {state}",
+                    changes.len()
+                ));
+                lines
+            }
+            Err(why) => vec![format!(
+                "survey: kill {kill}: the record before the attempt could not be made: {why}; \
+                 this list is incomplete"
+            )],
+        };
+        let mut restarts = self.restarts.lock().unwrap_or_else(PoisonError::into_inner);
+        restarts.survey.at_the_kill = None;
+        restarts.survey.say(lines);
+    }
+
+    /// Waits after a kill for the files that the worker's maintenance writes to stand still: the
+    /// time `timing` gives for the wait, then looks `timing.apart` apart until two looks agree.
+    /// Returns the time after the kill at which two looks agreed, or `None` where the bound passed
+    /// first.
+    fn survey_waits(&self, timing: SurveyTiming, killed: Instant) -> Option<Duration> {
+        std::thread::sleep(timing.after_the_kill.saturating_sub(killed.elapsed()));
+        let mut before = self.survey_view();
+        loop {
+            std::thread::sleep(timing.apart);
+            let after = self.survey_view();
+            if before.is_some() && before == after {
+                return Some(killed.elapsed());
+            }
+            if killed.elapsed() >= timing.at_most {
+                return None;
+            }
+            before = after;
+        }
+    }
+
+    /// The entries the survey watches for standing still, as they are now, or `None` where the
+    /// tree cannot be recorded.
+    fn survey_view(&self) -> Option<Vec<(PathBuf, Entry)>> {
+        let record =
+            Record::of(self.run.root(), self.run.pin(), &[RUNTIME_ROOT, STATE_ROOT]).ok()?;
+        Some(
+            record
+                .entries()
+                .filter(|(path, _)| survey_watches(path))
+                .map(|(path, entry)| (path.to_path_buf(), entry.clone()))
+                .collect(),
+        )
     }
 
     fn stop_daemon(&self) -> Result<(), String> {
@@ -2164,6 +2370,146 @@ mod shutdown_tests {
         drop(host);
         drop(run);
         std::fs::remove_file(root.join(STATE_ROOT)).expect("the link removed");
+        std::fs::remove_dir_all(&root).expect("clean up");
+    }
+
+    /// The lines a survey host has said.
+    fn surveyed_by(host: &Host<'_>) -> Vec<String> {
+        host.restarts
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .survey
+            .lines
+            .clone()
+    }
+
+    /// Gives a survey host no wait after the kill, looks 10 ms apart and one second in all.
+    fn survey_quickly(host: &Host<'_>) {
+        host.restarts
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .survey
+            .timing = SurveyTiming {
+            after_the_kill: Duration::ZERO,
+            apart: Duration::from_millis(10),
+            at_most: Duration::from_secs(1),
+        };
+    }
+
+    /// A thread that writes `path` again and again with other bytes, until `stop` is set.
+    fn rewrites(path: PathBuf, stop: Arc<AtomicBool>) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            let mut count = 0_u32;
+            while !stop.load(Ordering::SeqCst) {
+                count += 1;
+                let _ = std::fs::write(&path, count.to_string());
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        })
+    }
+
+    /// The survey says each entry that changed between the record made when the agent started and
+    /// the kill, and each that changed between the kill and the attempt; what changed before the
+    /// kill is not said again at the attempt.
+    #[test]
+    fn the_survey_says_what_changed_at_the_kill_and_what_changed_after_it() {
+        let root = scratch("survey-lists");
+        let (run, _mark) = host_with_a_kr(&root);
+        let host = host_over(&run);
+        std::fs::write(root.join("s/kept"), b"kept").expect("a file");
+        std::fs::write(root.join("s/goes"), b"goes").expect("a file");
+        host.declares_a_restart(Restart::Survey);
+        host.agent_starts();
+        survey_quickly(&host);
+        std::fs::write(root.join("s/before-the-kill"), b"before").expect("written by the agent");
+        std::fs::remove_file(root.join("s/goes")).expect("removed by the agent");
+        host.survey_the_kill();
+        std::fs::write(root.join("s/after-the-kill"), b"after").expect("written by the worker");
+        host.survey_before_the_attempt();
+        let lines = surveyed_by(&host);
+        let said = |text: &str| lines.iter().any(|line| line.contains(text));
+        assert!(
+            said("survey: kill 1, at the kill: s/before-the-kill: added, a file"),
+            "{lines:#?}"
+        );
+        assert!(
+            said("survey: kill 1, at the kill: s/goes: gone, it was a file"),
+            "{lines:#?}"
+        );
+        assert!(
+            !said("before the attempt: s/before-the-kill"),
+            "a change made before the kill is not said again: {lines:#?}"
+        );
+        assert!(
+            said("survey: kill 1, before the attempt: s/after-the-kill: added, a file"),
+            "{lines:#?}"
+        );
+        assert!(
+            said(
+                "survey: kill 1: 2 change(s) from the agent's start to the kill and 1 from the \
+                 kill to the attempt; the files of the index and the journals stood still"
+            ),
+            "{lines:#?}"
+        );
+        drop(host);
+        drop(run);
+        std::fs::remove_dir_all(&root).expect("clean up");
+    }
+
+    /// A watched file that keeps changing leaves the survey's list incomplete, and says so; a file
+    /// that is not watched and keeps changing does not hold the survey up.
+    #[test]
+    fn a_survey_says_its_list_is_incomplete_when_the_watched_files_do_not_stand_still() {
+        for (below, incomplete) in [("output-times", true), ("sessions", true), ("other", false)] {
+            let root = scratch("survey-still");
+            let (run, _mark) = host_with_a_kr(&root);
+            let host = host_over(&run);
+            std::fs::create_dir_all(root.join("s").join(below)).expect("a directory");
+            host.declares_a_restart(Restart::Survey);
+            host.agent_starts();
+            survey_quickly(&host);
+            host.survey_the_kill();
+            let stop = Arc::new(AtomicBool::new(false));
+            let writer = rewrites(root.join("s").join(below).join("file"), Arc::clone(&stop));
+            host.survey_before_the_attempt();
+            stop.store(true, Ordering::SeqCst);
+            writer.join().expect("the writer ends");
+            let lines = surveyed_by(&host);
+            assert_eq!(
+                lines.iter().any(|line| line.contains(
+                    "the files of the index and the journals did not stand still within 1 s \
+                     after the kill, so this list is incomplete"
+                )),
+                incomplete,
+                "{below}: {lines:#?}"
+            );
+            assert_eq!(
+                lines.iter().any(
+                    |line| line.contains("the files of the index and the journals stood still")
+                ),
+                !incomplete,
+                "{below}: {lines:#?}"
+            );
+            drop(host);
+            drop(run);
+            std::fs::remove_dir_all(&root).expect("clean up");
+        }
+    }
+
+    /// A host that is not a survey says nothing at a kill or before the attempt.
+    #[test]
+    fn a_host_that_is_not_a_survey_says_nothing_at_a_kill() {
+        let root = scratch("survey-off");
+        let (run, _mark) = host_with_a_kr(&root);
+        let host = host_over(&run);
+        host.declares_a_restart(Restart::Declared);
+        host.agent_starts();
+        std::fs::write(root.join("s/written"), b"written").expect("a file");
+        host.survey_the_kill();
+        host.survey_before_the_attempt();
+        assert!(surveyed_by(&host).is_empty());
+        drop(host);
+        drop(run);
         std::fs::remove_dir_all(&root).expect("clean up");
     }
 
