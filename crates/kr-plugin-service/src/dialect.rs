@@ -8,7 +8,8 @@
 //! generation of a fault. A notice that names a registration the host refused or removed is dropped
 //! too, since it belongs to an attempt the host did not keep. A notice of a registration whose
 //! answer has not been read is kept, since the host can write it before the answer, unless the
-//! answer to a removal written since has been read.
+//! answer to a removal written since has been read. Once its answer is read, a notice is kept only if
+//! the registration became the binding's.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -37,7 +38,9 @@ static NEXT_REGISTRATION: AtomicU64 = AtomicU64::new(1);
 /// than the one it answers. The order the client wrote the requests in decides what an answer
 /// means: a removal ends every registration of its binding that was written before it, and an
 /// answer never makes a registration the binding's once a removal, or a later registration that the
-/// host answered as registered, has ended it.
+/// host answered as registered, has ended it. A removal can end them all because the host admits one
+/// registration of a binding at a time, in preparation or live, and refuses any other as already
+/// live: the removal takes out the one the host admitted.
 #[derive(Debug, Default)]
 pub(crate) struct Registrations(Mutex<Held>);
 
@@ -59,8 +62,9 @@ struct Held {
 struct Attempt {
     binding_id: Uuid,
     registration: u64,
-    /// Whether a removal of the binding has been written since: the host will have removed this
-    /// registration, if it made it, so its answer makes nothing the binding's.
+    /// Whether a removal of the binding has been written since. The host removes the one
+    /// registration of the binding that it admitted and refuses the others, so an answer to this one
+    /// makes nothing the binding's.
     ended: bool,
 }
 
