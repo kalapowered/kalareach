@@ -40,6 +40,13 @@ package check refuses a table that carries it under a range that admits an earli
 a prerelease part. The plugin reference's [Command integration](README.md#command-integration)
 section holds the rules.
 
+The `acp_launch` member of a package's `plugin.json` is in version 0.1.11. It states how the
+package's agent starts in ACP mode: the command, the platforms, the variables the host copies from
+the person's shell and the variables it sets, with the publisher's own words. A manifest without it
+means what it meant before. A host on an earlier version parses all of `plugin.json` before it tests
+`sdk_range`, so it refuses a package that carries the member as a manifest it cannot read. The
+plugin reference's [ACP launch](README.md#acp-launch) section holds the rules.
+
 The `hidden_when` member of a selection route is in version 0.1.7. It lists conditions on the
 request: each names a place in the request's message and the strings, booleans or integers that
 place may hold. A request that meets every condition starts a thread that the terminal never shows,

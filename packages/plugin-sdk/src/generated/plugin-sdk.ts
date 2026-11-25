@@ -505,6 +505,10 @@ export type Predicate =
       request_id: string
     }
 /**
+ * An operating system a package supports.
+ */
+export type OperatingSystem = 'linux' | 'mac_os' | 'windows'
+/**
  * One piece of a terminal text template.
  */
 export type TextSegment =
@@ -697,6 +701,8 @@ export type FindingCode =
   | 'integration_invalid'
   | 'launch_probe_without_capability'
   | 'launch_probe_invalid'
+  | 'acp_launch_without_capability'
+  | 'acp_launch_invalid'
 /**
  * How messages are separated on the wire.
  */
@@ -741,10 +747,6 @@ export type Framing =
  * What a native method does to the upstream.
  */
 export type MethodClass = 'observation' | 'mutation' | 'credential' | 'unsupported'
-/**
- * An operating system a package supports.
- */
-export type OperatingSystem = 'linux' | 'mac_os' | 'windows'
 /**
  * A relative POSIX path inside the package, in ASCII letters, digits, '.', '-' and '_'. At most 8 segments. A '..' or '.' segment, a segment of only dots, a trailing dot, a Windows device name, a case-folded collision with another path and a path that shadows another's directory are all rejected by the host; a pattern cannot express them.
  */
@@ -1196,7 +1198,7 @@ export interface QualifiedBuild {
    */
   executable_digest: string
   /**
-   * The operating system it runs on.
+   * An operating system a package supports.
    */
   os: 'linux' | 'mac_os' | 'windows'
   /**
@@ -1303,7 +1305,7 @@ export interface PlatformSupport {
    */
   architectures: Architecture[]
   /**
-   * The operating system.
+   * An operating system a package supports.
    */
   os: 'linux' | 'mac_os' | 'windows'
 }
@@ -3918,6 +3920,17 @@ export interface PluginIdentity {
  */
 export interface PluginManifest {
   /**
+   * The ACP launch, where the package declares one: the variables the host copies from the
+   * person's shell into the agent's start, the ones it sets itself and the platforms it starts
+   * the agent on in ACP mode.
+   *
+   * A package that declares none leaves the member out, so a manifest written before the member
+   * existed reads and hashes exactly as it did. A host reads one only from this verified
+   * manifest, and only with `command_integration.launch` granted, `approval.decode` and
+   * `approval.respond` granted and the owner's switch on.
+   */
+  acp_launch?: AcpLaunch | null
+  /**
    * The actions a control may invoke.
    */
   actions: ActionDeclaration[]
@@ -3997,6 +4010,50 @@ export interface PluginManifest {
    * A semantic version range, such as '>=0.1, <0.2'. An unbounded range is rejected.
    */
   wit_range: string
+}
+/**
+ * What a package declares about starting its agent in ACP mode.
+ */
+export interface AcpLaunch {
+  /**
+   * The command name of the agent, with no directory.
+   */
+  command: string
+  /**
+   * The variables the host sets itself, in order.
+   */
+  constants: AcpConstant[]
+  /**
+   * What the package says the launch does and does not do, in its own words.
+   */
+  grant_statement: string
+  /**
+   * The variables the host copies from the person's shell into the agent's start, each only
+   * when the shell has it. No other variable of the shell is copied, whatever its name.
+   */
+  passed_names: string[]
+  /**
+   * The operating systems the host starts the agent on in ACP mode.
+   */
+  platforms: OperatingSystem[]
+  /**
+   * The variables the person's shell must have, each non-empty, or the launch is refused. Each
+   * is also a passed name.
+   */
+  required_names: string[]
+}
+/**
+ * One variable the host sets in the agent's start.
+ */
+export interface AcpConstant {
+  /**
+   * The variable's name.
+   */
+  name: string
+  /**
+   * Its value, or [`PRIVATE_HOME_PLACEHOLDER`] alone.
+   */
+  value: string
 }
 /**
  * An action registered in the package manifest.
@@ -4424,6 +4481,8 @@ export interface Finding {
     | 'integration_invalid'
     | 'launch_probe_without_capability'
     | 'launch_probe_invalid'
+    | 'acp_launch_without_capability'
+    | 'acp_launch_invalid'
   /**
    * What exactly is wrong.
    */
