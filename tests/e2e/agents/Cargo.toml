@@ -58,7 +58,11 @@ tokio = { workspace = true, features = ["test-util"] }
 # The keys and expiry a test signs a catalogue generation of its own with, through the catalogue's
 # own generation builder, and the connector package the host reads.
 aws-lc-rs.workspace = true
+# The command table of the forwarder, which says whether the host has a launch for an agent in ACP
+# mode: the cases of that mode start with it and fail while it has none.
+clap.workspace = true
 jiff.workspace = true
+kr-hook = { path = "../../../crates/kr-hook" }
 kr-plugin-catalogue = { workspace = true, features = ["testing"] }
 kr-worker = { workspace = true, features = ["testing"] }
 tough.workspace = true

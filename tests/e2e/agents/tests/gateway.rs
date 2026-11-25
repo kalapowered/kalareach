@@ -167,6 +167,10 @@ mod staged_b;
 #[path = "gateway/staged_c.rs"]
 mod staged_c;
 
+/// Cases 5b and 6b with an agent in ACP mode, which wait for the host's ACP launch.
+#[path = "gateway/acp.rs"]
+mod acp;
+
 /// The variable naming the build list entry of a real agent; without it the agent is the stand-in.
 const BUILD_VARIABLE: &str = "KR_AGENTS_GATEWAY_BUILD";
 

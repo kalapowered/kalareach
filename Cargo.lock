@@ -4792,11 +4792,13 @@ version = "0.1.0"
 dependencies = [
  "aws-lc-rs",
  "base64 0.23.1",
+ "clap",
  "jiff",
  "kr-cbor",
  "kr-client",
  "kr-controller",
  "kr-e2e-m1b",
+ "kr-hook",
  "kr-ipc",
  "kr-plugin-catalogue",
  "kr-plugin-sdk",
