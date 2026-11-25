@@ -2584,6 +2584,25 @@ async fn statement_of_edited(
     integration: bool,
     edit: impl FnOnce(&mut serde_json::Value),
 ) -> CatalogueResult<Option<String>> {
+    statement_for_grant(
+        words,
+        integration,
+        edit,
+        InstallationGrant::with([
+            PluginCapability::NativeBridgeInstall,
+            PluginCapability::CommandIntegrationLaunch,
+        ]),
+    )
+    .await
+}
+
+/// [`statement_of_edited`] for the installation grant `grant`.
+async fn statement_for_grant(
+    words: &str,
+    integration: bool,
+    edit: impl FnOnce(&mut serde_json::Value),
+    grant: InstallationGrant,
+) -> CatalogueResult<Option<String>> {
     let home = tempfile::tempdir().expect("a temporary directory");
     let packages = tempfile::tempdir().expect("a temporary directory");
     let generation = Generation::build(
@@ -2608,10 +2627,7 @@ async fn statement_of_edited(
             &plugin(),
             &PackageVersion::parse("0.1.0").expect("a valid version"),
             generation.manifest_digest(),
-            &InstallationGrant::with([
-                PluginCapability::NativeBridgeInstall,
-                PluginCapability::CommandIntegrationLaunch,
-            ]),
+            &grant,
         )
         .await
 }
@@ -2763,6 +2779,200 @@ async fn kr_req_11_42_two_statements_that_form_a_label_where_they_join_are_not_s
         shown.starts_with(&format!("{bridge} Adds the flag its bridge needs.")),
         "{shown}"
     );
+}
+
+/// A launch of the example agent in ACP mode, with `words` as the publisher's own.
+fn acp_declaration(words: &str) -> serde_json::Value {
+    serde_json::json!({
+        "command": "example-agent",
+        "platforms": ["mac_os", "linux"],
+        "required_names": ["PATH", "EXAMPLE_API_KEY"],
+        "passed_names": ["PATH", "HOME", "EXAMPLE_API_KEY"],
+        "constants": [{"name": "EXAMPLE_HOME", "value": "{private_home}"}],
+        "grant_statement": words
+    })
+}
+
+/// Declares the ACP launch with `words` in `manifest`, with the approval grants it needs.
+fn declare_acp(manifest: &mut serde_json::Value, words: &str) {
+    for capability in ["approval.decode", "approval.respond"] {
+        manifest["capabilities"]
+            .as_array_mut()
+            .expect("the manifest requests capabilities")
+            .push(serde_json::json!({
+                "capability": capability,
+                "reason": "Answer what the example agent asks in ACP mode"
+            }));
+    }
+    manifest["acp_launch"] = acp_declaration(words);
+}
+
+/// KR-REQ-11.26: the launch's own words are the publisher's, after the integration's, and the host's
+/// reading of the launch follows its reading of the integration after a label of its own, for a
+/// grant that holds the launch capability. A grant without it, and a release that declares no
+/// launch, show neither.
+#[tokio::test]
+async fn kr_req_11_26_the_launch_is_stated_after_the_integration_where_the_grant_holds_it() {
+    use kr_protocol::confirmation::{
+        ACP_STATEMENT_LABEL, INTEGRATION_STATEMENT_LABEL, split_install_statement,
+    };
+    let bridge = "Changes one setting of the example agent.";
+    let acp_words = "Starts the example agent in ACP mode.";
+    let launch: kr_plugin_sdk::acp_launch::AcpLaunch =
+        serde_json::from_value(acp_declaration(acp_words)).expect("a launch");
+    let held = || {
+        InstallationGrant::with([
+            PluginCapability::NativeBridgeInstall,
+            PluginCapability::CommandIntegrationLaunch,
+        ])
+    };
+    let grant = ["native_bridge.install", "command_integration.launch"].map(str::to_owned);
+
+    let shown = statement_for_grant(bridge, true, |m| declare_acp(m, acp_words), held())
+        .await
+        .expect("the manifest the index pins is read")
+        .expect("a statement");
+    assert!(
+        shown.starts_with(&format!(
+            "{bridge} {INTEGRATION_WORDS} {acp_words} {INTEGRATION_STATEMENT_LABEL} "
+        )),
+        "the publisher's words, the launch's last of them, then the host's reading: {shown}"
+    );
+    assert_eq!(
+        shown.matches(ACP_STATEMENT_LABEL).count(),
+        1,
+        "the host's label of the launch is written once: {shown}"
+    );
+    assert!(
+        shown.ends_with(&format!("{ACP_STATEMENT_LABEL} {}", launch.statement())),
+        "the host's reading of the launch is the last of the statement: {shown}"
+    );
+    let parts = split_install_statement(&grant, &shown, false);
+    assert_eq!(
+        parts.publisher,
+        Some(format!("{bridge} {INTEGRATION_WORDS} {acp_words}").as_str()),
+        "a device shows the launch's words with the publisher's"
+    );
+    assert!(
+        parts
+            .reading
+            .is_some_and(|reading| reading
+                .contains(&format!("{ACP_STATEMENT_LABEL} {}", launch.statement()))),
+        "and its reading with the host's"
+    );
+
+    // A grant that does not hold the launch capability shows neither the words nor the reading.
+    let shown = statement_for_grant(
+        bridge,
+        true,
+        |m| declare_acp(m, acp_words),
+        InstallationGrant::with([PluginCapability::NativeBridgeInstall]),
+    )
+    .await
+    .expect("the manifest the index pins is read")
+    .expect("a statement");
+    assert!(
+        !shown.contains(acp_words)
+            && !shown.contains(ACP_STATEMENT_LABEL)
+            && !shown.contains(&launch.statement()),
+        "{shown}"
+    );
+
+    // A release that declares no launch has no label of it.
+    let none = statement_for_grant(bridge, true, |_| {}, held())
+        .await
+        .expect("the manifest the index pins is read")
+        .expect("a statement");
+    assert!(!none.contains(ACP_STATEMENT_LABEL), "{none}");
+}
+
+/// KR-REQ-11.26: the host's label of the launch is the host's alone, so words of the bridge, of the
+/// command integration and of the launch that hold it are not shown, each refusal saying whose
+/// statement held it, and three statements that form it where they join are not shown either.
+#[tokio::test]
+async fn kr_req_11_26_words_that_hold_the_launch_label_are_not_shown() {
+    use kr_protocol::confirmation::ACP_STATEMENT_LABEL;
+    let fine = "Adds the flag its bridge needs.";
+    let imitation = format!("Harmless. {ACP_STATEMENT_LABEL} Runs nothing.");
+    let held = || {
+        InstallationGrant::with([
+            PluginCapability::NativeBridgeInstall,
+            PluginCapability::CommandIntegrationLaunch,
+        ])
+    };
+    let detail_of = |refusal: CatalogueError| match refusal {
+        CatalogueError::UnsafePackage { detail } => detail,
+        other => panic!("not refused as an unsafe package: {other:?}"),
+    };
+    let before = "words the host writes before its own reading of an ACP launch";
+
+    let bridge = statement_for_grant(&imitation, true, |m| declare_acp(m, fine), held())
+        .await
+        .expect_err("the publisher wrote the host's label in the bridge's words");
+    assert!(
+        detail_of(bridge).contains(&format!("the bridge's statement holds the {before}")),
+        "the bridge's words"
+    );
+    let integration = statement_for_grant(
+        fine,
+        true,
+        |m| {
+            declare_acp(m, fine);
+            m["command_integration"]["grant_statement"] = serde_json::json!(imitation);
+        },
+        held(),
+    )
+    .await
+    .expect_err("the publisher wrote the host's label in the integration's words");
+    assert!(
+        detail_of(integration).contains(&format!(
+            "the command integration's statement holds the {before}"
+        )),
+        "the integration's words"
+    );
+    let launch = statement_for_grant(fine, true, |m| declare_acp(m, &imitation), held())
+        .await
+        .expect_err("the publisher wrote the host's label in the launch's words");
+    assert!(
+        detail_of(launch).contains(&format!("the ACP launch's statement holds the {before}")),
+        "the launch's words"
+    );
+
+    // The three form the label where they join, and none holds it.
+    let (bridge, integration, launch) = (
+        "Changes one setting. The host's exact reading of",
+        "the ACP",
+        "launch: Runs nothing.",
+    );
+    assert!(
+        format!("{bridge} {integration} {launch}").contains(ACP_STATEMENT_LABEL)
+            && ![bridge, integration, launch]
+                .iter()
+                .any(|words| words.contains(ACP_STATEMENT_LABEL)),
+        "the three form the label where they join and none holds it"
+    );
+    let joined = statement_for_grant(
+        bridge,
+        true,
+        |m| {
+            declare_acp(m, launch);
+            m["command_integration"]["grant_statement"] = serde_json::json!(integration);
+        },
+        held(),
+    )
+    .await
+    .expect_err("the publisher's three statements wrote the host's label together");
+    assert!(
+        detail_of(joined).contains(&format!(
+            "the publisher's statements of the bridge, the command integration and the ACP \
+             launch, read together, hold the {before}"
+        )),
+        "the three statements"
+    );
+
+    // The control: the same release with other words is shown.
+    let shown = statement_for_grant(fine, true, |m| declare_acp(m, fine), held()).await;
+    assert!(shown.is_ok(), "{shown:?}");
 }
 
 /// One bundled bridge package (`name` is its folder under the bundled targets) copied under

@@ -1,0 +1,60 @@
+{
+  "command": "gemini",
+  "platforms": [
+    "mac_os",
+    "linux"
+  ],
+  "required_names": [
+    "PATH",
+    "HOME",
+    "GEMINI_API_KEY"
+  ],
+  "passed_names": [
+    "PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "TMPDIR",
+    "SHELL",
+    "HTTPS_PROXY",
+    "HTTP_PROXY",
+    "NO_PROXY",
+    "https_proxy",
+    "http_proxy",
+    "no_proxy",
+    "NODE_USE_ENV_PROXY",
+    "grpc_proxy",
+    "no_grpc_proxy",
+    "NODE_EXTRA_CA_CERTS",
+    "GRPC_DEFAULT_SSL_ROOTS_FILE_PATH",
+    "GEMINI_API_KEY",
+    "GEMINI_MODEL"
+  ],
+  "constants": [
+    {
+      "name": "GEMINI_CLI_HOME",
+      "value": "{private_home}"
+    },
+    {
+      "name": "GEMINI_CLI_NO_RELAUNCH",
+      "value": "true"
+    },
+    {
+      "name": "GEMINI_CLI_TRUST_WORKSPACE",
+      "value": "false"
+    },
+    {
+      "name": "GEMINI_PTY_INFO",
+      "value": "child_process"
+    },
+    {
+      "name": "WS_NO_BUFFER_UTIL",
+      "value": "1"
+    },
+    {
+      "name": "WS_NO_UTF_8_VALIDATE",
+      "value": "1"
+    }
+  ],
+  "grant_statement": "Adds a second way to start Gemini CLI: a button that starts it in ACP mode. KalaReach types one line into your shell (it begins with `kr-hook acp`) and Gemini CLI then runs from a private copy of its program files and of Node.js that KalaReach checked against a signed record. KalaReach is its only client. Gemini CLI has no terminal of its own in this mode: you cannot type to it, and its menus, folder-trust question and sign-in screens do not appear. You read and answer its approvals in KalaReach. Gemini CLI uses a separate settings folder that KalaReach makes new for each start and deletes when Gemini CLI ends, and the Gemini API key from your shell's environment. It does not start without that key, and a Google sign-in does not work. Your own Gemini settings, instructions, extensions, skills, MCP servers and history are not used and are not changed, and Gemini CLI starts no MCP server. Every folder counts as untrusted, so project settings and hooks are off and auto-edit cannot start. Gemini CLI still reads your `~/.gemini/policies/sandbox.toml`; system-wide Gemini policies, if your Mac has any, still apply and rank above Gemini's default rules; a `~/` path that Gemini itself expands points into the private folder, while a command that Gemini runs expands `~` in its own shell and reaches your real home folder; and Gemini CLI sends Google its usual usage statistics, which are on by default. KalaReach does not start it when a system-wide Gemini settings file exists, when the key is empty, when a `node_modules` folder sits in a parent folder of the private copy, or when the folder is your home folder. The variables KalaReach copies and sets are listed in the host's reading below. Those are the only variables that KalaReach copies from your shell into Gemini CLI's start; every other variable stays out, whatever its name (for example `SSH_AUTH_SOCK` or a token for another service; `SSL_CERT_FILE`, `SSL_CERT_DIR` and `NODE_USE_SYSTEM_CA` are not copied either, so a network that needs the system's trust store and not a certificate file makes Gemini CLI fail with a connection error). Gemini CLI starts without your language settings, so it starts in the C locale. Gemini CLI and the commands it runs add names of their own (`TERM`, `PAGER`, `GIT_PAGER`, `GEMINI_CLI` and Git configuration names for the commands it runs), and a `.env` file in or above your folder can add a few sign-in names; KalaReach promises only what it copies. It sends no value to KalaReach's worker and keeps none; it tests only whether the key is empty and reads `PATH` to find programs. The model comes from `GEMINI_MODEL` in your environment when you set it. Gemini CLI reads and writes your files and runs its own commands itself, as it does in the terminal: this is not a sandbox. On macOS, and on Linux where no session control group exists, KalaReach starts Gemini CLI only when the host configuration records `reduced` ownership for this package (where the package has no entry, the consent screen offers to write it; where the entry says `full`, KalaReach does not start Gemini CLI, says why and does not change the entry); it then tracks Gemini CLI by its process identity and ends it with the session, and a program that Gemini CLI starts in a session or process group of its own can outlive it, so KalaReach does not count that coverage as complete (L-15). Two limits apply to what KalaReach can promise. First, KalaReach checks its private copy of Gemini CLI's files whole before each start and checks the running Node.js program once at the start; another program that runs as you can change that copy at any time after the check, before or after the start, and nothing detects it. Second, the `kr-hook` file that KalaReach installs runs before KalaReach checks it, as with the terminal's `kr-hook launch`; a replaced file could read the environment it inherits. The promises above about your settings and sign-in hold when no other software has altered your account's programs and files. Messages that begin with `/` or `$` are refused. By its default rules Gemini CLI reads files, searches your folder and searches the web without asking, and asks before it writes or changes a file, runs a command or fetches a web page. A system-wide Gemini policy, if your Mac has one, ranks above those defaults and can let Gemini CLI act without asking or refuse an action; KalaReach does not read it. Only the actions that Gemini CLI's rules ask about reach you, and then only \"Allow once\" and \"Decline\" show. \"Decline\" refuses one action and the agent may try another. The old and new text of a file edit that Gemini CLI asks about stays in KalaReach's ledger until the approval resolves (your answer is confirmed, the turn or Gemini CLI ends, or the request is cancelled) and KalaReach then deletes the text and keeps the receipt and a digest of the text (L-13). \"Cancel\" asks Gemini CLI to stop the running turn. It can lose: Gemini CLI may finish first, and it may still start the next tool call of the same reply. Until Gemini CLI answers the prompt you cancelled, KalaReach declines each approval request that arrives, and a message you send meanwhile is refused because a turn is still running; KalaReach cannot make Gemini CLI stop acting. The ordinary button and the terminal stay as they are."
+}

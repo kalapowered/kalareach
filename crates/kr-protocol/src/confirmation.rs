@@ -414,6 +414,14 @@ pub const COMMAND_INTEGRATION_NOTICE: &str = "This package changes how a command
 pub const INTEGRATION_STATEMENT_LABEL: &str =
     "The host's exact reading of the command integration:";
 
+/// What the host writes before its own exact reading of an ACP launch in an installation's
+/// statement, for a package that declares one. The publisher's own words never hold it, alone or
+/// read together (the package check refuses them, and the host refuses a manifest that has it).
+/// The reading stands inside the command integration's part, after the host's reading of the
+/// integration, so a device that splits the statement at [`INTEGRATION_STATEMENT_LABEL`] shows both
+/// readings as the host's.
+pub const ACP_STATEMENT_LABEL: &str = "The host's exact reading of the ACP launch:";
+
 /// What the host writes before its own exact reading of a placement in an installation's
 /// statement, for a package whose table declares where its bridge's files are placed. The
 /// publisher's words never hold it (the package check refuses them, and the host refuses a manifest
@@ -474,6 +482,30 @@ pub fn publisher_words(bridge: Option<&str>, integration: Option<&str>) -> Optio
         (Some(bridge), Some(integration)) => Some(format!("{bridge} {integration}")),
         (Some(words), None) | (None, Some(words)) => Some(words.to_owned()),
         (None, None) => None,
+    }
+}
+
+/// The publisher's words of the command integration's part of a statement: what the manifest says
+/// of the command integration and then what it says of the ACP launch, each present only where the
+/// grant holds the capability that applies it. They are one run, passed to [`publisher_words`] as
+/// the integration's words.
+#[must_use]
+pub fn integration_words(integration: Option<&str>, acp: Option<&str>) -> Option<String> {
+    match (integration, acp) {
+        (Some(integration), Some(acp)) => Some(format!("{integration} {acp}")),
+        (Some(words), None) | (None, Some(words)) => Some(words.to_owned()),
+        (None, None) => None,
+    }
+}
+
+/// The host's reading of the command integration's part of a statement: its reading of the
+/// integration and then, for a package that declares an ACP launch, [`ACP_STATEMENT_LABEL`] and its
+/// reading of that launch. It is passed to [`install_statement`] as the integration's reading.
+#[must_use]
+pub fn integration_reading(integration: &str, acp: Option<&str>) -> String {
+    match acp {
+        Some(acp) => format!("{integration} {ACP_STATEMENT_LABEL} {acp}"),
+        None => integration.to_owned(),
     }
 }
 
@@ -1222,6 +1254,47 @@ mod tests {
             composed.chars().count() <= STATEMENT_CHARS,
             "the bound holds a bridge's words and an integration's own words"
         );
+    }
+
+    /// The integration's part holds the integration's own words and then the ACP launch's, joined by
+    /// one space, and the host's reading of the integration and then its own label and reading of
+    /// the launch. A device that splits at the integration's label shows the launch's label and
+    /// reading inside the host's reading, and the launch's words with the publisher's.
+    #[test]
+    fn the_integrations_part_holds_the_acp_launch_after_the_integration() {
+        assert_eq!(integration_words(None, None), None);
+        assert_eq!(
+            integration_words(Some("Adds a flag."), None).as_deref(),
+            Some("Adds a flag.")
+        );
+        assert_eq!(
+            integration_words(None, Some("Starts ACP.")).as_deref(),
+            Some("Starts ACP.")
+        );
+        let words = integration_words(Some("Adds a flag."), Some("Starts ACP.")).expect("words");
+        assert_eq!(words, "Adds a flag. Starts ACP.");
+        assert_eq!(integration_reading("Runs x.", None), "Runs x.");
+        let reading = integration_reading("Runs x.", Some("Starts y."));
+        assert_eq!(
+            reading,
+            "Runs x. The host's exact reading of the ACP launch: Starts y."
+        );
+
+        let grant = ["native_bridge.install", "command_integration.launch"].map(str::to_owned);
+        let publisher = publisher_words(Some("Places files."), Some(&words)).expect("words");
+        let composed =
+            install_statement(Some(&publisher), None, Some(&reading)).expect("a statement");
+        assert_eq!(
+            composed,
+            "Places files. Adds a flag. Starts ACP. The host's exact reading of the command \
+             integration: Runs x. The host's exact reading of the ACP launch: Starts y."
+        );
+        let parts = split_install_statement(&grant, &composed, false);
+        assert_eq!(
+            parts.publisher,
+            Some("Places files. Adds a flag. Starts ACP.")
+        );
+        assert_eq!(parts.reading, Some(reading.as_str()));
     }
 
     /// A device tells the publisher's bridge words from the host's reading at the host's label, and

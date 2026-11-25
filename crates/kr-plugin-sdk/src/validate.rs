@@ -1285,21 +1285,17 @@ fn check_placement(
     }
 }
 
-/// Refuses a package whose whole installation statement is longer than an owner is shown whole.
-///
-/// The statement is composed as the host composes it for a grant that holds every capability it
-/// has a part for: the publisher's words of the bridge and of the command integration, the host's
-/// reading of the placement the table declares and the host's reading of the command integration,
-/// or its words that the package declares none. Each part may meet its own limit and the parts
-/// together may not.
-fn check_statement(
+/// The whole installation statement the host composes for a package, as it composes it for a grant
+/// that holds every capability the package has a part for: the publisher's words of the bridge and
+/// of the command integration, the host's reading of the placement the table declares and the host's
+/// reading of the command integration, or its words that the package declares none. `None` for a
+/// package with no native bridge.
+#[must_use]
+pub fn whole_statement(
     manifest: &PluginManifest,
     connector: Option<&ConnectorManifest>,
-    report: &mut Report,
-) {
-    let Some(bridge) = manifest.native_bridge.0.as_ref() else {
-        return;
-    };
+) -> Option<String> {
+    let bridge = manifest.native_bridge.0.as_ref()?;
     let placement = connector
         .and_then(|table| table.placement.as_ref())
         .and_then(|placement| placement.statement(bridge).ok());
@@ -1314,12 +1310,21 @@ fn check_statement(
             .as_ref()
             .map(|declared| declared.grant_statement.as_str()),
     );
-    let whole = kr_protocol::confirmation::install_statement(
+    kr_protocol::confirmation::install_statement(
         publisher.as_deref(),
         placement.as_deref(),
         Some(integration.as_str()),
-    );
-    let length = whole.map_or(0, |text| text.chars().count());
+    )
+}
+
+/// Refuses a package whose whole installation statement is longer than the statement the host
+/// shows an owner. Each part may meet its own limit while the parts together do not.
+fn check_statement(
+    manifest: &PluginManifest,
+    connector: Option<&ConnectorManifest>,
+    report: &mut Report,
+) {
+    let length = whole_statement(manifest, connector).map_or(0, |text| text.chars().count());
     if length > kr_protocol::confirmation::STATEMENT_CHARS {
         report.push(Finding::at(
             FindingCode::BridgeRecipeInvalid,

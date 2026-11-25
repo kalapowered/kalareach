@@ -422,6 +422,92 @@ fn kr_req_11_26_launch_words_that_hold_a_label_of_the_host_are_refused() {
     );
 }
 
+/// The example manifest with a launch, a command integration whose words are `integration`, and a
+/// native bridge whose words are `bridge`.
+fn manifest_with_words(bridge: &str, integration: &str, launch_words: &str) -> Value {
+    let mut manifest = manifest_with(&declaration(), &GRANTS);
+    manifest["command_integration"] = json!({
+        "command": "example-agent",
+        "flags": ["--flag"],
+        "variables": [],
+        "grant_statement": integration
+    });
+    manifest["acp_launch"]["grant_statement"] = json!(launch_words);
+    manifest["capabilities"]
+        .as_array_mut()
+        .expect("the manifest requests capabilities")
+        .push(json!({
+            "capability": "native_bridge.install",
+            "reason": "Register the forwarder the example agent starts"
+        }));
+    manifest["native_bridge"] = json!({
+        "application": "Example Agent",
+        "application_range": ">=1.0.0, <2.0.0",
+        "install": [{
+            "type": "add_configuration_key",
+            "file": "settings.json",
+            "key": "enabled.example",
+            "value": "true"
+        }],
+        "remove": [{
+            "type": "remove_configuration_key",
+            "file": "settings.json",
+            "key": "enabled.example"
+        }],
+        "grant_statement": bridge
+    });
+    manifest
+}
+
+/// KR-REQ-11.26: the host writes its own label before its reading of the launch, so the words of
+/// the bridge, of the command integration and of the launch cannot hold it, each in its own
+/// sentence, and the three cannot form it where they join.
+#[test]
+fn kr_req_11_26_words_that_hold_the_launch_label_of_the_host_are_refused() {
+    let label = kr_protocol::confirmation::ACP_STATEMENT_LABEL;
+    let imitation = format!("Harmless. {label} Runs nothing.");
+    let fine = "Adds a flag.";
+    assert_refused(
+        &manifest_with_words(fine, fine, &imitation),
+        FindingCode::AcpLaunchInvalid,
+        "the ACP launch's statement holds the words the host writes before its own reading of an \
+         ACP launch",
+    );
+    assert_refused(
+        &manifest_with_words(fine, &imitation, fine),
+        FindingCode::IntegrationInvalid,
+        "the command integration's statement holds the words the host writes before its own \
+         reading of an ACP launch",
+    );
+    assert_refused(
+        &manifest_with_words(&imitation, fine, fine),
+        FindingCode::BridgeRecipeInvalid,
+        "the bridge's statement holds the words the host writes before its own reading of an ACP \
+         launch",
+    );
+
+    // Three statements that form the label only where they join: neither holds it.
+    let (bridge, integration, launch) = (
+        "Changes one setting. The host's exact reading of",
+        "the ACP",
+        "launch: Runs nothing.",
+    );
+    let joined = format!("{bridge} {integration} {launch}");
+    assert!(joined.contains(label), "the three form the label");
+    assert!(
+        ![bridge, integration, launch]
+            .iter()
+            .any(|words| words.contains(label)),
+        "and none holds it"
+    );
+    assert_refused(
+        &manifest_with_words(bridge, integration, launch),
+        FindingCode::AcpLaunchInvalid,
+        "the statements of the bridge, the command integration and the ACP launch, read \
+         together, hold the words the host writes before its own reading of an ACP launch",
+    );
+}
+
 /// What an installation's grant holds when the owner has confirmed the launch and both approval
 /// grants are held.
 const HELD: [PluginCapability; 3] = [
