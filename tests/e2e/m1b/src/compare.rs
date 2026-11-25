@@ -307,6 +307,13 @@ pub fn daemon_rows(layout: &Layout) -> Vec<Daemon> {
         "crates/kr-controller/src/attention.rs:913",
         When::Serving,
     );
+    // The delivery journal is opened at the start and written by the delivery pass while the daemon
+    // serves, which takes out the deliveries that have expired.
+    database(
+        "delivery.sqlite3",
+        "crates/kr-controller/src/push/mod.rs:256, 1033, 1342",
+        When::Serving,
+    );
     // The stores the daemon opens, and migrates or recovers, at its start.
     for (name, cite) in [
         (
@@ -316,10 +323,6 @@ pub fn daemon_rows(layout: &Layout) -> Vec<Daemon> {
         (
             "changesets/changesets.sqlite",
             "crates/kr-changeset/src/store.rs:50",
-        ),
-        (
-            "delivery.sqlite3",
-            "crates/kr-controller/src/push/mod.rs:256",
         ),
         (
             "descriptions.sqlite3",

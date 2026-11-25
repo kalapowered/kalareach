@@ -862,8 +862,10 @@ fn part_5a_declaring(
 /// daemon-crash case (5a) and both restart cases of 5b (the restart case with two kills and its
 /// control with one) run with the host in survey mode, which records the run's tree when the agent
 /// starts, at each kill and before each attempt to start the daemon again, and says each entry that
-/// changed. It waits after each kill for the files the worker's maintenance writes to stand still.
-/// A run with `--nocapture` shows the lines, each beginning `survey:`.
+/// changed and each change that the compares refuse. It waits after each kill for the files the
+/// worker's maintenance writes to stand still. A run with `--nocapture` shows the lines, each
+/// beginning `survey:`. It fails for each entry that changed and that no row of the live daemon's
+/// files covers, and for each list that is incomplete.
 #[test]
 #[ignore = "takes about ten minutes: run it with --ignored --exact staged_a::survey_the_files_a_restart_of_the_control_daemon_changes"]
 fn survey_the_files_a_restart_of_the_control_daemon_changes() {
@@ -882,9 +884,9 @@ fn survey_the_files_a_restart_of_the_control_daemon_changes() {
         .iter()
         .filter(|line| line.contains(" change(s) from the agent's start to the kill and "))
         .collect();
-    let incomplete = summaries
+    let incomplete = lines
         .iter()
-        .filter(|line| line.contains("so this list is incomplete"))
+        .filter(|line| line.contains(INCOMPLETE))
         .count();
     eprintln!(
         "survey: {} kills surveyed, {incomplete} of them with an incomplete list",
@@ -895,6 +897,59 @@ fn survey_the_files_a_restart_of_the_control_daemon_changes() {
         4,
         "5a kills the daemon once, the 5b restart case twice and its control once: {lines:#?}"
     );
+    let gaps = gaps_in_the_survey(&lines);
+    assert!(
+        gaps.is_empty(),
+        "the survey found an entry that no row of the live daemon's files covers, or a list that \
+         is incomplete: {gaps:#?}"
+    );
+}
+
+/// What a survey line says of an entry that no row of the live daemon's files covers.
+const NO_ROW: &str = "no row of the live daemon's files covers this entry";
+
+/// What a survey line says of a list that is not complete.
+const INCOMPLETE: &str = "this list is incomplete";
+
+/// The lines of a survey that show a gap: an entry that no row of the live daemon's files covers,
+/// and a list that is incomplete.
+fn gaps_in_the_survey(lines: &[String]) -> Vec<&String> {
+    lines
+        .iter()
+        .filter(|line| line.contains(NO_ROW) || line.contains(INCOMPLETE))
+        .collect()
+}
+
+/// A survey line that says no row covers an entry, or that a list is incomplete, is a gap; a line
+/// that says a table changed, or that the files stood still, is not.
+#[test]
+fn a_survey_line_for_an_entry_no_row_covers_or_for_an_incomplete_list_is_a_gap() {
+    let said = |text: &str| text.to_owned();
+    let lines = [
+        said("survey: kill 1, at the kill: s/x: added, a file"),
+        said(
+            "survey: kill 1, refused: the journal table bindings of a1 changed, appeared or is gone between the kill and the attempt",
+        ),
+        said(
+            "survey: kill 1: 2 change(s) from the agent's start to the kill and 1 from the kill to the attempt; the files of the index and the journals stood still 5 s after the kill; whether the worker's maintenance pass completed was not observed",
+        ),
+    ];
+    assert!(gaps_in_the_survey(&lines).is_empty());
+    let unnamed = said(
+        "survey: kill 2, refused: s/y: added, a file; no row of the live daemon's files covers this entry",
+    );
+    let incomplete = said(
+        "survey: kill 2: 0 change(s) from the agent's start to the kill and 0 from the kill to the attempt; the files of the index and the journals did not stand still within 180 s after the kill, so this list is incomplete; whether the worker's maintenance pass completed was not observed",
+    );
+    let not_made = said(
+        "survey: kill 3: the record before the attempt could not be made: no tree; this list is incomplete",
+    );
+    let all: Vec<String> = lines
+        .iter()
+        .cloned()
+        .chain([unnamed.clone(), incomplete.clone(), not_made.clone()])
+        .collect();
+    assert_eq!(gaps_in_the_survey(&all), [&unnamed, &incomplete, &not_made]);
 }
 
 /// The check that the agent survived fails for a process that ended, and holds for one that runs.

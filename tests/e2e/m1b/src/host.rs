@@ -235,7 +235,8 @@ pub enum Restart {
     /// run's tree when the agent starts, unless the agent is the stand-in.
     Declared,
     /// The survey of the files a restart changes: the host records the run's tree when the agent
-    /// starts on the stand-in too.
+    /// starts on the stand-in too, and says each change that the compares would refuse, without
+    /// refusing it.
     Survey,
 }
 
@@ -291,8 +292,6 @@ struct Survey {
     at_the_kill: Option<(Instant, Record)>,
     /// How many entries differ between the record made when the agent started and the latest kill.
     changes_to_the_kill: usize,
-    /// The tables of the session journals at the latest kill.
-    tables_at_the_kill: Option<Tables>,
     /// The lines this host has said.
     lines: Vec<String>,
 }
@@ -372,12 +371,12 @@ struct Restarts {
     record: Option<Record>,
     /// The watch on the clock floor, made with the record: the mapping is kept from the start.
     clock: Option<Watch>,
-    /// What the compares of a real agent's restart read: made at the start, kept at each kill.
+    /// What the compares of a restart read: made at the start, kept at each kill.
     verified: Option<Verified>,
     survey: Survey,
 }
 
-/// What the compares of a restart on a real agent's tree hold besides the record made at the start.
+/// What the compares of a restart hold besides the record made at the start.
 #[derive(Debug)]
 struct Verified {
     /// The address the configuration document gave at the start, read once.
@@ -710,6 +709,15 @@ impl<'r> Host<'r> {
         match answered {
             Ok(None) => {
                 self.note_control_socket();
+                if let Some(verified) = self
+                    .restarts
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .verified
+                    .as_mut()
+                {
+                    verified.starts += 1;
+                }
                 Ok(())
             }
             Ok(Some(said)) => Err(Failed::Exited(said)),
@@ -751,15 +759,9 @@ impl<'r> Host<'r> {
             if !records || restarts.record.is_some() {
                 return;
             }
-            let looked = if restarts.declared == Restart::Declared {
-                self.standing()
-                    .map(|(indexes, record)| (Some(indexes), record))
-            } else {
-                self.record().map(|record| (None, record))
-            };
-            looked.and_then(|(indexes, record)| {
+            self.standing().and_then(|(indexes, record)| {
                 let clock = self.watch_the_floor()?;
-                restarts.verified = indexes.map(|indexes| Verified {
+                restarts.verified = Some(Verified {
                     address: self.configured_address(),
                     indexes,
                     kill: None,
@@ -1345,7 +1347,6 @@ impl<'r> Host<'r> {
                     .map(|change| format!("survey: kill {kill}, at the kill: {change}"))
                     .collect();
                 restarts.survey.changes_to_the_kill = changes.len();
-                restarts.survey.tables_at_the_kill = Some(self.look_at_the_journals(&now));
                 restarts.survey.at_the_kill = Some((killed, now));
                 restarts.survey.say(lines);
             }
@@ -1361,9 +1362,10 @@ impl<'r> Host<'r> {
     /// The survey's look at the tree before the attempt to start the daemon ([`Restart::Survey`]):
     /// it waits until the worker's maintenance has had its beats and the files it writes stand
     /// still, or the bound passes, and then says what differs between the record made at the kill
-    /// and the tree. Nothing is refused.
+    /// and the tree, and each change that the compares of the kill and of the attempt refuse.
+    /// Nothing is refused here: the start goes on.
     fn survey_before_the_attempt(&self) {
-        let (timing, kill, killed, at_the_kill, to_the_kill, tables_at_the_kill) = {
+        let (timing, kill, killed, at_the_kill, to_the_kill) = {
             let restarts = self.restarts.lock().unwrap_or_else(PoisonError::into_inner);
             if restarts.declared != Restart::Survey {
                 return;
@@ -1377,7 +1379,6 @@ impl<'r> Host<'r> {
                 killed,
                 record,
                 restarts.survey.changes_to_the_kill,
-                restarts.survey.tables_at_the_kill.clone(),
             )
         };
         let stood_still = self.survey_waits(timing, killed);
@@ -1389,16 +1390,12 @@ impl<'r> Host<'r> {
                     .iter()
                     .map(|change| format!("survey: kill {kill}, before the attempt: {change}"))
                     .collect();
-                if let Some(before) = tables_at_the_kill {
-                    let layout = Layout::of(self.run.root(), &self.environment);
-                    let refused =
-                        tables::compare(&layout, &before, &self.look_at_the_journals(&at_the_kill));
-                    lines.extend(
-                        refused
-                            .iter()
-                            .map(|line| format!("survey: kill {kill}, refused: {line}")),
-                    );
-                }
+                let refused = self.verify_before_the_attempt();
+                lines.extend(
+                    refused
+                        .iter()
+                        .map(|line| format!("survey: kill {kill}, refused: {line}")),
+                );
                 lines.push(format!(
                     "survey: kill {kill}: {to_the_kill} change(s) from the agent's start to the \
                      kill and {} from the kill to the attempt; {state}",
@@ -1617,17 +1614,7 @@ impl<'r> Host<'r> {
             leg_not_run(format!("the restart was refused: {}", refused.join("; ")));
         }
         match self.start_once(ready, liveness) {
-            Ok(()) => {
-                if let Some(verified) = self
-                    .restarts
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .verified
-                    .as_mut()
-                {
-                    verified.starts += 1;
-                }
-            }
+            Ok(()) => {}
             Err(Failed::Exited(said)) => leg_not_run(format!(
                 "the control daemon did not start after the kill: {said}"
             )),
@@ -2870,11 +2857,15 @@ mod shutdown_tests {
         std::fs::write(root.join("s/kept"), b"kept").expect("a file");
         std::fs::write(root.join("s/goes"), b"goes").expect("a file");
         host.declares_a_restart(Restart::Survey);
+        // The survey's host is the stand-in's.
+        host.agent_is_a_stand_in();
         host.agent_starts();
         survey_quickly(&host);
         std::fs::write(root.join("s/before-the-kill"), b"before").expect("written by the agent");
         std::fs::remove_file(root.join("s/goes")).expect("removed by the agent");
         host.survey_the_kill();
+        // The compares of the kill, as `kill_daemon` makes them after the survey's look.
+        host.verify_the_kill();
         std::fs::write(root.join("s/after-the-kill"), b"after").expect("written by the worker");
         host.survey_before_the_attempt();
         let lines = surveyed_by(&host);
@@ -2926,12 +2917,16 @@ mod shutdown_tests {
             )
             .expect("tables");
         host.declares_a_restart(Restart::Survey);
+        // The survey's host is the stand-in's.
+        host.agent_is_a_stand_in();
         host.agent_starts();
         survey_quickly(&host);
         connection
             .execute_batch("INSERT INTO requests VALUES (1);")
             .expect("a row before the kill");
         host.survey_the_kill();
+        // The compares of the kill, as `kill_daemon` makes them after the survey's look.
+        host.verify_the_kill();
         connection
             .execute_batch("INSERT INTO bindings VALUES (1);")
             .expect("a row after the kill");
@@ -2947,6 +2942,79 @@ mod shutdown_tests {
         );
         assert!(!said("table requests"), "{lines:#?}");
         drop(connection);
+        drop(host);
+        drop(run);
+        std::fs::remove_dir_all(&root).expect("clean up");
+    }
+
+    /// A file that a daemon changes only when it starts is refused at a kill with no start before it,
+    /// and not at one that follows a start, in the survey as on the real route.
+    #[test]
+    fn the_survey_counts_a_start_for_the_kill_that_follows_it() {
+        let root = scratch("survey-starts");
+        let run = run_with_a_controller(&root);
+        let host = host_over(&run);
+        let lock = host.environment.state_dir().join("controller.lock");
+        std::fs::write(&lock, b"1").expect("a lock file");
+        assert!(
+            host.start_once(&started(&root, 1), Duration::from_secs(10))
+                .is_ok(),
+            "the first start"
+        );
+        host.declares_a_restart(Restart::Survey);
+        host.agent_is_a_stand_in();
+        host.agent_starts();
+        survey_quickly(&host);
+        std::fs::write(&lock, b"22").expect("written before the first kill");
+        host.kill_daemon();
+        host.start_daemon_ready_by(&started(&root, 2));
+        std::fs::write(&lock, b"333").expect("written before the second kill");
+        host.kill_daemon();
+        host.start_daemon_ready_by(&started(&root, 3));
+        let lines = surveyed_by(&host);
+        let refused_at = |kill: usize| {
+            lines.iter().any(|line| {
+                line.starts_with(&format!("survey: kill {kill}, refused: "))
+                    && line.contains("controller.lock changes only when a daemon starts")
+            })
+        };
+        assert!(
+            refused_at(1),
+            "a file that changes only at a start is refused at the first kill: {lines:#?}"
+        );
+        assert!(
+            !refused_at(2),
+            "the same file is not refused at a kill that follows a start: {lines:#?}"
+        );
+        drop(host);
+        drop(run);
+        std::fs::remove_dir_all(&root).expect("clean up");
+    }
+
+    /// The survey says each write that no row of the live daemon's files covers as a refusal, made
+    /// before the kill or after it.
+    #[test]
+    fn the_survey_says_a_write_that_no_row_covers_as_refused_before_the_kill_and_after_it() {
+        let root = scratch("survey-refuses");
+        let (run, _mark) = host_with_a_kr(&root);
+        let host = host_over(&run);
+        host.declares_a_restart(Restart::Survey);
+        host.agent_is_a_stand_in();
+        host.agent_starts();
+        survey_quickly(&host);
+        std::fs::write(root.join("s/before-the-kill"), b"before").expect("written by the agent");
+        host.survey_the_kill();
+        host.verify_the_kill();
+        std::fs::write(root.join("s/after-the-kill"), b"after").expect("written by the worker");
+        host.survey_before_the_attempt();
+        let lines = surveyed_by(&host);
+        for name in ["before-the-kill", "after-the-kill"] {
+            let refused = lines.iter().any(|line| {
+                line.starts_with(&format!("survey: kill 1, refused: s/{name}: added, a file"))
+                    && line.ends_with("; no row of the live daemon's files covers this entry")
+            });
+            assert!(refused, "{name}: {lines:#?}");
+        }
         drop(host);
         drop(run);
         std::fs::remove_dir_all(&root).expect("clean up");
