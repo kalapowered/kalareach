@@ -72,11 +72,12 @@ const RAW_LINKS: [&str; 5] = [
 /// The features that exist for tests, in whichever crate they are: each compiles seams into its
 /// crate that only a test acts through, so a program built with one carries a way in that nothing
 /// in the product uses. A host crate's feature that is for tests is named here.
-const TEST_FEATURES: [&str; 4] = [
+const TEST_FEATURES: [&str; 5] = [
     "testing",
     "fault-injection",
     "git-fixtures",
     "upgrade-suite",
+    "manager-stand-in",
 ];
 
 /// The features of the host's crates that are not for tests, as `(crate, feature)`: each adds code
