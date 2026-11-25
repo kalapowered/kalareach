@@ -1201,9 +1201,9 @@ fn a_start_of_a_host_still_under_way_when_the_world_ends_is_reported() {
 /// that was recorded too late or not at all leaves.
 #[cfg(target_os = "linux")]
 #[test]
-#[ignore = "needs a user service manager for this account (`systemctl --user`), which a hosted CI \
-            runner's account does not have; it runs with --ignored on a Linux host whose account \
-            has one"]
+#[ignore = "starts transient units in this account's own service manager (`systemctl --user`), so \
+            an ordinary run on a person's machine does not run it; \
+            `scripts/service-manager-cases.sh` runs it"]
 fn a_unit_the_record_does_not_hold_is_gone_when_the_world_ends_badly() {
     use kr_controller::supervision::{
         LaunchOutcome, ServiceLaunch, SystemdSupervisor, WorkerSupervisor as _,

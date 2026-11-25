@@ -167,9 +167,9 @@ fn register(environment: &EnvironmentPaths) -> Registered {
 #[test]
 #[cfg_attr(
     target_os = "linux",
-    ignore = "needs a user service manager for this account (`systemctl --user`), which a hosted CI \
-              runner's account does not have; it runs with --ignored on a Linux host whose account \
-              has one"
+    ignore = "starts transient units in this account's own service manager (`systemctl --user`), so \
+              an ordinary run on a person's machine does not run it; \
+              `scripts/service-manager-cases.sh` runs it"
 )]
 fn a_job_registered_for_a_tree_goes_with_it() {
     if kr_ipc::testing::account_launchd::stands_down("a launchd job") {
@@ -192,9 +192,9 @@ fn a_job_registered_for_a_tree_goes_with_it() {
 #[test]
 #[cfg_attr(
     target_os = "linux",
-    ignore = "needs a user service manager for this account (`systemctl --user`), which a hosted CI \
-              runner's account does not have; it runs with --ignored on a Linux host whose account \
-              has one"
+    ignore = "starts transient units in this account's own service manager (`systemctl --user`), so \
+              an ordinary run on a person's machine does not run it; \
+              `scripts/service-manager-cases.sh` runs it"
 )]
 fn a_job_registered_for_another_environment_of_a_tree_goes_with_it() {
     if kr_ipc::testing::account_launchd::stands_down("a launchd job") {
@@ -221,9 +221,9 @@ fn a_job_registered_for_another_environment_of_a_tree_goes_with_it() {
 #[test]
 #[cfg_attr(
     target_os = "linux",
-    ignore = "needs a user service manager for this account (`systemctl --user`), which a hosted CI \
-              runner's account does not have; it runs with --ignored on a Linux host whose account \
-              has one"
+    ignore = "starts transient units in this account's own service manager (`systemctl --user`), so \
+              an ordinary run on a person's machine does not run it; \
+              `scripts/service-manager-cases.sh` runs it"
 )]
 fn a_job_registered_for_another_tree_is_left_alone() {
     if kr_ipc::testing::account_launchd::stands_down("a launchd job") {
@@ -253,9 +253,9 @@ fn a_job_registered_for_another_tree_is_left_alone() {
 /// fails the test holding the tree, rather than passing for a manager with nothing to remove.
 #[cfg(target_os = "linux")]
 #[test]
-#[ignore = "needs a user service manager for this account (`systemctl --user`), which a hosted CI \
-            runner's account does not have; it runs with --ignored on a Linux host whose account \
-            has one"]
+#[ignore = "starts transient units in this account's own service manager (`systemctl --user`), so \
+            an ordinary run on a person's machine does not run it; \
+            `scripts/service-manager-cases.sh` runs it"]
 fn a_manager_that_does_not_answer_leaves_the_trees_units_not_established_as_gone() {
     let tree = teardown::Tree::create();
     let job = register(&tree.environment());
@@ -314,9 +314,9 @@ fn systemctl_after(before: &str) -> (tempfile::TempDir, PathBuf) {
 /// answered.
 #[cfg(target_os = "linux")]
 #[test]
-#[ignore = "needs a user service manager for this account (`systemctl --user`), which a hosted CI \
-            runner's account does not have; it runs with --ignored on a Linux host whose account \
-            has one"]
+#[ignore = "starts transient units in this account's own service manager (`systemctl --user`), so \
+            an ordinary run on a person's machine does not run it; \
+            `scripts/service-manager-cases.sh` runs it"]
 fn a_question_the_manager_fails_or_answers_late_is_asked_again_and_leaves_no_unit_behind() {
     let tree = teardown::Tree::create();
     let job = register(&tree.environment());
@@ -346,9 +346,9 @@ fn a_question_the_manager_fails_or_answers_late_is_asked_again_and_leaves_no_uni
 /// the unit's state here fails, and every answer after it says the unit is loaded.
 #[cfg(target_os = "linux")]
 #[test]
-#[ignore = "needs a user service manager for this account (`systemctl --user`), which a hosted CI \
-            runner's account does not have; it runs with --ignored on a Linux host whose account \
-            has one"]
+#[ignore = "starts transient units in this account's own service manager (`systemctl --user`), so \
+            an ordinary run on a person's machine does not run it; \
+            `scripts/service-manager-cases.sh` runs it"]
 fn a_unit_the_manager_goes_on_having_is_left_however_often_it_is_asked() {
     let tree = teardown::Tree::create();
     let job = register(&tree.environment());
