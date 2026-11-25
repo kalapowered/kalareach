@@ -2259,3 +2259,8 @@ mod making_way_for_an_update;
 /// answer it writes and the stop that follows it, through its own door.
 #[cfg(test)]
 mod stopped_on_the_local_socket;
+
+/// The local read door decides each read's ingress and version through the registry, as the write
+/// door does.
+#[cfg(test)]
+mod the_read_door_follows_the_registry;

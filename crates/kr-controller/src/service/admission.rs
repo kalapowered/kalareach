@@ -4,11 +4,12 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use kr_ipc::peer::PeerIdentity;
-use kr_protocol::envelope::MutationRequest;
+use kr_protocol::authority::{AuthorityDecision, MethodEntry};
+use kr_protocol::envelope::{ControlFrame, MutationRequest, Request};
 use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::hello::ActionWindow;
 use kr_protocol::ids::{ActorId, AuthorityRevision, ConnectionId, SessionId};
-use kr_protocol::method::Method;
+use kr_protocol::method::{Method, MethodVersion};
 use kr_protocol::scalars::U64;
 use kr_protocol::session::{SessionCloseParams, SessionCreateParams};
 use kr_transport::clock::ContinuousClock;
@@ -35,7 +36,50 @@ fn carries_no_freshness() -> ControllerError {
     }
 }
 
+/// What the registry says of `name` at `version` for a caller on the local socket.
+///
+/// The one decision both doors of the local socket take before a parameter is read, so they cannot
+/// disagree: an unlisted name and an ingress that may not reach the method are refused as not
+/// reachable from a local caller, and a version this build does not implement is refused as such.
+///
+/// # Errors
+///
+/// Returns the refusal both doors answer with.
+pub(super) fn listed_for_a_local_caller(
+    name: &str,
+    version: MethodVersion,
+) -> Result<&'static MethodEntry> {
+    match kr_protocol::method::decide(name, version, kr_protocol::actor::ActorIngress::LocalIpc) {
+        AuthorityDecision::Listed(entry) => Ok(entry),
+        AuthorityDecision::Denied(reason) => Err(match reason.error_code() {
+            ErrorCode::UnsupportedSchema => ControllerError::InvalidArgument(format!(
+                "{name} is not implemented at version {version}"
+            )),
+            _ => ControllerError::NotListed {
+                method: name.to_owned(),
+            },
+        }),
+    }
+}
+
 impl Controller {
+    /// The reply that refuses a read at the local door when the registry does not list its method
+    /// for the local socket, or lists it at another version, and none when it lists it.
+    ///
+    /// Asked before any handler, so a read whose row leaves out the local socket needs no guard of
+    /// its own at the switch. A name the registry does not hold is left to the read switch, which
+    /// answers it as the write door does before it reaches the registry.
+    pub(super) fn read_not_listed(request: &Request) -> Option<ControlFrame> {
+        request.method.method()?;
+        let refusal =
+            listed_for_a_local_caller(request.method.as_str(), request.method_version).err()?;
+        Some(super::error_reply(
+            request.request_id,
+            refusal.code(),
+            refusal.to_string(),
+        ))
+    }
+
     /// Validates a local caller's record and registers its connection in one step.
     ///
     /// The two have to be one step. Validating first and registering afterwards leaves a gap in
@@ -1190,29 +1234,9 @@ impl Controller {
         method: Method,
         received_at: kr_transport::clock::ContinuousInstant,
     ) -> Result<AcceptedDeadline> {
-        use kr_protocol::authority::AuthorityDecision;
-
         // The registry decides first: an unlisted name, a version this build does not implement
         // and an ingress that may not reach the method are all refused before a parameter is read.
-        let entry = match kr_protocol::method::decide(
-            mutation.method.as_str(),
-            mutation.method_version,
-            kr_protocol::actor::ActorIngress::LocalIpc,
-        ) {
-            AuthorityDecision::Listed(entry) => entry,
-            AuthorityDecision::Denied(reason) => {
-                return Err(match reason.error_code() {
-                    ErrorCode::UnsupportedSchema => ControllerError::InvalidArgument(format!(
-                        "{} is not implemented at version {}",
-                        mutation.method.as_str(),
-                        mutation.method_version
-                    )),
-                    _ => ControllerError::NotListed {
-                        method: mutation.method.as_str().to_owned(),
-                    },
-                });
-            }
-        };
+        let entry = listed_for_a_local_caller(mutation.method.as_str(), mutation.method_version)?;
         mutation
             .target
             .validate()

@@ -52,7 +52,7 @@ fn target() -> ReleaseName {
 }
 
 /// A daemon serving its local endpoint in this process, over a tree of its own.
-struct Serving {
+pub(super) struct Serving {
     controller: Arc<Controller>,
     endpoint: Endpoint,
     serving: tokio::task::JoinHandle<crate::error::Result<()>>,
@@ -86,7 +86,7 @@ async fn serving_on(bind: impl FnOnce(&Endpoint) -> Listener) -> Serving {
     }
 }
 
-async fn serving() -> Serving {
+pub(super) async fn serving() -> Serving {
     serving_on(|endpoint| Listener::bind(endpoint).expect("binds the endpoint")).await
 }
 
@@ -95,7 +95,7 @@ impl Serving {
         self.temp.environment_id()
     }
 
-    async fn client(&self) -> LocalClient {
+    pub(super) async fn client(&self) -> LocalClient {
         LocalClient::connect(&self.endpoint, LocalClientKind::Cli, build())
             .await
             .expect("reaches the daemon")

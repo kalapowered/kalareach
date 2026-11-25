@@ -1096,8 +1096,14 @@ impl Controller {
                     // The attention store's reads carry session text and a session's description
                     // carries what a model wrote. Neither leaves this daemon except under the
                     // privacy fence it was read under: its ticket is checked before every write.
+                    //
+                    // The lease is asked first and the registry after it, as the write door asks
+                    // them, and both before the handler.
                     match self.authorised(connection_id) {
-                        Ok(_) => match self.read_refused(&request) {
+                        Ok(_) => match self
+                            .read_refused(&request)
+                            .or_else(|| Self::read_not_listed(&request))
+                        {
                             Some(refused) => refused,
                             None => {
                                 let released = self.read_released(&actor_id, &request).await;
@@ -1154,8 +1160,13 @@ impl Controller {
                     }
                 }
                 ControlFrame::Request(request) if negotiated => {
+                    // The registry decides the method's ingress and version here, after the lease
+                    // and before the handler, as the write door does.
                     match self.authorised(connection_id) {
-                        Ok(_) => match self.read_refused(&request) {
+                        Ok(_) => match self
+                            .read_refused(&request)
+                            .or_else(|| Self::read_not_listed(&request))
+                        {
                             Some(refused) => refused,
                             None => {
                                 let answer = self.read_method(&actor_id, &request, false).await;

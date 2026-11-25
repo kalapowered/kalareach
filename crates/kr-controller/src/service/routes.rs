@@ -365,7 +365,8 @@ impl Controller {
             Method::BackupStatus => self.backup_status(&request.params).await,
             // Only a paired device whose decision holds `host.manage` reads it, as the registry
             // says. The guard asks for that decision and not for the owner's socket, so a caller
-            // this host has no name for is refused as the socket is.
+            // this host has no name for is refused as the socket is. The local door refuses the
+            // socket through the registry before it comes here; this is the second layer.
             Method::BackupCheckpoint if !device_manages_host => {
                 Err(ControllerError::PermissionDenied {
                     detail:

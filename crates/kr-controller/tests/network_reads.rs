@@ -442,7 +442,8 @@ async fn an_owner_device_is_told_the_newest_generation_the_host_published_and_no
     );
     viewing.close();
 
-    // The local socket does not serve it: the method's ingress is the paired device.
+    // The local socket does not serve it: the method's ingress is the paired device, which the
+    // door's decision through the registry refuses before the handler is asked.
     let mut local = host.client().await;
     let answered = local
         .request(Method::BackupCheckpoint, &BackupCheckpointParams {})
@@ -452,11 +453,9 @@ async fn an_owner_device_is_told_the_newest_generation_the_host_published_and_no
             &answered,
             Ok(Err(error))
                 if error.code == ErrorCode::PermissionDenied
-                    && error.message
-                        == "the backup checkpoint is read by a paired device, and the local \
-                            socket does not serve it"
+                    && error.message == "backup.checkpoint is not reachable from a local caller"
         ),
-        "the local socket is refused with the checkpoint's own words: {answered:?}"
+        "the local socket is refused with the door's sentence: {answered:?}"
     );
 
     // A newest row the host cannot read back is a refusal the device can tell from none.
