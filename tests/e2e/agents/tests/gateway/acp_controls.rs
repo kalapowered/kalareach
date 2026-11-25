@@ -2716,3 +2716,759 @@ fn the_judges_of_the_chunk_name_their_reds_when_the_start_with_the_copy_or_witho
         "the agent read no chunk"
     );
 }
+
+/// The pipe harness, which the scenarios below play the case scripts against.
+#[cfg(all(test, unix))]
+#[allow(dead_code, reason = "the pipe tests use what the scenarios do not")]
+#[path = "../support/acp_pipe.rs"]
+mod acp_pipe;
+
+/// Each case script played over pipes against the stand-in that its case runs on, as a correct host
+/// plays it, and the judges that read a record shown against that traffic and against what a wrong
+/// host does. No launch exists and no `Hosted` value is used.
+#[cfg(all(test, unix))]
+mod scenarios {
+    use std::time::{Duration, Instant};
+
+    use serde_json::{Value, json};
+    use tempfile::TempDir;
+
+    use super::acp_pipe::{
+        Played, QODER, UPGRADED_CHUNK, WITHIN, gemini_from, installed_package, package_source,
+    };
+    use super::*;
+
+    /// The stand-in of a shape started with `script`. The Gemini-shaped one runs from a copy of the
+    /// script package, which the second value keeps.
+    fn started(shape: Shape, script: &Value) -> (Played, Option<TempDir>) {
+        match shape {
+            Shape::Qoder => (Played::start(QODER, script), None),
+            Shape::Gemini => {
+                let package = installed_package();
+                (gemini_from(package.path(), script), Some(package))
+            }
+        }
+    }
+
+    /// What a frame of the stand-in is: `request 0`, `update tool_call/pending`, `reply 3 cancelled`
+    /// or `refusal 4`.
+    fn kind_of(frame: &Value) -> String {
+        let number = frame["id"].as_u64();
+        match (frame["method"].as_str(), number) {
+            (Some("session/request_permission"), Some(number)) => format!("request {number}"),
+            (Some("session/update"), _) => {
+                let update = &frame["params"]["update"];
+                let detail = update["status"]
+                    .as_str()
+                    .or(update["content"]["text"].as_str())
+                    .unwrap_or("");
+                let kind = update["sessionUpdate"].as_str().unwrap_or("");
+                format!("update {kind}/{detail}")
+            }
+            (None, Some(number)) if frame["error"].is_object() => format!("refusal {number}"),
+            (None, Some(number)) => {
+                let stop = frame["result"]["stopReason"].as_str().unwrap_or("");
+                format!("reply {number} {stop}")
+            }
+            _ => format!("a frame of no known kind: {frame}"),
+        }
+    }
+
+    /// The kinds of the next `count` frames of the stand-in, or of the frames that came within
+    /// [`WITHIN`] when fewer did.
+    fn kinds(agent: &Played, count: usize) -> Vec<String> {
+        let mut seen = Vec::new();
+        while seen.len() < count {
+            let Ok(line) = agent.frames.recv_timeout(WITHIN) else {
+                break;
+            };
+            seen.push(kind_of(
+                &serde_json::from_str(&line).expect("a frame is json"),
+            ));
+        }
+        seen
+    }
+
+    /// The person's cancel, as the host forwards it.
+    fn cancel(agent: &mut Played) {
+        agent.send(&json!({
+            "jsonrpc": "2.0",
+            "method": "session/cancel",
+            "params": { "sessionId": "stand-in-session" },
+        }));
+    }
+
+    /// The host's answer `cancelled` to the agent's request number `number`.
+    fn cancelled(agent: &mut Played, number: u64) {
+        agent.send(&json!({
+            "jsonrpc": "2.0",
+            "id": number,
+            "result": { "outcome": { "outcome": "cancelled" } },
+        }));
+    }
+
+    /// The record once `holds` is true of it, or what it holds after [`WITHIN`].
+    fn record_when(agent: &Played, holds: impl Fn(&[Value]) -> bool) -> Vec<Value> {
+        let deadline = Instant::now() + WITHIN;
+        loop {
+            let record = agent.record();
+            if holds(&record) || Instant::now() > deadline {
+                return record;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// The numbers of the requests that the stand-in sent and received no response to.
+    fn unanswered(record: &[Value]) -> Vec<u64> {
+        let answered = responses(record);
+        record
+            .iter()
+            .filter(|line| line["sent"] == "request")
+            .filter_map(|line| line["id"].as_u64())
+            .filter(|number| !answered.iter().any(|line| line["id"] == *number))
+            .collect()
+    }
+
+    /// The exit code of the stand-in once it ended by itself, or none when it runs after
+    /// [`WITHIN`]. Its input stays open.
+    fn ends_by_itself(agent: &mut Played) -> Option<i32> {
+        let deadline = Instant::now() + WITHIN;
+        loop {
+            if let Some(status) = agent.child.try_wait().expect("a status") {
+                return status.code();
+            }
+            if Instant::now() > deadline {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Opens a session, sends the prompt `run it` as request 3 and reads up to the stand-in's first
+    /// request.
+    fn at_the_first_request(agent: &mut Played) {
+        agent.open_session();
+        agent.prompt(3, "run it");
+        assert_eq!(
+            kinds(agent, 2),
+            ["update tool_call/pending", "request 0"],
+            "the first call is asked for"
+        );
+    }
+
+    /// Opens a session, releases the turn of the agent's own and reads up to its first request.
+    fn at_the_first_request_of_its_own_turn(agent: &mut Played) {
+        agent.open_session();
+        assert!(agent.is_quiet(), "no turn of its own before its file");
+        agent.release("go");
+        assert_eq!(
+            kinds(agent, 3),
+            [
+                "update agent_message_chunk/own",
+                "update tool_call/pending",
+                "request 0"
+            ],
+            "the turn of its own asks for its first call"
+        );
+    }
+
+    #[test]
+    fn the_restart_script_runs_a_tick_an_answer_and_a_second_request_in_that_order() {
+        let (mut agent, _package) = started(Shape::Qoder, &restart_script());
+        at_the_first_request(&mut agent);
+        agent.release("tick1");
+        assert_eq!(kinds(&agent, 1), ["update agent_message_chunk/tick 1"]);
+        assert!(
+            agent
+                .record()
+                .iter()
+                .any(|line| line["sent"] == "tick" && line["text"] == "tick 1"),
+            "the record holds the tick"
+        );
+        agent.choose(0, "proceed_once");
+        assert_eq!(
+            kinds(&agent, 2),
+            [
+                "update tool_call_update/in_progress",
+                "update tool_call_update/completed"
+            ],
+            "an allow runs the two updates"
+        );
+        assert!(agent.is_quiet(), "the second request waits for its file");
+        let once = record_when(&agent, |record| responses(record).len() == 1);
+        assert_eq!(one_reply_with_the_chosen_id(&once, "proceed_once"), Ok(()));
+        agent.release("second");
+        assert_eq!(kinds(&agent, 2), ["update tool_call/pending", "request 1"]);
+        // A host that forwards the answer a second time.
+        agent.choose(0, "proceed_once");
+        let twice = record_when(&agent, |record| responses(record).len() == 2);
+        assert_eq!(
+            one_reply_with_the_chosen_id(&twice, "proceed_once"),
+            Err(red("5b-2"))
+        );
+    }
+
+    #[test]
+    fn the_exit_script_asks_twice_and_the_exit_file_ends_the_program_with_the_code_0() {
+        for shape in [Shape::Qoder, Shape::Gemini] {
+            let (mut agent, _package) = started(shape, &exit_script());
+            at_the_first_request(&mut agent);
+            agent.choose(0, "proceed_once");
+            assert_eq!(
+                kinds(&agent, 3),
+                [
+                    "update tool_call_update/in_progress",
+                    "update tool_call/pending",
+                    "request 1"
+                ],
+                "the second request follows the answer"
+            );
+            agent.choose(1, "proceed_once");
+            assert!(agent.is_quiet(), "nothing follows the second answer");
+            assert_eq!(
+                agent.child.try_wait().expect("a status"),
+                None,
+                "the agent runs until its file appears"
+            );
+            agent.release("die");
+            assert_eq!(ends_by_itself(&mut agent), Some(0), "the agent exits");
+            let record = agent.record();
+            assert!(
+                record.iter().any(|line| line["sent"] == "exit"),
+                "the record says the agent exited"
+            );
+        }
+    }
+
+    #[test]
+    fn the_race_script_settles_once_whichever_of_the_answer_and_the_cancel_comes_first() {
+        // The answer first, and the cancel after it.
+        let (mut agent, _package) = started(Shape::Qoder, &race_script());
+        at_the_first_request(&mut agent);
+        agent.choose(0, "proceed_once");
+        assert_eq!(
+            kinds(&agent, 2),
+            ["update tool_call_update/completed", "reply 3 end_turn"]
+        );
+        assert!(agent.is_quiet(), "nothing follows the reply");
+        let race = Race {
+            cancel_accepted: false,
+            answer_accepted: true,
+        };
+        assert_eq!(
+            one_winner_and_the_call_settles(&race, &agent.record()),
+            Ok(())
+        );
+
+        // The cancel first, which waits for the host's answer `cancelled`.
+        let (mut agent, _package) = started(Shape::Qoder, &race_script());
+        at_the_first_request(&mut agent);
+        cancel(&mut agent);
+        assert!(agent.is_quiet(), "the request waits for its answer");
+        cancelled(&mut agent, 0);
+        assert_eq!(
+            kinds(&agent, 2),
+            ["update tool_call_update/cancelled", "reply 3 cancelled"]
+        );
+        let race = Race {
+            cancel_accepted: true,
+            answer_accepted: false,
+        };
+        let record = record_when(&agent, |record| responses(record).len() == 1);
+        assert_eq!(one_winner_and_the_call_settles(&race, &record), Ok(()));
+
+        // Both reach the stand-in.
+        let (mut agent, _package) = started(Shape::Qoder, &race_script());
+        at_the_first_request(&mut agent);
+        agent.choose(0, "proceed_once");
+        assert_eq!(
+            kinds(&agent, 2),
+            ["update tool_call_update/completed", "reply 3 end_turn"]
+        );
+        cancelled(&mut agent, 0);
+        let race = Race {
+            cancel_accepted: true,
+            answer_accepted: true,
+        };
+        let record = record_when(&agent, |record| responses(record).len() == 2);
+        assert_eq!(
+            one_winner_and_the_call_settles(&race, &record),
+            Err(red("5b-5"))
+        );
+    }
+
+    #[test]
+    fn the_late_request_script_settles_at_the_cancel_and_asks_again_when_its_file_appears() {
+        let (mut agent, _package) = started(Shape::Qoder, &late_request_script());
+        at_the_first_request(&mut agent);
+        cancel(&mut agent);
+        assert_eq!(
+            kinds(&agent, 2),
+            ["update tool_call_update/cancelled", "reply 3 cancelled"],
+            "the cancel settles the call and the prompt"
+        );
+        cancelled(&mut agent, 0);
+        assert!(agent.is_quiet(), "the late request waits for its file");
+        agent.release("late");
+        assert_eq!(
+            kinds(&agent, 2),
+            ["update tool_call/pending", "request 1"],
+            "the late request carries the next number"
+        );
+        // A host that leaves the late request pending.
+        let left = record_when(&agent, |record| sent(record, "request") == 2);
+        assert_eq!(
+            a_late_request_is_answered_cancelled(&left),
+            Err(red("5b-6"))
+        );
+        cancelled(&mut agent, 1);
+        assert!(agent.is_quiet(), "the answer ends the turn without a reply");
+        let answered = record_when(&agent, |record| sent(record, "turn end") == 1);
+        assert_eq!(a_late_request_is_answered_cancelled(&answered), Ok(()));
+    }
+
+    #[test]
+    fn the_abort_script_cancels_the_call_and_replies_cancelled_after_the_answer() {
+        let (mut agent, _package) = started(Shape::Qoder, &abort_script());
+        at_the_first_request(&mut agent);
+        agent.choose(0, "proceed_once");
+        assert_eq!(
+            kinds(&agent, 2),
+            ["update tool_call_update/cancelled", "reply 3 cancelled"],
+            "the agent aborts after the answer"
+        );
+        assert!(agent.is_quiet(), "nothing follows the abort");
+    }
+
+    #[test]
+    fn the_silent_script_asks_in_a_turn_of_its_own_and_a_cancel_reaches_it() {
+        let (mut agent, _package) = started(Shape::Qoder, &silent_script());
+        at_the_first_request_of_its_own_turn(&mut agent);
+        assert!(agent.is_quiet(), "the turn sends nothing else");
+        cancel(&mut agent);
+        assert_eq!(
+            kinds(&agent, 1),
+            ["update tool_call_update/cancelled"],
+            "the cancel settles the call"
+        );
+        cancelled(&mut agent, 0);
+        let record = record_when(&agent, |record| {
+            cancels(record) == 1 && !responses(record).is_empty()
+        });
+        assert_eq!(
+            a_cancel_after_eleven_seconds_reaches_the_agent(&record),
+            Ok(())
+        );
+
+        // A host that answers `cancelled` and forwards no cancel.
+        let (mut agent, _package) = started(Shape::Qoder, &silent_script());
+        at_the_first_request_of_its_own_turn(&mut agent);
+        cancelled(&mut agent, 0);
+        let record = record_when(&agent, |record| !responses(record).is_empty());
+        assert_eq!(
+            a_cancel_after_eleven_seconds_reaches_the_agent(&record),
+            Err(red("5b-15"))
+        );
+    }
+
+    #[test]
+    fn the_failed_script_sends_the_failed_update_after_a_decline_and_not_before() {
+        let (mut agent, _package) = started(Shape::Qoder, &failed_script());
+        agent.open_session();
+        agent.release("go");
+        assert_eq!(
+            kinds(&agent, 2),
+            ["update tool_call/pending", "request 0"],
+            "the turn of its own asks for its call"
+        );
+        assert!(agent.is_quiet(), "no update before the answer");
+        agent.choose(0, "cancel");
+        assert_eq!(
+            kinds(&agent, 1),
+            ["update tool_call_update/failed"],
+            "a decline is followed by the failed update"
+        );
+        assert!(agent.is_quiet(), "nothing follows the failed update");
+    }
+
+    #[test]
+    fn the_late_update_script_sends_its_update_only_when_its_file_appears_after_an_allow() {
+        let (mut agent, _package) = started(Shape::Qoder, &late_update_script());
+        agent.open_session();
+        agent.release("go");
+        assert_eq!(kinds(&agent, 2), ["update tool_call/pending", "request 0"]);
+        agent.choose(0, "proceed_once");
+        assert!(
+            agent.is_quiet(),
+            "the update waits for its file after the allow"
+        );
+        agent.release("late");
+        assert_eq!(
+            kinds(&agent, 1),
+            ["update tool_call_update/in_progress"],
+            "the late update arrives"
+        );
+    }
+
+    #[test]
+    fn the_completed_script_sends_its_update_after_the_cancel_ended_the_turn() {
+        let (mut agent, _package) = started(Shape::Qoder, &completed_after_a_cancel_script());
+        at_the_first_request(&mut agent);
+        agent.choose(0, "proceed_once");
+        assert!(agent.is_quiet(), "the call runs and sends nothing");
+        cancel(&mut agent);
+        assert_eq!(
+            kinds(&agent, 1),
+            ["reply 3 cancelled"],
+            "the cancel ends the turn"
+        );
+        assert!(
+            agent.is_quiet(),
+            "the completed update waits for its file after the cancel"
+        );
+        agent.release("done");
+        assert_eq!(
+            kinds(&agent, 1),
+            ["update tool_call_update/completed"],
+            "the completed update arrives after the reply"
+        );
+    }
+
+    #[test]
+    fn the_window_script_sends_six_ticks_and_requests_at_the_29th_and_the_31st_second() {
+        for answer_the_last in [false, true] {
+            let (mut agent, _package) = started(Shape::Qoder, &window_script());
+            at_the_first_request_of_its_own_turn(&mut agent);
+            cancel(&mut agent);
+            assert!(
+                agent.is_quiet(),
+                "a cancel in the wait mode settles nothing"
+            );
+            cancelled(&mut agent, 0);
+            for tick in 1..=5 {
+                agent.release(&format!("tick{tick}"));
+                assert_eq!(
+                    kinds(&agent, 1),
+                    [format!("update agent_message_chunk/tick {tick}")]
+                );
+            }
+            assert!(
+                agent.is_quiet(),
+                "the request at 29 seconds waits for its file"
+            );
+            agent.release("t29");
+            assert_eq!(kinds(&agent, 2), ["update tool_call/pending", "request 1"]);
+            cancelled(&mut agent, 1);
+            agent.release("tick6");
+            assert_eq!(kinds(&agent, 1), ["update agent_message_chunk/tick 6"]);
+            assert!(
+                agent.is_quiet(),
+                "the request at 31 seconds waits for its file"
+            );
+            agent.release("t31");
+            assert_eq!(kinds(&agent, 2), ["update tool_call/pending", "request 2"]);
+            let ticks: Vec<Value> = agent
+                .record()
+                .into_iter()
+                .filter(|line| line["sent"] == "tick")
+                .collect();
+            let texts: Vec<&str> = ticks
+                .iter()
+                .filter_map(|line| line["text"].as_str())
+                .collect();
+            assert_eq!(
+                texts,
+                ["tick 1", "tick 2", "tick 3", "tick 4", "tick 5", "tick 6"]
+            );
+            if answer_the_last {
+                // A host that answers the request at 31 seconds `cancelled`.
+                cancelled(&mut agent, 2);
+                let record = record_when(&agent, |record| responses(record).len() == 3);
+                assert_eq!(
+                    the_window_closes_thirty_seconds_after_the_cancel(
+                        &record,
+                        &unanswered(&record)
+                    ),
+                    Err(red("5b-16"))
+                );
+            } else {
+                let record = record_when(&agent, |record| sent(record, "request") == 3);
+                assert_eq!(unanswered(&record), [2]);
+                assert_eq!(
+                    the_window_closes_thirty_seconds_after_the_cancel(
+                        &record,
+                        &unanswered(&record)
+                    ),
+                    Ok(())
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_queued_prompt_script_answers_the_prompt_cancelled_before_the_old_turn_asks_again() {
+        for answer_the_late_request in [true, false] {
+            let (mut agent, _package) = started(Shape::Qoder, &queued_prompt_script());
+            at_the_first_request_of_its_own_turn(&mut agent);
+            agent.prompt(3, "ours");
+            assert!(agent.is_quiet(), "a prompt behind a running turn is queued");
+            cancel(&mut agent);
+            assert_eq!(
+                kinds(&agent, 1),
+                ["reply 3 cancelled"],
+                "the cancel answers the queued prompt first"
+            );
+            cancelled(&mut agent, 0);
+            assert!(agent.is_quiet(), "the old turn waits for its file");
+            agent.release("late");
+            assert_eq!(kinds(&agent, 2), ["update tool_call/pending", "request 1"]);
+            if answer_the_late_request {
+                cancelled(&mut agent, 1);
+                let record = record_when(&agent, |record| responses(record).len() == 2);
+                assert_eq!(
+                    a_prompt_answered_cancelled_leaves_the_window_open(&record),
+                    Ok(())
+                );
+            } else {
+                // A host that closes the window with the queued prompt's reply.
+                let record = record_when(&agent, |record| sent(record, "request") == 2);
+                assert_eq!(
+                    a_prompt_answered_cancelled_leaves_the_window_open(&record),
+                    Err(red("5b-18"))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_prompt_after_a_cancel_script_asks_for_a_new_call_under_the_next_number() {
+        for answer_the_new_request in [false, true] {
+            let (mut agent, _package) = started(Shape::Qoder, &prompt_after_a_cancel_script());
+            at_the_first_request_of_its_own_turn(&mut agent);
+            cancel(&mut agent);
+            assert_eq!(
+                kinds(&agent, 1),
+                ["update tool_call_update/cancelled"],
+                "the cancel settles the call of the turn of its own"
+            );
+            cancelled(&mut agent, 0);
+            agent.prompt(3, "again");
+            assert_eq!(
+                kinds(&agent, 2),
+                ["update tool_call/pending", "request 1"],
+                "the new prompt gets its own request"
+            );
+            if answer_the_new_request {
+                // A host that answers the new request `cancelled`.
+                cancelled(&mut agent, 1);
+            }
+            let wanted = if answer_the_new_request { 2 } else { 1 };
+            let record = record_when(&agent, |record| responses(record).len() == wanted);
+            let judged = a_prompt_after_a_cancel_shows_its_approval(&record, &unanswered(&record));
+            if answer_the_new_request {
+                assert_eq!(judged, Err(red("5b-19")));
+            } else {
+                assert_eq!(unanswered(&record), [1]);
+                assert_eq!(judged, Ok(()));
+            }
+        }
+    }
+
+    #[test]
+    fn the_late_request_of_a_waiting_agent_is_asked_after_the_cancel_and_answered_cancelled() {
+        let (mut agent, _package) =
+            started(Shape::Gemini, &late_request_of_a_waiting_agent_script());
+        at_the_first_request(&mut agent);
+        cancel(&mut agent);
+        assert!(agent.is_quiet(), "the agent waits at the cancel");
+        cancelled(&mut agent, 0);
+        assert!(agent.is_quiet(), "the late request waits for its file");
+        agent.release("late");
+        assert_eq!(kinds(&agent, 2), ["update tool_call/pending", "request 1"]);
+        // A host that leaves the late request pending.
+        let left = record_when(&agent, |record| sent(record, "request") == 2);
+        assert_eq!(
+            a_late_request_of_a_waiting_agent_is_answered_cancelled(&left),
+            Err(red("5b-6g"))
+        );
+        cancelled(&mut agent, 1);
+        assert_eq!(kinds(&agent, 1), ["reply 3 cancelled"]);
+        let answered = record_when(&agent, |record| sent(record, "reply") == 1);
+        assert_eq!(
+            a_late_request_of_a_waiting_agent_is_answered_cancelled(&answered),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn the_decline_script_sends_no_update_between_its_three_requests() {
+        let (mut agent, _package) = started(Shape::Gemini, &decline_script());
+        at_the_first_request(&mut agent);
+        for (number, file) in [(0, "second"), (1, "third")] {
+            agent.choose(number, "cancel");
+            assert!(agent.is_quiet(), "a decline is followed by no update");
+            agent.release(file);
+            assert_eq!(
+                kinds(&agent, 2),
+                [
+                    "update tool_call/pending",
+                    format!("request {}", number + 1).as_str()
+                ]
+            );
+        }
+        agent.choose(2, "cancel");
+        assert!(agent.is_quiet(), "a decline is followed by no update");
+        agent.release("reply");
+        assert_eq!(kinds(&agent, 1), ["reply 3 end_turn"]);
+        assert_eq!(
+            sent(&agent.record(), "update"),
+            0,
+            "the agent sent no update after any decline"
+        );
+    }
+
+    #[test]
+    fn the_thirty_one_seconds_script_refuses_a_prompt_and_replies_cancelled_after_its_late_request()
+    {
+        // A host that refuses the prompt of the meanwhile itself.
+        let (mut agent, _package) = started(Shape::Gemini, &thirty_one_seconds_script());
+        at_the_first_request(&mut agent);
+        cancel(&mut agent);
+        cancelled(&mut agent, 0);
+        assert!(agent.is_quiet(), "the agent waits for its file");
+        agent.release("t31");
+        assert_eq!(kinds(&agent, 2), ["update tool_call/pending", "request 1"]);
+        cancelled(&mut agent, 1);
+        assert_eq!(kinds(&agent, 1), ["reply 3 cancelled"]);
+        let record = record_when(&agent, |record| sent(record, "reply") == 1);
+        let meanwhile = Meanwhile {
+            accepted: false,
+            message: "a turn is still running".to_owned(),
+        };
+        assert_eq!(
+            the_window_stays_open_until_the_prompts_reply(&record, &meanwhile),
+            Ok(())
+        );
+
+        // A host that forwards the prompt of the meanwhile, which the agent refuses.
+        let (mut agent, _package) = started(Shape::Gemini, &thirty_one_seconds_script());
+        at_the_first_request(&mut agent);
+        cancel(&mut agent);
+        cancelled(&mut agent, 0);
+        agent.prompt(4, "meanwhile");
+        let frame = agent.frame();
+        assert_eq!(
+            kind_of(&frame),
+            "refusal 4",
+            "the agent refuses a second prompt"
+        );
+        agent.release("t31");
+        assert_eq!(kinds(&agent, 2), ["update tool_call/pending", "request 1"]);
+        cancelled(&mut agent, 1);
+        assert_eq!(kinds(&agent, 1), ["reply 3 cancelled"]);
+        let record = record_when(&agent, |record| sent(record, "reply") == 1);
+        let meanwhile = Meanwhile {
+            accepted: false,
+            message: frame["error"]["message"].as_str().unwrap_or("").to_owned(),
+        };
+        assert_eq!(
+            the_window_stays_open_until_the_prompts_reply(&record, &meanwhile),
+            Err(red("5b-17"))
+        );
+    }
+
+    #[test]
+    fn the_completed_while_cancelling_script_sends_its_update_and_then_the_reply_cancelled() {
+        let (mut agent, _package) = started(Shape::Gemini, &completed_while_cancelling_script());
+        at_the_first_request(&mut agent);
+        agent.choose(0, "proceed_once");
+        assert!(agent.is_quiet(), "the call runs and sends nothing");
+        cancel(&mut agent);
+        assert!(agent.is_quiet(), "the agent waits at the cancel");
+        agent.release("done");
+        assert_eq!(
+            kinds(&agent, 2),
+            ["update tool_call_update/completed", "reply 3 cancelled"],
+            "the update comes before the reply"
+        );
+    }
+
+    #[test]
+    fn the_chunk_script_reads_the_chunk_of_the_folder_the_agent_started_from() {
+        let installation = installed_package();
+        let copy = installed_package();
+        let original = std::fs::read(package_source().join("chunk.js")).expect("the chunk");
+        let chunks = Chunks {
+            original,
+            upgraded: UPGRADED_CHUNK.to_vec(),
+        };
+        let mut reads = Vec::new();
+        for folder in [copy.path(), installation.path()] {
+            let mut agent = gemini_from(folder, &chunk_script());
+            at_the_first_request(&mut agent);
+            agent.choose(0, "proceed_once");
+            assert!(agent.is_quiet(), "the chunk is read when its file appears");
+            assert_eq!(agent.marker(), None, "no chunk is read before its file");
+            std::fs::write(installation.path().join("chunk.js"), UPGRADED_CHUNK)
+                .expect("the upgrade");
+            agent.release("import");
+            assert_eq!(kinds(&agent, 1), ["reply 3 end_turn"]);
+            reads.push(agent.marker());
+        }
+        let (from_the_copy, from_the_installation) = (reads[0].as_deref(), reads[1].as_deref());
+        assert_eq!(
+            the_copys_chunk_is_read_after_the_upgrade(&chunks, from_the_copy),
+            Ok(())
+        );
+        assert_eq!(
+            the_copys_chunk_is_read_after_the_upgrade(&chunks, from_the_installation),
+            Err(red("6b-5"))
+        );
+        assert_eq!(
+            without_the_copy_the_upgraded_chunk_is_read(&chunks, from_the_installation),
+            Ok(())
+        );
+        assert_eq!(
+            without_the_copy_the_upgraded_chunk_is_read(&chunks, from_the_copy),
+            Err(red("6b-6"))
+        );
+    }
+
+    #[test]
+    fn the_upgrade_script_asks_again_after_its_file_appears_and_the_fresh_request_is_judged() {
+        for shape in [Shape::Qoder, Shape::Gemini] {
+            let decoded = Decoded {
+                before: Seen {
+                    identity: identity(),
+                    options: "proceed_once proceed_always cancel".to_owned(),
+                },
+                after: Seen {
+                    identity: identity(),
+                    options: "proceed_once proceed_always cancel".to_owned(),
+                },
+            };
+            for (option, expected) in [
+                ("proceed_once", Ok(())),
+                ("proceed_always", Err(red("6b-2"))),
+            ] {
+                let (mut agent, _package) = started(shape, &upgrade_script());
+                at_the_first_request(&mut agent);
+                agent.choose(0, "proceed_once");
+                assert!(agent.is_quiet(), "the fresh request waits for its file");
+                agent.release("after");
+                assert_eq!(
+                    kinds(&agent, 2),
+                    ["update tool_call/pending", "request 1"],
+                    "the fresh request follows the upgrade"
+                );
+                agent.choose(1, option);
+                let record = record_when(&agent, |record| responses(record).len() == 2);
+                assert_eq!(
+                    a_fresh_request_is_decoded_by_the_pinned_table("6b-2", &decoded, &record),
+                    expected
+                );
+            }
+        }
+    }
+}
