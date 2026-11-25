@@ -5,11 +5,12 @@
 #![cfg(unix)]
 
 use std::io::{BufRead as _, BufReader, Write as _};
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::time::Duration;
 
-use kr_e2e_agents::acp_agent::{RECORD_FILE, SCRIPT_FILE, check_script};
+use kr_e2e_agents::acp_agent::{MARKER_FILE, RECORD_FILE, SCRIPT_FILE, check_script};
 use serde_json::{Value, json};
 
 /// How long a test waits for a frame that must come.
@@ -33,9 +34,15 @@ struct Played {
 impl Played {
     /// Starts `program` in a working directory that holds `script`.
     fn start(program: &str, script: &Value) -> Self {
+        Self::start_with(program, &[], script)
+    }
+
+    /// Starts `program` with `arguments` in a working directory that holds `script`.
+    fn start_with(program: &str, arguments: &[&str], script: &Value) -> Self {
         let directory = tempfile::tempdir().expect("a working directory");
         std::fs::write(directory.path().join(SCRIPT_FILE), script.to_string()).expect("the script");
         let mut child = Command::new(program)
+            .args(arguments)
             .current_dir(directory.path())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -92,6 +99,11 @@ impl Played {
             .lines()
             .map(|line| serde_json::from_str(line).expect("a record line is json"))
             .collect()
+    }
+
+    /// The bytes an `import` step wrote to the marker, or none when it wrote none.
+    fn marker(&self) -> Option<Vec<u8>> {
+        std::fs::read(self.directory.path().join(MARKER_FILE)).ok()
     }
 
     /// Makes the file of the working directory that a `hold` step waits for.
@@ -586,4 +598,184 @@ fn a_script_with_a_step_the_stand_in_does_not_know_is_refused_before_any_agent_s
     let why = check_script(&json!({ "turns": [[{ "sya": "text" }]] }))
         .expect_err("a step with a misspelt name is no script");
     assert!(why.contains("sya"), "the refusal names the step: {why}");
+}
+
+/// The program that stands in for the interpreter that runs Gemini CLI.
+const GEMINI_NODE: &str = env!("CARGO_BIN_EXE_acp-gemini-stand-in-node");
+
+/// The bytes of the chunk after an upgrade of the installation.
+const UPGRADED_CHUNK: &[u8] = b"// The chunk after an upgrade.\n";
+
+/// The script package that stands in for Gemini CLI, as this crate keeps it.
+fn package_source() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/support/acp-gemini-package")
+}
+
+/// Copies the script package to a new folder and returns the folder.
+fn installed_package() -> tempfile::TempDir {
+    let folder = tempfile::tempdir().expect("an installation folder");
+    for name in ["gemini.js", "chunk.js"] {
+        std::fs::copy(package_source().join(name), folder.path().join(name))
+            .expect("a copy of the package");
+    }
+    folder
+}
+
+/// Starts the interpreter stand-in on the main file of the package in `folder`, as the host does.
+fn gemini_from(folder: &Path, script: &Value) -> Played {
+    let main_file = folder.join("gemini.js");
+    let main_file = main_file.to_str().expect("a path of text");
+    Played::start_with(GEMINI_NODE, &[main_file, "--acp"], script)
+}
+
+/// A turn that asks for a call and, once it was answered, imports the chunk.
+fn importing_turn() -> Value {
+    json!({ "turns": [[
+        { "call": { "id": "c1", "kind": "execute" } },
+        { "ask": "c1" },
+        { "import": "chunk.js" },
+        { "end": "end_turn" },
+    ]] })
+}
+
+/// Plays the importing turn up to its pending request.
+fn at_the_first_request(agent: &mut Played) {
+    agent.open_session();
+    agent.prompt(3, "run it");
+    for _ in 0..2 {
+        agent.frame();
+    }
+}
+
+#[test]
+fn a_gemini_shaped_stand_in_answers_initialize_with_the_version_the_table_pins() {
+    let package = installed_package();
+    let mut agent = gemini_from(package.path(), &json!({}));
+    agent.send(&json!({ "jsonrpc": "2.0", "id": 7, "method": "initialize", "params": { "protocolVersion": 1 } }));
+    let answer = agent.frame();
+    assert_eq!(answer["id"], 7);
+    assert_eq!(answer["result"]["agentInfo"]["version"], "0.60.0");
+    assert_eq!(answer["result"]["agentInfo"]["name"], "gemini-stand-in");
+    assert_eq!(answer["result"]["agentCapabilities"]["loadSession"], false);
+}
+
+#[test]
+fn the_gemini_shaped_stand_in_refuses_a_prompt_that_arrives_while_a_turn_runs() {
+    let package = installed_package();
+    let mut agent = gemini_from(package.path(), &json!({ "turns": [waiting_turn()] }));
+    agent.open_session();
+    agent.prompt(3, "first");
+    for _ in 0..2 {
+        agent.frame();
+    }
+    agent.prompt(4, "second");
+    let refusal = agent.frame();
+    assert_eq!(refusal["id"], 4);
+    assert!(
+        refusal["error"]["code"].is_i64(),
+        "a second prompt is refused with an error: {refusal}"
+    );
+    agent.choose(0, "allow-once");
+    let reply = agent.frame();
+    assert_eq!(
+        (reply["id"].as_u64(), stop(&reply)),
+        (Some(3), "end_turn"),
+        "the first turn goes on"
+    );
+}
+
+#[test]
+fn the_interpreter_stand_in_takes_the_main_file_and_the_acp_flag_and_nothing_else() {
+    let package = installed_package();
+    let main_file = package.path().join("gemini.js");
+    let main_file = main_file.to_str().expect("a path of text");
+    let absent = "/no/such/folder/gemini.js";
+    for arguments in [
+        vec![],
+        vec![main_file],
+        vec![main_file, "--stdio"],
+        vec![main_file, "--acp", "--extra"],
+        vec![absent, "--acp"],
+    ] {
+        let output = Command::new(GEMINI_NODE)
+            .args(&arguments)
+            .stdin(Stdio::null())
+            .output()
+            .expect("the stand-in runs");
+        assert_eq!(output.status.code(), Some(2), "{arguments:?}");
+        assert!(
+            output.stdout.is_empty(),
+            "a refused start writes no frame: {arguments:?}"
+        );
+    }
+}
+
+#[test]
+fn an_import_reads_the_chunk_from_the_folder_of_the_main_file_only_when_its_step_runs() {
+    let package = installed_package();
+    let mut agent = gemini_from(package.path(), &importing_turn());
+    at_the_first_request(&mut agent);
+    assert_eq!(
+        agent.marker(),
+        None,
+        "the chunk is not read before the first answer"
+    );
+    assert!(sent(&agent, "import").is_empty());
+    agent.choose(0, "allow-once");
+    assert_eq!(stop(&agent.frame()), "end_turn");
+    let original = std::fs::read(package.path().join("chunk.js")).expect("the chunk");
+    assert_eq!(agent.marker(), Some(original.clone()));
+    assert_eq!(sent(&agent, "import")[0]["bytes"], original.len());
+}
+
+#[test]
+fn an_agent_started_from_a_copy_reads_the_chunk_of_the_copy_after_the_installation_is_upgraded() {
+    let installation = installed_package();
+    let copy = installed_package();
+    let mut agent = gemini_from(copy.path(), &importing_turn());
+    at_the_first_request(&mut agent);
+    std::fs::write(installation.path().join("chunk.js"), UPGRADED_CHUNK).expect("the upgrade");
+    agent.choose(0, "allow-once");
+    agent.frame();
+    let original = std::fs::read(package_source().join("chunk.js")).expect("the chunk");
+    assert_eq!(agent.marker(), Some(original));
+}
+
+#[test]
+fn an_agent_started_from_the_installation_reads_the_chunk_the_upgrade_put_there() {
+    let installation = installed_package();
+    let mut agent = gemini_from(installation.path(), &importing_turn());
+    at_the_first_request(&mut agent);
+    std::fs::write(installation.path().join("chunk.js"), UPGRADED_CHUNK).expect("the upgrade");
+    agent.choose(0, "allow-once");
+    agent.frame();
+    assert_eq!(agent.marker(), Some(UPGRADED_CHUNK.to_vec()));
+}
+
+#[test]
+fn an_import_that_finds_no_chunk_or_no_package_is_recorded_as_an_error_and_writes_no_marker() {
+    let script = json!({ "turns": [[{ "import": "absent.js" }, { "end": "end_turn" }]] });
+    let package = installed_package();
+    let mut from_a_package = gemini_from(package.path(), &script);
+    let mut from_no_package = Played::start(QODER, &script);
+    for agent in [&mut from_a_package, &mut from_no_package] {
+        agent.open_session();
+        agent.prompt(3, "go");
+        agent.frame();
+        let imports = sent(agent, "import");
+        assert_eq!(imports.len(), 1);
+        assert!(imports[0]["error"].is_string(), "{imports:?}");
+        assert_eq!(agent.marker(), None);
+    }
+}
+
+#[test]
+fn the_package_files_begin_with_the_interpreter_line_and_hold_only_comments() {
+    let main = std::fs::read_to_string(package_source().join("gemini.js")).expect("the main file");
+    let mut lines = main.lines();
+    assert_eq!(lines.next(), Some("#!/usr/bin/env node"));
+    let chunk = std::fs::read_to_string(package_source().join("chunk.js")).expect("the chunk");
+    for line in lines.chain(chunk.lines()) {
+        assert!(line.starts_with("//"), "a line that is no comment: {line}");
+    }
 }

@@ -18,6 +18,7 @@ fn main() -> ExitCode {
     match run(
         Shape::Qoder,
         &directory,
+        None,
         BufReader::new(std::io::stdin()),
         std::io::stdout(),
     ) {

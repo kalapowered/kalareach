@@ -24,6 +24,11 @@
 //! `cancelled` and ends the turn `cancelled`; under `"cancel": "wait"` it changes nothing more.
 //! The steps of `on_cancel` then run once as a turn of the agent's own.
 //!
+//! The Gemini-shaped agent is a script package that an interpreter runs. [`run`] takes the folder
+//! of the package's main file, and an `import` step reads a chunk from that folder only when the
+//! step runs, as the real main file imports a chunk only when it first needs it. The bytes the step
+//! read go to the marker, so a case shows which folder the host started the agent from.
+//!
 //! | Step | What the stand-in does |
 //! | --- | --- |
 //! | `{"say": "text"}` | sends an `agent_message_chunk` update |
@@ -31,6 +36,7 @@
 //! | `{"ask": "c1"}` | sends `session/request_permission` for the call and waits for the response, offering `allow-once`, `allow-always` and `reject-once` |
 //! | `{"update": {"call": "c1", "status": "in_progress"}}` | sends a `tool_call_update` |
 //! | `{"when": {"outcome": "allowed", "then": [...]}}` | runs its steps if the last answer to a request was `allowed`, `declined` or `cancelled` |
+//! | `{"import": "name"}` | reads the file `name` from the folder of the package's main file and writes the bytes it read to [`MARKER_FILE`] |
 //! | `{"hold": "name"}` | waits until the file `name` exists in the working directory |
 //! | `{"end": "end_turn"}` | answers the prompt with that stop reason |
 //! | `{"exit": 0}` | ends the program with that code |
@@ -50,6 +56,9 @@ pub const SCRIPT_FILE: &str = "acp-stand-in.json";
 
 /// The file of the working directory that the stand-in appends its record to.
 pub const RECORD_FILE: &str = "acp-stand-in.record";
+
+/// The file of the working directory that an `import` step writes the bytes of the chunk to.
+pub const MARKER_FILE: &str = "acp-chunk-loaded";
 
 /// How often a step that waits looks again.
 const POLL: Duration = Duration::from_millis(20);
@@ -124,6 +133,8 @@ enum Step {
         /// What runs after it.
         then: Vec<Step>,
     },
+    /// A chunk of the package, read from the folder of its main file.
+    Import(String),
     /// A wait for a file of the working directory.
     Hold(String),
     /// The prompt's reply.
@@ -249,6 +260,8 @@ struct Agent<W: Write> {
     pending_call: Option<String>,
     /// Whether a cancel has been taken.
     cancelled: bool,
+    /// The folder of the main file of the script package the agent runs from, if it runs from one.
+    package: Option<PathBuf>,
 }
 
 /// Reads `script` as the stand-in reads the file of its working directory, so that a case finds a
@@ -264,7 +277,8 @@ pub fn check_script(script: &Value) -> Result<(), String> {
 }
 
 /// Runs the stand-in to the end of the client's stream or to an `exit` step, and returns the exit
-/// code.
+/// code. `package` is the folder of the main file of the script package the agent runs from, if it
+/// runs from one.
 ///
 /// # Errors
 ///
@@ -272,6 +286,7 @@ pub fn check_script(script: &Value) -> Result<(), String> {
 pub fn run(
     shape: Shape,
     directory: &Path,
+    package: Option<&Path>,
     input: impl BufRead + Send + 'static,
     output: impl Write,
 ) -> Result<i32, String> {
@@ -306,6 +321,7 @@ pub fn run(
         own_started: 0,
         pending_call: None,
         cancelled: false,
+        package: package.map(Path::to_path_buf),
     };
     loop {
         match received.recv_timeout(POLL) {
@@ -638,6 +654,7 @@ impl<W: Write> Agent<W> {
                     }
                 }
             }
+            Step::Import(name) => self.import(&name),
             Step::Hold(name) => {
                 if let Some(turn) = &mut self.turn {
                     turn.waiting = Waiting::File(PathBuf::from(name));
@@ -651,6 +668,24 @@ impl<W: Write> Agent<W> {
             Step::Exit(code) => return Some(code),
         }
         None
+    }
+
+    /// Reads the chunk `name` from the folder of the package's main file, as the agent's main file
+    /// imports a chunk, and writes the bytes it read to the marker. The record says how many bytes
+    /// it read, or why it read none.
+    fn import(&mut self, name: &str) {
+        let read = match &self.package {
+            Some(folder) => std::fs::read(folder.join(name)).map_err(|why| why.to_string()),
+            None => Err("the agent runs from no package".to_owned()),
+        };
+        let line = match read {
+            Ok(bytes) => match std::fs::write(self.directory.join(MARKER_FILE), &bytes) {
+                Ok(()) => json!({ "sent": "import", "file": name, "bytes": bytes.len() }),
+                Err(why) => json!({ "sent": "import", "file": name, "error": why.to_string() }),
+            },
+            Err(why) => json!({ "sent": "import", "file": name, "error": why }),
+        };
+        self.record(&line);
     }
 
     /// Sends a permission request for `call` and makes the turn wait for its response.
