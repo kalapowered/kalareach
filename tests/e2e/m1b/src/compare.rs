@@ -910,17 +910,19 @@ pub(crate) mod tests {
             }
             world.refused(&before, KILL)
         };
+        // One refusal that says `text` after `act` at the sidecar `suffix`; a failure names both.
+        let only_after = |suffix: &str, act: &str, text: &str| {
+            let refused = refused_after(suffix, act);
+            assert!(
+                refused.len() == 1 && refused[0].contains(text),
+                "registry.sqlite{suffix}, {act}: one refusal that says {text:?}: {refused:#?}"
+            );
+        };
         let replacement = "registry.sqlite permits no replacement";
-        only(&refused_after("-wal", "replace"), replacement);
-        only(
-            &refused_after("-wal", "remove"),
-            "registry.sqlite permits no removal",
-        );
-        only(
-            &refused_after("-wal", "create"),
-            "registry.sqlite permits no creation",
-        );
-        only(&refused_after("-journal", "replace"), replacement);
+        only_after("-wal", "replace", replacement);
+        only_after("-wal", "remove", "registry.sqlite permits no removal");
+        only_after("-wal", "create", "registry.sqlite permits no creation");
+        only_after("-journal", "replace", replacement);
         for (suffix, act) in [
             ("-journal", "remove"),
             ("-journal", "create"),
