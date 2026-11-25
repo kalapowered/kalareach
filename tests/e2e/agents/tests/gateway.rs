@@ -458,8 +458,9 @@ impl Route {
     ///
     /// Panics when the subject was made from a release and a generation is named, the entry names
     /// no login, the run's `HOME` is not the person's home as the system's account database names
-    /// it, the values of the keys cannot be read, or the person's files cannot be looked at:
-    /// nothing has started, and no turn is spent.
+    /// it, the values of the keys cannot be read, the entry names no guard or a guarded or shared
+    /// file is a symbolic link, or the person's files cannot be looked at: nothing has started, and
+    /// no turn is spent.
     fn acquire(chosen: Chosen, case: &str, login: bool, probe_only: bool) -> Self {
         let Chosen {
             subject,

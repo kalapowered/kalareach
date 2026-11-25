@@ -1409,9 +1409,9 @@ fn plain_relative(path: &str) -> bool {
 /// An agent that keeps a directory of the person's own, which a run is held to leave whole (Codex's
 /// `.codex`), is guarded by [`MetaGuard`]: it compares the whole tree and cannot tell a write of
 /// another process from the run's, so another process of the agent refuses the run. An entry that
-/// names files of the person's home ([`Account::guarded`], [`Account::shared`]) is guarded by
-/// [`FileGuard`]: those files and no others, so another process of the agent, a session of the
-/// person's among them, may run beside the run.
+/// names guarded files ([`Account::guarded`]) is guarded by [`FileGuard`]: those files, and the
+/// shared files ([`Account::shared`]) read once at the end for the run's name, and no others, so
+/// another process of the agent, a session of the person's among them, may run beside the run.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PersonPlan {
     /// The trees, each a path relative to the person's home, whose every entry is compared.
