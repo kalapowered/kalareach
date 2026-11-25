@@ -289,7 +289,27 @@ pub fn is_char_literal(bytes: &[char], at: usize) -> bool {
     )
 }
 
-/// Blanks every `#[cfg(test)]` module, so that a call a test makes is not a shipped one.
+/// Whether the item that `rest` starts is a module: `mod`, or `mod` after `pub` with or without a
+/// visibility in parentheses (`pub(crate)`, `pub(super)`, `pub(self)`, `pub(in path)`).
+fn starts_a_module(rest: &str) -> bool {
+    let item = rest.trim_start();
+    let Some(after_pub) = item.strip_prefix("pub") else {
+        return item.starts_with("mod ");
+    };
+    // `pub` is a word of its own: a longer word that starts with it is no visibility.
+    if !after_pub.starts_with(|c: char| c == '(' || c.is_whitespace()) {
+        return false;
+    }
+    let after_pub = after_pub.trim_start();
+    let item = match after_pub.strip_prefix('(') {
+        Some(path) => path.split_once(')').map_or("", |(_, tail)| tail),
+        None => after_pub,
+    };
+    item.trim_start().starts_with("mod ")
+}
+
+/// Blanks every `#[cfg(test)]` module, whatever its visibility, so that a call a test makes is not
+/// a shipped one.
 pub fn without_test_modules(blanked: &str) -> String {
     let mut text: Vec<char> = blanked.chars().collect();
     let mut from = 0;
@@ -298,8 +318,7 @@ pub fn without_test_modules(blanked: &str) -> String {
         let mut cursor = found + needle.len();
         // Another attribute may stand between, and then the item: only a module is a test module.
         let rest: String = text[cursor..].iter().take(200).collect();
-        let trimmed = rest.trim_start();
-        if !trimmed.starts_with("mod ") && !trimmed.starts_with("pub mod ") {
+        if !starts_a_module(&rest) {
             from = cursor;
             continue;
         }

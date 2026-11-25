@@ -167,7 +167,27 @@ fn is_char_literal(bytes: &[char], at: usize) -> bool {
     )
 }
 
-/// Blanks every `#[cfg(test)]` module, so that a call a test makes is not a shipped one.
+/// Whether the item that `rest` starts is a module: `mod`, or `mod` after `pub` with or without a
+/// visibility in parentheses (`pub(crate)`, `pub(super)`, `pub(self)`, `pub(in path)`).
+fn starts_a_module(rest: &str) -> bool {
+    let item = rest.trim_start();
+    let Some(after_pub) = item.strip_prefix("pub") else {
+        return item.starts_with("mod ");
+    };
+    // `pub` is a word of its own: a longer word that starts with it is no visibility.
+    if !after_pub.starts_with(|c: char| c == '(' || c.is_whitespace()) {
+        return false;
+    }
+    let after_pub = after_pub.trim_start();
+    let item = match after_pub.strip_prefix('(') {
+        Some(path) => path.split_once(')').map_or("", |(_, tail)| tail),
+        None => after_pub,
+    };
+    item.trim_start().starts_with("mod ")
+}
+
+/// Blanks every `#[cfg(test)]` module, whatever its visibility, so that a call a test makes is not
+/// a shipped one.
 fn without_test_modules(blanked: &str) -> String {
     let mut text: Vec<char> = blanked.chars().collect();
     let mut from = 0;
@@ -176,8 +196,7 @@ fn without_test_modules(blanked: &str) -> String {
         let mut cursor = found + needle.len();
         // Another attribute may stand between, and then the item: only a module is a test module.
         let rest: String = text[cursor..].iter().take(200).collect();
-        let trimmed = rest.trim_start();
-        if !trimmed.starts_with("mod ") && !trimmed.starts_with("pub mod ") {
+        if !starts_a_module(&rest) {
             from = cursor;
             continue;
         }
@@ -990,4 +1009,45 @@ mod tests { fn t() { s.ingest_output(b""); } }
         small(&[("crates/kr-worker/src/session.rs", quiet)], CLEAN_ROSTER),
         Vec::<String>::new()
     );
+}
+
+/// The forms that a visibility before `mod` takes, with none first.
+const VISIBILITIES: [&str; 6] = [
+    "",
+    "pub ",
+    "pub(crate) ",
+    "pub(super) ",
+    "pub(self) ",
+    "pub(in crate::desktop) ",
+];
+
+#[test]
+fn a_test_module_holds_no_call_whatever_its_visibility() {
+    for visibility in VISIBILITIES {
+        let quiet = format!(
+            "#[cfg(test)]\n{visibility}mod tests {{ fn t() {{ std::fs::OpenOptions::new().append(true); }} }}\n"
+        );
+        assert_eq!(
+            small(&[("crates/kr-worker/src/session.rs", &quiet)], CLEAN_ROSTER),
+            Vec::<String>::new(),
+            "{visibility}mod tests"
+        );
+    }
+}
+
+#[test]
+fn a_visibility_leaves_what_is_not_a_test_module_read() {
+    for source in [
+        "pub(super) mod shipped { fn t() { std::fs::OpenOptions::new().append(true); } }",
+        "#[cfg(unix)]\npub(crate) mod shipped { fn t() { std::fs::OpenOptions::new().append(true); } }",
+        "#[cfg(test)]\npub(super) fn only_for_tests() { std::fs::OpenOptions::new().append(true); }",
+    ] {
+        let found = small(&[("crates/kr-worker/src/session.rs", source)], CLEAN_ROSTER);
+        assert!(
+            found
+                .iter()
+                .any(|line| line.contains("a call with no row") && line.contains("append")),
+            "{source}: {found:?}"
+        );
+    }
 }

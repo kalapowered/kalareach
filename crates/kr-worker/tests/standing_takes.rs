@@ -654,6 +654,52 @@ fn a_take_in_a_test_helper_of_the_crate_is_reported() {
     );
 }
 
+/// The forms that a visibility before `mod` takes, with none first.
+const VISIBILITIES: [&str; 6] = [
+    "",
+    "pub ",
+    "pub(crate) ",
+    "pub(super) ",
+    "pub(self) ",
+    "pub(in crate::desktop) ",
+];
+
+/// What the scan finds in a file whose function `shipped` takes one lock, as its roster row says,
+/// with `beside` after it. Two functions of one name in one file are read as one body, so a second
+/// `shipped` that the scan reads makes it two takes.
+fn found_with_beside(beside: &str) -> Vec<String> {
+    let file = "crates/kr-worker/src/shipped.rs";
+    let source = format!("fn shipped(m: &M) {{ m.lock(); }}\n{beside}\n");
+    let roster = format!("scope {file} shipped\nsite {file} shipped lock 1\n");
+    scan::violations(&[(file.to_owned(), source)], &scan::parse(&roster), TAKES)
+}
+
+#[test]
+fn a_test_module_holds_no_take_whatever_its_visibility() {
+    for visibility in VISIBILITIES {
+        let found = found_with_beside(&format!(
+            "#[cfg(test)]\n{visibility}mod tests {{\n    fn shipped(m: &M) {{ m.lock(); }}\n}}"
+        ));
+        assert_eq!(found, Vec::<String>::new(), "{visibility}mod tests");
+    }
+}
+
+#[test]
+fn a_visibility_leaves_what_is_not_a_test_module_read() {
+    for source in [
+        "pub(super) mod shipped_too {\n    fn shipped(m: &M) { m.lock(); }\n}",
+        "#[cfg(unix)]\npub(crate) mod shipped_too {\n    fn shipped(m: &M) { m.lock(); }\n}",
+        "#[cfg(test)]\npub(super) fn shipped(m: &M) { m.lock(); }",
+    ] {
+        let found = found_with_beside(source);
+        assert_eq!(found.len(), 1, "{source}");
+        only_finding(
+            &found,
+            "shipped.rs shipped calls lock 2 time(s) and its row says 1",
+        );
+    }
+}
+
 const BOUNDARY: &str = "crates/kr-worker/src/service/boundary.rs";
 
 /// A child module of the boundary: its file stands in the folder that the boundary's file names.
