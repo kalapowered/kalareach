@@ -1174,9 +1174,21 @@ pub struct Build {
     /// The fields the entry gives as missing, each by its dotted path (`account.turn_line`) with
     /// the reason no value was found. A field listed here is missing, and never empty. None where
     /// the entry has no `missing` member: a real start of a non-Codex entry refuses that, so a
-    /// projection that drops the member fails closed.
-    #[serde(default)]
+    /// projection that drops the member fails closed. An explicit `null` is refused: where the
+    /// member is given, it must be an object.
+    #[serde(default, deserialize_with = "an_object_where_given")]
     pub missing: Option<BTreeMap<String, String>>,
+}
+
+/// Reads `missing` as an object where the member is there: an explicit `null` is refused, where a
+/// derived reader would take it for an absent member.
+fn an_object_where_given<'de, D>(
+    deserializer: D,
+) -> Result<Option<BTreeMap<String, String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    BTreeMap::deserialize(deserializer).map(Some)
 }
 
 impl Account {
@@ -1923,6 +1935,83 @@ mod tests {
         assert!(
             serde_json::from_value::<Build>(json).is_err(),
             "a member of isolation that the driver does not read is refused"
+        );
+    }
+
+    /// Whether an entry that gives `null` for the member at `path` is refused.
+    fn refuses_null_at(path: &[&str]) -> bool {
+        let mut json = entry_json(&serde_json::json!({}), &serde_json::json!({}));
+        let (last, parents) = path.split_last().expect("a path");
+        let mut member = &mut json;
+        for name in parents {
+            member = &mut member[*name];
+        }
+        member[*last] = serde_json::Value::Null;
+        serde_json::from_value::<Build>(json).is_err()
+    }
+
+    /// An explicit `null` in `account.draft` is refused; an absent member is read as empty.
+    #[test]
+    fn a_null_account_draft_is_refused() {
+        assert!(
+            refuses_null_at(&["account", "draft"]),
+            "an explicit null in account.draft is refused"
+        );
+    }
+
+    /// An explicit `null` in `account.resume_refused` is refused; an absent member is read as
+    /// empty.
+    #[test]
+    fn a_null_account_resume_refused_is_refused() {
+        assert!(
+            refuses_null_at(&["account", "resume_refused"]),
+            "an explicit null in account.resume_refused is refused"
+        );
+    }
+
+    /// An explicit `null` in `account.fork` is refused; an absent member is read as empty.
+    #[test]
+    fn a_null_account_fork_is_refused() {
+        assert!(
+            refuses_null_at(&["account", "fork"]),
+            "an explicit null in account.fork is refused"
+        );
+    }
+
+    /// An explicit `null` in `account.commands` is refused; an absent member is read as empty.
+    #[test]
+    fn a_null_account_commands_is_refused() {
+        assert!(
+            refuses_null_at(&["account", "commands"]),
+            "an explicit null in account.commands is refused"
+        );
+    }
+
+    /// An explicit `null` in `missing` is refused: it must be an object, and an absent member is the
+    /// one that reads as none.
+    #[test]
+    fn a_null_missing_is_refused() {
+        assert!(
+            refuses_null_at(&["missing"]),
+            "an explicit null in missing is refused"
+        );
+    }
+
+    /// An explicit `null` in `account.turn_line` and in `account.image_line` is read as absent.
+    #[test]
+    fn a_null_turn_line_and_a_null_image_line_are_read_as_absent() {
+        let mut json = entry_json(&serde_json::json!({}), &serde_json::json!({}));
+        json["account"]["turn_line"] = serde_json::Value::Null;
+        json["account"]["image_line"] = serde_json::Value::Null;
+        let build = serde_json::from_value::<Build>(json).expect("an entry");
+        let account = build.account.expect("an account");
+        assert!(
+            account.turn_line.is_none(),
+            "a null turn_line is read as absent"
+        );
+        assert!(
+            account.image_line.is_none(),
+            "a null image_line is read as absent"
         );
     }
 
