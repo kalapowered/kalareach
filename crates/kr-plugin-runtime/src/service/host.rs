@@ -2429,10 +2429,16 @@ fn called_binding(body: &RequestBody) -> Option<Uuid> {
 /// Records a registration the connection has just read, and starts standing behind it.
 ///
 /// An identifier has one registration in flight at a time: nothing is recorded, and there is no
-/// incarnation, when it already has one.
+/// incarnation, when it already has one. On `/4` the same holds while the connection stands behind
+/// a live registration of the identifier: an unbind removes the one registration it finds, so a
+/// second one admitted beside the live one could be completed after the unbind. On `/3` the
+/// runtime refuses such a registration after its payload has been read.
 fn begin(served: &Served, binding_id: Uuid, registration: u64) -> Option<Incarnation> {
     let incarnation = Incarnation::next();
     let mut held = served.registered.lock().ok()?;
+    if served.dialect == Dialect::Four && held.standing_binding(binding_id).is_some() {
+        return None;
+    }
     if !held.preparing(binding_id, incarnation) {
         return None;
     }

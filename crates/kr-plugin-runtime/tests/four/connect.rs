@@ -4,6 +4,8 @@
 //! The host here serves both protocols with its writer open, so what a case shows of the client is
 //! what it does with a host that writes every member of `/4`.
 
+use std::sync::Arc;
+
 use kr_plugin_runtime::runtime::binding::BindingRequest;
 use kr_plugin_service::client::PluginClient;
 use kr_plugin_service::error::ServiceResult;
@@ -343,6 +345,90 @@ async fn observation(client: &PluginClient) -> Option<Notice> {
             return Some(notice);
         }
     }
+}
+
+/// A second registration of a binding that stands is refused when the host reads it, so the unbind
+/// written after it removes the only registration the host admitted, and the host and the client
+/// hold nothing for the binding afterwards. The second registration is held before the runtime for
+/// a host that admits it: the unbind then finds the first registration live, and the second would
+/// complete after the first was removed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_24_24_an_unbind_after_a_second_registration_leaves_the_host_and_the_client_holding_nothing()
+ {
+    let Some(component) = components::component("recording") else {
+        return;
+    };
+    let served = Served::start_dual(true).await;
+    publish_three(&served);
+    publish_four(&served, &descriptor4_of(&served));
+    let client = Arc::new(connected(&served).await.expect("the client connects"));
+    assert_eq!(client.protocol(), HostProtocol::V4);
+    let (path, digest, bytes) = served.install("recording", &component);
+    let source = ComponentSource {
+        path,
+        digest,
+        bytes,
+    };
+    let request: BindingRequest = components::request("recording", 65);
+    register_over(&client, &request, &source)
+        .await
+        .expect("the binding registers");
+
+    let hold = served.host.hold_registrations_before_the_runtime();
+    let second = tokio::spawn({
+        let client = Arc::clone(&client);
+        let request = request.clone();
+        let source = source.clone();
+        async move { register_over(&client, &request, &source).await }
+    });
+    // The host has read the second registration once it holds it or has answered it.
+    tokio::time::timeout(HANG_GUARD, async {
+        while !hold.parked() && !second.is_finished() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the second registration was neither held nor answered");
+    assert!(
+        client.unbind(request.binding_id).await.expect("unbinds"),
+        "the host held the registration"
+    );
+    hold.release();
+    let second = tokio::time::timeout(HANG_GUARD, second)
+        .await
+        .expect("the second registration was answered")
+        .expect("the registration task ended");
+    assert!(
+        second.is_err(),
+        "the host registered a binding that it already held"
+    );
+
+    register_over(&client, &request, &source)
+        .await
+        .expect("the binding registers again after its unbind");
+    client
+        .deliver(request.binding_id, &components::scrape("se-1", "x"))
+        .await
+        .expect("the event is offered");
+    let read = tokio::time::timeout(HANG_GUARD, observation(&client))
+        .await
+        .expect("the notice never arrived");
+    assert!(
+        matches!(read, Some(Notice::Document { .. })),
+        "the notices of the registration the host holds were dropped: {read:?}"
+    );
+    let deadline = core::time::Duration::from_secs(20);
+    let state = client
+        .checkpoint(request.binding_id, deadline)
+        .await
+        .expect("the checkpoint runs")
+        .state
+        .expect("the state came back");
+    let restored = client.restore(request.binding_id, state, deadline).await;
+    assert!(
+        restored.is_ok(),
+        "a restore after the unbind and a new registration was refused: {restored:?}"
+    );
 }
 
 /// A binding that is registered, removed and registered again is read under its new registration
