@@ -127,14 +127,24 @@ fn build_previous(commit: &str) -> PathBuf {
         std::fs::write(place.join("stamp"), &stamp).expect("the stamp");
     }
     // The environment is this process's without what a test run sets for this tree, so the older
-    // tree builds with its own settings and the toolchain it pins.
+    // tree builds with its own settings and the toolchain it pins. Three settings of the run are
+    // kept by name, because they decide how much memory the build takes: debug information,
+    // incremental artefacts and the number of jobs. Without them a hosted runner ran out of memory
+    // and pagefile while the older tree built.
     let output = Command::new("cargo")
         .current_dir(&tree)
         .env_clear()
         .envs(std::env::vars_os().filter(|(name, _)| {
             let name = name.to_string_lossy();
             let carried = ["CARGO_HOME", "CARGO_NET", "CARGO_HTTP", "CARGO_REGISTR"];
-            (!name.starts_with("CARGO") || carried.iter().any(|kept| name.starts_with(kept)))
+            let small = [
+                "CARGO_PROFILE_DEV_DEBUG",
+                "CARGO_INCREMENTAL",
+                "CARGO_BUILD_JOBS",
+            ];
+            (!name.starts_with("CARGO")
+                || carried.iter().any(|kept| name.starts_with(kept))
+                || small.contains(&&*name))
                 && !["RUSTFLAGS", "RUSTUP_TOOLCHAIN", "RUSTC_WRAPPER"].contains(&&*name)
         }))
         .env("CARGO_TARGET_DIR", place.join("target"))

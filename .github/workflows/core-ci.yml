@@ -1063,6 +1063,12 @@ jobs:
       - name: The upgrade suite's Windows case
         timeout-minutes: 200
         shell: bash
+        env:
+          # The case builds the release before in a build of its own, which carries this setting
+          # and the workflow's two that turn off debug information and incremental artefacts. The
+          # runner has four processors, and a gate run of that build with four jobs and all of
+          # Cargo's defaults ran out of memory and pagefile.
+          CARGO_BUILD_JOBS: "2"
         run: bash scripts/contract-cases.sh windows
 
   windows:

@@ -1702,6 +1702,61 @@ fn the_rust_jobs_stub_daemon_step_builds_the_programs_its_cases_start_before_it_
     }
 }
 
+/// The Windows contract job builds the release before from its own commit, in an environment that
+/// leaves out this run's settings so that the older tree builds with its own. A hosted run of that
+/// build, with Cargo's defaults (debug information, incremental artefacts and one job for each
+/// processor), failed with "The paging file is too small for this operation to complete" (os error
+/// 1455). The workflow turns off debug information and incremental artefacts for every job, the
+/// step that runs the case limits the jobs to two, and the build carries those three settings by
+/// name.
+#[test]
+fn the_release_before_is_built_in_the_windows_contract_job_without_debug_information_and_with_two_jobs()
+ {
+    let workflow = fs::read_to_string(repository().join(".github/workflows/core-ci.yml"))
+        .expect("the landing workflow");
+    assert_eq!(
+        value_at(&workflow, 2, "CARGO_PROFILE_DEV_DEBUG").as_deref(),
+        Some("\"0\""),
+        "the workflow does not turn off debug information for its dev profile"
+    );
+    assert_eq!(
+        value_at(&workflow, 2, "CARGO_INCREMENTAL").as_deref(),
+        Some("\"0\""),
+        "the workflow does not turn off incremental builds"
+    );
+    let steps = steps_running(
+        &job(&workflow, "contract-tests-windows"),
+        "scripts/contract-cases.sh windows",
+    );
+    assert_eq!(
+        steps.len(),
+        1,
+        "the Windows contract job has not one step that runs the Windows case"
+    );
+    assert_eq!(
+        value_at(&steps[0], 10, "CARGO_BUILD_JOBS").as_deref(),
+        Some("\"2\""),
+        "the step that runs the Windows case does not limit the build to two jobs"
+    );
+    let suite = fs::read_to_string(repository().join("crates/kr-cli/tests/upgrade_windows.rs"))
+        .expect("the Windows upgrade suite");
+    let build = suite
+        .split("fn build_previous")
+        .nth(1)
+        .and_then(|rest| rest.split("\n}\n").next())
+        .expect("the function that builds the release before");
+    for name in [
+        "CARGO_PROFILE_DEV_DEBUG",
+        "CARGO_INCREMENTAL",
+        "CARGO_BUILD_JOBS",
+    ] {
+        assert!(
+            build.contains(&format!("\"{name}\"")),
+            "{name}: the release before's build does not carry it from the environment"
+        );
+    }
+}
+
 /// Where in the job's steps the first step stands that has a line `runs` accepts.
 fn position_of_line(job: &str, runs: fn(&str) -> bool) -> Option<usize> {
     steps_of(job).iter().position(|step| step.lines().any(runs))
