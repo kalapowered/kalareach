@@ -542,7 +542,7 @@ fn acp_a_daemon_killed_with_a_request_pending_leaves_the_agent_and_the_restarted
  {
     run_case(
         "5b-1",
-        &controls::restart_script(),
+        &controls::lingering(controls::restart_script()),
         controls::a_daemon_killed_with_a_request_pending,
     );
 }
@@ -654,7 +654,7 @@ fn acp_an_agent_that_exits_after_dispatch_leaves_the_receipt_unknown_unless_evid
 fn acp_the_launcher_ends_the_agent_when_the_workers_connection_ends() {
     run_case(
         "5b-12",
-        &controls::exit_script(),
+        &controls::lingering(controls::exit_script()),
         controls::the_launcher_ends_the_agent,
     );
 }

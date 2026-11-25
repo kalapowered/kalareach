@@ -38,6 +38,22 @@ fn ensure(holds: bool, id: &str) -> Result<(), Red> {
     if holds { Ok(()) } else { Err(red(id)) }
 }
 
+/// Stops the case when a condition that it relies on does not hold. That failure is not the
+/// control's red, because no mutation of the control makes it.
+pub fn requires(id: &str, holds: bool, what: &str) {
+    assert!(
+        holds,
+        "{id}: the case cannot show the control, because {what}"
+    );
+}
+
+/// The script with the field that keeps the agent running when its input closes, as an agent does
+/// that does not exit at the end of its input.
+pub fn lingering(mut script: Value) -> Value {
+    script["survive_end_of_input"] = Value::Bool(true);
+    script
+}
+
 /// The lines of the stand-in's record that are responses to its requests.
 fn responses(record: &[Value]) -> Vec<&Value> {
     record
@@ -228,8 +244,13 @@ pub fn a_daemon_killed_with_a_request_pending(host: &mut Hosted) -> Result<(), R
     reads_equal_after_a_restart(&before, &host.reads())?;
     host.answer("proceed_once");
     one_reply_with_the_chosen_id(&host.record(), "proceed_once")?;
+    requires(
+        "5b-11",
+        host.agent_runs(),
+        "the agent does not run just before the session is closed",
+    );
     ends_with_the_session(host.closes_the_session())?;
-    host.second_session(&restart_script());
+    host.second_session(&lingering(restart_script()));
     refused_as_a_closed_sessions(&host.kills_the_daemon_then_the_worker())
 }
 
@@ -406,7 +427,8 @@ impl Hosted {
     }
 
     /// Closes the worker's end of the launcher's connection, as only the harness does, and says
-    /// whether the agent still runs once the launcher has had time to end it.
+    /// whether the agent still runs once the launcher has had time to end it. The step does not
+    /// start the worker's ending ladder, so only the launcher can end the agent.
     pub fn ends_the_workers_connection(&mut self) -> bool {
         match *self {}
     }
@@ -457,6 +479,11 @@ fn exits_after_two_answers(id: &str, host: &mut Hosted) -> Result<(), Red> {
 
 /// Case 5b-12: the worker's connection to the launcher ends.
 pub fn the_launcher_ends_the_agent(host: &mut Hosted) -> Result<(), Red> {
+    requires(
+        "5b-12",
+        host.agent_runs(),
+        "the agent does not run before the worker's end is closed",
+    );
     ends_with_the_workers_connection(host.ends_the_workers_connection())
 }
 
@@ -896,7 +923,9 @@ pub fn a_completed_update_after_a_cancel(host: &mut Hosted) -> Result<(), Red> {
 fn scripts() -> Vec<(&'static str, Value)> {
     vec![
         ("restart_script", restart_script()),
+        ("lingering_restart_script", lingering(restart_script())),
         ("exit_script", exit_script()),
+        ("lingering_exit_script", lingering(exit_script())),
         ("race_script", race_script()),
         ("late_request_script", late_request_script()),
         ("abort_script", abort_script()),
@@ -926,6 +955,30 @@ fn scripts() -> Vec<(&'static str, Value)> {
             prompt_after_a_cancel_script(),
         ),
     ]
+}
+
+#[test]
+fn a_lingering_script_keeps_every_field_of_its_script_and_sets_the_one_that_keeps_the_agent_alive()
+{
+    let script = lingering(exit_script());
+    assert_eq!(script["survive_end_of_input"], true);
+    assert_eq!(script["exit_after"], exit_script()["exit_after"]);
+    assert_eq!(script["turns"], exit_script()["turns"]);
+    assert!(
+        exit_script().get("survive_end_of_input").is_none(),
+        "a script that is not made to linger does not"
+    );
+}
+
+#[test]
+fn a_condition_that_holds_stops_no_case() {
+    requires("5b-11", true, "the agent runs");
+}
+
+#[test]
+#[should_panic(expected = "5b-11: the case cannot show the control, because the agent runs")]
+fn a_condition_that_fails_stops_the_case_and_names_why() {
+    requires("5b-11", false, "the agent runs");
 }
 
 #[test]

@@ -112,6 +112,26 @@ impl Played {
         std::fs::write(self.directory.path().join(name), b"go").expect("the release");
     }
 
+    /// Closes the stand-in's input and returns without waiting for it to end.
+    fn close_input(&mut self) {
+        drop(self.input.take());
+    }
+
+    /// The record once it holds a line that says the stand-in received `what`, or what it holds
+    /// after [`WITHIN`].
+    fn record_with_received(&self, what: &str) -> Vec<Value> {
+        let deadline = std::time::Instant::now() + WITHIN;
+        loop {
+            let record = self.record();
+            if record.iter().any(|line| line["received"] == what)
+                || std::time::Instant::now() > deadline
+            {
+                return record;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     /// Closes the stand-in's input and waits for it to end.
     fn close(&mut self) -> std::process::ExitStatus {
         drop(self.input.take());
@@ -392,6 +412,57 @@ fn an_unknown_method_is_refused_and_a_line_that_is_not_json_is_recorded_and_the_
     assert_eq!(
         kinds,
         ["request", "a line that is not json", "end of input"]
+    );
+}
+
+#[test]
+fn an_agent_that_survives_the_end_of_its_input_goes_on_running_until_it_is_told_to_exit() {
+    let mut agent = Played::start(
+        QODER,
+        &json!({
+            "survive_end_of_input": true,
+            "ticks": [{ "after": "alive", "say": "still here" }],
+            "exit_after": "die",
+        }),
+    );
+    agent.open_session();
+    agent.close_input();
+    let record = agent.record_with_received("end of input");
+    assert!(
+        record.iter().any(|line| line["received"] == "end of input"),
+        "the record holds the end of the input"
+    );
+    // An agent that ends at the end of its input records it and then ends, so the test looks again
+    // after a moment.
+    std::thread::sleep(QUIET);
+    assert!(
+        agent.child.try_wait().expect("a status").is_none(),
+        "the agent runs after its input closed"
+    );
+    agent.release("alive");
+    assert_eq!(
+        agent.frame()["params"]["update"]["content"]["text"],
+        "still here",
+        "the agent acts after its input closed"
+    );
+    agent.release("die");
+    assert_eq!(
+        agent.child.wait().expect("the stand-in ends").code(),
+        Some(0),
+        "the file that ends the agent still ends it"
+    );
+}
+
+#[test]
+fn an_agent_with_no_such_field_ends_with_the_code_0_when_its_input_closes() {
+    let mut agent = Played::start(QODER, &json!({}));
+    agent.open_session();
+    assert_eq!(agent.close().code(), Some(0));
+    assert!(
+        agent
+            .record()
+            .iter()
+            .any(|line| line["received"] == "end of input")
     );
 }
 

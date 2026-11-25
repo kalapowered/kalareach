@@ -9,12 +9,15 @@
 //! allowlist and no others.
 //!
 //! A script is `{"turns": [...], "ticks": [...], "exit_after": "name", "own": [...], "cancel":
-//! "settle", "on_cancel": [...], "version": "text"}`. The k-th prompt of the client runs the k-th
+//! "settle", "on_cancel": [...], "version": "text", "survive_end_of_input": false}`. The k-th prompt of the client runs the k-th
 //! turn, which is a list of steps; a prompt with no turn left is answered at once with the stop
 //! reason `end_turn`. A tick is `{"after": "name", "say": "text"}`: when the file `name` appears in
 //! the working directory the agent sends an update that says `text`, once, whatever its turn does.
 //! When the file `exit_after` names appears the agent ends with the code 0, whatever its turn waits
 //! for. The agent reports the version of its shape in `initialize`, unless `version` names another.
+//! When the client's input closes the agent ends with the code 0, unless `survive_end_of_input` is
+//! true: then it records the end of the input and goes on, as an agent does that does not exit at
+//! the end of its input, until `exit_after`, an `exit` step or a signal ends it.
 //!
 //! A turn of the agent's own is `{"after": "name", "steps": [...]}` in `own`: it starts when the
 //! file appears and no turn runs, and it ends with no reply, because it answers no prompt. A
@@ -169,6 +172,10 @@ struct Script {
     /// The version the agent reports in `initialize`, in place of its shape's.
     #[serde(default)]
     version: Option<String>,
+    /// Whether the agent goes on running when its input closes, as an agent that does not exit at
+    /// the end of its input.
+    #[serde(default)]
+    survive_end_of_input: bool,
 }
 
 /// A turn of the agent's own: it answers no prompt, so it ends with no reply.
@@ -327,18 +334,26 @@ pub fn run(
         cancelled: false,
         package: package.map(Path::to_path_buf),
     };
+    let mut input_is_open = true;
     loop {
-        match received.recv_timeout(POLL) {
-            Ok(Input::Line(line)) => {
-                if let Some(code) = agent.receive(&line) {
-                    return Ok(code);
+        if input_is_open {
+            match received.recv_timeout(POLL) {
+                Ok(Input::Line(line)) => {
+                    if let Some(code) = agent.receive(&line) {
+                        return Ok(code);
+                    }
                 }
+                Ok(Input::Closed) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    agent.record(&json!({ "received": "end of input" }));
+                    if !agent.script.survive_end_of_input {
+                        return Ok(0);
+                    }
+                    input_is_open = false;
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
             }
-            Ok(Input::Closed) | Err(mpsc::RecvTimeoutError::Disconnected) => {
-                agent.record(&json!({ "received": "end of input" }));
-                return Ok(0);
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        } else {
+            std::thread::sleep(POLL);
         }
         agent.tick();
         agent.start_next();
