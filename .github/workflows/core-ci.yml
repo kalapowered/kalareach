@@ -4105,10 +4105,12 @@ jobs:
   # on a hosted runner (07:25 to 08:55 UTC on 21 November). Here it needs no other job, and in
   # eleven runs on hosted runners (21 to 24 November) it ran to its end in 82 to 147 minutes. Like
   # each macOS job of a run, it can still wait for one of the hosted macOS runners that the account
-  # can use at one time. The step has a limit of 300 minutes, twice the longest it took in those
-  # runs (147.1 minutes, run 45043176780), and every step has a limit of its own: they add up to 326
-  # of this job's 330 minutes, which keeps 3 for the set-up and clean-up that no step limit counts,
-  # under the 360 at which GitHub ends a hosted job.
+  # can use at one time. The step has a limit of 295 minutes, twice the longest it took in those
+  # runs (147.1 minutes, run 45043176780), rounded up, and every step has a limit of its own. The
+  # step that frees the disk has 8: its script waits up to 300 seconds after it deletes the
+  # runtimes, and the whole step took 1.5 minutes at most (run 45368318250). The limits add up to
+  # 324 of this job's 330 minutes, which leaves 6 for the set-up and clean-up that no step limit
+  # counts, under the 360 at which GitHub ends a hosted job.
   # It restores no cache: the release builds go in a new directory, which no restored output serves,
   # and the one debug build, of kr-ipc's test, is small.
   macos-shipped-hold:
@@ -4135,7 +4137,7 @@ jobs:
       # to show what was left.
       - name: Free the disk the build needs
         continue-on-error: true
-        timeout-minutes: 5
+        timeout-minutes: 8
         run: bash scripts/free-simulator-runtimes.sh
 
       - name: What the disk holds with the runtimes cleared
@@ -4164,7 +4166,7 @@ jobs:
           cargo --version
 
       - name: The programs a release ships hold no launchd refusal
-        timeout-minutes: 300
+        timeout-minutes: 295
         run: bash scripts/shipped-hold-gate.sh
 
       - name: What the disk has left
