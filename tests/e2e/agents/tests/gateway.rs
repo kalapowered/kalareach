@@ -101,10 +101,10 @@ use kr_e2e_agents::build::{self, Account, Build, InstallSwitch, Probe};
 use kr_e2e_agents::entry;
 use kr_e2e_agents::held::{
     Absent, Audit, CONFIG_DIRECTORY, HeldKeys, ISOLATION_UNPROVEN, NEWER_CONFIG_DIRECTORY,
-    PersonGuard, PersonPlan, Recorded, RunScan, Stop, absent_below, absent_paths, absent_paths_in,
-    audit_turns, conversations_relative, conversations_relative_in, folder_of, grouped_output,
-    kept_panic_text, new_turns, other_agents_refusal, panic_text, person_home, read_record,
-    turns_recorded, unchanged_before_the_charge,
+    PersonGuard, PersonPlan, Recorded, RunScan, Stop, absent_paths, absent_paths_in, audit_turns,
+    conversations_relative, conversations_relative_in, folder_of, grouped_output, kept_panic_text,
+    new_turns, other_agents_refusal, panic_text, person_home, read_record, turns_recorded,
+    unchanged_before_the_charge,
 };
 use kr_e2e_agents::launch_report::{Seen, launch_report};
 use kr_e2e_agents::outcome::{Failure, Outcome};
@@ -487,8 +487,13 @@ impl Route {
         // The entry's own guard: Codex's whole directory, or the files the entry names. A guard
         // over a whole directory cannot tell a write of another agent process of theirs from the
         // run's, so none runs at the start; one over named files has no such limit.
-        let plan = PersonPlan::of(&build.application, &account.guarded, &account.shared)
-            .unwrap_or_else(|why| panic!("{why}"));
+        let plan = PersonPlan::of(
+            &build.application,
+            &account.guarded,
+            &account.shared,
+            &account.absent,
+        )
+        .unwrap_or_else(|why| panic!("{why}"));
         let others = plan
             .other_agents(&executable_name(&build.command), None)
             .unwrap_or_else(|why| panic!("{why}"));
@@ -801,10 +806,11 @@ impl Real {
 
     /// Fails the case when a file of `absent`, the entry's list ([`Real::absent_list`]), exists:
     /// each path in the run is looked at by a walk from the run's pinned directory that follows no
-    /// link at any component.
+    /// link at any component. A look that does not show the absence is kept by the person's guard
+    /// as a failed look.
     fn checks_absent(&self, run: &Run, absent: &[PathBuf]) {
         for path in absent {
-            match absent_below(run.root(), run.pin(), path) {
+            match self.person.absent_below(run.root(), run.pin(), path) {
                 Ok(true) => {}
                 Ok(false) => panic!(
                     "{ISOLATION_UNPROVEN} {} exists, which would load the person's own settings, \

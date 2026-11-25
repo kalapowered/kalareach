@@ -1403,6 +1403,18 @@ fn plain_relative(path: &str) -> bool {
         .all(|part| !part.is_empty() && part != "." && part != "..")
 }
 
+/// The file of `files` that the path `template` of an entry's absent list names in the person's
+/// home, where it starts with `{person}/` or `{ancestors}/` and goes on with that file.
+fn names_a_person_file<'a>(
+    template: &str,
+    mut files: impl Iterator<Item = &'a String>,
+) -> Option<&'a String> {
+    let rest = template
+        .strip_prefix("{person}/")
+        .or_else(|| template.strip_prefix("{ancestors}/"))?;
+    files.find(|file| file.as_str() == rest)
+}
+
 /// How an entry's run guards the person's own agent files, and so whether another process of the
 /// agent refuses the run.
 ///
@@ -1428,12 +1440,24 @@ pub enum PersonPlan {
 impl PersonPlan {
     /// The guard of the build list entry for `application`, from the entry's own lists.
     ///
+    /// A path of `absent`, the entry's list of files that must not exist, names a guarded or shared
+    /// file when it starts with `{person}/` or `{ancestors}/` and goes on with that file: `{person}`
+    /// is the person's home, and `{ancestors}` takes in each folder above the run's working
+    /// directory, the home among them. A path that reaches a guarded name another way, through a link
+    /// or by a literal path, is not seen here: [`PersonGuard::absent_below`] keeps its failed look.
+    ///
     /// # Errors
     ///
     /// Returns why the entry has no guard: it names no person tree and no guarded file, and a run
     /// of it would leave the person's files unwatched; or a path of its lists is not a plain path
-    /// relative to the person's home, or a file is in both lists.
-    pub fn of(application: &str, guarded: &[String], shared: &[String]) -> Result<Self, String> {
+    /// relative to the person's home, or a file is in both lists, or a path that must be absent
+    /// names a guarded or shared file.
+    pub fn of(
+        application: &str,
+        guarded: &[String],
+        shared: &[String],
+        absent: &[String],
+    ) -> Result<Self, String> {
         if application == "codex" {
             return Ok(Self::Trees(&[".codex"]));
         }
@@ -1458,6 +1482,15 @@ impl PersonPlan {
             return Err(format!(
                 "the entry for {application} names ~/{path} as both a guarded and a shared file, \
                  so the end read would read a guarded file"
+            ));
+        }
+        if let Some((template, file)) = absent.iter().find_map(|template| {
+            names_a_person_file(template, guarded.iter().chain(shared)).map(|file| (template, file))
+        }) {
+            return Err(format!(
+                "the entry for {application} lists {template:?} as a file that must not exist, and \
+                 it names ~/{file}, which the entry also guards or shares: a look at it would be a \
+                 look of a guarded name outside the guard"
             ));
         }
         Ok(Self::Files {
@@ -1521,6 +1554,29 @@ impl PersonGuard {
     /// Returns why the listing is not known.
     pub fn other_agents(&self, agent: &str, run_root: Option<&Path>) -> Result<Vec<u32>, String> {
         self.plan.other_agents(agent, run_root)
+    }
+
+    /// [`absent_below`] for a path of the entry's absent list. A look that does not show the
+    /// absence, for any reason other than the name's not being there, a link on the way included,
+    /// is kept as a failed look where the entry has guarded files: the path may reach a guarded
+    /// name through a link, and every shared read after it is refused. A file that is present is no
+    /// failed look; the caller stops the case. A look that succeeds shows a file as present or
+    /// absent and never reads it.
+    ///
+    /// # Errors
+    ///
+    /// Returns why the absence was not shown.
+    pub fn absent_below(
+        &self,
+        root: &Path,
+        pin: &kr_e2e_m1b::run::RootPin,
+        path: &Path,
+    ) -> Result<bool, String> {
+        let looked = absent_below(root, pin, path);
+        if let (Err(_), Watch::Files(files)) = (&looked, &self.watch) {
+            files.looks.lost();
+        }
+        looked
     }
 
     /// Looks again by metadata alone and says what stops the driver, with what was seen; never a
@@ -4487,7 +4543,7 @@ mod tests {
             .iter()
             .map(|file| (*file).to_owned())
             .collect();
-        PersonPlan::of("claude-code", &guarded, &[".claude.json".to_owned()]).expect("a plan")
+        PersonPlan::of("claude-code", &guarded, &[".claude.json".to_owned()], &[]).expect("a plan")
     }
 
     /// The stops of a guard taken from `home` and compared at the end for the run's name and mark.
@@ -4498,7 +4554,7 @@ mod tests {
     #[test]
     fn an_entry_is_guarded_by_its_own_person_tree_or_its_own_guarded_files() {
         assert_eq!(
-            PersonPlan::of("codex", &[], &[]),
+            PersonPlan::of("codex", &[], &[], &[]),
             Ok(PersonPlan::Trees(&[".codex"]))
         );
         assert_eq!(
@@ -4511,7 +4567,7 @@ mod tests {
                 shared: vec![".claude.json".to_owned()],
             }
         );
-        let refused = PersonPlan::of("qoder-cli", &[], &[]).expect_err("no guard");
+        let refused = PersonPlan::of("qoder-cli", &[], &[], &[]).expect_err("no guard");
         assert!(
             refused.contains("qoder-cli") && refused.contains("no person tree"),
             "{refused}"
@@ -4831,7 +4887,7 @@ mod tests {
         let mut running = waiting_agent(&directory, "codex");
         let id = running.id();
         let seen = listed_with(id, "codex");
-        let plan = PersonPlan::of("codex", &[], &[]).expect("a plan");
+        let plan = PersonPlan::of("codex", &[], &[], &[]).expect("a plan");
         let at_the_start = plan.other_agents("codex", None).expect("a listing");
         let at_the_charge = plan.other_agents("codex", Some(&root)).expect("a listing");
         running.kill().expect("ended by its own handle");
@@ -4917,7 +4973,7 @@ mod tests {
     }
 
     /// What the end read says after the path of a shared file when a look of a guarded name has
-    /// failed.
+    /// failed, has seen a link or has not answered in time.
     const UNLOOKED: &str = "is not read, because a look of a guarded name has failed, has seen a \
                             link or has not answered in time since the run started, and this \
                             file may be the one it names";
@@ -5386,6 +5442,7 @@ mod tests {
             "claude-code",
             &guarded,
             &[".claude.json".to_owned(), ".claude2.json".to_owned()],
+            &[],
         )
         .expect("a plan")
     }
@@ -5672,6 +5729,44 @@ mod tests {
     }
 
     #[test]
+    fn an_absence_look_that_fails_is_a_failed_look_of_the_guard_and_a_present_file_is_not() {
+        let home = claude_home("absence-look");
+        let root = home.join("run");
+        std::fs::create_dir_all(root.join("w")).expect("a directory of the run");
+        let pin = pinned(&root);
+        let guard = claude_plan().take(&home);
+        // A guarded file that is present is a stop for the caller, and no failed look.
+        assert_eq!(
+            guard.absent_below(&root, &pin, &home.join(".claude/settings.json")),
+            Ok(false)
+        );
+        assert!(
+            !files_of(&guard).known().unlooked,
+            "a present file was kept as a failed look"
+        );
+        // The agent makes a folder of the run a link to the person's `.claude`: the look of a path
+        // through it is refused, and it is a failed look.
+        std::os::unix::fs::symlink(home.join(".claude"), root.join("w/.claude")).expect("a link");
+        let said = guard
+            .absent_below(&root, &pin, &root.join("w/.claude/settings.json"))
+            .expect_err("a link on the way is not looked through");
+        assert!(said.contains("symbolic link"), "{said}");
+        assert!(
+            files_of(&guard).known().unlooked,
+            "a failed absence look was not kept"
+        );
+        // A file that no look saw at a guarded name is then moved over the shared name.
+        std::fs::write(home.join("moved"), format!(r#"{{"id":"{RUN_NAME}"}}"#)).expect("a write");
+        std::fs::rename(home.join("moved"), home.join(".claude.json")).expect("a move");
+        let reading = Reading::real();
+        let (stops, _) =
+            files_of(&guard).compare_with(&lstat_in(&home), &reading, &[RUN_NAME, RUN_MARK]);
+        assert_refused_as_unlooked(&stops);
+        assert_eq!(begun(&reading), 0, "a shared file was read");
+        std::fs::remove_dir_all(&home).expect("clean up");
+    }
+
+    #[test]
     fn a_shared_file_larger_than_the_limit_is_refused_and_not_read() {
         let home = claude_home("shared-large");
         // A file of holes, so that it costs nothing to make: a read of it would find the run's
@@ -5941,24 +6036,69 @@ mod tests {
                  `/`"
             );
             assert_eq!(
-                PersonPlan::of("claude-code", &odd, &[]),
+                PersonPlan::of("claude-code", &odd, &[], &[]),
                 Err(said.clone()),
                 "{path:?} as a guarded file"
             );
             assert_eq!(
-                PersonPlan::of("claude-code", &plain, &odd),
+                PersonPlan::of("claude-code", &plain, &odd, &[]),
                 Err(said),
                 "{path:?} as a shared file"
             );
         }
-        assert!(PersonPlan::of("claude-code", &plain, &[".claude.json".to_owned()]).is_ok());
+        assert!(PersonPlan::of("claude-code", &plain, &[".claude.json".to_owned()], &[]).is_ok());
+    }
+
+    #[test]
+    fn a_plan_whose_absent_list_names_a_guarded_or_shared_file_is_refused() {
+        let guarded: Vec<String> = CLAUDE_GUARDED
+            .iter()
+            .map(|file| (*file).to_owned())
+            .collect();
+        let shared = [".claude.json".to_owned()];
+        for template in [
+            "{person}/.claude/settings.json",
+            "{person}/.claude.json",
+            "{ancestors}/.claude/.device-keys.json",
+        ] {
+            let refused = PersonPlan::of("claude-code", &guarded, &shared, &[template.to_owned()])
+                .expect_err("an absent path that names a guarded or shared file");
+            assert!(
+                refused.contains(template) && refused.contains("claude-code"),
+                "{refused}"
+            );
+        }
+        // The claude-code entry's own paths, none of which is a file of the person's home that the
+        // entry guards or shares.
+        let own: Vec<String> = [
+            "{config}/settings.json",
+            "{work}/.claude/settings.json",
+            "{work}/.mcp.json",
+            "/Library/Application Support/ClaudeCode/managed-settings.json",
+            "/Library/Managed Preferences/{user}/com.anthropic.claudecode.plist",
+        ]
+        .iter()
+        .map(|path| (*path).to_owned())
+        .collect();
+        assert!(PersonPlan::of("claude-code", &guarded, &shared, &own).is_ok());
+        // A path of the person's home below a guarded file's directory is not a guarded name.
+        let kimi_guarded = [".kimi-code/config.toml".to_owned()];
+        assert!(
+            PersonPlan::of(
+                "kimi-code-cli",
+                &kimi_guarded,
+                &[],
+                &["{person}/.kimi-code/plugins".to_owned()]
+            )
+            .is_ok()
+        );
     }
 
     #[test]
     fn a_file_in_both_lists_is_refused() {
         let both = vec![".claude/settings.json".to_owned()];
         assert_eq!(
-            PersonPlan::of("claude-code", &both, &both),
+            PersonPlan::of("claude-code", &both, &both, &[]),
             Err(
                 "the entry for claude-code names ~/.claude/settings.json as both a guarded and a \
                  shared file, so the end read would read a guarded file"
