@@ -7399,6 +7399,10 @@ impl kr_ipc::clock::SharedClock for ContinuousThatMovesAfterItsNthReading {
         }
         reading
     }
+
+    fn order_elapsed_ms(&self) -> u64 {
+        self.boot_elapsed_ms()
+    }
 }
 
 /// KR-REQ-09.19: a worker whose clock reading predates the owner's establishment does not spend

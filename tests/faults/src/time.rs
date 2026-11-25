@@ -160,6 +160,10 @@ impl kr_ipc::clock::SharedClock for Continuous {
     fn boot_elapsed_ms(&self) -> u64 {
         self.0.continuous_ms()
     }
+
+    fn order_elapsed_ms(&self) -> u64 {
+        self.boot_elapsed_ms()
+    }
 }
 
 #[derive(Debug)]

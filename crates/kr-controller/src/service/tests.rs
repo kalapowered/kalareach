@@ -47,6 +47,10 @@ impl kr_ipc::clock::SharedClock for SharedSide {
         self.0.pause_once();
         reading
     }
+
+    fn order_elapsed_ms(&self) -> u64 {
+        self.boot_elapsed_ms()
+    }
 }
 
 #[derive(Debug)]

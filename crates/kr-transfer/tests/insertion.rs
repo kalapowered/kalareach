@@ -1408,6 +1408,10 @@ impl kr_ipc::clock::SharedClock for WatchedClock {
             .send(());
         self.now.load(std::sync::atomic::Ordering::SeqCst)
     }
+
+    fn order_elapsed_ms(&self) -> u64 {
+        self.boot_elapsed_ms()
+    }
 }
 
 /// KR-REQ-24.09: a claim that waited for the store is judged by the time it commits at, not by the

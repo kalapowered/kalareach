@@ -21,6 +21,8 @@
 //! wall clock's pace. It is not `mach_continuous_time`, which is `CLOCK_MONOTONIC_RAW`, the same
 //! count with no adjustment, and which `kr_transport::clock` reads. `CLOCK_UPTIME_RAW`, which is
 //! `mach_absolute_time`, stops in sleep and is what [`std::time::Instant`] reads there.
+//! [`order_elapsed_ms`] is the counter for the order of two readings, and on Apple systems it reads
+//! `CLOCK_MONOTONIC_RAW` and not `CLOCK_MONOTONIC`.
 //!
 //! A reading of one of those is comparable between two processes, so a deadline expressed in it is
 //! the same deadline on both sides of the socket and nothing has to guess at what the journey cost.
@@ -52,6 +54,14 @@ use std::time::Duration;
 pub trait SharedClock: Send + Sync + std::fmt::Debug {
     /// Returns milliseconds since this boot.
     fn boot_elapsed_ms(&self) -> u64;
+
+    /// Returns the counter that orders two readings taken in different processes of one boot, in
+    /// milliseconds since this boot: [`order_elapsed_ms`].
+    ///
+    /// An implementer states it. A default of [`Self::boot_elapsed_ms`] would let an implementer
+    /// that forgot to state it read the clock that a clock set can move on Apple systems, and
+    /// nothing would fail.
+    fn order_elapsed_ms(&self) -> u64;
 }
 
 /// The operating system's own continuous clock.
@@ -61,6 +71,10 @@ pub struct SystemSharedClock;
 impl SharedClock for SystemSharedClock {
     fn boot_elapsed_ms(&self) -> u64 {
         boot_elapsed_ms()
+    }
+
+    fn order_elapsed_ms(&self) -> u64 {
+        order_elapsed_ms()
     }
 }
 
@@ -88,6 +102,10 @@ impl ManualSharedClock {
 impl SharedClock for ManualSharedClock {
     fn boot_elapsed_ms(&self) -> u64 {
         self.elapsed.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn order_elapsed_ms(&self) -> u64 {
+        self.boot_elapsed_ms()
     }
 }
 
@@ -243,6 +261,85 @@ pub fn boot_elapsed_ms() -> u64 {
     ))
 }
 
+/// Returns the counter that orders two readings taken in different processes of one boot, in
+/// milliseconds since this boot.
+///
+/// A reading never goes down as the moment it is taken goes up, and it is the same function of the
+/// moment in every process of the boot, whatever the wall clock does. That is all an order of two
+/// readings needs: a reading that lags the true count, one that is truncated and one that moves in
+/// ticks can each only turn a strict order into a tie.
+///
+/// On Linux and Windows it is [`boot_elapsed_ms`]: `CLOCK_BOOTTIME` is one count that no clock set
+/// reaches, and `QueryInterruptTime` is one count that every process reads. On Apple systems it is
+/// not. `CLOCK_MONOTONIC`, which [`boot_elapsed_ms`] reads there, is the wall clock less the boot
+/// time, so it keeps its order only while the kernel moves the boot time with every clock set. This
+/// reads `CLOCK_MONOTONIC_RAW` (`mach_continuous_time`), which counts through sleep, has no
+/// adjustment and is reached by no clock set.
+///
+/// Meaningless across boots.
+#[must_use]
+#[cfg(not(target_vendor = "apple"))]
+pub fn order_elapsed_ms() -> u64 {
+    boot_elapsed_ms()
+}
+
+/// Returns the counter that orders two readings taken in different processes of one boot, in
+/// milliseconds since this boot: `CLOCK_MONOTONIC_RAW` on Apple systems, where
+/// [`boot_elapsed_ms`] reads a clock that a clock set can move.
+///
+/// Meaningless across boots.
+#[must_use]
+#[cfg(target_vendor = "apple")]
+pub fn order_elapsed_ms() -> u64 {
+    apple::raw_elapsed_ms()
+}
+
+/// The raw continuous clock of Apple systems, read through the one call that has no safe
+/// interface.
+///
+/// The workspace forbids unsafe code; this crate denies it and relaxes the rule for this module and
+/// the Windows one, because no safe interface reads `CLOCK_MONOTONIC_RAW` on this platform.
+#[cfg(target_vendor = "apple")]
+mod apple {
+    #![expect(
+        unsafe_code,
+        reason = "the raw continuous clock has no safe interface on this platform"
+    )]
+
+    /// Returns `CLOCK_MONOTONIC_RAW`, in milliseconds since this boot, truncated as
+    /// [`super::from_timespec`] truncates.
+    pub fn raw_elapsed_ms() -> u64 {
+        let mut time = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: the call writes one `timespec` through the pointer it is given and has no other
+        // effect. The pointer is to a live local of exactly that type.
+        let status = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC_RAW, &raw mut time) };
+        debug_assert_eq!(
+            status, 0,
+            "CLOCK_MONOTONIC_RAW is read on every Apple system"
+        );
+        let seconds = u64::try_from(time.tv_sec).unwrap_or_default();
+        let milliseconds = u64::try_from(time.tv_nsec).unwrap_or_default() / 1_000_000;
+        seconds.saturating_mul(1_000).saturating_add(milliseconds)
+    }
+
+    #[cfg(test)]
+    unsafe extern "C" {
+        fn clock_gettime_nsec_np(clock_id: libc::clockid_t) -> u64;
+    }
+
+    /// Returns `CLOCK_MONOTONIC_RAW` in milliseconds through `clock_gettime_nsec_np`, which the
+    /// tests hold the counter against: another call of the system, so a fault in the call the
+    /// counter reads does not show in both.
+    #[cfg(test)]
+    pub fn reference_ms() -> u64 {
+        // SAFETY: the call reads one clock and has no other effect; it takes an identifier by value.
+        unsafe { clock_gettime_nsec_np(libc::CLOCK_MONOTONIC_RAW) / 1_000_000 }
+    }
+}
+
 #[cfg(unix)]
 fn from_timespec(time: rustix::time::Timespec) -> u64 {
     let seconds = u64::try_from(time.tv_sec).unwrap_or_default();
@@ -302,5 +399,120 @@ mod tests {
         assert_eq!(clock.boot_elapsed_ms(), 0);
         clock.advance(Duration::from_millis(1_000));
         assert_eq!(clock.boot_elapsed_ms(), 1_000);
+    }
+
+    /// The Apple counter, read through the handle the daemon holds: it lies between two readings of
+    /// the raw continuous clock that bracket it. The clock `boot_elapsed_ms` reads there is the wall
+    /// clock less the boot time, which can differ from the raw one by more than the bracket, so a
+    /// counter that reads it instead falls outside. Where the two clocks happen to coincide the
+    /// control cannot tell them apart, and the case says so instead of passing as proof.
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn the_order_counter_of_an_apple_host_is_the_raw_continuous_clock() {
+        let clock: std::sync::Arc<dyn SharedClock> = std::sync::Arc::new(SystemSharedClock);
+        let before = apple::reference_ms();
+        let order = clock.order_elapsed_ms();
+        let after = apple::reference_ms();
+        assert!(
+            (before..=after).contains(&order),
+            "the order counter read {order} ms, outside the raw continuous clock's \
+             {before} to {after} ms"
+        );
+        let before = apple::reference_ms();
+        let boot = clock.boot_elapsed_ms();
+        let after = apple::reference_ms();
+        if (before..=after).contains(&boot) {
+            eprintln!(
+                "not detected: this host's two continuous clocks read {boot} ms and {before} ms \
+                 together, so a counter that read the wrong one would pass here"
+            );
+        }
+    }
+
+    /// The name of the variable that makes this test program the second process of the exchange.
+    const EXCHANGE_PEER: &str = "KR_ORDER_COUNTER_EXCHANGE_PEER";
+
+    /// Two processes of one boot read one order counter, in both directions: each reading that the
+    /// other process takes after receiving a message is not below the reading that preceded the
+    /// message, and both name one boot.
+    ///
+    /// This is a premise of the order rule and kills no mutation. A finite exchange cannot show an
+    /// offset smaller than the time the messages take.
+    #[test]
+    fn two_processes_of_one_boot_read_one_order_counter_in_both_directions() {
+        use std::io::{BufRead, Write};
+
+        let epoch = || {
+            crate::identity::boot_epoch(&crate::identity::boot_identity().expect("a boot identity"))
+                .expect("a boot epoch")
+                .get()
+        };
+        if std::env::var_os(EXCHANGE_PEER).is_some() {
+            // The second process: answers each line with the epoch and a reading taken after it.
+            let mut lines = std::io::stdin().lock().lines();
+            let mut out = std::io::stdout().lock();
+            while let Some(Ok(_)) = lines.next() {
+                let reading = order_elapsed_ms();
+                writeln!(out, "reading {:016x} {reading}", epoch()).expect("the answer is written");
+                out.flush().expect("the answer is flushed");
+            }
+            return;
+        }
+
+        let name = module_path!()
+            .split_once("::")
+            .map(|(_, path)| {
+                format!(
+                    "{path}::two_processes_of_one_boot_read_one_order_counter_in_both_directions"
+                )
+            })
+            .expect("a module path");
+        let mut peer = std::process::Command::new(std::env::current_exe().expect("this program"))
+            .args([name.as_str(), "--exact", "--nocapture", "--test-threads=1"])
+            .env(EXCHANGE_PEER, "1")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("the second process starts");
+        let mut to_peer = peer.stdin.take().expect("its input");
+        let mut from_peer =
+            std::io::BufReader::new(peer.stdout.take().expect("its output")).lines();
+
+        let ours = epoch();
+        let mut last = 0_u64;
+        for round in 0..1_000 {
+            let first = order_elapsed_ms();
+            assert!(
+                first >= last,
+                "round {round}: this process read {first} ms after the other had read {last} ms"
+            );
+            writeln!(to_peer, "go").expect("the request is written");
+            to_peer.flush().expect("the request is flushed");
+            let answer = loop {
+                let line = from_peer
+                    .next()
+                    .expect("the second process answers")
+                    .expect("its answer is text");
+                // The test harness of the second process has written the start of its own line
+                // ("test <name> ... ") before the first answer, with no end of line.
+                if let Some((_, answer)) = line.split_once("reading ") {
+                    break answer.to_owned();
+                }
+            };
+            let (theirs, second) = answer.split_once(' ').expect("an epoch and a reading");
+            let second: u64 = second.parse().expect("a reading");
+            assert_eq!(
+                u64::from_str_radix(theirs, 16).expect("an epoch"),
+                ours,
+                "round {round}: the two processes name different boots"
+            );
+            assert!(
+                second >= first,
+                "round {round}: the other process read {second} ms after this one had read {first} ms"
+            );
+            last = second;
+        }
+        drop(to_peer);
+        assert!(peer.wait().expect("the second process ends").success());
     }
 }

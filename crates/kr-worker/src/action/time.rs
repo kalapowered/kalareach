@@ -3895,6 +3895,10 @@ mod tests {
             }
             self.held.continuous.boot_elapsed_ms()
         }
+
+        fn order_elapsed_ms(&self) -> u64 {
+            self.boot_elapsed_ms()
+        }
     }
 
     const HELD_UP: Duration = Duration::from_secs(10);

@@ -1387,6 +1387,10 @@ mod tests {
                 }
                 reading
             }
+
+            fn order_elapsed_ms(&self) -> u64 {
+                self.boot_elapsed_ms()
+            }
         }
 
         let store = Store::new();
@@ -2235,6 +2239,10 @@ mod tests {
                 self.pause.lands();
             }
             reading
+        }
+
+        fn order_elapsed_ms(&self) -> u64 {
+            self.boot_elapsed_ms()
         }
     }
 
