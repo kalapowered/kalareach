@@ -4961,6 +4961,34 @@ mod tests {
     }
 
     #[test]
+    fn a_guarded_file_that_cannot_be_looked_at_after_the_start_stops_the_run() {
+        let home = claude_home("files-unlooked");
+        let guard = claude_plan().take(&home);
+        let Watch::Files(files) = &guard.watch else {
+            panic!("a claude-code plan guards files");
+        };
+        let refused = |relative: &str| -> std::io::Result<Option<Seen>> {
+            if relative == ".claude/settings.json" {
+                Err(std::io::ErrorKind::PermissionDenied.into())
+            } else {
+                seen_by_lstat(&home.join(relative))
+            }
+        };
+        let (stops, evidence) = files.compared(&refused);
+        assert_eq!(
+            stops,
+            vec![(
+                "person_file_unreadable",
+                "~/.claude/settings.json cannot be looked at after the run: permission denied"
+                    .to_owned()
+            )]
+        );
+        assert_eq!(evidence[2]["unreadable"], json!(true));
+        assert_eq!(evidence[0].get("unreadable"), None);
+        std::fs::remove_dir_all(&home).expect("clean up");
+    }
+
+    #[test]
     fn a_path_of_the_lists_that_is_not_plain_and_relative_is_refused() {
         let plain = vec![".claude/settings.json".to_owned()];
         for path in [
