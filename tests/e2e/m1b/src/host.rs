@@ -1682,6 +1682,34 @@ mod shutdown_tests {
         assert_eq!(worker_session("/tmp/kr-a/b/kr-worker", program), None);
     }
 
+    /// Ends the stand-in's process group when the case ends, passed or failed: the shell's `sleep` is
+    /// another process, and it outlives the shell.
+    struct StandIn(std::process::Child);
+
+    impl std::ops::Deref for StandIn {
+        type Target = std::process::Child;
+
+        fn deref(&self) -> &Self::Target {
+            &self.0
+        }
+    }
+
+    impl std::ops::DerefMut for StandIn {
+        fn deref_mut(&mut self) -> &mut Self::Target {
+            &mut self.0
+        }
+    }
+
+    impl Drop for StandIn {
+        fn drop(&mut self) {
+            let _ = Command::new("/bin/kill")
+                .args(["-KILL", "--", &format!("-{}", self.0.id())])
+                .status();
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
     /// A worker of a second host of the case's own, whose run directory's name begins with this
     /// run's directory's name, is not found in this run's process table, is not recorded, and is
     /// left running when this run's host stops and again when it is dropped; this run's own worker
@@ -1694,20 +1722,17 @@ mod shutdown_tests {
         std::fs::create_dir_all(&other).expect("the second host's directory");
         let run = Run::over(&root);
         let standing_for = |directory: &Path, session: &str| {
-            Command::new("/bin/sh")
-                .arg0(directory.join("b/kr-worker"))
-                .args(["-c", "/bin/sleep 30; true", "--session", session])
-                .stdin(Stdio::null())
-                // A group of its own: the shell's `sleep` is another process, and ending the shell
-                // alone leaves it running with the case's output open.
-                .process_group(0)
-                .spawn()
-                .expect("a process standing for a worker")
-        };
-        let end_group = |stand_in: &std::process::Child| {
-            let _ = Command::new("/bin/kill")
-                .args(["-KILL", "--", &format!("-{}", stand_in.id())])
-                .status();
+            StandIn(
+                Command::new("/bin/sh")
+                    .arg0(directory.join("b/kr-worker"))
+                    .args(["-c", "/bin/sleep 30; true", "--session", session])
+                    .stdin(Stdio::null())
+                    // A group of its own: the shell's `sleep` is another process, and ending the
+                    // shell alone leaves it running with the case's output open.
+                    .process_group(0)
+                    .spawn()
+                    .expect("a process standing for a worker"),
+            )
         };
         let (own_session, foreign_session) = (
             kr_ipc::new_uuid().to_string(),
@@ -1752,11 +1777,8 @@ mod shutdown_tests {
             foreign.try_wait().expect("the other worker").is_none(),
             "the other host's worker still runs after this run's host was dropped"
         );
-        end_group(&foreign);
-        let _ = foreign.kill();
-        let _ = foreign.wait();
-        end_group(&own);
-        let _ = own.wait();
+        drop(foreign);
+        drop(own);
         drop(run);
         std::fs::remove_dir_all(&root).expect("clean up");
         std::fs::remove_dir_all(&other).expect("clean up");
