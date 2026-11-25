@@ -719,6 +719,47 @@ pub struct Mirror {
     pub query: String,
 }
 
+/// The switch that makes the agent ignore every server of its configuration but the ones a command
+/// line names, which is also the bridge's own.
+const STRICT_MCP_CONFIG: &str = "--strict-mcp-config";
+
+/// A step of a real leg before the agent's first start.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Step {
+    /// The entry's isolation probes run.
+    Probes,
+    /// The host applies the recipe of the package's native bridge.
+    Recipe,
+}
+
+/// How the agent is run while the host's native bridge is in place, where a package installs one.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Integrated {
+    /// The switches the agent is given in these parts while the bridge is in place, after its
+    /// arguments and on every probe: [`Account::switches`] without the one that makes the
+    /// agent ignore the bridge's server.
+    pub switches: Vec<String>,
+    /// The commands that say, without calling a model, that with the bridge in place the agent
+    /// loads its server and nothing of the person's own.
+    pub isolated: Vec<Probe>,
+    /// Whether [`Account::isolated`] runs before the host applies the recipe: a probe that lists
+    /// the agent's servers may start each of them, and the bridge's is the forwarder.
+    pub probes_before_the_recipe: bool,
+}
+
+impl Integrated {
+    /// The order the entry gives the two steps in.
+    #[must_use]
+    pub const fn order(&self) -> [Step; 2] {
+        if self.probes_before_the_recipe {
+            [Step::Probes, Step::Recipe]
+        } else {
+            [Step::Recipe, Step::Probes]
+        }
+    }
+}
+
 /// How the parts that need the person's vendor login run the agent. Nothing here is a credential:
 /// a login is named by its kind and where it lives, and a variable by its name.
 #[derive(Clone, Debug, Deserialize)]
@@ -820,6 +861,10 @@ pub struct Account {
     /// its directory ([`Account::allowed_below_config`]).
     #[serde(default)]
     pub allowed: Vec<String>,
+    /// How the agent is run while a native bridge is in place: required of a real leg whose package
+    /// installs one ([`Build::integrated_for`]).
+    #[serde(default)]
+    pub integrated: Option<Integrated>,
     /// The switches that stop the agent updating itself or installing a package of its own accord,
     /// each of which the entry must give the agent (`installs_are_off`).
     #[serde(default)]
@@ -1503,6 +1548,54 @@ impl Build {
         installs_off(&account.installs_off, &variables, &arguments, &files)
     }
 
+    /// What a real leg runs the agent with while its package's native bridge is in place, where
+    /// `installs_a_bridge` says that the package the leg installs asks for the capability that
+    /// installs one: none where it asks for none.
+    ///
+    /// # Errors
+    ///
+    /// Returns what the entry lacks where the package installs a bridge: the account, its
+    /// `integrated`, the probes first, a switch list without `--strict-mcp-config`, or a probe.
+    pub fn integrated_for(&self, installs_a_bridge: bool) -> Result<Option<&Integrated>, String> {
+        if !installs_a_bridge {
+            return Ok(None);
+        }
+        let package = &self.package;
+        let Some(integrated) = self
+            .account
+            .as_ref()
+            .and_then(|account| account.integrated.as_ref())
+        else {
+            return Err(format!(
+                "{package} installs a native bridge, and the entry says nothing of how the agent runs \
+                 with it in place (`account.integrated`)"
+            ));
+        };
+        if integrated.order()[0] != Step::Probes {
+            return Err(format!(
+                "{package} installs a native bridge, and the entry's probes do not run before the \
+                 host applies its recipe"
+            ));
+        }
+        if integrated
+            .switches
+            .iter()
+            .any(|switch| switch == STRICT_MCP_CONFIG)
+        {
+            return Err(format!(
+                "{package} installs a native bridge, and the entry's switches with it in place give \
+                 {STRICT_MCP_CONFIG}, which by the vendor's reference makes the agent ignore the bridge's server"
+            ));
+        }
+        if integrated.isolated.is_empty() {
+            return Err(format!(
+                "{package} installs a native bridge, and the entry has no probe of what the agent \
+                 loads with it in place"
+            ));
+        }
+        Ok(Some(integrated))
+    }
+
     /// Takes out of `variables`, the environment a part's session is to be created with, every
     /// variable the account's `cleared` names but for the ones the build list sets itself, and
     /// returns the names it took out, never a value. A build with no account clears nothing here.
@@ -1927,6 +2020,103 @@ mod tests {
                 why.contains(&format!("{bad:?}")) && (part.is_empty() || why.contains(part)),
                 "{bad}: {why}"
             );
+        }
+    }
+
+    /// An entry whose account carries `integrated`.
+    fn with_integrated(integrated: serde_json::Value) -> Build {
+        let mut entry = entry_json(&serde_json::json!({}), &serde_json::json!({}));
+        entry["account"]["integrated"] = integrated;
+        serde_json::from_value(entry).expect("an entry")
+    }
+
+    /// An `integrated` member that a leg may run with.
+    fn integrated() -> serde_json::Value {
+        serde_json::json!({
+            "switches": ["--setting-sources", "project"],
+            "isolated": [{ "arguments": ["mcp", "list"], "shows": ["kalareach"] }],
+            "probes_before_the_recipe": true
+        })
+    }
+
+    /// The member `integrated` of an account parses, and a member it does not know is refused.
+    #[test]
+    fn the_integrated_member_of_an_account_parses_and_an_unknown_member_of_it_is_refused() {
+        let build = with_integrated(integrated());
+        let read = build
+            .account
+            .as_ref()
+            .and_then(|account| account.integrated.as_ref())
+            .expect("the member");
+        assert_eq!(read.switches, ["--setting-sources", "project"]);
+        assert_eq!(read.isolated.len(), 1);
+        assert_eq!(read.isolated[0].arguments, ["mcp", "list"]);
+        assert!(read.probes_before_the_recipe);
+        let mut unknown = integrated();
+        unknown["strict"] = serde_json::json!(true);
+        let mut entry = entry_json(&serde_json::json!({}), &serde_json::json!({}));
+        entry["account"]["integrated"] = unknown;
+        let refused = serde_json::from_value::<Build>(entry).expect_err("an unknown member");
+        assert!(refused.to_string().contains("strict"), "{refused}");
+    }
+
+    /// The probes come first where the entry says they run before the recipe, and the recipe first
+    /// where it does not.
+    #[test]
+    fn the_probes_run_before_the_recipe_where_the_entry_says_so() {
+        let mut before = integrated();
+        let read = |member: &serde_json::Value| -> [Step; 2] {
+            with_integrated(member.clone())
+                .account
+                .and_then(|account| account.integrated)
+                .expect("the member")
+                .order()
+        };
+        assert_eq!(read(&before), [Step::Probes, Step::Recipe]);
+        before["probes_before_the_recipe"] = serde_json::json!(false);
+        assert_eq!(read(&before), [Step::Recipe, Step::Probes]);
+    }
+
+    /// A leg whose package installs a native bridge is refused for each thing the entry lacks, and
+    /// one whose package installs none is given nothing and needs nothing.
+    #[test]
+    fn a_leg_whose_package_installs_a_bridge_needs_the_entry_to_say_how_the_agent_runs_with_it() {
+        let given = with_integrated(integrated());
+        assert!(
+            given
+                .integrated_for(true)
+                .expect("a leg that may run")
+                .is_some()
+        );
+        // No member at all.
+        let entry = entry_json(&serde_json::json!({}), &serde_json::json!({}));
+        let bare: Build = serde_json::from_value(entry).expect("an entry");
+        let why = bare.integrated_for(true).expect_err("no member");
+        assert!(why.contains("account.integrated"), "{why}");
+        assert!(matches!(bare.integrated_for(false), Ok(None)));
+        // Each member that is not as it must be.
+        for (member, said) in [
+            (
+                serde_json::json!({ "probes_before_the_recipe": false }),
+                "do not run before the host applies its recipe",
+            ),
+            (
+                serde_json::json!({ "switches": ["--strict-mcp-config"] }),
+                "--strict-mcp-config",
+            ),
+            (
+                serde_json::json!({ "isolated": [] }),
+                "no probe of what the agent loads",
+            ),
+        ] {
+            let mut changed = integrated();
+            for (key, value) in member.as_object().expect("a member") {
+                changed[key] = value.clone();
+            }
+            let why = with_integrated(changed)
+                .integrated_for(true)
+                .expect_err("a member that is not as it must be");
+            assert!(why.contains(said), "{said}: {why}");
         }
     }
 

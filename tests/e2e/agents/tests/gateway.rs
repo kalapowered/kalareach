@@ -1944,6 +1944,10 @@ impl Context {
                     &builds,
                     distribution,
                     generation,
+                    match &self.route {
+                        Route::StandIn => None,
+                        Route::Real(real) => Some(&real.build),
+                    },
                 ));
                 *self
                     .package_digest
@@ -2409,12 +2413,18 @@ fn generation_source(environment: &EnvironmentPaths) -> PathBuf {
 /// Publishes the subject's package in a signed generation of its own, whose index names the digest
 /// of `executable` as the one build it qualifies, and installs and enables it in the environment
 /// with the grants it asks for, as the owner's confirmation of that exact installation does.
+///
+/// On a real route, where `build` is the leg's entry, it first refuses the leg when the generation's
+/// entry for the package asks for the capability that installs a native bridge and the build list's
+/// entry does not say how the agent runs with one in place ([`Build::integrated_for`]): every leg
+/// installs its package here, so that none can go on without it.
 async fn install_agent(
     subject: &Subject,
     environment: &EnvironmentPaths,
     executables: &[(PathBuf, String)],
     distribution: &str,
     generation: Option<&Path>,
+    build: Option<&Build>,
 ) -> [u8; 32] {
     if let Some(why) = release_with_generation(subject, generation) {
         panic!("{why}");
@@ -2451,6 +2461,15 @@ async fn install_agent(
     {
         let wanted = generation_entry(directory, &plugin);
         let grant = wanted.grant.clone();
+        if let Some(build) = build {
+            build
+                .integrated_for(
+                    wanted
+                        .grant
+                        .contains(&PluginCapability::NativeBridgeInstall),
+                )
+                .unwrap_or_else(|why| panic!("{ISOLATION_UNPROVEN} {why}"));
+        }
         (
             generations::directory_url(&directory.join("metadata")),
             generations::directory_url(&directory.join("targets")),
