@@ -171,6 +171,11 @@ mod staged_c;
 #[path = "gateway/acp.rs"]
 mod acp;
 
+/// The package the stand-in route installs for an agent other than Codex, written from the release
+/// the run was given.
+#[path = "gateway/package.rs"]
+mod package;
+
 /// The variable naming the build list entry of a real agent; without it the agent is the stand-in.
 const BUILD_VARIABLE: &str = "KR_AGENTS_GATEWAY_BUILD";
 

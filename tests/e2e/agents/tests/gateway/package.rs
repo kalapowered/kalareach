@@ -1,0 +1,335 @@
+//! The package the stand-in route installs for an agent other than Codex.
+//!
+//! The stand-in route has no signed generation that an operator names, so the run publishes one of
+//! its own. For Codex the package is the one this crate keeps. For another agent it is written
+//! here from the release the run was given: the release's manifest and the files that manifest
+//! lists, as the release has them, with one change. A build list entry has no match rules, so the
+//! release's own are replaced by one rule that recognises the entry's command, which is the name
+//! the stand-in program is placed under. The actions, the capabilities, the command integration
+//! and the platforms stay the release's, so the host registers the actions the release declares
+//! and the installation's grant is what the release asks for.
+
+use std::path::Path;
+
+use kr_e2e_agents::subject::Subject;
+use kr_plugin_sdk::digest::PayloadDigest;
+use kr_plugin_sdk::ids::PluginName;
+use kr_plugin_sdk::matching::{ExecutableMatch, MatchConfidence, MatchRule};
+use kr_plugin_sdk::package::MANIFEST_FILE;
+use kr_plugin_sdk::plugin::PluginManifest;
+use kr_plugin_sdk::validate::validate_package_directory;
+use kr_protocol::scalars::Nullable;
+
+/// The one match rule of a written package: the executable named `command`, in any directory,
+/// whatever distribution it came from. A command is a name, never a path: the stand-in is placed
+/// at `t/<command>`.
+fn rule_of(manifest: &PluginManifest, command: &str) -> Result<MatchRule, String> {
+    let id = format!("{}-executable", manifest.plugin_name.as_str());
+    Ok(MatchRule {
+        id: PluginName::new(&id).map_err(|error| format!("{id} is not a rule name: {error}"))?,
+        executable: ExecutableMatch {
+            file_stem: command.to_owned(),
+            path_suffix: Vec::new(),
+            version_range: Nullable(None),
+        },
+        distribution: Nullable(None),
+        confidence: MatchConfidence::Inferred,
+    })
+}
+
+/// Writes the package that `subject` stands for, made from the release in `release`, into `into`,
+/// and returns its manifest.
+///
+/// # Errors
+///
+/// Returns why no package is written: the release has no readable manifest, is another package's
+/// than the subject's, lists a file that is missing or is not the digest the manifest names, or
+/// the written package is not one the host reads.
+pub fn write(subject: &Subject, release: &Path, into: &Path) -> Result<PluginManifest, String> {
+    let manifest_path = release.join(MANIFEST_FILE);
+    let bytes = std::fs::read(&manifest_path).map_err(|error| {
+        format!(
+            "the release's manifest {}: {error}",
+            manifest_path.display()
+        )
+    })?;
+    let mut manifest: PluginManifest = serde_json::from_slice(&bytes).map_err(|error| {
+        format!(
+            "the release's manifest {}: {error}",
+            manifest_path.display()
+        )
+    })?;
+    let named = format!("{}/{}", manifest.publisher_id, manifest.plugin_name);
+    if named != subject.plugin().to_string() {
+        return Err(format!(
+            "the release is of the package {named}, not of the subject's package {}",
+            subject.plugin()
+        ));
+    }
+    manifest.match_rules = vec![rule_of(&manifest, subject.command())?];
+    std::fs::create_dir_all(into)
+        .map_err(|error| format!("a directory for the package {}: {error}", into.display()))?;
+    for payload in &manifest.payloads {
+        let from = release.join(payload.path.as_str());
+        let content = std::fs::read(&from)
+            .map_err(|error| format!("the release's file {}: {error}", from.display()))?;
+        if PayloadDigest::of(&content) != payload.digest {
+            return Err(format!(
+                "the release's file {} does not have the digest the manifest names",
+                payload.path.as_str()
+            ));
+        }
+        let to = into.join(payload.path.as_str());
+        if let Some(parent) = to.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|error| format!("a directory {}: {error}", parent.display()))?;
+        }
+        std::fs::write(&to, content)
+            .map_err(|error| format!("the file {}: {error}", to.display()))?;
+    }
+    let mut text = serde_json::to_string_pretty(&manifest)
+        .map_err(|error| format!("the package's manifest: {error}"))?;
+    text.push('\n');
+    std::fs::write(into.join(MANIFEST_FILE), text)
+        .map_err(|error| format!("the package's manifest: {error}"))?;
+    let validated = validate_package_directory(into);
+    if validated.report.is_valid() {
+        Ok(manifest)
+    } else {
+        Err(format!(
+            "the written package is not one the host reads: {}",
+            validated
+                .report
+                .findings
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("; ")
+        ))
+    }
+}
+
+/// What a synthetic release declares, for the cases that write a package from one.
+#[derive(Clone, Copy, Debug)]
+pub enum Shape {
+    /// Codex's package under another name, with its command integration and backend.
+    Backend,
+    /// Codex's package under another name, with no command integration and terminal input
+    /// requested besides, which no grant of Codex's covers.
+    TerminalInput,
+    /// The SDK's example package under another name: one presentation action, and nothing that the
+    /// repository's ceiling does not already allow.
+    Observed,
+}
+
+/// The synthetic entries the cases write a package for: the plugin, the command and what the
+/// release declares.
+pub const SYNTHETIC: [(&str, &str, Shape); 3] = [
+    ("kalareach/claude-code", "claude", Shape::Backend),
+    ("kalareach/opencode", "opencode", Shape::Observed),
+    ("kalareach/kimi-code-cli", "kimi", Shape::TerminalInput),
+];
+
+/// Writes a release of the package `plugin` for an agent typed as `command` into `into`.
+///
+/// # Panics
+///
+/// Panics where the release cannot be written.
+pub fn release(into: &Path, plugin: &str, command: &str, shape: Shape) {
+    let name = plugin.split_once('/').expect("a plugin identifier").1;
+    if let Shape::Observed = shape {
+        let presentation = kr_plugin_sdk::example::example_presentation_json();
+        let mut manifest = kr_plugin_sdk::example::example_manifest_for(presentation.as_bytes());
+        manifest.plugin_name = PluginName::new(name).expect("a plugin name");
+        std::fs::create_dir_all(into).expect("a directory for the release");
+        let mut text = serde_json::to_string_pretty(&manifest).expect("a manifest");
+        text.push('\n');
+        std::fs::write(into.join(MANIFEST_FILE), text).expect("the release's manifest");
+        std::fs::write(
+            into.join(kr_plugin_sdk::package::PRESENTATION_FILE),
+            presentation,
+        )
+        .expect("the release's presentation");
+        return;
+    }
+    super::generations::copy_tree(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("codex-package"),
+        into,
+    );
+    let path = into.join(MANIFEST_FILE);
+    let mut json: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).expect("the copied manifest"))
+            .expect("a manifest");
+    json["plugin_name"] = serde_json::json!(name);
+    match shape {
+        Shape::Backend => {
+            json["command_integration"]["command"] = serde_json::json!(command);
+        }
+        Shape::TerminalInput => {
+            json.as_object_mut()
+                .expect("a manifest")
+                .remove("command_integration");
+            let capabilities = json["capabilities"].as_array_mut().expect("capabilities");
+            capabilities.retain(|request| request["capability"] != "command_integration.launch");
+            capabilities.push(serde_json::json!({
+                "capability": "terminal.input",
+                "reason": "Type a path at the terminal's prompt when a device attaches a file"
+            }));
+        }
+        Shape::Observed => unreachable!("written above"),
+    }
+    // The connector table names the package it belongs to, and the manifest names its digest.
+    let connector_path = into.join("connector.json");
+    let mut connector: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&connector_path).expect("the copied table"))
+            .expect("a connector table");
+    connector["plugin_id"] = serde_json::json!(plugin);
+    let table = serde_json::to_vec_pretty(&connector).expect("a connector table");
+    std::fs::write(&connector_path, &table).expect("the release's connector table");
+    let payload = json["payloads"]
+        .as_array_mut()
+        .expect("payloads")
+        .iter_mut()
+        .find(|payload| payload["path"] == "connector.json")
+        .expect("the connector table is a payload");
+    payload["digest"] = serde_json::json!(PayloadDigest::of(&table).to_string());
+    payload["size_bytes"] = serde_json::json!(table.len().to_string());
+    let mut text = serde_json::to_string_pretty(&json).expect("a manifest");
+    text.push('\n');
+    std::fs::write(&path, text).expect("the release's manifest");
+}
+
+/// A build list entry for `plugin`, typed as `command`.
+pub fn entry(plugin: &str, command: &str) -> kr_e2e_agents::build::Build {
+    serde_json::from_value(serde_json::json!({
+        "package": plugin, "application": "a", "version": "1", "prefix": "/p",
+        "pinned": format!("bin/{command}"), "sha256": "00", "command": command,
+        "launch": "native", "ready": "r", "harmless": { "input": "h", "shows": "h" },
+        "transcript": "t", "missing": {}
+    }))
+    .expect("an entry")
+}
+
+/// A directory of this case's own below the system's temporary one, empty.
+fn scratch(case: &str) -> std::path::PathBuf {
+    let directory = std::env::temp_dir().join(format!("kr-package-{case}-{}", super::mark()));
+    std::fs::create_dir_all(&directory).expect("a directory for the case");
+    directory
+}
+
+/// The subject of `plugin` typed as `command`, whose release of `shape` is written into `release`.
+fn subject_of(release_directory: &Path, plugin: &str, command: &str, shape: Shape) -> Subject {
+    release(release_directory, plugin, command, shape);
+    let manifest: PluginManifest = serde_json::from_slice(
+        &std::fs::read(release_directory.join(MANIFEST_FILE)).expect("the release's manifest"),
+    )
+    .expect("a manifest");
+    Subject::from_build(&entry(plugin, command), &manifest).expect("a subject")
+}
+
+/// The package written for each synthetic entry is a package the host reads, and carries the
+/// version, the actions, the capabilities, the command integration and the platforms of the release
+/// it was written from.
+#[test]
+fn a_written_package_is_valid_and_keeps_what_its_release_declares() {
+    for (plugin, command, shape) in SYNTHETIC {
+        let base = scratch("valid");
+        let subject = subject_of(&base.join("release"), plugin, command, shape);
+        let released: PluginManifest = serde_json::from_slice(
+            &std::fs::read(base.join("release").join(MANIFEST_FILE)).expect("the release"),
+        )
+        .expect("a manifest");
+        let written = write(&subject, &base.join("release"), &base.join("package"))
+            .unwrap_or_else(|why| panic!("{plugin}: {why}"));
+        let on_disk: PluginManifest = serde_json::from_slice(
+            &std::fs::read(base.join("package").join(MANIFEST_FILE)).expect("the package"),
+        )
+        .expect("a manifest");
+        assert_eq!(on_disk, written, "{plugin}: the manifest on disk");
+        assert_eq!(written.version, released.version, "{plugin}");
+        assert_eq!(written.actions, released.actions, "{plugin}");
+        assert_eq!(written.capabilities, released.capabilities, "{plugin}");
+        assert_eq!(
+            written.command_integration, released.command_integration,
+            "{plugin}"
+        );
+        assert_eq!(written.platforms, released.platforms, "{plugin}");
+        assert_eq!(written.payloads, released.payloads, "{plugin}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+}
+
+/// The written package recognises a program by the entry's command and by no other name, and keeps
+/// none of the release's own rules, which name a distribution or a location the stand-in has not.
+#[test]
+fn a_written_package_recognises_the_entrys_command_and_no_other_name() {
+    for (plugin, command, shape) in SYNTHETIC {
+        let base = scratch("rules");
+        let subject = subject_of(&base.join("release"), plugin, command, shape);
+        let written = write(&subject, &base.join("release"), &base.join("package"))
+            .unwrap_or_else(|why| panic!("{plugin}: {why}"));
+        assert_eq!(written.match_rules.len(), 1, "{plugin}");
+        let rule = &written.match_rules[0];
+        assert_eq!(rule.executable.file_stem, command, "{plugin}");
+        assert!(rule.executable.path_suffix.is_empty(), "{plugin}");
+        assert!(rule.distribution.0.is_none(), "{plugin}");
+        assert!(
+            rule.executable.matches_path(&format!("/run/t/{command}")),
+            "{plugin}: the command's own place"
+        );
+        for other in ["codex", "other", &format!("{command}-other")] {
+            assert!(
+                !rule.executable.matches_path(&format!("/run/t/{other}")),
+                "{plugin}: {other}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+}
+
+/// A release of another package than the subject's is refused, naming both.
+#[test]
+fn a_release_of_another_package_than_the_subjects_is_not_written() {
+    let base = scratch("other");
+    let subject = subject_of(
+        &base.join("release"),
+        "kalareach/claude-code",
+        "claude",
+        Shape::Backend,
+    );
+    release(
+        &base.join("other"),
+        "kalareach/gemini-cli",
+        "gemini",
+        Shape::Backend,
+    );
+    let refused = write(&subject, &base.join("other"), &base.join("package"))
+        .expect_err("a release of another package");
+    assert!(
+        refused.contains("kalareach/gemini-cli") && refused.contains("kalareach/claude-code"),
+        "{refused}"
+    );
+    assert!(!base.join("package").join(MANIFEST_FILE).exists());
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// A file of the release whose digest is not the one its manifest names is not written.
+#[test]
+fn a_release_file_without_the_digest_its_manifest_names_is_not_written() {
+    let base = scratch("digest");
+    let subject = subject_of(
+        &base.join("release"),
+        "kalareach/claude-code",
+        "claude",
+        Shape::Backend,
+    );
+    std::fs::write(base.join("release").join("README.md"), "changed").expect("a changed file");
+    let refused = write(&subject, &base.join("release"), &base.join("package"))
+        .expect_err("a file of another digest");
+    assert!(
+        refused
+            .contains("the release's file README.md does not have the digest the manifest names"),
+        "{refused}"
+    );
+    let _ = std::fs::remove_dir_all(&base);
+}
