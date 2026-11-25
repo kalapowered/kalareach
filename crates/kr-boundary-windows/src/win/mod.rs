@@ -41,6 +41,7 @@ pub mod channel;
 pub mod client;
 pub mod ffi;
 pub mod fresh;
+pub mod hold;
 pub mod install;
 pub mod job;
 pub mod journal;

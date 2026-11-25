@@ -24,6 +24,7 @@
 //! | [`journal`] | The journal's records: their framing (a length, the bytes and a checksum, with a torn tail dropped), their rows and the order the rows may come in |
 //! | [`repository`] | What the broker reads of a repository before it starts Git, from bytes alone: its `HEAD`, its attributes, its configuration listing and the output of the five readers it runs |
 //! | [`refusal`] | The refusal those readers give: a kind, the rule's name and a short text |
+//! | [`slot`] | A tree's identity: the keys of its directories from the volume's root, which the hold and the slot name a project by |
 //! | [`records`] | The installation's own records in the data directory, and the order the removal deletes them in |
 //! | [`remedy`] | What a refusal of an entry of the data directory tells the person to do, chosen from what the entry's own handle showed |
 //! | [`names`] | The grammar of the branch names and object identifiers the broker admits |
@@ -79,6 +80,7 @@ pub mod refusal;
 pub mod remedy;
 pub mod repository;
 pub mod setup_args;
+pub mod slot;
 pub mod standing;
 pub mod state;
 pub mod window;

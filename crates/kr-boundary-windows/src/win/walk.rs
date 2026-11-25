@@ -297,7 +297,11 @@ pub enum Verdict {
     Skip,
 }
 
-fn query<T: Default>(handle: &Handle, class: FILE_INFO_BY_HANDLE_CLASS, what: &str) -> Result<T> {
+pub(super) fn query<T: Default>(
+    handle: &Handle,
+    class: FILE_INFO_BY_HANDLE_CLASS,
+    what: &str,
+) -> Result<T> {
     let mut value = T::default();
     // SAFETY: the handle is open and the buffer is the structure the class fills, of the size given.
     let read = unsafe {
@@ -771,6 +775,24 @@ impl DirHandle {
         share_delete: bool,
         disposition: u32,
     ) -> Result<Handle> {
+        let share =
+            FILE_SHARE_READ | FILE_SHARE_WRITE | if share_delete { FILE_SHARE_DELETE } else { 0 };
+        DirHandle::open_beneath_shared(root, name, access, share, disposition)
+    }
+
+    /// As [`DirHandle::open_beneath`], with the sharing mode given whole: what another open of the
+    /// object may ask for while this handle is open.
+    ///
+    /// # Errors
+    ///
+    /// Returns the platform's error when the name cannot be opened or made.
+    pub fn open_beneath_shared(
+        root: &Handle,
+        name: &[u16],
+        access: u32,
+        share: u32,
+        disposition: u32,
+    ) -> Result<Handle> {
         let bytes = name.len() * 2;
         if bytes > usize::from(u16::MAX) {
             // text: walk-10
@@ -794,8 +816,6 @@ impl DirHandle {
         };
         let mut raw: HANDLE = std::ptr::null_mut();
         let mut status_block = IO_STATUS_BLOCK::default();
-        let share =
-            FILE_SHARE_READ | FILE_SHARE_WRITE | if share_delete { FILE_SHARE_DELETE } else { 0 };
         // SAFETY: the name, the attributes and the status block live through the call, the
         // directory handle is open, and the call keeps none of them.
         let status = unsafe {
@@ -826,7 +846,8 @@ impl DirHandle {
 impl DirHandle {
     /// Opens the directory named `name` directly beneath this one, relative to its handle, and
     /// holds it: it must be a directory and not a reparse point, and its final path must be this
-    /// directory's plus the name.
+    /// directory's plus the name (a volume's root is the directory whose path already ends in a
+    /// backslash).
     ///
     /// # Errors
     ///
@@ -856,10 +877,16 @@ impl DirHandle {
             return Ok(Err(Lost::IdentityChanged));
         }
         let path = final_path(&handle)?;
-        let beneath = path.len() == self.path.len() + 1 + name.len()
+        // A volume's root already ends in a backslash; every other directory's path does not.
+        let prefix = if self.path.last() == Some(&u16::from(b'\\')) {
+            self.path.len()
+        } else {
+            self.path.len() + 1
+        };
+        let beneath = path.len() == prefix + name.len()
             && path.starts_with(&self.path)
-            && path[self.path.len()] == u16::from(b'\\')
-            && path[self.path.len() + 1..] == *name;
+            && path[prefix - 1] == u16::from(b'\\')
+            && path[prefix..] == *name;
         if !beneath {
             return Ok(Err(Lost::MovedOut));
         }

@@ -4,6 +4,8 @@
 
 #![allow(dead_code, unsafe_code)]
 
+pub mod people;
+
 use std::ffi::c_void;
 use std::path::{Path, PathBuf};
 use std::process::Command;
