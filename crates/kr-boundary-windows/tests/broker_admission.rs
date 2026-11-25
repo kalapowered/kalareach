@@ -29,21 +29,24 @@ use kr_boundary_windows::win::hold::{
     FOLDER_LINK_WORDS, RULE_FOLDER_CHANGED, RULE_FOLDER_LINK, TreeHold, hold_tree,
 };
 
+use kr_boundary_windows::filekey::FileKey;
 use kr_boundary_windows::frame::Class;
 use kr_boundary_windows::manifest::{Manifest, ObjectKind};
 use kr_boundary_windows::refusal::Refusal;
 use kr_boundary_windows::win::admission::{
     ADMISSION_FAILED_WORDS, Admitted, CASE_SENSITIVE_WORDS, CLOUD_WORDS, DRIVE_WORDS,
-    ENCRYPTED_WORDS, LABEL_WORDS, LIMITS, LINK_WORDS, Limits, NESTED_WORDS, OPEN_WORDS,
-    OWNER_WORDS, PERSON_LACKS_WORDS, PROFILE_WORDS, Probes, RULE_CASE_SENSITIVE, RULE_CLOUD,
-    RULE_DRIVE, RULE_ENCRYPTED, RULE_LABEL, RULE_LINK, RULE_NESTED, RULE_OPEN, RULE_OWNER,
-    RULE_PERSON_LACKS, RULE_PROFILE, RULE_SIBLING, RULE_STALE, RULE_SYSTEM_LACKS, RULE_TOO_LARGE,
-    RULE_WRITER, SIBLING_WORDS, STALE_WORDS, SYSTEM_LACKS_WORDS, TOO_LARGE_WORDS, WRITER_WORDS,
-    admit, admit_within, attributes_refusal, is_cloud_tag, reparse_refusal,
+    ENCRYPTED_WORDS, Expected, HARD_LINK_WORDS, LABEL_WORDS, LIMITS, LINK_WORDS, Limits,
+    NESTED_WORDS, Names, OPEN_WORDS, OWNER_WORDS, PERSON_LACKS_WORDS, PROFILE_WORDS, Probes,
+    RECHECK_LINKS_WORDS, RULE_CASE_SENSITIVE, RULE_CLOUD, RULE_DRIVE, RULE_ENCRYPTED,
+    RULE_HARD_LINK, RULE_LABEL, RULE_LINK, RULE_NESTED, RULE_OPEN, RULE_OWNER, RULE_PERSON_LACKS,
+    RULE_PROFILE, RULE_SIBLING, RULE_STALE, RULE_SYSTEM_LACKS, RULE_TOO_LARGE, RULE_WRITER,
+    Recheck, SIBLING_WORDS, STALE_WORDS, SYSTEM_LACKS_WORDS, TOO_LARGE_WORDS, WRITER_WORDS, admit,
+    admit_within, attributes_refusal, is_cloud_tag, recheck, recheck_refusal, reparse_refusal,
 };
 use kr_boundary_windows::win::ffi::Handle;
 use kr_boundary_windows::win::rights::{Right, Sd, may, probe_token};
 use kr_boundary_windows::win::sd::descriptor_from_text;
+use kr_boundary_windows::win::walk::INSPECT;
 
 use common::disk::Disk;
 use common::people::{Boundary, Person, acting_as, prepare, runs_as_the_system};
@@ -1278,4 +1281,103 @@ fn broker_admission_a_tree_beyond_the_bounds_of_the_walk_is_refused_as_too_large
         assert_eq!(refusal.rule, RULE_TOO_LARGE, "{what}");
         assert_eq!(refusal.detail(), TOO_LARGE_WORDS, "{what}");
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// The names of a file, and the recheck before a write
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn broker_admission_a_file_with_more_than_one_name_is_refused() {
+    if !runs_as_the_system() {
+        eprintln!("skipped: the case needs the system's token");
+        return;
+    }
+    prepare();
+    let person = Person::new("krhap");
+    let siblings = Siblings::new();
+    let scratch = Scratch::on_drive();
+    let project = Project::make_private(&scratch, "names", &person.sid);
+    let file = project.root.join("a.txt");
+    fs::write(&file, b"x").unwrap();
+    // The second name is outside the tree, where a grant of the tree would not reach.
+    fs::hard_link(&file, scratch.path("outside.txt")).unwrap();
+    let refusal = admit_project(&person, &siblings, &project).expect_err("a second name refuses");
+    assert_eq!(refusal.rule, RULE_HARD_LINK);
+    assert_eq!(
+        refusal.detail(),
+        format!("{}: {HARD_LINK_WORDS}", display(&file))
+    );
+}
+
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn broker_admission_a_name_made_after_admission_a_changed_identity_and_a_moved_object_are_seen() {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    use std::os::windows::io::IntoRawHandle as _;
+    if !runs_as_the_system() {
+        eprintln!("skipped: the case needs the system's token");
+        return;
+    }
+    prepare();
+    let person = Person::new("krhap");
+    let scratch = Scratch::on_drive();
+    let project = Project::make_private(&scratch, "recheck", &person.sid);
+    let file = project.root.join("f.txt");
+    fs::write(&file, b"x").unwrap();
+    let moving = project.root.join("g.txt");
+    fs::write(&moving, b"x").unwrap();
+    let hold = held(&person, &project.root);
+    let root = hold.chain.last().unwrap();
+    let children = root.children().unwrap();
+    let listed = |name: &str| {
+        children
+            .iter()
+            .find(|child| child.display() == name)
+            .unwrap()
+    };
+    let expected = |name: &str| Expected {
+        key: listed(name).key,
+        directory: root.path(),
+        name: &listed(name).name,
+    };
+
+    // A file with one name, in its place, is as admitted.
+    let f = root.open_child(listed("f.txt"), INSPECT).unwrap().unwrap();
+    recheck(&f.handle, &expected("f.txt"), Names::One).expect("the object is as admitted");
+
+    // A name made after admission: the actions that need one name stop, the others go on.
+    fs::hard_link(&file, scratch.path("later.txt")).unwrap();
+    let found = recheck(&f.handle, &expected("f.txt"), Names::One).expect_err("a second name");
+    assert!(matches!(found, Recheck::Links), "{found:?}");
+    recheck(&f.handle, &expected("f.txt"), Names::Any).expect("any number of names is accepted");
+    assert_eq!(
+        recheck_refusal(&found, "P").detail(),
+        format!("P: {RECHECK_LINKS_WORDS}")
+    );
+
+    // Another object behind the same name.
+    let mut other = listed("f.txt").key;
+    other.file_id[0] ^= 1;
+    let changed = Expected {
+        key: FileKey { ..other },
+        ..expected("f.txt")
+    };
+    let found = recheck(&f.handle, &changed, Names::Any).expect_err("another identity");
+    assert!(matches!(found, Recheck::Identity), "{found:?}");
+
+    // An object that was moved out of its folder while a handle on it stayed open.
+    let handle = {
+        let open = fs::OpenOptions::new()
+            .access_mode(0x0002_0000 | 0x0080)
+            .share_mode(7)
+            .open(&moving)
+            .unwrap();
+        Handle::new(open.into_raw_handle(), "a file").unwrap()
+    };
+    recheck(&handle, &expected("g.txt"), Names::One).expect("the file is in its place");
+    fs::rename(&moving, scratch.path("moved.txt")).unwrap();
+    let found = recheck(&handle, &expected("g.txt"), Names::One).expect_err("the file moved");
+    assert!(matches!(found, Recheck::Place), "{found:?}");
 }

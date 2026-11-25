@@ -20,11 +20,13 @@
 use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Storage::FileSystem::{
-    FILE_ATTRIBUTE_ENCRYPTED, FILE_ATTRIBUTE_TAG_INFO, FILE_CASE_SENSITIVE_INFO,
-    FileAttributeTagInfo, FileCaseSensitiveInfo,
+    FILE_ATTRIBUTE_ENCRYPTED, FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO,
+    FILE_CASE_SENSITIVE_INFO, FILE_STANDARD_INFO, FileAttributeTagInfo, FileCaseSensitiveInfo,
+    FileStandardInfo,
 };
 use windows_sys::Win32::UI::Shell::GetProfilesDirectoryW;
 
+use crate::filekey::FileKey;
 use crate::frame::Class;
 use crate::frame::invocation::{MAX_DETAIL_BYTES, RefusedKind};
 use crate::manifest::Manifest;
@@ -39,7 +41,10 @@ use super::rights::{
 };
 use super::sd::{Entry as ListEntry, has_label_of_handle, summary_of_handle};
 use super::token::INVOCATION_GROUP_FIRST;
-use super::walk::{Bounds, DirHandle, Entry, INSPECT, Kind, Lost, Verdict, WalkError, query, walk};
+use super::walk::{
+    Bounds, DirHandle, Entry, INSPECT, Kind, Lost, Verdict, WalkError, final_path, key_of, query,
+    walk,
+};
 
 /// The most notes admission keeps; the rest are counted.
 pub const MAX_NOTES: usize = 64;
@@ -68,6 +73,14 @@ pub const RULE_PROFILE: &str = "admission-profile-root";
 pub const RULE_DRIVE: &str = "admission-drive-root";
 /// The rule of a refusal for a tree beyond the bounds of the walk.
 pub const RULE_TOO_LARGE: &str = "admission-tree-too-large";
+/// The rule of a refusal for a file with more than one name.
+pub const RULE_HARD_LINK: &str = "admission-hard-link";
+/// The rule of a refusal for an object that is not the one admitted.
+pub const RULE_RECHECK_IDENTITY: &str = "admission-recheck-identity";
+/// The rule of a refusal for an object that is no longer in the folder where it was admitted.
+pub const RULE_RECHECK_PLACE: &str = "admission-recheck-place";
+/// The rule of a refusal for a file that has gained a name since it was admitted.
+pub const RULE_RECHECK_LINKS: &str = "admission-recheck-links";
 /// The rule of a refusal for a check that could not be made.
 pub const RULE_FAILED: &str = "admission-failed";
 /// The rule of a refusal for an entry that gives another principal a write right in the Git folder.
@@ -149,6 +162,26 @@ pub const PROFILE_WORDS: &str = "this is a user's profile folder; name a folder 
 /// The end of the reply when the tree's root is a drive's root; the path comes before it.
 // text: DRIVE_WORDS
 pub const DRIVE_WORDS: &str = "this is the root of a drive; name a folder inside it";
+
+/// The end of the reply when a file has more than one name; the path comes before it.
+// text: HARD_LINK_WORDS
+pub const HARD_LINK_WORDS: &str =
+    "this file has more than one name, and another name may lie outside the project";
+
+/// The end of the reply when an object is not the one that was admitted; the path comes before it.
+// text: RECHECK_IDENTITY_WORDS
+pub const RECHECK_IDENTITY_WORDS: &str = "this object is not the one the broker admitted";
+
+/// The end of the reply when an object is no longer in the folder where it was admitted; the path
+/// comes before it.
+// text: RECHECK_PLACE_WORDS
+pub const RECHECK_PLACE_WORDS: &str =
+    "this object is no longer in the folder where the broker admitted it";
+
+/// The end of the reply when a file has gained a name since it was admitted; the path comes before
+/// it.
+// text: RECHECK_LINKS_WORDS
+pub const RECHECK_LINKS_WORDS: &str = "this file has gained a name since the broker admitted it";
 
 /// The reply when the tree is beyond the bounds of the walk.
 // text: TOO_LARGE_WORDS
@@ -633,6 +666,9 @@ impl Checking<'_> {
             Kind::Directory => ObjectKind::Directory,
             Kind::ReparsePoint => return Err(link_refusal(&opened.handle, &path)),
         };
+        if kind == ObjectKind::File && opened.links > 1 {
+            return Err(object_refusal(RULE_HARD_LINK, &path, HARD_LINK_WORDS));
+        }
         if let Some(refusal) = attributes_refusal(opened.attributes, &path) {
             return Err(refusal);
         }
@@ -719,6 +755,95 @@ fn is_stale(sid: &str) -> bool {
         && parts[1..]
             .iter()
             .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
+/// How many names the action that follows needs an object to have: the grant and the release of
+/// an object the invocation made need one, and the release of any other object accepts any.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Names {
+    /// The object has one name.
+    One,
+    /// The object has any number of names.
+    Any,
+}
+
+/// What an open handle must still show before a write: the object's identity, and its place, the
+/// final path of the directory it was listed in and its name there.
+#[derive(Clone, Copy, Debug)]
+pub struct Expected<'a> {
+    /// The identity recorded at admission.
+    pub key: FileKey,
+    /// The final path of the directory that listed the object.
+    pub directory: &'a [u16],
+    /// The name the directory listed.
+    pub name: &'a [u16],
+}
+
+/// What a recheck found different from what admission recorded.
+#[derive(Debug)]
+pub enum Recheck {
+    /// The handle is another object.
+    Identity,
+    /// The object has become a link.
+    Link,
+    /// The object is no longer directly beneath its directory.
+    Place,
+    /// The object has more names than the action allows.
+    Links,
+    /// The platform refused a read, so nothing is shown.
+    Os(ffi::Error),
+}
+
+/// Reads again, from the object's own handle, what must hold before the broker writes to the
+/// object: the same volume and identity, not a link, the same final path beneath its directory,
+/// and the number of names the action needs. A file with several names may show any of them as its
+/// final path, so its place is not shown by it.
+///
+/// # Errors
+///
+/// Returns what differs, or the platform's error when a read is refused.
+pub fn recheck(handle: &Handle, expected: &Expected<'_>, names: Names) -> Result<(), Recheck> {
+    if key_of(handle).map_err(Recheck::Os)? != expected.key {
+        return Err(Recheck::Identity);
+    }
+    let tag: FILE_ATTRIBUTE_TAG_INFO = query(
+        handle,
+        FileAttributeTagInfo,
+        "reading an object's attributes",
+    )
+    .map_err(Recheck::Os)?;
+    if tag.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(Recheck::Link);
+    }
+    let standard: FILE_STANDARD_INFO =
+        query(handle, FileStandardInfo, "reading an object's names").map_err(Recheck::Os)?;
+    if names == Names::One && standard.NumberOfLinks != 1 {
+        return Err(Recheck::Links);
+    }
+    if standard.Directory || standard.NumberOfLinks == 1 {
+        let path = final_path(handle).map_err(Recheck::Os)?;
+        let (directory, name) = (expected.directory, expected.name);
+        let beneath = path.len() == directory.len() + 1 + name.len()
+            && path.starts_with(directory)
+            && path[directory.len()] == u16::from(b'\\')
+            && path[directory.len() + 1..] == *name;
+        if !beneath {
+            return Err(Recheck::Place);
+        }
+    }
+    Ok(())
+}
+
+/// The refusal for a recheck that found a difference, naming the object.
+#[must_use]
+pub fn recheck_refusal(found: &Recheck, path: &str) -> Refusal {
+    match found {
+        Recheck::Identity => object_refusal(RULE_RECHECK_IDENTITY, path, RECHECK_IDENTITY_WORDS),
+        Recheck::Link => object_refusal(RULE_LINK, path, LINK_WORDS),
+        Recheck::Place => object_refusal(RULE_RECHECK_PLACE, path, RECHECK_PLACE_WORDS),
+        Recheck::Links => object_refusal(RULE_RECHECK_LINKS, path, RECHECK_LINKS_WORDS),
+        Recheck::Os(failure) => failed(failure),
+    }
 }
 
 /// Admits the held tree or refuses it, naming the object and the right.
