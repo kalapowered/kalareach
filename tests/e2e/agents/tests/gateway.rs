@@ -1108,7 +1108,9 @@ fn judged(probe: &Probe, answer: &Answer) -> Result<(), String> {
 const EVIDENCE_VARIABLE: &str = "KR_AGENTS_GATEWAY_EVIDENCE";
 
 /// The most rows of one answer the probe-only run records, the most characters of each, and the
-/// most characters of all the probes' rows together.
+/// most bytes of all the probes' rows together. `RECORDED_TOTAL_CHARS` counts bytes, not
+/// characters: a row of non-ASCII text uses more of it, so the bound can come sooner and refuse a
+/// probe, and it never adopts one wrongly.
 const RECORDED_ROWS: usize = 400;
 const RECORDED_ROW_CHARS: usize = 240;
 const RECORDED_TOTAL_CHARS: usize = 96 * 1024;
@@ -1185,7 +1187,7 @@ struct RecordedRows {
 
 /// The rows of `text` the record keeps for `probe`, in order: every feature row and every row that
 /// holds a text the probe expects or refuses (spaces and case aside), each cut to
-/// [`RECORDED_ROW_CHARS`], at most [`RECORDED_ROWS`] of them and at most `total_left` characters
+/// [`RECORDED_ROW_CHARS`], at most [`RECORDED_ROWS`] of them and at most `total_left` bytes
 /// of all the probes' together, which it takes from; with each row that was cut, the reasons rows
 /// are missing, and how many non-empty rows of the whole answer are not kept because they are
 /// neither a feature row nor such a row.
@@ -1262,9 +1264,9 @@ fn lists_features(probe: &Probe) -> bool {
 /// whole answer), what is missing from the rows, how many non-empty rows were left out of those (the
 /// reviewers read them in the whole answer that was kept), and whether the record may be adopted:
 /// only where the probe answered and ended as a probe must, the whole answer is kept, no key was
-/// found in it, no row is missing from the record and, for the feature list, no non-empty row was
-/// left out. A row cut to [`RECORDED_ROW_CHARS`] does not refuse it: the whole answer, with its
-/// digest, is the evidence, and the record names the row.
+/// found in it, no relevant row is missing from the record and, for the feature list, no non-empty
+/// row was left out. A row cut to [`RECORDED_ROW_CHARS`] does not refuse it: the whole answer, with
+/// its digest, is the evidence, and the record names the row.
 fn probe_record(
     probe: &Probe,
     answer: &Answer,
@@ -8914,7 +8916,7 @@ fn a_probe_only_record_names_the_expectation_of_the_pinned_entry_the_answer_miss
 }
 
 /// The probe and the answer of the newer Codex build's `debug prompt-input`: a relevant row of 3,995
-/// characters on the second line, among rows the record does not keep, 10,000 bytes in all.
+/// characters on the second line, among rows the record does not keep, 9,723 bytes in all.
 fn a_prompt_input_answer_with_a_long_row() -> (Probe, String) {
     let probe = a_probe(serde_json::json!({
         "arguments": ["debug", "prompt-input"],
@@ -8979,7 +8981,7 @@ fn a_probe_whose_only_cut_is_a_relevant_row_is_adopted_on_its_whole_kept_answer(
 
 /// A cut row adopts nothing by itself: the probe stays refused where its whole answer is not kept,
 /// where a key was found, where it is the feature list with a row left out, or where rows are missing
-/// from the record altogether, each with the same cut row that a kept answer would carry.
+/// from the record altogether. The record names a cut row only where it keeps that row.
 #[test]
 fn a_cut_row_does_not_adopt_a_probe_that_is_refused_for_another_reason() {
     let (probe, text) = a_prompt_input_answer_with_a_long_row();
