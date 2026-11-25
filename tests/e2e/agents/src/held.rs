@@ -1461,7 +1461,7 @@ impl PersonPlan {
     /// # Panics
     ///
     /// Panics when a tree or a file cannot be looked at, for any reason other than its not being
-    /// there.
+    /// there, or when a file the guard names is a symbolic link.
     #[must_use]
     pub fn take(self, home: &Path) -> PersonGuard {
         let watch = match &self {
@@ -1535,6 +1535,8 @@ struct Stamp {
 struct Seen {
     stamp: Stamp,
     owner: u32,
+    /// Whether the name is a symbolic link.
+    link: bool,
 }
 
 /// How `path` stands by `lstat` alone: none where it is not there. No link is followed at its last
@@ -1551,6 +1553,7 @@ fn seen_by_lstat(path: &Path) -> std::io::Result<Option<Seen>> {
                 modified: (metadata.mtime(), metadata.mtime_nsec()),
             },
             owner: metadata.uid(),
+            link: metadata.file_type().is_symlink(),
         })),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error),
@@ -1560,7 +1563,9 @@ fn seen_by_lstat(path: &Path) -> std::io::Result<Option<Seen>> {
 /// An entry's named files of the person's home, as `lstat` showed them before a driver started
 /// anything, and the check that none of the guarded ones changed. A guarded file is looked at by
 /// `lstat` alone, never read: its kind, permissions, inode, size and times are compared, and its
-/// owner on its own. A shared file, which the person's own sessions also write, is not looked at
+/// owner on its own. A guarded name that is a symbolic link is refused when the guard is taken,
+/// since a write through it changes the target and not the link, and so is a shared name, which
+/// would not be read. A shared file, which the person's own sessions also write, is not looked at
 /// until the end of the run, and is then read once for the run's directory name and mark; nothing
 /// of what is read is kept. A write to a file that is not named, a transcript below
 /// `~/.claude/projects` among them, is not seen. What is said is the path the entry names and
@@ -1577,20 +1582,39 @@ impl FileGuard {
     ///
     /// # Panics
     ///
-    /// Panics when a guarded file cannot be looked at, for any reason other than its not being
-    /// there: a file whose state is not known cannot be shown unchanged.
+    /// Panics when a guarded or a shared file cannot be looked at, for any reason other than its
+    /// not being there, or is a symbolic link: a file whose state is not known cannot be shown
+    /// unchanged, and a link would hide the file it points to.
     fn take(home: &Path, guarded: &[String], shared: &[String]) -> Self {
+        let look = |relative: &String| {
+            seen_by_lstat(&home.join(relative)).unwrap_or_else(|error| {
+                panic!("the person's file ~/{relative} cannot be looked at: {error}")
+            })
+        };
+        let guarded: Vec<(String, Option<Seen>)> = guarded
+            .iter()
+            .map(|relative| {
+                let seen = look(relative);
+                assert!(
+                    !seen.is_some_and(|seen| seen.link),
+                    "the person's file ~/{relative} is a symbolic link, which the guard does not \
+                     follow, so a write to its target would go unseen: replace the link with a \
+                     file before a real run"
+                );
+                (relative.clone(), seen)
+            })
+            .collect();
+        for relative in shared {
+            assert!(
+                !look(relative).is_some_and(|seen| seen.link),
+                "the person's file ~/{relative} is a symbolic link, which the guard does not \
+                 read, so it could not be searched for the run's name at the end: replace the \
+                 link with a file before a real run"
+            );
+        }
         Self {
             home: home.to_path_buf(),
-            guarded: guarded
-                .iter()
-                .map(|relative| {
-                    let seen = seen_by_lstat(&home.join(relative)).unwrap_or_else(|error| {
-                        panic!("the person's file ~/{relative} cannot be looked at: {error}")
-                    });
-                    (relative.clone(), seen)
-                })
-                .collect(),
+            guarded,
             shared: shared.to_vec(),
         }
     }
@@ -4419,5 +4443,44 @@ mod tests {
             "the charge did not count the process ({} counted)",
             at_the_charge.len()
         );
+    }
+
+    #[test]
+    fn a_link_at_a_guarded_name_is_refused_when_the_guard_is_taken() {
+        let home = claude_home("guarded-link");
+        let target = home.join("elsewhere.json");
+        std::fs::write(&target, b"one").expect("a file");
+        let name = home.join(".claude/settings.json");
+        std::fs::remove_file(&name).expect("removed");
+        std::os::unix::fs::symlink(&target, &name).expect("a link");
+        let taken =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| claude_plan().take(&home)));
+        let why = panic_text(&*taken.expect_err("the take refuses a link at a guarded name"));
+        assert_eq!(
+            why,
+            "the person's file ~/.claude/settings.json is a symbolic link, which the guard does \
+             not follow, so a write to its target would go unseen: replace the link with a file \
+             before a real run"
+        );
+        std::fs::remove_dir_all(&home).expect("clean up");
+    }
+
+    #[test]
+    fn a_link_at_a_shared_name_is_refused_when_the_guard_is_taken() {
+        let home = claude_home("shared-link-at-the-take");
+        let target = home.join("elsewhere.json");
+        std::fs::write(&target, b"one").expect("a file");
+        std::fs::remove_file(home.join(".claude.json")).expect("removed");
+        std::os::unix::fs::symlink(&target, home.join(".claude.json")).expect("a link");
+        let taken =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| claude_plan().take(&home)));
+        let why = panic_text(&*taken.expect_err("the take refuses a link at a shared name"));
+        assert_eq!(
+            why,
+            "the person's file ~/.claude.json is a symbolic link, which the guard does not read, \
+             so it could not be searched for the run's name at the end: replace the link with a \
+             file before a real run"
+        );
+        std::fs::remove_dir_all(&home).expect("clean up");
     }
 }
