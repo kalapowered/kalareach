@@ -424,3 +424,46 @@ fn gateway_claude_recipe_the_sessions_configuration_variable_names_the_directory
         },
     );
 }
+
+/// Disables the claude-code package in the environment, as the owner's change of that installation
+/// does.
+async fn disable_claude_code(environment: &EnvironmentPaths) {
+    let mut catalogue = Catalogue::open(
+        &environment.state_dir().join("catalogue"),
+        Arc::new(RepositoryTransport::local_only(
+            "this test reads its repository from disk",
+        )),
+    )
+    .expect("an openable catalogue");
+    catalogue
+        .set_enabled(environment.environment_id(), &claude_code(), false)
+        .await
+        .expect("disabled");
+}
+
+/// Taking the package out of use removes the recipe's three files and its settings key, and the
+/// person's settings are the bytes they were.
+#[test]
+fn gateway_claude_recipe_the_removal_leaves_the_settings_as_they_were() {
+    in_a_host("claude-recipe-removal", &Variant::default(), |ctx, host| {
+        let configuration = ctx.run.home().join(CLAUDE_CONFIGURATION);
+        assert!(
+            configuration.join(RECIPE_FILES[1]).is_file(),
+            "the recipe is applied before it is removed"
+        );
+        host.kill_daemon();
+        ctx.runtime
+            .block_on(disable_claude_code(host.environment()));
+        host.start_daemon();
+        assert_eq!(
+            files_below(&configuration),
+            ["settings.json"],
+            "the recipe's files are gone"
+        );
+        assert_eq!(
+            std::fs::read_to_string(configuration.join("settings.json")).expect("the settings"),
+            SEEDED_SETTINGS,
+            "the person's settings are the bytes they were"
+        );
+    });
+}
