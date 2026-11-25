@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use rusqlite::Connection;
 use rusqlite::types::ValueRef;
 
-use crate::compare::{Layout, Refusal};
+use crate::compare::{Class, Layout, Refusal};
 use crate::copies::Copies;
 use crate::index::equal_copies;
 use crate::tree::{Kind, Record};
@@ -177,6 +177,7 @@ pub fn compare(layout: &Layout, before: &Tables, now: &Tables) -> Vec<Refusal> {
                 said: format!(
                     "the session journal of {session} cannot be read at the look before: {why}"
                 ),
+                class: Class::FailedLook,
             });
         }
     }
@@ -185,6 +186,7 @@ pub fn compare(layout: &Layout, before: &Tables, now: &Tables) -> Vec<Refusal> {
             refused.push(Refusal {
                 path: journal_path(layout, session),
                 said: format!("the session journal of {session} cannot be read: {why}"),
+                class: Class::FailedLook,
             });
         }
     }
@@ -195,6 +197,7 @@ pub fn compare(layout: &Layout, before: &Tables, now: &Tables) -> Vec<Refusal> {
                 said: format!(
                     "the journal table {name} of {session} changed, appeared or is gone between the kill and the attempt"
                 ),
+                class: Class::Table,
             });
         }
     }

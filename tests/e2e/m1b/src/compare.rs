@@ -437,6 +437,42 @@ pub fn daemon_rows(layout: &Layout) -> Vec<Daemon> {
     rows
 }
 
+/// What a refusal is about, so that a run that must show none can name the kind it showed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Class {
+    /// An entry, or a name beside one, that no row covers.
+    UnknownEntry,
+    /// A look or a copy that failed, so that what it must be compared with is not known.
+    FailedLook,
+    /// A change that a row covers and does not allow.
+    Rule,
+    /// The clock floor.
+    Floor,
+    /// An output-time index.
+    Index,
+    /// A table of a session journal.
+    Table,
+    /// What lies outside the run's two roots.
+    Outside,
+    /// The record of the run's tree, which could not be made.
+    Record,
+}
+
+impl std::fmt::Display for Class {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::UnknownEntry => "an entry that no row covers",
+            Self::FailedLook => "a look or a copy that failed",
+            Self::Rule => "a change that a row does not allow",
+            Self::Floor => "the clock floor",
+            Self::Index => "an output-time index",
+            Self::Table => "a journal table",
+            Self::Outside => "what lies outside the run's roots",
+            Self::Record => "the record of the run's tree",
+        })
+    }
+}
+
 /// A change the compare refuses, said in one line.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Refusal {
@@ -444,6 +480,8 @@ pub struct Refusal {
     pub path: PathBuf,
     /// The change and why it is refused.
     pub said: String,
+    /// What the refusal is about.
+    pub class: Class,
 }
 
 impl std::fmt::Display for Refusal {
@@ -484,6 +522,7 @@ pub fn compare(
         if worker::covers(layout, path) {
             continue;
         }
+        let mut class = Class::Rule;
         let said = if path.starts_with(&layout.programs) {
             Some(
                 "the run's programs may not change: no name is added, and no program is changed, \
@@ -514,7 +553,10 @@ pub fn compare(
                 })
         } else {
             match rows.iter().find(|row| row.covers(path)) {
-                None => Some("no row of the live daemon's files covers this entry".to_owned()),
+                None => {
+                    class = Class::UnknownEntry;
+                    Some("no row of the live daemon's files covers this entry".to_owned())
+                }
                 Some(row) => row.refuses(&changes, interval, uid),
             }
         };
@@ -523,6 +565,7 @@ pub fn compare(
             refusals.push(Refusal {
                 path: path.to_path_buf(),
                 said: format!("{}; {why}", lines.join("; ")),
+                class,
             });
         }
     }

@@ -10,7 +10,7 @@ use std::time::Duration;
 use kr_worker::output_times::{MAX_ROWS, VERSION};
 use rusqlite::Connection;
 
-use crate::compare::{Layout, Refusal};
+use crate::compare::{Class, Layout, Refusal};
 use crate::copies::Copies;
 use crate::run::open_file_below;
 use crate::tree::{Kind, Record};
@@ -250,26 +250,30 @@ pub fn compare(
                 said: format!(
                     "the output-time index of {session} could not be read at the look before, so nothing can be compared with it: {why}"
                 ),
+                class: Class::FailedLook,
             });
         }
     }
     for (session, found) in &now.indexes {
         let path = index_path(layout, session);
-        let mut refuse = |why: String| {
-            refused.push(Refusal {
-                path: path.clone(),
-                said: why,
-            });
-        };
         let rows = match found {
             Ok(Some(rows)) => rows,
             Ok(None) => continue,
             Err(why) => {
-                refuse(format!(
-                    "the output-time index of {session} cannot be read: {why}"
-                ));
+                refused.push(Refusal {
+                    path,
+                    said: format!("the output-time index of {session} cannot be read: {why}"),
+                    class: Class::FailedLook,
+                });
                 continue;
             }
+        };
+        let mut refuse = |why: String| {
+            refused.push(Refusal {
+                path: path.clone(),
+                said: why,
+                class: Class::Index,
+            });
         };
         let before = match base.indexes.get(session) {
             Some(Err(_)) => continue,

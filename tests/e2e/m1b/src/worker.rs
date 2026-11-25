@@ -5,7 +5,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use crate::compare::{Layout, Refusal};
+use crate::compare::{Class, Layout, Refusal};
 use crate::run::RootPin;
 use crate::tree::{Change, Entry, Kind, Record, prefix_digest};
 
@@ -160,12 +160,22 @@ pub fn judge(layout: &Layout, place: Place<'_>, base: &Record, now: &Record, uid
 
 impl Judge<'_> {
     fn refuse(&mut self, path: &Path, why: &str) {
+        self.refuse_as(Class::Rule, path, why);
+    }
+
+    /// Refuses `path` as an entry that no row of the worker's files names.
+    fn refuse_unknown(&mut self, path: &Path, why: &str) {
+        self.refuse_as(Class::UnknownEntry, path, why);
+    }
+
+    fn refuse_as(&mut self, class: Class, path: &Path, why: &str) {
         let lines: Vec<String> = self.changes.get(path).map_or_else(Vec::new, |all| {
             all.iter().map(ToString::to_string).collect()
         });
         self.judged.refusals.push(Refusal {
             path: path.to_path_buf(),
             said: format!("{}; {why}", lines.join("; ")),
+            class,
         });
     }
 
@@ -241,25 +251,25 @@ impl Judge<'_> {
             .filter_map(|part| part.as_os_str().to_str())
             .collect();
         match names.as_slice() {
-            [] => self.refuse(path, W0),
+            [] => self.refuse_unknown(path, W0),
             ["host-cap.lock"] => {
                 let new_and_not_a_file = self.added(path).is_some_and(|now| now.kind != Kind::File);
                 if new_and_not_a_file || self.object_changed(path) {
                     self.refuse(path, W6);
                 }
             }
-            [_] => self.refuse(path, W0),
+            [_] => self.refuse_unknown(path, W0),
             [_, name] => {
                 let segment = cursor_of(name).is_some();
                 let known = segment || *name == BOUNDARY_FILE || *name == BOUNDARY_STAGING;
                 let new_and_not_a_file = self.added(path).is_some_and(|now| now.kind != Kind::File);
                 if !known || new_and_not_a_file {
-                    self.refuse(path, W1);
+                    self.refuse_unknown(path, W1);
                 } else if self.spool_object_changed(path, segment) {
                     self.refuse(path, if segment { W7 } else { W8 });
                 }
             }
-            _ => self.refuse(path, W1),
+            _ => self.refuse_unknown(path, W1),
         }
     }
 
@@ -450,6 +460,7 @@ impl Judge<'_> {
             .filter_map(|part| part.as_os_str().to_str())
             .collect();
         let now = self.added(path);
+        let mut unknown = false;
         let fine = match names.as_slice() {
             [] => {
                 let only_added = self
@@ -482,10 +493,18 @@ impl Judge<'_> {
                         now.kind == Kind::File && now.owner == uid && now.mode & 0o077 == 0
                     })
             }
-            _ => false,
+            _ => {
+                unknown = true;
+                false
+            }
         };
         if !fine {
-            self.refuse(path, W15);
+            let class = if unknown {
+                Class::UnknownEntry
+            } else {
+                Class::Rule
+            };
+            self.refuse_as(class, path, W15);
         }
     }
 
@@ -520,11 +539,13 @@ impl Judge<'_> {
                         Change::Retyped { .. } | Change::Owner { .. } | Change::Mode { .. }
                     )
                 });
-                if !beside_a_journal || new_and_wrong || retyped_or_moved {
+                if !beside_a_journal {
+                    self.refuse_unknown(path, W14);
+                } else if new_and_wrong || retyped_or_moved {
                     self.refuse(path, W14);
                 }
             }
-            _ => self.refuse(path, W14),
+            _ => self.refuse_unknown(path, W14),
         }
     }
 }

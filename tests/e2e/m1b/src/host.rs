@@ -30,7 +30,7 @@ use kr_protocol::ids::EnvironmentId;
 use serde_json::Value;
 
 use crate::LIVENESS;
-use crate::compare::{self, Interval, Layout};
+use crate::compare::{self, Class, Interval, Layout};
 use crate::copies::Copies;
 use crate::floor::{Opening, Readings, Watch};
 use crate::index::{self, Looked};
@@ -259,6 +259,38 @@ pub fn surveyed() -> Vec<String> {
         .clone()
 }
 
+/// What a survey shows that fails a run which wants none of it: a refusal of a compare, with the
+/// class of the refusal, or a list that is incomplete.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Gap {
+    /// A compare of a kill or of an attempt refused.
+    Refused {
+        /// The kill, counted from 1 over the kills of the survey.
+        kill: usize,
+        /// What the refusal is about.
+        class: Class,
+        /// The refusal, as the survey says it.
+        line: String,
+    },
+    /// A look that the survey needs could not be made, or the files it watches did not stand
+    /// still, so that the list of the kill is incomplete.
+    Incomplete {
+        /// The kill.
+        kill: usize,
+        /// Why.
+        why: String,
+    },
+}
+
+/// The gaps every survey host has shown in this process, in the order they were shown.
+static GAPS: Mutex<Vec<Gap>> = Mutex::new(Vec::new());
+
+/// The gaps every survey host has shown so far in this process.
+#[must_use]
+pub fn survey_gaps() -> Vec<Gap> {
+    GAPS.lock().unwrap_or_else(PoisonError::into_inner).clone()
+}
+
 /// How the survey waits after a kill, and how it looks for the files that the worker's
 /// maintenance writes to stand still.
 #[derive(Clone, Copy, Debug)]
@@ -295,6 +327,8 @@ struct Survey {
     changes_to_the_kill: usize,
     /// The lines this host has said.
     lines: Vec<String>,
+    /// The gaps this host has shown.
+    gaps: Vec<Gap>,
 }
 
 impl Survey {
@@ -308,6 +342,14 @@ impl Survey {
                 .push(line.clone());
             self.lines.push(line);
         }
+    }
+
+    /// Shows `gap`: keeps it, for the host and for the process.
+    fn gap(&mut self, gap: Gap) {
+        GAPS.lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(gap.clone());
+        self.gaps.push(gap);
     }
 }
 
@@ -389,9 +431,46 @@ struct Verified {
     /// The tables of the session journals at the latest kill, on a leg where the table check is on.
     tables: Option<Tables>,
     /// What the compares at the kills refused.
-    refused: Vec<String>,
+    refused: Vec<Refused>,
     /// How many daemon starts have followed the start's record.
     starts: usize,
+}
+
+/// One refusal of a compare of a restart, with what it is about.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Refused {
+    class: Class,
+    line: String,
+}
+
+impl Refused {
+    /// The refusals `refusals` of the compare of the tree, an index or a table.
+    fn of(refusals: &[compare::Refusal]) -> Vec<Self> {
+        refusals
+            .iter()
+            .map(|refusal| Self {
+                class: refusal.class,
+                line: refusal.to_string(),
+            })
+            .collect()
+    }
+
+    /// The lines `lines` that a check of one class refused.
+    fn all(class: Class, lines: Vec<String>) -> Vec<Self> {
+        lines.into_iter().map(|line| Self { class, line }).collect()
+    }
+}
+
+/// The gap that the wait after a kill shows when the watched files did not stand still.
+fn gap_of_the_wait(
+    kill: usize,
+    timing: SurveyTiming,
+    stood_still: Option<Duration>,
+) -> Option<Gap> {
+    stood_still.is_none().then(|| Gap::Incomplete {
+        kill,
+        why: standing_still_said(timing, None),
+    })
 }
 
 /// Why one start of the daemon failed.
@@ -1359,9 +1438,11 @@ impl<'r> Host<'r> {
             }
             Err(why) => {
                 restarts.survey.at_the_kill = None;
-                restarts.survey.say(vec![format!(
-                    "survey: kill {kill}: the record at the kill could not be made: {why}"
-                )]);
+                let said = format!("the record at the kill could not be made: {why}");
+                restarts
+                    .survey
+                    .say(vec![format!("survey: kill {kill}: {said}")]);
+                restarts.survey.gap(Gap::Incomplete { kill, why: said });
             }
         }
     }
@@ -1389,7 +1470,7 @@ impl<'r> Host<'r> {
             )
         };
         let stood_still = self.survey_waits(timing, killed);
-        let lines = match self.record() {
+        let (lines, gaps) = match self.record() {
             Ok(now) => {
                 let changes = at_the_kill.changes_to(&now);
                 let state = standing_still_said(timing, stood_still);
@@ -1401,23 +1482,40 @@ impl<'r> Host<'r> {
                 lines.extend(
                     refused
                         .iter()
-                        .map(|line| format!("survey: kill {kill}, refused: {line}")),
+                        .map(|refused| format!("survey: kill {kill}, refused: {}", refused.line)),
                 );
                 lines.push(format!(
                     "survey: kill {kill}: {to_the_kill} change(s) from the agent's start to the \
                      kill and {} from the kill to the attempt; {state}",
                     changes.len()
                 ));
-                lines
+                let mut gaps: Vec<Gap> = refused
+                    .into_iter()
+                    .map(|refused| Gap::Refused {
+                        kill,
+                        class: refused.class,
+                        line: refused.line,
+                    })
+                    .collect();
+                gaps.extend(gap_of_the_wait(kill, timing, stood_still));
+                (lines, gaps)
             }
-            Err(why) => vec![format!(
-                "survey: kill {kill}: the record before the attempt could not be made: {why}; \
-                 this list is incomplete"
-            )],
+            Err(why) => {
+                let said = format!("the record before the attempt could not be made: {why}");
+                (
+                    vec![format!(
+                        "survey: kill {kill}: {said}; this list is incomplete"
+                    )],
+                    vec![Gap::Incomplete { kill, why: said }],
+                )
+            }
         };
         let mut restarts = self.restarts.lock().unwrap_or_else(PoisonError::into_inner);
         restarts.survey.at_the_kill = None;
         restarts.survey.say(lines);
+        for gap in gaps {
+            restarts.survey.gap(gap);
+        }
     }
 
     /// The tables of the journals of the sessions that `record` holds, as they stand, read through
@@ -1503,9 +1601,10 @@ impl<'r> Host<'r> {
         let (indexes, record) = match self.standing() {
             Ok(standing) => standing,
             Err(why) => {
-                verified
-                    .refused
-                    .push(format!("the record at the kill could not be made: {why}"));
+                verified.refused.push(Refused {
+                    class: Class::Record,
+                    line: format!("the record at the kill could not be made: {why}"),
+                });
                 verified.kill = None;
                 return;
             }
@@ -1516,23 +1615,21 @@ impl<'r> Host<'r> {
         };
         let uid = rustix::process::getuid().as_raw();
         let compared = compare::compare(&layout, self.place(), start, &record, interval, uid);
+        verified.refused.extend(Refused::of(&compared.refusals));
         verified
             .refused
-            .extend(compared.refusals.iter().map(ToString::to_string));
-        verified.refused.extend(self.outside_refusals());
+            .extend(Refused::all(Class::Outside, self.outside_refusals()));
         let readings = Readings::now();
-        verified.refused.extend(watch.at_the_kill(readings));
-        verified.refused.extend(
-            index::compare(
-                &layout,
-                &verified.indexes,
-                &indexes,
-                &record,
-                watch.limit(readings),
-            )
-            .iter()
-            .map(ToString::to_string),
-        );
+        verified
+            .refused
+            .extend(Refused::all(Class::Floor, watch.at_the_kill(readings)));
+        verified.refused.extend(Refused::of(&index::compare(
+            &layout,
+            &verified.indexes,
+            &indexes,
+            &record,
+            watch.limit(readings),
+        )));
         if tables::applies(self.stand_in.load(Ordering::SeqCst)) {
             verified.tables = Some(self.look_at_the_journals(&record));
         }
@@ -1541,7 +1638,7 @@ impl<'r> Host<'r> {
 
     /// Before the attempt on a real agent's host: compares the tree with the record made at the
     /// kill, and returns every refusal, those of the kills included.
-    fn verify_before_the_attempt(&self) -> Vec<String> {
+    fn verify_before_the_attempt(&self) -> Vec<Refused> {
         let mut guard = self.restarts.lock().unwrap_or_else(PoisonError::into_inner);
         let restarts = &mut *guard;
         let (Some(verified), Some(watch)) = (restarts.verified.as_mut(), restarts.clock.as_mut())
@@ -1550,15 +1647,19 @@ impl<'r> Host<'r> {
         };
         let mut refused = std::mem::take(&mut verified.refused);
         let Some((killed, killed_indexes)) = verified.kill.clone() else {
-            refused.push("the record at the kill was not made".to_owned());
+            refused.push(Refused {
+                class: Class::Record,
+                line: "the record at the kill was not made".to_owned(),
+            });
             return refused;
         };
         let (indexes, record) = match self.standing() {
             Ok(standing) => standing,
             Err(why) => {
-                refused.push(format!(
-                    "the record before the attempt could not be made: {why}"
-                ));
+                refused.push(Refused {
+                    class: Class::Record,
+                    line: format!("the record before the attempt could not be made: {why}"),
+                });
                 return refused;
             }
         };
@@ -1572,33 +1673,35 @@ impl<'r> Host<'r> {
             Interval::BeforeTheAttempt,
             uid,
         );
-        refused.extend(compared.refusals.iter().map(ToString::to_string));
-        refused.extend(self.outside_refusals());
+        refused.extend(Refused::of(&compared.refusals));
+        refused.extend(Refused::all(Class::Outside, self.outside_refusals()));
         let readings = Readings::now();
-        refused.extend(watch.before_the_attempt(readings));
+        refused.extend(Refused::all(
+            Class::Floor,
+            watch.before_the_attempt(readings),
+        ));
         if let Err(why) = watch.open_again(
             &self.environment.utc_floor_file(),
             self.environment.environment_id(),
         ) {
-            refused.push(why);
+            refused.push(Refused {
+                class: Class::Floor,
+                line: why,
+            });
         }
-        refused.extend(
-            index::compare(
-                &layout,
-                &killed_indexes,
-                &indexes,
-                &record,
-                watch.limit(readings),
-            )
-            .iter()
-            .map(ToString::to_string),
-        );
+        refused.extend(Refused::of(&index::compare(
+            &layout,
+            &killed_indexes,
+            &indexes,
+            &record,
+            watch.limit(readings),
+        )));
         if let Some(before) = &verified.tables {
-            refused.extend(
-                tables::compare(&layout, before, &self.look_at_the_journals(&record))
-                    .iter()
-                    .map(ToString::to_string),
-            );
+            refused.extend(Refused::of(&tables::compare(
+                &layout,
+                before,
+                &self.look_at_the_journals(&record),
+            )));
         }
         refused
     }
@@ -1627,7 +1730,11 @@ impl<'r> Host<'r> {
         }
         let refused = self.verify_before_the_attempt();
         if !refused.is_empty() {
-            leg_not_run(format!("the restart was refused: {}", refused.join("; ")));
+            let lines: Vec<&str> = refused
+                .iter()
+                .map(|refused| refused.line.as_str())
+                .collect();
+            leg_not_run(format!("the restart was refused: {}", lines.join("; ")));
         }
         match self.start_once(ready, liveness) {
             Ok(()) => {}
@@ -2933,6 +3040,24 @@ mod shutdown_tests {
             .clone()
     }
 
+    /// The gaps a survey host has shown.
+    fn gaps_of(host: &Host<'_>) -> Vec<Gap> {
+        host.restarts
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .survey
+            .gaps
+            .clone()
+    }
+
+    /// Whether `gaps` hold a refusal of `class` whose line says `text`.
+    fn refused_as(gaps: &[Gap], class: Class, text: &str) -> bool {
+        gaps.iter().any(|gap| {
+            matches!(gap, Gap::Refused { class: found, line, .. }
+                if *found == class && line.contains(text))
+        })
+    }
+
     /// Gives a survey host no wait after the kill, looks 150 ms apart and one second in all.
     fn survey_quickly(host: &Host<'_>) {
         host.restarts
@@ -3041,6 +3166,15 @@ mod shutdown_tests {
             "{lines:#?}"
         );
         assert!(!said("table requests"), "{lines:#?}");
+        let gaps = gaps_of(&host);
+        assert!(
+            refused_as(
+                &gaps,
+                Class::Table,
+                "the journal table bindings of a1 changed"
+            ),
+            "{gaps:#?}"
+        );
         drop(connection);
         drop(host);
         drop(run);
@@ -3086,9 +3220,104 @@ mod shutdown_tests {
             !refused_at(2),
             "the same file is not refused at a kill that follows a start: {lines:#?}"
         );
+        let gaps = gaps_of(&host);
+        assert!(
+            refused_as(
+                &gaps,
+                Class::Rule,
+                "controller.lock changes only when a daemon starts"
+            ),
+            "{gaps:#?}"
+        );
         drop(host);
         drop(run);
         std::fs::remove_dir_all(&root).expect("clean up");
+    }
+
+    /// The survey shows each refusal with its class: a name no row of the worker's files knows, in
+    /// the spool before the kill and below the output-times directory after it, is an entry that no
+    /// row covers although the refusal does not say so; a journal that cannot be copied or read is a
+    /// failed look; a change of the clock floor's bytes is the clock floor's. None of them says "no
+    /// row of the live daemon's files covers this entry", which is all that a text check of the
+    /// lines would have found.
+    #[test]
+    fn the_survey_names_the_class_of_each_refusal_it_shows() {
+        let root = scratch("survey-classes");
+        let (run, _mark) = host_with_a_kr(&root);
+        let host = host_over(&run);
+        let state = host.environment.state_dir();
+        std::fs::create_dir_all(state.join("spool/s1.log")).expect("a spool");
+        std::fs::write(state.join("spool/s1.log/00000000000000000000.out"), b"0123")
+            .expect("a segment");
+        std::fs::create_dir_all(state.join("output-times")).expect("the index directory");
+        std::fs::create_dir_all(state.join("sessions")).expect("the journals' directory");
+        std::fs::write(state.join("sessions/session-a1.sqlite"), b"not a database")
+            .expect("a journal that cannot be read");
+        host.declares_a_restart(Restart::Survey);
+        host.agent_is_a_stand_in();
+        host.agent_starts();
+        survey_quickly(&host);
+        std::fs::write(state.join("spool/s1.log/other"), b"x").expect("written by the agent");
+        host.survey_the_kill();
+        host.verify_the_kill();
+        std::fs::write(state.join("output-times/other"), b"x").expect("written by the worker");
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(host.environment.utc_floor_file())
+            .and_then(|mut floor| std::io::Write::write_all(&mut floor, b"x"))
+            .expect("a byte appended to the clock floor");
+        host.survey_before_the_attempt();
+        let gaps = gaps_of(&host);
+        for (class, text) in [
+            (Class::UnknownEntry, "spool/s1.log/other: added, a file"),
+            (Class::UnknownEntry, "output-times/other: added, a file"),
+            (
+                Class::FailedLook,
+                "the session journal of a1 cannot be read at the look before",
+            ),
+            (
+                Class::FailedLook,
+                "the session journal of a1 cannot be read: ",
+            ),
+            (
+                Class::Floor,
+                "the clock floor's bytes outside its words changed",
+            ),
+        ] {
+            assert!(
+                refused_as(&gaps, class, text),
+                "{class} ({text}): {gaps:#?}"
+            );
+        }
+        let lines = surveyed_by(&host);
+        assert!(
+            !lines.iter().any(|line| line.contains("other: added")
+                && line.contains("no row of the live daemon's files covers this entry")),
+            "the two unknown names are not found by the text of the old check: {lines:#?}"
+        );
+        drop(host);
+        drop(run);
+        std::fs::remove_dir_all(&root).expect("clean up");
+    }
+
+    /// A survey whose watched files stood still shows no gap for its wait, and one whose files did
+    /// not stand still within the bound shows an incomplete list for its kill.
+    #[test]
+    fn the_wait_after_a_kill_shows_a_gap_only_when_the_files_did_not_stand_still() {
+        let timing = SurveyTiming {
+            after_the_kill: Duration::ZERO,
+            apart: Duration::from_millis(150),
+            at_most: Duration::from_secs(1),
+        };
+        assert_eq!(
+            gap_of_the_wait(2, timing, Some(Duration::from_secs(5))),
+            None
+        );
+        let gap = gap_of_the_wait(2, timing, None);
+        assert!(
+            matches!(&gap, Some(Gap::Incomplete { kill: 2, why }) if why.contains("did not stand still within 1 s")),
+            "{gap:?}"
+        );
     }
 
     /// The survey says each write that no row of the live daemon's files covers as a refusal, made
@@ -3114,6 +3343,15 @@ mod shutdown_tests {
                     && line.ends_with("; no row of the live daemon's files covers this entry")
             });
             assert!(refused, "{name}: {lines:#?}");
+            let gaps = gaps_of(&host);
+            assert!(
+                refused_as(
+                    &gaps,
+                    Class::UnknownEntry,
+                    &format!("s/{name}: added, a file")
+                ),
+                "{name}: {gaps:#?}"
+            );
         }
         drop(host);
         drop(run);
