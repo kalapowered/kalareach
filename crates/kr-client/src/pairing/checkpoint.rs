@@ -18,9 +18,10 @@
 
 use std::collections::BTreeSet;
 use std::fs::TryLockError;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use kr_protocol::backup_checkpoint::HostCheckpoint;
 use kr_protocol::ids::{ArchiveId, BackupGeneration, DeviceId};
 use kr_protocol::scalars::Digest256;
 use kr_protocol::service::GatewayOrigin;
@@ -28,6 +29,7 @@ use serde::{Deserialize, Serialize};
 
 use super::failure::{FailureKind, PairingFailure};
 use super::paired::{PairedHost, read_hosts};
+use crate::recovery::Standing;
 use crate::shown::Shown;
 
 /// The version of the file this release writes and reads.
@@ -117,7 +119,7 @@ impl Told {
     }
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CheckpointsFile {
     version: u32,
@@ -186,6 +188,83 @@ pub enum Acquisition {
     Told,
 }
 
+/// What a host answered when this device asked it for its checkpoint.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Answer {
+    /// The host named a checkpoint.
+    Checkpoint(HostCheckpoint),
+    /// The host had accepted no generation.
+    NothingPublished,
+}
+
+impl Answer {
+    /// What the pairing's `told` entry says once this answer is settled.
+    const fn intended(&self) -> Intended {
+        match self {
+            Self::Checkpoint(_) => Intended::Checkpoint,
+            Self::NothingPublished => Intended::NothingPublished,
+        }
+    }
+}
+
+/// How a settled answer stood against what the file held. No outcome lowers or deletes a
+/// checkpoint.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Outcome {
+    /// The archive had no checkpoint at that service, and now has this one.
+    New,
+    /// The host named a newer generation than the one held, and it replaced it.
+    Raised,
+    /// The host named the generation held, with the manifest held.
+    Same,
+    /// The host named an older generation than the one held, which stays.
+    Lower,
+    /// The host named the generation held with another manifest. The one held stays.
+    Disagrees,
+    /// The host had accepted no generation.
+    NothingPublished,
+    /// The file was replaced, and the directory could not be confirmed to hold it. The file is
+    /// either the old one or the new one, whole.
+    Uncertain,
+}
+
+/// An answer that is part of the file now: the pairing's `told` entry names it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Settled {
+    /// How the answer stood against the file.
+    pub outcome: Outcome,
+    /// What the answer said, which an uncertain outcome does not otherwise tell.
+    pub intended: Intended,
+}
+
+/// An answer that is not part of the file. The pairing's state is as it was, and no held
+/// checkpoint was lowered or deleted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Unsettled {
+    /// The pairing is no longer the host's current one in `hosts.json`. A checkpoint the answer
+    /// raised was taken, and no `told` entry was written.
+    Superseded,
+    /// The answer names a new archive past the bound, or the file would pass the byte cap.
+    Full,
+    /// The answer names generation 0, which no host publishes and the file never holds.
+    Malformed,
+    /// The file or `hosts.json` cannot be read.
+    Unreadable(SnapshotCause),
+    /// Something else holds the lock.
+    Busy,
+    /// The file could not be written, and it was not replaced.
+    WriteFailed,
+}
+
+impl From<Refused> for Unsettled {
+    fn from(refused: Refused) -> Self {
+        match refused.cause {
+            SnapshotCause::Busy => Self::Busy,
+            cause => Self::Unreadable(cause),
+        }
+    }
+}
+
 /// A refusal to read the checkpoints, with the file it is about.
 struct Refused {
     file: Shown,
@@ -200,7 +279,16 @@ struct Refused {
 #[derive(Clone)]
 pub struct PairedCheckpoints {
     directory: PathBuf,
+    /// How the file is replaced. The one value production gives is
+    /// [`kr_ipc::paths::write_owner_only_file`]; a test gives another so that it can count the
+    /// writes, or fail one, which no real directory does on request: the replacement can land and
+    /// the flush of the directory after it fail, and a settle must tell that from a write that never
+    /// began.
+    write: Writer,
 }
+
+/// A function that replaces a file whole.
+type Writer = fn(&Path, &[u8]) -> kr_ipc::Result<()>;
 
 crate::debug_as_name!(PairedCheckpoints);
 
@@ -223,8 +311,18 @@ impl PairedCheckpoints {
     }
 
     /// The checkpoints of a directory that exists.
-    pub(super) const fn at(directory: PathBuf) -> Self {
-        Self { directory }
+    pub(super) fn at(directory: PathBuf) -> Self {
+        Self {
+            directory,
+            write: kr_ipc::paths::write_owner_only_file,
+        }
+    }
+
+    /// These checkpoints, replacing the file through `write`.
+    #[cfg(test)]
+    fn with_writer(mut self, write: Writer) -> Self {
+        self.write = write;
+        self
     }
 
     /// Every checkpoint held and how many owner pairings are unanswered, read under the lock.
@@ -272,6 +370,74 @@ impl PairedCheckpoints {
             Some(Intended::NothingPublished) => Acquisition::NothingPublished,
             Some(Intended::Checkpoint) => Acquisition::Told,
         })
+    }
+
+    /// Settles what the host of pairing `id` answered: at most one write, under the lock, and never
+    /// one that lowers or deletes a checkpoint.
+    ///
+    /// A checkpoint is set against the one held for its archive at its service ([`Standing`]), and
+    /// only a newer generation replaces it. The pairing's `told` entry is written when the pairing
+    /// is still the host's current one and the answer is new or changed; an entry of a pairing that
+    /// has gone is dropped. When the write reports an error, the file is read again: if it holds
+    /// what was meant, the replacement landed and the outcome is [`Outcome::Uncertain`].
+    ///
+    /// # Errors
+    ///
+    /// Returns why nothing was settled, and with [`Unsettled::Superseded`] that the pairing has
+    /// gone, after the checkpoint it named was taken.
+    pub fn settle_checkpoint(
+        &self,
+        id: PairingId,
+        answer: &Answer,
+        now_ms: u64,
+    ) -> Result<Settled, Unsettled> {
+        if matches!(answer, Answer::Checkpoint(given) if given.backup_generation.get() == 0) {
+            return Err(Unsettled::Malformed);
+        }
+        let (_lock, snapshot) = self.snapshot()?;
+        let Snapshot { file, hosts } = snapshot;
+        let current = hosts.iter().any(|host| PairingId::of(host) == id);
+        let intended = answer.intended();
+        let mut next = file.clone();
+        let mut outcome = match answer {
+            Answer::NothingPublished => Outcome::NothingPublished,
+            Answer::Checkpoint(given) => take(&mut next.checkpoints, given, now_ms)?,
+        };
+        next.told
+            .retain(|told| hosts.iter().any(|host| told.is(PairingId::of(host))));
+        if current {
+            match next.told.iter_mut().find(|told| told.is(id)) {
+                Some(told) if told.answer == intended => {}
+                Some(told) => {
+                    told.answer = intended;
+                    told.at_ms = now_ms;
+                }
+                None => next.told.push(Told {
+                    host_device_id: id.host_device_id,
+                    device_id: id.device_id,
+                    answer: intended,
+                    at_ms: now_ms,
+                }),
+            }
+        }
+        if next != file {
+            let bytes = serde_json::to_vec(&next).map_err(|_| Unsettled::WriteFailed)?;
+            if u64::try_from(bytes.len()).map_or(true, |len| len > MAX_FILE_BYTES) {
+                return Err(Unsettled::Full);
+            }
+            let path = self.directory.join(CHECKPOINTS_FILE);
+            if (self.write)(&path, &bytes).is_err() {
+                match self.read_file() {
+                    Ok(read) if read == next => outcome = Outcome::Uncertain,
+                    _ => return Err(Unsettled::WriteFailed),
+                }
+            }
+        }
+        if current {
+            Ok(Settled { outcome, intended })
+        } else {
+            Err(Unsettled::Superseded)
+        }
     }
 
     /// The file, and the paired hosts, read together while the lock is held. The lock is let go
@@ -329,6 +495,44 @@ impl PairedCheckpoints {
             Ok(None) => Ok(CheckpointsFile::empty()),
             Ok(Some(bytes)) => parse(&bytes).map_err(|(cause, why)| refused(cause, why)),
             Err(error) => Err(refused(SnapshotCause::Unreadable, Shown::ipc(&error))),
+        }
+    }
+}
+
+/// Sets `given` against the checkpoint held for its archive at its service, and takes it when it
+/// is newer. A new archive past the bound is refused.
+fn take(
+    held: &mut Vec<PairedCheckpoint>,
+    given: &HostCheckpoint,
+    now_ms: u64,
+) -> Result<Outcome, Unsettled> {
+    let key = |entry: &PairedCheckpoint| {
+        entry.service_origin == given.service_origin && entry.archive_id == given.archive_id
+    };
+    let known = held.iter().any(key);
+    let standing = Standing::of(
+        held.iter()
+            .find(|entry| key(entry))
+            .map(|entry| (entry.backup_generation, &entry.encrypted_manifest_hash)),
+        (given.backup_generation, &given.encrypted_manifest_hash),
+    );
+    match standing {
+        Standing::Same => Ok(Outcome::Same),
+        Standing::Lower => Ok(Outcome::Lower),
+        Standing::Disagrees => Ok(Outcome::Disagrees),
+        Standing::Raises => {
+            if !known && held.len() >= MAX_CHECKPOINTS {
+                return Err(Unsettled::Full);
+            }
+            held.retain(|entry| !key(entry));
+            held.push(PairedCheckpoint {
+                service_origin: given.service_origin.clone(),
+                archive_id: given.archive_id,
+                backup_generation: given.backup_generation,
+                encrypted_manifest_hash: given.encrypted_manifest_hash,
+                taken_at_ms: now_ms,
+            });
+            Ok(if known { Outcome::Raised } else { Outcome::New })
         }
     }
 }
@@ -884,5 +1088,499 @@ mod tests {
             Ok(Some(SnapshotCause::Unreadable)),
             "a FIFO"
         );
+    }
+
+    const NOW: u64 = 1_764_000_100_000;
+
+    fn given(archive: u8, generation: u64) -> Answer {
+        Answer::Checkpoint(host_checkpoint(
+            "https://reach.kala.to",
+            archive,
+            generation,
+            archive,
+        ))
+    }
+
+    fn host_checkpoint(origin: &str, archive: u8, generation: u64, manifest: u8) -> HostCheckpoint {
+        HostCheckpoint {
+            service_origin: GatewayOrigin::new(origin).expect("an origin"),
+            archive_id: ArchiveId::new(Uuid::from_bytes([archive; 16])),
+            backup_generation: BackupGeneration::new(generation),
+            encrypted_manifest_hash: Digest256::from_bytes([manifest; 32]),
+        }
+    }
+
+    fn id(record: &PairedHost) -> PairingId {
+        PairingId::of(record)
+    }
+
+    fn entries(rig: &Rig) -> Vec<(u8, u64)> {
+        let Held::Read { entries, .. } = rig.checkpoints.held_checkpoints() else {
+            panic!("a readable file");
+        };
+        let mut named: Vec<(u8, u64)> = entries
+            .iter()
+            .map(|held| {
+                let archive = (0..=u8::MAX)
+                    .find(|byte| held.archive_id == ArchiveId::new(Uuid::from_bytes([*byte; 16])))
+                    .unwrap_or(0);
+                (archive, held.backup_generation.get())
+            })
+            .collect();
+        named.sort_unstable();
+        named
+    }
+
+    fn answers(rig: &Rig) -> Vec<(PairingId, Intended, u64)> {
+        let bytes = std::fs::read(rig.path(CHECKPOINTS_FILE)).expect("the file");
+        let file: CheckpointsFile = serde_json::from_slice(&bytes).expect("a file");
+        file.told
+            .iter()
+            .map(|told| {
+                (
+                    PairingId {
+                        host_device_id: told.host_device_id,
+                        device_id: told.device_id,
+                    },
+                    told.answer,
+                    told.at_ms,
+                )
+            })
+            .collect()
+    }
+
+    fn settled(outcome: Outcome, intended: Intended) -> Result<Settled, Unsettled> {
+        Ok(Settled { outcome, intended })
+    }
+
+    /// Each outcome of a settle is its own, a held checkpoint never goes down, and the checkpoints
+    /// are read apart from the answers.
+    #[test]
+    fn each_outcome_of_a_settle_is_its_own_and_no_held_checkpoint_goes_down() {
+        let rig = Rig::new();
+        let record = owner(1);
+        rig.hosts.record(record.clone()).expect("recorded");
+        let settle = |answer: Answer| rig.checkpoints.settle_checkpoint(id(&record), &answer, NOW);
+
+        assert_eq!(
+            settle(given(1, 7)),
+            settled(Outcome::New, Intended::Checkpoint)
+        );
+        assert_eq!(entries(&rig), vec![(1, 7)]);
+        assert_eq!(
+            answers(&rig),
+            vec![(id(&record), Intended::Checkpoint, NOW)]
+        );
+        assert_eq!(
+            settle(given(1, 7)),
+            settled(Outcome::Same, Intended::Checkpoint)
+        );
+        assert_eq!(
+            settle(given(1, 9)),
+            settled(Outcome::Raised, Intended::Checkpoint)
+        );
+        assert_eq!(entries(&rig), vec![(1, 9)]);
+        assert_eq!(
+            settle(given(1, 8)),
+            settled(Outcome::Lower, Intended::Checkpoint)
+        );
+        assert_eq!(entries(&rig), vec![(1, 9)], "a lower answer lowers nothing");
+        let other_manifest = Answer::Checkpoint(host_checkpoint("https://reach.kala.to", 1, 9, 77));
+        assert_eq!(
+            settle(other_manifest),
+            settled(Outcome::Disagrees, Intended::Checkpoint)
+        );
+        assert_eq!(entries(&rig), vec![(1, 9)], "the held entry stands");
+        assert_eq!(
+            rig.checkpoints.acquisition(&record),
+            Ok(Acquisition::Told),
+            "a host that disagreed is settled"
+        );
+        assert_eq!(
+            settle(Answer::NothingPublished),
+            settled(Outcome::NothingPublished, Intended::NothingPublished)
+        );
+        assert_eq!(
+            entries(&rig),
+            vec![(1, 9)],
+            "no answer deletes a checkpoint"
+        );
+        assert_eq!(
+            rig.checkpoints.acquisition(&record),
+            Ok(Acquisition::NothingPublished)
+        );
+    }
+
+    /// An answer for a pairing that is no longer the host's current one raises a checkpoint and
+    /// writes no answer.
+    #[test]
+    fn an_answer_of_an_earlier_pairing_raises_a_checkpoint_and_settles_no_pairing() {
+        let rig = Rig::new();
+        let old = owner(1);
+        let mut current = old.clone();
+        current.device_id = DeviceId::new(Uuid::from_bytes([50; 16]));
+        rig.hosts.record(current.clone()).expect("recorded");
+
+        assert_eq!(
+            rig.checkpoints
+                .settle_checkpoint(id(&old), &given(1, 4), NOW),
+            Err(Unsettled::Superseded)
+        );
+        assert_eq!(entries(&rig), vec![(1, 4)], "the checkpoint was taken");
+        assert!(answers(&rig).is_empty(), "no answer was written");
+        assert_eq!(
+            rig.checkpoints.acquisition(&current),
+            Ok(Acquisition::Owed),
+            "the current pairing is still owed"
+        );
+        assert_eq!(
+            rig.checkpoints
+                .settle_checkpoint(id(&old), &Answer::NothingPublished, NOW),
+            Err(Unsettled::Superseded)
+        );
+        assert!(answers(&rig).is_empty());
+    }
+
+    thread_local! {
+        static WRITES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    fn counting(path: &Path, bytes: &[u8]) -> kr_ipc::Result<()> {
+        WRITES.set(WRITES.get() + 1);
+        kr_ipc::paths::write_owner_only_file(path, bytes)
+    }
+
+    /// A write that changes nothing is not made.
+    #[test]
+    fn a_write_that_changes_nothing_is_not_made() {
+        let mut rig = Rig::new();
+        rig.checkpoints = rig.checkpoints.clone().with_writer(counting);
+        let record = owner(1);
+        rig.hosts.record(record.clone()).expect("recorded");
+        let settle = |answer: Answer| rig.checkpoints.settle_checkpoint(id(&record), &answer, NOW);
+        WRITES.set(0);
+
+        settle(given(1, 7)).expect("settled");
+        assert_eq!(WRITES.get(), 1, "a new checkpoint is written");
+        settle(given(1, 7)).expect("settled");
+        settle(given(1, 6)).expect("settled");
+        settle(Answer::Checkpoint(host_checkpoint(
+            "https://reach.kala.to",
+            1,
+            7,
+            99,
+        )))
+        .expect("settled");
+        assert_eq!(
+            WRITES.get(),
+            1,
+            "the same, a lower and a disagreeing answer write nothing"
+        );
+        settle(Answer::NothingPublished).expect("settled");
+        assert_eq!(
+            WRITES.get(),
+            2,
+            "an answer that changes the entry is written"
+        );
+        settle(Answer::NothingPublished).expect("settled");
+        assert_eq!(WRITES.get(), 2, "the same answer again writes nothing");
+    }
+
+    fn fails_before(_: &Path, _: &[u8]) -> kr_ipc::Result<()> {
+        Err(kr_ipc::IpcError::io(
+            "write",
+            "checkpoints.json",
+            std::io::Error::other("no space"),
+        ))
+    }
+
+    /// The write lands and then the directory flush fails, as `write_owner_only_file` reports it.
+    fn fails_after(path: &Path, bytes: &[u8]) -> kr_ipc::Result<()> {
+        kr_ipc::paths::write_owner_only_file(path, bytes)?;
+        Err(kr_ipc::IpcError::io(
+            "flush",
+            "pairing",
+            std::io::Error::other("the directory cannot be flushed"),
+        ))
+    }
+
+    /// A write that fails before the replacement leaves the old file whole, and one that fails after
+    /// it is told apart by reading the file again.
+    #[test]
+    fn a_failure_before_the_replacement_is_a_failure_and_one_after_it_is_uncertain() {
+        let mut rig = Rig::new();
+        let record = owner(1);
+        rig.hosts.record(record.clone()).expect("recorded");
+        rig.checkpoints
+            .settle_checkpoint(id(&record), &given(1, 7), NOW)
+            .expect("settled");
+        let before = std::fs::read(rig.path(CHECKPOINTS_FILE)).expect("the file");
+
+        rig.checkpoints = rig.checkpoints.clone().with_writer(fails_before);
+        assert_eq!(
+            rig.checkpoints
+                .settle_checkpoint(id(&record), &given(1, 9), NOW),
+            Err(Unsettled::WriteFailed)
+        );
+        assert_eq!(
+            std::fs::read(rig.path(CHECKPOINTS_FILE)).expect("the file"),
+            before,
+            "the old file is whole"
+        );
+
+        rig.checkpoints = rig.checkpoints.clone().with_writer(fails_after);
+        assert_eq!(
+            rig.checkpoints
+                .settle_checkpoint(id(&record), &given(1, 9), NOW),
+            settled(Outcome::Uncertain, Intended::Checkpoint)
+        );
+        assert_eq!(entries(&rig), vec![(1, 9)], "the new file stands");
+    }
+
+    /// A new archive past the bound is refused and an archive already held still rises, and an
+    /// answer of generation 0 is never written.
+    #[test]
+    fn the_bound_refuses_a_new_archive_and_generation_zero_is_never_written() {
+        let rig = Rig::new();
+        let record = owner(1);
+        rig.hosts.record(record.clone()).expect("recorded");
+        let full: Vec<PairedCheckpoint> = (0..MAX_CHECKPOINTS)
+            .map(|position| {
+                let mut held = entry(1, 1);
+                held.archive_id = ArchiveId::new(Uuid::from_bytes(
+                    u128::try_from(position + 1).expect("a count").to_be_bytes(),
+                ));
+                held
+            })
+            .collect();
+        rig.write_file(full, Vec::new());
+        let before = std::fs::read(rig.path(CHECKPOINTS_FILE)).expect("the file");
+
+        assert_eq!(
+            rig.checkpoints
+                .settle_checkpoint(id(&record), &given(200, 1), NOW),
+            Err(Unsettled::Full)
+        );
+        assert_eq!(
+            rig.checkpoints
+                .settle_checkpoint(id(&record), &given(1, 0), NOW),
+            Err(Unsettled::Malformed)
+        );
+        assert_eq!(
+            std::fs::read(rig.path(CHECKPOINTS_FILE)).expect("the file"),
+            before,
+            "nothing was written"
+        );
+        let mut known = host_checkpoint("https://reach.kala.to", 1, 5, 1);
+        known.archive_id = ArchiveId::new(Uuid::from_bytes(1_u128.to_be_bytes()));
+        assert_eq!(
+            rig.checkpoints
+                .settle_checkpoint(id(&record), &Answer::Checkpoint(known), NOW),
+            settled(Outcome::Raised, Intended::Checkpoint),
+            "an archive already held still rises at the bound"
+        );
+    }
+
+    /// An answer of a pairing that has gone is dropped at the next settle.
+    #[test]
+    fn an_answer_of_a_pairing_that_is_gone_is_dropped_at_the_next_settle() {
+        let rig = Rig::new();
+        let record = owner(1);
+        let gone = owner(4);
+        rig.hosts.record(record.clone()).expect("recorded");
+        rig.write_file(Vec::new(), vec![told(&gone, Intended::Checkpoint)]);
+
+        rig.checkpoints
+            .settle_checkpoint(id(&record), &Answer::NothingPublished, NOW)
+            .expect("settled");
+        assert_eq!(
+            answers(&rig),
+            vec![(id(&record), Intended::NothingPublished, NOW)]
+        );
+    }
+
+    /// A settle that cannot read the file, or `hosts.json`, writes nothing.
+    #[test]
+    fn a_settle_that_cannot_read_what_it_rests_on_writes_nothing() {
+        let rig = Rig::new();
+        let record = owner(1);
+        rig.hosts.record(record.clone()).expect("recorded");
+        let settle = || {
+            rig.checkpoints
+                .settle_checkpoint(id(&record), &given(1, 3), NOW)
+        };
+
+        kr_ipc::paths::write_owner_only_file(&rig.path(CHECKPOINTS_FILE), b"{").expect("a file");
+        assert_eq!(
+            settle(),
+            Err(Unsettled::Unreadable(SnapshotCause::Unreadable))
+        );
+        rig.write(&serde_json::json!({"version": 2}));
+        assert_eq!(
+            settle(),
+            Err(Unsettled::Unreadable(SnapshotCause::NewerVersion))
+        );
+        assert_eq!(
+            std::fs::read(rig.path(CHECKPOINTS_FILE)).expect("the file"),
+            serde_json::to_vec(&serde_json::json!({"version": 2})).expect("bytes"),
+            "the file a newer release wrote is not replaced"
+        );
+        rig.write_file(Vec::new(), Vec::new());
+        kr_ipc::paths::write_owner_only_file(
+            &rig.path("hosts.json"),
+            b"{\"version\":1,\"hosts\":[{}]}",
+        )
+        .expect("overwritten");
+        assert_eq!(
+            settle(),
+            Err(Unsettled::Unreadable(SnapshotCause::HostsFile))
+        );
+    }
+
+    /// Two archives of one id at two services are two entries, and the answered origin is the key.
+    #[test]
+    fn one_archive_id_at_two_services_is_two_entries() {
+        let rig = Rig::new();
+        let record = owner(1);
+        rig.hosts.record(record.clone()).expect("recorded");
+        let at = |origin: &str, generation: u64| {
+            Answer::Checkpoint(host_checkpoint(origin, 1, generation, 1))
+        };
+        let settle = |answer: Answer| rig.checkpoints.settle_checkpoint(id(&record), &answer, NOW);
+
+        assert_eq!(
+            settle(at("https://one.example", 3)),
+            settled(Outcome::New, Intended::Checkpoint)
+        );
+        assert_eq!(
+            settle(at("https://two.example", 5)),
+            settled(Outcome::New, Intended::Checkpoint),
+            "another service is another entry"
+        );
+        assert_eq!(
+            settle(at("https://one.example", 4)),
+            settled(Outcome::Raised, Intended::Checkpoint)
+        );
+        let Held::Read { entries, .. } = rig.checkpoints.held_checkpoints() else {
+            panic!("a readable file");
+        };
+        let mut held: Vec<(String, u64)> = entries
+            .iter()
+            .map(|held| {
+                (
+                    held.service_origin.as_str().to_owned(),
+                    held.backup_generation.get(),
+                )
+            })
+            .collect();
+        held.sort();
+        assert_eq!(
+            held,
+            vec![
+                ("https://one.example".to_owned(), 4),
+                ("https://two.example".to_owned(), 5)
+            ]
+        );
+    }
+
+    /// A settle waits for the lock and says Busy, and writes nothing.
+    #[test]
+    fn a_settle_waits_for_the_lock_and_says_busy_and_writes_nothing() {
+        let rig = Rig::new();
+        let record = owner(1);
+        rig.hosts.record(record.clone()).expect("recorded");
+        let holder = kr_ipc::paths::open_lock_file(&rig.path(LOCK_FILE)).expect("a lock file");
+        kr_flush::lock::exclusive(&holder).expect("held");
+
+        assert_eq!(
+            rig.checkpoints
+                .settle_checkpoint(id(&record), &given(1, 3), NOW),
+            Err(Unsettled::Busy)
+        );
+        assert!(!rig.path(CHECKPOINTS_FILE).exists(), "nothing was written");
+        kr_flush::lock::release(&holder).expect("released");
+        assert_eq!(
+            rig.checkpoints
+                .settle_checkpoint(id(&record), &given(1, 3), NOW),
+            settled(Outcome::New, Intended::Checkpoint)
+        );
+    }
+
+    /// Handles of one directory, on two threads, never lose each other's entries or lower one.
+    #[test]
+    fn two_handles_settling_beside_each_other_lose_no_entry_and_lower_none() {
+        let rig = Rig::new();
+        let record = owner(1);
+        rig.hosts.record(record.clone()).expect("recorded");
+        let record_id = id(&record);
+        let spawn = |archives: std::ops::Range<u8>| {
+            let checkpoints = rig.hosts.checkpoints();
+            std::thread::spawn(move || {
+                for archive in archives {
+                    checkpoints
+                        .settle_checkpoint(record_id, &given(archive, 1), NOW)
+                        .expect("settled");
+                }
+            })
+        };
+        let (first, second) = (spawn(1..31), spawn(31..61));
+        first.join().expect("the first thread");
+        second.join().expect("the second thread");
+        assert_eq!(entries(&rig).len(), 60, "every entry is there");
+
+        for round in 0..20_u8 {
+            let key = 100 + round;
+            let handles: Vec<_> = [10_u64, 12, 11]
+                .into_iter()
+                .map(|generation| {
+                    let checkpoints = rig.hosts.checkpoints();
+                    std::thread::spawn(move || {
+                        checkpoints.settle_checkpoint(record_id, &given(key, generation), NOW)
+                    })
+                })
+                .collect();
+            for handle in handles {
+                handle.join().expect("a thread").expect("settled");
+            }
+            assert!(
+                entries(&rig).contains(&(key, 12)),
+                "round {round}: generations 10, 12 and 11 end at 12"
+            );
+        }
+    }
+
+    /// A second process settles beside this one under the same lock.
+    #[test]
+    fn a_second_process_settles_beside_this_one() {
+        const CHILD: &str = "KR_CHECKPOINT_TEST_DIRECTORY";
+        if let Ok(directory) = std::env::var(CHILD) {
+            // The child process: it settles thirty archives through a handle of its own.
+            let checkpoints = PairedCheckpoints::open(&directory).expect("the directory");
+            let record = read_hosts(Path::new(&directory)).expect("hosts").remove(0);
+            for archive in 31..61_u8 {
+                checkpoints
+                    .settle_checkpoint(id(&record), &given(archive, 1), NOW)
+                    .expect("settled");
+            }
+            return;
+        }
+        let rig = Rig::new();
+        let record = owner(1);
+        rig.hosts.record(record.clone()).expect("recorded");
+        let mut child = std::process::Command::new(std::env::current_exe().expect("this program"))
+            .args([
+                "--exact",
+                "pairing::checkpoint::tests::a_second_process_settles_beside_this_one",
+            ])
+            .env(CHILD, rig.hosts.directory())
+            .spawn()
+            .expect("the child starts");
+        for archive in 1..31_u8 {
+            rig.checkpoints
+                .settle_checkpoint(id(&record), &given(archive, 1), NOW)
+                .expect("settled");
+        }
+        assert!(child.wait().expect("the child ends").success());
+        assert_eq!(entries(&rig).len(), 60, "both processes' entries are there");
     }
 }

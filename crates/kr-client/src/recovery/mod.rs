@@ -60,6 +60,7 @@ pub use crate::recovery::bundle::{
     fresh_locator,
 };
 pub use crate::recovery::capacity::TRUST_ROOM_BYTES;
+pub(crate) use crate::recovery::checkpoint::Standing;
 pub use crate::recovery::checkpoint::advance_checkpoint;
 pub use crate::recovery::export::{
     ExportSource, ExportedArchive, ExportedObject, MAX_EXPORT_BYTES, OFFLINE_EXPORT_FORMAT,
