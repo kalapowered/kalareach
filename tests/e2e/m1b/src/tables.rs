@@ -170,6 +170,16 @@ pub fn changed(before: &Tables, now: &Tables) -> Vec<(String, String)> {
 #[must_use]
 pub fn compare(layout: &Layout, before: &Tables, now: &Tables) -> Vec<Refusal> {
     let mut refused = Vec::new();
+    for (session, found) in &before.journals {
+        if let Err(why) = found {
+            refused.push(Refusal {
+                path: journal_path(layout, session),
+                said: format!(
+                    "the session journal of {session} cannot be read at the look before: {why}"
+                ),
+            });
+        }
+    }
     for (session, found) in &now.journals {
         if let Err(why) = found {
             refused.push(Refusal {
@@ -230,6 +240,48 @@ mod tests {
     const SETUP: &str = "CREATE TABLE requests (id INTEGER PRIMARY KEY, body TEXT);
         CREATE TABLE bindings (id INTEGER PRIMARY KEY, revision INTEGER);
         INSERT INTO bindings VALUES (1, 1);";
+
+    /// A journal that could not be read at either look is refused: a look before that failed
+    /// refuses though the look now reads the journal, and a look now that failed refuses too.
+    #[test]
+    fn a_journal_that_could_not_be_read_at_either_look_is_refused() {
+        let world = world("tables-failed-look");
+        let read = Tables {
+            journals: BTreeMap::from([(
+                "a1".to_owned(),
+                Ok(BTreeMap::from([("bindings".to_owned(), [1_u8; 32])])),
+            )]),
+        };
+        let failed = Tables {
+            journals: BTreeMap::from([("a1".to_owned(), Err("it is gone".to_owned()))]),
+        };
+        let before = lines(compare(&world.layout, &failed, &read));
+        assert!(
+            before.len() == 1
+                && before[0].contains(
+                    "the session journal of a1 cannot be read at the look before: it is gone"
+                ),
+            "a look before that failed refuses once: {before:#?}"
+        );
+        let now = lines(compare(&world.layout, &read, &failed));
+        assert!(
+            now.len() == 1
+                && now[0].contains("the session journal of a1 cannot be read: it is gone"),
+            "a look now that failed refuses once: {now:#?}"
+        );
+        let both = lines(compare(&world.layout, &failed, &failed));
+        assert_eq!(
+            both.len(),
+            2,
+            "a failure at each look is refused at each: {both:#?}"
+        );
+        assert_eq!(
+            lines(compare(&world.layout, &read, &read)),
+            Vec::<String>::new(),
+            "two reads that agree refuse nothing"
+        );
+        world.clean();
+    }
 
     /// A table changed after the kill is refused by name; the tables the agent's request, binding
     /// and instance changed before the kill are not compared; a table that appears or is gone is

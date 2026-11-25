@@ -766,6 +766,7 @@ impl<'r> Host<'r> {
                 return;
             }
             self.standing().and_then(|(indexes, record)| {
+                index::known(&indexes)?;
                 let clock = self.watch_the_floor()?;
                 restarts.verified = Some(Verified {
                     address: self.configured_address(),
@@ -2829,6 +2830,39 @@ mod shutdown_tests {
             not_run.0.starts_with(
                 "no record could be made before the agent started: the clock floor cannot be \
                  read at the start: "
+            ),
+            "{}",
+            not_run.0
+        );
+        assert!(recorded(&host).is_none());
+        drop(host);
+        drop(run);
+        std::fs::remove_dir_all(&root).expect("clean up");
+    }
+
+    /// An index that cannot be read when the agent starts ends the leg as not run, before the agent
+    /// is launched, and leaves no record: a baseline that could not be read is not the absence of an
+    /// index.
+    #[test]
+    fn an_index_that_cannot_be_read_when_the_agent_starts_ends_the_leg_as_not_run() {
+        let root = scratch("record-index");
+        let (run, _mark) = host_with_a_kr(&root);
+        let host = host_over(&run);
+        let state = host.environment.state_dir();
+        std::fs::create_dir_all(state.join("output-times")).expect("the indexes' directory");
+        std::fs::write(state.join("output-times/s1.sqlite"), b"not a database").expect("an index");
+        host.declares_a_restart(Restart::Declared);
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            host.agent_starts();
+        }))
+        .expect_err("no baseline, no start");
+        let not_run = unwound
+            .downcast_ref::<LegNotRun>()
+            .expect("the leg is not run, it did not fail");
+        assert!(
+            not_run.0.starts_with(
+                "no record could be made before the agent started: the output-time index of s1 \
+                 cannot be read: "
             ),
             "{}",
             not_run.0

@@ -54,6 +54,25 @@ pub struct Looked {
     pub indexes: BTreeMap<String, Result<Option<Rows>, String>>,
 }
 
+/// Whether every index of `looked` was read: the first one that could not be read is the reason a
+/// baseline is unknown.
+///
+/// # Errors
+///
+/// Returns the first index that could not be read, with why.
+pub fn known(looked: &Looked) -> Result<(), String> {
+    match looked
+        .indexes
+        .iter()
+        .find_map(|(session, found)| found.as_ref().err().map(|why| (session, why)))
+    {
+        Some((session, why)) => Err(format!(
+            "the output-time index of {session} cannot be read: {why}"
+        )),
+        None => Ok(()),
+    }
+}
+
 /// The index of `session` below the state directory, relative to the run's directory.
 fn index_path(layout: &Layout, session: &str) -> PathBuf {
     layout
@@ -224,6 +243,16 @@ pub fn compare(
     limit_ms: u64,
 ) -> Vec<Refusal> {
     let mut refused = Vec::new();
+    for (session, found) in &base.indexes {
+        if let Err(why) = found {
+            refused.push(Refusal {
+                path: index_path(layout, session),
+                said: format!(
+                    "the output-time index of {session} could not be read at the look before, so nothing can be compared with it: {why}"
+                ),
+            });
+        }
+    }
     for (session, found) in &now.indexes {
         let path = index_path(layout, session);
         let mut refuse = |why: String| {
@@ -242,11 +271,11 @@ pub fn compare(
                 continue;
             }
         };
-        let before = base
-            .indexes
-            .get(session)
-            .and_then(|found| found.as_ref().ok())
-            .and_then(Option::as_ref);
+        let before = match base.indexes.get(session) {
+            Some(Err(_)) => continue,
+            Some(Ok(found)) => found.as_ref(),
+            None => None,
+        };
         let expected = before.map_or_else(|| vec![VERSION], |before| before.versions.clone());
         if rows.versions != expected {
             refuse(format!(
@@ -553,6 +582,55 @@ mod tests {
             settled::<u8>(|| Err("gone".to_owned())),
             Err("gone".to_owned())
         );
+    }
+
+    /// An index that could not be read at either look is not taken for an absent one: a look before
+    /// that failed refuses whatever the look now finds, and a look now that failed refuses too.
+    #[test]
+    fn an_index_that_could_not_be_read_at_either_look_is_not_taken_for_an_absent_one() {
+        let world = world("index-failed-look");
+        let failed = |why: &str| {
+            let mut looked = Looked::default();
+            looked.indexes.insert("s1".to_owned(), Err(why.to_owned()));
+            looked
+        };
+        let rows = looked(&[VERSION], &recorded());
+        let said = |base: &Looked, now: &Looked| -> Vec<String> {
+            compare(&world.layout, base, now, &world.record(), LIMIT)
+                .iter()
+                .map(ToString::to_string)
+                .collect()
+        };
+        let before = said(
+            &failed("its copies did not become equal within 5 tries"),
+            &rows,
+        );
+        assert!(
+            before.len() == 1
+                && before[0].contains(
+                    "the output-time index of s1 could not be read at the look before, so nothing \
+                     can be compared with it: its copies did not become equal within 5 tries"
+                ),
+            "a look before that failed refuses once: {before:#?}"
+        );
+        let now = said(&rows, &failed("it is gone"));
+        assert!(
+            now.len() == 1
+                && now[0].contains("the output-time index of s1 cannot be read: it is gone"),
+            "a look now that failed refuses once: {now:#?}"
+        );
+        let both = said(&failed("it is gone"), &failed("it is gone"));
+        assert_eq!(
+            both.len(),
+            2,
+            "a failure at each look is refused at each: {both:#?}"
+        );
+        assert_eq!(
+            said(&rows, &rows),
+            Vec::<String>::new(),
+            "two reads that agree refuse nothing"
+        );
+        world.clean();
     }
 
     /// An index that is read as the worker made it gives its rows, an absent one gives none, and a
