@@ -9,10 +9,17 @@
 //! check refuses and never passes: a word moved forward inside the limit is not seen, which is the
 //! stated residual.
 //!
-//! The floor's open once more, before the attempt, maps no file the agent can name: its bytes are
-//! read through the descriptor, written to a file in a directory of the harness's own, and the
-//! product's open runs on that file. An agent that finds that file and truncates it while the
-//! product maps it can still end the harness with a signal.
+//! The floor's open once more, before the attempt, maps no file in this program: the floor's bytes
+//! are read through the descriptor, written to a file in a directory of the harness's own, and the
+//! product's open runs on that file in a program of its own, `kr-e2e-m1b-floor-open`, whose end is
+//! read. An agent that finds the file can cut it, which ends that program with a signal that the
+//! harness reads as a refusal, or replace it after the directory is checked, which can make the
+//! product open another regular file that the agent names, of the floor's length, of the account
+//! and closed to others; the open writes nothing. The program is not bounded in time, because its
+//! open ends for every file the agent can put there: it opens with `O_NONBLOCK` before it looks at
+//! the file's type (`crates/kr-ipc/src/floor.rs:607`), refuses a file that is not a regular one
+//! (`:626`), and maps a file of the floor's length (`:641`, `:653`). A regular file on a filesystem
+//! that has stopped answering is not covered.
 
 use std::fs::File;
 use std::io::Write as _;
@@ -27,7 +34,8 @@ use kr_protocol::ids::{BootEpoch, EnvironmentId};
 use rustix::fs::{AtFlags, Mode, OFlags};
 
 use crate::run::{
-    Removal, RootPin, make_root, open_directory, open_file_below, remove_run_directory, run_base,
+    Removal, RootPin, built_directory, make_root, open_directory, open_file_below,
+    remove_run_directory, run_base,
 };
 
 /// How far above what H's own readings allow a floor word that rose may stand, in milliseconds.
@@ -262,31 +270,26 @@ impl Watch {
     /// Opens the floor once more as the daemon does, and requires that its name still names the
     /// file held since the start. The file held is read through its descriptor, shown to be a
     /// regular file of the account that no other user can read or write, of the floor's length, and
-    /// the product's open runs on a copy of its bytes in the harness's own directory: no mapping of
-    /// the file the agent can name is made.
+    /// the product's open runs on a copy of its bytes in the harness's own directory, in a program
+    /// of its own: this program maps no file.
     ///
     /// # Errors
     ///
-    /// Returns why the open fails or that the name no longer names the file held.
+    /// Returns why the open fails, including that the program that ran it was ended by a signal,
+    /// or that the name no longer names the file held.
     pub fn open_again(&self, environment: EnvironmentId) -> Result<(), String> {
         let said = |why: &dyn std::fmt::Display| {
             format!("the clock floor cannot be opened again before the attempt: {why}")
         };
-        let boot = kr_ipc::identity::boot_identity()
-            .and_then(|identity| kr_ipc::identity::boot_epoch(&identity))
-            .map_err(|why| said(&why))?;
         if !self.mapping.named() {
             return Err(said(
                 &"its name no longer names the file held since the start",
             ));
         }
         let bytes = held_bytes(&self.file).map_err(|why| said(&why))?;
+        let program = built_directory().join(FLOOR_OPEN);
         self.scratch
-            .with(&bytes, |copy| {
-                SharedFloor::open(copy, environment, boot)
-                    .map(drop)
-                    .map_err(|why| why.to_string())
-            })
+            .with(&bytes, |copy| product_opens(&program, copy, environment))
             .map_err(|why| said(&why))
     }
 
@@ -372,6 +375,44 @@ impl Watch {
             }
         }
         (refused, Some(found))
+    }
+}
+
+/// The name of the program that runs the product's open of the floor.
+const FLOOR_OPEN: &str = "kr-e2e-m1b-floor-open";
+
+/// Runs `program` on the floor's copy at `copy` for `environment`, and reads how it ended: the open
+/// when it exits 0, a refusal with its text when it exits 2, and a refusal that names the signal
+/// when a signal ends it, as the cut of the copy by an agent does.
+fn product_opens(program: &Path, copy: &Path, environment: EnvironmentId) -> Result<(), String> {
+    use std::os::unix::process::ExitStatusExt as _;
+    if !program.is_file() {
+        return Err(format!(
+            "the program that opens the floor is not at {}; build it with `cargo build -p \
+             kr-e2e-m1b --features legs --bins`",
+            program.display()
+        ));
+    }
+    let output = std::process::Command::new(program)
+        .arg(copy)
+        .arg(environment.to_string())
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|why| format!("the program that opens the floor does not start: {why}"))?;
+    let said = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+    match (output.status.code(), output.status.signal()) {
+        (Some(0), _) => Ok(()),
+        (Some(2), _) => Err(said),
+        (Some(code), _) => Err(format!(
+            "the program that opens the floor ended with the code {code}: {said}"
+        )),
+        (None, Some(signal)) => Err(format!(
+            "the product's open of the floor's copy was ended by the signal {signal}, which an \
+             agent that cuts the copy while the product maps it can cause"
+        )),
+        (None, None) => {
+            Err("the program that opens the floor ended with no code and no signal".to_owned())
+        }
     }
 }
 
@@ -734,6 +775,197 @@ mod tests {
             "the child said how often the open passed and was refused: {said}"
         );
         assert!(!root.exists(), "the child removed its directory");
+    }
+
+    /// The environment variable that tells the test program, started again by the case below, that
+    /// it is the child and where its directory is.
+    const COPY_CHILD: &str = "KR_FLOOR_COPY_CHILD";
+
+    /// The child of the case below: a thread cuts the floor's copy to nothing and extends it again,
+    /// over and over, wherever the copy stands, while the main thread opens the floor once more
+    /// over and over for five seconds. It says how often the open passed, how often it was refused
+    /// and how often a signal ended the program that ran the product's open, and removes its
+    /// directory.
+    fn open_again_while_the_copy_is_cut(root: PathBuf) {
+        let world = world_at(root, 1_000_000);
+        let watch = world.watch();
+        let copy = watch.scratch.root.join(COPY);
+        let stop = AtomicBool::new(false);
+        let (opened, refused, signalled) = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                while !stop.load(Ordering::Relaxed) {
+                    if let Ok(file) = std::fs::OpenOptions::new().write(true).open(&copy) {
+                        let _ = file.set_len(0);
+                        let _ = file.set_len(FLOOR_FILE_LEN as u64);
+                    }
+                }
+            });
+            let started = Instant::now();
+            let (mut opened, mut refused, mut signalled) = (0_u32, 0_u32, 0_u32);
+            while started.elapsed() < Duration::from_secs(5) {
+                match watch.open_again(world.environment) {
+                    Ok(()) => opened += 1,
+                    Err(why) if why.contains("was ended by the signal") => signalled += 1,
+                    Err(_) => refused += 1,
+                }
+            }
+            stop.store(true, Ordering::Relaxed);
+            (opened, refused, signalled)
+        });
+        println!(
+            "the floor was opened again {opened} times, refused {refused} times and refused for a \
+             signal {signalled} times"
+        );
+        drop(watch);
+        world.clean();
+    }
+
+    /// A copy that the agent cuts to nothing and extends again, over and over, while the product
+    /// opens it ends the product's open, which the harness reads as a refusal; it does not end the
+    /// test program that asks, which cleans up as it would otherwise. The case runs itself again as
+    /// a child to see the end of the program.
+    #[test]
+    fn a_copy_that_is_cut_while_the_product_opens_it_ends_the_open_and_not_this_program() {
+        if let Ok(root) = std::env::var(COPY_CHILD) {
+            open_again_while_the_copy_is_cut(PathBuf::from(root));
+            return;
+        }
+        let root = base().join(format!("kf-copy-{}", &kr_ipc::new_uuid().to_string()[..8]));
+        let output = std::process::Command::new(std::env::current_exe().expect("this program"))
+            .args([
+                "--exact",
+                "floor::tests::a_copy_that_is_cut_while_the_product_opens_it_ends_the_open_and_not_this_program",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(COPY_CHILD, &root)
+            .output()
+            .expect("the child ran");
+        let said = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "the child ended with {:?}, signal {:?}: {said} {}",
+            output.status,
+            std::os::unix::process::ExitStatusExt::signal(&output.status),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            said.contains("the floor was opened again "),
+            "the child said how often the open passed and was refused: {said}"
+        );
+        assert!(!root.exists(), "the child removed its directory");
+    }
+
+    /// The end of the program that runs the product's open is read: an open where it exits 0, its
+    /// text where it exits 2, its code where it exits with another, the signal where a signal ends
+    /// it, and where the program is not there, how to build it.
+    #[test]
+    fn the_end_of_the_program_that_opens_the_floor_is_read_as_an_open_or_a_refusal() {
+        let world = world("open-ends", 1_000_000);
+        let script = |name: &str, body: &str| {
+            let path = world.root.join(name);
+            std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("a script");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
+                .expect("a program");
+            path
+        };
+        // A program written a moment ago is busy while a child that another test starts holds the
+        // descriptor it was written through, until that child runs its own program: asked again.
+        let ends = |path: &Path| {
+            let mut ended = product_opens(path, &world.path, world.environment);
+            for _ in 0..100 {
+                if !ended
+                    .as_ref()
+                    .is_err_and(|why| why.contains("Text file busy"))
+                {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+                ended = product_opens(path, &world.path, world.environment);
+            }
+            ended
+        };
+        assert_eq!(ends(&script("exits-0", "exit 0")), Ok(()), "exit 0");
+        assert_eq!(
+            ends(&script(
+                "exits-2",
+                "echo 'the floor belongs to another boot' >&2; exit 2"
+            )),
+            Err("the floor belongs to another boot".to_owned()),
+            "exit 2"
+        );
+        let why = ends(&script("exits-3", "echo odd >&2; exit 3")).expect_err("another code");
+        assert!(why.contains("ended with the code 3: odd"), "{why}");
+        let why = ends(&script("ended-by-a-signal", "kill -BUS $$")).expect_err("a signal");
+        assert!(why.contains("was ended by the signal "), "{why}");
+        let why = ends(&world.root.join("absent")).expect_err("no program");
+        assert!(
+            why.contains("is not at") && why.contains("--features legs --bins"),
+            "{why}"
+        );
+        world.clean();
+    }
+
+    /// A copy that the agent cuts, replaces by a link, replaces by a pipe or replaces by a second
+    /// name of the floor after the directory is checked is read by the product's open as the file
+    /// it is: a cut copy and a link and a pipe are refused with the product's reason, and a pipe
+    /// does not hold the open; a second name of the floor is opened, which is the stated residual.
+    #[test]
+    fn a_copy_replaced_after_the_directory_check_is_refused_and_a_pipe_does_not_hold_the_open() {
+        let world = world("copy-replaced", 1_000_000);
+        let watch = world.watch();
+        let program = built_directory().join(FLOOR_OPEN);
+        let bytes = held_bytes(&watch.file).expect("the floor's bytes");
+        let attacked = |what: &str, attack: &dyn Fn(&Path)| {
+            let started = Instant::now();
+            let said = watch.scratch.with(&bytes, |copy| {
+                attack(copy);
+                product_opens(&program, copy, world.environment)
+            });
+            assert!(
+                started.elapsed() < Duration::from_secs(30),
+                "{what}: the open ended in time"
+            );
+            said
+        };
+        let why = attacked("cut", &|copy| {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(copy)
+                .and_then(|file| file.set_len(0))
+                .expect("the copy is cut");
+        })
+        .expect_err("a cut copy");
+        assert!(why.contains("not the length this build writes"), "{why}");
+        let why = attacked("link", &|copy| {
+            std::fs::remove_file(copy).expect("the copy is removed");
+            std::os::unix::fs::symlink(&world.path, copy).expect("a link in its place");
+        })
+        .expect_err("a link in the place of the copy");
+        assert!(why.contains("must not be a symbolic link"), "{why}");
+        let why = attacked("pipe", &|copy| {
+            std::fs::remove_file(copy).expect("the copy is removed");
+            rustix::fs::mknodat(
+                rustix::fs::CWD,
+                copy,
+                rustix::fs::FileType::Fifo,
+                Mode::from_raw_mode(0o600),
+                0,
+            )
+            .expect("a pipe in its place");
+        })
+        .expect_err("a pipe in the place of the copy");
+        assert!(why.contains("must be a regular file"), "{why}");
+        assert_eq!(
+            attacked("second name", &|copy| {
+                std::fs::remove_file(copy).expect("the copy is removed");
+                std::fs::hard_link(&world.path, copy).expect("a second name of the floor");
+            }),
+            Ok(()),
+            "a second name of the floor is opened"
+        );
+        drop(watch);
+        world.clean();
     }
 
     /// The floor opened once more is refused where the directory of its copy is not the one the

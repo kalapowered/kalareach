@@ -292,9 +292,12 @@ pub const RESTART_RESIDUALS: [&str; 14] = [
     "SQLite reads each database from an image that the harness builds in memory from the main file, \
      the -wal and the -journal it read through the run's handles, and opens no path; the image holds \
      the bytes that the agent left at the instant of the copy.",
-    "The product's second open of the clock floor maps a copy of the floor's bytes in a directory of \
-     the harness's own, and not the floor itself; an agent that finds that copy and truncates it while \
-     the product maps it can still end the harness with a signal.",
+    "The product's second open of the clock floor runs in a program of its own on a copy of the \
+     floor's bytes in a directory of the harness's own; an agent that finds the copy can cut it, \
+     which ends that program with a signal that the harness reads as a refusal, or replace it, \
+     which can make the product open another regular file that the agent names, of the floor's \
+     length, of the account and closed to others; the open writes nothing, and it ends for every \
+     file the agent can put there.",
 ];
 
 /// What a survey shows that fails a run which wants none of it: a refusal of a compare, with the
@@ -3405,10 +3408,10 @@ mod shutdown_tests {
             "what a copy holds and that SQLite opens no path: {residuals:#?}"
         );
         assert!(
-            residuals
-                .iter()
-                .any(|said| said.contains("maps a copy of the floor's bytes")
-                    && said.contains("can still end the harness with a signal")),
+            residuals.iter().any(
+                |said| said.contains("runs in a program of its own on a copy")
+                    && said.contains("reads as a refusal")
+            ),
             "the second open of the floor: {residuals:#?}"
         );
         let notes = evidence["notes"].as_array().expect("a list of notes");

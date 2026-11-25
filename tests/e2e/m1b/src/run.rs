@@ -2669,7 +2669,7 @@ fn read_all<R: std::io::Read + Send + 'static>(
 }
 
 /// The directory this build put its binaries in, beside this test's own.
-fn built_directory() -> PathBuf {
+pub(crate) fn built_directory() -> PathBuf {
     let mut directory = std::env::current_exe().expect("the test binary");
     directory.pop();
     if directory.file_name().is_some_and(|name| name == "deps") {
