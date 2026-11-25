@@ -167,6 +167,29 @@ impl Watch {
         self.compare(now, &before, true).0
     }
 
+    /// Opens the floor at `path` once more as the daemon does, and requires that its name still
+    /// names the file held since the start.
+    ///
+    /// # Errors
+    ///
+    /// Returns why the open fails or that the name no longer names the file held.
+    pub fn open_again(&self, path: &Path, environment: EnvironmentId) -> Result<(), String> {
+        let said = |why: &dyn std::fmt::Display| {
+            format!("the clock floor cannot be opened again before the attempt: {why}")
+        };
+        let boot = kr_ipc::identity::boot_identity()
+            .and_then(|identity| kr_ipc::identity::boot_epoch(&identity))
+            .map_err(|why| said(&why))?;
+        if !self.mapping.named() {
+            return Err(said(
+                &"its name no longer names the file held since the start",
+            ));
+        }
+        SharedFloor::open(path, environment, boot)
+            .map(drop)
+            .map_err(|why| said(&why))
+    }
+
     /// The limit on a floor word that rose: the greatest of H's greatest wall reading, the anchor's
     /// wall reading with the continuous time since the anchor, and the floor at the start with the
     /// continuous time since the start, and the allowance above it.

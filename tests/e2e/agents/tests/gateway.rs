@@ -6422,6 +6422,7 @@ fn ends_the_worker_beside_a_dead_daemon(
     resource: PendingResourceId,
 ) -> Closed {
     session.host.kill_daemon();
+    session.host.record_workers();
     kr_e2e_m1b::run::signal(&agent.worker, rustix::process::Signal::KILL);
     let started = Instant::now();
     while kr_e2e_m1b::run::running(&agent.worker) {

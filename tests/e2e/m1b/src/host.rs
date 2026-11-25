@@ -30,8 +30,10 @@ use kr_protocol::ids::EnvironmentId;
 use serde_json::Value;
 
 use crate::LIVENESS;
-use crate::compare::Layout;
+use crate::compare::{self, Interval, Layout};
 use crate::floor::{Opening, Readings, Watch};
+use crate::index::{self, Looked};
+use crate::outside::Outside;
 use crate::run::{
     HARNESS_PROGRAM, Run, binary_place, ended_within, output_within, processes_under,
     read_tail_below, running, signal, socket_below, worker_session,
@@ -370,7 +372,41 @@ struct Restarts {
     record: Option<Record>,
     /// The watch on the clock floor, made with the record: the mapping is kept from the start.
     clock: Option<Watch>,
+    /// What the compares of a real agent's restart read: made at the start, kept at each kill.
+    verified: Option<Verified>,
     survey: Survey,
+}
+
+/// What the compares of a restart on a real agent's tree hold besides the record made at the start.
+#[derive(Debug)]
+struct Verified {
+    /// The address the configuration document gave at the start, read once.
+    address: Option<std::net::SocketAddr>,
+    /// The output-time indexes at the start.
+    indexes: Looked,
+    /// The record and the indexes at the latest kill: what the attempt is compared with.
+    kill: Option<(Record, Looked)>,
+    /// The tables of the session journals at the latest kill, on a leg where the table check is on.
+    tables: Option<Tables>,
+    /// What the compares at the kills refused.
+    refused: Vec<String>,
+    /// How many daemon starts have followed the start's record.
+    starts: usize,
+}
+
+/// Why one start of the daemon failed.
+enum Failed {
+    /// The daemon exited before it answered, with what it wrote.
+    Exited(String),
+    /// The daemon neither exited nor answered in time: what it was last heard to say, and what it
+    /// wrote.
+    Silent { heard: String, said: String },
+}
+
+/// Ends the leg as not run with `said`: the unwinding carries the text to the end of the case.
+fn leg_not_run(said: String) -> ! {
+    eprintln!("{said}");
+    std::panic::resume_unwind(Box::new(LegNotRun(said)))
 }
 
 /// A running host.
@@ -503,7 +539,10 @@ impl<'r> Host<'r> {
     /// given, not when `kr list` answers: after the agent under test has started no `kr` is run.
     ///
     /// A daemon is started after the agent under test started only where that agent is the
-    /// harness's own stand-in ([`Host::agent_is_a_stand_in`]). The start acts on the run's tree: it
+    /// harness's own stand-in ([`Host::agent_is_a_stand_in`]), or where the case declared a restart
+    /// ([`Host::declares_a_restart`]) and a record was made when the agent started: that start is
+    /// `Host::restart_after_a_real_agent`, and it ends the leg as not run where it cannot go on.
+    /// The start acts on the run's tree: it
     /// reads the address from the configuration document, opens the log by its path, and starts the
     /// programs placed under `b/` with no check that they are the placed files, and a live agent
     /// runs in the same account and may have changed any of them. The stand-in is the harness's own
@@ -512,14 +551,27 @@ impl<'r> Host<'r> {
     ///
     /// # Panics
     ///
-    /// As [`Self::start_daemon`], and when the agent under test has started and is not the stand-in.
+    /// As [`Self::start_daemon`], and when the agent under test has started, is not the stand-in and
+    /// no record was made.
     pub fn start_daemon_ready_by(&self, ready: &dyn Fn(Duration) -> Result<(), String>) {
+        let real =
+            self.agent_started.load(Ordering::SeqCst) && !self.stand_in.load(Ordering::SeqCst);
+        let verified = self
+            .restarts
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .verified
+            .is_some();
         assert!(
-            !self.agent_started.load(Ordering::SeqCst) || self.stand_in.load(Ordering::SeqCst),
+            !real || verified,
             "no daemon is started after the agent under test started, unless that agent is the \
              harness's own stand-in: the start acts on the run's tree, which a live agent may have \
              changed"
         );
+        if real {
+            self.restart_after_a_real_agent(ready, ADDRESS_FREE, LIVENESS);
+            return;
+        }
         self.survey_before_the_attempt();
         let kept = self
             .configured_address()
@@ -575,6 +627,22 @@ impl<'r> Host<'r> {
         &self,
         ready: &dyn Fn(Duration) -> Result<(), String>,
     ) -> Result<(), String> {
+        match self.start_once(ready, LIVENESS) {
+            Ok(()) => Ok(()),
+            Err(Failed::Exited(said)) => Err(said),
+            Err(Failed::Silent { heard, said }) => {
+                panic!("the control daemon did not answer within {LIVENESS:?} ({heard}): {said}")
+            }
+        }
+    }
+
+    /// Starts the daemon over the host tree once and waits up to `liveness` for the readiness that
+    /// `ready` names, and says how the start failed where it did.
+    fn start_once(
+        &self,
+        ready: &dyn Fn(Duration) -> Result<(), String>,
+        liveness: Duration,
+    ) -> Result<(), Failed> {
         kr_ipc::testing::account_launchd::require("the host start");
         *self.control.lock().unwrap_or_else(PoisonError::into_inner) = None;
         // What the log holds before this start is an earlier start's, and is not this one's to say.
@@ -617,13 +685,13 @@ impl<'r> Host<'r> {
             // A daemon that has already exited has no identity to read on some systems. Whether it
             // exited, and what it wrote, is what decides what this start came to.
             return match child.try_wait() {
-                Ok(Some(_)) => Err(self.daemon_said_since(earlier)),
+                Ok(Some(_)) => Err(Failed::Exited(self.daemon_said_since(earlier))),
                 _ => panic!("the daemon ended at once: {}", self.daemon_said()),
             };
         };
         *self.daemon.lock().unwrap_or_else(PoisonError::into_inner) =
             Some(Daemon { child, identity });
-        let answered = Deadline::after(LIVENESS).poll(CLEANUP_COMMAND, ASK_AGAIN, |bound| {
+        let answered = Deadline::after(liveness).poll(CLEANUP_COMMAND, ASK_AGAIN, |bound| {
             let heard = match ready(bound) {
                 Ok(()) => return ControlFlow::Break(None),
                 Err(heard) => heard,
@@ -644,11 +712,11 @@ impl<'r> Host<'r> {
                 self.note_control_socket();
                 Ok(())
             }
-            Ok(Some(said)) => Err(said),
-            Err(heard) => panic!(
-                "the control daemon did not answer within {LIVENESS:?} ({heard}): {}",
-                self.daemon_said()
-            ),
+            Ok(Some(said)) => Err(Failed::Exited(said)),
+            Err(heard) => Err(Failed::Silent {
+                heard,
+                said: self.daemon_said(),
+            }),
         }
     }
 
@@ -683,8 +751,22 @@ impl<'r> Host<'r> {
             if !records || restarts.record.is_some() {
                 return;
             }
-            self.record().and_then(|record| {
+            let looked = if restarts.declared == Restart::Declared {
+                self.standing()
+                    .map(|(indexes, record)| (Some(indexes), record))
+            } else {
+                self.record().map(|record| (None, record))
+            };
+            looked.and_then(|(indexes, record)| {
                 let clock = self.watch_the_floor()?;
+                restarts.verified = indexes.map(|indexes| Verified {
+                    address: self.configured_address(),
+                    indexes,
+                    kill: None,
+                    tables: None,
+                    refused: Vec::new(),
+                    starts: 0,
+                });
                 restarts.record = Some(record);
                 restarts.clock = Some(clock);
                 Ok(())
@@ -1230,6 +1312,7 @@ impl<'r> Host<'r> {
         );
         let _ = daemon.child.wait();
         self.survey_the_kill();
+        self.verify_the_kill();
     }
 
     /// The survey's look at the tree at a kill ([`Restart::Survey`]): the record at the kill, and
@@ -1341,6 +1424,212 @@ impl<'r> Host<'r> {
         )
     }
 
+    fn place(&self) -> Place<'_> {
+        Place {
+            root: self.run.root(),
+            pin: self.run.pin(),
+        }
+    }
+
+    /// The output-time indexes and the record of the run's tree as they stand. The indexes are
+    /// copied before the tree is listed, so that a row pruned between the two is not taken as lost.
+    fn standing(&self) -> Result<(Looked, Record), String> {
+        let layout = Layout::of(self.run.root(), &self.environment);
+        let known = self.record()?;
+        let indexes = index::look(
+            &layout,
+            self.place(),
+            &self.run.root().join("i"),
+            &index::sessions_of(&layout, &known),
+        );
+        Ok((indexes, self.record()?))
+    }
+
+    /// What lies outside the two roots and can change what a restarted daemon runs or reads: the
+    /// Git it would run, the values it inherits, the shell packages and its log.
+    fn outside_refusals(&self) -> Vec<String> {
+        let inherited = [
+            ("XDG_RUNTIME_DIR", std::env::var_os("XDG_RUNTIME_DIR")),
+            (
+                "DBUS_SESSION_BUS_ADDRESS",
+                std::env::var_os("DBUS_SESSION_BUS_ADDRESS"),
+            ),
+        ];
+        let log = self.daemon_log();
+        Outside {
+            run_root: self.run.root(),
+            pin: self.run.pin(),
+            search_path: "/usr/bin:/bin",
+            inherited: &inherited,
+            shell_packages: self.shell_packages.as_deref(),
+            log: log.strip_prefix(self.run.root()).unwrap_or(&log),
+        }
+        .refusals()
+    }
+
+    /// At a kill of a real agent's host: compares the tree with the record made at the start and
+    /// keeps what the attempt is compared with. What it refuses is held until the attempt.
+    fn verify_the_kill(&self) {
+        let mut guard = self.restarts.lock().unwrap_or_else(PoisonError::into_inner);
+        let restarts = &mut *guard;
+        let (Some(verified), Some(watch), Some(start)) = (
+            restarts.verified.as_mut(),
+            restarts.clock.as_mut(),
+            restarts.record.as_ref(),
+        ) else {
+            return;
+        };
+        let (indexes, record) = match self.standing() {
+            Ok(standing) => standing,
+            Err(why) => {
+                verified
+                    .refused
+                    .push(format!("the record at the kill could not be made: {why}"));
+                verified.kill = None;
+                return;
+            }
+        };
+        let layout = Layout::of(self.run.root(), &self.environment);
+        let interval = Interval::AtTheKill {
+            restarted: verified.starts > 0,
+        };
+        let uid = rustix::process::getuid().as_raw();
+        let compared = compare::compare(&layout, self.place(), start, &record, interval, uid);
+        verified
+            .refused
+            .extend(compared.refusals.iter().map(ToString::to_string));
+        verified.refused.extend(self.outside_refusals());
+        let readings = Readings::now();
+        verified.refused.extend(watch.at_the_kill(readings));
+        verified.refused.extend(
+            index::compare(
+                &layout,
+                &verified.indexes,
+                &indexes,
+                &record,
+                watch.limit(readings),
+            )
+            .iter()
+            .map(ToString::to_string),
+        );
+        if tables::applies(self.stand_in.load(Ordering::SeqCst)) {
+            verified.tables = Some(self.look_at_the_journals(&record));
+        }
+        verified.kill = Some((record, indexes));
+    }
+
+    /// Before the attempt on a real agent's host: compares the tree with the record made at the
+    /// kill, and returns every refusal, those of the kills included.
+    fn verify_before_the_attempt(&self) -> Vec<String> {
+        let mut guard = self.restarts.lock().unwrap_or_else(PoisonError::into_inner);
+        let restarts = &mut *guard;
+        let (Some(verified), Some(watch)) = (restarts.verified.as_mut(), restarts.clock.as_mut())
+        else {
+            return Vec::new();
+        };
+        let mut refused = std::mem::take(&mut verified.refused);
+        let Some((killed, killed_indexes)) = verified.kill.clone() else {
+            refused.push("the record at the kill was not made".to_owned());
+            return refused;
+        };
+        let (indexes, record) = match self.standing() {
+            Ok(standing) => standing,
+            Err(why) => {
+                refused.push(format!(
+                    "the record before the attempt could not be made: {why}"
+                ));
+                return refused;
+            }
+        };
+        let layout = Layout::of(self.run.root(), &self.environment);
+        let uid = rustix::process::getuid().as_raw();
+        let compared = compare::compare(
+            &layout,
+            self.place(),
+            &killed,
+            &record,
+            Interval::BeforeTheAttempt,
+            uid,
+        );
+        refused.extend(compared.refusals.iter().map(ToString::to_string));
+        refused.extend(self.outside_refusals());
+        let readings = Readings::now();
+        refused.extend(watch.before_the_attempt(readings));
+        if let Err(why) = watch.open_again(
+            &self.environment.utc_floor_file(),
+            self.environment.environment_id(),
+        ) {
+            refused.push(why);
+        }
+        refused.extend(
+            index::compare(
+                &layout,
+                &killed_indexes,
+                &indexes,
+                &record,
+                watch.limit(readings),
+            )
+            .iter()
+            .map(ToString::to_string),
+        );
+        if let Some(before) = &verified.tables {
+            refused.extend(
+                tables::compare(&layout, before, &self.look_at_the_journals(&record))
+                    .iter()
+                    .map(ToString::to_string),
+            );
+        }
+        refused
+    }
+
+    /// The one start of the daemon after a real agent started: the address must be free, every
+    /// compare must pass, and the daemon must answer. A leg that fails any of them ends as not run
+    /// before another start is tried.
+    fn restart_after_a_real_agent(
+        &self,
+        ready: &dyn Fn(Duration) -> Result<(), String>,
+        address_bound: Duration,
+        liveness: Duration,
+    ) {
+        let address = self
+            .restarts
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .verified
+            .as_ref()
+            .and_then(|verified| verified.address)
+            .filter(|address| address.port() != 0);
+        if let Some(address) = address
+            && let Err(why) = address_is_free(address, address_bound)
+        {
+            leg_not_run(format!("the address was not free: {why}"));
+        }
+        let refused = self.verify_before_the_attempt();
+        if !refused.is_empty() {
+            leg_not_run(format!("the restart was refused: {}", refused.join("; ")));
+        }
+        match self.start_once(ready, liveness) {
+            Ok(()) => {
+                if let Some(verified) = self
+                    .restarts
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .verified
+                    .as_mut()
+                {
+                    verified.starts += 1;
+                }
+            }
+            Err(Failed::Exited(said)) => leg_not_run(format!(
+                "the control daemon did not start after the kill: {said}"
+            )),
+            Err(Failed::Silent { heard, said }) => leg_not_run(format!(
+                "the control daemon did not start after the kill: it did not answer within \
+                 {liveness:?} ({heard}): {said}"
+            )),
+        }
+    }
+
     /// Waits after a kill for the files that the worker's maintenance writes to stand still: the
     /// time `timing` gives for the wait, then looks `timing.apart` apart until two looks agree.
     /// Returns the time after the kill at which two looks agreed, or `None` where the bound passed
@@ -1437,20 +1726,34 @@ const ADDRESS_ASK_AGAIN: Duration = Duration::from_millis(200);
 ///
 /// Panics when the address stays held for [`ADDRESS_FREE`], or cannot be bound for another reason.
 fn until_the_address_is_free(address: std::net::SocketAddr) {
-    let free = Deadline::after(ADDRESS_FREE).poll(ADDRESS_FREE, ADDRESS_ASK_AGAIN, |_| {
-        match std::net::UdpSocket::bind(address) {
-            Ok(socket) => {
-                drop(socket);
-                ControlFlow::Break(())
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
-                ControlFlow::Continue(error.to_string())
-            }
-            Err(error) => panic!("the daemon's address {address} cannot be bound: {error}"),
-        }
-    });
-    if let Err(heard) = free {
-        panic!("the daemon's address {address} stayed held for {ADDRESS_FREE:?}: {heard}");
+    address_is_free(address, ADDRESS_FREE).unwrap_or_else(|why| panic!("{why}"));
+}
+
+/// `until_the_address_is_free` with a bound of its own, saying why where the address is not free.
+fn address_is_free(address: std::net::SocketAddr, bound: Duration) -> Result<(), String> {
+    let free =
+        Deadline::after(bound).poll(
+            bound,
+            ADDRESS_ASK_AGAIN,
+            |_| match std::net::UdpSocket::bind(address) {
+                Ok(socket) => {
+                    drop(socket);
+                    ControlFlow::Break(None)
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
+                    ControlFlow::Continue(error.to_string())
+                }
+                Err(error) => ControlFlow::Break(Some(format!(
+                    "the daemon's address {address} cannot be bound: {error}"
+                ))),
+            },
+        );
+    match free {
+        Ok(None) => Ok(()),
+        Ok(Some(why)) => Err(why),
+        Err(heard) => Err(format!(
+            "the daemon's address {address} stayed held for {bound:?}: {heard}"
+        )),
     }
 }
 
@@ -2639,6 +2942,240 @@ mod shutdown_tests {
         drop(host);
         drop(run);
         std::fs::remove_dir_all(&root).expect("clean up");
+    }
+
+    /// A scratch run whose `kr-controller` is a script that counts its starts in the run's home,
+    /// exits when the home holds a file `fail`, and otherwise stays running.
+    fn run_with_a_controller(root: &Path) -> Run {
+        std::fs::create_dir_all(root.join("b")).expect("b");
+        std::fs::create_dir_all(root.join("h")).expect("h");
+        let program = root.join("b/kr-controller");
+        std::fs::write(
+            &program,
+            "#!/bin/sh\necho started >> \"$HOME/starts\"\nif [ -e \"$HOME/fail\" ]; then\n  \
+             echo \"the controller broke\" >&2\n  exit 3\nfi\nexec sleep 30\n",
+        )
+        .expect("a controller");
+        std::fs::set_permissions(
+            &program,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .expect("executable");
+        Run::over(root)
+    }
+
+    fn started(root: &Path, count: usize) -> impl Fn(Duration) -> Result<(), String> + '_ {
+        move |_| {
+            if starts(root) >= count {
+                Ok(())
+            } else {
+                Err("the controller has not started".to_owned())
+            }
+        }
+    }
+
+    fn starts(root: &Path) -> usize {
+        std::fs::read_to_string(root.join("h/starts")).map_or(0, |text| text.lines().count())
+    }
+
+    /// A host that declared a restart, whose daemon started once and was killed after the agent
+    /// started: `setup` runs before the agent starts and `before_the_kill` after it.
+    fn killed_host<'r>(
+        run: &'r Run,
+        setup: impl FnOnce(&Host<'r>),
+        before_the_kill: impl FnOnce(),
+    ) -> Host<'r> {
+        let host = host_over(run);
+        setup(&host);
+        assert!(
+            host.start_once(&started(run.root(), 1), Duration::from_secs(10))
+                .is_ok(),
+            "the first start"
+        );
+        host.declares_a_restart(Restart::Declared);
+        host.agent_starts();
+        before_the_kill();
+        host.kill_daemon();
+        host
+    }
+
+    /// The reason a leg that ends as not run gives.
+    fn not_run(attempt: impl FnOnce()) -> String {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(attempt))
+            .expect_err("the leg ends as not run")
+            .downcast_ref::<LegNotRun>()
+            .expect("a leg that is not run")
+            .0
+            .clone()
+    }
+
+    const QUICKLY: Duration = Duration::from_secs(2);
+
+    /// A real agent's restart is one start after every compare passed, and the daemon is then
+    /// running again.
+    #[test]
+    fn a_real_agents_restart_is_one_start_after_the_compares_pass() {
+        let root = scratch("verified-start");
+        let run = run_with_a_controller(&root);
+        let host = killed_host(&run, |_| {}, || {});
+        assert_eq!(starts(&root), 1);
+        host.restart_after_a_real_agent(&started(&root, 2), QUICKLY, Duration::from_secs(10));
+        assert_eq!(starts(&root), 2);
+        assert!(host.daemon.lock().expect("a lock").is_some());
+        drop(host);
+        drop(run);
+        std::fs::remove_dir_all(&root).expect("clean up");
+    }
+
+    /// An address that stays held, a start that fails, a daemon that does not answer in time and a
+    /// compare that refuses each end the leg as not run with their reason and make no further
+    /// attempt.
+    #[test]
+    fn a_restart_that_cannot_go_on_ends_the_leg_as_not_run_and_tries_once() {
+        let held = std::net::UdpSocket::bind("127.0.0.1:0").expect("a socket");
+        let port = held.local_addr().expect("an address").port();
+        let root = scratch("verified-address");
+        let run = run_with_a_controller(&root);
+        let host = killed_host(
+            &run,
+            |host| write_configuration(&host.environment, &[], port),
+            || {},
+        );
+        let said = not_run(|| {
+            host.restart_after_a_real_agent(&|_| Ok(()), Duration::from_millis(300), QUICKLY);
+        });
+        assert!(
+            said.starts_with(&format!(
+                "the address was not free: the daemon's address 127.0.0.1:{port} stayed held for "
+            )),
+            "{said}"
+        );
+        assert_eq!(starts(&root), 1, "no start was tried");
+        drop(host);
+        drop(run);
+        std::fs::remove_dir_all(&root).expect("clean up");
+
+        let root = scratch("verified-failing");
+        let run = run_with_a_controller(&root);
+        let host = killed_host(&run, |_| {}, || {});
+        std::fs::write(root.join("h/fail"), b"").expect("a mark");
+        let said = not_run(|| {
+            host.restart_after_a_real_agent(&|_| Err("not ready".to_owned()), QUICKLY, QUICKLY);
+        });
+        assert!(
+            said.starts_with("the control daemon did not start after the kill: ")
+                && said.contains("the controller broke"),
+            "{said}"
+        );
+        assert_eq!(starts(&root), 2, "one attempt and no retry");
+        drop(host);
+        drop(run);
+        std::fs::remove_dir_all(&root).expect("clean up");
+
+        let root = scratch("verified-silent");
+        let run = run_with_a_controller(&root);
+        let host = killed_host(&run, |_| {}, || {});
+        let said = not_run(|| {
+            host.restart_after_a_real_agent(
+                &|_| Err("not yet".to_owned()),
+                QUICKLY,
+                Duration::from_secs(1),
+            );
+        });
+        assert!(
+            said.starts_with(
+                "the control daemon did not start after the kill: it did not answer within 1s \
+                 (not yet): "
+            ),
+            "{said}"
+        );
+        assert_eq!(starts(&root), 2, "one attempt and no retry");
+        drop(host);
+        drop(run);
+        std::fs::remove_dir_all(&root).expect("clean up");
+    }
+
+    /// A file changed between the kill and the attempt, and one changed between the start and the
+    /// kill, each refuse the restart before any daemon starts; the record of the kill is kept.
+    #[test]
+    fn a_restart_over_a_tree_that_changed_is_refused_before_any_start() {
+        for (name, after_the_kill) in [("after-the-kill", true), ("before-the-kill", false)] {
+            let root = scratch(&format!("verified-refused-{name}"));
+            let run = run_with_a_controller(&root);
+            let recorded = root.join("s/recorded");
+            let host = killed_host(
+                &run,
+                |_| std::fs::write(&recorded, b"before").expect("a file"),
+                || {
+                    if !after_the_kill {
+                        std::fs::write(&recorded, b"after").expect("written by the agent");
+                    }
+                },
+            );
+            if after_the_kill {
+                std::fs::write(&recorded, b"after").expect("written by the agent");
+            }
+            let said = not_run(|| {
+                host.start_daemon_ready_by(&|_| Ok(()));
+            });
+            assert!(
+                said.starts_with("the restart was refused: ")
+                    && said.contains("no row of the live daemon's files covers this entry"),
+                "{name}: {said}"
+            );
+            assert_eq!(starts(&root), 1, "{name}: no start was tried");
+            assert!(
+                host.restarts
+                    .lock()
+                    .expect("a lock")
+                    .verified
+                    .as_ref()
+                    .is_some_and(|verified| verified.kill.is_some()),
+                "{name}: the record of the kill is kept"
+            );
+            drop(host);
+            drop(run);
+            std::fs::remove_dir_all(&root).expect("clean up");
+        }
+    }
+
+    /// The harness's own stand-in restarts as it did: no record, no compare, the same start.
+    #[test]
+    fn a_stand_in_restarts_as_it_did() {
+        let root = scratch("verified-stand-in");
+        let run = run_with_a_controller(&root);
+        let host = host_over(&run);
+        assert!(
+            host.start_once(&started(run.root(), 1), Duration::from_secs(10))
+                .is_ok(),
+            "the first start"
+        );
+        host.agent_is_a_stand_in();
+        host.agent_starts();
+        host.kill_daemon();
+        host.start_daemon_ready_by(&started(&root, 2));
+        assert_eq!(starts(&root), 2);
+        assert!(host.restarts.lock().expect("a lock").verified.is_none());
+        drop(host);
+        drop(run);
+        std::fs::remove_dir_all(&root).expect("clean up");
+    }
+
+    /// An address that nothing holds is free at once, and one that is held says how long it was
+    /// held.
+    #[test]
+    fn an_address_is_free_or_says_how_long_it_was_held() {
+        let held = std::net::UdpSocket::bind("127.0.0.1:0").expect("a socket");
+        let address = held.local_addr().expect("an address");
+        let why = address_is_free(address, Duration::from_millis(200)).expect_err("held");
+        assert!(
+            why.starts_with(&format!(
+                "the daemon's address {address} stayed held for 200ms: "
+            )),
+            "{why}"
+        );
+        drop(held);
+        assert_eq!(address_is_free(address, Duration::from_secs(2)), Ok(()));
     }
 
     /// The wait for the watched files to stand still returns when two looks agree, and gives up at
