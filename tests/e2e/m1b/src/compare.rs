@@ -39,6 +39,8 @@ pub struct Layout {
     pub programs: PathBuf,
     /// The application directory of the run's home (h/.claude), where the agent's own files live.
     pub application: PathBuf,
+    /// The clock floor's file (utc-floor), relative to the run's directory.
+    pub floor: PathBuf,
 }
 
 impl Layout {
@@ -59,6 +61,7 @@ impl Layout {
             state_dir: below(environment.state_dir()),
             programs: PathBuf::from(PROGRAMS_ROOT),
             application: PathBuf::from(APPLICATION_ROOT),
+            floor: below(&environment.utc_floor_file()),
         }
     }
 }
@@ -463,6 +466,17 @@ pub fn compare(
                 .then(|| {
                     "an entry of the application directory that the record holds may not change; \
                      names added beside it are not looked at"
+                        .to_owned()
+                })
+        } else if path == layout.floor {
+            // The words of the floor move while the worker runs, so its bytes are judged by the
+            // clock floor check; the file itself stays the file the record holds.
+            changes
+                .iter()
+                .any(|change| !matches!(change, Change::Bytes { .. }))
+                .then(|| {
+                    "the clock floor stays the one file the record holds, with its owner and \
+                     permission bits; its bytes are judged by the clock floor check"
                         .to_owned()
                 })
         } else {
@@ -984,6 +998,58 @@ mod tests {
         );
         world_without.clean();
         world.clean();
+    }
+
+    /// The clock floor may change its bytes, which its own check judges, and nothing else: a copy on
+    /// a new inode, another mode, a removal and another kind are refused at every interval.
+    #[test]
+    fn the_clock_floor_may_change_its_bytes_and_nothing_else_at_every_interval() {
+        enum Act {
+            Rewrite,
+            Replace,
+            Chmod,
+            Remove,
+            Retype,
+        }
+        let said = "the clock floor stays the one file the record holds, with its owner and \
+                    permission bits; its bytes are judged by the clock floor check";
+        for (label, act) in [
+            ("a rewrite", Act::Rewrite),
+            ("a copy on a new inode", Act::Replace),
+            ("another mode", Act::Chmod),
+            ("a removal", Act::Remove),
+            ("another kind", Act::Retype),
+        ] {
+            let world = world("floor");
+            let floor = world.runtime("utc-floor");
+            world.put(&floor, b"floor");
+            let before = world.record();
+            match act {
+                Act::Rewrite => std::fs::write(&floor, b"floor, moved").expect("rewritten"),
+                Act::Replace => world.replace(&floor, b"floor"),
+                Act::Chmod => {
+                    std::fs::set_permissions(&floor, std::fs::Permissions::from_mode(0o644))
+                        .expect("readable");
+                }
+                Act::Remove => std::fs::remove_file(&floor).expect("removed"),
+                Act::Retype => {
+                    std::fs::remove_file(&floor).expect("removed");
+                    std::fs::create_dir(&floor).expect("a directory");
+                }
+            }
+            for interval in [KILL, LATER_KILL, ATTEMPT] {
+                let refused = world.refused(&before, interval);
+                if matches!(act, Act::Rewrite) {
+                    assert_eq!(refused, Vec::<String>::new(), "{label}, {interval:?}");
+                } else {
+                    assert!(
+                        refused.len() == 1 && refused[0].ends_with(said),
+                        "{label}, {interval:?}: {refused:#?}"
+                    );
+                }
+            }
+            world.clean();
+        }
     }
 
     /// Every row names its entry and the code that writes it.

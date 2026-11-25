@@ -30,6 +30,7 @@ use kr_protocol::ids::EnvironmentId;
 use serde_json::Value;
 
 use crate::LIVENESS;
+use crate::floor::{Opening, Readings, Watch};
 use crate::run::{
     HARNESS_PROGRAM, Run, binary_place, ended_within, output_within, processes_under,
     read_tail_below, running, signal, socket_below, worker_session,
@@ -362,6 +363,8 @@ struct Restarts {
     declared: Restart,
     /// The record of the run's tree, made once at the first start of the agent.
     record: Option<Record>,
+    /// The watch on the clock floor, made with the record: the mapping is kept from the start.
+    clock: Option<Watch>,
     survey: Survey,
 }
 
@@ -385,6 +388,9 @@ pub struct Host<'r> {
     kr_after_start: Arc<Mutex<Vec<String>>>,
     /// The restart the case declared and the record of the run's tree made when its agent started.
     restarts: Mutex<Restarts>,
+    /// The wall clock and the continuous clock, read before the host's first daemon start: the
+    /// anchor of the clock floor's limit.
+    anchor: Readings,
 }
 
 #[derive(Debug)]
@@ -446,6 +452,7 @@ impl<'r> Host<'r> {
             stand_in: AtomicBool::new(false),
             kr_after_start: Arc::default(),
             restarts: Mutex::default(),
+            anchor: Readings::now(),
         };
         // The port was free when it was chosen, and it is bound when the daemon starts: other legs
         // choose theirs meanwhile, on this machine and on a shared one, and two can choose alike.
@@ -671,8 +678,11 @@ impl<'r> Host<'r> {
             if !records || restarts.record.is_some() {
                 return;
             }
-            self.record().map(|record| {
+            self.record().and_then(|record| {
+                let clock = self.watch_the_floor()?;
                 restarts.record = Some(record);
+                restarts.clock = Some(clock);
+                Ok(())
             })
         };
         if let Err(why) = made {
@@ -690,6 +700,30 @@ impl<'r> Host<'r> {
             self.run.pin(),
             &REQUIRED_ROOTS,
             &OPTIONAL_ROOTS,
+        )
+    }
+
+    /// Maps the clock floor as the daemon does and keeps the mapping, with the readings of the
+    /// clocks now.
+    fn watch_the_floor(&self) -> Result<Watch, String> {
+        let path = self.environment.utc_floor_file();
+        let relative = path
+            .strip_prefix(self.run.root())
+            .expect("the clock floor lies below the run's directory");
+        let boot = kr_ipc::identity::boot_identity()
+            .and_then(|identity| kr_ipc::identity::boot_epoch(&identity))
+            .map_err(|why| format!("the clock floor cannot be read at the start: {why}"))?;
+        Watch::at_the_start(
+            Opening {
+                root: self.run.root(),
+                pin: self.run.pin(),
+                relative,
+                path: &path,
+            },
+            self.environment.environment_id(),
+            boot,
+            self.anchor,
+            Readings::now(),
         )
     }
 
@@ -1683,6 +1717,18 @@ mod shutdown_tests {
             .expect("the environment's identity");
         let environment = paths.environment(identity);
         environment.create().expect("the environment's directories");
+        // The floor a daemon would have made, so that the tree is one a case's agent starts in.
+        let boot = kr_ipc::identity::boot_epoch(
+            &kr_ipc::identity::boot_identity().expect("a boot identity"),
+        )
+        .expect("a boot epoch");
+        kr_ipc::floor::SharedFloor::create(
+            &environment.utc_floor_file(),
+            environment.environment_id(),
+            boot,
+            1_000_000,
+        )
+        .expect("a clock floor");
         Host {
             run,
             paths,
@@ -1694,6 +1740,7 @@ mod shutdown_tests {
             stand_in: AtomicBool::new(false),
             kr_after_start: Arc::default(),
             restarts: Mutex::default(),
+            anchor: Readings::now(),
         }
     }
 
@@ -2401,6 +2448,47 @@ mod shutdown_tests {
         drop(host);
         drop(run);
         std::fs::remove_file(root.join(STATE_ROOT)).expect("the link removed");
+        std::fs::remove_dir_all(&root).expect("clean up");
+    }
+
+    /// A clock floor that cannot be opened as the daemon opens it ends the leg as not run, before
+    /// the agent is launched, and leaves no record and no watch; with a floor the watch is kept.
+    #[test]
+    fn a_clock_floor_that_cannot_be_opened_ends_the_leg_as_not_run_and_one_that_opens_is_kept() {
+        let root = scratch("record-floor");
+        let (run, _mark) = host_with_a_kr(&root);
+        let host = host_over(&run);
+        host.declares_a_restart(Restart::Declared);
+        host.agent_starts();
+        let kept = host
+            .restarts
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clock
+            .is_some();
+        assert!(kept, "the mapping is kept from the start");
+        drop(host);
+        let host = host_over(&run);
+        std::fs::remove_file(host.environment.utc_floor_file()).expect("the floor removed");
+        host.declares_a_restart(Restart::Declared);
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            host.agent_starts();
+        }))
+        .expect_err("no floor, no start");
+        let not_run = unwound
+            .downcast_ref::<LegNotRun>()
+            .expect("the leg is not run, it did not fail");
+        assert!(
+            not_run.0.starts_with(
+                "no record could be made before the agent started: the clock floor cannot be \
+                 read at the start: "
+            ),
+            "{}",
+            not_run.0
+        );
+        assert!(recorded(&host).is_none());
+        drop(host);
+        drop(run);
         std::fs::remove_dir_all(&root).expect("clean up");
     }
 
