@@ -27,8 +27,9 @@ mod controls;
 /// What a case says when it starts before any ACP launch exists.
 const NO_LAUNCH: &str = "no ACP launch exists: kr-hook has no `acp` subcommand, so no case can start an agent in ACP mode";
 
-/// What a case says when the launch exists and the body of the case is not written.
-const NO_BODY: &str = "the body of this case is not written";
+/// What a case says when the launch exists and the harness that starts a stand-in through it is not
+/// written.
+const NO_HOST: &str = "the harness that starts the stand-in through the ACP launch is not written";
 
 /// The names of the subcommands in the forwarder's command table.
 fn hook_subcommands() -> Vec<String> {
@@ -50,13 +51,6 @@ fn starts_in_acp_mode(case: &str) {
     assert!(launch_exists(), "{case}: {NO_LAUNCH}");
 }
 
-/// What a case does until its own commit writes its body: it starts, and fails if the launch
-/// exists.
-fn unwritten(case: &str) -> ! {
-    starts_in_acp_mode(case);
-    panic!("{case}: {NO_BODY}");
-}
-
 /// The row of the table for control `id`.
 fn control_of(id: &str) -> &'static Control {
     CONTROLS
@@ -70,6 +64,15 @@ fn red_of(id: &str) -> &'static str {
     control_of(id).red
 }
 
+/// Where the stand-in's program or package runs from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Source {
+    /// The verified copy that the host makes, as it starts every agent.
+    TheCopy,
+    /// The installation itself, which only the harness does, as the control of 6b-6 shows.
+    TheInstallation,
+}
+
 /// Starts the stand-in that the table names for control `id`, with `script`, through the launch and
 /// runs `body` on the host. It fails with the red the body returns.
 fn run_case(
@@ -77,8 +80,18 @@ fn run_case(
     script: &Value,
     body: impl FnOnce(&mut controls::Hosted) -> Result<(), controls::Red>,
 ) {
+    run_case_from(id, Source::TheCopy, script, body);
+}
+
+/// The same as [`run_case`], with the stand-in started from `source`.
+fn run_case_from(
+    id: &str,
+    source: Source,
+    script: &Value,
+    body: impl FnOnce(&mut controls::Hosted) -> Result<(), controls::Red>,
+) {
     starts_in_acp_mode(id);
-    match controls::Hosted::start(control_of(id).shape, script) {
+    match controls::Hosted::start(control_of(id).shape, source, script) {
         Err(why) => panic!("{id}: {why}"),
         Ok(mut host) => {
             if let Err(red) = body(&mut host) {
@@ -828,14 +841,23 @@ fn acp_a_start_whose_version_differs_from_the_hashed_build_is_refused() {
 #[test]
 #[ignore = "waits for ACP-7c"]
 fn acp_an_upgrade_leaves_a_gemini_shaped_process_the_chunk_of_its_copy() {
-    unwritten("6b-5");
+    run_case(
+        "6b-5",
+        &controls::chunk_script(),
+        controls::an_upgrade_while_a_gemini_shaped_agent_runs,
+    );
 }
 
 /// Control 6b-6.
 #[test]
 #[ignore = "waits for ACP-7c"]
 fn acp_without_the_copy_the_same_upgrade_changes_the_chunk_a_gemini_shaped_process_loads() {
-    unwritten("6b-6");
+    run_case_from(
+        "6b-6",
+        Source::TheInstallation,
+        &controls::chunk_script(),
+        controls::an_upgrade_while_the_agent_runs_from_the_installation,
+    );
 }
 
 // The guards. They start no agent and run in the workspace's gate.

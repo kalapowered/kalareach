@@ -8,7 +8,7 @@
 
 use serde_json::Value;
 
-use super::{Shape, red_of};
+use super::{Shape, Source, red_of};
 
 /// The red a control shows: the control's number and the text of the table.
 #[derive(Debug, PartialEq, Eq)]
@@ -119,12 +119,14 @@ pub enum Hosted {}
 
 impl Hosted {
     /// Starts the stand-in of `shape` with `script` through the launch: the native program for
-    /// Qoder, and for Gemini the script package that the interpreter stand-in runs. When the script
-    /// holds no turn of the agent's own, it sends a prompt and returns once the agent's first
-    /// request is pending and read; when it holds one, it returns once the agent runs, and the case
-    /// releases the file that starts the turn and sends the prompts it needs.
-    pub fn start(_shape: Shape, _script: &Value) -> Result<Self, &'static str> {
-        Err(super::NO_BODY)
+    /// Qoder, and for Gemini the script package that the interpreter stand-in runs. `source` says
+    /// where it runs from: the verified copy, as every agent the host starts does, or the
+    /// installation itself, as only the harness can start it. When the script holds no turn of the
+    /// agent's own, it sends a prompt and returns once the agent's first request is pending and
+    /// read; when it holds one, it returns once the agent runs, and the case releases the file that
+    /// starts the turn and sends the prompts it needs.
+    pub fn start(_shape: Shape, _source: Source, _script: &Value) -> Result<Self, &'static str> {
+        Err(super::NO_HOST)
     }
 
     /// The four reads of the instance and its pending request.
@@ -916,6 +918,7 @@ fn scripts() -> Vec<(&'static str, Value)> {
             completed_while_cancelling_script(),
         ),
         ("upgrade_script", upgrade_script()),
+        ("chunk_script", chunk_script()),
         ("window_script", window_script()),
         ("queued_prompt_script", queued_prompt_script()),
         (
@@ -1826,5 +1829,117 @@ fn the_judge_of_the_version_names_its_red_when_a_start_with_another_version_is_a
         the_reported_version_is_the_bindings(&versions("1.1.64", "1.1.63"), &start(false)),
         Err(red("6b-4")),
         "the agent reports another version than the binding's"
+    );
+}
+
+/// The bytes of the installation's chunk before and after the upgrade replaced it.
+#[derive(Debug)]
+pub struct Chunks {
+    /// The bytes before the upgrade.
+    pub original: Vec<u8>,
+    /// The bytes after the upgrade.
+    pub upgraded: Vec<u8>,
+}
+
+/// 6b-5: the chunk the Gemini-shaped agent read, from the copy it runs from, holds the bytes the
+/// installation's chunk had before the upgrade.
+pub fn the_copys_chunk_is_read_after_the_upgrade(
+    chunks: &Chunks,
+    read: Option<&[u8]>,
+) -> Result<(), Red> {
+    ensure(read == Some(chunks.original.as_slice()), "6b-5")
+}
+
+/// 6b-6: the chunk the Gemini-shaped agent read, started from the installation with no copy, holds
+/// the bytes the upgrade put there, so the two starts differ.
+pub fn without_the_copy_the_upgraded_chunk_is_read(
+    chunks: &Chunks,
+    read: Option<&[u8]>,
+) -> Result<(), Red> {
+    ensure(read == Some(chunks.upgraded.as_slice()), "6b-6")
+}
+
+impl Hosted {
+    /// Replaces the installation's chunk in place, as an upgrade of the package does, and returns
+    /// its bytes before and after. It stops the case when the stand-in has read the chunk already
+    /// or the bytes did not change.
+    pub fn upgrades_the_package(&mut self) -> Chunks {
+        match *self {}
+    }
+
+    /// The bytes the stand-in's import step wrote to the marker, or none when it wrote none within
+    /// five seconds.
+    pub fn chunk_read(&mut self) -> Option<Vec<u8>> {
+        match *self {}
+    }
+}
+
+/// The script of a Gemini-shaped agent that asks for a call and, when the file `import` appears
+/// after the answer, reads its chunk.
+pub fn chunk_script() -> Value {
+    serde_json::json!({
+        "turns": [[
+            { "call": { "id": "c1", "kind": "execute" } },
+            { "ask": "c1" },
+            { "hold": "import" },
+            { "import": "chunk.js" },
+            { "end": "end_turn" },
+        ]],
+    })
+}
+
+/// Cases 6b-5 and 6b-3g: the first request is answered, the package is upgraded before the agent
+/// reads its chunk, and a second agent is started from the upgraded installation.
+pub fn an_upgrade_while_a_gemini_shaped_agent_runs(host: &mut Hosted) -> Result<(), Red> {
+    host.answer_next("allow-once");
+    let chunks = host.upgrades_the_package();
+    host.release("import");
+    the_copys_chunk_is_read_after_the_upgrade(&chunks, host.chunk_read().as_deref())?;
+    let start = host.starts_a_second_agent(&serde_json::json!({}));
+    a_build_outside_the_range_is_refused("6b-3g", "=0.60.0", &start)
+}
+
+/// Case 6b-6: the same upgrade, with the agent started from the installation and not from a copy.
+pub fn an_upgrade_while_the_agent_runs_from_the_installation(host: &mut Hosted) -> Result<(), Red> {
+    host.answer_next("allow-once");
+    let chunks = host.upgrades_the_package();
+    host.release("import");
+    without_the_copy_the_upgraded_chunk_is_read(&chunks, host.chunk_read().as_deref())
+}
+
+#[test]
+fn the_judges_of_the_chunk_name_their_reds_when_the_start_with_the_copy_or_without_it_reads_the_other_chunk()
+ {
+    let chunks = Chunks {
+        original: b"original".to_vec(),
+        upgraded: b"upgraded".to_vec(),
+    };
+    assert_eq!(
+        the_copys_chunk_is_read_after_the_upgrade(&chunks, Some(b"original")),
+        Ok(())
+    );
+    assert_eq!(
+        the_copys_chunk_is_read_after_the_upgrade(&chunks, Some(b"upgraded")),
+        Err(red("6b-5")),
+        "the launch ran the installation's package, so the marker holds the replaced chunk"
+    );
+    assert_eq!(
+        the_copys_chunk_is_read_after_the_upgrade(&chunks, None),
+        Err(red("6b-5")),
+        "the agent read no chunk"
+    );
+    assert_eq!(
+        without_the_copy_the_upgraded_chunk_is_read(&chunks, Some(b"upgraded")),
+        Ok(())
+    );
+    assert_eq!(
+        without_the_copy_the_upgraded_chunk_is_read(&chunks, Some(b"original")),
+        Err(red("6b-6")),
+        "the replaced chunk is not the one the stand-in imports, so the control shows no difference"
+    );
+    assert_eq!(
+        without_the_copy_the_upgraded_chunk_is_read(&chunks, None),
+        Err(red("6b-6")),
+        "the agent read no chunk"
     );
 }
