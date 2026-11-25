@@ -279,10 +279,33 @@ impl Setup {
     }
 }
 
+/// Removes `directory` once whatever holds a file in it has let go, trying for at most a minute.
+///
+/// A backend's task holds the file of its program's image until the runtime drops the task, which
+/// is after the case's body, on the failure path as well as the passing one: this thread waits for
+/// that, and the case does not.
+#[cfg(windows)]
+fn remove_when_let_go(directory: PathBuf) {
+    std::thread::spawn(move || {
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while directory.exists() && std::time::Instant::now() < until {
+            if std::fs::remove_dir_all(&directory).is_ok() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    });
+}
+
 impl Drop for Setup {
     fn drop(&mut self) {
         let _ = self.backends.close();
+        #[cfg(unix)]
         let _ = std::fs::remove_dir_all(&self.directory);
+        #[cfg(windows)]
+        if std::fs::remove_dir_all(&self.directory).is_err() {
+            remove_when_let_go(self.directory.clone());
+        }
     }
 }
 
@@ -1880,16 +1903,14 @@ async fn a_program_the_fixture_created_ends_with_the_launcher_when_the_backend_n
     let directory = setup.directory.clone();
     drop(setup);
     // The backend lets go of the file it holds as its tasks end, which is after the setup has closed
-    // it, so the folder is removed when they have.
+    // it, and the setup's thread removes the folder when they have.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     while directory.exists() {
-        if let Err(error) = std::fs::remove_dir_all(&directory) {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "the case removed what it made in the temporary folder: {error}"
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the case removed what it made in the temporary folder"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
 }
 
