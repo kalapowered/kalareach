@@ -150,14 +150,19 @@ fn kr_req_11_26_the_statement_states_the_launch_after_the_integration() {
 /// rounded up to the next 1,000.
 #[test]
 fn kr_req_11_26_the_budget_holds_the_longer_of_the_two_statements_and_a_margin() {
-    let longest = statements()
+    let lengths: Vec<(&str, usize)> = statements()
         .iter()
-        .map(|(_, _, statement)| statement.chars().count())
+        .map(|(package, _, statement)| (*package, statement.chars().count()))
+        .collect();
+    let longest = lengths
+        .iter()
+        .map(|(_, length)| *length)
         .max()
         .expect("two packages");
     assert!(
         longest <= STATEMENT_CHARS,
-        "the longer statement is {longest} characters and the budget is {STATEMENT_CHARS}"
+        "the longer statement is {longest} characters and the budget is {STATEMENT_CHARS}: \
+         {lengths:?}"
     );
     assert_eq!(
         STATEMENT_CHARS,

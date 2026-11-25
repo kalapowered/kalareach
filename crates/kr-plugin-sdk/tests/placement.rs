@@ -915,21 +915,23 @@ fn a_publishers_words_holding_the_placement_label_are_refused() {
     );
 }
 
+/// The longest statement a package without an ACP launch can have, with each part at the longest the
+/// package contract allows, is within the budget a device shows whole.
 #[test]
-fn the_statement_bound_is_the_sum_of_the_contract_limits() {
+fn the_statement_budget_holds_the_contract_limits_of_a_bridge_and_an_integration() {
     use kr_protocol::confirmation::{INTEGRATION_STATEMENT_LABEL, STATEMENT_CHARS};
-    assert_eq!(
-        STATEMENT_CHARS,
-        // The bridge's words, the integration's own words, the host's label and the host's reading.
-        2 * kr_plugin_sdk::text::Summary::LIMIT
-            + 1
-            + 1
-            + INTEGRATION_STATEMENT_LABEL.len()
-            + 1
-            + kr_plugin_sdk::integration::MAX_STATEMENT_CHARS,
-        "today's sum"
+    // The bridge's words, the integration's own words, the host's label and the host's reading.
+    let longest = 2 * kr_plugin_sdk::text::Summary::LIMIT
+        + 1
+        + 1
+        + INTEGRATION_STATEMENT_LABEL.len()
+        + 1
+        + kr_plugin_sdk::integration::MAX_STATEMENT_CHARS;
+    assert_eq!(longest, 6055, "the sum of the contract's limits");
+    assert!(
+        longest <= STATEMENT_CHARS,
+        "{longest} and {STATEMENT_CHARS}"
     );
-    assert_eq!(STATEMENT_CHARS, 6055);
 }
 
 /// The longest reading `statement` can return is the bound: the one label whose reading holds a
@@ -1423,59 +1425,78 @@ fn a_bridge_file_at_the_root_is_kept_whatever_the_order_of_the_listing() {
 }
 
 /// The package check composes the host's whole statement, the publisher's words, the reading of
-/// the placement and the reading of the command integration, and holds it to the one limit an
-/// owner is shown whole: the longest that fits is accepted, and one character more is refused
-/// though each part is within its own limit.
+/// the placement, the reading of the command integration and the launch's words and reading, and
+/// holds it to the one limit an owner is shown whole: the longest that fits is accepted, and one
+/// character more is refused though each part is within its own limit. The filler is the words of
+/// an ACP launch, the one part whose contract limit lets the whole pass the budget.
 #[test]
 fn the_package_check_holds_the_whole_statement_to_the_shared_limit() {
-    use kr_protocol::confirmation::{STATEMENT_CHARS, install_statement};
+    use kr_plugin_sdk::connector::ConnectorManifest;
+    use kr_plugin_sdk::plugin::PluginManifest;
+    use kr_protocol::confirmation::STATEMENT_CHARS;
     let base: Value = serde_json::from_slice(
         &std::fs::read(bundled("claude-code").join("plugin.json")).expect("reads"),
     )
     .expect("JSON");
     let with_filler = |length: usize| {
         let mut manifest = base.clone();
-        manifest["command_integration"]["flags"]
-            .as_array_mut()
-            .expect("flags")
-            .push(json!("x".repeat(length)));
+        let requested = |manifest: &Value, capability: &str| {
+            manifest["capabilities"]
+                .as_array()
+                .expect("capabilities")
+                .iter()
+                .any(|entry| entry["capability"] == capability)
+        };
+        for capability in ["approval.decode", "approval.respond"] {
+            if !requested(&manifest, capability) {
+                manifest["capabilities"]
+                    .as_array_mut()
+                    .expect("capabilities")
+                    .push(json!({
+                        "capability": capability,
+                        "reason": "Answer what the agent asks in ACP mode"
+                    }));
+            }
+        }
+        // The filler is the launch's own words up to 5,000 characters and then names of 64
+        // characters, each of which adds 66 to the host's reading of the launch (the name and
+        // the separator), so the statement grows by one character for each character of filler.
+        let names = length.saturating_sub(5_000) / 66;
+        let mut passed = vec!["PATH".to_owned()];
+        passed.extend((0..names).map(|index| format!("{:_<64}", format!("FILLER_{index:02}_"))));
+        manifest["acp_launch"] = json!({
+            "command": "claude",
+            "platforms": ["mac_os", "linux"],
+            "required_names": ["PATH"],
+            "passed_names": passed,
+            "constants": [],
+            "grant_statement": "w".repeat(length - 66 * names)
+        });
         manifest
     };
-    let parts = |manifest: &Value| {
-        let bridge: kr_plugin_sdk::plugin::NativeBridge =
-            serde_json::from_value(manifest["native_bridge"].clone()).expect("a recipe");
-        let integration: kr_plugin_sdk::integration::CommandIntegration =
-            serde_json::from_value(manifest["command_integration"].clone())
-                .expect("an integration");
-        let reading = Placement::claude_code()
-            .statement(&bridge)
-            .expect("a reading");
-        // The publisher's words are the bridge's and then the integration's own, in the one
-        // statement.
-        let words = format!(
-            "{} {}",
-            bridge.grant_statement.as_str(),
-            integration.grant_statement.as_str()
-        );
-        (words, reading, integration.statement())
-    };
     let composed = |manifest: &Value| {
-        let (words, reading, integration) = parts(manifest);
-        install_statement(Some(&words), Some(&reading), Some(&integration))
+        let plugin: PluginManifest = serde_json::from_value(manifest.clone()).expect("a manifest");
+        let mut table: Value = serde_json::from_slice(
+            &std::fs::read(bundled("claude-code").join("connector.json")).expect("reads"),
+        )
+        .expect("JSON");
+        table["placement"] = claude();
+        let connector: ConnectorManifest = serde_json::from_value(table).expect("a table");
+        kr_plugin_sdk::validate::whole_statement(&plugin, Some(&connector))
             .expect("a statement")
             .chars()
             .count()
     };
     let exact = 1 + (STATEMENT_CHARS - composed(&with_filler(1)));
+    assert!(
+        exact < 5_000 + 66 * 63,
+        "the filler is within the launch's own limits: {exact}"
+    );
     assert_eq!(
         composed(&with_filler(exact)),
         STATEMENT_CHARS,
         "the longest that fits"
     );
-    let (words, reading, integration) = parts(&with_filler(exact + 1));
-    assert!(words.chars().count() <= 2 * kr_plugin_sdk::text::Summary::LIMIT + 1);
-    assert!(reading.chars().count() <= kr_plugin_sdk::placement::MAX_PLACEMENT_STATEMENT_CHARS);
-    assert!(integration.chars().count() <= kr_plugin_sdk::integration::MAX_STATEMENT_CHARS);
 
     // The package as `package_edited` writes it, with the SDK range that holds the arrival of a
     // placement kept, and the whole validation result returned.
@@ -1509,7 +1530,9 @@ fn the_package_check_holds_the_whole_statement_to_the_shared_limit() {
         over.report.findings
     );
     assert!(
-        over.report.findings[0].detail.contains("6056 characters"),
+        over.report.findings[0]
+            .detail
+            .contains(&format!("{} characters", STATEMENT_CHARS + 1)),
         "{:?}",
         over.report.findings
     );

@@ -1286,34 +1286,50 @@ fn check_placement(
 }
 
 /// The whole installation statement the host composes for a package, as it composes it for a grant
-/// that holds every capability the package has a part for: the publisher's words of the bridge and
-/// of the command integration, the host's reading of the placement the table declares and the host's
-/// reading of the command integration, or its words that the package declares none. `None` for a
-/// package with no native bridge.
+/// that holds every capability the package has a part for: the publisher's words of the bridge, of
+/// the command integration and of the ACP launch, the host's reading of the placement the table
+/// declares and the host's reading of the command integration, followed by its label and reading of
+/// the ACP launch. `None` for a package with neither a native bridge nor an ACP launch.
 #[must_use]
 pub fn whole_statement(
     manifest: &PluginManifest,
     connector: Option<&ConnectorManifest>,
 ) -> Option<String> {
-    let bridge = manifest.native_bridge.0.as_ref()?;
-    let placement = connector
-        .and_then(|table| table.placement.as_ref())
-        .and_then(|placement| placement.statement(bridge).ok());
+    let bridge = manifest.native_bridge.0.as_ref();
+    let launch = manifest.acp_launch.as_ref();
+    if bridge.is_none() && launch.is_none() {
+        return None;
+    }
+    let placement = bridge.and_then(|bridge| {
+        connector
+            .and_then(|table| table.placement.as_ref())
+            .and_then(|placement| placement.statement(bridge).ok())
+    });
     let integration = manifest.command_integration.as_ref().map_or_else(
         || crate::integration::NO_INTEGRATION_STATEMENT.to_owned(),
         crate::integration::CommandIntegration::statement,
     );
-    let publisher = kr_protocol::confirmation::publisher_words(
-        Some(bridge.grant_statement.as_str()),
+    let reading = kr_protocol::confirmation::integration_reading(
+        &integration,
+        launch
+            .map(crate::acp_launch::AcpLaunch::statement)
+            .as_deref(),
+    );
+    let integration_words = kr_protocol::confirmation::integration_words(
         manifest
             .command_integration
             .as_ref()
             .map(|declared| declared.grant_statement.as_str()),
+        launch.map(|launch| launch.grant_statement.as_str()),
+    );
+    let publisher = kr_protocol::confirmation::publisher_words(
+        bridge.map(|bridge| bridge.grant_statement.as_str()),
+        integration_words.as_deref(),
     );
     kr_protocol::confirmation::install_statement(
         publisher.as_deref(),
         placement.as_deref(),
-        Some(integration.as_str()),
+        Some(reading.as_str()),
     )
 }
 
@@ -1326,13 +1342,21 @@ fn check_statement(
 ) {
     let length = whole_statement(manifest, connector).map_or(0, |text| text.chars().count());
     if length > kr_protocol::confirmation::STATEMENT_CHARS {
+        // A package with a bridge is refused as before; a package whose statement is long only by
+        // its ACP launch is refused as an invalid launch.
+        let code = if manifest.native_bridge.0.is_some() {
+            FindingCode::BridgeRecipeInvalid
+        } else {
+            FindingCode::AcpLaunchInvalid
+        };
         report.push(Finding::at(
-            FindingCode::BridgeRecipeInvalid,
+            code,
             MANIFEST_FILE,
             format!(
                 "the host's whole statement of this package, with the publisher's words, its \
-                 reading of the placement and its reading of the command integration, is {length} \
-                 characters; the host shows an owner a statement of at most {} characters",
+                 reading of the placement, its reading of the command integration and its reading \
+                 of the ACP launch, is {length} characters; the host shows an owner a statement of \
+                 at most {} characters",
                 kr_protocol::confirmation::STATEMENT_CHARS
             ),
         ));
@@ -1920,6 +1944,10 @@ fn check_integration_words(
             kr_protocol::confirmation::PLACEMENT_STATEMENT_LABEL,
             "a placement",
         ),
+        (
+            kr_protocol::confirmation::ACP_STATEMENT_LABEL,
+            "an ACP launch",
+        ),
     ] {
         if words.contains(label) {
             report.push(Finding::at(
@@ -2031,6 +2059,10 @@ fn check_acp_words(
             kr_protocol::confirmation::PLACEMENT_STATEMENT_LABEL,
             "a placement",
         ),
+        (
+            kr_protocol::confirmation::ACP_STATEMENT_LABEL,
+            "an ACP launch",
+        ),
     ] {
         if words.contains(label) {
             report.push(Finding::at(
@@ -2082,6 +2114,19 @@ fn check_bridge(manifest: &PluginManifest, bridge: &NativeBridge, report: &mut R
             MANIFEST_FILE,
             "the bridge's statement holds the words the host writes before its own reading of a \
              placement",
+        ));
+    }
+    // And for the label the host writes before its own reading of an ACP launch.
+    if bridge
+        .grant_statement
+        .as_str()
+        .contains(kr_protocol::confirmation::ACP_STATEMENT_LABEL)
+    {
+        report.push(Finding::at(
+            FindingCode::BridgeRecipeInvalid,
+            MANIFEST_FILE,
+            "the bridge's statement holds the words the host writes before its own reading of an \
+             ACP launch",
         ));
     }
     if bridge.install.is_empty() {

@@ -3256,9 +3256,9 @@ async fn kr_req_11_44_a_release_whose_table_cannot_be_fetched_or_read_gets_a_ref
 }
 
 /// KR-REQ-11.44: a release whose whole statement, the publisher's words, the host's reading of the
-/// placement and its reading of the command integration, is longer than an owner is shown whole is
-/// refused, though each part is within its own limit; the same release with a shorter integration
-/// is shown its statement.
+/// placement, its reading of the command integration and the words and reading of an ACP launch, is
+/// longer than an owner is shown whole is refused, though each part is within its own limit; the
+/// same release with a shorter launch is shown its statement.
 #[tokio::test]
 async fn a_whole_statement_longer_than_the_bound_is_refused() {
     use kr_plugin_sdk::placement::Placement;
@@ -3269,15 +3269,24 @@ async fn a_whole_statement_longer_than_the_bound_is_refused() {
         PluginCapability::NativeBridgeInstall,
         PluginCapability::CommandIntegrationLaunch,
     ];
-    let with_filler = |length: usize| {
+    // The package asks for both approval grants already. Its launch has `words` characters of the
+    // publisher's own words and `names` passed names of 64 characters each.
+    let with_launch = |words: usize, names: usize| {
         move |manifest: &mut serde_json::Value| {
-            manifest["command_integration"]["flags"]
-                .as_array_mut()
-                .expect("flags")
-                .push(serde_json::json!("x".repeat(length)));
+            let mut passed = vec!["PATH".to_owned()];
+            passed
+                .extend((0..names).map(|index| format!("{:_<64}", format!("FILLER_{index:02}_"))));
+            manifest["acp_launch"] = serde_json::json!({
+                "command": "claude",
+                "platforms": ["mac_os", "linux"],
+                "required_names": ["PATH"],
+                "passed_names": passed,
+                "constants": [],
+                "grant_statement": "w".repeat(words)
+            });
         }
     };
-    let shown = placed_statement_granted("claude-code", claude, with_filler(1), false, both)
+    let shown = placed_statement_granted("claude-code", claude, with_launch(1, 0), false, both)
         .await
         .expect("the release is read")
         .expect("a statement");
@@ -3286,8 +3295,12 @@ async fn a_whole_statement_longer_than_the_bound_is_refused() {
         "the control is within the bound: {}",
         shown.chars().count()
     );
+    assert!(
+        shown.contains(kr_protocol::confirmation::ACP_STATEMENT_LABEL),
+        "and states its launch: {shown}"
+    );
     let refusal =
-        placed_statement_granted("claude-code", claude, with_filler(3500), false, both).await;
+        placed_statement_granted("claude-code", claude, with_launch(6000, 63), false, both).await;
     assert!(
         matches!(&refusal, Err(CatalogueError::UnsafePackage { detail })
             if detail.contains("whole statement is longer")),

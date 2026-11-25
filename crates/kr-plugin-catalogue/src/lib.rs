@@ -2391,11 +2391,19 @@ impl Catalogue {
             .as_ref()
             .filter(|_| grant.holds(PluginCapability::CommandIntegrationLaunch))
             .map(|declared| declared.grant_statement.as_str());
+        // The ACP launch's own words are the publisher's too, and are shown only where the grant
+        // holds the capability the launch rides on.
+        let acp_words = manifest
+            .acp_launch
+            .as_ref()
+            .filter(|_| grant.holds(PluginCapability::CommandIntegrationLaunch))
+            .map(|declared| declared.grant_statement.as_str());
         // The host's label tells its reading from the publisher's words, so words that hold it are
         // not shown: the package check refuses them, and a manifest kept from before does too.
         for (words, whose) in [
             (bridge, "the bridge's"),
             (integration_words, "the command integration's"),
+            (acp_words, "the ACP launch's"),
         ] {
             if words.is_some_and(|words| {
                 words.contains(kr_protocol::confirmation::INTEGRATION_STATEMENT_LABEL)
@@ -2419,10 +2427,24 @@ impl Catalogue {
                     ),
                 });
             }
+            // So are the words the host writes before its reading of an ACP launch.
+            if words
+                .is_some_and(|words| words.contains(kr_protocol::confirmation::ACP_STATEMENT_LABEL))
+            {
+                return Err(CatalogueError::UnsafePackage {
+                    detail: format!(
+                        "{subject} is not a package this host will install: {whose} statement \
+                         holds the words the host writes before its own reading of an ACP launch"
+                    ),
+                });
+            }
         }
-        // Neither holds a label by itself. The two are shown as one run of the publisher's words,
+        // None holds a label by itself. The three are shown as one run of the publisher's words,
         // and a label can still be formed where they join, which the owner would read as the host's.
-        let publisher = kr_protocol::confirmation::publisher_words(bridge, integration_words);
+        let integration_run =
+            kr_protocol::confirmation::integration_words(integration_words, acp_words);
+        let publisher =
+            kr_protocol::confirmation::publisher_words(bridge, integration_run.as_deref());
         for (label, reading_of) in [
             (
                 kr_protocol::confirmation::INTEGRATION_STATEMENT_LABEL,
@@ -2432,6 +2454,10 @@ impl Catalogue {
                 kr_protocol::confirmation::PLACEMENT_STATEMENT_LABEL,
                 "a placement",
             ),
+            (
+                kr_protocol::confirmation::ACP_STATEMENT_LABEL,
+                "an ACP launch",
+            ),
         ] {
             if publisher
                 .as_deref()
@@ -2439,9 +2465,10 @@ impl Catalogue {
             {
                 return Err(CatalogueError::UnsafePackage {
                     detail: format!(
-                        "{subject} is not a package this host will install: the bridge's \
-                         statement and the command integration's statement, read together, hold \
-                         the words the host writes before its own reading of {reading_of}"
+                        "{subject} is not a package this host will install: the publisher's \
+                         statements of the bridge, the command integration and the ACP launch, \
+                         read together, hold the words the host writes before its own reading of \
+                         {reading_of}"
                     ),
                 });
             }
@@ -2481,6 +2508,16 @@ impl Catalogue {
                 ),
             });
         }
+        // The reading of an ACP launch stands after the reading of the integration, in its part.
+        let integration = integration.map(|reading| {
+            kr_protocol::confirmation::integration_reading(
+                &reading,
+                acp_words
+                    .and(manifest.acp_launch.as_ref())
+                    .map(kr_plugin_sdk::acp_launch::AcpLaunch::statement)
+                    .as_deref(),
+            )
+        });
         let statement = kr_protocol::confirmation::install_statement(
             publisher.as_deref(),
             placement.as_deref(),

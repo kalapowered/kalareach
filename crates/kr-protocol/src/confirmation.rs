@@ -436,14 +436,19 @@ pub const PLACEMENT_STATEMENT_LABEL: &str = "The host's exact reading of the pla
 pub const PLACEMENT_READING_CAPABILITY: &str = "statement.placement_reading/1";
 
 /// The longest statement an installation's confirmation carries, and so the longest shown whole:
-/// the publisher's statement of a native bridge, the publisher's statement of a command
-/// integration, the host's label, and the host's reading of a command integration, each at the
-/// longest the package contract allows. The host's reading of a placement shares the room: a
-/// release whose whole statement is longer is refused by the host.
+/// the publisher's words of a native bridge, of a command integration and of an ACP launch, the
+/// host's reading of a placement, the host's label and reading of a command integration, and the
+/// host's label and reading of an ACP launch. A release whose whole statement is longer is refused
+/// by the host.
+///
+/// The figure is the longer of the statements of the two packages that declare an ACP launch,
+/// composed as the host composes them, plus a margin of 500 characters, rounded up to the next
+/// 1,000 (`kr-plugin-sdk`, `tests/statement_budget.rs`). It is not the sum of the limits the
+/// package contract sets for each part.
 ///
 /// A device that holds a smaller figure refuses a longer statement: nothing is confirmed and
 /// nothing is shown wrongly.
-pub const STATEMENT_CHARS: usize = 6055;
+pub const STATEMENT_CHARS: usize = 10_000;
 
 /// Whether a link's hello states that its host writes the placement reading.
 #[must_use]
