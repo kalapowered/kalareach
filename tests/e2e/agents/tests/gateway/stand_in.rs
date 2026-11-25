@@ -285,7 +285,7 @@ pub fn stand_in_chosen(
 }
 
 /// A directory of this case's own below the system's temporary one, empty.
-fn scratch(case: &str) -> PathBuf {
+pub fn scratch(case: &str) -> PathBuf {
     let directory = std::env::temp_dir().join(format!("kr-stand-in-{case}-{}", super::mark()));
     std::fs::create_dir_all(&directory).expect("a directory for the case");
     directory
@@ -1087,6 +1087,24 @@ fn marked(base: &Path, synthetic: &Synthetic) -> (Synthetic, PathBuf) {
     )
 }
 
+/// The subject the terminal stand-in stands for, made from `synthetic` and a release of the entry's
+/// package written below `base`.
+///
+/// # Panics
+///
+/// Panics where the subject cannot be made from the release.
+pub fn subject_for(synthetic: &Synthetic, base: &Path) -> Subject {
+    let directory = base.join("release");
+    release(
+        &directory,
+        &synthetic.build.package,
+        &synthetic.build.command,
+        Shape::Backend,
+    );
+    Subject::from_release(&synthetic.build, &directory)
+        .unwrap_or_else(|why| panic!("{}: {why}", synthetic.name))
+}
+
 /// Runs `part`, one of the staged parts that start no model turn, as `test`, for the stand-in made
 /// from each synthetic entry, installed from a release of the entry's package. Every program the
 /// entry names is a marker ([`marked`]) in a folder of the case, outside the run's directory, and
@@ -1095,15 +1113,7 @@ fn for_each_entry(test: &str, part: fn(Option<Subject>, &str)) {
     for synthetic in synthetic() {
         let base = scratch("part");
         let (synthetic, mark) = marked(&base, &synthetic);
-        let directory = base.join("release");
-        release(
-            &directory,
-            &synthetic.build.package,
-            &synthetic.build.command,
-            Shape::Backend,
-        );
-        let subject = Subject::from_release(&synthetic.build, &directory)
-            .unwrap_or_else(|why| panic!("{}: {why}", synthetic.name));
+        let subject = subject_for(&synthetic, &base);
         part(Some(subject), test);
         assert!(
             !mark.exists(),

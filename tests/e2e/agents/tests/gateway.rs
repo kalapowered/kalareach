@@ -8098,12 +8098,16 @@ fn gateway_an_agent_that_rewrote_the_hosts_state_is_not_obeyed_when_the_host_is_
 /// link to a program of the case's own that leaves a mark when it runs; the host is then asked to
 /// start the agent again, as a line typed again is. Returns the text the second start ended in, and
 /// whether the case's program ever ran. The first start is the control: it went through the same
-/// check over the files as they were placed.
+/// check over the files as they were placed. The agent is Codex's application stand-in where
+/// `subject` is none; where it is some, it is the terminal stand-in made from that entry, started
+/// by hand, which runs the program when it reads the first prompt the case types.
 fn an_agent_replaces_a_placed_file_and_is_started_again(
+    subject: Option<Subject>,
     replaced: &str,
     forge: bool,
 ) -> (String, bool) {
     an_agent_leaves_a_change_and_is_started_again(
+        subject,
         forge,
         &|ctx, program, _| {
             let place = ctx.run.root().join(replaced);
@@ -8115,13 +8119,17 @@ fn an_agent_replaces_a_placed_file_and_is_started_again(
             )
         },
         &|ctx, _| {
-            assert!(
-                std::fs::symlink_metadata(ctx.run.root().join(replaced))
-                    .expect("the link the stand-in made")
-                    .file_type()
-                    .is_symlink(),
-                "the stand-in replaced {replaced} by a link"
-            );
+            let place = ctx.run.root().join(replaced);
+            let started = Instant::now();
+            while !std::fs::symlink_metadata(&place)
+                .is_ok_and(|found| found.file_type().is_symlink())
+            {
+                assert!(
+                    started.elapsed() < LIVENESS,
+                    "the stand-in did not replace {replaced} by a link within {LIVENESS:?}"
+                );
+                std::thread::sleep(Duration::from_millis(50));
+            }
         },
     )
 }
@@ -8132,8 +8140,11 @@ fn an_agent_replaces_a_placed_file_and_is_started_again(
 /// with the real one beside it; `changed` then asserts that the program did its change; the host is asked to start the agent
 /// again, as a line typed again is. Returns the text the second start ended in, and whether the
 /// case's program ever ran. The first start is the control: it went through the same checks over
-/// the run as it was placed.
+/// the run as it was placed. The agent is Codex's application stand-in where `subject` is none;
+/// where it is some, it is the terminal stand-in made from that entry, started by hand, which runs
+/// the program when it reads the first prompt the case types.
 fn an_agent_leaves_a_change_and_is_started_again(
+    subject: Option<Subject>,
     forge: bool,
     script: &dyn Fn(&Context, &Path, &Path) -> String,
     changed: &dyn Fn(&Context, &Path),
@@ -8167,6 +8178,10 @@ fn an_agent_leaves_a_change_and_is_started_again(
         Run::start("gateway-replaces"),
         runtime(),
     );
+    if let Some(subject) = subject {
+        ctx.subject = subject;
+        ctx.manual = true;
+    }
     ctx.forge = forge;
     ctx.place();
     let leave = scratch.join("leave.sh");
@@ -8182,16 +8197,22 @@ fn an_agent_leaves_a_change_and_is_started_again(
         let root = std::fs::canonicalize(ctx.run.root()).expect("the run's directory");
         more.push(("KALAREACH_E2E_FORGE_ROOT", root.display().to_string()));
     }
-    let session = Session::open_with(
-        &ctx,
-        "answer-when-released,keep-reading,stay,leave-a-host",
-        &more,
-    );
-    let first = session.starts_the_agent(&[], None, &[]);
+    let variants = if ctx.subject.entry().is_some() {
+        "leave-a-host"
+    } else {
+        "answer-when-released,keep-reading,stay,leave-a-host"
+    };
+    let session = Session::open_with(&ctx, variants, &more);
+    let start = |not: Option<ApplicationInstanceId>| match ctx.subject.entry() {
+        Some(build) => session.starts_the_agent_showing(&build.ready, &[], not, &[]),
+        None => session.starts_the_agent(&[], not, &[]),
+    };
+    let first = start(None);
+    if let Some(build) = ctx.subject.entry() {
+        session.person.types(&build.harmless.input);
+    }
     changed(&ctx, &scratch);
-    let second = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        session.starts_the_agent(&[], Some(first), &[])
-    }));
+    let second = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| start(Some(first))));
     let said = match second {
         Ok(_) => "the second start went through".to_owned(),
         Err(panic) => panic_text(&*panic),
@@ -8207,7 +8228,8 @@ fn an_agent_leaves_a_change_and_is_started_again(
 /// the start is refused before the line is typed.
 #[test]
 fn gateway_a_launcher_the_agent_replaced_is_not_run_by_the_next_start() {
-    let (said, ran) = an_agent_replaces_a_placed_file_and_is_started_again("b/kr-hook", false);
+    let (said, ran) =
+        an_agent_replaces_a_placed_file_and_is_started_again(None, "b/kr-hook", false);
     if said.is_empty() {
         return;
     }
@@ -8224,7 +8246,8 @@ fn gateway_a_launcher_the_agent_replaced_is_not_run_by_the_next_start() {
 #[test]
 fn gateway_a_real_launcher_the_agent_replaced_beside_the_forging_one_is_not_run_by_the_next_start()
 {
-    let (said, ran) = an_agent_replaces_a_placed_file_and_is_started_again("b/h/kr-hook", true);
+    let (said, ran) =
+        an_agent_replaces_a_placed_file_and_is_started_again(None, "b/h/kr-hook", true);
     if said.is_empty() {
         return;
     }
@@ -8235,19 +8258,40 @@ fn gateway_a_real_launcher_the_agent_replaced_beside_the_forging_one_is_not_run_
     assert!(!ran, "the program the replaced real launcher names ran");
 }
 
-/// The stand-in the shell finds by name, replaced by a link after the first start, is not run by the
-/// next start either.
+/// Each file the stand-in route places for a launch, replaced by a link after the first start, is
+/// not run by the next start either: Codex's stand-in the shell finds by name and, for each
+/// synthetic entry, the file the host sees as the agent, the script typed as the command and, for a
+/// wheel, the wheel's file.
 #[test]
 fn gateway_a_stand_in_the_agent_replaced_is_not_run_by_the_next_start() {
-    let (said, ran) = an_agent_replaces_a_placed_file_and_is_started_again("t/codex", false);
-    if said.is_empty() {
+    let not_run = |subject: Option<Subject>, place: &str| {
+        let (said, ran) =
+            an_agent_replaces_a_placed_file_and_is_started_again(subject, place, false);
+        if said.is_empty() {
+            return false;
+        }
+        assert!(
+            said.contains(ISOLATION_UNPROVEN) && said.contains("symbolic link"),
+            "{place}: the next start was refused as a replaced file: {said}"
+        );
+        assert!(!ran, "{place}: the program the replaced file names ran");
+        true
+    };
+    if !not_run(None, "t/codex") {
         return;
     }
-    assert!(
-        said.contains(ISOLATION_UNPROVEN) && said.contains("symbolic link"),
-        "the next start was refused as a replaced file: {said}"
-    );
-    assert!(!ran, "the program the replaced stand-in names ran");
+    for synthetic in stand_in::synthetic() {
+        let base = stand_in::scratch("replaced");
+        let subject = stand_in::subject_for(&synthetic, &base);
+        let placing = stand_in::placing_of(Some(&synthetic.build), &synthetic.build.command);
+        for name in [Some(placing.program), placing.script, placing.wheel]
+            .into_iter()
+            .flatten()
+        {
+            not_run(Some(subject.clone()), &format!("t/{name}"));
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
 }
 
 /// What the checks made right before a typing say of a run where a launcher was replaced after the
@@ -8348,6 +8392,7 @@ fn the_variables_a_case_asks_for_reach_the_session_on_every_route() {
 #[test]
 fn gateway_a_work_directory_the_agent_moved_out_of_the_run_is_not_started_in_by_the_next_start() {
     let (said, _) = an_agent_leaves_a_change_and_is_started_again(
+        None,
         false,
         &|ctx, _, scratch| {
             let work = ctx.run.work();

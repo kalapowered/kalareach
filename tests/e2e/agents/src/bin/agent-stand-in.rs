@@ -45,6 +45,9 @@
 //!   in the home. A prompt is a line that holds the entry's prompt mark, after a line that holds
 //!   its turn mark where the entry has one; a reply is a line that holds its reply mark; an image
 //!   a prompt names is a line that holds the entry's image mark and the image as base64 text.
+//! - Where `STAND_IN_LEAVE` names a program, it runs that program once, when it reads its first
+//!   prompt and before it answers, and stops with an error if the program does not end well. A case
+//!   uses it to have the agent change a file of the run after the host has found the agent.
 
 /// The stand-in's own code, which uses the system's terminal and file locks.
 #[cfg(unix)]
@@ -73,6 +76,9 @@ mod stand_in {
 
     /// The variable that names the file of names and texts of the entry the stand-in stands for.
     const ENTRY_VARIABLE: &str = "STAND_IN_ENTRY";
+
+    /// The variable that names a program the stand-in runs once, when it reads its first prompt.
+    const LEAVE_VARIABLE: &str = "STAND_IN_LEAVE";
 
     /// The text the composer shows while it waits for a prompt.
     const COMPOSER: &str = "Ask Codex to do anything";
@@ -234,6 +240,7 @@ mod stand_in {
                 std::slice::from_ref(&entry.ready),
                 &entry.composer,
                 true,
+                std::env::var_os(LEAVE_VARIABLE).filter(|program| !program.is_empty()),
             ),
             None => composer(
                 conversation,
@@ -244,6 +251,7 @@ mod stand_in {
                 ],
                 COMPOSER,
                 false,
+                None,
             ),
         }
     }
@@ -583,6 +591,7 @@ mod stand_in {
         banner: &[String],
         composer: &str,
         keys_typed: bool,
+        mut leave_program: Option<std::ffi::OsString>,
     ) {
         for line in banner {
             println!("{line}");
@@ -614,6 +623,12 @@ mod stand_in {
             if prompt.is_empty() {
                 continue;
             }
+            if let Some(program) = leave_program.take()
+                && let Err(why) = leave(&program)
+            {
+                eprintln!("Error: {why}");
+                std::process::exit(2);
+            }
             let reply = answer(&prompt, &mut conversation);
             println!("• {reply}");
             println!();
@@ -622,6 +637,23 @@ mod stand_in {
         if let Some(saved) = saved {
             let _ =
                 rustix::termios::tcsetattr(&stdin, rustix::termios::OptionalActions::Now, &saved);
+        }
+    }
+
+    /// Runs `program` and waits for it, as the agent's own change to the files of the run.
+    ///
+    /// # Errors
+    ///
+    /// Returns why the program did not start or did not end well.
+    fn leave(program: &std::ffi::OsStr) -> Result<(), String> {
+        let name = program.to_string_lossy();
+        let status = Command::new(program)
+            .status()
+            .map_err(|error| format!("{LEAVE_VARIABLE} {name}: {error}"))?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(format!("{LEAVE_VARIABLE} {name} ended with {status}"))
         }
     }
 
