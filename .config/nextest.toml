@@ -150,3 +150,30 @@ slow-timeout = { period = "120s", terminate-after = 20 }
 [[profile.default.overrides]]
 filter = 'package(kr-cli) & (binary(update) | binary(admit))'
 priority = 80
+
+# These cases start their mount namespace through `podman unshare` where `unshare -r -m` is refused, as it is on the box,
+# so they take the container runtime's turn.
+[[profile.default.overrides]]
+filter = '''
+  (binary_id(kr-changeset::filesystems) & (
+      test(=a_workspace_on_another_filesystem_is_not_opened_whatever_its_numbers)
+      | test(=a_materialisation_on_another_filesystem_is_not_read_or_emptied_whatever_its_numbers)
+      | test(=a_directory_bound_into_a_materialisation_from_its_own_filesystem_is_not_changed_by_its_release)
+  ))
+  | (binary_id(kr-changeset::apply) & test(=a_staged_name_on_another_filesystem_is_left_where_it_is_whatever_its_numbers))
+  | (binary_id(kr-project::locations) & test(=owner_cleanup_does_not_remove_a_staging_directory_on_another_filesystem))
+  | (binary_id(kr-project::workspaces) & (
+      test(=a_registered_repository_on_another_filesystem_is_refused_whatever_its_numbers)
+      | test(=a_workspace_tree_on_another_filesystem_is_not_removed_whatever_its_numbers)
+      | test(=a_workspace_tree_on_another_filesystem_is_not_read_whatever_its_numbers)
+      | test(=a_directory_bound_over_a_registered_subdirectorys_parent_is_not_read_as_it)
+      | test(=a_filesystem_mounted_over_a_registered_subdirectory_is_not_read_as_it)
+  ))
+  | (binary_id(kr-project) & test(=git::tests::a_directory_on_another_filesystem_is_not_taken_away_as_the_one_this_host_made))
+  | (binary_id(kr-transfer::filesystems) & (
+      test(=a_staging_directory_on_another_filesystem_is_refused_whatever_its_numbers)
+      | test(=a_scope_on_another_filesystem_is_refused_whatever_its_numbers)
+      | test(=a_directory_on_another_filesystem_is_not_the_recorded_one_whatever_its_numbers)
+  ))
+'''
+test-group = 'container-runtime'
