@@ -396,6 +396,9 @@ pub fn check(build: &Build) -> Report {
         .iter()
         .map(|runtime| runtime.display().to_string())
         .collect();
+    // Codex's entry is exempt while its live entry and the runner's projection carry no `missing`
+    // member. The exemption ends when the projection gives every entry a `missing` member: a Codex
+    // entry with none is then refused like any other.
     if build.package != CODEX_PACKAGE {
         let isolation = build.isolation.as_ref();
         let own = |from_account: Option<usize>, from_isolation: Option<usize>| {
