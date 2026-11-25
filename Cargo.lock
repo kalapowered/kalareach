@@ -4809,6 +4809,7 @@ dependencies = [
  "rustix",
  "serde",
  "serde_json",
+ "syn 2.0.119",
  "tempfile",
  "tokio",
  "toml_edit 0.25.15+spec-1.1.0",
