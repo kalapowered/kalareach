@@ -2643,6 +2643,30 @@ fn every_step_with_a_limit_has_more_time_than_the_waits_it_and_its_scripts_decla
     assert!(misses.is_empty(), "{}", misses.join("\n"));
 }
 
+/// The jobs whose every step has a limit of its own: a step that hangs is ended by it, and the
+/// evidence upload after it still has its own time.
+const JOBS_WITH_A_LIMIT_ON_EVERY_STEP: [&str; 2] = ["android-app", "ios"];
+
+#[test]
+fn every_step_of_the_android_and_ios_jobs_has_a_limit_of_its_own() {
+    let workflow = fs::read_to_string(repository().join(".github/workflows/core-ci.yml"))
+        .expect("the landing workflow");
+    let mut misses = Vec::new();
+    for name in JOBS_WITH_A_LIMIT_ON_EVERY_STEP {
+        let steps = steps_of(&job(&workflow, name));
+        assert!(steps.len() >= 10, "the {name} job's steps were not read");
+        for step in steps {
+            if value_at(&step, 8, "timeout-minutes").is_none() {
+                misses.push(format!(
+                    "the step \"{}\" of the {name} job has no limit",
+                    value_at(&step, 8, "name").unwrap_or_default()
+                ));
+            }
+        }
+    }
+    assert!(misses.is_empty(), "{}", misses.join("\n"));
+}
+
 /// The names of the jobs of a workflow, in the order they are written.
 fn job_names(workflow: &str) -> Vec<String> {
     let mut in_jobs = false;
