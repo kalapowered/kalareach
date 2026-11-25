@@ -193,7 +193,7 @@ fn starts_by_hand(
     match &ctx.route {
         Route::StandIn => {
             let _ = at.person.types_until_it_shows(
-                &launch_words("codex", extra).join(" "),
+                &ctx.subject.typed_line(extra),
                 BY_HAND,
                 "the stand-in is up by hand",
                 &|| ctx.checks_the_placed_files(),

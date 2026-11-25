@@ -3598,7 +3598,7 @@ impl<'a> Session<'a> {
         match &self.ctx.route {
             Route::StandIn => {
                 let _ = self.person.types_until_it_shows(
-                    "codex",
+                    &self.ctx.subject.typed_line(&[]),
                     stand_in_shows,
                     "the terminal reaches the server through the gateway",
                     &|| self.ctx.checks_the_placed_files(),
@@ -5052,7 +5052,7 @@ fn gateway_a_process_started_after_an_upgrade_keeps_the_first_its_own_build_and_
             }
             let sampled_before = servers_seen(&workers, &mut servers);
             let (typed, shows) = match &ctx.route {
-                Route::StandIn => ("codex".to_owned(), RAN_AS_TYPED.to_owned()),
+                Route::StandIn => (ctx.subject.typed_line(&[]), RAN_AS_TYPED.to_owned()),
                 Route::Real(real) => (
                     real.typed(&[]),
                     real.build
@@ -6846,7 +6846,7 @@ fn gateway_a_launch_whose_first_presentation_carries_a_forged_credential_is_refu
             // One typed launch: the line is typed once, with a mark on the byte stream before it.
             let mark = session.person.window.collected().mark();
             let typed = match &ctx.route {
-                Route::StandIn => "codex".to_owned(),
+                Route::StandIn => ctx.subject.typed_line(&[]),
                 Route::Real(real) => real.typed(&[]),
             };
             let mut servers: Vec<ProcessStartIdentity> = Vec::new();
@@ -8642,12 +8642,12 @@ fn the_launches_the_real_route_types_are_ones_the_command_integration_serves() {
     let thread = "0199a213-81c0-7800-8aa1-bbab2a035a53";
     for extra in [&[][..], &["resume", thread][..], &["fork", thread][..]] {
         assert_eq!(
-            backend.refuses(&launch_words("codex", extra)),
+            backend.refuses(&launch_words(Subject::codex().command(), extra)),
             None,
             "{extra:?}"
         );
     }
-    let resume = launch_words("codex", &["resume", thread]);
+    let resume = launch_words(Subject::codex().command(), &["resume", thread]);
     assert_eq!(backend.saved_conversation(&resume), Some(thread));
     // The entry's own options are what the integration refuses, which is why they are keys of the
     // run's configuration file instead.
@@ -8655,7 +8655,7 @@ fn the_launches_the_real_route_types_are_ones_the_command_integration_serves() {
         &["-a", "on-request"][..],
         &["-c", "approval_policy=\"on-request\""][..],
     ] {
-        let words = launch_words("codex", options);
+        let words = launch_words(Subject::codex().command(), options);
         assert!(backend.refuses(&words).is_some(), "{words:?}");
     }
 }

@@ -801,7 +801,7 @@ fn gateway_a_running_agent_keeps_its_build_through_an_upgrade_and_the_newer_buil
                 );
             }
             let (typed, shows) = match &ctx.route {
-                Route::StandIn => ("codex".to_owned(), RAN_AS_TYPED.to_owned()),
+                Route::StandIn => (ctx.subject.typed_line(&[]), RAN_AS_TYPED.to_owned()),
                 Route::Real(real) => (
                     real.typed(&[]),
                     real.build
