@@ -1618,8 +1618,9 @@ impl Unread {
             Self::Gone => "has no name left and is not read".to_owned(),
             Self::ManyNames => "has more than one name and is not read".to_owned(),
             Self::GuardedFile => "is the same file as a guarded file and is not read".to_owned(),
-            Self::Unlooked => "is not read, because a guarded name cannot be looked at and this \
-                               file may be the one it names"
+            Self::Unlooked => "is not read, because a look of a guarded name has failed, has seen \
+                               a link or has not answered in time since the run started, and \
+                               this file may be the one it names"
                 .to_owned(),
             Self::TooLarge => format!("is larger than {SHARED_LIMIT} bytes and is not read"),
             Self::TooSlow => format!("was not read within {} seconds", SHARED_BOUND.as_secs()),
@@ -1635,7 +1636,7 @@ struct Known {
     /// The device and inode of every file a look saw at a guarded name.
     seen: BTreeSet<(u64, u64)>,
     /// Whether a look of a guarded name failed for any reason other than the name's not being
-    /// there. It is never cleared.
+    /// there, saw a link at the name, or gave no answer in time. It is never cleared.
     unlooked: bool,
 }
 
@@ -1660,7 +1661,7 @@ impl Looks {
         self.state().seen.insert(identity);
     }
 
-    /// Keeps that a look failed.
+    /// Keeps that a look failed, saw a link or gave no answer in time.
     fn lost(&self) {
         self.state().unlooked = true;
     }
@@ -1847,8 +1848,10 @@ fn read_within(
 /// Whether the shared file at `path` holds one of `needles`, read once through a handle of its own:
 /// opened with no link followed and no wait, then checked by the handle before any byte is read (a
 /// regular file, one name, no guarded file by the identities `looks` holds now or by the guarded
-/// names now, within the byte limit), and read within the time bound. Nothing of the file is kept, and a file that is not
-/// there holds nothing.
+/// names now, within the byte limit), and read within the time bound. Nothing of the file is kept,
+/// and a file that is not there holds nothing. A read that gives no answer in time leaves the look
+/// of its worker unresolved, which may yet fail or see a file: it is kept as a failed look, and
+/// every shared read after it is refused.
 fn shared_names_the_run(
     path: PathBuf,
     guarded: Vec<PathBuf>,
@@ -1858,13 +1861,14 @@ fn shared_names_the_run(
 ) -> Result<bool, Unread> {
     let deadline = std::time::Instant::now() + reading.bound;
     let reading = reading.clone();
-    read_within(std::thread::Builder::new(), reading.bound, move || {
+    let worker_looks = looks.clone();
+    let read = read_within(std::thread::Builder::new(), reading.bound, move || {
         let needles: Vec<&[u8]> = needles
             .iter()
             .filter(|needle| !needle.is_empty())
             .map(String::as_bytes)
             .collect();
-        match open_shared(&path, &guarded, &looks, &*reading.stat)? {
+        match open_shared(&path, &guarded, &worker_looks, &*reading.stat)? {
             Some(mut file) => {
                 reading
                     .begun
@@ -1873,7 +1877,11 @@ fn shared_names_the_run(
             }
             None => Ok(false),
         }
-    })
+    });
+    if read == Err(Unread::TooSlow) {
+        looks.lost();
+    }
+    read
 }
 
 /// An entry's named files of the person's home, as `lstat` showed them before a driver started
@@ -2053,6 +2061,12 @@ impl FileGuard {
                 Ok(after) => {
                     if let Some(now) = after {
                         self.looks.saw((now.stamp.device, now.stamp.inode));
+                        // The take refuses a link at a guarded name, so a link seen now is a change,
+                        // and the look records the link and not its target: every shared read after
+                        // it is refused.
+                        if now.link {
+                            self.looks.lost();
+                        }
                     }
                     let owner_changed = matches!(
                         (before, &after),
@@ -4904,8 +4918,9 @@ mod tests {
 
     /// What the end read says after the path of a shared file when a look of a guarded name has
     /// failed.
-    const UNLOOKED: &str = "is not read, because a guarded name cannot be looked at and this file \
-                            may be the one it names";
+    const UNLOOKED: &str = "is not read, because a look of a guarded name has failed, has seen a \
+                            link or has not answered in time since the run started, and this \
+                            file may be the one it names";
 
     /// What the take refuses a shared file with, for `reason`: the end read's text, after the
     /// person's file.
@@ -5127,11 +5142,9 @@ mod tests {
             .expect("a link");
         })
         .expect("the end compare finished");
+        // The end's own look sees the link at the guarded name, so no shared read goes on.
         let said: Vec<&str> = stops.iter().map(|(_, why)| why.as_str()).collect();
-        assert!(
-            said.contains(&not_read("is the same file as a guarded file and is not read").as_str()),
-            "{said:?}"
-        );
+        assert!(said.contains(&not_read(UNLOOKED).as_str()), "{said:?}");
         assert!(
             !said.iter().any(|why| why.contains("now holds")),
             "the shared file was read as a guarded file's object: {said:?}"
@@ -5548,6 +5561,113 @@ mod tests {
             .as_str()]
         );
         assert_eq!(begun(&reading), 1, "the second shared file was read");
+        std::fs::remove_dir_all(&home).expect("clean up");
+    }
+
+    #[test]
+    fn a_link_seen_at_a_guarded_name_refuses_every_shared_read_after_it_though_the_link_is_gone() {
+        let home = claude_home("link-seen-at-a-guarded-name");
+        let guard = claude_plan().take(&home);
+        // A file that names the run, and a link to it at a guarded name.
+        std::fs::write(home.join("target"), format!(r#"{{"id":"{RUN_NAME}"}}"#)).expect("a write");
+        std::fs::remove_file(home.join(".claude/.device-keys.json")).expect("removed");
+        std::os::unix::fs::symlink(home.join("target"), home.join(".claude/.device-keys.json"))
+            .expect("a link");
+        // The look before a charge sees the link: the guarded file's own stop is one thing, and
+        // the cell is another.
+        let (stops, _) = guard.compare();
+        assert!(
+            stops
+                .iter()
+                .any(|(_, why)| why.contains("~/.claude/.device-keys.json changed")),
+            "{stops:?}"
+        );
+        assert!(
+            files_of(&guard).known().unlooked,
+            "a link seen at a guarded name was not kept"
+        );
+        // The link goes, and its target is moved over the shared name.
+        std::fs::remove_file(home.join(".claude/.device-keys.json")).expect("removed");
+        std::fs::rename(home.join("target"), home.join(".claude.json")).expect("a move");
+        let reading = Reading::real();
+        let (stops, _) =
+            files_of(&guard).compare_with(&lstat_in(&home), &reading, &[RUN_NAME, RUN_MARK]);
+        assert_refused_as_unlooked(&stops);
+        assert_eq!(begun(&reading), 0, "a shared file was read");
+        std::fs::remove_dir_all(&home).expect("clean up");
+    }
+
+    #[test]
+    fn a_guarded_name_that_is_a_link_to_the_shared_path_is_refused_as_a_guarded_file() {
+        let home = scratch("guarded-link-to-shared");
+        std::fs::write(home.join("shared.json"), b"{}").expect("a file");
+        std::os::unix::fs::symlink(home.join("shared.json"), home.join("guarded")).expect("a link");
+        let real = Reading::real();
+        let opened = open_shared(
+            &home.join("shared.json"),
+            &[home.join("guarded")],
+            &clean_looks(),
+            &*real.stat,
+        );
+        assert_eq!(opened.err(), Some(Unread::GuardedFile));
+        std::fs::remove_dir_all(&home).expect("clean up");
+    }
+
+    #[test]
+    fn a_read_with_no_answer_in_time_refuses_every_shared_read_after_it_while_its_worker_waits() {
+        let home = claude_home("no-answer-in-time");
+        // The credentials file is not there at the take and at the end's first look.
+        std::fs::remove_file(home.join(".claude/.credentials.json")).expect("removed");
+        std::fs::write(home.join(".claude2.json"), b"{}").expect("a second shared file");
+        let guard = two_shared_plan().take(&home);
+        let (release, waiting) = std::sync::mpsc::channel::<()>();
+        let (ended, worker_ended) = std::sync::mpsc::channel::<()>();
+        let (waiting, ended) = (std::sync::Mutex::new(waiting), std::sync::Mutex::new(ended));
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let moving = home.clone();
+        let reading = reading_with(
+            move |path| {
+                if calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                    // After the end's looks: another process makes the credentials file, which holds
+                    // the run's name and which no look of the guard saw, and moves it over the second
+                    // shared name. The first look of the worker then waits until the case lets it
+                    // go, and fails.
+                    make_the_credentials(&moving);
+                    std::fs::rename(
+                        moving.join(".claude/.credentials.json"),
+                        moving.join(".claude2.json"),
+                    )
+                    .expect("a move");
+                    let _ = waiting.lock().expect("a lock").recv();
+                    let _ = ended.lock().expect("a lock").send(());
+                    return Err(input_output_error());
+                }
+                std::fs::metadata(path)
+            },
+            std::time::Duration::from_secs(2),
+        );
+        let (stops, _) =
+            files_of(&guard).compare_with(&lstat_in(&home), &reading, &[RUN_NAME, RUN_MARK]);
+        let said: Vec<&str> = stops.iter().map(|(_, why)| why.as_str()).collect();
+        assert!(
+            said.contains(&not_read("was not read within 10 seconds").as_str()),
+            "{said:?}"
+        );
+        assert!(
+            said.contains(&not_read_at(".claude2.json", UNLOOKED).as_str()),
+            "the second shared read went on while the first worker's look had no answer: {said:?}"
+        );
+        assert_eq!(begun(&reading), 0, "a shared file was read");
+        // The first worker still waits, so its failure is not what the cell keeps.
+        assert!(
+            files_of(&guard).known().unlooked,
+            "a read with no answer in time was not kept"
+        );
+        release.send(()).expect("the worker waits");
+        worker_ended
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("the worker's look ended");
+        assert!(files_of(&guard).known().unlooked);
         std::fs::remove_dir_all(&home).expect("clean up");
     }
 
