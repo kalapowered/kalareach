@@ -77,7 +77,7 @@ fn bytes_of(place: Place<'_>, relative: &Path) -> Result<Option<Vec<u8>>, String
 type Copies = (Vec<u8>, Option<Vec<u8>>);
 
 /// The main file and the `-wal` of the index at `relative`, copied twice and equal, or why not.
-fn equal_copies(place: Place<'_>, relative: &Path) -> Result<Option<Copies>, String> {
+pub(crate) fn equal_copies(place: Place<'_>, relative: &Path) -> Result<Option<Copies>, String> {
     let wal = PathBuf::from(format!("{}-wal", relative.display()));
     let (main, wal) = settled(|| Ok((bytes_of(place, relative)?, bytes_of(place, &wal)?)))?;
     Ok(main.map(|main| (main, wal)))

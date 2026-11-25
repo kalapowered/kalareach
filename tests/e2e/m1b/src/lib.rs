@@ -88,6 +88,8 @@ pub mod site;
 #[path = "../../../../crates/kr-controller/tests/net_support/typing.rs"]
 pub mod typing;
 #[cfg(all(unix, feature = "legs"))]
+pub mod tables;
+#[cfg(all(unix, feature = "legs"))]
 pub mod tree;
 #[cfg(all(unix, feature = "legs"))]
 pub mod view;

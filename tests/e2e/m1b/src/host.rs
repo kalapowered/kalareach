@@ -30,12 +30,15 @@ use kr_protocol::ids::EnvironmentId;
 use serde_json::Value;
 
 use crate::LIVENESS;
+use crate::compare::Layout;
 use crate::floor::{Opening, Readings, Watch};
 use crate::run::{
     HARNESS_PROGRAM, Run, binary_place, ended_within, output_within, processes_under,
     read_tail_below, running, signal, socket_below, worker_session,
 };
+use crate::tables::{self, Tables};
 use crate::tree::{Entry, OPTIONAL_ROOTS, REQUIRED_ROOTS, RUNTIME_ROOT, Record, STATE_ROOT};
+use crate::worker::Place;
 
 /// The daemon's log, in the run's directory.
 const DAEMON_LOG: &str = "controller.log";
@@ -286,6 +289,8 @@ struct Survey {
     at_the_kill: Option<(Instant, Record)>,
     /// How many entries differ between the record made when the agent started and the latest kill.
     changes_to_the_kill: usize,
+    /// The tables of the session journals at the latest kill.
+    tables_at_the_kill: Option<Tables>,
     /// The lines this host has said.
     lines: Vec<String>,
 }
@@ -1249,6 +1254,7 @@ impl<'r> Host<'r> {
                     .map(|change| format!("survey: kill {kill}, at the kill: {change}"))
                     .collect();
                 restarts.survey.changes_to_the_kill = changes.len();
+                restarts.survey.tables_at_the_kill = Some(self.look_at_the_journals(&now));
                 restarts.survey.at_the_kill = Some((killed, now));
                 restarts.survey.say(lines);
             }
@@ -1266,7 +1272,7 @@ impl<'r> Host<'r> {
     /// still, or the bound passes, and then says what differs between the record made at the kill
     /// and the tree. Nothing is refused.
     fn survey_before_the_attempt(&self) {
-        let (timing, kill, killed, at_the_kill, to_the_kill) = {
+        let (timing, kill, killed, at_the_kill, to_the_kill, tables_at_the_kill) = {
             let restarts = self.restarts.lock().unwrap_or_else(PoisonError::into_inner);
             if restarts.declared != Restart::Survey {
                 return;
@@ -1280,6 +1286,7 @@ impl<'r> Host<'r> {
                 killed,
                 record,
                 restarts.survey.changes_to_the_kill,
+                restarts.survey.tables_at_the_kill.clone(),
             )
         };
         let stood_still = self.survey_waits(timing, killed);
@@ -1291,6 +1298,16 @@ impl<'r> Host<'r> {
                     .iter()
                     .map(|change| format!("survey: kill {kill}, before the attempt: {change}"))
                     .collect();
+                if let Some(before) = tables_at_the_kill {
+                    let layout = Layout::of(self.run.root(), &self.environment);
+                    let refused =
+                        tables::compare(&layout, &before, &self.look_at_the_journals(&at_the_kill));
+                    lines.extend(
+                        refused
+                            .iter()
+                            .map(|line| format!("survey: kill {kill}, refused: {line}")),
+                    );
+                }
                 lines.push(format!(
                     "survey: kill {kill}: {to_the_kill} change(s) from the agent's start to the \
                      kill and {} from the kill to the attempt; {state}",
@@ -1306,6 +1323,22 @@ impl<'r> Host<'r> {
         let mut restarts = self.restarts.lock().unwrap_or_else(PoisonError::into_inner);
         restarts.survey.at_the_kill = None;
         restarts.survey.say(lines);
+    }
+
+    /// The tables of the journals of the sessions that `record` holds, as they stand, read through
+    /// copies in a directory of the run outside both host roots.
+    fn look_at_the_journals(&self, record: &Record) -> Tables {
+        let layout = Layout::of(self.run.root(), &self.environment);
+        let place = Place {
+            root: self.run.root(),
+            pin: self.run.pin(),
+        };
+        tables::look(
+            &layout,
+            place,
+            &self.run.root().join("i"),
+            &tables::sessions_of(&layout, record),
+        )
     }
 
     /// Waits after a kill for the files that the worker's maintenance writes to stand still: the
@@ -2558,6 +2591,51 @@ mod shutdown_tests {
             ),
             "{lines:#?}"
         );
+        drop(host);
+        drop(run);
+        std::fs::remove_dir_all(&root).expect("clean up");
+    }
+
+    /// The survey says each journal table that changed between the kill and the attempt, and none
+    /// that changed before the kill.
+    #[test]
+    fn the_survey_says_the_journal_tables_that_changed_after_the_kill_and_not_before_it() {
+        let root = scratch("survey-tables");
+        let (run, _mark) = host_with_a_kr(&root);
+        let host = host_over(&run);
+        let journal = host
+            .environment
+            .state_dir()
+            .join("sessions/session-a1.sqlite");
+        std::fs::create_dir_all(journal.parent().expect("a parent")).expect("a directory");
+        let connection = rusqlite::Connection::open(&journal).expect("a journal");
+        connection
+            .execute_batch(
+                "CREATE TABLE requests (id INTEGER); CREATE TABLE bindings (id INTEGER);",
+            )
+            .expect("tables");
+        host.declares_a_restart(Restart::Survey);
+        host.agent_starts();
+        survey_quickly(&host);
+        connection
+            .execute_batch("INSERT INTO requests VALUES (1);")
+            .expect("a row before the kill");
+        host.survey_the_kill();
+        connection
+            .execute_batch("INSERT INTO bindings VALUES (1);")
+            .expect("a row after the kill");
+        host.survey_before_the_attempt();
+        let lines = surveyed_by(&host);
+        let said = |text: &str| lines.iter().any(|line| line.contains(text));
+        assert!(
+            said(
+                "survey: kill 1, refused: the journal table bindings of a1 changed, appeared or is \
+                 gone between the kill and the attempt"
+            ),
+            "{lines:#?}"
+        );
+        assert!(!said("table requests"), "{lines:#?}");
+        drop(connection);
         drop(host);
         drop(run);
         std::fs::remove_dir_all(&root).expect("clean up");
