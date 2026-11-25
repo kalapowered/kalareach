@@ -8333,6 +8333,24 @@ fn the_line_under_the_fence_is_empty(shell: &RealShell) -> Option<bool> {
     }
 }
 
+/// Waits until a fence stands over the line the reader edits, and says whether the line is empty,
+/// or `None` when none stands within 30 seconds. The wait for the host's answer ends when the
+/// machine names a fence other than the last one, which can be before the reader has acknowledged
+/// it; this waits for the acknowledgement.
+#[cfg(unix)]
+async fn until_the_line_under_the_fence_stands(shell: &RealShell) -> Option<bool> {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if let Some(empty) = the_line_under_the_fence_is_empty(shell) {
+                return empty;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .ok()
+}
+
 /// Runs a line that prints a word it puts together from two pieces and waits for the word, which
 /// shows the shell takes a line typed after the host's answer and runs it as typed.
 #[cfg(unix)]
@@ -8439,7 +8457,7 @@ async fn a_hosts_answers_stay_out_of_a_real_readers_line(
             ));
             break;
         }
-        if the_line_under_the_fence_is_empty(&shell) != Some(true) {
+        if until_the_line_under_the_fence_stands(&shell).await != Some(true) {
             failures.push(format!(
                 "{kind:?}: the host's answer to the {name} is in the line the reader edits; the \
                  output ends {}",
@@ -8512,7 +8530,7 @@ async fn a_hosts_answer_to_a_program_that_ended_stays_out_of_a_real_readers_line
             "{kind:?}: the writer dropped the host's answer to the program that ended instead of \
              writing it to the terminal"
         ));
-    } else if the_line_under_the_fence_is_empty(&shell) != Some(true) {
+    } else if until_the_line_under_the_fence_stands(&shell).await != Some(true) {
         failures.push(format!(
             "{kind:?}: the host's answer to a program that ended is in the line the reader \
              edits; the output ends {}",
