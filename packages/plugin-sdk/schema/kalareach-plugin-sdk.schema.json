@@ -6,6 +6,76 @@
       "minLength": 1,
       "type": "string"
     },
+    "AcpConstant": {
+      "additionalProperties": false,
+      "description": "One variable the host sets in the agent's start.",
+      "properties": {
+        "name": {
+          "description": "The variable's name.",
+          "type": "string"
+        },
+        "value": {
+          "description": "Its value, or [`PRIVATE_HOME_PLACEHOLDER`] alone.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "value"
+      ],
+      "type": "object"
+    },
+    "AcpLaunch": {
+      "additionalProperties": false,
+      "description": "What a package declares about starting its agent in ACP mode.",
+      "properties": {
+        "command": {
+          "description": "The command name of the agent, with no directory.",
+          "type": "string"
+        },
+        "constants": {
+          "description": "The variables the host sets itself, in order.",
+          "items": {
+            "$ref": "#/$defs/AcpConstant"
+          },
+          "type": "array"
+        },
+        "grant_statement": {
+          "$ref": "#/$defs/GrantWords",
+          "description": "What the package says the launch does and does not do, in its own words."
+        },
+        "passed_names": {
+          "description": "The variables the host copies from the person's shell into the agent's start, each only\nwhen the shell has it. No other variable of the shell is copied, whatever its name.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "platforms": {
+          "description": "The operating systems the host starts the agent on in ACP mode.",
+          "items": {
+            "$ref": "#/$defs/OperatingSystem"
+          },
+          "type": "array"
+        },
+        "required_names": {
+          "description": "The variables the person's shell must have, each non-empty, or the launch is refused. Each\nis also a passed name.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "command",
+        "platforms",
+        "required_names",
+        "passed_names",
+        "constants",
+        "grant_statement"
+      ],
+      "type": "object"
+    },
     "ActionArgument": {
       "additionalProperties": false,
       "description": "One supplied parameter value.",
@@ -2022,6 +2092,16 @@
           "const": "launch_probe_invalid",
           "description": "A launch probe passes an argument it may not, carries an option it may not or names a\nmode pointer that is not one.",
           "type": "string"
+        },
+        {
+          "const": "acp_launch_without_capability",
+          "description": "The package declares an ACP launch without requesting the grants it needs: the launch\ngrant, and the two approval grants that let an approval the agent asks for be answered.",
+          "type": "string"
+        },
+        {
+          "const": "acp_launch_invalid",
+          "description": "An ACP launch lists no required name, names a required name it does not pass, lists no\nplatform or one the package does not support, or breaks the shape of a name or a constant.",
+          "type": "string"
         }
       ]
     },
@@ -2118,6 +2198,12 @@
           "type": "object"
         }
       ]
+    },
+    "GrantWords": {
+      "description": "The publisher's own words for a launch grant. One line, no control or bidirectional characters.",
+      "maxLength": 6000,
+      "minLength": 1,
+      "type": "string"
     },
     "HookAgreed": {
       "description": "Which name an agreeing member holds.",
@@ -3775,6 +3861,17 @@
       "additionalProperties": false,
       "description": "The `plugin.json` manifest.",
       "properties": {
+        "acp_launch": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AcpLaunch"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The ACP launch, where the package declares one: the variables the host copies from the\nperson's shell into the agent's start, the ones it sets itself and the platforms it starts\nthe agent on in ACP mode.\n\nA package that declares none leaves the member out, so a manifest written before the member\nexisted reads and hashes exactly as it did. A host reads one only from this verified\nmanifest, and only with `command_integration.launch` granted, `approval.decode` and\n`approval.respond` granted and the owner's switch on."
+        },
         "actions": {
           "description": "The actions a control may invoke.",
           "items": {

@@ -230,6 +230,14 @@ pub fn package_contract() -> Value {
             "max_word_bytes": crate::launch_probe::MAX_WORD_BYTES,
             "max_mode_bytes": crate::launch_probe::MAX_MODE_BYTES,
         },
+        "acp_launch": {
+            "agent_argument": crate::acp_launch::AGENT_ARGUMENT,
+            "private_home_placeholder": crate::acp_launch::PRIVATE_HOME_PLACEHOLDER,
+            "max_names": crate::acp_launch::MAX_NAMES,
+            "max_name_bytes": crate::acp_launch::MAX_NAME_BYTES,
+            "max_constants": crate::acp_launch::MAX_CONSTANTS,
+            "max_value_bytes": crate::acp_launch::MAX_VALUE_BYTES,
+        },
         "command_integration": {
             "max_command_bytes": crate::integration::MAX_COMMAND_BYTES,
             "max_flags": crate::integration::MAX_FLAGS,

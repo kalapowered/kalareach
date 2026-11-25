@@ -1,4 +1,12 @@
 {
+  "acp_launch": {
+    "agent_argument": "--acp",
+    "max_constants": 16,
+    "max_name_bytes": 64,
+    "max_names": 64,
+    "max_value_bytes": 256,
+    "private_home_placeholder": "{private_home}"
+  },
   "arrivals": [
     {
       "definition": "SelectionRoute",
@@ -341,7 +349,9 @@
     "integration_without_capability",
     "integration_invalid",
     "launch_probe_without_capability",
-    "launch_probe_invalid"
+    "launch_probe_invalid",
+    "acp_launch_without_capability",
+    "acp_launch_invalid"
   ],
   "index_bounds": {
     "max_qualified_builds": 256
