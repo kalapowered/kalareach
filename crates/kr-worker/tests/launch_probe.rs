@@ -928,7 +928,7 @@ fn kr_req_07_64_an_answer_that_ended_after_the_caller_gave_up_is_late_before_the
     let watched = here.path().to_path_buf();
     let giving_up = std::thread::spawn(move || {
         let until = std::time::Instant::now() + deadline;
-        while !probe::seams::reached(probe::seams::Point::FinalRead, &watched) {
+        while !probe::seams::point_reached(probe::seams::Point::FinalRead, &watched) {
             if std::time::Instant::now() >= until {
                 return false;
             }

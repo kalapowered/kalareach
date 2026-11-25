@@ -415,7 +415,7 @@ pub mod seams {
 
     /// Whether a probe that runs in `directory` has come to `point`, whether or not a delay holds it
     /// there.
-    pub fn reached(point: Point, directory: &Path) -> bool {
+    pub fn point_reached(point: Point, directory: &Path) -> bool {
         REACHED
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
