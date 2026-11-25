@@ -316,48 +316,95 @@ pub fn hex_of(bytes: &[u8]) -> String {
     })
 }
 
-const DATA_MEMBER: &str = "\"data\":\"";
-
 fn digest_of_base64(encoded: &str) -> Option<String> {
     use base64::Engine as _;
 
+    if encoded.is_empty() {
+        return None;
+    }
     base64::engine::general_purpose::STANDARD
         .decode(encoded.as_bytes())
         .ok()
         .map(|bytes| hex_of(&kr_cbor::sha256(&bytes)))
 }
 
-/// The digests of the images a conversation's `text` records as given to the agent: each line the
-/// build list's `marker` is in. A line that holds `base64,` gives each text after a `base64,` in
-/// it, decoded and hashed, so a message that holds several images gives one digest for each. A line
-/// that holds none gives, for each mark in it, the text between the quotes after the first
-/// `"data":"` that starts at the mark, as Claude Code and Gemini CLI write an image. A mark with no
-/// image text after it, or whose image cannot be decoded, gives `None`.
-#[must_use]
-pub fn images_recorded(text: &str, marker: &str) -> Vec<Option<String>> {
-    let mut found = Vec::new();
-    for line in text.lines().filter(|line| line.contains(marker)) {
-        if line.contains("base64,") {
-            for after in line.split("base64,").skip(1) {
+/// The byte ranges of the objects of the JSON text `line`, each from its `{` to just past its `}`,
+/// found by a scan that knows strings. An object that the line leaves open has none.
+fn object_ranges(line: &str) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    let mut open: Vec<usize> = Vec::new();
+    let mut in_string = false;
+    let mut escaped = false;
+    for (at, byte) in line.bytes().enumerate() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match byte {
+            b'"' => in_string = true,
+            b'{' => open.push(at),
+            b'}' => {
+                if let Some(start) = open.pop() {
+                    ranges.push((start, at + 1));
+                }
+            }
+            _ => {}
+        }
+    }
+    ranges
+}
+
+/// The digests of the images that the object `object` holds.
+fn images_of(object: &str) -> Vec<Option<String>> {
+    if object.contains("base64,") {
+        return object
+            .split("base64,")
+            .skip(1)
+            .map(|after| {
                 let encoded: String = after
                     .chars()
                     .take_while(|character| {
                         character.is_ascii_alphanumeric() || matches!(character, '+' | '/' | '=')
                     })
                     .collect();
-                found.push(digest_of_base64(&encoded));
+                digest_of_base64(&encoded)
+            })
+            .collect();
+    }
+    let data = serde_json::from_str::<serde_json::Value>(object)
+        .ok()
+        .and_then(|value| value.get("data")?.as_str().map(str::to_owned));
+    vec![data.and_then(|text| digest_of_base64(&text))]
+}
+
+/// The digests of the images a conversation's `text` records as given to the agent: for each mark
+/// of the build list's `marker` in a line, the image of the object that holds the end of the mark.
+/// An object that holds `base64,` gives each text after a `base64,` in it, decoded and hashed, as
+/// Codex and OpenCode write an image. Any other object gives its own `data` member, as Claude Code
+/// and Gemini CLI write an image. An object with no image text, or whose text is empty, unfinished
+/// or cannot be decoded, gives `None`; text of another object, or of the line outside the object,
+/// is no image text of it.
+#[must_use]
+pub fn images_recorded(text: &str, marker: &str) -> Vec<Option<String>> {
+    let mut found = Vec::new();
+    for line in text.lines().filter(|line| line.contains(marker)) {
+        let objects = object_ranges(line);
+        for (at, _) in line.match_indices(marker) {
+            let last = at + marker.len().saturating_sub(1);
+            let own = objects
+                .iter()
+                .filter(|(start, end)| *start <= last && last < *end)
+                .max_by_key(|(start, _)| *start);
+            match own {
+                Some(&(start, end)) => found.extend(images_of(&line[start..end])),
+                None => found.push(None),
             }
-            continue;
-        }
-        let marks: Vec<usize> = line.match_indices(marker).map(|(at, _)| at).collect();
-        for (index, &start) in marks.iter().enumerate() {
-            let end = marks.get(index + 1).copied().unwrap_or(line.len());
-            found.push(
-                line[start..end]
-                    .split_once(DATA_MEMBER)
-                    .and_then(|(_, after)| after.split('"').next())
-                    .and_then(digest_of_base64),
-            );
         }
     }
     found
@@ -443,6 +490,90 @@ mod tests {
             ),
             vec![None],
             "text in the data member that is not base64 gives None"
+        );
+    }
+
+    /// The mark of Claude Code's image.
+    const CLAUDE_MARK: &str = r#""type":"image","source":{"type":"base64""#;
+
+    /// An image is read in its own form, whatever text of the line looks like another form.
+    #[test]
+    fn an_image_is_read_in_its_own_form_whatever_text_of_the_line_looks_like_another_form() {
+        let line = r#"{"type":"user","message":{"content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"Yg=="}},{"type":"text","text":"base64,YQ=="}]}}"#;
+        assert_eq!(
+            images_recorded(&format!("{line}\n"), CLAUDE_MARK),
+            vec![Some(hex_of(&kr_cbor::sha256(b"b")))],
+            "the image's own data member is read, not the text after a `base64,` elsewhere in the line"
+        );
+    }
+
+    /// A data member outside the marked image's own object is no text of that image.
+    #[test]
+    fn a_data_member_outside_the_marked_images_own_object_is_no_text_of_that_image() {
+        let line = r#"{"type":"image","source":{"type":"base64"},"other":{"data":"YQ=="}}"#;
+        assert_eq!(
+            images_recorded(&format!("{line}\n"), CLAUDE_MARK),
+            vec![None],
+            "a data member of another object gives None"
+        );
+    }
+
+    /// A line that holds an image in a data member and an image in a data URL gives each its own
+    /// digest.
+    #[test]
+    fn a_line_that_holds_both_forms_gives_each_image_its_own_digest() {
+        let line = r#"{"parts":[{"mime":"image/png","data":"Yg=="},{"mime":"image/png","url":"data:image/png;base64,Yw=="}]}"#;
+        assert_eq!(
+            images_recorded(&format!("{line}\n"), r#""mime":"image/png""#),
+            vec![
+                Some(hex_of(&kr_cbor::sha256(b"b"))),
+                Some(hex_of(&kr_cbor::sha256(b"c")))
+            ],
+            "each image is read in its own form"
+        );
+    }
+
+    /// An image with no text in its data member gives `None`.
+    #[test]
+    fn an_empty_data_member_gives_none() {
+        let line = r#"{"content":[{"type":"image","source":{"type":"base64","data":""}}]}"#;
+        assert_eq!(
+            images_recorded(&format!("{line}\n"), CLAUDE_MARK),
+            vec![None],
+            "an empty data member gives None"
+        );
+    }
+
+    /// An image whose data member the line leaves unfinished gives `None`.
+    #[test]
+    fn an_unfinished_data_member_gives_none() {
+        let line = r#"{"content":[{"type":"image","source":{"type":"base64","data":"YQ=="#;
+        assert_eq!(
+            images_recorded(&format!("{line}\n"), CLAUDE_MARK),
+            vec![None],
+            "an unfinished data member gives None"
+        );
+    }
+
+    /// An image with no text after the `base64,` of its data URL gives `None`.
+    #[test]
+    fn an_empty_data_url_gives_none() {
+        let line = r#"{"type":"input_image","image_url":"data:image/png;base64,"}"#;
+        assert_eq!(
+            images_recorded(&format!("{line}\n"), r#""type":"input_image""#),
+            vec![None],
+            "an empty data URL gives None"
+        );
+    }
+
+    /// A marked object with no image text gives `None` and does not take the text of the next image.
+    #[test]
+    fn a_marked_object_with_no_image_text_does_not_take_the_text_of_the_next_image() {
+        let line = r#"{"content":[{"type":"image","source":{"type":"base64"}},{"type":"image","source":{"type":"base64","data":"YQ=="}}]}"#;
+        assert_eq!(
+            images_recorded(&format!("{line}\n"), CLAUDE_MARK),
+            vec![None, Some(hex_of(&kr_cbor::sha256(b"a")))],
+            "the first image has no text, the second has"
         );
     }
 }
