@@ -1307,11 +1307,16 @@ jobs:
       #
       # The release tool is built with them as well: `kr-cli`'s `stack_windows` case reads the
       # header of `kr`, the control daemon, the worker, the plugin host and that tool.
-      #
-      # The Codex stand-in is built with them: the gateway harness's cases in `kr-hook` find
-      # `codex-stand-in.exe` beside the test executables and fail when it is not there.
       - name: Build the control daemon, the worker and the forwarder the suites run
-        run: cargo build --locked -p kr-controller -p kr-worker -p kr-hook -p kr-plugin-host -p kr-release -p kr-codex-stand-in
+        run: cargo build --locked -p kr-controller -p kr-worker -p kr-hook -p kr-plugin-host -p kr-release
+
+      # The Codex stand-in is built on its own, in the part that runs the gateway harness's cases in
+      # `kr-hook`, which find `codex-stand-in.exe` beside the test executables and fail when it is
+      # not there. A build that held it with the programs above would give them a feature of
+      # `serde_json` that only the stand-in's schema checker asks for.
+      - name: Build the Codex stand-in the forwarder's suite finds
+        if: ${{ matrix.part == 'first' }}
+        run: cargo build --locked -p kr-codex-stand-in
 
       # The daemon as the suites start it, built with the `testing` feature, which the build above
       # leaves off: `kr-cli`'s `stack_windows` case reads its header as well.
