@@ -896,7 +896,9 @@ pub fn late_request_script() -> Value {
 /// Case 5b-5: a cancel and an answer at once.
 pub fn a_cancel_racing_an_approval(host: &mut Hosted) -> Result<(), Red> {
     let race = host.cancel_and_answer_at_once("proceed_once");
-    one_winner_and_the_call_settles(&race, &host.record_after("reply", 1))
+    // The agent reads a second response only after it has sent its reply to the first, so the record
+    // is read after five seconds, by when a second response, if one was sent, is in it.
+    one_winner_and_the_call_settles(&race, &host.record_after_quiet())
 }
 
 /// Case 5b-6: the person cancels, and the stand-in then sends a request of the cancelled turn.
@@ -2261,7 +2263,10 @@ fn a_fresh_request_after_an_upgrade_for(id: &str, host: &mut Hosted) -> Result<(
     let after = seen(host);
     requires(id, after.is_filled(), EMPTY_IDENTITY);
     host.answer_next("proceed_once");
-    a_fresh_request_is_decoded_by_the_pinned_table(id, &Decoded { before, after }, &host.record())
+    // The host shows the answer as dispatched before the agent has read it, so the record is read
+    // once it holds the response.
+    let record = host.record_after_response(1);
+    a_fresh_request_is_decoded_by_the_pinned_table(id, &Decoded { before, after }, &record)
 }
 
 /// Case 6b-2: a fresh request after the upgrade of a Qoder-shaped agent's installation.
