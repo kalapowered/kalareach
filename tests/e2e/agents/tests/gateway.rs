@@ -100,11 +100,11 @@ use kr_e2e_agents::account::{KEY_SCAN_VARIABLE, Ledger};
 use kr_e2e_agents::build::{self, Account, Build, InstallSwitch, Probe};
 use kr_e2e_agents::entry;
 use kr_e2e_agents::held::{
-    Absent, Audit, CONFIG_DIRECTORY, HeldKeys, ISOLATION_UNPROVEN, MetaGuard,
-    NEWER_CONFIG_DIRECTORY, Recorded, RunScan, Stop, absent_below, absent_paths, absent_paths_in,
+    Absent, Audit, CONFIG_DIRECTORY, HeldKeys, ISOLATION_UNPROVEN, NEWER_CONFIG_DIRECTORY,
+    PersonGuard, PersonPlan, Recorded, RunScan, Stop, absent_below, absent_paths, absent_paths_in,
     audit_turns, conversations_relative, conversations_relative_in, folder_of, grouped_output,
-    kept_panic_text, new_turns, other_agent_processes, other_agents_refusal, panic_text,
-    person_home, read_record, turns_recorded, unchanged_before_the_charge,
+    kept_panic_text, new_turns, other_agents_refusal, panic_text, person_home, read_record,
+    turns_recorded, unchanged_before_the_charge,
 };
 use kr_e2e_agents::launch_report::{Seen, launch_report};
 use kr_e2e_agents::outcome::{Failure, Outcome};
@@ -313,7 +313,7 @@ struct Real {
     ledger: Option<Ledger>,
     held: HeldKeys,
     home: PathBuf,
-    person: MetaGuard,
+    person: PersonGuard,
     /// The agent's program as the run placed it, recorded once before the agent first starts.
     placed: std::sync::OnceLock<PlacedProgram>,
     /// The agent's configuration files as the harness wrote them, by their place below the run's
@@ -481,9 +481,13 @@ impl Route {
         // The turn ledger is made by the operator before the run: a missing one, or one with no
         // array for the budget, stops the run here, before anything starts and before any key is read.
         let ledger = login.then(|| Ledger::from_environment(&account.budget, account.turns));
-        // The guard over the person's directory compares the whole of it at the end, and cannot
-        // tell a write of another agent process of theirs from the run's: none runs at the start.
-        let others = other_agent_processes(&executable_name(&build.command), None)
+        // The entry's own guard: Codex's whole directory, or the files the entry names. A guard
+        // over a whole directory cannot tell a write of another agent process of theirs from the
+        // run's, so none runs at the start; one over named files has no such limit.
+        let plan = PersonPlan::of(&build.application, &account.guarded, &account.shared)
+            .unwrap_or_else(|why| panic!("{why}"));
+        let others = plan
+            .other_agents(&executable_name(&build.command), None)
             .unwrap_or_else(|why| panic!("{why}"));
         assert!(
             others.is_empty(),
@@ -496,8 +500,7 @@ impl Route {
         } else {
             HeldKeys::read_without_login(&who)
         };
-        let trees: Vec<&str> = subject.person_trees().iter().map(String::as_str).collect();
-        let person = MetaGuard::take(&home, &trees);
+        let person = plan.take(&home);
         Self::Real(Box::new(Real {
             build,
             subject,
@@ -1088,12 +1091,14 @@ impl Real {
     }
 
     /// Charges one turn to the entry's budget before a prompt the model answers is sent, once no
-    /// other process of this user is the agent outside `run` and the person's own agent files are as
-    /// they stood at the start: a process that started since the run began, and any change of the
-    /// files since (by a process the listing missed, or any other writer), stops the case here with
-    /// no turn charged or spent.
+    /// other process of this user is the agent outside `run` (where the entry's guard is a whole
+    /// directory) and the person's own agent files are as they stood at the start: a process that
+    /// started since the run began, and any change of the files since (by a process the listing
+    /// missed, or any other writer), stops the case here with no turn charged or spent.
     fn charge(&self, run: &Run, case: &str, what: &str) {
-        let others = other_agent_processes(&executable_name(&self.build.command), Some(run.root()))
+        let others = self
+            .person
+            .other_agents(&executable_name(&self.build.command), Some(run.root()))
             .unwrap_or_else(|why| panic!("no turn is charged: {why}"));
         assert!(
             others.is_empty(),
@@ -4346,7 +4351,21 @@ fn ends(
         evidence["keys"] = serde_json::json!({ "read": false });
     }
     if let Route::Real(real) = &route {
-        let (guard_stops, guard_evidence) = real.person.compare();
+        // The one read of the files the entry shares with the person's sessions, for the run's
+        // directory name and mark: the run's directory is still there.
+        let names: Vec<String> = run
+            .as_ref()
+            .map(|run| {
+                vec![
+                    run.root()
+                        .file_name()
+                        .map_or_else(String::new, |name| name.to_string_lossy().into_owned()),
+                    run.mark().1.to_owned(),
+                ]
+            })
+            .unwrap_or_default();
+        let needles: Vec<&str> = names.iter().map(String::as_str).collect();
+        let (guard_stops, guard_evidence) = real.person.compare_at_the_end(&needles);
         stops.extend(guard_stops);
         evidence["person_files"] = guard_evidence;
         let charged = real.ledger.as_ref().map_or(0, Ledger::charged_here);

@@ -1300,13 +1300,13 @@ pub fn other_agents_refusal(found: &[u32], when: &str) -> String {
 
 /// Whether the person's own agent files are as they stood when `guard` was taken, looked at again
 /// right before a turn is charged: a change since then, by a process the listing missed or any
-/// other writer, stops the case here, with no turn charged. What is said is the class and the
-/// counts of [`MetaGuard::compare`], never a name.
+/// other writer, stops the case here, with no turn charged. What is said is the class and the words
+/// of [`PersonGuard::compare`]: a path the entry names, counts, and no other name.
 ///
 /// # Errors
 ///
 /// Returns what changed.
-pub fn unchanged_before_the_charge(guard: &MetaGuard) -> Result<(), String> {
+pub fn unchanged_before_the_charge(guard: &PersonGuard) -> Result<(), String> {
     let (stops, _) = guard.compare();
     if stops.is_empty() {
         return Ok(());
@@ -3282,7 +3282,7 @@ mod tests {
         let tree = home.join(".agent");
         std::fs::create_dir_all(tree.join("sessions")).expect("directories");
         std::fs::write(tree.join("sessions/rollout-name.jsonl"), b"x").expect("a file");
-        let guard = MetaGuard::take(&home, &[".agent"]);
+        let guard = PersonPlan::Trees(&[".agent"]).take(&home);
         assert_eq!(unchanged_before_the_charge(&guard), Ok(()));
         // A write by some other process during the setup, which no listing of processes saw.
         std::fs::write(tree.join("sessions/another-name.jsonl"), b"y").expect("a new file");
@@ -3294,6 +3294,22 @@ mod tests {
         for name in ["rollout-name", "another-name", "sessions"] {
             assert!(!why.contains(name), "{why}");
         }
+        std::fs::remove_dir_all(&home).expect("clean up");
+    }
+
+    #[test]
+    fn a_change_of_a_guarded_file_since_the_start_stops_the_charge() {
+        let home = claude_home("before-charge-files");
+        let guard = claude_plan().take(&home);
+        assert_eq!(unchanged_before_the_charge(&guard), Ok(()));
+        std::fs::write(home.join(".claude/settings.json"), b"two").expect("a write");
+        assert_eq!(
+            unchanged_before_the_charge(&guard),
+            Err(
+                "guarded_file_changed: ~/.claude/settings.json changed while the run ran"
+                    .to_owned()
+            )
+        );
         std::fs::remove_dir_all(&home).expect("clean up");
     }
 
