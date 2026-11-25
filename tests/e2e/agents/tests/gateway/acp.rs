@@ -16,7 +16,13 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use serde_json::Value;
+
 use super::{Filed, recorded_as};
+
+/// What each control reads and how it judges it, and the host a case works with.
+#[path = "acp_controls.rs"]
+mod controls;
 
 /// What a case says when it starts before any ACP launch exists.
 const NO_LAUNCH: &str = "no ACP launch exists: kr-hook has no `acp` subcommand, so no case can start an agent in ACP mode";
@@ -49,6 +55,33 @@ fn starts_in_acp_mode(case: &str) {
 fn unwritten(case: &str) -> ! {
     starts_in_acp_mode(case);
     panic!("{case}: {NO_BODY}");
+}
+
+/// The text the table names as the red of control `id`.
+fn red_of(id: &str) -> &'static str {
+    CONTROLS
+        .iter()
+        .find(|control| control.id == id)
+        .unwrap_or_else(|| panic!("{id} is no control of the table"))
+        .red
+}
+
+/// Starts the stand-in with `script` through the launch and runs `body` on the host. It fails with
+/// the red the body returns.
+fn run_case(
+    id: &str,
+    script: &Value,
+    body: impl FnOnce(&mut controls::Hosted) -> Result<(), controls::Red>,
+) {
+    starts_in_acp_mode(id);
+    match controls::Hosted::start(script) {
+        Err(why) => panic!("{id}: {why}"),
+        Ok(mut host) => {
+            if let Err(red) = body(&mut host) {
+                panic!("{red}");
+            }
+        }
+    }
 }
 
 /// The stand-in a case starts.
@@ -490,14 +523,22 @@ fn cases_in_source() -> BTreeMap<String, Option<String>> {
 #[ignore = "waits for ACP-5"]
 fn acp_a_daemon_killed_with_a_request_pending_leaves_the_agent_and_the_restarted_daemon_serves_the_same_request()
  {
-    unwritten("5b-1");
+    run_case(
+        "5b-1",
+        &controls::restart_script(),
+        controls::a_daemon_killed_with_a_request_pending,
+    );
 }
 
 /// Control 5b-4.
 #[test]
 #[ignore = "waits for ACP-5"]
 fn acp_two_concurrent_answers_to_one_request_reach_the_agent_once_also_across_a_daemon_reconnect() {
-    unwritten("5b-4");
+    run_case(
+        "5b-4",
+        &controls::restart_script(),
+        controls::two_answers_at_once,
+    );
 }
 
 /// Control 5b-5.
@@ -525,21 +566,33 @@ fn acp_a_permission_request_after_a_cancel_is_answered_cancelled_by_a_gemini_sha
 #[test]
 #[ignore = "waits for ACP-5"]
 fn acp_the_same_request_id_in_a_second_instance_is_a_second_pending_request() {
-    unwritten("5b-7");
+    run_case(
+        "5b-7",
+        &controls::restart_script(),
+        controls::the_same_id_in_a_second_instance,
+    );
 }
 
 /// Control 5b-8.
 #[test]
 #[ignore = "waits for ACP-5"]
 fn acp_a_fresh_request_after_a_daemon_restart_is_a_pending_request() {
-    unwritten("5b-8");
+    run_case(
+        "5b-8",
+        &controls::restart_script(),
+        controls::a_fresh_request_after_a_restart,
+    );
 }
 
 /// Control 5b-9.
 #[test]
 #[ignore = "waits for ACP-4"]
 fn acp_an_agent_that_exits_before_dispatch_leaves_its_request_cancelled() {
-    unwritten("5b-9");
+    run_case(
+        "5b-9",
+        &controls::exit_script(),
+        controls::an_agent_exits_before_dispatch,
+    );
 }
 
 /// Control 5b-10.
@@ -547,7 +600,11 @@ fn acp_an_agent_that_exits_before_dispatch_leaves_its_request_cancelled() {
 #[ignore = "waits for ACP-4"]
 fn acp_an_agent_that_exits_after_dispatch_leaves_the_receipt_unknown_unless_evidence_came_first_for_a_qoder_shaped_agent()
  {
-    unwritten("5b-10");
+    run_case(
+        "5b-10",
+        &controls::exit_script(),
+        controls::an_agent_exits_after_dispatch,
+    );
 }
 
 /// Control 5b-10g.
@@ -562,7 +619,11 @@ fn acp_an_agent_that_exits_after_dispatch_leaves_the_receipt_unknown_unless_evid
 #[test]
 #[ignore = "waits for ACP-3a"]
 fn acp_the_launcher_ends_the_agent_when_the_workers_connection_ends() {
-    unwritten("5b-12");
+    run_case(
+        "5b-12",
+        &controls::exit_script(),
+        controls::the_launcher_ends_the_agent,
+    );
 }
 
 /// Control 5b-13.
