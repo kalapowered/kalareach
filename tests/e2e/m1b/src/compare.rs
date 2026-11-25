@@ -128,6 +128,14 @@ impl Operations {
         create: true,
         remove: true,
     };
+    /// The writer makes the entry, changes it in place and removes it, and never puts another
+    /// object in its place.
+    pub const COMES_AND_GOES: Self = Self {
+        content: true,
+        replace: false,
+        create: true,
+        remove: true,
+    };
 }
 
 /// Which names a row covers, beside the file the row is about.
@@ -135,15 +143,13 @@ impl Operations {
 enum Names {
     /// The file itself.
     Itself,
-    /// The names a SQLite database makes beside itself: `-wal`, `-shm` and `-journal`.
-    Sidecars,
+    /// The one name a SQLite database makes beside itself that ends with the suffix: `-wal`,
+    /// `-shm` or `-journal`.
+    Sidecar(&'static str),
     /// The names an owner-only file writer makes beside the file it writes, `.<uuid>.tmp` in the
     /// same directory, and removes or renames.
     Staging,
 }
-
-/// The names SQLite makes beside a database.
-const SIDECARS: [&str; 3] = ["-wal", "-shm", "-journal"];
 
 /// The length of a hyphenated UUID.
 const UUID_LEN: usize = 36;
@@ -184,9 +190,7 @@ impl Daemon {
         };
         match self.names {
             Names::Itself => false,
-            Names::Sidecars => SIDECARS
-                .iter()
-                .any(|sidecar| name.strip_prefix(file) == Some(sidecar)),
+            Names::Sidecar(suffix) => name.strip_prefix(file) == Some(suffix),
             Names::Staging => {
                 name.len() == UUID_LEN + ".tmp".len() + 1
                     && name.starts_with('.')
@@ -273,8 +277,11 @@ pub fn daemon_rows(layout: &Layout) -> Vec<Daemon> {
     let state = |name: &str| layout.state_dir.join(name);
     let runtime = |name: &str| layout.runtime_dir.join(name);
     let mut rows = Vec::new();
-    // A database the daemon opens: the file keeps its object and changes in place, and SQLite makes
-    // and removes its sidecars (SQLite's behaviour, not checked here).
+    // A database the daemon opens: the file keeps its object and changes in place. Its write-ahead
+    // log does the same, and no survey list shows one made or removed. SQLite makes and removes the
+    // journal an unfinished write leaves, and makes and removes the shared-memory file at the last
+    // close and the next open, so that file may be another object (SQLite's behaviour, not checked
+    // here).
     let mut database = |name: &'static str, cite: &'static str, when: When| {
         let path = state(name);
         rows.push(Daemon {
@@ -286,15 +293,21 @@ pub fn daemon_rows(layout: &Layout) -> Vec<Daemon> {
             path: path.clone(),
             names: Names::Itself,
         });
-        rows.push(Daemon {
-            name,
-            cite,
-            when,
-            kind: Kind::File,
-            operations: Operations::ALL,
-            path,
-            names: Names::Sidecars,
-        });
+        for (suffix, operations) in [
+            ("-wal", Operations::CONTENT),
+            ("-journal", Operations::COMES_AND_GOES),
+            ("-shm", Operations::ALL),
+        ] {
+            rows.push(Daemon {
+                name,
+                cite,
+                when,
+                kind: Kind::File,
+                operations,
+                path: path.clone(),
+                names: Names::Sidecar(suffix),
+            });
+        }
     };
     // The registry and the attention store are written while the daemon serves.
     database(
@@ -751,8 +764,8 @@ pub(crate) mod tests {
     }
 
     /// A database the daemon writes changes in place at a kill, and does not change between the kill
-    /// and the attempt; it is not replaced, removed or given another mode; its sidecars are made,
-    /// changed, replaced and removed, owner-only; another name beside it is no row's.
+    /// and the attempt; it is not replaced, removed or given another mode; its sidecars change as
+    /// their own rows say, owner-only; another name beside it is no row's.
     #[test]
     fn a_database_the_daemon_writes_changes_in_place_at_a_kill_and_nowhere_else() {
         let world = world("database");
@@ -762,7 +775,7 @@ pub(crate) mod tests {
         world.put(&world.state("registry.sqlite-journal"), b"journal");
         let before = world.record();
         std::fs::write(&registry, b"registry, written").expect("written in place");
-        world.replace(&world.state("registry.sqlite-wal"), b"another wal");
+        std::fs::write(world.state("registry.sqlite-wal"), b"wal, written").expect("in place");
         std::fs::remove_file(world.state("registry.sqlite-journal")).expect("removed");
         world.put(&world.state("registry.sqlite-shm"), b"shm");
         assert_eq!(world.refused(&before, KILL), Vec::<String>::new());
@@ -813,14 +826,62 @@ pub(crate) mod tests {
         world.clean();
     }
 
+    /// Each sidecar of a database has the operations its own row gives it: the write-ahead log
+    /// changes in place and is neither replaced, made nor removed; the journal is made, changed and
+    /// removed and is never another object; the shared-memory file may also be another object.
+    #[test]
+    fn each_sidecar_of_a_database_has_the_operations_its_own_row_gives_it() {
+        let world = world("sidecars");
+        let refused_after = |suffix: &str, act: &str| {
+            let path = world.state(&format!("registry.sqlite{suffix}"));
+            std::fs::remove_file(&path).unwrap_or_default();
+            if act != "create" {
+                world.put(&path, b"before");
+            }
+            let before = world.record();
+            match act {
+                "replace" => world.replace(&path, b"after!"),
+                "remove" => std::fs::remove_file(&path).expect("removed"),
+                _ => world.put(&path, b"after!"),
+            }
+            world.refused(&before, KILL)
+        };
+        let replacement = "registry.sqlite permits no replacement";
+        only(&refused_after("-wal", "replace"), replacement);
+        only(
+            &refused_after("-wal", "remove"),
+            "registry.sqlite permits no removal",
+        );
+        only(
+            &refused_after("-wal", "create"),
+            "registry.sqlite permits no creation",
+        );
+        only(&refused_after("-journal", "replace"), replacement);
+        for (suffix, act) in [
+            ("-journal", "remove"),
+            ("-journal", "create"),
+            ("-shm", "replace"),
+            ("-shm", "remove"),
+            ("-shm", "create"),
+        ] {
+            assert_eq!(
+                refused_after(suffix, act),
+                Vec::<String>::new(),
+                "{suffix}: {act}"
+            );
+        }
+        world.clean();
+    }
+
     /// A database the daemon opens at its start changes only at a kill that follows a restart.
     #[test]
     fn a_database_the_daemon_opens_at_a_start_changes_only_at_a_kill_after_a_restart() {
         let world = world("start-database");
         world.put(&world.state("privacy.sqlite3"), b"privacy");
+        world.put(&world.state("privacy.sqlite3-wal"), b"wal");
         let before = world.record();
         std::fs::write(world.state("privacy.sqlite3"), b"privacy, written").expect("written");
-        world.put(&world.state("privacy.sqlite3-wal"), b"wal");
+        std::fs::write(world.state("privacy.sqlite3-wal"), b"wal, written").expect("written");
         let refused = world.refused(&before, KILL);
         assert_eq!(refused.len(), 2, "{refused:#?}");
         assert!(
