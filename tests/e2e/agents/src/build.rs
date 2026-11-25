@@ -1124,21 +1124,23 @@ pub struct Build {
     pub command: String,
     /// How a launch reaches the pinned file.
     pub launch: Launch,
-    /// The arguments typed after it, with `{port}` where a server's loopback port goes.
-    #[serde(default)]
+    /// The arguments typed after it, with `{port}` where a server's loopback port goes. An explicit
+    /// `null` is read as empty.
+    #[serde(default, deserialize_with = "null_is_empty")]
     pub arguments: Vec<String>,
     /// The executables of the runtimes the build needs, such as `node`: each is linked into a
     /// directory of the run's own that the session searches after the build's `bin`, so the
     /// session's PATH names no directory another installation shares.
     #[serde(default)]
     pub runtime: Vec<PathBuf>,
-    /// Variables the build is started with: its updater and telemetry switches.
-    #[serde(default)]
+    /// Variables the build is started with: its updater and telemetry switches. An explicit `null`
+    /// is read as empty.
+    #[serde(default, deserialize_with = "null_is_empty")]
     pub environment: BTreeMap<String, String>,
     /// Files written into the agent's home before it starts, by path relative to the home: the
     /// state a person's installation has after the vendor's own first-run steps, and never an
-    /// account.
-    #[serde(default)]
+    /// account. An explicit `null` is read as empty.
+    #[serde(default, deserialize_with = "null_is_empty")]
     pub home: BTreeMap<String, String>,
     /// Text the agent's first screen shows.
     pub ready: String,
@@ -1189,6 +1191,15 @@ where
     D: serde::Deserializer<'de>,
 {
     BTreeMap::deserialize(deserializer).map(Some)
+}
+
+/// Reads a member that is absent or `null` as empty.
+fn null_is_empty<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Default + Deserialize<'de>,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 impl Account {
@@ -2013,6 +2024,61 @@ mod tests {
             account.image_line.is_none(),
             "a null image_line is read as absent"
         );
+    }
+
+    /// An explicit `null` in `arguments` is read as empty, as the runner's projection writes it for
+    /// a member the entry leaves out.
+    #[test]
+    fn a_null_arguments_is_read_as_empty() {
+        let mut json = entry_json(&serde_json::json!({}), &serde_json::json!({}));
+        json["arguments"] = serde_json::Value::Null;
+        let build = serde_json::from_value::<Build>(json).expect("an entry");
+        assert!(
+            build.arguments.is_empty(),
+            "a null arguments is read as empty"
+        );
+    }
+
+    /// An explicit `null` in `environment` is read as empty, as the runner's projection writes it
+    /// for a member the entry leaves out.
+    #[test]
+    fn a_null_environment_is_read_as_empty() {
+        let mut json = entry_json(&serde_json::json!({}), &serde_json::json!({}));
+        json["environment"] = serde_json::Value::Null;
+        let build = serde_json::from_value::<Build>(json).expect("an entry");
+        assert!(
+            build.environment.is_empty(),
+            "a null environment is read as empty"
+        );
+    }
+
+    /// An explicit `null` in `home` is read as empty, as the runner's projection writes it for a
+    /// member the entry leaves out.
+    #[test]
+    fn a_null_home_is_read_as_empty() {
+        let mut json = entry_json(&serde_json::json!({}), &serde_json::json!({}));
+        json["home"] = serde_json::Value::Null;
+        let build = serde_json::from_value::<Build>(json).expect("an entry");
+        assert!(build.home.is_empty(), "a null home is read as empty");
+    }
+
+    /// An entry that leaves out `arguments`, `environment` and `home` reads them as empty.
+    #[test]
+    fn an_entry_with_no_arguments_environment_or_home_reads_them_as_empty() {
+        let mut json = entry_json(&serde_json::json!({}), &serde_json::json!({}));
+        json.as_object_mut()
+            .expect("an object")
+            .remove("environment");
+        let build = serde_json::from_value::<Build>(json).expect("an entry");
+        assert!(
+            build.arguments.is_empty(),
+            "an absent arguments is read as empty"
+        );
+        assert!(
+            build.environment.is_empty(),
+            "an absent environment is read as empty"
+        );
+        assert!(build.home.is_empty(), "an absent home is read as empty");
     }
 
     /// An entry that types options is not served by a command integration, so its words are the keys
