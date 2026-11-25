@@ -1459,6 +1459,11 @@ fn the_real_proxy_cases_run_in_a_job_that_fails_without_squid_and_without_the_ca
     }
 }
 
+/// A job that runs the retained_surface suite: its workflow file, its name, the command that starts
+/// the workspace's tests when the job does not name the suite, the package that installs the cross
+/// compiler, and the condition its install step runs under.
+type SuiteJob<'a> = (String, String, Option<&'a str>, &'a str, Option<&'a str>);
+
 /// `kr-cli`'s retained_surface suite checks the workspace for x86_64-pc-windows-gnu. The build
 /// scripts in that build that compile C look for `x86_64-w64-mingw32-gcc`, and the companion
 /// application's looks for `x86_64-w64-mingw32-windres`; no hosted runner image has them, so
@@ -1474,7 +1479,7 @@ fn the_real_proxy_cases_run_in_a_job_that_fails_without_squid_and_without_the_ca
 #[test]
 fn the_jobs_that_run_the_retained_surface_suite_install_the_windows_cross_compiler_first() {
     // The jobs that run the workspace's tests: the command that starts them, which holds the suite.
-    let mut jobs: Vec<(String, String, Option<&str>, &str, Option<&str>)> = [
+    let mut jobs: Vec<SuiteJob> = [
         (
             "core-ci.yml",
             "rust",
