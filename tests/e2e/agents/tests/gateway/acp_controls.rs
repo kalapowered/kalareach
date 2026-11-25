@@ -3396,22 +3396,51 @@ mod scenarios {
 
     #[test]
     fn the_chunk_script_reads_the_chunk_of_the_folder_the_agent_started_from() {
-        let installation = installed_package();
-        let copy = installed_package();
         let original = std::fs::read(package_source().join("chunk.js")).expect("the chunk");
+        assert_ne!(
+            original, UPGRADED_CHUNK,
+            "the replacement changes the bytes of the chunk"
+        );
         let chunks = Chunks {
-            original,
+            original: original.clone(),
             upgraded: UPGRADED_CHUNK.to_vec(),
         };
+        let chunk_in = |folder: &std::path::Path| {
+            std::fs::read(folder.join("chunk.js")).expect("the chunk of a folder")
+        };
+        // Each run has an installation and a copy of its own, so that the upgrade of one run is not in
+        // the installation when the next agent starts.
         let mut reads = Vec::new();
-        for folder in [copy.path(), installation.path()] {
+        for from_the_copy in [true, false] {
+            let installation = installed_package();
+            let copy = installed_package();
+            let folder = if from_the_copy {
+                copy.path()
+            } else {
+                installation.path()
+            };
             let mut agent = gemini_from(folder, &chunk_script());
             at_the_first_request(&mut agent);
             agent.choose(0, "proceed_once");
             assert!(agent.is_quiet(), "the chunk is read when its file appears");
             assert_eq!(agent.marker(), None, "no chunk is read before its file");
+            assert_eq!(
+                chunk_in(installation.path()),
+                original,
+                "the installation holds the original chunk when the agent starts"
+            );
             std::fs::write(installation.path().join("chunk.js"), UPGRADED_CHUNK)
                 .expect("the upgrade");
+            assert_eq!(
+                chunk_in(installation.path()),
+                UPGRADED_CHUNK,
+                "the upgrade replaces the installation's chunk while the agent runs"
+            );
+            assert_eq!(
+                chunk_in(copy.path()),
+                original,
+                "the upgrade leaves the copy's chunk as it was"
+            );
             agent.release("import");
             assert_eq!(kinds(&agent, 1), ["reply 3 end_turn"]);
             reads.push(agent.marker());
