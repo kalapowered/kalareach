@@ -623,6 +623,66 @@ mod tests {
     }
 
     #[test]
+    fn a_removal_written_after_a_second_registration_ends_the_binding_whichever_answer_is_read_first()
+     {
+        for removal_first in [false, true] {
+            let registrations = Registrations::default();
+            let first = register(&registrations, 1);
+            registrations.settled(1, &registered(first));
+            // A second registration of the binding is written while the first stands, and the
+            // unbind after it. The host refuses the second as a duplicate and removes the first.
+            let second = register(&registrations, 2);
+            registrations.removal(3, binding());
+            let unbound = ResponseBody4::Unbound { existed: true };
+            if removal_first {
+                registrations.settled(3, &unbound);
+                registrations.settled(2, &refused());
+            } else {
+                registrations.settled(2, &refused());
+                registrations.settled(3, &unbound);
+            }
+            assert_eq!(
+                registrations.of(binding()),
+                None,
+                "a registration was the binding's after the unbind that removed it was answered"
+            );
+            assert!(
+                notice_of(document(first), &registrations).is_none(),
+                "a notice of the removed registration was kept"
+            );
+            assert!(
+                notice_of(document(second), &registrations).is_none(),
+                "a notice of the refused registration was kept"
+            );
+            let held = registrations.0.lock().expect("the record is usable");
+            assert!(
+                held.trying.is_empty() && held.live.is_empty() && held.removing.is_empty(),
+                "the answers left a record behind: {held:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_registration_written_after_a_removal_is_kept_when_the_removals_answer_is_read_first() {
+        let registrations = Registrations::default();
+        // The unbind is written, then a registration of the binding. The unbind's answer is read
+        // before the registration's.
+        registrations.removal(1, binding());
+        let later = register(&registrations, 2);
+        registrations.settled(1, &ResponseBody4::Unbound { existed: false });
+        assert!(
+            notice_of(document(later), &registrations).is_some(),
+            "a notice of a registration written after the unbind was dropped"
+        );
+        registrations.settled(2, &registered(later));
+        assert_eq!(
+            registrations.of(binding()),
+            Some(later),
+            "a removal ended a registration written after it"
+        );
+    }
+
+    #[test]
     fn a_report_of_what_was_consumed_is_not_passed_on() {
         let registrations = Registrations::default();
         let current = register(&registrations, 1);
