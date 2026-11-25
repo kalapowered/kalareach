@@ -11,6 +11,7 @@
 
 use std::path::Path;
 
+use kr_e2e_agents::detect::check_detected;
 use kr_e2e_agents::subject::Subject;
 use kr_plugin_sdk::digest::PayloadDigest;
 use kr_plugin_sdk::ids::PluginName;
@@ -19,6 +20,9 @@ use kr_plugin_sdk::package::MANIFEST_FILE;
 use kr_plugin_sdk::plugin::PluginManifest;
 use kr_plugin_sdk::validate::validate_package_directory;
 use kr_protocol::scalars::Nullable;
+
+use super::staged_a::{BY_HAND, HandAgent, detects, launched};
+use super::{Chosen, Context, ISOLATION_UNPROVEN, Session, Setup, run_case_with, shells};
 
 /// The one match rule of a written package: the executable named `command`, in any directory,
 /// whatever distribution it came from. A command is a name, never a path: the stand-in is placed
@@ -287,6 +291,59 @@ fn a_written_package_recognises_the_entrys_command_and_no_other_name() {
     }
 }
 
+/// The subject of `plugin` typed as `command`, made from the release of `shape` that is written
+/// into `release_directory`, for a run on the stand-in route.
+fn selected_subject(
+    release_directory: &Path,
+    plugin: &str,
+    command: &str,
+    shape: Shape,
+) -> Subject {
+    release(release_directory, plugin, command, shape);
+    Subject::from_release(&entry(plugin, command), release_directory)
+        .expect("a subject of the release")
+}
+
+/// Runs `body` on a host that has the package written for `subject` installed, with the agent
+/// started by hand and no login, on the stand-in route.
+fn by_hand_on(
+    subject: Subject,
+    test: &str,
+    body: impl FnOnce(&Context, &Session<'_>) -> serde_json::Value,
+) {
+    if kr_ipc::testing::account_launchd::stands_down("the host start") {
+        return;
+    }
+    let shell = match shells::managed_zsh() {
+        Ok(shell) => shell,
+        Err(why) if shells::required() => panic!("the package leg's managed shell: {why}"),
+        Err(why) => {
+            eprintln!("skipping: the package leg: {why}");
+            return;
+        }
+    };
+    run_case_with(
+        Setup {
+            manual: true,
+            no_login: true,
+            ..Setup::default()
+        },
+        "package",
+        "package",
+        test,
+        "by-hand",
+        (
+            shell,
+            Chosen {
+                subject,
+                generation: None,
+            },
+            false,
+        ),
+        body,
+    );
+}
+
 /// A release of another package than the subject's is refused, naming both.
 #[test]
 fn a_release_of_another_package_than_the_subjects_is_not_written() {
@@ -331,5 +388,86 @@ fn a_release_file_without_the_digest_its_manifest_names_is_not_written() {
             .contains("the release's file README.md does not have the digest the manifest names"),
         "{refused}"
     );
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// The host that installed the package written for each synthetic entry detects a program that is
+/// typed under the entry's command, as one live instance of that package.
+#[test]
+fn the_host_detects_a_program_typed_as_the_command_of_the_package_it_installed() {
+    const TEST: &str =
+        "the_host_detects_a_program_typed_as_the_command_of_the_package_it_installed";
+    for (plugin, command, shape) in SYNTHETIC {
+        let base = scratch("detects");
+        let subject = selected_subject(&base.join("release"), plugin, command, shape);
+        by_hand_on(subject, TEST, |ctx, session| {
+            let agent = HandAgent::starts(ctx, session);
+            let shown = detects(ctx, &session.remote, session.session_id());
+            check_detected(&launched(ctx, &agent), &shown).unwrap_or_else(|why| {
+                panic!("{plugin}: the host did not detect a program typed as {command}: {why}")
+            });
+            agent.ends();
+            serde_json::json!({ "plugin": plugin, "detection": shown.detection.evidence() })
+        });
+        let _ = std::fs::remove_dir_all(&base);
+    }
+}
+
+/// The name a program is placed and typed under that no match rule of a written package names.
+const OTHER_NAME: &str = "kr-other-name";
+
+/// The host that installed a written package does not detect a program that runs under another name
+/// than the entry's command, though the program is the same file as the one it detects.
+#[test]
+fn the_host_does_not_detect_a_program_run_under_another_name_than_the_entrys_command() {
+    const TEST: &str =
+        "the_host_does_not_detect_a_program_run_under_another_name_than_the_entrys_command";
+    let (plugin, command, shape) = SYNTHETIC[1];
+    let base = scratch("not-detected");
+    let subject = selected_subject(&base.join("release"), plugin, command, shape);
+    by_hand_on(subject, TEST, |ctx, session| {
+        let other = ctx.bin.join(OTHER_NAME);
+        ctx.run
+            .place_built("codex-stand-in", &other, &["--version"]);
+        let place = format!("t/{OTHER_NAME}");
+        ctx.run
+            .note_placed(Path::new(&place))
+            .unwrap_or_else(|why| panic!("{ISOLATION_UNPROVEN} {why}"));
+        // The program is started as `starts_the_agent_showing` starts the entry's own command.
+        if !session.environment_read.replace(true) {
+            session
+                .person
+                .reads_the_environment(&session.person.expected)
+                .unwrap_or_else(|why| panic!("{why}"));
+        }
+        if session.stand_in_leaves_the_tree {
+            session.host.agent_is_a_stand_in();
+        }
+        session.host.agent_starts();
+        let _ = session.person.types_until_it_shows(
+            OTHER_NAME,
+            BY_HAND,
+            "the program placed under another name starts",
+            &|| {
+                ctx.checks_the_placed_files();
+                ctx.run
+                    .placed_as_it_was(Path::new(&place))
+                    .unwrap_or_else(|why| panic!("{ISOLATION_UNPROVEN} {why}"));
+            },
+        );
+        let agent = HandAgent::running(ctx, session, &other);
+        let shown = detects(ctx, &session.remote, session.session_id());
+        assert!(
+            shown.detection.instances.is_empty(),
+            "{plugin}: the host announced live instances ({}) for a program named {OTHER_NAME}, \
+             though no rule of the package recognises that name",
+            shown.detection.instances.len()
+        );
+        agent
+            .runs()
+            .unwrap_or_else(|why| panic!("the program ran while the host looked: {why}"));
+        agent.ends();
+        serde_json::json!({ "plugin": plugin, "detection": shown.detection.evidence() })
+    });
     let _ = std::fs::remove_dir_all(&base);
 }

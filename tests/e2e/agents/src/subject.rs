@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 
 use kr_plugin_sdk::capability::PluginCapability;
 use kr_plugin_sdk::integration::{CommandIntegration, IntegrationBackend};
+use kr_plugin_sdk::package::MANIFEST_FILE;
 use kr_plugin_sdk::plugin::PluginManifest;
 use kr_protocol::ids::PluginId;
 
@@ -42,6 +43,9 @@ pub struct Subject {
     requested: Vec<PluginCapability>,
     version: String,
     package: Option<PathBuf>,
+    /// Whether `package` is a release the run was given, which the stand-in route writes its
+    /// package from, and not the package this crate keeps.
+    selected: bool,
 }
 
 impl Subject {
@@ -98,6 +102,25 @@ impl Subject {
         )
     }
 
+    /// The subject of a build list entry on the stand-in route, whose package is the release in
+    /// `release`: the directory that holds the release's `plugin.json` and the files it lists.
+    ///
+    /// # Errors
+    ///
+    /// Returns why the release has no readable manifest, or is the package of another agent than
+    /// the entry's.
+    pub fn from_release(build: &Build, release: &Path) -> Result<Self, String> {
+        let path = release.join(MANIFEST_FILE);
+        let bytes = std::fs::read(&path)
+            .map_err(|error| format!("the release's manifest {}: {error}", path.display()))?;
+        let manifest: PluginManifest = serde_json::from_slice(&bytes)
+            .map_err(|error| format!("the release's manifest {}: {error}", path.display()))?;
+        let mut subject = Self::from_build(build, &manifest)?;
+        subject.package = Some(release.to_path_buf());
+        subject.selected = true;
+        Ok(subject)
+    }
+
     fn made(
         entry: Option<Build>,
         manifest: &PluginManifest,
@@ -140,6 +163,7 @@ impl Subject {
             gateway,
             requested,
             version: manifest.version.to_string(),
+            selected: false,
         })
     }
 
@@ -290,11 +314,19 @@ impl Subject {
         &self.requested
     }
 
-    /// The directory of the package the driver keeps for the subject: the Codex package kept in
-    /// this crate; none for another subject.
+    /// The directory of the package the subject's actions are read from: the release the subject
+    /// was made from ([`Subject::from_release`]), or the Codex package kept in this crate; none for
+    /// another subject.
     #[must_use]
     pub fn package(&self) -> Option<&Path> {
         self.package.as_deref()
+    }
+
+    /// The release the stand-in route writes its package from; none for a subject whose package is
+    /// the one this crate keeps, or the generation's.
+    #[must_use]
+    pub fn selected_release(&self) -> Option<&Path> {
+        self.package.as_deref().filter(|_| self.selected)
     }
 
     /// The version of the package the manifest declares.
@@ -369,6 +401,40 @@ mod tests {
             assert_eq!(subject.place(), "t/codex");
             assert!(subject.gateway().is_some(), "Codex declares a backend");
         }
+    }
+
+    /// A subject made from a release names that release as the package to write, and the Codex
+    /// package this crate keeps is not a release.
+    #[test]
+    fn a_subject_made_from_a_release_names_it_and_the_kept_codex_package_is_not_one() {
+        let kept = Path::new(env!("CARGO_MANIFEST_DIR")).join("codex-package");
+        let codex = Subject::codex();
+        assert_eq!(codex.selected_release(), None);
+        assert_eq!(codex.package(), Some(kept.as_path()));
+        let entry = Subject::from_build(&build_of(CODEX), &manifest("codex", Integration::Backend))
+            .expect("the Codex entry's subject");
+        assert_eq!(entry.selected_release(), None);
+        let release =
+            Subject::from_release(&build_of(CODEX), &kept).expect("a subject of the release");
+        assert_eq!(release.selected_release(), Some(kept.as_path()));
+        assert_eq!(release.package(), Some(kept.as_path()));
+        assert_eq!(release.plugin().to_string(), CODEX);
+    }
+
+    /// A release with no manifest, and a release of another package than the entry's, are refused,
+    /// naming the directory or both packages.
+    #[test]
+    fn a_release_with_no_manifest_or_of_another_package_is_refused_naming_it() {
+        let missing = Subject::from_release(&build_of(CODEX), Path::new("/no/such/release"))
+            .expect_err("a release that is not there");
+        assert!(missing.contains("/no/such/release"), "{missing}");
+        let kept = Path::new(env!("CARGO_MANIFEST_DIR")).join("codex-package");
+        let other = Subject::from_release(&build_of("kalareach/claude-code"), &kept)
+            .expect_err("a release of another package");
+        assert!(
+            other.contains("kalareach/claude-code") && other.contains(CODEX),
+            "{other}"
+        );
     }
 
     /// Each other committed entry makes a subject that names its own plugin, command and trees,

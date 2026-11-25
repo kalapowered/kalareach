@@ -26,7 +26,7 @@ use kr_e2e_agents::stage::{Keyboard, events_snapshot};
 use kr_e2e_m1b::run::{ended_within, running, signal};
 
 /// What the stand-in started by hand says on its first row.
-const BY_HAND: &str = "codex-stand-in: by hand";
+pub(super) const BY_HAND: &str = "codex-stand-in: by hand";
 
 /// A file name of the working directory that a path typed at the composer names.
 const SHOT: &str = "kalareach-shot.png";
@@ -102,7 +102,7 @@ fn harmless(ctx: &Context) -> (String, String) {
 
 /// The agent a case started by hand: its worker and the process that runs the pinned program,
 /// by the identities recorded when they were found.
-struct HandAgent {
+pub(super) struct HandAgent {
     worker: ProcessStartIdentity,
     agent: ProcessStartIdentity,
 }
@@ -110,28 +110,29 @@ struct HandAgent {
 impl HandAgent {
     /// Types the agent's name in the session's shell, waits until the host announces an instance
     /// for it, and records the worker and the process that maps the pinned program below it.
-    fn starts(ctx: &Context, session: &Session<'_>) -> Self {
+    pub(super) fn starts(ctx: &Context, session: &Session<'_>) -> Self {
         let _ = session.starts_the_agent_showing(BY_HAND, &[], None, &[]);
+        Self::running(ctx, session, &ctx.executable)
+    }
+
+    /// Records the worker and the process that maps `executable` below it, for a program the
+    /// session's shell has started.
+    pub(super) fn running(ctx: &Context, session: &Session<'_>, executable: &Path) -> Self {
         let worker = ctx.run.worker_of(&session.session_id().to_string());
         let pid = u32::try_from(worker.pid.get()).expect("a pid");
-        let agent = process_mapping_within(
-            pid,
-            inode_of(&ctx.executable),
-            None,
-            &[pid],
-            &mut Vec::new(),
-        )
-        .unwrap_or_else(|why| panic!("the agent started by hand: {why}"));
+        let agent =
+            process_mapping_within(pid, inode_of(executable), None, &[pid], &mut Vec::new())
+                .unwrap_or_else(|why| panic!("the agent started by hand: {why}"));
         Self { worker, agent }
     }
 
     /// Whether both still run.
-    fn runs(&self) -> Result<(), String> {
+    pub(super) fn runs(&self) -> Result<(), String> {
         all_run(&[("the worker", &self.worker), ("the agent", &self.agent)])
     }
 
     /// Ends the agent by its recorded identity.
-    fn ends(&self) {
+    pub(super) fn ends(&self) {
         signal(&self.agent, rustix::process::Signal::KILL);
         assert!(
             ended_within(&self.agent, LIVENESS),
@@ -181,7 +182,7 @@ fn shown_from(
 }
 
 /// What the host shows once it has had time to detect the agent.
-fn detects(ctx: &Context, remote: &Remote, session_id: SessionId) -> Shown {
+pub(super) fn detects(ctx: &Context, remote: &Remote, session_id: SessionId) -> Shown {
     let detection = wait_for_detection(remote, &ctx.runtime, session_id, &|| {
         ctx.checks_the_placed_files();
     });
@@ -245,7 +246,7 @@ fn surface(
 }
 
 /// What the agent started by hand was launched as, for the check of its detection.
-fn launched(ctx: &Context, agent: &HandAgent) -> Launched {
+pub(super) fn launched(ctx: &Context, agent: &HandAgent) -> Launched {
     Launched {
         plugin_id: ctx.subject.plugin(),
         running: agent.runs().is_ok(),

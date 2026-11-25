@@ -2238,7 +2238,8 @@ async fn install_agent(
         })
         .collect();
     // The stand-in route publishes a generation of its own, whose index names the digests of the
-    // executables above. A real route installs from the signed generation the operator names
+    // executables above, with the package kept for Codex or the one written from the release the
+    // subject was made from. A real route installs from the signed generation the operator names
     // ([`GENERATION_VARIABLE`]): the package and the builds it qualifies are that generation's, and
     // there is no fixture to fall back to.
     let fixture;
@@ -2253,15 +2254,21 @@ async fn install_agent(
     } else {
         let home = environment.state_dir().join("generation-source");
         std::fs::create_dir_all(&home).expect("a directory for the generation");
+        let directory = if let Some(release) = subject.selected_release() {
+            let written = home.join("package");
+            let _ = package::write(subject, release, &written)
+                .unwrap_or_else(|why| panic!("the package written for {plugin}: {why}"));
+            written
+        } else {
+            subject
+                .package()
+                .expect("the stand-in route installs a package the driver keeps")
+                .to_path_buf()
+        };
         fixture = generations::Generation::build(
             &home,
             generations::GenerationSpec {
-                package: Some(
-                    subject
-                        .package()
-                        .expect("the stand-in route installs a package the driver keeps")
-                        .to_path_buf(),
-                ),
+                package: Some(directory),
                 builds,
                 ..generations::GenerationSpec::default()
             },
