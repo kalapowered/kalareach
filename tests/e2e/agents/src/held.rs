@@ -3516,6 +3516,22 @@ mod tests {
         directory
     }
 
+    /// A directory of this test's own whose path is short enough for a socket below it: a socket's
+    /// path must be shorter than 104 bytes on macOS, and the per-user temporary directory there
+    /// takes about half of them. Below `/private/tmp` on macOS, below the system's temporary
+    /// directory elsewhere.
+    #[cfg(unix)]
+    fn short_scratch() -> PathBuf {
+        let base = if cfg!(target_os = "macos") {
+            PathBuf::from("/private/tmp")
+        } else {
+            std::fs::canonicalize(std::env::temp_dir()).expect("the temporary directory")
+        };
+        let directory = base.join(format!("kt-{}", &kr_ipc::new_uuid().to_string()[..8]));
+        std::fs::create_dir_all(&directory).expect("a short scratch directory");
+        directory
+    }
+
     /// The pin of `root`, as the run that made it holds it.
     fn pinned(root: &Path) -> kr_e2e_m1b::run::RootPin {
         kr_e2e_m1b::run::RootPin::of(root).expect("a directory to pin")
@@ -4084,12 +4100,14 @@ mod tests {
 
     /// An entry that is neither a regular file, a directory nor a link (a socket, a pipe) is refused
     /// at every name below the configuration directory, an allowed name too: the agent may read
-    /// from it or write to it, and a name says nothing of what is on the other end.
+    /// from it or write to it, and a name says nothing of what is on the other end. The run's
+    /// directory is a short one, so that the socket's path is within the limit on macOS.
     #[cfg(unix)]
     #[test]
     fn an_entry_that_is_neither_a_file_a_directory_nor_a_link_is_refused_at_every_name() {
-        let root = configured("end-kind");
+        let root = short_scratch();
         let config = root.join("c");
+        filled(&config);
         let said = |name: &str| {
             format!(
                 "{name} is neither a regular file, a directory nor a link, and such an entry is \
