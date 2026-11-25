@@ -9630,18 +9630,44 @@ fn subject_with_no_gateway_listing(missing: &serde_json::Value) -> Subject {
         .as_object_mut()
         .expect("an object")
         .remove("command_integration");
-    let build: Build = serde_json::from_value(serde_json::json!({
+    Subject::from_build(
+        &entry_of_another_package(missing),
+        &serde_json::from_value(manifest).expect("a manifest"),
+    )
+    .expect("a subject")
+}
+
+/// An entry of a package that is not Codex's, whose `missing` member lists the fields it lacks,
+/// with no account and no isolation contract.
+fn entry_of_another_package(missing: &serde_json::Value) -> Build {
+    serde_json::from_value(serde_json::json!({
         "package": "kalareach/other", "application": "a", "version": "1", "prefix": "/p",
         "pinned": "bin/other", "sha256": "00", "command": "other", "launch": "native",
         "ready": "r", "harmless": { "input": "h", "shows": "h" }, "transcript": "t",
         "missing": missing
     }))
-    .expect("an entry");
-    Subject::from_build(
-        &build,
-        &serde_json::from_value(manifest).expect("a manifest"),
-    )
-    .expect("a subject")
+    .expect("an entry")
+}
+
+/// An entry that a real start refuses ends the choice of the agent with the refusal, before the
+/// package's manifest is read.
+#[test]
+fn the_agent_of_an_entry_that_a_real_start_refuses_is_not_chosen() {
+    let refused = std::panic::catch_unwind(|| {
+        Chosen::of(
+            entry_of_another_package(&serde_json::json!({})),
+            PathBuf::from("/no/generation"),
+        )
+        .err()
+    });
+    let said = refused
+        .expect("the entry was refused before the package's manifest was read")
+        .expect("the agent of an entry that a real start refuses was chosen");
+    assert!(
+        said.contains("names an entry that a real start refuses")
+            && said.contains("isolation contract"),
+        "{said}"
+    );
 }
 
 /// A case that drives the gateway for an agent with no gateway, and no account either, ends as not
