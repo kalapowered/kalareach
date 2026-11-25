@@ -460,8 +460,9 @@ impl Route {
     /// no login, the run's `HOME` is not the person's home as the system's account database names
     /// it, the values of the keys cannot be read, the entry names no guard, a path of its lists is
     /// not a plain path relative to the person's home or a file is in both lists, a guarded or
-    /// shared file is a symbolic link, a shared file is one that the end read refuses, or the
-    /// person's files cannot be looked at: nothing has started, and no turn is spent.
+    /// shared file is a symbolic link, a shared file is one that the end read refuses by its kind,
+    /// names, size or identity, or the person's files cannot be looked at: nothing has started, and
+    /// no turn is spent.
     fn acquire(chosen: Chosen, case: &str, login: bool, probe_only: bool) -> Self {
         let Chosen {
             subject,

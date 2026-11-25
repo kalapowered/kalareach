@@ -1487,7 +1487,7 @@ impl PersonPlan {
     ///
     /// Panics when a tree or a file cannot be looked at, for any reason other than its not being
     /// there, when a file the guard names is a symbolic link, or when a shared file is one that
-    /// the end read refuses.
+    /// the end read refuses by its kind, names, size or identity.
     #[must_use]
     pub fn take(self, home: &Path) -> PersonGuard {
         let watch = match &self {
@@ -1588,7 +1588,8 @@ fn seen_by_lstat(path: &Path) -> std::io::Result<Option<Seen>> {
     }
 }
 
-/// The most bytes of a shared file that the end read takes: a larger file is refused unread.
+/// The size above which a shared file is refused: by its metadata when it is looked at, or by the
+/// read, which asks for one byte past it, when the file has grown.
 const SHARED_LIMIT: u64 = 16 << 20;
 
 /// The longest the end read of a shared file may take: the run stops on one that takes longer.
@@ -1750,7 +1751,7 @@ fn scan(
 /// What `work` gives within `bound`, run on a thread that `builder` makes: its own answer, or a
 /// refusal: too slow where it gave none in time, and failed where the thread could not be made or
 /// ended without an answer. A thread still waiting is not cancelled: it keeps its descriptor and
-/// its buffers until the call it waits in returns.
+/// its buffers until its calls return.
 fn read_within(
     builder: std::thread::Builder,
     bound: std::time::Duration,
@@ -1800,24 +1801,24 @@ fn shared_names_the_run(
 /// and its owner on its own. A guarded name that is a symbolic link is refused when the guard is
 /// taken, since a write through it changes the target and not the link, and so is a shared name,
 /// which would not be read. A shared file, which the person's own sessions also write, is looked
-/// at by metadata when the guard is taken, where one that the end read would refuse is refused
-/// too, and is not read until the end of the run. It is then opened with no link followed and no
-/// wait; its opened handle must be a regular file with one name that is not a guarded file; and it
-/// is read once, up to a byte limit and within a time bound, for the run's directory name and
-/// mark. Nothing of what is read is kept, and a file that fails these checks is not read and stops
-/// the run. A file that is the same file as a guarded file is not read: the guard keeps the device
-/// and inode of each guarded file from the take and from every later look, and refuses a handle
-/// with one of them, or with the one a guarded name holds at the end, so a guarded file moved or
-/// linked over the shared name is refused even when its guarded name is gone or holds another
-/// file. A look of a guarded name that fails, for any reason other than the name's not being
-/// there, is kept for the rest of the run, and every shared read after it is refused; so is a read
-/// at which a guarded name cannot be looked at. What no look saw is not known, and is read: a file
-/// that was at no guarded name at any look, put there and then moved over the shared name between
-/// two looks; a file that a guarded name pointed to as a link, since a look records the link and
-/// not its target; and a file on a file system whose device and inode change when it is renamed
-/// or linked. A write to a file that is not named, a transcript below `~/.claude/projects` among
-/// them, is not seen. What is said is the path the entry names and whether it changed, never a
-/// value.
+/// at by metadata when the guard is taken, where one that the end read would refuse by its kind,
+/// names, size or identity is refused too, and is not read until the end of the run. It is then
+/// opened with no link followed and no wait; its opened handle must be a regular file with one
+/// name that is not a guarded file; and it is read once, up to a byte limit and within a time
+/// bound, for the run's directory name and mark. Nothing of what is read is kept, and a file that
+/// fails these checks is not read and stops the run. A file that is the same file as a guarded
+/// file is not read: the guard keeps the device and inode of each guarded file from the take and
+/// from every later look, and refuses a handle with one of them, or with the one a guarded name
+/// holds at the end, so a guarded file moved or linked over the shared name is refused even when
+/// its guarded name is gone or holds another file. A look of a guarded name that fails, for any
+/// reason other than the name's not being there, is kept for the rest of the run, and every shared
+/// read after it is refused; so is a read at which a guarded name cannot be looked at. What no look
+/// saw is not known, and is read: a file that was at no guarded name at any look, put there and
+/// then moved over the shared name between two looks; a file that a guarded name pointed to as a
+/// link, since a look records the link and not its target; and a file on a file system whose
+/// device and inode change when it is renamed or linked. A write to a file that is not named, a
+/// transcript below `~/.claude/projects` among them, is not seen. What is said is the path the
+/// entry names and whether it changed, never a value.
 #[derive(Debug)]
 pub struct FileGuard {
     home: PathBuf,
