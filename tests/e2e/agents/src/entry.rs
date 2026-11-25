@@ -447,6 +447,11 @@ pub fn check(build: &Build) -> Report {
             .refusals
             .push(Refusal::NotDigested("the pinned build"));
     }
+    if build.pinned.is_empty() {
+        report
+            .refusals
+            .push(Refusal::NoPinnedFile("the pinned build"));
+    }
     if build
         .newer
         .as_ref()
@@ -1134,6 +1139,26 @@ mod tests {
         assert_eq!(
             why,
             "the entry names no pinned file for the newer build, so a real start of it is refused"
+        );
+    }
+
+    /// A build the entry names no pinned file for is refused, whichever build it is.
+    #[test]
+    fn a_build_the_entry_names_no_pinned_file_for_is_refused_whichever_build_it_is() {
+        let mut pinned = build_of("kalareach/opencode");
+        pinned.pinned = String::new();
+        assert_eq!(
+            check(&pinned).refusals,
+            vec![Refusal::NoPinnedFile("the pinned build")],
+            "the pinned build has no pinned file"
+        );
+        assert_eq!(
+            refuse_real_start(&pinned),
+            Err(
+                "the entry names no pinned file for the pinned build, so a real start of it is \
+                 refused"
+                    .to_owned()
+            )
         );
     }
 
