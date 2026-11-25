@@ -24,7 +24,7 @@ use crate::account::{
     self, KeyScan, RunRules, ScanBytes, now_ms, record_key_scan, run_files_holding_any_sharing,
     run_files_holding_sharing,
 };
-use crate::build::Account;
+use crate::build::{Account, NEVER_ALLOWED_BELOW_CONFIG, same_name};
 use crate::{confine, keys};
 
 /// How a part says it could not show that the agent loads none of the person's own servers. A
@@ -543,8 +543,9 @@ fn absent_below(root: &Path, pin: &kr_e2e_m1b::run::RootPin, path: &Path) -> Res
 }
 
 /// Whether `relative`, the path of a file below the configuration directory, is one the allowed
-/// patterns name: each part is a name or a lone `*`, which is any one name, and a last `**` is every
-/// file below its directory. The patterns are [`Account::allowed_below_config`]'s.
+/// patterns name: each part is a name (one that differs only in letter case is the same name) or a
+/// lone `*`, which is any one name, and a last `**` is every file below its directory. The
+/// patterns are [`Account::allowed_below_config`]'s.
 #[must_use]
 pub fn is_allowed(patterns: &[String], relative: &str) -> bool {
     let names: Vec<&str> = relative.split('/').collect();
@@ -556,7 +557,7 @@ pub fn is_allowed(patterns: &[String], relative: &str) -> bool {
                 return names.len() > taken;
             }
             match names.get(taken) {
-                Some(name) if *part == "*" || part == name => taken += 1,
+                Some(name) if *part == "*" || same_name(part, name) => taken += 1,
                 _ => return false,
             }
         }
@@ -571,10 +572,11 @@ pub fn is_allowed(patterns: &[String], relative: &str) -> bool {
 /// file is one of the recipe's files (`recipe_files`, each by its path below `config` and the
 /// bytes the recipe wrote), a regular file with one name that holds those bytes, or `settings.json`
 /// as such a file holding exactly the one key the recipe sets (`settings_key`, in
-/// `enabledPlugins`, set to `true`), or one that the entry's allowed files name. The name
-/// `settings.json` and the recipe's names are looked at before any directory is entered, so a
-/// directory by one of them is refused and its contents are not compared. Any other link is
-/// matched by its name as a file is and is not followed.
+/// `enabledPlugins`, set to `true`), or one that the entry's allowed files name. The names
+/// `settings.json`, `settings.local.json` and `rules`, in any letter case, and the recipe's names
+/// are looked at before any directory is entered, so a directory by one of them is refused and its
+/// contents are not compared; `settings.local.json` and `rules` are refused whatever they are. Any
+/// other link is matched by its name as a file is and is not followed.
 ///
 /// # Errors
 ///
@@ -662,8 +664,16 @@ impl EndCompare<'_> {
                     }
                 };
             self.seen += 1;
-            if relative == "settings.json" {
-                self.settings();
+            if same_name(&relative, "settings.json") {
+                self.settings(&relative);
+            } else if NEVER_ALLOWED_BELOW_CONFIG
+                .iter()
+                .any(|reserved| same_name(&relative, reserved))
+            {
+                self.refused.push(format!(
+                    "{relative} is a name the agent reads its settings or rules from, which no \
+                     entry may allow"
+                ));
             } else if let Some((_, wrote)) =
                 self.recipe_files.iter().find(|(path, _)| *path == relative)
             {
@@ -702,18 +712,19 @@ impl EndCompare<'_> {
         }
     }
 
-    /// Whether `settings.json` is a regular file that holds exactly the one key the recipe sets.
-    fn settings(&mut self) {
-        match self.read("settings.json", SETTINGS_AT_MOST) {
-            Err(why) => self.refused.push(format!(
-                "settings.json is not a file of the run's own: {why}"
-            )),
+    /// Whether the settings file `relative` (`settings.json` in any letter case) is a regular file
+    /// that holds exactly the one key the recipe sets.
+    fn settings(&mut self, relative: &str) {
+        match self.read(relative, SETTINGS_AT_MOST) {
+            Err(why) => self
+                .refused
+                .push(format!("{relative} is not a file of the run's own: {why}")),
             Ok(bytes) => {
                 let held: Option<Value> = serde_json::from_slice(&bytes).ok();
                 let key = self.settings_key;
                 if held != Some(json!({ "enabledPlugins": { key: true } })) {
                     self.refused.push(format!(
-                        "settings.json does not hold exactly the recipe's key {}",
+                        "{relative} does not hold exactly the recipe's key {}",
                         self.settings_key
                     ));
                 }
@@ -3433,9 +3444,20 @@ mod tests {
         for named in ["a/b/c", "a/x/c", "d/f", "d/f/g/h", "e.json"] {
             assert!(is_allowed(&allowed, named), "{named} is allowed");
         }
-        for refused in [
-            "a/c", "a/b/c/d", "a/b", "d", "e.json/x", "x/e.json", "D/f", "",
-        ] {
+        for refused in ["a/c", "a/b/c/d", "a/b", "d", "e.json/x", "x/e.json", ""] {
+            assert!(!is_allowed(&allowed, refused), "{refused} is not allowed");
+        }
+    }
+
+    /// Names that differ only in letter case are one name: a pattern names a file whatever the
+    /// case of the file's name, since the volume a run lives on may ignore it.
+    #[test]
+    fn a_pattern_names_a_file_whatever_the_letter_case_of_its_name() {
+        let allowed = patterns(&["a/*/c", "d/**", "e.json"]);
+        for named in ["A/b/C", "a/X/c", "D/f", "d/F/G/h", "E.JSON"] {
+            assert!(is_allowed(&allowed, named), "{named} is allowed");
+        }
+        for refused in ["a/C/d", "e.jsonl", "D", "x/E.json"] {
             assert!(!is_allowed(&allowed, refused), "{refused} is not allowed");
         }
     }
@@ -3521,6 +3543,69 @@ mod tests {
         let refused =
             compared(&root, &["settings.json/*"]).expect_err("a pattern for its contents");
         assert!(refused.contains("no entry may allow"), "{refused}");
+    }
+
+    /// A name that differs from `settings.json` only in letter case is `settings.json`: a file by it
+    /// must hold exactly the recipe's key and a directory by it is refused, empty or not. The volume
+    /// a run lives on may ignore letter case, so the agent reads the file by that name too.
+    #[test]
+    fn settings_json_in_another_letter_case_is_held_to_the_settings_rule() {
+        let root = configured("end-settings-case");
+        let config = root.join("c");
+        std::fs::remove_file(config.join("settings.json")).expect("the settings go");
+        std::fs::write(config.join("SETTINGS.JSON"), br#"{"theme":"dark"}"#).expect("a file");
+        let refused = compared(&root, &[]).expect_err("a file that holds another key");
+        assert!(
+            refused.contains("SETTINGS.JSON does not hold exactly the recipe's key"),
+            "{refused}"
+        );
+        std::fs::remove_file(config.join("SETTINGS.JSON")).expect("the file goes");
+        std::fs::create_dir(config.join("SETTINGS.JSON")).expect("an empty directory");
+        let refused = compared(&root, &[]).expect_err("an empty directory");
+        assert!(
+            refused.contains("SETTINGS.JSON is not a file of the run's own: "),
+            "{refused}"
+        );
+        std::fs::write(config.join("SETTINGS.JSON/inside"), b"x").expect("a file inside");
+        let refused = compared(&root, &[]).expect_err("a directory with a file");
+        assert!(
+            refused.contains("SETTINGS.JSON is not a file of the run's own: ")
+                && !refused.contains("inside"),
+            "{refused}"
+        );
+    }
+
+    /// `settings.local.json` and `rules`, in any letter case, as a file or a directory, empty or
+    /// not, are refused: the agent reads its settings and its rules from them, and no entry may
+    /// allow them.
+    #[test]
+    fn the_other_names_the_agent_reads_its_settings_and_rules_from_are_refused_in_any_case() {
+        for name in [
+            "settings.local.json",
+            "Settings.Local.Json",
+            "rules",
+            "RULES",
+            "Rules",
+        ] {
+            for kind in ["a file", "an empty directory"] {
+                let root = configured("end-reserved");
+                let config = root.join("c");
+                if kind == "a file" {
+                    std::fs::write(config.join(name), b"{}").expect("a file");
+                } else {
+                    std::fs::create_dir(config.join(name)).expect("a directory");
+                }
+                let refused = compared(&root, &[]).expect_err(name);
+                assert!(
+                    refused.contains(&format!(
+                        "{name} is a name the agent reads its settings or rules from, which no \
+                         entry may allow"
+                    )),
+                    "{name} as {kind}: {refused}"
+                );
+                std::fs::remove_dir_all(&root).expect("clean up");
+            }
+        }
     }
 
     /// Each of the recipe's files is held to a regular file with the bytes the recipe wrote: other
