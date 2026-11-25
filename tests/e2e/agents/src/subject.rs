@@ -427,15 +427,16 @@ mod tests {
     /// naming the directory or both packages.
     #[test]
     fn a_release_with_no_manifest_or_of_another_package_is_refused_naming_it() {
-        let missing = Subject::from_release(&build_of(CODEX), Path::new("/no/such/release"))
-            .expect_err("a release that is not there");
-        assert!(missing.contains("/no/such/release"), "{missing}");
-        let kept = Path::new(env!("CARGO_MANIFEST_DIR")).join("codex-package");
-        let other = Subject::from_release(&build_of("kalareach/claude-code"), &kept)
-            .expect_err("a release of another package");
+        let missing = Subject::from_release(&build_of(CODEX), Path::new("/no/such/release"));
         assert!(
-            other.contains("kalareach/claude-code") && other.contains(CODEX),
-            "{other}"
+            matches!(&missing, Err(why) if why.contains("/no/such/release")),
+            "a release that is not there: {missing:?}"
+        );
+        let kept = Path::new(env!("CARGO_MANIFEST_DIR")).join("codex-package");
+        let other = Subject::from_release(&build_of("kalareach/claude-code"), &kept);
+        assert!(
+            matches!(&other, Err(why) if why.contains("kalareach/claude-code") && why.contains(CODEX)),
+            "a release of another package: {other:?}"
         );
     }
 

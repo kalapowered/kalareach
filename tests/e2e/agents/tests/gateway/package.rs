@@ -273,9 +273,8 @@ fn subject_of(release_directory: &Path, plugin: &str, command: &str, shape: Shap
     Subject::from_build(&entry(plugin, command), &manifest).expect("a subject")
 }
 
-/// The package written for each synthetic entry is a package the host reads, and carries the
-/// version, the actions, the capabilities, the command integration and the platforms of the release
-/// it was written from.
+/// The package written for each synthetic entry is a package the host reads, and its manifest is
+/// its release's in every member but the match rules.
 #[test]
 fn a_written_package_is_valid_and_keeps_what_its_release_declares() {
     for (plugin, command, shape) in SYNTHETIC {
@@ -292,15 +291,12 @@ fn a_written_package_is_valid_and_keeps_what_its_release_declares() {
         )
         .expect("a manifest");
         assert_eq!(on_disk, written, "{plugin}: the manifest on disk");
-        assert_eq!(written.version, released.version, "{plugin}");
-        assert_eq!(written.actions, released.actions, "{plugin}");
-        assert_eq!(written.capabilities, released.capabilities, "{plugin}");
+        let mut expected = released.clone();
+        expected.match_rules.clone_from(&written.match_rules);
         assert_eq!(
-            written.command_integration, released.command_integration,
-            "{plugin}"
+            written, expected,
+            "{plugin}: the manifest written differs from its release's in more than the match rules"
         );
-        assert_eq!(written.platforms, released.platforms, "{plugin}");
-        assert_eq!(written.payloads, released.payloads, "{plugin}");
         let _ = std::fs::remove_dir_all(&base);
     }
 }
@@ -649,12 +645,11 @@ fn a_written_package_is_not_installed_without_the_grant_of_a_capability_one_of_i
                 &written,
                 &without,
                 &format!("without-{index}"),
-            )
-            .expect_err("an install without the grant of an action's capability");
+            );
             assert!(
-                matches!(&refused, CatalogueError::GrantRequired { capability: named, .. } if named == capability),
-                "{plugin}: the install without the grant of {capability} was refused for another \
-                 reason: {refused}"
+                matches!(&refused, Err(CatalogueError::GrantRequired { capability: named, .. }) if named == capability),
+                "{plugin}: the install without the grant of {capability} was not refused for it: \
+                 {refused:?}"
             );
         }
         installs(&base, &base.join("package"), &written, &grant, "with")
@@ -981,25 +976,31 @@ fn a_generation_that_holds_the_package_written_for_an_entry_passes_the_real_pack
     for (plugin, command, shape) in SYNTHETIC {
         let base = scratch("real-passes");
         let generation = generation_holding(&base, plugin, command, shape);
-        check_real_package(&entry(plugin, command), &generation)
-            .unwrap_or_else(|why| panic!("{plugin}: {why}"));
+        assert_eq!(
+            check_real_package(&entry(plugin, command), &generation),
+            Ok(()),
+            "{plugin}"
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 }
 
 /// An entry whose command no match rule of the generation's package recognises fails the check,
-/// naming the command.
+/// naming the command and the package. A package with no command integration is tried first: the
+/// writer has nothing else to refuse the command by, as it has for one with an integration.
 #[test]
 fn an_entry_whose_command_no_rule_of_the_generations_package_recognises_fails_the_real_package_check()
  {
-    let (plugin, command, shape) = SYNTHETIC[0];
-    let base = scratch("real-refuses");
-    let generation = generation_holding(&base, plugin, command, shape);
-    let refused = check_real_package(&entry(plugin, "other-command"), &generation)
-        .expect_err("an entry whose command no rule recognises");
-    assert!(refused.contains("other-command"), "{refused}");
-    assert!(refused.contains(plugin), "{refused}");
-    let _ = std::fs::remove_dir_all(&base);
+    for (plugin, command, shape) in [SYNTHETIC[1], SYNTHETIC[0]] {
+        let base = scratch("real-refuses");
+        let generation = generation_holding(&base, plugin, command, shape);
+        let refused = check_real_package(&entry(plugin, "other-command"), &generation);
+        assert!(
+            matches!(&refused, Err(why) if why.contains("other-command") && why.contains(plugin)),
+            "{plugin}: an entry whose command no rule recognises: {refused:?}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
 }
 
 /// The words of the panic that `outcome` caught, empty where nothing panicked.
