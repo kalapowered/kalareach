@@ -464,16 +464,22 @@ pub fn absent_paths_in(
 ///
 /// For an entry that `read_build` accepted, whose names are printable ASCII, no spelling of a path
 /// below `config` escapes this on a volume that treats two ASCII names as one only where they
-/// differ in letter case (APFS and the usual Linux file systems). That rests on three facts of the
+/// differ in letter case (APFS and the usual Linux file systems). That rests on four facts of the
 /// harness. Every placeholder that names a place in the run expands from the run's one root path,
 /// as its handle gives it (`Run::root`), so the names above `config` are the same in `config` and
 /// in the expanded path. The run's tree is on one volume: the run's directory, the absence check
 /// and the end compare refuse another file system. The absence check ([`absent_below`]) refuses a
-/// link and a `..` part below the root, so the path it looks at is the path the system opens.
+/// link and a `..` part below the root, so the path it looks at is the path the system opens. An
+/// absolute path cannot name a place in the run, since the run's folder takes a fresh name when the
+/// run starts: `make_root` makes it `krm-` and eight characters of a new name, which no entry,
+/// written before the run, can spell. The macOS `/tmp` alias is why this matters: the run's base is
+/// `/tmp`, the root its handle gives is `/private/tmp/krm-<name>`, and
+/// `/tmp/krm-<name>/agent-config/x` would name a place below `config` that the comparison does not
+/// match, since `tmp` is not `private`.
 ///
 /// What this does not claim: a volume with short names (such as FAT); a link into the run that
 /// another process makes while the run is live; absence through a whole run, since the absence check
-/// runs before the first start and after the probes and the end compare does not repeat it. It
+/// runs at points of the run and the end compare does not repeat it. It
 /// also refuses two names that a case-sensitive volume holds apart and that differ in letter case
 /// only, which costs an entry one spelling. Whether a file is there is not decided here: the
 /// absence check asks the file system.
@@ -3883,7 +3889,7 @@ mod tests {
     fn a_path_spelled_below_the_config_placeholder_and_the_live_forms_are_expanded_as_before() {
         let root = scratch("expand-live");
         let home = root.join("h");
-        // The working directory is `w` beside the configuration directory's parent.
+        // The working directory is `w` in the home, beside the configuration directory.
         let work = home.join("w");
         let directory = home.join(".claude");
         assert_eq!(

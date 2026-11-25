@@ -2269,7 +2269,8 @@ mod tests {
 
     /// An absent path of any form whose parts hold an empty part, `.` or `..` is refused where the
     /// entry is read: the expansion of a placeholder before it can lead into the configuration
-    /// directory, and such a path names the same file as the path without those parts.
+    /// directory, and `..` takes off the part before it, so such a path can name a file that its
+    /// plain parts do not show (`/etc/../x` names `/x`).
     #[test]
     fn an_absent_path_with_an_empty_part_a_dot_or_a_dot_dot_is_refused_wherever_it_lies() {
         for bad in [
