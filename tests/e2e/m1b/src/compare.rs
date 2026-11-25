@@ -154,6 +154,25 @@ enum Names {
 /// The length of a hyphenated UUID.
 const UUID_LEN: usize = 36;
 
+/// Whether `name` is `.<uuid>.tmp` with a hyphenated UUID of hexadecimal digits, the temporary name
+/// an owner-only file writer makes beside the file it writes.
+fn is_staging_name(name: &str) -> bool {
+    let Some(uuid) = name
+        .strip_prefix('.')
+        .and_then(|rest| rest.strip_suffix(".tmp"))
+    else {
+        return false;
+    };
+    uuid.len() == UUID_LEN
+        && uuid.bytes().enumerate().all(|(at, byte)| {
+            if matches!(at, 8 | 13 | 18 | 23) {
+                byte == b'-'
+            } else {
+                byte.is_ascii_hexdigit()
+            }
+        })
+}
+
 /// A row of the live daemon's class: one entry the daemon writes, and what it may do to it.
 #[derive(Clone, Debug)]
 pub struct Daemon {
@@ -191,11 +210,7 @@ impl Daemon {
         match self.names {
             Names::Itself => false,
             Names::Sidecar(suffix) => name.strip_prefix(file) == Some(suffix),
-            Names::Staging => {
-                name.len() == UUID_LEN + ".tmp".len() + 1
-                    && name.starts_with('.')
-                    && name.ends_with(".tmp")
-            }
+            Names::Staging => is_staging_name(name),
         }
     }
 
@@ -1004,6 +1019,15 @@ pub(crate) mod tests {
         world.put(&world.state(".not-a-uuid.tmp"), b"staged");
         only(&world.refused(&before, KILL), ".not-a-uuid.tmp: added");
         std::fs::remove_file(world.state(".not-a-uuid.tmp")).expect("removed");
+        // Names of the length of a staging name that are no hyphenated UUID of hexadecimal digits.
+        for name in [
+            ".zzzzzzzz-zzzz-zzzz-zzzz-zzzzzzzzzzzz.tmp",
+            ".0123456789abcdef0123456789abcdef0123.tmp",
+        ] {
+            world.put(&world.state(name), b"staged");
+            only(&world.refused(&before, KILL), &format!("{name}: added"));
+            std::fs::remove_file(world.state(name)).expect("removed");
+        }
         std::fs::write(world.state("controller.lock"), b"22").expect("written in place");
         only(
             &world.refused(&before, KILL),
