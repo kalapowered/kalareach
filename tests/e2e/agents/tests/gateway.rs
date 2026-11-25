@@ -1583,6 +1583,47 @@ impl Context {
         }
     }
 
+    /// Places the stand-in `program` in `directory`, below the run's directory, as the agent is
+    /// typed: the file the host sees as the agent, which is the program under the command's name
+    /// and, for an entry that launches as a script or a wheel, the program under the runtime's
+    /// name beside a script named for the command, and for a wheel the wheel's file. The script's
+    /// first line is `#!` and the absolute path of the placed runtime, as a launch line reads no
+    /// search path.
+    /// Each file is recorded when it is placed. Returns the file the host sees as the agent and
+    /// the files placed, relative to the run's directory.
+    fn places_stand_in(
+        &self,
+        run: &Run,
+        program: &str,
+        directory: &Path,
+    ) -> (PathBuf, Vec<PathBuf>) {
+        let placing = stand_in::placing_of(self.subject.entry(), self.subject.command());
+        let executable = directory.join(&placing.program);
+        run.place_built(program, &executable, &["--version"]);
+        let mut names = vec![placing.program];
+        if let Some(script) = placing.script {
+            let path = directory.join(&script);
+            std::fs::write(&path, format!("#!{}\n", executable.display()))
+                .expect("the script a person types");
+            std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+                .expect("the script is executable");
+            names.push(script);
+        }
+        if let Some(wheel) = placing.wheel {
+            std::fs::write(directory.join(&wheel), b"the wheel").expect("the wheel's file");
+            names.push(wheel);
+        }
+        let relative = directory
+            .strip_prefix(run.root())
+            .expect("the programs' directory is below the run's directory");
+        let files: Vec<PathBuf> = names.iter().map(|name| relative.join(name)).collect();
+        for file in &files {
+            run.note_placed(file)
+                .unwrap_or_else(|why| panic!("{ISOLATION_UNPROVEN} {why}"));
+        }
+        (executable, files)
+    }
+
     /// Places the forwarder and the agent in the run, and checks the entry. A failure here is a
     /// failure of the case, which ends as every case does.
     fn place(&mut self) {
@@ -1615,7 +1656,6 @@ impl Context {
         let mut newer = None;
         let mut newer_placed = None;
         let mut newer_prefix = None;
-        let command = self.subject.command();
         let (pinned_program, newer_program) = self.stand_in_programs();
         if let (Route::StandIn, Some(build)) = (&self.route, self.subject.entry()) {
             std::fs::write(
@@ -1627,39 +1667,34 @@ impl Context {
         let (executable, bin) = match &self.route {
             Route::StandIn if self.upgrade => {
                 // Two installed builds behind the link `agent/current`: the pinned stand-in and the
-                // newer one, each a program built from the stand-in's source, each at
-                // `t/<prefix>/bin/<command>`; the link names the first.
+                // newer one, each a program built from the stand-in's source, each below
+                // `t/<prefix>/bin`; the link names the first.
                 let (first, second) = (run.root().join("t/a"), run.root().join("t/b"));
                 for prefix in [&first, &second] {
                     kr_ipc::paths::create_private_tree(run.root(), &prefix.join("bin"))
                         .expect("a directory for the programs");
                 }
-                let program = format!("bin/{command}");
-                run.place_built(pinned_program, &first.join(&program), &["--version"]);
-                run.place_built(newer_program, &second.join(&program), &["--version"]);
-                for relative in [format!("t/a/{program}"), format!("t/b/{program}")] {
-                    run.note_placed(Path::new(&relative))
-                        .unwrap_or_else(|why| panic!("{ISOLATION_UNPROVEN} {why}"));
-                    placed_files.push(PathBuf::from(relative));
-                }
+                let (executable, pinned_files) =
+                    self.places_stand_in(run, pinned_program, &first.join("bin"));
+                let (newer_file, newer_files) =
+                    self.places_stand_in(run, newer_program, &second.join("bin"));
+                placed_files.extend(pinned_files);
+                placed_files.extend(newer_files);
                 let linked = Installation::link(run, &first, &[]);
                 let bin = linked.bin();
                 installation = Some(linked);
-                newer = Some((second.join(&program), "0.156.1".to_owned()));
+                newer = Some((newer_file, "0.156.1".to_owned()));
                 newer_prefix = Some(second);
-                (first.join(&program), bin)
+                (executable, bin)
             }
             Route::StandIn => {
                 let tools = run.root().join("t");
                 kr_ipc::paths::create_private_tree(run.root(), &tools)
                     .expect("a directory for the programs");
-                run.place_built(pinned_program, &tools.join(command), &["--version"]);
                 // The shell finds the stand-in by its name on a search path, as it finds the build.
-                let place = self.subject.place();
-                run.note_placed(Path::new(&place))
-                    .unwrap_or_else(|why| panic!("{ISOLATION_UNPROVEN} {why}"));
-                placed_files.push(PathBuf::from(place));
-                (tools.join(command), tools)
+                let (executable, files) = self.places_stand_in(run, pinned_program, &tools);
+                placed_files.extend(files);
+                (executable, tools)
             }
             Route::Real(real) => {
                 real.checks_installs_off(run);

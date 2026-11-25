@@ -5,7 +5,9 @@
 //! launch, a wheel launch and a native entry with texts of its own. Some cases in this file start the
 //! program alone, with a home of its own, and read what it printed and what it recorded. The others
 //! choose the entry that the stand-in route stands in for ([`stand_in_chosen`]) and run the staged
-//! parts that start no model turn for the stand-in made from it.
+//! parts that start no model turn for the stand-in made from it. The route places the stand-in as
+//! the entry is launched ([`placing_of`]): a script or a wheel as the program under the runtime's
+//! name and a script that names it, which a person types as the command.
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -18,9 +20,12 @@ use kr_e2e_agents::subject::Subject;
 use kr_e2e_m1b::run::RootPin;
 use kr_plugin_sdk::package::MANIFEST_FILE;
 
-use super::package::{Shape, release};
+use super::package::{Shape, release, write};
 use super::staged_a::{part_2b, part_2c, part_5a, part_6a, part_8a, part_14_03a};
-use super::{BUILD_VARIABLE, Chosen, STAND_IN_ENTRY_VARIABLE, STAND_IN_MANIFEST_VARIABLE};
+use super::{
+    BUILD_VARIABLE, Chosen, Context, Route, STAND_IN_ENTRY_VARIABLE, STAND_IN_MANIFEST_VARIABLE,
+    inode_of,
+};
 
 /// The pinned program and the newer one: one source, two programs.
 const PROGRAM: &str = env!("CARGO_BIN_EXE_agent-stand-in");
@@ -854,18 +859,178 @@ fn an_entry_with_no_account_or_a_manifest_of_another_package_is_refused_for_the_
     let _ = std::fs::remove_dir_all(&base);
 }
 
-/// The entries the stand-in is placed for in the parts below: the native ones.
-fn placed_for() -> Vec<Synthetic> {
-    synthetic()
+/// The names of the files the stand-in route places for an entry, below one directory.
+pub struct Placing {
+    /// The file the host sees as the agent: the entry's command, or for a script or a wheel the
+    /// file name of the entry's runtime.
+    pub program: String,
+    /// The script a person types as the command, for a script or a wheel.
+    pub script: Option<String>,
+    /// The wheel's file, for a wheel.
+    pub wheel: Option<String>,
+}
+
+/// The names of the files the stand-in route places for `build`, typed as `command`. A name is the
+/// last part of a path and never a path: the entry's runtime and pinned file name real places, and
+/// nothing placed is a copy of either.
+///
+/// # Panics
+///
+/// Panics where an entry that launches as a script or a wheel names no runtime.
+pub fn placing_of(build: Option<&Build>, command: &str) -> Placing {
+    let Some(build) = build.filter(|build| matches!(build.launch, Launch::Script | Launch::Wheel))
+    else {
+        return Placing {
+            program: command.to_owned(),
+            script: None,
+            wheel: None,
+        };
+    };
+    let last = |path: &Path| {
+        path.file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+    };
+    Placing {
+        program: build
+            .runtime
+            .first()
+            .and_then(|runtime| last(runtime))
+            .expect(
+                "the entry launches as a script or a wheel and names no runtime, so there is no \
+                 program for the stand-in to stand for",
+            ),
+        script: Some(command.to_owned()),
+        wheel: (build.launch == Launch::Wheel)
+            .then(|| last(Path::new(&build.pinned)))
+            .flatten(),
+    }
+}
+
+/// Fails the case unless the stand-in is placed as the entry says. For a script or a wheel the
+/// file the host sees as the agent is the entry's runtime, under the runtime's file name, and the
+/// file typed as the command is another file: an executable script whose first line is `#!` and the
+/// placed runtime's absolute path; a wheel's file is placed too. For every entry the program placed
+/// as the agent is the terminal stand-in the harness built. Where the route is not the stand-in's
+/// there is nothing to check.
+///
+/// # Panics
+///
+/// Panics at the first thing that is not as the entry says.
+pub fn placed_as_the_entry_says(ctx: &Context) {
+    let (Route::StandIn, Some(build)) = (&ctx.route, ctx.subject.entry()) else {
+        return;
+    };
+    let command = ctx.subject.command();
+    // What is placed is read from the entry again, and not from `placing_of`, which places it: the
+    // check holds the placing to what the entry says.
+    let last = |path: &Path| {
+        path.file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+    };
+    let scripted = matches!(build.launch, Launch::Script | Launch::Wheel);
+    let program = if scripted {
+        build.runtime.first().and_then(|runtime| last(runtime))
+    } else {
+        Some(command.to_owned())
+    };
+    let wheel = (build.launch == Launch::Wheel)
+        .then(|| last(Path::new(&build.pinned)))
+        .flatten();
+    let placed = ctx
+        .executable
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned());
+    assert_eq!(
+        placed.as_deref(),
+        program.as_deref(),
+        "{command}: the file the host sees as the agent is placed under the file name {program:?}, \
+         which the entry's runtime has, or the command's own name for a native entry"
+    );
+    assert!(
+        std::fs::read(&ctx.executable).expect("the program placed as the agent")
+            == std::fs::read(PROGRAM).expect("the terminal stand-in the harness built"),
+        "{command}: the program placed as the agent is the terminal stand-in the harness built"
+    );
+    if scripted {
+        let typed = ctx.bin.join(command);
+        let text = std::fs::read_to_string(&typed).unwrap_or_default();
+        assert_eq!(
+            text.lines().next(),
+            Some(format!("#!{}", ctx.executable.display()).as_str()),
+            "{command}: the file typed as the command is a script whose first line is #! and the \
+             placed runtime's absolute path"
+        );
+        let mode = std::os::unix::fs::PermissionsExt::mode(
+            &std::fs::metadata(&typed)
+                .expect("the script a person types")
+                .permissions(),
+        );
+        assert!(
+            mode & 0o111 != 0 && inode_of(&typed) != inode_of(&ctx.executable),
+            "{command}: the script a person types is executable and is not the runtime"
+        );
+    }
+    if let Some(wheel) = &wheel {
+        assert!(
+            ctx.bin.join(wheel).is_file(),
+            "{command}: the wheel's file {wheel} is placed beside the script"
+        );
+    }
+}
+
+/// The package written for a script or a wheel recognises the command a person types, as its
+/// integration names it, and the name of the runtime, which the host sees as the agent.
+#[test]
+fn the_package_written_for_a_script_or_a_wheel_recognises_the_command_and_the_runtimes_name() {
+    for synthetic in synthetic()
         .into_iter()
-        .filter(|synthetic| synthetic.build.launch == Launch::Native)
-        .collect()
+        .filter(|synthetic| synthetic.build.launch != Launch::Native)
+    {
+        let (name, command) = (synthetic.name, &synthetic.build.command);
+        let base = scratch("rule");
+        let directory = base.join("release");
+        release(
+            &directory,
+            &synthetic.build.package,
+            command,
+            Shape::Backend,
+        );
+        let subject = Subject::from_release(&synthetic.build, &directory)
+            .unwrap_or_else(|why| panic!("{name}: {why}"));
+        let written = write(&subject, &directory, &base.join("package"))
+            .unwrap_or_else(|why| panic!("{name}: {why}"));
+        let runtime = placing_of(Some(&synthetic.build), command).program;
+        assert_eq!(
+            written.match_rules.len(),
+            2,
+            "{name}: a rule for the command and a rule for the runtime"
+        );
+        let recognises = |program: &str| {
+            written
+                .match_rules
+                .iter()
+                .any(|rule| rule.executable.matches_path(&format!("/run/t/{program}")))
+        };
+        assert!(
+            recognises(command),
+            "{name}: the package recognises the command {command}, which its integration names"
+        );
+        assert!(
+            recognises(&runtime),
+            "{name}: the package recognises the runtime {runtime}, which the host sees as the agent"
+        );
+        assert!(
+            !recognises("another-name"),
+            "{name}: the package recognises no other name"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
 }
 
 /// Runs `part`, one of the staged parts that start no model turn, as `test`, for the stand-in made
-/// from each of the entries it is placed for, installed from a release of the entry's package.
+/// from each synthetic entry, installed from a release of the entry's package.
 fn for_each_entry(test: &str, part: fn(Option<Subject>, &str)) {
-    for synthetic in placed_for() {
+    for synthetic in synthetic() {
         let base = scratch("part");
         let directory = base.join("release");
         release(

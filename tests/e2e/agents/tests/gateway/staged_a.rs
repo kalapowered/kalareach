@@ -67,6 +67,12 @@ fn by_hand_case(
         no_login: true,
         ..setup
     };
+    // On the stand-in route the case starts by checking that the stand-in is placed as the entry
+    // says, before anything is started.
+    let body = |ctx: &Context, session: &Session<'_>| {
+        stand_in::placed_as_the_entry_says(ctx);
+        body(ctx, session)
+    };
     match subject {
         None => run_case_in(setup, &leg, part, test, "by-hand", body),
         Some(subject) => run_case_for(subject, setup, (&leg, part, test), "by-hand", body),

@@ -5,10 +5,12 @@
 //! made from a release, Codex's included, it is written here from the release the run was given:
 //! the release's manifest and the files that manifest lists, as the release has them, with one
 //! change. A build list entry has no match rules, so the release's own are replaced by one rule
-//! that recognises the entry's command, which is the name the stand-in program is placed under.
-//! The actions, the capabilities, the command integration and the platforms stay the release's, so
-//! the host registers the actions the release declares, and the installation's grant is what the
-//! release asks for that the repository's ceiling does not already allow.
+//! that recognises the entry's command, which is the name the stand-in program is placed under,
+//! and for a script or a wheel a second rule that recognises the file name of its runtime, which
+//! the host sees as the agent. The actions, the capabilities, the command integration and the
+//! platforms stay the release's, so the host registers the actions the release declares, and the
+//! installation's grant is what the release asks for that the repository's ceiling does not
+//! already allow.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -31,18 +33,18 @@ use kr_protocol::ids::{EnvironmentId, PluginId};
 use kr_protocol::scalars::Nullable;
 
 use super::staged_a::{BY_HAND, HandAgent, detects, launched};
-use super::stand_in::native_entry;
+use super::stand_in::{native_entry, placing_of};
 use super::{Chosen, Context, ISOLATION_UNPROVEN, Session, Setup, generations, run_case_for};
 
-/// The one match rule of a written package: the executable named `command`, in any directory,
-/// whatever distribution it came from. A command is a name, never a path: the stand-in is placed
-/// at `t/<command>`.
-fn rule_of(manifest: &PluginManifest, command: &str) -> Result<MatchRule, String> {
-    let id = format!("{}-executable", manifest.plugin_name.as_str());
+/// A match rule of a written package, named for `kind`: the executable named `program`, in any
+/// directory, whatever distribution it came from. A program is a name, never a path: the stand-in
+/// is placed at `t/<program>`.
+fn rule_of(manifest: &PluginManifest, program: &str, kind: &str) -> Result<MatchRule, String> {
+    let id = format!("{}-{kind}", manifest.plugin_name.as_str());
     Ok(MatchRule {
         id: PluginName::new(&id).map_err(|error| format!("{id} is not a rule name: {error}"))?,
         executable: ExecutableMatch {
-            file_stem: command.to_owned(),
+            file_stem: program.to_owned(),
             path_suffix: Vec::new(),
             version_range: Nullable(None),
         },
@@ -80,7 +82,14 @@ pub fn write(subject: &Subject, release: &Path, into: &Path) -> Result<PluginMan
             subject.plugin()
         ));
     }
-    manifest.match_rules = vec![rule_of(&manifest, subject.command())?];
+    // The integration's command is the name a person types, and the host adopts a program by its
+    // executable, which for a script or a wheel is its runtime: the package recognises both.
+    let mut rules = vec![rule_of(&manifest, subject.command(), "executable")?];
+    let placing = placing_of(subject.entry(), subject.command());
+    if placing.program != subject.command() {
+        rules.push(rule_of(&manifest, &placing.program, "runtime")?);
+    }
+    manifest.match_rules = rules;
     std::fs::create_dir_all(into)
         .map_err(|error| format!("a directory for the package {}: {error}", into.display()))?;
     for payload in &manifest.payloads {
