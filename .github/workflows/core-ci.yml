@@ -4457,8 +4457,9 @@ jobs:
     # run, and the second had run 40 more without ending; the third builds one test program and
     # compiles again the crates whose features its dev-dependencies change. Every step has a limit
     # of its own, and the limits add up to less than this one: the build's 240 minutes and the
-    # other steps' 113 make 353, which keeps 3 for the set-up and clean-up that no step limit
-    # counts, and this limit of 359 is under the 360 at which GitHub ends a hosted job. The build
+    # other steps' 113 make 353, which leaves 6 for the set-up and clean-up that no step limit
+    # counts (the case asks for 3), and this limit of 359 is under the 360 at which GitHub ends a
+    # hosted job. The build
     # took 185.1 minutes with no cache (run 45081806255), so its 240 are 1.3 times that, and twice
     # that would not fit in this job's limit. The cache save has 10 of the 113, 3.8 times the
     # longest it took in 45 hosted runs of 16 to 24 November, 2.6 minutes (run 44194834495); the run
