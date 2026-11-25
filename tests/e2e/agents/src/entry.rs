@@ -25,6 +25,9 @@ pub enum Class {
     ProductGap,
     /// The entry's value cannot be read until the driver learns to read it.
     HarnessGap,
+    /// The agent itself lacks what the part needs, and the entry says so by giving no value: a
+    /// build that shows no composer before an account is signed in.
+    AgentLimit,
 }
 
 /// A field a part reads that the entry lacks.
@@ -228,12 +231,11 @@ fn has_members(build: &Build, field: &str) -> bool {
 /// value: the entry states that the list is empty, and that statement rests on a positive finding.
 fn given(build: &Build, field: &str) -> bool {
     has_members(build, field)
-        // An entry with an account states its lists, and reaches its composer by the account's own
-        // steps.
+        // An entry with an account states its lists.
         || (build.account.is_some()
             && matches!(
                 field,
-                "account.draft" | "account.resume_refused" | "account.fork" | "composer"
+                "account.draft" | "account.resume_refused" | "account.fork"
             ))
 }
 
@@ -269,6 +271,20 @@ pub fn check(build: &Build) -> Report {
                 .as_ref()
                 .and_then(|missing| missing.get(field));
             if listed.is_none() && given(build, field) {
+                continue;
+            }
+            // An entry with an account that gives no composer says that the build shows none before
+            // an account is signed in: the agent's limit, not a gap of the entry. A listing is
+            // unknown evidence and keeps the entry's gap below.
+            if field == "composer" && listed.is_none() && build.account.is_some() {
+                report.gaps.push(Gap {
+                    part,
+                    field: field.to_owned(),
+                    class: Class::AgentLimit,
+                    reason: "the entry gives no composer, which says that the build shows none \
+                             before an account is signed in, so part 14.03a is not run"
+                        .to_owned(),
+                });
                 continue;
             }
             let harness = HARNESS_GAPS
@@ -502,7 +518,7 @@ mod tests {
     /// contract of its own instead.
     #[test]
     fn the_gaps_of_each_committed_entry_are_named_per_part_and_classed() {
-        use Class::{EntryField, HarnessGap, ProductGap};
+        use Class::{AgentLimit, EntryField, HarnessGap, ProductGap};
         let accountless = [
             ("1", "account", ProductGap),
             ("2a", "account", ProductGap),
@@ -526,7 +542,10 @@ mod tests {
             all.extend(upgrade);
             expected(&all)
         };
-        assert_eq!(found("kalareach/codex"), with_upgrade(&[]));
+        assert_eq!(
+            found("kalareach/codex"),
+            with_upgrade(&[("14.03a", "composer", AgentLimit)])
+        );
         assert_eq!(
             found("kalareach/claude-code"),
             with_upgrade(&[
@@ -547,6 +566,7 @@ mod tests {
                 ("7f", "account.resume_refused", EntryField),
                 ("7f", "account.fork", EntryField),
                 ("gateway-3", "account.commands.fork", EntryField),
+                ("14.03a", "composer", AgentLimit),
                 ("naming", "launch", ProductGap),
             ])
         );
@@ -599,6 +619,53 @@ mod tests {
         kimi.push(("naming", "launch", ProductGap));
         kimi.push(("6a", "newer", ProductGap));
         assert_eq!(found("kalareach/kimi-cli"), expected(&kimi));
+    }
+
+    /// A build with an account and no composer is a limit of the agent, which the entry states by
+    /// giving none; one that lists the composer as missing, or has no account and gives none, has a
+    /// gap of its own entry, with the entry's reason.
+    #[test]
+    fn a_build_with_an_account_and_no_composer_is_a_limit_of_the_agent_and_a_listed_one_is_an_entry_gap()
+     {
+        let composer_gap = |build: &Build| {
+            check(build)
+                .gaps
+                .into_iter()
+                .find(|gap| gap.part == "14.03a" && gap.field == "composer")
+        };
+        let limit = composer_gap(&build_of("kalareach/codex"))
+            .expect("an entry with an account and no composer has a composer gap");
+        assert_eq!(limit.class, Class::AgentLimit);
+        assert_eq!(
+            limit.reason,
+            "the entry gives no composer, which says that the build shows none before an account \
+             is signed in, so part 14.03a is not run"
+        );
+        let mut listed = build_of("kalareach/codex");
+        listed
+            .missing
+            .as_mut()
+            .expect("a missing member")
+            .insert("composer".to_owned(), "not found in the program".to_owned());
+        let listed = composer_gap(&listed).expect("a listed composer has a composer gap");
+        assert_eq!(listed.class, Class::EntryField);
+        assert_eq!(listed.reason, "not found in the program");
+        let qoder = composer_gap(&build_of("kalareach/qoder-cli"))
+            .expect("an entry with no account that lists its composer has a composer gap");
+        assert_eq!(qoder.class, Class::EntryField);
+        assert!(qoder.reason.starts_with("not found"), "{}", qoder.reason);
+        let mut unlisted = build_of("kalareach/qoder-cli");
+        unlisted
+            .missing
+            .as_mut()
+            .expect("a missing member")
+            .remove("composer");
+        let unlisted = composer_gap(&unlisted).expect("an entry with no composer has a gap");
+        assert_eq!(unlisted.class, Class::EntryField);
+        assert_eq!(
+            unlisted.reason,
+            "the entry gives no value and does not list it as missing"
+        );
     }
 
     /// A real start of a committed entry is refused only where the entry has an account and no
