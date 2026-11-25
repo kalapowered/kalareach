@@ -42,8 +42,8 @@
 //! - It shows the text of the entry's harmless key once it has read that key.
 //! - An entry with no account has no composer text and no record: the program shows the first
 //!   screen, answers prompts and keeps no conversation file.
-//! - It shows no approval dialog: the part whose staged case answers an approval on the terminal
-//!   stand-in adds it.
+//! - It shows no approval dialog: part 3 of the staged cases, in which the device and the local
+//!   terminal answer one approval at once, adds it.
 //! - On a terminal it takes each key as it is typed and echoes it itself, as a full-screen agent
 //!   does: a part of a line that is typed and not sent is the agent's, and is not left in the
 //!   terminal when the agent ends.
