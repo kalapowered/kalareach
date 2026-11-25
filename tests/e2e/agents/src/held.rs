@@ -1403,16 +1403,55 @@ fn plain_relative(path: &str) -> bool {
         .all(|part| !part.is_empty() && part != "." && part != "..")
 }
 
-/// The file of `files` that the path `template` of an entry's absent list names in the person's
-/// home, where it starts with `{person}/` or `{ancestors}/` and goes on with that file.
-fn names_a_person_file<'a>(
-    template: &str,
-    mut files: impl Iterator<Item = &'a String>,
-) -> Option<&'a String> {
-    let rest = template
+/// Why the path `template` of an entry's absent list is refused for `application`, where it names
+/// one of `files`, the entry's guarded and shared files, in the person's home: it starts with
+/// `{person}/` or `{ancestors}/` and goes on with a path that is not plain or with one of the
+/// files, or it starts with `/` and its last parts are one of the files', where the empty and `.`
+/// parts are dropped and each `..` takes away the part before it.
+fn absent_path_refusal(application: &str, template: &str, files: &[&String]) -> Option<String> {
+    let listed =
+        format!("the entry for {application} lists {template:?} as a file that must not exist");
+    let reason = |file: &String| {
+        format!(
+            "{listed}, and it can name ~/{file}, which the entry also guards or shares, so a look \
+             at it could be a look at a guarded name"
+        )
+    };
+    if let Some(rest) = template
         .strip_prefix("{person}/")
-        .or_else(|| template.strip_prefix("{ancestors}/"))?;
-    files.find(|file| file.as_str() == rest)
+        .or_else(|| template.strip_prefix("{ancestors}/"))
+    {
+        if !plain_relative(rest) {
+            return Some(format!(
+                "{listed}, and the path after its first folder is not a plain path: it has an \
+                 empty, `.` or `..` part, so it could name a guarded or shared file by another \
+                 spelling"
+            ));
+        }
+        return files
+            .iter()
+            .copied()
+            .find(|file| file.as_str() == rest)
+            .map(reason);
+    }
+    if template.starts_with('/') {
+        let mut parts: Vec<&str> = Vec::new();
+        for part in template.split('/') {
+            match part {
+                "" | "." => {}
+                ".." => {
+                    parts.pop();
+                }
+                part => parts.push(part),
+            }
+        }
+        return files
+            .iter()
+            .copied()
+            .find(|file| parts.ends_with(&file.split('/').collect::<Vec<_>>()))
+            .map(reason);
+    }
+    None
 }
 
 /// How an entry's run guards the person's own agent files, and so whether another process of the
@@ -1440,18 +1479,23 @@ pub enum PersonPlan {
 impl PersonPlan {
     /// The guard of the build list entry for `application`, from the entry's own lists.
     ///
-    /// A path of `absent`, the entry's list of files that must not exist, names a guarded or shared
-    /// file when it starts with `{person}/` or `{ancestors}/` and goes on with that file: `{person}`
-    /// is the person's home, and `{ancestors}` takes in each folder above the run's working
-    /// directory, the home among them. A path that reaches a guarded name another way, through a link
-    /// or by a literal path, is not seen here: [`PersonGuard::absent_below`] keeps its failed look.
+    /// A path of `absent`, the entry's list of files that must not exist, is refused when it names
+    /// a guarded or shared file of the person's home. `{person}` is the person's home, and
+    /// `{ancestors}` takes in each folder above the run's working directory, the home among them.
+    /// After `{person}/` or `{ancestors}/` the path must be a plain relative path and not one of
+    /// those files. A path that starts with `/` is refused when its last parts are the parts of one
+    /// of those files, with the empty and `.` parts dropped and each `..` taking away the part
+    /// before it. A path that reaches a guarded name another way, through a link or by climbing out
+    /// of the run's directories, is not seen here. What protects a guarded name from a path of the
+    /// list that reaches it is the write of [`PersonGuard::absent_below`], which keeps every look
+    /// that does not show the path absent; this check is a second line.
     ///
     /// # Errors
     ///
     /// Returns why the entry has no guard: it names no person tree and no guarded file, and a run
     /// of it would leave the person's files unwatched; or a path of its lists is not a plain path
     /// relative to the person's home, or a file is in both lists, or a path that must be absent
-    /// names a guarded or shared file.
+    /// names a guarded or shared file, or names one by a spelling that is not plain.
     pub fn of(
         application: &str,
         guarded: &[String],
@@ -1484,14 +1528,12 @@ impl PersonPlan {
                  so the end read would read a guarded file"
             ));
         }
-        if let Some((template, file)) = absent.iter().find_map(|template| {
-            names_a_person_file(template, guarded.iter().chain(shared)).map(|file| (template, file))
-        }) {
-            return Err(format!(
-                "the entry for {application} lists {template:?} as a file that must not exist, and \
-                 it names ~/{file}, which the entry also guards or shares: a look at it would be a \
-                 look of a guarded name outside the guard"
-            ));
+        let named: Vec<&String> = guarded.iter().chain(shared).collect();
+        if let Some(refusal) = absent
+            .iter()
+            .find_map(|template| absent_path_refusal(application, template, &named))
+        {
+            return Err(refusal);
         }
         Ok(Self::Files {
             guarded: guarded.to_vec(),
@@ -6175,6 +6217,52 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    #[test]
+    fn a_not_plain_absent_path_of_the_person_is_refused() {
+        let guarded: Vec<String> = CLAUDE_GUARDED
+            .iter()
+            .map(|file| (*file).to_owned())
+            .collect();
+        let shared = [".claude.json".to_owned()];
+        for template in [
+            "{person}/./.claude.json",
+            "{person}/.claude/./.credentials.json",
+            "{person}//.claude.json",
+            "{ancestors}/.claude/../.claude.json",
+        ] {
+            let refused = PersonPlan::of("claude-code", &guarded, &shared, &[template.to_owned()])
+                .expect_err("an absent path that is not plain");
+            assert!(
+                refused.contains(template)
+                    && refused.contains("claude-code")
+                    && refused.contains("is not a plain path"),
+                "{refused}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_literal_absolute_absent_path_that_names_a_guarded_or_shared_file_is_refused() {
+        let guarded: Vec<String> = CLAUDE_GUARDED
+            .iter()
+            .map(|file| (*file).to_owned())
+            .collect();
+        let shared = [".claude.json".to_owned()];
+        for template in [
+            "/Users/x/.claude.json",
+            "/Users/{user}/.claude/settings.json",
+            "/Users/x/.claude/./.credentials.json",
+            "/Users/x/.claude/y/../.device-keys.json",
+        ] {
+            let refused = PersonPlan::of("claude-code", &guarded, &shared, &[template.to_owned()])
+                .expect_err("a literal absent path that ends in a guarded or shared file");
+            assert!(
+                refused.contains(template) && refused.contains("claude-code"),
+                "{refused}"
+            );
+        }
     }
 
     #[test]
