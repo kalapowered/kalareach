@@ -118,10 +118,10 @@ pub fn a_fresh_request_appears(pending: usize) -> Result<(), Red> {
 pub enum Hosted {}
 
 impl Hosted {
-    /// Starts the stand-in with `script` through the launch. When the script has a turn for a
-    /// prompt, it sends a prompt and returns once the agent's first request is pending and read;
-    /// when the script holds only turns of the agent's own, it returns once the agent runs, and the
-    /// case releases the file that starts the turn.
+    /// Starts the stand-in with `script` through the launch. When the script holds no turn of the
+    /// agent's own, it sends a prompt and returns once the agent's first request is pending and
+    /// read; when it holds one, it returns once the agent runs, and the case releases the file that
+    /// starts the turn and sends the prompts it needs.
     pub fn start(_script: &Value) -> Result<Self, &'static str> {
         Err(super::NO_BODY)
     }
@@ -888,6 +888,12 @@ fn scripts() -> Vec<(&'static str, Value)> {
             "completed_after_a_cancel_script",
             completed_after_a_cancel_script(),
         ),
+        ("window_script", window_script()),
+        ("queued_prompt_script", queued_prompt_script()),
+        (
+            "prompt_after_a_cancel_script",
+            prompt_after_a_cancel_script(),
+        ),
     ]
 }
 
@@ -985,5 +991,275 @@ fn the_judge_of_a_completed_update_names_its_red_when_the_receipt_reads_unknown(
     assert_eq!(
         an_allow_stays_applied_after_a_cancel("5b-23", "dispatching"),
         Err(red("5b-23"))
+    );
+}
+
+/// How many `session/cancel` notifications the stand-in received.
+fn cancels(record: &[Value]) -> usize {
+    record
+        .iter()
+        .filter(|line| line["received"] == "notification" && line["method"] == "session/cancel")
+        .count()
+}
+
+/// 5b-15: the person's cancel, 11 seconds after the agent's last traffic, reached the stand-in as
+/// `session/cancel`, and the pending approval was answered `cancelled`.
+pub fn a_cancel_after_eleven_seconds_reaches_the_agent(record: &[Value]) -> Result<(), Red> {
+    ensure(
+        cancels(record) == 1 && outcome_of(record, 0) == Some("cancelled"),
+        "5b-15",
+    )
+}
+
+/// 5b-16: the approval at 29 seconds after the cancel was answered `cancelled`, and the approval at
+/// 31 seconds got no answer and is listed as pending.
+pub fn the_window_closes_thirty_seconds_after_the_cancel(
+    record: &[Value],
+    pending: usize,
+) -> Result<(), Red> {
+    ensure(
+        outcome_of(record, 1) == Some("cancelled")
+            && outcome_of(record, 2).is_none()
+            && pending == 1,
+        "5b-16",
+    )
+}
+
+/// 5b-18: the request that the old turn sent after our prompt was answered `cancelled` was itself
+/// answered `cancelled`.
+pub fn a_prompt_answered_cancelled_leaves_the_window_open(record: &[Value]) -> Result<(), Red> {
+    ensure(outcome_of(record, 1) == Some("cancelled"), "5b-18")
+}
+
+/// 5b-19: the approval of a prompt sent after the cancel got no answer and is listed as pending.
+pub fn a_prompt_after_a_cancel_shows_its_approval(
+    record: &[Value],
+    pending: usize,
+) -> Result<(), Red> {
+    ensure(outcome_of(record, 1).is_none() && pending == 1, "5b-19")
+}
+
+impl Hosted {
+    /// Sends a prompt through the device and waits until the stand-in's record shows that it
+    /// received it.
+    pub fn send_prompt(&mut self, _text: &str) {
+        match *self {}
+    }
+
+    /// The stand-in's record once it holds the response to the request numbered `number`, or after
+    /// five seconds when it never does.
+    pub fn record_after_response(&mut self, _number: u64) -> Vec<Value> {
+        match *self {}
+    }
+}
+
+/// The script of the agent of 5b-16: a turn of its own that asks for a call, goes on waiting for
+/// the answer after a cancel, and asks for a second call when the file `t29` appears and for a
+/// third when the file `t31` appears. Six ticks, one for each file `tick1` to `tick6`, are the
+/// traffic that goes on meanwhile.
+pub fn window_script() -> Value {
+    let ticks: Vec<Value> = (1..=6)
+        .map(|number| {
+            serde_json::json!({
+                "after": format!("tick{number}"),
+                "say": format!("tick {number}"),
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "cancel": "wait",
+        "own": [{ "after": "go", "steps": [
+            { "say": "own" },
+            { "call": { "id": "c0", "kind": "execute" } },
+            { "ask": "c0" },
+            { "hold": "t29" },
+            { "call": { "id": "c1", "kind": "execute" } },
+            { "ask": "c1" },
+            { "hold": "t31" },
+            { "call": { "id": "c2", "kind": "execute" } },
+            { "ask": "c2" },
+            { "hold": "never" },
+        ] }],
+        "ticks": ticks,
+    })
+}
+
+/// The script of the agent of 5b-18: a turn of its own that asks for a call and waits, a prompt of
+/// ours that waits behind it, and, after the cancel, a request of the old turn when the file `late`
+/// appears.
+pub fn queued_prompt_script() -> Value {
+    serde_json::json!({
+        "own": [{ "after": "go", "steps": [
+            { "say": "own" },
+            { "call": { "id": "c0", "kind": "execute" } },
+            { "ask": "c0" },
+            { "hold": "never" },
+        ] }],
+        "turns": [[{ "say": "ours" }, { "end": "end_turn" }]],
+        "on_cancel": [
+            { "hold": "late" },
+            { "call": { "id": "c1", "kind": "execute" } },
+            { "ask": "c1" },
+            { "end": "end_turn" },
+        ],
+    })
+}
+
+/// The script of the agent of 5b-19: a turn of its own that asks for a call and waits, and a turn
+/// for a prompt of ours that asks for a second call.
+pub fn prompt_after_a_cancel_script() -> Value {
+    serde_json::json!({
+        "own": [{ "after": "go", "steps": [
+            { "say": "own" },
+            { "call": { "id": "c0", "kind": "execute" } },
+            { "ask": "c0" },
+            { "hold": "never" },
+        ] }],
+        "turns": [[
+            { "call": { "id": "c1", "kind": "execute" } },
+            { "ask": "c1" },
+            { "end": "end_turn" },
+        ]],
+    })
+}
+
+/// Case 5b-15: 11 seconds with no traffic after a request, and then the person's cancel.
+pub fn a_cancel_after_eleven_quiet_seconds(host: &mut Hosted) -> Result<(), Red> {
+    host.release("go");
+    host.waits_for_a_request();
+    host.advance_clock(11);
+    host.cancel();
+    a_cancel_after_eleven_seconds_reaches_the_agent(&host.record_after_response(0))
+}
+
+/// Case 5b-16: a cancel, traffic every 5 seconds, and a request at 29 seconds and one at 31.
+pub fn approvals_at_twenty_nine_and_thirty_one_seconds(host: &mut Hosted) -> Result<(), Red> {
+    host.release("go");
+    host.waits_for_a_request();
+    host.cancel();
+    for tick in 1..=5 {
+        host.advance_clock(5);
+        host.release(&format!("tick{tick}"));
+    }
+    host.advance_clock(4);
+    host.release("t29");
+    let _ = host.record_after_response(1);
+    host.advance_clock(2);
+    host.release("tick6");
+    host.release("t31");
+    let record = host.record_after_response(2);
+    the_window_closes_thirty_seconds_after_the_cancel(&record, host.pending_requests())
+}
+
+/// Case 5b-18: a prompt of ours waits behind a turn of the agent's own, the cancel answers it
+/// `cancelled`, and the old turn sends a request 3 seconds later.
+pub fn a_prompt_answered_cancelled_while_the_old_turn_goes_on(
+    host: &mut Hosted,
+) -> Result<(), Red> {
+    host.release("go");
+    host.waits_for_a_request();
+    host.send_prompt("ours");
+    host.cancel();
+    host.advance_clock(3);
+    host.release("late");
+    a_prompt_answered_cancelled_leaves_the_window_open(&host.record_after_response(1))
+}
+
+/// Case 5b-19: a cancel, and a prompt of ours 5 seconds later whose turn asks for a call.
+pub fn a_prompt_five_seconds_after_a_cancel(host: &mut Hosted) -> Result<(), Red> {
+    host.release("go");
+    host.waits_for_a_request();
+    host.cancel();
+    host.advance_clock(5);
+    host.send_prompt("again");
+    let record = host.record_after_response(1);
+    a_prompt_after_a_cancel_shows_its_approval(&record, host.pending_requests())
+}
+
+/// A record line that is a `session/cancel` the stand-in received.
+#[cfg(test)]
+fn cancel_line() -> Value {
+    serde_json::json!({ "received": "notification", "method": "session/cancel" })
+}
+
+#[test]
+fn the_judge_of_a_quiet_cancel_names_its_red_when_the_stand_in_sees_no_cancel() {
+    let answered = [cancel_line(), cancelled_response_line(0)];
+    assert_eq!(
+        a_cancel_after_eleven_seconds_reaches_the_agent(&answered),
+        Ok(())
+    );
+    assert_eq!(
+        a_cancel_after_eleven_seconds_reaches_the_agent(&[]),
+        Err(red("5b-15")),
+        "a quiet period of 10 seconds closed the turn and the cancel was refused as stale"
+    );
+    assert_eq!(
+        a_cancel_after_eleven_seconds_reaches_the_agent(&[cancel_line()]),
+        Err(red("5b-15")),
+        "the pending approval was not answered"
+    );
+}
+
+#[test]
+fn the_judge_of_the_window_names_its_red_when_it_stays_open_while_traffic_goes_on() {
+    let closed = [cancelled_response_line(0), cancelled_response_line(1)];
+    assert_eq!(
+        the_window_closes_thirty_seconds_after_the_cancel(&closed, 1),
+        Ok(())
+    );
+    let open = [
+        cancelled_response_line(0),
+        cancelled_response_line(1),
+        cancelled_response_line(2),
+    ];
+    assert_eq!(
+        the_window_closes_thirty_seconds_after_the_cancel(&open, 0),
+        Err(red("5b-16")),
+        "the approval at 31 seconds was answered cancelled"
+    );
+    assert_eq!(
+        the_window_closes_thirty_seconds_after_the_cancel(&closed[..1], 2),
+        Err(red("5b-16")),
+        "the approval at 29 seconds was not answered cancelled"
+    );
+    assert_eq!(
+        the_window_closes_thirty_seconds_after_the_cancel(&closed, 0),
+        Err(red("5b-16")),
+        "the approval at 31 seconds is not listed"
+    );
+}
+
+#[test]
+fn the_judge_of_a_queued_prompt_names_its_red_when_the_late_request_shows() {
+    let answered = [cancelled_response_line(0), cancelled_response_line(1)];
+    assert_eq!(
+        a_prompt_answered_cancelled_leaves_the_window_open(&answered),
+        Ok(())
+    );
+    assert_eq!(
+        a_prompt_answered_cancelled_leaves_the_window_open(&answered[..1]),
+        Err(red("5b-18")),
+        "the window closed at the reply to our prompt, so the request at 3 seconds shows"
+    );
+}
+
+#[test]
+fn the_judge_of_a_prompt_after_a_cancel_names_its_red_when_its_approval_is_answered_cancelled() {
+    let shown = [cancelled_response_line(0)];
+    assert_eq!(
+        a_prompt_after_a_cancel_shows_its_approval(&shown, 1),
+        Ok(())
+    );
+    let answered = [cancelled_response_line(0), cancelled_response_line(1)];
+    assert_eq!(
+        a_prompt_after_a_cancel_shows_its_approval(&answered, 0),
+        Err(red("5b-19")),
+        "the window ignored the dispatch of the prompt and stayed open"
+    );
+    assert_eq!(
+        a_prompt_after_a_cancel_shows_its_approval(&shown, 0),
+        Err(red("5b-19")),
+        "the approval of the prompt is not listed"
     );
 }

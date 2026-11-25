@@ -656,14 +656,22 @@ fn acp_an_abort_that_settles_a_call_without_taking_the_answer_leaves_the_receipt
 #[test]
 #[ignore = "waits for ACP-4"]
 fn acp_a_silent_unresolved_approval_is_cancelled_by_a_cancel_after_eleven_seconds() {
-    unwritten("5b-15");
+    run_case(
+        "5b-15",
+        &controls::silent_script(),
+        controls::a_cancel_after_eleven_quiet_seconds,
+    );
 }
 
 /// Control 5b-16.
 #[test]
 #[ignore = "waits for ACP-4"]
 fn acp_the_cancel_window_of_a_turn_of_the_agents_own_closes_thirty_seconds_after_the_cancel() {
-    unwritten("5b-16");
+    run_case(
+        "5b-16",
+        &controls::window_script(),
+        controls::approvals_at_twenty_nine_and_thirty_one_seconds,
+    );
 }
 
 /// Control 5b-17.
@@ -679,14 +687,22 @@ fn acp_the_cancel_window_with_a_prompt_in_flight_closes_at_that_prompts_reply_fo
 #[ignore = "waits for ACP-4"]
 fn acp_a_prompt_answered_cancelled_while_the_agents_own_turn_goes_on_leaves_the_cancel_window_open()
 {
-    unwritten("5b-18");
+    run_case(
+        "5b-18",
+        &controls::queued_prompt_script(),
+        controls::a_prompt_answered_cancelled_while_the_old_turn_goes_on,
+    );
 }
 
 /// Control 5b-19.
 #[test]
 #[ignore = "waits for ACP-4"]
 fn acp_a_prompt_sent_five_seconds_after_a_cancel_shows_its_approval() {
-    unwritten("5b-19");
+    run_case(
+        "5b-19",
+        &controls::prompt_after_a_cancel_script(),
+        controls::a_prompt_five_seconds_after_a_cancel,
+    );
 }
 
 /// Control 5b-20.
