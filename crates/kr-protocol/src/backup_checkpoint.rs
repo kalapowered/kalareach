@@ -42,10 +42,15 @@ pub struct HostCheckpoint {
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct HostCheckpointWire {
+    /// The service the host's backups are kept at, as the host recorded it.
     service_origin: GatewayOrigin,
+    /// The archive the generation belongs to.
     archive_id: ArchiveId,
+    /// The generation. A host numbers its generations from 1, and a report of 0 is refused when it
+    /// is read.
     #[schemars(extend("pattern" = "^[1-9][0-9]*$"))]
     backup_generation: BackupGeneration,
+    /// The hash of the generation's encrypted manifest.
     encrypted_manifest_hash: Digest256,
 }
 

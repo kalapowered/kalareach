@@ -2824,6 +2824,8 @@ export interface KalaReachProtocol {
   backup_bundle_place?: BackupBundlePlace
   backup_bundle_write_params?: BackupBundleWriteParams
   backup_bundle_write_result?: BackupBundleWriteResult
+  backup_checkpoint_params?: BackupCheckpointParams
+  backup_checkpoint_result?: BackupCheckpointResult
   backup_enable_cause?: BackupEnableCause
   backup_enable_params?: BackupEnableParams
   backup_enable_result?: BackupEnableResult
@@ -2997,6 +2999,7 @@ export interface KalaReachProtocol {
   history_page_result?: HistoryPageResult
   history_times_params?: HistoryTimesParams
   history_times_result?: HistoryTimesResult
+  host_checkpoint?: HostCheckpoint
   host_clock_establish_params?: HostClockEstablishParams
   host_clock_establish_result?: HostClockEstablishResult
   host_doctor_result?: HostDoctorResult
@@ -7338,6 +7341,42 @@ export interface BackupBundlePlace2 {
    * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   write_sequence: string
+}
+/**
+ * Parameters of `backup.checkpoint`: none. The environment is the one the connection reaches.
+ */
+export interface BackupCheckpointParams {}
+/**
+ * What `backup.checkpoint` answers.
+ */
+export interface BackupCheckpointResult {
+  /**
+   * The newest generation this host's storage service accepted and the host still keeps, or
+   * null when there is none.
+   */
+  checkpoint: HostCheckpoint | null
+}
+/**
+ * One backup generation a host published, as the host reports it.
+ */
+export interface HostCheckpoint {
+  /**
+   * The archive the generation belongs to.
+   */
+  archive_id: string
+  /**
+   * The generation. A host numbers its generations from 1, and a report of 0 is refused when it
+   * is read.
+   */
+  backup_generation: string
+  /**
+   * A 32-byte SHA-256 digest. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
+   */
+  encrypted_manifest_hash: string
+  /**
+   * The service the host's backups are kept at, as the host recorded it.
+   */
+  service_origin: string
 }
 /**
  * Parameters of `backup.enable`: everything the daemon needs to set backups up, and nothing of the
@@ -19849,6 +19888,7 @@ export interface MethodEntry {
     | 'account.storage_status'
     | 'backup.read'
     | 'backup.status'
+    | 'backup.checkpoint'
     | 'backup.enable'
     | 'backup.bundle.write'
     | 'host.update.handover'
@@ -29061,6 +29101,7 @@ export interface ServiceRequestPayload {
     | 'account.storage_status'
     | 'backup.read'
     | 'backup.status'
+    | 'backup.checkpoint'
     | 'backup.enable'
     | 'backup.bundle.write'
     | 'host.update.handover'

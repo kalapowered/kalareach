@@ -140,6 +140,7 @@ pub(crate) const fn described_in(method: Method) -> Section {
             at(HOST, "Reading a backup for a restore")
         }
         Method::BackupStatus | Method::BackupEnable => at(HOST, "Setting up backups"),
+        Method::BackupCheckpoint => at(METHOD_REFERENCE, "The host's backup checkpoint"),
         Method::AccountSignIn
         | Method::AccountSignOut
         | Method::AccountStatus

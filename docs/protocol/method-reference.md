@@ -34,6 +34,14 @@ The call carries all four keys and a signature over a statement that names the d
 
 Both calls are served by the daemon's catalogue module. [The plugin catalogue](../host/README.md#the-plugin-catalogue) describes the rest of the group, and [Repositories and the catalogue](../plugins/catalogue.md) describes what a sync does.
 
+## The host's backup checkpoint
+
+**`backup.checkpoint`** takes no parameters and answers `checkpoint`: the newest backup generation of the host's current setup that its storage service accepted and the host still keeps, or null when the host has no backup setup or no such generation. A checkpoint names the archive (`archive_id`), the service the setup was made at (`service_origin`), the generation (`backup_generation`, at least 1) and the hash of the generation's encrypted manifest (`encrypted_manifest_hash`).
+
+A generation counts once the service has accepted its descriptor, even when the host's production of it was cancelled afterwards. It stops counting while the host is deleting every object of it, because the service may no longer hold all that the generation names. A generation of an earlier setup's archive is not sent.
+
+The host reads its own records and asks no service, so the answer does not wait for the service, and privacy mode does not hold it. A paired device that holds `host.manage` may call it, and the local socket does not serve it. When the host cannot read its backup records, or the newest accepted generation's record is not one it can read back as the archive and generation it names, it answers `STORAGE_UNAVAILABLE`, never null and never an older generation.
+
 ## Reading sessions
 
 **`session.list`** takes an optional environment and `include_closed`. This build parses the environment and does not use it: the daemon serves one environment, and a request that names another still lists this one's sessions that the caller may see. It answers the sessions in display-number order, each as a session summary. A closed session is listed only when the request asks for closed ones. The daemon lists every unclosed session from its registry; a session whose worker cannot answer is listed from the registry's own row as `live`, `creating` or `closing` ([Closure](../host/README.md#closure)).

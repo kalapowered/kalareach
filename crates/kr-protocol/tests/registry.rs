@@ -1235,6 +1235,8 @@ fn the_required_methods_of_the_specification_table_are_all_listed() {
             + test_reports.len()
             + streams.len()
             + launch_commands.len()
+            // `backup.checkpoint`, which its own case asserts: a paired device reads it.
+            + 1
             + 1,
         "the registry holds the required methods and the named additions"
     );
@@ -1892,4 +1894,42 @@ fn the_processes_of_a_session_are_read_at_the_host_and_nowhere_else() {
             "{ingress:?} is refused"
         );
     }
+}
+
+/// `backup.checkpoint` is the one backup method a paired device reaches: an owner device reads
+/// the host's newest accepted backup generation, and no local caller does. It asks for host
+/// management over the host itself, is decided on the current authority, and changes nothing.
+#[test]
+fn the_backup_checkpoint_is_a_read_for_a_paired_owner_device_alone() {
+    let Some(entry) = lookup("backup.checkpoint") else {
+        panic!("backup.checkpoint is missing from the registry");
+    };
+    assert_eq!(entry.effect, EffectClass::Read);
+    assert_eq!(entry.group, MethodGroup::HostAndEnvironment);
+    assert_eq!(
+        entry.ingress,
+        &[ActorIngress::PairedDevice],
+        "a paired device reads it and the local socket does not serve it"
+    );
+    assert_eq!(
+        entry.required_rights,
+        &[RequiredRight::right(ActionRight::HostManage)],
+        "it asks for host management and nothing else"
+    );
+    assert_eq!(
+        entry.resource_selectors,
+        &[kr_protocol::authority::ResourceSelectorKind::Host]
+    );
+    assert_eq!(entry.freshness, FreshnessRequirement::CurrentAuthority);
+    assert_eq!(entry.confirmation, ConfirmationRequirement::None);
+    assert_eq!(entry.idempotency, IdempotencyBehaviour::IdempotentRead);
+    assert_eq!(entry.history_filter, HistoryFilter::NotApplicable);
+    assert_eq!(entry.capability, CapabilityRequirement::None);
+    assert_eq!(
+        decide("backup.checkpoint", entry.version, ActorIngress::LocalIpc),
+        AuthorityDecision::Denied(DenialReason::ForbiddenIngress {
+            ingress: ActorIngress::LocalIpc
+        }),
+        "the local socket is refused whatever it holds"
+    );
 }

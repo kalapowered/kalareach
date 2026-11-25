@@ -58,6 +58,7 @@ use crate::automation::{
     WorkflowRunStatus, WorkflowRunSummary, WorkflowTrigger,
 };
 use crate::backup_bundle::{BackupBundlePlace, BackupBundleWriteParams, BackupBundleWriteResult};
+use crate::backup_checkpoint::{BackupCheckpointParams, BackupCheckpointResult, HostCheckpoint};
 use crate::backup_read::{BackupBundle, BackupReadParams, BackupReadResult, BackupSignIn};
 use crate::backup_setup::{
     BackupEnableCause, BackupEnableParams, BackupEnableResult, BackupHostKeys, BackupLastAttempt,
@@ -983,6 +984,11 @@ pub fn protocol_schema() -> Value {
         "organisation_policy_apply_params" => OrganisationPolicyApplyParams,
         "organisation_policy_apply_result" => OrganisationPolicyApplyResult,
         "organisation_withdraw_params" => OrganisationWithdrawParams,
+        // The newest backup generation this host's storage service accepted, for an owner's
+        // device to keep. Appended for the same reason.
+        "backup_checkpoint_params" => BackupCheckpointParams,
+        "backup_checkpoint_result" => BackupCheckpointResult,
+        "host_checkpoint" => HostCheckpoint,
     }
     properties.insert(
         "identifiers".to_owned(),

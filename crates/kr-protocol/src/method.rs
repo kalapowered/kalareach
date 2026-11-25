@@ -578,6 +578,16 @@ methods! {
           up, being set up or not, the host's writer and producer by public key and identifier, \
           and what the account holds at the service.";
 
+    BackupCheckpoint = "backup.checkpoint", HostAndEnvironment,
+    effect: Read, ingress: [PairedDevice], rights: [req(HostManage)], selectors: [Host],
+    history: NotApplicable, capability: NO_CAPABILITY, freshness: CurrentAuthority,
+    confirmation: None, idempotency: READ,
+    doc: "The newest backup generation of the current setup that this host's storage service \
+          accepted and the host still keeps, read from the host's own records without asking the \
+          service: the archive, the service, the generation and the hash of its encrypted \
+          manifest. Null when the host has no backup setup or no such generation. For an owner \
+          device to keep.";
+
     BackupEnable = "backup.enable", HostAndEnvironment,
     effect: Write, ingress: [LocalIpc], rights: [req(HostManage)], selectors: [Environment],
     history: NotApplicable, capability: NO_CAPABILITY, freshness: ActionWindow,
@@ -2286,6 +2296,9 @@ mod tests {
         ("backup.read", &[ActionRight::HostManage]),
         // Setting this host's backups up and reading where they stand, at the host itself.
         ("backup.status", &[ActionRight::HostManage]),
+        // The newest backup generation this host's storage service accepted, for an owner's device
+        // to keep.
+        ("backup.checkpoint", &[ActionRight::HostManage]),
         ("backup.enable", &[ActionRight::HostManage]),
         ("backup.bundle.write", &[ActionRight::HostManage]),
         // Session descriptions: reading what is offered, and the two changes an owner makes.
