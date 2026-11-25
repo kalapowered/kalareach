@@ -679,28 +679,42 @@ pub(crate) mod tests {
             self.compared(before, interval).0
         }
 
-        /// What the compare refuses and notes between `before` and the tree now, one line each.
-        pub(crate) fn compared(
-            &self,
-            before: &Record,
-            interval: Interval,
-        ) -> (Vec<String>, Vec<String>) {
+        /// What the compare gives between `before` and the tree now.
+        fn comparison(&self, before: &Record, interval: Interval) -> Compared {
             let place = Place {
                 root: &self.root,
                 pin: &self.pin,
             };
-            let compared = compare(
+            compare(
                 &self.layout,
                 place,
                 before,
                 &self.record(),
                 interval,
                 rustix::process::getuid().as_raw(),
-            );
+            )
+        }
+
+        /// What the compare refuses and notes between `before` and the tree now, one line each.
+        pub(crate) fn compared(
+            &self,
+            before: &Record,
+            interval: Interval,
+        ) -> (Vec<String>, Vec<String>) {
+            let compared = self.comparison(before, interval);
             (
                 compared.refusals.iter().map(ToString::to_string).collect(),
                 compared.notes,
             )
+        }
+
+        /// What the compare refuses between `before` and the tree now, with the class of each.
+        pub(crate) fn classed(&self, before: &Record, interval: Interval) -> Vec<(Class, String)> {
+            self.comparison(before, interval)
+                .refusals
+                .iter()
+                .map(|refusal| (refusal.class, refusal.to_string()))
+                .collect()
         }
 
         /// Puts another object, with the same bytes or others, in the place of the file at `path`.

@@ -271,14 +271,26 @@ impl Judge<'_> {
             .filter_map(|part| part.as_os_str().to_str())
             .collect();
         match names.as_slice() {
-            [] => self.refuse_unknown(path, W0),
             ["host-cap.lock"] => {
                 let new_and_not_a_file = self.added(path).is_some_and(|now| now.kind != Kind::File);
                 if new_and_not_a_file || self.object_changed(path) {
                     self.refuse(path, W6);
                 }
             }
-            [_] => self.refuse_unknown(path, W0),
+            // The rule names the spool directory and the session directories the record holds: a
+            // change to one of them is a change the rule does not allow, and any other entry is one
+            // that no row names.
+            [] | [_] => {
+                if self
+                    .base
+                    .get(path)
+                    .is_some_and(|entry| entry.kind == Kind::Directory)
+                {
+                    self.refuse(path, W0);
+                } else {
+                    self.refuse_unknown(path, W0);
+                }
+            }
             [_, name] => {
                 let segment = cursor_of(name).is_some();
                 let known = segment || *name == BOUNDARY_FILE || *name == BOUNDARY_STAGING;
@@ -579,8 +591,8 @@ mod tests {
     use std::os::unix::fs::PermissionsExt as _;
     use std::os::unix::net::UnixListener;
 
-    use crate::compare::Interval;
     use crate::compare::tests::{World, world};
+    use crate::compare::{Class, Interval};
 
     const KILL: Interval = Interval::AtTheKill { restarted: false };
     const ATTEMPT: Interval = Interval::BeforeTheAttempt;
@@ -797,6 +809,71 @@ mod tests {
             replaced.0.iter().any(|line| line.ends_with(W0)),
             "{:#?}",
             replaced.0
+        );
+    }
+
+    /// A change to the spool directory or to a session directory that the record holds is refused
+    /// by the rule that names it. A directory or a file that the record does not hold, and a change
+    /// to a recorded file that no row names, are each an entry that no row covers.
+    #[test]
+    fn a_changed_spool_directory_the_record_holds_is_a_rule_and_one_it_lacks_is_unknown() {
+        const W0: &str = "the spool keeps the directory it is and the session directories the \
+                          record holds, and holds no other directory";
+        type Act = fn(&World);
+        let classed = |name: &str, act: Act| {
+            let world = world(name);
+            spool(&world);
+            world.put(&world.state("spool/stray"), b"x");
+            let before = world.record();
+            act(&world);
+            let classed = world.classed(&before, KILL);
+            world.clean();
+            classed
+        };
+        let cases: [(&str, Class, Act); 5] = [
+            ("session-directory-chmod", Class::Rule, |w| {
+                std::fs::set_permissions(
+                    w.state("spool/s1.log"),
+                    std::fs::Permissions::from_mode(0o750),
+                )
+                .expect("mode");
+            }),
+            ("spool-directory-chmod", Class::Rule, |w| {
+                std::fs::set_permissions(w.state("spool"), std::fs::Permissions::from_mode(0o750))
+                    .expect("mode");
+            }),
+            ("new-session-directory", Class::UnknownEntry, |w| {
+                std::fs::create_dir(w.state("spool/s2.log")).expect("a directory");
+            }),
+            ("new-file-below-the-spool", Class::UnknownEntry, |w| {
+                w.put(&w.state("spool/other"), b"x");
+            }),
+            ("recorded-file-below-the-spool", Class::UnknownEntry, |w| {
+                std::fs::write(w.state("spool/stray"), b"y").expect("written");
+            }),
+        ];
+        for (name, class, act) in cases {
+            let refused = classed(name, act);
+            assert!(
+                refused.len() == 1 && refused[0].0 == class && refused[0].1.ends_with(W0),
+                "{name}: one refusal of the class {class:?} that ends {W0:?}: {refused:#?}"
+            );
+        }
+        let replaced = classed("spool-replaced", |w| {
+            std::fs::rename(w.state("spool/s1.log"), w.state("spool/moved")).expect("moved");
+            std::fs::create_dir_all(w.state("spool/s1.log")).expect("another directory");
+        });
+        let ending = |class: Class| {
+            replaced
+                .iter()
+                .filter(|(found, line)| *found == class && line.ends_with(W0))
+                .count()
+        };
+        assert_eq!(
+            (ending(Class::Rule), ending(Class::UnknownEntry)),
+            (1, 1),
+            "the session directory that was replaced is a rule and the one it was moved to is an \
+             entry no row covers: {replaced:#?}"
         );
     }
 
