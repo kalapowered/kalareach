@@ -358,7 +358,7 @@ impl CommandIntegration {
     #[must_use]
     pub fn problems(&self, match_rules: &[MatchRule], permits: &LaunchPermits) -> Vec<String> {
         let mut problems = Vec::new();
-        if let Some(problem) = command_problem(&self.command) {
+        if let Some(problem) = command_problem("the integration", &self.command) {
             problems.push(problem);
         } else if !match_rules.iter().any(|rule| {
             rule.executable
@@ -533,15 +533,15 @@ fn launching_word_problem(word: &str) -> Option<String> {
     None
 }
 
-/// Returns why a command name is not one an integration may name, where it is not.
-fn command_problem(command: &str) -> Option<String> {
+/// Returns why a command name is not one a declaration may name, where it is not. `whose` is the
+/// declaration as the reason names it: "the integration" or "the ACP launch".
+pub(crate) fn command_problem(whose: &str, command: &str) -> Option<String> {
     if command.is_empty() {
-        return Some("the integration names no command".to_owned());
+        return Some(format!("{whose} names no command"));
     }
     if command.len() > MAX_COMMAND_BYTES {
         return Some(format!(
-            "the integration's command is {} bytes, over the {MAX_COMMAND_BYTES} a command name \
-             may be",
+            "{whose}'s command is {} bytes, over the {MAX_COMMAND_BYTES} a command name may be",
             command.len()
         ));
     }
@@ -550,14 +550,14 @@ fn command_problem(command: &str) -> Option<String> {
         .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'+' | b'-'))
     {
         return Some(format!(
-            "the integration's command {} is not a bare command name: letters, digits, '.', \
-             '_', '+' and '-' only",
+            "{whose}'s command {} is not a bare command name: letters, digits, '.', '_', '+' and \
+             '-' only",
             quoted(command)
         ));
     }
     if command.starts_with(['-', '.']) {
         return Some(format!(
-            "the integration's command {} starts with '-' or '.'",
+            "{whose}'s command {} starts with '-' or '.'",
             quoted(command)
         ));
     }

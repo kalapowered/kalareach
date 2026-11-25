@@ -10,6 +10,7 @@ use kr_protocol::scalars::Nullable;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::acp_launch::AcpLaunch;
 use crate::capability::CapabilityRequest;
 use crate::digest::{ByteSize, PayloadDigest};
 use crate::effect::{ActionDeclaration, AttachmentContribution};
@@ -232,6 +233,16 @@ pub struct PluginManifest {
     /// and only with `launch.probe` granted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub launch_probe: Option<LaunchProbe>,
+    /// The ACP launch, where the package declares one: the variables the host copies from the
+    /// person's shell into the agent's start, the ones it sets itself and the platforms it starts
+    /// the agent on in ACP mode.
+    ///
+    /// A package that declares none leaves the member out, so a manifest written before the member
+    /// existed reads and hashes exactly as it did. A host reads one only from this verified
+    /// manifest, and only with `command_integration.launch` granted, `approval.decode` and
+    /// `approval.respond` granted and the owner's switch on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acp_launch: Option<AcpLaunch>,
 }
 
 impl PluginManifest {

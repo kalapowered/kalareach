@@ -162,6 +162,12 @@ pub enum FindingCode {
     /// A launch probe passes an argument it may not, carries an option it may not or names a
     /// mode pointer that is not one.
     LaunchProbeInvalid,
+    /// The package declares an ACP launch without requesting the grants it needs: the launch
+    /// grant, and the two approval grants that let an approval the agent asks for be answered.
+    AcpLaunchWithoutCapability,
+    /// An ACP launch lists no required name, names a required name it does not pass, lists no
+    /// platform or one the package does not support, or breaks the shape of a name or a constant.
+    AcpLaunchInvalid,
 }
 
 impl FindingCode {
@@ -215,6 +221,8 @@ impl FindingCode {
         Self::IntegrationInvalid,
         Self::LaunchProbeWithoutCapability,
         Self::LaunchProbeInvalid,
+        Self::AcpLaunchWithoutCapability,
+        Self::AcpLaunchInvalid,
     ];
 
     /// Returns the stable wire string.
@@ -269,6 +277,8 @@ impl FindingCode {
             Self::IntegrationInvalid => "integration_invalid",
             Self::LaunchProbeWithoutCapability => "launch_probe_without_capability",
             Self::LaunchProbeInvalid => "launch_probe_invalid",
+            Self::AcpLaunchWithoutCapability => "acp_launch_without_capability",
+            Self::AcpLaunchInvalid => "acp_launch_invalid",
         }
     }
 }

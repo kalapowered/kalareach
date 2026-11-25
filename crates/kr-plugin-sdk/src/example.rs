@@ -242,6 +242,7 @@ pub fn example_manifest_for(presentation_bytes: &[u8]) -> PluginManifest {
         native_bridge: Nullable(None),
         command_integration: None,
         launch_probe: None,
+        acp_launch: None,
     }
 }
 
@@ -742,6 +743,7 @@ pub fn example_connector_manifest(
         native_bridge: Nullable(None),
         command_integration: None,
         launch_probe: None,
+        acp_launch: None,
     }
 }
 

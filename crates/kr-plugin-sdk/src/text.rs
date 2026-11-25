@@ -192,6 +192,15 @@ bounded_text!(
     "The package summary. One line, no control or bidirectional characters."
 );
 
+bounded_text!(
+    /// The publisher's own words for a launch grant that has to say what an agent does and does
+    /// not do: the one text longer than a summary.
+    GrantWords,
+    6000,
+    "grant words",
+    "The publisher's own words for a launch grant. One line, no control or bidirectional characters."
+);
+
 #[cfg(test)]
 mod tests {
     use super::*;

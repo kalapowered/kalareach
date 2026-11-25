@@ -59,6 +59,7 @@
 //! | [`connector`] | The declarative native-proxy table |
 //! | [`plugin`] | The `plugin.json` manifest |
 //! | [`integration`] | A package's command integration: its command, flags and variables |
+//! | [`acp_launch`] | A package's ACP launch: the one argument, the variables passed and set, and the platforms |
 //! | [`launch_probe`] | A package's launch probe: how the host reads the mode an application will run in |
 //! | [`forwarder`] | The placeholder a package writes for the forwarder, and how the host replaces it |
 //! | [`catalogue`] | The signed catalogue index |
@@ -94,6 +95,7 @@
 //! assert!(!PluginCapability::TerminalInput.within_default_ceiling());
 //! ```
 
+pub mod acp_launch;
 pub mod arrivals;
 pub mod bundle;
 pub mod capability;
