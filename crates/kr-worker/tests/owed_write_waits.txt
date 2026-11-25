@@ -33,6 +33,7 @@ site crates/kr-worker/src/output_times.rs flush append 1  # a vector's own appen
 site crates/kr-worker/src/broker/semantic.rs append_reported append 1  # the semantic log, which is not a history
 site crates/kr-worker/src/broker/mod.rs note append 1  # the semantic log
 site crates/kr-worker/src/broker/mod.rs observe append 1  # the semantic log
+site crates/kr-worker/src/desktop/payload.rs a_stand_in_held_open_for_writing_stops_its_case_after_the_bound_and_names_it append 1  # the open options of a stand-in file, in a test case of a module that the scan does not read as a test module
 
 # The history's readers.
 reader time_index via standing
