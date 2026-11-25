@@ -25,6 +25,9 @@ const SESSION_ROOT_PREFIX: &str = "c";
 /// The name of a session spool's boundary file.
 const BOUNDARY_FILE: &str = "boundary";
 
+/// The name of the file the boundary is written to before it is renamed over the boundary file.
+const BOUNDARY_STAGING: &str = "boundary.writing";
+
 /// Where the compare reads bytes the record does not hold, through the run's handles.
 #[derive(Clone, Copy, Debug)]
 pub struct Place<'a> {
@@ -206,6 +209,21 @@ impl Judge<'_> {
         }
     }
 
+    /// Whether the recorded spool entry at `path` changed in a way its writer does not need: its
+    /// kind, its link target, its owner or its permission bits, or, for a segment, its object. The
+    /// boundary file and its staging file may be other objects, since the writer renames the staging
+    /// file over the boundary file.
+    fn spool_object_changed(&self, path: &Path, is_segment: bool) -> bool {
+        self.changes_at(path).iter().any(|change| match change {
+            Change::Retyped { .. }
+            | Change::Target { .. }
+            | Change::Owner { .. }
+            | Change::Mode { .. } => true,
+            Change::Replaced { .. } => is_segment,
+            Change::Added { .. } | Change::Gone { .. } | Change::Bytes { .. } => false,
+        })
+    }
+
     fn spool_entry(&mut self, path: &Path, rest: &Path) {
         const W0: &str = "the spool keeps the directory it is and the session directories the \
                           record holds, and holds no other directory";
@@ -213,6 +231,11 @@ impl Judge<'_> {
                           and this entry is none of them";
         const W6: &str = "the spool's host-cap lock is a regular file, and a recorded one keeps \
                           its object";
+        const W7: &str = "a recorded spool segment keeps its object, its kind, its owner and its \
+                          permission bits";
+        const W8: &str = "a recorded boundary file and its staging file keep their kind, their \
+                          owner and their permission bits; the writer may put other files in their \
+                          places, since it renames the staging file over the boundary file";
         let names: Vec<&str> = rest
             .components()
             .filter_map(|part| part.as_os_str().to_str())
@@ -227,12 +250,13 @@ impl Judge<'_> {
             }
             [_] => self.refuse(path, W0),
             [_, name] => {
-                let known = cursor_of(name).is_some()
-                    || *name == BOUNDARY_FILE
-                    || *name == "boundary.writing";
-                let file = self.added(path).is_none_or(|now| now.kind == Kind::File);
-                if self.added(path).is_some() && !(known && file) {
+                let segment = cursor_of(name).is_some();
+                let known = segment || *name == BOUNDARY_FILE || *name == BOUNDARY_STAGING;
+                let new_and_not_a_file = self.added(path).is_some_and(|now| now.kind != Kind::File);
+                if !known || new_and_not_a_file {
                     self.refuse(path, W1);
+                } else if self.spool_object_changed(path, segment) {
+                    self.refuse(path, if segment { W7 } else { W8 });
                 }
             }
             _ => self.refuse(path, W1),
@@ -246,7 +270,7 @@ impl Judge<'_> {
         const W3: &str = "the newest recorded spool segment may only grow: its recorded bytes must \
                           be the start of its bytes now";
         const W4: &str =
-            "a new spool segment starts at or after the end of the newest recorded one";
+            "a new spool segment starts at or after where the newest recorded one ends now";
         const W5: &str = "the spool's boundary is decimal text and not below the recorded value";
         let spool = self.layout.state_dir.join("spool");
         let directories: Vec<PathBuf> = self
@@ -265,9 +289,10 @@ impl Judge<'_> {
         for directory in directories {
             let original = segments(self.base, &directory);
             let current = segments(self.now, &directory);
-            let end_of_newest = original
-                .last()
-                .map(|(cursor, _, entry)| cursor.saturating_add(entry.size));
+            // Where the newest recorded segment ends now: a new segment follows what it holds.
+            let end_of_newest = original.last().map(|(cursor, path, entry)| {
+                cursor.saturating_add(self.now.get(path).map_or(entry.size, |now| now.size))
+            });
             // A failed write cuts the newest segment back and removes it when it is empty.
             let newest_gone_empty = original
                 .last()
@@ -566,7 +591,8 @@ mod tests {
                       recorded one keeps its bytes";
     const W3: &str = "the newest recorded spool segment may only grow: its recorded bytes must be \
                       the start of its bytes now";
-    const W4: &str = "a new spool segment starts at or after the end of the newest recorded one";
+    const W4: &str =
+        "a new spool segment starts at or after where the newest recorded one ends now";
     const W5: &str = "the spool's boundary is decimal text and not below the recorded value";
 
     /// Retention removes the oldest segments, the last segment grows and new segments follow it:
@@ -727,6 +753,91 @@ mod tests {
             "{:#?}",
             replaced.0
         );
+    }
+
+    const W7: &str = "a recorded spool segment keeps its object, its kind, its owner and its \
+                      permission bits";
+    const W8: &str = "a recorded boundary file and its staging file keep their kind, their owner \
+                      and their permission bits; the writer may put other files in their places, \
+                      since it renames the staging file over the boundary file";
+
+    /// A recorded segment, boundary file or staging file that changes its permission bits or its
+    /// kind, a recorded segment that is another object with the same bytes, and a recorded name no
+    /// row knows that changes are each refused. The boundary file and its staging file may be other
+    /// objects, and a new segment may start where the newest recorded one ends now.
+    #[test]
+    fn a_recorded_spool_entry_keeps_its_kind_and_its_mode_and_a_segment_keeps_its_object() {
+        const W1: &str = "a session's spool holds segments, a boundary file and its staging file, \
+                          and this entry is none of them";
+        let boundary = |w: &World| w.state("spool/s1.log/boundary");
+        let staging = |w: &World| w.state("spool/s1.log/boundary.writing");
+        let with_both = |w: &World| {
+            spool(w);
+            w.put(&boundary(w), b"50");
+            w.put(&staging(w), b"51");
+        };
+        let chmod = |path: std::path::PathBuf| {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644)).expect("mode");
+        };
+        refused_by("sealed-chmod", W7, spool, |w| chmod(segment(w, 0)));
+        refused_by("newest-chmod", W7, spool, |w| chmod(segment(w, 20)));
+        refused_by("sealed-same-bytes-other-object", W7, spool, |w| {
+            w.replace(&segment(w, 0), b"0123456789");
+        });
+        refused_by("newest-same-bytes-other-object", W7, spool, |w| {
+            w.replace(&segment(w, 20), b"vwxyz");
+        });
+        refused_by("boundary-chmod", W8, with_both, |w| chmod(boundary(w)));
+        refused_by("staging-chmod", W8, with_both, |w| chmod(staging(w)));
+        refused_by("staging-a-link", W8, with_both, |w| {
+            std::fs::remove_file(staging(w)).expect("removed");
+            std::os::unix::fs::symlink("elsewhere", staging(w)).expect("a link");
+        });
+        // The boundary file as a link is refused by its own row and by the rule of its text.
+        let (refused, _) = outcome("boundary-a-link", with_both, |w| {
+            std::fs::remove_file(boundary(w)).expect("removed");
+            std::os::unix::fs::symlink("elsewhere", boundary(w)).expect("a link");
+        });
+        assert!(
+            refused.len() == 2
+                && refused.iter().any(|line| line.ends_with(W8))
+                && refused.iter().any(|line| line.ends_with(W5)),
+            "a boundary file made a link is refused by W8 and W5: {refused:#?}"
+        );
+        refused_by(
+            "unknown-recorded-name",
+            W1,
+            |w| {
+                spool(w);
+                w.put(&w.state("spool/s1.log/other"), b"x");
+            },
+            |w| chmod(w.state("spool/s1.log/other")),
+        );
+        // What the writer does: the staging file is made and renamed over the boundary file, and
+        // a recorded staging file is made again.
+        allowed("boundary-another-object", with_both, |w| {
+            w.replace(&boundary(w), b"50");
+        });
+        allowed("staging-another-object", with_both, |w| {
+            w.replace(&staging(w), b"61");
+        });
+        allowed("staging-gone", with_both, |w| {
+            std::fs::remove_file(staging(w)).expect("removed");
+        });
+        // A new segment follows the newest one as it is now: it grew to 14 bytes, so it ends at 34.
+        let grown = |w: &World| std::fs::write(segment(w, 20), b"vwxyz and more").expect("grown");
+        refused_by("new-segment-inside-the-grown-newest", W4, spool, |w| {
+            grown(w);
+            w.put(&segment(w, 25), b"new");
+        });
+        refused_by("new-segment-one-byte-early", W4, spool, |w| {
+            grown(w);
+            w.put(&segment(w, 33), b"new");
+        });
+        allowed("new-segment-at-the-grown-end", spool, |w| {
+            grown(w);
+            w.put(&segment(w, 34), b"new");
+        });
     }
 
     fn claim_name() -> String {
