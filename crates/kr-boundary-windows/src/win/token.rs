@@ -60,7 +60,13 @@ fn lsa_string(text: &[u8]) -> LSA_STRING {
     }
 }
 
-/// A fresh group identifier that no other token carries: the authority 9 with four random parts.
+/// The first part of every invocation group's identifier, a number of this crate's own: it lets
+/// the admission of a tree name a group of an invocation that did not finish without naming the
+/// identifiers of other software.
+pub const INVOCATION_GROUP_FIRST: u32 = 0x4B52_4247;
+
+/// A fresh group identifier that no other token carries: the authority 9, the crate's own first
+/// part and three random parts.
 #[must_use]
 pub fn new_invocation_group() -> Sid {
     let random = uuid::Uuid::new_v4();
@@ -74,11 +80,10 @@ pub fn new_invocation_group() -> Sid {
         ])
     };
     Sid::parse(&format!(
-        "S-1-9-{}-{}-{}-{}",
+        "S-1-9-{INVOCATION_GROUP_FIRST}-{}-{}-{}",
         part(0),
         part(4),
-        part(8),
-        part(12)
+        part(8)
     ))
     .expect("an identifier of this form is valid")
 }

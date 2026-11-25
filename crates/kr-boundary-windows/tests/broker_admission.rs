@@ -29,9 +29,10 @@ use kr_boundary_windows::frame::Class;
 use kr_boundary_windows::manifest::{Manifest, ObjectKind};
 use kr_boundary_windows::refusal::Refusal;
 use kr_boundary_windows::win::admission::{
-    ADMISSION_FAILED_WORDS, Admitted, LINK_WORDS, OPEN_WORDS, PERSON_LACKS_WORDS, Probes,
-    RULE_LINK, RULE_OPEN, RULE_PERSON_LACKS, RULE_SIBLING, RULE_SYSTEM_LACKS, SIBLING_WORDS,
-    SYSTEM_LACKS_WORDS, admit,
+    ADMISSION_FAILED_WORDS, Admitted, LABEL_WORDS, LINK_WORDS, OPEN_WORDS, OWNER_WORDS,
+    PERSON_LACKS_WORDS, Probes, RULE_LABEL, RULE_LINK, RULE_OPEN, RULE_OWNER, RULE_PERSON_LACKS,
+    RULE_SIBLING, RULE_STALE, RULE_SYSTEM_LACKS, RULE_WRITER, SIBLING_WORDS, STALE_WORDS,
+    SYSTEM_LACKS_WORDS, WRITER_WORDS, admit,
 };
 use kr_boundary_windows::win::ffi::Handle;
 use kr_boundary_windows::win::rights::{Right, Sd, may, probe_token};
@@ -712,4 +713,182 @@ fn broker_admission_a_right_on_an_ancestor_refuses_only_when_it_deletes_or_chang
         refusal.detail(),
         format!("{}: {LINK_WORDS}", display(&link))
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// The Git folder's writers, the groups of invocations that did not finish, and labels
+// ---------------------------------------------------------------------------------------------
+
+/// The first part of the identifier of an invocation's group, written out here so that a change
+/// of the crate's number is seen: the number 0x4B524247.
+const GROUP_FIRST: u32 = 1_263_682_119;
+
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn broker_admission_another_account_that_can_write_in_the_git_folder_refuses_the_tree() {
+    if !runs_as_the_system() {
+        eprintln!("skipped: the case needs the system's token");
+        return;
+    }
+    prepare();
+    let person = Person::new("krhap");
+    let other = Person::new("krsec");
+    let siblings = Siblings::new();
+    let scratch = Scratch::on_drive();
+    let other_sid = other.sid.to_text().unwrap();
+
+    // An explicit right to write, given to a second ordinary account on an object of the Git
+    // folder: no probe token stands for that account, so the entry itself is read.
+    let project = Project::make_private(&scratch, "writes", &person.sid);
+    let head = project.git.join("HEAD");
+    grant(&head, &other.name, "(M)");
+    let refusal = admit_project(&person, &siblings, &project).expect_err("a second writer refuses");
+    assert_eq!(refusal.rule, RULE_WRITER);
+    assert_eq!(
+        refusal.detail(),
+        format!("{WRITER_WORDS} {other_sid} on {}", display(&head))
+    );
+
+    // The same account may read it.
+    let project = Project::make_private(&scratch, "reads", &person.sid);
+    grant(&project.git.join("HEAD"), &other.name, "(R)");
+    admit_project(&person, &siblings, &project).expect("a second account that reads is admitted");
+
+    // The rule is the Git folder's: the same account may write a file of the working tree.
+    let project = Project::make_private(&scratch, "work", &person.sid);
+    let work = project.root.join("src.txt");
+    fs::write(&work, b"x").unwrap();
+    grant(&work, &other.name, "(M)");
+    admit_project(&person, &siblings, &project)
+        .expect("a second account that writes the working tree is admitted");
+}
+
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn broker_admission_an_owner_other_than_the_person_the_system_or_an_administrator_refuses_the_tree()
+{
+    if !runs_as_the_system() {
+        eprintln!("skipped: the case needs the system's token");
+        return;
+    }
+    prepare();
+    let person = Person::new("krhap");
+    let other = Person::new("krsec");
+    let siblings = Siblings::new();
+    let scratch = Scratch::on_drive();
+    let who = person.sid.to_text().unwrap();
+    let other_sid = other.sid.to_text().unwrap();
+    // The list gives nobody else a right; the owner of an object may change its list.
+    let owned_by_other = format!("O:{other_sid}D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;{who})");
+
+    let project = Project::make_private(&scratch, "git", &person.sid);
+    let file = project.git.join("owned");
+    privileged(|| file_described(&file, &descriptor_from_text(&owned_by_other).unwrap(), b"x"));
+    let refusal = admit_project(&person, &siblings, &project).expect_err("a second owner refuses");
+    assert_eq!(refusal.rule, RULE_OWNER);
+    assert_eq!(
+        refusal.detail(),
+        format!("{OWNER_WORDS} {other_sid} on {}", display(&file))
+    );
+
+    let project = Project::make_private(&scratch, "work", &person.sid);
+    let file = project.root.join("owned.txt");
+    privileged(|| file_described(&file, &descriptor_from_text(&owned_by_other).unwrap(), b"x"));
+    admit_project(&person, &siblings, &project)
+        .expect("a file of the working tree that another account owns is admitted");
+}
+
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn broker_admission_a_group_of_an_invocation_that_did_not_finish_refuses_the_tree() {
+    if !runs_as_the_system() {
+        eprintln!("skipped: the case needs the system's token");
+        return;
+    }
+    prepare();
+    let person = Person::new("krhap");
+    let siblings = Siblings::new();
+    let scratch = Scratch::on_drive();
+    let who = person.sid.to_text().unwrap();
+    assert!(
+        kr_boundary_windows::win::token::new_invocation_group()
+            .to_text()
+            .unwrap()
+            .starts_with(&format!("S-1-9-{GROUP_FIRST}-")),
+        "a new group has the form that admission names"
+    );
+    let with_entry =
+        |sid: &str| format!("O:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;{who})(A;;0x1301bf;;;{sid})");
+
+    // A group of an invocation that did not finish, on a file of the working tree and on one of
+    // the Git folder: refused, naming the object.
+    for (label, git) in [("work", false), ("git", true)] {
+        let project = Project::make_private(&scratch, label, &person.sid);
+        let file = if git {
+            project.git.join("stale")
+        } else {
+            project.root.join("stale.txt")
+        };
+        let stale = with_entry(&format!("S-1-9-{GROUP_FIRST}-11-22-33"));
+        file_described(&file, &descriptor_from_text(&stale).unwrap(), b"x");
+        let refusal =
+            admit_project(&person, &siblings, &project).expect_err("a stale group refuses");
+        assert_eq!(refusal.rule, RULE_STALE, "{label}");
+        assert_eq!(
+            refusal.detail(),
+            format!("{STALE_WORDS} on {}", display(&file)),
+            "{label}"
+        );
+    }
+
+    // Other identifiers of the same authority, or of the same first part with fewer parts, are not
+    // the crate's groups: on a file of the working tree they refuse nothing.
+    for (label, sid) in [
+        ("other-first", "S-1-9-1-11-22-33".to_owned()),
+        ("short", format!("S-1-9-{GROUP_FIRST}-11-22")),
+    ] {
+        let project = Project::make_private(&scratch, label, &person.sid);
+        let file = project.root.join("other.txt");
+        file_described(
+            &file,
+            &descriptor_from_text(&with_entry(&sid)).unwrap(),
+            b"x",
+        );
+        admit_project(&person, &siblings, &project)
+            .unwrap_or_else(|refusal| panic!("{label}: {sid} is not a group of ours: {refusal}"));
+    }
+}
+
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn broker_admission_a_mandatory_label_on_any_object_refuses_the_tree() {
+    if !runs_as_the_system() {
+        eprintln!("skipped: the case needs the system's token");
+        return;
+    }
+    prepare();
+    let person = Person::new("krhap");
+    let siblings = Siblings::new();
+    let scratch = Scratch::on_drive();
+    for (label, git) in [("work", false), ("git", true)] {
+        let project = Project::make_private(&scratch, label, &person.sid);
+        let file = if git {
+            project.git.join("HEAD")
+        } else {
+            let file = project.root.join("low.txt");
+            fs::write(&file, b"x").unwrap();
+            file
+        };
+        run(
+            "icacls",
+            &[file.to_str().unwrap(), "/setintegritylevel", "L"],
+        );
+        let refusal = admit_project(&person, &siblings, &project).expect_err("a label refuses");
+        assert_eq!(refusal.rule, RULE_LABEL, "{label}");
+        assert_eq!(
+            refusal.detail(),
+            format!("{LABEL_WORDS} on {}", display(&file)),
+            "{label}"
+        );
+    }
 }

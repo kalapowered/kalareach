@@ -16,11 +16,14 @@ use crate::manifest::Manifest;
 use crate::refusal::Refusal;
 
 use super::client::ClientIdentity;
+use super::ffi::Handle;
 use super::hold::{FOLDER_CHANGED_WORDS, RULE_FOLDER_CHANGED, TreeHold};
 use super::rights::{
     ImpersonationToken, ObjectKind, PERSON_RIGHTS, REPORT_RIGHT, Right, SYSTEM_RIGHTS, Sd, may,
     probe_token, system_may, write_rights,
 };
+use super::sd::{Entry as ListEntry, has_label_of_handle, summary_of_handle};
+use super::token::INVOCATION_GROUP_FIRST;
 use super::walk::{DirHandle, Entry, INSPECT, Kind, Lost, ROOT_BOUNDS, Verdict, walk};
 
 /// The most notes admission keeps; the rest are counted.
@@ -38,6 +41,14 @@ pub const RULE_OPEN: &str = "admission-open";
 pub const RULE_LINK: &str = "admission-link";
 /// The rule of a refusal for a check that could not be made.
 pub const RULE_FAILED: &str = "admission-failed";
+/// The rule of a refusal for an entry that gives another principal a write right in the Git folder.
+pub const RULE_WRITER: &str = "admission-writer";
+/// The rule of a refusal for an owner that is not the person, the system or an administrator.
+pub const RULE_OWNER: &str = "admission-owner";
+/// The rule of a refusal for an entry that names a group of an invocation that did not finish.
+pub const RULE_STALE: &str = "admission-stale-grant";
+/// The rule of a refusal for an object that carries a mandatory label.
+pub const RULE_LABEL: &str = "admission-label";
 
 /// The end of the reply when a boundary account holds a right on an object; the path and the right
 /// come before it.
@@ -59,6 +70,28 @@ pub const OPEN_WORDS: &str = "the broker cannot open this object";
 /// The end of the reply when an object of the tree is a link; the path comes before it.
 // text: LINK_WORDS
 pub const LINK_WORDS: &str = "this object is a link, and the broker does not follow links";
+
+/// The start of the reply when a principal other than the person, the system and the
+/// administrators can write in the Git folder; the principal's identifier, `on` and the object's
+/// path follow.
+// text: WRITER_WORDS
+pub const WRITER_WORDS: &str = "writer";
+
+/// The start of the reply when an object of the Git folder is owned by a principal other than the
+/// person, the system and the administrators, which can change its list as its owner; the
+/// principal's identifier, `on` and the object's path follow.
+// text: OWNER_WORDS
+pub const OWNER_WORDS: &str = "owner";
+
+/// The start of the reply when an entry names the group of an invocation that did not finish; `on`
+/// and the object's path follow.
+// text: STALE_WORDS
+pub const STALE_WORDS: &str = "stale grant";
+
+/// The start of the reply when an object carries a mandatory label; `on` and the object's path
+/// follow.
+// text: LABEL_WORDS
+pub const LABEL_WORDS: &str = "label";
 
 /// The start of the reply when a check could not be made; the platform's error follows after a
 /// colon.
@@ -139,18 +172,36 @@ fn right_words(right: Right) -> &'static str {
     }
 }
 
-/// The reply's detail: the path, then the end, which is cut at its start with `...` when the whole
-/// would be longer than a detail may be, so that the end is never the part that is lost.
-fn fitted(path: &str, end: &str) -> String {
-    let room = MAX_DETAIL_BYTES.saturating_sub(end.len());
-    if path.len() <= room {
-        return format!("{path}{end}");
+/// The text, cut at its start with `...` when it is longer than `room` bytes, so that the end of a
+/// path, which names the object, is never the part that is lost.
+fn cut_start(text: &str, room: usize) -> String {
+    if text.len() <= room {
+        return text.to_owned();
     }
-    let mut start = path.len() - room.saturating_sub(3);
-    while !path.is_char_boundary(start) {
+    let mut start = text.len() - room.saturating_sub(3);
+    while !text.is_char_boundary(start) {
         start += 1;
     }
-    format!("...{}{end}", &path[start..])
+    format!("...{}", &text[start..])
+}
+
+/// The reply's detail: the path, then the end, with the path cut when the whole would be longer
+/// than a detail may be.
+fn fitted(path: &str, end: &str) -> String {
+    let path = cut_start(path, MAX_DETAIL_BYTES.saturating_sub(end.len()));
+    format!("{path}{end}")
+}
+
+/// The reply's detail for a rule that names the object last: the words, the identifier if there
+/// is one, `on`, and the path, cut when the whole would be longer than a detail may be.
+fn named_last(rule: &'static str, words: &str, sid: &str, path: &str) -> Refusal {
+    let start = if sid.is_empty() {
+        format!("{words} on ")
+    } else {
+        format!("{words} {sid} on ")
+    };
+    let path = cut_start(path, MAX_DETAIL_BYTES.saturating_sub(start.len()));
+    Refusal::new(RefusedKind::Admission, rule, &format!("{start}{path}"))
 }
 
 fn right_refusal(rule: &'static str, path: &str, right: Right, words: &str) -> Refusal {
@@ -188,9 +239,22 @@ fn chain_paths(tree_path: &str) -> Vec<String> {
         .collect()
 }
 
+/// An object of the tree as the checks meet it.
+struct Object<'a> {
+    path: &'a str,
+    kind: ObjectKind,
+    descriptor: &'a Sd,
+    handle: &'a Handle,
+    /// Whether the object is the Git folder or lies under it.
+    in_git: bool,
+}
+
 struct Checking<'a> {
     client: &'a ClientIdentity,
     probes: &'a Probes,
+    /// The identifiers that may write in the Git folder: the person, the system, the
+    /// administrators.
+    writers: [String; 3],
     admitted: Admitted,
 }
 
@@ -208,8 +272,10 @@ impl Checking<'_> {
     }
 
     /// Every check an object of the grant's walk meets, in order: the siblings' write rights, what
-    /// the person needs, what the broker needs, and then the note for a read right that is shared.
-    fn object(&mut self, path: &str, kind: ObjectKind, descriptor: &Sd) -> Result<(), Refusal> {
+    /// the person needs, what the broker needs, what its list and label say, and then the note for
+    /// a read right that is shared.
+    fn object(&mut self, object: &Object<'_>) -> Result<(), Refusal> {
+        let (path, kind, descriptor) = (object.path, object.kind, object.descriptor);
         self.siblings(path, descriptor, write_rights(kind))?;
         for right in PERSON_RIGHTS {
             if !self.client.may(descriptor, right) {
@@ -231,6 +297,7 @@ impl Checking<'_> {
                 ));
             }
         }
+        self.marks(object)?;
         if self
             .probes
             .both()
@@ -241,6 +308,42 @@ impl Checking<'_> {
                 self.admitted.notes.push(format!("shared-read: {path}"));
             } else {
                 self.admitted.notes_cut += 1;
+            }
+        }
+        Ok(())
+    }
+
+    /// What the object's own list and label say: a group of an invocation that did not finish, a
+    /// label, and, in the Git folder, a principal other than the person, the system and the
+    /// administrators that can write, or that owns the object and so can change its list.
+    fn marks(&self, object: &Object<'_>) -> Result<(), Refusal> {
+        let summary = summary_of_handle(object.handle).map_err(|failure| failed(&failure))?;
+        let entries = summary.entries.unwrap_or_default();
+        if entries.iter().any(|entry| is_stale(&entry.sid)) {
+            return Err(named_last(RULE_STALE, STALE_WORDS, "", object.path));
+        }
+        if has_label_of_handle(object.handle).map_err(|failure| failed(&failure))? {
+            return Err(named_last(RULE_LABEL, LABEL_WORDS, "", object.path));
+        }
+        if object.in_git {
+            if let Some(entry) = entries
+                .iter()
+                .find(|entry| gives_writing(entry) && !self.writers.contains(&entry.sid))
+            {
+                return Err(named_last(
+                    RULE_WRITER,
+                    WRITER_WORDS,
+                    &entry.sid,
+                    object.path,
+                ));
+            }
+            if !self.writers.contains(&summary.owner) {
+                return Err(named_last(
+                    RULE_OWNER,
+                    OWNER_WORDS,
+                    &summary.owner,
+                    object.path,
+                ));
             }
         }
         Ok(())
@@ -270,7 +373,13 @@ impl Checking<'_> {
             ));
         };
         let descriptor = Sd::of_handle(root.handle()).map_err(|failure| failed(&failure))?;
-        self.object(spelled(&hold.path), ObjectKind::Directory, &descriptor)?;
+        self.object(&Object {
+            path: spelled(&hold.path),
+            kind: ObjectKind::Directory,
+            descriptor: &descriptor,
+            handle: root.handle(),
+            in_git: false,
+        })?;
         let mut refusal: Option<Refusal> = None;
         let outcome = walk(root, ROOT_BOUNDS, &mut |entry: &Entry<'_>| {
             if refusal.is_some() {
@@ -321,7 +430,24 @@ impl Checking<'_> {
             Kind::ReparsePoint => return Err(object_refusal(RULE_LINK, &path, LINK_WORDS)),
         };
         let descriptor = Sd::of_handle(&opened.handle).map_err(|failure| failed(&failure))?;
-        self.object(&path, kind, &descriptor)
+        let git = hold.git_dir.path();
+        let place: Vec<u16> = entry
+            .dir
+            .path()
+            .iter()
+            .copied()
+            .chain(std::iter::once(u16::from(b'\\')))
+            .chain(entry.child.name.iter().copied())
+            .collect();
+        let in_git = place == git
+            || (place.starts_with(git) && place.get(git.len()) == Some(&u16::from(b'\\')));
+        self.object(&Object {
+            path: &path,
+            kind,
+            descriptor: &descriptor,
+            handle: &opened.handle,
+            in_git,
+        })
     }
 }
 
@@ -338,6 +464,44 @@ fn path_of(hold: &TreeHold, root: &DirHandle, entry: &Entry<'_>) -> String {
     )
 }
 
+/// The bits of an access mask that let a principal write, change or remove an object: the write
+/// rights of a file and a directory, and the generic write and all-access bits.
+const WRITE_BITS: u32 = 0x0000_0002
+    | 0x0000_0004
+    | 0x0000_0010
+    | 0x0000_0040
+    | 0x0000_0100
+    | 0x0001_0000
+    | 0x0004_0000
+    | 0x0008_0000
+    | 0x4000_0000
+    | 0x1000_0000;
+/// The flag of an entry that does not apply to the object itself, only to what is made in it later.
+const INHERIT_ONLY: u8 = 0x08;
+
+/// Whether an entry gives its principal a write right. An entry that is only a template for what
+/// the creator will own (creator owner and creator group, for objects made later) names nobody.
+fn gives_writing(entry: &ListEntry) -> bool {
+    let allows = entry.kind == 0 || entry.kind == 9;
+    let template =
+        entry.flags & INHERIT_ONLY != 0 && matches!(entry.sid.as_str(), "S-1-3-0" | "S-1-3-1");
+    allows && !template && entry.mask & WRITE_BITS != 0
+}
+
+/// Whether an identifier is the group of an invocation: the authority 9, the crate's first part
+/// and three more.
+fn is_stale(sid: &str) -> bool {
+    let Some(rest) = sid.strip_prefix("S-1-9-") else {
+        return false;
+    };
+    let parts: Vec<&str> = rest.split('-').collect();
+    parts.len() == 4
+        && parts[0] == INVOCATION_GROUP_FIRST.to_string()
+        && parts[1..]
+            .iter()
+            .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
 /// Admits the held tree or refuses it, naming the object and the right.
 ///
 /// # Errors
@@ -350,9 +514,14 @@ pub fn admit(
     client: &ClientIdentity,
     probes: &Probes,
 ) -> Result<Admitted, Refusal> {
+    let person = client
+        .user_sid
+        .to_text()
+        .map_err(|failure| failed(&failure))?;
     let mut checking = Checking {
         client,
         probes,
+        writers: [person, "S-1-5-18".to_owned(), "S-1-5-32-544".to_owned()],
         admitted: Admitted::default(),
     };
     checking.ancestors(hold)?;

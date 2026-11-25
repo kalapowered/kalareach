@@ -21,7 +21,7 @@ use windows_sys::Win32::Security::Authorization::{
 };
 use windows_sys::Win32::Security::{
     ACE_HEADER, ACL, GetAce, GetSecurityDescriptorControl, GetSecurityDescriptorDacl,
-    GetSecurityDescriptorOwner, SECURITY_ATTRIBUTES,
+    GetSecurityDescriptorOwner, LABEL_SECURITY_INFORMATION, SECURITY_ATTRIBUTES,
 };
 
 use super::ffi::{Handle, Result, Sid, error, last, wide};
@@ -389,6 +389,66 @@ impl OwnedSd {
 /// Returns an error when the platform cannot read the object's descriptor.
 pub fn summary_of_handle(handle: &Handle) -> Result<Summary> {
     summary_of_object(handle.raw(), SE_FILE_OBJECT)
+}
+
+/// The type of an entry in a system access list that sets an object's mandatory integrity level.
+const SYSTEM_MANDATORY_LABEL_ACE_TYPE: u8 = 0x11;
+
+/// Whether the open object carries a mandatory-label entry. The handle needs the right to read the
+/// descriptor.
+///
+/// # Errors
+///
+/// Returns an error when the platform cannot read the object's label.
+pub fn has_label_of_handle(handle: &Handle) -> Result<bool> {
+    let mut descriptor: *mut c_void = null_mut();
+    let mut list: *mut ACL = null_mut();
+    // SAFETY: the handle is open with the right to read the descriptor; the out-parameters are
+    // local, and the block they point into is freed below.
+    let code = unsafe {
+        GetSecurityInfo(
+            handle.raw(),
+            SE_FILE_OBJECT,
+            LABEL_SECURITY_INFORMATION,
+            null_mut(),
+            null_mut(),
+            null_mut(),
+            &raw mut list,
+            &raw mut descriptor,
+        )
+    };
+    if code != 0 {
+        // text: sd_has_label-1
+        return Err(error(code, "reading an object's label"));
+    }
+    let mut found = false;
+    let mut failure = None;
+    if !list.is_null() {
+        // SAFETY: the list pointer is inside the valid descriptor.
+        let count = unsafe { (*list).AceCount };
+        for index in 0..u32::from(count) {
+            let mut ace: *mut c_void = null_mut();
+            // SAFETY: the index is below the entry count.
+            if unsafe { GetAce(list, index, &raw mut ace) } == 0 {
+                // text: sd_has_label-2
+                failure = Some(last("reading a label entry"));
+                break;
+            }
+            // SAFETY: the platform returned a pointer to a whole entry, which starts with a header.
+            if unsafe { (*ace.cast::<ACE_HEADER>()).AceType } == SYSTEM_MANDATORY_LABEL_ACE_TYPE {
+                found = true;
+                break;
+            }
+        }
+    }
+    // SAFETY: the block came from the platform's allocator and is freed once.
+    unsafe {
+        LocalFree(descriptor);
+    }
+    match failure {
+        Some(failure) => Err(failure),
+        None => Ok(found),
+    }
 }
 
 /// What the descriptor of an open registry key says.
