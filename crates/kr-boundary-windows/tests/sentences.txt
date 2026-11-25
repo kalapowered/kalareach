@@ -717,6 +717,13 @@ ABSENT_NAME_WORDS | the repository holds a file or folder that the broker does n
 LISTING_BOUND_WORDS | the repository's hooks folder or info attributes file is larger than the broker reads | the repository's hooks folder or info attributes file is larger than the broker reads (at most 256 objects, 4 levels, 128 hook files, 255 bytes a name and 1 MiB a file) | read: the walk of the hooks folder passed 256 objects or 4 levels, or the folder held more than 128 objects, or a name relative to the Git folder was over 255 bytes (as the journal counts them), or a hook or info\attributes held more than 1 MiB
 listing_lost-1 | reading a hook or the attributes file of the repository | reading a hook or the attributes file of the repository: Windows error N | read: opening a hook, the attributes file or a folder of the listing relative to its held folder was refused by the platform with an error that is not a missing name
 listing_digest-1 | reading a hook or the attributes file of the repository | reading a hook or the attributes file of the repository: Windows error N | read: the duplicate of the handle of a hook or of the attributes file could not be made, or its read returned an error
+# ---- win/admission.rs (the admission of a held tree: what an object of the tree is refused for)
+SIBLING_WORDS | another boundary account has this right | X, the right: another boundary account has this right | read: AccessCheck of the probe token of a boundary class over the descriptor of an ancestor of the tree, of the tree's root or of an object of the tree, asked for one write right alone (rights::write_rights for the kind, or the ancestor rights), answered yes
+PERSON_LACKS_WORDS | your account does not have this right | X, the right: your account does not have this right | read: AccessCheck of the person's token over the descriptor of an object of the tree, asked for one of PERSON_RIGHTS alone, answered no
+SYSTEM_LACKS_WORDS | the broker does not have this right | X, the right: the broker does not have this right | read: AccessCheck of the broker's own token with its privileges off over the descriptor of an object of the tree, asked for one of SYSTEM_RIGHTS alone, answered no
+OPEN_WORDS | the broker cannot open this object | X: the broker cannot open this object | read: opening an object of the tree relative to its held directory, for its attributes and its descriptor, was refused by the platform
+LINK_WORDS | this object is a link, and the broker does not follow links | X: this object is a link, and the broker does not follow links | read: the attributes read from the handle of an object of the tree hold the reparse flag
+ADMISSION_FAILED_WORDS | the broker could not check the access lists of the project | the broker could not check the access lists of the project: the platform's error | read: the descriptor of an object could not be read, a probe token could not be made, the walk was refused by the platform or the tree is over a bound of the walk; the words follow after the colon
 
 # ---- the places of a form that carry no identifier, counted by file (tests/sentences.rs)
 listed | #[error] | env.rs | 1 | reaches no person: production builds only the proof block, which never lacks a tree
@@ -776,6 +783,7 @@ listed | pub const | limits.rs | 2 | names of rules, for cases and documents; no
 listed | pub const | standing.rs | 8 | names of rules, for cases and documents; no sentence for a person
 listed | pub const | repository/readers.rs | 8 | names, keys, limits, encodings and paths; no sentence for a person
 listed | pub const | win/hold.rs | 12 | names of rules, for cases and documents; no sentence for a person
+listed | pub const | win/admission.rs | 6 | names of rules, for cases and documents; no sentence for a person
 listed | pub const | win/install.rs | 3 | names, keys, limits, encodings and paths; no sentence for a person
 listed | pub const | win/verify.rs | 1 | names, keys, limits, encodings and paths; no sentence for a person
 listed | pub fn | env.rs | 2 | names, keys, limits, encodings and paths; no sentence for a person

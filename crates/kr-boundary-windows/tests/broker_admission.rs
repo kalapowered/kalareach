@@ -25,9 +25,21 @@ use kr_boundary_windows::slot::{Blocked, SlotTable};
 use kr_boundary_windows::win::ffi::wide_path;
 use kr_boundary_windows::win::hold::hold_tree;
 
-use common::Scratch;
-use common::people::{Person, prepare, runs_as_the_system};
+use kr_boundary_windows::frame::Class;
+use kr_boundary_windows::manifest::{Manifest, ObjectKind};
+use kr_boundary_windows::refusal::Refusal;
+use kr_boundary_windows::win::admission::{
+    ADMISSION_FAILED_WORDS, Admitted, LINK_WORDS, OPEN_WORDS, PERSON_LACKS_WORDS, Probes,
+    RULE_LINK, RULE_OPEN, RULE_PERSON_LACKS, RULE_SIBLING, RULE_SYSTEM_LACKS, SIBLING_WORDS,
+    SYSTEM_LACKS_WORDS, admit,
+};
+use kr_boundary_windows::win::ffi::Handle;
+use kr_boundary_windows::win::rights::{Right, Sd, may, probe_token};
+use kr_boundary_windows::win::sd::descriptor_from_text;
+
+use common::people::{Boundary, Person, acting_as, prepare, runs_as_the_system};
 use common::project::{Project, repository_at};
+use common::{Scratch, file_described, hostile_file, privileged, run};
 
 const SHARING_VIOLATION: i32 = 32;
 
@@ -261,4 +273,443 @@ fn broker_admission_every_spelling_of_one_tree_gives_one_chain_and_one_slot() {
     drop(holds);
     drop(reference);
     drop(substituted);
+}
+
+// ---------------------------------------------------------------------------------------------
+// The rights of every object
+// ---------------------------------------------------------------------------------------------
+
+/// The two boundary accounts of a case, one for each class, and the manifest that records them.
+struct Siblings {
+    checkout: Boundary,
+    connect: Boundary,
+    manifest: Manifest,
+}
+
+impl Siblings {
+    fn new() -> Siblings {
+        let checkout = Boundary::new("krsca");
+        let connect = Boundary::new("krscn");
+        let mut manifest = Manifest::begin();
+        manifest.record(
+            ObjectKind::Account,
+            "krb-checkout",
+            Some(&checkout.sid.to_text().unwrap()),
+        );
+        manifest.record(
+            ObjectKind::Account,
+            "krb-connect",
+            Some(&connect.sid.to_text().unwrap()),
+        );
+        Siblings {
+            checkout,
+            connect,
+            manifest,
+        }
+    }
+
+    /// The probe tokens, made now: a group that an account joined before this call is in its token.
+    fn probes(&self) -> Probes {
+        Probes::new(&self.manifest).expect("the probe tokens are made")
+    }
+}
+
+/// Holds the project's tree and asks for its admission.
+fn admit_project(
+    person: &Person,
+    siblings: &Siblings,
+    project: &Project,
+) -> Result<Admitted, Refusal> {
+    let client = person.as_client();
+    let hold = hold_tree(project.root.to_str().unwrap(), &client).expect("the tree is held");
+    admit(&hold, &client, &siblings.probes())
+}
+
+/// Adds an entry for `who` (a name, or `*` and an identifier) to the object's list.
+fn grant(path: &Path, who: &str, rights: &str) {
+    run(
+        "icacls",
+        &[path.to_str().unwrap(), "/grant", &format!("{who}:{rights}")],
+    );
+}
+
+const EVERYONE: &str = "*S-1-1-0";
+
+/// A local group with one member, or none, made before the probe tokens are.
+fn make_group(prefix: &str, member: &str) -> String {
+    let id = uuid::Uuid::new_v4().simple().to_string();
+    let name = format!("{prefix}{}", &id[..8]);
+    run("net", &["localgroup", &name, "/add"]);
+    if !member.is_empty() {
+        run("net", &["localgroup", &name, member, "/add"]);
+    }
+    name
+}
+
+fn display(path: &Path) -> String {
+    path.to_str().unwrap().to_owned()
+}
+
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn broker_admission_a_shared_read_is_reported_and_a_shared_write_refuses_naming_the_object() {
+    if !runs_as_the_system() {
+        eprintln!("skipped: the case needs the system's token");
+        return;
+    }
+    prepare();
+    let person = Person::new("krhap");
+    let siblings = Siblings::new();
+    let scratch = Scratch::on_drive();
+
+    // Nobody but the person, the system and the administrators has a right: no note, no refusal.
+    let alone = Project::make_private(&scratch, "alone", &person.sid);
+    let admitted = admit_project(&person, &siblings, &alone).expect("the private tree is admitted");
+    assert!(admitted.notes.is_empty(), "no note: {:?}", admitted.notes);
+
+    // Everyone may read: the read is reported by object and does not refuse.
+    let shared = Project::make_private(&scratch, "shared", &person.sid);
+    grant(&shared.root, EVERYONE, "(OI)(CI)R");
+    let admitted = admit_project(&person, &siblings, &shared).expect("a shared read is admitted");
+    let root = display(&shared.root);
+    let config = display(&shared.git.join("config"));
+    assert!(
+        admitted.notes.contains(&format!("shared-read: {root}")),
+        "the tree's root is reported: {:?}",
+        admitted.notes
+    );
+    assert!(
+        admitted.notes.contains(&format!("shared-read: {config}")),
+        "the config is reported: {:?}",
+        admitted.notes
+    );
+
+    // Everyone may modify, by an entry that every object takes: the tree is refused at its root and
+    // the reply names the root and the right.
+    let modify = Project::make_private(&scratch, "modify", &person.sid);
+    grant(&modify.root, EVERYONE, "(OI)(CI)M");
+    let refusal =
+        admit_project(&person, &siblings, &modify).expect_err("a shared modify entry refuses");
+    assert_eq!(refusal.rule, RULE_SIBLING);
+    assert_eq!(
+        refusal.detail(),
+        format!(
+            "{}, write data or add a file: {SIBLING_WORDS}",
+            display(&modify.root)
+        )
+    );
+    assert!(
+        !refusal.detail().contains(ADMISSION_FAILED_WORDS),
+        "a refusal for a right is not a failed check"
+    );
+}
+
+const DIRECTORY_RIGHTS: [(&str, &str); 8] = [
+    ("WD", "write data or add a file"),
+    ("AD", "append data or add a folder"),
+    ("WEA", "write extended attributes"),
+    ("WA", "write attributes"),
+    ("DC", "delete what is in the folder"),
+    ("D", "delete"),
+    ("WDAC", "change the access list"),
+    ("WO", "change the owner"),
+];
+
+const FILE_RIGHTS: [(&str, &str); 7] = [
+    ("WD", "write data or add a file"),
+    ("AD", "append data or add a folder"),
+    ("WEA", "write extended attributes"),
+    ("WA", "write attributes"),
+    ("D", "delete"),
+    ("WDAC", "change the access list"),
+    ("WO", "change the owner"),
+];
+
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn broker_admission_each_write_right_alone_refuses_the_tree_naming_that_right() {
+    if !runs_as_the_system() {
+        eprintln!("skipped: the case needs the system's token");
+        return;
+    }
+    prepare();
+    let person = Person::new("krhap");
+    let siblings = Siblings::new();
+    let scratch = Scratch::on_drive();
+    for (code, words) in DIRECTORY_RIGHTS {
+        let project = Project::make_private(&scratch, &format!("d-{code}"), &person.sid);
+        let folder = project.git.join("refs");
+        grant(&folder, EVERYONE, &format!("({code})"));
+        let refusal = admit_project(&person, &siblings, &project)
+            .expect_err(&format!("a folder that anyone may {words} refuses"));
+        assert_eq!(refusal.rule, RULE_SIBLING, "folder, {code}");
+        assert_eq!(
+            refusal.detail(),
+            format!("{}, {words}: {SIBLING_WORDS}", display(&folder)),
+            "folder, {code}"
+        );
+    }
+    for (code, words) in FILE_RIGHTS {
+        let project = Project::make_private(&scratch, &format!("f-{code}"), &person.sid);
+        let file = project.git.join("HEAD");
+        grant(&file, EVERYONE, &format!("({code})"));
+        let refusal = admit_project(&person, &siblings, &project)
+            .expect_err(&format!("a file that anyone may {words} refuses"));
+        assert_eq!(refusal.rule, RULE_SIBLING, "file, {code}");
+        assert_eq!(
+            refusal.detail(),
+            format!("{}, {words}: {SIBLING_WORDS}", display(&file)),
+            "file, {code}"
+        );
+    }
+}
+
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn broker_admission_the_probe_token_of_each_class_is_asked() {
+    if !runs_as_the_system() {
+        eprintln!("skipped: the case needs the system's token");
+        return;
+    }
+    prepare();
+    let person = Person::new("krhap");
+    let siblings = Siblings::new();
+    let scratch = Scratch::on_drive();
+    // A group that only one boundary account belongs to gives a right to that account's sibling
+    // alone. The groups are made before the probe tokens, which copy the account's groups.
+    let of_checkout = make_group("krgc", &siblings.checkout.name);
+    let of_connect = make_group("krgn", &siblings.connect.name);
+    let of_nobody = make_group("krgx", "");
+    for (label, group, refused) in [
+        ("checkout", &of_checkout, true),
+        ("connect", &of_connect, true),
+        ("nobody", &of_nobody, false),
+    ] {
+        let project = Project::make_private(&scratch, label, &person.sid);
+        let file = project.git.join("HEAD");
+        grant(&file, group, "(M)");
+        let outcome = admit_project(&person, &siblings, &project);
+        if refused {
+            let refusal = outcome.expect_err(&format!("a group of the {label} account refuses"));
+            assert_eq!(refusal.rule, RULE_SIBLING, "{label}");
+            assert_eq!(
+                refusal.detail(),
+                format!(
+                    "{}, write data or add a file: {SIBLING_WORDS}",
+                    display(&file)
+                ),
+                "{label}"
+            );
+        } else {
+            outcome.expect("a group that no boundary account belongs to refuses nothing");
+        }
+    }
+}
+
+/// The write rights of a file, each with its mask, in the order the plan lists them.
+const FILE_MASKS: [(Right, u32); 7] = [
+    (Right::WriteData, 0x0002),
+    (Right::AppendData, 0x0004),
+    (Right::WriteEa, 0x0010),
+    (Right::WriteAttributes, 0x0100),
+    (Right::Delete, 0x0001_0000),
+    (Right::WriteDac, 0x0004_0000),
+    (Right::WriteOwner, 0x0008_0000),
+];
+
+/// Whether an open of the file with this one right succeeds for a thread that acts as the token.
+fn opens_with(path: &Path, token: &Handle, mask: u32) -> bool {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    acting_as(Some(token), || {
+        fs::OpenOptions::new()
+            .access_mode(mask)
+            .share_mode(7)
+            .open(path)
+            .is_ok()
+    })
+}
+
+/// The descriptor of a file as an access check reads it.
+fn descriptor_of(path: &Path) -> Sd {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    use std::os::windows::io::IntoRawHandle as _;
+    let file = fs::OpenOptions::new()
+        .access_mode(0x0002_0000)
+        .share_mode(7)
+        .open(path)
+        .expect("the file opens for its descriptor");
+    let handle = Handle::new(file.into_raw_handle(), "a file").unwrap();
+    Sd::of_handle(&handle).expect("the descriptor reads")
+}
+
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn broker_admission_deny_owner_rights_and_generic_entries_agree_with_a_real_open() {
+    if !runs_as_the_system() {
+        eprintln!("skipped: the case needs the system's token");
+        return;
+    }
+    prepare();
+    let siblings = Siblings::new();
+    let scratch = Scratch::new();
+    let probe = probe_token(&siblings.manifest, Class::Checkout).expect("the probe token is made");
+    let owner = siblings.checkout.sid.to_text().unwrap();
+    // Each descriptor is protected, and gives the system control so that the case can clean up.
+    let table = [
+        (
+            "a deny entry before an allow entry",
+            "O:SYD:P(D;;0x2;;;WD)(A;;FA;;;SY)(A;;FA;;;WD)".to_owned(),
+            Some([false, true, true, true, true, true, true]),
+        ),
+        (
+            "a generic write entry",
+            "O:SYD:P(A;;FA;;;SY)(A;;GW;;;WD)".to_owned(),
+            Some([true, true, true, true, false, false, false]),
+        ),
+        (
+            "an owner rights entry on a file the account owns",
+            format!("O:{owner}D:P(A;;FA;;;SY)(A;;0x2;;;OW)(A;;0x1;;;WD)"),
+            None,
+        ),
+    ];
+    for (index, (what, text, expected)) in table.iter().enumerate() {
+        let path = scratch.path(&format!("object-{index}"));
+        privileged(|| file_described(&path, &descriptor_from_text(text).unwrap(), b"x"));
+        let descriptor = descriptor_of(&path);
+        let mut answers = Vec::new();
+        for (right, mask) in FILE_MASKS {
+            let computed = may(&probe, &descriptor, right);
+            let opened = opens_with(&path, &siblings.checkout.primary, mask);
+            assert_eq!(
+                computed, opened,
+                "{what}: the access check and a real open agree on {right:?}"
+            );
+            answers.push(computed);
+        }
+        if let Some(expected) = expected {
+            assert_eq!(&answers[..], &expected[..], "{what}: the answers");
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn broker_admission_a_right_the_person_or_the_broker_lacks_refuses_early_naming_it() {
+    if !runs_as_the_system() {
+        eprintln!("skipped: the case needs the system's token");
+        return;
+    }
+    prepare();
+    let person = Person::new("krhap");
+    let siblings = Siblings::new();
+    let scratch = Scratch::on_drive();
+    let who = person.sid.to_text().unwrap();
+
+    // The person may read it and may not change its list.
+    let project = Project::make_private(&scratch, "person", &person.sid);
+    let file = project.git.join("person-reads");
+    let person_may_not = format!("O:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1200a9;;;{who})");
+    file_described(&file, &descriptor_from_text(&person_may_not).unwrap(), b"x");
+    let refusal =
+        admit_project(&person, &siblings, &project).expect_err("the person lacks a right");
+    assert_eq!(refusal.rule, RULE_PERSON_LACKS);
+    assert_eq!(
+        refusal.detail(),
+        format!(
+            "{}, change the access list: {PERSON_LACKS_WORDS}",
+            display(&file)
+        )
+    );
+
+    // The broker may read it and may not change its list: the person owns it.
+    let project = Project::make_private(&scratch, "broker", &person.sid);
+    let file = project.git.join("broker-reads");
+    let broker_may_not = format!("O:{who}D:P(A;;FR;;;SY)(A;;FA;;;{who})");
+    privileged(|| file_described(&file, &descriptor_from_text(&broker_may_not).unwrap(), b"x"));
+    let refusal =
+        admit_project(&person, &siblings, &project).expect_err("the broker lacks a right");
+    assert_eq!(refusal.rule, RULE_SYSTEM_LACKS);
+    assert_eq!(
+        refusal.detail(),
+        format!(
+            "{}, change the access list: {SYSTEM_LACKS_WORDS}",
+            display(&file)
+        )
+    );
+
+    // The broker cannot open it at all.
+    let project = Project::make_private(&scratch, "closed", &person.sid);
+    let file = project.git.join("closed");
+    privileged(|| hostile_file(&file, &person.sid, b"x"));
+    let refusal =
+        admit_project(&person, &siblings, &project).expect_err("the broker cannot open it");
+    assert_eq!(refusal.rule, RULE_OPEN);
+    assert_eq!(
+        refusal.detail(),
+        format!("{}: {OPEN_WORDS}", display(&file))
+    );
+}
+
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn broker_admission_a_right_on_an_ancestor_refuses_only_when_it_deletes_or_changes_the_list() {
+    if !runs_as_the_system() {
+        eprintln!("skipped: the case needs the system's token");
+        return;
+    }
+    prepare();
+    let person = Person::new("krhap");
+    let siblings = Siblings::new();
+    let scratch = Scratch::on_drive();
+
+    // The right to add to a folder above the tree is not refused.
+    let project = Project::make_private(&scratch, "adds", &person.sid);
+    grant(&project.mid, EVERYONE, "(WD,AD)");
+    admit_project(&person, &siblings, &project)
+        .expect("the right to add above the tree is admitted");
+
+    // Each of the rights that delete or change the list is refused, naming the folder.
+    for (label, folder, code, words) in [
+        ("children", "mid", "DC", "delete what is in the folder"),
+        ("itself", "parent", "D", "delete"),
+        ("list", "top", "WDAC", "change the access list"),
+        ("owner", "base", "WO", "change the owner"),
+    ] {
+        let project = Project::make_private(&scratch, label, &person.sid);
+        let above = match folder {
+            "mid" => project.mid.clone(),
+            "parent" => project.parent.clone(),
+            "top" => project.top.clone(),
+            _ => project.base.clone(),
+        };
+        grant(&above, EVERYONE, &format!("({code})"));
+        let refusal = admit_project(&person, &siblings, &project)
+            .expect_err(&format!("a right to {words} on {folder} refuses"));
+        assert_eq!(refusal.rule, RULE_SIBLING, "{label}");
+        assert_eq!(
+            refusal.detail(),
+            format!("{}, {words}: {SIBLING_WORDS}", display(&above)),
+            "{label}"
+        );
+    }
+
+    // A link inside the tree is refused by name; the broker does not follow it.
+    let project = Project::make_private(&scratch, "link", &person.sid);
+    let link = project.root.join("link");
+    run(
+        "cmd",
+        &[
+            "/c",
+            "mklink",
+            "/J",
+            link.to_str().unwrap(),
+            project.top.to_str().unwrap(),
+        ],
+    );
+    let refusal = admit_project(&person, &siblings, &project).expect_err("a link refuses");
+    assert_eq!(refusal.rule, RULE_LINK);
+    assert_eq!(
+        refusal.detail(),
+        format!("{}: {LINK_WORDS}", display(&link))
+    );
 }

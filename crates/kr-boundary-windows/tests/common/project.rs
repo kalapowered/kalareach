@@ -3,6 +3,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use kr_boundary_windows::win::ffi::Sid;
+
 use super::{Scratch, run};
 
 /// The repository's configuration: what Git writes for a repository of its own, shortened.
@@ -40,6 +42,27 @@ impl Project {
             "icacls",
             &[base.to_str().unwrap(), "/grant", "*S-1-1-0:(OI)(CI)F"],
         );
+        Project::laid_out(base)
+    }
+
+    /// Makes the folders and the repository's files for a person alone: the lists give the person,
+    /// the system and the administrators full control and nobody else anything, so that a refusal
+    /// below comes from the list a case adds.
+    pub fn make_private(scratch: &Scratch, label: &str, person: &Sid) -> Project {
+        let base = scratch.path(label);
+        fs::create_dir_all(&base).unwrap();
+        run(
+            "icacls",
+            &[
+                base.to_str().unwrap(),
+                "/grant",
+                &format!("*{}:(OI)(CI)F", person.to_text().unwrap()),
+            ],
+        );
+        Project::laid_out(base)
+    }
+
+    fn laid_out(base: PathBuf) -> Project {
         let top = base.join("t");
         let mid = top.join("mid");
         let parent = mid.join("parent");

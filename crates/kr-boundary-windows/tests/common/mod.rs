@@ -49,6 +49,17 @@ impl Scratch {
         Scratch { dir }
     }
 
+    /// A folder directly under the drive's root that only the system and the administrators can
+    /// use, so that no list above a case's tree gives anyone else a right.
+    pub fn on_drive() -> Scratch {
+        let id = uuid::Uuid::new_v4().simple().to_string();
+        let dir = PathBuf::from(r"C:\").join(format!("kradm-{}", &id[..12]));
+        std::fs::create_dir_all(&dir).unwrap();
+        let admin_only = descriptor(SdKind::AdminDir, &Principals::default()).unwrap();
+        acl::set_protected(&dir, &admin_only).unwrap();
+        Scratch { dir }
+    }
+
     pub fn path(&self, name: &str) -> PathBuf {
         self.dir.join(name)
     }
@@ -128,7 +139,11 @@ pub fn hostile_descriptor(owner: &Sid) -> OwnedSd {
 /// Makes a file with a hostile descriptor. The caller holds a guard that enables the restore
 /// privilege, which an owner other than the caller needs.
 pub fn hostile_file(path: &Path, owner: &Sid, bytes: &[u8]) {
-    let descriptor = hostile_descriptor(owner);
+    file_described(path, &hostile_descriptor(owner), bytes);
+}
+
+/// Makes a file with the descriptor given, under the same condition as [`hostile_file`].
+pub fn file_described(path: &Path, descriptor: &OwnedSd, bytes: &[u8]) {
     let attributes = descriptor.attributes();
     let wide = wide_path(path);
     // SAFETY: the path is NUL-terminated and the attributes point at a descriptor that lives

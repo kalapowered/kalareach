@@ -20,6 +20,7 @@
 //! | `journal` | The journal's file: each row written through before the step it protects, and read back after a crash |
 //! | `channel` | An invocation's data pipes: the two named pipes that carry Git's output to the client |
 //! | `client` | The client of an invocation: its process and token, known from the pipe and never from a message |
+//! | `admission` | The admission of a held tree: the rights each object gives a sibling, the person and the broker |
 //! | `rights` | What a token may do to an object, computed from the object's descriptor: the person's, the broker's own and a sibling's |
 //! | `session` | The system's logon sessions: the session of a token, the list, and the wait until one is gone |
 //! | `scan` | The detector scan of an invocation's end: every process, looked at once |
@@ -34,6 +35,7 @@
 
 pub mod account;
 pub mod acl;
+pub mod admission;
 pub mod applocker;
 pub mod boot;
 pub mod broker;
