@@ -288,8 +288,8 @@ const CONTROLS: [Control; 33] = [
         owner: "ACP-7c",
         waits: true,
         shows: "a decline sends the Gemini-shaped agent's client no update, so the receipt stays dispatching until the next request, the reply or the deadline of 300 seconds",
-        mutation: "a decline counted as applied at dispatch",
-        red: "the receipt reads applied with no evidence",
+        mutation: "a decline counted as applied at dispatch, or the next request and the reply not taken as evidence of a decline",
+        red: "the receipt reads applied at dispatch, or the receipts at the boundaries do not read unknown, applied and applied",
     },
     Control {
         id: "5b-14",

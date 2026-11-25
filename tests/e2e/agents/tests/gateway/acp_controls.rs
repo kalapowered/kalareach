@@ -1370,14 +1370,15 @@ pub struct Declines {
 }
 
 /// 5b-13: a Gemini-shaped agent sends no update after a decline, so each receipt stays
-/// `dispatching` until the deadline, the agent's next request or its reply, and then reads
-/// `unknown`.
+/// `dispatching` until its boundary. The first reads `unknown` at the deadline. The second reads
+/// `applied` at the agent's next request and the third at its reply, because no cancel followed
+/// either dispatch and so both are evidence for a decline.
 pub fn a_decline_stays_dispatching_until_a_boundary(read: &Declines) -> Result<(), Red> {
     ensure(
         read.dispatched
             .iter()
             .all(|receipt| receipt == "dispatching")
-            && read.settled.iter().all(|receipt| receipt == "unknown"),
+            && read.settled == ["unknown", "applied", "applied"],
         "5b-13",
     )
 }
@@ -1490,11 +1491,11 @@ pub fn three_declines_and_no_update(host: &mut Hosted) -> Result<(), Red> {
     let second = host.receipt_becoming("applied");
     host.release("third");
     host.waits_for_a_request();
-    let second_settled = host.receipt_becoming("unknown");
+    let second_settled = host.receipt_becoming("applied");
     host.answer_next("cancel");
     let third = host.receipt_becoming("applied");
     host.release("reply");
-    let third_settled = host.receipt_becoming("unknown");
+    let third_settled = host.receipt_becoming("applied");
     a_decline_stays_dispatching_until_a_boundary(&Declines {
         dispatched: [first, second, third],
         settled: [first_settled, second_settled, third_settled],
@@ -1541,33 +1542,45 @@ fn the_judge_of_a_late_request_of_a_waiting_agent_names_its_red_when_the_request
 }
 
 #[test]
-fn the_judge_of_the_declines_names_its_red_when_a_decline_is_counted_applied_at_dispatch() {
+fn the_judge_of_the_declines_names_its_red_at_dispatch_and_at_each_boundary() {
     let read = |dispatched: [&str; 3], settled: [&str; 3]| Declines {
         dispatched: dispatched.map(str::to_owned),
         settled: settled.map(str::to_owned),
     };
     let held = ["dispatching"; 3];
-    let settled = ["unknown"; 3];
+    let settled = ["unknown", "applied", "applied"];
     assert_eq!(
         a_decline_stays_dispatching_until_a_boundary(&read(held, settled)),
         Ok(())
     );
     for at in 0..3 {
-        let mut counted = held;
-        counted[at] = "applied";
-        assert_eq!(
-            a_decline_stays_dispatching_until_a_boundary(&read(counted, ["applied"; 3])),
-            Err(red("5b-13")),
-            "decline {at} was counted applied at dispatch"
-        );
-        let mut unsettled = settled;
-        unsettled[at] = "dispatching";
-        assert_eq!(
-            a_decline_stays_dispatching_until_a_boundary(&read(held, unsettled)),
-            Err(red("5b-13")),
-            "the boundary of decline {at} did not settle it"
-        );
+        for wrong in ["applied", "unknown"] {
+            let mut counted = held;
+            counted[at] = wrong;
+            assert_eq!(
+                a_decline_stays_dispatching_until_a_boundary(&read(counted, settled)),
+                Err(red("5b-13")),
+                "decline {at} reads {wrong} at dispatch"
+            );
+        }
+        for wrong in ["dispatching", "unknown", "applied"] {
+            if wrong == settled[at] {
+                continue;
+            }
+            let mut other = settled;
+            other[at] = wrong;
+            assert_eq!(
+                a_decline_stays_dispatching_until_a_boundary(&read(held, other)),
+                Err(red("5b-13")),
+                "decline {at} reads {wrong} at its boundary"
+            );
+        }
     }
+    assert_eq!(
+        a_decline_stays_dispatching_until_a_boundary(&read(held, ["unknown"; 3])),
+        Err(red("5b-13")),
+        "a product that takes the next request and the reply for no evidence reads unknown three times"
+    );
 }
 
 #[test]
