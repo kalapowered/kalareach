@@ -1486,7 +1486,8 @@ impl PersonPlan {
     /// # Panics
     ///
     /// Panics when a tree or a file cannot be looked at, for any reason other than its not being
-    /// there, or when a file the guard names is a symbolic link.
+    /// there, when a file the guard names is a symbolic link, or when a shared file is one that
+    /// the end read refuses.
     #[must_use]
     pub fn take(self, home: &Path) -> PersonGuard {
         let watch = match &self {
@@ -1642,6 +1643,24 @@ fn is_a_guarded_file(opened: &std::fs::Metadata, guarded: &[PathBuf]) -> Result<
     Ok(false)
 }
 
+/// Why `file`, a handle's or a name's metadata, is not one to read for the run's name: it is not a
+/// regular file, has more than one name, has the device and inode of a file in `seen`, or is larger
+/// than the byte limit. None where it may be read.
+fn refusal_of(file: &std::fs::Metadata, seen: &BTreeSet<(u64, u64)>) -> Option<Unread> {
+    use std::os::unix::fs::MetadataExt as _;
+    if !file.is_file() {
+        Some(Unread::NotAFile)
+    } else if file.nlink() != 1 {
+        Some(Unread::ManyNames)
+    } else if seen.contains(&(file.dev(), file.ino())) {
+        Some(Unread::GuardedFile)
+    } else if file.len() > SHARED_LIMIT {
+        Some(Unread::TooLarge)
+    } else {
+        None
+    }
+}
+
 /// Opens the shared file at `path` with no link followed and no wait, and checks the handle before
 /// a byte is read: a regular file, with one name, that is no guarded file (by the device and inode
 /// of any file the guard saw at a guarded name, `seen`, or by the guarded names now) and is within
@@ -1652,7 +1671,6 @@ fn open_shared(
     seen: &BTreeSet<(u64, u64)>,
 ) -> Result<Option<std::fs::File>, Unread> {
     use rustix::fs::{Mode, OFlags};
-    use std::os::unix::fs::MetadataExt as _;
     let handle = match rustix::fs::open(
         path,
         OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
@@ -1665,17 +1683,11 @@ fn open_shared(
     };
     let file = std::fs::File::from(handle);
     let opened = file.metadata().map_err(|_| Unread::Failed)?;
-    if !opened.is_file() {
-        return Err(Unread::NotAFile);
+    if let Some(unread) = refusal_of(&opened, seen) {
+        return Err(unread);
     }
-    if opened.nlink() != 1 {
-        return Err(Unread::ManyNames);
-    }
-    if seen.contains(&(opened.dev(), opened.ino())) || is_a_guarded_file(&opened, guarded)? {
+    if is_a_guarded_file(&opened, guarded)? {
         return Err(Unread::GuardedFile);
-    }
-    if opened.len() > SHARED_LIMIT {
-        return Err(Unread::TooLarge);
     }
     Ok(Some(file))
 }
@@ -1770,11 +1782,13 @@ fn shared_names_the_run(
 /// `lstat` alone, never read: its kind, permissions, device, inode, size and times are compared,
 /// and its owner on its own. A guarded name that is a symbolic link is refused when the guard is
 /// taken, since a write through it changes the target and not the link, and so is a shared name,
-/// which would not be read. A shared file, which the person's own sessions also write, is not
-/// looked at until the end of the run. It is then opened with no link followed and no wait; its
-/// opened handle must be a regular file with one name that is not a guarded file; and it is read
-/// once, up to a byte limit and within a time bound, for the run's directory name and mark. Nothing
-/// of what is read is kept, and a file that fails these checks is not read and stops the run. A
+/// which would not be read. A shared file, which the person's own sessions also write, is looked
+/// at by metadata when the guard is taken, where one that the end read would refuse is refused
+/// too, and is not read until the end of the run. It is then opened with no link followed and no
+/// wait; its opened handle must be a regular file with one name that is not a guarded file; and it
+/// is read once, up to a byte limit and within a time bound, for the run's directory name and
+/// mark. Nothing of what is read is kept, and a file that fails these checks is not read and stops
+/// the run. A
 /// file that is the same file as a guarded file is not read: the guard keeps the device and inode
 /// of each guarded file from the take and from every later look, and refuses a handle with one of
 /// them, or with the one a guarded name holds at the end, so a guarded file moved or linked over
@@ -1800,7 +1814,10 @@ impl FileGuard {
     ///
     /// Panics when a guarded or a shared file cannot be looked at, for any reason other than its
     /// not being there, or is a symbolic link: a file whose state is not known cannot be shown
-    /// unchanged, and a link would hide the file it points to.
+    /// unchanged, and a link would hide the file it points to. It panics too when a shared file is
+    /// one that the end read refuses (not a regular file, with more than one name, the same file as
+    /// a guarded file, or too large): the run would otherwise spend its turns and stop only at the
+    /// end.
     fn take(home: &Path, guarded: &[String], shared: &[String]) -> Self {
         let look = |relative: &String| {
             seen_by_lstat(&home.join(relative)).unwrap_or_else(|error| {
@@ -1820,18 +1837,29 @@ impl FileGuard {
                 (relative.clone(), seen)
             })
             .collect();
-        for relative in shared {
-            assert!(
-                !look(relative).is_some_and(|seen| seen.link),
-                "the person's file ~/{relative} is a symbolic link, which the guard does not \
-                 read, so it could not be searched for the run's name at the end: replace the \
-                 link with a file before a real run"
-            );
-        }
-        let seen = guarded
+        let seen: BTreeSet<(u64, u64)> = guarded
             .iter()
             .filter_map(|(_, seen)| seen.map(|seen| (seen.stamp.device, seen.stamp.inode)))
             .collect();
+        for relative in shared {
+            match std::fs::symlink_metadata(home.join(relative)) {
+                Ok(metadata) => {
+                    assert!(
+                        !metadata.file_type().is_symlink(),
+                        "the person's file ~/{relative} is a symbolic link, which the guard does \
+                         not read, so it could not be searched for the run's name at the end: \
+                         replace the link with a file before a real run"
+                    );
+                    if let Some(unread) = refusal_of(&metadata, &seen) {
+                        panic!("the person's file ~/{relative} {}", unread.said());
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    panic!("the person's file ~/{relative} cannot be looked at: {error}")
+                }
+            }
+        }
         Self {
             home: home.to_path_buf(),
             guarded,
@@ -4583,12 +4611,16 @@ mod tests {
             Some(Vec::new()),
             "the guard did not finish: it read a guarded file, or stopped on one it could not read"
         );
-        // The shared file as a named pipe: taken, and compared before the end, with no read of it.
-        std::fs::remove_file(home.join(".claude.json")).expect("removed");
-        make_pipe(&home.join(".claude.json"));
+        // The shared file as a named pipe, made after the take: compared before the end, with no
+        // read of it.
         let looked = within(20, {
             let (home, plan) = (home.clone(), claude_plan());
-            move || plan.take(&home).compare().0
+            move || {
+                let guard = plan.take(&home);
+                std::fs::remove_file(home.join(".claude.json")).expect("removed");
+                make_pipe(&home.join(".claude.json"));
+                guard.compare().0
+            }
         });
         assert_eq!(
             looked,
@@ -4737,6 +4769,93 @@ mod tests {
         )
     }
 
+    /// What the take refuses a shared file with, for `reason`: the end read's text, after the
+    /// person's file.
+    fn take_not_read(reason: &str) -> String {
+        format!("the person's file {}", not_read(reason))
+    }
+
+    /// The text of the panic with which the take of the claude-code guard from `home` is refused.
+    fn why_the_take_is_refused(home: &Path) -> String {
+        let taken =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| claude_plan().take(home)));
+        panic_text(&*taken.expect_err("the take refuses a shared file the end read would refuse"))
+    }
+
+    #[test]
+    fn a_named_pipe_at_the_shared_name_is_refused_when_the_guard_is_taken() {
+        let home = claude_home("take-pipe");
+        std::fs::remove_file(home.join(".claude.json")).expect("removed");
+        make_pipe(&home.join(".claude.json"));
+        assert_eq!(
+            why_the_take_is_refused(&home),
+            take_not_read("is not a regular file and is not read")
+        );
+        std::fs::remove_dir_all(&home).expect("clean up");
+    }
+
+    #[test]
+    fn a_directory_at_the_shared_name_is_refused_when_the_guard_is_taken() {
+        let home = claude_home("take-directory");
+        std::fs::remove_file(home.join(".claude.json")).expect("removed");
+        std::fs::create_dir(home.join(".claude.json")).expect("a directory");
+        assert_eq!(
+            why_the_take_is_refused(&home),
+            take_not_read("is not a regular file and is not read")
+        );
+        std::fs::remove_dir_all(&home).expect("clean up");
+    }
+
+    #[test]
+    fn a_second_name_at_the_shared_name_is_refused_when_the_guard_is_taken() {
+        let home = claude_home("take-second-name");
+        std::fs::remove_file(home.join(".claude.json")).expect("removed");
+        std::fs::hard_link(
+            home.join(".claude/settings.json"),
+            home.join(".claude.json"),
+        )
+        .expect("a second name");
+        assert_eq!(
+            why_the_take_is_refused(&home),
+            take_not_read("has more than one name and is not read")
+        );
+        std::fs::remove_dir_all(&home).expect("clean up");
+    }
+
+    #[test]
+    fn a_shared_file_larger_than_the_limit_is_refused_when_the_guard_is_taken() {
+        let home = claude_home("take-large");
+        let file = std::fs::File::create(home.join(".claude.json")).expect("a file");
+        file.set_len(SHARED_LIMIT + 1).expect("a size");
+        assert_eq!(
+            why_the_take_is_refused(&home),
+            take_not_read("is larger than 16777216 bytes and is not read")
+        );
+        // A file of the limit's size is taken.
+        file.set_len(SHARED_LIMIT).expect("a size");
+        let taken =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| claude_plan().take(&home)));
+        assert!(taken.is_ok(), "a file of the limit's size is refused");
+        std::fs::remove_dir_all(&home).expect("clean up");
+    }
+
+    #[test]
+    fn a_file_with_the_device_and_inode_of_a_guarded_file_is_refused_by_the_shared_checks() {
+        use std::os::unix::fs::MetadataExt as _;
+        let home = scratch("refusal-identity");
+        std::fs::write(home.join("file"), b"one").expect("a file");
+        let metadata = std::fs::metadata(home.join("file")).expect("a look");
+        let mut seen = BTreeSet::new();
+        assert_eq!(refusal_of(&metadata, &seen), None);
+        // The device alone, or the inode alone, is another file.
+        seen.insert((metadata.dev() + 1, metadata.ino()));
+        seen.insert((metadata.dev(), metadata.ino() + 1));
+        assert_eq!(refusal_of(&metadata, &seen), None);
+        seen.insert((metadata.dev(), metadata.ino()));
+        assert_eq!(refusal_of(&metadata, &seen), Some(Unread::GuardedFile));
+        std::fs::remove_dir_all(&home).expect("clean up");
+    }
+
     /// The stops of the end compare of a guard taken from `home` after `home` stands as `change`
     /// makes it, on a thread with a bound: none where it did not finish.
     fn end_stops_after(home: &Path, change: impl FnOnce(&Path)) -> Option<Vec<Stop>> {
@@ -4761,6 +4880,8 @@ mod tests {
             Some(vec![not_read("is not a regular file and is not read")]),
             "the end read waited on a named pipe, or read it"
         );
+        std::fs::remove_file(home.join(".claude.json")).expect("removed");
+        std::fs::write(home.join(".claude.json"), b"{}").expect("a file");
         let stops = end_stops_after(&home, |home| {
             std::fs::remove_file(home.join(".claude.json")).expect("removed");
             std::fs::create_dir(home.join(".claude.json")).expect("a directory");
@@ -4809,17 +4930,23 @@ mod tests {
             PLANTED_IN_CREDENTIALS,
         )
         .expect("a write");
-        std::fs::remove_file(home.join(".claude.json")).expect("removed");
-        std::fs::hard_link(
-            home.join(".claude/.credentials.json"),
-            home.join(".claude.json"),
-        )
-        .expect("a second name");
-        let stops = end_stops_after(&home, |_| {}).expect("the end compare finished");
-        assert_eq!(
-            stops.into_iter().map(|(_, why)| why).collect::<Vec<_>>(),
-            vec![not_read("has more than one name and is not read")],
-            "the second name of a guarded file was read"
+        let stops = end_stops_after(&home, |home| {
+            std::fs::remove_file(home.join(".claude.json")).expect("removed");
+            std::fs::hard_link(
+                home.join(".claude/.credentials.json"),
+                home.join(".claude.json"),
+            )
+            .expect("a second name");
+        })
+        .expect("the end compare finished");
+        let said: Vec<&str> = stops.iter().map(|(_, why)| why.as_str()).collect();
+        assert!(
+            said.contains(&not_read("has more than one name and is not read").as_str()),
+            "{said:?}"
+        );
+        assert!(
+            !said.iter().any(|why| why.contains("now holds")),
+            "the second name of a guarded file was read: {said:?}"
         );
         std::fs::remove_dir_all(&home).expect("clean up");
     }
