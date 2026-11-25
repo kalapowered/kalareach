@@ -265,10 +265,11 @@ impl Hosted {
     /// Starts the stand-in of `shape` with `script` through the launch: the native program for
     /// Qoder, and for Gemini the script package that the interpreter stand-in runs. `source` says
     /// where it runs from: the verified copy, as every agent the host starts does, or the
-    /// installation itself, as only the harness can start it. When the script holds no turn of the
-    /// agent's own, it sends a prompt and returns once the agent's first request is pending and
-    /// read; when it holds one, it returns once the agent runs, and the case releases the file that
-    /// starts the turn and sends the prompts it needs.
+    /// installation itself, as only the harness can start it. The call returns once the agent has
+    /// answered `session/new`, so the record holds `initialize` and `session/new`. When the script
+    /// holds no turn of the agent's own, it also sends a prompt and returns once the agent's first
+    /// request is pending and read; when it holds one, the case releases the file that starts the
+    /// turn and sends the prompts it needs.
     pub fn start(_shape: Shape, _source: Source, _script: &Value) -> Result<Self, &'static str> {
         Err(super::NO_HOST)
     }
@@ -335,13 +336,17 @@ impl Hosted {
         match *self {}
     }
 
-    /// Starts a second instance of the agent in the session, with `script`.
+    /// Starts a second instance of the agent in the session, with `script`, and returns once that
+    /// agent's first request is pending and read, as [`Hosted::start`] does for a script that holds
+    /// no turn of the agent's own.
     pub fn second_instance(&mut self, _script: &Value) {
         match *self {}
     }
 
     /// The numbers, in the agent's own numbering, of the agent's requests that the host lists as
-    /// pending for the session, once it lists one or after five seconds when it lists none.
+    /// pending for the session, as soon as it lists one, or after five seconds when it lists none.
+    /// It does not wait for a particular request: a case that expects one reads the record first,
+    /// with [`Hosted::record_after`].
     pub fn pending_agent_requests(&mut self) -> Vec<u64> {
         match *self {}
     }
@@ -429,13 +434,12 @@ pub fn a_fresh_request_after_a_restart(host: &mut Hosted) -> Result<(), Red> {
     host.kill_daemon();
     host.restart_daemon();
     host.release("second");
-    let pending = host.pending_agent_requests();
     requires(
         "5b-8",
-        sent_request(&host.record(), 1),
+        sent_request(&host.record_after("request", 2), 1),
         "the stand-in did not send its second request",
     );
-    a_fresh_request_appears(&pending)
+    a_fresh_request_appears(&host.pending_agent_requests())
 }
 
 /// A record line that is the response to request 0 with the chosen option.
