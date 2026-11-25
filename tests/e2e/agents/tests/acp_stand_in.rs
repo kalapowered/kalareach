@@ -10,7 +10,7 @@ use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::time::Duration;
 
-use kr_e2e_agents::acp_agent::{MARKER_FILE, RECORD_FILE, SCRIPT_FILE, check_script};
+use kr_e2e_agents::acp_agent::{MARKER_FILE, RECORD_FILE, SCRIPT_FILE, Shape, check_script, run};
 use serde_json::{Value, json};
 
 /// How long a test waits for a frame that must come.
@@ -917,4 +917,167 @@ fn the_package_files_begin_with_the_interpreter_line_and_hold_only_comments() {
     for line in lines.chain(chunk.lines()) {
         assert!(line.starts_with("//"), "a line that is no comment: {line}");
     }
+}
+
+/// The standard output of an agent that runs in the test's own process. For each frame the agent
+/// writes it checks that the record already holds the line that says the agent sent that frame, so
+/// a reader that has seen the frame finds the line.
+struct Checking {
+    /// The agent's working directory.
+    directory: PathBuf,
+    /// The bytes of the frame that is being written.
+    frame: Vec<u8>,
+    /// The kinds of frame that were checked.
+    checked: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl Checking {
+    /// The record line that says the agent sent `frame`, and the kind of frame, or none for a frame
+    /// that has no line.
+    fn line_of(frame: &Value) -> Option<(&'static str, Value)> {
+        let update = &frame["params"]["update"];
+        if frame["method"] == "session/request_permission" {
+            Some((
+                "request",
+                json!({ "sent": "request", "id": frame["id"], "call": frame["params"]["toolCall"]["toolCallId"] }),
+            ))
+        } else if frame["result"]["stopReason"].is_string() {
+            Some((
+                "reply",
+                json!({ "sent": "reply", "id": frame["id"], "stop": frame["result"]["stopReason"] }),
+            ))
+        } else if update["sessionUpdate"] == "tool_call_update" {
+            Some((
+                "update",
+                json!({ "sent": "update", "call": update["toolCallId"], "status": update["status"] }),
+            ))
+        } else if update["content"]["text"]
+            .as_str()
+            .is_some_and(|text| text.starts_with("tick"))
+        {
+            Some((
+                "tick",
+                json!({ "sent": "tick", "text": update["content"]["text"] }),
+            ))
+        } else {
+            None
+        }
+    }
+}
+
+impl std::io::Write for Checking {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.frame.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        let frame = std::mem::take(&mut self.frame);
+        let Ok(frame) = serde_json::from_slice::<Value>(&frame) else {
+            return Ok(());
+        };
+        if let Some((kind, line)) = Self::line_of(&frame) {
+            let record =
+                std::fs::read_to_string(self.directory.join(RECORD_FILE)).unwrap_or_default();
+            let held = record
+                .lines()
+                .filter_map(|held| serde_json::from_str::<Value>(held).ok())
+                .any(|held| held == line);
+            assert!(
+                held,
+                "the record holds no line {line} when the frame {frame} is written"
+            );
+            self.checked.lock().expect("a lock").push(kind.to_owned());
+        }
+        Ok(())
+    }
+}
+
+#[test]
+fn the_record_holds_the_line_of_each_frame_before_the_frame_is_written() {
+    let directory = tempfile::tempdir().expect("a working directory");
+    let script = json!({
+        "turns": [[
+            { "say": "going to run it" },
+            { "call": { "id": "c1", "kind": "execute" } },
+            { "ask": "c1" },
+            { "when": { "outcome": "allowed", "then": [
+                { "update": { "call": "c1", "status": "in_progress" } },
+                { "update": { "call": "c1", "status": "completed" } },
+            ] } },
+            { "end": "end_turn" },
+        ]],
+        "ticks": [{ "after": "go", "say": "tick 1" }],
+    });
+    std::fs::write(directory.path().join(SCRIPT_FILE), script.to_string()).expect("the script");
+    std::fs::write(directory.path().join("go"), b"go").expect("the file of the tick");
+    let frames = [
+        json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {} }),
+        json!({ "jsonrpc": "2.0", "id": 2, "method": "session/new", "params": {} }),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "session/prompt",
+            "params": { "sessionId": "stand-in-session", "prompt": [{ "type": "text", "text": "run it" }] },
+        }),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 0,
+            "result": { "outcome": { "outcome": "selected", "optionId": "proceed_once" } },
+        }),
+    ];
+    let input: String = frames.iter().map(|frame| format!("{frame}\n")).collect();
+    let checked = std::sync::Arc::default();
+    let output = Checking {
+        directory: directory.path().to_path_buf(),
+        frame: Vec::new(),
+        checked: std::sync::Arc::clone(&checked),
+    };
+    let code = run(
+        Shape::Qoder,
+        directory.path(),
+        None,
+        std::io::Cursor::new(input.into_bytes()),
+        output,
+    )
+    .expect("the stand-in runs");
+    assert_eq!(code, 0);
+    let mut kinds = checked.lock().expect("a lock").clone();
+    kinds.sort();
+    assert_eq!(
+        kinds,
+        ["reply", "request", "tick", "update", "update"],
+        "each kind of frame that has a line was checked"
+    );
+}
+
+#[test]
+fn the_gemini_shaped_agent_waits_at_a_cancel_whatever_its_script_says() {
+    let package = installed_package();
+    let script = json!({ "turns": [[
+        { "call": { "id": "c1", "kind": "execute" } },
+        { "ask": "c1" },
+        { "end": "end_turn" },
+    ]] });
+    let mut agent = gemini_from(package.path(), &script);
+    agent.open_session();
+    agent.prompt(3, "run it");
+    for _ in 0..2 {
+        agent.frame();
+    }
+    agent.send(
+        &json!({ "jsonrpc": "2.0", "method": "session/cancel", "params": { "sessionId": "stand-in-session" } }),
+    );
+    assert!(
+        agent.is_quiet(),
+        "the agent goes on waiting for the answer to its request"
+    );
+    agent.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 0,
+        "result": { "outcome": { "outcome": "cancelled" } },
+    }));
+    let reply = agent.frame();
+    assert_eq!(reply["id"], 3);
+    assert_eq!(reply["result"]["stopReason"], "end_turn");
 }

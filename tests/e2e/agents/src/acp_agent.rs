@@ -5,13 +5,14 @@
 //! The stand-in reads a script from [`SCRIPT_FILE`] in its working directory and appends one line
 //! to [`RECORD_FILE`] there for each frame it receives, for each tick, request, update and reply it
 //! sends, for the end of a turn of its own and for the end of its input, so a case reads what the
-//! agent saw and did. It reads no environment name: the launcher passes the agent the names of an
-//! allowlist and no others.
+//! agent saw and did. The line of a frame that the agent sends goes to the record before the frame
+//! goes out, so a reader that has seen the frame finds its line. It reads no environment name: the
+//! launcher passes the agent the names of an allowlist and no others.
 //!
 //! A script is `{"turns": [...], "ticks": [...], "exit_after": "name", "own": [...], "cancel":
-//! "settle", "on_cancel": [...], "version": "text", "survive_end_of_input": false}`. The k-th prompt of the client runs the k-th
-//! turn, which is a list of steps; a prompt with no turn left is answered at once with the stop
-//! reason `end_turn`. A tick is `{"after": "name", "say": "text"}`: when the file `name` appears in
+//! "settle", "on_cancel": [...], "version": "text", "survive_end_of_input": false}`. The k-th
+//! prompt of the client runs the k-th turn, which is a list of steps; a prompt with no turn left is
+//! answered at once with the stop reason `end_turn`. A tick is `{"after": "name", "say": "text"}`: when the file `name` appears in
 //! the working directory the agent sends an update that says `text`, once, whatever its turn does.
 //! When the file `exit_after` names appears the agent ends with the code 0, whatever its turn waits
 //! for. The agent reports the version of its shape in `initialize`, unless `version` names another.
@@ -23,9 +24,10 @@
 //! file appears and no turn runs, and it ends with no reply, because it answers no prompt. A
 //! prompt that arrives while a turn runs waits in a queue and starts when the turn ends; the
 //! Gemini-shaped agent refuses it instead. On `session/cancel` the agent answers each prompt that
-//! waits in its queue with the stop reason `cancelled`. Under `"cancel": "settle"`, the default, it
-//! then stops waiting on the request of its turn, sends the call's update with the status
-//! `cancelled` and ends the turn `cancelled`; under `"cancel": "wait"` it changes nothing more.
+//! waits in its queue with the stop reason `cancelled`. Under `"cancel": "settle"`, the default, the
+//! Qoder-shaped agent then stops waiting on the request of its turn, sends the call's update with
+//! the status `cancelled` and ends the turn `cancelled`; under `"cancel": "wait"`, and always for
+//! the Gemini-shaped agent, it changes nothing more.
 //! The steps of `on_cancel` then run once as a turn of the agent's own.
 //!
 //! The Gemini-shaped agent is a script package that an interpreter runs. [`run`] takes the folder
@@ -195,7 +197,8 @@ enum CancelMode {
     /// The agent stops waiting at once, as Qoder does: it cancels the call and ends the turn.
     #[default]
     Settle,
-    /// The agent goes on waiting for the client's answer, as Gemini does.
+    /// The agent goes on waiting for the client's answer, as Gemini does, and as the Gemini-shaped
+    /// agent does whatever the script says.
     Wait,
 }
 
@@ -533,6 +536,7 @@ impl<W: Write> Agent<W> {
             self.finish(Some(id), "cancelled");
         }
         if self.script.cancel == CancelMode::Settle
+            && self.shape == Shape::Qoder
             && let Some(turn) = self.turn.take()
         {
             if let Some(call) = self.pending_call.take() {
@@ -553,8 +557,8 @@ impl<W: Write> Agent<W> {
     /// Ends a turn: answers its prompt with `stop`, or records the end of a turn of the agent's own.
     fn finish(&mut self, prompt: Option<Value>, stop: &str) {
         if let Some(id) = prompt {
-            self.answer(&id, &json!({ "stopReason": stop }));
             self.record(&json!({ "sent": "reply", "id": id, "stop": stop }));
+            self.answer(&id, &json!({ "stopReason": stop }));
         } else {
             self.record(&json!({ "sent": "turn end" }));
         }
@@ -562,12 +566,12 @@ impl<W: Write> Agent<W> {
 
     /// Sends a `tool_call_update` for `call` and records it.
     fn send_update(&mut self, call: &str, status: &str) {
+        self.record(&json!({ "sent": "update", "call": call, "status": status }));
         self.update(&json!({
             "sessionUpdate": "tool_call_update",
             "toolCallId": call,
             "status": status,
         }));
-        self.record(&json!({ "sent": "update", "call": call, "status": status }));
     }
 
     /// Takes the client's response to a request of the agent's.
@@ -620,11 +624,11 @@ impl<W: Write> Agent<W> {
         }
         let text = tick.say.clone();
         self.ticked += 1;
+        self.record(&json!({ "sent": "tick", "text": text }));
         self.update(&json!({
             "sessionUpdate": "agent_message_chunk",
             "content": { "type": "text", "text": text },
         }));
-        self.record(&json!({ "sent": "tick", "text": text }));
     }
 
     /// Takes steps of the running turn until one waits. Returns the exit code if the program ends.
@@ -725,7 +729,9 @@ impl<W: Write> Agent<W> {
             .iter()
             .map(|(id, _, _, outcome)| ((*id).to_owned(), *outcome))
             .collect();
-        let number = self.ask(
+        let number = self.next_request;
+        self.record(&json!({ "sent": "request", "id": number, "call": call }));
+        self.ask(
             "session/request_permission",
             &json!({
                 "sessionId": SESSION,
@@ -741,7 +747,6 @@ impl<W: Write> Agent<W> {
                     .collect::<Vec<_>>(),
             }),
         );
-        self.record(&json!({ "sent": "request", "id": number, "call": call }));
         self.pending_call = Some(call.to_owned());
         if let Some(turn) = &mut self.turn {
             turn.waiting = Waiting::Response(number);
