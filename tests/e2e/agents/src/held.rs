@@ -1668,11 +1668,13 @@ fn refusal_of(file: &std::fs::Metadata, seen: &BTreeSet<(u64, u64)>) -> Option<U
 /// Opens the shared file at `path` with no link followed and no wait, and checks the handle before
 /// a byte is read: a regular file, with one name, that is no guarded file (by the device and inode
 /// of any file the guard saw at a guarded name, `seen`, or by the guarded names now) and is within
-/// the byte limit. None where the file is not there.
+/// the byte limit; and none is read where a look of a guarded name has failed since the take
+/// (`unlooked`). None where the file is not there.
 fn open_shared(
     path: &Path,
     guarded: &[PathBuf],
     seen: &BTreeSet<(u64, u64)>,
+    unlooked: bool,
 ) -> Result<Option<std::fs::File>, Unread> {
     use rustix::fs::{Mode, OFlags};
     let handle = match rustix::fs::open(
@@ -1689,6 +1691,9 @@ fn open_shared(
     let opened = file.metadata().map_err(|_| Unread::Failed)?;
     if let Some(unread) = refusal_of(&opened, seen) {
         return Err(unread);
+    }
+    if unlooked {
+        return Err(Unread::Unlooked);
     }
     if is_a_guarded_file(&opened, guarded)? {
         return Err(Unread::GuardedFile);
@@ -1772,6 +1777,7 @@ fn shared_names_the_run(
     path: PathBuf,
     guarded: Vec<PathBuf>,
     seen: BTreeSet<(u64, u64)>,
+    unlooked: bool,
     needles: Vec<String>,
 ) -> Result<bool, Unread> {
     let deadline = std::time::Instant::now() + SHARED_BOUND;
@@ -1781,7 +1787,7 @@ fn shared_names_the_run(
             .filter(|needle| !needle.is_empty())
             .map(String::as_bytes)
             .collect();
-        match open_shared(&path, &guarded, &seen)? {
+        match open_shared(&path, &guarded, &seen, unlooked)? {
             Some(mut file) => scan(&mut file, &needles, SHARED_LIMIT, deadline),
             None => Ok(false),
         }
@@ -1799,16 +1805,19 @@ fn shared_names_the_run(
 /// wait; its opened handle must be a regular file with one name that is not a guarded file; and it
 /// is read once, up to a byte limit and within a time bound, for the run's directory name and
 /// mark. Nothing of what is read is kept, and a file that fails these checks is not read and stops
-/// the run. A
-/// file that is the same file as a guarded file is not read: the guard keeps the device and inode
-/// of each guarded file from the take and from every later look, and refuses a handle with one of
-/// them, or with the one a guarded name holds at the end, so a guarded file moved or linked over
-/// the shared name is refused even when its guarded name is gone or holds another file. The end
-/// read is also refused where a guarded name cannot be looked at. What no look saw is not known: a
-/// file that was at no guarded name at any look, put there and then moved over the shared name
-/// between two looks, is read. A write to a file that is not named, a transcript below
-/// `~/.claude/projects` among them, is not seen. What is said is the path the entry names and
-/// whether it changed, never a value.
+/// the run. A file that is the same file as a guarded file is not read: the guard keeps the device
+/// and inode of each guarded file from the take and from every later look, and refuses a handle
+/// with one of them, or with the one a guarded name holds at the end, so a guarded file moved or
+/// linked over the shared name is refused even when its guarded name is gone or holds another
+/// file. A look of a guarded name that fails, for any reason other than the name's not being
+/// there, is kept for the rest of the run, and every shared read after it is refused; so is a read
+/// at which a guarded name cannot be looked at. What no look saw is not known, and is read: a file
+/// that was at no guarded name at any look, put there and then moved over the shared name between
+/// two looks; a file that a guarded name pointed to as a link, since a look records the link and
+/// not its target; and a file on a file system whose device and inode change when it is renamed
+/// or linked. A write to a file that is not named, a transcript below `~/.claude/projects` among
+/// them, is not seen. What is said is the path the entry names and whether it changed, never a
+/// value.
 #[derive(Debug)]
 pub struct FileGuard {
     home: PathBuf,
@@ -1816,6 +1825,9 @@ pub struct FileGuard {
     shared: Vec<String>,
     /// The device and inode of every guarded file as the take and each later look saw it.
     seen: std::sync::Mutex<BTreeSet<(u64, u64)>>,
+    /// Whether a look of a guarded file has failed since the take, for any reason other than the
+    /// file's not being there: it stays set for the rest of the run.
+    unlooked: std::sync::atomic::AtomicBool,
 }
 
 impl FileGuard {
@@ -1876,14 +1888,26 @@ impl FileGuard {
             guarded,
             shared: shared.to_vec(),
             seen: std::sync::Mutex::new(seen),
+            unlooked: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
     /// Looks at each guarded file again, and, where `needles` names something, reads each shared
     /// file once for it.
     fn compare(&self, needles: &[&str]) -> (Vec<Stop>, Value) {
-        let (mut stops, files) =
-            self.compared(&|relative| seen_by_lstat(&self.home.join(relative)));
+        self.compare_with(
+            &|relative| seen_by_lstat(&self.home.join(relative)),
+            needles,
+        )
+    }
+
+    /// [`FileGuard::compare`] with the look of the guarded files that `look` gives.
+    fn compare_with(
+        &self,
+        look: &dyn Fn(&str) -> std::io::Result<Option<Seen>>,
+        needles: &[&str],
+    ) -> (Vec<Stop>, Value) {
+        let (mut stops, files) = self.compared(look);
         let mut shared: Vec<Value> = Vec::new();
         let names: Vec<String> = needles
             .iter()
@@ -1901,11 +1925,13 @@ impl FileGuard {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone();
+            let unlooked = self.unlooked.load(std::sync::atomic::Ordering::SeqCst);
             for relative in &self.shared {
                 let read = shared_names_the_run(
                     self.home.join(relative),
                     guarded.clone(),
                     seen.clone(),
+                    unlooked,
                     names.clone(),
                 );
                 if matches!(read, Ok(true)) {
@@ -1969,6 +1995,8 @@ impl FileGuard {
                     }));
                 }
                 Err(error) => {
+                    self.unlooked
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
                     stops.push((
                         "person_file_unreadable",
                         format!("~/{relative} cannot be looked at after the run: {error}"),
@@ -5134,6 +5162,116 @@ mod tests {
         std::fs::remove_dir_all(&home).expect("clean up");
     }
 
+    /// Makes the credentials file, which the claude-code entry guards and which was not there when
+    /// the guard was taken, hold the run's directory name.
+    fn make_the_credentials(home: &Path) {
+        std::fs::write(
+            home.join(".claude/.credentials.json"),
+            format!(r#"{{"id":"{RUN_NAME}"}}"#),
+        )
+        .expect("a write");
+    }
+
+    /// The look of the guarded files that fails for the credentials file with a permission error,
+    /// and is the guard's own look for the others.
+    fn look_failing_for_the_credentials(
+        home: &Path,
+    ) -> impl Fn(&str) -> std::io::Result<Option<Seen>> + '_ {
+        move |relative| {
+            if relative == ".claude/.credentials.json" {
+                Err(std::io::ErrorKind::PermissionDenied.into())
+            } else {
+                seen_by_lstat(&home.join(relative))
+            }
+        }
+    }
+
+    /// Asserts that the end read refused the shared file because a guarded name could not be looked
+    /// at, and read none of it.
+    fn assert_refused_as_unlooked(stops: &[Stop]) {
+        let said: Vec<&str> = stops.iter().map(|(_, why)| why.as_str()).collect();
+        assert!(
+            said.contains(
+                &not_read(
+                    "is not read, because a guarded name cannot be looked at and this file may be \
+                     the one it names"
+                )
+                .as_str()
+            ),
+            "{said:?}"
+        );
+        assert!(
+            !said.iter().any(|why| why.contains("now holds")),
+            "the shared file was read after a look of a guarded name failed: {said:?}"
+        );
+    }
+
+    #[test]
+    fn a_guarded_name_that_cannot_be_looked_at_is_an_error_and_one_that_is_not_there_is_no_match() {
+        let home = scratch("guarded-stat");
+        std::fs::write(home.join("file"), b"one").expect("a file");
+        let metadata = std::fs::metadata(home.join("file")).expect("a look");
+        // A name below a file fails with another error than "not found"; a name that is not there
+        // does not.
+        assert_eq!(
+            is_a_guarded_file(&metadata, &[home.join("file/below")]),
+            Err(Unread::Unlooked)
+        );
+        assert_eq!(
+            is_a_guarded_file(&metadata, &[home.join("not-there")]),
+            Ok(false)
+        );
+        assert_eq!(is_a_guarded_file(&metadata, &[home.join("file")]), Ok(true));
+        std::fs::remove_dir_all(&home).expect("clean up");
+    }
+
+    #[test]
+    fn a_failed_look_at_a_charge_refuses_every_later_shared_read_though_the_next_looks_succeed() {
+        let home = claude_home("failed-look-charge");
+        std::fs::remove_file(home.join(".claude/.credentials.json")).expect("removed");
+        let guard = claude_plan().take(&home);
+        let Watch::Files(files) = &guard.watch else {
+            panic!("a claude-code plan guards files");
+        };
+        // Another process makes the credentials file, and the look of it before a charge fails.
+        make_the_credentials(&home);
+        let (stops, _) = files.compare_with(&look_failing_for_the_credentials(&home), &[]);
+        assert_eq!(stops.len(), 1, "{stops:?}");
+        // The next looks succeed, and the file is moved over the shared name.
+        std::fs::rename(
+            home.join(".claude/.credentials.json"),
+            home.join(".claude.json"),
+        )
+        .expect("a move");
+        assert_refused_as_unlooked(&stops_at_the_end(&guard));
+        std::fs::remove_dir_all(&home).expect("clean up");
+    }
+
+    #[test]
+    fn a_failed_look_at_the_end_refuses_the_shared_read_though_the_guarded_name_then_looks_fine() {
+        let home = claude_home("failed-look-end");
+        std::fs::remove_file(home.join(".claude/.credentials.json")).expect("removed");
+        let guard = claude_plan().take(&home);
+        let Watch::Files(files) = &guard.watch else {
+            panic!("a claude-code plan guards files");
+        };
+        // The credentials file is made and moved over the shared name before the end, and the
+        // first look of the end fails for its name; the guard's own look of it, with nothing
+        // there, finds nothing.
+        make_the_credentials(&home);
+        std::fs::rename(
+            home.join(".claude/.credentials.json"),
+            home.join(".claude.json"),
+        )
+        .expect("a move");
+        let (stops, _) = files.compare_with(
+            &look_failing_for_the_credentials(&home),
+            &[RUN_NAME, RUN_MARK],
+        );
+        assert_refused_as_unlooked(&stops);
+        std::fs::remove_dir_all(&home).expect("clean up");
+    }
+
     #[test]
     fn a_shared_file_larger_than_the_limit_is_refused_and_not_read() {
         let home = claude_home("shared-large");
@@ -5158,9 +5296,12 @@ mod tests {
         let file = std::fs::File::create(&path).expect("a file");
         file.set_len(SHARED_LIMIT + 1).expect("a size");
         let none = BTreeSet::new();
-        assert_eq!(open_shared(&path, &[], &none).err(), Some(Unread::TooLarge));
+        assert_eq!(
+            open_shared(&path, &[], &none, false).err(),
+            Some(Unread::TooLarge)
+        );
         file.set_len(SHARED_LIMIT).expect("a size");
-        assert!(matches!(open_shared(&path, &[], &none), Ok(Some(_))));
+        assert!(matches!(open_shared(&path, &[], &none, false), Ok(Some(_))));
         std::fs::remove_dir_all(&home).expect("clean up");
     }
 
