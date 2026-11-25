@@ -1429,7 +1429,8 @@ impl ComposedBundle {
 ///     }
 ///   },
 ///   "relay": { "origin": "https://reach.example.com" },
-///   "push": { "gateways": ["https://push.builder.example"] }
+///   "push": { "gateways": ["https://push.builder.example"] },
+///   "acp": { "packages": ["kalareach/gemini-cli"] }
 /// }
 /// ```
 ///
@@ -1443,6 +1444,9 @@ impl ComposedBundle {
 /// The `push` section lists the push gateways, besides the official one, that a paired device's
 /// credential may name ([`PushSelection`]). It is not read once at start: the host takes the list
 /// whenever the document is put into force, and a gateway taken out of it loses its credentials.
+///
+/// The `acp` section lists the packages whose agent may start in ACP mode ([`AcpSelection`]). It is
+/// validated with the rest of the document, and `acp_enabled` answers from it.
 ///
 /// Its numbers are ordinary JSON numbers rather than the decimal strings the wire types use. This
 /// is a file a person may open and edit, not a message a JavaScript consumer parses, and the
@@ -1496,6 +1500,7 @@ impl ComposedBundle {
 /// [`MailboxSelection`]: configuration::MailboxSelection
 /// [`RelaySelection`]: configuration::RelaySelection
 /// [`PushSelection`]: configuration::PushSelection
+/// [`AcpSelection`]: configuration::AcpSelection
 /// [`resolve`]: configuration::resolve
 /// [`ALLOWLIST`]: configuration::ALLOWLIST
 pub mod configuration {
@@ -2272,8 +2277,7 @@ pub mod configuration {
         /// listed.
         #[must_use]
         pub fn acp_enabled(&self, package: &str) -> bool {
-            let _ = package;
-            false
+            self.acp.packages().iter().any(|listed| listed == package)
         }
 
         /// Returns the preference set a selected profile contributes, when it names one.
@@ -4081,11 +4085,51 @@ pub mod configuration {
             );
         }
         problems.extend(push_gateway_problems(&document.push));
+        problems.extend(acp_problems(&document.acp));
         if problems.is_empty() {
             Ok(())
         } else {
             Err(problems)
         }
+    }
+
+    /// Returns what is wrong with the list of packages allowed in ACP mode, entry by entry.
+    ///
+    /// Each entry is a package's `publisher/plugin` identifier, no package is named twice and the
+    /// list holds at most [`MAX_ACP_PACKAGES`]. A misspelt package would read as a package the
+    /// owner did not allow, so it is refused instead.
+    fn acp_problems(acp: &AcpSelection) -> Vec<Sentence> {
+        let mut problems = Vec::new();
+        let packages = acp.packages();
+        if packages.len() > MAX_ACP_PACKAGES {
+            problems.push(
+                Sentence::new()
+                    .stated("acp.packages names ")
+                    .number(packages.len() as u64)
+                    .stated(" packages, more than the ")
+                    .number(MAX_ACP_PACKAGES as u64)
+                    .stated(" a document may list"),
+            );
+        }
+        let mut named = std::collections::BTreeSet::new();
+        for package in packages {
+            if !is_package_identifier(package) {
+                problems.push(
+                    Sentence::new()
+                        .stated("acp.packages names ")
+                        .withheld(super::export::ContentClass::Name, package)
+                        .stated(", which is not a package's publisher/plugin identifier"),
+                );
+            } else if !named.insert(package.as_str()) {
+                problems.push(
+                    Sentence::new()
+                        .stated("acp.packages names ")
+                        .withheld(super::export::ContentClass::Name, package)
+                        .stated(" more than once"),
+                );
+            }
+        }
+        problems
     }
 
     /// Returns what is wrong with the list of push gateways, entry by entry.

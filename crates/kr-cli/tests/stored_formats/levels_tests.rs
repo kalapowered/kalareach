@@ -553,6 +553,7 @@ fn the_views_observe_builds_hold_the_names_the_reader_compares() {
     assert_eq!(
         sections,
         [
+            ("acp", Some(8)),
             ("authority", Some(2)),
             ("automation", Some(5)),
             ("mailbox", Some(3)),

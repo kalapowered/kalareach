@@ -25,7 +25,7 @@ use crate::hostinfo::export::{ContentClass, Sentence};
 pub const BASE_LEVEL: u64 = 1;
 
 /// The highest level this build reads.
-pub const LEVEL: u64 = 7;
+pub const LEVEL: u64 = 8;
 
 /// The first version of the document that has a `level` member. A document of an earlier version
 /// states none; one of this version or later may.
@@ -102,6 +102,10 @@ pub const LEVELLED: &[Levelled] = &[
     Levelled {
         member: "push",
         level: 7,
+    },
+    Levelled {
+        member: "acp",
+        level: 8,
     },
 ];
 

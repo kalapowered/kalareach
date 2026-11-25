@@ -608,7 +608,7 @@ async fn kr_doctor_prints_the_members_a_higher_level_document_adds_and_the_bundl
     kr_ipc::paths::write_owner_only_file(
         &document,
         format!(
-            r#"{{"version": 3, "level": 8, "preferences": {{"sleep_inhibition": "battery_too"}}, "{NAME}": {{"enabled": true}}, "{OTHER}": {{}}}}"#
+            r#"{{"version": 3, "level": 9, "preferences": {{"sleep_inhibition": "battery_too"}}, "{NAME}": {{"enabled": true}}, "{OTHER}": {{}}}}"#
         )
         .as_bytes(),
     )
@@ -628,10 +628,10 @@ async fn kr_doctor_prints_the_members_a_higher_level_document_adds_and_the_bundl
     );
     let status = said
         .lines()
-        .find(|line| line.starts_with("configuration ") && line.contains("level 8"))
+        .find(|line| line.starts_with("configuration ") && line.contains("level 9"))
         .unwrap_or_else(|| panic!("no line of the levels: {said}"));
     assert!(
-        status.contains("reads level 7") && status.contains("2 members this build does not know"),
+        status.contains("reads level 8") && status.contains("2 members this build does not know"),
         "{status}"
     );
     assert!(
