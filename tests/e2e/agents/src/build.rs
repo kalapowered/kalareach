@@ -865,7 +865,10 @@ pub struct Account {
     pub stop_before_turns: bool,
     /// Files that would load the person's own settings, hooks or servers into the agent, none of
     /// which may exist before it starts: `{config}` names the configuration directory of the run's
-    /// own and `{work}` the working directory.
+    /// own and `{work}` the working directory. A path begins with one placeholder (`{config}`,
+    /// `{work}`, `{home}`, `{person}` or `{ancestors}`) and holds none after it; a path that begins
+    /// with none may hold the account's name, `{user}`, as a whole part, as the live
+    /// `/Library/Managed Preferences/{user}/` files do.
     #[serde(default)]
     pub absent: Vec<String>,
     /// Files below the run's configuration directory that the agent's own use writes beside what
@@ -1276,7 +1279,9 @@ where
 pub const NEVER_ALLOWED_BELOW_CONFIG: [&str; 3] = ["rules", "settings.json", "settings.local.json"];
 
 /// Whether `first` and `second` are one name below the configuration directory: names that differ
-/// only in letter case are, on every platform, since the volume a run lives on may ignore it.
+/// only in letter case are, on every platform, since the volume a run lives on may ignore it. Names
+/// are compared as `to_lowercase` maps them, with no Unicode normalisation, so two spellings of one
+/// letter that a volume treats as one name are two names here.
 #[must_use]
 pub fn same_name(first: &str, second: &str) -> bool {
     first == second || first.to_lowercase() == second.to_lowercase()
@@ -1286,7 +1291,7 @@ pub fn same_name(first: &str, second: &str) -> bool {
 /// below it: each part of `path` is the pattern's part at that place (a name that differs only in
 /// letter case is the same name), or the pattern has a lone `*` there, or a last `**` covers
 /// everything from there on.
-fn pattern_reaches(pattern: &[&str], path: &[&str]) -> bool {
+pub(crate) fn pattern_reaches(pattern: &[&str], path: &[&str]) -> bool {
     for (index, part) in path.iter().enumerate() {
         match pattern.get(index) {
             Some(&"**") => return true,
@@ -1297,20 +1302,63 @@ fn pattern_reaches(pattern: &[&str], path: &[&str]) -> bool {
     true
 }
 
+/// The placeholders that stand for a directory: an absent path may begin with one of them, as its
+/// whole first part, and hold no placeholder after it.
+const DIRECTORY_PLACEHOLDERS: [&str; 5] = ["config", "work", "home", "person", "ancestors"];
+
+/// Whether the absent path `path` spells its placeholders as an entry may. A path that begins with
+/// a placeholder begins with one of [`DIRECTORY_PLACEHOLDERS`], as its whole first part, and holds
+/// no `{` or `}` after it. A path that begins with none may hold the account's name, `{user}`, as a
+/// whole part, as the live entries' `/Library/Managed Preferences/{user}/` files do, and no other
+/// placeholder. A placeholder anywhere else is refused: expanded, it can name a file below the
+/// configuration directory that the literal comparison with the allowed files does not see.
+fn absent_path_spelling(path: &str) -> Result<(), String> {
+    let refused = || {
+        Err(format!(
+            "the absent path {path:?} holds a placeholder where it may not: a path may begin with \
+             `{{config}}`, `{{work}}`, `{{home}}`, `{{person}}` or `{{ancestors}}`, and a path that \
+             begins with none of them may hold `{{user}}` as a whole part, and nothing else is a \
+             placeholder"
+        ))
+    };
+    if let Some(after) = path.strip_prefix('{') {
+        let Some((name, rest)) = after.split_once('}') else {
+            return refused();
+        };
+        let whole = rest.is_empty() || rest.starts_with('/');
+        if DIRECTORY_PLACEHOLDERS.contains(&name) && whole && !rest.contains(['{', '}']) {
+            return Ok(());
+        }
+        return refused();
+    }
+    if path
+        .split('/')
+        .all(|part| part == "{user}" || !part.contains(['{', '}']))
+    {
+        Ok(())
+    } else {
+        refused()
+    }
+}
+
 impl Account {
     /// The entry's allowed files as paths below the configuration directory, `{config}/` taken off.
     ///
     /// # Errors
     ///
-    /// Returns the first absent path below `{config}` whose rest holds an empty part, `.` or `..`;
-    /// the first pattern that does not begin with `{config}/`, or that holds an empty part, `.` or
-    /// `..`, a template, a `*` inside a name, or a `**` that is not the last part; one that begins
-    /// with `*` or `**`; and one that names a path, or a file below a path, that
-    /// [`NEVER_ALLOWED_BELOW_CONFIG`] holds or that the entry lists as absent below `{config}`, a
-    /// name that differs only in letter case being the same name ([`same_name`]).
+    /// Returns the first absent path that holds a placeholder where it may not (one that begins
+    /// with a placeholder holds one only as its whole first part, from `{config}`, `{work}`,
+    /// `{home}`, `{person}` and `{ancestors}`, and a path that begins with none may hold `{user}` as
+    /// a whole part and no other); the first absent path below `{config}` whose rest holds an
+    /// empty part, `.` or `..`; the first pattern that does not begin with `{config}/`, or that
+    /// holds an empty part, `.` or `..`, a template, a `*` inside a name, or a `**` that is not the
+    /// last part; one that begins with `*` or `**`; and one that names a path, or a file below a
+    /// path, that [`NEVER_ALLOWED_BELOW_CONFIG`] holds or that the entry lists as absent below
+    /// `{config}`, a name that differs only in letter case being the same name ([`same_name`]).
     pub fn allowed_below_config(&self) -> Result<Vec<String>, String> {
         let mut absent: Vec<&str> = Vec::new();
         for path in &self.absent {
+            absent_path_spelling(path)?;
             let Some(rest) = path.strip_prefix("{config}/") else {
                 continue;
             };
@@ -1765,8 +1813,10 @@ impl Inputs {
 /// # Panics
 ///
 /// Panics when the file cannot be read or is not an entry, when the entry sets a variable the host
-/// owns ([`Build::names_reach_the_session`]), and when its account's absent paths below the
-/// configuration directory are not plain or its allowed files are not ones the harness reads
+/// owns ([`Build::names_reach_the_session`]), and when its account's absent paths hold a
+/// placeholder where it may not (the live form `/Library/Managed Preferences/{user}/` is kept: it
+/// is `{user}` as a whole part of an absolute path) or are not plain below the configuration
+/// directory, or its allowed files are not ones the harness reads
 /// ([`Account::allowed_below_config`]).
 #[must_use]
 pub fn read_build(path: &Path) -> Build {
@@ -2159,6 +2209,51 @@ mod tests {
             allowed_files(&["{config}/.claude.json", "{work}/./x"], &["{config}/p/**"]),
             Ok(vec!["p/**".to_owned()]),
             "a plain absent path, and one outside the configuration directory, are not refused"
+        );
+    }
+
+    /// A placeholder is an absent path's whole first part, from the five that stand for a
+    /// directory, or `{user}` as a whole part of a path that begins with none: any other spelling is
+    /// refused where the entry is read, since expanded it can name a file below the configuration
+    /// directory that the comparison with the allowed files does not see.
+    #[test]
+    fn an_absent_path_with_a_placeholder_where_it_may_not_be_is_refused() {
+        for bad in [
+            "/{config}/.claude.json",
+            "{config}/{user}.json",
+            "x/{config}/y",
+            "{config}x/y",
+            "{home}/a/{work}",
+            "/etc/{home}/x",
+            "/etc/{user}x/y",
+            "{user}/x",
+            "{nothing}/x",
+            "{config",
+            "a}b",
+        ] {
+            for list in [&[][..], &["{config}/.claude.json"][..]] {
+                let why = allowed_files(&[bad], list).expect_err(bad);
+                assert!(
+                    why.contains(&format!("the absent path {bad:?} holds a placeholder")),
+                    "{bad} with {list:?}: {why}"
+                );
+            }
+        }
+        // The spellings the live entries use pass: a leading placeholder, and the account's name
+        // as a whole part of an absolute path.
+        let live = [
+            "{config}/settings.json",
+            "{config}",
+            "{work}/.mcp.json",
+            "{home}/.config/opencode/auth.json",
+            "{person}/.kimi-code/plugins",
+            "{ancestors}/.gemini/.env",
+            "/Library/Managed Preferences/{user}/com.anthropic.claudecode.plist",
+            "/etc/claude/managed-settings.json",
+        ];
+        assert_eq!(
+            allowed_files(&live, &["{config}/p/**"]),
+            Ok(vec!["p/**".to_owned()])
         );
     }
 

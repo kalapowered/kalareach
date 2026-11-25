@@ -24,7 +24,7 @@ use crate::account::{
     self, KeyScan, RunRules, ScanBytes, now_ms, record_key_scan, run_files_holding_any_sharing,
     run_files_holding_sharing,
 };
-use crate::build::{Account, NEVER_ALLOWED_BELOW_CONFIG, same_name};
+use crate::build::{Account, NEVER_ALLOWED_BELOW_CONFIG, pattern_reaches, same_name};
 use crate::{confine, keys};
 
 /// How a part says it could not show that the agent loads none of the person's own servers. A
@@ -433,7 +433,8 @@ pub fn absent_paths(
 ///
 /// # Panics
 ///
-/// Panics when the system cannot say the account name.
+/// Panics when the system cannot say the account name, or when an allowed file of the entry names a
+/// path of the list that lies below the configuration directory ([`absent_paths_under`]).
 #[must_use]
 pub fn absent_paths_in(
     account: &Account,
@@ -444,9 +445,55 @@ pub fn absent_paths_in(
     resolved_work: &Path,
     which: Absent,
 ) -> Vec<PathBuf> {
+    absent_paths_under(
+        account,
+        &run.root().join(config_directory),
+        &run.work(),
+        home,
+        person,
+        resolved_work,
+        which,
+    )
+}
+
+/// [`absent_paths_in`] for the configuration directory `config` and the working directory `work`
+/// of a run. Each path is expanded and then normalised by its parts alone (no empty or `.` part,
+/// and a `..` part takes off the one before it), and one that lies below the configuration
+/// directory is held to the entry's allowed files, whatever placeholder or spelling named it: the
+/// run stops where an allowed file names it, so that no spelling of an absent path below the
+/// configuration directory escapes the entry's check.
+///
+/// # Panics
+///
+/// Panics when the system cannot say the account name, or when an allowed file of the entry names
+/// a path of the list that lies below the configuration directory.
+#[must_use]
+pub fn absent_paths_under(
+    account: &Account,
+    config: &Path,
+    work: &Path,
+    home: &Path,
+    person: &Path,
+    resolved_work: &Path,
+    which: Absent,
+) -> Vec<PathBuf> {
+    // The entry was checked where it was read; this holds the expansion to the same allowed files a
+    // second way, so it takes them as they stand and checks no spelling of them again.
+    let allowed: Vec<String> = account
+        .allowed
+        .iter()
+        .map(|pattern| {
+            pattern
+                .strip_prefix("{config}/")
+                .unwrap_or_else(|| {
+                    panic!("{ISOLATION_UNPROVEN} the allowed file {pattern:?} is not below `{{config}}`")
+                })
+                .to_owned()
+        })
+        .collect();
     let home = home.display().to_string();
-    let config = run.root().join(config_directory).display().to_string();
-    let work = run.work().display().to_string();
+    let config_text = config.display().to_string();
+    let work_text = work.display().to_string();
     let person = person.display().to_string();
     // The account name as the system has it, as the agent itself reads it, not the environment's.
     let user = std::process::Command::new("/usr/bin/id")
@@ -461,7 +508,7 @@ pub fn absent_paths_in(
         });
     let folders: Vec<String> = {
         let mut seen = Vec::new();
-        for start in [run.work(), resolved_work.to_path_buf()] {
+        for start in [work.to_path_buf(), resolved_work.to_path_buf()] {
             for folder in start.ancestors() {
                 let text = folder.display().to_string();
                 let text = if text == "/" { String::new() } else { text };
@@ -477,14 +524,16 @@ pub fn absent_paths_in(
         .iter()
         .filter(|path| which != Absent::Ancestors || path.contains("{ancestors}"))
         .flat_map(|path| {
-            let expand = |path: &str| {
-                PathBuf::from(
-                    path.replace("{config}", &config)
-                        .replace("{work}", &work)
+            let expand = |text: &str| {
+                let expanded = PathBuf::from(
+                    text.replace("{config}", &config_text)
+                        .replace("{work}", &work_text)
                         .replace("{home}", &home)
                         .replace("{person}", &person)
                         .replace("{user}", &user),
-                )
+                );
+                held_to_the_allowed_files(config, &allowed, path, &expanded);
+                expanded
             };
             if path.contains("{ancestors}") && which == Absent::Published {
                 vec![PathBuf::from(path)]
@@ -503,9 +552,54 @@ pub fn absent_paths_in(
         // (the vendor documents it, and the agent's own help for checking a command against rule
         // files shows the feature): a rule there lets a command run with no prompt, so the
         // directory is known absent whatever the entry lists.
-        paths.push(PathBuf::from(&config).join("rules"));
+        paths.push(config.join("rules"));
     }
     paths
+}
+
+/// `path` by its parts alone: no empty or `.` part, and a `..` part takes off the part before it.
+fn lexically_normal(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut normal = PathBuf::new();
+    for part in path.components() {
+        match part {
+            Component::CurDir => {}
+            Component::ParentDir if normal.file_name().is_some() => {
+                normal.pop();
+            }
+            Component::ParentDir if normal.has_root() => {}
+            other => normal.push(other.as_os_str()),
+        }
+    }
+    normal
+}
+
+/// Stops the run where `expanded`, the absent path `template` with its placeholders filled in, lies
+/// below the configuration directory `config` and one of the entry's allowed files (`allowed`, as
+/// [`Account::allowed_below_config`] gives them) names it or a file below it.
+fn held_to_the_allowed_files(config: &Path, allowed: &[String], template: &str, expanded: &Path) {
+    let below = lexically_normal(expanded);
+    let Ok(below) = below.strip_prefix(lexically_normal(config)) else {
+        return;
+    };
+    let parts: Vec<String> = below
+        .components()
+        .map(|part| part.as_os_str().to_string_lossy().into_owned())
+        .collect();
+    let held: Vec<&str> = parts.iter().map(String::as_str).collect();
+    if held.is_empty() {
+        return;
+    }
+    for pattern in allowed {
+        let names: Vec<&str> = pattern.split('/').collect();
+        assert!(
+            !pattern_reaches(&names, &held),
+            "{ISOLATION_UNPROVEN} the absent path {template:?} names {:?} below the configuration \
+             directory, which the entry's allowed file {:?} names",
+            parts.join("/"),
+            format!("{{config}}/{pattern}")
+        );
+    }
 }
 
 /// Whether nothing is at `path`, looked at with no link followed at its last component: "not found"
@@ -3478,6 +3572,165 @@ mod tests {
             "projects/*/s.jsonl",
         ];
         assert_eq!(compared(&root, &allowed), Ok(()));
+    }
+
+    /// The account name as the system has it, as the expansion of `{user}` reads it.
+    fn user() -> String {
+        let output = std::process::Command::new("/usr/bin/id")
+            .arg("-un")
+            .output()
+            .expect("the account name");
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    }
+
+    /// The absent list of an entry with `absent` and `allowed` as the expansion makes it for a run
+    /// whose configuration directory is `config` and whose home is `home`, or what it stops with.
+    fn expanded(
+        absent: &[&str],
+        allowed: &[String],
+        config: &Path,
+        home: &Path,
+    ) -> Result<Vec<PathBuf>, String> {
+        let mut account = account();
+        account.absent = absent.iter().map(|path| (*path).to_owned()).collect();
+        account.allowed = allowed
+            .iter()
+            .map(|pattern| format!("{{config}}/{pattern}"))
+            .collect();
+        let root = config.parent().expect("a run's directory").to_path_buf();
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            absent_paths_under(
+                &account,
+                config,
+                &root.join("w"),
+                home,
+                Path::new("/person"),
+                &root.join("w"),
+                Absent::All,
+            )
+        }))
+        .map_err(|panic| {
+            panic
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| panic.downcast_ref::<&str>().map(|text| (*text).to_owned()))
+                .unwrap_or_default()
+        })
+    }
+
+    /// An absent path that the expansion puts below the configuration directory is held to the
+    /// allowed files whatever spells it: a root slash before `{config}`, which the expansion
+    /// turns into two leading slashes that name the same file.
+    #[test]
+    fn a_slash_before_the_config_placeholder_does_not_hide_an_absent_path_from_the_allowed_files() {
+        let root = scratch("expand-slash");
+        let said = expanded(
+            &["/{config}/.claude.json"],
+            &[".claude.json".to_owned()],
+            &root.join("c"),
+            &root.join("h"),
+        )
+        .expect_err("an absent path an allowed file names");
+        assert!(
+            said.contains("\"/{config}/.claude.json\" names \".claude.json\" below the configuration directory")
+                && said.contains("\"{config}/.claude.json\""),
+            "{said}"
+        );
+    }
+
+    /// A placeholder inside a name of the rest, expanded, names the file an allowed file names.
+    #[test]
+    fn a_placeholder_in_a_name_below_the_config_placeholder_does_not_hide_an_absent_path() {
+        let root = scratch("expand-user");
+        let user = user();
+        let said = expanded(
+            &["{config}/{user}.json"],
+            &[format!("{user}.json")],
+            &root.join("c"),
+            &root.join("h"),
+        )
+        .expect_err("an absent path an allowed file names");
+        assert!(
+            said.contains(&format!(
+                "\"{{config}}/{{user}}.json\" names \"{user}.json\" below the configuration directory"
+            )),
+            "{said}"
+        );
+    }
+
+    /// Where the configuration directory is a directory of the home, the home placeholder names a
+    /// path below it, and an allowed file that names it is refused though the path does not begin
+    /// with `{config}`.
+    #[test]
+    fn the_home_placeholder_naming_a_path_below_the_configuration_directory_is_held_too() {
+        let root = scratch("expand-home");
+        let home = root.join("h");
+        let said = expanded(
+            &["{home}/.claude/x", "{home}/.claude/../.claude/y/z"],
+            &["x".to_owned()],
+            &home.join(".claude"),
+            &home,
+        )
+        .expect_err("an absent path an allowed file names");
+        assert!(
+            said.contains("\"{home}/.claude/x\" names \"x\" below the configuration directory"),
+            "{said}"
+        );
+        let said = expanded(
+            &["{home}/.claude/../.claude/y/z"],
+            &["y/*".to_owned()],
+            &home.join(".claude"),
+            &home,
+        )
+        .expect_err("a path with a part that is taken back");
+        assert!(said.contains("names \"y/z\""), "{said}");
+    }
+
+    /// An absent path that no allowed file names, whatever directory it lies in, is expanded as it
+    /// always was, with the configuration directory's `rules` last; and the list with an
+    /// `{ancestors}` template for the record is not held to anything.
+    #[test]
+    fn an_absent_path_that_no_allowed_file_names_is_expanded_as_before() {
+        let root = scratch("expand-plain");
+        let (config, home) = (root.join("c"), root.join("h"));
+        let allowed = ["projects/**".to_owned()];
+        assert_eq!(
+            expanded(
+                &[
+                    "{config}/auth.json",
+                    "{work}/b",
+                    "{home}/c",
+                    "{home}/.claude/x"
+                ],
+                &allowed,
+                &config,
+                &home
+            ),
+            Ok(vec![
+                config.join("auth.json"),
+                root.join("w/b"),
+                home.join("c"),
+                home.join(".claude/x"),
+                config.join("rules"),
+            ])
+        );
+        let mut account = account();
+        account.absent = vec!["{ancestors}/.env".to_owned()];
+        account.allowed = vec!["{config}/projects/**".to_owned()];
+        let work = root.join("w");
+        assert_eq!(
+            absent_paths_under(
+                &account,
+                &config,
+                &work,
+                &home,
+                Path::new("/person"),
+                &work,
+                Absent::Published,
+            ),
+            vec![PathBuf::from("{ancestors}/.env")],
+            "the list for the record keeps its template"
+        );
     }
 
     fn patterns(list: &[&str]) -> Vec<String> {
