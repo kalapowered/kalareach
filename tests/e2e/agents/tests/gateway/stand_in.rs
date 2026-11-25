@@ -181,7 +181,7 @@ pub fn synthetic() -> [Synthetic; 4] {
     [
         Synthetic::of(
             "the script launch",
-            "kalareach/gemini-cli",
+            "kalareach/synthetic-script",
             (
                 "gemini",
                 "script",
@@ -198,7 +198,7 @@ pub fn synthetic() -> [Synthetic; 4] {
         ),
         Synthetic::of(
             "the wheel launch",
-            "kalareach/kimi-cli",
+            "kalareach/synthetic-wheel",
             (
                 "kimi",
                 "wheel",
@@ -215,7 +215,7 @@ pub fn synthetic() -> [Synthetic; 4] {
         ),
         Synthetic::of(
             "the native entry with texts of its own",
-            "kalareach/claude-code",
+            "kalareach/synthetic-native",
             ("claude", "native", &[], "bin/claude"),
             ("Native agent ready", "native> type here"),
             NATIVE_MARKS,

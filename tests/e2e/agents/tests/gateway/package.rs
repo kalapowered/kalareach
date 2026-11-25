@@ -236,9 +236,13 @@ pub enum Shape {
 /// The synthetic entries the cases write a package for: the plugin, the command and what the
 /// release declares.
 pub const SYNTHETIC: [(&str, &str, Shape); 3] = [
-    ("kalareach/claude-code", "claude", Shape::Backend),
-    ("kalareach/opencode", "opencode", Shape::Observed),
-    ("kalareach/kimi-code-cli", "kimi", Shape::TerminalInput),
+    ("kalareach/synthetic-backend", "claude", Shape::Backend),
+    ("kalareach/synthetic-observed", "opencode", Shape::Observed),
+    (
+        "kalareach/synthetic-terminal-input",
+        "kimi",
+        Shape::TerminalInput,
+    ),
 ];
 
 /// Writes a release of the package `plugin` for an agent typed as `command` into `into`.
