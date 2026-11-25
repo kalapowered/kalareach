@@ -7,7 +7,8 @@
 //! none: the setup runs before any generation exists. A restore holds the kit, and has just
 //! verified a generation, so it is where the checkpoint is recorded.
 //!
-//! [`advance_checkpoint`] is the whole rule, in one place and with nothing to send:
+//! [`advance_checkpoint`] is the whole rule, in one place and with nothing to send, and [`Standing`]
+//! is the comparison it makes:
 //!
 //! * a checkpoint never goes down, so a restore of an older generation that the person accepted
 //!   leaves the bundle as it was;
@@ -21,8 +22,49 @@
 //! place the revision advances.
 
 use kr_protocol::archive::{ArchiveCheckpoint, RecoveryBundle};
+use kr_protocol::ids::BackupGeneration;
+use kr_protocol::scalars::Digest256;
 
 use crate::recovery::{RecoveryError, Result};
+
+/// How a verified checkpoint stands against the highest one held for the same archive.
+///
+/// This is the one comparison every holder of checkpoints makes, so that none of them reads a
+/// generation or a manifest its own way.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Standing {
+    /// Nothing is held for the archive, or the verified generation is newer than the one held.
+    Raises,
+    /// The verified generation is the one held, with the same manifest.
+    Same,
+    /// The verified generation is older than the one held.
+    Lower,
+    /// The verified generation is the one held, with another manifest.
+    Disagrees,
+}
+
+impl Standing {
+    /// How `verified` stands against `held`, the generation and manifest hash of the highest
+    /// checkpoint held for the archive, if one is held.
+    pub(crate) fn of(
+        held: Option<(BackupGeneration, &Digest256)>,
+        verified: (BackupGeneration, &Digest256),
+    ) -> Self {
+        let Some((held_generation, held_hash)) = held else {
+            return Self::Raises;
+        };
+        let (generation, hash) = verified;
+        if generation > held_generation {
+            Self::Raises
+        } else if generation < held_generation {
+            Self::Lower
+        } else if hash == held_hash {
+            Self::Same
+        } else {
+            Self::Disagrees
+        }
+    }
+}
 
 /// The strongest the restore has read of the bundle, authenticated: its newest revision, and for
 /// every archive its highest checkpoint.
@@ -112,19 +154,20 @@ pub fn advance_checkpoint(
         .iter()
         .filter(|held| held.archive_id == verified.archive_id)
         .max_by_key(|held| held.backup_generation);
-    if let Some(held) = held {
-        if held.backup_generation == verified.backup_generation {
-            return if held.encrypted_manifest_hash == verified.encrypted_manifest_hash {
-                Ok(None)
-            } else {
-                Err(RecoveryError::CheckpointDisagrees {
-                    generation: verified.backup_generation.get(),
-                })
-            };
+    match Standing::of(
+        held.map(|held| (held.backup_generation, &held.encrypted_manifest_hash)),
+        (
+            verified.backup_generation,
+            &verified.encrypted_manifest_hash,
+        ),
+    ) {
+        Standing::Same | Standing::Lower => return Ok(None),
+        Standing::Disagrees => {
+            return Err(RecoveryError::CheckpointDisagrees {
+                generation: verified.backup_generation.get(),
+            });
         }
-        if held.backup_generation > verified.backup_generation {
-            return Ok(None);
-        }
+        Standing::Raises => {}
     }
     let mut advanced = bundle.clone();
     advanced.checkpoints = bundle
@@ -135,4 +178,44 @@ pub fn advance_checkpoint(
         .chain(std::iter::once(verified.clone()))
         .collect();
     Ok(Some(advanced))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A verified checkpoint stands as raising, the same, lower or disagreeing, whichever way the
+    /// held one is set against it.
+    #[test]
+    fn a_verified_checkpoint_stands_by_its_generation_and_its_manifest() {
+        let generation = BackupGeneration::new;
+        let one = Digest256::from_bytes([1; 32]);
+        let other = Digest256::from_bytes([2; 32]);
+
+        assert_eq!(
+            Standing::of(None, (generation(1), &one)),
+            Standing::Raises,
+            "nothing is held"
+        );
+        assert_eq!(
+            Standing::of(Some((generation(4), &one)), (generation(5), &other)),
+            Standing::Raises,
+            "a newer generation raises, whatever its manifest"
+        );
+        assert_eq!(
+            Standing::of(Some((generation(5), &one)), (generation(5), &one)),
+            Standing::Same,
+            "the same generation with the same manifest"
+        );
+        assert_eq!(
+            Standing::of(Some((generation(5), &one)), (generation(5), &other)),
+            Standing::Disagrees,
+            "the same generation with another manifest"
+        );
+        assert_eq!(
+            Standing::of(Some((generation(6), &one)), (generation(5), &other)),
+            Standing::Lower,
+            "an older generation is lower, whatever its manifest"
+        );
+    }
 }
