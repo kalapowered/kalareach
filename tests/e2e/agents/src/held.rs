@@ -1599,6 +1599,7 @@ const SHARED_BOUND: std::time::Duration = std::time::Duration::from_secs(10);
 enum Unread {
     Link,
     NotAFile,
+    Gone,
     ManyNames,
     GuardedFile,
     Unlooked,
@@ -1613,6 +1614,7 @@ impl Unread {
         let reason = match self {
             Self::Link => "is a symbolic link and is not read".to_owned(),
             Self::NotAFile => "is not a regular file and is not read".to_owned(),
+            Self::Gone => "has no name left and is not read".to_owned(),
             Self::ManyNames => "has more than one name and is not read".to_owned(),
             Self::GuardedFile => "is the same file as a guarded file and is not read".to_owned(),
             Self::Unlooked => "is not read, because a guarded name cannot be looked at and this \
@@ -1644,12 +1646,14 @@ fn is_a_guarded_file(opened: &std::fs::Metadata, guarded: &[PathBuf]) -> Result<
 }
 
 /// Why `file`, a handle's or a name's metadata, is not one to read for the run's name: it is not a
-/// regular file, has more than one name, has the device and inode of a file in `seen`, or is larger
-/// than the byte limit. None where it may be read.
+/// regular file, has no name left or more than one name, has the device and inode of a file in
+/// `seen`, or is larger than the byte limit. None where it may be read.
 fn refusal_of(file: &std::fs::Metadata, seen: &BTreeSet<(u64, u64)>) -> Option<Unread> {
     use std::os::unix::fs::MetadataExt as _;
     if !file.is_file() {
         Some(Unread::NotAFile)
+    } else if file.nlink() == 0 {
+        Some(Unread::Gone)
     } else if file.nlink() != 1 {
         Some(Unread::ManyNames)
     } else if seen.contains(&(file.dev(), file.ino())) {
@@ -4847,6 +4851,23 @@ mod tests {
     }
 
     #[test]
+    fn a_file_with_no_name_left_is_refused_by_the_shared_checks() {
+        let home = scratch("refusal-no-name");
+        let path = home.join("file");
+        std::fs::write(&path, b"one").expect("a file");
+        let file = std::fs::File::open(&path).expect("opened");
+        let none = BTreeSet::new();
+        assert_eq!(refusal_of(&file.metadata().expect("a look"), &none), None);
+        // The only name is removed while the file is open.
+        std::fs::remove_file(&path).expect("removed");
+        assert_eq!(
+            refusal_of(&file.metadata().expect("a look"), &none),
+            Some(Unread::Gone)
+        );
+        std::fs::remove_dir_all(&home).expect("clean up");
+    }
+
+    #[test]
     fn a_file_with_the_device_and_inode_of_a_guarded_file_is_refused_by_the_shared_checks() {
         use std::os::unix::fs::MetadataExt as _;
         let home = scratch("refusal-identity");
@@ -4876,7 +4897,7 @@ mod tests {
     const PLANTED_IN_CREDENTIALS: &str = "krm-3f9a61c2-in-the-credentials";
 
     #[test]
-    fn a_named_pipe_or_a_directory_at_the_shared_name_is_refused_and_not_waited_on() {
+    fn a_named_pipe_made_at_the_shared_name_after_the_take_is_refused_and_not_waited_on() {
         let home = claude_home("shared-pipe");
         let stops = end_stops_after(&home, |home| {
             std::fs::remove_file(home.join(".claude.json")).expect("removed");
@@ -4887,8 +4908,12 @@ mod tests {
             Some(vec![not_read("is not a regular file and is not read")]),
             "the end read waited on a named pipe, or read it"
         );
-        std::fs::remove_file(home.join(".claude.json")).expect("removed");
-        std::fs::write(home.join(".claude.json"), b"{}").expect("a file");
+        std::fs::remove_dir_all(&home).expect("clean up");
+    }
+
+    #[test]
+    fn a_directory_made_at_the_shared_name_after_the_take_is_refused() {
+        let home = claude_home("shared-directory");
         let stops = end_stops_after(&home, |home| {
             std::fs::remove_file(home.join(".claude.json")).expect("removed");
             std::fs::create_dir(home.join(".claude.json")).expect("a directory");
@@ -5271,6 +5296,7 @@ mod tests {
         let said: Vec<String> = [
             (Unread::Link, "is a symbolic link and is not read"),
             (Unread::NotAFile, "is not a regular file and is not read"),
+            (Unread::Gone, "has no name left and is not read"),
             (Unread::ManyNames, "has more than one name and is not read"),
             (
                 Unread::GuardedFile,
