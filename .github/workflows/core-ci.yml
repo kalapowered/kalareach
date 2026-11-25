@@ -2668,21 +2668,29 @@ jobs:
   # No cache is saved: the repository's caches are at their limit, and a cache saved here would
   # take the room of one every other job restores. The job's time is the cost of that.
   #
-  # Each step that installs or builds has a limit of twice the longest it took in the 59 to 65
-  # hosted runs of 16 to 24 November, all of them with no cache, since the job restores none,
-  # rounded up, and of at least 5 minutes: the NDK, emulator and system image 5 (1.6 at most), the
-  # debug build 26 (13.0, run 45345872273), the run on the emulator 10 (4.7) and the minified build
-  # 47 (23.2, run 44759162215). With the 2 of the last reading of the disk they add up to 90, and
-  # the job's limit of 93 keeps 3 for the set-up and clean-up that no step limit counts. The whole
-  # job took 42.4 minutes at most (run 45051604117).
+  # Every step has a limit of its own, so that a step that hangs is ended, and the evidence upload
+  # after it still has its time. A step that installs or builds has twice the longest it took in the
+  # 59 to 65 hosted runs of 16 to 24 November, all of them with no cache, since the job restores
+  # none, rounded up: the NDK, emulator and system image 5 (1.6 at most), the debug build 26 (13.0,
+  # run 45345872273) and the minified build 47 (23.2, run 44759162215). The steps that only set up
+  # or read, none of which took more than 1.5 minutes, have 5, or 6 for the disk, as the other
+  # jobs' do; the evidence upload has 3, its pause 2 and its second try 3, as in the macOS jobs.
+  # The step that starts the emulator has 65: its own waits can add up to 3510 seconds, the boot's
+  # 600, the launch script's twelve deadlines of 240 seconds (the install's four, seven waits and the
+  # two looks after them) and 30 for its clean-up, and a run that waits that long should still reach
+  # its own error line and keep the device's log; the 6.5 minutes over are for the device's creation
+  # and the library's cases, which took 4.7 minutes in all in the longest of 63 runs. All the limits
+  # add up to 199 of the job's 202 minutes, which leaves 3 for the set-up and clean-up that no step
+  # limit counts. The whole job took 42.4 minutes at most (run 45051604117).
   android-app:
     name: android-app
     runs-on: ubuntu-24.04
-    timeout-minutes: 93
+    timeout-minutes: 202
     steps:
       # The runner arrives with toolchains this project never uses; the Android SDK stays, with the
       # emulator and a system image to be added to it.
       - name: Free the disk the build needs
+        timeout-minutes: 6
         run: |
           df -h /
           sudo rm -rf /usr/share/dotnet /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
@@ -2690,9 +2698,11 @@ jobs:
           df -h /
 
       - name: Check out
+        timeout-minutes: 5
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       - name: Install pnpm
+        timeout-minutes: 5
         uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v4.4.0
         with:
           version: 11.14.0
@@ -2700,18 +2710,21 @@ jobs:
       # No package cache: the job saves none (see the job's comment), and the packages come from the
       # registry.
       - name: Install Node
+        timeout-minutes: 5
         uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
         with:
           node-version: 22.23.1
           package-manager-cache: false
 
       - name: Install the pinned toolchain
+        timeout-minutes: 5
         run: |
           rustup show active-toolchain || rustup toolchain install
           rustc --version
 
       # The architectures the universal package carries: the phone's, and the emulator's.
       - name: Install the Android targets
+        timeout-minutes: 5
         run: rustup target add aarch64-linux-android x86_64-linux-android
 
       # The NDK the application's Gradle project pins is not on the runner's image, whose NDKs are
@@ -2740,11 +2753,13 @@ jobs:
           } >> "$GITHUB_ENV"
 
       - name: Install dependencies
+        timeout-minutes: 5
         run: pnpm install --frozen-lockfile
 
       # The script that reads the package back is held to its answers first, on archives made for the
       # purpose: a check that passes whatever it is given would be found by nothing else here.
       - name: Check the class check
+        timeout-minutes: 5
         run: node apps/companion/scripts/android-classes-selftest.mjs
 
       # The package is built the way a person builds it, and the script reads it back: the classes
@@ -2756,6 +2771,7 @@ jobs:
 
       # GitHub's documented way to give a hosted Linux runner's user the virtual machine device.
       - name: Let the emulator use the runner's virtual machine device
+        timeout-minutes: 5
         run: |
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' |
             sudo tee /etc/udev/rules.d/99-kvm4all.rules
@@ -2767,7 +2783,7 @@ jobs:
       # on the x86-64 architecture the emulator runs, then the application started and looked at.
       # Both run whatever the other did, and the log of the device is kept either way.
       - name: Run the native library and start the application on the emulator
-        timeout-minutes: 10
+        timeout-minutes: 65
         run: |
           set -uo pipefail
           export PATH="$ANDROID_HOME/platform-tools:$PATH"
@@ -2856,6 +2872,7 @@ jobs:
         id: keep-the-android-evidence
         if: ${{ !cancelled() }}
         continue-on-error: true
+        timeout-minutes: 3
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: test-evidence-android
@@ -2865,6 +2882,7 @@ jobs:
       # The first try failed: wait, then try once more. A second failure fails the job.
       - name: Keep the Android evidence, pause before the second try
         if: ${{ !cancelled() && steps.keep-the-android-evidence.outcome == 'failure' }}
+        timeout-minutes: 2
         shell: bash
         run: |
           echo "::warning title=Evidence not kept::The first try failed. Trying once more in 60 seconds."
@@ -2872,6 +2890,7 @@ jobs:
 
       - name: Keep the Android evidence, second try
         if: ${{ !cancelled() && steps.keep-the-android-evidence.outcome == 'failure' }}
+        timeout-minutes: 3
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: test-evidence-android
