@@ -31,7 +31,6 @@ use serde_json::Value;
 
 use crate::LIVENESS;
 use crate::compare::{self, Class, Interval, Layout};
-use crate::copies::Copies;
 use crate::floor::{Opening, Readings, Watch};
 use crate::index::{self, Looked};
 use crate::outside::Outside;
@@ -290,8 +289,9 @@ pub const RESTART_RESIDUALS: [&str; 13] = [
     "A name that the agent adds under the application directory is not looked at.",
     "A digest check followed by a start by path leaves a race between the last compare and the \
      start.",
-    "A copy of a database is opened by its path, so a swap of the copies' directory between its \
-     last check and the open is a race that the checks do not close.",
+    "SQLite reads each database from an image that the harness builds in memory from the main file, \
+     the -wal and the -journal it read through the run's handles, and opens no path; the image holds \
+     the bytes that the agent left at the instant of the copy.",
 ];
 
 /// What a survey shows that fails a run which wants none of it: a refusal of a compare, with the
@@ -549,10 +549,6 @@ pub struct Host<'r> {
     /// The wall clock and the continuous clock, read before the host's first daemon start: the
     /// anchor of the clock floor's limit.
     anchor: Readings,
-    /// The directory the host reads the databases of the run's sessions through copies in, made the
-    /// first time a look needs it: outside the run's directory and the agent's, so that nothing an
-    /// agent leaves in the run's tree decides where a copy is written or removed.
-    copies: std::sync::OnceLock<Result<Copies, String>>,
 }
 
 #[derive(Debug)]
@@ -615,7 +611,6 @@ impl<'r> Host<'r> {
             kr_after_start: Arc::default(),
             restarts: Mutex::default(),
             anchor: Readings::now(),
-            copies: std::sync::OnceLock::new(),
         };
         // The port was free when it was chosen, and it is bound when the daemon starts: other legs
         // choose theirs meanwhile, on this machine and on a shared one, and two can choose alike.
@@ -1557,29 +1552,12 @@ impl<'r> Host<'r> {
         }
     }
 
-    /// The tables of the journals of the sessions that `record` holds, as they stand, read through
-    /// copies in the host's own directory of copies.
+    /// The tables of the journals of the sessions that `record` holds, as they stand, read from
+    /// images made in memory.
     fn look_at_the_journals(&self, record: &Record) -> Tables {
         let layout = Layout::of(self.run.root(), &self.environment);
         let sessions = tables::sessions_of(&layout, record);
-        match self.copies() {
-            Ok(copies) => tables::look(&layout, self.place(), copies, &sessions),
-            Err(why) => Tables {
-                journals: sessions
-                    .into_iter()
-                    .map(|session| (session, Err(why.clone())))
-                    .collect(),
-            },
-        }
-    }
-
-    /// The directory the copies of the run's databases are read in, made the first time it is
-    /// asked for.
-    fn copies(&self) -> Result<&Copies, String> {
-        self.copies
-            .get_or_init(Copies::make)
-            .as_ref()
-            .map_err(Clone::clone)
+        tables::look(&layout, self.place(), &sessions)
     }
 
     fn place(&self) -> Place<'_> {
@@ -1594,12 +1572,7 @@ impl<'r> Host<'r> {
     fn standing(&self) -> Result<(Looked, Record), String> {
         let layout = Layout::of(self.run.root(), &self.environment);
         let known = self.record()?;
-        let indexes = index::look(
-            &layout,
-            self.place(),
-            self.copies()?,
-            &index::sessions_of(&layout, &known),
-        );
+        let indexes = index::look(&layout, self.place(), &index::sessions_of(&layout, &known));
         Ok((indexes, self.record()?))
     }
 
@@ -2250,7 +2223,6 @@ mod shutdown_tests {
             kr_after_start: Arc::default(),
             restarts: Mutex::default(),
             anchor: Readings::now(),
-            copies: std::sync::OnceLock::new(),
         }
     }
 
@@ -3036,8 +3008,7 @@ mod shutdown_tests {
     }
 
     /// A link the agent leaves where the harness once kept its copies is followed by nothing: a look
-    /// at the indexes and at the journals removes and writes nothing outside the harness's own
-    /// directory.
+    /// at the indexes and at the journals makes, changes and removes no file.
     #[test]
     fn a_look_at_the_databases_removes_and_writes_nothing_where_the_agent_left_a_link() {
         let root = scratch("copies-link");
@@ -3421,10 +3392,9 @@ mod shutdown_tests {
             "the race between the last compare and the start: {residuals:#?}"
         );
         assert!(
-            residuals
-                .iter()
-                .any(|said| said.contains("a race that the checks do not close")),
-            "the race at the open of a copy: {residuals:#?}"
+            residuals.iter().any(|said| said.contains("opens no path")
+                && said.contains("the bytes that the agent left at the instant of the copy")),
+            "what a copy holds and that SQLite opens no path: {residuals:#?}"
         );
         let notes = evidence["notes"].as_array().expect("a list of notes");
         assert!(

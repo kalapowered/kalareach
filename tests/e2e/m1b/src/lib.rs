@@ -59,13 +59,13 @@ pub mod ceremony;
 #[cfg(all(unix, feature = "legs"))]
 pub mod compare;
 #[cfg(all(unix, feature = "legs"))]
-pub mod copies;
-#[cfg(all(unix, feature = "legs"))]
 pub mod device;
 #[cfg(all(unix, feature = "legs"))]
 pub mod floor;
 #[cfg(all(unix, feature = "legs"))]
 pub mod host;
+#[cfg(all(unix, feature = "legs"))]
+pub mod image;
 #[cfg(all(unix, feature = "legs"))]
 pub mod index;
 #[cfg(all(unix, feature = "legs"))]

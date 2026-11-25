@@ -12,7 +12,7 @@ use rusqlite::Connection;
 use rusqlite::types::ValueRef;
 
 use crate::compare::{Class, Layout, Refusal};
-use crate::copies::Copies;
+use crate::image;
 use crate::index::equal_copies;
 use crate::tree::{Kind, Record};
 use crate::worker::Place;
@@ -124,20 +124,14 @@ pub fn sessions_of(layout: &Layout, record: &Record) -> Vec<String> {
         .collect()
 }
 
-/// Looks at the journals of `sessions`, each through copies in the directory `copies` keeps.
+/// Looks at the journals of `sessions`, each from an image of its copy made in memory.
 #[must_use]
-pub fn look(layout: &Layout, place: Place<'_>, copies: &Copies, sessions: &[String]) -> Tables {
+pub fn look(layout: &Layout, place: Place<'_>, sessions: &[String]) -> Tables {
     let mut tables = Tables::default();
     for session in sessions {
         let found = equal_copies(place, &journal_path(layout, session)).and_then(|copied| {
-            let (main, wal) = copied.ok_or_else(|| "it is not there".to_owned())?;
-            copies.read(
-                &format!("journal-{session}"),
-                "journal.sqlite",
-                &main,
-                wal.as_deref(),
-                digests_of,
-            )
+            let files = copied.ok_or_else(|| "it is not there".to_owned())?;
+            image::read(&files, digests_of)
         });
         tables.journals.insert(session.clone(), found);
     }
@@ -232,8 +226,7 @@ mod tests {
             root: &world.root,
             pin: &world.pin,
         };
-        let copies = Copies::make().expect("a directory for the copies");
-        look(&world.layout, place, &copies, &["a1".to_owned()])
+        look(&world.layout, place, &["a1".to_owned()])
     }
 
     fn lines(refused: Vec<Refusal>) -> Vec<String> {

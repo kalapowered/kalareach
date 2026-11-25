@@ -1,7 +1,7 @@
-//! The output-time indexes of a run's sessions, compared by meaning through copies. The live file is
-//! never opened: its main file and its `-wal` are copied twice into a directory outside both host
-//! roots, a copy is used only when two successive copies are equal, and the copy is opened by H
-//! with a connection of its own.
+//! The output-time indexes of a run's sessions, compared by meaning through copies. SQLite never
+//! opens the live file: its main file, its `-wal` and its `-journal` are read twice through the
+//! run's handles into memory, a copy is used only when two successive copies are equal, and H gives
+//! a connection of its own an image made from the copy, in memory, with no file name.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -11,7 +11,7 @@ use kr_worker::output_times::{MAX_ROWS, VERSION};
 use rusqlite::Connection;
 
 use crate::compare::{Class, Layout, Refusal};
-use crate::copies::Copies;
+use crate::image::{self, Files};
 use crate::run::open_file_below;
 use crate::tree::{Kind, Record};
 use crate::worker::Place;
@@ -94,13 +94,19 @@ fn bytes_of(place: Place<'_>, relative: &Path) -> Result<Option<Vec<u8>>, String
     Ok(Some(bytes))
 }
 
-type Taken = (Vec<u8>, Option<Vec<u8>>);
-
-/// The main file and the `-wal` of the index at `relative`, copied twice and equal, or why not.
-pub(crate) fn equal_copies(place: Place<'_>, relative: &Path) -> Result<Option<Taken>, String> {
+/// The main file, the `-wal` and the `-journal` of the database at `relative`, copied twice and
+/// equal, or why not. None where there is no main file.
+pub(crate) fn equal_copies(place: Place<'_>, relative: &Path) -> Result<Option<Files>, String> {
     let wal = PathBuf::from(format!("{}-wal", relative.display()));
-    let (main, wal) = settled(|| Ok((bytes_of(place, relative)?, bytes_of(place, &wal)?)))?;
-    Ok(main.map(|main| (main, wal)))
+    let journal = PathBuf::from(format!("{}-journal", relative.display()));
+    let (main, wal, journal) = settled(|| {
+        Ok((
+            bytes_of(place, relative)?,
+            bytes_of(place, &wal)?,
+            bytes_of(place, &journal)?,
+        ))
+    })?;
+    Ok(main.map(|main| Files { main, wal, journal }))
 }
 
 /// Makes copies with `copy` until two successive ones are equal, and gives up after [`TRIES`].
@@ -118,23 +124,6 @@ fn settled<T: PartialEq>(mut copy: impl FnMut() -> Result<T, String>) -> Result<
     Err(format!(
         "its copies did not become equal within {TRIES} tries"
     ))
-}
-
-/// Reads the rows of the copy that `main` and `wal` make in the directory `copies` keeps for
-/// `session`, with a connection of H's own.
-fn rows_of(
-    copies: &Copies,
-    session: &str,
-    main: &[u8],
-    wal: Option<&[u8]>,
-) -> Result<Rows, String> {
-    copies.read(
-        &format!("index-{session}"),
-        "index.sqlite",
-        main,
-        wal,
-        rows_in,
-    )
 }
 
 /// The rows of the copy `connection` is open on.
@@ -166,17 +155,14 @@ fn rows_in(connection: &Connection) -> Result<Rows, String> {
     Ok(Rows { versions, marks })
 }
 
-/// Looks at the indexes of `sessions`: each copied twice outside both roots, in the directory
-/// `copies` keeps, and read.
+/// Looks at the indexes of `sessions`: each copied twice into memory and read from an image of the
+/// copy.
 #[must_use]
-pub fn look(layout: &Layout, place: Place<'_>, copies: &Copies, sessions: &[String]) -> Looked {
+pub fn look(layout: &Layout, place: Place<'_>, sessions: &[String]) -> Looked {
     let mut looked = Looked::default();
     for session in sessions {
-        let found = equal_copies(place, &index_path(layout, session)).and_then(|copied| {
-            copied
-                .map(|(main, wal)| rows_of(copies, session, &main, wal.as_deref()))
-                .transpose()
-        });
+        let found = equal_copies(place, &index_path(layout, session))
+            .and_then(|copied| copied.map(|files| image::read(&files, rows_in)).transpose());
         looked.indexes.insert(session.clone(), found);
     }
     looked
@@ -720,9 +706,8 @@ mod tests {
             root: &world.root,
             pin: &world.pin,
         };
-        let copies = Copies::make().expect("a directory for the copies");
         let sessions = ["s1".to_owned(), "none".to_owned()];
-        let found = look(&world.layout, place, &copies, &sessions);
+        let found = look(&world.layout, place, &sessions);
         assert_eq!(
             found.indexes["s1"],
             Ok(Some(Rows {
@@ -733,7 +718,7 @@ mod tests {
         assert_eq!(found.indexes["none"], Ok(None));
         let garbage = world.state("output-times/s2.sqlite");
         std::fs::write(&garbage, b"not a database at all").expect("a file");
-        let found = look(&world.layout, place, &copies, &["s2".to_owned()]);
+        let found = look(&world.layout, place, &["s2".to_owned()]);
         assert!(found.indexes["s2"].is_err(), "{:?}", found.indexes);
         world.clean();
     }
