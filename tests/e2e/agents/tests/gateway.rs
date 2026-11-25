@@ -315,28 +315,33 @@ struct Real {
     probe_only: bool,
 }
 
-impl Route {
-    /// The route this run was given.
+/// The agent a run is given, read from the environment before anything of a real route is
+/// acquired: no account, ledger, key or file of the person has been looked at.
+struct Chosen {
+    subject: Subject,
+    /// The signed catalogue generation the package is installed from, which the operator names: a
+    /// real route has no fixture generation to fall back to. None on the stand-in route.
+    generation: Option<PathBuf>,
+}
+
+impl Chosen {
+    /// The agent the environment names: the build list entry that [`BUILD_VARIABLE`] names, or the
+    /// stand-in's Codex where it names none.
     ///
     /// # Panics
     ///
-    /// With `login` false the case runs with no login: the entry still gives its configuration, but
-    /// the descriptor of the login's value is not read, no ledger is asked for and none can be
-    /// charged, while the file guards and the searches for the other keys are kept. The mode is
-    /// the case's own and is chosen here, before any key is acquired.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the entry is one a real start refuses ([`entry::refuse_real_start`]), the entry
-    /// names no login, the run's `HOME` is not the person's home as the system's account database
-    /// names it, the values of the keys cannot be read, or the person's files cannot be looked at:
-    /// nothing has started, and no turn is spent.
-    fn from_environment(case: &str, login: bool, probe_only: bool) -> Self {
+    /// Panics when a real agent is asked for and the key scan names no file, the generation is not
+    /// one, the entry is one a real start refuses ([`entry::refuse_real_start`]), or the package's
+    /// manifest cannot be read: nothing has started.
+    fn from_environment() -> Self {
         let Some(path) = std::env::var_os(BUILD_VARIABLE)
             .filter(|value| !value.is_empty())
             .map(PathBuf::from)
         else {
-            return Self::StandIn;
+            return Self {
+                subject: Subject::codex(),
+                generation: None,
+            };
         };
         assert!(
             std::env::var_os(KEY_SCAN_VARIABLE).is_some_and(|value| !value.is_empty()),
@@ -356,21 +361,62 @@ impl Route {
             generation.is_absolute() && generation.join("root.json").is_file(),
             "{GENERATION_VARIABLE} names no generation (an absolute directory with a root.json)"
         );
-        let build = build::read_build(&path);
-        entry::refuse_real_start(&build).unwrap_or_else(|why| {
-            panic!("{BUILD_VARIABLE} names an entry that a real start refuses: {why}")
-        });
-        let account = build.account.clone().unwrap_or_else(|| {
-            panic!("{BUILD_VARIABLE} names an entry with no login, which no case may start")
-        });
-        let plugin = PluginId::new(&build.package).unwrap_or_else(|why| {
-            panic!(
+        Self::of(build::read_build(&path), generation).unwrap_or_else(|why| panic!("{why}"))
+    }
+
+    /// The agent of `build`, with its package installed from the generation at `generation`.
+    ///
+    /// # Errors
+    ///
+    /// Returns why a real start of the entry is refused, or why the entry and the package's
+    /// manifest are not one agent's.
+    ///
+    /// # Panics
+    ///
+    /// Panics where the package's manifest cannot be read from the generation, or is not the digest
+    /// the generation's index names.
+    fn of(build: Build, generation: PathBuf) -> Result<Self, String> {
+        entry::refuse_real_start(&build).map_err(|why| {
+            format!("{BUILD_VARIABLE} names an entry that a real start refuses: {why}")
+        })?;
+        let plugin = PluginId::new(&build.package).map_err(|why| {
+            format!(
                 "the entry's package {} is not a plugin identifier: {why}",
                 build.package
             )
+        })?;
+        let subject = Subject::from_build(&build, &generation_manifest(&generation, &plugin))?;
+        Ok(Self {
+            subject,
+            generation: Some(generation),
+        })
+    }
+}
+
+impl Route {
+    /// The route this run was given, from the agent `chosen` names.
+    ///
+    /// With `login` false the case runs with no login: the entry still gives its configuration, but
+    /// the descriptor of the login's value is not read, no ledger is asked for and none can be
+    /// charged, while the file guards and the searches for the other keys are kept. The mode is
+    /// the case's own and is chosen here, before any key is acquired.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the entry names no login, the run's `HOME` is not the person's home as the
+    /// system's account database names it, the values of the keys cannot be read, or the person's
+    /// files cannot be looked at: nothing has started, and no turn is spent.
+    fn acquire(chosen: Chosen, case: &str, login: bool, probe_only: bool) -> Self {
+        let Chosen {
+            subject,
+            generation,
+        } = chosen;
+        let (Some(build), Some(generation)) = (subject.entry().cloned(), generation) else {
+            return Self::StandIn;
+        };
+        let account = build.account.clone().unwrap_or_else(|| {
+            panic!("{BUILD_VARIABLE} names an entry with no login, which no case may start")
         });
-        let subject = Subject::from_build(&build, &generation_manifest(&generation, &plugin))
-            .unwrap_or_else(|why| panic!("{why}"));
         // The person's files are the ones under the home the system names, and a run started under
         // another `HOME` would guard a tree that is not theirs and pass.
         let home =
@@ -4092,7 +4138,7 @@ fn ends(
     };
     let mut stops: Vec<Stop> = Vec::new();
     let mut evidence = serde_json::json!({
-        "route": if matches!(route, Route::StandIn) { "the application stand-in" } else { "the pinned build" },
+        "route": route_label(matches!(route, Route::Real(_))),
         "run_started": run.is_some(),
     });
     let mut scan = None;
@@ -4502,22 +4548,99 @@ fn run_case_in(
             return;
         }
     };
-    let route = match std::panic::catch_unwind(|| {
+    let (chosen, probe_only) = match std::panic::catch_unwind(|| {
         let asked = std::env::var_os(PROBE_ONLY_VARIABLE).is_some_and(|value| !value.is_empty());
         let probe_only =
             probe_only_mode(setup, asked, real_asked).unwrap_or_else(|why| panic!("{why}"));
-        // A probe-only run has no login, whatever the case's own mode is.
-        Route::from_environment(case, !setup.no_login && !probe_only, probe_only)
+        (Chosen::from_environment(), probe_only)
     }) {
-        Ok(route) => route,
+        Ok(read) => read,
         Err(panic) => {
             records_failure(case, test, &kept_panic_text(&panic_text(&*panic)), &[]);
             std::panic::resume_unwind(panic);
         }
     };
-    let subject = match &route {
-        Route::StandIn => Subject::codex(),
-        Route::Real(real) => real.subject.clone(),
+    run_case_with(
+        setup,
+        leg,
+        case,
+        test,
+        variants,
+        (shell, chosen, probe_only),
+        body,
+    );
+}
+
+/// The route label of an outcome's evidence.
+const fn route_label(real_route: bool) -> &'static str {
+    if real_route {
+        "the pinned build"
+    } else {
+        "the application stand-in"
+    }
+}
+
+/// Why a case has nothing to run on `subject`, found before anything of a real route is acquired:
+/// a case that drives the gateway for an agent with no gateway ([`Subject::gateway_not_run`]).
+fn nothing_to_run(subject: &Subject, manual: bool, probe_only: bool) -> Option<String> {
+    subject.gateway_not_run(manual, probe_only)
+}
+
+/// The outcome of a case that has nothing to run, ended before a route, a run, a host or a session
+/// exists: not run, with its reason, through the outcome every other case ends with
+/// ([`outcome_of`]).
+fn not_run_outcome(
+    case: &str,
+    test: &str,
+    why: &str,
+    real_route: bool,
+    subject: &Subject,
+) -> Outcome {
+    outcome_of(
+        case,
+        test,
+        &Ok(serde_json::json!({ "not_run": why })),
+        &[],
+        false,
+        real_route,
+        serde_json::json!({
+            "route": route_label(real_route),
+            "run_started": false,
+            "turns": { "charged": 0 },
+            "subject": { "plugin": subject.plugin().to_string() },
+        }),
+    )
+}
+
+/// [`run_case_in`] on the shell and the agent the environment names. A case that has nothing to run
+/// for that agent ends here, as not run with its reason, before the account, the ledger or a key
+/// is looked at, and before a run, a host or a session exists.
+fn run_case_with(
+    setup: Setup,
+    leg: &str,
+    case: &str,
+    test: &str,
+    variants: &str,
+    (shell, chosen, probe_only): (shells::ManagedShell, Chosen, bool),
+    body: impl FnOnce(&Context, &Session<'_>) -> serde_json::Value,
+) {
+    let real_route = chosen.generation.is_some();
+    if let Some(why) = nothing_to_run(&chosen.subject, setup.manual, probe_only) {
+        if let Some(path) = std::env::var_os(RESULT_VARIABLE).filter(|value| !value.is_empty()) {
+            not_run_outcome(case, test, &why, real_route, &chosen.subject).append(Path::new(&path));
+        }
+        return;
+    }
+    let subject = chosen.subject.clone();
+    let route = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // A probe-only run has no login, whatever the case's own mode is.
+        Route::acquire(chosen, case, !setup.no_login && !probe_only, probe_only)
+    })) {
+        Ok(route) => route,
+        Err(panic) => {
+            records_failure(case, test, &kept_panic_text(&panic_text(&*panic)), &[]);
+            std::panic::resume_unwind(panic);
+        }
     };
     run_case_on(
         setup,
@@ -4530,9 +4653,7 @@ fn run_case_in(
     );
 }
 
-/// [`run_case_in`] on the shell, the route and the agent it has made. A case that drives the
-/// gateway for an agent with no gateway ends here, as not run with its reason, before a run, a
-/// host or a session exists.
+/// [`run_case_with`] on the shell, the route and the agent it has made.
 fn run_case_on(
     setup: Setup,
     leg: &str,
@@ -4542,19 +4663,6 @@ fn run_case_on(
     (shell, route, subject): (shells::ManagedShell, Route, Subject),
     body: impl FnOnce(&Context, &Session<'_>) -> serde_json::Value,
 ) {
-    let probe_only = matches!(&route, Route::Real(real) if real.probe_only);
-    if let Some(why) = subject.gateway_not_run(setup.manual, probe_only) {
-        let outcome = Outcome::not_run(
-            case,
-            test,
-            &why,
-            serde_json::json!({ "subject": { "plugin": subject.plugin().to_string() } }),
-        );
-        if let Some(path) = std::env::var_os(RESULT_VARIABLE).filter(|value| !value.is_empty()) {
-            outcome.append(Path::new(&path));
-        }
-        return;
-    }
     // The runtime is made before the run's directory, so that nothing that can fail is left to
     // fail between the run and the context that holds it.
     let runtime = match std::panic::catch_unwind(runtime) {
@@ -9529,8 +9637,9 @@ fn subject_with_no_gateway() -> Subject {
     .expect("a subject")
 }
 
-/// A case that drives the gateway for an agent with no gateway ends as not run before a run, a host
-/// or a session is made, and its body never runs.
+/// A case that drives the gateway for an agent with no gateway, and no account either, ends as not
+/// run before the route's account, ledger and keys are looked at and before a run, a host or a
+/// session is made: its body never runs, and nothing panics.
 #[test]
 fn a_case_that_drives_the_gateway_for_an_agent_with_no_gateway_ends_before_its_body_runs() {
     let shell = match shells::managed_zsh() {
@@ -9541,14 +9650,19 @@ fn a_case_that_drives_the_gateway_for_an_agent_with_no_gateway_ends_before_its_b
         }
     };
     let ran = std::sync::atomic::AtomicBool::new(false);
+    // A real route's agent: it has an entry, which has no account, so acquiring the route panics.
+    let chosen = Chosen {
+        subject: subject_with_no_gateway(),
+        generation: Some(PathBuf::from("/no/generation")),
+    };
     let ended = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        run_case_on(
+        run_case_with(
             Setup::default(),
             "gateway-no-gateway",
             "5b",
             "a test",
             "",
-            (shell, Route::StandIn, subject_with_no_gateway()),
+            (shell, chosen, false),
             |_, _| {
                 ran.store(true, std::sync::atomic::Ordering::SeqCst);
                 serde_json::json!({})
@@ -9560,4 +9674,21 @@ fn a_case_that_drives_the_gateway_for_an_agent_with_no_gateway_ends_before_its_b
         !ran.load(std::sync::atomic::Ordering::SeqCst),
         "the body of a case that drives the gateway ran for an agent with no gateway"
     );
+}
+
+/// The outcome of a case with nothing to run is not run, with the reason, the route it would have
+/// had and no run, like the outcome every other case ends with.
+#[test]
+fn a_case_with_nothing_to_run_is_recorded_as_not_run_with_the_evidence_of_every_outcome() {
+    let subject = subject_with_no_gateway();
+    let why = nothing_to_run(&subject, false, false).expect("a reason");
+    let outcome = not_run_outcome("5b", "a test", &why, true, &subject);
+    assert_eq!(outcome.outcome, "not_run");
+    assert_eq!(outcome.reason.as_deref(), Some(why.as_str()));
+    assert_eq!(outcome.evidence["route"], "the pinned build");
+    assert_eq!(outcome.evidence["run_started"], false);
+    assert_eq!(outcome.evidence["turns"]["charged"], 0);
+    assert_eq!(outcome.evidence["subject"]["plugin"], "kalareach/other");
+    let stand_in = not_run_outcome("5b", "a test", &why, false, &subject);
+    assert_eq!(stand_in.evidence["route"], "the application stand-in");
 }

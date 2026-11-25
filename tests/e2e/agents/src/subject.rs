@@ -199,6 +199,12 @@ impl Subject {
         })
     }
 
+    /// The build list entry of a real route; none on the stand-in route.
+    #[must_use]
+    pub const fn entry(&self) -> Option<&Build> {
+        self.entry.as_ref()
+    }
+
     /// The entry's account; none on the stand-in route and for an entry that has none.
     #[must_use]
     pub fn account(&self) -> Option<&Account> {
