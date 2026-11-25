@@ -74,7 +74,7 @@ fn by_hand_case(
 }
 
 /// The package's actions, as its manifest declares them.
-fn package_actions(subject: &Subject) -> Vec<Action> {
+pub(super) fn package_actions(subject: &Subject) -> Vec<Action> {
     let manifest: serde_json::Value = serde_json::from_slice(
         &std::fs::read(
             subject

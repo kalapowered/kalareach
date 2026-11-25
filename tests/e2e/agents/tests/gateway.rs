@@ -120,8 +120,8 @@ use kr_e2e_m1b::{LIVENESS, ceremony, shells};
 use kr_ipc::paths::EnvironmentPaths;
 use kr_plugin_catalogue::transport::RepositoryTransport;
 use kr_plugin_catalogue::{
-    CapabilityCeiling, Catalogue, Change, Enrolment, InstallationGrant, Owner, RepositoryId,
-    RepositoryKind,
+    CapabilityCeiling, Catalogue, CatalogueError, Change, Enrolment, InstallationGrant, Owner,
+    RepositoryId, RepositoryKind,
 };
 use kr_plugin_sdk::capability::PluginCapability;
 use kr_plugin_sdk::catalogue::QualifiedBuild;
@@ -141,8 +141,8 @@ use kr_protocol::error::ErrorCode;
 use kr_protocol::gateway::PendingState;
 use kr_protocol::identity::ProcessStartIdentity;
 use kr_protocol::ids::{
-    AgentBindingRevision, AgentTurnId, ApplicationInstanceId, PendingResourceId, PluginId,
-    SessionEpoch, SessionId,
+    AgentBindingRevision, AgentTurnId, ApplicationInstanceId, EnvironmentId, PendingResourceId,
+    PluginId, SessionEpoch, SessionId,
 };
 use kr_protocol::method::Method;
 use kr_protocol::recovery::{AgentInstancesParams, AgentInstancesResult};
@@ -2243,27 +2243,33 @@ async fn install_agent(
     // ([`GENERATION_VARIABLE`]): the package and the builds it qualifies are that generation's, and
     // there is no fixture to fall back to.
     let fixture;
-    let (metadata_url, targets_url, root_bytes, wanted) = if let Some(directory) = generation {
+    let (metadata_url, targets_url, root_bytes, wanted, grant) = if let Some(directory) = generation
+    {
         let wanted = generation_entry(directory, &plugin);
+        let grant = wanted.grant.clone();
         (
             generations::directory_url(&directory.join("metadata")),
             generations::directory_url(&directory.join("targets")),
             std::fs::read(directory.join("root.json")).expect("the generation's root"),
             Some(wanted),
+            grant,
         )
     } else {
         let home = environment.state_dir().join("generation-source");
         std::fs::create_dir_all(&home).expect("a directory for the generation");
-        let directory = if let Some(release) = subject.selected_release() {
+        let (directory, grant) = if let Some(release) = subject.selected_release() {
             let written = home.join("package");
-            let _ = package::write(subject, release, &written)
+            let manifest = package::write(subject, release, &written)
                 .unwrap_or_else(|why| panic!("the package written for {plugin}: {why}"));
-            written
+            (written, package::grant_of(&manifest))
         } else {
-            subject
-                .package()
-                .expect("the stand-in route installs a package the driver keeps")
-                .to_path_buf()
+            (
+                subject
+                    .package()
+                    .expect("the stand-in route installs a package the driver keeps")
+                    .to_path_buf(),
+                beyond_the_ceiling(subject.requested_capabilities().iter().copied()),
+            )
         };
         fixture = generations::Generation::build(
             &home,
@@ -2279,10 +2285,57 @@ async fn install_agent(
             generations::directory_url(&fixture.targets_dir()),
             fixture.root_bytes(),
             None,
+            grant,
         )
     };
+    let version = wanted
+        .as_ref()
+        .map_or_else(|| subject.package_version(), |entry| entry.version.clone());
+    let package = install_published(
+        environment.state_dir(),
+        environment.environment_id(),
+        (metadata_url, targets_url, root_bytes),
+        &plugin,
+        &version,
+        grant,
+    )
+    .await
+    .expect("installed");
+    // The package installed is the one the generation's index names: its digest is recorded, and
+    // compared with the index's own text of it.
+    if let Some(entry) = &wanted {
+        assert_eq!(
+            package.to_string(),
+            entry.manifest_digest,
+            "the package installed is the digest the generation's index names"
+        );
+    }
+    *package.as_bytes()
+}
+
+/// Enrols the repository whose metadata, targets and root are given in the catalogue below
+/// `state_dir`, installs the package `plugin` at `version` in `environment` with `grant`, as the
+/// owner's confirmation of that exact installation does, and enables it. Returns the digest of the
+/// package installed.
+///
+/// # Errors
+///
+/// Returns the catalogue's refusal of the installation.
+///
+/// # Panics
+///
+/// Panics where the catalogue cannot be opened, the repository cannot be enrolled or read, the
+/// generation does not hold the package, or the package cannot be enabled.
+async fn install_published(
+    state_dir: &Path,
+    environment: EnvironmentId,
+    (metadata_url, targets_url, root_bytes): (url::Url, url::Url, Vec<u8>),
+    plugin: &PluginId,
+    version: &str,
+    grant: Vec<PluginCapability>,
+) -> Result<PayloadDigest, CatalogueError> {
     let mut catalogue = Catalogue::open(
-        &environment.state_dir().join("catalogue"),
+        &state_dir.join("catalogue"),
         Arc::new(RepositoryTransport::local_only(
             "this test reads its repository from disk",
         )),
@@ -2305,50 +2358,30 @@ async fn install_agent(
         )
         .expect("the owner adopted the root");
     catalogue.sync(&id).await.expect("a generation");
-    let version = kr_plugin_sdk::version::PackageVersion::parse(
-        wanted
-            .as_ref()
-            .map_or(subject.package_version().as_str(), |entry| {
-                entry.version.as_str()
-            }),
-    )
-    .expect("a version");
+    let version = kr_plugin_sdk::version::PackageVersion::parse(version).expect("a version");
     let package = catalogue
         .index(&id)
         .expect("activated")
-        .find(&plugin, &version)
+        .find(plugin, &version)
         .expect("the package")
         .manifest_digest;
     catalogue
         .install_with(
             &id,
-            environment.environment_id(),
-            &plugin,
+            environment,
+            plugin,
             &version,
             package,
-            InstallationGrant::with(wanted.as_ref().map_or_else(
-                || beyond_the_ceiling(subject.requested_capabilities().iter().copied()),
-                |entry| entry.grant.clone(),
-            )),
+            InstallationGrant::with(grant),
             None,
             &mut Change::new(&Owner::confirming()),
         )
-        .await
-        .expect("installed");
+        .await?;
     catalogue
-        .set_enabled(environment.environment_id(), &plugin, true)
+        .set_enabled(environment, plugin, true)
         .await
         .expect("enabled");
-    // The package installed is the one the generation's index names: its digest is recorded, and
-    // compared with the index's own text of it.
-    if let Some(entry) = &wanted {
-        assert_eq!(
-            package.to_string(),
-            entry.manifest_digest,
-            "the package installed is the digest the generation's index names"
-        );
-    }
-    *package.as_bytes()
+    Ok(package)
 }
 
 /// The entry of a package in a generation the operator names, as its index says it.

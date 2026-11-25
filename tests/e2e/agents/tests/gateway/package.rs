@@ -13,16 +13,21 @@ use std::path::Path;
 
 use kr_e2e_agents::detect::check_detected;
 use kr_e2e_agents::subject::Subject;
+use kr_plugin_catalogue::CatalogueError;
+use kr_plugin_sdk::capability::PluginCapability;
 use kr_plugin_sdk::digest::PayloadDigest;
 use kr_plugin_sdk::ids::PluginName;
 use kr_plugin_sdk::matching::{ExecutableMatch, MatchConfidence, MatchRule};
 use kr_plugin_sdk::package::MANIFEST_FILE;
 use kr_plugin_sdk::plugin::PluginManifest;
 use kr_plugin_sdk::validate::validate_package_directory;
+use kr_protocol::ids::{EnvironmentId, PluginId};
 use kr_protocol::scalars::Nullable;
 
 use super::staged_a::{BY_HAND, HandAgent, detects, launched};
-use super::{Chosen, Context, ISOLATION_UNPROVEN, Session, Setup, run_case_with, shells};
+use super::{
+    Chosen, Context, ISOLATION_UNPROVEN, Session, Setup, generations, run_case_with, shells,
+};
 
 /// The one match rule of a written package: the executable named `command`, in any directory,
 /// whatever distribution it came from. A command is a name, never a path: the stand-in is placed
@@ -111,6 +116,17 @@ pub fn write(subject: &Subject, release: &Path, into: &Path) -> Result<PluginMan
                 .join("; ")
         ))
     }
+}
+
+/// The capabilities an installation of a written package is granted: those its own manifest asks
+/// for that the repository's ceiling does not already allow.
+pub fn grant_of(manifest: &PluginManifest) -> Vec<PluginCapability> {
+    super::beyond_the_ceiling(
+        manifest
+            .capabilities
+            .iter()
+            .map(|request| request.capability),
+    )
 }
 
 /// What a synthetic release declares, for the cases that write a package from one.
@@ -470,4 +486,185 @@ fn the_host_does_not_detect_a_program_run_under_another_name_than_the_entrys_com
         serde_json::json!({ "plugin": plugin, "detection": shown.detection.evidence() })
     });
     let _ = std::fs::remove_dir_all(&base);
+}
+
+/// Installs the package written into `directory`, whose manifest is `manifest`, with `grant`, from
+/// a generation and a catalogue of their own below `base`, named `attempt`.
+fn installs(
+    base: &Path,
+    directory: &Path,
+    manifest: &PluginManifest,
+    grant: &[PluginCapability],
+    attempt: &str,
+) -> Result<PayloadDigest, CatalogueError> {
+    let runtime = super::runtime();
+    let home = base.join(format!("generation-{attempt}"));
+    std::fs::create_dir_all(&home).expect("a directory for the generation");
+    let generation = runtime.block_on(generations::Generation::build(
+        &home,
+        generations::GenerationSpec {
+            package: Some(directory.to_path_buf()),
+            ..generations::GenerationSpec::default()
+        },
+    ));
+    let state = base.join(format!("state-{attempt}"));
+    std::fs::create_dir_all(&state).expect("a directory for the catalogue");
+    let plugin = PluginId::new(format!(
+        "{}/{}",
+        manifest.publisher_id, manifest.plugin_name
+    ))
+    .expect("a plugin identifier");
+    runtime.block_on(super::install_published(
+        &state,
+        EnvironmentId::new(kr_ipc::new_uuid()),
+        (
+            generations::directory_url(&generation.metadata_dir()),
+            generations::directory_url(&generation.targets_dir()),
+            generation.root_bytes(),
+        ),
+        &plugin,
+        &manifest.version.to_string(),
+        grant.to_vec(),
+    ))
+}
+
+/// The grant of the package written for each synthetic entry is the capabilities its own manifest
+/// asks for that the repository's ceiling does not allow: none for a package that asks for no more,
+/// and not the four that Codex's package is granted.
+#[test]
+fn the_grant_of_a_written_package_is_what_its_own_manifest_asks_for_beyond_the_ceiling() {
+    use PluginCapability::{
+        ApprovalDecode, ApprovalRespond, CommandIntegrationLaunch, TerminalInput, UpstreamAction,
+    };
+    let expected = [
+        vec![
+            CommandIntegrationLaunch,
+            ApprovalDecode,
+            ApprovalRespond,
+            UpstreamAction,
+        ],
+        Vec::new(),
+        vec![
+            ApprovalDecode,
+            ApprovalRespond,
+            UpstreamAction,
+            TerminalInput,
+        ],
+    ];
+    for ((plugin, command, shape), mut expected) in SYNTHETIC.into_iter().zip(expected) {
+        expected.sort();
+        let base = scratch("grant-of");
+        let subject = subject_of(&base.join("release"), plugin, command, shape);
+        let written = write(&subject, &base.join("release"), &base.join("package"))
+            .unwrap_or_else(|why| panic!("{plugin}: {why}"));
+        assert_eq!(grant_of(&written), expected, "{plugin}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+}
+
+/// The package written for each synthetic entry is installed with its own grant, and an install
+/// whose grant lacks a capability that an action of the package needs is refused, naming it.
+#[test]
+fn a_written_package_is_not_installed_without_the_grant_of_a_capability_one_of_its_actions_needs() {
+    for (plugin, command, shape) in SYNTHETIC {
+        let base = scratch("without-grant");
+        let subject = subject_of(&base.join("release"), plugin, command, shape);
+        let written = write(&subject, &base.join("release"), &base.join("package"))
+            .unwrap_or_else(|why| panic!("{plugin}: {why}"));
+        let grant = grant_of(&written);
+        let needed = super::beyond_the_ceiling(
+            written
+                .actions
+                .iter()
+                .map(|action| action.effect.required_capability()),
+        );
+        for (index, capability) in needed.iter().enumerate() {
+            let without: Vec<PluginCapability> = grant
+                .iter()
+                .copied()
+                .filter(|held| held != capability)
+                .collect();
+            let refused = installs(
+                &base,
+                &base.join("package"),
+                &written,
+                &without,
+                &format!("without-{index}"),
+            )
+            .expect_err("an install without the grant of an action's capability");
+            assert!(
+                matches!(&refused, CatalogueError::GrantRequired { capability: named, .. } if named == capability),
+                "{plugin}: the install without the grant of {capability} was refused for another \
+                 reason: {refused}"
+            );
+        }
+        installs(&base, &base.join("package"), &written, &grant, "with")
+            .unwrap_or_else(|why| panic!("{plugin}: the install with its own grant: {why}"));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+}
+
+/// A grant that names a capability the written package does not ask for is refused, so a grant that
+/// is not the package's own is not installed.
+#[test]
+fn a_written_package_is_not_installed_with_a_grant_for_a_capability_it_does_not_request() {
+    let (plugin, command, shape) = SYNTHETIC[1];
+    let base = scratch("extra-grant");
+    let subject = subject_of(&base.join("release"), plugin, command, shape);
+    let written = write(&subject, &base.join("release"), &base.join("package"))
+        .unwrap_or_else(|why| panic!("{plugin}: {why}"));
+    let mut grant = grant_of(&written);
+    grant.push(PluginCapability::TerminalInput);
+    let refused = installs(&base, &base.join("package"), &written, &grant, "extra")
+        .expect_err("an install with a grant the package did not ask for");
+    match &refused {
+        CatalogueError::GrantRequired {
+            capability,
+            requirement,
+        } => {
+            assert_eq!(*capability, PluginCapability::TerminalInput, "{plugin}");
+            assert!(
+                requirement.contains("a package that asks for it"),
+                "{requirement}"
+            );
+        }
+        other => panic!("{plugin}: refused for another reason: {other}"),
+    }
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// The actions that the two staged parts read for a subject made from a release are the ones the
+/// release declares, and not the actions of the Codex package this crate keeps.
+#[test]
+fn the_actions_of_a_subject_made_from_a_release_are_the_releases_own() {
+    for (plugin, command, shape) in SYNTHETIC {
+        let base = scratch("actions");
+        let subject = selected_subject(&base.join("release"), plugin, command, shape);
+        let released: PluginManifest = serde_json::from_slice(
+            &std::fs::read(base.join("release").join(MANIFEST_FILE)).expect("the release"),
+        )
+        .expect("a manifest");
+        let declared: Vec<String> = released
+            .actions
+            .iter()
+            .map(|action| action.id.to_string())
+            .collect();
+        let ids = |actions: Vec<kr_e2e_agents::build::Action>| -> Vec<String> {
+            actions.into_iter().map(|action| action.id).collect()
+        };
+        assert_eq!(
+            ids(super::staged_a::package_actions(&subject)),
+            declared,
+            "{plugin}: staged A"
+        );
+        assert_eq!(
+            ids(super::staged_c::package_actions(&subject)),
+            declared,
+            "{plugin}: staged C"
+        );
+        if matches!(shape, Shape::Observed) {
+            assert_eq!(declared, ["status.refresh"], "{plugin}");
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
 }
