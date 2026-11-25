@@ -96,6 +96,7 @@ use crate::given::{Given, Recorded};
 use crate::service::LeaseAsked;
 
 mod change_sets;
+pub mod order;
 
 /// What one answer of a method in this group is.
 pub type Answer<T> = std::result::Result<T, ProtocolError>;
