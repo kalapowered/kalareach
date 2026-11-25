@@ -1,10 +1,12 @@
 //! The terminal stand-in for the build list's other entries.
 //!
 //! `agent-stand-in` takes the names and texts of the entry it stands for from a file the driver
-//! makes ([`stand_in_file`]) and never a path to run. The three synthetic entries here are a script
-//! launch, a wheel launch and a native entry with texts of its own. Some cases in this file start the
-//! program alone, with a home of its own, and read what it printed and what it recorded. The others
-//! choose the entry that the stand-in route stands in for ([`stand_in_chosen`]) and run the staged
+//! makes ([`stand_in_file`]) and never a path to run. The synthetic entries here are a script
+//! launch, a wheel launch, a native entry with texts of its own and a native entry whose harmless
+//! key is a key sequence, each with an account, and a wheel launch and a native entry with none.
+//! Some cases in this file start the program alone, with a home of its own, and read what it
+//! printed and what it recorded. The others choose the entry that the stand-in route stands in for
+//! ([`stand_in_chosen`]) and run the staged
 //! parts that start no model turn for the stand-in made from it. The route places the stand-in as
 //! the entry is launched ([`placing_of`]): a script or a wheel as the program under the runtime's
 //! name and a script that names it, which a person types as the command. The parts run with a
@@ -16,7 +18,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use kr_e2e_agents::build::{Build, Launch, read_build};
+use kr_e2e_agents::build::{Account, Build, Launch, read_build};
 use kr_e2e_agents::held::{conversations_relative_in, turns_recorded};
 use kr_e2e_agents::subject::Subject;
 use kr_e2e_m1b::run::{RootPin, Run};
@@ -38,13 +40,14 @@ const NEWER: &str = env!("CARGO_BIN_EXE_agent-stand-in-newer");
 const WITHIN: Duration = Duration::from_secs(20);
 
 /// The members of the file the stand-in takes: names and texts, and no path.
-const MEMBERS: [&str; 13] = [
+const MEMBERS: [&str; 14] = [
     "command",
     "launch",
     "version",
     "newer_version",
     "ready",
     "newer_ready",
+    "harmless",
     "composer",
     "config_variable",
     "conversations",
@@ -76,6 +79,25 @@ impl Synthetic {
         let file = entry_json(package, shape, texts, marks);
         let build = serde_json::from_value(file.clone()).expect("an entry");
         Self { name, file, build }
+    }
+
+    /// The entry with `input` as its harmless key and `shows` as the text its screen shows once it
+    /// has taken that key.
+    fn harmless_key(mut self, input: &str, shows: &str) -> Self {
+        self.file["harmless"] = serde_json::json!({ "input": input, "shows": shows });
+        self.build = serde_json::from_value(self.file.clone()).expect("an entry");
+        self
+    }
+
+    /// The entry of an agent that has no account, named `name`.
+    fn without_account(mut self, name: &'static str) -> Self {
+        self.file
+            .as_object_mut()
+            .expect("an entry")
+            .remove("account");
+        self.name = name;
+        self.build = serde_json::from_value(self.file.clone()).expect("an entry");
+        self
     }
 }
 
@@ -140,9 +162,10 @@ pub fn native_entry(plugin: &str, command: &str) -> Build {
     .build
 }
 
-/// The three synthetic entries: a script launch, a wheel launch and a native entry whose texts and
-/// marks are not Codex's.
-pub fn synthetic() -> [Synthetic; 3] {
+/// The four synthetic entries of an agent that has an account: a script launch, a wheel launch, a
+/// native entry whose texts and marks are not Codex's, and a native entry whose harmless key is a
+/// key sequence, as kimi-code-cli's Down key is.
+pub fn synthetic() -> [Synthetic; 4] {
     [
         Synthetic::of(
             "the script launch",
@@ -185,19 +208,31 @@ pub fn synthetic() -> [Synthetic; 3] {
             ("Native agent ready", "native> type here"),
             NATIVE_MARKS,
         ),
+        Synthetic::of(
+            "the native entry whose harmless key is a key sequence",
+            "kalareach/synthetic-keys",
+            ("kimi-code", "native", &[], "bin/kimi-code"),
+            ("Keys agent ready", "keys> type here"),
+            NATIVE_MARKS,
+        )
+        .harmless_key("\u{1b}[B", "❯ Don't trust"),
     ]
 }
 
-/// The file the stand-in takes for `build`: the names and texts of the entry, and no path to run.
-///
-/// # Panics
-///
-/// Panics where the entry has no account to take the record's marks from.
+/// The two synthetic entries of an agent that has no account, as kimi-cli and opencode-attach have
+/// none: the wheel launch and the native entry of [`synthetic`] with their accounts removed.
+pub fn without_account() -> [Synthetic; 2] {
+    let [_, wheel, native, ..] = synthetic();
+    [
+        wheel.without_account("the wheel launch with no account"),
+        native.without_account("the native entry with no account"),
+    ]
+}
+
+/// The file the stand-in takes for `build`: the names and texts of the entry, and no path to run. An
+/// entry with no account has no composer text and no record, so the file names none.
 pub fn stand_in_file(build: &Build) -> serde_json::Value {
-    let account = build
-        .account
-        .as_ref()
-        .expect("an entry with an account, for the record's marks");
+    let account = build.account.as_ref();
     serde_json::json!({
         "command": build.command,
         "launch": serde_json::to_value(build.launch).expect("a launch kind"),
@@ -205,16 +240,30 @@ pub fn stand_in_file(build: &Build) -> serde_json::Value {
         "newer_version": build.newer.as_ref().map(|newer| newer.version.clone()),
         "ready": build.ready,
         "newer_ready": build.newer.as_ref().map(|newer| newer.ready.clone()),
-        "composer": account.composer,
+        "harmless": { "input": build.harmless.input, "shows": build.harmless.shows },
+        "composer": account.map(|account| account.composer.clone()),
         "config_variable": account
-            .config_directory
-            .as_ref()
+            .and_then(|account| account.config_directory.as_ref())
             .map(|directory| directory.variable.clone()),
-        "conversations": account.conversations,
-        "prompt_line": account.prompt_line,
-        "reply_line": account.reply_line,
-        "turn_line": account.turn_line,
-        "image_line": account.image_line,
+        "conversations": account.map(|account| account.conversations.clone()),
+        "prompt_line": account.map(|account| account.prompt_line.clone()),
+        "reply_line": account.map(|account| account.reply_line.clone()),
+        "turn_line": account.and_then(|account| account.turn_line.clone()),
+        "image_line": account.and_then(|account| account.image_line.clone()),
+    })
+}
+
+/// The account of `build`, which a part that reads the composer's text or the record's marks needs.
+///
+/// # Errors
+///
+/// Returns the refusal of an entry with no account.
+pub fn account_for(build: &Build) -> Result<&Account, String> {
+    build.account.as_ref().ok_or_else(|| {
+        format!(
+            "{STAND_IN_ENTRY_VARIABLE} names an entry with no account, which gives the terminal \
+             stand-in no composer text and no record marks"
+        )
     })
 }
 
@@ -225,7 +274,7 @@ pub fn stand_in_file(build: &Build) -> serde_json::Value {
 /// # Errors
 ///
 /// Returns why the two are refused: one is named without the other, a real build is named beside
-/// them, the manifest is not a file named `plugin.json`, the entry has no account, the entry's
+/// them, the manifest is not a file named `plugin.json`, the entry's
 /// command, runtime file or wheel file is not one plain file name ([`placing_of`]), or the entry and
 /// the release are not one agent's.
 ///
@@ -273,12 +322,6 @@ pub fn stand_in_chosen(
         ));
     }
     let build = read_build(entry);
-    if build.account.is_none() {
-        return Err(format!(
-            "{STAND_IN_ENTRY_VARIABLE} names an entry with no account, which gives the terminal \
-             stand-in no composer text and no record marks"
-        ));
-    }
     placing_of(Some(&build), &build.command).map_err(|why| {
         format!(
             "{STAND_IN_ENTRY_VARIABLE} names an entry the terminal stand-in cannot be placed \
@@ -431,11 +474,8 @@ fn the_stand_in_shows_the_texts_of_the_entry_it_stands_for_and_no_sign_in_screen
             &[],
         );
         let (name, ready) = (synthetic.name, &synthetic.build.ready);
-        let composer = &synthetic
-            .build
-            .account
-            .as_ref()
-            .expect("an account")
+        let composer = &account_for(&synthetic.build)
+            .unwrap_or_else(|why| panic!("{name}: {why}"))
             .composer;
         assert!(
             ran.out.contains(ready.as_str()),
@@ -528,7 +568,8 @@ fn the_stand_in_writes_the_entrys_record_lines_below_its_conversations() {
             &[red_variable()],
         );
         let name = synthetic.name;
-        let account = synthetic.build.account.as_ref().expect("an account");
+        let account =
+            account_for(&synthetic.build).unwrap_or_else(|why| panic!("{}: {why}", synthetic.name));
         let record = ran.home.join("sessions");
         let files = files_below(&record);
         assert_eq!(
@@ -683,6 +724,43 @@ fn a_stand_in_started_by_a_script_does_not_take_the_script_for_a_command() {
                 started.err
             );
         }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+}
+
+/// The stand-in for an entry with no account shows the entry's first screen, answers a prompt, and
+/// keeps no record.
+#[test]
+fn the_stand_in_for_an_entry_with_no_account_shows_its_first_screen_answers_and_keeps_no_record() {
+    for synthetic in without_account() {
+        let base = scratch("no-account-shows");
+        let ran = ran(
+            &base,
+            PROGRAM,
+            &stand_in_file(&synthetic.build),
+            &[],
+            &["What is 12 plus 30".to_owned()],
+            &[],
+        );
+        let (name, ready) = (synthetic.name, &synthetic.build.ready);
+        assert!(
+            ran.success && ran.out.contains(ready.as_str()),
+            "{name}: the first screen shows the entry's ready text {ready:?}, and the stand-in \
+             printed:\n{}{}",
+            ran.out,
+            ran.err
+        );
+        assert_eq!(
+            replies(&ran.out),
+            ["42"],
+            "{name}: the stand-in answers the prompt, and printed:\n{}",
+            ran.out
+        );
+        let left = files_below(&ran.home);
+        assert!(
+            left.is_empty(),
+            "{name}: the stand-in keeps no record, and left: {left:?}"
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 }
@@ -861,26 +939,41 @@ fn a_manifest_for_the_stand_in_route_that_is_not_named_plugin_json_is_refused() 
     let _ = std::fs::remove_dir_all(&base);
 }
 
-/// An entry with no account, and an entry with the release of another package, are refused.
+/// An entry with no account is accepted for the stand-in route, which gives its stand-in no
+/// composer text and no record; a part that reads the account of the entry is refused it, with the
+/// reason.
 #[test]
-fn an_entry_with_no_account_or_a_manifest_of_another_package_is_refused_for_the_stand_in_route() {
+fn an_entry_with_no_account_is_accepted_for_the_stand_in_route_and_refused_where_a_part_reads_its_account()
+ {
+    let base = scratch("no-account");
+    for synthetic in without_account() {
+        let name = synthetic.name;
+        let (entry, manifest) = named(&base, &synthetic);
+        let chosen = stand_in_chosen(Some(&entry), Some(&manifest), false)
+            .unwrap_or_else(|why| panic!("{name}: an entry with no account is accepted: {why}"))
+            .unwrap_or_else(|| panic!("{name}: the entry is the agent the stand-in stands for"));
+        assert_eq!(
+            chosen.subject.command(),
+            synthetic.build.command,
+            "{name}: the stand-in route stands for the entry"
+        );
+        assert_eq!(
+            account_for(&synthetic.build).err().as_deref(),
+            Some(
+                "KR_AGENTS_STAND_IN_ENTRY names an entry with no account, which gives the \
+                 terminal stand-in no composer text and no record marks"
+            ),
+            "{name}: a part that reads the entry's account is refused"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// An entry with the release of another package is refused.
+#[test]
+fn a_manifest_of_another_package_is_refused_for_the_stand_in_route() {
     let base = scratch("not-one-agent");
     let [first, second, ..] = synthetic();
-    let (entry, manifest) = named(&base, &first);
-    let mut bare = first.file.clone();
-    bare.as_object_mut()
-        .expect("an entry")
-        .remove("account")
-        .expect("the entry's account");
-    std::fs::write(&entry, bare.to_string()).expect("the entry without an account");
-    assert_eq!(
-        refused(
-            stand_in_chosen(Some(&entry), Some(&manifest), false),
-            "an entry with no account"
-        ),
-        "KR_AGENTS_STAND_IN_ENTRY names an entry with no account, which gives the terminal \
-         stand-in no composer text and no record marks"
-    );
     let (entry, _) = named(&base, &first);
     let other = base.join("other");
     release(
@@ -1391,7 +1484,7 @@ fn assert_no_program_the_entry_names_ran(name: &str, mark: &Path) {
 /// the case fails once the part has ended if one of them ran
 /// ([`assert_no_program_the_entry_names_ran`]).
 fn for_each_entry(test: &str, part: fn(Option<Subject>, &str)) {
-    for synthetic in synthetic() {
+    for synthetic in synthetic().into_iter().chain(without_account()) {
         let base = scratch("part");
         let (synthetic, mark) = marked(&base, &synthetic);
         let subject = subject_for(&synthetic, &base);

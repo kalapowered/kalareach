@@ -113,20 +113,35 @@ mod stand_in {
         ready: String,
         /// The text the newer build's first screen shows, where the entry has a newer build.
         newer_ready: Option<String>,
-        /// The text the composer shows while it waits for a prompt.
-        composer: String,
+        /// The key the agent takes at its composer without sending a prompt, and the text its screen
+        /// shows once it has taken it.
+        harmless: Harmless,
+        /// The text the composer shows while it waits for a prompt; none for an entry with no
+        /// account.
+        composer: Option<String>,
         /// The variable that names the configuration directory, where the agent has one.
         config_variable: Option<String>,
-        /// Where the conversations are, relative to the configuration directory or the home.
-        conversations: String,
-        /// What marks the line of a prompt.
-        prompt_line: String,
-        /// What marks the line of a reply.
-        reply_line: String,
+        /// Where the conversations are, relative to the configuration directory or the home; none
+        /// for an entry with no account, which keeps no record.
+        conversations: Option<String>,
+        /// What marks the line of a prompt; given with the conversations.
+        prompt_line: Option<String>,
+        /// What marks the line of a reply; given with the conversations.
+        reply_line: Option<String>,
         /// What marks the line that starts a turn, where the agent writes one.
         turn_line: Option<String>,
         /// What marks the line of an image a prompt names, where the agent records one.
         image_line: Option<String>,
+    }
+
+    /// A key, and the text the agent's screen shows once it has taken it.
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Harmless {
+        /// The key.
+        input: String,
+        /// The text.
+        shows: String,
     }
 
     /// The marks of the lines the conversation file holds, as the entry gives them.
@@ -147,6 +162,41 @@ mod stand_in {
         conversations: String,
         /// The marks of an entry's lines; none for the Codex terminal's own shape.
         marks: Option<Marks>,
+    }
+
+    /// Where the conversations are and what marks their lines: the Codex terminal's own, the
+    /// entry's, or none for an entry that keeps no record.
+    ///
+    /// # Errors
+    ///
+    /// Returns why the entry names some of its conversations, prompt mark and reply mark and not
+    /// all three.
+    fn layout_of(entry: Option<&Entry>, home: PathBuf) -> Result<Option<Layout>, String> {
+        let Some(entry) = entry else {
+            return Ok(Some(Layout {
+                home,
+                conversations: CODEX_CONVERSATIONS.to_owned(),
+                marks: None,
+            }));
+        };
+        match (&entry.conversations, &entry.prompt_line, &entry.reply_line) {
+            (None, None, None) => Ok(None),
+            (Some(conversations), Some(prompt), Some(reply)) => Ok(Some(Layout {
+                home,
+                conversations: conversations.clone(),
+                marks: Some(Marks {
+                    prompt: prompt.clone(),
+                    reply: reply.clone(),
+                    turn: entry.turn_line.clone(),
+                    image: entry.image_line.clone(),
+                }),
+            })),
+            _ => Err(
+                "the entry names some of its conversations, prompt mark and reply mark, and \
+                      not all three"
+                    .to_owned(),
+            ),
+        }
     }
 
     /// Whether this program is the newer build of the source: the second `[[bin]]` of the package.
@@ -235,34 +285,34 @@ mod stand_in {
             sign_in_screen();
             return;
         }
-        let layout = Layout {
-            home,
-            conversations: entry
-                .as_ref()
-                .map_or(CODEX_CONVERSATIONS, |entry| entry.conversations.as_str())
-                .to_owned(),
-            marks: entry.as_ref().map(|entry| Marks {
-                prompt: entry.prompt_line.clone(),
-                reply: entry.reply_line.clone(),
-                turn: entry.turn_line.clone(),
-                image: entry.image_line.clone(),
-            }),
-        };
-        let conversation =
-            match open_conversation(&layout, subcommand.as_deref(), identifier.as_deref()) {
-                Ok(conversation) => conversation,
-                Err(why) => {
-                    eprintln!("Error: {why}");
-                    std::process::exit(1);
+        let layout = layout_of(entry.as_ref(), home).unwrap_or_else(|why| {
+            eprintln!("Error: {why}");
+            std::process::exit(2);
+        });
+        let conversation = match &layout {
+            Some(layout) => {
+                match open_conversation(layout, subcommand.as_deref(), identifier.as_deref()) {
+                    Ok(conversation) => Some(conversation),
+                    Err(why) => {
+                        eprintln!("Error: {why}");
+                        std::process::exit(1);
+                    }
                 }
-            };
+            }
+            None if subcommand.is_some() => {
+                eprintln!("Error: the entry keeps no conversation to resume or fork");
+                std::process::exit(1);
+            }
+            None => None,
+        };
         match &entry {
             Some(entry) => composer(
                 conversation,
                 &[ready.expect("the first screen of an entry").to_owned()],
-                &entry.composer,
+                entry.composer.as_deref().unwrap_or(""),
                 true,
                 std::env::var_os(LEAVE_VARIABLE).filter(|program| !program.is_empty()),
+                Some(&entry.harmless),
             ),
             None => composer(
                 conversation,
@@ -273,6 +323,7 @@ mod stand_in {
                 ],
                 COMPOSER,
                 false,
+                None,
                 None,
             ),
         }
@@ -538,8 +589,9 @@ mod stand_in {
 
     /// Reads one line of keys a terminal delivers as they are typed, and echoes each printable key
     /// as it comes; the backspace and the line-kill key take back what was echoed. Escape sequences
-    /// are kept in the line and not echoed. None where the terminal closes.
-    fn line_of_keys(input: &mut impl Read) -> Option<Vec<u8>> {
+    /// are kept in the line and not echoed. The harmless key shows its text once it has been read.
+    /// None where the terminal closes.
+    fn line_of_keys(input: &mut impl Read, harmless: Option<&Harmless>) -> Option<Vec<u8>> {
         let mut out = std::io::stdout();
         let mut line: Vec<u8> = Vec::new();
         let mut escape = Escape::None;
@@ -557,12 +609,16 @@ mod stand_in {
                     } else {
                         Escape::None
                     };
+                    if matches!(escape, Escape::None) {
+                        shows_the_harmless_key(&mut out, &line, harmless);
+                    }
                     continue;
                 }
                 Escape::Csi => {
                     line.push(key);
                     if (0x40..=0x7e).contains(&key) {
                         escape = Escape::None;
+                        shows_the_harmless_key(&mut out, &line, harmless);
                     }
                     continue;
                 }
@@ -599,8 +655,21 @@ mod stand_in {
                         let _ = out.write_all(&[key]);
                         let _ = out.flush();
                     }
+                    shows_the_harmless_key(&mut out, &line, harmless);
                 }
             }
+        }
+    }
+
+    /// Shows the text of the harmless key on a line of its own once the line ends with the key,
+    /// where that text is not what the echo of the key already shows.
+    fn shows_the_harmless_key(out: &mut impl Write, line: &[u8], harmless: Option<&Harmless>) {
+        if let Some(harmless) = harmless
+            && harmless.shows != harmless.input
+            && line.ends_with(harmless.input.as_bytes())
+        {
+            let _ = out.write_all(format!("\r\n{}\r\n", harmless.shows).as_bytes());
+            let _ = out.flush();
         }
     }
 
@@ -609,11 +678,12 @@ mod stand_in {
     /// it, as a full-screen agent does, so that a part of a line typed and not yet sent is the
     /// agent's and not left in the terminal when the agent ends.
     fn composer(
-        mut conversation: Conversation,
+        mut conversation: Option<Conversation>,
         banner: &[String],
         composer: &str,
         keys_typed: bool,
         mut leave_program: Option<std::ffi::OsString>,
+        harmless: Option<&Harmless>,
     ) {
         for line in banner {
             println!("{line}");
@@ -626,7 +696,7 @@ mod stand_in {
         loop {
             line.clear();
             if saved.is_some() {
-                match line_of_keys(&mut stdin.lock()) {
+                match line_of_keys(&mut stdin.lock(), harmless) {
                     Some(keys) => line = keys,
                     None => break,
                 }
@@ -651,7 +721,7 @@ mod stand_in {
                 eprintln!("Error: {why}");
                 std::process::exit(2);
             }
-            let reply = answer(&prompt, &mut conversation);
+            let reply = answer(&prompt, conversation.as_mut());
             println!("• {reply}");
             println!();
             println!("› {composer}");
@@ -680,9 +750,11 @@ mod stand_in {
     }
 
     /// Records the prompt, finds the reply to it and records that.
-    fn answer(prompt: &str, conversation: &mut Conversation) -> String {
+    fn answer(prompt: &str, mut conversation: Option<&mut Conversation>) -> String {
         let image = image_named(prompt);
-        record(conversation, "user", prompt, image.as_deref());
+        if let Some(conversation) = conversation.as_deref_mut() {
+            record(conversation, "user", prompt, image.as_deref());
+        }
         if let Some(code) = prompt
             .split_once("Remember the code ")
             .map(|(_, after)| after)
@@ -693,11 +765,17 @@ mod stand_in {
                     .collect()
             })
             .filter(|code: &String| !code.is_empty())
+            && let Some(conversation) = conversation.as_deref_mut()
         {
             conversation.remembered = Some(code);
         }
-        let reply = reply_to(prompt, image.as_deref(), conversation.remembered.as_deref());
-        record(conversation, "assistant", &reply, None);
+        let remembered = conversation
+            .as_deref()
+            .and_then(|conversation| conversation.remembered.as_deref());
+        let reply = reply_to(prompt, image.as_deref(), remembered);
+        if let Some(conversation) = conversation {
+            record(conversation, "assistant", &reply, None);
+        }
         reply
     }
 
