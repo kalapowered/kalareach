@@ -3087,7 +3087,6 @@ fn the_linux_job_of_the_conformance_workflow_runs_its_plan_in_two_parts_and_the_
 #[test]
 fn every_job_of_the_conformance_workflow_has_a_limit_under_githubs_and_its_steps_limits_fit_in_it()
 {
-    const SET_UP_AND_CLEAN_UP_MINUTES: u32 = 3;
     let workflow = fs::read_to_string(repository().join(".github/workflows/conformance.yml"))
         .expect("the conformance workflow");
     let jobs = jobs_of(&workflow);
