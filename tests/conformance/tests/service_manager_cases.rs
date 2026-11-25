@@ -5,12 +5,18 @@
 //! The script runs here against stand-ins for `uname`, `systemctl` and `cargo` placed first on its
 //! `PATH`, so that no case runs and no service manager is asked. Each stand-in appends the
 //! command it was given to one file, which a case compares with what the script must have run.
+//!
+//! The script has to run every case whose `ignore` reason names the user service manager: a case
+//! added with such a reason that the script does not name fails here.
 
 #![cfg(unix)]
 
+use std::collections::BTreeSet;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+use kr_conformance::rust_lex::{self, Tok};
 
 const CRASH_CASE: &str = "a_crashed_workers_tree_is_stopped_under_the_platforms_service_manager";
 const SESSION_CASE: &str =
@@ -280,5 +286,193 @@ fn the_script_keeps_its_count_in_a_temporary_file_and_removes_it_when_it_ends() 
     assert!(
         !dir.path().join("target").exists(),
         "the script makes nothing in the target directory"
+    );
+}
+
+/// What an `ignore` reason holds when its case starts units in the account's own user service
+/// manager: the command every such case asks the manager with.
+const MANAGER_REASON: &str = "systemctl --user";
+
+/// Every `.rs` file under `directory`, leaving out build output and installed packages.
+fn rust_files(directory: &Path, found: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name();
+        if path.is_dir() {
+            if name != "target" && name != "node_modules" {
+                rust_files(&path, found);
+            }
+        } else if path.extension().is_some_and(|extension| extension == "rs") {
+            found.push(path);
+        }
+    }
+}
+
+/// The functions under `root`'s `crates`, `tests` and `apps` whose `ignore` gives a reason that
+/// names the user service manager, a `cfg_attr` that applies the `ignore` on one platform and a
+/// reason over several lines included. A function is named by its own name, without its module.
+fn cases_that_need_the_manager(root: &Path) -> BTreeSet<String> {
+    let mut files = Vec::new();
+    for top in ["crates", "tests", "apps"] {
+        rust_files(&root.join(top), &mut files);
+    }
+    let mut found = BTreeSet::new();
+    for file in files {
+        let text = std::fs::read_to_string(&file).expect("a source file");
+        if !text.contains(MANAGER_REASON) {
+            continue;
+        }
+        let tokens = rust_lex::lex(&text).unwrap_or_else(|error| {
+            panic!(
+                "{} cannot be read, line {}: {}",
+                file.display(),
+                error.line,
+                error.what
+            )
+        });
+        for (at, token) in tokens.iter().enumerate() {
+            let named = matches!(&token.tok, Tok::Ident(word) if word == "ignore")
+                && matches!(
+                    tokens.get(at + 1).map(|next| &next.tok),
+                    Some(Tok::Punct('='))
+                )
+                && matches!(
+                    tokens.get(at + 2).map(|next| &next.tok),
+                    Some(Tok::Str(reason, _)) if reason.contains(MANAGER_REASON)
+                );
+            if !named {
+                continue;
+            }
+            let after = &tokens[at + 3..];
+            let function = after
+                .iter()
+                .position(|token| matches!(&token.tok, Tok::Ident(word) if word == "fn"));
+            if let Some(Tok::Ident(name)) = function
+                .and_then(|position| after.get(position + 1))
+                .map(|token| &token.tok)
+            {
+                found.insert(name.clone());
+            }
+        }
+    }
+    found
+}
+
+/// The cases the script runs: each name that a `step` line gives after `--exact`, without its
+/// module.
+fn cases_the_script_runs(script: &str) -> BTreeSet<String> {
+    script
+        .lines()
+        .filter_map(|line| line.strip_prefix("step "))
+        .flat_map(|command| {
+            command
+                .split_whitespace()
+                .skip_while(|word| *word != "--exact")
+                .skip(1)
+        })
+        .map(|name| name.rsplit("::").next().unwrap_or(name).to_owned())
+        .collect()
+}
+
+/// A repository with one source file under `crates`.
+fn a_repository_with(source: &str) -> tempfile::TempDir {
+    let root = tempfile::tempdir().expect("a folder for the repository");
+    let tests = root.path().join("crates/kr-example/tests");
+    std::fs::create_dir_all(&tests).expect("the folder of the source");
+    std::fs::write(tests.join("cases.rs"), source).expect("the source");
+    root
+}
+
+fn names(cases: &[&str]) -> BTreeSet<String> {
+    cases.iter().map(|case| (*case).to_owned()).collect()
+}
+
+#[test]
+fn a_case_the_script_does_not_name_is_found_among_those_that_need_the_manager() {
+    let root = a_repository_with(
+        r##"
+#[test]
+#[ignore = "needs a user service manager for this account (`systemctl --user`)"]
+fn a_case_that_starts_a_unit() {}
+
+#[test]
+#[ignore = "needs a device; the device lane runs it"]
+fn a_case_that_needs_a_device() {}
+
+#[test]
+fn a_case_that_is_not_ignored() {
+    // `systemctl --user` named in a comment is no reason.
+}
+"##,
+    );
+    let needed = cases_that_need_the_manager(root.path());
+    assert_eq!(needed, names(&["a_case_that_starts_a_unit"]));
+
+    let steps = "\
+step cargo test -p kr-example --test cases -- --ignored --exact a_case_that_is_not_ignored
+";
+    let runs = cases_the_script_runs(steps);
+    let left_out: Vec<_> = needed.difference(&runs).collect();
+    assert_eq!(left_out, ["a_case_that_starts_a_unit"]);
+
+    let steps = "\
+step cargo test -p kr-example --test cases -- --ignored --exact a_case_that_is_not_ignored
+step cargo test -p kr-example --test cases -- --ignored --exact m::a_case_that_starts_a_unit
+";
+    let runs = cases_the_script_runs(steps);
+    assert!(
+        needed.is_subset(&runs),
+        "a name given with its module counts as its function: {runs:?}"
+    );
+}
+
+#[test]
+fn a_reason_over_several_lines_that_a_cfg_attr_applies_on_one_platform_is_found() {
+    let root = a_repository_with(
+        r##"
+#[test]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "needs a user service manager for this account (`systemctl --user`), which a \
+              hosted CI runner's account does not have"
+)]
+fn a_case_in_the_cfg_attr_form() {}
+
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "starts transient units in this account's own service manager (`systemctl --user`), \
+            so an ordinary run does not run it"]
+async fn an_async_case_with_the_reason_over_two_lines() {}
+"##,
+    );
+    assert_eq!(
+        cases_that_need_the_manager(root.path()),
+        names(&[
+            "a_case_in_the_cfg_attr_form",
+            "an_async_case_with_the_reason_over_two_lines"
+        ])
+    );
+}
+
+/// A case ignored for want of the user service manager that the script does not run is a case no
+/// train runs: the box runs the script, and nothing else asks for an ignored case there.
+#[test]
+fn every_case_whose_ignore_reason_names_the_user_service_manager_is_one_the_script_runs() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let needed = cases_that_need_the_manager(&root);
+    assert!(
+        needed.contains(SESSION_CASE),
+        "the search finds the case the script was made for: {needed:?}"
+    );
+    let text = std::fs::read_to_string(script()).expect("the script");
+    let runs = cases_the_script_runs(&text);
+    let left_out: Vec<_> = needed.difference(&runs).collect();
+    assert!(
+        left_out.is_empty(),
+        "these cases are ignored because they start units in the user service manager, and no \
+         `step` line of scripts/service-manager-cases.sh names them after --exact: {left_out:?}"
     );
 }
