@@ -515,7 +515,7 @@ pub fn absent_paths_in(
 /// # Errors
 ///
 /// Returns what the system said when it said anything but "not found".
-pub fn is_absent(path: &Path) -> std::io::Result<bool> {
+fn is_absent(path: &Path) -> std::io::Result<bool> {
     match std::fs::symlink_metadata(path) {
         Ok(_) => Ok(false),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
@@ -531,11 +531,7 @@ pub fn is_absent(path: &Path) -> std::io::Result<bool> {
 /// # Errors
 ///
 /// Returns why the absence was not shown.
-pub fn absent_below(
-    root: &Path,
-    pin: &kr_e2e_m1b::run::RootPin,
-    path: &Path,
-) -> Result<bool, String> {
+fn absent_below(root: &Path, pin: &kr_e2e_m1b::run::RootPin, path: &Path) -> Result<bool, String> {
     match path.strip_prefix(root) {
         Ok(relative) if !relative.as_os_str().is_empty() => {
             kr_e2e_m1b::run::entry_below(root, pin, relative)
@@ -1598,14 +1594,14 @@ impl PersonGuard {
         self.plan.other_agents(agent, run_root)
     }
 
-    /// [`absent_below`] for a path of the entry's absent list. Where the entry has guarded files,
-    /// every look that does not show the path absent is kept as a failed look: a path found
-    /// present, whether a file, a directory or a link, and a look that failed for any reason other
-    /// than the name's not being there, a link on the way included. The path may reach a guarded
-    /// name, and the look keeps no identity of what it found, so every shared read after it is
-    /// refused. The caller still stops the case on a path found present. A path shown absent keeps
-    /// nothing, and a look never reads a file. This write is what protects a guarded name from a
-    /// path of the list that reaches it; the check of [`PersonPlan::of`] is a second line.
+    /// Looks at a path of the entry's absent list. Where the entry has guarded files, every look
+    /// that does not show the path absent is kept as a failed look: a path found present, whether
+    /// a file, a directory or a link, and a look that failed for any reason other than the name's
+    /// not being there, a link on the way included. The path may reach a guarded name, and the
+    /// look keeps no identity of what it found, so every shared read after it is refused. The
+    /// caller still stops the case on a path found present. A path shown absent keeps nothing,
+    /// and a look never reads a file. This write is what protects a guarded name from a path of
+    /// the list that reaches it; the check of [`PersonPlan::of`] is a second line.
     ///
     /// # Errors
     ///
