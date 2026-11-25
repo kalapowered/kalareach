@@ -870,7 +870,7 @@ impl<'r> Host<'r> {
     /// ([`Restart::Survey`]), which records on the stand-in too.
     ///
     /// Where the agent is not the stand-in, the program that runs the product's second open of the
-    /// clock floor is placed in the run's `b/` first ([`FLOOR_OPEN`]), so that the record holds it
+    /// clock floor is placed in the run's `b/` first (`FLOOR_OPEN`), so that the record holds it
     /// and a restart starts it only while it is the file that was placed. The stand-in never opens
     /// the floor again, and places none.
     ///
