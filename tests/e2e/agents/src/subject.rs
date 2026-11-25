@@ -32,7 +32,8 @@ pub struct GatewayRoute {
 /// The agent a run is about.
 #[derive(Clone, Debug)]
 pub struct Subject {
-    /// The build list entry of a real route; none on the stand-in route, which has no entry.
+    /// The build list entry of a real route, or of a subject made from a release; none for the
+    /// Codex subject of the stand-in route, which has no entry.
     entry: Option<Build>,
     plugin: PluginId,
     command: String,
@@ -223,13 +224,14 @@ impl Subject {
         })
     }
 
-    /// The build list entry of a real route; none on the stand-in route.
+    /// The build list entry of a real route, or of a subject made from a release; none for the
+    /// Codex subject of the stand-in route.
     #[must_use]
     pub const fn entry(&self) -> Option<&Build> {
         self.entry.as_ref()
     }
 
-    /// The entry's account; none on the stand-in route and for an entry that has none.
+    /// The entry's account; none for a subject with no entry, and for an entry that has none.
     #[must_use]
     pub fn account(&self) -> Option<&Account> {
         self.entry.as_ref().and_then(|build| build.account.as_ref())

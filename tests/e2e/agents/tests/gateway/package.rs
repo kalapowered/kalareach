@@ -1001,3 +1001,61 @@ fn an_entry_whose_command_no_rule_of_the_generations_package_recognises_fails_th
     assert!(refused.contains(plugin), "{refused}");
     let _ = std::fs::remove_dir_all(&base);
 }
+
+/// The words of the panic that `outcome` caught, empty where nothing panicked.
+fn refusal_of(outcome: Result<(), Box<dyn std::any::Any + Send>>) -> String {
+    outcome
+        .err()
+        .map(|panic| kr_e2e_agents::held::panic_text(&*panic))
+        .unwrap_or_default()
+}
+
+/// A subject made from a release is not given a signed generation: the route is refused before it
+/// looks at any account, key or file of the person.
+#[test]
+fn a_subject_made_from_a_release_is_refused_a_generation_when_the_route_is_acquired() {
+    let (plugin, command, shape) = SYNTHETIC[1];
+    let base = scratch("release-and-generation-route");
+    let subject = selected_subject(&base.join("release"), plugin, command, shape);
+    let chosen = Chosen {
+        subject,
+        generation: Some(base.join("generation")),
+    };
+    let refused = refusal_of(std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+        || {
+            let _ = super::Route::acquire(chosen, "package", false, false);
+        },
+    )));
+    assert!(
+        refused.contains("was made from a release") && refused.contains(plugin),
+        "{refused}"
+    );
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// The package of a subject made from a release is not installed from a signed generation.
+#[test]
+fn a_subject_made_from_a_release_is_refused_a_generation_when_its_package_is_installed() {
+    let (plugin, command, shape) = SYNTHETIC[1];
+    let base = scratch("release-and-generation-install");
+    let subject = selected_subject(&base.join("release"), plugin, command, shape);
+    let environment = environment_in(&base);
+    let generation = base.join("generation");
+    let runtime = super::runtime();
+    let refused = refusal_of(std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+        || {
+            let _ = runtime.block_on(super::install_agent(
+                &subject,
+                &environment,
+                &[],
+                "test stand-in",
+                Some(&generation),
+            ));
+        },
+    )));
+    assert!(
+        refused.contains("was made from a release") && refused.contains(plugin),
+        "{refused}"
+    );
+    let _ = std::fs::remove_dir_all(&base);
+}

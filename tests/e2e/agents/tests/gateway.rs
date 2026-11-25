@@ -402,6 +402,19 @@ impl Chosen {
     }
 }
 
+/// Why `subject` is not given a signed generation, where it was made from a release: the stand-in
+/// route writes the package of a release, and a generation holds a package of its own.
+fn release_with_generation(subject: &Subject, generation: Option<&Path>) -> Option<String> {
+    (subject.selected_release().is_some() && generation.is_some()).then(|| {
+        format!(
+            "the subject of {} was made from a release, which the stand-in route writes its package \
+             from, and a signed generation holds a package of its own: a run is given the one or the \
+             other",
+            subject.plugin()
+        )
+    })
+}
+
 impl Route {
     /// The route this run was given, from the agent `chosen` names.
     ///
@@ -412,14 +425,18 @@ impl Route {
     ///
     /// # Panics
     ///
-    /// Panics when the entry names no login, the run's `HOME` is not the person's home as the
-    /// system's account database names it, the values of the keys cannot be read, or the person's
-    /// files cannot be looked at: nothing has started, and no turn is spent.
+    /// Panics when the subject was made from a release and a generation is named, the entry names
+    /// no login, the run's `HOME` is not the person's home as the system's account database names
+    /// it, the values of the keys cannot be read, or the person's files cannot be looked at:
+    /// nothing has started, and no turn is spent.
     fn acquire(chosen: Chosen, case: &str, login: bool, probe_only: bool) -> Self {
         let Chosen {
             subject,
             generation,
         } = chosen;
+        if let Some(why) = release_with_generation(&subject, generation.as_deref()) {
+            panic!("{why}");
+        }
         let (Some(build), Some(generation)) = (subject.entry().cloned(), generation) else {
             return Self::StandIn;
         };
@@ -2220,6 +2237,9 @@ async fn install_agent(
     distribution: &str,
     generation: Option<&Path>,
 ) -> [u8; 32] {
+    if let Some(why) = release_with_generation(subject, generation) {
+        panic!("{why}");
+    }
     let plugin = subject.plugin();
     let builds: Vec<QualifiedBuild> = executables
         .iter()
