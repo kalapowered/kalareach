@@ -690,40 +690,75 @@ fn configure_the_host(host: &Host, address: Option<&str>, suite: bool) {
 }
 
 impl Updated {
-    /// Puts the registry back to the version the release before writes, over this build's tables,
-    /// so that a rollback to that release can be made.
+    /// Puts the registry, the attention store and the privacy record back to the versions the
+    /// release before lists for them, so that a rollback to that release can be made.
     ///
-    /// This build raised the registry past what the release before reads, so a rollback to it is
-    /// refused (`a_rollback_to_the_release_before_is_refused_for_the_registry_it_cannot_read`) and
-    /// no host that was updated can go back. A case whose subject is another store, and what the
-    /// release before makes of it, needs the rollback to go on, and the registry is not what it
-    /// asks about: it holds a registry as the earlier release's own tables name it, which is how
-    /// the registry's own cases leave a file at an earlier version. The daemon of this build stays
-    /// as it is until the rollback stops it, and the release before opens the file at the version
-    /// it writes. Returns the version it wrote.
-    ///
-    /// Remove it when the release before reads the registry at the version this release writes,
-    /// which is when a kept release of this level is the release before: a rollback to it is then
-    /// no longer refused for the registry.
-    fn puts_the_registry_back_for_the_release_before(&self) -> i64 {
-        let registry = self
+    /// This build raised each of the three past what the release before reads, so a rollback to it
+    /// is refused for each (`a_rollback_to_the_release_before_is_refused_for_the_registry_it_cannot_read`
+    /// and the rollback cases of `update.rs`). A case about another subject that needs the
+    /// rollback to go on calls this first: it leaves each store as the earlier release's own tables
+    /// name it, as the registry's own cases leave a file at an earlier version. The daemon of this
+    /// build stays as it is until the rollback stops it, and the release before opens each file at
+    /// the version it writes. A store that is not above the version the release before lists is
+    /// left as it is. Each store has a function of its own, and its comment says when it is
+    /// removed.
+    fn puts_the_stores_back_for_the_release_before(&self) {
+        let environment = self.host.tree.environment();
+        let registry = environment.registry_database();
+        let attention = environment.state_dir().join("attention.sqlite3");
+        let privacy = environment
+            .state_dir()
+            .join(kr_controller::privacy::PRIVACY_RECORD);
+        let put_back_when_above =
+            |store: &str, path: &Path, table: &str, put_back: fn(&Path, i64)| {
+                let listed = self.listed_by_the_release_before(store);
+                let connection = rusqlite::Connection::open_with_flags(
+                    path,
+                    rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
+                )
+                .unwrap_or_else(|error| panic!("the {store} opens: {error}"));
+                connection
+                    .busy_timeout(Duration::from_secs(30))
+                    .expect("waits for the daemon's writes");
+                let found: i64 = connection
+                    .query_row(&format!("SELECT version FROM {table}"), [], |row| {
+                        row.get(0)
+                    })
+                    .unwrap_or_else(|error| panic!("the {store} records its version: {error}"));
+                drop(connection);
+                if found > listed {
+                    put_back(path, listed);
+                }
+            };
+        put_back_when_above(
+            "registry",
+            registry.as_path(),
+            "schema_version",
+            put_the_registry_back,
+        );
+        put_back_when_above(
+            "attention",
+            attention.as_path(),
+            "attention_schema",
+            put_the_attention_back,
+        );
+        put_back_when_above(
+            "privacy",
+            privacy.as_path(),
+            "privacy_schema",
+            put_the_privacy_back,
+        );
+    }
+
+    fn listed_by_the_release_before(&self, store: &str) -> i64 {
+        let listed = self
             .one
             .manifest
             .stores
             .iter()
-            .find(|store| store.store == "registry")
-            .expect("the release before lists its registry");
-        let connection =
-            rusqlite::Connection::open(self.host.tree.environment().registry_database())
-                .expect("the registry opens");
-        connection
-            .busy_timeout(Duration::from_secs(30))
-            .expect("waits for the daemon's writes");
-        let version = i64::from(registry.version);
-        connection
-            .execute("UPDATE schema_version SET version = ?1", [version])
-            .expect("the registry takes the version the release before writes");
-        version
+            .find(|listed| listed.store == store)
+            .unwrap_or_else(|| panic!("the release before lists its {store}"));
+        i64::from(listed.version)
     }
 
     async fn new() -> Self {
@@ -1443,30 +1478,33 @@ fn registry_version_of(host: &Host) -> i64 {
     .expect("reads the registry's version")
 }
 
-impl Host {
-    /// Rolls back as a person types it, over a host whose attention store a daemon of this build
-    /// wrote at version 13, which the release before lists at version 12. At this build the two
-    /// versions differ in their number alone, and the cases that use this are about the rollback and
-    /// not about that store, so the version is written back first. The refusal itself is the subject
-    /// of the case in `update.rs` that rolls back over the attention store at version 13. A store that
-    /// is not at version 13, or that holds a value naming `attention.receipt_uncertain` or
-    /// `attention.receipts_gap`, which the release before cannot read, fails here and is not written
-    /// back.
-    fn roll_back_json(&self) -> (Output, Value) {
-        let store = self
-            .tree
-            .environment()
-            .state_dir()
-            .join("attention.sqlite3");
-        write_the_attention_version_back(&store);
-        self.kr_json(&["host", "rollback", "--json"])
-    }
+/// Writes `listed` as the version of the registry at `path`, over this build's tables. Remove it
+/// when the release before reads the registry at the version this release writes, which is when a
+/// kept release of this level is the release before: a rollback to it is then no longer refused
+/// for the registry.
+fn put_the_registry_back(path: &Path, listed: i64) {
+    let connection = rusqlite::Connection::open(path).expect("the registry opens");
+    connection
+        .busy_timeout(Duration::from_secs(30))
+        .expect("waits for the daemon's writes");
+    connection
+        .execute("UPDATE schema_version SET version = ?1", [listed])
+        .expect("the registry takes the version the release before writes");
 }
 
-/// Writes version 12 into the attention store at `store`, as `Host::roll_back_json` says. Remove it
-/// when the release before lists the attention store at version 13.
-fn write_the_attention_version_back(store: &Path) {
-    let connection = rusqlite::Connection::open(store).expect("the attention store");
+/// Writes `listed` as the version of the attention store at `path`, over a store that a daemon of
+/// this build wrote at version 13, which the release before lists at version 12. At this build the
+/// two versions differ in their number alone, and the cases that use this are about the rollback
+/// and not about that store, so the version is written back first. The refusal itself is the
+/// subject of the case in `update.rs` that rolls back over the attention store at version 13. A
+/// store that is not at version 13, or that holds a value naming `attention.receipt_uncertain` or
+/// `attention.receipts_gap`, which the release before cannot read, fails here and is not written
+/// back.
+///
+/// Remove it when the release before lists the attention store at version 13.
+fn put_the_attention_back(path: &Path, listed: i64) {
+    use kr_attention::store::SCHEMA_VERSION;
+    let connection = rusqlite::Connection::open(path).expect("the attention store");
     connection
         .busy_timeout(Duration::from_secs(10))
         .expect("a wait for the daemon's writes");
@@ -1474,8 +1512,8 @@ fn write_the_attention_version_back(store: &Path) {
         .query_row("SELECT version FROM attention_schema", [], |row| row.get(0))
         .expect("the version");
     assert_eq!(
-        found, 13,
-        "the attention store records version {found}; only version 13 is written back to version 12"
+        found, SCHEMA_VERSION,
+        "the attention store records version {found}; only version {SCHEMA_VERSION} is written back to version {listed}"
     );
     // Every column of every table: an item, an acknowledgement or a client's preference may name a
     // rule, and a column is read as text whatever it holds.
@@ -1512,11 +1550,46 @@ fn write_the_attention_version_back(store: &Path) {
     }
     assert_eq!(
         held, 0,
-        "the attention store holds {held} value(s) that name attention.receipt_uncertain or attention.receipts_gap, which a release that lists version 12 cannot read, so its version is not written back"
+        "the attention store holds {held} value(s) that name attention.receipt_uncertain or attention.receipts_gap, which a release that lists version {listed} cannot read, so its version is not written back"
     );
     connection
-        .execute("UPDATE attention_schema SET version = 12", [])
+        .execute("UPDATE attention_schema SET version = ?1", [listed])
         .expect("the version is written back");
+}
+
+/// Writes `listed` as the version of the privacy record at `path`, and sets the moment and the
+/// generation at which a change took effect (`effective_at_ms` and `effective_generation`) to NULL
+/// in the same transaction, as the migration from version 1 leaves them: the release that lists
+/// version 1 knows neither, and a record that a daemon of this build wrote after a change holds
+/// both. A record that is not at version 2 fails here and is not written back.
+///
+/// Remove it when the release before lists the privacy record at version 2.
+fn put_the_privacy_back(path: &Path, listed: i64) {
+    use kr_controller::privacy::SCHEMA_VERSION;
+    let mut connection = rusqlite::Connection::open(path).expect("the privacy record");
+    connection
+        .busy_timeout(Duration::from_secs(30))
+        .expect("waits for the daemon's writes");
+    let transaction = connection
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .expect("the record is held for the write");
+    let found: i64 = transaction
+        .query_row("SELECT version FROM privacy_schema", [], |row| row.get(0))
+        .expect("the version");
+    assert_eq!(
+        found, SCHEMA_VERSION,
+        "the privacy record records version {found}; only version {SCHEMA_VERSION} is written back to version {listed}"
+    );
+    transaction
+        .execute(
+            "UPDATE privacy_record SET effective_at_ms = NULL, effective_generation = NULL",
+            [],
+        )
+        .expect("the moment and the generation are emptied");
+    transaction
+        .execute("UPDATE privacy_schema SET version = ?1", [listed])
+        .expect("the version is written back");
+    transaction.commit().expect("both are written together");
 }
 
 /// The version of an attention store that holds a value naming the receipt rule is not written back,
@@ -1524,6 +1597,7 @@ fn write_the_attention_version_back(store: &Path) {
 #[test]
 fn the_version_of_an_attention_store_that_holds_a_value_naming_the_receipt_rule_is_not_written_back()
  {
+    use kr_attention::store::SCHEMA_VERSION;
     let directory = tempfile::tempdir().expect("a temporary directory");
     let store = directory.path().join("attention.sqlite3");
     let boot = kr_attention::time::BootMark::from_bytes([7; 16]);
@@ -1546,14 +1620,14 @@ fn the_version_of_an_attention_store_that_holds_a_value_naming_the_receipt_rule_
     };
     assert_eq!(
         version(),
-        13,
+        SCHEMA_VERSION,
         "an opened store is at the version this build writes"
     );
 
     // A store that holds no such value is written back: the control.
     let control = directory.path().join("control.sqlite3");
     std::fs::copy(&store, &control).expect("a copy of the store");
-    write_the_attention_version_back(&control);
+    put_the_attention_back(&control, SCHEMA_VERSION - 1);
     assert_eq!(
         rusqlite::Connection::open(&control)
             .expect("the copy")
@@ -1561,8 +1635,8 @@ fn the_version_of_an_attention_store_that_holds_a_value_naming_the_receipt_rule_
                 row.get::<_, i64>(0)
             })
             .expect("the version"),
-        12,
-        "a store that holds no value naming the receipt rule is written back to version 12"
+        SCHEMA_VERSION - 1,
+        "a store that holds no value naming the receipt rule is written back to the version before"
     );
 
     for (word, what) in [
@@ -1579,7 +1653,8 @@ fn the_version_of_an_attention_store_that_holds_a_value_naming_the_receipt_rule_
                 [format!("{word}|a")],
             )
             .expect("an acknowledgement that names the rule");
-        let refused = std::panic::catch_unwind(|| write_the_attention_version_back(&held));
+        let refused =
+            std::panic::catch_unwind(|| put_the_attention_back(&held, SCHEMA_VERSION - 1));
         assert!(
             refused.is_err(),
             "the version is not written back while the store holds a value that names {what}"
@@ -1591,7 +1666,7 @@ fn the_version_of_an_attention_store_that_holds_a_value_naming_the_receipt_rule_
                     row.get::<_, i64>(0)
                 })
                 .expect("the version"),
-            13,
+            SCHEMA_VERSION,
             "the store is as it was found"
         );
     }
@@ -1601,6 +1676,7 @@ fn the_version_of_an_attention_store_that_holds_a_value_naming_the_receipt_rule_
 /// above 13.
 #[test]
 fn the_version_of_an_attention_store_that_is_not_at_13_is_not_written_back() {
+    use kr_attention::store::SCHEMA_VERSION;
     let directory = tempfile::tempdir().expect("a temporary directory");
     let store = directory.path().join("attention.sqlite3");
     let boot = kr_attention::time::BootMark::from_bytes([7; 16]);
@@ -1622,14 +1698,15 @@ fn the_version_of_an_attention_store_that_is_not_at_13_is_not_written_back() {
             .expect("the version")
     };
 
-    for at in [12, 14] {
+    for at in [SCHEMA_VERSION - 1, SCHEMA_VERSION + 1] {
         let copy = directory.path().join(format!("at-{at}.sqlite3"));
         std::fs::copy(&store, &copy).expect("a copy of the store");
         rusqlite::Connection::open(&copy)
             .expect("the copy")
             .execute("UPDATE attention_schema SET version = ?1", [at])
             .expect("the copy");
-        let refused = std::panic::catch_unwind(|| write_the_attention_version_back(&copy));
+        let refused =
+            std::panic::catch_unwind(|| put_the_attention_back(&copy, SCHEMA_VERSION - 1));
         assert!(
             refused.is_err(),
             "the version is not written back while the store is at {at}"
@@ -1640,22 +1717,136 @@ fn the_version_of_an_attention_store_that_is_not_at_13_is_not_written_back() {
             .cloned()
             .unwrap_or_default();
         assert!(
-            said.contains("only version 13 is written back"),
+            said.contains(&format!("only version {SCHEMA_VERSION} is written back")),
             "the refusal names the one version that is written back"
         );
         assert_eq!(version_of(&copy), at, "the store is as it was found");
     }
 }
 
+/// Makes the privacy record at `path` as a daemon of this build leaves it after a change of privacy
+/// mode took effect, at schema version `version`: generation 2, the mode off, changed at 1000 ms,
+/// the change effective at 1500 ms in generation 2.
+fn a_privacy_record_a_change_took_effect_in(path: &Path, version: i64) {
+    let connection = rusqlite::Connection::open(path).expect("the record");
+    connection
+        .execute_batch(
+            "CREATE TABLE privacy_schema (version INTEGER NOT NULL);
+             CREATE TABLE privacy_record (
+                 id INTEGER PRIMARY KEY CHECK (id = 0),
+                 generation INTEGER NOT NULL,
+                 enabled INTEGER NOT NULL,
+                 changed_at_ms INTEGER NOT NULL,
+                 effective_at_ms INTEGER,
+                 effective_generation INTEGER
+             );
+             INSERT INTO privacy_record
+                 (id, generation, enabled, changed_at_ms, effective_at_ms, effective_generation)
+             VALUES (0, 2, 0, 1000, 1500, 2);",
+        )
+        .expect("a record a change has taken effect in");
+    connection
+        .execute(
+            "INSERT INTO privacy_schema (version) VALUES (?1)",
+            [version],
+        )
+        .expect("the version");
+}
+
+/// KR-REQ-26.10, KR-REQ-15.20: a privacy record that holds the moment a change of privacy mode took
+/// effect and its generation, put back to the version the release before lists, holds neither and
+/// is at that version, as a record the migration from version 1 has just made is; the rest of the
+/// record is as it was.
+#[test]
+fn a_privacy_record_put_back_to_the_release_before_holds_no_moment_and_no_generation_of_a_change() {
+    use kr_controller::privacy::{PRIVACY_RECORD, SCHEMA_VERSION};
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    let record = directory.path().join(PRIVACY_RECORD);
+    a_privacy_record_a_change_took_effect_in(&record, SCHEMA_VERSION);
+
+    put_the_privacy_back(&record, SCHEMA_VERSION - 1);
+
+    let connection = rusqlite::Connection::open(&record).expect("the record");
+    let version: i64 = connection
+        .query_row("SELECT version FROM privacy_schema", [], |row| row.get(0))
+        .expect("the version");
+    assert_eq!(
+        version,
+        SCHEMA_VERSION - 1,
+        "the record is at the version the release before lists"
+    );
+    let (effective_at, effective_generation): (Option<i64>, Option<i64>) = connection
+        .query_row(
+            "SELECT effective_at_ms, effective_generation FROM privacy_record WHERE id = 0",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("the record's change");
+    assert_eq!(
+        (effective_at, effective_generation),
+        (None, None),
+        "the moment and the generation are empty"
+    );
+    let rest: (i64, i64, i64) = connection
+        .query_row(
+            "SELECT generation, enabled, changed_at_ms FROM privacy_record WHERE id = 0",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("the rest of the record");
+    assert_eq!(rest, (2, 0, 1000), "the rest of the record is as it was");
+}
+
+/// KR-REQ-26.10, KR-REQ-15.20: the version of a privacy record that is not at 2 is not written back,
+/// whether it is below or above 2, and the record is as it was found.
+#[test]
+fn the_version_of_a_privacy_record_that_is_not_at_2_is_not_written_back() {
+    use kr_controller::privacy::{PRIVACY_RECORD, SCHEMA_VERSION};
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    for at in [SCHEMA_VERSION - 1, SCHEMA_VERSION + 1] {
+        let record = directory.path().join(format!("at-{at}-{PRIVACY_RECORD}"));
+        a_privacy_record_a_change_took_effect_in(&record, at);
+        let refused =
+            std::panic::catch_unwind(|| put_the_privacy_back(&record, SCHEMA_VERSION - 1));
+        assert!(
+            refused.is_err(),
+            "the version is not written back while the record is at {at}"
+        );
+        let said = refused
+            .unwrap_err()
+            .downcast_ref::<String>()
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            said.contains(&format!("only version {SCHEMA_VERSION} is written back")),
+            "the refusal names the one version that is written back"
+        );
+        let found: (i64, Option<i64>, Option<i64>) = rusqlite::Connection::open(&record)
+            .expect("the record")
+            .query_row(
+                "SELECT (SELECT version FROM privacy_schema), effective_at_ms, effective_generation
+                 FROM privacy_record WHERE id = 0",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("the record's version and change");
+        assert_eq!(
+            found,
+            (at, Some(1500), Some(2)),
+            "the record is as it was found"
+        );
+    }
+}
+
 /// KR-REQ-26.10, KR-REQ-26.08: a rollback to the release before goes on while only its session is
 /// live, and waits, exit 9, naming the session, while a session of this release is live.
 ///
-/// The registry is at schema version 19 under this release's daemon, which the release before does
-/// not read, so a rollback to it is refused
-/// (`a_rollback_to_the_release_before_is_refused_for_the_registry_it_cannot_read`). This case asks
-/// about sessions and `host.info`, not about the registry, so it puts the registry back to the
-/// version the release before writes before the first rollback, as the cases of the other stores
-/// do; the rollback that waits leaves it there.
+/// The registry, the attention store and the privacy record are at versions under this release's
+/// daemon that the release before does not read, so a rollback to it is refused
+/// (`a_rollback_to_the_release_before_is_refused_for_the_registry_it_cannot_read` and the rollback
+/// cases of `update.rs`). This case asks about sessions and `host.info`, not about those stores, so
+/// it puts each back to the version the release before lists before the first rollback; the
+/// rollback that waits leaves them there.
 ///
 /// The two releases also read each other's `host.info`: the release before's own `kr` reads the
 /// answer of this release's daemon, and this release reads the answer of the release before's
@@ -1692,7 +1883,8 @@ async fn a_rollback_to_the_release_before_goes_on_beside_its_session_and_waits_f
     // A session of this release: the older release's daemon does not retain its level.
     let (display, session_now) = host.new_session(&updated.kr_now());
     let worker_now = host.worker_process(session_now);
-    let written = updated.puts_the_registry_back_for_the_release_before();
+    updated.puts_the_stores_back_for_the_release_before();
+    let written = updated.listed_by_the_release_before("registry");
     let (output, said) = host.kr_json(&["host", "rollback", "--json"]);
     assert_eq!(
         output.status.code(),
@@ -1941,7 +2133,7 @@ async fn a_closed_session_naming_an_application_is_read_by_the_release_before_af
 
     // And the release before's daemon reads the same journal after the rollback: the summary row
     // keeps the shape it reads, so the session shows as it did, with its shell and directory.
-    updated.puts_the_registry_back_for_the_release_before();
+    updated.puts_the_stores_back_for_the_release_before();
     let (output, said) = host.kr_json(&["host", "rollback", "--json"]);
     assert_eq!(
         output.status.code(),
@@ -2080,7 +2272,7 @@ async fn a_rollback_that_would_lift_an_organisations_adapter_list_is_refused_unt
     let (organisation_id, store) =
         enrolled_with_a_policy(&updated, Some(&["kalareach/codex"])).await;
 
-    updated.puts_the_registry_back_for_the_release_before();
+    updated.puts_the_stores_back_for_the_release_before();
     let (output, said) = host.kr_json(&["host", "rollback", "--json"]);
     assert_eq!(
         output.status.code(),
@@ -2121,8 +2313,9 @@ async fn a_rollback_that_would_lift_an_organisations_adapter_list_is_refused_unt
     assert!(!store.exists(), "the list went with the enrolment");
 
     // The refused rollback stopped the daemon of this release and started it again, which brought
-    // the registry forward again: it goes back to the version the release before writes once more.
-    updated.puts_the_registry_back_for_the_release_before();
+    // the stores forward again: each that is above the version the release before lists goes back
+    // to it once more.
+    updated.puts_the_stores_back_for_the_release_before();
     std::fs::write(host.store.root().join("installer"), "homebrew\n").expect("the installer file");
     let (output, said) = host.kr_json(&["host", "rollback", "--json"]);
     assert_eq!(
@@ -2166,7 +2359,7 @@ async fn a_rollback_goes_on_while_an_applied_policy_states_no_list_and_leaves_it
     let host = &updated.host;
     let (_, store) = enrolled_with_a_policy(&updated, None).await;
 
-    updated.puts_the_registry_back_for_the_release_before();
+    updated.puts_the_stores_back_for_the_release_before();
     let (output, said) = host.kr_json(&["host", "rollback", "--json"]);
     assert_eq!(
         output.status.code(),
@@ -2196,7 +2389,7 @@ async fn a_rollback_to_a_release_that_reads_the_organisation_store_goes_on_with_
     let host = &updated.host;
     let (_, store) = enrolled_with_a_policy(&updated, Some(&["kalareach/codex"])).await;
 
-    updated.puts_the_registry_back_for_the_release_before();
+    updated.puts_the_stores_back_for_the_release_before();
     let (output, said) = host.kr_json(&["host", "rollback", "--json"]);
     assert_eq!(
         output.status.code(),
@@ -3329,7 +3522,7 @@ async fn a_kept_answer_and_its_record_of_sends_are_sent_and_discarded_together_b
     // The host goes back to the release before: only its own session is live, so the rollback goes
     // on. Its `kr` reads the answer this release wrote, sends it to its own worker, and discards
     // the answer and the record of the send.
-    updated.puts_the_registry_back_for_the_release_before();
+    updated.puts_the_stores_back_for_the_release_before();
     let (output, said) = host.kr_json(&["host", "rollback", "--json"]);
     assert_eq!(
         output.status.code(),
@@ -3884,7 +4077,7 @@ async fn a_rollback_leaves_the_plugin_host_of_this_release_for_the_release_befor
     assert_runs_the_host_of(&this_host, updated.two.name());
 
     // The session of this release holds the rollback.
-    updated.puts_the_registry_back_for_the_release_before();
+    updated.puts_the_stores_back_for_the_release_before();
     let (output, said) = host.kr_json(&["host", "rollback", "--json"]);
     assert_eq!(
         output.status.code(),
@@ -4492,7 +4685,7 @@ async fn a_rollback_leaves_the_delivery_journal_at_version_11_and_the_release_be
 
     // The rollback starts the release before's daemon, which opens the journal at version 11,
     // reads the generation this release wrote and writes the next ones.
-    updated.puts_the_registry_back_for_the_release_before();
+    updated.puts_the_stores_back_for_the_release_before();
     let (output, said) = host.kr_json(&["host", "rollback", "--json"]);
     assert_eq!(
         output.status.code(),
@@ -4731,7 +4924,7 @@ async fn the_release_before_reads_the_journal_of_a_command_session_this_release_
 
     // The rollback goes on beside the release before's own session, and that release's `kr` reads
     // the closed session whole.
-    updated.puts_the_registry_back_for_the_release_before();
+    updated.puts_the_stores_back_for_the_release_before();
     let (output, said) = host.kr_json(&["host", "rollback", "--json"]);
     assert_eq!(
         output.status.code(),
@@ -4822,7 +5015,7 @@ async fn a_rollback_leaves_the_record_of_when_output_was_produced_and_the_releas
         times.display()
     );
 
-    updated.puts_the_registry_back_for_the_release_before();
+    updated.puts_the_stores_back_for_the_release_before();
     let (output, said) = host.kr_json(&["host", "rollback", "--json"]);
     assert_eq!(
         output.status.code(),
@@ -4964,7 +5157,7 @@ async fn a_rollback_from_a_daemon_of_a_later_public_major_goes_on_beside_the_ses
     updated.the_worker_is_as_it_was().await;
 
     let host = &updated.host;
-    updated.puts_the_registry_back_for_the_release_before();
+    updated.puts_the_stores_back_for_the_release_before();
     let (output, said) = host.kr_json_with(
         &[(LATER_MAJOR_VARIABLE, std::ffi::OsStr::new("2"))],
         &["host", "rollback", "--json"],
@@ -5176,7 +5369,7 @@ async fn a_stored_apply_node_is_admitted_across_an_update_and_a_rollback() {
     let updated = prepared.update().await;
     run("evt-after-the-update").await;
 
-    updated.puts_the_registry_back_for_the_release_before();
+    updated.puts_the_stores_back_for_the_release_before();
     let (output, said) = updated.host.kr_json(&["host", "rollback", "--json"]);
     assert!(
         output.status.success(),
@@ -5259,7 +5452,7 @@ async fn a_voice_start_hold_is_kept_across_a_rollback_and_an_update() {
     let before = standing("before the rollback");
 
     // The rollback is not refused, and the release before serves the device and leaves the store.
-    updated.puts_the_registry_back_for_the_release_before();
+    updated.puts_the_stores_back_for_the_release_before();
     let (output, said) = host.kr_json(&["host", "rollback", "--json"]);
     assert_eq!(
         output.status.code(),
@@ -5385,7 +5578,7 @@ async fn a_rollback_leaves_the_record_of_a_restored_policy_and_an_update_again_w
     assert_eq!(held.owed, vec![owed], "and kept the list");
     let written = std::fs::read(&file).expect("the record reads");
 
-    updated.puts_the_registry_back_for_the_release_before();
+    updated.puts_the_stores_back_for_the_release_before();
     let (output, said) = host.kr_json(&["host", "rollback", "--json"]);
     assert_eq!(
         output.status.code(),
@@ -5861,7 +6054,7 @@ async fn a_report_store_the_release_before_keeps_too_is_kept_across_a_rollback_a
 
     // Back to the release before: it reads the result this release wrote, reads the rows of the
     // store of reports, and records a run of its own with a row beside them.
-    updated.puts_the_registry_back_for_the_release_before();
+    updated.puts_the_stores_back_for_the_release_before();
     let (output, said) = updated.host.kr_json(&["host", "rollback", "--json"]);
     assert!(
         output.status.success(),
@@ -6075,7 +6268,7 @@ async fn a_rollback_keeps_a_draft_written_for_an_application_and_its_binding_rev
         )
         .expect("writes the draft as a release from before the store of revisions wrote it");
 
-    updated.puts_the_registry_back_for_the_release_before();
+    updated.puts_the_stores_back_for_the_release_before();
     let (output, said) = host.kr_json(&["host", "rollback", "--json"]);
     assert_eq!(
         output.status.code(),
@@ -6266,7 +6459,7 @@ async fn a_rollback_to_a_release_that_lists_the_store_of_binding_revisions_state
         "the daemon of this release is stopped through its own door"
     );
 
-    updated.puts_the_registry_back_for_the_release_before();
+    updated.puts_the_stores_back_for_the_release_before();
     let (output, said) = host.kr_json(&["host", "rollback", "--json"]);
     assert_eq!(
         output.status.code(),
