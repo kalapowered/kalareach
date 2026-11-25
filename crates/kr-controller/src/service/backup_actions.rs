@@ -296,12 +296,77 @@ impl SetupAdmission for Unchecked {
 mod tests {
     use std::sync::Arc;
 
-    use kr_protocol::ids::{ActorId, ConnectionId};
+    use kr_protocol::envelope::{ControlFrame, Outcome, Request, Response};
+    use kr_protocol::ids::{ActorId, ConnectionId, RequestId};
+    use kr_protocol::method::{Method, MethodVersion};
 
     use super::super::AdmittedConnection;
     use super::super::a_transfer_left_unanswered::daemon;
     use super::*;
     use crate::authority::AdmittedMutation;
+
+    /// One read of `backup.checkpoint`, as the daemon's read switch is asked for it.
+    fn checkpoint_request() -> Request {
+        Request {
+            request_id: RequestId::new(1),
+            method: Method::BackupCheckpoint.into(),
+            method_version: MethodVersion::V1,
+            params: ParamsValue::from_typed(&BackupCheckpointParams {}).expect("encodes"),
+        }
+    }
+
+    /// The checkpoint is read under a decision that holds `host.manage`, and by no caller that has
+    /// no such decision: the guard asks for the decision and never for a name. A caller that the
+    /// host cannot name as the owner's socket is refused as the owner's socket is, so a new way
+    /// into the read switch does not publish the checkpoint.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_checkpoint_is_refused_to_every_caller_with_no_decision_that_holds_host_manage() {
+        let (_temp, controller) = daemon().await;
+        let request = checkpoint_request();
+        for name in ["local:test", "device:test", "workflow:test", "user:1"] {
+            let caller = ActorId::new(name).expect("a principal");
+            let answer = controller.read_method(&caller, &request, false).await;
+            assert!(
+                matches!(
+                    &answer,
+                    ControlFrame::Response(Response {
+                        outcome: Outcome::Error(error),
+                        ..
+                    }) if error.code == kr_protocol::error::ErrorCode::PermissionDenied
+                        && error.message
+                            == "the backup checkpoint is read by a paired device, and the \
+                                local socket does not serve it"
+                ),
+                "{name} with no decision that holds host.manage is refused with the checkpoint's \
+                 own words: {answer:?}"
+            );
+        }
+    }
+
+    /// The same read under a decision that holds `host.manage` is answered, so the guard refuses
+    /// what has no such decision and nothing else.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_checkpoint_is_answered_under_a_decision_that_holds_host_manage() {
+        let (_temp, controller) = daemon().await;
+        let caller = ActorId::new("device:test").expect("a principal");
+        let answer = controller
+            .read_method(&caller, &checkpoint_request(), true)
+            .await;
+        let result = match &answer {
+            ControlFrame::Response(Response {
+                outcome: Outcome::Ok(value),
+                ..
+            }) => value.to_typed::<BackupCheckpointResult>().ok(),
+            _ => None,
+        };
+        assert_eq!(
+            result,
+            Some(BackupCheckpointResult {
+                checkpoint: Nullable::null()
+            }),
+            "a host with no setup has no checkpoint: {answer:?}"
+        );
+    }
 
     /// The setup is recorded while the registration it was admitted under is held standing: a
     /// withdrawal, or a refusal the authority feed raises, takes the lock this write is run under

@@ -363,12 +363,17 @@ impl Controller {
             Method::AccountStorageStatus => self.account_storage_status(&request.params),
             Method::BackupRead => self.backup_read(&request.params).await,
             Method::BackupStatus => self.backup_status(&request.params).await,
-            // A paired device reads it and the local socket does not, as the registry says.
-            Method::BackupCheckpoint if owner => Err(ControllerError::PermissionDenied {
-                detail: "the backup checkpoint is read by a paired device, and the local socket \
+            // Only a paired device whose decision holds `host.manage` reads it, as the registry
+            // says. The guard asks for that decision and not for the owner's socket, so a caller
+            // this host has no name for is refused as the socket is.
+            Method::BackupCheckpoint if !device_manages_host => {
+                Err(ControllerError::PermissionDenied {
+                    detail:
+                        "the backup checkpoint is read by a paired device, and the local socket \
                          does not serve it"
-                    .to_owned(),
-            }),
+                            .to_owned(),
+                })
+            }
             Method::BackupCheckpoint => self.backup_checkpoint(&request.params).await,
             Method::DescriptionSetup => self.description_setup(),
             _ => Err(ControllerError::InvalidArgument(format!(
