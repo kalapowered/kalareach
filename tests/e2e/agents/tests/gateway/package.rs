@@ -9,8 +9,10 @@
 //! and the platforms stay the release's, so the host registers the actions the release declares
 //! and the installation's grant is what the release asks for.
 
-use std::path::Path;
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
 
+use kr_e2e_agents::build::Build;
 use kr_e2e_agents::detect::check_detected;
 use kr_e2e_agents::subject::Subject;
 use kr_plugin_catalogue::CatalogueError;
@@ -667,4 +669,153 @@ fn the_actions_of_a_subject_made_from_a_release_are_the_releases_own() {
         }
         let _ = std::fs::remove_dir_all(&base);
     }
+}
+
+/// The entry and the generation a run names for the real-package check, given the values of the
+/// variables that name them: none where either is not named.
+fn named(entry: Option<OsString>, generation: Option<OsString>) -> Option<(PathBuf, PathBuf)> {
+    let given =
+        |value: Option<OsString>| value.filter(|value| !value.is_empty()).map(PathBuf::from);
+    Some((given(entry)?, given(generation)?))
+}
+
+/// Checks that the package the generation at `generation` holds for the entry `build` is one the
+/// stand-in route can write its own package from: a match rule of the package recognises a program
+/// named by the entry's command, and the package written from it declares the actions and asks for
+/// the capabilities that the generation's package does.
+///
+/// # Errors
+///
+/// Returns why the generation's package is not one the stand-in route can write its package from.
+///
+/// # Panics
+///
+/// Panics where the generation's index does not name the package exactly once, or the package's
+/// manifest does not have the digest the index names.
+pub fn check_real_package(build: &Build, generation: &Path) -> Result<(), String> {
+    let plugin = PluginId::new(&build.package).map_err(|why| {
+        format!(
+            "the entry's package {} is not a plugin identifier: {why}",
+            build.package
+        )
+    })?;
+    let manifest = super::generation_manifest(generation, &plugin);
+    let recognised = manifest.match_rules.iter().any(|rule| {
+        let directory = rule.executable.path_suffix.join("/");
+        rule.executable
+            .matches_path(&format!("/{directory}/{}", build.command))
+    });
+    if !recognised {
+        return Err(format!(
+            "no match rule of the package {plugin} in the generation recognises a program named {}",
+            build.command
+        ));
+    }
+    let subject = Subject::from_build(build, &manifest)?;
+    let release = generation
+        .join("targets/packages")
+        .join(manifest.publisher_id.to_string())
+        .join(manifest.plugin_name.to_string())
+        .join(super::generation_entry(generation, &plugin).version);
+    let into = scratch("real");
+    let written = write(&subject, &release, &into.join("package"));
+    let _ = std::fs::remove_dir_all(&into);
+    let written = written.map_err(|why| {
+        format!("the stand-in route cannot write its package from the generation's package {plugin}: {why}")
+    })?;
+    if written.actions != manifest.actions {
+        return Err(format!(
+            "the package written from the generation's package {plugin} declares other actions \
+             than the generation's"
+        ));
+    }
+    if written.capabilities != manifest.capabilities {
+        return Err(format!(
+            "the package written from the generation's package {plugin} asks for other \
+             capabilities than the generation's"
+        ));
+    }
+    Ok(())
+}
+
+/// The package a generation holds for the entry the run names is one the stand-in route can write
+/// its own package from. It runs only when the run names an entry and a generation, as a run of a
+/// real agent does.
+#[test]
+fn the_package_a_generation_holds_for_the_entry_is_one_the_stand_in_route_writes_from() {
+    let Some((entry, generation)) = named(
+        std::env::var_os(super::BUILD_VARIABLE),
+        std::env::var_os(super::GENERATION_VARIABLE),
+    ) else {
+        eprintln!(
+            "skipping: the run names no entry ({}) and no generation ({})",
+            super::BUILD_VARIABLE,
+            super::GENERATION_VARIABLE
+        );
+        return;
+    };
+    check_real_package(&kr_e2e_agents::build::read_build(&entry), &generation)
+        .unwrap_or_else(|why| panic!("{why}"));
+}
+
+/// The real-package check has an entry and a generation to read only where the run names both.
+#[test]
+fn the_real_package_check_has_something_to_read_only_when_the_run_names_an_entry_and_a_generation()
+{
+    let value = |text: &str| Some(OsString::from(text));
+    assert_eq!(
+        named(value("entry.json"), value("/generation")),
+        Some((PathBuf::from("entry.json"), PathBuf::from("/generation")))
+    );
+    assert_eq!(named(None, value("/generation")), None);
+    assert_eq!(named(value("entry.json"), None), None);
+    assert_eq!(named(value(""), value("/generation")), None);
+    assert_eq!(named(value("entry.json"), value("")), None);
+}
+
+/// A generation of its own below `base` that holds the package written for `plugin`, typed as
+/// `command`, from a release of `shape`; returns the generation's directory.
+fn generation_holding(base: &Path, plugin: &str, command: &str, shape: Shape) -> PathBuf {
+    let subject = subject_of(&base.join("release"), plugin, command, shape);
+    write(&subject, &base.join("release"), &base.join("package"))
+        .unwrap_or_else(|why| panic!("{plugin}: {why}"));
+    let home = base.join("home");
+    std::fs::create_dir_all(&home).expect("a directory for the generation");
+    super::runtime()
+        .block_on(generations::Generation::build(
+            &home,
+            generations::GenerationSpec {
+                package: Some(base.join("package")),
+                ..generations::GenerationSpec::default()
+            },
+        ))
+        .directory()
+}
+
+/// A generation that holds the package written for each synthetic entry passes the real-package
+/// check for that entry.
+#[test]
+fn a_generation_that_holds_the_package_written_for_an_entry_passes_the_real_package_check() {
+    for (plugin, command, shape) in SYNTHETIC {
+        let base = scratch("real-passes");
+        let generation = generation_holding(&base, plugin, command, shape);
+        check_real_package(&entry(plugin, command), &generation)
+            .unwrap_or_else(|why| panic!("{plugin}: {why}"));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+}
+
+/// An entry whose command no match rule of the generation's package recognises fails the check,
+/// naming the command.
+#[test]
+fn an_entry_whose_command_no_rule_of_the_generations_package_recognises_fails_the_real_package_check()
+ {
+    let (plugin, command, shape) = SYNTHETIC[0];
+    let base = scratch("real-refuses");
+    let generation = generation_holding(&base, plugin, command, shape);
+    let refused = check_real_package(&entry(plugin, "other-command"), &generation)
+        .expect_err("an entry whose command no rule recognises");
+    assert!(refused.contains("other-command"), "{refused}");
+    assert!(refused.contains(plugin), "{refused}");
+    let _ = std::fs::remove_dir_all(&base);
 }
