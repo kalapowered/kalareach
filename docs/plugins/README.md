@@ -314,6 +314,29 @@ suspended, even when the table classifies every method the terminal sends. A tab
 observation member never lifts the suspension, so rich mutations stay suspended for the instance's
 life. The terminal is unaffected either way.
 
+### ACP launch
+
+`acp_launch` states how the package's agent starts in ACP mode, a second way to start it in which the agent speaks the Agent Client Protocol and KalaReach is its only client. A package that has none leaves the member out, so a manifest written before the member existed reads and hashes as it did.
+
+```json
+"acp_launch": {
+  "command": "gemini",
+  "platforms": ["mac_os", "linux"],
+  "required_names": ["PATH", "HOME", "GEMINI_API_KEY"],
+  "passed_names": ["PATH", "HOME", "GEMINI_API_KEY", "HTTPS_PROXY", "https_proxy"],
+  "constants": [{ "name": "GEMINI_CLI_HOME", "value": "{private_home}" }],
+  "grant_statement": "Starts Gemini CLI in ACP mode, with no terminal of its own."
+}
+```
+
+- `command` follows the rules of a command integration's `command` and is the executable name of one of the package's own match rules. The declaration holds no argument: the host passes the one argument `--acp` and adds no other, and a declaration that names an argument is refused as an unknown member.
+- `platforms` lists the operating systems the host starts the agent on in ACP mode, each at most once: `mac_os` and `linux`, never `windows`, and each one the package's own `platforms` support.
+- `passed_names` are the variables the host copies from the person's shell into the agent's start, each only when the shell has it. No other variable of the shell is copied, whatever its name. `required_names` are the variables the shell must have, each non-empty, or the start is refused; at least one is listed and each is also in `passed_names`. A name is letters, digits and underscores, not beginning with a digit, at most 64 bytes, and a list holds at most 64 names, none twice.
+- `constants` are the variables the host sets itself, in order: at most 16, each with a name that is not also passed, and a value of at most 256 bytes that holds no brace, or `{private_home}` alone, which stands for a folder that KalaReach makes new and empty for each start and deletes when the agent ends.
+- `grant_statement` is the publisher's own words for what the launch does and does not do, at most 6,000 characters. The host writes its own exact reading of the declaration after it.
+- The package requests `command_integration.launch`, which the launch rides on, and `approval.decode` and `approval.respond`, which an answer to the agent's approvals needs.
+- The statement an owner is shown holds the publisher's words of the bridge, of the command integration and of the launch, then the host's reading of the command integration and, after the label "The host's exact reading of the ACP launch:", the host's reading of the launch. The whole is at most 10,000 characters.
+
 ### The forwarder's placeholder
 
 A package that has an application start the forwarder writes `{kr_hook}` where it runs it, and the
@@ -982,12 +1005,14 @@ report the same code for the same defect.
 | `payload_role_invalid` | A structural payload role is at the wrong path or declared twice |
 | `implementation_mismatch` | An action's implementation cannot produce its effect class |
 | `implementation_unsatisfied` | An implementation names something the package does not carry |
-| `bridge_recipe_invalid` | A native bridge recipe is incomplete, names something absent, or has a statement that holds the words the host writes before its own reading of a command integration |
+| `bridge_recipe_invalid` | A native bridge recipe is incomplete, names something absent, or has a statement that holds the words the host writes before its own reading of a command integration, of a placement or of an ACP launch, or a whole statement longer than the host shows an owner |
 | `duplicate_element_id` | Two nodes or two controls share an identifier |
 | `control_parameters_widen` | A control's parameters do not narrow its action's |
 | `qualification_invalid` | A qualification result claims something the catalogue cannot know |
 | `integration_without_capability` | A command integration without `command_integration.launch` |
-| `integration_invalid` | A command integration (1) references another command, (2) adds a flag not permitted by the contract, (3) sets a variable not permitted by the contract, (4) has a statement of what it does that is longer than an owner is shown whole, (5) includes a backend declaration that does not adhere to the contract (e.g. by omitting or repeating `{gateway}`, by including arguments or launching words that fall outside the acceptable bounds, or by failing to provide a table to read from), or (6) has a statement of what it does that holds the words the host writes before its own reading of a command integration or of a placement, by itself or read together with a native bridge's statement |
+| `integration_invalid` | A command integration (1) references another command, (2) adds a flag not permitted by the contract, (3) sets a variable not permitted by the contract, (4) has a statement of what it does that is longer than an owner is shown whole, (5) includes a backend declaration that does not adhere to the contract (e.g. by omitting or repeating `{gateway}`, by including arguments or launching words that fall outside the acceptable bounds, or by failing to provide a table to read from), or (6) has a statement of what it does that holds the words the host writes before its own reading of a command integration, of a placement or of an ACP launch, by itself or read together with a native bridge's statement |
+| `acp_launch_without_capability` | An ACP launch without `command_integration.launch`, `approval.decode` or `approval.respond` |
+| `acp_launch_invalid` | An ACP launch that (1) names a command that no match rule of the package matches, (2) lists no platform, a platform twice, a platform that has no ACP launch or one the package does not support, (3) lists no required name, a required name that is not passed, a name outside the contract, a list over its bound or a name twice, (4) sets a constant outside the contract, (5) has words that hold a label the host writes before its own reading of a command integration, of a placement or of an ACP launch, by themselves or read together with the bridge's words and the command integration's, or (6) makes the host's whole statement longer than it shows an owner |
 | `launch_probe_without_capability` | A launch probe without `launch.probe` |
 | `launch_probe_invalid` | A launch probe passes no argument or too many, carries an option that is not a name, or names a mode that is not a JSON Pointer |
 
