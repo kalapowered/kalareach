@@ -967,9 +967,10 @@ pub struct Account {
     /// How an image is given at the composer: `paste`, its absolute path as a terminal pastes it,
     /// or a template with `{path}`.
     pub image: String,
-    /// What marks the line of a conversation file that records an image given to the agent, whose
-    /// bytes it holds as base64 text after `base64,`: the part reads the image the agent received
-    /// from it. Without one, what the agent received is not read from its record.
+    /// What marks the line of a conversation file that records an image given to the agent: the
+    /// part reads the image the agent received from the object that holds the end of the mark,
+    /// whose bytes it holds as base64 text after `base64,` or as the text of its own `data` member.
+    /// Without one, what the agent received is not read from its record.
     #[serde(default)]
     pub image_line: Option<String>,
 }
