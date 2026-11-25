@@ -8,7 +8,7 @@
 
 use serde_json::Value;
 
-use super::red_of;
+use super::{Shape, red_of};
 
 /// The red a control shows: the control's number and the text of the table.
 #[derive(Debug, PartialEq, Eq)]
@@ -118,11 +118,12 @@ pub fn a_fresh_request_appears(pending: usize) -> Result<(), Red> {
 pub enum Hosted {}
 
 impl Hosted {
-    /// Starts the stand-in with `script` through the launch. When the script holds no turn of the
-    /// agent's own, it sends a prompt and returns once the agent's first request is pending and
-    /// read; when it holds one, it returns once the agent runs, and the case releases the file that
-    /// starts the turn and sends the prompts it needs.
-    pub fn start(_script: &Value) -> Result<Self, &'static str> {
+    /// Starts the stand-in of `shape` with `script` through the launch: the native program for
+    /// Qoder, and for Gemini the script package that the interpreter stand-in runs. When the script
+    /// holds no turn of the agent's own, it sends a prompt and returns once the agent's first
+    /// request is pending and read; when it holds one, it returns once the agent runs, and the case
+    /// releases the file that starts the turn and sends the prompts it needs.
+    pub fn start(_shape: Shape, _script: &Value) -> Result<Self, &'static str> {
         Err(super::NO_BODY)
     }
 
@@ -368,12 +369,15 @@ pub fn cancelled_when_the_agent_exits_first(state: &str) -> Result<(), Red> {
     ensure(state == "Cancelled", "5b-9")
 }
 
-/// 5b-10: after the exit the confirmed answer still reads `applied` and the unproved one reads
-/// `unknown`.
-pub fn the_exit_leaves_a_confirmed_answer_confirmed(receipts: &Receipts) -> Result<(), Red> {
+/// 5b-10 and 5b-10g, by `id`: after the exit the confirmed answer still reads `applied` and the
+/// unproved one reads `unknown`.
+pub fn the_exit_leaves_a_confirmed_answer_confirmed(
+    id: &str,
+    receipts: &Receipts,
+) -> Result<(), Red> {
     ensure(
         receipts.confirmed == "applied" && receipts.unproved == "unknown",
-        "5b-10",
+        id,
     )
 }
 
@@ -432,10 +436,21 @@ pub fn an_agent_exits_before_dispatch(host: &mut Hosted) -> Result<(), Red> {
 
 /// Case 5b-10: the agent exits after one answer it used and one it did not.
 pub fn an_agent_exits_after_dispatch(host: &mut Hosted) -> Result<(), Red> {
+    exits_after_two_answers("5b-10", host)
+}
+
+/// Case 5b-10g: the same case with the Gemini-shaped agent.
+pub fn a_gemini_shaped_agent_exits_after_dispatch(host: &mut Hosted) -> Result<(), Red> {
+    exits_after_two_answers("5b-10g", host)
+}
+
+/// The agent exits after one answer it used and one it did not, and the control `id` judges the
+/// receipts.
+fn exits_after_two_answers(id: &str, host: &mut Hosted) -> Result<(), Red> {
     host.answer_next("allow-once");
     host.answer_next("allow-once");
     host.release("die");
-    the_exit_leaves_a_confirmed_answer_confirmed(&host.receipts())
+    the_exit_leaves_a_confirmed_answer_confirmed(id, &host.receipts())
 }
 
 /// Case 5b-12: the worker's connection to the launcher ends.
@@ -458,25 +473,27 @@ fn the_judge_of_an_exit_after_dispatch_names_its_red_when_a_receipt_is_rewritten
         confirmed: confirmed.to_owned(),
         unproved: unproved.to_owned(),
     };
-    assert_eq!(
-        the_exit_leaves_a_confirmed_answer_confirmed(&receipts("applied", "unknown")),
-        Ok(())
-    );
-    assert_eq!(
-        the_exit_leaves_a_confirmed_answer_confirmed(&receipts("unknown", "unknown")),
-        Err(red("5b-10")),
-        "the exit rewrote the confirmed answer"
-    );
-    assert_eq!(
-        the_exit_leaves_a_confirmed_answer_confirmed(&receipts("applied", "applied")),
-        Err(red("5b-10")),
-        "the unproved answer claims applied"
-    );
-    assert_eq!(
-        the_exit_leaves_a_confirmed_answer_confirmed(&receipts("applied", "dispatching")),
-        Err(red("5b-10")),
-        "the exit left the unproved answer where it was"
-    );
+    for id in ["5b-10", "5b-10g"] {
+        assert_eq!(
+            the_exit_leaves_a_confirmed_answer_confirmed(id, &receipts("applied", "unknown")),
+            Ok(())
+        );
+        assert_eq!(
+            the_exit_leaves_a_confirmed_answer_confirmed(id, &receipts("unknown", "unknown")),
+            Err(red(id)),
+            "the exit rewrote the confirmed answer"
+        );
+        assert_eq!(
+            the_exit_leaves_a_confirmed_answer_confirmed(id, &receipts("applied", "applied")),
+            Err(red(id)),
+            "the unproved answer claims applied"
+        );
+        assert_eq!(
+            the_exit_leaves_a_confirmed_answer_confirmed(id, &receipts("applied", "dispatching")),
+            Err(red(id)),
+            "the exit left the unproved answer where it was"
+        );
+    }
 }
 
 #[test]
@@ -735,8 +752,8 @@ impl Hosted {
         match *self {}
     }
 
-    /// The receipt of the answered request once it reads `wanted`, or what it reads after five
-    /// seconds when it never does.
+    /// The receipt of the request the case answered last, once it reads `wanted`, or what it reads
+    /// after five seconds when it never does.
     pub fn receipt_becoming(&mut self, _wanted: &str) -> String {
         match *self {}
     }
@@ -888,6 +905,16 @@ fn scripts() -> Vec<(&'static str, Value)> {
             "completed_after_a_cancel_script",
             completed_after_a_cancel_script(),
         ),
+        (
+            "late_request_of_a_waiting_agent_script",
+            late_request_of_a_waiting_agent_script(),
+        ),
+        ("decline_script", decline_script()),
+        ("thirty_one_seconds_script", thirty_one_seconds_script()),
+        (
+            "completed_while_cancelling_script",
+            completed_while_cancelling_script(),
+        ),
         ("window_script", window_script()),
         ("queued_prompt_script", queued_prompt_script()),
         (
@@ -979,19 +1006,18 @@ fn the_judge_of_a_late_update_names_its_red_when_the_receipt_stays_unknown() {
 
 #[test]
 fn the_judge_of_a_completed_update_names_its_red_when_the_receipt_reads_unknown() {
-    assert_eq!(
-        an_allow_stays_applied_after_a_cancel("5b-23", "applied"),
-        Ok(())
-    );
-    assert_eq!(
-        an_allow_stays_applied_after_a_cancel("5b-23", "unknown"),
-        Err(red("5b-23")),
-        "every update after a cancel is ignored"
-    );
-    assert_eq!(
-        an_allow_stays_applied_after_a_cancel("5b-23", "dispatching"),
-        Err(red("5b-23"))
-    );
+    for id in ["5b-23", "5b-23g"] {
+        assert_eq!(an_allow_stays_applied_after_a_cancel(id, "applied"), Ok(()));
+        assert_eq!(
+            an_allow_stays_applied_after_a_cancel(id, "unknown"),
+            Err(red(id)),
+            "every update after a cancel is ignored"
+        );
+        assert_eq!(
+            an_allow_stays_applied_after_a_cancel(id, "dispatching"),
+            Err(red(id))
+        );
+    }
 }
 
 /// How many `session/cancel` notifications the stand-in received.
@@ -1261,5 +1287,247 @@ fn the_judge_of_a_prompt_after_a_cancel_names_its_red_when_its_approval_is_answe
         a_prompt_after_a_cancel_shows_its_approval(&shown, 0),
         Err(red("5b-19")),
         "the approval of the prompt is not listed"
+    );
+}
+
+/// 5b-6g: the request that the Gemini-shaped stand-in sent after the cancel was answered
+/// `cancelled`, and the stand-in's turn ended with the reply to our prompt.
+pub fn a_late_request_of_a_waiting_agent_is_answered_cancelled(
+    record: &[Value],
+) -> Result<(), Red> {
+    ensure(
+        outcome_of(record, 1) == Some("cancelled") && sent(record, "reply") == 1,
+        "5b-6g",
+    )
+}
+
+/// What the receipts of three declined requests read, first once each was dispatched and then once
+/// its boundary came: the deadline of 300 seconds for the first, the agent's next request for the
+/// second and the agent's reply for the third.
+#[derive(Debug)]
+pub struct Declines {
+    /// The receipt of each decline once it was dispatched.
+    pub dispatched: [String; 3],
+    /// The receipt of each decline once its boundary came.
+    pub settled: [String; 3],
+}
+
+/// 5b-13: a Gemini-shaped agent sends no update after a decline, so each receipt stays
+/// `dispatching` until the deadline, the agent's next request or its reply, and then reads
+/// `unknown`.
+pub fn a_decline_stays_dispatching_until_a_boundary(read: &Declines) -> Result<(), Red> {
+    ensure(
+        read.dispatched
+            .iter()
+            .all(|receipt| receipt == "dispatching")
+            && read.settled.iter().all(|receipt| receipt == "unknown"),
+        "5b-13",
+    )
+}
+
+/// 5b-17: with our prompt in flight the window was still open at 31 seconds, so the approval at
+/// that time was answered `cancelled`, and a prompt sent meanwhile was refused.
+pub fn the_window_stays_open_until_the_prompts_reply(
+    record: &[Value],
+    prompt_refused: bool,
+) -> Result<(), Red> {
+    ensure(
+        outcome_of(record, 1) == Some("cancelled") && prompt_refused,
+        "5b-17",
+    )
+}
+
+impl Hosted {
+    /// Sends a prompt through the device and says whether the host accepted it.
+    pub fn sends_a_prompt(&mut self, _text: &str) -> bool {
+        match *self {}
+    }
+}
+
+/// The script of a Gemini-shaped agent that asks for a call, goes on waiting for the answer after
+/// a cancel, and sends a request of its own accord when the file `late` appears, before it ends
+/// the turn of our prompt `cancelled`.
+pub fn late_request_of_a_waiting_agent_script() -> Value {
+    serde_json::json!({
+        "cancel": "wait",
+        "turns": [[
+            { "call": { "id": "c1", "kind": "execute" } },
+            { "ask": "c1" },
+            { "hold": "late" },
+            { "call": { "id": "c2", "kind": "execute" } },
+            { "ask": "c2" },
+            { "end": "cancelled" },
+        ]],
+    })
+}
+
+/// The script of a Gemini-shaped agent that sends no update after a decline: it asks for a call,
+/// asks for a second when the file `second` appears and for a third when the file `third` appears,
+/// and replies to the prompt when the file `reply` appears.
+pub fn decline_script() -> Value {
+    serde_json::json!({
+        "turns": [[
+            { "call": { "id": "c1", "kind": "execute" } },
+            { "ask": "c1" },
+            { "hold": "second" },
+            { "call": { "id": "c2", "kind": "execute" } },
+            { "ask": "c2" },
+            { "hold": "third" },
+            { "call": { "id": "c3", "kind": "execute" } },
+            { "ask": "c3" },
+            { "hold": "reply" },
+            { "end": "end_turn" },
+        ]],
+    })
+}
+
+/// The script of a Gemini-shaped agent that asks for a call, goes on waiting for the answer after a
+/// cancel, asks for a second call when the file `t31` appears, and then ends the turn `cancelled`.
+pub fn thirty_one_seconds_script() -> Value {
+    serde_json::json!({
+        "cancel": "wait",
+        "turns": [[
+            { "call": { "id": "c0", "kind": "execute" } },
+            { "ask": "c0" },
+            { "hold": "t31" },
+            { "call": { "id": "c1", "kind": "execute" } },
+            { "ask": "c1" },
+            { "end": "cancelled" },
+        ]],
+    })
+}
+
+/// The script of a Gemini-shaped agent that asks for a call, goes on waiting after a cancel, and
+/// sends the call's `completed` update when the file `done` appears.
+pub fn completed_while_cancelling_script() -> Value {
+    serde_json::json!({
+        "cancel": "wait",
+        "turns": [[
+            { "call": { "id": "c1", "kind": "execute" } },
+            { "ask": "c1" },
+            { "hold": "done" },
+            { "update": { "call": "c1", "status": "completed" } },
+            { "end": "cancelled" },
+        ]],
+    })
+}
+
+/// Case 5b-6g: the person cancels, and the Gemini-shaped agent then sends a request of the turn
+/// the cancel did not end.
+pub fn a_request_after_a_cancel_of_a_waiting_agent(host: &mut Hosted) -> Result<(), Red> {
+    host.cancel();
+    host.release("late");
+    a_late_request_of_a_waiting_agent_is_answered_cancelled(&host.record_after("reply"))
+}
+
+/// Case 5b-13: three declines, and what each receipt reads at its boundary: 300 seconds for the
+/// first, the agent's next request for the second and its reply for the third.
+pub fn three_declines_and_no_update(host: &mut Hosted) -> Result<(), Red> {
+    host.answer_next("reject-once");
+    let first = host.receipt_becoming("applied");
+    host.advance_clock(300);
+    let first_settled = host.receipt_becoming("unknown");
+    host.release("second");
+    host.waits_for_a_request();
+    host.answer_next("reject-once");
+    let second = host.receipt_becoming("applied");
+    host.release("third");
+    host.waits_for_a_request();
+    let second_settled = host.receipt_becoming("unknown");
+    host.answer_next("reject-once");
+    let third = host.receipt_becoming("applied");
+    host.release("reply");
+    let third_settled = host.receipt_becoming("unknown");
+    a_decline_stays_dispatching_until_a_boundary(&Declines {
+        dispatched: [first, second, third],
+        settled: [first_settled, second_settled, third_settled],
+    })
+}
+
+/// Case 5b-17: a cancel with our prompt in flight, 31 seconds, a prompt of ours, and then a request
+/// of the agent's.
+pub fn an_approval_at_thirty_one_seconds_with_a_prompt_in_flight(
+    host: &mut Hosted,
+) -> Result<(), Red> {
+    host.cancel();
+    host.advance_clock(31);
+    let refused = !host.sends_a_prompt("meanwhile");
+    host.release("t31");
+    the_window_stays_open_until_the_prompts_reply(&host.record_after("reply"), refused)
+}
+
+/// Case 5b-23g: an allow, the person's cancel, and then the call's `completed` update, with the
+/// Gemini-shaped agent.
+pub fn a_completed_update_after_a_cancel_of_a_waiting_agent(host: &mut Hosted) -> Result<(), Red> {
+    host.answer_next("allow-once");
+    host.cancel();
+    host.release("done");
+    an_allow_stays_applied_after_a_cancel("5b-23g", &host.receipt_becoming("applied"))
+}
+
+#[test]
+fn the_judge_of_a_late_request_of_a_waiting_agent_names_its_red_when_the_request_is_left_pending() {
+    let answered = [
+        cancelled_response_line(0),
+        cancelled_response_line(1),
+        sent_line("reply"),
+    ];
+    assert_eq!(
+        a_late_request_of_a_waiting_agent_is_answered_cancelled(&answered),
+        Ok(())
+    );
+    assert_eq!(
+        a_late_request_of_a_waiting_agent_is_answered_cancelled(&[cancelled_response_line(0)]),
+        Err(red("5b-6g")),
+        "the late request is left pending and the stand-in blocks, so its turn never ends"
+    );
+}
+
+#[test]
+fn the_judge_of_the_declines_names_its_red_when_a_decline_is_counted_applied_at_dispatch() {
+    let read = |dispatched: [&str; 3], settled: [&str; 3]| Declines {
+        dispatched: dispatched.map(str::to_owned),
+        settled: settled.map(str::to_owned),
+    };
+    let held = ["dispatching"; 3];
+    let settled = ["unknown"; 3];
+    assert_eq!(
+        a_decline_stays_dispatching_until_a_boundary(&read(held, settled)),
+        Ok(())
+    );
+    for at in 0..3 {
+        let mut counted = held;
+        counted[at] = "applied";
+        assert_eq!(
+            a_decline_stays_dispatching_until_a_boundary(&read(counted, ["applied"; 3])),
+            Err(red("5b-13")),
+            "decline {at} was counted applied at dispatch"
+        );
+        let mut unsettled = settled;
+        unsettled[at] = "dispatching";
+        assert_eq!(
+            a_decline_stays_dispatching_until_a_boundary(&read(held, unsettled)),
+            Err(red("5b-13")),
+            "the boundary of decline {at} did not settle it"
+        );
+    }
+}
+
+#[test]
+fn the_judge_of_the_gemini_window_names_its_red_when_the_window_is_capped_at_thirty_seconds() {
+    let answered = [cancelled_response_line(0), cancelled_response_line(1)];
+    assert_eq!(
+        the_window_stays_open_until_the_prompts_reply(&answered, true),
+        Ok(())
+    );
+    assert_eq!(
+        the_window_stays_open_until_the_prompts_reply(&answered[..1], true),
+        Err(red("5b-17")),
+        "the approval at 31 seconds shows"
+    );
+    assert_eq!(
+        the_window_stays_open_until_the_prompts_reply(&answered, false),
+        Err(red("5b-17")),
+        "the prompt sent meanwhile was accepted"
     );
 }

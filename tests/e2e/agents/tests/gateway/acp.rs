@@ -57,24 +57,28 @@ fn unwritten(case: &str) -> ! {
     panic!("{case}: {NO_BODY}");
 }
 
-/// The text the table names as the red of control `id`.
-fn red_of(id: &str) -> &'static str {
+/// The row of the table for control `id`.
+fn control_of(id: &str) -> &'static Control {
     CONTROLS
         .iter()
         .find(|control| control.id == id)
         .unwrap_or_else(|| panic!("{id} is no control of the table"))
-        .red
 }
 
-/// Starts the stand-in with `script` through the launch and runs `body` on the host. It fails with
-/// the red the body returns.
+/// The text the table names as the red of control `id`.
+fn red_of(id: &str) -> &'static str {
+    control_of(id).red
+}
+
+/// Starts the stand-in that the table names for control `id`, with `script`, through the launch and
+/// runs `body` on the host. It fails with the red the body returns.
 fn run_case(
     id: &str,
     script: &Value,
     body: impl FnOnce(&mut controls::Hosted) -> Result<(), controls::Red>,
 ) {
     starts_in_acp_mode(id);
-    match controls::Hosted::start(script) {
+    match controls::Hosted::start(control_of(id).shape, script) {
         Err(why) => panic!("{id}: {why}"),
         Ok(mut host) => {
             if let Err(red) = body(&mut host) {
@@ -567,7 +571,11 @@ fn acp_a_permission_request_after_a_cancel_is_answered_cancelled_by_a_qoder_shap
 #[test]
 #[ignore = "waits for ACP-7c"]
 fn acp_a_permission_request_after_a_cancel_is_answered_cancelled_by_a_gemini_shaped_agent() {
-    unwritten("5b-6g");
+    run_case(
+        "5b-6g",
+        &controls::late_request_of_a_waiting_agent_script(),
+        controls::a_request_after_a_cancel_of_a_waiting_agent,
+    );
 }
 
 /// Control 5b-7.
@@ -620,7 +628,11 @@ fn acp_an_agent_that_exits_after_dispatch_leaves_the_receipt_unknown_unless_evid
 #[ignore = "waits for ACP-7c"]
 fn acp_an_agent_that_exits_after_dispatch_leaves_the_receipt_unknown_unless_evidence_came_first_for_a_gemini_shaped_agent()
  {
-    unwritten("5b-10g");
+    run_case(
+        "5b-10g",
+        &controls::exit_script(),
+        controls::a_gemini_shaped_agent_exits_after_dispatch,
+    );
 }
 
 /// Control 5b-12.
@@ -638,7 +650,11 @@ fn acp_the_launcher_ends_the_agent_when_the_workers_connection_ends() {
 #[test]
 #[ignore = "waits for ACP-7c"]
 fn acp_a_gemini_decline_stays_dispatching_until_the_next_request_the_reply_or_the_deadline() {
-    unwritten("5b-13");
+    run_case(
+        "5b-13",
+        &controls::decline_script(),
+        controls::three_declines_and_no_update,
+    );
 }
 
 /// Control 5b-14.
@@ -679,7 +695,11 @@ fn acp_the_cancel_window_of_a_turn_of_the_agents_own_closes_thirty_seconds_after
 #[ignore = "waits for ACP-7c"]
 fn acp_the_cancel_window_with_a_prompt_in_flight_closes_at_that_prompts_reply_for_a_gemini_shaped_agent()
  {
-    unwritten("5b-17");
+    run_case(
+        "5b-17",
+        &controls::thirty_one_seconds_script(),
+        controls::an_approval_at_thirty_one_seconds_with_a_prompt_in_flight,
+    );
 }
 
 /// Control 5b-18.
@@ -753,7 +773,11 @@ fn acp_a_completed_update_after_a_cancel_leaves_an_allow_applied_for_a_qoder_sha
 #[test]
 #[ignore = "waits for ACP-7c"]
 fn acp_a_completed_update_after_a_cancel_leaves_an_allow_applied_for_a_gemini_shaped_agent() {
-    unwritten("5b-23g");
+    run_case(
+        "5b-23g",
+        &controls::completed_while_cancelling_script(),
+        controls::a_completed_update_after_a_cancel_of_a_waiting_agent,
+    );
 }
 
 /// Control 6b-1.
