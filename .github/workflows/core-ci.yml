@@ -1445,6 +1445,12 @@ jobs:
       # before it runs, and that read delays every other start while it lasts.
       - name: Test the forwarder
         if: ${{ !cancelled() && matrix.part == 'first' }}
+        env:
+          # The case that a credential which is a link is refused makes a symbolic link, and stands
+          # down with a printed reason where its account cannot. This runner's account is an
+          # administrator and can, so a link that cannot be made here fails the case: the refusal is
+          # a safety claim, and a stand-down would pass it without a run.
+          KR_REQUIRE_SYMBOLIC_LINKS: "1"
         run: cargo test --locked -p kr-hook
 
       # The broker's endpoint on this platform and what it rests on. A launch binds a named pipe
