@@ -12,8 +12,10 @@
 
 use std::path::Path;
 
-use kr_plugin_sdk::acp_launch::AcpLaunch;
+use kr_plugin_sdk::acp_launch::{AcpLaunch, AcpRefusal};
+use kr_plugin_sdk::capability::PluginCapability;
 use kr_plugin_sdk::example;
+use kr_plugin_sdk::matching::OperatingSystem;
 use kr_plugin_sdk::package::{MANIFEST_FILE, PRESENTATION_FILE};
 use kr_plugin_sdk::validate::{FindingCode, Validated, validate_package_directory};
 use serde_json::{Value, json};
@@ -417,5 +419,82 @@ fn kr_req_11_26_launch_words_that_hold_a_label_of_the_host_are_refused() {
         FindingCode::AcpLaunchInvalid,
         "the statements of the bridge, the command integration and the ACP launch, read \
          together, hold the words the host writes before its own reading of a placement",
+    );
+}
+
+/// What an installation's grant holds when the owner has confirmed the launch and both approval
+/// grants are held.
+const HELD: [PluginCapability; 3] = [
+    PluginCapability::CommandIntegrationLaunch,
+    PluginCapability::ApprovalDecode,
+    PluginCapability::ApprovalRespond,
+];
+
+/// The example agent's launch, as the declaration reads.
+fn launch() -> AcpLaunch {
+    serde_json::from_value(declaration()).expect("a launch")
+}
+
+/// KR-REQ-11.26: a launch with the switch on, the grants held and the host's platform listed is
+/// admitted, and the declaration comes back whole.
+#[test]
+fn kr_req_11_26_a_granted_launch_is_admitted() {
+    let launch = launch();
+    let admitted = launch
+        .admission(&HELD, true, OperatingSystem::Linux)
+        .expect("the launch is admitted");
+    assert_eq!(admitted, &launch);
+    assert!(
+        launch
+            .admission(&HELD, true, OperatingSystem::MacOs)
+            .is_ok()
+    );
+}
+
+/// KR-REQ-11.26: each cause that forbids a launch is refused in its own sentence.
+#[test]
+fn kr_req_11_26_each_cause_that_forbids_a_launch_is_refused_in_its_own_words() {
+    let launch = launch();
+    let refused = |held: &[PluginCapability], switch_on: bool, host: OperatingSystem| {
+        launch
+            .admission(held, switch_on, host)
+            .expect_err("the launch is refused")
+            .to_string()
+    };
+    assert_eq!(
+        refused(&HELD, false, OperatingSystem::Linux),
+        "ACP mode is switched off for this agent on this host."
+    );
+    assert_eq!(
+        refused(&HELD[1..], true, OperatingSystem::Linux),
+        "The owner has not confirmed this release's launch grant, so ACP mode is not available."
+    );
+    assert_eq!(
+        refused(&HELD[..2], true, OperatingSystem::Linux),
+        "ACP mode needs the approval.decode and approval.respond grants, and this release does \
+         not hold both."
+    );
+    assert_eq!(
+        refused(&HELD, true, OperatingSystem::Windows),
+        "This release does not offer ACP mode on this platform: it lists macOS and Linux."
+    );
+}
+
+/// KR-REQ-11.26: where two causes apply, the first in the host's order is the one the person
+/// reads: the switch, then the confirmation, then the approvals, then the platform.
+#[test]
+fn kr_req_11_26_the_first_cause_in_the_hosts_order_is_the_one_refused() {
+    let launch = launch();
+    assert_eq!(
+        launch.admission(&[], false, OperatingSystem::Windows),
+        Err(AcpRefusal::SwitchOff)
+    );
+    assert_eq!(
+        launch.admission(&[], true, OperatingSystem::Windows),
+        Err(AcpRefusal::NotConfirmed)
+    );
+    assert_eq!(
+        launch.admission(&HELD[..1], true, OperatingSystem::Windows),
+        Err(AcpRefusal::ApprovalsMissing)
     );
 }

@@ -29,6 +29,7 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::capability::PluginCapability;
 use crate::integration::{command_problem, quoted};
 use crate::matching::{MatchRule, OperatingSystem};
 use crate::text::{GrantWords, is_forbidden_text_char};
@@ -361,4 +362,82 @@ fn value_problem(value: &str) -> Option<String> {
         ));
     }
     None
+}
+
+/// Why a host does not start an agent in ACP mode, in the order the host checks.
+///
+/// Its text is what the person reads, one sentence for each cause.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AcpRefusal {
+    /// The owner's switch for this package is off.
+    SwitchOff,
+    /// The owner has not confirmed this release's launch grant.
+    NotConfirmed,
+    /// The release does not hold both approval grants.
+    ApprovalsMissing,
+    /// The host's operating system is not one the declaration lists.
+    Platform {
+        /// The operating systems the declaration lists, as a person reads them.
+        listed: String,
+    },
+}
+
+impl std::fmt::Display for AcpRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SwitchOff => {
+                formatter.write_str("ACP mode is switched off for this agent on this host.")
+            }
+            Self::NotConfirmed => formatter.write_str(
+                "The owner has not confirmed this release's launch grant, so ACP mode is not \
+                 available.",
+            ),
+            Self::ApprovalsMissing => formatter.write_str(
+                "ACP mode needs the approval.decode and approval.respond grants, and this \
+                 release does not hold both.",
+            ),
+            Self::Platform { listed } => write!(
+                formatter,
+                "This release does not offer ACP mode on this platform: it lists {listed}."
+            ),
+        }
+    }
+}
+
+impl AcpLaunch {
+    /// Returns this declaration when a host may start the agent in ACP mode, and the first cause
+    /// that forbids it otherwise.
+    ///
+    /// `held` is what the installation's grant holds for this release, `switch_on` is the owner's
+    /// switch for the package in the host configuration, and `host` is the operating system the
+    /// host runs on. The causes are checked in this order: the switch, the owner's confirmation of
+    /// the launch grant, the two approval grants, the platform.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first [`AcpRefusal`] that applies.
+    pub fn admission(
+        &self,
+        held: &[PluginCapability],
+        switch_on: bool,
+        host: OperatingSystem,
+    ) -> Result<&Self, AcpRefusal> {
+        if !switch_on {
+            return Err(AcpRefusal::SwitchOff);
+        }
+        if !held.contains(&PluginCapability::CommandIntegrationLaunch) {
+            return Err(AcpRefusal::NotConfirmed);
+        }
+        if !held.contains(&PluginCapability::ApprovalDecode)
+            || !held.contains(&PluginCapability::ApprovalRespond)
+        {
+            return Err(AcpRefusal::ApprovalsMissing);
+        }
+        if !self.platforms.contains(&host) {
+            return Err(AcpRefusal::Platform {
+                listed: platform_words(&self.platforms),
+            });
+        }
+        Ok(self)
+    }
 }
