@@ -1560,14 +1560,176 @@ fn seen_by_lstat(path: &Path) -> std::io::Result<Option<Seen>> {
     }
 }
 
+/// The most bytes of a shared file that the end read takes: a larger file is refused unread.
+const SHARED_LIMIT: u64 = 16 << 20;
+
+/// The longest the end read of a shared file may take: the run stops on one that takes longer.
+const SHARED_BOUND: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Why a shared file was not read to its end.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Unread {
+    Link,
+    NotAFile,
+    ManyNames,
+    GuardedFile,
+    TooLarge,
+    TooSlow,
+    Failed,
+}
+
+impl Unread {
+    /// What is said of the file after its path.
+    fn said(self) -> String {
+        let reason = match self {
+            Self::Link => "is a symbolic link and is not read".to_owned(),
+            Self::NotAFile => "is not a regular file and is not read".to_owned(),
+            Self::ManyNames => "has more than one name and is not read".to_owned(),
+            Self::GuardedFile => "is the same file as a guarded file and is not read".to_owned(),
+            Self::TooLarge => format!("is larger than {SHARED_LIMIT} bytes and is not read"),
+            Self::TooSlow => format!("was not read within {} seconds", SHARED_BOUND.as_secs()),
+            Self::Failed => "cannot be read after the run".to_owned(),
+        };
+        format!("{reason}, so it is not known whether it holds the run's directory name or mark")
+    }
+}
+
+/// Whether `opened` is the object of one of the `guarded` names, which a stat follows to the file.
+fn is_a_guarded_file(opened: &std::fs::Metadata, guarded: &[PathBuf]) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    guarded.iter().any(|name| {
+        std::fs::metadata(name)
+            .is_ok_and(|other| (other.dev(), other.ino()) == (opened.dev(), opened.ino()))
+    })
+}
+
+/// Opens the shared file at `path` with no link followed and no wait, and checks the handle before
+/// a byte is read: a regular file, with one name, that is no guarded file and is within the byte
+/// limit. None where the file is not there.
+fn open_shared(path: &Path, guarded: &[PathBuf]) -> Result<Option<std::fs::File>, Unread> {
+    use rustix::fs::{Mode, OFlags};
+    use std::os::unix::fs::MetadataExt as _;
+    let handle = match rustix::fs::open(
+        path,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(handle) => handle,
+        Err(rustix::io::Errno::NOENT) => return Ok(None),
+        Err(rustix::io::Errno::LOOP) => return Err(Unread::Link),
+        Err(_) => return Err(Unread::Failed),
+    };
+    let file = std::fs::File::from(handle);
+    let opened = file.metadata().map_err(|_| Unread::Failed)?;
+    if !opened.is_file() {
+        return Err(Unread::NotAFile);
+    }
+    if opened.nlink() != 1 {
+        return Err(Unread::ManyNames);
+    }
+    if is_a_guarded_file(&opened, guarded) {
+        return Err(Unread::GuardedFile);
+    }
+    if opened.len() > SHARED_LIMIT {
+        return Err(Unread::TooLarge);
+    }
+    Ok(Some(file))
+}
+
+/// Whether `source` holds one of `needles`, read a piece at a time: no more than `limit` bytes, and
+/// none after `deadline`. Nothing is kept but the last bytes that a needle split across two pieces
+/// needs.
+fn scan(
+    source: &mut dyn std::io::Read,
+    needles: &[&[u8]],
+    limit: u64,
+    deadline: std::time::Instant,
+) -> Result<bool, Unread> {
+    const PIECE: usize = 64 * 1024;
+    let overlap = needles.iter().map(|needle| needle.len()).max().unwrap_or(1) - 1;
+    let mut window: Vec<u8> = Vec::with_capacity(PIECE + overlap);
+    let mut piece = vec![0_u8; PIECE];
+    let mut taken = 0_u64;
+    loop {
+        if std::time::Instant::now() > deadline {
+            return Err(Unread::TooSlow);
+        }
+        match source.read(&mut piece) {
+            Ok(0) => return Ok(false),
+            Ok(count) => {
+                taken += count as u64;
+                if taken > limit {
+                    return Err(Unread::TooLarge);
+                }
+                window.extend_from_slice(&piece[..count]);
+                if needles.iter().any(|needle| {
+                    window
+                        .windows(needle.len())
+                        .any(|candidate| candidate == *needle)
+                }) {
+                    return Ok(true);
+                }
+                let keep = window.len().min(overlap);
+                window.drain(..window.len() - keep);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return Err(Unread::Failed),
+        }
+    }
+}
+
+/// Runs `work` on a thread of its own and waits `bound` for its answer: the error where it gave
+/// none in time, or the thread ended without one. A thread still waiting is left to end by itself.
+fn bounded<T: Send + 'static>(
+    bound: std::time::Duration,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, std::sync::mpsc::RecvTimeoutError> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = sender.send(work());
+    });
+    receiver.recv_timeout(bound)
+}
+
+/// Whether the shared file at `path` holds one of `needles`, read once through a handle of its own:
+/// opened with no link followed and no wait, then checked by the handle before any byte is read (a
+/// regular file, one name, no guarded file, within the byte limit), and read within the time
+/// bound. Nothing of the file is kept, and a file that is not there holds nothing.
+fn shared_names_the_run(
+    path: PathBuf,
+    guarded: Vec<PathBuf>,
+    needles: Vec<String>,
+) -> Result<bool, Unread> {
+    let deadline = std::time::Instant::now() + SHARED_BOUND;
+    let read = bounded(SHARED_BOUND, move || {
+        let needles: Vec<&[u8]> = needles
+            .iter()
+            .filter(|needle| !needle.is_empty())
+            .map(String::as_bytes)
+            .collect();
+        match open_shared(&path, &guarded)? {
+            Some(mut file) => scan(&mut file, &needles, SHARED_LIMIT, deadline),
+            None => Ok(false),
+        }
+    });
+    match read {
+        Ok(read) => read,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(Unread::TooSlow),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(Unread::Failed),
+    }
+}
+
 /// An entry's named files of the person's home, as `lstat` showed them before a driver started
 /// anything, and the check that none of the guarded ones changed. A guarded file is looked at by
 /// `lstat` alone, never read: its kind, permissions, inode, size and times are compared, and its
 /// owner on its own. A guarded name that is a symbolic link is refused when the guard is taken,
 /// since a write through it changes the target and not the link, and so is a shared name, which
 /// would not be read. A shared file, which the person's own sessions also write, is not looked at
-/// until the end of the run, and is then read once for the run's directory name and mark; nothing
-/// of what is read is kept. A write to a file that is not named, a transcript below
+/// until the end of the run. It is then opened with no link followed and no wait; its opened handle
+/// must be a regular file with one name that is not a guarded file; and it is read once, up to a
+/// byte limit and within a time bound, for the run's directory name and mark. Nothing of what is
+/// read is kept, and a file that fails these checks is not read and stops the run. A write to a
+/// file that is not named, a transcript below
 /// `~/.claude/projects` among them, is not seen. What is said is the path the entry names and
 /// whether it changed, never a value.
 #[derive(Clone, Debug)]
@@ -1625,27 +1787,36 @@ impl FileGuard {
         let (mut stops, files) =
             self.compared(&|relative| seen_by_lstat(&self.home.join(relative)));
         let mut shared: Vec<Value> = Vec::new();
-        if needles.iter().any(|needle| !needle.is_empty()) {
+        let names: Vec<String> = needles
+            .iter()
+            .filter(|needle| !needle.is_empty())
+            .map(|needle| (*needle).to_owned())
+            .collect();
+        if !names.is_empty() {
+            let guarded: Vec<PathBuf> = self
+                .guarded
+                .iter()
+                .map(|(relative, _)| self.home.join(relative))
+                .collect();
             for relative in &self.shared {
-                let (holding, unread) = account::which_hold(&[self.home.join(relative)], needles);
-                if !unread.is_empty() {
-                    stops.push((
-                        "person_file_unreadable",
-                        format!(
-                            "~/{relative} cannot be read after the run, so it is not known whether \
-                             it holds the run's directory name or mark"
-                        ),
-                    ));
-                } else if !holding.is_empty() {
+                let read =
+                    shared_names_the_run(self.home.join(relative), guarded.clone(), names.clone());
+                if matches!(read, Ok(true)) {
                     stops.push((
                         "guarded_file_changed",
                         format!("~/{relative} now holds the run's directory name or mark"),
                     ));
                 }
+                if let Err(unread) = read {
+                    stops.push((
+                        "person_file_unreadable",
+                        format!("~/{relative} {}", unread.said()),
+                    ));
+                }
                 shared.push(json!({
                     "path": format!("~/{relative}"),
-                    "unreadable": !unread.is_empty(),
-                    "holds_the_run": !holding.is_empty(),
+                    "unreadable": read.is_err(),
+                    "holds_the_run": matches!(read, Ok(true)),
                 }));
             }
         }
@@ -4482,5 +4653,254 @@ mod tests {
              file before a real run"
         );
         std::fs::remove_dir_all(&home).expect("clean up");
+    }
+
+    /// What the end read says of a shared file it did not read, for `reason`.
+    fn not_read(reason: &str) -> String {
+        format!(
+            "~/.claude.json {reason}, so it is not known whether it holds the run's directory name \
+             or mark"
+        )
+    }
+
+    /// The stops of the end compare of a guard taken from `home` after `home` stands as `change`
+    /// makes it, on a thread with a bound: none where it did not finish.
+    fn end_stops_after(home: &Path, change: impl FnOnce(&Path)) -> Option<Vec<Stop>> {
+        let plan = claude_plan();
+        let guard = plan.take(home);
+        change(home);
+        within(20, move || stops_at_the_end(&guard))
+    }
+
+    /// A text only a guarded file holds, which no read of one may find.
+    const PLANTED_IN_CREDENTIALS: &str = "krm-3f9a61c2-in-the-credentials";
+
+    #[test]
+    fn a_named_pipe_or_a_directory_at_the_shared_name_is_refused_and_not_waited_on() {
+        let home = claude_home("shared-pipe");
+        let stops = end_stops_after(&home, |home| {
+            std::fs::remove_file(home.join(".claude.json")).expect("removed");
+            make_pipe(&home.join(".claude.json"));
+        });
+        assert_eq!(
+            stops.map(|stops| stops.into_iter().map(|(_, why)| why).collect::<Vec<_>>()),
+            Some(vec![not_read("is not a regular file and is not read")]),
+            "the end read waited on a named pipe, or read it"
+        );
+        let stops = end_stops_after(&home, |home| {
+            std::fs::remove_file(home.join(".claude.json")).expect("removed");
+            std::fs::create_dir(home.join(".claude.json")).expect("a directory");
+        });
+        assert_eq!(
+            stops.map(|stops| stops.into_iter().map(|(_, why)| why).collect::<Vec<_>>()),
+            Some(vec![not_read("is not a regular file and is not read")])
+        );
+        std::fs::remove_dir_all(&home).expect("clean up");
+    }
+
+    #[test]
+    fn a_symbolic_link_at_the_shared_name_is_refused_and_its_target_is_not_read() {
+        let home = claude_home("shared-link");
+        let stops = end_stops_after(&home, |home| {
+            std::fs::write(
+                home.join(".claude/.credentials.json"),
+                PLANTED_IN_CREDENTIALS,
+            )
+            .expect("a write");
+            std::fs::remove_file(home.join(".claude.json")).expect("removed");
+            std::os::unix::fs::symlink(
+                home.join(".claude/.credentials.json"),
+                home.join(".claude.json"),
+            )
+            .expect("a link");
+        })
+        .expect("the end compare finished");
+        let said: Vec<&str> = stops.iter().map(|(_, why)| why.as_str()).collect();
+        assert!(
+            said.contains(&not_read("is a symbolic link and is not read").as_str()),
+            "{said:?}"
+        );
+        assert!(
+            !said.iter().any(|why| why.contains("now holds")),
+            "the target of the link was read: {said:?}"
+        );
+        std::fs::remove_dir_all(&home).expect("clean up");
+    }
+
+    #[test]
+    fn a_second_name_of_a_guarded_file_at_the_shared_name_is_refused_and_not_read() {
+        let home = claude_home("shared-hard-link");
+        std::fs::write(
+            home.join(".claude/.credentials.json"),
+            PLANTED_IN_CREDENTIALS,
+        )
+        .expect("a write");
+        std::fs::remove_file(home.join(".claude.json")).expect("removed");
+        std::fs::hard_link(
+            home.join(".claude/.credentials.json"),
+            home.join(".claude.json"),
+        )
+        .expect("a second name");
+        let stops = end_stops_after(&home, |_| {}).expect("the end compare finished");
+        assert_eq!(
+            stops.into_iter().map(|(_, why)| why).collect::<Vec<_>>(),
+            vec![not_read("has more than one name and is not read")],
+            "the second name of a guarded file was read"
+        );
+        std::fs::remove_dir_all(&home).expect("clean up");
+    }
+
+    #[test]
+    fn the_shared_file_made_the_object_of_a_guarded_name_after_the_take_is_not_read() {
+        let home = claude_home("shared-guarded-object");
+        std::fs::write(
+            home.join(".claude.json"),
+            format!(r#"{{"id":"{RUN_NAME}"}}"#),
+        )
+        .expect("a write");
+        let stops = end_stops_after(&home, |home| {
+            std::fs::remove_file(home.join(".claude/.device-keys.json")).expect("removed");
+            std::os::unix::fs::symlink(
+                home.join(".claude.json"),
+                home.join(".claude/.device-keys.json"),
+            )
+            .expect("a link");
+        })
+        .expect("the end compare finished");
+        let said: Vec<&str> = stops.iter().map(|(_, why)| why.as_str()).collect();
+        assert!(
+            said.contains(&not_read("is the same file as a guarded file and is not read").as_str()),
+            "{said:?}"
+        );
+        assert!(
+            !said.iter().any(|why| why.contains("now holds")),
+            "the shared file was read as a guarded file's object: {said:?}"
+        );
+        std::fs::remove_dir_all(&home).expect("clean up");
+    }
+
+    #[test]
+    fn a_shared_file_larger_than_the_limit_is_refused_and_not_read() {
+        let home = claude_home("shared-large");
+        // A file of holes, so that it costs nothing to make: a read of it would find the run's
+        // name nowhere, and a refusal is the only stop.
+        let stops = end_stops_after(&home, |home| {
+            let file = std::fs::File::create(home.join(".claude.json")).expect("a file");
+            file.set_len(SHARED_LIMIT + 1).expect("a size");
+        })
+        .expect("the end compare finished");
+        assert_eq!(
+            stops.into_iter().map(|(_, why)| why).collect::<Vec<_>>(),
+            vec![not_read("is larger than 16777216 bytes and is not read")]
+        );
+        std::fs::remove_dir_all(&home).expect("clean up");
+    }
+
+    #[test]
+    fn the_handle_of_a_shared_file_larger_than_the_limit_is_refused_before_any_read() {
+        let home = scratch("shared-handle-large");
+        let path = home.join("shared.json");
+        let file = std::fs::File::create(&path).expect("a file");
+        file.set_len(SHARED_LIMIT + 1).expect("a size");
+        assert_eq!(open_shared(&path, &[]).err(), Some(Unread::TooLarge));
+        file.set_len(SHARED_LIMIT).expect("a size");
+        assert!(matches!(open_shared(&path, &[]), Ok(Some(_))));
+        std::fs::remove_dir_all(&home).expect("clean up");
+    }
+
+    /// A time far enough on that no test reaches it.
+    fn far_off() -> std::time::Instant {
+        std::time::Instant::now() + std::time::Duration::from_secs(3600)
+    }
+
+    #[test]
+    fn a_read_that_passes_the_byte_limit_is_refused() {
+        use std::io::Read as _;
+        let needle: &[&[u8]] = &[b"zzz"];
+        let mut source = std::io::repeat(b'a').take(1000);
+        assert_eq!(
+            scan(&mut source, needle, 100, far_off()),
+            Err(Unread::TooLarge)
+        );
+        // Within the limit it reads to the end, and finds what is there.
+        let mut source = std::io::repeat(b'a').take(1000);
+        assert_eq!(scan(&mut source, needle, 1000, far_off()), Ok(false));
+        let mut source = std::io::Cursor::new(b"aaaazzzaaaa".to_vec());
+        assert_eq!(scan(&mut source, needle, 1000, far_off()), Ok(true));
+    }
+
+    #[test]
+    fn an_error_during_the_read_is_refused() {
+        /// Gives ten bytes, then fails.
+        struct Fails(bool);
+        impl std::io::Read for Fails {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                if self.0 {
+                    return Err(std::io::Error::other("a failing disk"));
+                }
+                self.0 = true;
+                buffer[..10].fill(b'a');
+                Ok(10)
+            }
+        }
+        let needle: &[&[u8]] = &[b"zzz"];
+        assert_eq!(
+            scan(&mut Fails(false), needle, 1000, far_off()),
+            Err(Unread::Failed)
+        );
+    }
+
+    #[test]
+    fn a_read_that_outlasts_its_deadline_is_refused() {
+        use std::io::Read as _;
+        let needle: &[&[u8]] = &[b"zzz"];
+        let deadline = std::time::Instant::now();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        // A source of fifty megabytes, which the limit allows: only the deadline stops it.
+        let mut source = std::io::repeat(b'a').take(50_000_000);
+        assert_eq!(
+            scan(&mut source, needle, u64::MAX, deadline),
+            Err(Unread::TooSlow)
+        );
+        let mut source = std::io::repeat(b'a').take(50_000_000);
+        assert_eq!(scan(&mut source, needle, u64::MAX, far_off()), Ok(false));
+    }
+
+    #[test]
+    fn a_read_that_waits_is_given_up_at_its_bound() {
+        let slow = bounded(std::time::Duration::from_millis(50), || {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            7
+        });
+        assert_eq!(slow, Err(std::sync::mpsc::RecvTimeoutError::Timeout));
+        assert_eq!(bounded(std::time::Duration::from_secs(30), || 7), Ok(7));
+    }
+
+    #[test]
+    fn each_refusal_of_the_shared_read_says_so_in_its_own_words() {
+        let end = ", so it is not known whether it holds the run's directory name or mark";
+        let said: Vec<String> = [
+            (Unread::Link, "is a symbolic link and is not read"),
+            (Unread::NotAFile, "is not a regular file and is not read"),
+            (Unread::ManyNames, "has more than one name and is not read"),
+            (
+                Unread::GuardedFile,
+                "is the same file as a guarded file and is not read",
+            ),
+            (
+                Unread::TooLarge,
+                "is larger than 16777216 bytes and is not read",
+            ),
+            (Unread::TooSlow, "was not read within 10 seconds"),
+            (Unread::Failed, "cannot be read after the run"),
+        ]
+        .into_iter()
+        .map(|(refusal, words)| {
+            assert_eq!(refusal.said(), format!("{words}{end}"));
+            refusal.said()
+        })
+        .collect();
+        let distinct: std::collections::BTreeSet<&String> = said.iter().collect();
+        assert_eq!(distinct.len(), said.len());
     }
 }
