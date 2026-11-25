@@ -69,10 +69,17 @@ pub fn read<T>(
 ///
 /// # Errors
 ///
-/// Returns why the files cannot be read whole: a `-journal` that SQLite would play back first, a
-/// main file that is not whole pages, a log whose header is torn or is not SQLite's, a log of
-/// another page size, an image of no pages or of more than the limit.
+/// Returns why the files cannot be read whole: a main file of no bytes, a `-journal` that SQLite
+/// would play back first, a main file that is not whole pages, a log whose header is torn or is not
+/// SQLite's, a log of another page size, an image of no pages or of more than the limit.
 pub fn image(files: &Files) -> Result<Vec<u8>, String> {
+    if files.main.is_empty() {
+        return Err(
+            "the main file is empty, and SQLite reads a database whose main file is \
+             empty as having no pages whatever its -wal holds"
+                .to_owned(),
+        );
+    }
     if let Some(journal) = files
         .journal
         .as_deref()
@@ -90,11 +97,11 @@ pub fn image(files: &Files) -> Result<Vec<u8>, String> {
         None | Some([]) => None,
         Some(wal) => Some(Log::of(wal)?),
     };
-    if let (Some(from_main), Some(log)) = (main_page, &log)
-        && from_main != log.page_size
+    if let Some(log) = &log
+        && main_page != log.page_size
     {
         return Err(format!(
-            "the -wal's page size is {}, not the main file's {from_main}",
+            "the -wal's page size is {}, not the main file's {main_page}",
             log.page_size
         ));
     }
@@ -136,11 +143,8 @@ pub fn image(files: &Files) -> Result<Vec<u8>, String> {
     Ok(image)
 }
 
-/// The page size the main file's header names, or none where the file is empty.
-fn page_size_of_main(main: &[u8]) -> Result<Option<usize>, String> {
-    if main.is_empty() {
-        return Ok(None);
-    }
+/// The page size the main file's header names.
+fn page_size_of_main(main: &[u8]) -> Result<usize, String> {
     if main.len() < HEADER || main[..16] != MAGIC[..] {
         return Err("the main file does not hold a database".to_owned());
     }
@@ -155,7 +159,7 @@ fn page_size_of_main(main: &[u8]) -> Result<Option<usize>, String> {
             main.len()
         ));
     }
-    Ok(Some(size))
+    Ok(size)
 }
 
 fn valid_page_size(size: usize) -> bool {
@@ -336,16 +340,46 @@ mod tests {
             .expect("a change");
     }
 
-    /// The database SQLite itself reads from `files`, in a private directory: its own recovery of
-    /// the log, then its own serialisation of the pages as it reads them, with the bytes that name
-    /// the mode read as the image reads them.
-    fn sqlite_reads(files: &Files) -> Vec<u8> {
+    /// The files of `files` written in a private directory, and the path of the main file there.
+    fn on_disk(files: &Files) -> (tempfile::TempDir, std::path::PathBuf) {
         let directory = tempfile::tempdir().expect("a directory");
         let path = directory.path().join("db.sqlite");
         std::fs::write(&path, &files.main).expect("the main file");
         if let Some(wal) = &files.wal {
             std::fs::write(directory.path().join("db.sqlite-wal"), wal).expect("the log");
         }
+        (directory, path)
+    }
+
+    /// How many tables SQLite itself finds in `files`, in a private directory.
+    fn tables_sqlite_finds(files: &Files) -> i64 {
+        let (_directory, path) = on_disk(files);
+        Connection::open(&path)
+            .expect("SQLite opens the files")
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type = 'table'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("SQLite's own reading")
+    }
+
+    /// How many pages the last commit of the log of `files` gives the database, and how many
+    /// different pages the log holds up to that commit.
+    fn pages_the_log_commits_and_holds(files: &Files) -> (u32, usize) {
+        let wal = files.wal.as_deref().expect("a log");
+        let (pages, frames) = Log::of(wal)
+            .expect("a log header")
+            .committed()
+            .expect("a commit");
+        (pages, frames.len())
+    }
+
+    /// The database SQLite itself reads from `files`, in a private directory: its own recovery of
+    /// the log, then its own serialisation of the pages as it reads them, with the bytes that name
+    /// the mode read as the image reads them.
+    fn sqlite_reads(files: &Files) -> Vec<u8> {
+        let (_directory, path) = on_disk(files);
         let mut connection = Connection::open(&path).expect("SQLite opens the files");
         let mut bytes = connection
             .serialize(MAIN_DB)
@@ -389,10 +423,7 @@ mod tests {
 
     /// The bytes of one frame with its page: the log is a header and frames of this length.
     fn frame_length(files: &Files) -> usize {
-        FRAME_HEADER
-            + page_size_of_main(&files.main)
-                .expect("a page size")
-                .expect("a database")
+        FRAME_HEADER + page_size_of_main(&files.main).expect("a page size")
     }
 
     /// The offset of the frame `number` of the log.
@@ -648,7 +679,8 @@ mod tests {
     }
 
     /// A log of another page size than the main file's, a `-journal` that holds anything, a main
-    /// file that is not whole pages and files that hold no database are refused.
+    /// file that is not whole pages, a main file of no bytes and files that hold no database are
+    /// refused.
     #[test]
     fn files_that_cannot_be_read_whole_are_refused_and_say_why() {
         let files = made(4096, several);
@@ -687,8 +719,8 @@ mod tests {
             wal: None,
             journal: None,
         })
-        .expect_err("files that hold no database");
-        assert!(why.contains("do not hold a database"), "{why}");
+        .expect_err("a main file of no bytes");
+        assert!(why.contains("the main file is empty"), "{why}");
         let why = image(&Files {
             main: vec![7; 4096],
             wal: None,
@@ -696,6 +728,99 @@ mod tests {
         })
         .expect_err("a main file that is not a database");
         assert!(why.contains("does not hold a database"), "{why}");
+    }
+
+    /// A log of the page size of `files` that holds one frame: the page `number` with the bytes
+    /// `page`, committing a database of `size_after` pages, with its checksum right.
+    fn one_frame_log(files: &Files, number: u32, size_after: u32, page: &[u8]) -> Vec<u8> {
+        let wal = files.wal.as_deref().expect("a log");
+        let big = wal[3] & 1 == 1;
+        let mut log = wal[..LOG_HEADER].to_vec();
+        let mut header = [0_u8; FRAME_HEADER];
+        header[0..4].copy_from_slice(&number.to_be_bytes());
+        header[4..8].copy_from_slice(&size_after.to_be_bytes());
+        header[8..16].copy_from_slice(&wal[16..24]);
+        let sum = checksum(big, &log[..24], (0, 0));
+        let sum = checksum(big, &header[..8], sum);
+        let sum = checksum(big, page, sum);
+        header[16..20].copy_from_slice(&sum.0.to_be_bytes());
+        header[20..24].copy_from_slice(&sum.1.to_be_bytes());
+        log.extend_from_slice(&header);
+        log.extend_from_slice(page);
+        log
+    }
+
+    /// A main file of no bytes is refused whatever the log and the journal hold. SQLite reads a
+    /// database whose main file has no pages as empty and removes its log, so an image laid from a
+    /// log that holds every page would be a database that a fresh open of the same files does not
+    /// read.
+    #[test]
+    fn a_main_file_of_no_bytes_is_refused_whatever_the_log_and_the_journal_hold() {
+        let files = made(4096, several);
+        let (pages, held) = pages_the_log_commits_and_holds(&files);
+        assert_eq!(
+            held, pages as usize,
+            "the log holds every page of the database it commits"
+        );
+        assert!(
+            tables_sqlite_finds(&files) > 0,
+            "the database with its log has its table"
+        );
+        let emptied = Files {
+            main: Vec::new(),
+            ..files.clone()
+        };
+        assert_eq!(
+            tables_sqlite_finds(&emptied),
+            0,
+            "SQLite reads the emptied main file with its log as an empty database"
+        );
+        for (what, files) in [
+            ("a log that holds every page", emptied.clone()),
+            (
+                "no log",
+                Files {
+                    wal: None,
+                    ..emptied.clone()
+                },
+            ),
+            (
+                "an empty log",
+                Files {
+                    wal: Some(Vec::new()),
+                    ..emptied.clone()
+                },
+            ),
+            (
+                "a journal that holds bytes",
+                Files {
+                    journal: Some(vec![0; 512]),
+                    ..emptied.clone()
+                },
+            ),
+        ] {
+            match image(&files) {
+                Ok(image) => panic!(
+                    "{what}: an image of {} bytes is made from files whose main file is empty",
+                    image.len()
+                ),
+                Err(why) => assert!(why.contains("the main file is empty"), "{what}: {why}"),
+            }
+        }
+    }
+
+    /// A log whose last commit lays a first page that is no database over a main file that is one
+    /// gives files that hold no database.
+    #[test]
+    fn an_image_whose_first_page_is_no_database_is_refused() {
+        let files = made(4096, several);
+        let log = one_frame_log(&files, 1, 1, &[0; 4096]);
+        let why = image(&Files {
+            wal: Some(log),
+            ..files
+        })
+        .expect_err("a first page that is no database");
+        assert!(why.contains("do not hold a database"), "{why}");
     }
 
     /// A last commit that says the database has more pages than the harness reads is refused, and
