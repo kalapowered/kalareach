@@ -1,10 +1,11 @@
 //! What a build list entry gives, what it lacks, and what a real start of it refuses.
 //!
-//! A part reads fields of its entry. A field the entry lists in `missing` is missing, and a case
-//! that reads it stops: it is never read as empty. [`check`] names, for each part, the fields the
-//! entry lacks and says whose gap each is, and lists what a real start of the entry refuses: an
-//! entry with no isolation contract, an entry of another package than Codex's with no `missing`
-//! member, an entry with an account and no `turn_line`, and a build the entry does not digest.
+//! A case reads fields of its entry. A field the entry lists in `missing` is missing, and a case
+//! that reads it stops: it is never read as empty. [`check`] names, for each case, the fields it
+//! reads that the entry lacks, and says whose gap each is. It lists what a real start of the entry
+//! refuses: an entry with no isolation contract, an entry of a package other than Codex's with no
+//! `missing` member, an entry with an account and no `turn_line`, and a build the entry does not
+//! name or digest.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -52,6 +53,8 @@ pub enum Refusal {
     Contradiction(String),
     /// An entry of another package than Codex's has no `missing` member.
     NoMissing,
+    /// A build the entry names no pinned file for.
+    NoPinnedFile(&'static str),
 }
 
 impl fmt::Display for Refusal {
@@ -72,6 +75,10 @@ impl fmt::Display for Refusal {
                 "the entry gives no digest for {program}, so a real start of it is refused"
             ),
             Self::Contradiction(text) => write!(out, "{text}"),
+            Self::NoPinnedFile(program) => write!(
+                out,
+                "the entry names no pinned file for {program}, so a real start of it is refused"
+            ),
             Self::NoMissing => write!(
                 out,
                 "the entry has no `missing` member, so a field it lacks would read as empty, and a \
@@ -380,11 +387,20 @@ pub fn check(build: &Build) -> Report {
     if build
         .newer
         .as_ref()
-        .is_some_and(|newer| !is_digest(&newer.sha256) || newer.pinned.is_empty())
+        .is_some_and(|newer| !is_digest(&newer.sha256))
     {
         report
             .refusals
             .push(Refusal::NotDigested("the newer build"));
+    }
+    if build
+        .newer
+        .as_ref()
+        .is_some_and(|newer| newer.pinned.is_empty())
+    {
+        report
+            .refusals
+            .push(Refusal::NoPinnedFile("the newer build"));
     }
     report
 }
@@ -863,7 +879,12 @@ mod tests {
         unnamed.newer.as_mut().expect("a newer build").pinned = String::new();
         assert_eq!(
             check(&unnamed).refusals,
-            vec![Refusal::NotDigested("the newer build")]
+            vec![Refusal::NoPinnedFile("the newer build")]
+        );
+        let why = refuse_real_start(&unnamed).expect_err("a newer build with no pinned file");
+        assert_eq!(
+            why,
+            "the entry names no pinned file for the newer build, so a real start of it is refused"
         );
     }
 
