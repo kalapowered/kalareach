@@ -1,7 +1,7 @@
 //! What a build list entry gives, what it lacks, and what a real start of it refuses.
 //!
 //! A case reads fields of its entry. A field the entry lists in `missing` is missing, and a case
-//! that reads it stops where [`NEEDS`] names the case for that field: it is never read as empty.
+//! that reads it stops where `NEEDS` names the case for that field: it is never read as empty.
 //! [`check`] names, for each case, the fields it reads that the entry lacks, and says whose gap
 //! each is. It lists what a real start of the entry refuses: an entry with no isolation contract, an
 //! entry of a package other than Codex's with no `missing` member, an entry with an account and no
