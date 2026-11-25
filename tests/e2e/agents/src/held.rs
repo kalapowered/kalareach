@@ -1518,11 +1518,12 @@ impl PersonGuard {
     }
 }
 
-/// What `lstat` says of one file, apart from its owner: its kind and permissions, identity, size
-/// and times.
+/// What `lstat` says of one file, apart from its owner: its kind and permissions, device, inode,
+/// size and times.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Stamp {
     mode: u32,
+    device: u64,
     inode: u64,
     size: u64,
     changed: (i64, i64),
@@ -1547,6 +1548,7 @@ fn seen_by_lstat(path: &Path) -> std::io::Result<Option<Seen>> {
         Ok(metadata) => Ok(Some(Seen {
             stamp: Stamp {
                 mode: metadata.mode(),
+                device: metadata.dev(),
                 inode: metadata.ino(),
                 size: metadata.size(),
                 changed: (metadata.ctime(), metadata.ctime_nsec()),
@@ -1721,17 +1723,16 @@ fn shared_names_the_run(
 
 /// An entry's named files of the person's home, as `lstat` showed them before a driver started
 /// anything, and the check that none of the guarded ones changed. A guarded file is looked at by
-/// `lstat` alone, never read: its kind, permissions, inode, size and times are compared, and its
-/// owner on its own. A guarded name that is a symbolic link is refused when the guard is taken,
-/// since a write through it changes the target and not the link, and so is a shared name, which
-/// would not be read. A shared file, which the person's own sessions also write, is not looked at
-/// until the end of the run. It is then opened with no link followed and no wait; its opened handle
-/// must be a regular file with one name that is not a guarded file; and it is read once, up to a
-/// byte limit and within a time bound, for the run's directory name and mark. Nothing of what is
-/// read is kept, and a file that fails these checks is not read and stops the run. A write to a
-/// file that is not named, a transcript below
-/// `~/.claude/projects` among them, is not seen. What is said is the path the entry names and
-/// whether it changed, never a value.
+/// `lstat` alone, never read: its kind, permissions, device, inode, size and times are compared,
+/// and its owner on its own. A guarded name that is a symbolic link is refused when the guard is
+/// taken, since a write through it changes the target and not the link, and so is a shared name,
+/// which would not be read. A shared file, which the person's own sessions also write, is not
+/// looked at until the end of the run. It is then opened with no link followed and no wait; its
+/// opened handle must be a regular file with one name that is not a guarded file; and it is read
+/// once, up to a byte limit and within a time bound, for the run's directory name and mark. Nothing
+/// of what is read is kept, and a file that fails these checks is not read and stops the run. A
+/// write to a file that is not named, a transcript below `~/.claude/projects` among them, is not
+/// seen. What is said is the path the entry names and whether it changed, never a value.
 #[derive(Clone, Debug)]
 pub struct FileGuard {
     home: PathBuf,
@@ -4902,5 +4903,35 @@ mod tests {
         .collect();
         let distinct: std::collections::BTreeSet<&String> = said.iter().collect();
         assert_eq!(distinct.len(), said.len());
+    }
+
+    #[test]
+    fn a_change_of_the_device_of_a_guarded_file_stops_the_run() {
+        let home = claude_home("files-device");
+        let guard = claude_plan().take(&home);
+        let Watch::Files(files) = &guard.watch else {
+            panic!("a claude-code plan guards files");
+        };
+        let look = |relative: &str| seen_by_lstat(&home.join(relative));
+        // The same file, to the last inode, time and byte, on another device.
+        let another_device = |relative: &str| {
+            look(relative).map(|seen| {
+                seen.map(|mut seen| {
+                    if relative == ".claude/settings.json" {
+                        seen.stamp.device += 1;
+                    }
+                    seen
+                })
+            })
+        };
+        let (stops, evidence) = files.compared(&another_device);
+        assert_eq!(stops.len(), 1, "{stops:?}");
+        assert_eq!(
+            stops[0].1,
+            "~/.claude/settings.json changed while the run ran"
+        );
+        assert_eq!(evidence[2]["changed"], json!(true));
+        assert_eq!(evidence[2]["owner_changed"], json!(false));
+        std::fs::remove_dir_all(&home).expect("clean up");
     }
 }
