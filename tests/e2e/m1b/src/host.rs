@@ -874,9 +874,9 @@ impl<'r> Host<'r> {
     ///
     /// # Panics
     ///
-    /// Unwinds with a [`LegNotRun`] when the record cannot be made: the leg ends as not run before
-    /// the agent is launched. Panics when the floor's opener this build should have produced is
-    /// missing or cannot be placed.
+    /// Unwinds with a [`LegNotRun`] when the record cannot be made, or when the floor's opener this
+    /// build should have produced is missing: the leg ends as not run before the agent is
+    /// launched. Panics when the opener cannot be placed or started.
     pub fn agent_starts(&self) {
         self.agent_starts_from(&built_directory());
     }
@@ -894,25 +894,29 @@ impl<'r> Host<'r> {
             if !records || restarts.record.is_some() {
                 return;
             }
-            if !self.stand_in.load(Ordering::SeqCst) {
-                self.place_the_floors_opener(built);
-            }
-            self.standing().and_then(|(indexes, record)| {
-                index::known(&indexes)?;
-                let clock = self.watch_the_floor()?;
-                restarts.verified = Some(Verified {
-                    address: self.configured_address(),
-                    indexes,
-                    kill: None,
-                    tables: None,
-                    refused: Vec::new(),
-                    notes: Vec::new(),
-                    starts: 0,
-                });
-                restarts.record = Some(record);
-                restarts.clock = Some(clock);
+            let placed = if self.stand_in.load(Ordering::SeqCst) {
                 Ok(())
-            })
+            } else {
+                self.place_the_floors_opener(built)
+            };
+            placed
+                .and_then(|()| self.standing())
+                .and_then(|(indexes, record)| {
+                    index::known(&indexes)?;
+                    let clock = self.watch_the_floor()?;
+                    restarts.verified = Some(Verified {
+                        address: self.configured_address(),
+                        indexes,
+                        kill: None,
+                        tables: None,
+                        refused: Vec::new(),
+                        notes: Vec::new(),
+                        starts: 0,
+                    });
+                    restarts.record = Some(record);
+                    restarts.clock = Some(clock);
+                    Ok(())
+                })
         };
         if let Err(why) = made {
             let said = format!("no record could be made before the agent started: {why}");
@@ -924,25 +928,28 @@ impl<'r> Host<'r> {
     /// Places the floor's opener, which this build made in `built`, in the run's `b/`, starts it
     /// once where nothing is timed, and records it as placed ([`Run::note_placed`]).
     ///
+    /// # Errors
+    ///
+    /// Returns that the program is missing, saying how to build it, or why it was not recorded.
+    ///
     /// # Panics
     ///
-    /// Panics when the program is missing, saying how to build it, or cannot be placed or started.
-    fn place_the_floors_opener(&self, built: &Path) {
+    /// Panics when the program cannot be placed or started.
+    fn place_the_floors_opener(&self, built: &Path) -> Result<(), String> {
         let source = built.join(FLOOR_OPEN);
-        assert!(
-            source.is_file(),
-            "the clock floor's opener is not at {}; build it with `cargo build -p kr-e2e-m1b \
-             --features legs --bins`",
-            source.display()
-        );
+        if !source.is_file() {
+            return Err(format!(
+                "the clock floor's opener is not at {}; build it with `cargo build -p kr-e2e-m1b \
+                 --features legs --bins`",
+                source.display()
+            ));
+        }
         kr_ipc::testing::place_and_start_once(
             &source,
             &self.run.binary(FLOOR_OPEN),
             &["--version"],
         );
-        self.run
-            .note_placed(&binary_place(FLOOR_OPEN))
-            .unwrap_or_else(|why| panic!("{why}"));
+        self.run.note_placed(&binary_place(FLOOR_OPEN))
     }
 
     /// The record of the run's tree as it stands: the host's two roots, the run's programs and the
@@ -2957,6 +2964,52 @@ mod shutdown_tests {
         assert!(
             held.get(opener).is_none(),
             "the stand-in path places no floor's opener"
+        );
+        drop(host);
+        drop(run);
+        std::fs::remove_dir_all(&root).expect("clean up");
+    }
+
+    /// A real agent whose floor's opener this build did not make ends the leg as not run before the
+    /// agent starts, and the reason says how to build the program; the stand-in, which never opens
+    /// the floor again, needs none.
+    #[test]
+    fn a_real_agent_whose_floors_opener_is_not_built_ends_the_leg_before_it_starts() {
+        let root = scratch("opener-not-built");
+        let (run, _mark) = host_with_a_kr(&root);
+        let nothing_built = root.join("nothing-built");
+        std::fs::create_dir_all(&nothing_built).expect("a build directory with no programs");
+        let host = host_over(&run);
+        host.declares_a_restart(Restart::Declared);
+        let unwinding = unwound(|| host.agent_starts_from(&nothing_built))
+            .expect("the agent does not start with no opener to place");
+        assert!(
+            unwinding.is::<LegNotRun>(),
+            "the leg ends as not run, and is not a panic: {}",
+            said_by(&*unwinding)
+        );
+        let said = said_by(&*unwinding);
+        assert!(
+            said.contains("the clock floor's opener is not at")
+                && said.contains("cargo build -p kr-e2e-m1b --features legs --bins"),
+            "the reason says where the opener is not and how to build it: {said}"
+        );
+        assert!(recorded(&host).is_none(), "no record was made");
+        drop(host);
+        drop(run);
+        std::fs::remove_dir_all(&root).expect("clean up");
+
+        let root = scratch("opener-not-built-stand-in");
+        let (run, _mark) = host_with_a_kr(&root);
+        std::fs::create_dir_all(root.join("nothing-built")).expect("an empty build directory");
+        let host = host_over(&run);
+        host.declares_a_restart(Restart::Survey);
+        host.agent_is_a_stand_in();
+        let unwinding = unwound(|| host.agent_starts_from(&root.join("nothing-built")));
+        assert!(
+            unwinding.is_none(),
+            "the stand-in needs no opener: {:?}",
+            unwinding.as_deref().map(said_by)
         );
         drop(host);
         drop(run);
