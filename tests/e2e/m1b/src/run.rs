@@ -59,9 +59,9 @@ pub struct Owned {
 
 /// The program the harness runs only while it is the file that was placed in the run
 /// ([`Run::placed_as_it_was`]): `kr`, which it starts before the agent under test starts and never
-/// after. The one program it starts after the agent has run is the floor's opener (`FLOOR_OPEN` in
-/// `floor`), placed and checked the same way. The restarted daemon and its workers are started from
-/// the run's tree with no such check.
+/// after. The one program of the run that it checks and then starts after the agent has run is the
+/// floor's opener (`FLOOR_OPEN` in `floor`), placed and checked the same way. The restarted daemon
+/// and its workers are started from the run's tree with no such check.
 pub const HARNESS_PROGRAM: &str = "kr";
 
 /// The place of a copied binary below the run's directory.
@@ -195,7 +195,8 @@ impl Run {
                     &["--version"],
                 );
             }
-            // The one program the harness starts itself once the agent under test has run.
+            // The program the harness starts itself, before the agent under test starts and never
+            // after.
             run.note_placed(&binary_place(HARNESS_PROGRAM))
                 .unwrap_or_else(|why| panic!("{why}"));
         }));
