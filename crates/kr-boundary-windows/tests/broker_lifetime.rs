@@ -45,6 +45,7 @@ use kr_boundary_windows::journal::rows::{Label, ObjectKind, RootName, Row, Rule}
 use kr_boundary_windows::lifecycle::{Left, UNCERTAIN_END_WORDS};
 use kr_boundary_windows::manifest::Manifest;
 use kr_boundary_windows::pipe_access;
+use kr_boundary_windows::slot::Blocked;
 use kr_boundary_windows::win::boot::BootMarker;
 use kr_boundary_windows::win::client::ClientIdentity;
 use kr_boundary_windows::win::ffi::{Handle, Sid, system_windows_directory, wide};
@@ -53,7 +54,7 @@ use kr_boundary_windows::win::launch::VerifiedPath;
 use kr_boundary_windows::win::lifecycle::fixture::{FixtureTrees, Plan};
 use kr_boundary_windows::win::lifecycle::testing as hooks;
 use kr_boundary_windows::win::lifecycle::{
-    Blocked, ChildPlan, Environment, Recovered, recover, run_invocation,
+    ChildPlan, Environment, Recovered, recover, run_invocation,
 };
 use kr_boundary_windows::win::pipe::{
     Connection, Kind, Listener, ServerProcess, Stop, connect_held,

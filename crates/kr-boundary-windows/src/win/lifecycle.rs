@@ -42,6 +42,7 @@ use crate::limits::{INVOCATION_DEADLINE, InvocationCounts};
 use crate::manifest::Manifest;
 use crate::messages::STILL_STARTING;
 use crate::refusal::Refusal;
+use crate::slot::Blocked;
 
 use super::boot;
 use super::channel::{DataPipes, Outcome, make_data_pipes};
@@ -166,15 +167,6 @@ impl Environment {
             bounds: Bounds::default(),
         }
     }
-}
-
-/// Why a project is blocked after an invocation.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Blocked {
-    /// An object of the tree, the repository or the journal is left unfinished.
-    Leftover(String),
-    /// The end of an invocation is not proved.
-    Uncertain,
 }
 
 /// A project's slot, taken when its tree is resolved and given back last. A slot that is dropped

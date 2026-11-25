@@ -5,6 +5,7 @@
 #![allow(dead_code, unsafe_code)]
 
 pub mod people;
+pub mod project;
 
 use std::ffi::c_void;
 use std::path::{Path, PathBuf};

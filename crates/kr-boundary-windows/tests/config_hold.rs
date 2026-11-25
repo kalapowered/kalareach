@@ -22,7 +22,7 @@ mod common;
 
 use std::fs::{self, File, OpenOptions};
 use std::os::windows::fs::OpenOptionsExt as _;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Storage::FileSystem::ReadFile;
@@ -49,53 +49,12 @@ use kr_boundary_windows::win::launch::{
 use kr_boundary_windows::win::sd::{Principals, SdKind, descriptor};
 
 use common::people::{Boundary, Person, acting_as, prepare, runs_as_the_system};
+use common::project::{CONFIG, Project};
 use common::{Scratch, run};
 
 const GUEST_GIT: &str = r"C:\Program Files\Git";
 const DELETE: u32 = 0x0001_0000;
 const INVOCATION: InvocationId = InvocationId([9; 16]);
-
-/// The folders of a case's project: `base\t\mid\parent\root`, with its `.git` inside the root.
-struct Project {
-    base: PathBuf,
-    top: PathBuf,
-    mid: PathBuf,
-    parent: PathBuf,
-    root: PathBuf,
-    git: PathBuf,
-}
-
-impl Project {
-    /// Makes the folders and the repository's files. Everyone has full control by inheritance, so
-    /// that no refusal below comes from an access list.
-    fn make(scratch: &Scratch, label: &str) -> Project {
-        let base = scratch.path(label);
-        fs::create_dir_all(&base).unwrap();
-        run(
-            "icacls",
-            &[base.to_str().unwrap(), "/grant", "*S-1-1-0:(OI)(CI)F"],
-        );
-        let top = base.join("t");
-        let mid = top.join("mid");
-        let parent = mid.join("parent");
-        let root = parent.join("root");
-        let git = root.join(".git");
-        fs::create_dir_all(git.join("objects")).unwrap();
-        fs::create_dir_all(git.join("refs")).unwrap();
-        fs::write(git.join("config"), CONFIG).unwrap();
-        fs::write(git.join("HEAD"), "ref: refs/heads/main\n").unwrap();
-        Project {
-            base,
-            top,
-            mid,
-            parent,
-            root,
-            git,
-        }
-    }
-}
-
-const CONFIG: &str = "[core]\n\trepositoryformatversion = 0\n\tfilemode = false\n\tbare = false\n";
 
 /// What an operation answers: success, or the platform's error number.
 type Answer = Result<(), i32>;
