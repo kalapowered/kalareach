@@ -23,7 +23,9 @@ use backup_seed::SeededBackups;
 use kr_client::session::Session;
 use kr_controller::grants::GrantRecord;
 use kr_crypto::keys::DeviceKeys;
-use kr_protocol::backup_checkpoint::{BackupCheckpointParams, BackupCheckpointResult};
+use kr_protocol::backup_checkpoint::{
+    BackupCheckpointParams, BackupCheckpointResult, HostCheckpoint,
+};
 use kr_protocol::describe::{SessionDescribeParams, SessionDescribeResult};
 use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::grant::{Grant, GrantExpiry, SessionSelector};
@@ -367,12 +369,15 @@ async fn kr_req_10_50_a_device_that_holds_the_screen_and_history_but_not_files_r
     host.stop().await;
 }
 
-/// What a device reads of the host's backups with `backup.checkpoint`.
-async fn read_checkpoint(session: &Session) -> BackupCheckpointResult {
+/// What a device reads of the host's backups with `backup.checkpoint`: the checkpoint the host
+/// answered, or the words of what came back in its place. A case asserts on the whole, so a read
+/// the host does not serve fails the case's own assertion.
+async fn read_checkpoint(session: &Session) -> Result<Nullable<HostCheckpoint>, String> {
     session
         .read(Method::BackupCheckpoint, &BackupCheckpointParams {})
         .await
-        .expect("the host answers the owner device")
+        .map(|answer: BackupCheckpointResult| answer.checkpoint)
+        .map_err(|error| format!("{error:?}"))
 }
 
 /// An owner device, over a real paired connection, is told the newest generation the host's
@@ -390,27 +395,27 @@ async fn an_owner_device_is_told_the_newest_generation_the_host_published_and_no
     let session = connect(&host, &device, &record).await;
 
     assert_eq!(
-        read_checkpoint(&session).await.checkpoint,
-        Nullable::null(),
+        read_checkpoint(&session).await,
+        Ok(Nullable::null()),
         "a host with no setup"
     );
     let service = host.controller().backup();
     let seeded = SeededBackups::set_up(service);
     assert_eq!(
-        read_checkpoint(&session).await.checkpoint,
-        Nullable::null(),
+        read_checkpoint(&session).await,
+        Ok(Nullable::null()),
         "a setup and no generation"
     );
     let first = seeded.publish(service, 1);
     assert_eq!(
-        read_checkpoint(&session).await.checkpoint,
-        Nullable::some(first),
+        read_checkpoint(&session).await,
+        Ok(Nullable::some(first)),
         "the first generation the service accepted"
     );
     let second = seeded.publish(service, 2);
     assert_eq!(
-        read_checkpoint(&session).await.checkpoint,
-        Nullable::some(second),
+        read_checkpoint(&session).await,
+        Ok(Nullable::some(second)),
         "a newer generation, read from a host already running"
     );
 
@@ -424,13 +429,17 @@ async fn an_owner_device_is_told_the_newest_generation_the_host_published_and_no
     )
     .await;
     let viewing = connect(&host, &viewer, &viewer_record).await;
-    let refusal = refused::<_, BackupCheckpointResult>(
-        &viewing,
-        Method::BackupCheckpoint,
-        &BackupCheckpointParams {},
-    )
-    .await;
-    assert_eq!(refusal.code, ErrorCode::PermissionDenied, "{refusal:?}");
+    let refusal = viewing
+        .read::<_, BackupCheckpointResult>(Method::BackupCheckpoint, &BackupCheckpointParams {})
+        .await;
+    assert!(
+        matches!(
+            &refusal,
+            Err(kr_client::error::ClientError::Host(error))
+                if error.code == ErrorCode::PermissionDenied
+        ),
+        "a device that does not manage the host is refused: {refusal:?}"
+    );
     viewing.close();
 
     // The local socket does not serve it: the method's ingress is the paired device.
@@ -439,8 +448,15 @@ async fn an_owner_device_is_told_the_newest_generation_the_host_published_and_no
         .request(Method::BackupCheckpoint, &BackupCheckpointParams {})
         .await;
     assert!(
-        matches!(&answered, Ok(Err(error)) if error.code == ErrorCode::PermissionDenied),
-        "the local socket is refused: {answered:?}"
+        matches!(
+            &answered,
+            Ok(Err(error))
+                if error.code == ErrorCode::PermissionDenied
+                    && error.message
+                        == "the backup checkpoint is read by a paired device, and the local \
+                            socket does not serve it"
+        ),
+        "the local socket is refused with the checkpoint's own words: {answered:?}"
     );
 
     // A newest row the host cannot read back is a refusal the device can tell from none.
@@ -452,13 +468,17 @@ async fn an_owner_device_is_told_the_newest_generation_the_host_published_and_no
             [],
         )
         .expect("the row is damaged");
-    let damaged = refused::<_, BackupCheckpointResult>(
-        &session,
-        Method::BackupCheckpoint,
-        &BackupCheckpointParams {},
-    )
-    .await;
-    assert_eq!(damaged.code, ErrorCode::StorageUnavailable, "{damaged:?}");
+    let damaged = session
+        .read::<_, BackupCheckpointResult>(Method::BackupCheckpoint, &BackupCheckpointParams {})
+        .await;
+    assert!(
+        matches!(
+            &damaged,
+            Err(kr_client::error::ClientError::Host(error))
+                if error.code == ErrorCode::StorageUnavailable
+        ),
+        "a newest row the host cannot read back is a refusal, never null: {damaged:?}"
+    );
     session.close();
     host.stop().await;
 }

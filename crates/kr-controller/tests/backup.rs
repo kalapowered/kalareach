@@ -11849,15 +11849,6 @@ fn checkpoint_of(generation: u64, hash: Digest256) -> HostCheckpoint {
     }
 }
 
-fn assert_unreadable(answer: Result<Option<HostCheckpoint>, ControllerError>, what: &str) {
-    match answer {
-        Err(ControllerError::RegistryUnavailable { detail }) => {
-            assert_eq!(detail, CHECKPOINT_UNREADABLE, "{what}");
-        }
-        other => panic!("{what}: a refusal was expected, not {other:?}"),
-    }
-}
-
 /// No setup, no generation, and a generation that no service accepted give no checkpoint,
 /// whichever of the three states short of accepted it is in.
 #[test]
@@ -12172,6 +12163,19 @@ fn a_newest_row_the_host_cannot_read_back_is_a_refusal_and_never_the_row_before_
             )
             .expect("the row is changed");
     };
+    // The refusal is asserted here, in the body, so that a read that answers where it should
+    // refuse fails this case's own assertion.
+    let assert_unreadable = |answer: Result<Option<HostCheckpoint>, ControllerError>,
+                             what: &str| {
+        assert!(
+            matches!(
+                &answer,
+                Err(ControllerError::RegistryUnavailable { detail })
+                    if detail.as_str() == CHECKPOINT_UNREADABLE
+            ),
+            "{what}: the host's refusal was expected, not {answer:?}"
+        );
+    };
     set_descriptor(None);
     assert_unreadable(service.latest_published(), "no descriptor");
     set_descriptor(Some(b"not a descriptor".as_slice()));
@@ -12197,12 +12201,77 @@ fn a_newest_row_the_host_cannot_read_back_is_a_refusal_and_never_the_row_before_
     );
 }
 
+/// A newest row numbered 0 is a refusal: no generation is numbered 0, and a checkpoint of one is
+/// not one the wire carries. The descriptor beside the row names 0 too, so the row's number is
+/// the one thing that is wrong.
+#[test]
+fn a_newest_row_numbered_0_is_a_refusal() {
+    let (_root, state) = state_directory();
+    let producer = Producer::generate();
+    let service = service_with_setup(&state, &producer);
+    assert_eq!(
+        service.latest_published().expect("a read"),
+        None,
+        "a setup and no generation"
+    );
+
+    let numbered_0 = producer
+        .seal_with_manifest(0, &[stage(0x20, "a.cbor", b"content")], object_id(0xf0))
+        .descriptor_bytes;
+    assert_eq!(
+        ArchiveDescriptor::from_canonical_bytes(&numbered_0)
+            .expect("a descriptor")
+            .backup_generation
+            .get(),
+        0,
+        "the descriptor names the number the row will carry"
+    );
+    // The store admits no generation numbered 0 and rewrites no row's number, so the row is
+    // written as a damaged store would hold it.
+    rusqlite::Connection::open(state.join("backup.sqlite"))
+        .expect("the backup store")
+        .execute(
+            "INSERT INTO generations
+             (archive_id, backup_generation, production, remote, writer_key_id,
+              privacy_generation, descriptor, created_at_ms, settled_at_ms, detail)
+             VALUES (?1, 0, 'complete', 'published', ?2, 0, ?3, 1000, NULL, NULL)",
+            rusqlite::params![
+                archive_id().get().as_bytes().as_slice(),
+                producer.writer.key_id().as_bytes().as_slice(),
+                numbered_0
+            ],
+        )
+        .expect("the row is written");
+    let answer = service.latest_published();
+    assert!(
+        matches!(
+            &answer,
+            Err(ControllerError::RegistryUnavailable { detail })
+                if detail.as_str() == CHECKPOINT_UNREADABLE
+        ),
+        "a row numbered 0: the host's refusal was expected, not {answer:?}"
+    );
+}
+
 /// A setup whose service is not an origin, and a store that cannot be read, are refusals: the
 /// host does not say it has published nothing.
 #[test]
 fn a_setup_with_no_origin_and_a_store_that_cannot_be_read_are_refusals() {
     let (_root, state) = state_directory();
     let producer = Producer::generate();
+    // The refusal is asserted here, in the body, so that a read that answers where it should
+    // refuse fails this case's own assertion.
+    let assert_unreadable = |answer: Result<Option<HostCheckpoint>, ControllerError>,
+                             what: &str| {
+        assert!(
+            matches!(
+                &answer,
+                Err(ControllerError::RegistryUnavailable { detail })
+                    if detail.as_str() == CHECKPOINT_UNREADABLE
+            ),
+            "{what}: the host's refusal was expected, not {answer:?}"
+        );
+    };
     {
         let service = BackupService::open(&state).expect("a backup service");
         service
