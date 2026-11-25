@@ -6753,6 +6753,7 @@ fn a_daemon_killed_with_a_request_pending_leaves_the_agent(restart: Restart) {
                 "no `kr` ran after the agent started"
             );
             serde_json::json!({
+                "restart": session.host.restart_evidence(),
                 "pending_resource_compared_field_for_field": true,
                 "answers_the_server_received": answers,
                 "session_after_the_worker_ended": format!("{:?}", closed.state),
@@ -6889,6 +6890,7 @@ fn a_second_request_pending_when_the_daemon_and_then_the_worker_are_killed(resta
                 "no `kr` ran after the agent started"
             );
             serde_json::json!({
+                "restart": session.host.restart_evidence(),
                 "second_request_pending_when_the_worker_ended": true,
                 "session_after_the_worker_ended": format!("{:?}", closed.state),
                 "refusals_after_the_worker_ended": format!("{:?}", closed.refusals()),

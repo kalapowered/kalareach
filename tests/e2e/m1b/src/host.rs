@@ -259,6 +259,41 @@ pub fn surveyed() -> Vec<String> {
         .clone()
 }
 
+/// What a restart case's result states of the compares of its restart, as the specification states
+/// it: the residuals of the live daemon's class, and the limits of the other compares. A passing
+/// restart case does not show that none of them happened.
+pub const RESTART_RESIDUALS: [&str; 13] = [
+    "(1) An agent's in-place write to an entry of the live daemon's class between the start of the \
+     agent and a kill is not seen, and the restarted daemon reads it; the registry and the stores \
+     the daemon writes while it serves, the delivery journal among them, are the main case.",
+    "(2) Where a row of that class permits replacement or removal, an agent's replacement or removal \
+     of that entry is not seen either.",
+    "(3) A start-time entry may change at the second kill, so an agent's write to a start-time entry \
+     between the first restart and the second kill is not seen; in the first cycle a change to one \
+     refuses.",
+    "(4) Entries of that class are compared for equality only between the kill and the attempt, when \
+     the daemon is dead; an entry of that class that an agent changed before the kill passes.",
+    "The session journals are compared on no real leg, since a real agent may write tables of the \
+     broker between the kill and the attempt.",
+    "The time of a new output-time index row has an upper limit that is checked; neither the time of \
+     its production nor its proven value is verified, so a row may read later than the truth by up \
+     to its age plus the allowance, and nothing bounds the age.",
+    "A forward step of the wall clock of more than the allowance followed by a rollback of more than \
+     the allowance, observed or not, can refuse a good run; that is a refusal, never a pass. A \
+     clock floor word that moves forward inside the limit is not seen.",
+    "What the compares permit enters the record taken at the kill: the clock floor's words within the \
+     limit and its establishment words, a new session root, and what each row of the worker's files \
+     allows, so the residual of each of those rows applies.",
+    "The daemon's writes to the clock floor are listed in part.",
+    "The contents of the spool and of the output-time indexes are not proven: the compares check \
+     their names, their growth and their order.",
+    "A name that the agent adds under the application directory is not looked at.",
+    "A digest check followed by a start by path leaves a race between the last compare and the \
+     start.",
+    "A copy of a database is opened by its path, so a swap of the copies' directory between its \
+     last check and the open is a race that the checks do not close.",
+];
+
 /// What a survey shows that fails a run which wants none of it: a refusal of a compare, with the
 /// class of the refusal, or a list that is incomplete.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -432,6 +467,9 @@ struct Verified {
     tables: Option<Tables>,
     /// What the compares at the kills refused.
     refused: Vec<Refused>,
+    /// What the rows of the worker's files kept as evidence at the compares of the kills and of the
+    /// attempts.
+    notes: Vec<String>,
     /// How many daemon starts have followed the start's record.
     starts: usize,
 }
@@ -853,6 +891,7 @@ impl<'r> Host<'r> {
                     kill: None,
                     tables: None,
                     refused: Vec::new(),
+                    notes: Vec::new(),
                     starts: 0,
                 });
                 restarts.record = Some(record);
@@ -1616,6 +1655,7 @@ impl<'r> Host<'r> {
         let uid = rustix::process::getuid().as_raw();
         let compared = compare::compare(&layout, self.place(), start, &record, interval, uid);
         verified.refused.extend(Refused::of(&compared.refusals));
+        verified.notes.extend(compared.notes);
         verified
             .refused
             .extend(Refused::all(Class::Outside, self.outside_refusals()));
@@ -1674,6 +1714,7 @@ impl<'r> Host<'r> {
             uid,
         );
         refused.extend(Refused::of(&compared.refusals));
+        verified.notes.extend(compared.notes);
         refused.extend(Refused::all(Class::Outside, self.outside_refusals()));
         let readings = Readings::now();
         refused.extend(Refused::all(
@@ -1704,6 +1745,20 @@ impl<'r> Host<'r> {
             )));
         }
         refused
+    }
+
+    /// What a restart case's result states of its restart: the residuals of the compares and the
+    /// notes the rows of the worker's files kept as evidence.
+    #[must_use]
+    pub fn restart_evidence(&self) -> Value {
+        let notes = self
+            .restarts
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .verified
+            .as_ref()
+            .map_or_else(Vec::new, |verified| verified.notes.clone());
+        serde_json::json!({ "residuals": RESTART_RESIDUALS, "notes": notes })
     }
 
     /// The one start of the daemon after a real agent started: the address must be free, every
@@ -3318,6 +3373,70 @@ mod shutdown_tests {
             matches!(&gap, Some(Gap::Incomplete { kill: 2, why }) if why.contains("did not stand still within 1 s")),
             "{gap:?}"
         );
+    }
+
+    /// The result of a restart case states the residuals of the compares in the words of the
+    /// specification, and the notes the rows of the worker's files kept as evidence: bytes added
+    /// to a worker's diagnostics between the start of the agent and a kill are in it.
+    #[test]
+    fn the_evidence_of_a_restart_states_the_residuals_and_the_notes_the_rows_kept() {
+        let root = scratch("restart-evidence");
+        let (run, _mark) = host_with_a_kr(&root);
+        let host = host_over(&run);
+        let diagnostics = host
+            .environment
+            .state_dir()
+            .join("jobs/kr-worker-1.diagnostics");
+        std::fs::create_dir_all(diagnostics.parent().expect("a parent")).expect("a directory");
+        std::fs::write(&diagnostics, b"first line\n").expect("a diagnostics file");
+        host.declares_a_restart(Restart::Survey);
+        host.agent_is_a_stand_in();
+        host.agent_starts();
+        survey_quickly(&host);
+        let mut written = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&diagnostics)
+            .expect("the diagnostics file");
+        std::io::Write::write_all(&mut written, b"a second line\n").expect("appended");
+        host.survey_the_kill();
+        host.verify_the_kill();
+        let evidence = host.restart_evidence();
+        let residuals: Vec<&str> = evidence["residuals"]
+            .as_array()
+            .expect("a list of residuals")
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert_eq!(residuals, RESTART_RESIDUALS, "{evidence:#}");
+        for number in ["(1) ", "(2) ", "(3) ", "(4) "] {
+            assert!(
+                residuals.iter().any(|said| said.starts_with(number)),
+                "the residual {number}: {residuals:#?}"
+            );
+        }
+        assert!(
+            residuals
+                .iter()
+                .any(|said| said.contains("a race between the last compare and the start")),
+            "the race between the last compare and the start: {residuals:#?}"
+        );
+        assert!(
+            residuals
+                .iter()
+                .any(|said| said.contains("a race that the checks do not close")),
+            "the race at the open of a copy: {residuals:#?}"
+        );
+        let notes = evidence["notes"].as_array().expect("a list of notes");
+        assert!(
+            notes
+                .iter()
+                .filter_map(Value::as_str)
+                .any(|said| said.ends_with("14 bytes were added to the worker's diagnostics")),
+            "{evidence:#}"
+        );
+        drop(host);
+        drop(run);
+        std::fs::remove_dir_all(&root).expect("clean up");
     }
 
     /// The survey says each write that no row of the live daemon's files covers as a refusal, made

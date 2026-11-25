@@ -849,6 +849,7 @@ fn part_5a_declaring(
         );
         serde_json::json!({
             "arm": arm(ctx),
+            "restart": session.host.restart_evidence(),
             "agent_processes": ["the worker", "the agent"],
             "local_terminal_input": shows,
             "detection": shown.detection.evidence(),
