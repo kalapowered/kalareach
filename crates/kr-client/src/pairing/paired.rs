@@ -22,6 +22,7 @@ use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::{EndpointKey, Nullable};
 use serde::{Deserialize, Serialize};
 
+use super::checkpoint::PairedCheckpoints;
 use super::failure::{FailureKind, PairingFailure};
 use crate::shown::Shown;
 
@@ -281,6 +282,12 @@ impl PairedHosts {
         &self.directory
     }
 
+    /// The checkpoints the hosts gave this device, kept in the same directory.
+    #[must_use]
+    pub fn checkpoints(&self) -> PairedCheckpoints {
+        PairedCheckpoints::at(self.directory.clone())
+    }
+
     /// Every host this device is paired with, oldest first.
     ///
     /// # Errors
@@ -289,29 +296,7 @@ impl PairedHosts {
     /// read are an error, never an empty list: forgetting a pairing silently would leave a host
     /// holding a grant this device no longer knows it has.
     pub fn list(&self) -> Result<Vec<PairedHost>, PairingFailure> {
-        let Some(bytes) = self.read(HOSTS_FILE)? else {
-            return Ok(Vec::new());
-        };
-        let file: HostsFile = serde_json::from_slice(&bytes).map_err(|error| {
-            store_failed(unreadable_host(&bytes).map_or_else(
-                || crate::shown!("the paired hosts cannot be read: {}", Shown::json(&error)),
-                |host| {
-                    crate::shown!(
-                        "the paired host {} in hosts.json cannot be read: {}",
-                        host,
-                        Shown::json(&error)
-                    )
-                },
-            ))
-        })?;
-        if file.version != FORMAT_VERSION {
-            return Err(store_failed(crate::shown!(
-                "the paired hosts are version {}, and this release reads {}",
-                file.version,
-                FORMAT_VERSION
-            )));
-        }
-        Ok(file.hosts)
+        read_hosts(&self.directory)
     }
 
     /// The paired host whose endpoint is `endpoint_id`, if there is one.
@@ -486,9 +471,7 @@ impl PairedHosts {
     }
 
     fn read(&self, name: &'static str) -> Result<Option<Vec<u8>>, PairingFailure> {
-        let path = self.directory.join(name);
-        kr_ipc::paths::read_owner_only_file(&path, MAX_FILE_BYTES)
-            .map_err(|error| self.file_failed(name, &error))
+        read_in(&self.directory, name)
     }
 
     fn write(&self, name: &'static str, bytes: &[u8]) -> Result<(), PairingFailure> {
@@ -499,11 +482,7 @@ impl PairedHosts {
 
     /// Says which of the records' files could not be used, and why.
     fn file_failed(&self, name: &'static str, error: &kr_ipc::IpcError) -> PairingFailure {
-        store_failed(crate::shown!(
-            "{}: {}",
-            Shown::within(&self.directory, name),
-            Shown::ipc(error)
-        ))
+        file_failed_in(&self.directory, name, error)
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, ()> {
@@ -511,6 +490,58 @@ impl PairedHosts {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
+}
+
+/// Every host recorded in `directory`, oldest first, read as [`PairedHosts::list`] reads them.
+///
+/// It takes no store: a holder that never writes the records, and so opens none, reads them
+/// through this.
+///
+/// # Errors
+///
+/// As [`PairedHosts::list`].
+pub(super) fn read_hosts(directory: &Path) -> Result<Vec<PairedHost>, PairingFailure> {
+    let Some(bytes) = read_in(directory, HOSTS_FILE)? else {
+        return Ok(Vec::new());
+    };
+    let file: HostsFile = serde_json::from_slice(&bytes).map_err(|error| {
+        store_failed(unreadable_host(&bytes).map_or_else(
+            || crate::shown!("the paired hosts cannot be read: {}", Shown::json(&error)),
+            |host| {
+                crate::shown!(
+                    "the paired host {} in hosts.json cannot be read: {}",
+                    host,
+                    Shown::json(&error)
+                )
+            },
+        ))
+    })?;
+    if file.version != FORMAT_VERSION {
+        return Err(store_failed(crate::shown!(
+            "the paired hosts are version {}, and this release reads {}",
+            file.version,
+            FORMAT_VERSION
+        )));
+    }
+    Ok(file.hosts)
+}
+
+fn read_in(directory: &Path, name: &'static str) -> Result<Option<Vec<u8>>, PairingFailure> {
+    let path = directory.join(name);
+    kr_ipc::paths::read_owner_only_file(&path, MAX_FILE_BYTES)
+        .map_err(|error| file_failed_in(directory, name, &error))
+}
+
+fn file_failed_in(
+    directory: &Path,
+    name: &'static str,
+    error: &kr_ipc::IpcError,
+) -> PairingFailure {
+    store_failed(crate::shown!(
+        "{}: {}",
+        Shown::within(directory, name),
+        Shown::ipc(error)
+    ))
 }
 
 fn store_failed(detail: Shown) -> PairingFailure {

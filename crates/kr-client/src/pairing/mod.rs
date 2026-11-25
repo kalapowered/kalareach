@@ -5,6 +5,7 @@
 //! | [`room`] | The rendezvous room socket a host and a candidate open, with its role, its bounds and its typed failures |
 //! | [`invitation`] | The one invitation reader: a scanned or pasted QR payload, read as the host issued it |
 //! | [`candidate`] | This device pairing: the short-code attempt, the start's lookup, and the wait for the owner that both modes share |
+//! | [`checkpoint`] | The backup checkpoints a paired host gave this device, kept beside the paired-host records |
 //! | [`direct`] | Redeeming a direct invitation |
 //! | [`link`] | How a device reaches a host over iroh: the device's one dialling endpoint, and the pre-authorisation surface |
 //! | [`paired`] | The paired-host records, and an attempt still waiting for its owner |
@@ -22,6 +23,7 @@ use std::future::Future;
 use std::pin::Pin;
 
 pub mod candidate;
+pub mod checkpoint;
 pub mod clock;
 pub mod direct;
 pub mod failure;
