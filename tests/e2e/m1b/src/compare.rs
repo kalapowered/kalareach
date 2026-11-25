@@ -975,6 +975,298 @@ pub(crate) mod tests {
         world.clean();
     }
 
+    /// The files below `directory`, sorted.
+    fn files_below(directory: &Path) -> Vec<PathBuf> {
+        let mut found = Vec::new();
+        for entry in std::fs::read_dir(directory).expect("a listing") {
+            let path = entry.expect("an entry").path();
+            if path.is_dir() {
+                found.extend(files_below(&path));
+            } else {
+                found.push(path);
+            }
+        }
+        found.sort();
+        found
+    }
+
+    /// The text of a configuration document the host wrote: an address, a discovery server and a
+    /// list of command integrations.
+    fn configuration_text(discovery: &str, integration: &str) -> String {
+        use kr_protocol::hostinfo::configuration::{self, ConfigurationDocument};
+        use kr_protocol::scalars::Nullable;
+        let mut document = ConfigurationDocument::empty();
+        document.network.bind_address = Nullable::some("127.0.0.1:7777".to_owned());
+        document.network.pkarr_publisher_url = Nullable::some(discovery.to_owned());
+        document.preferences.command_integrations = Nullable::some(vec![integration.to_owned()]);
+        configuration::contents(&document)
+    }
+
+    /// Records a tree with `written` as the host's configuration document, writes `after` over it
+    /// in place, and returns what the compare refuses at each of the three intervals.
+    fn refused_after_a_configuration_change(
+        name: &str,
+        written: &str,
+        after: &str,
+    ) -> Vec<(Interval, Vec<String>)> {
+        let world = world(name);
+        let path = kr_worker::config::document_path(&world.environment);
+        world.put(&path, written.as_bytes());
+        let before = world.record();
+        std::fs::write(&path, after).expect("rewritten");
+        let refused = [KILL, LATER_KILL, ATTEMPT]
+            .into_iter()
+            .map(|interval| (interval, world.refused(&before, interval)))
+            .collect();
+        world.clean();
+        refused
+    }
+
+    /// Makes the registry hold the accepted-configuration record of its environment, through the
+    /// writer the daemon uses, and reads it back.
+    fn accept_a_configuration(world: &World, revision: u64, discovery: &str) {
+        use kr_controller::registry::{AcceptedConfiguration, Registry};
+        let identity = world.paths.open_environment_id().expect("an identity");
+        let mut registry =
+            Registry::open(world.state("registry.sqlite"), identity).expect("a registry");
+        let accepted = AcceptedConfiguration {
+            revision,
+            document: Some(configuration_text(discovery, "kalareach/claude-code")),
+        };
+        registry
+            .record_accepted_configuration(&accepted)
+            .expect("the accepted configuration is recorded");
+        let held = registry.accepted_configuration().expect("a read");
+        assert_eq!(
+            (held.revision, held.document),
+            (accepted.revision, accepted.document)
+        );
+    }
+
+    /// Makes the registry hold the sharing policy of the host, through the writer the daemon uses,
+    /// and reads it back.
+    fn keep_a_sharing_policy(world: &World, exclusively_managed: bool) {
+        use kr_controller::grants::{GrantDirectory, HostPolicy};
+        use kr_protocol::ids::AuthorityRevision;
+        let directory =
+            GrantDirectory::open(world.state("registry.sqlite")).expect("a grant directory");
+        let mut policy = HostPolicy::personal(AuthorityRevision::new(1)).snapshot();
+        policy.exclusively_managed = exclusively_managed;
+        directory.store_policy(&policy).expect("the sharing policy");
+        assert_eq!(directory.stored_policy().expect("a read"), Some(policy));
+    }
+
+    /// The controller's identity marker and the device keys of its secret store are entries the
+    /// record holds, and no row of the live daemon's files covers them: a marker that is gone while
+    /// the keys stay, and a key that is gone while the marker stays, are each refused at every
+    /// interval.
+    #[test]
+    fn a_missing_identity_marker_or_key_is_refused_at_every_interval() {
+        use kr_ipc::verify::ControllerIdentity;
+        for gone in ["marker", "key"] {
+            let world = world(&format!("identity-{gone}"));
+            let identity = world.paths.open_environment_id().expect("an identity");
+            let secrets = world.environment.secrets_dir();
+            let keys = kr_crypto::store::open_store_in(&secrets).expect("a key store");
+            ControllerIdentity::initialise(keys.store.as_ref(), identity).expect("the device keys");
+            let marker = world.state("controller-identity");
+            kr_ipc::paths::write_owner_only_file(&marker, format!("{:?}\n", keys.kind).as_bytes())
+                .expect("the marker");
+            let key_files = files_below(&secrets);
+            assert_eq!(key_files.len(), 4, "one file for each key: {key_files:#?}");
+            let before = world.record();
+            for interval in [KILL, LATER_KILL, ATTEMPT] {
+                assert_eq!(
+                    world.refused(&before, interval),
+                    Vec::<String>::new(),
+                    "{gone}, nothing changed, {interval:?}"
+                );
+            }
+            let path = if gone == "marker" {
+                marker
+            } else {
+                key_files[0].clone()
+            };
+            std::fs::remove_file(&path).expect("removed");
+            let name = path.strip_prefix(&world.root).expect("below the root");
+            let gone_line = format!("{}: gone", name.display());
+            for interval in [KILL, LATER_KILL, ATTEMPT] {
+                let refused = world.refused(&before, interval);
+                assert!(
+                    refused.len() == 1
+                        && refused[0].starts_with(&gone_line)
+                        && refused[0]
+                            .ends_with("no row of the live daemon's files covers this entry"),
+                    "{gone}, {interval:?}: {refused:#?}"
+                );
+            }
+            world.clean();
+        }
+    }
+
+    /// In the configuration document the host wrote, changed discovery settings at an unchanged
+    /// address are refused at every interval.
+    #[test]
+    fn changed_discovery_settings_at_an_unchanged_address_are_refused_at_every_interval() {
+        let written = configuration_text("https://discovery.example/a", "kalareach/claude-code");
+        let after = configuration_text("https://discovery.example/b", "kalareach/claude-code");
+        assert_ne!(written, after);
+        assert_eq!(
+            written.len(),
+            after.len(),
+            "the size does not show the change"
+        );
+        for (interval, refused) in
+            refused_after_a_configuration_change("discovery", &written, &after)
+        {
+            assert!(
+                refused.len() == 1
+                    && refused[0].contains("config.json: the bytes changed")
+                    && refused[0].ends_with("no row of the live daemon's files covers this entry"),
+                "{interval:?}: {refused:#?}"
+            );
+        }
+    }
+
+    /// In the configuration document the host wrote, a changed list of command integrations is
+    /// refused at every interval.
+    #[test]
+    fn a_changed_list_of_command_integrations_is_refused_at_every_interval() {
+        let written = configuration_text("https://discovery.example/a", "kalareach/claude-code");
+        let after = configuration_text("https://discovery.example/a", "kalareach/gemini-cli");
+        assert_ne!(written, after);
+        for (interval, refused) in
+            refused_after_a_configuration_change("integrations", &written, &after)
+        {
+            assert!(
+                refused.len() == 1
+                    && refused[0].contains("config.json: the bytes changed")
+                    && refused[0].ends_with("no row of the live daemon's files covers this entry"),
+                "{interval:?}: {refused:#?}"
+            );
+        }
+    }
+
+    /// Changes one record of a registry that holds the accepted-configuration record and the sharing
+    /// policy, each written by the daemon's own writer, and checks that the change passes at a kill,
+    /// since the registry is the live daemon's, and is refused when it is made between the kill and
+    /// the attempt.
+    fn a_registry_record_changed_alone(name: &str, change: fn(&World)) {
+        let world = world(name);
+        accept_a_configuration(&world, 1, "https://discovery.example/a");
+        keep_a_sharing_policy(&world, false);
+        assert!(
+            world.state("policy-mirror.cbor").is_file(),
+            "the copy of the policy"
+        );
+        let before = world.record();
+        change(&world);
+        for interval in [KILL, LATER_KILL] {
+            assert_eq!(
+                world.refused(&before, interval),
+                Vec::<String>::new(),
+                "{name}, {interval:?}"
+            );
+        }
+        let refused = world.refused(&before, ATTEMPT);
+        assert!(
+            refused
+                .iter()
+                .any(|line| line.contains("registry.sqlite: the bytes changed")),
+            "{name}: {refused:#?}"
+        );
+        assert!(
+            refused.iter().all(|line| line.ends_with(
+                "is written by the live daemon and no daemon runs between the kill and the \
+                 attempt"
+            )),
+            "{name}: {refused:#?}"
+        );
+        world.clean();
+    }
+
+    /// A changed accepted-configuration record of the registry passes at a kill and is refused
+    /// before the attempt.
+    #[test]
+    fn a_changed_accepted_configuration_record_is_refused_after_the_kill() {
+        a_registry_record_changed_alone("accepted-configuration", |world| {
+            accept_a_configuration(world, 2, "https://discovery.example/b");
+        });
+    }
+
+    /// A changed sharing policy of the registry passes at a kill and is refused before the attempt.
+    #[test]
+    fn a_changed_sharing_policy_record_is_refused_after_the_kill() {
+        a_registry_record_changed_alone("sharing-policy", |world| {
+            keep_a_sharing_policy(world, true);
+        });
+    }
+
+    /// An `organisation-policy.json` that holds a record in the format the daemon writes, once it is
+    /// gone, is refused at every interval because no row covers the file, and not because a row of
+    /// the daemon's files forbids a removal.
+    #[test]
+    fn a_removed_applied_policy_record_is_refused_at_every_interval() {
+        use kr_controller::grants::applied::{self, StoredAppliedPolicy};
+        use kr_protocol::ids::{AuthorityRevision, OrganisationId, OrganisationPolicyRevision};
+        use kr_protocol::scalars::Nullable;
+        let world = world("applied-policy");
+        let state = world.environment.state_dir().to_path_buf();
+        let entry = StoredAppliedPolicy {
+            organisation_id: OrganisationId::new(kr_ipc::new_uuid()),
+            enrolment_revision: AuthorityRevision::new(2),
+            organisation_policy_revision: OrganisationPolicyRevision::new(1),
+            adapter_allowlist: Nullable::null(),
+        };
+        applied::write(&state, std::slice::from_ref(&entry)).expect("the record");
+        assert_eq!(
+            applied::read(&state).expect("the record reads"),
+            vec![entry]
+        );
+        let before = world.record();
+        std::fs::remove_file(applied::file_in(&state)).expect("removed");
+        for interval in [KILL, LATER_KILL, ATTEMPT] {
+            let refused = world.refused(&before, interval);
+            assert!(
+                refused.len() == 1
+                    && refused[0].contains("organisation-policy.json: gone")
+                    && refused[0].ends_with("no row of the live daemon's files covers this entry"),
+                "{interval:?}: {refused:#?}"
+            );
+        }
+        world.clean();
+    }
+
+    /// A root that is renamed and replaced by a directory that holds a hard link to a file of the
+    /// recorded root is refused at every interval: the file is the same object, and the root is not.
+    #[test]
+    fn a_root_renamed_and_replaced_by_a_directory_with_a_hard_link_is_refused() {
+        let world = world("renamed-root");
+        world.put(&world.root.join("s/loose"), b"kept");
+        let before = world.record();
+        std::fs::rename(world.root.join("s"), world.root.join("s-moved")).expect("renamed");
+        std::fs::create_dir(world.root.join("s")).expect("another root");
+        std::fs::set_permissions(world.root.join("s"), std::fs::Permissions::from_mode(0o700))
+            .expect("owner only");
+        std::fs::hard_link(world.root.join("s-moved/loose"), world.root.join("s/loose"))
+            .expect("a hard link to the recorded file");
+        for interval in [KILL, LATER_KILL, ATTEMPT] {
+            let refused = world.refused(&before, interval);
+            assert!(
+                refused
+                    .iter()
+                    .any(|line| line.starts_with("s: another object of the same kind")),
+                "{interval:?}: {refused:#?}"
+            );
+            assert!(
+                !refused.iter().any(|line| line.starts_with("s/loose")),
+                "the linked file is the same object: {refused:#?}"
+            );
+        }
+        std::fs::remove_dir_all(world.root.join("s-moved")).expect("clean up the moved root");
+        world.clean();
+    }
+
     /// The daemon's sockets are bound at its start: a new object is permitted at a kill that follows
     /// a restart, never at the first kill and never before the attempt; the worker's endpoint is
     /// no row's, so a replaced socket of the worker is refused at every interval.
