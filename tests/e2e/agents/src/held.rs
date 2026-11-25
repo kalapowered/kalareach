@@ -1396,6 +1396,13 @@ impl MetaGuard {
     }
 }
 
+/// Whether `path` is a plain path relative to the person's home: it has no empty, `.` or `..` part,
+/// and does not start with `/`.
+fn plain_relative(path: &str) -> bool {
+    path.split('/')
+        .all(|part| !part.is_empty() && part != "." && part != "..")
+}
+
 /// How an entry's run guards the person's own agent files, and so whether another process of the
 /// agent refuses the run.
 ///
@@ -1424,7 +1431,8 @@ impl PersonPlan {
     /// # Errors
     ///
     /// Returns why the entry has no guard: it names no person tree and no guarded file, and a run
-    /// of it would leave the person's files unwatched.
+    /// of it would leave the person's files unwatched; or a path of its lists is not a plain path
+    /// relative to the person's home, or a file is in both lists.
     pub fn of(application: &str, guarded: &[String], shared: &[String]) -> Result<Self, String> {
         if application == "codex" {
             return Ok(Self::Trees(&[".codex"]));
@@ -1433,6 +1441,23 @@ impl PersonPlan {
             return Err(format!(
                 "the entry for {application} names no person tree and no guarded file, so nothing \
                  would guard the person's own agent files and no real run of it starts"
+            ));
+        }
+        if let Some(path) = guarded
+            .iter()
+            .chain(shared)
+            .find(|path| !plain_relative(path))
+        {
+            return Err(format!(
+                "the entry for {application} names the path {path:?}, which is not a plain path \
+                 relative to the person's home: it has an empty, `.` or `..` part, or starts with \
+                 `/`"
+            ));
+        }
+        if let Some(path) = shared.iter().find(|path| guarded.contains(path)) {
+            return Err(format!(
+                "the entry for {application} names ~/{path} as both a guarded and a shared file, \
+                 so the end read would read a guarded file"
             ));
         }
         Ok(Self::Files {
@@ -4933,5 +4958,50 @@ mod tests {
         assert_eq!(evidence[2]["changed"], json!(true));
         assert_eq!(evidence[2]["owner_changed"], json!(false));
         std::fs::remove_dir_all(&home).expect("clean up");
+    }
+
+    #[test]
+    fn a_path_of_the_lists_that_is_not_plain_and_relative_is_refused() {
+        let plain = vec![".claude/settings.json".to_owned()];
+        for path in [
+            "/etc/passwd",
+            "../outside",
+            "a/../b",
+            "./a",
+            "a//b",
+            "a/",
+            "",
+        ] {
+            let odd = vec![path.to_owned()];
+            let said = format!(
+                "the entry for claude-code names the path {path:?}, which is not a plain path \
+                 relative to the person's home: it has an empty, `.` or `..` part, or starts with \
+                 `/`"
+            );
+            assert_eq!(
+                PersonPlan::of("claude-code", &odd, &[]),
+                Err(said.clone()),
+                "{path:?} as a guarded file"
+            );
+            assert_eq!(
+                PersonPlan::of("claude-code", &plain, &odd),
+                Err(said),
+                "{path:?} as a shared file"
+            );
+        }
+        assert!(PersonPlan::of("claude-code", &plain, &[".claude.json".to_owned()]).is_ok());
+    }
+
+    #[test]
+    fn a_file_in_both_lists_is_refused() {
+        let both = vec![".claude/settings.json".to_owned()];
+        assert_eq!(
+            PersonPlan::of("claude-code", &both, &both),
+            Err(
+                "the entry for claude-code names ~/.claude/settings.json as both a guarded and a \
+                 shared file, so the end read would read a guarded file"
+                    .to_owned()
+            )
+        );
     }
 }
