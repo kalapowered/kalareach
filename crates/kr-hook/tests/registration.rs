@@ -314,6 +314,9 @@ fn kr_req_05_09_a_credential_outside_the_registration_s_directory_is_refused() {
 /// wherever it points and however closed its target is: out of the registration's directory, or to
 /// another file in it. The forwarder reads it through the registration's directory without
 /// following it, presents nothing and reaches nothing.
+///
+/// On Windows, an account that cannot make a link cannot set the case up. The case then says so
+/// with a `skipped:` line and passes, unless `KR_REQUIRE_SYMBOLIC_LINKS=1` is set, which fails it.
 #[test]
 fn kr_req_05_09_a_credential_that_is_a_link_is_refused() {
     for leaves_the_directory in [true, false] {
@@ -335,7 +338,15 @@ fn kr_req_05_09_a_credential_that_is_a_link_is_refused() {
         } else {
             PathBuf::from("credential.real")
         };
-        link(&pointing_at, &launch.credential());
+        match link(&pointing_at, &launch.credential()) {
+            Ok(()) => {}
+            #[cfg(windows)]
+            Err(error) if error.raw_os_error() == Some(PRIVILEGE_NOT_HELD) => {
+                no_link_can_be_made(&error);
+                return;
+            }
+            Err(error) => panic!("a link in its place: {error}"),
+        }
         launch.publish(&launch.whole(&endpoint));
 
         let mut relay = launch.start();
@@ -360,16 +371,41 @@ fn kr_req_05_09_a_credential_that_is_a_link_is_refused() {
 /// Puts a link at `path` that points at `target`, which a relative target is read from the directory
 /// the link is in.
 #[cfg(unix)]
-fn link(target: &Path, path: &Path) {
-    std::os::unix::fs::symlink(target, path).expect("a link in its place");
+fn link(target: &Path, path: &Path) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(target, path)
 }
 
 /// Puts a link at `path` that points at `target`, which a relative target is read from the
-/// directory the link is in. Making one needs the privilege to, which the accounts these suites run
-/// as hold.
+/// directory the link is in. An account can make one if it holds the privilege to make links, as an
+/// administrator's token does, or if Developer Mode is on, since `symlink_file` asks for a link that
+/// needs no privilege. A standard account with neither fails with error 1314, which is the
+/// account's limit and not the forwarder's.
 #[cfg(windows)]
-fn link(target: &Path, path: &Path) {
-    std::os::windows::fs::symlink_file(target, path).expect("a link in its place");
+fn link(target: &Path, path: &Path) -> std::io::Result<()> {
+    std::os::windows::fs::symlink_file(target, path)
+}
+
+/// The error that `link` returns on Windows for an account that holds no privilege to make a link
+/// and has no Developer Mode.
+#[cfg(windows)]
+const PRIVILEGE_NOT_HELD: i32 = 1314;
+
+/// Set to `1` by the run that has to show the credential case ran, which is the hosted Windows
+/// job: its account can make a link, so a failure to make one fails the case there and does not
+/// stand it down.
+#[cfg(windows)]
+const REQUIRE_LINKS: &str = "KR_REQUIRE_SYMBOLIC_LINKS";
+
+/// Says that the credential case did not run because this account cannot make a link, or fails it
+/// where [`REQUIRE_LINKS`] says the account can.
+#[cfg(windows)]
+fn no_link_can_be_made(error: &std::io::Error) {
+    let required = std::env::var(REQUIRE_LINKS).is_ok_and(|value| value == "1");
+    assert!(
+        !required,
+        "{REQUIRE_LINKS}=1 and this account cannot make a symbolic link: {error}"
+    );
+    eprintln!("skipped: this account cannot make a symbolic link, which this case needs: {error}");
 }
 
 /// Waits for a relay that is expected to end on its own, within its deadline.
