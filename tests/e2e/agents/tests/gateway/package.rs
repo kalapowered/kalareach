@@ -754,11 +754,35 @@ fn the_actions_the_staged_parts_read_are_those_of_the_written_package_whatever_i
 }
 
 /// The entry and the generation a run names for the real-package check, given the values of the
-/// variables that name them: none where either is not named.
-fn named(entry: Option<OsString>, generation: Option<OsString>) -> Option<(PathBuf, PathBuf)> {
+/// variables that name them and whether the run requires the agents: none where it names neither
+/// and need not. A variable that is not set, or is empty, names nothing.
+///
+/// # Errors
+///
+/// Returns why the run cannot skip the check and cannot make it: it names an entry and no
+/// generation or a generation and no entry, or it requires the agents and names neither.
+fn named(
+    entry: Option<OsString>,
+    generation: Option<OsString>,
+    required: bool,
+) -> Result<Option<(PathBuf, PathBuf)>, String> {
     let given =
         |value: Option<OsString>| value.filter(|value| !value.is_empty()).map(PathBuf::from);
-    Some((given(entry)?, given(generation)?))
+    let (build, generations) = (super::BUILD_VARIABLE, super::GENERATION_VARIABLE);
+    match (given(entry), given(generation)) {
+        (Some(entry), Some(generation)) => Ok(Some((entry, generation))),
+        (None, None) if required => Err(format!(
+            "{}=1, and the run names no entry ({build}) and no generation ({generations})",
+            kr_e2e_agents::REQUIRE_VARIABLE
+        )),
+        (None, None) => Ok(None),
+        (None, Some(_)) => Err(format!(
+            "{generations} names a generation, and {build} names no entry (it is not set or is empty)"
+        )),
+        (Some(_), None) => Err(format!(
+            "{build} names an entry, and {generations} names no generation (it is not set or is empty)"
+        )),
+    }
 }
 
 /// Checks that the package the generation at `generation` holds for the entry `build` is one the
@@ -821,14 +845,17 @@ pub fn check_real_package(build: &Build, generation: &Path) -> Result<(), String
 }
 
 /// The package a generation holds for the entry the run names is one the stand-in route can write
-/// its own package from. It runs only when the run names an entry and a generation, as a run of a
-/// real agent does.
+/// its own package from. It is skipped only when the run names neither an entry nor a generation
+/// and does not require the agents; a run of a real agent names both.
 #[test]
 fn the_package_a_generation_holds_for_the_entry_is_one_the_stand_in_route_writes_from() {
+    let required = std::env::var(kr_e2e_agents::REQUIRE_VARIABLE).is_ok_and(|value| value == "1");
     let Some((entry, generation)) = named(
         std::env::var_os(super::BUILD_VARIABLE),
         std::env::var_os(super::GENERATION_VARIABLE),
-    ) else {
+        required,
+    )
+    .unwrap_or_else(|why| panic!("{why}")) else {
         eprintln!(
             "skipping: the run names no entry ({}) and no generation ({})",
             super::BUILD_VARIABLE,
@@ -840,19 +867,59 @@ fn the_package_a_generation_holds_for_the_entry_is_one_the_stand_in_route_writes
         .unwrap_or_else(|why| panic!("{why}"));
 }
 
-/// The real-package check has an entry and a generation to read only where the run names both.
+/// A run that names an entry and a generation has them to check, and a run that names neither, and
+/// does not require the agents, has nothing to check.
 #[test]
-fn the_real_package_check_has_something_to_read_only_when_the_run_names_an_entry_and_a_generation()
-{
+fn the_real_package_check_reads_what_a_run_names_and_skips_a_run_that_names_neither() {
     let value = |text: &str| Some(OsString::from(text));
-    assert_eq!(
-        named(value("entry.json"), value("/generation")),
-        Some((PathBuf::from("entry.json"), PathBuf::from("/generation")))
-    );
-    assert_eq!(named(None, value("/generation")), None);
-    assert_eq!(named(value("entry.json"), None), None);
-    assert_eq!(named(value(""), value("/generation")), None);
-    assert_eq!(named(value("entry.json"), value("")), None);
+    let pair = Some((PathBuf::from("entry.json"), PathBuf::from("/generation")));
+    for required in [false, true] {
+        assert_eq!(
+            named(value("entry.json"), value("/generation"), required),
+            Ok(pair.clone()),
+            "required: {required}"
+        );
+    }
+    assert_eq!(named(None, None, false), Ok(None));
+    assert_eq!(named(value(""), value(""), false), Ok(None));
+}
+
+/// A run that names an entry and no generation, or a generation and no entry, is refused, naming
+/// what it does not name; an empty value names nothing.
+#[test]
+fn the_real_package_check_refuses_a_run_that_names_an_entry_or_a_generation_and_not_both() {
+    let value = |text: &str| Some(OsString::from(text));
+    let no_generation = format!("{} names no generation", super::GENERATION_VARIABLE);
+    let no_entry = format!("{} names no entry", super::BUILD_VARIABLE);
+    for required in [false, true] {
+        for generation in [None, value("")] {
+            let refused = named(value("entry.json"), generation, required);
+            assert!(
+                matches!(&refused, Err(why) if why.contains(&no_generation)),
+                "an entry and no generation: {refused:?}"
+            );
+        }
+        for entry in [None, value("")] {
+            let refused = named(entry, value("/generation"), required);
+            assert!(
+                matches!(&refused, Err(why) if why.contains(&no_entry)),
+                "a generation and no entry: {refused:?}"
+            );
+        }
+    }
+}
+
+/// A run that requires the agents is refused where the check would be skipped.
+#[test]
+fn the_real_package_check_is_not_skipped_by_a_run_that_requires_the_agents() {
+    let value = |text: &str| Some(OsString::from(text));
+    for (entry, generation) in [(None, None), (value(""), value(""))] {
+        let refused = named(entry, generation, true);
+        assert!(
+            matches!(&refused, Err(why) if why.contains(kr_e2e_agents::REQUIRE_VARIABLE)),
+            "a run that requires the agents and names neither: {refused:?}"
+        );
+    }
 }
 
 /// A generation of its own below `base` that holds the package written for `plugin`, typed as
