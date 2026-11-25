@@ -152,20 +152,15 @@ impl Run {
                 built.join(name).display()
             );
         }
-        // Short on purpose: a Unix socket address is 104 bytes on macOS, and the per-user
-        // temporary directory there is 57 of them. A socket a worker binds for a command it
-        // integrates lies 42 bytes below the run's directory, which would make it 111 bytes.
-        // `/tmp` is on the internal disk there as well.
-        let base = if cfg!(target_os = "macos") {
-            PathBuf::from("/tmp")
-        } else {
-            std::env::temp_dir()
-        };
         // Made by this call and no other, and pinned from the handle it was opened by: a directory
         // that was there is never taken, a mount or a link put in its place is refused, and a start
         // that fails here leaves the path where it is and removes nothing.
-        let (root, pin) = make_root(&base, &mut || kr_ipc::new_uuid().to_string(), &mut |_| {})
-            .unwrap_or_else(|why| panic!("{why}"));
+        let (root, pin) = make_root(
+            &run_base(),
+            &mut || kr_ipc::new_uuid().to_string(),
+            &mut |_| {},
+        )
+        .unwrap_or_else(|why| panic!("{why}"));
         let run = Self {
             leg: leg.to_owned(),
             root,
@@ -1003,6 +998,18 @@ fn proposed_label(command: &str) -> Option<String> {
     has_uuid_form(reservation).then(|| format!("kr-worker-{reservation}"))
 }
 
+/// The directory a run's own directory is made below. Short on purpose: a Unix socket address is
+/// 104 bytes on macOS, and the per-user temporary directory there is 57 of them. A socket a worker
+/// binds for a command it integrates lies 42 bytes below the run's directory, which would make it
+/// 111 bytes. `/tmp` is on the internal disk there as well.
+pub(crate) fn run_base() -> PathBuf {
+    if cfg!(target_os = "macos") {
+        PathBuf::from("/tmp")
+    } else {
+        std::env::temp_dir()
+    }
+}
+
 /// Makes the run's own directory below `base`, with a name `names` gives (eight characters of it),
 /// and pins it, through handles only: `base` is opened as a handle, the directory is made with
 /// `mkdirat` on it and opened with `openat` and no link followed, and on that handle the directory
@@ -1015,7 +1022,7 @@ fn proposed_label(command: &str) -> Option<String> {
 ///
 /// Returns why the directory was not made or is not the directory this call made, as a class and no
 /// name. Nothing is removed in any case: a failed start leaves the path where it is.
-fn make_root(
+pub(crate) fn make_root(
     base: &Path,
     names: &mut dyn FnMut() -> String,
     between: &mut dyn FnMut(&Path),
@@ -1209,7 +1216,7 @@ fn make_fifo_through(
 }
 
 /// Opens the directory at `path`, following no link at its last component.
-fn open_directory(path: &Path) -> rustix::io::Result<std::os::fd::OwnedFd> {
+pub(crate) fn open_directory(path: &Path) -> rustix::io::Result<std::os::fd::OwnedFd> {
     use rustix::fs::{Mode, OFlags};
     rustix::fs::open(
         path,
@@ -1659,7 +1666,7 @@ impl PlacedDirectory {
 }
 
 /// A name that is one component of a directory: not empty, no separator, not a dot entry.
-fn one_name(name: &str) -> Result<String, String> {
+pub(crate) fn one_name(name: &str) -> Result<String, String> {
     if name.is_empty() || name == "." || name == ".." || name.contains('/') || name.contains('\0') {
         return Err(format!("{name:?} is not one name"));
     }
@@ -1669,7 +1676,7 @@ fn one_name(name: &str) -> Result<String, String> {
 /// Opens the directory `relative` below the run's directory `root` by the walk of [`parent_below`]:
 /// no link is followed at any component, the last included, and the handle is checked to be what was
 /// looked at and to lie beneath the pinned place.
-fn directory_below(
+pub(crate) fn directory_below(
     root: &Path,
     pin: &RootPin,
     relative: &Path,

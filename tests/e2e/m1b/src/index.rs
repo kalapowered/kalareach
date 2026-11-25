@@ -8,9 +8,10 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use kr_worker::output_times::{MAX_ROWS, VERSION};
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::Connection;
 
 use crate::compare::{Layout, Refusal};
+use crate::copies::Copies;
 use crate::run::open_file_below;
 use crate::tree::{Kind, Record};
 use crate::worker::Place;
@@ -74,10 +75,10 @@ fn bytes_of(place: Place<'_>, relative: &Path) -> Result<Option<Vec<u8>>, String
     Ok(Some(bytes))
 }
 
-type Copies = (Vec<u8>, Option<Vec<u8>>);
+type Taken = (Vec<u8>, Option<Vec<u8>>);
 
 /// The main file and the `-wal` of the index at `relative`, copied twice and equal, or why not.
-pub(crate) fn equal_copies(place: Place<'_>, relative: &Path) -> Result<Option<Copies>, String> {
+pub(crate) fn equal_copies(place: Place<'_>, relative: &Path) -> Result<Option<Taken>, String> {
     let wal = PathBuf::from(format!("{}-wal", relative.display()));
     let (main, wal) = settled(|| Ok((bytes_of(place, relative)?, bytes_of(place, &wal)?)))?;
     Ok(main.map(|main| (main, wal)))
@@ -100,24 +101,26 @@ fn settled<T: PartialEq>(mut copy: impl FnMut() -> Result<T, String>) -> Result<
     ))
 }
 
-/// Reads the rows of the copy that `main` and `wal` make in `directory`, with a connection of H's
-/// own.
-fn rows_of(directory: &Path, main: &[u8], wal: Option<&[u8]>) -> Result<Rows, String> {
-    let said = |why: &dyn std::fmt::Display| why.to_string();
-    std::fs::create_dir_all(directory).map_err(|why| said(&why))?;
-    let path = directory.join("index.sqlite");
-    for stale in ["index.sqlite", "index.sqlite-wal", "index.sqlite-shm"] {
-        let _ = std::fs::remove_file(directory.join(stale));
-    }
-    std::fs::write(&path, main).map_err(|why| said(&why))?;
-    if let Some(wal) = wal {
-        std::fs::write(directory.join("index.sqlite-wal"), wal).map_err(|why| said(&why))?;
-    }
-    let connection = Connection::open_with_flags(
-        &path,
-        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+/// Reads the rows of the copy that `main` and `wal` make in the directory `copies` keeps for
+/// `session`, with a connection of H's own.
+fn rows_of(
+    copies: &Copies,
+    session: &str,
+    main: &[u8],
+    wal: Option<&[u8]>,
+) -> Result<Rows, String> {
+    copies.read(
+        &format!("index-{session}"),
+        "index.sqlite",
+        main,
+        wal,
+        rows_in,
     )
-    .map_err(|why| said(&why))?;
+}
+
+/// The rows of the copy `connection` is open on.
+fn rows_in(connection: &Connection) -> Result<Rows, String> {
+    let said = |why: &dyn std::fmt::Display| why.to_string();
     let versions = connection
         .prepare("SELECT version FROM times_schema")
         .and_then(|mut statement| {
@@ -144,14 +147,15 @@ fn rows_of(directory: &Path, main: &[u8], wal: Option<&[u8]>) -> Result<Rows, St
     Ok(Rows { versions, marks })
 }
 
-/// Looks at the indexes of `sessions`: each copied twice outside both roots, in `copies`, and read.
+/// Looks at the indexes of `sessions`: each copied twice outside both roots, in the directory
+/// `copies` keeps, and read.
 #[must_use]
-pub fn look(layout: &Layout, place: Place<'_>, copies: &Path, sessions: &[String]) -> Looked {
+pub fn look(layout: &Layout, place: Place<'_>, copies: &Copies, sessions: &[String]) -> Looked {
     let mut looked = Looked::default();
     for session in sessions {
         let found = equal_copies(place, &index_path(layout, session)).and_then(|copied| {
             copied
-                .map(|(main, wal)| rows_of(&copies.join(session), &main, wal.as_deref()))
+                .map(|(main, wal)| rows_of(copies, session, &main, wal.as_deref()))
                 .transpose()
         });
         looked.indexes.insert(session.clone(), found);
@@ -577,7 +581,7 @@ mod tests {
             root: &world.root,
             pin: &world.pin,
         };
-        let copies = world.root.join("i");
+        let copies = Copies::make().expect("a directory for the copies");
         let sessions = ["s1".to_owned(), "none".to_owned()];
         let found = look(&world.layout, place, &copies, &sessions);
         assert_eq!(

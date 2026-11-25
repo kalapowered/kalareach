@@ -31,6 +31,7 @@ use serde_json::Value;
 
 use crate::LIVENESS;
 use crate::compare::{self, Interval, Layout};
+use crate::copies::Copies;
 use crate::floor::{Opening, Readings, Watch};
 use crate::index::{self, Looked};
 use crate::outside::Outside;
@@ -431,6 +432,10 @@ pub struct Host<'r> {
     /// The wall clock and the continuous clock, read before the host's first daemon start: the
     /// anchor of the clock floor's limit.
     anchor: Readings,
+    /// The directory the host reads the databases of the run's sessions through copies in, made the
+    /// first time a look needs it: outside the run's directory and the agent's, so that nothing an
+    /// agent leaves in the run's tree decides where a copy is written or removed.
+    copies: std::sync::OnceLock<Result<Copies, String>>,
 }
 
 #[derive(Debug)]
@@ -493,6 +498,7 @@ impl<'r> Host<'r> {
             kr_after_start: Arc::default(),
             restarts: Mutex::default(),
             anchor: Readings::now(),
+            copies: std::sync::OnceLock::new(),
         };
         // The port was free when it was chosen, and it is bound when the daemon starts: other legs
         // choose theirs meanwhile, on this machine and on a shared one, and two can choose alike.
@@ -1414,19 +1420,28 @@ impl<'r> Host<'r> {
     }
 
     /// The tables of the journals of the sessions that `record` holds, as they stand, read through
-    /// copies in a directory of the run outside both host roots.
+    /// copies in the host's own directory of copies.
     fn look_at_the_journals(&self, record: &Record) -> Tables {
         let layout = Layout::of(self.run.root(), &self.environment);
-        let place = Place {
-            root: self.run.root(),
-            pin: self.run.pin(),
-        };
-        tables::look(
-            &layout,
-            place,
-            &self.run.root().join("i"),
-            &tables::sessions_of(&layout, record),
-        )
+        let sessions = tables::sessions_of(&layout, record);
+        match self.copies() {
+            Ok(copies) => tables::look(&layout, self.place(), copies, &sessions),
+            Err(why) => Tables {
+                journals: sessions
+                    .into_iter()
+                    .map(|session| (session, Err(why.clone())))
+                    .collect(),
+            },
+        }
+    }
+
+    /// The directory the copies of the run's databases are read in, made the first time it is
+    /// asked for.
+    fn copies(&self) -> Result<&Copies, String> {
+        self.copies
+            .get_or_init(Copies::make)
+            .as_ref()
+            .map_err(Clone::clone)
     }
 
     fn place(&self) -> Place<'_> {
@@ -1444,7 +1459,7 @@ impl<'r> Host<'r> {
         let indexes = index::look(
             &layout,
             self.place(),
-            &self.run.root().join("i"),
+            self.copies()?,
             &index::sessions_of(&layout, &known),
         );
         Ok((indexes, self.record()?))
@@ -2072,6 +2087,7 @@ mod shutdown_tests {
             kr_after_start: Arc::default(),
             restarts: Mutex::default(),
             anchor: Readings::now(),
+            copies: std::sync::OnceLock::new(),
         }
     }
 
@@ -2818,6 +2834,56 @@ mod shutdown_tests {
             not_run.0
         );
         assert!(recorded(&host).is_none());
+        drop(host);
+        drop(run);
+        std::fs::remove_dir_all(&root).expect("clean up");
+    }
+
+    /// A link the agent leaves where the harness once kept its copies is followed by nothing: a look
+    /// at the indexes and at the journals removes and writes nothing outside the harness's own
+    /// directory.
+    #[test]
+    fn a_look_at_the_databases_removes_and_writes_nothing_where_the_agent_left_a_link() {
+        let root = scratch("copies-link");
+        let (run, _mark) = host_with_a_kr(&root);
+        let host = host_over(&run);
+        let state = host.environment.state_dir();
+        std::fs::create_dir_all(state.join("output-times")).expect("the indexes' directory");
+        std::fs::write(state.join("output-times/s1.sqlite"), b"an index").expect("an index");
+        std::fs::create_dir_all(state.join("sessions")).expect("the journals' directory");
+        std::fs::write(state.join("sessions/session-a1.sqlite"), b"a journal").expect("a journal");
+        std::fs::create_dir_all(root.join("i")).expect("the old place of the copies");
+        let mut left = Vec::new();
+        for (link, names) in [
+            (
+                "i/s1",
+                ["index.sqlite", "index.sqlite-wal", "index.sqlite-shm"],
+            ),
+            (
+                "i/journal-a1",
+                ["journal.sqlite", "journal.sqlite-wal", "journal.sqlite-shm"],
+            ),
+        ] {
+            let elsewhere = scratch("copies-elsewhere");
+            for name in names {
+                std::fs::write(elsewhere.join(name), b"left by the agent").expect("a file");
+                left.push(elsewhere.join(name));
+            }
+            std::os::unix::fs::symlink(&elsewhere, root.join(link)).expect("a link");
+        }
+        host.standing().expect("a look at the indexes");
+        let record = host.record().expect("a record");
+        drop(host.look_at_the_journals(&record));
+        for file in &left {
+            assert_eq!(
+                std::fs::read(file).ok().as_deref(),
+                Some(&b"left by the agent"[..]),
+                "{} is as the agent left it, after a look at the databases",
+                file.file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("")
+            );
+        }
         drop(host);
         drop(run);
         std::fs::remove_dir_all(&root).expect("clean up");

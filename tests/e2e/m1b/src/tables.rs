@@ -6,12 +6,13 @@
 //! the kill.
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
+use rusqlite::Connection;
 use rusqlite::types::ValueRef;
-use rusqlite::{Connection, OpenFlags};
 
 use crate::compare::{Layout, Refusal};
+use crate::copies::Copies;
 use crate::index::equal_copies;
 use crate::tree::{Kind, Record};
 use crate::worker::Place;
@@ -46,14 +47,10 @@ fn journal_path(layout: &Layout, session: &str) -> PathBuf {
         .join(format!("session-{session}.sqlite"))
 }
 
-/// Every table of the copy opened at `path`, by a digest of its rows in the order of their columns.
-fn digests_of(path: &Path) -> Result<BTreeMap<String, [u8; 32]>, String> {
+/// Every table of the copy `connection` is open on, by a digest of its rows in the order of their
+/// columns.
+fn digests_of(connection: &Connection) -> Result<BTreeMap<String, [u8; 32]>, String> {
     let said = |why: &dyn std::fmt::Display| why.to_string();
-    let connection = Connection::open_with_flags(
-        path,
-        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .map_err(|why| said(&why))?;
     let names = connection
         .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'")
         .and_then(|mut statement| {
@@ -127,25 +124,20 @@ pub fn sessions_of(layout: &Layout, record: &Record) -> Vec<String> {
         .collect()
 }
 
-/// Looks at the journals of `sessions`, each through copies in `copies`.
+/// Looks at the journals of `sessions`, each through copies in the directory `copies` keeps.
 #[must_use]
-pub fn look(layout: &Layout, place: Place<'_>, copies: &Path, sessions: &[String]) -> Tables {
+pub fn look(layout: &Layout, place: Place<'_>, copies: &Copies, sessions: &[String]) -> Tables {
     let mut tables = Tables::default();
     for session in sessions {
         let found = equal_copies(place, &journal_path(layout, session)).and_then(|copied| {
             let (main, wal) = copied.ok_or_else(|| "it is not there".to_owned())?;
-            let directory = copies.join(format!("journal-{session}"));
-            std::fs::create_dir_all(&directory).map_err(|why| why.to_string())?;
-            for stale in ["journal.sqlite", "journal.sqlite-wal", "journal.sqlite-shm"] {
-                let _ = std::fs::remove_file(directory.join(stale));
-            }
-            std::fs::write(directory.join("journal.sqlite"), &main)
-                .map_err(|why| why.to_string())?;
-            if let Some(wal) = wal {
-                std::fs::write(directory.join("journal.sqlite-wal"), wal)
-                    .map_err(|why| why.to_string())?;
-            }
-            digests_of(&directory.join("journal.sqlite"))
+            copies.read(
+                &format!("journal-{session}"),
+                "journal.sqlite",
+                &main,
+                wal.as_deref(),
+                digests_of,
+            )
         });
         tables.journals.insert(session.clone(), found);
     }
@@ -227,12 +219,8 @@ mod tests {
             root: &world.root,
             pin: &world.pin,
         };
-        look(
-            &world.layout,
-            place,
-            &world.root.join("i"),
-            &["a1".to_owned()],
-        )
+        let copies = Copies::make().expect("a directory for the copies");
+        look(&world.layout, place, &copies, &["a1".to_owned()])
     }
 
     fn lines(refused: Vec<Refusal>) -> Vec<String> {
