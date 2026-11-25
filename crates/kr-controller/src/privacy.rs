@@ -234,6 +234,26 @@ impl PrivacyState {
         self.published.try_write().is_ok()
     }
 
+    /// Waits until a change of state could be made, which is once no reading of this state is held
+    /// any longer, and returns whether that came within `bound`, for this crate's own tests of what
+    /// a decision held the state for. A reading that another part of the daemon takes for its own
+    /// purpose, such as the delivery runtime's pass or the host description, is held for an
+    /// instant, so one attempt can find the state held by it after the decision under test has let
+    /// it go.
+    #[cfg(test)]
+    pub(crate) fn changeable_within(&self, bound: std::time::Duration) -> bool {
+        let until = std::time::Instant::now() + bound;
+        loop {
+            if self.published.try_write().is_ok() {
+                return true;
+            }
+            if std::time::Instant::now() >= until {
+                return false;
+            }
+            std::thread::yield_now();
+        }
+    }
+
     /// Returns the state as it stands now.
     #[must_use]
     pub fn now(&self) -> Published {

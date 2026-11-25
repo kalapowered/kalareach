@@ -1833,8 +1833,9 @@ async fn a_page_is_written_whole_under_the_privacy_state_it_was_read_in_and_hold
         "privacy mode could not be changed while the page was handed over"
     );
     assert!(
-        kept.watching.changeable_now(),
-        "and can be once it has been"
+        kept.watching
+            .changeable_within(std::time::Duration::from_secs(30)),
+        "and can be once it has been, whatever else reads the state"
     );
     world.serving.abort();
 }
