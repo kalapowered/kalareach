@@ -38,10 +38,12 @@ use kr_protocol::archive::{
     ArchiveDescriptor, BackupGenerationPublication, BackupGenerationPublicationPayload,
     BackupWriterRecord,
 };
+use kr_protocol::backup_checkpoint::HostCheckpoint;
 use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::ids::{ArchiveId, BackupGeneration, BackupObjectId, DeviceId};
 use kr_protocol::pairing::GenerationCheckpoint;
 use kr_protocol::scalars::{AuthorisationKey, Digest256, KeyId, TimestampMs, Uuid};
+use kr_protocol::service::GatewayOrigin;
 use kr_worker::privacy::{PrivacyGeneration, PrivacyMode, PrivacySubsystem};
 
 /// Who these tests hand a dispatch attempt to. A real one names the transport that carries it.
@@ -11755,4 +11757,476 @@ fn a_sweep_of_a_staging_directory_that_is_gone_finds_nothing() {
         )
         .expect("the directory is made again");
     assert!(staged.path.exists());
+}
+
+// ---------------------------------------------------------------------------------------------
+// `backup.checkpoint`: the newest generation a service accepted that this host still keeps.
+// ---------------------------------------------------------------------------------------------
+
+/// The service every setup of these cases is made at.
+const CHECKPOINT_ORIGIN: &str = "https://storage.example";
+
+/// What the host refuses with when its records are not what a checkpoint is made from.
+const CHECKPOINT_UNREADABLE: &str = "this host cannot read its backup records, so it cannot say \
+                                     which backup generation it last published";
+
+/// A service over a store file, reconciled as a daemon's is, whose owner has set backups up.
+fn service_with_setup(state: &std::path::Path, producer: &Producer) -> BackupService {
+    let service = BackupService::open(state).expect("a backup service");
+    service
+        .reconcile(TimestampMs::new(4_000))
+        .expect("the startup reconciliation");
+    service
+        .commit_setup(
+            &a_setup(archive_id(), producer, "ABCD2345"),
+            false,
+            TimestampMs::new(1_000),
+            &|write| write(),
+        )
+        .expect("the setup is written");
+    service
+}
+
+/// Takes one generation as far as a publication attempt that has left this host. Returns that
+/// attempt's sequence and the hash of the generation's encrypted manifest.
+fn dispatched_publication(
+    service: &BackupService,
+    producer: &Producer,
+    generation: u64,
+) -> (u64, Digest256) {
+    let seed = u8::try_from(generation).expect("a small generation");
+    let objects = [stage(0x20 + seed, "a.cbor", b"content")];
+    let sealed = producer.seal_with_manifest(generation, &objects, object_id(0xf0 + seed));
+    let upload = service
+        .admit(
+            &sealed,
+            &objects,
+            producer.writer.key_id(),
+            TimestampMs::new(5_000 + generation),
+        )
+        .expect("the generation is admitted")
+        .sequence;
+    service
+        .note_dispatched(upload, EXECUTOR, TimestampMs::new(5_100 + generation))
+        .expect("its upload leaves");
+    let publication = dispatch_publication(
+        service,
+        upload,
+        BackupGeneration::new(generation),
+        TimestampMs::new(5_200 + generation),
+    );
+    let hash = ArchiveDescriptor::from_canonical_bytes(&sealed.descriptor_bytes)
+        .expect("a descriptor")
+        .encrypted_manifest
+        .encrypted_object_hash;
+    (publication, hash)
+}
+
+/// Takes one generation to what a service accepted, and returns the hash of its encrypted
+/// manifest.
+fn accepted_by_the_service(
+    service: &BackupService,
+    producer: &Producer,
+    generation: u64,
+) -> Digest256 {
+    let (publication, hash) = dispatched_publication(service, producer, generation);
+    service
+        .note_published(
+            publication,
+            PrivacyGeneration::INITIAL,
+            TimestampMs::new(5_300 + generation),
+        )
+        .expect("the service holds it");
+    hash
+}
+
+fn checkpoint_of(generation: u64, hash: Digest256) -> HostCheckpoint {
+    HostCheckpoint {
+        service_origin: GatewayOrigin::new(CHECKPOINT_ORIGIN).expect("an origin"),
+        archive_id: archive_id(),
+        backup_generation: BackupGeneration::new(generation),
+        encrypted_manifest_hash: hash,
+    }
+}
+
+fn assert_unreadable(answer: Result<Option<HostCheckpoint>, ControllerError>, what: &str) {
+    match answer {
+        Err(ControllerError::RegistryUnavailable { detail }) => {
+            assert_eq!(detail, CHECKPOINT_UNREADABLE, "{what}");
+        }
+        other => panic!("{what}: a refusal was expected, not {other:?}"),
+    }
+}
+
+/// No setup, no generation, and a generation that no service accepted give no checkpoint,
+/// whichever of the three states short of accepted it is in.
+#[test]
+fn a_host_with_no_accepted_generation_has_no_checkpoint() {
+    let (_root, state) = state_directory();
+    let producer = Producer::generate();
+    let service = BackupService::open(&state).expect("a backup service");
+    service
+        .reconcile(TimestampMs::new(4_000))
+        .expect("the startup reconciliation");
+    assert_eq!(
+        service.latest_published().expect("a read"),
+        None,
+        "no setup"
+    );
+
+    service
+        .commit_setup(
+            &a_setup(archive_id(), &producer, "ABCD2345"),
+            false,
+            TimestampMs::new(1_000),
+            &|write| write(),
+        )
+        .expect("the setup is written");
+    assert_eq!(
+        service.latest_published().expect("a read"),
+        None,
+        "a setup and no generation"
+    );
+
+    // Generation 1 is only admitted, 2 has every object at the service, and 3 left a publication
+    // whose outcome this host cannot establish.
+    for generation in 1_u64..=3 {
+        let seed = u8::try_from(generation).expect("a small generation");
+        let objects = [stage(0x20 + seed, "a.cbor", b"content")];
+        let upload = service
+            .admit(
+                &producer.seal_with_manifest(generation, &objects, object_id(0xf0 + seed)),
+                &objects,
+                producer.writer.key_id(),
+                TimestampMs::new(5_000 + generation),
+            )
+            .expect("the generation is admitted")
+            .sequence;
+        service
+            .note_dispatched(upload, EXECUTOR, TimestampMs::new(5_100 + generation))
+            .expect("its upload leaves");
+        match generation {
+            2 => {
+                acknowledge_every_object(
+                    &service,
+                    upload,
+                    BackupGeneration::new(2),
+                    TimestampMs::new(5_200),
+                );
+            }
+            3 => {
+                let publication = dispatch_publication(
+                    &service,
+                    upload,
+                    BackupGeneration::new(3),
+                    TimestampMs::new(5_300),
+                );
+                service
+                    .note_attempt_stopped(publication, TimestampMs::new(5_400))
+                    .expect("the publication's outcome is unknown");
+            }
+            _ => {}
+        }
+    }
+    let remotes: Vec<Remote> = (1..=3)
+        .map(|generation| {
+            service
+                .generation(archive_id(), BackupGeneration::new(generation))
+                .expect("a read")
+                .expect("the generation")
+                .remote
+        })
+        .collect();
+    assert_eq!(
+        remotes,
+        [Remote::Nothing, Remote::Objects, Remote::Unknown],
+        "the three states short of accepted"
+    );
+    assert_eq!(service.latest_published().expect("a read"), None);
+}
+
+/// The newest accepted generation is the checkpoint, with the setup's service, and a newer one
+/// that no service accepted is not.
+#[test]
+fn the_newest_accepted_generation_is_the_checkpoint_with_the_setups_origin() {
+    let (_root, state) = state_directory();
+    let producer = Producer::generate();
+    let service = service_with_setup(&state, &producer);
+
+    let first = accepted_by_the_service(&service, &producer, 1);
+    assert_eq!(
+        service.latest_published().expect("a read"),
+        Some(checkpoint_of(1, first))
+    );
+    let second = accepted_by_the_service(&service, &producer, 2);
+    assert_ne!(first, second, "the two manifests differ");
+    assert_eq!(
+        service.latest_published().expect("a read"),
+        Some(checkpoint_of(2, second)),
+        "the newer of two accepted generations"
+    );
+
+    // A third generation that is admitted and not accepted is not the checkpoint.
+    let objects = [stage(0x23, "a.cbor", b"content")];
+    service
+        .admit(
+            &producer.seal_with_manifest(3, &objects, object_id(0xf3)),
+            &objects,
+            producer.writer.key_id(),
+            TimestampMs::new(6_000),
+        )
+        .expect("the generation is admitted");
+    assert_eq!(
+        service.latest_published().expect("a read"),
+        Some(checkpoint_of(2, second)),
+        "a newer generation no service accepted is not sent"
+    );
+}
+
+/// A generation whose descriptor a service accepted counts although its production did not
+/// complete: the answer reached this host after privacy mode's line.
+#[test]
+fn a_generation_whose_production_was_cancelled_after_the_service_accepted_it_still_counts() {
+    let (_root, state) = state_directory();
+    let producer = Producer::generate();
+    let service = service_with_setup(&state, &producer);
+    let first = accepted_by_the_service(&service, &producer, 1);
+
+    let (publication, second) = dispatched_publication(&service, &producer, 2);
+    service
+        .accept_privacy_request(PrivacyGeneration::new(1), TimestampMs::new(6_000))
+        .expect("the request is accepted");
+    assert_eq!(
+        service
+            .note_published(
+                publication,
+                PrivacyGeneration::INITIAL,
+                TimestampMs::new(7_000)
+            )
+            .expect("an answer while this host is stopped"),
+        Publication::RetainedArtifact {
+            privacy_generation: 0
+        }
+    );
+    let record = service
+        .generation(archive_id(), BackupGeneration::new(2))
+        .expect("a read")
+        .expect("the generation");
+    assert_ne!(record.production, Production::Complete);
+    assert_eq!(record.remote, Remote::Published);
+    assert_ne!(first, second);
+    assert_eq!(
+        service.latest_published().expect("a read"),
+        Some(checkpoint_of(2, second))
+    );
+}
+
+/// A generation whose every object the host is deleting is no backup the host has, so the
+/// checkpoint is the newest generation that is not being deleted, and none once every one is.
+#[test]
+fn a_generation_the_host_is_deleting_is_left_out() {
+    let (_root, state) = state_directory();
+    let producer = Producer::generate();
+    let service = service_with_setup(&state, &producer);
+    let first = accepted_by_the_service(&service, &producer, 1);
+    let second = accepted_by_the_service(&service, &producer, 2);
+    let third = accepted_by_the_service(&service, &producer, 3);
+    assert_eq!(
+        service.latest_published().expect("a read"),
+        Some(checkpoint_of(3, third))
+    );
+
+    service
+        .ask_deletion(
+            archive_id(),
+            BackupGeneration::new(3),
+            TimestampMs::new(8_000),
+            &|write| write(),
+        )
+        .expect("the person asks for every object of the newest generation to go");
+    assert_eq!(
+        service.latest_published().expect("a read"),
+        Some(checkpoint_of(2, second)),
+        "the generation being deleted is not the checkpoint, and its row is still published"
+    );
+    assert_eq!(
+        service
+            .generation(archive_id(), BackupGeneration::new(3))
+            .expect("a read")
+            .expect("the generation")
+            .remote,
+        Remote::Published
+    );
+
+    service
+        .ask_deletion(
+            archive_id(),
+            BackupGeneration::new(2),
+            TimestampMs::new(8_100),
+            &|write| write(),
+        )
+        .expect("and the one before it");
+    assert_eq!(
+        service.latest_published().expect("a read"),
+        Some(checkpoint_of(1, first)),
+        "the next newest is the checkpoint"
+    );
+    service
+        .ask_deletion(
+            archive_id(),
+            BackupGeneration::new(1),
+            TimestampMs::new(8_200),
+            &|write| write(),
+        )
+        .expect("and the first");
+    assert_eq!(
+        service.latest_published().expect("a read"),
+        None,
+        "no generation the host keeps"
+    );
+}
+
+/// What a replaced setup's earlier archive published is not sent: the answer is of the setup's
+/// own archive.
+#[test]
+fn a_replaced_setups_earlier_archive_is_not_sent() {
+    let (_root, state) = state_directory();
+    let producer = Producer::generate();
+    let service = service_with_setup(&state, &producer);
+    accepted_by_the_service(&service, &producer, 1);
+    assert!(service.latest_published().expect("a read").is_some());
+
+    let next = ArchiveId::new(Uuid::from_bytes([0x12; 16]));
+    service
+        .commit_setup(
+            &a_setup(next, &producer, "QQQQ2345"),
+            true,
+            TimestampMs::new(9_000),
+            &|write| write(),
+        )
+        .expect("the replacement is written");
+    assert_eq!(
+        service.latest_published().expect("a read"),
+        None,
+        "the earlier archive's generation stays where it is and is not the checkpoint"
+    );
+}
+
+/// The newest accepted row is the answer or the refusal. A row whose descriptor is missing, does
+/// not read, or names another archive or generation is a refusal, and is never skipped for the
+/// older row beside it or taken for no generation.
+#[test]
+fn a_newest_row_the_host_cannot_read_back_is_a_refusal_and_never_the_row_before_it() {
+    let (_root, state) = state_directory();
+    let producer = Producer::generate();
+    let service = service_with_setup(&state, &producer);
+    accepted_by_the_service(&service, &producer, 1);
+    let second = accepted_by_the_service(&service, &producer, 2);
+    assert_eq!(
+        service.latest_published().expect("a read"),
+        Some(checkpoint_of(2, second)),
+        "the control: the newest row reads back"
+    );
+
+    let first_descriptor = service
+        .generation(archive_id(), BackupGeneration::new(1))
+        .expect("a read")
+        .expect("the generation")
+        .descriptor
+        .expect("a descriptor");
+    let second_descriptor = service
+        .generation(archive_id(), BackupGeneration::new(2))
+        .expect("a read")
+        .expect("the generation")
+        .descriptor
+        .expect("a descriptor");
+    // The same generation 2, sealed for another archive.
+    let other_archive = {
+        let objects = [stage(0x22, "a.cbor", b"content")];
+        let mut recipients = ArchiveRecipients::new(CollectionKind::Owned);
+        assert!(recipients.add(*producer.device.public()));
+        seal_archive(
+            &producer.writer,
+            &producer.sender,
+            &recipients,
+            &ArchivePlan {
+                archive_id: ArchiveId::new(Uuid::from_bytes([0x44; 16])),
+                backup_generation: BackupGeneration::new(2),
+                owner_device_id: owner_device(),
+                manifest_object_id: object_id(0xf2),
+                created_at_ms: TimestampMs::new(1_700_000_000_000),
+            },
+            &objects,
+        )
+        .expect("a sealed archive")
+        .descriptor_bytes
+    };
+
+    let connection =
+        rusqlite::Connection::open(state.join("backup.sqlite")).expect("the backup store");
+    let set_descriptor = |bytes: Option<&[u8]>| {
+        connection
+            .execute(
+                "UPDATE generations SET descriptor = ?1 WHERE backup_generation = 2",
+                rusqlite::params![bytes],
+            )
+            .expect("the row is changed");
+    };
+    set_descriptor(None);
+    assert_unreadable(service.latest_published(), "no descriptor");
+    set_descriptor(Some(b"not a descriptor".as_slice()));
+    assert_unreadable(
+        service.latest_published(),
+        "a descriptor that does not read",
+    );
+    set_descriptor(Some(first_descriptor.as_slice()));
+    assert_unreadable(
+        service.latest_published(),
+        "a descriptor that names generation 1 on the row of generation 2",
+    );
+    set_descriptor(Some(other_archive.as_slice()));
+    assert_unreadable(
+        service.latest_published(),
+        "a descriptor that names another archive",
+    );
+    set_descriptor(Some(second_descriptor.as_slice()));
+    assert_eq!(
+        service.latest_published().expect("a read"),
+        Some(checkpoint_of(2, second)),
+        "the control again: the row as it was"
+    );
+}
+
+/// A setup whose service is not an origin, and a store that cannot be read, are refusals: the
+/// host does not say it has published nothing.
+#[test]
+fn a_setup_with_no_origin_and_a_store_that_cannot_be_read_are_refusals() {
+    let (_root, state) = state_directory();
+    let producer = Producer::generate();
+    {
+        let service = BackupService::open(&state).expect("a backup service");
+        service
+            .reconcile(TimestampMs::new(4_000))
+            .expect("the startup reconciliation");
+        let mut record = a_setup(archive_id(), &producer, "ABCD2345");
+        record.origin = "storage.example/path".to_owned();
+        service
+            .commit_setup(&record, false, TimestampMs::new(1_000), &|write| write())
+            .expect("the setup is written");
+        accepted_by_the_service(&service, &producer, 1);
+        assert_unreadable(
+            service.latest_published(),
+            "a setup whose service is not an origin",
+        );
+    }
+
+    let (_other_root, other_state) = state_directory();
+    let service = service_with_setup(&other_state, &producer);
+    accepted_by_the_service(&service, &producer, 1);
+    assert!(service.latest_published().expect("a read").is_some());
+    rusqlite::Connection::open(other_state.join("backup.sqlite"))
+        .expect("the backup store")
+        .execute("ALTER TABLE host_backup RENAME TO host_backup_gone", [])
+        .expect("the table is renamed");
+    assert_unreadable(service.latest_published(), "a store that cannot be read");
 }

@@ -7,11 +7,14 @@
 //! deletion in the one transaction that writes it down, from its own rows and nothing a caller
 //! read before, and decides it again for a deletion already written down and asked for again.
 
+use kr_protocol::archive::ArchiveDescriptor;
+use kr_protocol::backup_checkpoint::HostCheckpoint;
 use kr_protocol::error::ErrorCode;
+use kr_protocol::service::GatewayOrigin;
 
 use super::{
     ArchiveId, BackupGeneration, BackupObjectId, BackupStore, ControllerError, OptionalExtension,
-    Reads, Result, TimestampMs, current_generation, inhibited_at, millis, params, sql,
+    Reads, Result, TimestampMs, current_generation, inhibited_at, millis, params, sql, uuid,
 };
 
 /// The test, for a row of `generations`, that the host is deleting the whole generation: it
@@ -32,9 +35,19 @@ macro_rules! being_deleted {
     };
 }
 
+/// The newest accepted row of the current setup: its archive, its generation, its descriptor and the
+/// setup's service.
+type NewestRow = (Vec<u8>, i64, Option<Vec<u8>>, String);
+
 /// The fewest generations of an archive the host keeps published: the newest, and the one a
 /// restore may be reading when the next is published.
 pub const LEAST_KEPT: u64 = 2;
+
+/// Why `backup.checkpoint` is refused when the host's records are not what a checkpoint is made
+/// from. The same words serve every cause, so that a record that cannot be read is never taken
+/// for no record at all.
+const UNREADABLE: &str = "this host cannot read its backup records, so it cannot say which backup \
+                          generation it last published";
 
 /// Why a deletion for `archive` is not asked now, or nothing when its standing holds.
 ///
@@ -211,6 +224,64 @@ pub(super) fn person_refusal(
 }
 
 impl BackupStore {
+    /// The newest generation of the current setup's archive that a service accepted and that the
+    /// host still keeps, with the setup's service, or nothing when there is none.
+    ///
+    /// The row is chosen in one statement, so the generation and the service are one fact. A
+    /// generation counts once its descriptor was accepted, whatever became of its production
+    /// after, and does not count while the host is deleting every object of it: the service may
+    /// no longer hold all that the generation names. The newest such row is the answer or the
+    /// refusal, and never skipped for an older one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::RegistryUnavailable`] when the store cannot be read, when the
+    /// newest row has no descriptor, a descriptor that does not read, or one that names another
+    /// archive or generation than the row does, and when the setup's service is not an origin.
+    pub fn latest_published(&self) -> Result<Option<HostCheckpoint>> {
+        let unreadable = || ControllerError::RegistryUnavailable {
+            detail: UNREADABLE.to_owned(),
+        };
+        let newest: Option<NewestRow> = self
+            .connection
+            .read_one(
+                sql!(concat!(
+                    "SELECT generations.archive_id, generations.backup_generation,
+                            generations.descriptor, host_backup.origin
+                       FROM generations
+                       JOIN host_backup ON host_backup.archive_id = generations.archive_id
+                      WHERE generations.remote = 'published' AND NOT ",
+                    being_deleted!(),
+                    " ORDER BY generations.backup_generation DESC LIMIT 1"
+                )),
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()
+            .map_err(|_| unreadable())?;
+        let Some((archive, generation, descriptor, origin)) = newest else {
+            return Ok(None);
+        };
+        let archive_id =
+            ArchiveId::new(uuid(&archive, "an archive identifier").map_err(|_| unreadable())?);
+        let generation = u64::try_from(generation)
+            .ok()
+            .filter(|generation| *generation > 0)
+            .ok_or_else(unreadable)?;
+        let descriptor = descriptor.ok_or_else(unreadable).and_then(|bytes| {
+            ArchiveDescriptor::from_canonical_bytes(&bytes).map_err(|_| unreadable())
+        })?;
+        if descriptor.archive_id != archive_id || descriptor.backup_generation.get() != generation {
+            return Err(unreadable());
+        }
+        Ok(Some(HostCheckpoint {
+            service_origin: GatewayOrigin::new(origin).map_err(|_| unreadable())?,
+            archive_id,
+            backup_generation: BackupGeneration::new(generation),
+            encrypted_manifest_hash: descriptor.encrypted_manifest.encrypted_object_hash,
+        }))
+    }
+
     /// Writes down that this host will ask the service to delete one object of a published
     /// generation that is older than the newest `keep` published generations of its archive.
     ///

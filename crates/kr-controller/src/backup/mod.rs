@@ -44,6 +44,7 @@ use tokio::sync::Notify;
 use kr_client::services::AccountMark;
 use kr_crypto::backup::{SealedArchive, StagedObject};
 use kr_flush::{NameKind, flush_directory};
+use kr_protocol::backup_checkpoint::HostCheckpoint;
 use kr_protocol::ids::{ArchiveId, BackupGeneration, BackupObjectId};
 use kr_protocol::scalars::{KeyId, TimestampMs};
 use kr_worker::privacy::{
@@ -871,6 +872,18 @@ impl BackupService {
     /// Returns [`ControllerError::RegistryUnavailable`] when the store cannot be read.
     pub fn setup(&self) -> Result<Option<Setup>> {
         self.store().setup()
+    }
+
+    /// The newest generation of the current setup's archive that a service accepted and the host
+    /// still keeps, with the setup's service, or nothing when there is none. The store's own rule
+    /// decides which generation that is.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::RegistryUnavailable`] as the store does, so that records that
+    /// cannot be read are never taken for none.
+    pub fn latest_published(&self) -> Result<Option<HostCheckpoint>> {
+        self.store().latest_published()
     }
 
     /// Returns every writer this host may still publish under, with the archive it may publish.
