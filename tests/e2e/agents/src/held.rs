@@ -568,15 +568,17 @@ pub fn is_allowed(patterns: &[String], relative: &str) -> bool {
 /// Compares what stands below the run's configuration directory `config` (a path below the run's
 /// directory `root`, which `pin` names) at the end of a part with what the harness and the agent
 /// may have put there. The directory is reached through the pin and listed through handles, so a
-/// directory that was made a link, or replaced, is refused and nothing is read through it. Every
-/// file is one of the recipe's files (`recipe_files`, each by its path below `config` and the
-/// bytes the recipe wrote), a regular file with one name that holds those bytes, or `settings.json`
-/// as such a file holding exactly the one key the recipe sets (`settings_key`, in
-/// `enabledPlugins`, set to `true`), or one that the entry's allowed files name. The names
-/// `settings.json`, `settings.local.json` and `rules`, in any letter case, and the recipe's names
-/// are looked at before any directory is entered, so a directory by one of them is refused and its
-/// contents are not compared; `settings.local.json` and `rules` are refused whatever they are. Any
-/// other link is matched by its name as a file is and is not followed.
+/// directory that was made a link, or replaced, is refused and nothing is read through it. Each of
+/// the recipe's files (`recipe_files`, each by its path below `config` and the bytes the recipe
+/// wrote) and `settings.json` is looked at by its own path, whatever names the directory holds: a
+/// regular file with one name that holds those bytes, or, for `settings.json`, exactly the one key
+/// the recipe sets (`settings_key`, in `enabledPlugins`, set to `true`); one that is not there is
+/// refused. Every other name is looked at as the directory lists it: a link, and a regular file
+/// with more than one name, are refused at every name, an allowed one included; the names
+/// `settings.json`, `settings.local.json` and `rules`, in any letter case, are looked at before any
+/// directory is entered, so a directory with one of these names is refused and its contents are
+/// not compared, and `settings.local.json` and `rules` are refused whatever they are; any other
+/// file must be one that the entry's allowed files name.
 ///
 /// # Errors
 ///
@@ -603,6 +605,7 @@ pub fn end_compare(
         refused: Vec::new(),
         seen: 0,
     };
+    compare.each_file_of_the_recipe();
     compare.walk(&directory, "", 0);
     compare.refused.sort();
     if compare.refused.is_empty() {
@@ -625,8 +628,17 @@ struct EndCompare<'a> {
 }
 
 impl EndCompare<'_> {
+    /// Looks at `settings.json` and at each of the recipe's files by its own path.
+    fn each_file_of_the_recipe(&mut self) {
+        self.settings("settings.json");
+        for (path, wrote) in self.recipe_files {
+            self.recipe_file(path, wrote);
+        }
+    }
+
     /// Looks at each entry of `directory`, which `prefix` names below the configuration directory,
-    /// and at each directory below it, through handles.
+    /// and at each directory below it, through handles. `settings.json` and the recipe's files, as
+    /// they are written, are looked at by `each_file_of_the_recipe` and not here.
     fn walk(&mut self, directory: &std::os::fd::OwnedFd, prefix: &str, depth: usize) {
         use rustix::fs::{AtFlags, FileType};
         let place = if prefix.is_empty() {
@@ -664,6 +676,12 @@ impl EndCompare<'_> {
                     }
                 };
             self.seen += 1;
+            if relative == "settings.json"
+                || self.recipe_files.iter().any(|(path, _)| *path == relative)
+            {
+                continue;
+            }
+            let kind = FileType::from_raw_mode(looked.st_mode);
             if same_name(&relative, "settings.json") {
                 self.settings(&relative);
             } else if NEVER_ALLOWED_BELOW_CONFIG
@@ -674,17 +692,23 @@ impl EndCompare<'_> {
                     "{relative} is a name the agent reads its settings or rules from, which no \
                      entry may allow"
                 ));
-            } else if let Some((_, wrote)) =
-                self.recipe_files.iter().find(|(path, _)| *path == relative)
-            {
-                self.recipe_file(&relative, wrote);
-            } else if FileType::from_raw_mode(looked.st_mode) == FileType::Directory {
+            } else if kind == FileType::Directory {
                 match opened_directory(directory, name.as_c_str(), &looked, self.seen) {
                     Ok(child) => self.walk(&child, &relative, depth + 1),
                     Err(unlooked) => self
                         .refused
                         .push(format!("{relative} cannot be listed: {unlooked}")),
                 }
+            } else if kind == FileType::Symlink {
+                self.refused.push(format!(
+                    "{relative} is a link, and a link is accepted at no name below the \
+                     configuration directory"
+                ));
+            } else if kind == FileType::RegularFile && looked.st_nlink > 1 {
+                self.refused.push(format!(
+                    "{relative} is a file with more than one name, and such a file is accepted \
+                     at no name below the configuration directory"
+                ));
             } else if !is_allowed(self.allowed, &relative) {
                 self.refused.push(format!(
                     "{relative} is not one of the recipe's files, and the entry does not allow it"
@@ -3462,30 +3486,117 @@ mod tests {
         }
     }
 
-    /// A link is matched by its name, as a file is; a `settings.json` that is a link is not the
-    /// recipe's.
+    /// A link below the configuration directory is refused at every name, an allowed name too: a
+    /// name says nothing of where a link leads, and the agent may read what it leads to.
     #[cfg(unix)]
     #[test]
-    fn a_link_in_the_configuration_directory_is_matched_by_its_name_as_a_file_is() {
+    fn a_link_below_the_configuration_directory_is_refused_at_every_name_an_allowed_one_too() {
         let root = configured("end-link");
         let config = root.join("c");
-        let outside = scratch("end-link-outside").join("somewhere");
-        std::fs::write(&outside, b"{}").expect("a file outside");
-        std::os::unix::fs::symlink(&outside, config.join("link")).expect("a link");
-        assert_eq!(
-            compared(&root, &[]),
-            Err(
-                "link is not one of the recipe's files, and the entry does not allow it".to_owned()
+        let outside = scratch("end-link-outside");
+        std::fs::write(outside.join("somewhere"), b"{}").expect("a file outside");
+        std::fs::create_dir(outside.join("directory")).expect("a directory outside");
+        std::fs::write(outside.join("directory/in"), b"{}").expect("a file in it");
+        let said = |name: &str| {
+            format!(
+                "{name} is a link, and a link is accepted at no name below the configuration directory"
             )
-        );
-        assert_eq!(compared(&root, &["link"]), Ok(()));
+        };
+        // A link by a name that no pattern names, and by names that a pattern names exactly.
+        for (name, allowed) in [
+            ("link", &[][..]),
+            ("link", &["link"][..]),
+            (".claude.json", &[".claude.json"][..]),
+        ] {
+            std::os::unix::fs::symlink(outside.join("somewhere"), config.join(name))
+                .expect("a link");
+            assert_eq!(
+                compared(&root, allowed),
+                Err(said(name)),
+                "{name} with {allowed:?}"
+            );
+            std::fs::remove_file(config.join(name)).expect("the link goes");
+        }
+        // A link to a directory, named like an allowed directory, and a link below a directory.
+        std::os::unix::fs::symlink(outside.join("directory"), config.join("projects"))
+            .expect("a link");
+        assert_eq!(compared(&root, &["projects"]), Err(said("projects")));
+        assert_eq!(compared(&root, &["projects/**"]), Err(said("projects")));
+        std::fs::remove_file(config.join("projects")).expect("the link goes");
+        std::fs::create_dir(config.join("projects")).expect("a directory");
+        std::os::unix::fs::symlink(outside.join("somewhere"), config.join("projects/x"))
+            .expect("a link");
+        assert_eq!(compared(&root, &["projects/*"]), Err(said("projects/x")));
+        std::fs::remove_dir_all(config.join("projects")).expect("the directory goes");
+        // A `settings.json` that is a link is not the recipe's.
         std::fs::remove_file(config.join("settings.json")).expect("the settings go");
-        std::os::unix::fs::symlink(&outside, config.join("settings.json")).expect("a link");
+        std::os::unix::fs::symlink(outside.join("somewhere"), config.join("settings.json"))
+            .expect("a link");
         let refused = compared(&root, &["link"]).expect_err("settings.json as a link");
         assert!(
             refused.starts_with("settings.json is not a file of the run's own: "),
             "{refused}"
         );
+    }
+
+    /// A file with more than one name is refused at every name below the configuration directory,
+    /// an allowed name too: its other name may be a file the agent reads, in a place of the
+    /// person's.
+    #[cfg(unix)]
+    #[test]
+    fn a_file_with_a_second_name_is_refused_below_the_configuration_directory_an_allowed_name_too()
+    {
+        let root = configured("end-hard-allowed");
+        let config = root.join("c");
+        std::fs::write(root.join("theirs"), b"{}").expect("a file of theirs");
+        std::fs::hard_link(root.join("theirs"), config.join(".claude.json"))
+            .expect("a second name");
+        let said = ".claude.json is a file with more than one name, and such a file is accepted at no name below the configuration directory";
+        assert_eq!(compared(&root, &[".claude.json"]), Err(said.to_owned()));
+        assert_eq!(compared(&root, &[]), Err(said.to_owned()));
+        std::fs::remove_file(root.join("theirs")).expect("the other name goes");
+        assert_eq!(
+            compared(&root, &[".claude.json"]),
+            Ok(()),
+            "with one name, the allowed file passes"
+        );
+    }
+
+    /// Each of the recipe's files and `settings.json` is looked at by itself, whatever names the
+    /// directory holds: a directory that holds none of them is refused with each one named.
+    #[test]
+    fn an_empty_configuration_directory_is_refused_with_each_file_of_the_recipe_named() {
+        let root = scratch("end-empty");
+        std::fs::create_dir(root.join("c")).expect("an empty directory");
+        let refused = compared(&root, &[]).expect_err("none of the recipe is there");
+        for file in ["settings.json", RECIPE[0].0, RECIPE[1].0] {
+            assert!(
+                refused.contains(&format!(
+                    "{file} is not a file of the run's own: it is not there"
+                )),
+                "{file}: {refused}"
+            );
+        }
+    }
+
+    /// A link named like an allowed directory that leads to files of the recipe's bytes is
+    /// refused: each recipe file is looked at by its own path, and a link on the way is a refusal.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_named_like_an_allowed_directory_does_not_stand_for_the_recipes_files() {
+        let root = configured("end-recipe-link");
+        let config = root.join("c");
+        let theirs = scratch("end-recipe-link-theirs");
+        std::fs::rename(config.join("skills"), theirs.join("skills"))
+            .expect("the recipe's directory moves");
+        std::os::unix::fs::symlink(theirs.join("skills"), config.join("skills")).expect("a link");
+        let refused = compared(&root, &["skills"]).expect_err("a link named like an allowed one");
+        for (file, _) in RECIPE {
+            assert!(
+                refused.contains(&format!("{file} is not a file of the run's own: ")),
+                "{file}: {refused}"
+            );
+        }
     }
 
     /// The configuration directory is reached through the run's pinned directory: one that was
