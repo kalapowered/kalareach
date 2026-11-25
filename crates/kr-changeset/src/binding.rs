@@ -667,27 +667,14 @@ mod unix {
         }
     }
 
-    #[cfg(target_os = "macos")]
-    mod names {
+    /// What the host makes of the reports a platform's watcher sends, whichever platform sends them.
+    ///
+    /// A report is the paths it names and whether it says that reports were lost. Judging a
+    /// report needs nothing of the platform's, so every platform runs these cases.
+    #[cfg(any(target_os = "macos", test))]
+    mod judged {
         use std::collections::{BTreeMap, BTreeSet};
         use std::path::{Path, PathBuf};
-        use std::sync::{Arc, Mutex, PoisonError, mpsc};
-        use std::time::{Duration, Instant};
-
-        use notify::{Event, RecursiveMode, Watcher as _};
-
-        use kr_transfer::{AuthorisedDirectory, RelativeName};
-
-        /// How long the host waits for the watcher to report a file the host wrote itself.
-        ///
-        /// FSEvents delivers reports in order and on its own schedule, so the only way to know it
-        /// has delivered every report up to a moment is to make a change at that moment and wait
-        /// for it to be reported.
-        const REPORT_WAIT: Duration = Duration::from_secs(10);
-
-        /// The start of the name of a file the host writes to find out whether the watcher is
-        /// up to date.
-        const MARK: &str = ".mark-";
 
         /// How many written paths the watcher keeps. A run that has written this many beside its
         /// outputs has been told enough for a result to name a few of them.
@@ -695,24 +682,26 @@ mod unix {
 
         /// What the platform said of the run, judged as each report arrived.
         #[derive(Debug, Default)]
-        struct Heard {
+        pub(super) struct Heard {
             /// Paths written beside a declared output, relative to the copy; the copy's own path
             /// is the empty one.
-            written: BTreeSet<String>,
+            pub(super) written: BTreeSet<String>,
             /// Why the reports cannot be taken as all there were, when they cannot.
-            lost: Option<String>,
-            /// The file the host is waiting to hear of.
-            awaited: Option<PathBuf>,
+            pub(super) lost: Option<String>,
         }
 
         /// Where the watched places are, and what a report about each means.
         #[derive(Debug)]
-        struct Places {
+        pub(super) struct Places {
             copy: PathBuf,
             parents: BTreeMap<String, BTreeSet<String>>,
         }
 
         impl Places {
+            pub(super) fn new(copy: PathBuf, parents: BTreeMap<String, BTreeSet<String>>) -> Self {
+                Self { copy, parents }
+            }
+
             /// The path of the copy that a report about `path` shows to have been written, if it
             /// does.
             ///
@@ -736,15 +725,21 @@ mod unix {
                 (!outputs.contains(name)).then_some(relative)
             }
 
-            /// Takes one report into `heard`.
-            fn hear(&self, heard: &mut Heard, event: &Event) {
+            /// Takes one report into `heard`: `rescan` is whether it says that reports were lost,
+            /// and `paths` are the paths it names.
+            ///
+            /// A report that says reports were lost is a loss whatever paths it names, and when it
+            /// names none. FSEvents sends such a report at the path where it lost reports, which
+            /// is often a directory above the copy or the root of the volume. The watcher passes
+            /// it on with that path, so a path outside the copy is no reason to leave it out.
+            pub(super) fn hear(&self, heard: &mut Heard, rescan: bool, paths: &[PathBuf]) {
                 // A report that reports are lost is not about a path that was written.
-                if event.need_rescan() {
+                if rescan {
                     heard.lost.get_or_insert_with(|| {
                         "the watcher lost reports of changes to the copy".to_owned()
                     });
                 }
-                for path in &event.paths {
+                for path in paths {
                     if heard.written.len() < KEPT
                         && let Some(relative) = self.written(path)
                     {
@@ -754,12 +749,164 @@ mod unix {
             }
         }
 
+        #[cfg(test)]
+        mod tests {
+            use std::collections::{BTreeMap, BTreeSet};
+            use std::path::PathBuf;
+
+            use super::{Heard, Places};
+
+            /// A copy at `/work/run/copy`, in the directory `/work/run`, with a declared output
+            /// `out` at its root and another, `gen`, in its directory `sub`.
+            fn places() -> Places {
+                Places::new(
+                    PathBuf::from("/work/run/copy"),
+                    BTreeMap::from([
+                        (String::new(), BTreeSet::from(["out".to_owned()])),
+                        ("sub".to_owned(), BTreeSet::from(["gen".to_owned()])),
+                    ]),
+                )
+            }
+
+            /// What is heard of one report that names `paths`.
+            fn heard_of(rescan: bool, paths: &[&str]) -> Heard {
+                let paths: Vec<PathBuf> = paths.iter().map(PathBuf::from).collect();
+                let mut heard = Heard::default();
+                places().hear(&mut heard, rescan, &paths);
+                heard
+            }
+
+            /// KR-REQ-14.34: a notice that reports were lost is a loss at whatever path it names.
+            /// FSEvents names the root of the volume, a directory above the copy, or the directory
+            /// the copy is in, and none of them is a path written in the copy.
+            #[test]
+            fn a_loss_notice_at_a_path_outside_the_copy_is_a_loss() {
+                for outside in ["/", "/work", "/work/run", "/elsewhere/file"] {
+                    let heard = heard_of(true, &[outside]);
+                    assert!(heard.lost.is_some(), "{outside} is a loss");
+                    assert!(heard.written.is_empty(), "{outside} is no write");
+                }
+            }
+
+            /// KR-REQ-14.34: a notice that names no path is a loss.
+            #[test]
+            fn a_loss_notice_that_names_no_path_is_a_loss() {
+                let heard = heard_of(true, &[]);
+                assert!(heard.lost.is_some());
+                assert!(heard.written.is_empty());
+            }
+
+            /// KR-REQ-14.34: a notice at a path in the copy is a loss, and the path is kept like
+            /// any other that was reported.
+            #[test]
+            fn a_loss_notice_in_the_copy_is_a_loss_and_keeps_the_path() {
+                let heard = heard_of(true, &["/work/run/copy/sub/file"]);
+                assert!(heard.lost.is_some());
+                assert_eq!(heard.written, BTreeSet::from(["sub/file".to_owned()]));
+            }
+
+            /// A report that does not say that reports were lost is judged by its path alone,
+            /// and a path outside the copy is no write.
+            #[test]
+            fn a_report_outside_the_copy_that_loses_nothing_is_no_loss_and_no_write() {
+                let heard = heard_of(
+                    false,
+                    &[
+                        "/",
+                        "/work",
+                        "/work/run",
+                        "/work/run/other",
+                        "/elsewhere/file",
+                    ],
+                );
+                assert!(heard.lost.is_none());
+                assert!(heard.written.is_empty());
+            }
+
+            /// A name beside a declared output is a write and the output is not, and the copy
+            /// itself is written when a report names it.
+            #[test]
+            fn a_name_beside_a_declared_output_is_a_write_and_the_output_is_not() {
+                let heard = heard_of(false, &["/work/run/copy/out", "/work/run/copy/sub/gen"]);
+                assert!(heard.written.is_empty());
+                let heard = heard_of(
+                    false,
+                    &[
+                        "/work/run/copy/other",
+                        "/work/run/copy/sub/x",
+                        "/work/run/copy",
+                    ],
+                );
+                assert!(heard.lost.is_none());
+                assert_eq!(
+                    heard.written,
+                    BTreeSet::from(["".to_owned(), "other".to_owned(), "sub/x".to_owned()])
+                );
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    mod names {
+        use std::collections::{BTreeMap, BTreeSet};
+        use std::path::{Path, PathBuf};
+        use std::sync::{Arc, Mutex, PoisonError, mpsc};
+        use std::time::{Duration, Instant};
+
+        use notify::{Event, RecursiveMode, Watcher as _};
+
+        use kr_transfer::{AuthorisedDirectory, RelativeName};
+
+        use super::judged::{Heard, Places};
+
+        /// How long the host waits for the watcher to report a file the host wrote itself.
+        ///
+        /// FSEvents delivers reports in order and on its own schedule, so the only way to know it
+        /// has delivered every report up to a moment is to make a change at that moment and wait
+        /// for it to be reported.
+        const REPORT_WAIT: Duration = Duration::from_secs(10);
+
+        /// The start of the name of a file the host writes to find out whether the watcher is
+        /// up to date.
+        const MARK: &str = ".mark-";
+
+        /// What the watcher's handler and the host both hold.
+        #[derive(Debug, Default)]
+        struct Shared {
+            heard: Heard,
+            /// The file the host is waiting to hear of.
+            awaited: Option<PathBuf>,
+        }
+
+        /// Takes one report from the watcher into `shared`, and gives back the file the host is
+        /// waiting to hear of when the report names it.
+        fn take(
+            places: &Places,
+            shared: &mut Shared,
+            report: notify::Result<Event>,
+        ) -> Option<PathBuf> {
+            match report {
+                Ok(event) => {
+                    places.hear(&mut shared.heard, event.need_rescan(), &event.paths);
+                    let awaited = shared.awaited.as_ref();
+                    event.paths.into_iter().find(|path| Some(path) == awaited)
+                }
+                Err(error) => {
+                    shared
+                        .heard
+                        .lost
+                        .get_or_insert_with(|| format!("the watcher failed: {error}"));
+                    None
+                }
+            }
+        }
+
         /// A watch on the copy, which reports each name written in the directories declared
         /// outputs are in, and each change to those directories themselves.
         pub struct NameWatch {
             /// Held so that the stream is.
             _watcher: notify::RecommendedWatcher,
-            heard: Arc<Mutex<Heard>>,
+            shared: Arc<Mutex<Shared>>,
             reported: Mutex<mpsc::Receiver<PathBuf>>,
             /// The directory the copy is in, where the host writes the files it marks time with.
             beside: AuthorisedDirectory,
@@ -810,33 +957,17 @@ mod unix {
                         return Err("the copy is no longer where it was opened".to_owned());
                     }
                 }
-                let places = Arc::new(Places {
-                    copy: copy_path.clone(),
-                    parents: parents.clone(),
-                });
-                let heard = Arc::new(Mutex::new(Heard::default()));
+                let places = Arc::new(Places::new(copy_path.clone(), parents.clone()));
+                let shared = Arc::new(Mutex::new(Shared::default()));
                 let (tell, reported) = mpsc::channel();
                 // Each report is judged here, as it arrives, so the host keeps what it needs of a
                 // run's reports and not the reports.
                 let handler = {
-                    let (places, heard) = (Arc::clone(&places), Arc::clone(&heard));
+                    let (places, shared) = (Arc::clone(&places), Arc::clone(&shared));
                     move |report: notify::Result<Event>| {
-                        let mut heard = heard.lock().unwrap_or_else(PoisonError::into_inner);
-                        match report {
-                            Ok(event) => {
-                                places.hear(&mut heard, &event);
-                                let awaited = heard.awaited.as_ref();
-                                if let Some(path) =
-                                    event.paths.iter().find(|path| Some(*path) == awaited)
-                                {
-                                    let _ = tell.send(path.clone());
-                                }
-                            }
-                            Err(error) => {
-                                heard
-                                    .lost
-                                    .get_or_insert_with(|| format!("the watcher failed: {error}"));
-                            }
+                        let mut shared = shared.lock().unwrap_or_else(PoisonError::into_inner);
+                        if let Some(path) = take(&places, &mut shared, report) {
+                            let _ = tell.send(path);
                         }
                     }
                 };
@@ -851,7 +982,7 @@ mod unix {
                     .map_err(|error| format!("the copy could not be watched: {error}"))?;
                 let watch = Self {
                     _watcher: watcher,
-                    heard,
+                    shared,
                     reported: Mutex::new(reported),
                     beside: beside.try_clone().map_err(|error| {
                         format!("the copy's place could not be reopened: {error}")
@@ -860,7 +991,11 @@ mod unix {
                     copy_path,
                 };
                 watch.up_to_date()?;
-                *watch.heard.lock().unwrap_or_else(PoisonError::into_inner) = Heard::default();
+                watch
+                    .shared
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .heard = Heard::default();
                 Ok(Some(watch))
             }
 
@@ -871,7 +1006,7 @@ mod unix {
                 let name = RelativeName::parse(&mark)
                     .map_err(|error| format!("a file to mark time with: {error}"))?;
                 let marked = self.beside_path.join(&mark);
-                self.heard
+                self.shared
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
                     .awaited = Some(marked.clone());
@@ -880,7 +1015,7 @@ mod unix {
                     .create_new(&name)
                     .map_err(|error| format!("a file to mark time with: {error}"))
                     .and_then(|_| self.until_reported(&marked));
-                self.heard
+                self.shared
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
                     .awaited = None;
@@ -911,11 +1046,119 @@ mod unix {
             /// directories themselves when something was done to them.
             pub fn drain(&self) -> Result<Vec<String>, String> {
                 self.up_to_date()?;
-                let heard = self.heard.lock().unwrap_or_else(PoisonError::into_inner);
-                match &heard.lost {
+                let shared = self.shared.lock().unwrap_or_else(PoisonError::into_inner);
+                match &shared.heard.lost {
                     Some(why) => Err(why.clone()),
-                    None => Ok(heard.written.iter().cloned().collect()),
+                    None => Ok(shared.heard.written.iter().cloned().collect()),
                 }
+            }
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use std::collections::{BTreeMap, BTreeSet};
+            use std::path::PathBuf;
+
+            use notify::Event;
+            use notify::event::{CreateKind, EventKind, Flag, ModifyKind, RenameMode};
+
+            use super::{Places, Shared, take};
+
+            /// A copy at `/work/run/copy`, in the directory `/work/run`, with a declared output
+            /// `out` at its root.
+            fn places() -> Places {
+                Places::new(
+                    PathBuf::from("/work/run/copy"),
+                    BTreeMap::from([(String::new(), BTreeSet::from(["out".to_owned()]))]),
+                )
+            }
+
+            /// A notice that reports were lost, as notify 9.0.0 sends it when FSEvents says
+            /// "must scan subdirectories": an event of no particular kind with the rescan flag,
+            /// the reason FSEvents gave when it gave one, and the path FSEvents named.
+            fn notice(reason: Option<&str>, path: Option<&str>) -> Event {
+                let mut event = Event::new(EventKind::Other).set_flag(Flag::Rescan);
+                if let Some(reason) = reason {
+                    event = event.set_info(reason);
+                }
+                if let Some(path) = path {
+                    event = event.add_path(PathBuf::from(path));
+                }
+                event
+            }
+
+            /// KR-REQ-14.34: the notices notify 9.0.0 sends for a loss at a path the watcher does
+            /// not watch are a loss, with each reason FSEvents gives and with none.
+            #[test]
+            fn the_notices_notify_sends_for_a_loss_outside_the_copy_are_a_loss() {
+                for (reason, path) in [
+                    (Some("rescan: user dropped"), "/"),
+                    (Some("rescan: kernel dropped"), "/work"),
+                    (None, "/work/run"),
+                ] {
+                    let mut shared = Shared::default();
+                    let seen = take(&places(), &mut shared, Ok(notice(reason, Some(path))));
+                    assert_eq!(seen, None, "{path}");
+                    assert!(shared.heard.lost.is_some(), "{path} is a loss");
+                    assert!(shared.heard.written.is_empty(), "{path} is no write");
+                }
+            }
+
+            /// KR-REQ-14.34: a notice with no path is a loss.
+            #[test]
+            fn a_notice_notify_sends_with_no_path_is_a_loss() {
+                let mut shared = Shared::default();
+                take(&places(), &mut shared, Ok(notice(None, None)));
+                assert!(shared.heard.lost.is_some());
+            }
+
+            /// A failure the watcher reports instead of an event is a loss, and says so.
+            #[test]
+            fn a_failure_the_watcher_reports_is_a_loss() {
+                let mut shared = Shared::default();
+                take(
+                    &places(),
+                    &mut shared,
+                    Err(notify::Error::generic("the stream stopped")),
+                );
+                let lost = shared.heard.lost.expect("the failure is a loss");
+                assert!(lost.contains("the watcher failed"), "{lost}");
+            }
+
+            /// The file the host is waiting to hear of is given back when a report names it, and
+            /// no other path is.
+            #[test]
+            fn the_file_the_host_waits_for_is_given_back_when_a_report_names_it() {
+                let awaited = PathBuf::from("/work/run/.mark-1");
+                let mut shared = Shared {
+                    awaited: Some(awaited.clone()),
+                    ..Shared::default()
+                };
+                let other = Event::new(EventKind::Create(CreateKind::File))
+                    .add_path(PathBuf::from("/work/run/.mark-0"));
+                assert_eq!(take(&places(), &mut shared, Ok(other)), None);
+                let marked =
+                    Event::new(EventKind::Create(CreateKind::File)).add_path(awaited.clone());
+                assert_eq!(take(&places(), &mut shared, Ok(marked)), Some(awaited));
+                assert!(shared.heard.lost.is_none());
+            }
+
+            /// Since 9.0.0 the watcher also says when a place it watches is renamed or removed, at
+            /// that place's own path. A report at the copy's own path is a write to the copy. A
+            /// report at the directory beside the copy is not, as nothing in the copy changed.
+            #[test]
+            fn a_change_of_root_at_the_copy_is_a_write_and_beside_it_is_not() {
+                let changed = |path: &str| {
+                    Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::From)))
+                        .set_info("root changed")
+                        .add_path(PathBuf::from(path))
+                };
+                let mut shared = Shared::default();
+                take(&places(), &mut shared, Ok(changed("/work/run")));
+                assert!(shared.heard.written.is_empty());
+                take(&places(), &mut shared, Ok(changed("/work/run/copy")));
+                assert_eq!(shared.heard.written, BTreeSet::from([String::new()]));
+                assert!(shared.heard.lost.is_none());
             }
         }
     }
