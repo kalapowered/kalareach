@@ -3,16 +3,26 @@
 //! mode, and each of the two has its own [`Shape`].
 //!
 //! The stand-in reads a script from [`SCRIPT_FILE`] in its working directory and appends one line
-//! to [`RECORD_FILE`] there for each frame it receives, for each tick it sends and for the end of
-//! its input, so a case reads what the agent saw and did. It reads no environment name: the
-//! launcher passes the agent the names of an allowlist and no others.
+//! to [`RECORD_FILE`] there for each frame it receives, for each tick, request, update and reply it
+//! sends, for the end of a turn of its own and for the end of its input, so a case reads what the
+//! agent saw and did. It reads no environment name: the launcher passes the agent the names of an
+//! allowlist and no others.
 //!
-//! A script is `{"turns": [...], "ticks": [...], "exit_after": "name"}`. The k-th prompt of the
-//! client runs the k-th turn, which is a list of steps; a prompt with no turn left is answered at
-//! once with the stop reason `end_turn`. A tick is `{"after": "name", "say": "text"}`: when the
-//! file `name` appears in the working directory the agent sends an update that says `text`, once,
-//! whatever its turn does. When the file `exit_after` names appears the agent ends with the code 0,
-//! whatever its turn waits for.
+//! A script is `{"turns": [...], "ticks": [...], "exit_after": "name", "own": [...], "cancel":
+//! "settle", "on_cancel": [...]}`. The k-th prompt of the client runs the k-th turn, which is a list
+//! of steps; a prompt with no turn left is answered at once with the stop reason `end_turn`. A
+//! tick is `{"after": "name", "say": "text"}`: when the file `name` appears in the working
+//! directory the agent sends an update that says `text`, once, whatever its turn does. When the
+//! file `exit_after` names appears the agent ends with the code 0, whatever its turn waits for.
+//!
+//! A turn of the agent's own is `{"after": "name", "steps": [...]}` in `own`: it starts when the
+//! file appears and no turn runs, and it ends with no reply, because it answers no prompt. A
+//! prompt that arrives while a turn runs waits in a queue and starts when the turn ends; the
+//! Gemini-shaped agent refuses it instead. On `session/cancel` the agent answers each prompt that
+//! waits in its queue with the stop reason `cancelled`. Under `"cancel": "settle"`, the default, it
+//! then stops waiting on the request of its turn, sends the call's update with the status
+//! `cancelled` and ends the turn `cancelled`; under `"cancel": "wait"` it changes nothing more.
+//! The steps of `on_cancel` then run once as a turn of the agent's own.
 //!
 //! | Step | What the stand-in does |
 //! | --- | --- |
@@ -135,6 +145,36 @@ struct Script {
     /// The agent ends with the code 0 when this file appears, whatever its turn waits for.
     #[serde(default)]
     exit_after: Option<String>,
+    /// Turns the agent starts of its own accord, each when its file appears and no turn runs.
+    #[serde(default)]
+    own: Vec<Own>,
+    /// What `session/cancel` does to the request the running turn waits on.
+    #[serde(default)]
+    cancel: CancelMode,
+    /// Steps that run once as a turn of the agent's own, after the first cancel settled its turn.
+    #[serde(default)]
+    on_cancel: Vec<Step>,
+}
+
+/// A turn of the agent's own: it answers no prompt, so it ends with no reply.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Own {
+    /// The file that starts the turn.
+    after: String,
+    /// The steps of the turn.
+    steps: Vec<Step>,
+}
+
+/// What `session/cancel` does to the request the running turn waits on.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum CancelMode {
+    /// The agent stops waiting at once, as Qoder does: it cancels the call and ends the turn.
+    #[default]
+    Settle,
+    /// The agent goes on waiting for the client's answer, as Gemini does.
+    Wait,
 }
 
 /// An update the agent sends once, when a file of the working directory appears, whatever its turn
@@ -162,8 +202,9 @@ enum Waiting {
 /// The turn that a prompt of the client started.
 #[derive(Debug)]
 struct Turn {
-    /// The prompt's request identifier, as the client wrote it.
-    prompt: Value,
+    /// The prompt's request identifier, as the client wrote it, or none for a turn of the agent's
+    /// own.
+    prompt: Option<Value>,
     /// The steps that remain.
     steps: VecDeque<Step>,
     /// What the turn waits for.
@@ -200,6 +241,14 @@ struct Agent<W: Write> {
     last_answer: Option<Outcome>,
     /// How many ticks have been sent: they go in the order the script lists them.
     ticked: usize,
+    /// The prompts that wait behind the running turn, as the client wrote their identifiers.
+    queued: VecDeque<Value>,
+    /// How many turns of the agent's own have started: they go in the order the script lists them.
+    own_started: usize,
+    /// The call whose request the running turn waits on.
+    pending_call: Option<String>,
+    /// Whether a cancel has been taken.
+    cancelled: bool,
 }
 
 /// Runs the stand-in to the end of the client's stream or to an `exit` step, and returns the exit
@@ -241,6 +290,10 @@ pub fn run(
         outcomes: BTreeMap::new(),
         last_answer: None,
         ticked: 0,
+        queued: VecDeque::new(),
+        own_started: 0,
+        pending_call: None,
+        cancelled: false,
     };
     loop {
         match received.recv_timeout(POLL) {
@@ -256,6 +309,7 @@ pub fn run(
             Err(mpsc::RecvTimeoutError::Timeout) => {}
         }
         agent.tick();
+        agent.start_next();
         if agent.is_told_to_exit() {
             return Ok(0);
         }
@@ -273,7 +327,8 @@ impl<W: Write> Agent<W> {
             .append(true)
             .open(self.directory.join(RECORD_FILE))
         {
-            let _ = writeln!(file, "{line}");
+            // One write for the line and its newline, so a reader never sees half a line.
+            let _ = file.write_all(format!("{line}\n").as_bytes());
         }
     }
 
@@ -343,6 +398,9 @@ impl<W: Write> Agent<W> {
             }
             (Some(method), None) => {
                 self.record(&json!({ "received": "notification", "method": method }));
+                if method == "session/cancel" {
+                    self.cancel();
+                }
             }
             (None, Some(id)) => self.response(&id, &frame),
             (None, None) => self.record(&json!({ "received": "a frame of no kind" })),
@@ -374,10 +432,17 @@ impl<W: Write> Agent<W> {
 
     /// Starts the turn of a prompt of the client's.
     fn prompt(&mut self, id: &Value) {
-        if self.turn.is_some() {
+        if self.turn.is_none() {
+            self.start_prompt(id.clone());
+        } else if self.shape == Shape::Qoder {
+            self.queued.push_back(id.clone());
+        } else {
             self.refuse(id, -32000, "a prompt is running");
-            return;
         }
+    }
+
+    /// Starts the turn the next prompt of the client runs.
+    fn start_prompt(&mut self, id: Value) {
         let steps = self
             .script
             .turns
@@ -386,10 +451,76 @@ impl<W: Write> Agent<W> {
             .unwrap_or_else(|| vec![Step::End("end_turn".to_owned())]);
         self.prompts += 1;
         self.turn = Some(Turn {
-            prompt: id.clone(),
+            prompt: Some(id),
             steps: steps.into(),
             waiting: Waiting::Nothing,
         });
+    }
+
+    /// Starts a turn when none runs: the prompt that waited longest, else a turn of the agent's own
+    /// whose file has appeared.
+    fn start_next(&mut self) {
+        if self.turn.is_some() {
+            return;
+        }
+        if let Some(id) = self.queued.pop_front() {
+            self.start_prompt(id);
+        } else if let Some(own) = self.script.own.get(self.own_started)
+            && self.directory.join(&own.after).exists()
+        {
+            self.own_started += 1;
+            self.turn = Some(Turn {
+                prompt: None,
+                steps: own.steps.clone().into(),
+                waiting: Waiting::Nothing,
+            });
+        }
+    }
+
+    /// Takes a `session/cancel`. The Qoder-shaped agent answers the prompts that wait in its queue
+    /// `cancelled` at once and only then, under `settle`, abandons the request its turn waits on:
+    /// the call is cancelled and the turn ends `cancelled`. The steps of `on_cancel` start a turn
+    /// of the agent's own the first time.
+    fn cancel(&mut self) {
+        while let Some(id) = self.queued.pop_front() {
+            self.finish(Some(id), "cancelled");
+        }
+        if self.script.cancel == CancelMode::Settle
+            && let Some(turn) = self.turn.take()
+        {
+            if let Some(call) = self.pending_call.take() {
+                self.send_update(&call, "cancelled");
+            }
+            self.finish(turn.prompt, "cancelled");
+        }
+        if !self.cancelled && self.turn.is_none() && !self.script.on_cancel.is_empty() {
+            self.turn = Some(Turn {
+                prompt: None,
+                steps: self.script.on_cancel.clone().into(),
+                waiting: Waiting::Nothing,
+            });
+        }
+        self.cancelled = true;
+    }
+
+    /// Ends a turn: answers its prompt with `stop`, or records the end of a turn of the agent's own.
+    fn finish(&mut self, prompt: Option<Value>, stop: &str) {
+        if let Some(id) = prompt {
+            self.answer(&id, &json!({ "stopReason": stop }));
+            self.record(&json!({ "sent": "reply", "id": id, "stop": stop }));
+        } else {
+            self.record(&json!({ "sent": "turn end" }));
+        }
+    }
+
+    /// Sends a `tool_call_update` for `call` and records it.
+    fn send_update(&mut self, call: &str, status: &str) {
+        self.update(&json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": call,
+            "status": status,
+        }));
+        self.record(&json!({ "sent": "update", "call": call, "status": status }));
     }
 
     /// Takes the client's response to a request of the agent's.
@@ -412,6 +543,7 @@ impl<W: Write> Agent<W> {
             Some(Waiting::Response(number)) if Some(*number) == id.as_u64()
         );
         if waits {
+            self.pending_call = None;
             self.last_answer = answer;
             if let Some(turn) = &mut self.turn {
                 turn.waiting = Waiting::Nothing;
@@ -484,11 +616,7 @@ impl<W: Write> Agent<W> {
                 "status": "pending",
             })),
             Step::Ask(call) => self.ask_for(&call),
-            Step::Update { call, status } => self.update(&json!({
-                "sessionUpdate": "tool_call_update",
-                "toolCallId": call,
-                "status": status,
-            })),
+            Step::Update { call, status } => self.send_update(&call, &status),
             Step::When { outcome, then } => {
                 if self.last_answer == Some(outcome)
                     && let Some(turn) = &mut self.turn
@@ -505,7 +633,7 @@ impl<W: Write> Agent<W> {
             }
             Step::End(reason) => {
                 if let Some(turn) = self.turn.take() {
-                    self.answer(&turn.prompt, &json!({ "stopReason": reason }));
+                    self.finish(turn.prompt, &reason);
                 }
             }
             Step::Exit(code) => return Some(code),
@@ -545,6 +673,8 @@ impl<W: Write> Agent<W> {
                     .collect::<Vec<_>>(),
             }),
         );
+        self.record(&json!({ "sent": "request", "id": number, "call": call }));
+        self.pending_call = Some(call.to_owned());
         if let Some(turn) = &mut self.turn {
             turn.waiting = Waiting::Response(number);
         }

@@ -361,3 +361,218 @@ fn the_agent_exits_when_its_exit_file_appears_whatever_its_turn_waits_for() {
         .collect();
     assert_eq!(sent.len(), 1, "the record says the agent exited");
 }
+
+/// The `params.update.status` of a frame, or the empty text.
+fn status(frame: &Value) -> &str {
+    frame["params"]["update"]["status"].as_str().unwrap_or("")
+}
+
+/// The stop reason of a reply frame, or the empty text.
+fn stop(frame: &Value) -> &str {
+    frame["result"]["stopReason"].as_str().unwrap_or("")
+}
+
+/// The lines of the record that the stand-in sent, of one kind.
+fn sent(agent: &Played, kind: &str) -> Vec<Value> {
+    agent
+        .record()
+        .into_iter()
+        .filter(|line| line["sent"] == kind)
+        .collect()
+}
+
+/// A turn that asks for a call and waits.
+fn waiting_turn() -> Value {
+    json!([
+        { "call": { "id": "c1", "kind": "execute" } },
+        { "ask": "c1" },
+        { "end": "end_turn" },
+    ])
+}
+
+#[test]
+fn a_turn_of_the_agents_own_starts_when_its_file_appears_and_ends_with_no_reply() {
+    let mut agent = Played::start(
+        QODER,
+        &json!({ "own": [{ "after": "go", "steps": [{ "say": "own" }, { "end": "end_turn" }] }] }),
+    );
+    agent.open_session();
+    assert!(agent.is_quiet(), "no turn of its own before its file");
+    agent.release("go");
+    assert_eq!(agent.frame()["params"]["update"]["content"]["text"], "own");
+    assert!(
+        agent.is_quiet(),
+        "a turn of its own has no prompt to reply to"
+    );
+    assert_eq!(sent(&agent, "turn end").len(), 1);
+}
+
+#[test]
+fn a_cancel_settles_a_waiting_request_and_ends_the_turn_cancelled_as_qoder_does() {
+    let mut agent = Played::start(QODER, &json!({ "turns": [waiting_turn()] }));
+    agent.open_session();
+    agent.prompt(3, "run it");
+    for _ in 0..2 {
+        agent.frame();
+    }
+    agent.send(&json!({ "jsonrpc": "2.0", "method": "session/cancel", "params": { "sessionId": "stand-in-session" } }));
+    assert_eq!(status(&agent.frame()), "cancelled", "the call is cancelled");
+    let reply = agent.frame();
+    assert_eq!((reply["id"].as_u64(), stop(&reply)), (Some(3), "cancelled"));
+    agent.send(
+        &json!({ "jsonrpc": "2.0", "id": 0, "result": { "outcome": { "outcome": "cancelled" } } }),
+    );
+    assert!(
+        agent.is_quiet(),
+        "a late response to a settled request changes nothing"
+    );
+    let cancels = agent
+        .record()
+        .into_iter()
+        .filter(|line| line["method"] == "session/cancel")
+        .count();
+    assert_eq!(cancels, 1);
+}
+
+#[test]
+fn a_cancel_in_the_wait_mode_leaves_the_request_waiting_until_it_is_answered() {
+    let mut agent = Played::start(
+        QODER,
+        &json!({
+            "cancel": "wait",
+            "turns": [[
+                { "call": { "id": "c1", "kind": "execute" } },
+                { "ask": "c1" },
+                { "when": { "outcome": "cancelled", "then": [
+                    { "update": { "call": "c1", "status": "cancelled" } },
+                ] } },
+                { "end": "cancelled" },
+            ]],
+        }),
+    );
+    agent.open_session();
+    agent.prompt(3, "run it");
+    for _ in 0..2 {
+        agent.frame();
+    }
+    agent.send(&json!({ "jsonrpc": "2.0", "method": "session/cancel", "params": { "sessionId": "stand-in-session" } }));
+    assert!(agent.is_quiet(), "the request still waits");
+    agent.send(
+        &json!({ "jsonrpc": "2.0", "id": 0, "result": { "outcome": { "outcome": "cancelled" } } }),
+    );
+    assert_eq!(status(&agent.frame()), "cancelled");
+    assert_eq!(stop(&agent.frame()), "cancelled");
+}
+
+#[test]
+fn a_prompt_sent_behind_a_running_turn_is_queued_and_a_cancel_answers_it_cancelled_first() {
+    let mut agent = Played::start(QODER, &json!({ "turns": [waiting_turn()] }));
+    agent.open_session();
+    agent.prompt(3, "first");
+    for _ in 0..2 {
+        agent.frame();
+    }
+    agent.prompt(4, "second");
+    assert!(agent.is_quiet(), "a queued prompt is not answered");
+    agent.send(&json!({ "jsonrpc": "2.0", "method": "session/cancel", "params": { "sessionId": "stand-in-session" } }));
+    let queued = agent.frame();
+    assert_eq!(
+        (queued["id"].as_u64(), stop(&queued)),
+        (Some(4), "cancelled")
+    );
+    assert_eq!(status(&agent.frame()), "cancelled");
+    let running = agent.frame();
+    assert_eq!(
+        (running["id"].as_u64(), stop(&running)),
+        (Some(3), "cancelled")
+    );
+}
+
+#[test]
+fn a_queued_prompt_starts_when_the_turn_before_it_ends() {
+    let mut agent = Played::start(
+        QODER,
+        &json!({ "turns": [
+            [{ "hold": "go" }, { "end": "end_turn" }],
+            [{ "say": "second" }, { "end": "end_turn" }],
+        ] }),
+    );
+    agent.open_session();
+    agent.prompt(3, "first");
+    agent.prompt(4, "second");
+    assert!(
+        agent.is_quiet(),
+        "the first turn holds and the second waits"
+    );
+    agent.release("go");
+    assert_eq!(agent.frame()["id"], 3);
+    assert_eq!(
+        agent.frame()["params"]["update"]["content"]["text"],
+        "second"
+    );
+    assert_eq!(agent.frame()["id"], 4);
+}
+
+#[test]
+fn steps_of_a_cancel_run_as_a_turn_of_the_agents_own_after_the_settle() {
+    let mut agent = Played::start(
+        QODER,
+        &json!({
+            "turns": [waiting_turn()],
+            "on_cancel": [
+                { "hold": "late" },
+                { "call": { "id": "c2", "kind": "execute" } },
+                { "ask": "c2" },
+            ],
+        }),
+    );
+    agent.open_session();
+    agent.prompt(3, "run it");
+    for _ in 0..2 {
+        agent.frame();
+    }
+    agent.send(&json!({ "jsonrpc": "2.0", "method": "session/cancel", "params": { "sessionId": "stand-in-session" } }));
+    assert_eq!(status(&agent.frame()), "cancelled");
+    assert_eq!(stop(&agent.frame()), "cancelled");
+    assert!(agent.is_quiet(), "the late request waits for its file");
+    agent.release("late");
+    assert_eq!(agent.frame()["params"]["update"]["toolCallId"], "c2");
+    let late = agent.frame();
+    assert_eq!(late["method"], "session/request_permission");
+    assert_eq!(
+        late["id"], 1,
+        "the request of the second call carries the next number"
+    );
+}
+
+#[test]
+fn the_agent_records_what_it_asked_and_how_each_call_and_turn_ended() {
+    let mut agent = Played::start(
+        QODER,
+        &json!({ "turns": [[
+            { "call": { "id": "c1", "kind": "execute" } },
+            { "ask": "c1" },
+            { "update": { "call": "c1", "status": "completed" } },
+            { "end": "end_turn" },
+        ]] }),
+    );
+    agent.open_session();
+    agent.prompt(3, "run it");
+    for _ in 0..2 {
+        agent.frame();
+    }
+    agent.choose(0, "allow-once");
+    agent.frame();
+    agent.frame();
+    let asked = sent(&agent, "request");
+    assert_eq!(
+        (
+            asked.len(),
+            asked[0]["id"].as_u64(),
+            asked[0]["call"].as_str()
+        ),
+        (1, Some(0), Some("c1"))
+    );
+    assert_eq!(sent(&agent, "update")[0]["status"], "completed");
+    assert_eq!(sent(&agent, "reply")[0]["stop"], "end_turn");
+}
