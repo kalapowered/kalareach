@@ -13,9 +13,9 @@
 //!
 //! Four more rules, each a method here:
 //!
-//! * **A record that does not follow the accepted one is refused.** `AuthorityFeed::accept`
-//!   keeps the latest accepted revision and rejects anything at or below it, so replaying an old
-//!   feed entry cannot put authority back.
+//! * **A record never goes back to an older revision.** `AuthorityFeed::note_revision` keeps the
+//!   latest accepted revision and ignores any number at or below it, and the snapshot carries it
+//!   across a restart, so replaying an old feed entry cannot put authority back.
 //! * **Revocation records are retained until every enrolled host has acknowledged them.** They do
 //!   not share mailbox expiry or notification coalescing, so [`AuthorityFeed::retained`] holds them
 //!   until [`AuthorityFeed::acknowledge`] has heard from each enrolled host or that host is
