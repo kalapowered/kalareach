@@ -564,24 +564,6 @@ pub fn is_allowed(patterns: &[String], relative: &str) -> bool {
     })
 }
 
-/// Whether `path`, below either of the run's two configuration directories, is one of the agent's
-/// own records the entry allows.
-///
-/// # Panics
-///
-/// Panics when a pattern of the entry's allowed files is not one the harness reads.
-#[must_use]
-pub fn is_agents_own_record(account: &Account, run_root: &Path, path: &Path) -> bool {
-    let patterns = account
-        .allowed_below_config()
-        .unwrap_or_else(|why| panic!("{ISOLATION_UNPROVEN} {why}"));
-    [CONFIG_DIRECTORY, NEWER_CONFIG_DIRECTORY]
-        .iter()
-        .filter_map(|directory| path.strip_prefix(run_root.join(directory)).ok())
-        .filter_map(|relative| relative.to_str())
-        .any(|relative| is_allowed(&patterns, relative))
-}
-
 /// Compares what stands below the run's configuration directory `config` at the end of a part with
 /// what the harness and the agent may have put there: every file is one of the recipe's files
 /// (`recipe_files`, by their path below `config`), or `settings.json` holding exactly the one key
@@ -3353,37 +3335,6 @@ mod tests {
             end_compare(&config, &RECIPE, KEY, &patterns(&["link"])),
             Err("settings.json is not a file of the run's own".to_owned())
         );
-    }
-
-    /// A file below either of the run's configuration directories is the agent's own record where
-    /// the entry's allowed set names it, and no file elsewhere in the run is.
-    #[test]
-    fn a_path_below_either_configuration_directory_is_the_agents_own_record_where_the_entry_allows_it()
-     {
-        let mut account = account();
-        account.allowed = patterns(&["{config}/.claude.json", "{config}/projects/**"]);
-        let root = Path::new("/run");
-        for own in [
-            "agent-config/.claude.json",
-            "agent-config/projects/a/b.jsonl",
-            "agent-config-newer/.claude.json",
-        ] {
-            assert!(
-                is_agents_own_record(&account, root, &root.join(own)),
-                "{own} is the agent's own record"
-            );
-        }
-        for other in [
-            "agent-config/settings.json",
-            "agent-config/projects",
-            "h/.claude.json",
-            "w/.claude.json",
-        ] {
-            assert!(
-                !is_agents_own_record(&account, root, &root.join(other)),
-                "{other} is not the agent's own record"
-            );
-        }
     }
 
     #[test]

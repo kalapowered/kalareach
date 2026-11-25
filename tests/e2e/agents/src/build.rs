@@ -858,7 +858,9 @@ pub struct Account {
     /// Files below the run's configuration directory that the agent's own use writes beside what
     /// the harness put there, such as its records of a session. Each is `{config}/` and a path
     /// whose parts are names, a lone `*` for any one name, and a last `**` for every file below
-    /// its directory ([`Account::allowed_below_config`]).
+    /// its directory ([`Account::allowed_below_config`]). None begins with a wildcard, and none
+    /// names a file that must stay absent, a settings file or the `rules` directory, or a file
+    /// below one.
     #[serde(default)]
     pub allowed: Vec<String>,
     /// How the agent is run while a native bridge is in place: required of a real leg whose package
@@ -1255,14 +1257,40 @@ where
     Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
 }
 
+/// The paths below the configuration directory that no entry may allow: the agent reads its rules
+/// from `rules` and its settings from the two settings files, so a file there is an input of the
+/// agent and not a record that it wrote.
+pub const NEVER_ALLOWED_BELOW_CONFIG: [&str; 3] = ["rules", "settings.json", "settings.local.json"];
+
+/// Whether the pattern `pattern`, as the parts of an allowed file, names the path `path` or a file
+/// below it: each part of `path` is the pattern's part at that place, or the pattern has a lone
+/// `*` there, or a last `**` covers everything from there on.
+fn pattern_reaches(pattern: &[&str], path: &[&str]) -> bool {
+    for (index, part) in path.iter().enumerate() {
+        match pattern.get(index) {
+            Some(&"**") => return true,
+            Some(&name) if name == "*" || name == *part => {}
+            _ => return false,
+        }
+    }
+    true
+}
+
 impl Account {
     /// The entry's allowed files as paths below the configuration directory, `{config}/` taken off.
     ///
     /// # Errors
     ///
     /// Returns the first pattern that does not begin with `{config}/`, or that holds an empty
-    /// part, `.` or `..`, a template, a `*` inside a name, or a `**` that is not the last part.
+    /// part, `.` or `..`, a template, a `*` inside a name, or a `**` that is not the last part; one
+    /// that begins with `*` or `**`; and one that names a path, or a file below a path, that
+    /// [`NEVER_ALLOWED_BELOW_CONFIG`] holds or that the entry lists as absent below `{config}`.
     pub fn allowed_below_config(&self) -> Result<Vec<String>, String> {
+        let absent: Vec<&str> = self
+            .absent
+            .iter()
+            .filter_map(|path| path.strip_prefix("{config}/"))
+            .collect();
         self.allowed
             .iter()
             .map(|pattern| {
@@ -1284,6 +1312,25 @@ impl Account {
                         return Err(format!(
                             "the allowed file {pattern:?} holds {part:?}, and a part is a name, a lone \
                              `*`, or a last `**`"
+                        ));
+                    }
+                }
+                if matches!(parts[0], "*" | "**") {
+                    return Err(format!(
+                        "the allowed file {pattern:?} begins with {:?}, so it names any file of the \
+                         configuration directory",
+                        parts[0]
+                    ));
+                }
+                let protected = NEVER_ALLOWED_BELOW_CONFIG
+                    .iter()
+                    .map(|path| (*path, "no entry may allow"))
+                    .chain(absent.iter().map(|path| (*path, "the entry lists as absent")));
+                for (path, why) in protected {
+                    let held: Vec<&str> = path.split('/').collect();
+                    if pattern_reaches(&parts, &held) {
+                        return Err(format!(
+                            "the allowed file {pattern:?} would name {path:?}, which {why}"
                         ));
                     }
                 }
@@ -1671,8 +1718,9 @@ impl Inputs {
 ///
 /// # Panics
 ///
-/// Panics when the file cannot be read or is not an entry, and when the entry sets a variable the
-/// host owns ([`Build::names_reach_the_session`]).
+/// Panics when the file cannot be read or is not an entry, when the entry sets a variable the host
+/// owns ([`Build::names_reach_the_session`]), and when its account's allowed files are not ones the
+/// harness reads ([`Account::allowed_below_config`]).
 #[must_use]
 pub fn read_build(path: &Path) -> Build {
     let bytes = std::fs::read(path)
@@ -1682,6 +1730,11 @@ pub fn read_build(path: &Path) -> Build {
     build
         .names_reach_the_session()
         .unwrap_or_else(|why| panic!("the build file {}: {why}", path.display()));
+    if let Some(account) = &build.account {
+        account
+            .allowed_below_config()
+            .unwrap_or_else(|why| panic!("the build file {}: {why}", path.display()));
+    }
     build
 }
 
@@ -2021,6 +2074,114 @@ mod tests {
                 "{bad}: {why}"
             );
         }
+    }
+
+    /// An allowed file that could name a file that must stay absent, or a file of the agent's
+    /// settings, is refused where the entry is read, with the pattern and the path it would name.
+    #[test]
+    fn an_allowed_file_that_could_name_a_file_that_must_stay_absent_or_a_settings_file_is_refused()
+    {
+        let allowed = |absent: &[&str], list: &[&str]| -> Result<Vec<String>, String> {
+            let mut entry = entry_json(&serde_json::json!({}), &serde_json::json!({}));
+            entry["account"]["absent"] = serde_json::json!(absent);
+            entry["account"]["allowed"] = serde_json::json!(list);
+            serde_json::from_value::<Build>(entry)
+                .expect("an entry")
+                .account
+                .expect("an account")
+                .allowed_below_config()
+        };
+        // A pattern that begins with a wildcard names any file of the directory.
+        for bad in ["{config}/**", "{config}/*", "{config}/*/x"] {
+            let why = allowed(&[], &[bad]).expect_err(bad);
+            assert!(
+                why.contains(&format!("{bad:?}")) && why.contains("any file"),
+                "{bad}: {why}"
+            );
+        }
+        // The settings files and the rules directory, whatever the entry's absent list says.
+        for (bad, path) in [
+            ("{config}/settings.json", "settings.json"),
+            ("{config}/settings.local.json", "settings.local.json"),
+            ("{config}/rules/**", "rules"),
+            ("{config}/rules/a/b", "rules"),
+        ] {
+            let why = allowed(&[], &[bad]).expect_err(bad);
+            assert!(
+                why.contains(&format!("{bad:?}"))
+                    && why.contains(&format!("{path:?}"))
+                    && why.contains("no entry may allow"),
+                "{bad}: {why}"
+            );
+        }
+        // A path the entry lists as absent below the configuration directory, named exactly, as a
+        // directory's contents, or by a lone `*` in one of its parts.
+        let absent = [
+            "{config}/.claude.json",
+            "{config}/.gemini/GEMINI.md",
+            "{work}/.mcp.json",
+        ];
+        for (bad, path) in [
+            ("{config}/.claude.json", ".claude.json"),
+            ("{config}/.gemini/GEMINI.md", ".gemini/GEMINI.md"),
+            ("{config}/.gemini/**", ".gemini/GEMINI.md"),
+            ("{config}/.gemini/*", ".gemini/GEMINI.md"),
+            ("{config}/.claude.json/x", ".claude.json"),
+        ] {
+            let why = allowed(&absent, &[bad]).expect_err(bad);
+            assert!(
+                why.contains(&format!("{bad:?}"))
+                    && why.contains(&format!("{path:?}"))
+                    && why.contains("lists as absent"),
+                "{bad}: {why}"
+            );
+        }
+        // The files the agent's own use writes pass, and so does a name that only begins like an
+        // absent path or a path of the working directory.
+        assert_eq!(
+            allowed(
+                &absent,
+                &[
+                    "{config}/projects/**",
+                    "{config}/plugins/installed_plugins.json",
+                    "{config}/.gemini/other",
+                    "{config}/.claude.jsonl",
+                    "{config}/.mcp.json",
+                ]
+            ),
+            Ok(vec![
+                "projects/**".to_owned(),
+                "plugins/installed_plugins.json".to_owned(),
+                ".gemini/other".to_owned(),
+                ".claude.jsonl".to_owned(),
+                ".mcp.json".to_owned(),
+            ])
+        );
+    }
+
+    /// A build file whose allowed files could name a file that must stay absent is refused where it
+    /// is read: no part and no case is started from it.
+    #[test]
+    fn a_build_file_with_a_broad_allowed_file_is_refused_where_it_is_read() {
+        let file = std::env::temp_dir().join(format!("kr-entry-{}.json", kr_ipc::new_uuid()));
+        let write = |allowed: serde_json::Value| {
+            let mut entry = entry_json(&serde_json::json!({}), &serde_json::json!({}));
+            entry["account"]["allowed"] = allowed;
+            std::fs::write(&file, serde_json::to_vec(&entry).expect("the entry's text"))
+                .expect("writes the entry");
+        };
+        write(serde_json::json!(["{config}/projects/**"]));
+        let _ = read_build(&file);
+        write(serde_json::json!(["{config}/**"]));
+        let refused = std::panic::catch_unwind(|| read_build(&file));
+        std::fs::remove_file(&file).expect("removes the entry");
+        let panic = refused.expect_err("an entry that allows every file is refused");
+        let said = panic
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| panic.downcast_ref::<&str>().map(|text| (*text).to_owned()))
+            .unwrap_or_default();
+        assert!(said.contains("{config}/**"), "{said}");
     }
 
     /// An entry whose account carries `integrated`.
