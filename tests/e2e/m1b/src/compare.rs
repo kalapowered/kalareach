@@ -592,6 +592,12 @@ pub fn compare(
     }
 }
 
+/// The controller's own stand-in for an organisation's policy-signing authority, which signs with real
+/// keys and publishes the chain a host verifies when it enrols, included from its test support.
+#[cfg(test)]
+#[path = "../../../../crates/kr-controller/tests/organisation_support/mod.rs"]
+mod organisation_support;
+
 #[cfg(test)]
 pub(crate) mod tests {
     use std::os::unix::fs::PermissionsExt as _;
@@ -1202,26 +1208,67 @@ pub(crate) mod tests {
         });
     }
 
-    /// An `organisation-policy.json` that holds a record in the format the daemon writes, once it is
-    /// gone, is refused at every interval because no row covers the file, and not because a row of
-    /// the daemon's files forbids a removal.
+    /// An `organisation-policy.json` that holds a record in the format the daemon writes, for an
+    /// enrolment the host holds, is kept by the product's restoration and dropped by it where the
+    /// host holds no such enrolment; once the file is gone, it is refused at every interval because
+    /// no row covers the file, and not because a row of the daemon's files forbids a removal.
     #[test]
     fn a_removed_applied_policy_record_is_refused_at_every_interval() {
+        use std::sync::Arc;
+
         use kr_controller::grants::applied::{self, StoredAppliedPolicy};
-        use kr_protocol::ids::{AuthorityRevision, OrganisationId, OrganisationPolicyRevision};
+        use kr_controller::grants::policy::UtcFloor;
+        use kr_controller::grants::{GrantDirectory, HostPolicy};
+        use kr_protocol::ids::{AuthorityRevision, OrganisationPolicyRevision};
         use kr_protocol::scalars::Nullable;
         let world = world("applied-policy");
         let state = world.environment.state_dir().to_path_buf();
+        // The host holds an enrolment, which the registry stores as the daemon stores it.
+        let organisation = organisation_support::Organisation::new(7, organisation_support::T);
+        let mut policy = HostPolicy::personal(AuthorityRevision::new(1));
+        organisation.enrol(&mut policy, organisation_support::T);
+        let directory =
+            GrantDirectory::open(world.state("registry.sqlite")).expect("a grant directory");
+        directory
+            .store_policy(&policy.snapshot())
+            .expect("the enrolment is stored");
+        let stored = directory
+            .stored_policy()
+            .expect("a read")
+            .expect("a stored policy");
         let entry = StoredAppliedPolicy {
-            organisation_id: OrganisationId::new(kr_ipc::new_uuid()),
-            enrolment_revision: AuthorityRevision::new(2),
+            organisation_id: organisation.organisation_id,
+            enrolment_revision: policy
+                .enrolment(organisation.organisation_id)
+                .expect("the host is enrolled")
+                .enrolment_revision(),
             organisation_policy_revision: OrganisationPolicyRevision::new(1),
             adapter_allowlist: Nullable::null(),
         };
-        applied::write(&state, std::slice::from_ref(&entry)).expect("the record");
+        // A start restores the record for the enrolment the registry holds and keeps it.
+        let mut restored = HostPolicy::restore(
+            &stored,
+            AuthorityRevision::new(1),
+            Arc::new(UtcFloor::at(stored.utc_floor_ms.get())),
+        );
+        restored.restore_applied_policies(std::slice::from_ref(&entry));
+        assert_eq!(
+            restored.applied_policies(),
+            vec![entry.clone()],
+            "the restoration keeps the record of an enrolment the host holds"
+        );
+        applied::write(&state, &restored.applied_policies()).expect("the record");
         assert_eq!(
             applied::read(&state).expect("the record reads"),
-            vec![entry]
+            vec![entry.clone()]
+        );
+        // Where the host holds no such enrolment the restoration drops it, and a start then removes
+        // the file: the record must name an enrolment the run's host holds.
+        let mut without = HostPolicy::personal(AuthorityRevision::new(1));
+        without.restore_applied_policies(std::slice::from_ref(&entry));
+        assert!(
+            without.applied_policies().is_empty(),
+            "the restoration drops the record of an enrolment the host does not hold"
         );
         let before = world.record();
         std::fs::remove_file(applied::file_in(&state)).expect("removed");
