@@ -3408,7 +3408,9 @@ mod shutdown_tests {
             notes
                 .iter()
                 .filter_map(Value::as_str)
-                .any(|said| said.ends_with("14 bytes were added to the worker's diagnostics")),
+                .any(|said| said.ends_with(
+                    "14 bytes were added to the worker's diagnostics: \"a second line\\n\""
+                )),
             "{evidence:#}"
         );
         drop(host);

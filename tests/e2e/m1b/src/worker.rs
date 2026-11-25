@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use crate::compare::{Class, Layout, Refusal};
-use crate::run::RootPin;
+use crate::run::{RootPin, open_file_below};
 use crate::tree::{Change, Entry, Kind, Record, prefix_digest};
 
 /// The name of the conversation claims directory, directly below the state root.
@@ -27,6 +27,9 @@ const BOUNDARY_FILE: &str = "boundary";
 
 /// The name of the file the boundary is written to before it is renamed over the boundary file.
 const BOUNDARY_STAGING: &str = "boundary.writing";
+
+/// The most bytes that a worker's diagnostics gained between two looks that a note holds.
+const NOTE_BYTES: usize = 4096;
 
 /// Where the compare reads bytes the record does not hold, through the run's handles.
 #[derive(Clone, Copy, Debug)]
@@ -49,6 +52,23 @@ pub struct Judged {
 fn is_session_root(name: &str) -> bool {
     name.strip_prefix(SESSION_ROOT_PREFIX)
         .is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
+/// The bytes of the regular file `relative` from `from` to `to`, the first `NOTE_BYTES` of them at
+/// most, read through the run's handles.
+fn appended(place: Place<'_>, relative: &Path, from: u64, to: u64) -> Result<Vec<u8>, String> {
+    use std::os::unix::fs::FileExt as _;
+    let said =
+        |why: &dyn std::fmt::Display| format!("{} cannot be read: {why}", relative.display());
+    let file = open_file_below(place.root, place.pin, relative)
+        .map_err(|why| said(&why))?
+        .ok_or_else(|| said(&"it is gone"))?;
+    let length = usize::try_from(to - from).map_or(NOTE_BYTES, |length| length.min(NOTE_BYTES));
+    let mut bytes = vec![0_u8; length];
+    std::fs::File::from(file)
+        .read_exact_at(&mut bytes, from)
+        .map_err(|why| said(&why))?;
+    Ok(bytes)
 }
 
 fn is_diagnostics(name: &str) -> bool {
@@ -441,8 +461,12 @@ impl Judge<'_> {
         if now.size < was.size || !matches!(held, Ok(Some(digest)) if Some(digest) == was.digest) {
             self.refuse(path, W12);
         } else if now.size > was.size {
+            let added = appended(self.place, path, was.size, now.size).map_or_else(
+                |why| format!("they could not be read: {why}"),
+                |bytes| format!("{:?}", String::from_utf8_lossy(&bytes)),
+            );
             self.judged.notes.push(format!(
-                "{}: {} bytes were added to the worker's diagnostics",
+                "{}: {} bytes were added to the worker's diagnostics: {added}",
                 path.display(),
                 now.size - was.size
             ));
@@ -1015,7 +1039,9 @@ mod tests {
         assert_eq!(refused, Vec::<String>::new());
         assert_eq!(notes.len(), 1, "{notes:#?}");
         assert!(
-            notes[0].ends_with("15 bytes were added to the worker's diagnostics"),
+            notes[0].ends_with(
+                "15 bytes were added to the worker's diagnostics: \"kr-worker: two\\n\""
+            ),
             "{notes:#?}"
         );
         let (_, notes) = outcome("unchanged", recorded, |_| {});
