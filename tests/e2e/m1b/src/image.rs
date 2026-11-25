@@ -824,6 +824,25 @@ mod tests {
         assert!(why.contains("do not hold a database"), "{why}");
     }
 
+    /// A frame whose page number is 0 ends the log as SQLite reads it, though its checksum is right
+    /// and it says that it commits a larger database: the image is the main file's.
+    #[test]
+    fn a_frame_of_page_zero_ends_the_log_though_its_checksum_is_right() {
+        let files = made(4096, several);
+        let pages = u32::try_from(files.main.len() / 4096).expect("a page count");
+        let log = one_frame_log(&files, 0, pages + 2, &[7; 4096]);
+        let with_the_frame = Files {
+            wal: Some(log),
+            ..files.clone()
+        };
+        is_what_sqlite_reads(&with_the_frame, "a frame of page 0");
+        assert_eq!(
+            image(&with_the_frame).expect("an image"),
+            without_the_log(&files),
+            "the frame ends the log"
+        );
+    }
+
     /// A last commit that says the database has more pages than the harness reads is refused, and
     /// nothing of that size is made.
     #[test]
