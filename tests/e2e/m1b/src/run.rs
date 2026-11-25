@@ -1530,6 +1530,12 @@ impl PlacedDirectory {
         })
     }
 
+    /// Where below the run's directory the directory was placed.
+    #[must_use]
+    pub fn relative(&self) -> &Path {
+        &self.relative
+    }
+
     /// The place to start a program in: the directory is reached again by the walk from the pin
     /// that follows no link, and must be the directory that was recorded, by its device and inode
     /// on the same handle. The place returned is the one that handle has now, which no link names,

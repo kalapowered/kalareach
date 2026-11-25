@@ -565,20 +565,22 @@ pub fn is_allowed(patterns: &[String], relative: &str) -> bool {
     })
 }
 
-/// Compares what stands below the run's configuration directory `config` (a path below the run's
-/// directory `root`, which `pin` names) at the end of a part with what the harness and the agent
-/// may have put there. The directory is reached through the pin and listed through handles, so a
-/// directory that was made a link, or replaced, is refused and nothing is read through it. Each of
-/// the recipe's files (`recipe_files`, each by its path below `config` and the bytes the recipe
-/// wrote) and `settings.json` is looked at by its own path, whatever names the directory holds: a
-/// regular file with one name that holds those bytes, or, for `settings.json`, exactly the one key
-/// the recipe sets (`settings_key`, in `enabledPlugins`, set to `true`); one that is not there is
-/// refused. Every other name is looked at as the directory lists it: a link, and a regular file
-/// with more than one name, are refused at every name, an allowed one included; the names
-/// `settings.json`, `settings.local.json` and `rules`, in any letter case, are looked at before any
-/// directory is entered, so a directory with one of these names is refused and its contents are
-/// not compared, and `settings.local.json` and `rules` are refused whatever they are; any other
-/// file must be one that the entry's allowed files name.
+/// Compares what stands below the run's configuration directory `config`, as the run placed it
+/// ([`kr_e2e_m1b::run::PlacedDirectory::record`], called before the agent starts, below the run's
+/// directory `root`, which `pin` names), at the end of a part with what the harness and the agent
+/// may have put there. The directory is reached again through the pin and must be the one that was
+/// recorded, by its device and inode, and it is listed through handles, so a directory that was
+/// made a link, or that another directory has replaced, is refused and nothing is read through it.
+/// Each of the recipe's files (`recipe_files`, each by its path below `config` and the bytes the
+/// recipe wrote) and `settings.json` is looked at by its own path, whatever names the directory
+/// holds: a regular file with one name that holds those bytes, or, for `settings.json`, exactly the
+/// one key the recipe sets (`settings_key`, in `enabledPlugins`, set to `true`); one that is not
+/// there is refused. Every other name is looked at as the directory lists it: a link, and a
+/// regular file with more than one name, are refused at every name, an allowed one included; the
+/// names `settings.json`, `settings.local.json` and `rules`, in any letter case, are looked at
+/// before any directory is entered, so a directory with one of these names is refused and its
+/// contents are not compared, and `settings.local.json` and `rules` are refused whatever they are;
+/// any other file must be one that the entry's allowed files name.
 ///
 /// # Errors
 ///
@@ -587,18 +589,19 @@ pub fn is_allowed(patterns: &[String], relative: &str) -> bool {
 pub fn end_compare(
     root: &Path,
     pin: &kr_e2e_m1b::run::RootPin,
-    config: &Path,
+    config: &kr_e2e_m1b::run::PlacedDirectory,
     recipe_files: &[(&str, &[u8])],
     settings_key: &str,
     account: &Account,
 ) -> Result<(), String> {
     let allowed = account.allowed_below_config()?;
-    let directory = kr_e2e_m1b::run::directory_below(root, pin, config)
+    let directory = config
+        .open(root, pin)
         .map_err(|refusal| format!("the configuration directory cannot be compared: {refusal}"))?;
     let mut compare = EndCompare {
         root,
         pin,
-        config,
+        config: config.relative(),
         recipe_files,
         settings_key,
         allowed: &allowed,
@@ -3355,7 +3358,12 @@ mod tests {
     /// bytes and `settings.json` with its key.
     fn configured(name: &str) -> PathBuf {
         let root = scratch(name);
-        let config = root.join("c");
+        filled(&root.join("c"));
+        root
+    }
+
+    /// Puts the recipe's files with their bytes and `settings.json` with its key in `config`.
+    fn filled(config: &Path) {
         for (file, bytes) in RECIPE {
             let path = config.join(file);
             std::fs::create_dir_all(path.parent().expect("a directory")).expect("directories");
@@ -3366,18 +3374,34 @@ mod tests {
             format!(r#"{{"enabledPlugins":{{"{KEY}":true}}}}"#),
         )
         .expect("the settings");
-        root
     }
 
-    /// The end compare of the run's directory `root`, whose configuration directory is `c`, for an
-    /// entry that allows `allowed` below it.
+    /// The configuration directory `c` of the run's directory `root` as it stands now, recorded as
+    /// the run placed it.
+    fn placed(root: &Path) -> kr_e2e_m1b::run::PlacedDirectory {
+        kr_e2e_m1b::run::PlacedDirectory::record(root, &pinned(root), Path::new("c"))
+            .expect("the directory as placed")
+    }
+
+    /// The end compare of the run's directory `root`, whose configuration directory is `c` as it
+    /// stands now, for an entry that allows `allowed` below it.
     fn compared(root: &Path, allowed: &[&str]) -> Result<(), String> {
+        compared_with(root, &placed(root), allowed)
+    }
+
+    /// The end compare of the run's directory `root` against the configuration directory `placed`,
+    /// for an entry that allows `allowed` below it.
+    fn compared_with(
+        root: &Path,
+        placed: &kr_e2e_m1b::run::PlacedDirectory,
+        allowed: &[&str],
+    ) -> Result<(), String> {
         let mut account = account();
         account.allowed = allowed
             .iter()
             .map(|pattern| format!("{{config}}/{pattern}"))
             .collect();
-        end_compare(root, &pinned(root), Path::new("c"), &RECIPE, KEY, &account)
+        end_compare(root, &pinned(root), placed, &RECIPE, KEY, &account)
     }
 
     /// With no allowed set, the recipe's files and the settings with the recipe's key are all the
@@ -3612,12 +3636,37 @@ mod tests {
         )
         .expect("their settings");
         std::fs::write(theirs.join("their-file"), b"x").expect("their file");
+        let kept = placed(&root);
         std::fs::rename(root.join("c"), root.join("c-moved")).expect("moved");
         std::os::unix::fs::symlink(&theirs, root.join("c")).expect("a link");
-        let refused = compared(&root, &[]).expect_err("a link in place of the directory");
+        let refused =
+            compared_with(&root, &kept, &[]).expect_err("a link in place of the directory");
         assert!(
             refused.starts_with("the configuration directory cannot be compared: ")
                 && !refused.contains("their-file"),
+            "{refused}"
+        );
+    }
+
+    /// A directory that stands where the configuration directory was, with the recipe's files and
+    /// key in it, is not the directory the run placed: it is refused, though every file in it is
+    /// as it should be.
+    #[test]
+    fn another_directory_in_the_place_of_the_configuration_directory_is_refused() {
+        let root = configured("end-placed");
+        let kept = placed(&root);
+        assert_eq!(
+            compared_with(&root, &kept, &[]),
+            Ok(()),
+            "the directory as placed"
+        );
+        std::fs::rename(root.join("c"), root.join("c-moved")).expect("moved");
+        std::fs::create_dir(root.join("c")).expect("another directory");
+        filled(&root.join("c"));
+        let refused = compared_with(&root, &kept, &[]).expect_err("another directory");
+        assert!(
+            refused.starts_with("the configuration directory cannot be compared: ")
+                && refused.contains("it is another directory"),
             "{refused}"
         );
     }
