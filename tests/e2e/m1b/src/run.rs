@@ -1677,10 +1677,14 @@ pub(crate) fn one_name(name: &str) -> Result<String, String> {
     Ok(name.to_owned())
 }
 
-/// Opens the directory `relative` below the run's directory `root` by the walk of [`parent_below`]:
+/// Opens the directory `relative` below the run's directory `root` by the walk of `parent_below`:
 /// no link is followed at any component, the last included, and the handle is checked to be what was
 /// looked at and to lie beneath the pinned place.
-pub(crate) fn directory_below(
+///
+/// # Errors
+///
+/// Returns why the path is not a directory of the run.
+pub fn directory_below(
     root: &Path,
     pin: &RootPin,
     relative: &Path,

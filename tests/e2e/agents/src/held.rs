@@ -564,84 +564,192 @@ pub fn is_allowed(patterns: &[String], relative: &str) -> bool {
     })
 }
 
-/// Compares what stands below the run's configuration directory `config` at the end of a part with
-/// what the harness and the agent may have put there: every file is one of the recipe's files
-/// (`recipe_files`, by their path below `config`), or `settings.json` holding exactly the one key
-/// the recipe sets (`settings_key`, in `enabledPlugins`, set to `true`), or one the allowed
-/// patterns name. A link is matched by its name as a file is, and `settings.json` as a link is
-/// not the recipe's.
+/// Compares what stands below the run's configuration directory `config` (a path below the run's
+/// directory `root`, which `pin` names) at the end of a part with what the harness and the agent
+/// may have put there. The directory is reached through the pin and listed through handles, so a
+/// directory that was made a link, or replaced, is refused and nothing is read through it. Every
+/// file is one of the recipe's files (`recipe_files`, each by its path below `config` and the
+/// bytes the recipe wrote), a regular file with one name that holds those bytes, or `settings.json`
+/// as such a file holding exactly the one key the recipe sets (`settings_key`, in
+/// `enabledPlugins`, set to `true`), or one that the entry's allowed files name. The name
+/// `settings.json` and the recipe's names are looked at before any directory is entered, so a
+/// directory by one of them is refused and its contents are not compared. Any other link is
+/// matched by its name as a file is and is not followed.
 ///
 /// # Errors
 ///
-/// Returns a line for each file that is none of these, and for a `settings.json` that holds more
-/// than the key, in the order of their names.
+/// Returns why the entry's allowed files are not ones the harness reads, or why the directory
+/// cannot be compared, or a line for each file that is none of these, in the order of their names.
 pub fn end_compare(
+    root: &Path,
+    pin: &kr_e2e_m1b::run::RootPin,
     config: &Path,
-    recipe_files: &[&str],
+    recipe_files: &[(&str, &[u8])],
     settings_key: &str,
-    allowed: &[String],
+    account: &Account,
 ) -> Result<(), String> {
-    let mut refused = Vec::new();
-    let mut pending = vec![(config.to_path_buf(), String::new())];
-    while let Some((directory, prefix)) = pending.pop() {
-        let entries = match std::fs::read_dir(&directory) {
-            Ok(entries) => entries,
+    let allowed = account.allowed_below_config()?;
+    let directory = kr_e2e_m1b::run::directory_below(root, pin, config)
+        .map_err(|refusal| format!("the configuration directory cannot be compared: {refusal}"))?;
+    let mut compare = EndCompare {
+        root,
+        pin,
+        config,
+        recipe_files,
+        settings_key,
+        allowed: &allowed,
+        refused: Vec::new(),
+        seen: 0,
+    };
+    compare.walk(&directory, "", 0);
+    compare.refused.sort();
+    if compare.refused.is_empty() {
+        Ok(())
+    } else {
+        Err(compare.refused.join("; "))
+    }
+}
+
+/// The state of one [`end_compare`]: what it compares against, and the lines it has to say.
+struct EndCompare<'a> {
+    root: &'a Path,
+    pin: &'a kr_e2e_m1b::run::RootPin,
+    config: &'a Path,
+    recipe_files: &'a [(&'a str, &'a [u8])],
+    settings_key: &'a str,
+    allowed: &'a [String],
+    refused: Vec<String>,
+    seen: usize,
+}
+
+impl EndCompare<'_> {
+    /// Looks at each entry of `directory`, which `prefix` names below the configuration directory,
+    /// and at each directory below it, through handles.
+    fn walk(&mut self, directory: &std::os::fd::OwnedFd, prefix: &str, depth: usize) {
+        use rustix::fs::{AtFlags, FileType};
+        let place = if prefix.is_empty() {
+            "the configuration directory"
+        } else {
+            prefix
+        };
+        if depth > DEEPEST {
+            self.refused
+                .push(format!("{place} is deeper than {DEEPEST} levels"));
+            return;
+        }
+        let names = match names_in(directory) {
+            Ok(names) => names,
             Err(error) => {
-                refused.push(format!("{} cannot be listed: {error}", directory.display()));
-                continue;
+                self.refused
+                    .push(format!("{place} cannot be listed: {error}"));
+                return;
             }
         };
-        for entry in entries {
-            let entry = match entry {
-                Ok(entry) => entry,
-                Err(error) => {
-                    refused.push(format!("{} cannot be listed: {error}", directory.display()));
-                    continue;
-                }
-            };
-            let name = entry.file_name().to_string_lossy().into_owned();
+        for name in names {
+            let text = name.to_string_lossy().into_owned();
             let relative = if prefix.is_empty() {
-                name
+                text
             } else {
-                format!("{prefix}/{name}")
+                format!("{prefix}/{text}")
             };
-            if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
-                pending.push((entry.path(), relative));
-            } else if relative == "settings.json" {
-                if let Err(why) = settings_hold_only(&entry.path(), settings_key) {
-                    refused.push(why);
-                }
-            } else if !recipe_files.contains(&relative.as_str()) && !is_allowed(allowed, &relative)
+            let looked =
+                match rustix::fs::statat(directory, name.as_c_str(), AtFlags::SYMLINK_NOFOLLOW) {
+                    Ok(looked) => looked,
+                    Err(error) => {
+                        self.refused
+                            .push(format!("{relative} cannot be looked at: {error}"));
+                        continue;
+                    }
+                };
+            self.seen += 1;
+            if relative == "settings.json" {
+                self.settings();
+            } else if let Some((_, wrote)) =
+                self.recipe_files.iter().find(|(path, _)| *path == relative)
             {
-                refused.push(format!(
+                self.recipe_file(&relative, wrote);
+            } else if FileType::from_raw_mode(looked.st_mode) == FileType::Directory {
+                match opened_directory(directory, name.as_c_str(), &looked, self.seen) {
+                    Ok(child) => self.walk(&child, &relative, depth + 1),
+                    Err(unlooked) => self
+                        .refused
+                        .push(format!("{relative} cannot be listed: {unlooked}")),
+                }
+            } else if !is_allowed(self.allowed, &relative) {
+                self.refused.push(format!(
                     "{relative} is not one of the recipe's files, and the entry does not allow it"
                 ));
             }
         }
     }
-    refused.sort();
-    if refused.is_empty() {
-        Ok(())
-    } else {
-        Err(refused.join("; "))
+
+    /// The bytes of the regular file `relative` below the configuration directory, with one name,
+    /// read through the pin by [`kr_e2e_m1b::run::open_file_below`]: at most `at_most` of them and
+    /// one more where the file is longer.
+    fn read(&self, relative: &str, at_most: u64) -> Result<Vec<u8>, String> {
+        use std::io::Read as _;
+        match kr_e2e_m1b::run::open_file_below(self.root, self.pin, &self.config.join(relative)) {
+            Ok(Some(file)) => {
+                let mut bytes = Vec::new();
+                std::fs::File::from(file)
+                    .take(at_most + 1)
+                    .read_to_end(&mut bytes)
+                    .map_err(|error| error.to_string())?;
+                Ok(bytes)
+            }
+            Ok(None) => Err("it is not there".to_owned()),
+            Err(refusal) => Err(refusal.to_string()),
+        }
+    }
+
+    /// Whether `settings.json` is a regular file that holds exactly the one key the recipe sets.
+    fn settings(&mut self) {
+        match self.read("settings.json", SETTINGS_AT_MOST) {
+            Err(why) => self.refused.push(format!(
+                "settings.json is not a file of the run's own: {why}"
+            )),
+            Ok(bytes) => {
+                let held: Option<Value> = serde_json::from_slice(&bytes).ok();
+                let key = self.settings_key;
+                if held != Some(json!({ "enabledPlugins": { key: true } })) {
+                    self.refused.push(format!(
+                        "settings.json does not hold exactly the recipe's key {}",
+                        self.settings_key
+                    ));
+                }
+            }
+        }
+    }
+
+    /// Whether the recipe's file `relative` is a regular file that holds the bytes `wrote`.
+    fn recipe_file(&mut self, relative: &str, wrote: &[u8]) {
+        match self.read(relative, wrote.len() as u64) {
+            Err(why) => self
+                .refused
+                .push(format!("{relative} is not a file of the run's own: {why}")),
+            Ok(bytes) if bytes != wrote => self.refused.push(format!(
+                "{relative} does not hold the bytes the recipe wrote"
+            )),
+            Ok(_) => {}
+        }
     }
 }
 
-/// Whether the file `settings` is a regular file that holds exactly the one key the recipe sets.
-fn settings_hold_only(settings: &Path, key: &str) -> Result<(), String> {
-    if !std::fs::symlink_metadata(settings).is_ok_and(|found| found.is_file()) {
-        return Err("settings.json is not a file of the run's own".to_owned());
+/// The most bytes of `settings.json` that the end compare reads.
+const SETTINGS_AT_MOST: u64 = 1 << 20;
+
+/// The names in `directory`, as its handle lists them, in order: no entry is looked at.
+fn names_in(directory: &std::os::fd::OwnedFd) -> Result<Vec<std::ffi::CString>, rustix::io::Errno> {
+    let mut names = Vec::new();
+    for entry in rustix::fs::Dir::read_from(directory)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        if name.to_bytes() != b"." && name.to_bytes() != b".." {
+            names.push(name.to_owned());
+        }
     }
-    let held: Option<Value> = std::fs::read(settings)
-        .ok()
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok());
-    if held == Some(json!({ "enabledPlugins": { key: true } })) {
-        Ok(())
-    } else {
-        Err(format!(
-            "settings.json does not hold exactly the recipe's key {key}"
-        ))
-    }
+    names.sort();
+    Ok(names)
 }
 
 /// What stops a driver, as a class and the words that say it.
@@ -3200,28 +3308,41 @@ mod tests {
         .expect("an account")
     }
 
-    /// The recipe's files below a configuration directory, and the key it sets.
-    const RECIPE: [&str; 2] = ["skills/p/.mcp.json", "skills/p/hooks/hooks.json"];
+    /// The recipe's files below a configuration directory, with the bytes it wrote, and the key it
+    /// sets.
+    const RECIPE: [(&str, &[u8]); 2] = [
+        ("skills/p/.mcp.json", br#"{"servers":1}"#),
+        ("skills/p/hooks/hooks.json", br#"{"hooks":1}"#),
+    ];
     const KEY: &str = "p@skills-dir";
 
-    /// A configuration directory that holds the recipe's files and `settings.json` with its key.
+    /// A run's directory whose configuration directory `c` holds the recipe's files with their
+    /// bytes and `settings.json` with its key.
     fn configured(name: &str) -> PathBuf {
-        let config = scratch(name);
-        for file in RECIPE {
+        let root = scratch(name);
+        let config = root.join("c");
+        for (file, bytes) in RECIPE {
             let path = config.join(file);
             std::fs::create_dir_all(path.parent().expect("a directory")).expect("directories");
-            std::fs::write(path, b"{}").expect("a recipe file");
+            std::fs::write(path, bytes).expect("a recipe file");
         }
         std::fs::write(
             config.join("settings.json"),
             format!(r#"{{"enabledPlugins":{{"{KEY}":true}}}}"#),
         )
         .expect("the settings");
-        config
+        root
     }
 
-    fn patterns(list: &[&str]) -> Vec<String> {
-        list.iter().map(|pattern| (*pattern).to_owned()).collect()
+    /// The end compare of the run's directory `root`, whose configuration directory is `c`, for an
+    /// entry that allows `allowed` below it.
+    fn compared(root: &Path, allowed: &[&str]) -> Result<(), String> {
+        let mut account = account();
+        account.allowed = allowed
+            .iter()
+            .map(|pattern| format!("{{config}}/{pattern}"))
+            .collect();
+        end_compare(root, &pinned(root), Path::new("c"), &RECIPE, KEY, &account)
     }
 
     /// With no allowed set, the recipe's files and the settings with the recipe's key are all the
@@ -3229,20 +3350,21 @@ mod tests {
     #[test]
     fn the_recipes_files_and_its_key_are_all_the_end_compare_finds_below_the_configuration_directory()
      {
-        let config = configured("end-recipe");
-        assert_eq!(end_compare(&config, &RECIPE, KEY, &[]), Ok(()));
+        let root = configured("end-recipe");
+        assert_eq!(compared(&root, &[]), Ok(()));
     }
 
     /// A file that is not the recipe's and that no pattern names is named, and one that a pattern
     /// names is not.
     #[test]
     fn a_file_beyond_the_recipe_and_the_allowed_set_is_named_by_the_end_compare() {
-        let config = configured("end-beyond");
+        let root = configured("end-beyond");
+        let config = root.join("c");
         std::fs::write(config.join(".claude.json"), b"{}").expect("a file");
         std::fs::create_dir_all(config.join("projects/a")).expect("directories");
         std::fs::write(config.join("projects/a/t.jsonl"), b"x").expect("a file");
         assert_eq!(
-            end_compare(&config, &RECIPE, KEY, &patterns(&["projects/**"])),
+            compared(&root, &["projects/**"]),
             Err(
                 ".claude.json is not one of the recipe's files, and the entry does not allow it"
                     .to_owned()
@@ -3251,10 +3373,11 @@ mod tests {
     }
 
     /// A `settings.json` that holds another key, or the recipe's key set to false, is named, and an
-    /// allowed pattern that names it does not excuse it.
+    /// allowed file that names it is refused before any file is compared.
     #[test]
     fn a_settings_file_that_holds_more_than_the_recipes_key_is_named_by_the_end_compare() {
-        let config = configured("end-settings");
+        let root = configured("end-settings");
+        let config = root.join("c");
         for held in [
             format!(r#"{{"enabledPlugins":{{"{KEY}":true,"other@x":true}}}}"#),
             format!(r#"{{"enabledPlugins":{{"{KEY}":false}}}}"#),
@@ -3263,19 +3386,22 @@ mod tests {
         ] {
             std::fs::write(config.join("settings.json"), &held).expect("the settings");
             assert_eq!(
-                end_compare(&config, &RECIPE, KEY, &patterns(&["settings.json"])),
+                compared(&root, &[]),
                 Err(format!(
                     "settings.json does not hold exactly the recipe's key {KEY}"
                 )),
                 "{held}"
             );
         }
+        let refused = compared(&root, &["settings.json"]).expect_err("a pattern that names it");
+        assert!(refused.contains("no entry may allow"), "{refused}");
     }
 
     /// The files a signed-in run writes beside the recipe pass when the entry names them.
     #[test]
     fn a_name_in_the_allowed_set_passes_the_end_compare() {
-        let config = configured("end-allowed");
+        let root = configured("end-allowed");
+        let config = root.join("c");
         for file in [
             ".claude.json",
             "plugins/installed_plugins.json",
@@ -3286,13 +3412,17 @@ mod tests {
             std::fs::create_dir_all(path.parent().expect("a directory")).expect("directories");
             std::fs::write(path, b"{}").expect("a file");
         }
-        let allowed = patterns(&[
+        let allowed = [
             ".claude.json",
             "plugins/installed_plugins.json",
             "plugins/data/p/**",
             "projects/*/s.jsonl",
-        ]);
-        assert_eq!(end_compare(&config, &RECIPE, KEY, &allowed), Ok(()));
+        ];
+        assert_eq!(compared(&root, &allowed), Ok(()));
+    }
+
+    fn patterns(list: &[&str]) -> Vec<String> {
+        list.iter().map(|pattern| (*pattern).to_owned()).collect()
     }
 
     /// A `*` is one name and a last `**` is every file below its directory, and neither is the
@@ -3315,26 +3445,139 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_link_in_the_configuration_directory_is_matched_by_its_name_as_a_file_is() {
-        let config = configured("end-link");
+        let root = configured("end-link");
+        let config = root.join("c");
         let outside = scratch("end-link-outside").join("somewhere");
         std::fs::write(&outside, b"{}").expect("a file outside");
         std::os::unix::fs::symlink(&outside, config.join("link")).expect("a link");
         assert_eq!(
-            end_compare(&config, &RECIPE, KEY, &[]),
+            compared(&root, &[]),
             Err(
                 "link is not one of the recipe's files, and the entry does not allow it".to_owned()
             )
         );
-        assert_eq!(
-            end_compare(&config, &RECIPE, KEY, &patterns(&["link"])),
-            Ok(())
-        );
+        assert_eq!(compared(&root, &["link"]), Ok(()));
         std::fs::remove_file(config.join("settings.json")).expect("the settings go");
         std::os::unix::fs::symlink(&outside, config.join("settings.json")).expect("a link");
-        assert_eq!(
-            end_compare(&config, &RECIPE, KEY, &patterns(&["link"])),
-            Err("settings.json is not a file of the run's own".to_owned())
+        let refused = compared(&root, &["link"]).expect_err("settings.json as a link");
+        assert!(
+            refused.starts_with("settings.json is not a file of the run's own: "),
+            "{refused}"
         );
+    }
+
+    /// The configuration directory is reached through the run's pinned directory: one that was
+    /// made a link to another directory is refused, and nothing in that directory is read or named.
+    #[cfg(unix)]
+    #[test]
+    fn a_configuration_directory_replaced_by_a_link_is_refused_and_nothing_through_it_is_read() {
+        let root = configured("end-root-link");
+        let theirs = scratch("end-root-link-theirs");
+        std::fs::write(
+            theirs.join("settings.json"),
+            format!(r#"{{"enabledPlugins":{{"{KEY}":true}}}}"#),
+        )
+        .expect("their settings");
+        std::fs::write(theirs.join("their-file"), b"x").expect("their file");
+        std::fs::rename(root.join("c"), root.join("c-moved")).expect("moved");
+        std::os::unix::fs::symlink(&theirs, root.join("c")).expect("a link");
+        let refused = compared(&root, &[]).expect_err("a link in place of the directory");
+        assert!(
+            refused.starts_with("the configuration directory cannot be compared: ")
+                && !refused.contains("their-file"),
+            "{refused}"
+        );
+    }
+
+    /// A `settings.json` with a second name is the same file under another one, and is refused
+    /// though it holds the recipe's key.
+    #[cfg(unix)]
+    #[test]
+    fn a_settings_file_with_a_second_name_is_refused_though_it_holds_the_recipes_key() {
+        let root = configured("end-hard");
+        let config = root.join("c");
+        std::fs::hard_link(config.join("settings.json"), root.join("second-name"))
+            .expect("a second name");
+        let refused = compared(&root, &[]).expect_err("a second name");
+        assert!(
+            refused.starts_with("settings.json is not a file of the run's own: ")
+                && refused.contains("more than one name"),
+            "{refused}"
+        );
+    }
+
+    /// A directory named `settings.json` is refused, empty or not, and its contents are not
+    /// compared: the name is the agent's settings file's, and only a file may have it.
+    #[test]
+    fn a_directory_named_settings_json_is_refused_whatever_it_holds() {
+        let root = configured("end-settings-directory");
+        let config = root.join("c");
+        std::fs::remove_file(config.join("settings.json")).expect("the settings go");
+        std::fs::create_dir(config.join("settings.json")).expect("an empty directory");
+        let said = "settings.json is not a file of the run's own: an entry is not the kind of entry the path names";
+        assert_eq!(compared(&root, &[]), Err(said.to_owned()));
+        std::fs::write(config.join("settings.json/inside"), b"x").expect("a file inside");
+        assert_eq!(compared(&root, &[]), Err(said.to_owned()));
+        let refused =
+            compared(&root, &["settings.json/*"]).expect_err("a pattern for its contents");
+        assert!(refused.contains("no entry may allow"), "{refused}");
+    }
+
+    /// Each of the recipe's files is held to a regular file with the bytes the recipe wrote: other
+    /// bytes, a link, a second name and a directory are each refused, and the file is named.
+    #[cfg(unix)]
+    #[test]
+    fn a_recipe_file_that_is_not_a_regular_file_with_the_recipes_bytes_is_refused() {
+        let root = configured("end-recipe-files");
+        let config = root.join("c");
+        let (file, bytes) = RECIPE[0];
+        let place = config.join(file);
+        let outside = scratch("end-recipe-files-outside").join("theirs");
+        std::fs::write(&outside, bytes).expect("a file with the same bytes");
+        // Other bytes.
+        std::fs::write(&place, br#"{"servers":2}"#).expect("other bytes");
+        assert_eq!(
+            compared(&root, &[]),
+            Err(format!("{file} does not hold the bytes the recipe wrote"))
+        );
+        // The same bytes under a link, a second name and a directory.
+        for kind in ["link", "second name", "directory"] {
+            std::fs::remove_file(&place).ok();
+            std::fs::remove_dir_all(&place).ok();
+            match kind {
+                "link" => std::os::unix::fs::symlink(&outside, &place).expect("a link"),
+                "second name" => {
+                    std::fs::write(&place, bytes).expect("the bytes");
+                    std::fs::hard_link(&place, root.join("second-name")).expect("a second name");
+                }
+                _ => {
+                    std::fs::create_dir(&place).expect("a directory");
+                    std::fs::write(place.join("inside"), bytes).expect("a file inside");
+                }
+            }
+            let refused = compared(&root, &[]).expect_err(kind);
+            assert!(
+                refused.starts_with(&format!("{file} is not a file of the run's own: "))
+                    && !refused.contains("inside"),
+                "{kind}: {refused}"
+            );
+            std::fs::remove_file(root.join("second-name")).ok();
+        }
+        // And the file as it was written passes again.
+        std::fs::remove_dir_all(&place).ok();
+        std::fs::write(&place, bytes).expect("the bytes");
+        assert_eq!(compared(&root, &[]), Ok(()));
+    }
+
+    /// An allowed set the harness does not read is refused before any file is compared, so that no
+    /// unchecked list reaches the compare.
+    #[test]
+    fn an_allowed_file_that_could_excuse_a_settings_file_does_not_reach_the_end_compare() {
+        let root = configured("end-unchecked");
+        for broad in ["**", "*", "rules/**"] {
+            let refused = compared(&root, &[broad]).expect_err(broad);
+            assert!(refused.contains("the allowed file"), "{broad}: {refused}");
+        }
     }
 
     #[test]
