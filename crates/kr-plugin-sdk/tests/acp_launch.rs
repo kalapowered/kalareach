@@ -225,8 +225,7 @@ fn kr_req_11_26_a_launch_without_the_launch_grant_is_refused() {
     );
 }
 
-/// KR-REQ-11.26: a launch with no required name, or one that requires a name it does not pass, is
-/// refused.
+/// KR-REQ-11.26: a launch with no required name is refused.
 #[test]
 fn kr_req_11_26_a_launch_with_no_required_name_is_refused() {
     let mut launch = declaration();
@@ -236,6 +235,11 @@ fn kr_req_11_26_a_launch_with_no_required_name_is_refused() {
         FindingCode::AcpLaunchInvalid,
         "names missing: acp_launch lists no required name",
     );
+}
+
+/// KR-REQ-11.26: a launch that requires a name it does not pass is refused.
+#[test]
+fn kr_req_11_26_a_required_name_that_is_not_passed_is_refused() {
     let mut launch = declaration();
     launch["required_names"] = json!(["PATH", "OTHER_KEY"]);
     assert_refused(
@@ -245,10 +249,9 @@ fn kr_req_11_26_a_launch_with_no_required_name_is_refused() {
     );
 }
 
-/// KR-REQ-11.26: a launch with no platform, one the package does not support, or Windows, is
-/// refused.
+/// KR-REQ-11.26: a launch with no platform is refused.
 #[test]
-fn kr_req_11_26_a_launch_on_a_platform_the_package_does_not_list_is_refused() {
+fn kr_req_11_26_a_launch_with_no_platform_is_refused() {
     let mut launch = declaration();
     launch["platforms"] = json!([]);
     assert_refused(
@@ -256,6 +259,11 @@ fn kr_req_11_26_a_launch_on_a_platform_the_package_does_not_list_is_refused() {
         FindingCode::AcpLaunchInvalid,
         "platform: acp_launch lists no platform",
     );
+}
+
+/// KR-REQ-11.26: a launch on Windows is refused, whatever the package supports.
+#[test]
+fn kr_req_11_26_a_launch_on_windows_is_refused() {
     let mut launch = declaration();
     launch["platforms"] = json!(["mac_os", "windows"]);
     assert_refused(
@@ -263,6 +271,11 @@ fn kr_req_11_26_a_launch_on_a_platform_the_package_does_not_list_is_refused() {
         FindingCode::AcpLaunchInvalid,
         "platform: acp_launch lists windows, which has no ACP launch",
     );
+}
+
+/// KR-REQ-11.26: a launch on a platform the package does not support is refused.
+#[test]
+fn kr_req_11_26_a_launch_on_a_platform_the_package_does_not_list_is_refused() {
     let mut manifest = manifest_with(&declaration(), &GRANTS);
     manifest["platforms"] = json!([{"os": "linux", "architectures": ["x86_64"]}]);
     assert_refused(
@@ -283,5 +296,126 @@ fn kr_req_11_26_a_launch_cannot_declare_an_argument() {
         validated.report.has(FindingCode::ManifestUnreadable),
         "{:?}",
         validated.report.findings
+    );
+}
+
+/// KR-REQ-11.26: a command that is no executable of the package's match rules is refused.
+#[test]
+fn kr_req_11_26_a_command_that_the_package_does_not_match_is_refused() {
+    let mut launch = declaration();
+    launch["command"] = json!("other-agent");
+    assert_refused(
+        &manifest_with(&launch, &GRANTS),
+        FindingCode::AcpLaunchInvalid,
+        "the ACP launch's command \"other-agent\" is not the executable name",
+    );
+}
+
+/// KR-REQ-11.26: a name that is not a variable name, and a name only the worker sets, are refused.
+#[test]
+fn kr_req_11_26_a_name_outside_the_contract_is_refused() {
+    let mut launch = declaration();
+    launch["passed_names"] = json!(["PATH", "HOME", "EXAMPLE_API_KEY", "bad name"]);
+    assert_refused(
+        &manifest_with(&launch, &GRANTS),
+        FindingCode::AcpLaunchInvalid,
+        "name: \"bad name\" in passed_names is not a variable name",
+    );
+    let mut launch = declaration();
+    launch["passed_names"] = json!(["PATH", "HOME", "EXAMPLE_API_KEY", "KR_TOKEN"]);
+    assert_refused(
+        &manifest_with(&launch, &GRANTS),
+        FindingCode::AcpLaunchInvalid,
+        "name: \"KR_TOKEN\" in passed_names begins with KR_",
+    );
+    let mut launch = declaration();
+    launch["passed_names"] = json!(["PATH", "HOME", "EXAMPLE_API_KEY", "PATH"]);
+    assert_refused(
+        &manifest_with(&launch, &GRANTS),
+        FindingCode::AcpLaunchInvalid,
+        "name: \"PATH\" is listed more than once in passed_names",
+    );
+}
+
+/// KR-REQ-11.26: a list over the bound is refused.
+#[test]
+fn kr_req_11_26_a_list_over_the_bound_is_refused() {
+    let mut launch = declaration();
+    let names: Vec<String> = (0..65).map(|index| format!("NAME_{index}")).collect();
+    launch["passed_names"] = json!(names);
+    launch["required_names"] = json!(["NAME_0"]);
+    assert_refused(
+        &manifest_with(&launch, &GRANTS),
+        FindingCode::AcpLaunchInvalid,
+        "name: passed_names lists 65 names, over the 64 one list may",
+    );
+}
+
+/// KR-REQ-11.26: a constant that the shell also passes, one set twice, an empty value and a value
+/// that holds a brace beside other text are refused.
+#[test]
+fn kr_req_11_26_a_constant_outside_the_contract_is_refused() {
+    let with_constants = |constants: Value| {
+        let mut launch = declaration();
+        launch["constants"] = constants;
+        manifest_with(&launch, &GRANTS)
+    };
+    assert_refused(
+        &with_constants(json!([{"name": "HOME", "value": "x"}])),
+        FindingCode::AcpLaunchInvalid,
+        "constant: \"HOME\" is both set by KalaReach and passed from the shell",
+    );
+    assert_refused(
+        &with_constants(json!([
+            {"name": "A_ONE", "value": "x"},
+            {"name": "A_ONE", "value": "y"}
+        ])),
+        FindingCode::AcpLaunchInvalid,
+        "constant: \"A_ONE\" is set more than once",
+    );
+    assert_refused(
+        &with_constants(json!([{"name": "A_ONE", "value": ""}])),
+        FindingCode::AcpLaunchInvalid,
+        "constant: the value of \"A_ONE\" is empty",
+    );
+    assert_refused(
+        &with_constants(json!([{"name": "A_ONE", "value": "x{private_home}"}])),
+        FindingCode::AcpLaunchInvalid,
+        "constant: the value of \"A_ONE\" holds a brace",
+    );
+}
+
+/// KR-REQ-11.26: the publisher's words for a launch cannot hold a label the host writes, alone or
+/// where they join the words before them.
+#[test]
+fn kr_req_11_26_launch_words_that_hold_a_label_of_the_host_are_refused() {
+    let mut launch = declaration();
+    launch["grant_statement"] = json!(format!(
+        "Starts the agent. {} nothing",
+        kr_protocol::confirmation::INTEGRATION_STATEMENT_LABEL
+    ));
+    assert_refused(
+        &manifest_with(&launch, &GRANTS),
+        FindingCode::AcpLaunchInvalid,
+        "the ACP launch's statement holds the words the host writes before its own reading of a \
+         command integration",
+    );
+    let label = kr_protocol::confirmation::PLACEMENT_STATEMENT_LABEL;
+    let (start, rest) = label
+        .split_once(' ')
+        .expect("the label has more than one word");
+    let mut manifest = manifest_with(&declaration(), &GRANTS);
+    manifest["command_integration"] = json!({
+        "command": "example-agent",
+        "flags": ["--flag"],
+        "variables": [],
+        "grant_statement": format!("Adds a flag. {start}")
+    });
+    manifest["acp_launch"]["grant_statement"] = json!(format!("{rest} and starts the agent"));
+    assert_refused(
+        &manifest,
+        FindingCode::AcpLaunchInvalid,
+        "the statements of the bridge, the command integration and the ACP launch, read \
+         together, hold the words the host writes before its own reading of a placement",
     );
 }

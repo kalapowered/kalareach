@@ -1587,6 +1587,11 @@ fn check_manifest(
             ));
         }
     }
+    // An ACP launch starts the agent with an environment the package chose and answers what the
+    // agent asks, so it has grants of its own, and what it may declare is closed.
+    if let Some(launch) = &manifest.acp_launch {
+        check_acp_launch(manifest, launch, report);
+    }
     if let Some(attachments) = &manifest.attachments.0 {
         if !manifest.requests(PluginCapability::UpstreamAction) {
             report.push(Finding::at(
@@ -1931,6 +1936,113 @@ fn check_integration_words(
                 format!(
                     "the bridge's statement and the command integration's statement, read \
                      together, hold the words the host writes before its own reading of \
+                     {reading_of}"
+                ),
+            ));
+        }
+    }
+}
+
+/// Checks an ACP launch: the grants it needs, the words the publisher wrote for it, and what the
+/// declaration itself may say.
+fn check_acp_launch(
+    manifest: &PluginManifest,
+    launch: &crate::acp_launch::AcpLaunch,
+    report: &mut Report,
+) {
+    if !manifest.requests(PluginCapability::CommandIntegrationLaunch) {
+        report.push(Finding::at(
+            FindingCode::AcpLaunchWithoutCapability,
+            MANIFEST_FILE,
+            "capability: the package declares acp_launch without requesting \
+             command_integration.launch",
+        ));
+    }
+    let missing: Vec<&str> = [
+        PluginCapability::ApprovalDecode,
+        PluginCapability::ApprovalRespond,
+    ]
+    .into_iter()
+    .filter(|needed| !manifest.requests(*needed))
+    .map(PluginCapability::as_str)
+    .collect();
+    if !missing.is_empty() {
+        report.push(Finding::at(
+            FindingCode::AcpLaunchWithoutCapability,
+            MANIFEST_FILE,
+            format!(
+                "grants missing: the package declares acp_launch and does not request {}",
+                missing.join(" and ")
+            ),
+        ));
+    }
+    check_acp_words(manifest, launch, report);
+    let supported: Vec<crate::matching::OperatingSystem> = manifest
+        .platforms
+        .iter()
+        .map(|support| support.os)
+        .collect();
+    for problem in launch.problems(&manifest.match_rules, &supported) {
+        report.push(Finding::at(
+            FindingCode::AcpLaunchInvalid,
+            MANIFEST_FILE,
+            problem,
+        ));
+    }
+}
+
+/// Checks that an ACP launch's own words hold neither label the host writes, by themselves or read
+/// together with the bridge's words and the command integration's. An owner reads the three as one
+/// run of the publisher's words, ahead of the host's readings, and tells them apart from those by
+/// the labels, so the publisher cannot write them: not in one statement, and not by ending one
+/// statement with the start of a label and beginning the next with the rest of it.
+fn check_acp_words(
+    manifest: &PluginManifest,
+    launch: &crate::acp_launch::AcpLaunch,
+    report: &mut Report,
+) {
+    let words = launch.grant_statement.as_str();
+    let earlier: Vec<&str> = [
+        manifest
+            .native_bridge
+            .0
+            .as_ref()
+            .map(|bridge| bridge.grant_statement.as_str()),
+        manifest
+            .command_integration
+            .as_ref()
+            .map(|declared| declared.grant_statement.as_str()),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    let together = [earlier.as_slice(), &[words]].concat().join(" ");
+    for (label, reading_of) in [
+        (
+            kr_protocol::confirmation::INTEGRATION_STATEMENT_LABEL,
+            "a command integration",
+        ),
+        (
+            kr_protocol::confirmation::PLACEMENT_STATEMENT_LABEL,
+            "a placement",
+        ),
+    ] {
+        if words.contains(label) {
+            report.push(Finding::at(
+                FindingCode::AcpLaunchInvalid,
+                MANIFEST_FILE,
+                format!(
+                    "the ACP launch's statement holds the words the host writes before its own \
+                     reading of {reading_of}"
+                ),
+            ));
+        } else if !earlier.iter().any(|text| text.contains(label)) && together.contains(label) {
+            report.push(Finding::at(
+                FindingCode::AcpLaunchInvalid,
+                MANIFEST_FILE,
+                format!(
+                    "the statements of the bridge, the command integration and the ACP launch, \
+                     read together, hold the words the host writes before its own reading of \
                      {reading_of}"
                 ),
             ));
