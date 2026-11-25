@@ -73,16 +73,11 @@ fn by_hand_case(
     );
 }
 
-/// The package's actions, as its manifest declares them.
-pub(super) fn package_actions(subject: &Subject) -> Vec<Action> {
+/// The actions of the package the host installed for `subject`, as its manifest declares them.
+pub(super) fn package_actions(subject: &Subject, environment: &EnvironmentPaths) -> Vec<Action> {
     let manifest: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(
-            subject
-                .package()
-                .expect("the subject's package")
-                .join("plugin.json"),
-        )
-        .expect("the package's manifest"),
+        &std::fs::read(super::package::installed(subject, environment).join("plugin.json"))
+            .expect("the package's manifest"),
     )
     .expect("a manifest");
     serde_json::from_value(manifest["actions"].clone()).expect("the package's actions")
@@ -216,7 +211,7 @@ fn surface(
     session_id: SessionId,
     shown: &Shown,
 ) -> (Surface, Vec<Reply>) {
-    let upstream: Vec<Action> = package_actions(&ctx.subject)
+    let upstream: Vec<Action> = package_actions(&ctx.subject, session.host.environment())
         .into_iter()
         .filter(Action::upstream)
         .collect();
@@ -627,7 +622,7 @@ fn gateway_under_a_binding_a_supported_action_is_permitted_and_an_unsupported_on
         check_detected(&launched(ctx, &agent), &shown)
             .unwrap_or_else(|why| panic!("the host did not detect the manual launch: {why}"));
         let held = Held::of(&shown).expect("the binding could not be read");
-        let actions = package_actions(&ctx.subject);
+        let actions = package_actions(&ctx.subject, session.host.environment());
         let presentation: Vec<&Action> = actions
             .iter()
             .filter(|action| action.presentation())

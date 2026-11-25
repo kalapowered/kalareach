@@ -70,16 +70,11 @@ fn by_hand_login_case(
     );
 }
 
-/// The package's actions, as its manifest declares them.
-pub(super) fn package_actions(subject: &Subject) -> Vec<Action> {
+/// The actions of the package the host installed for `subject`, as its manifest declares them.
+pub(super) fn package_actions(subject: &Subject, environment: &EnvironmentPaths) -> Vec<Action> {
     let manifest: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(
-            subject
-                .package()
-                .expect("the subject's package")
-                .join("plugin.json"),
-        )
-        .expect("the package's manifest"),
+        &std::fs::read(super::package::installed(subject, environment).join("plugin.json"))
+            .expect("the package's manifest"),
     )
     .expect("a manifest");
     serde_json::from_value(manifest["actions"].clone()).expect("the package's actions")
@@ -296,7 +291,7 @@ fn surface(
     at: &Seated<'_>,
     shown: &Shown,
 ) -> (Surface, Vec<Reply>) {
-    let upstream: Vec<Action> = package_actions(&ctx.subject)
+    let upstream: Vec<Action> = package_actions(&ctx.subject, session.host.environment())
         .into_iter()
         .filter(Action::upstream)
         .collect();

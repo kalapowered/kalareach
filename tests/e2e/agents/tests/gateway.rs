@@ -2205,6 +2205,11 @@ fn subject(session_id: SessionId, instance: ApplicationInstanceId) -> AgentSubje
     }
 }
 
+/// The directory of the generation the stand-in route publishes for `environment`.
+fn generation_source(environment: &EnvironmentPaths) -> PathBuf {
+    environment.state_dir().join("generation-source")
+}
+
 /// Publishes the subject's package in a signed generation of its own, whose index names the digest
 /// of `executable` as the one build it qualifies, and installs and enables it in the environment
 /// with the grants it asks for, as the owner's confirmation of that exact installation does.
@@ -2255,10 +2260,10 @@ async fn install_agent(
             grant,
         )
     } else {
-        let home = environment.state_dir().join("generation-source");
+        let home = generation_source(environment);
         std::fs::create_dir_all(&home).expect("a directory for the generation");
         let (directory, grant) = if let Some(release) = subject.selected_release() {
-            let written = home.join("package");
+            let written = package::written_place(environment);
             let manifest = package::write(subject, release, &written)
                 .unwrap_or_else(|why| panic!("the package written for {plugin}: {why}"));
             (written, package::grant_of(&manifest))

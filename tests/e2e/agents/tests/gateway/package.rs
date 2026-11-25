@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use kr_e2e_agents::build::Build;
 use kr_e2e_agents::detect::check_detected;
 use kr_e2e_agents::subject::Subject;
+use kr_ipc::paths::{EnvironmentPaths, HostPaths};
 use kr_plugin_catalogue::CatalogueError;
 use kr_plugin_sdk::capability::PluginCapability;
 use kr_plugin_sdk::digest::PayloadDigest;
@@ -129,6 +130,29 @@ pub fn grant_of(manifest: &PluginManifest) -> Vec<PluginCapability> {
             .iter()
             .map(|request| request.capability),
     )
+}
+
+/// The directory the stand-in route writes the package of a subject made from a release into, below
+/// the state of the environment that installs it.
+pub fn written_place(environment: &EnvironmentPaths) -> PathBuf {
+    super::generation_source(environment).join("package")
+}
+
+/// The directory of the package the host installed for `subject`: the one written from its release,
+/// or else the package this crate keeps.
+///
+/// # Panics
+///
+/// Panics where the subject has no package.
+pub fn installed(subject: &Subject, environment: &EnvironmentPaths) -> PathBuf {
+    if subject.selected_release().is_some() {
+        written_place(environment)
+    } else {
+        subject
+            .package()
+            .expect("the subject's package")
+            .to_path_buf()
+    }
 }
 
 /// What a synthetic release declares, for the cases that write a package from one.
@@ -635,6 +659,18 @@ fn a_written_package_is_not_installed_with_a_grant_for_a_capability_it_does_not_
     let _ = std::fs::remove_dir_all(&base);
 }
 
+/// An environment of its own below `base`, whose state holds nothing yet.
+fn environment_in(base: &Path) -> EnvironmentPaths {
+    HostPaths::new(base.join("run"), base.join("state"))
+        .expect("absolute host roots")
+        .environment(EnvironmentId::new(kr_ipc::new_uuid()))
+}
+
+/// The identifiers of `actions`, in order.
+fn action_ids(actions: Vec<kr_e2e_agents::build::Action>) -> Vec<String> {
+    actions.into_iter().map(|action| action.id).collect()
+}
+
 /// The actions that the two staged parts read for a subject made from a release are the ones the
 /// release declares, and not the actions of the Codex package this crate keeps.
 #[test]
@@ -642,6 +678,13 @@ fn the_actions_of_a_subject_made_from_a_release_are_the_releases_own() {
     for (plugin, command, shape) in SYNTHETIC {
         let base = scratch("actions");
         let subject = selected_subject(&base.join("release"), plugin, command, shape);
+        let environment = environment_in(&base);
+        write(
+            &subject,
+            &base.join("release"),
+            &written_place(&environment),
+        )
+        .unwrap_or_else(|why| panic!("{plugin}: {why}"));
         let released: PluginManifest = serde_json::from_slice(
             &std::fs::read(base.join("release").join(MANIFEST_FILE)).expect("the release"),
         )
@@ -651,22 +694,61 @@ fn the_actions_of_a_subject_made_from_a_release_are_the_releases_own() {
             .iter()
             .map(|action| action.id.to_string())
             .collect();
-        let ids = |actions: Vec<kr_e2e_agents::build::Action>| -> Vec<String> {
-            actions.into_iter().map(|action| action.id).collect()
-        };
         assert_eq!(
-            ids(super::staged_a::package_actions(&subject)),
+            action_ids(super::staged_a::package_actions(&subject, &environment)),
             declared,
             "{plugin}: staged A"
         );
         assert_eq!(
-            ids(super::staged_c::package_actions(&subject)),
+            action_ids(super::staged_c::package_actions(&subject, &environment)),
             declared,
             "{plugin}: staged C"
         );
         if matches!(shape, Shape::Observed) {
             assert_eq!(declared, ["status.refresh"], "{plugin}");
         }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+}
+
+/// The actions that the two staged parts read are those of the package written from the release,
+/// and a change of the release after the write does not change them.
+#[test]
+fn the_actions_the_staged_parts_read_are_those_of_the_written_package_whatever_its_release_says_later()
+ {
+    for (plugin, command, shape) in SYNTHETIC {
+        let base = scratch("actions-written");
+        let subject = selected_subject(&base.join("release"), plugin, command, shape);
+        let environment = environment_in(&base);
+        let written = write(
+            &subject,
+            &base.join("release"),
+            &written_place(&environment),
+        )
+        .unwrap_or_else(|why| panic!("{plugin}: {why}"));
+        let kept: Vec<String> = written
+            .actions
+            .iter()
+            .map(|action| action.id.to_string())
+            .collect();
+        assert!(!kept.is_empty(), "{plugin}: the release declares an action");
+        let path = base.join("release").join(MANIFEST_FILE);
+        let mut json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).expect("the release's manifest"))
+                .expect("a manifest");
+        json["actions"] = serde_json::json!([]);
+        std::fs::write(&path, serde_json::to_vec_pretty(&json).expect("a manifest"))
+            .expect("the changed release");
+        assert_eq!(
+            action_ids(super::staged_a::package_actions(&subject, &environment)),
+            kept,
+            "{plugin}: staged A reads the written package's actions, not those of the release changed after the write"
+        );
+        assert_eq!(
+            action_ids(super::staged_c::package_actions(&subject, &environment)),
+            kept,
+            "{plugin}: staged C reads the written package's actions, not those of the release changed after the write"
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 }
