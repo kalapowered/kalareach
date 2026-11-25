@@ -16,6 +16,15 @@ const CRASH_CASE: &str = "a_crashed_workers_tree_is_stopped_under_the_platforms_
 const SESSION_CASE: &str =
     "a_session_in_a_service_rests_on_a_control_group_and_a_close_ends_what_left_its_tree";
 const COLLECT_CASE: &str = "supervision::tests::a_transient_unit_whose_process_failed_is_collected";
+const TEARDOWN_CASES: [&str; 6] = [
+    "a_job_registered_for_a_tree_goes_with_it",
+    "a_job_registered_for_another_environment_of_a_tree_goes_with_it",
+    "a_job_registered_for_another_tree_is_left_alone",
+    "a_manager_that_does_not_answer_leaves_the_trees_units_not_established_as_gone",
+    "a_question_the_manager_fails_or_answers_late_is_asked_again_and_leaves_no_unit_behind",
+    "a_unit_the_manager_goes_on_having_is_left_however_often_it_is_asked",
+];
+const PLUGIN_CASE: &str = "a_unit_the_record_does_not_hold_is_gone_when_the_world_ends_badly";
 const MANAGER_ASK: &str = "systemctl --user show --property=Version --value";
 
 /// What each stand-in does: the kernel's name the host reports, whether its user manager answers,
@@ -24,23 +33,32 @@ struct Host {
     kernel: &'static str,
     manager_exit: i32,
     cargo_exit: i32,
-    cargo_prints: String,
+    /// The number of cases cargo says passed, or `None` for as many as the command names after
+    /// `--exact`, which is what cargo says when each name matches a case.
+    cargo_passes: Option<usize>,
 }
 
-/// The result line cargo prints when `passed` cases ran and passed.
-fn result(passed: usize) -> String {
+/// The shell lines of a stand-in `cargo` that prints the result line cargo prints when its cases
+/// ran and passed: `passes` of them, or as many as the command names after `--exact`.
+fn cargo_says(passes: Option<usize>) -> String {
+    let passed = passes.map_or_else(|| "$named".to_owned(), |passes| passes.to_string());
     format!(
-        "running {passed} test\ntest result: ok. {passed} passed; 0 failed; 0 ignored; \
-         0 measured; 33 filtered out; finished in 31.20s\n"
+        "seen=0; named=0\n\
+         for word in \"$@\"; do\n\
+         if [ \"$seen\" = 1 ]; then named=$((named + 1)); elif [ \"$word\" = --exact ]; then seen=1; fi\n\
+         done\n\
+         echo \"running {passed} test\"\n\
+         echo \"test result: ok. {passed} passed; 0 failed; 0 ignored; 0 measured; 33 filtered out; \
+         finished in 31.20s\""
     )
 }
 
-fn a_linux_host(cargo_prints: String) -> Host {
+fn a_linux_host() -> Host {
     Host {
         kernel: "Linux",
         manager_exit: 0,
         cargo_exit: 0,
-        cargo_prints,
+        cargo_passes: None,
     }
 }
 
@@ -62,8 +80,6 @@ fn place(dir: &Path, name: &str, body: &str) {
 fn run(host: &Host) -> (String, Option<i32>, Vec<String>) {
     let dir = tempfile::tempdir().expect("a folder for the stand-ins");
     let calls = dir.path().join("calls");
-    let says = dir.path().join("cargo-says");
-    std::fs::write(&says, &host.cargo_prints).expect("what cargo prints");
     let log = format!("echo \"$(basename \"$0\") $*\" >> '{}'", calls.display());
     place(dir.path(), "uname", &format!("echo {}", host.kernel));
     place(
@@ -74,7 +90,11 @@ fn run(host: &Host) -> (String, Option<i32>, Vec<String>) {
     place(
         dir.path(),
         "cargo",
-        &format!("{log}\ncat '{}'\nexit {}", says.display(), host.cargo_exit),
+        &format!(
+            "{log}\n{}\nexit {}",
+            cargo_says(host.cargo_passes),
+            host.cargo_exit
+        ),
     );
     let output = Command::new("/bin/bash")
         .arg(script())
@@ -103,11 +123,25 @@ fn collect_command() -> String {
     format!("cargo test --locked -p kr-controller --lib -- --ignored --exact {COLLECT_CASE}")
 }
 
+fn teardown_command() -> String {
+    format!(
+        "cargo test --locked -p kr-controller --test teardown_jobs -- --ignored --exact {}",
+        TEARDOWN_CASES.join(" ")
+    )
+}
+
+fn plugin_command() -> String {
+    format!(
+        "cargo test --locked -p kr-controller --test plugin_decoding -- --ignored --exact \
+         {PLUGIN_CASE}"
+    )
+}
+
 #[test]
 fn a_host_that_is_not_linux_is_refused_before_a_service_manager_is_asked() {
     let host = Host {
         kernel: "Darwin",
-        ..a_linux_host(result(1))
+        ..a_linux_host()
     };
     let (text, code, calls) = run(&host);
     assert_eq!(code, Some(2), "{text}");
@@ -119,7 +153,7 @@ fn a_host_that_is_not_linux_is_refused_before_a_service_manager_is_asked() {
 fn an_account_with_no_user_service_manager_fails_the_step_before_any_case_runs() {
     let host = Host {
         manager_exit: 1,
-        ..a_linux_host(result(1))
+        ..a_linux_host()
     };
     let (text, code, calls) = run(&host);
     assert_eq!(code, Some(2), "{text}");
@@ -129,7 +163,7 @@ fn an_account_with_no_user_service_manager_fails_the_step_before_any_case_runs()
 
 #[test]
 fn each_case_runs_by_its_exact_name_and_the_step_passes_when_each_passed() {
-    let (text, code, calls) = run(&a_linux_host(result(1)));
+    let (text, code, calls) = run(&a_linux_host());
     assert_eq!(code, Some(0), "{text}");
     assert_eq!(
         calls,
@@ -137,7 +171,9 @@ fn each_case_runs_by_its_exact_name_and_the_step_passes_when_each_passed() {
             MANAGER_ASK.to_owned(),
             test_command(CRASH_CASE),
             test_command(SESSION_CASE),
-            collect_command()
+            collect_command(),
+            teardown_command(),
+            plugin_command()
         ],
         "{text}"
     );
@@ -145,24 +181,51 @@ fn each_case_runs_by_its_exact_name_and_the_step_passes_when_each_passed() {
 
 #[test]
 fn a_case_that_cargo_filtered_out_fails_the_step_although_cargo_exited_0() {
-    let (text, code, calls) = run(&a_linux_host(result(0)));
+    let host = Host {
+        cargo_passes: Some(0),
+        ..a_linux_host()
+    };
+    let (text, code, calls) = run(&host);
     assert_eq!(code, Some(1), "{text}");
     assert!(
-        text.contains(CRASH_CASE) && text.contains(SESSION_CASE) && text.contains(COLLECT_CASE),
+        text.contains(CRASH_CASE)
+            && text.contains(SESSION_CASE)
+            && text.contains(COLLECT_CASE)
+            && text.contains(TEARDOWN_CASES[0])
+            && text.contains(PLUGIN_CASE),
         "{text}"
     );
-    assert_eq!(calls.len(), 4, "each command ran: {calls:?}");
+    assert_eq!(calls.len(), 6, "each command ran: {calls:?}");
+}
+
+/// The count the script holds a command to is the number of names it gives after `--exact`: a
+/// command that names six cases and passes one fails, and the commands that name one pass.
+#[test]
+fn a_command_that_passed_fewer_cases_than_it_names_fails_the_step() {
+    let host = Host {
+        cargo_passes: Some(1),
+        ..a_linux_host()
+    };
+    let (text, code, calls) = run(&host);
+    assert_eq!(code, Some(1), "{text}");
+    let said = format!(
+        "did not pass the {} case(s) it names after --exact",
+        TEARDOWN_CASES.len()
+    );
+    assert_eq!(text.matches("did not pass").count(), 1, "{text}");
+    assert!(text.contains(&said), "{text}");
+    assert_eq!(calls.len(), 6, "each command ran: {calls:?}");
 }
 
 #[test]
 fn a_failed_case_fails_the_step_and_the_next_command_still_runs() {
     let host = Host {
         cargo_exit: 101,
-        ..a_linux_host(result(1))
+        ..a_linux_host()
     };
     let (text, code, calls) = run(&host);
     assert_eq!(code, Some(1), "{text}");
-    assert_eq!(calls.len(), 4, "each command ran: {calls:?}");
+    assert_eq!(calls.len(), 6, "each command ran: {calls:?}");
 }
 
 /// The script keeps what each command printed in a file `mktemp` makes in the temporary directory,
@@ -174,18 +237,16 @@ fn the_script_keeps_its_count_in_a_temporary_file_and_removes_it_when_it_ends() 
     let temporary = dir.path().join("temporary");
     std::fs::create_dir(&temporary).expect("a temporary directory");
     let during = dir.path().join("during");
-    let says = dir.path().join("cargo-says");
-    std::fs::write(&says, result(1)).expect("what cargo prints");
     place(dir.path(), "uname", "echo Linux");
     place(dir.path(), "systemctl", "exit 0");
     place(
         dir.path(),
         "cargo",
         &format!(
-            "ls '{}' >> '{}'\ncat '{}'",
+            "ls '{}' >> '{}'\n{}",
             temporary.display(),
             during.display(),
-            says.display()
+            cargo_says(None)
         ),
     );
     let output = Command::new("/bin/bash")
@@ -204,8 +265,8 @@ fn the_script_keeps_its_count_in_a_temporary_file_and_removes_it_when_it_ends() 
     let seen = std::fs::read_to_string(&during).unwrap_or_default();
     assert_eq!(
         seen.lines().count(),
-        3,
-        "one file in the temporary directory while each of the three commands ran: {seen:?}"
+        5,
+        "one file in the temporary directory while each of the five commands ran: {seen:?}"
     );
     assert!(
         seen.lines()

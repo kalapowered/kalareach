@@ -57,5 +57,7 @@ step() {
 step cargo test --locked -p kr-worker --test host -- --ignored --exact a_crashed_workers_tree_is_stopped_under_the_platforms_service_manager
 step cargo test --locked -p kr-worker --test host -- --ignored --exact a_session_in_a_service_rests_on_a_control_group_and_a_close_ends_what_left_its_tree
 step cargo test --locked -p kr-controller --lib -- --ignored --exact supervision::tests::a_transient_unit_whose_process_failed_is_collected
+step cargo test --locked -p kr-controller --test teardown_jobs -- --ignored --exact a_job_registered_for_a_tree_goes_with_it a_job_registered_for_another_environment_of_a_tree_goes_with_it a_job_registered_for_another_tree_is_left_alone a_manager_that_does_not_answer_leaves_the_trees_units_not_established_as_gone a_question_the_manager_fails_or_answers_late_is_asked_again_and_leaves_no_unit_behind a_unit_the_manager_goes_on_having_is_left_however_often_it_is_asked
+step cargo test --locked -p kr-controller --test plugin_decoding -- --ignored --exact a_unit_the_record_does_not_hold_is_gone_when_the_world_ends_badly
 
 exit "$failed"
