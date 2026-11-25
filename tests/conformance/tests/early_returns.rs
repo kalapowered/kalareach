@@ -227,6 +227,11 @@ const ALLOWED: &[Allowed] = &[
         said: "stand-in: ",
         reason: "the stand-in program's own error line before it ends",
     },
+    Allowed {
+        path: "tests/support/codex-stand-in/tests/common/mod.rs",
+        said: "{} is not removed: {error}",
+        reason: "the helper says which folder it could not remove after its bounded wait and returns, and no case depends on the line",
+    },
 ];
 
 fn repository() -> PathBuf {
