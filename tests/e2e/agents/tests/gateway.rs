@@ -1916,7 +1916,9 @@ impl Context {
     }
 
     /// A host whose catalogue holds the package installed and whose configuration turns its
-    /// integration on, with the address devices dial kept across a restart of its daemon.
+    /// integration on, with the address devices dial kept across a restart of its daemon. A case
+    /// of the claude-code recipe gets its host from [`claude_recipe::host`] instead, which turns
+    /// the integration on only where the variant types the command, and keeps no address.
     fn host(&self) -> Host<'_> {
         if self.claude_code.is_some() {
             assert!(

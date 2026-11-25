@@ -5,8 +5,8 @@
 //! one the repository bundles, published in a signed generation of the case's own whose index names
 //! the digest of the one build it qualifies. The host makes the directory the recipe is written in
 //! before its daemon starts and gives the daemon a search path that holds that program and no other
-//! `claude`. Nothing here starts an agent or a forwarder, and nothing reads or writes the
-//! person's own `~/.claude`.
+//! `claude`. Nothing here starts a forwarder, and nothing reads or writes the person's own
+//! `~/.claude`. The cases that type `claude` start the stand-in under that name.
 
 use super::*;
 
@@ -366,6 +366,28 @@ fn forwarders(ctx: &Context) -> Vec<String> {
         .collect()
 }
 
+/// Nothing of the recipe is in place: no file beside the person's settings, the settings are the
+/// bytes they were, no forwarder runs, and the doctor says the bridge was refused.
+fn assert_nothing_was_applied(ctx: &Context, host: &Host<'_>) {
+    let configuration = ctx.run.home().join(CLAUDE_CONFIGURATION);
+    assert_eq!(
+        files_below(&configuration),
+        ["settings.json"],
+        "nothing was written beside the person's settings"
+    );
+    assert_eq!(
+        std::fs::read_to_string(configuration.join("settings.json")).expect("the settings"),
+        SEEDED_SETTINGS,
+        "the person's settings are the bytes they were"
+    );
+    assert_eq!(forwarders(ctx), Vec::<String>::new(), "no forwarder runs");
+    let said = bridges_said(host);
+    assert!(
+        said.contains(REFUSED),
+        "the doctor says the bridge was refused: {said}"
+    );
+}
+
 /// The recipe is in place below the run's home: exactly its three files beside the person's
 /// settings, the one key set and every other setting as it was, and the registration names the
 /// forwarder the host placed.
@@ -434,47 +456,23 @@ fn gateway_claude_recipe_a_stand_in_no_record_names_writes_nothing_and_starts_no
         names_another: true,
         ..Variant::default()
     };
-    in_a_host("claude-recipe-unnamed", &variant, |ctx, host| {
-        let configuration = ctx.run.home().join(CLAUDE_CONFIGURATION);
-        assert_eq!(
-            files_below(&configuration),
-            ["settings.json"],
-            "nothing was written beside the person's settings"
-        );
-        assert_eq!(
-            std::fs::read_to_string(configuration.join("settings.json")).expect("the settings"),
-            SEEDED_SETTINGS,
-            "the person's settings are the bytes they were"
-        );
-        assert_eq!(forwarders(ctx), Vec::<String>::new(), "no forwarder runs");
-        let said = bridges_said(host);
-        assert!(
-            said.contains(REFUSED),
-            "the doctor says the bridge was refused: {said}"
-        );
-    });
+    in_a_host(
+        "claude-recipe-unnamed",
+        &variant,
+        assert_nothing_was_applied,
+    );
 }
 
-/// A stand-in that is a script is refused though a record names its digest: nothing is written.
+/// A stand-in that is a script is refused though a record names its digest: nothing is written, the
+/// person's settings are the bytes they were, no forwarder runs, and the doctor says the bridge was
+/// refused.
 #[test]
 fn gateway_claude_recipe_a_stand_in_that_is_a_script_is_refused() {
     let variant = Variant {
         script: true,
         ..Variant::default()
     };
-    in_a_host("claude-recipe-script", &variant, |ctx, host| {
-        let configuration = ctx.run.home().join(CLAUDE_CONFIGURATION);
-        assert_eq!(
-            files_below(&configuration),
-            ["settings.json"],
-            "nothing was written beside the person's settings"
-        );
-        let said = bridges_said(host);
-        assert!(
-            said.contains(REFUSED),
-            "the doctor says the bridge was refused: {said}"
-        );
-    });
+    in_a_host("claude-recipe-script", &variant, assert_nothing_was_applied);
 }
 
 /// The variable a session is given for Claude Code's configuration directory names the directory
