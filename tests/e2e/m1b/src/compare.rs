@@ -26,7 +26,7 @@ use std::path::{Path, PathBuf};
 
 use kr_ipc::paths::EnvironmentPaths;
 
-use crate::tree::{Change, Kind, Record};
+use crate::tree::{APPLICATION_ROOT, Change, Kind, PROGRAMS_ROOT, Record};
 
 /// Where the host's directories are, relative to the run's directory.
 #[derive(Clone, Debug)]
@@ -35,6 +35,10 @@ pub struct Layout {
     pub runtime_dir: PathBuf,
     /// The state directory of the environment (`--state-dir`, `environments` and its name).
     pub state_dir: PathBuf,
+    /// The directory that holds the programs the run placed (b).
+    pub programs: PathBuf,
+    /// The application directory of the run's home (h/.claude), where the agent's own files live.
+    pub application: PathBuf,
 }
 
 impl Layout {
@@ -53,6 +57,8 @@ impl Layout {
         Self {
             runtime_dir: below(environment.runtime_dir()),
             state_dir: below(environment.state_dir()),
+            programs: PathBuf::from(PROGRAMS_ROOT),
+            application: PathBuf::from(APPLICATION_ROOT),
         }
     }
 }
@@ -442,9 +448,28 @@ pub fn compare(
     }
     let mut refusals = Vec::new();
     for (path, changes) in by_path {
-        let said = match rows.iter().find(|row| row.covers(path)) {
-            None => Some("no row of the live daemon's files covers this entry".to_owned()),
-            Some(row) => row.refuses(&changes, interval, uid),
+        let said = if path.starts_with(&layout.programs) {
+            Some(
+                "the run's programs may not change: no name is added, and no program is changed, \
+                 replaced or removed"
+                    .to_owned(),
+            )
+        } else if path.starts_with(&layout.application) {
+            // The agent makes its own files there, so a name it adds is not looked at; an entry the
+            // record holds must stay as it is.
+            changes
+                .iter()
+                .any(|change| !matches!(change, Change::Added { .. }))
+                .then(|| {
+                    "an entry of the application directory that the record holds may not change; \
+                     names added beside it are not looked at"
+                        .to_owned()
+                })
+        } else {
+            match rows.iter().find(|row| row.covers(path)) {
+                None => Some("no row of the live daemon's files covers this entry".to_owned()),
+                Some(row) => row.refuses(&changes, interval, uid),
+            }
         };
         if let Some(why) = said {
             let lines: Vec<String> = changes.iter().map(ToString::to_string).collect();
@@ -492,7 +517,9 @@ mod tests {
         ));
         std::fs::create_dir_all(root.join("r")).expect("a runtime root");
         std::fs::create_dir_all(root.join("s")).expect("a state root");
-        for name in ["r", "s"] {
+        std::fs::create_dir_all(root.join("b")).expect("the programs");
+        std::fs::create_dir_all(root.join("h")).expect("the run's home");
+        for name in ["r", "s", "b", "h"] {
             std::fs::set_permissions(root.join(name), std::fs::Permissions::from_mode(0o700))
                 .expect("owner only");
         }
@@ -528,7 +555,7 @@ mod tests {
         }
 
         fn record(&self) -> Record {
-            Record::of(&self.root, &self.pin, &["r", "s"]).expect("a record")
+            Record::of(&self.root, &self.pin, &["r", "s", "b"], &["h/.claude"]).expect("a record")
         }
 
         /// What the compare refuses between `before` and the tree now, one line each.
@@ -849,6 +876,113 @@ mod tests {
         std::fs::write(&identity, b"another identity").expect("what the agent wrote");
         let refused = world.refused(&before, LATER_KILL);
         only(&refused, "environment-id: the bytes changed");
+        world.clean();
+    }
+
+    /// The programs the run placed may not change at any interval: a replaced worker or
+    /// controller, a changed byte, another mode, a file added to `b/` or beside the plugin host,
+    /// and a program removed are refused.
+    #[test]
+    fn a_change_to_the_run_programs_is_refused_at_every_interval() {
+        enum Act {
+            Replace,
+            Rewrite,
+            Add,
+            AddBelow,
+            Remove,
+            Chmod,
+        }
+        let acts = [
+            ("a replaced worker", "kr-worker", Act::Replace),
+            ("a replaced controller", "kr-controller", Act::Replace),
+            ("a rewritten program", "kr-worker", Act::Rewrite),
+            ("a file added to b/", "added", Act::Add),
+            (
+                "a file added below the plugin host",
+                "kr-plugin-host",
+                Act::AddBelow,
+            ),
+            ("a removed program", "kr-worker", Act::Remove),
+            ("another mode", "kr-controller", Act::Chmod),
+        ];
+        for (label, name, act) in acts {
+            let world = world("programs");
+            let path = world.root.join("b").join(name);
+            if !matches!(act, Act::Add | Act::AddBelow) {
+                world.put(&path, b"program");
+            }
+            if matches!(act, Act::AddBelow) {
+                world.put(&path.join("inside"), b"program");
+            }
+            let before = world.record();
+            match act {
+                Act::Replace => world.replace(&path, b"program"),
+                Act::Rewrite => std::fs::write(&path, b"changed").expect("rewritten"),
+                Act::Add => world.put(&path, b"added"),
+                Act::AddBelow => world.put(&path.join("added"), b"added"),
+                Act::Remove => std::fs::remove_file(&path).expect("removed"),
+                Act::Chmod => {
+                    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                        .expect("another mode")
+                }
+            }
+            for interval in [KILL, LATER_KILL, ATTEMPT] {
+                let refused = world.refused(&before, interval);
+                assert!(
+                    !refused.is_empty()
+                        && refused.iter().all(|line| line.contains(
+                            "the run's programs may not change: no name is added, and no \
+                             program is changed, replaced or removed"
+                        )),
+                    "{label}, {interval:?}: {refused:#?}"
+                );
+            }
+            world.clean();
+        }
+    }
+
+    /// In the application directory a recorded entry that changed or is gone is refused, and a name
+    /// the agent adds is not looked at.
+    #[test]
+    fn a_recorded_entry_of_the_application_directory_may_not_change_and_a_new_name_may_appear() {
+        let world = world("application");
+        let directory = world.root.join("h/.claude");
+        world.put(&directory.join("recipe/settings.json"), b"recipe");
+        world.put(&directory.join("kept"), b"kept");
+        let before = world.record();
+        world.put(&directory.join("projects/transcript"), b"the agent's own");
+        world.put(&directory.join("recipe/added"), b"added");
+        for interval in [KILL, LATER_KILL, ATTEMPT] {
+            assert_eq!(world.refused(&before, interval), Vec::<String>::new());
+        }
+        let said = "an entry of the application directory that the record holds may not change; \
+                    names added beside it are not looked at";
+        std::fs::write(directory.join("recipe/settings.json"), b"changed").expect("rewritten");
+        only(&world.refused(&before, KILL), said);
+        world.replace(&directory.join("recipe/settings.json"), b"recipe");
+        only(
+            &world.refused(&before, ATTEMPT),
+            "another object of the same kind",
+        );
+        std::fs::remove_file(directory.join("kept")).expect("removed");
+        let refused = world.refused(&before, LATER_KILL);
+        assert_eq!(refused.len(), 2, "{refused:#?}");
+        assert!(
+            refused.iter().all(|line| line.ends_with(said)),
+            "{refused:#?}"
+        );
+        // Without an application directory at the record, one the agent makes is only added names.
+        let world_without = self::world("application-absent");
+        let before = world_without.record();
+        world_without.put(
+            &world_without.root.join("h/.claude/settings.json"),
+            b"the agent's own",
+        );
+        assert_eq!(
+            world_without.refused(&before, ATTEMPT),
+            Vec::<String>::new()
+        );
+        world_without.clean();
         world.clean();
     }
 

@@ -25,6 +25,24 @@ use rustix::io::Errno;
 
 use crate::run::RootPin;
 
+/// The directory of the run that holds the host's runtime directory (`--runtime-dir`).
+pub const RUNTIME_ROOT: &str = "r";
+
+/// The directory of the run that holds the host's state directory (`--state-dir`).
+pub const STATE_ROOT: &str = "s";
+
+/// The directory that holds the programs the run placed.
+pub const PROGRAMS_ROOT: &str = "b";
+
+/// The application directory of the run's home, where the agent's own files live.
+pub const APPLICATION_ROOT: &str = "h/.claude";
+
+/// The roots every record holds.
+pub const REQUIRED_ROOTS: [&str; 3] = [RUNTIME_ROOT, STATE_ROOT, PROGRAMS_ROOT];
+
+/// The roots a record holds where they are there.
+pub const OPTIONAL_ROOTS: [&str; 1] = [APPLICATION_ROOT];
+
 /// The kind of an entry, as the walk tells them apart.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
@@ -294,20 +312,28 @@ pub struct Record {
 }
 
 impl Record {
-    /// Records the roots `below` of the run's directory `root`: each root and everything below it.
+    /// Records the roots of the run's directory `root`: each root and everything below it. The
+    /// `required` roots must be there; an `optional` root is recorded where it is, and is no entry
+    /// where it is not.
     ///
-    /// `root` must be the directory `pin` names. A root is looked at with no link followed, opened
-    /// through the handle of `root`, and checked to lie beneath the pinned place. An entry that is
-    /// removed between the listing of its directory and the look at it is not recorded, since the
-    /// live daemon removes its staging files as the walk goes.
+    /// `root` must be the directory `pin` names. A root name may have several components
+    /// (`h/.claude`): each is looked at with no link followed, opened through the handle of the one
+    /// before, checked to lie beneath the pinned place, and recorded as an entry of its own. An
+    /// entry that is removed between the listing of its directory and the look at it is not
+    /// recorded, since the live daemon removes its staging files as the walk goes.
     ///
     /// # Errors
     ///
     /// Returns why the tree cannot be recorded: the run's directory is not the one that was
-    /// pinned, a root is absent or is not a directory, an entry lies on another file system, an
-    /// entry cannot be listed, opened or read, or an entry was another one when it was opened than
-    /// when it was looked at.
-    pub fn of(root: &Path, pin: &RootPin, below: &[&str]) -> Result<Self, String> {
+    /// pinned, a required root is absent, a root or a component of one is not a directory, an
+    /// entry lies on another file system, an entry cannot be listed, opened or read, or an entry
+    /// was another one when it was opened than when it was looked at.
+    pub fn of(
+        root: &Path,
+        pin: &RootPin,
+        required: &[&str],
+        optional: &[&str],
+    ) -> Result<Self, String> {
         let handle = rustix::fs::open(
             root,
             OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
@@ -321,26 +347,12 @@ impl Record {
             .map_err(|error| format!("the run's directory cannot be looked at: {error}"))?
             .st_dev;
         let mut entries = BTreeMap::new();
-        for name in below {
-            let looked = rustix::fs::statat(&handle, *name, AtFlags::SYMLINK_NOFOLLOW)
-                .map_err(|error| format!("{name} cannot be looked at: {error}"))?;
-            if FileType::from_raw_mode(looked.st_mode) != FileType::Directory {
-                return Err(format!("{name} is not a directory of the run"));
-            }
-            if looked.st_dev != device {
-                return Err(format!("{name} is on another file system than the run's"));
-            }
-            let child = open_directory_at(&handle, *name, &looked)
-                .map_err(|why| format!("{name} {why}"))?
-                .ok_or_else(|| format!("{name} is gone"))?;
-            if !pin.contains(&child) {
-                return Err(format!("{name} is not beneath the run's directory"));
-            }
-            entries.insert(
-                PathBuf::from(name),
-                entry_of(&looked, Kind::Directory, 0, None, None),
-            );
-            walk(&child, Path::new(name), device, &mut entries)?;
+        let names = required
+            .iter()
+            .map(|name| (*name, false))
+            .chain(optional.iter().map(|name| (*name, true)));
+        for (name, optional) in names {
+            record_root(&handle, device, pin, name, optional, &mut entries)?;
         }
         Ok(Self { entries })
     }
@@ -402,6 +414,66 @@ fn entry_of(
         mode: looked.st_mode & 0o7777,
         target,
     }
+}
+
+/// Records the root `name` of the run's directory `handle` and everything below it: each
+/// component of the name is an entry of its own, and the last is walked. An `optional` root that is
+/// not there is no entry.
+fn record_root(
+    handle: &OwnedFd,
+    device: rustix::fs::Dev,
+    pin: &RootPin,
+    name: &str,
+    optional: bool,
+    entries: &mut BTreeMap<PathBuf, Entry>,
+) -> Result<(), String> {
+    let mut current: Option<OwnedFd> = None;
+    let mut relative = PathBuf::new();
+    for component in name.split('/') {
+        relative.push(component);
+        let directory = current.as_ref().unwrap_or(handle);
+        let looked = match rustix::fs::statat(directory, component, AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(looked) => looked,
+            Err(Errno::NOENT) if optional => return Ok(()),
+            Err(error) => {
+                return Err(format!(
+                    "{} cannot be looked at: {error}",
+                    relative.display()
+                ));
+            }
+        };
+        if FileType::from_raw_mode(looked.st_mode) != FileType::Directory {
+            return Err(format!(
+                "{} is not a directory of the run",
+                relative.display()
+            ));
+        }
+        if looked.st_dev != device {
+            return Err(format!(
+                "{} is on another file system than the run's",
+                relative.display()
+            ));
+        }
+        let child = match open_directory_at(directory, component, &looked) {
+            Ok(Some(child)) => child,
+            Ok(None) if optional => return Ok(()),
+            Ok(None) => return Err(format!("{} is gone", relative.display())),
+            Err(why) => return Err(format!("{} {why}", relative.display())),
+        };
+        if !pin.contains(&child) {
+            return Err(format!(
+                "{} is not beneath the run's directory",
+                relative.display()
+            ));
+        }
+        entries.insert(
+            relative.clone(),
+            entry_of(&looked, Kind::Directory, 0, None, None),
+        );
+        current = Some(child);
+    }
+    let last = current.ok_or_else(|| "a root has no name".to_owned())?;
+    walk(&last, &relative, device, entries)
 }
 
 /// Opens the directory `name` in `directory` with no link followed, and checks it to be the
@@ -561,7 +633,7 @@ mod tests {
     }
 
     fn record(root: &Path, pin: &RootPin) -> Record {
-        Record::of(root, pin, &["r", "s"]).expect("a record")
+        Record::of(root, pin, &["r", "s"], &[]).expect("a record")
     }
 
     /// Each change is said in one line that names the entry and what is found of it.
@@ -877,14 +949,14 @@ mod tests {
         std::fs::create_dir_all(&outside).expect("a directory outside the roots");
         std::fs::remove_dir_all(root.join("s")).expect("removed");
         std::os::unix::fs::symlink(&outside, root.join("s")).expect("a link at the root");
-        let why = Record::of(&root, &pin, &["r", "s"]).expect_err("a link is no root");
+        let why = Record::of(&root, &pin, &["r", "s"], &[]).expect_err("a link is no root");
         assert!(why.contains("s is not a directory of the run"), "{why}");
         std::fs::remove_file(root.join("s")).expect("removed");
         write(&root.join("s"), b"a file");
-        let why = Record::of(&root, &pin, &["r", "s"]).expect_err("a file is no root");
+        let why = Record::of(&root, &pin, &["r", "s"], &[]).expect_err("a file is no root");
         assert!(why.contains("s is not a directory of the run"), "{why}");
         std::fs::remove_file(root.join("s")).expect("removed");
-        let why = Record::of(&root, &pin, &["r", "s"]).expect_err("an absent root");
+        let why = Record::of(&root, &pin, &["r", "s"], &[]).expect_err("an absent root");
         assert!(why.starts_with("s cannot be looked at"), "{why}");
         std::fs::create_dir(root.join("s")).expect("a root again");
         let moved = root.with_file_name(format!(
@@ -894,10 +966,55 @@ mod tests {
         std::fs::rename(&root, &moved).expect("the run's directory moved");
         std::fs::create_dir_all(root.join("s")).expect("a directory in its place");
         std::fs::create_dir_all(root.join("r")).expect("a directory in its place");
-        let why = Record::of(&root, &pin, &["r", "s"]).expect_err("another directory");
+        let why = Record::of(&root, &pin, &["r", "s"], &[]).expect_err("another directory");
         assert!(why.contains("is not the directory the run made"), "{why}");
         clean(&root);
         clean(&moved);
+    }
+
+    /// A root with several components records each component and walks the last; an optional root
+    /// that is not there is no entry, and one that is there is recorded whole.
+    #[test]
+    fn a_nested_root_is_recorded_component_by_component_and_an_optional_root_may_be_absent() {
+        let (root, pin) = run_directory("nested");
+        let both = |root: &Path, pin: &RootPin| {
+            Record::of(root, pin, &["r", "s"], &["h/.app"]).expect("a record")
+        };
+        let absent = both(&root, &pin);
+        assert!(
+            absent.get(Path::new("h")).is_none(),
+            "{:?}",
+            absent.entries().count()
+        );
+        write(&root.join("h/.app/recipe"), b"recipe");
+        write(&root.join("h/other/file"), b"not under the root");
+        let held = both(&root, &pin);
+        assert_eq!(
+            held.get(Path::new("h")).map(|entry| entry.kind),
+            Some(Kind::Directory)
+        );
+        assert_eq!(
+            held.get(Path::new("h/.app")).map(|entry| entry.kind),
+            Some(Kind::Directory)
+        );
+        assert_eq!(
+            held.get(Path::new("h/.app/recipe")).map(|entry| entry.size),
+            Some(6)
+        );
+        assert!(
+            held.get(Path::new("h/other")).is_none(),
+            "only the root's own components and what is below it"
+        );
+        // A required root with several components is an error where it is not there, and a
+        // component of a root that is a link is no directory of the run.
+        let why = Record::of(&root, &pin, &["r", "s", "h/.missing"], &[])
+            .expect_err("a required root that is absent");
+        assert!(why.starts_with("h/.missing cannot be looked at"), "{why}");
+        std::fs::remove_dir_all(root.join("h")).expect("removed");
+        std::os::unix::fs::symlink(root.join("s"), root.join("h")).expect("a link at a component");
+        let why = Record::of(&root, &pin, &["r", "s"], &["h/.app"]).expect_err("a link");
+        assert!(why.contains("h is not a directory of the run"), "{why}");
+        clean(&root);
     }
 
     /// A file the walk cannot read and an entry on no file system of the run fail the record: the
@@ -915,7 +1032,7 @@ mod tests {
             std::fs::Permissions::from_mode(0o000),
         )
         .expect("no access");
-        let why = Record::of(&root, &pin, &["r", "s"]).expect_err("an unreadable file");
+        let why = Record::of(&root, &pin, &["r", "s"], &[]).expect_err("an unreadable file");
         assert!(why.starts_with("s/secret cannot be read"), "{why}");
         std::fs::set_permissions(
             root.join("s/secret"),

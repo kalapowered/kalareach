@@ -34,16 +34,10 @@ use crate::run::{
     HARNESS_PROGRAM, Run, binary_place, ended_within, output_within, processes_under,
     read_tail_below, running, signal, socket_below, worker_session,
 };
-use crate::tree::{Entry, Record};
+use crate::tree::{Entry, OPTIONAL_ROOTS, REQUIRED_ROOTS, RUNTIME_ROOT, Record, STATE_ROOT};
 
 /// The daemon's log, in the run's directory.
 const DAEMON_LOG: &str = "controller.log";
-
-/// The directory of the run that holds the host's runtime directory (`--runtime-dir`).
-const RUNTIME_ROOT: &str = "r";
-
-/// The directory of the run that holds the host's state directory (`--state-dir`).
-const STATE_ROOT: &str = "s";
 
 /// How long the daemon is given to stop once it has been interrupted.
 const DAEMON_STOP: Duration = Duration::from_secs(20);
@@ -318,6 +312,47 @@ fn survey_watches(path: &Path) -> bool {
             Some("output-times" | "sessions")
         )
     })
+}
+
+/// Waits after a kill for what the survey watches to stand still: the time `timing` gives for the
+/// wait, then looks `timing.apart` apart until two looks agree. Returns the time after the kill at
+/// which two looks agreed, or `None` where the bound passed first.
+fn wait_for_standing_still(
+    timing: SurveyTiming,
+    killed: Instant,
+    mut view: impl FnMut() -> Option<Vec<(PathBuf, Entry)>>,
+) -> Option<Duration> {
+    std::thread::sleep(timing.after_the_kill.saturating_sub(killed.elapsed()));
+    let mut before = view();
+    loop {
+        std::thread::sleep(timing.apart);
+        let after = view();
+        if before.is_some() && before == after {
+            return Some(killed.elapsed());
+        }
+        if killed.elapsed() >= timing.at_most {
+            return None;
+        }
+        before = after;
+    }
+}
+
+/// What the survey says of the wait: that the watched files stood still, or that they did not and
+/// the list is incomplete.
+fn standing_still_said(timing: SurveyTiming, stood_still: Option<Duration>) -> String {
+    match stood_still {
+        Some(at) => format!(
+            "the files of the index and the journals stood still {} s after the kill; whether the \
+             worker's maintenance pass completed was not observed",
+            at.as_secs()
+        ),
+        None => format!(
+            "the files of the index and the journals did not stand still within {} s after the \
+             kill, so this list is incomplete; whether the worker's maintenance pass completed was \
+             not observed",
+            timing.at_most.as_secs()
+        ),
+    }
 }
 
 /// What a host holds of a restart: what the case declared and the record made when its agent
@@ -636,7 +671,7 @@ impl<'r> Host<'r> {
             if !records || restarts.record.is_some() {
                 return;
             }
-            Record::of(self.run.root(), self.run.pin(), &[RUNTIME_ROOT, STATE_ROOT]).map(|record| {
+            self.record().map(|record| {
                 restarts.record = Some(record);
             })
         };
@@ -645,6 +680,17 @@ impl<'r> Host<'r> {
             eprintln!("{said}");
             std::panic::resume_unwind(Box::new(LegNotRun(said)));
         }
+    }
+
+    /// The record of the run's tree as it stands: the host's two roots, the run's programs and the
+    /// application directory of the run's home where it exists.
+    fn record(&self) -> Result<Record, String> {
+        Record::of(
+            self.run.root(),
+            self.run.pin(),
+            &REQUIRED_ROOTS,
+            &OPTIONAL_ROOTS,
+        )
     }
 
     /// Says how the case restarts the daemon after its agent has started. A case calls it before
@@ -1161,7 +1207,7 @@ impl<'r> Host<'r> {
         restarts.survey.kills += 1;
         let kill = restarts.survey.kills;
         let killed = Instant::now();
-        match Record::of(self.run.root(), self.run.pin(), &[RUNTIME_ROOT, STATE_ROOT]) {
+        match self.record() {
             Ok(now) => {
                 let changes = start.changes_to(&now);
                 let lines = changes
@@ -1203,22 +1249,10 @@ impl<'r> Host<'r> {
             )
         };
         let stood_still = self.survey_waits(timing, killed);
-        let lines = match Record::of(self.run.root(), self.run.pin(), &[RUNTIME_ROOT, STATE_ROOT]) {
+        let lines = match self.record() {
             Ok(now) => {
                 let changes = at_the_kill.changes_to(&now);
-                let state = match stood_still {
-                    Some(at) => format!(
-                        "the files of the index and the journals stood still {} s after the kill; \
-                         whether the worker's maintenance pass completed was not observed",
-                        at.as_secs()
-                    ),
-                    None => format!(
-                        "the files of the index and the journals did not stand still within {} s \
-                         after the kill, so this list is incomplete; whether the worker's \
-                         maintenance pass completed was not observed",
-                        timing.at_most.as_secs()
-                    ),
-                };
+                let state = standing_still_said(timing, stood_still);
                 let mut lines: Vec<String> = changes
                     .iter()
                     .map(|change| format!("survey: kill {kill}, before the attempt: {change}"))
@@ -1245,26 +1279,13 @@ impl<'r> Host<'r> {
     /// Returns the time after the kill at which two looks agreed, or `None` where the bound passed
     /// first.
     fn survey_waits(&self, timing: SurveyTiming, killed: Instant) -> Option<Duration> {
-        std::thread::sleep(timing.after_the_kill.saturating_sub(killed.elapsed()));
-        let mut before = self.survey_view();
-        loop {
-            std::thread::sleep(timing.apart);
-            let after = self.survey_view();
-            if before.is_some() && before == after {
-                return Some(killed.elapsed());
-            }
-            if killed.elapsed() >= timing.at_most {
-                return None;
-            }
-            before = after;
-        }
+        wait_for_standing_still(timing, killed, || self.survey_view())
     }
 
     /// The entries the survey watches for standing still, as they are now, or `None` where the
     /// tree cannot be recorded.
     fn survey_view(&self) -> Option<Vec<(PathBuf, Entry)>> {
-        let record =
-            Record::of(self.run.root(), self.run.pin(), &[RUNTIME_ROOT, STATE_ROOT]).ok()?;
+        let record = self.record().ok()?;
         Some(
             record
                 .entries()
@@ -2287,6 +2308,8 @@ mod shutdown_tests {
         let (run, _mark) = host_with_a_kr(&root);
         let host = host_over(&run);
         std::fs::write(root.join("s/before"), b"before").expect("a file");
+        std::fs::create_dir_all(root.join("h/.claude")).expect("the application directory");
+        std::fs::write(root.join("h/.claude/recipe"), b"recipe").expect("a recipe file");
         host.declares_a_restart(Restart::Declared);
         assert!(
             recorded(&host).is_none(),
@@ -2296,8 +2319,16 @@ mod shutdown_tests {
         let held = recorded(&host).expect("the tree is recorded");
         assert!(held.get(Path::new("s/before")).is_some());
         assert!(
-            held.get(Path::new("b/kr")).is_none(),
-            "only the host's two roots are recorded"
+            held.get(Path::new("b/kr")).is_some(),
+            "the run's programs are recorded"
+        );
+        assert!(
+            held.get(Path::new("h/.claude/recipe")).is_some(),
+            "the application directory is recorded where it is"
+        );
+        assert!(
+            held.get(Path::new("h/ran")).is_none(),
+            "the rest of the run's home is not recorded"
         );
         std::fs::write(root.join("s/later"), b"later").expect("a file the agent wrote");
         host.agent_starts();
@@ -2383,7 +2414,7 @@ mod shutdown_tests {
             .clone()
     }
 
-    /// Gives a survey host no wait after the kill, looks 10 ms apart and one second in all.
+    /// Gives a survey host no wait after the kill, looks 150 ms apart and one second in all.
     fn survey_quickly(host: &Host<'_>) {
         host.restarts
             .lock()
@@ -2391,21 +2422,9 @@ mod shutdown_tests {
             .survey
             .timing = SurveyTiming {
             after_the_kill: Duration::ZERO,
-            apart: Duration::from_millis(10),
+            apart: Duration::from_millis(150),
             at_most: Duration::from_secs(1),
         };
-    }
-
-    /// A thread that writes `path` again and again with other bytes, until `stop` is set.
-    fn rewrites(path: PathBuf, stop: Arc<AtomicBool>) -> std::thread::JoinHandle<()> {
-        std::thread::spawn(move || {
-            let mut count = 0_u32;
-            while !stop.load(Ordering::SeqCst) {
-                count += 1;
-                let _ = std::fs::write(&path, count.to_string());
-                std::thread::sleep(Duration::from_millis(2));
-            }
-        })
     }
 
     /// The survey says each entry that changed between the record made when the agent started and
@@ -2456,43 +2475,67 @@ mod shutdown_tests {
         std::fs::remove_dir_all(&root).expect("clean up");
     }
 
-    /// A watched file that keeps changing leaves the survey's list incomplete, and says so; a file
-    /// that is not watched and keeps changing does not hold the survey up.
+    /// The wait for the watched files to stand still returns when two looks agree, and gives up at
+    /// its bound where every look differs from the one before or no look can be made; the lines
+    /// that say which are the survey's.
     #[test]
-    fn a_survey_says_its_list_is_incomplete_when_the_watched_files_do_not_stand_still() {
-        for (below, incomplete) in [("output-times", true), ("sessions", true), ("other", false)] {
-            let root = scratch("survey-still");
-            let (run, _mark) = host_with_a_kr(&root);
-            let host = host_over(&run);
-            std::fs::create_dir_all(root.join("s").join(below)).expect("a directory");
-            host.declares_a_restart(Restart::Survey);
-            host.agent_starts();
-            survey_quickly(&host);
-            host.survey_the_kill();
-            let stop = Arc::new(AtomicBool::new(false));
-            let writer = rewrites(root.join("s").join(below).join("file"), Arc::clone(&stop));
-            host.survey_before_the_attempt();
-            stop.store(true, Ordering::SeqCst);
-            writer.join().expect("the writer ends");
-            let lines = surveyed_by(&host);
-            assert_eq!(
-                lines.iter().any(|line| line.contains(
-                    "the files of the index and the journals did not stand still within 1 s \
-                     after the kill, so this list is incomplete"
-                )),
-                incomplete,
-                "{below}: {lines:#?}"
-            );
-            assert_eq!(
-                lines.iter().any(
-                    |line| line.contains("the files of the index and the journals stood still")
-                ),
-                !incomplete,
-                "{below}: {lines:#?}"
-            );
-            drop(host);
-            drop(run);
-            std::fs::remove_dir_all(&root).expect("clean up");
+    fn the_wait_for_the_watched_files_returns_when_two_looks_agree_and_gives_up_at_its_bound() {
+        let timing = SurveyTiming {
+            after_the_kill: Duration::ZERO,
+            apart: Duration::from_millis(1),
+            at_most: Duration::from_secs(1),
+        };
+        let held = vec![(PathBuf::from("s/sessions/file"), entry_of_size(3))];
+        let stood = wait_for_standing_still(timing, Instant::now(), || Some(held.clone()));
+        assert!(stood.is_some(), "two equal looks agree");
+        let mut size = 0;
+        let moving = wait_for_standing_still(timing, Instant::now(), || {
+            size += 1;
+            Some(vec![(
+                PathBuf::from("s/sessions/file"),
+                entry_of_size(size),
+            )])
+        });
+        assert_eq!(moving, None, "looks that all differ do not agree");
+        let none = wait_for_standing_still(timing, Instant::now(), || None);
+        assert_eq!(none, None, "no look can be made");
+        assert!(standing_still_said(timing, stood).starts_with(
+            "the files of the index and the journals stood still 0 s after the kill; "
+        ));
+        assert!(standing_still_said(timing, None).starts_with(
+            "the files of the index and the journals did not stand still within 1 s after \
+                 the kill, so this list is incomplete; "
+        ));
+    }
+
+    /// The survey watches what the worker's maintenance writes while no daemon runs: the
+    /// output-time index and the session journals, and nothing else.
+    #[test]
+    fn the_survey_watches_the_index_and_the_journals_only() {
+        for (path, watched) in [
+            ("s/environments/e1/output-times/a.sqlite", true),
+            ("s/environments/e1/sessions/session-a.sqlite-wal", true),
+            (
+                "s/environments/e1/spool/a.log/00000000000000000000.out",
+                false,
+            ),
+            ("r/e1/utc-floor", false),
+        ] {
+            assert_eq!(survey_watches(Path::new(path)), watched, "{path}");
+        }
+    }
+
+    /// An entry of a file of this size, for a look.
+    fn entry_of_size(size: u64) -> Entry {
+        Entry {
+            kind: crate::tree::Kind::File,
+            size,
+            digest: None,
+            device: 1,
+            inode: 1,
+            owner: 1,
+            mode: 0o600,
+            target: None,
         }
     }
 
