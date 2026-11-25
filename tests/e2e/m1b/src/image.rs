@@ -6,9 +6,10 @@
 
 use rusqlite::{Connection, MAIN_DB};
 
-/// The most bytes an image may hold. The databases of a run are far smaller; a log that claims more
-/// is refused, so that its claim cannot make the harness allocate what it names.
-const IMAGE_LIMIT: usize = 256 << 20;
+/// The most bytes an image may hold, and the most bytes the harness reads of one file of a database.
+/// The databases of a run are far smaller. A log that claims more is refused, so that its claim
+/// cannot make the harness allocate what it names, and a longer file is refused too.
+pub(crate) const IMAGE_LIMIT: usize = 256 << 20;
 
 /// The first bytes of every database file.
 const MAGIC: &[u8; 16] = b"SQLite format 3\0";

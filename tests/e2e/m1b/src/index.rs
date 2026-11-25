@@ -82,16 +82,42 @@ fn index_path(layout: &Layout, session: &str) -> PathBuf {
 }
 
 /// The bytes of the file at `relative`, through the run's handles, or `None` where it is not there.
+/// The length is asked of the opened handle first, and a file longer than the image limit is
+/// refused unread.
 fn bytes_of(place: Place<'_>, relative: &Path) -> Result<Option<Vec<u8>>, String> {
-    let Some(file) = open_file_below(place.root, place.pin, relative)
-        .map_err(|why| format!("{}: {why}", relative.display()))?
+    let said = |why: &dyn std::fmt::Display| format!("{}: {why}", relative.display());
+    let Some(file) = open_file_below(place.root, place.pin, relative).map_err(|why| said(&why))?
     else {
         return Ok(None);
     };
+    let file = std::fs::File::from(file);
+    let length = file.metadata().map_err(|why| said(&why))?.len();
+    read_within(file, length, image::IMAGE_LIMIT)
+        .map(Some)
+        .map_err(|why| said(&why))
+}
+
+/// The bytes of `reader`, whose handle gave `length`. Refused before any read where `length` is
+/// above `limit`, and refused where more than `limit` bytes are read, as a file that grew after its
+/// length was asked gives.
+fn read_within(reader: impl std::io::Read, length: u64, limit: usize) -> Result<Vec<u8>, String> {
+    if length > limit as u64 {
+        return Err(format!(
+            "it holds {length} bytes, more than the {limit} bytes the harness reads"
+        ));
+    }
     let mut bytes = Vec::new();
-    std::io::Read::read_to_end(&mut std::fs::File::from(file), &mut bytes)
-        .map_err(|why| format!("{}: {why}", relative.display()))?;
-    Ok(Some(bytes))
+    std::io::Read::read_to_end(
+        &mut std::io::Read::take(reader, limit as u64 + 1),
+        &mut bytes,
+    )
+    .map_err(|why| why.to_string())?;
+    if bytes.len() > limit {
+        return Err(format!(
+            "it holds more than the {limit} bytes the harness reads"
+        ));
+    }
+    Ok(bytes)
 }
 
 /// The main file, the `-wal` and the `-journal` of the database at `relative`, copied twice and
@@ -720,6 +746,73 @@ mod tests {
         std::fs::write(&garbage, b"not a database at all").expect("a file");
         let found = look(&world.layout, place, &["s2".to_owned()]);
         assert!(found.indexes["s2"].is_err(), "{:?}", found.indexes);
+        world.clean();
+    }
+
+    /// A reader that fails the case when it is read.
+    struct Unread;
+
+    impl std::io::Read for Unread {
+        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+            panic!("a file above the limit was read");
+        }
+    }
+
+    /// A file whose handle gives a length above the limit is refused before it is read, a file of
+    /// the limit's length is read whole, and a reader that holds more than its handle gave is
+    /// refused after the limit and one byte are read.
+    #[test]
+    fn a_file_above_the_limit_is_refused_by_its_length_unread_and_by_its_bytes_read() {
+        let why = read_within(Unread, 11, 10).expect_err("a length above the limit");
+        assert!(
+            why.contains("it holds 11 bytes, more than the 10 bytes the harness reads"),
+            "{why}"
+        );
+        assert_eq!(
+            read_within(&[7_u8; 10][..], 10, 10),
+            Ok(vec![7; 10]),
+            "a file of the limit's length is read whole"
+        );
+        let why = read_within(std::io::repeat(0), 3, 10)
+            .expect_err("a reader that holds more than its length said");
+        assert!(
+            why.contains("it holds more than the 10 bytes the harness reads"),
+            "{why}"
+        );
+    }
+
+    /// A main file, a `-wal` or a `-journal` above the limit, which a sparse file of that length
+    /// makes at no cost, is a failed look that names the file and its length.
+    #[test]
+    fn an_index_file_above_the_limit_is_a_failed_look_that_names_it() {
+        let world = world("index-limit");
+        let place = Place {
+            root: &world.root,
+            pin: &world.pin,
+        };
+        std::fs::create_dir_all(world.state("output-times")).expect("a directory");
+        for (session, suffix) in [("m", ""), ("w", "-wal"), ("j", "-journal")] {
+            let main = world.state(&format!("output-times/{session}.sqlite"));
+            std::fs::write(&main, b"x").expect("a main file");
+            let long = world.state(&format!("output-times/{session}.sqlite{suffix}"));
+            std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(false)
+                .open(&long)
+                .and_then(|file| file.set_len(image::IMAGE_LIMIT as u64 + 1))
+                .expect("a sparse file above the limit");
+            let found = look(&world.layout, place, &[session.to_owned()]);
+            let why = found.indexes[session]
+                .as_ref()
+                .expect_err("a file above the limit is a failed look");
+            assert!(
+                why.contains(&format!(
+                    "{session}.sqlite{suffix}: it holds 268435457 bytes"
+                )),
+                "{suffix:?}: {why}"
+            );
+        }
         world.clean();
     }
 }
