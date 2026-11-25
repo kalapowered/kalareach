@@ -870,7 +870,8 @@ pub struct Account {
     /// `{person}` or `{ancestors}`) and holds none after it, or begins with `/` and then may hold
     /// the account's name, `{user}`, as a whole part, as the live
     /// `/Library/Managed Preferences/{user}/` files do. `{config}` alone is no path: the run always
-    /// makes that directory.
+    /// makes that directory. A path below the configuration directory is spelled `{config}/` and its
+    /// names: `absent_paths_under` stops the run for any other spelling.
     #[serde(default)]
     pub absent: Vec<String>,
     /// Files below the run's configuration directory that the agent's own use writes beside what
@@ -1868,7 +1869,10 @@ impl Inputs {
 /// placeholders, that holds a placeholder after its first part (the live form
 /// `/Library/Managed Preferences/{user}/` is kept: it is `{user}` as a whole part of an absolute
 /// path), that holds an empty part, `.` or `..`, or that is `{config}` alone; and an allowed file
-/// that names a settings file, the `rules` directory or an absent path spelled `{config}/`.
+/// that names a settings file, the `rules` directory or an absent path spelled `{config}/`. The read
+/// cannot say whether a path that begins with another placeholder lies below the configuration
+/// directory, since that depends on the directory a leg uses: `absent_paths_under` decides it where
+/// the leg expands the list.
 #[must_use]
 pub fn read_build(path: &Path) -> Build {
     let bytes = std::fs::read(path)

@@ -407,7 +407,7 @@ pub enum Absent {
 ///
 /// # Panics
 ///
-/// Panics when the system cannot say the account name.
+/// Panics when the system cannot say the account name, and where [`absent_paths_in`] panics.
 #[must_use]
 pub fn absent_paths(
     account: &Account,
@@ -433,8 +433,7 @@ pub fn absent_paths(
 ///
 /// # Panics
 ///
-/// Panics when the system cannot say the account name, or when an allowed file of the entry names a
-/// path of the list that lies below the configuration directory ([`absent_paths_under`]).
+/// Panics when the system cannot say the account name, and where [`absent_paths_under`] panics.
 #[must_use]
 pub fn absent_paths_in(
     account: &Account,
@@ -457,16 +456,34 @@ pub fn absent_paths_in(
 }
 
 /// [`absent_paths_in`] for the configuration directory `config` and the working directory `work`
-/// of a run. Each path is expanded and then normalised by its parts alone (no empty or `.` part,
-/// and a `..` part takes off the one before it), and one that lies below the configuration
-/// directory is held to the entry's allowed files, whatever placeholder or spelling named it: the
-/// run stops where an allowed file names it, so that no spelling of an absent path below the
-/// configuration directory escapes the entry's check.
+/// of a run. Each path is expanded, and the names of the expanded path are compared with the names
+/// of `config`, each pair by [`same_name`]. A path that names the directory or a path below it must
+/// be spelled `{config}/` and a plain rest (names only, no placeholder), and any other spelling
+/// stops the run, whatever the allowed files are. A path spelled so is held to the entry's allowed
+/// files too, and the run stops where an allowed file names it or a file below it.
+///
+/// For an entry that `read_build` accepted, whose names are printable ASCII, no spelling of a path
+/// below `config` escapes this on a volume that treats two ASCII names as one only where they
+/// differ in letter case (APFS and the usual Linux file systems). That rests on three facts of the
+/// harness. Every placeholder that names a place in the run expands from the run's one root path,
+/// as its handle gives it (`Run::root`), so the names above `config` are the same in `config` and
+/// in the expanded path. The run's tree is on one volume: the run's directory, the absence check
+/// and the end compare refuse another file system. The absence check ([`absent_below`]) refuses a
+/// link and a `..` part below the root, so the path it looks at is the path the system opens.
+///
+/// What this does not claim: a volume with short names (such as FAT); a link into the run that
+/// another process makes while the run is live; absence through a whole run, since the absence check
+/// runs before the first start and after the probes and the end compare does not repeat it. It
+/// also refuses two names that a case-sensitive volume holds apart and that differ in letter case
+/// only, which costs an entry one spelling. Whether a file is there is not decided here: the
+/// absence check asks the file system.
 ///
 /// # Panics
 ///
-/// Panics when the system cannot say the account name, or when an allowed file of the entry names
-/// a path of the list that lies below the configuration directory.
+/// Panics when the system cannot say the account name; when an allowed file of the entry does not
+/// begin with `{config}/`; when a path names the configuration directory, or a path below it, in a
+/// spelling other than `{config}/` and a plain rest; and when an allowed file names such a path or
+/// a file below it.
 #[must_use]
 pub fn absent_paths_under(
     account: &Account,
@@ -532,7 +549,7 @@ pub fn absent_paths_under(
                         .replace("{person}", &person)
                         .replace("{user}", &user),
                 );
-                held_to_the_allowed_files(config, &allowed, path, &expanded);
+                held_to_the_entry(config, &allowed, path, &expanded);
                 expanded
             };
             if path.contains("{ancestors}") && which == Absent::Published {
@@ -557,46 +574,46 @@ pub fn absent_paths_under(
     paths
 }
 
-/// `path` by its parts alone: no empty or `.` part, and a `..` part takes off the part before it.
-fn lexically_normal(path: &Path) -> PathBuf {
-    use std::path::Component;
-    let mut normal = PathBuf::new();
-    for part in path.components() {
-        match part {
-            Component::CurDir => {}
-            Component::ParentDir if normal.file_name().is_some() => {
-                normal.pop();
-            }
-            Component::ParentDir if normal.has_root() => {}
-            other => normal.push(other.as_os_str()),
-        }
-    }
-    normal
+/// The names `path` is made of, as text.
+fn names_of(path: &Path) -> Vec<String> {
+    path.components()
+        .map(|part| part.as_os_str().to_string_lossy().into_owned())
+        .collect()
 }
 
-/// Stops the run where `expanded`, the absent path `template` with its placeholders filled in, lies
-/// below the configuration directory `config` and one of the entry's allowed files (`allowed`, as
-/// [`Account::allowed_below_config`] gives them) names it or a file below it.
-fn held_to_the_allowed_files(config: &Path, allowed: &[String], template: &str, expanded: &Path) {
-    let below = lexically_normal(expanded);
-    let Ok(below) = below.strip_prefix(lexically_normal(config)) else {
-        return;
-    };
-    let parts: Vec<String> = below
-        .components()
-        .map(|part| part.as_os_str().to_string_lossy().into_owned())
-        .collect();
-    let held: Vec<&str> = parts.iter().map(String::as_str).collect();
-    if held.is_empty() {
+/// Stops the run where `expanded`, the absent path `template` with its placeholders filled in,
+/// names the configuration directory `config` or a path below it, each name compared with the
+/// directory's own by [`same_name`], unless the template is `{config}/` and a plain rest, and where
+/// one of the entry's allowed files (`allowed`, as [`Account::allowed_below_config`] gives them)
+/// names such a path or a file below it.
+fn held_to_the_entry(config: &Path, allowed: &[String], template: &str, expanded: &Path) {
+    let directory_names = names_of(config);
+    let path_names = names_of(expanded);
+    let at_or_below = path_names.len() >= directory_names.len()
+        && directory_names
+            .iter()
+            .zip(&path_names)
+            .all(|(own, other)| same_name(own, other));
+    if !at_or_below {
         return;
     }
+    let plain = template.strip_prefix("{config}/").filter(|rest| {
+        rest.split('/')
+            .all(|part| !matches!(part, "" | "." | "..") && !part.contains(['{', '}']))
+    });
+    let Some(rest) = plain else {
+        panic!(
+            "{ISOLATION_UNPROVEN} the absent path {template:?} names the configuration directory \
+             or a path below it, and an entry spells such a path `{{config}}/` and its names"
+        );
+    };
+    let held: Vec<&str> = rest.split('/').collect();
     for pattern in allowed {
         let names: Vec<&str> = pattern.split('/').collect();
         assert!(
             !pattern_reaches(&names, &held),
-            "{ISOLATION_UNPROVEN} the absent path {template:?} names {:?} below the configuration \
-             directory, which the entry's allowed file {:?} names",
-            parts.join("/"),
+            "{ISOLATION_UNPROVEN} the absent path {template:?} names {rest:?} below the \
+             configuration directory, which the entry's allowed file {:?} names",
             format!("{{config}}/{pattern}")
         );
     }
@@ -634,6 +651,48 @@ fn absent_below(root: &Path, pin: &kr_e2e_m1b::run::RootPin, path: &Path) -> Res
         }
         _ => is_absent(path).map_err(|error| error.to_string()),
     }
+}
+
+/// Whether nothing is at any path of `absent`, the entry's list as [`absent_paths`] gives it, for
+/// the run whose directory is `root` and whose pin is `pin`: each path is looked at by
+/// [`absent_below`]. Nothing is excused: an entry at one of the paths, a link included, is refused,
+/// whatever the entry's allowed files name.
+///
+/// # Errors
+///
+/// Returns the first path that exists, or that could not be shown absent, with what was found.
+pub fn shown_absent(
+    root: &Path,
+    pin: &kr_e2e_m1b::run::RootPin,
+    absent: &[PathBuf],
+) -> Result<(), String> {
+    shown_absent_by(absent, |path| absent_below(root, pin, path))
+}
+
+/// [`shown_absent`] with the look of each path given: the free [`absent_below`], or the guard's.
+fn shown_absent_by(
+    absent: &[PathBuf],
+    look: impl Fn(&Path) -> Result<bool, String>,
+) -> Result<(), String> {
+    for path in absent {
+        match look(path) {
+            Ok(true) => {}
+            Ok(false) => {
+                return Err(format!(
+                    "{} exists, which would load the person's own settings, hooks or servers into \
+                     the agent, or which it would remove",
+                    path.display()
+                ));
+            }
+            Err(error) => {
+                return Err(format!(
+                    "{} cannot be shown absent: {error}",
+                    path.display()
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Whether `relative`, the path of a file below the configuration directory, is one the allowed
@@ -1989,6 +2048,22 @@ impl PersonGuard {
             files.looks.lost();
         }
         looked
+    }
+
+    /// [`shown_absent`] through the guard: each path is looked at by [`PersonGuard::absent_below`],
+    /// so a look that finds a path present, or does not show the absence, stays on the guard's
+    /// record and no shared file is read for the rest of the run.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first path that exists, or that could not be shown absent, with what was found.
+    pub fn shown_absent(
+        &self,
+        root: &Path,
+        pin: &kr_e2e_m1b::run::RootPin,
+        absent: &[PathBuf],
+    ) -> Result<(), String> {
+        shown_absent_by(absent, |path| self.absent_below(root, pin, path))
     }
 
     /// Looks again by metadata alone and says what stops the driver, with what was seen; never a
@@ -3639,9 +3714,10 @@ mod tests {
         })
     }
 
-    /// An absent path that the expansion puts below the configuration directory is held to the
-    /// allowed files whatever spells it: a root slash before `{config}`, which the expansion
-    /// turns into two leading slashes that name the same file.
+    /// An absent path that the expansion puts below the configuration directory is refused unless
+    /// it is spelled `{config}/` and its names, whatever the allowed files are: a root slash
+    /// before `{config}`, which the expansion turns into two leading slashes that name the same
+    /// file.
     #[test]
     fn a_slash_before_the_config_placeholder_does_not_hide_an_absent_path_from_the_allowed_files() {
         let root = scratch("expand-slash");
@@ -3653,13 +3729,13 @@ mod tests {
         )
         .expect_err("an absent path an allowed file names");
         assert!(
-            said.contains("\"/{config}/.claude.json\" names \".claude.json\" below the configuration directory")
-                && said.contains("\"{config}/.claude.json\""),
+            said.contains("the absent path \"/{config}/.claude.json\" names the configuration directory or a path below it"),
             "{said}"
         );
     }
 
-    /// A placeholder inside a name of the rest, expanded, names the file an allowed file names.
+    /// A placeholder inside a name of the rest, expanded, names a file below the configuration
+    /// directory, so the path is refused as one that is not spelled with its names alone.
     #[test]
     fn a_placeholder_in_a_name_below_the_config_placeholder_does_not_hide_an_absent_path() {
         let root = scratch("expand-user");
@@ -3672,16 +3748,16 @@ mod tests {
         )
         .expect_err("an absent path an allowed file names");
         assert!(
-            said.contains(&format!(
-                "\"{{config}}/{{user}}.json\" names \"{user}.json\" below the configuration directory"
-            )),
+            said.contains(
+                "the absent path \"{config}/{user}.json\" names the configuration directory or a path below it"
+            ),
             "{said}"
         );
     }
 
     /// Where the configuration directory is a directory of the home, the home placeholder names a
-    /// path below it, and an allowed file that names it is refused though the path does not begin
-    /// with `{config}`.
+    /// path below it, and the path is refused, with an allowed file that names it or with none,
+    /// since an entry spells such a path `{config}/`.
     #[test]
     fn the_home_placeholder_naming_a_path_below_the_configuration_directory_is_held_too() {
         let root = scratch("expand-home");
@@ -3694,7 +3770,7 @@ mod tests {
         )
         .expect_err("an absent path an allowed file names");
         assert!(
-            said.contains("\"{home}/.claude/x\" names \"x\" below the configuration directory"),
+            said.contains("the absent path \"{home}/.claude/x\" names the configuration directory or a path below it"),
             "{said}"
         );
         let said = expanded(
@@ -3704,7 +3780,176 @@ mod tests {
             &home,
         )
         .expect_err("a path with a part that is taken back");
-        assert!(said.contains("names \"y/z\""), "{said}");
+        assert!(
+            said.contains("the absent path \"{home}/.claude/../.claude/y/z\" names the configuration directory or a path below it"),
+            "{said}"
+        );
+    }
+
+    /// The directory's own names in another letter case still name the directory on a volume that
+    /// ignores it, so a path below them is refused though an allowed file names it as `{config}/`
+    /// spells it.
+    #[test]
+    fn the_directorys_own_names_in_another_letter_case_do_not_escape_the_expansion() {
+        let root = scratch("expand-case");
+        let home = root.join("h");
+        let said = expanded(
+            &["{home}/.CLAUDE/x"],
+            &["x".to_owned()],
+            &home.join(".claude"),
+            &home,
+        )
+        .expect_err("a path that names a path below the directory");
+        assert!(
+            said.contains("the absent path \"{home}/.CLAUDE/x\" names the configuration directory or a path below it"),
+            "{said}"
+        );
+    }
+
+    /// A spelling of a path below the directory other than `{config}/` is refused with no allowed
+    /// file at all: the check is of the spelling, not of the allowed files.
+    #[test]
+    fn a_spelling_other_than_the_config_placeholder_is_refused_with_no_allowed_file() {
+        let root = scratch("expand-spelling");
+        let home = root.join("h");
+        for absent in ["{home}/.claude/x", "{home}/.CLAUDE/x", "{home}/.Claude/a/b"] {
+            let said = expanded(&[absent], &[], &home.join(".claude"), &home)
+                .expect_err("a path below the directory");
+            assert!(
+                said.contains(&format!(
+                    "the absent path {absent:?} names the configuration directory or a path below it"
+                )),
+                "{said}"
+            );
+        }
+    }
+
+    /// The directory itself is no absent path of an entry, in any spelling: not as `{config}` alone
+    /// and not through another placeholder in another letter case.
+    #[test]
+    fn the_configuration_directory_itself_is_refused_in_any_spelling() {
+        let root = scratch("expand-itself");
+        let home = root.join("h");
+        for absent in ["{home}/.CLAUDE", "{home}/.claude", "{config}"] {
+            let said = expanded(&[absent], &[], &home.join(".claude"), &home)
+                .expect_err("the directory itself");
+            assert!(
+                said.contains(&format!(
+                    "the absent path {absent:?} names the configuration directory or a path below it"
+                )),
+                "{said}"
+            );
+        }
+    }
+
+    /// The working folder and each folder above it can be the directory's parent, so a path below
+    /// it that is spelled with `{ancestors}` is refused in any letter case.
+    #[test]
+    fn an_ancestor_that_is_the_configuration_directorys_parent_does_not_escape_the_expansion() {
+        let root = scratch("expand-ancestors");
+        let said = expanded(
+            &["{ancestors}/AGENT-CONFIG/x"],
+            &[],
+            &root.join("agent-config"),
+            &root.join("h"),
+        )
+        .expect_err("a path below the directory");
+        assert!(
+            said.contains("the absent path \"{ancestors}/AGENT-CONFIG/x\" names the configuration directory or a path below it"),
+            "{said}"
+        );
+    }
+
+    /// A path spelled `{config}/` and its names, with no allowed file that names it, is expanded as
+    /// before whatever the directory is, and so is each form the live entries use where the
+    /// directory is `.claude` of the home.
+    #[test]
+    fn a_path_spelled_below_the_config_placeholder_and_the_live_forms_are_expanded_as_before() {
+        let root = scratch("expand-live");
+        let home = root.join("h");
+        // The working directory is `w` beside the configuration directory's parent.
+        let work = home.join("w");
+        let directory = home.join(".claude");
+        assert_eq!(
+            expanded(&["{config}/x"], &[], &directory, &home),
+            Ok(vec![directory.join("x"), directory.join("rules")])
+        );
+        let mut live = vec![
+            work.join(".mcp.json"),
+            home.join(".claude.json"),
+            PathBuf::from(format!("/Library/Managed Preferences/{}/x.plist", user())),
+        ];
+        live.extend(work.ancestors().map(|folder| folder.join(".env")));
+        live.push(directory.join("rules"));
+        assert_eq!(
+            expanded(
+                &[
+                    "{work}/.mcp.json",
+                    "{home}/.claude.json",
+                    "/Library/Managed Preferences/{user}/x.plist",
+                    "{ancestors}/.env"
+                ],
+                &["projects/**".to_owned()],
+                &directory,
+                &home
+            ),
+            Ok(live)
+        );
+    }
+
+    /// A path spelled `{config}/` and its names is held to the allowed files as well, names that
+    /// differ in letter case being one name: the second line behind the entry's own check.
+    #[test]
+    fn a_path_spelled_below_the_config_placeholder_is_held_to_the_allowed_files() {
+        let root = scratch("expand-allowed");
+        for (absent, allowed, names) in [
+            ("{config}/x", "x", "x"),
+            ("{config}/Projects/x", "projects/**", "Projects/x"),
+            ("{config}/a/b", "a/*", "a/b"),
+        ] {
+            let said = expanded(
+                &[absent],
+                &[allowed.to_owned()],
+                &root.join("c"),
+                &root.join("h"),
+            )
+            .expect_err("an absent path an allowed file names");
+            assert!(
+                said.contains(&format!(
+                    "the absent path {absent:?} names {names:?} below the configuration directory, which the entry's allowed file \"{{config}}/{allowed}\" names"
+                )),
+                "{said}"
+            );
+        }
+    }
+
+    /// A path that is there is not shown absent, whatever an allowed file names: the file system
+    /// is asked and nothing else, so a file and a link at names that allowed files name are
+    /// present, and a name nothing is at is absent.
+    #[cfg(unix)]
+    #[test]
+    fn a_present_path_is_not_shown_absent_whatever_an_allowed_file_names() {
+        let root = configured("shown-present");
+        let config = root.join("c");
+        let pin = pinned(&root);
+        std::fs::write(config.join(".claude.json"), b"{}").expect("a file");
+        std::os::unix::fs::symlink(root.join("nowhere"), config.join("link")).expect("a link");
+        let allowed = patterns(&[".claude.json", "link", "projects/**"]);
+        for name in [".claude.json", "link", "projects/x"] {
+            assert!(is_allowed(&allowed, name), "{name} is an allowed name");
+        }
+        for name in [".claude.json", "link"] {
+            let said = shown_absent(&root, &pin, &[config.join(name)])
+                .expect_err("a path that is there, whatever an allowed file names");
+            assert!(
+                said.contains(&format!("{} exists", config.join(name).display())),
+                "{said}"
+            );
+        }
+        assert_eq!(
+            shown_absent(&root, &pin, &[config.join("projects/x")]),
+            Ok(())
+        );
     }
 
     /// An absent path that no allowed file names, whatever directory it lies in, is expanded as it
@@ -6940,6 +7185,40 @@ mod tests {
             "a file that an absence look found was not kept as a failed look"
         );
         // The file moves over the shared name, and no look at the end sees it at a guarded name.
+        std::fs::rename(
+            home.join(".claude/.credentials.json"),
+            home.join(".claude.json"),
+        )
+        .expect("a move");
+        let reading = Reading::real();
+        let (stops, _) =
+            files_of(&guard).compare_with(&lstat_in(&home), &reading, &[RUN_NAME, RUN_MARK]);
+        let said: Vec<&str> = stops.iter().map(|(_, why)| why.as_str()).collect();
+        assert!(said.contains(&not_read(UNLOOKED).as_str()), "{said:?}");
+        assert_eq!(begun(&reading), 0, "a shared file was read");
+        std::fs::remove_dir_all(&home).expect("clean up");
+    }
+
+    /// The list form the gateway calls, through the guard: a path that the look finds present is
+    /// refused with what was found, and it is kept as a failed look, so that no shared file is
+    /// read at the end.
+    #[test]
+    fn the_guards_absent_list_keeps_a_look_that_finds_a_file_as_a_failed_look() {
+        let home = claude_home("absent-list-finds-a-file");
+        let root = home.join("run");
+        std::fs::create_dir_all(root.join("w")).expect("a directory of the run");
+        let pin = pinned(&root);
+        std::fs::remove_file(home.join(".claude/.credentials.json")).expect("removed");
+        let guard = claude_plan().take(&home);
+        make_the_credentials(&home);
+        let refused = guard
+            .shown_absent(&root, &pin, &[home.join(".claude/./.credentials.json")])
+            .expect_err("a file that exists is not absent");
+        assert!(refused.contains("exists"), "{refused}");
+        assert!(
+            files_of(&guard).known().unlooked,
+            "a file that an absent list found was not kept as a failed look"
+        );
         std::fs::rename(
             home.join(".claude/.credentials.json"),
             home.join(".claude.json"),

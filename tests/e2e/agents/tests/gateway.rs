@@ -823,20 +823,9 @@ impl Real {
     /// paths, a link included, fails the case, and the entry's allowed files cannot name one of
     /// them.
     fn checks_absent(&self, run: &Run, absent: &[PathBuf]) {
-        for path in absent {
-            match self.person.absent_below(run.root(), run.pin(), path) {
-                Ok(true) => {}
-                Ok(false) => panic!(
-                    "{ISOLATION_UNPROVEN} {} exists, which would load the person's own settings, \
-                     hooks or servers into the agent, or which it would remove",
-                    path.display()
-                ),
-                Err(error) => panic!(
-                    "{ISOLATION_UNPROVEN} {} cannot be shown absent: {error}",
-                    path.display()
-                ),
-            }
-        }
+        self.person
+            .shown_absent(run.root(), run.pin(), absent)
+            .unwrap_or_else(|why| panic!("{ISOLATION_UNPROVEN} {why}"));
     }
 
     /// Runs the entry's isolation probes before the agent's first launch, as the qualification
