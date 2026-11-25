@@ -865,10 +865,12 @@ pub struct Account {
     pub stop_before_turns: bool,
     /// Files that would load the person's own settings, hooks or servers into the agent, none of
     /// which may exist before it starts: `{config}` names the configuration directory of the run's
-    /// own and `{work}` the working directory. A path begins with one placeholder (`{config}`,
-    /// `{work}`, `{home}`, `{person}` or `{ancestors}`) and holds none after it; a path that begins
-    /// with none may hold the account's name, `{user}`, as a whole part, as the live
-    /// `/Library/Managed Preferences/{user}/` files do.
+    /// own and `{work}` the working directory. Every name is printable ASCII, and no part is
+    /// empty, `.` or `..`. A path begins with one placeholder (`{config}`, `{work}`, `{home}`,
+    /// `{person}` or `{ancestors}`) and holds none after it, or begins with `/` and then may hold
+    /// the account's name, `{user}`, as a whole part, as the live
+    /// `/Library/Managed Preferences/{user}/` files do. `{config}` alone is no path: the run always
+    /// makes that directory.
     #[serde(default)]
     pub absent: Vec<String>,
     /// Files below the run's configuration directory that the agent's own use writes beside what
@@ -876,7 +878,8 @@ pub struct Account {
     /// whose parts are names, a lone `*` for any one name, and a last `**` for every file below
     /// its directory ([`Account::allowed_below_config`]). None begins with a wildcard, and none
     /// names a file that must stay absent, a settings file or the `rules` directory, or a file
-    /// below one. Names that differ only in letter case are one name.
+    /// below one. Every name is printable ASCII, and names that differ only in letter case are one
+    /// name.
     #[serde(default)]
     pub allowed: Vec<String>,
     /// How the agent is run while a native bridge is in place: required of a real leg whose package
@@ -1341,40 +1344,86 @@ fn absent_path_spelling(path: &str) -> Result<(), String> {
     }
 }
 
+/// Whether `text` holds printable ASCII only, 0x20 to 0x7E. On a volume of the usual kinds two ASCII
+/// names are one name only where they differ in letter case, which [`same_name`] sees; two other
+/// names can be one by form alone (a composed letter and its decomposed form), which it does not.
+fn is_printable_ascii(text: &str) -> bool {
+    text.bytes()
+        .all(|byte| byte.is_ascii_graphic() || byte == b' ')
+}
+
+/// Whether the absent path `path`, whose placeholders [`absent_path_spelling`] accepted, is a path
+/// the harness looks at: it begins with `/` or with a directory placeholder (a relative path is
+/// looked at from the test's own directory, not where the agent reads), it is not `{config}` alone
+/// (the directory the run always makes), and none of its parts is empty, `.` or `..`.
+fn absent_path_names(path: &str) -> Result<(), String> {
+    let tail = if let Some(after) = path.strip_prefix('{') {
+        if path == "{config}" {
+            return Err(format!(
+                "the absent path {path:?} is the configuration directory itself, which the run \
+                 always makes"
+            ));
+        }
+        // The spelling was read: a directory placeholder is the whole first part.
+        after
+            .split_once('}')
+            .and_then(|(_, rest)| rest.strip_prefix('/'))
+    } else if let Some(tail) = path.strip_prefix('/') {
+        Some(tail)
+    } else {
+        return Err(format!(
+            "the absent path {path:?} begins with neither `/` nor a directory placeholder"
+        ));
+    };
+    if let Some(part) = tail.and_then(|tail| {
+        tail.split('/')
+            .find(|part| matches!(*part, "" | "." | ".."))
+    }) {
+        return Err(format!(
+            "the absent path {path:?} holds {part:?}, and a part of an absent path is a name"
+        ));
+    }
+    Ok(())
+}
+
 impl Account {
     /// The entry's allowed files as paths below the configuration directory, `{config}/` taken off.
     ///
     /// # Errors
     ///
-    /// Returns the first absent path that holds a placeholder where it may not (one that begins
-    /// with a placeholder holds one only as its whole first part, from `{config}`, `{work}`,
-    /// `{home}`, `{person}` and `{ancestors}`, and a path that begins with none may hold `{user}` as
-    /// a whole part and no other); the first absent path below `{config}` whose rest holds an
-    /// empty part, `.` or `..`; the first pattern that does not begin with `{config}/`, or that
-    /// holds an empty part, `.` or `..`, a template, a `*` inside a name, or a `**` that is not the
-    /// last part; one that begins with `*` or `**`; and one that names a path, or a file below a
-    /// path, that [`NEVER_ALLOWED_BELOW_CONFIG`] holds or that the entry lists as absent below
-    /// `{config}`, a name that differs only in letter case being the same name ([`same_name`]).
+    /// Returns the first name, of the absent paths and then of the allowed files, that is not
+    /// printable ASCII (0x20 to 0x7E); the first absent path that holds a placeholder where it may
+    /// not (one that begins with a placeholder holds one only as its whole first part, from
+    /// `{config}`, `{work}`, `{home}`, `{person}` and `{ancestors}`, and a path that begins with `/`
+    /// may hold `{user}` as a whole part and no other); the first absent path that begins with
+    /// neither `/` nor a placeholder, that is `{config}` alone, or that holds an empty part, `.` or
+    /// `..`; the first pattern that does not begin with `{config}/`, or that holds an empty part,
+    /// `.` or `..`, a template, a `*` inside a name, or a `**` that is not the last part; one that
+    /// begins with `*` or `**`; and one that names a path, or a file below a path, that
+    /// [`NEVER_ALLOWED_BELOW_CONFIG`] holds or that the entry lists as absent below `{config}`, a
+    /// name that differs only in letter case being the same name ([`same_name`]).
     pub fn allowed_below_config(&self) -> Result<Vec<String>, String> {
         let mut absent: Vec<&str> = Vec::new();
         for path in &self.absent {
-            absent_path_spelling(path)?;
-            let Some(rest) = path.strip_prefix("{config}/") else {
-                continue;
-            };
-            if let Some(part) = rest
-                .split('/')
-                .find(|part| matches!(*part, "" | "." | ".."))
-            {
+            if !is_printable_ascii(path) {
                 return Err(format!(
-                    "the absent path {path:?} holds {part:?}, and a part below `{{config}}` is a name"
+                    "the absent path {path:?} is not printable ASCII (0x20 to 0x7E)"
                 ));
             }
-            absent.push(rest);
+            absent_path_spelling(path)?;
+            absent_path_names(path)?;
+            if let Some(rest) = path.strip_prefix("{config}/") {
+                absent.push(rest);
+            }
         }
         self.allowed
             .iter()
             .map(|pattern| {
+                if !is_printable_ascii(pattern) {
+                    return Err(format!(
+                        "the allowed file {pattern:?} is not printable ASCII (0x20 to 0x7E)"
+                    ));
+                }
                 let Some(below) = pattern.strip_prefix("{config}/") else {
                     return Err(format!(
                         "the allowed file {pattern:?} does not begin with `{{config}}/`"
@@ -1813,11 +1862,13 @@ impl Inputs {
 /// # Panics
 ///
 /// Panics when the file cannot be read or is not an entry, when the entry sets a variable the host
-/// owns ([`Build::names_reach_the_session`]), and when its account's absent paths hold a
-/// placeholder where it may not (the live form `/Library/Managed Preferences/{user}/` is kept: it
-/// is `{user}` as a whole part of an absolute path) or are not plain below the configuration
-/// directory, or its allowed files are not ones the harness reads
-/// ([`Account::allowed_below_config`]).
+/// owns ([`Build::names_reach_the_session`]), and when its account's absent paths or allowed files
+/// are not ones the harness reads ([`Account::allowed_below_config`]), among them: a name that is
+/// not printable ASCII; an absent path that begins with neither `/` nor one of the five directory
+/// placeholders, that holds a placeholder after its first part (the live form
+/// `/Library/Managed Preferences/{user}/` is kept: it is `{user}` as a whole part of an absolute
+/// path), that holds an empty part, `.` or `..`, or that is `{config}` alone; and an allowed file
+/// that names a settings file, the `rules` directory or an absent path spelled `{config}/`.
 #[must_use]
 pub fn read_build(path: &Path) -> Build {
     let bytes = std::fs::read(path)
@@ -2206,9 +2257,151 @@ mod tests {
             }
         }
         assert_eq!(
-            allowed_files(&["{config}/.claude.json", "{work}/./x"], &["{config}/p/**"]),
+            allowed_files(&["{config}/.claude.json", "{work}/x"], &["{config}/p/**"]),
             Ok(vec!["p/**".to_owned()]),
             "a plain absent path, and one outside the configuration directory, are not refused"
+        );
+    }
+
+    /// An absent path of any form whose parts hold an empty part, `.` or `..` is refused where the
+    /// entry is read: the expansion of a placeholder before it can lead into the configuration
+    /// directory, and such a path names the same file as the path without those parts.
+    #[test]
+    fn an_absent_path_with_an_empty_part_a_dot_or_a_dot_dot_is_refused_wherever_it_lies() {
+        for bad in [
+            "{work}/./x",
+            "{home}/a//b",
+            "{ancestors}/../x",
+            "{person}/x/",
+            "{work}/",
+            "/etc/../x",
+            "//etc/x",
+            "/etc/x/",
+            "/",
+        ] {
+            for list in [&[][..], &["{config}/.claude.json"][..]] {
+                let why = allowed_files(&[bad], list).expect_err(bad);
+                assert!(
+                    why.contains(&format!("the absent path {bad:?} holds")),
+                    "{bad} with {list:?}: {why}"
+                );
+            }
+        }
+    }
+
+    /// An absent path begins with `/` or with one of the five directory placeholders: a relative
+    /// path is looked at from the test's own directory, which is not where the agent reads.
+    #[test]
+    fn an_absent_path_that_begins_with_neither_a_slash_nor_a_directory_placeholder_is_refused() {
+        for bad in [".mcp.json", "~/.claude.json", "x/{user}/y", "etc/x"] {
+            for list in [&[][..], &["{config}/.claude.json"][..]] {
+                let why = allowed_files(&[bad], list).expect_err(bad);
+                assert!(
+                    why.contains(&format!(
+                        "the absent path {bad:?} begins with neither `/` nor a directory placeholder"
+                    )),
+                    "{bad} with {list:?}: {why}"
+                );
+            }
+        }
+    }
+
+    /// `{config}` alone is the configuration directory, which the run always makes, so an entry that
+    /// lists it as absent could not run.
+    #[test]
+    fn the_configuration_directory_itself_is_not_an_absent_path() {
+        for list in [&[][..], &["{config}/.claude.json"][..]] {
+            let why = allowed_files(&["{config}"], list).expect_err("{config} alone");
+            assert!(
+                why.contains("the absent path \"{config}\" is the configuration directory itself"),
+                "{list:?}: {why}"
+            );
+        }
+    }
+
+    /// The lists the claude-code entry is to carry (the live absent list without
+    /// `{config}/settings.json`, and the files a signed-in run writes beside the recipe) are read.
+    #[test]
+    fn the_lists_the_claude_code_entry_is_to_carry_are_read() {
+        let absent = [
+            "{config}/settings.local.json",
+            "{work}/.claude/settings.json",
+            "{work}/.claude/settings.local.json",
+            "{work}/.mcp.json",
+            "/Library/Application Support/ClaudeCode/managed-settings.json",
+            "/Library/Application Support/ClaudeCode/managed-mcp.json",
+            "/Library/Application Support/ClaudeCode/managed-settings.d",
+            "/Library/Managed Preferences/com.anthropic.claudecode.plist",
+            "/Library/Managed Preferences/{user}/com.anthropic.claudecode.plist",
+        ];
+        let allowed = [
+            "{config}/.claude.json",
+            "{config}/projects/**",
+            "{config}/plugins/installed_plugins.json",
+            "{config}/plugins/data/kalareach-channels-skills-dir/**",
+        ];
+        assert_eq!(
+            allowed_files(&absent, &allowed),
+            Ok(vec![
+                ".claude.json".to_owned(),
+                "projects/**".to_owned(),
+                "plugins/installed_plugins.json".to_owned(),
+                "plugins/data/kalareach-channels-skills-dir/**".to_owned(),
+            ])
+        );
+    }
+
+    /// A name of an absent path or an allowed file is printable ASCII (0x20 to 0x7E): a composed
+    /// letter and its decomposed form are two names to [`same_name`] and one on a volume that
+    /// ignores the difference, and a control byte is no name an entry may write.
+    #[test]
+    fn a_name_that_is_not_printable_ascii_is_refused_where_the_entry_is_read() {
+        let composed = "{config}/caf\u{e9}";
+        let decomposed = "{config}/cafe\u{301}";
+        let why =
+            allowed_files(&[composed], &[decomposed]).expect_err("an absent path with an accent");
+        assert!(
+            why.contains(&format!(
+                "the absent path {composed:?} is not printable ASCII"
+            )),
+            "{why}"
+        );
+        let why = allowed_files(&["{config}/cafe"], &[decomposed])
+            .expect_err("an allowed file with an accent");
+        assert!(
+            why.contains(&format!(
+                "the allowed file {decomposed:?} is not printable ASCII"
+            )),
+            "{why}"
+        );
+        for bad in [
+            "{work}/a\u{7}b",
+            "{work}/a\tb",
+            "{home}/x\n",
+            "/etc/\u{7f}",
+            "{work}/\u{e9}",
+        ] {
+            let why = allowed_files(&[bad], &[]).expect_err(bad);
+            assert!(
+                why.contains(&format!("the absent path {bad:?} is not printable ASCII")),
+                "{bad}: {why}"
+            );
+        }
+        for bad in [
+            "{config}/a\u{0}b",
+            "{config}/a\u{1b}[0m",
+            "{config}/\u{4e2d}",
+        ] {
+            let why = allowed_files(&[], &[bad]).expect_err(bad);
+            assert!(
+                why.contains(&format!("the allowed file {bad:?} is not printable ASCII")),
+                "{bad}: {why}"
+            );
+        }
+        assert_eq!(
+            allowed_files(&["{work}/a b~", "/etc/ x/~"], &["{config}/ p ~/**"]),
+            Ok(vec![" p ~/**".to_owned()]),
+            "a space and a tilde are printable ASCII"
         );
     }
 
@@ -2243,7 +2436,6 @@ mod tests {
         // as a whole part of an absolute path.
         let live = [
             "{config}/settings.json",
-            "{config}",
             "{work}/.mcp.json",
             "{home}/.config/opencode/auth.json",
             "{person}/.kimi-code/plugins",
