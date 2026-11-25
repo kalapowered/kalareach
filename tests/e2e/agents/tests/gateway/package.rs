@@ -155,8 +155,9 @@ pub fn written_place(environment: &EnvironmentPaths) -> PathBuf {
 ///
 /// # Panics
 ///
-/// Panics where the environment's catalogue holds no installation of the subject's package, or
-/// holds a manifest of other bytes than its digest names.
+/// Panics where the environment's catalogue does not open, holds no installation of the subject's
+/// package, holds no manifest in the bytes of the digest the installation names, or holds a
+/// manifest that is not JSON.
 pub fn installed_manifest(subject: &Subject, environment: &EnvironmentPaths) -> serde_json::Value {
     let plugin = subject.plugin();
     let (catalogue, installation) = installation_of(subject, environment);
@@ -166,7 +167,7 @@ pub fn installed_manifest(subject: &Subject, environment: &EnvironmentPaths) -> 
         .unwrap_or_else(|why| panic!("the manifest of the installed package {plugin}: {why}"))
         .unwrap_or_else(|| {
             panic!(
-                "the manifest of the installed package {plugin} is not the digest {} the installation names",
+                "the manifest of the installed package {plugin}: the catalogue holds no manifest in the bytes of the digest {} that the installation names",
                 installation.package_digest
             )
         });
@@ -209,8 +210,9 @@ fn installation_of(subject: &Subject, environment: &EnvironmentPaths) -> (Catalo
 ///
 /// # Panics
 ///
-/// Panics where the environment's catalogue holds no installation of the subject's package.
-pub fn installed_directory(subject: &Subject, environment: &EnvironmentPaths) -> PathBuf {
+/// Panics where the environment's catalogue does not open or holds no installation of the
+/// subject's package.
+fn installed_directory(subject: &Subject, environment: &EnvironmentPaths) -> PathBuf {
     let (catalogue, installation) = installation_of(subject, environment);
     catalogue
         .store_of(&installation)
@@ -864,7 +866,8 @@ fn the_actions_the_staged_parts_read_are_those_of_the_written_package_whatever_i
 }
 
 /// Installs the package written into the place of `environment`, whose manifest is `manifest`, in
-/// `environment`, with the grant its own manifest asks for, from a generation built below `base`.
+/// `environment`, with the grant of its own manifest, which is what it asks for beyond the
+/// repository's ceiling, from a generation built below `base`.
 fn install_written(environment: &EnvironmentPaths, base: &Path, manifest: &PluginManifest) {
     install_in(
         environment.state_dir(),
