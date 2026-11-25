@@ -720,8 +720,17 @@ pub struct Mirror {
 }
 
 /// The switch that makes the agent ignore every server of its configuration but the ones a command
-/// line names, which is also the bridge's own.
+/// line names. The bridge's server is one of its configuration's, so with the switch the agent
+/// ignores it.
 const STRICT_MCP_CONFIG: &str = "--strict-mcp-config";
+
+/// Whether `word` is the switch of [`STRICT_MCP_CONFIG`], alone or with a value after an `=`.
+fn is_strict_mcp_config(word: &str) -> bool {
+    word == STRICT_MCP_CONFIG
+        || word
+            .strip_prefix(STRICT_MCP_CONFIG)
+            .is_some_and(|rest| rest.starts_with('='))
+}
 
 /// A step of a real leg before the agent's first start.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -736,9 +745,13 @@ pub enum Step {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Integrated {
-    /// The switches the agent is given in these parts while the bridge is in place, after its
-    /// arguments and on every probe: [`Account::switches`] without the one that makes the
-    /// agent ignore the bridge's server.
+    /// The arguments the agent is given in these parts while the bridge is in place, in place of
+    /// [`Account::arguments`]: the entry restates the ones it keeps, and the one that makes the
+    /// agent ignore the bridge's server is not among them.
+    pub arguments: Vec<String>,
+    /// The switches the agent is given in these parts while the bridge is in place, after
+    /// [`Integrated::arguments`] and on every probe, in place of [`Account::switches`]: the one
+    /// that makes the agent ignore the bridge's server is not among them.
     pub switches: Vec<String>,
     /// The commands that say, without calling a model, that with the bridge in place the agent
     /// loads its server and nothing of the person's own.
@@ -1572,8 +1585,9 @@ impl Build {
     /// Whether every switch the account names for the agent's updates and installs is in what every
     /// launch gives the agent, probes included: the build's variables, the account's, its `switches`
     /// (not its `arguments`, which only the parts get), and the files of its configuration
-    /// directory. A build with no account has no part that gives the agent the network, and is not
-    /// asked.
+    /// directory. Where the account has `integrated`, the same holds of the switches it gives
+    /// while a native bridge is in place, which stand in place of the account's. A build with no
+    /// account has no part that gives the agent the network, and is not asked.
     ///
     /// # Errors
     ///
@@ -1592,7 +1606,17 @@ impl Build {
             .as_ref()
             .map(|directory| directory.files.clone())
             .unwrap_or_default();
-        installs_off(&account.installs_off, &variables, &arguments, &files)
+        installs_off(&account.installs_off, &variables, &arguments, &files)?;
+        if let Some(integrated) = &account.integrated {
+            installs_off(
+                &account.installs_off,
+                &variables,
+                &integrated.switches,
+                &files,
+            )
+            .map_err(|why| format!("with a native bridge in place, {why}"))?;
+        }
+        Ok(())
     }
 
     /// What a real leg runs the agent with while its package's native bridge is in place, where
@@ -1602,7 +1626,8 @@ impl Build {
     /// # Errors
     ///
     /// Returns what the entry lacks where the package installs a bridge: the account, its
-    /// `integrated`, the probes first, a switch list without `--strict-mcp-config`, or a probe.
+    /// `integrated`, the probes first, arguments and switches without `--strict-mcp-config`, or a
+    /// probe.
     pub fn integrated_for(&self, installs_a_bridge: bool) -> Result<Option<&Integrated>, String> {
         if !installs_a_bridge {
             return Ok(None);
@@ -1624,15 +1649,16 @@ impl Build {
                  host applies its recipe"
             ));
         }
-        if integrated
-            .switches
-            .iter()
-            .any(|switch| switch == STRICT_MCP_CONFIG)
-        {
-            return Err(format!(
-                "{package} installs a native bridge, and the entry's switches with it in place give \
-                 {STRICT_MCP_CONFIG}, which by the vendor's reference makes the agent ignore the bridge's server"
-            ));
+        for (which, words) in [
+            ("arguments", &integrated.arguments),
+            ("switches", &integrated.switches),
+        ] {
+            if words.iter().any(|word| is_strict_mcp_config(word)) {
+                return Err(format!(
+                    "{package} installs a native bridge, and the entry's {which} with it in place give \
+                     {STRICT_MCP_CONFIG}, which by the vendor's reference makes the agent ignore the bridge's server"
+                ));
+            }
         }
         if integrated.isolated.is_empty() {
             return Err(format!(
@@ -2194,6 +2220,7 @@ mod tests {
     /// An `integrated` member that a leg may run with.
     fn integrated() -> serde_json::Value {
         serde_json::json!({
+            "arguments": ["--model", "haiku"],
             "switches": ["--setting-sources", "project"],
             "isolated": [{ "arguments": ["mcp", "list"], "shows": ["kalareach"] }],
             "probes_before_the_recipe": true
@@ -2209,6 +2236,7 @@ mod tests {
             .as_ref()
             .and_then(|account| account.integrated.as_ref())
             .expect("the member");
+        assert_eq!(read.arguments, ["--model", "haiku"]);
         assert_eq!(read.switches, ["--setting-sources", "project"]);
         assert_eq!(read.isolated.len(), 1);
         assert_eq!(read.isolated[0].arguments, ["mcp", "list"]);
@@ -2219,6 +2247,16 @@ mod tests {
         entry["account"]["integrated"] = unknown;
         let refused = serde_json::from_value::<Build>(entry).expect_err("an unknown member");
         assert!(refused.to_string().contains("strict"), "{refused}");
+        // The arguments are the entry's to state: a member without them is not read.
+        let mut without = integrated();
+        without
+            .as_object_mut()
+            .expect("a member")
+            .remove("arguments");
+        let mut entry = entry_json(&serde_json::json!({}), &serde_json::json!({}));
+        entry["account"]["integrated"] = without;
+        let refused = serde_json::from_value::<Build>(entry).expect_err("no arguments");
+        assert!(refused.to_string().contains("arguments"), "{refused}");
     }
 
     /// The probes come first where the entry says they run before the recipe, and the recipe first
@@ -2263,7 +2301,19 @@ mod tests {
             ),
             (
                 serde_json::json!({ "switches": ["--strict-mcp-config"] }),
-                "--strict-mcp-config",
+                "switches with it in place give --strict-mcp-config",
+            ),
+            (
+                serde_json::json!({ "switches": ["--strict-mcp-config=true"] }),
+                "switches with it in place give --strict-mcp-config",
+            ),
+            (
+                serde_json::json!({ "arguments": ["--model", "haiku", "--strict-mcp-config"] }),
+                "arguments with it in place give --strict-mcp-config",
+            ),
+            (
+                serde_json::json!({ "arguments": ["--strict-mcp-config=true"] }),
+                "arguments with it in place give --strict-mcp-config",
             ),
             (
                 serde_json::json!({ "isolated": [] }),
@@ -2279,6 +2329,37 @@ mod tests {
                 .expect_err("a member that is not as it must be");
             assert!(why.contains(said), "{said}: {why}");
         }
+    }
+
+    /// The claude-code entry of the plugins repository (`fixtures/agents/builds.json`) gives
+    /// `--strict-mcp-config` in the account's own arguments. A leg whose package installs a bridge
+    /// runs with the arguments of `integrated`, which leave it out, and not with the account's.
+    #[test]
+    fn a_leg_with_a_bridge_runs_with_the_integrated_arguments_where_the_account_gives_the_flag() {
+        let mut entry = entry_json(&serde_json::json!({}), &serde_json::json!({}));
+        entry["account"]["arguments"] =
+            serde_json::json!(["--model", "haiku", "--strict-mcp-config"]);
+        entry["account"]["integrated"] = integrated();
+        let build: Build = serde_json::from_value(entry).expect("an entry");
+        let account = build.account.as_ref().expect("an account");
+        assert!(
+            account
+                .arguments
+                .iter()
+                .any(|word| word == "--strict-mcp-config")
+        );
+        let integrated = build
+            .integrated_for(true)
+            .expect("a leg that may run")
+            .expect("the member");
+        assert_eq!(integrated.arguments, ["--model", "haiku"]);
+        assert!(
+            !integrated
+                .arguments
+                .iter()
+                .any(|word| word == "--strict-mcp-config"),
+            "the flag is not among the arguments of the leg with the bridge"
+        );
     }
 
     /// An entry that sets a variable the host's worker drops from every session (its own prefix,
@@ -2712,6 +2793,34 @@ mod tests {
         ] {
             assert!(serde_json::from_value::<InstallSwitch>(bad).is_err());
         }
+    }
+
+    /// A switch that stops the agent's updates and installs is required of the switches the agent has
+    /// with the bridge in place as it is of the account's: an entry that leaves it out there is
+    /// refused, and one that gives it there is not.
+    #[test]
+    fn the_switches_with_a_bridge_in_place_must_stop_the_agents_updates_and_installs_too() {
+        let build = |integrated_switches: &[&str]| -> Build {
+            let mut entry = entry_json(&serde_json::json!({}), &serde_json::json!({}));
+            entry["account"]["installs_off"] =
+                serde_json::json!([{ "switch": "argument", "text": "--no-update" }]);
+            entry["account"]["switches"] = serde_json::json!(["--no-update"]);
+            let mut member = integrated();
+            member["switches"] = serde_json::json!(integrated_switches);
+            entry["account"]["integrated"] = member;
+            serde_json::from_value(entry).expect("an entry")
+        };
+        assert_eq!(
+            build(&["--no-update", "--setting-sources", "project"]).installs_are_off(),
+            Ok(())
+        );
+        let refused = build(&["--setting-sources", "project"])
+            .installs_are_off()
+            .expect_err("a list that leaves the switch out");
+        assert!(
+            refused.contains("with a native bridge in place") && refused.contains("--no-update"),
+            "{refused}"
+        );
     }
 
     /// Where an agent draws its dialog over its conversation, the rows above the dialog's title are
