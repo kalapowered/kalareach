@@ -213,8 +213,34 @@ const NEEDS: [(&str, &[&str]); 14] = [
 /// agent, so it reads no start draft.
 const PROBE_ONLY_SKIPS: [&str; 2] = ["newer.isolated", "account.draft"];
 
-/// The keys of `missing` that the isolation contract reads and no part does.
-const ISOLATION_KEYS: [&str; 1] = ["isolation.startup"];
+/// The keys of `missing` that the isolation contract reads and no part reads: `isolation.startup`
+/// and `isolation.person_trees` for every entry, and `isolation.installs_off` and
+/// `isolation.absent` for an entry with no account.
+const ISOLATION_KEYS: [(&str, &str); 4] = [
+    ("isolation.startup", "startup controls"),
+    ("isolation.person_trees", "person trees"),
+    ("isolation.installs_off", "installs-off switches"),
+    ("isolation.absent", "absent files"),
+];
+
+fn isolation_members(build: &Build, key: &str) -> Option<(&'static str, bool)> {
+    let &(_, what) = ISOLATION_KEYS.iter().find(|(named, _)| *named == key)?;
+    let isolation = build.isolation.as_ref();
+    let given = match key {
+        "isolation.startup" => isolation.is_some_and(|isolation| !isolation.startup.is_empty()),
+        "isolation.person_trees" => {
+            isolation.is_some_and(|isolation| !isolation.person_trees.is_empty())
+        }
+        "isolation.installs_off" if build.account.is_none() => {
+            isolation.is_some_and(|isolation| !isolation.installs_off.is_empty())
+        }
+        "isolation.absent" if build.account.is_none() => {
+            isolation.is_some_and(|isolation| !isolation.absent.is_empty())
+        }
+        _ => return None,
+    };
+    Some((what, given))
+}
 
 /// Whether the entry gives members for `field`: a value that is not empty.
 fn has_members(build: &Build, field: &str) -> bool {
@@ -333,14 +359,10 @@ pub fn check(build: &Build) -> Report {
         .flat_map(|(_, fields)| fields.iter().copied())
         .collect();
     for field in build.missing.iter().flat_map(BTreeMap::keys) {
-        if ISOLATION_KEYS.contains(&field.as_str()) {
-            if build
-                .isolation
-                .as_ref()
-                .is_some_and(|isolation| !isolation.startup.is_empty())
-            {
+        if let Some((what, given)) = isolation_members(build, field) {
+            if given {
                 report.refusals.push(Refusal::Contradiction(format!(
-                    "the entry lists {field} as missing and gives startup controls"
+                    "the entry lists {field} as missing and gives {what}"
                 )));
             }
         } else if !read.contains(&field.as_str()) {
@@ -873,6 +895,99 @@ mod tests {
                 refusal, Refusal::Contradiction(text) if text.contains("isolation.startup")
             )),
             "an entry that gives startup controls and lists them as missing contradicts itself"
+        );
+    }
+
+    /// Whether the check refuses `build` for listing `key` as missing and giving `what`.
+    fn contradicts_by_giving(build: &Build, key: &str, what: &str) -> bool {
+        check(build).refusals.iter().any(|refusal| {
+            matches!(refusal, Refusal::Contradiction(text)
+                if *text == format!("the entry lists {key} as missing and gives {what}"))
+        })
+    }
+
+    /// An entry that lists the person trees as missing and gives them contradicts itself.
+    #[test]
+    fn person_trees_listed_as_missing_and_given_are_refused() {
+        let mut build = build_of("kalareach/opencode");
+        build
+            .missing
+            .as_mut()
+            .expect("a missing member")
+            .insert("isolation.person_trees".to_owned(), "listed".to_owned());
+        assert!(contradicts_by_giving(
+            &build,
+            "isolation.person_trees",
+            "person trees"
+        ));
+    }
+
+    /// An entry with no account that lists its installs-off switches as missing and gives them
+    /// contradicts itself.
+    #[test]
+    fn installs_off_listed_as_missing_and_given_are_refused_for_an_entry_with_no_account() {
+        let mut build = build_of("kalareach/opencode-attach");
+        build
+            .missing
+            .as_mut()
+            .expect("a missing member")
+            .insert("isolation.installs_off".to_owned(), "listed".to_owned());
+        assert!(contradicts_by_giving(
+            &build,
+            "isolation.installs_off",
+            "installs-off switches"
+        ));
+    }
+
+    /// An entry with no account that lists its absent files as missing and gives them contradicts
+    /// itself.
+    #[test]
+    fn absent_files_listed_as_missing_and_given_are_refused_for_an_entry_with_no_account() {
+        let mut build = build_of("kalareach/opencode-attach");
+        build
+            .missing
+            .as_mut()
+            .expect("a missing member")
+            .insert("isolation.absent".to_owned(), "listed".to_owned());
+        assert!(contradicts_by_giving(
+            &build,
+            "isolation.absent",
+            "absent files"
+        ));
+    }
+
+    /// An isolation key that the entry lists as missing and does not give is no contradiction, and
+    /// a real start is still refused for what the entry lacks. For an entry with an account, the
+    /// keys of the installs-off switches and the absent files are keys that no part reads.
+    #[test]
+    fn an_isolation_key_listed_as_missing_is_known_to_the_check_where_it_applies() {
+        let mut bare = build_of("kalareach/opencode");
+        bare.isolation
+            .as_mut()
+            .expect("isolation")
+            .person_trees
+            .clear();
+        bare.missing.as_mut().expect("a missing member").insert(
+            "isolation.person_trees".to_owned(),
+            "no tree was found".to_owned(),
+        );
+        assert_eq!(
+            check(&bare).refusals,
+            vec![Refusal::NoIsolation(vec!["person_trees"])],
+            "listed and not given: no contradiction, and the start is refused for the lack"
+        );
+        let mut account = build_of("kalareach/opencode");
+        account
+            .missing
+            .as_mut()
+            .expect("a missing member")
+            .insert("isolation.installs_off".to_owned(), "listed".to_owned());
+        assert!(
+            check(&account).refusals.iter().any(|refusal| matches!(
+                refusal, Refusal::Contradiction(text)
+                    if text.contains("isolation.installs_off") && text.contains("no part reads it")
+            )),
+            "an entry with an account has its installs-off switches in the account"
         );
     }
 
