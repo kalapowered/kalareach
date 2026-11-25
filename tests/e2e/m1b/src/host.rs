@@ -34,9 +34,16 @@ use crate::run::{
     HARNESS_PROGRAM, Run, binary_place, ended_within, output_within, processes_under,
     read_tail_below, running, signal, socket_below, worker_session,
 };
+use crate::tree::Record;
 
 /// The daemon's log, in the run's directory.
 const DAEMON_LOG: &str = "controller.log";
+
+/// The directory of the run that holds the host's runtime directory (`--runtime-dir`).
+const RUNTIME_ROOT: &str = "r";
+
+/// The directory of the run that holds the host's state directory (`--state-dir`).
+const STATE_ROOT: &str = "s";
 
 /// How long the daemon is given to stop once it has been interrupted.
 const DAEMON_STOP: Duration = Duration::from_secs(20);
@@ -216,6 +223,36 @@ pub struct Preparation {
     pub stable_address: bool,
 }
 
+/// What a case says of a restart of the control daemon after its agent has started
+/// ([`Host::declares_a_restart`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Restart {
+    /// The case starts no daemon again after its agent started, or does so only for the harness's
+    /// own stand-in, which changes none of the run's files.
+    #[default]
+    Off,
+    /// The case kills the daemon and starts it again after its agent started: the host records the
+    /// run's tree when the agent starts, unless the agent is the stand-in.
+    Declared,
+    /// The survey of the files a restart changes: the host records the run's tree when the agent
+    /// starts on the stand-in too.
+    Survey,
+}
+
+/// Why a leg did not run, carried by the unwinding of a case's body to the end of the case, which
+/// records the leg as not run with this text and then fails.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LegNotRun(pub String);
+
+/// What a host holds of a restart: what the case declared and the record made when its agent
+/// started.
+#[derive(Debug, Default)]
+struct Restarts {
+    declared: Restart,
+    /// The record of the run's tree, made once at the first start of the agent.
+    record: Option<Record>,
+}
+
 /// A running host.
 #[derive(Debug)]
 pub struct Host<'r> {
@@ -234,6 +271,8 @@ pub struct Host<'r> {
     /// The `kr` commands asked for after the agent under test started, each as its arguments: none
     /// is run, and the record shows that none was asked for either.
     kr_after_start: Arc<Mutex<Vec<String>>>,
+    /// The restart the case declared and the record of the run's tree made when its agent started.
+    restarts: Mutex<Restarts>,
 }
 
 #[derive(Debug)]
@@ -269,7 +308,7 @@ impl<'r> Host<'r> {
         seed: impl FnOnce(&EnvironmentPaths),
     ) -> Self {
         kr_ipc::testing::account_launchd::require("the host start");
-        let paths = HostPaths::new(run.root().join("r"), run.root().join("s"))
+        let paths = HostPaths::new(run.root().join(RUNTIME_ROOT), run.root().join(STATE_ROOT))
             .expect("absolute host roots");
         // The same identity the daemon opens when it starts: it reads the one that is there.
         let environment_id = paths
@@ -294,6 +333,7 @@ impl<'r> Host<'r> {
             agent_started: AtomicBool::new(false),
             stand_in: AtomicBool::new(false),
             kr_after_start: Arc::default(),
+            restarts: Mutex::default(),
         };
         // The port was free when it was chosen, and it is bound when the daemon starts: other legs
         // choose theirs meanwhile, on this machine and on a shared one, and two can choose alike.
@@ -494,8 +534,48 @@ impl<'r> Host<'r> {
     /// and the endpoint it connects to from that tree at every call, so no `kr` is run once the
     /// agent may have started ([`Host::kr_within`] refuses, and [`Host::command`] panics); the host
     /// is stopped, and dropped, by ending what the run recorded by identity instead.
+    ///
+    /// A case that declared a restart ([`Host::declares_a_restart`]) has the whole tree of the run's
+    /// two host roots recorded here, once, at the first call, while the daemon is alive and the
+    /// agent has not run: the record is what a later compare takes as the tree before the agent
+    /// acted. No record is made for any other case, nor on the stand-in path (the flag set by
+    /// [`Host::agent_is_a_stand_in`] comes before this call), except for the survey
+    /// ([`Restart::Survey`]), which records on the stand-in too.
+    ///
+    /// # Panics
+    ///
+    /// Unwinds with a [`LegNotRun`] when the record cannot be made: the leg ends as not run before
+    /// the agent is launched.
     pub fn agent_starts(&self) {
         self.agent_started.store(true, Ordering::SeqCst);
+        let made = {
+            let mut restarts = self.restarts.lock().unwrap_or_else(PoisonError::into_inner);
+            let records = match restarts.declared {
+                Restart::Off => false,
+                Restart::Declared => !self.stand_in.load(Ordering::SeqCst),
+                Restart::Survey => true,
+            };
+            if !records || restarts.record.is_some() {
+                return;
+            }
+            Record::of(self.run.root(), self.run.pin(), &[RUNTIME_ROOT, STATE_ROOT]).map(|record| {
+                restarts.record = Some(record);
+            })
+        };
+        if let Err(why) = made {
+            let said = format!("no record could be made before the agent started: {why}");
+            eprintln!("{said}");
+            std::panic::resume_unwind(Box::new(LegNotRun(said)));
+        }
+    }
+
+    /// Says how the case restarts the daemon after its agent has started. A case calls it before
+    /// its agent starts ([`Host::agent_starts`]); a case that does not call it declares none.
+    pub fn declares_a_restart(&self, how: Restart) {
+        self.restarts
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .declared = how;
     }
 
     /// Says that the agent under test is the harness's own stand-in, which runs none of the run's
@@ -1369,7 +1449,7 @@ mod shutdown_tests {
 
     /// A host over a run's tree with no daemon started.
     fn host_over(run: &Run) -> Host<'_> {
-        let paths = HostPaths::new(run.root().join("r"), run.root().join("s"))
+        let paths = HostPaths::new(run.root().join(RUNTIME_ROOT), run.root().join(STATE_ROOT))
             .expect("absolute host roots");
         let identity = paths
             .open_environment_id()
@@ -1386,6 +1466,7 @@ mod shutdown_tests {
             agent_started: AtomicBool::new(false),
             stand_in: AtomicBool::new(false),
             kr_after_start: Arc::default(),
+            restarts: Mutex::default(),
         }
     }
 
@@ -1974,8 +2055,115 @@ mod shutdown_tests {
                 .is_none(),
             "nothing was started"
         );
+        assert!(
+            recorded(&host).is_none(),
+            "a case that declared no restart has no record of the tree"
+        );
         drop(host);
         drop(run);
+        std::fs::remove_dir_all(&root).expect("clean up");
+    }
+
+    /// The record `agent_starts` made, if it made one.
+    fn recorded(host: &Host<'_>) -> Option<Record> {
+        host.restarts
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .record
+            .clone()
+    }
+
+    /// The run's two host roots are recorded once, when the agent of a case that declared a restart
+    /// starts, and what the agent writes afterwards is not taken into the record.
+    #[test]
+    fn a_case_that_declares_a_restart_has_the_run_tree_recorded_once_when_its_agent_starts() {
+        let root = scratch("record-once");
+        let (run, _mark) = host_with_a_kr(&root);
+        let host = host_over(&run);
+        std::fs::write(root.join("s/before"), b"before").expect("a file");
+        host.declares_a_restart(Restart::Declared);
+        assert!(
+            recorded(&host).is_none(),
+            "nothing is recorded before the agent starts"
+        );
+        host.agent_starts();
+        let held = recorded(&host).expect("the tree is recorded");
+        assert!(held.get(Path::new("s/before")).is_some());
+        assert!(
+            held.get(Path::new("b/kr")).is_none(),
+            "only the host's two roots are recorded"
+        );
+        std::fs::write(root.join("s/later"), b"later").expect("a file the agent wrote");
+        host.agent_starts();
+        let again = recorded(&host).expect("the record");
+        assert!(
+            again.get(Path::new("s/later")).is_none(),
+            "the record is made once, at the first start"
+        );
+        drop(host);
+        drop(run);
+        std::fs::remove_dir_all(&root).expect("clean up");
+    }
+
+    /// No record is made for a case that declares no restart, nor for the stand-in path of one
+    /// that does; the survey records on the stand-in too.
+    #[test]
+    fn no_record_is_made_for_a_case_with_no_restart_or_on_the_stand_in_path() {
+        for (how, stand_in, records) in [
+            (Restart::Off, false, false),
+            (Restart::Off, true, false),
+            (Restart::Declared, true, false),
+            (Restart::Declared, false, true),
+            (Restart::Survey, true, true),
+            (Restart::Survey, false, true),
+        ] {
+            let root = scratch("record-when");
+            let (run, _mark) = host_with_a_kr(&root);
+            let host = host_over(&run);
+            host.declares_a_restart(how);
+            if stand_in {
+                host.agent_is_a_stand_in();
+            }
+            host.agent_starts();
+            assert_eq!(
+                recorded(&host).is_some(),
+                records,
+                "{how:?}, stand-in {stand_in}"
+            );
+            drop(host);
+            drop(run);
+            std::fs::remove_dir_all(&root).expect("clean up");
+        }
+    }
+
+    /// A record that cannot be made ends the leg as not run, by the unwinding the end of the case
+    /// reads, before the agent is launched, and leaves no record.
+    #[test]
+    fn a_record_that_cannot_be_made_ends_the_leg_as_not_run_and_leaves_no_record() {
+        let root = scratch("record-fails");
+        let (run, _mark) = host_with_a_kr(&root);
+        let host = host_over(&run);
+        std::fs::remove_dir_all(root.join(STATE_ROOT)).expect("the state root removed");
+        std::os::unix::fs::symlink(&root, root.join(STATE_ROOT)).expect("a link at the state root");
+        host.declares_a_restart(Restart::Declared);
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            host.agent_starts();
+        }))
+        .expect_err("no record, no start");
+        let not_run = unwound
+            .downcast_ref::<LegNotRun>()
+            .expect("the leg is not run, it did not fail");
+        assert!(
+            not_run
+                .0
+                .starts_with("no record could be made before the agent started: "),
+            "{}",
+            not_run.0
+        );
+        assert!(recorded(&host).is_none());
+        drop(host);
+        drop(run);
+        std::fs::remove_file(root.join(STATE_ROOT)).expect("the link removed");
         std::fs::remove_dir_all(&root).expect("clean up");
     }
 

@@ -116,7 +116,7 @@ use kr_e2e_agents::stub::RequestStub;
 use kr_e2e_agents::subject::Subject;
 use kr_e2e_agents::{GENERATION_VARIABLE, RESULT_VARIABLE};
 use kr_e2e_m1b::device::{Device, PairedHost, Remote, RequestError};
-use kr_e2e_m1b::host::{Host, HostOptions, Preparation};
+use kr_e2e_m1b::host::{Host, HostOptions, LegNotRun, Preparation, Restart};
 use kr_e2e_m1b::run::{PlacedDirectory, Run, binary_place};
 use kr_e2e_m1b::window::{Window, answered};
 use kr_e2e_m1b::{LIVENESS, ceremony, shells};
@@ -4173,6 +4173,36 @@ fn a_body_that_returns_not_run_is_recorded_not_run_and_never_passed() {
     assert_eq!(recorded_as(&ran, &[], true), Filed::ProbeOnly);
 }
 
+/// What a case's body came to: what it showed, or the text it failed with. A body that unwound
+/// with a [`LegNotRun`] showed that the leg did not run, and says why.
+fn shown_or_failed(
+    result: &std::thread::Result<serde_json::Value>,
+) -> Result<serde_json::Value, String> {
+    match result {
+        Ok(shows) => Ok(shows.clone()),
+        Err(panic) => match panic.downcast_ref::<LegNotRun>() {
+            Some(LegNotRun(why)) => Ok(serde_json::json!({ "not_run": why })),
+            None => Err(kept_panic_text(&panic_text(&**panic))),
+        },
+    }
+}
+
+/// A body that unwinds with the host's not-run payload is recorded as not run, with its reason,
+/// and one that panics is recorded as failed.
+#[test]
+fn a_body_that_unwinds_as_not_run_is_recorded_not_run_and_a_panic_is_recorded_failed() {
+    let not_run: std::thread::Result<serde_json::Value> = Err(Box::new(LegNotRun(
+        "no record could be made before the agent started: why".to_owned(),
+    )));
+    let shown = shown_or_failed(&not_run).expect("a body that did not run shows that");
+    assert_eq!(
+        recorded_as(&shown, &[], false),
+        Filed::NotRun("no record could be made before the agent started: why".to_owned())
+    );
+    let panicked: std::thread::Result<serde_json::Value> = Err(Box::new("it broke".to_owned()));
+    assert!(shown_or_failed(&panicked).is_err());
+}
+
 /// The outcome of a real route that ended with `stops` (a key found in the run's directory before
 /// the charge, a turn that was not charged, a run left in place), marked so that the harness stops
 /// the agent here: `stop_agent` in its evidence and an `agent_stops` code of each stop's class. An
@@ -4549,10 +4579,7 @@ fn ends(
         .collect();
     let probe_only = matches!(&route, Route::Real(real) if real.probe_only);
     let real_route = matches!(&route, Route::Real(_));
-    let said: Result<serde_json::Value, String> = match &result {
-        Ok(shows) => Ok(shows.clone()),
-        Err(panic) => Err(kept_panic_text(&panic_text(&**panic))),
-    };
+    let said = shown_or_failed(&result);
     let failed_after_showing =
         matches!(&said, Ok(shows) if recorded_as(shows, &stops, probe_only) == Filed::Failed);
     record(outcome_of(
@@ -4678,6 +4705,9 @@ struct Setup {
     /// build behind it (the forging session of 8a, and the second start of 7 and 7f). The agent in
     /// it is the first's, with the same variants.
     second: bool,
+    /// What the case says of a restart of the control daemon after its agent started: the host
+    /// records the run's tree when the agent starts for a case that declares one.
+    restart: Restart,
 }
 
 /// The stand-in's variants in a case's second session's shell: none where the second session
@@ -4962,6 +4992,7 @@ fn run_case_on(
         } else {
             Session::open(&ctx, variants)
         };
+        session.host.declares_a_restart(setup.restart);
         let shows = body(&ctx, &session);
         ctx.close(&session.host);
         shows
