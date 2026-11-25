@@ -6581,7 +6581,6 @@ fn the_pass_at_a_start_gives_each_active_grant_without_a_point_the_start() {
     let (_temp, database, directory, root) = a_store_with_a_root();
     let clock = SetClock::at(9_000);
     let boot = boot_in(&clock, 7);
-    let now = kr_ipc::now_ms().get();
     let held = Grant {
         grant_id: grant_id(0x41),
         ..grant(

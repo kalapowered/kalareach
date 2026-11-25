@@ -118,6 +118,10 @@ mod tests {
 
     use super::*;
 
+    /// A way a counter reads a moment: its name, the reading, and the time after which a stamp is
+    /// certain to read above a point.
+    type Reading<'a> = (&'a str, &'a dyn Fn(u64) -> u64, u64);
+
     /// A record of boots a case writes by hand.
     struct Record(BTreeMap<u64, BootState>);
 
@@ -168,7 +172,7 @@ mod tests {
         let ticks_of_16 = |moment: u64| moment / 16 * 16;
         let ticks_of_7 = |moment: u64| moment / 7 * 7;
         let lagging = |moment: u64| moment.saturating_sub(3) * 1_000 / 15_625 * 15_625 / 1_000;
-        let readings: [(&str, &dyn Fn(u64) -> u64, u64); 4] = [
+        let readings: [Reading<'_>; 4] = [
             ("truncation", &truncated, 2),
             ("tick of 16", &ticks_of_16, 16),
             ("tick of 7", &ticks_of_7, 7),
