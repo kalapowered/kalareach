@@ -166,9 +166,17 @@ pub fn the_same_id_is_two_requests(listed: usize) -> Result<(), Red> {
     ensure(listed == 2, "5b-7")
 }
 
-/// 5b-8: a fresh request after a restart is the one request pending.
-pub fn a_fresh_request_appears(pending: usize) -> Result<(), Red> {
-    ensure(pending == 1, "5b-8")
+/// 5b-8: a fresh request after a restart is the one request pending: the agent's request 1, which
+/// follows the answered request 0.
+pub fn a_fresh_request_appears(pending: &[u64]) -> Result<(), Red> {
+    ensure(pending == [1], "5b-8")
+}
+
+/// Whether the stand-in sent the request numbered `number`.
+fn sent_request(record: &[Value], number: u64) -> bool {
+    record
+        .iter()
+        .any(|line| line["sent"] == "request" && line["id"] == number)
 }
 
 /// The host, the daemon, the worker and the stand-in a case works with, started through the ACP
@@ -250,8 +258,9 @@ impl Hosted {
         match *self {}
     }
 
-    /// How many requests the host lists as pending for the session.
-    pub fn pending_requests(&mut self) -> usize {
+    /// The numbers, in the agent's own numbering, of the agent's requests that the host lists as
+    /// pending for the session, once it lists one or after five seconds when it lists none.
+    pub fn pending_agent_requests(&mut self) -> Vec<u64> {
         match *self {}
     }
 
@@ -329,7 +338,13 @@ pub fn a_fresh_request_after_a_restart(host: &mut Hosted) -> Result<(), Red> {
     host.kill_daemon();
     host.restart_daemon();
     host.release("second");
-    a_fresh_request_appears(host.pending_requests())
+    let pending = host.pending_agent_requests();
+    requires(
+        "5b-8",
+        sent_request(&host.record(), 1),
+        "the stand-in did not send its second request",
+    );
+    a_fresh_request_appears(&pending)
 }
 
 /// A record line that is the response to request 0 with the chosen option.
@@ -428,8 +443,36 @@ fn the_judges_of_the_requests_name_their_reds_when_the_id_alone_keys_them_or_a_f
  {
     assert_eq!(the_same_id_is_two_requests(2), Ok(()));
     assert_eq!(the_same_id_is_two_requests(1), Err(red("5b-7")));
-    assert_eq!(a_fresh_request_appears(1), Ok(()));
-    assert_eq!(a_fresh_request_appears(0), Err(red("5b-8")));
+    assert_eq!(a_fresh_request_appears(&[1]), Ok(()));
+    assert_eq!(
+        a_fresh_request_appears(&[]),
+        Err(red("5b-8")),
+        "the fresh request was dropped"
+    );
+    assert_eq!(
+        a_fresh_request_appears(&[0]),
+        Err(red("5b-8")),
+        "the answered request still waits and the fresh one does not appear"
+    );
+    assert_eq!(
+        a_fresh_request_appears(&[0, 1]),
+        Err(red("5b-8")),
+        "the answered request still waits beside the fresh one"
+    );
+}
+
+#[test]
+fn the_reader_of_the_record_finds_the_requests_the_stand_in_sent() {
+    let record = [
+        serde_json::json!({ "sent": "request", "id": 1, "call": "c1" }),
+        serde_json::json!({ "received": "request", "id": 2, "method": "session/prompt" }),
+    ];
+    assert!(sent_request(&record, 1));
+    assert!(!sent_request(&record, 0), "request 0 was not sent");
+    assert!(
+        !sent_request(&record, 2),
+        "a request that the stand-in received is not one it sent"
+    );
 }
 
 /// What the receipts of the two answers of [`exit_script`] read after the agent exited.
@@ -1190,16 +1233,17 @@ pub fn a_cancel_after_eleven_seconds_reaches_the_agent(record: &[Value]) -> Resu
     )
 }
 
-/// 5b-16: the approval at 29 seconds after the cancel was answered `cancelled`, and the approval at
-/// 31 seconds got no answer and is listed as pending.
+/// 5b-16: the approval at 29 seconds after the cancel, the agent's request 1, was answered
+/// `cancelled`, and the approval at 31 seconds, its request 2, got no answer and is the one request
+/// listed as pending.
 pub fn the_window_closes_thirty_seconds_after_the_cancel(
     record: &[Value],
-    pending: usize,
+    pending: &[u64],
 ) -> Result<(), Red> {
     ensure(
         outcome_of(record, 1) == Some("cancelled")
             && outcome_of(record, 2).is_none()
-            && pending == 1,
+            && pending == [2],
         "5b-16",
     )
 }
@@ -1210,12 +1254,13 @@ pub fn a_prompt_answered_cancelled_leaves_the_window_open(record: &[Value]) -> R
     ensure(outcome_of(record, 1) == Some("cancelled"), "5b-18")
 }
 
-/// 5b-19: the approval of a prompt sent after the cancel got no answer and is listed as pending.
+/// 5b-19: the approval of a prompt sent after the cancel, the agent's request 1, got no answer and
+/// is the one request listed as pending.
 pub fn a_prompt_after_a_cancel_shows_its_approval(
     record: &[Value],
-    pending: usize,
+    pending: &[u64],
 ) -> Result<(), Red> {
-    ensure(outcome_of(record, 1).is_none() && pending == 1, "5b-19")
+    ensure(outcome_of(record, 1).is_none() && pending == [1], "5b-19")
 }
 
 impl Hosted {
@@ -1327,7 +1372,12 @@ pub fn approvals_at_twenty_nine_and_thirty_one_seconds(host: &mut Hosted) -> Res
     host.release("tick6");
     host.release("t31");
     let record = host.record_after_response(2);
-    the_window_closes_thirty_seconds_after_the_cancel(&record, host.pending_requests())
+    requires(
+        "5b-16",
+        sent_request(&record, 2),
+        "the stand-in did not send its request at 31 seconds",
+    );
+    the_window_closes_thirty_seconds_after_the_cancel(&record, &host.pending_agent_requests())
 }
 
 /// Case 5b-18: a prompt of ours waits behind a turn of the agent's own, the cancel answers it
@@ -1352,7 +1402,22 @@ pub fn a_prompt_five_seconds_after_a_cancel(host: &mut Hosted) -> Result<(), Red
     host.advance_clock(5);
     host.send_prompt("again");
     let record = host.record_after_response(1);
-    a_prompt_after_a_cancel_shows_its_approval(&record, host.pending_requests())
+    requires(
+        "5b-19",
+        cancels(&record) == 1,
+        "the stand-in did not receive exactly one `session/cancel`",
+    );
+    requires(
+        "5b-19",
+        outcome_of(&record, 0) == Some("cancelled"),
+        "the stand-in's request 0 was not answered `cancelled`",
+    );
+    requires(
+        "5b-19",
+        sent_request(&record, 1),
+        "the stand-in did not send its request 1",
+    );
+    a_prompt_after_a_cancel_shows_its_approval(&record, &host.pending_agent_requests())
 }
 
 /// A record line that is a `session/cancel` the stand-in received.
@@ -1384,7 +1449,7 @@ fn the_judge_of_a_quiet_cancel_names_its_red_when_the_stand_in_sees_no_cancel() 
 fn the_judge_of_the_window_names_its_red_when_it_stays_open_while_traffic_goes_on() {
     let closed = [cancelled_response_line(0), cancelled_response_line(1)];
     assert_eq!(
-        the_window_closes_thirty_seconds_after_the_cancel(&closed, 1),
+        the_window_closes_thirty_seconds_after_the_cancel(&closed, &[2]),
         Ok(())
     );
     let open = [
@@ -1393,20 +1458,27 @@ fn the_judge_of_the_window_names_its_red_when_it_stays_open_while_traffic_goes_o
         cancelled_response_line(2),
     ];
     assert_eq!(
-        the_window_closes_thirty_seconds_after_the_cancel(&open, 0),
+        the_window_closes_thirty_seconds_after_the_cancel(&open, &[]),
         Err(red("5b-16")),
         "the approval at 31 seconds was answered cancelled"
     );
     assert_eq!(
-        the_window_closes_thirty_seconds_after_the_cancel(&closed[..1], 2),
+        the_window_closes_thirty_seconds_after_the_cancel(&closed[..1], &[2]),
         Err(red("5b-16")),
         "the approval at 29 seconds was not answered cancelled"
     );
     assert_eq!(
-        the_window_closes_thirty_seconds_after_the_cancel(&closed, 0),
+        the_window_closes_thirty_seconds_after_the_cancel(&closed, &[]),
         Err(red("5b-16")),
         "the approval at 31 seconds is not listed"
     );
+    for other in [&[1][..], &[1, 2][..], &[0][..]] {
+        assert_eq!(
+            the_window_closes_thirty_seconds_after_the_cancel(&closed, other),
+            Err(red("5b-16")),
+            "the request listed as pending is {other:?} and not the one at 31 seconds alone"
+        );
+    }
 }
 
 #[test]
@@ -1427,20 +1499,27 @@ fn the_judge_of_a_queued_prompt_names_its_red_when_the_late_request_shows() {
 fn the_judge_of_a_prompt_after_a_cancel_names_its_red_when_its_approval_is_answered_cancelled() {
     let shown = [cancelled_response_line(0)];
     assert_eq!(
-        a_prompt_after_a_cancel_shows_its_approval(&shown, 1),
+        a_prompt_after_a_cancel_shows_its_approval(&shown, &[1]),
         Ok(())
     );
     let answered = [cancelled_response_line(0), cancelled_response_line(1)];
     assert_eq!(
-        a_prompt_after_a_cancel_shows_its_approval(&answered, 0),
+        a_prompt_after_a_cancel_shows_its_approval(&answered, &[]),
         Err(red("5b-19")),
         "the window ignored the dispatch of the prompt and stayed open"
     );
     assert_eq!(
-        a_prompt_after_a_cancel_shows_its_approval(&shown, 0),
+        a_prompt_after_a_cancel_shows_its_approval(&shown, &[]),
         Err(red("5b-19")),
         "the approval of the prompt is not listed"
     );
+    for other in [&[0][..], &[0, 1][..], &[2][..]] {
+        assert_eq!(
+            a_prompt_after_a_cancel_shows_its_approval(&shown, other),
+            Err(red("5b-19")),
+            "the request listed as pending is {other:?} and not the prompt's request 1 alone"
+        );
+    }
 }
 
 /// 5b-6g: the request that the Gemini-shaped stand-in sent after the cancel was answered

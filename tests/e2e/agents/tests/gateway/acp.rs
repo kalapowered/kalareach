@@ -257,7 +257,7 @@ const CONTROLS: [Control; 33] = [
         waits: true,
         shows: "a fresh permission request after a daemon restart is listed as a pending request",
         mutation: "the new request is dropped",
-        red: "no request appears",
+        red: "the fresh request is not the one pending: none appears, or the answered one still waits",
         harness_start: None,
     },
     Control {
@@ -345,7 +345,7 @@ const CONTROLS: [Control; 33] = [
         waits: true,
         shows: "with no prompt of ours in flight and steady traffic, the cancel window closes 30 seconds after the cancel by the injected clock: an approval at 29 seconds is answered cancelled and one at 31 seconds shows",
         mutation: "the window stays open while traffic goes on",
-        red: "the approval at 31 seconds is answered cancelled",
+        red: "the approval at 31 seconds is answered cancelled, or is not listed as the one pending request",
         harness_start: None,
     },
     Control {
@@ -378,7 +378,7 @@ const CONTROLS: [Control; 33] = [
         waits: true,
         shows: "a prompt sent 5 seconds after a Cancel closes the window: the worker dispatches it, the stand-in sends an approval for it, and the approval shows",
         mutation: "the window ignores the dispatch and stays open to 30 seconds",
-        red: "the approval is answered cancelled",
+        red: "the approval is answered cancelled, or is not listed as the one pending request",
         harness_start: None,
     },
     Control {
