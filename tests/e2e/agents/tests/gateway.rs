@@ -176,6 +176,11 @@ mod acp;
 #[path = "gateway/package.rs"]
 mod package;
 
+/// The terminal stand-in for the build list's other entries, and the synthetic entries the cases
+/// stand it in for.
+#[path = "gateway/stand_in.rs"]
+mod stand_in;
+
 /// The variable naming the build list entry of a real agent; without it the agent is the stand-in.
 const BUILD_VARIABLE: &str = "KR_AGENTS_GATEWAY_BUILD";
 

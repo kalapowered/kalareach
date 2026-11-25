@@ -1,28 +1,47 @@
-//! A stand-in for the pinned Codex terminal, for running the qualification parts that need a
-//! login with no account and no model: it signs in nowhere, answers three kinds of question from
-//! its own text, and keeps a conversation file of the shape the real agent keeps.
+//! A stand-in for a terminal coding agent, for running the qualification parts that need a
+//! signed-in agent with no account and no model: it signs in nowhere, answers three kinds of
+//! question from its own text, and keeps a conversation file of the shape the real agent keeps.
 //!
-//! It is started as the build list's command, placed as `bin/codex` in a prefix of its own, with
-//! the arguments the build list gives the real agent. Flags that take a value are skipped; the
-//! first word after them is the subcommand: `resume <id>` or `fork <id>`, or none.
+//! It is started as the build list's command, placed under the command's name, with the arguments
+//! the build list gives the real agent. Flags that take a value are skipped; the first word after
+//! them is the subcommand: `resume <id>` or `fork <id>`, or none.
 //!
 //! - `--version` prints a version line.
-//! - Without a `config.toml` in the configuration directory (`CODEX_HOME`, else `~/.codex`) it
-//!   shows the sign-in screen and moves its marker with the arrow keys, as the real agent's first
-//!   screen does, and does nothing else.
-//! - With one it shows the banner and the composer and reads prompts a line at a time. It answers
-//!   "What is A plus B" with the sum, "What code did I ask you to remember" with the code of an
-//!   earlier "Remember the code X." in the conversation, upper case, and "What colour fills this
-//!   image" with `red` and the code the question gives, upper case, when the file the prompt
-//!   names holds the bytes whose SHA-256 is in `STAND_IN_RED_SHA256`. Anything else it
+//! - It answers "What is A plus B" with the sum, "What code did I ask you to remember" with the
+//!   code of an earlier "Remember the code X." in the conversation, upper case, and "What colour
+//!   fills this image" with `red` and the code the question gives, upper case, when the file the
+//!   prompt names holds the bytes whose SHA-256 is in `STAND_IN_RED_SHA256`. Anything else it
 //!   answers with a line that holds none of those.
-//! - Each prompt and reply is a line of the conversation file
-//!   `sessions/YYYY/MM/DD/rollout-<time>-<uuid>.jsonl` in the configuration directory; an image
-//!   a prompt names is recorded in the prompt's line as the base64 text the real agent writes.
 //! - What `resume <id>` does with a conversation another process holds is set by
 //!   `STAND_IN_RESUME`: `continue` (the default) writes into the same file, `locked`
 //!   refuses because the first process holds the file's lock, and `fork` writes into a copy under
 //!   an identifier of its own. `fork <id>` always writes into a copy.
+//!
+//! Without `STAND_IN_ENTRY` it is the pinned Codex terminal's stand-in:
+//!
+//! - `--version` prints `codex-cli` and the version of the release it stands for.
+//! - Without a `config.toml` in the configuration directory (`CODEX_HOME`, else `~/.codex`) it
+//!   shows the sign-in screen and moves its marker with the arrow keys, as the real agent's first
+//!   screen does, and does nothing else.
+//! - With one it shows the banner and the composer and reads prompts a line at a time.
+//! - Each prompt and reply is a line of the conversation file
+//!   `sessions/YYYY/MM/DD/rollout-<time>-<uuid>.jsonl` in the configuration directory; an image
+//!   a prompt names is recorded in the prompt's line as the base64 text the real agent writes.
+//!
+//! With `STAND_IN_ENTRY` it stands for the build list entry whose names and texts that file holds
+//! (a JSON object of the members of `Entry`, made by the driver; a member that names a program to
+//! run is refused):
+//!
+//! - `--version` prints the entry's command and its version; the program built as the newer
+//!   release prints the entry's newer version.
+//! - A script or a wheel is started through its runtime, which is this program, with the script as
+//!   its first argument; for those launches that argument is not taken for a command.
+//! - It shows the entry's first screen text and its composer text, and no sign-in screen.
+//! - The conversation file is `rollout-<time>-<uuid>.jsonl` below the entry's `conversations`
+//!   (`{date}` as `YYYY/MM/DD`) in the directory the entry's configuration variable names, else
+//!   in the home. A prompt is a line that holds the entry's prompt mark, after a line that holds
+//!   its turn mark where the entry has one; a reply is a line that holds its reply mark; an image
+//!   a prompt names is a line that holds the entry's image mark and the image as base64 text.
 
 /// The stand-in's own code, which uses the system's terminal and file locks.
 #[cfg(unix)]
@@ -34,10 +53,14 @@ mod stand_in {
 
     use base64::Engine as _;
     use rustix::fs::{FlockOperation, flock};
+    use serde::Deserialize;
     use serde_json::json;
 
     /// The version the pinned release reports.
     const VERSION: &str = "0.155.1";
+
+    /// The version the newer release reports, where no entry is named.
+    const NEWER_VERSION: &str = "0.156.1";
 
     /// The variable that holds the lower-case hexadecimal SHA-256 of the image the stand-in calls red.
     const RED_DIGEST: &str = "STAND_IN_RED_SHA256";
@@ -45,8 +68,14 @@ mod stand_in {
     /// The variable that says what `resume` does: `continue`, `locked` or `fork`.
     const RESUME_VARIABLE: &str = "STAND_IN_RESUME";
 
+    /// The variable that names the file of names and texts of the entry the stand-in stands for.
+    const ENTRY_VARIABLE: &str = "STAND_IN_ENTRY";
+
     /// The text the composer shows while it waits for a prompt.
     const COMPOSER: &str = "Ask Codex to do anything";
+
+    /// Where the Codex terminal keeps its conversations, below its configuration directory.
+    const CODEX_CONVERSATIONS: &str = "sessions/{date}";
 
     /// What the sign-in screen offers, in order.
     const SIGN_IN: [&str; 3] = [
@@ -58,27 +87,160 @@ mod stand_in {
     /// Flags the agent takes a value after.
     const WITH_VALUE: [&str; 6] = ["-c", "-a", "-s", "-m", "--disable", "--enable"];
 
+    /// What the stand-in takes from the entry it stands for: names and texts, and no path to run.
+    /// A member that is not one of these is refused.
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Entry {
+        /// The name the agent is typed as.
+        command: String,
+        /// How the agent is launched: `native`, `child`, `script` or `wheel`.
+        launch: String,
+        /// The version the pinned build reports.
+        version: String,
+        /// The version the newer build reports, where the entry has one.
+        newer_version: Option<String>,
+        /// The text the first screen shows.
+        ready: String,
+        /// The text the composer shows while it waits for a prompt.
+        composer: String,
+        /// The variable that names the configuration directory, where the agent has one.
+        config_variable: Option<String>,
+        /// Where the conversations are, relative to the configuration directory or the home.
+        conversations: String,
+        /// What marks the line of a prompt.
+        prompt_line: String,
+        /// What marks the line of a reply.
+        reply_line: String,
+        /// What marks the line that starts a turn, where the agent writes one.
+        turn_line: Option<String>,
+        /// What marks the line of an image a prompt names, where the agent records one.
+        image_line: Option<String>,
+    }
+
+    /// The marks of the lines the conversation file holds, as the entry gives them.
+    #[derive(Clone)]
+    struct Marks {
+        prompt: String,
+        reply: String,
+        turn: Option<String>,
+        image: Option<String>,
+    }
+
+    /// Where the conversations are, and what marks their lines: the Codex terminal's own, which
+    /// has no marks, or the entry's.
+    struct Layout {
+        /// The directory the conversations are below.
+        home: PathBuf,
+        /// Where they are below it, with `{date}` for the day.
+        conversations: String,
+        /// The marks of an entry's lines; none for the Codex terminal's own shape.
+        marks: Option<Marks>,
+    }
+
+    /// Whether this program is the newer build of the source: the second `[[bin]]` of the package.
+    fn newer() -> bool {
+        option_env!("CARGO_BIN_NAME") == Some("agent-stand-in-newer")
+    }
+
+    /// The entry the environment names, where it names one.
+    fn entry() -> Result<Option<Entry>, String> {
+        let Some(path) = std::env::var_os(ENTRY_VARIABLE).filter(|value| !value.is_empty()) else {
+            return Ok(None);
+        };
+        let text =
+            std::fs::read_to_string(&path).map_err(|error| format!("{ENTRY_VARIABLE}: {error}"))?;
+        serde_json::from_str(&text).map(Some).map_err(|error| {
+            format!("{ENTRY_VARIABLE} names a file that is not an entry's names and texts: {error}")
+        })
+    }
+
+    /// The version line this build prints.
+    fn version_line(entry: Option<&Entry>) -> Result<String, String> {
+        let Some(entry) = entry else {
+            return Ok(format!(
+                "codex-cli {}",
+                if newer() { NEWER_VERSION } else { VERSION }
+            ));
+        };
+        let version = if newer() {
+            entry
+                .newer_version
+                .as_deref()
+                .ok_or("the entry names no newer version")?
+        } else {
+            &entry.version
+        };
+        Ok(format!("{} {version}", entry.command))
+    }
+
     pub fn run() {
-        let arguments: Vec<String> = std::env::args().skip(1).collect();
+        let entry = entry().unwrap_or_else(|why| {
+            eprintln!("Error: {why}");
+            std::process::exit(2);
+        });
+        let mut arguments: Vec<String> = std::env::args().skip(1).collect();
         if arguments.iter().any(|argument| argument == "--version") {
-            println!("codex-cli {VERSION}");
+            match version_line(entry.as_ref()) {
+                Ok(line) => println!("{line}"),
+                Err(why) => {
+                    eprintln!("Error: {why}");
+                    std::process::exit(2);
+                }
+            }
             return;
         }
+        if entry
+            .as_ref()
+            .is_some_and(|entry| entry.launch == "script" || entry.launch == "wheel")
+            && !arguments.is_empty()
+        {
+            // The runtime is this program and its first argument is the script it was started for.
+            arguments.remove(0);
+        }
         let (subcommand, identifier) = subcommand_of(&arguments);
-        let home = configuration_directory();
-        if !home.join("config.toml").is_file() {
+        let home = configuration_directory(entry.as_ref());
+        if entry.is_none() && !home.join("config.toml").is_file() {
             sign_in_screen();
             return;
         }
+        let layout = Layout {
+            home,
+            conversations: entry
+                .as_ref()
+                .map_or(CODEX_CONVERSATIONS, |entry| entry.conversations.as_str())
+                .to_owned(),
+            marks: entry.as_ref().map(|entry| Marks {
+                prompt: entry.prompt_line.clone(),
+                reply: entry.reply_line.clone(),
+                turn: entry.turn_line.clone(),
+                image: entry.image_line.clone(),
+            }),
+        };
         let conversation =
-            match open_conversation(&home, subcommand.as_deref(), identifier.as_deref()) {
+            match open_conversation(&layout, subcommand.as_deref(), identifier.as_deref()) {
                 Ok(conversation) => conversation,
                 Err(why) => {
                     eprintln!("Error: {why}");
                     std::process::exit(1);
                 }
             };
-        composer(conversation);
+        match &entry {
+            Some(entry) => composer(
+                conversation,
+                std::slice::from_ref(&entry.ready),
+                &entry.composer,
+            ),
+            None => composer(
+                conversation,
+                &[
+                    "╭──────────────────────────────────────╮".to_owned(),
+                    format!("│ >_ OpenAI Codex (v{VERSION})          │"),
+                    "╰──────────────────────────────────────╯".to_owned(),
+                ],
+                COMPOSER,
+            ),
+        }
     }
 
     /// The subcommand the arguments name, with its identifier: the first word that is not a flag or a
@@ -95,14 +257,22 @@ mod stand_in {
         (None, None)
     }
 
-    /// The directory the agent keeps its configuration and conversations in.
-    fn configuration_directory() -> PathBuf {
-        std::env::var_os("CODEX_HOME")
-            .filter(|value| !value.is_empty())
-            .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".codex")
-            })
+    /// The directory the agent keeps its configuration and conversations in: for an entry, the one
+    /// its configuration variable names, else the home; for the Codex terminal, `CODEX_HOME`, else
+    /// `~/.codex`.
+    fn configuration_directory(entry: Option<&Entry>) -> PathBuf {
+        let home = || PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
+        let named = |variable: &str| std::env::var_os(variable).filter(|value| !value.is_empty());
+        match entry {
+            Some(entry) => entry
+                .config_variable
+                .as_deref()
+                .and_then(named)
+                .map_or_else(home, PathBuf::from),
+            None => named("CODEX_HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| home().join(".codex")),
+        }
     }
 
     /// Shows the sign-in screen and moves its marker until the terminal closes or the person sends an
@@ -154,20 +324,29 @@ mod stand_in {
         file: File,
         /// The code an earlier "Remember the code" in the conversation gave.
         remembered: Option<String>,
+        /// The marks of an entry's lines; none for the Codex terminal's own shape.
+        marks: Option<Marks>,
+    }
+
+    /// The directory the conversations are searched for below: the part of `conversations` before
+    /// the day.
+    fn record_root(layout: &Layout) -> PathBuf {
+        let base = layout.conversations.split("{date}").next().unwrap_or("");
+        layout.home.join(base.trim_end_matches('/'))
     }
 
     /// Opens the conversation this start is for: a new one, or the one `resume` or `fork` names.
     fn open_conversation(
-        home: &Path,
+        layout: &Layout,
         subcommand: Option<&str>,
         identifier: Option<&str>,
     ) -> Result<Conversation, String> {
         let Some(subcommand) = subcommand else {
-            return create(home, "");
+            return create(layout, "");
         };
         let id =
             identifier.ok_or_else(|| format!("{subcommand} needs a conversation identifier"))?;
-        let saved = find(&home.join("sessions"), id)
+        let saved = find(&record_root(layout), id)
             .ok_or_else(|| format!("no saved conversation with the identifier {id}"))?;
         let forks = match subcommand {
             "fork" => true,
@@ -176,7 +355,7 @@ mod stand_in {
         };
         if forks {
             let text = std::fs::read_to_string(&saved).map_err(|error| error.to_string())?;
-            return create(home, &text);
+            return create(layout, &text);
         }
         let file = OpenOptions::new()
             .append(true)
@@ -194,15 +373,18 @@ mod stand_in {
         Ok(Conversation {
             file,
             remembered: remembered_in(&text),
+            marks: layout.marks.clone(),
         })
     }
 
     /// Creates a conversation file with the lines `text` holds, under an identifier of its own, and
     /// takes its lock.
-    fn create(home: &Path, text: &str) -> Result<Conversation, String> {
+    fn create(layout: &Layout, text: &str) -> Result<Conversation, String> {
         let day = date(&["+%Y/%m/%d"])?;
         let time = date(&["+%Y-%m-%dT%H-%M-%S"])?;
-        let directory = home.join("sessions").join(day);
+        let directory = layout
+            .home
+            .join(layout.conversations.replace("{date}", &day));
         std::fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
         let path = directory.join(format!("rollout-{time}-{}.jsonl", uuid()?));
         let mut file = OpenOptions::new()
@@ -219,6 +401,7 @@ mod stand_in {
         Ok(Conversation {
             file,
             remembered: remembered_in(text),
+            marks: layout.marks.clone(),
         })
     }
 
@@ -286,14 +469,14 @@ mod stand_in {
             .next_back()
     }
 
-    /// Shows the banner and the composer and answers prompts, a line at a time, until the terminal
+    /// Shows `banner` and the composer and answers prompts, a line at a time, until the terminal
     /// closes.
-    fn composer(mut conversation: Conversation) {
-        println!("╭──────────────────────────────────────╮");
-        println!("│ >_ OpenAI Codex (v{VERSION})          │");
-        println!("╰──────────────────────────────────────╯");
+    fn composer(mut conversation: Conversation, banner: &[String], composer: &str) {
+        for line in banner {
+            println!("{line}");
+        }
         println!();
-        println!("› {COMPOSER}");
+        println!("› {composer}");
         let stdin = std::io::stdin();
         let mut line = Vec::new();
         loop {
@@ -314,24 +497,14 @@ mod stand_in {
             let reply = answer(&prompt, &mut conversation);
             println!("• {reply}");
             println!();
-            println!("› {COMPOSER}");
+            println!("› {composer}");
         }
     }
 
     /// Records the prompt, finds the reply to it and records that.
     fn answer(prompt: &str, conversation: &mut Conversation) -> String {
         let image = image_named(prompt);
-        let mut content = vec![json!({ "type": "input_text", "text": prompt })];
-        if let Some(bytes) = &image {
-            content.push(json!({
-                "type": "input_image",
-                "image_url": format!(
-                    "data:image/png;base64,{}",
-                    base64::engine::general_purpose::STANDARD.encode(bytes)
-                ),
-            }));
-        }
-        record(conversation, "user", &content);
+        record(conversation, "user", prompt, image.as_deref());
         if let Some(code) = prompt
             .split_once("Remember the code ")
             .map(|(_, after)| after)
@@ -346,11 +519,7 @@ mod stand_in {
             conversation.remembered = Some(code);
         }
         let reply = reply_to(prompt, image.as_deref(), conversation.remembered.as_deref());
-        record(
-            conversation,
-            "assistant",
-            &[json!({ "type": "output_text", "text": reply })],
-        );
+        record(conversation, "assistant", &reply, None);
         reply
     }
 
@@ -404,25 +573,80 @@ mod stand_in {
         hex_of(&kr_cbor::sha256(bytes))
     }
 
-    /// Appends one message to the conversation file, as a line of JSON.
-    fn record(conversation: &mut Conversation, role: &str, content: &[serde_json::Value]) {
-        let kind = if role == "user" {
-            json!({ "type": "event_msg", "payload": { "type": "task_started" } })
-        } else {
-            json!(null)
+    /// The data address of a PNG image whose bytes are `bytes`.
+    fn data_address(bytes: &[u8]) -> String {
+        format!(
+            "data:image/png;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(bytes)
+        )
+    }
+
+    /// Appends one message to the conversation file, as the lines the agent writes: those of the
+    /// Codex terminal, or those that hold the entry's marks.
+    fn record(conversation: &mut Conversation, role: &str, text: &str, image: Option<&[u8]>) {
+        let lines = match &conversation.marks {
+            Some(marks) => entry_lines(marks, role, text, image),
+            None => codex_lines(role, text, image),
         };
-        let mut lines = Vec::new();
-        if !kind.is_null() {
-            lines.push(kind);
-        }
-        lines.push(json!({
-            "type": "response_item",
-            "payload": { "type": "message", "role": role, "content": content },
-        }));
         for line in lines {
             let _ = writeln!(conversation.file, "{line}");
         }
         let _ = conversation.file.flush();
+    }
+
+    /// The lines the Codex terminal writes for one message.
+    fn codex_lines(role: &str, text: &str, image: Option<&[u8]>) -> Vec<String> {
+        let mut lines = Vec::new();
+        let mut content = Vec::new();
+        if role == "user" {
+            lines.push(
+                json!({ "type": "event_msg", "payload": { "type": "task_started" } }).to_string(),
+            );
+            content.push(json!({ "type": "input_text", "text": text }));
+            if let Some(bytes) = image {
+                content.push(json!({ "type": "input_image", "image_url": data_address(bytes) }));
+            }
+        } else {
+            content.push(json!({ "type": "output_text", "text": text }));
+        }
+        lines.push(
+            json!({
+                "type": "response_item",
+                "payload": { "type": "message", "role": role, "content": content },
+            })
+            .to_string(),
+        );
+        lines
+    }
+
+    /// The lines an entry's agent writes for one message: a prompt after the line that starts its
+    /// turn, where the entry has one, and a reply; each holds its mark as the entry gives it.
+    fn entry_lines(marks: &Marks, role: &str, text: &str, image: Option<&[u8]>) -> Vec<String> {
+        let mut lines = Vec::new();
+        if role == "user" {
+            if let Some(turn) = &marks.turn {
+                lines.push(format!("{{{turn}}}"));
+            }
+            let mut content = vec![format!("{{\"text\":{}}}", json!(text))];
+            if let (Some(mark), Some(bytes)) = (&marks.image, image) {
+                content.push(format!(
+                    "{{{mark},\"image_url\":{}}}",
+                    json!(data_address(bytes))
+                ));
+            }
+            lines.push(format!(
+                "{{{},\"content\":[{}]}}",
+                marks.prompt,
+                content.join(",")
+            ));
+        } else {
+            lines.push(format!(
+                "{{{},\"content\":[{{\"text\":{}}}]}}",
+                marks.reply,
+                json!(text)
+            ));
+        }
+        lines
     }
 }
 

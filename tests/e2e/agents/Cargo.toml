@@ -8,6 +8,16 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
+[[bin]]
+name = "agent-stand-in"
+path = "src/bin/agent-stand-in.rs"
+
+# The same program built again as the newer release: one source, a second program with another
+# digest and another version, so a case can install it beside the first and upgrade to it.
+[[bin]]
+name = "agent-stand-in-newer"
+path = "src/bin/agent-stand-in.rs"
+
 [[test]]
 name = "cases"
 
