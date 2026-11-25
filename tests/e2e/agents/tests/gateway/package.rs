@@ -1,13 +1,14 @@
 //! The package the stand-in route installs for an agent other than Codex.
 //!
 //! The stand-in route has no signed generation that an operator names, so the run publishes one of
-//! its own. For Codex the package is the one this crate keeps. For another agent it is written
-//! here from the release the run was given: the release's manifest and the files that manifest
-//! lists, as the release has them, with one change. A build list entry has no match rules, so the
-//! release's own are replaced by one rule that recognises the entry's command, which is the name
-//! the stand-in program is placed under. The actions, the capabilities, the command integration
-//! and the platforms stay the release's, so the host registers the actions the release declares
-//! and the installation's grant is what the release asks for.
+//! its own. For the default Codex subject the package is the one this crate keeps. For a subject
+//! made from a release, Codex's included, it is written here from the release the run was given:
+//! the release's manifest and the files that manifest lists, as the release has them, with one
+//! change. A build list entry has no match rules, so the release's own are replaced by one rule
+//! that recognises the entry's command, which is the name the stand-in program is placed under.
+//! The actions, the capabilities, the command integration and the platforms stay the release's, so
+//! the host registers the actions the release declares and the installation's grant is what the
+//! release asks for.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -158,7 +159,8 @@ pub fn installed(subject: &Subject, environment: &EnvironmentPaths) -> PathBuf {
 /// What a synthetic release declares, for the cases that write a package from one.
 #[derive(Clone, Copy, Debug)]
 pub enum Shape {
-    /// Codex's package under another name, with its command integration and backend.
+    /// Codex's package under another name, with its backend and a command integration whose command
+    /// is the entry's.
     Backend,
     /// Codex's package under another name, with no command integration and terminal input
     /// requested besides, which no grant of Codex's covers.
@@ -263,7 +265,8 @@ fn scratch(case: &str) -> std::path::PathBuf {
     directory
 }
 
-/// The subject of `plugin` typed as `command`, whose release of `shape` is written into `release`.
+/// The subject of `plugin` typed as `command`, whose release of `shape` is written into
+/// `release_directory`.
 fn subject_of(release_directory: &Path, plugin: &str, command: &str, shape: Shape) -> Subject {
     release(release_directory, plugin, command, shape);
     let manifest: PluginManifest = serde_json::from_slice(
@@ -499,7 +502,7 @@ fn the_host_detects_a_program_typed_as_the_command_of_the_package_it_installed()
 const OTHER_NAME: &str = "kr-other-name";
 
 /// The host that installed a written package does not detect a program that runs under another name
-/// than the entry's command, though the program is the same file as the one it detects.
+/// than the entry's command, though the program is a copy of the one it detects.
 #[test]
 fn the_host_does_not_detect_a_program_run_under_another_name_than_the_entrys_command() {
     const TEST: &str =
@@ -584,8 +587,9 @@ fn installs(
 }
 
 /// The grant of the package written for each synthetic entry is the capabilities its own manifest
-/// asks for that the repository's ceiling does not allow: none for a package that asks for no more,
-/// and not the four that Codex's package is granted.
+/// asks for that the repository's ceiling does not allow, whatever Codex's package is granted: none
+/// for a package that asks for no more, and the four of Codex's only for one that asks for those
+/// four.
 #[test]
 fn the_grant_of_a_written_package_is_what_its_own_manifest_asks_for_beyond_the_ceiling() {
     use PluginCapability::{
@@ -816,7 +820,9 @@ fn named(
 /// Checks that the package the generation at `generation` holds for the entry `build` is one the
 /// stand-in route can write its own package from: a match rule of the package recognises a program
 /// named by the entry's command, and the package written from it declares the actions and asks for
-/// the capabilities that the generation's package does.
+/// the capabilities that the generation's package does. The two comparisons are of the written
+/// package with the generation's own manifest, so they guard the writer only; they do not compare
+/// the package with a release that the stand-in route is given.
 ///
 /// # Errors
 ///
