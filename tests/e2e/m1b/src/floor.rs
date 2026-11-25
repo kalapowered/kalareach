@@ -8,17 +8,27 @@
 //! tear; a write between them that restores the value, or a tear that repeats, is not seen. The
 //! check refuses and never passes: a word moved forward inside the limit is not seen, which is the
 //! stated residual.
+//!
+//! The floor's open once more, before the attempt, maps no file the agent can name: its bytes are
+//! read through the descriptor, written to a file in a directory of the harness's own, and the
+//! product's open runs on that file. An agent that finds that file and truncates it while the
+//! product maps it can still end the harness with a signal.
 
 use std::fs::File;
-use std::os::unix::fs::FileExt as _;
-use std::path::Path;
+use std::io::Write as _;
+use std::os::unix::fs::{FileExt as _, MetadataExt as _};
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use kr_ipc::clock::{SharedClock as _, SystemSharedClock};
 use kr_ipc::floor::{FLOOR_FILE_LEN, SharedFloor};
 use kr_protocol::ids::{BootEpoch, EnvironmentId};
 
-use crate::run::{RootPin, open_file_below};
+use rustix::fs::{AtFlags, Mode, OFlags};
+
+use crate::run::{
+    Removal, RootPin, make_root, open_directory, open_file_below, remove_run_directory, run_base,
+};
 
 /// How far above what H's own readings allow a floor word that rose may stand, in milliseconds.
 pub const ALLOWANCE_MS: u64 = 60_000;
@@ -110,7 +120,61 @@ pub struct Watch {
     anchor: Readings,
     greatest_wall: u64,
     at_the_kill: Option<State>,
+    scratch: Scratch,
 }
+
+/// The directory of the harness's own in which the floor's bytes are written for the product's open
+/// once more: made before the agent starts, pinned, owner-only and empty, and removed with the watch.
+#[derive(Debug)]
+struct Scratch {
+    root: PathBuf,
+    pin: RootPin,
+}
+
+impl Scratch {
+    /// The file in the directory that holds `bytes`, made by exclusive creation through the
+    /// directory's handle, for `open` to open by its path; it is removed after, whatever `open`
+    /// returns.
+    fn with<T>(
+        &self,
+        bytes: &[u8],
+        open: impl FnOnce(&Path) -> Result<T, String>,
+    ) -> Result<T, String> {
+        let directory = open_directory(&self.root)
+            .map_err(|why| format!("the directory of the floor's copy cannot be opened: {why}"))?;
+        if !self.pin.holds(&directory) {
+            return Err(
+                "the directory of the floor's copy is not the directory the harness made"
+                    .to_owned(),
+            );
+        }
+        let made = rustix::fs::openat(
+            &directory,
+            COPY,
+            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::from_raw_mode(0o600),
+        )
+        .map_err(|why| format!("the floor's copy is not made: {why}"))?;
+        let opened = File::from(made)
+            .write_all(bytes)
+            .map_err(|why| format!("the floor's copy is not written: {why}"))
+            .and_then(|()| open(&self.root.join(COPY)));
+        let removed = rustix::fs::unlinkat(&directory, COPY, AtFlags::empty())
+            .map_err(|why| format!("the floor's copy is not removed: {why}"));
+        opened.and_then(|opened| removed.map(|()| opened))
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        if let Removal::Left(why) = remove_run_directory(&self.root, &self.pin) {
+            eprintln!("the directory of the floor's copy is left in place: {why}");
+        }
+    }
+}
+
+/// The name of the floor's copy in its directory.
+const COPY: &str = "floor";
 
 impl Watch {
     /// Opens the floor at `path` as the daemon does and keeps the mapping, opens the file at
@@ -143,6 +207,16 @@ impl Watch {
             .map(File::from)
             .ok_or_else(|| said(&"it is not there"))?;
         let at_the_start = look(&file).map_err(|why| said(&why))?;
+        let (scratch_root, scratch_pin) = make_root(
+            &run_base(),
+            &mut || kr_ipc::new_uuid().to_string(),
+            &mut |_| {},
+        )
+        .map_err(|why| said(&format_args!("the directory for the floor's copy: {why}")))?;
+        let scratch = Scratch {
+            root: scratch_root,
+            pin: scratch_pin,
+        };
         for (word, value) in [
             ("owed", at_the_start.owed),
             ("recorded", at_the_start.recorded),
@@ -162,6 +236,7 @@ impl Watch {
             anchor,
             greatest_wall: anchor.wall_ms.max(now.wall_ms),
             at_the_kill: None,
+            scratch,
         })
     }
 
@@ -184,13 +259,16 @@ impl Watch {
         self.compare(now, &before, true).0
     }
 
-    /// Opens the floor at `path` once more as the daemon does, and requires that its name still
-    /// names the file held since the start.
+    /// Opens the floor once more as the daemon does, and requires that its name still names the
+    /// file held since the start. The file held is read through its descriptor, shown to be a
+    /// regular file of the account that no other user can read or write, of the floor's length, and
+    /// the product's open runs on a copy of its bytes in the harness's own directory: no mapping of
+    /// the file the agent can name is made.
     ///
     /// # Errors
     ///
     /// Returns why the open fails or that the name no longer names the file held.
-    pub fn open_again(&self, path: &Path, environment: EnvironmentId) -> Result<(), String> {
+    pub fn open_again(&self, environment: EnvironmentId) -> Result<(), String> {
         let said = |why: &dyn std::fmt::Display| {
             format!("the clock floor cannot be opened again before the attempt: {why}")
         };
@@ -202,8 +280,13 @@ impl Watch {
                 &"its name no longer names the file held since the start",
             ));
         }
-        SharedFloor::open(path, environment, boot)
-            .map(drop)
+        let bytes = held_bytes(&self.file).map_err(|why| said(&why))?;
+        self.scratch
+            .with(&bytes, |copy| {
+                SharedFloor::open(copy, environment, boot)
+                    .map(drop)
+                    .map_err(|why| why.to_string())
+            })
             .map_err(|why| said(&why))
     }
 
@@ -292,6 +375,29 @@ impl Watch {
     }
 }
 
+/// The bytes of the floor, read through the descriptor of the file held since the start once the
+/// file is shown to be what the daemon opens: a regular file of the account, with no permission for
+/// any other user, of the floor's length.
+fn held_bytes(file: &File) -> Result<Vec<u8>, String> {
+    let metadata = file.metadata().map_err(|why| why.to_string())?;
+    if !metadata.is_file() {
+        return Err("the clock floor file must be a regular file".to_owned());
+    }
+    if metadata.uid() != rustix::process::getuid().as_raw() {
+        return Err("the clock floor file belongs to another user".to_owned());
+    }
+    if metadata.mode() & 0o077 != 0 {
+        return Err("the clock floor file may be read or written by another user".to_owned());
+    }
+    if metadata.len() != FLOOR_FILE_LEN as u64 {
+        return Err("the clock floor file is not the length this build writes".to_owned());
+    }
+    let mut bytes = vec![0_u8; FLOOR_FILE_LEN];
+    file.read_exact_at(&mut bytes, 0)
+        .map_err(|why| format!("the clock floor file cannot be read whole: {why}"))?;
+    Ok(bytes)
+}
+
 /// Reads the floor through the descriptor and loads nothing from the mapping, so that a truncation
 /// while the floor is read ends in an error and not in a signal: the length first, which must be
 /// the floor's at least, then the moving words in the order owed, recorded, floor, then the whole
@@ -354,6 +460,7 @@ mod tests {
     use std::io::Write as _;
     use std::os::unix::fs::PermissionsExt as _;
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
 
     use kr_ipc::paths::HostPaths;
@@ -550,6 +657,135 @@ mod tests {
             "the child said the refusal of the look after the truncation: {said}"
         );
         assert!(!root.exists(), "the child removed its directory");
+    }
+
+    /// The environment variable that tells the test program, started again by the case below, that
+    /// it is the child and where its directory is.
+    const OPEN_CHILD: &str = "KR_FLOOR_OPEN_AGAIN_CHILD";
+
+    /// The child of the case below: it keeps a watch on a floor, and a thread truncates the floor's
+    /// file to nothing and extends it again, over and over, while the main thread opens the floor
+    /// once more over and over for three seconds. It says how often the open passed and how often it
+    /// was refused, and removes its directory.
+    fn open_again_while_the_floor_is_truncated(root: PathBuf) {
+        let world = world_at(root, 1_000_000);
+        let watch = world.watch();
+        let stop = AtomicBool::new(false);
+        let (opened, refused) = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&world.path)
+                    .expect("the floor");
+                while !stop.load(Ordering::Relaxed) {
+                    file.set_len(0).expect("the floor is truncated");
+                    file.set_len(FLOOR_FILE_LEN as u64)
+                        .expect("the floor is extended");
+                }
+            });
+            let started = Instant::now();
+            let (mut opened, mut refused) = (0_u32, 0_u32);
+            while started.elapsed() < Duration::from_secs(3) {
+                match watch.open_again(world.environment) {
+                    Ok(()) => opened += 1,
+                    Err(_) => refused += 1,
+                }
+            }
+            stop.store(true, Ordering::Relaxed);
+            (opened, refused)
+        });
+        println!("the floor was opened again {opened} times and refused {refused} times");
+        assert!(refused > 0, "the truncation made no open refuse");
+        drop(watch);
+        world.clean();
+    }
+
+    /// A floor that the agent truncates while H opens it once more gives a refusal, and the test
+    /// program that opens it ends and cleans up as it would otherwise: a map of the truncated file
+    /// that the product reads its header through would end it with a signal. The case runs itself
+    /// again as a child to see the end of the program.
+    #[test]
+    fn a_floor_that_is_truncated_while_it_is_opened_again_gives_a_refusal_and_not_a_signal() {
+        if let Ok(root) = std::env::var(OPEN_CHILD) {
+            open_again_while_the_floor_is_truncated(PathBuf::from(root));
+            return;
+        }
+        let root = base().join(format!("kf-open-{}", &kr_ipc::new_uuid().to_string()[..8]));
+        let output = std::process::Command::new(std::env::current_exe().expect("this program"))
+            .args([
+                "--exact",
+                "floor::tests::a_floor_that_is_truncated_while_it_is_opened_again_gives_a_refusal_and_not_a_signal",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(OPEN_CHILD, &root)
+            .output()
+            .expect("the child ran");
+        let said = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "the child ended with {:?}, signal {:?}: {said} {}",
+            output.status,
+            std::os::unix::process::ExitStatusExt::signal(&output.status),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            said.contains("the floor was opened again "),
+            "the child said how often the open passed and was refused: {said}"
+        );
+        assert!(!root.exists(), "the child removed its directory");
+    }
+
+    /// The floor opened once more is refused where the directory of its copy is not the one the
+    /// harness made, where its file may be read or written by another user, and where it is not the
+    /// floor's length, each with the reason.
+    #[test]
+    fn the_floor_opened_again_is_refused_for_a_replaced_directory_a_mode_and_a_length() {
+        let world = world("open-again-checks", 1_000_000);
+        let watch = world.watch();
+        assert_eq!(watch.open_again(world.environment), Ok(()));
+        let moved = watch.scratch.root.with_extension("moved");
+        std::fs::rename(&watch.scratch.root, &moved).expect("moved away");
+        std::fs::create_dir(&watch.scratch.root).expect("another directory");
+        std::fs::set_permissions(&watch.scratch.root, std::fs::Permissions::from_mode(0o700))
+            .expect("owner only");
+        let why = watch
+            .open_again(world.environment)
+            .expect_err("another directory in the place of the copy's");
+        assert!(
+            why.ends_with(
+                "the directory of the floor's copy is not the directory the harness made"
+            ),
+            "{why}"
+        );
+        std::fs::remove_dir(&watch.scratch.root).expect("the other directory goes");
+        std::fs::rename(&moved, &watch.scratch.root).expect("moved back");
+        std::fs::set_permissions(&world.path, std::fs::Permissions::from_mode(0o644))
+            .expect("readable by others");
+        let why = watch
+            .open_again(world.environment)
+            .expect_err("a floor that others can read");
+        assert!(
+            why.ends_with("the clock floor file may be read or written by another user"),
+            "{why}"
+        );
+        std::fs::set_permissions(&world.path, std::fs::Permissions::from_mode(0o600))
+            .expect("owner only");
+        assert_eq!(watch.open_again(world.environment), Ok(()));
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&world.path)
+            .and_then(|file| file.set_len(100))
+            .expect("a short floor");
+        let why = watch
+            .open_again(world.environment)
+            .expect_err("a floor of another length");
+        assert!(
+            why.ends_with("the clock floor file is not the length this build writes"),
+            "{why}"
+        );
+        drop(watch);
+        world.clean();
     }
 
     /// A file shorter than the floor is refused before any word is read, and a word that does not
@@ -854,11 +1090,11 @@ mod tests {
     fn the_floor_opens_again_while_its_name_names_the_file_held_and_says_why_it_cannot() {
         let world = world("open-again", 1_000_000);
         let watch = world.watch();
-        assert_eq!(watch.open_again(&world.path, world.environment), Ok(()));
+        assert_eq!(watch.open_again(world.environment), Ok(()));
         // The file held is still at the name, and the daemon would refuse it: another environment's.
         let another = EnvironmentId::new(kr_ipc::new_uuid());
         assert_eq!(
-            watch.open_again(&world.path, another),
+            watch.open_again(another),
             Err(
                 "the clock floor cannot be opened again before the attempt: the clock floor file \
                  belongs to another environment"
@@ -871,7 +1107,7 @@ mod tests {
         std::fs::copy(&world.path, &staging).expect("a copy");
         std::fs::rename(&staging, &world.path).expect("renamed over");
         assert_eq!(
-            watch.open_again(&world.path, world.environment),
+            watch.open_again(world.environment),
             Err(
                 "the clock floor cannot be opened again before the attempt: its name no longer \
                  names the file held since the start"

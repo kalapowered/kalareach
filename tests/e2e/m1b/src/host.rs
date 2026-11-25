@@ -261,7 +261,7 @@ pub fn surveyed() -> Vec<String> {
 /// What a restart case's result states of the compares of its restart, as the specification states
 /// it: the residuals of the live daemon's class, and the limits of the other compares. A passing
 /// restart case does not show that none of them happened.
-pub const RESTART_RESIDUALS: [&str; 13] = [
+pub const RESTART_RESIDUALS: [&str; 14] = [
     "(1) An agent's in-place write to an entry of the live daemon's class between the start of the \
      agent and a kill is not seen, and the restarted daemon reads it; the registry and the stores \
      the daemon writes while it serves, the delivery journal among them, are the main case.",
@@ -292,6 +292,9 @@ pub const RESTART_RESIDUALS: [&str; 13] = [
     "SQLite reads each database from an image that the harness builds in memory from the main file, \
      the -wal and the -journal it read through the run's handles, and opens no path; the image holds \
      the bytes that the agent left at the instant of the copy.",
+    "The product's second open of the clock floor maps a copy of the floor's bytes in a directory of \
+     the harness's own, and not the floor itself; an agent that finds that copy and truncates it while \
+     the product maps it can still end the harness with a signal.",
 ];
 
 /// What a survey shows that fails a run which wants none of it: a refusal of a compare, with the
@@ -1694,10 +1697,7 @@ impl<'r> Host<'r> {
             Class::Floor,
             watch.before_the_attempt(readings),
         ));
-        if let Err(why) = watch.open_again(
-            &self.environment.utc_floor_file(),
-            self.environment.environment_id(),
-        ) {
+        if let Err(why) = watch.open_again(self.environment.environment_id()) {
             refused.push(Refused {
                 class: Class::Floor,
                 line: why,
@@ -3395,6 +3395,13 @@ mod shutdown_tests {
             residuals.iter().any(|said| said.contains("opens no path")
                 && said.contains("the bytes that the agent left at the instant of the copy")),
             "what a copy holds and that SQLite opens no path: {residuals:#?}"
+        );
+        assert!(
+            residuals
+                .iter()
+                .any(|said| said.contains("maps a copy of the floor's bytes")
+                    && said.contains("can still end the harness with a signal")),
+            "the second open of the floor: {residuals:#?}"
         );
         let notes = evidence["notes"].as_array().expect("a list of notes");
         assert!(
