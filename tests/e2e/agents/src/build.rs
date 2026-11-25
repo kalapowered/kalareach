@@ -2404,10 +2404,12 @@ mod tests {
     }
 
     /// The claude-code entry of the plugins repository (`fixtures/agents/builds.json`) gives
-    /// `--strict-mcp-config` in the account's own arguments. A leg whose package installs a bridge
-    /// runs with the arguments of `integrated`, which leave it out, and not with the account's.
+    /// `--strict-mcp-config` in the account's own arguments. The entry check of a leg whose package
+    /// installs a bridge returns the arguments of `integrated`, which leave it out, and not the
+    /// account's. The check reads the entry only: no leg runs here.
     #[test]
-    fn a_leg_with_a_bridge_runs_with_the_integrated_arguments_where_the_account_gives_the_flag() {
+    fn an_entry_with_the_flag_in_its_account_arguments_gives_the_bridge_check_the_integrated_arguments()
+     {
         let mut entry = entry_json(&serde_json::json!({}), &serde_json::json!({}));
         entry["account"]["arguments"] =
             serde_json::json!(["--model", "haiku", "--strict-mcp-config"]);

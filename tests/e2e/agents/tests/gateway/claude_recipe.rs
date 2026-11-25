@@ -6,7 +6,8 @@
 //! the digest of the one build it qualifies. The host makes the directory the recipe is written in
 //! before its daemon starts and gives the daemon a search path that holds that program and no other
 //! `claude`. Nothing here starts a forwarder, and nothing reads or writes the person's own
-//! `~/.claude`. The cases that type `claude` start the stand-in under that name.
+//! `~/.claude`. Each case starts the placed program once, with `--version`, when it places it, and
+//! the cases that type `claude` start it again under that name.
 
 use super::*;
 
