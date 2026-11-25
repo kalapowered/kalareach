@@ -36,6 +36,18 @@ const TEMPORARY: &str = if cfg!(windows) { "TEMP" } else { "TMPDIR" };
 /// What the command a turn asks to run writes: a line, as the shell ends it.
 const RAN: &str = if cfg!(windows) { "ran\r\n" } else { "ran\n" };
 
+/// Ends a server the way its terminal does, by closing its input, and waits for it to go. It ends
+/// its commands first, and can do that only while its input is open: a server that is killed
+/// leaves its command, which runs in a session of its own.
+async fn ends_with_its_input(mut child: Child, stdin: ChildStdin) {
+    drop(stdin);
+    let status = tokio::time::timeout(WAIT, child.wait())
+        .await
+        .expect("the server ends with its input")
+        .expect("waited");
+    assert!(status.success());
+}
+
 fn server(variants: &str, command: Option<&str>) -> Child {
     let mut server = Command::new(PROGRAM);
     server
@@ -690,6 +702,7 @@ async fn the_server_answers_the_sum_a_turn_asks_for_only_under_the_variant() {
             second_answer,
             "a later turn, variants {variants:?}, asked {second_text:?}"
         );
+        ends_with_its_input(child, stdin).await;
     }
 }
 
@@ -797,6 +810,7 @@ async fn the_server_records_a_turn_with_a_prompt_in_the_agents_folder_only_under
         let _ = messages_of_the_turn(&mut stdin, &mut lines).await;
         write(&mut stdin, &turn_asking(4, "thread-1", question)).await;
         let _ = messages_of_the_turn(&mut stdin, &mut lines).await;
+        ends_with_its_input(child, stdin).await;
         let files = jsonl_files(&home);
         if !records {
             assert!(
