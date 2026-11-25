@@ -1739,7 +1739,7 @@ mod shutdown_tests {
             kr_ipc::new_uuid().to_string(),
         );
         let mut foreign = standing_for(&other, &foreign_session);
-        let mut own = standing_for(&root, &own_session);
+        let own = standing_for(&root, &own_session);
         let host = host_over(&run);
         let started = Instant::now();
         loop {
