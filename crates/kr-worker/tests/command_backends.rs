@@ -1755,18 +1755,23 @@ async fn the_fixture_reads_a_commit_on_the_launchers_clock() {
     let released = setup.directory.join(RELEASE);
     let done = setup.directory.join(DONE);
 
-    // The backend is held after it reads `going`, and let go after a time the case chose.
+    // The backend is held after it reads `going`, and let go after a time the case chose. A
+    // launcher that is over before the backend has come goes on to the checks below.
     let (arrived, release) = setup.backends.pause_before_showing();
     let mut launcher = Launcher::start(&launch);
-    let pause = async {
-        tokio::time::timeout(std::time::Duration::from_secs(60), arrived)
-            .await
-            .expect("the launch reaches the backend and waits there")
-            .expect("the launch reaches the backend and waits there");
-        tokio::time::sleep(BACKEND_PAUSE).await;
-        release.send(()).expect("the backend is let go");
+    let played = {
+        let played = launcher.played();
+        tokio::pin!(played);
+        tokio::select! {
+            played = &mut played => played,
+            reached = arrived => {
+                reached.expect("the launch reaches the backend and waits there");
+                tokio::time::sleep(BACKEND_PAUSE).await;
+                release.send(()).expect("the backend is let go");
+                played.await
+            }
+        }
     };
-    let (played, ()) = tokio::join!(launcher.played(), pause);
     assert_eq!(played.admission, Admission::Admitted, "{played:?}");
     assert_eq!(
         played.answer,
