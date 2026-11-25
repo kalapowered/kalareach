@@ -77,7 +77,7 @@ impl PairingId {
 
 /// The newest backup generation of one archive at one service that a host named, with the
 /// manifest it named for it.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PairedCheckpoint {
     /// The service the archive is at, as the host spells it.
@@ -90,6 +90,16 @@ pub struct PairedCheckpoint {
     pub encrypted_manifest_hash: Digest256,
     /// When this device took the checkpoint, in UTC milliseconds.
     pub taken_at_ms: u64,
+}
+
+impl std::fmt::Debug for PairedCheckpoint {
+    /// The generation only: the service, the archive and the manifest hash are what a host sent.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PairedCheckpoint")
+            .field("backup_generation", &self.backup_generation)
+            .finish_non_exhaustive()
+    }
 }
 
 /// What a host answered when this device asked for its checkpoint.
@@ -189,12 +199,25 @@ pub enum Acquisition {
 }
 
 /// What a host answered when this device asked it for its checkpoint.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum Answer {
     /// The host named a checkpoint.
     Checkpoint(HostCheckpoint),
     /// The host had accepted no generation.
     NothingPublished,
+}
+
+impl std::fmt::Debug for Answer {
+    /// Which kind of answer it is and, for a checkpoint, its generation; never the manifest hash.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Checkpoint(given) => formatter
+                .debug_struct("Checkpoint")
+                .field("backup_generation", &given.backup_generation)
+                .finish_non_exhaustive(),
+            Self::NothingPublished => formatter.write_str("NothingPublished"),
+        }
+    }
 }
 
 impl Answer {
