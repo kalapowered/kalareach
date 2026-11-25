@@ -1084,19 +1084,42 @@ pub fn placing_of(build: Option<&Build>, command: &str) -> Result<Placing, Strin
     })
 }
 
-/// Fails the case unless the stand-in is placed as the entry says. For a script or a wheel the
-/// file the host sees as the agent is the entry's runtime, under the runtime's file name, and the
-/// file typed as the command is another file: an executable script whose first line is `#!` and the
-/// placed runtime's absolute path; a wheel's file is placed too. For every entry the program placed
-/// as the agent is the terminal stand-in the harness built. Where the route is not the stand-in's
-/// there is nothing to check.
+/// One thing the placing of the stand-in is held to, as [`what_is_placed`] found it. A case
+/// asserts that `found` is `entry_says` in its own body, and fails with `says`.
+pub struct Placed {
+    /// What was found, as `{:?}` prints it.
+    pub found: String,
+    /// What the entry says it is, as `{:?}` prints it.
+    pub entry_says: String,
+    /// What the case says where the two differ.
+    pub says: String,
+}
+
+impl Placed {
+    fn new(found: impl std::fmt::Debug, entry_says: impl std::fmt::Debug, says: String) -> Self {
+        Self {
+            found: format!("{found:?}"),
+            entry_says: format!("{entry_says:?}"),
+            says,
+        }
+    }
+}
+
+/// What is placed for the stand-in made from the entry of the case's subject: one [`Placed`] for
+/// each thing the placing is held to, in the order they are held to it, for the case to assert in
+/// its own body. For a script or a wheel the file the host sees as the agent is the entry's
+/// runtime, under the runtime's file name, and the file typed as the command is another file: an
+/// executable script whose first line is `#!` and the placed runtime's absolute path; a wheel's
+/// file is placed too. For every entry the program placed as the agent is the terminal stand-in the
+/// harness built. Where the route is not the stand-in's there is nothing to hold, and the list is
+/// empty.
 ///
 /// # Panics
 ///
-/// Panics at the first thing that is not as the entry says.
-pub fn placed_as_the_entry_says(ctx: &Context) {
+/// Panics where a program the harness built cannot be read.
+pub fn what_is_placed(ctx: &Context) -> Vec<Placed> {
     let (Route::StandIn, Some(build)) = (&ctx.route, ctx.subject.entry()) else {
-        return;
+        return Vec::new();
     };
     let command = ctx.subject.command();
     // What is placed is read from the entry again, and not from `placing_of`, which places it: the
@@ -1118,61 +1141,78 @@ pub fn placed_as_the_entry_says(ctx: &Context) {
         .executable
         .file_name()
         .map(|name| name.to_string_lossy().into_owned());
-    assert_eq!(
-        placed.as_deref(),
-        program.as_deref(),
-        "{command}: the file the host sees as the agent is placed under the file name {program:?}, \
-         which the entry's runtime has, or the command's own name for a native entry"
-    );
-    assert!(
-        std::fs::read(&ctx.executable).expect("the program placed as the agent")
-            == std::fs::read(PROGRAM).expect("the terminal stand-in the harness built"),
-        "{command}: the program placed as the agent is the terminal stand-in the harness built"
-    );
-    assert_eq!(
-        ctx.qualified_as().1,
-        build.version,
-        "{command}: the generation lists the entry's build under the entry's version"
-    );
+    let stand_in = std::fs::read(PROGRAM).expect("the terminal stand-in the harness built");
+    let mut held = vec![
+        Placed::new(
+            placed.as_deref(),
+            program.as_deref(),
+            format!(
+                "{command}: the file the host sees as the agent is placed under the file name \
+                 {program:?}, which the entry's runtime has, or the command's own name for a \
+                 native entry"
+            ),
+        ),
+        Placed::new(
+            std::fs::read(&ctx.executable).is_ok_and(|file| file == stand_in),
+            true,
+            format!(
+                "{command}: the program placed as the agent is the terminal stand-in the harness \
+                 built"
+            ),
+        ),
+        Placed::new(
+            ctx.qualified_as().1,
+            &build.version,
+            format!("{command}: the generation lists the entry's build under the entry's version"),
+        ),
+    ];
     if let (Some((_, version)), Some(newer)) = (&ctx.newer, &build.newer) {
-        assert_eq!(
-            version, &newer.version,
-            "{command}: the newer build is listed under the entry's newer version"
-        );
+        held.push(Placed::new(
+            version,
+            &newer.version,
+            format!("{command}: the newer build is listed under the entry's newer version"),
+        ));
     }
     if let Some((newer, _)) = &ctx.newer {
-        assert!(
-            std::fs::read(newer).expect("the program placed as the newer build")
-                == std::fs::read(NEWER).expect("the newer terminal stand-in the harness built"),
-            "{command}: the program placed as the newer build is the newer terminal stand-in the \
-             harness built"
-        );
+        let newer_stand_in =
+            std::fs::read(NEWER).expect("the newer terminal stand-in the harness built");
+        held.push(Placed::new(
+            std::fs::read(newer).is_ok_and(|file| file == newer_stand_in),
+            true,
+            format!(
+                "{command}: the program placed as the newer build is the newer terminal stand-in \
+                 the harness built"
+            ),
+        ));
     }
     if scripted {
         let typed = ctx.bin.join(command);
         let text = std::fs::read_to_string(&typed).unwrap_or_default();
-        assert_eq!(
+        held.push(Placed::new(
             text.lines().next(),
-            Some(format!("#!{}", ctx.executable.display()).as_str()),
-            "{command}: the file typed as the command is a script whose first line is #! and the \
-             placed runtime's absolute path"
-        );
-        let mode = std::os::unix::fs::PermissionsExt::mode(
-            &std::fs::metadata(&typed)
-                .expect("the script a person types")
-                .permissions(),
-        );
-        assert!(
-            mode & 0o111 != 0 && inode_of(&typed) != inode_of(&ctx.executable),
-            "{command}: the script a person types is executable and is not the runtime"
-        );
+            Some(format!("#!{}", ctx.executable.display())),
+            format!(
+                "{command}: the file typed as the command is a script whose first line is #! and \
+                 the placed runtime's absolute path"
+            ),
+        ));
+        let executable = std::fs::metadata(&typed).is_ok_and(|file| {
+            std::os::unix::fs::PermissionsExt::mode(&file.permissions()) & 0o111 != 0
+        });
+        held.push(Placed::new(
+            executable && inode_of(&typed) != inode_of(&ctx.executable),
+            true,
+            format!("{command}: the script a person types is executable and is not the runtime"),
+        ));
     }
     if let Some(wheel) = &wheel {
-        assert!(
+        held.push(Placed::new(
             ctx.bin.join(wheel).is_file(),
-            "{command}: the wheel's file {wheel} is placed beside the script"
-        );
+            true,
+            format!("{command}: the wheel's file {wheel} is placed beside the script"),
+        ));
     }
+    held
 }
 
 /// The package written for a script or a wheel recognises the command a person types, as its
@@ -1486,33 +1526,35 @@ pub fn subject_for(synthetic: &Synthetic, base: &Path) -> Subject {
         .unwrap_or_else(|why| panic!("{}: {why}", synthetic.name))
 }
 
-/// Fails the case if a marker ([`marked`]) of the entry `name` ran: `mark` is the mark file, which
-/// exists only once one has.
-///
-/// # Panics
-///
-/// Panics where the mark file exists, with the paths of the markers that ran.
-fn assert_no_program_the_entry_names_ran(name: &str, mark: &Path) {
-    assert!(
-        !mark.exists(),
-        "{name}: the part ran a program that the entry names and the harness did not build; each \
-         such program wrote its path to the mark file:\n{}",
-        std::fs::read_to_string(mark).unwrap_or_default()
-    );
+/// A staged part that starts no model turn, which takes the subject, the case's name and the check
+/// of the stand-in's placing that the case binds ([`what_is_placed`]).
+type Part = fn(Option<Subject>, &str, Option<&dyn Fn(&Context)>);
+
+/// The paths of the markers ([`marked`]) that ran, which `mark`, the mark file, holds: none where
+/// no marker ran, since the file exists only once one has.
+fn markers_that_ran(mark: &Path) -> Option<String> {
+    mark.exists()
+        .then(|| std::fs::read_to_string(mark).unwrap_or_default())
 }
 
 /// Runs `part`, one of the staged parts that start no model turn, as `test`, for the stand-in made
 /// from each synthetic entry, installed from a release of the entry's package. Every program the
-/// entry names is a marker ([`marked`]) in a folder of the case, outside the run's directory, and
-/// the case fails once the part has ended if one of them ran
-/// ([`assert_no_program_the_entry_names_ran`]).
-fn for_each_entry(test: &str, part: fn(Option<Subject>, &str)) {
+/// entry names is a marker ([`marked`]) in a folder of the case, outside the run's directory. The
+/// case holds the part to two things in its own body: `placed` is called at the start of the part
+/// with the run's context ([`what_is_placed`]), and `no_marker_ran` is called once the part has
+/// ended with the entry's name and the markers that ran ([`markers_that_ran`]).
+fn for_each_entry(
+    test: &str,
+    part: Part,
+    placed: &dyn Fn(&Context),
+    no_marker_ran: &dyn Fn(&str, Option<String>),
+) {
     for synthetic in synthetic().into_iter().chain(without_account()) {
         let base = scratch("part");
         let (synthetic, mark) = marked(&base, &synthetic);
         let subject = subject_for(&synthetic, &base);
-        part(Some(subject), test);
-        assert_no_program_the_entry_names_ran(synthetic.name, &mark);
+        part(Some(subject), test, Some(placed));
+        no_marker_ran(synthetic.name, markers_that_ran(&mark));
         let _ = std::fs::remove_dir_all(&base);
     }
 }
@@ -1523,7 +1565,20 @@ fn for_each_entry(test: &str, part: fn(Option<Subject>, &str)) {
 fn a_stand_in_for_an_entry_on_its_terminal_route_is_advertised_no_typed_capability_and_every_typed_action_is_refused()
  {
     const TEST: &str = "a_stand_in_for_an_entry_on_its_terminal_route_is_advertised_no_typed_capability_and_every_typed_action_is_refused";
-    for_each_entry(TEST, part_2b);
+    let placed = |ctx: &Context| {
+        for what in what_is_placed(ctx) {
+            assert_eq!(what.found, what.entry_says, "{}", what.says);
+        }
+    };
+    let no_marker_ran = |name: &str, ran: Option<String>| {
+        assert!(
+            ran.is_none(),
+            "{name}: the part ran a program that the entry names and the harness did not build; \
+             each such program wrote its path to the mark file:\n{}",
+            ran.unwrap_or_default()
+        );
+    };
+    for_each_entry(TEST, part_2b, &placed, &no_marker_ran);
 }
 
 /// Part 2c for the stand-in made from each entry: under a binding the host permits a supported
@@ -1532,7 +1587,20 @@ fn a_stand_in_for_an_entry_on_its_terminal_route_is_advertised_no_typed_capabili
 fn under_a_binding_a_stand_in_for_an_entry_is_permitted_a_supported_action_and_refused_an_unsupported_one()
  {
     const TEST: &str = "under_a_binding_a_stand_in_for_an_entry_is_permitted_a_supported_action_and_refused_an_unsupported_one";
-    for_each_entry(TEST, part_2c);
+    let placed = |ctx: &Context| {
+        for what in what_is_placed(ctx) {
+            assert_eq!(what.found, what.entry_says, "{}", what.says);
+        }
+    };
+    let no_marker_ran = |name: &str, ran: Option<String>| {
+        assert!(
+            ran.is_none(),
+            "{name}: the part ran a program that the entry names and the harness did not build; \
+             each such program wrote its path to the mark file:\n{}",
+            ran.unwrap_or_default()
+        );
+    };
+    for_each_entry(TEST, part_2c, &placed, &no_marker_ran);
 }
 
 /// Part 5a for the stand-in made from each entry: a crash of the control daemon leaves the stand-in
@@ -1541,7 +1609,20 @@ fn under_a_binding_a_stand_in_for_an_entry_is_permitted_a_supported_action_and_r
 fn a_control_daemon_crash_leaves_a_stand_in_for_an_entry_and_its_local_terminal_running() {
     const TEST: &str =
         "a_control_daemon_crash_leaves_a_stand_in_for_an_entry_and_its_local_terminal_running";
-    for_each_entry(TEST, part_5a);
+    let placed = |ctx: &Context| {
+        for what in what_is_placed(ctx) {
+            assert_eq!(what.found, what.entry_says, "{}", what.says);
+        }
+    };
+    let no_marker_ran = |name: &str, ran: Option<String>| {
+        assert!(
+            ran.is_none(),
+            "{name}: the part ran a program that the entry names and the harness did not build; \
+             each such program wrote its path to the mark file:\n{}",
+            ran.unwrap_or_default()
+        );
+    };
+    for_each_entry(TEST, part_5a, &placed, &no_marker_ran);
 }
 
 /// Part 6a for the stand-in made from each entry: a running stand-in keeps its build through an
@@ -1550,7 +1631,20 @@ fn a_control_daemon_crash_leaves_a_stand_in_for_an_entry_and_its_local_terminal_
 fn a_running_stand_in_for_an_entry_keeps_its_build_through_an_upgrade_and_the_newer_build_gets_the_terminal_route()
  {
     const TEST: &str = "a_running_stand_in_for_an_entry_keeps_its_build_through_an_upgrade_and_the_newer_build_gets_the_terminal_route";
-    for_each_entry(TEST, part_6a);
+    let placed = |ctx: &Context| {
+        for what in what_is_placed(ctx) {
+            assert_eq!(what.found, what.entry_says, "{}", what.says);
+        }
+    };
+    let no_marker_ran = |name: &str, ran: Option<String>| {
+        assert!(
+            ran.is_none(),
+            "{name}: the part ran a program that the entry names and the harness did not build; \
+             each such program wrote its path to the mark file:\n{}",
+            ran.unwrap_or_default()
+        );
+    };
+    for_each_entry(TEST, part_6a, &placed, &no_marker_ran);
 }
 
 /// Part 8a for the stand-in made from each entry: forged titles, transcripts, identifiers and hook
@@ -1559,7 +1653,20 @@ fn a_running_stand_in_for_an_entry_keeps_its_build_through_an_upgrade_and_the_ne
 fn forged_titles_transcripts_identifiers_and_hook_input_leave_the_host_unchanged_for_a_stand_in_for_an_entry()
  {
     const TEST: &str = "forged_titles_transcripts_identifiers_and_hook_input_leave_the_host_unchanged_for_a_stand_in_for_an_entry";
-    for_each_entry(TEST, part_8a);
+    let placed = |ctx: &Context| {
+        for what in what_is_placed(ctx) {
+            assert_eq!(what.found, what.entry_says, "{}", what.says);
+        }
+    };
+    let no_marker_ran = |name: &str, ran: Option<String>| {
+        assert!(
+            ran.is_none(),
+            "{name}: the part ran a program that the entry names and the harness did not build; \
+             each such program wrote its path to the mark file:\n{}",
+            ran.unwrap_or_default()
+        );
+    };
+    for_each_entry(TEST, part_8a, &placed, &no_marker_ran);
 }
 
 /// Part 14.03a for the stand-in made from each entry: a path typed at the stand-in is terminal
@@ -1568,5 +1675,18 @@ fn forged_titles_transcripts_identifiers_and_hook_input_leave_the_host_unchanged
 fn a_path_typed_at_a_stand_in_for_an_entry_is_terminal_input_that_reaches_its_composer() {
     const TEST: &str =
         "a_path_typed_at_a_stand_in_for_an_entry_is_terminal_input_that_reaches_its_composer";
-    for_each_entry(TEST, part_14_03a);
+    let placed = |ctx: &Context| {
+        for what in what_is_placed(ctx) {
+            assert_eq!(what.found, what.entry_says, "{}", what.says);
+        }
+    };
+    let no_marker_ran = |name: &str, ran: Option<String>| {
+        assert!(
+            ran.is_none(),
+            "{name}: the part ran a program that the entry names and the harness did not build; \
+             each such program wrote its path to the mark file:\n{}",
+            ran.unwrap_or_default()
+        );
+    };
+    for_each_entry(TEST, part_14_03a, &placed, &no_marker_ran);
 }

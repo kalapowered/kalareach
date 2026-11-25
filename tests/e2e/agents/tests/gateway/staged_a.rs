@@ -53,11 +53,14 @@ fn arm(ctx: &Context) -> &'static str {
 }
 
 /// A case that starts its agent by hand and takes no login: the agent the environment names where
-/// `subject` is none, and the stand-in made from the entry of `subject` where it is some.
+/// `subject` is none, and the stand-in made from the entry of `subject` where it is some. Where
+/// `placed` is some, the case calls it with the run's context before anything is started, to hold
+/// the stand-in's placing to what the entry says.
 fn by_hand_case(
     subject: Option<Subject>,
     part: &str,
     test: &str,
+    placed: Option<&dyn Fn(&Context)>,
     setup: Setup,
     body: impl FnOnce(&Context, &Session<'_>) -> serde_json::Value,
 ) {
@@ -67,10 +70,10 @@ fn by_hand_case(
         no_login: true,
         ..setup
     };
-    // On the stand-in route the case starts by checking that the stand-in is placed as the entry
-    // says, before anything is started.
     let body = |ctx: &Context, session: &Session<'_>| {
-        stand_in::placed_as_the_entry_says(ctx);
+        if let Some(placed) = placed {
+            placed(ctx);
+        }
         body(ctx, session)
     };
     match subject {
@@ -531,75 +534,85 @@ fn judges_a_forwarder_answer(
 fn gateway_an_agent_on_its_terminal_route_is_advertised_no_typed_capability_and_every_typed_action_is_refused()
  {
     const TEST: &str = "gateway_an_agent_on_its_terminal_route_is_advertised_no_typed_capability_and_every_typed_action_is_refused";
-    part_2b(None, TEST);
+    part_2b(None, TEST, None);
 }
 
 /// Part 2b as the case `test`, for the agent the environment names, or for the stand-in made from
 /// the entry of `subject`.
-pub(super) fn part_2b(subject: Option<Subject>, test: &str) {
-    by_hand_case(subject, "2b", test, Setup::default(), |ctx, session| {
-        let session_id = session.session_id();
-        let agent = HandAgent::starts(ctx, session);
-        let shown = detects(ctx, &session.remote, session_id);
-        let running = launched(ctx, &agent);
-        let detected = check_detected(&running, &shown)
-            .unwrap_or_else(|why| panic!("the host did not detect the manual launch: {why}"));
-        let (offered, reads) = surface(ctx, session, &session.remote, session_id, &shown);
-        check_observation_only(&offered)
-            .unwrap_or_else(|why| panic!("only observation and the terminal are offered: {why}"));
-        let after = shown_now(ctx, &session.remote, session_id);
-        check_unchanged(Held::of(&shown), &after)
-            .unwrap_or_else(|why| panic!("the refusals change nothing: {why}"));
-        let states = capability_states(&session.remote, &ctx.runtime, &ctx.subject.plugin());
-        advertises_nothing_as_available(&states).unwrap_or_else(|why| panic!("{why}"));
-        shows_no_trace(&session.person.window.screen(), TYPED_PROMPT)
-            .unwrap_or_else(|why| panic!("no refused prompt reached the agent: {why}"));
-        agent
-            .runs()
-            .unwrap_or_else(|why| panic!("the agent goes on after the refusals: {why}"));
-        let checker = checker_controls(&running, &shown, &offered);
-        all_rejected(&checker).unwrap_or_else(|why| panic!("{why}"));
-        // The live control for the surface, which does not break it: terminal input under the
-        // lease, which the same device's connection delivers.
-        let (input, shows) = harmless(ctx);
-        let mut keys = keyboard(ctx, session, true);
-        let _ = keys
-            .type_text(&session.remote, &ctx.runtime, &input)
-            .unwrap_or_else(|why| panic!("{why}"));
-        let _ = session
-            .person
-            .sees(&shows, "the agent's composer shows the keystroke");
-        // The live control for detection, which breaks it: the agent ends, and the check fails.
-        agent.ends();
-        let gone = shown_gone(ctx, &session.remote, session_id);
-        let ended = launched(ctx, &agent);
-        let ended_check = check_detected(&ended, &gone);
-        assert!(
-            ended_check.is_err(),
-            "the detection check fails once the agent has ended: {}",
-            gone.detection.evidence()
-        );
-        check_ended(&gone).unwrap_or_else(|why| panic!("the host ends the instance: {why}"));
-        serde_json::json!({
-            "arm": arm(ctx),
-            "detection": shown.detection.evidence(),
-            "binding": shown.binding,
-            "live_bindings": shown.live_bindings,
-            "detected": detected.identity,
-            "surface": offered.evidence(),
-            "agent_reads": reads.iter().map(Reply::evidence).collect::<Vec<_>>(),
-            "after": after.detection.evidence(),
-            "capability_states": states,
-            "checker_controls": checker,
-            "control": { "what": "terminal input under the lease", "breaks_property": false },
-            "detection_control": {
-                "what": "the agent ended by its recorded identity",
-                "breaks_property": true,
-                "after": gone.detection.evidence(),
-                "check": ended_check.err().map(|undetected| undetected.why),
-            },
-        })
-    });
+///
+/// Where `placed` is some, the part calls it with the run's context before it starts anything.
+pub(super) fn part_2b(subject: Option<Subject>, test: &str, placed: Option<&dyn Fn(&Context)>) {
+    by_hand_case(
+        subject,
+        "2b",
+        test,
+        placed,
+        Setup::default(),
+        |ctx, session| {
+            let session_id = session.session_id();
+            let agent = HandAgent::starts(ctx, session);
+            let shown = detects(ctx, &session.remote, session_id);
+            let running = launched(ctx, &agent);
+            let detected = check_detected(&running, &shown)
+                .unwrap_or_else(|why| panic!("the host did not detect the manual launch: {why}"));
+            let (offered, reads) = surface(ctx, session, &session.remote, session_id, &shown);
+            check_observation_only(&offered).unwrap_or_else(|why| {
+                panic!("only observation and the terminal are offered: {why}")
+            });
+            let after = shown_now(ctx, &session.remote, session_id);
+            check_unchanged(Held::of(&shown), &after)
+                .unwrap_or_else(|why| panic!("the refusals change nothing: {why}"));
+            let states = capability_states(&session.remote, &ctx.runtime, &ctx.subject.plugin());
+            advertises_nothing_as_available(&states).unwrap_or_else(|why| panic!("{why}"));
+            shows_no_trace(&session.person.window.screen(), TYPED_PROMPT)
+                .unwrap_or_else(|why| panic!("no refused prompt reached the agent: {why}"));
+            agent
+                .runs()
+                .unwrap_or_else(|why| panic!("the agent goes on after the refusals: {why}"));
+            let checker = checker_controls(&running, &shown, &offered);
+            all_rejected(&checker).unwrap_or_else(|why| panic!("{why}"));
+            // The live control for the surface, which does not break it: terminal input under the
+            // lease, which the same device's connection delivers.
+            let (input, shows) = harmless(ctx);
+            let mut keys = keyboard(ctx, session, true);
+            let _ = keys
+                .type_text(&session.remote, &ctx.runtime, &input)
+                .unwrap_or_else(|why| panic!("{why}"));
+            let _ = session
+                .person
+                .sees(&shows, "the agent's composer shows the keystroke");
+            // The live control for detection, which breaks it: the agent ends, and the check fails.
+            agent.ends();
+            let gone = shown_gone(ctx, &session.remote, session_id);
+            let ended = launched(ctx, &agent);
+            let ended_check = check_detected(&ended, &gone);
+            assert!(
+                ended_check.is_err(),
+                "the detection check fails once the agent has ended: {}",
+                gone.detection.evidence()
+            );
+            check_ended(&gone).unwrap_or_else(|why| panic!("the host ends the instance: {why}"));
+            serde_json::json!({
+                "arm": arm(ctx),
+                "detection": shown.detection.evidence(),
+                "binding": shown.binding,
+                "live_bindings": shown.live_bindings,
+                "detected": detected.identity,
+                "surface": offered.evidence(),
+                "agent_reads": reads.iter().map(Reply::evidence).collect::<Vec<_>>(),
+                "after": after.detection.evidence(),
+                "capability_states": states,
+                "checker_controls": checker,
+                "control": { "what": "terminal input under the lease", "breaks_property": false },
+                "detection_control": {
+                    "what": "the agent ended by its recorded identity",
+                    "breaks_property": true,
+                    "after": gone.detection.evidence(),
+                    "check": ended_check.err().map(|undetected| undetected.why),
+                },
+            })
+        },
+    );
 }
 
 /// A capability the host advertises as qualified and available is refused by the check.
@@ -633,76 +646,86 @@ fn a_typed_prompt_that_reached_the_agents_screen_fails_the_check_of_2b() {
 fn gateway_under_a_binding_a_supported_action_is_permitted_and_an_unsupported_one_is_refused() {
     const TEST: &str =
         "gateway_under_a_binding_a_supported_action_is_permitted_and_an_unsupported_one_is_refused";
-    part_2c(None, TEST);
+    part_2c(None, TEST, None);
 }
 
 /// Part 2c as the case `test`, for the agent the environment names, or for the stand-in made from
 /// the entry of `subject`.
-pub(super) fn part_2c(subject: Option<Subject>, test: &str) {
-    by_hand_case(subject, "2c", test, Setup::default(), |ctx, session| {
-        let session_id = session.session_id();
-        let agent = HandAgent::starts(ctx, session);
-        let shown = detects(ctx, &session.remote, session_id);
-        check_detected(&launched(ctx, &agent), &shown)
-            .unwrap_or_else(|why| panic!("the host did not detect the manual launch: {why}"));
-        let held = Held::of(&shown).expect("the binding could not be read");
-        let actions = package_actions(&ctx.subject, session.host.environment());
-        let presentation: Vec<&Action> = actions
-            .iter()
-            .filter(|action| action.presentation())
-            .collect();
-        let upstream: Vec<Action> = actions.iter().filter(|a| a.upstream()).cloned().collect();
-        let (target, envelope) =
-            target_of(&session.remote, session_id, held.instance, held.revision);
-        let send = |action: &Action| {
-            invoke(
+///
+/// Where `placed` is some, the part calls it with the run's context before it starts anything.
+pub(super) fn part_2c(subject: Option<Subject>, test: &str, placed: Option<&dyn Fn(&Context)>) {
+    by_hand_case(
+        subject,
+        "2c",
+        test,
+        placed,
+        Setup::default(),
+        |ctx, session| {
+            let session_id = session.session_id();
+            let agent = HandAgent::starts(ctx, session);
+            let shown = detects(ctx, &session.remote, session_id);
+            check_detected(&launched(ctx, &agent), &shown)
+                .unwrap_or_else(|why| panic!("the host did not detect the manual launch: {why}"));
+            let held = Held::of(&shown).expect("the binding could not be read");
+            let actions = package_actions(&ctx.subject, session.host.environment());
+            let presentation: Vec<&Action> = actions
+                .iter()
+                .filter(|action| action.presentation())
+                .collect();
+            let upstream: Vec<Action> = actions.iter().filter(|a| a.upstream()).cloned().collect();
+            let (target, envelope) =
+                target_of(&session.remote, session_id, held.instance, held.revision);
+            let send = |action: &Action| {
+                invoke(
+                    &session.remote,
+                    &ctx.runtime,
+                    &envelope,
+                    target,
+                    &ctx.subject.plugin(),
+                    action,
+                )
+            };
+            let supported: Vec<Reply> = presentation.iter().map(|action| send(action)).collect();
+            let unsupported: Vec<Reply> = typed_actions(
                 &session.remote,
                 &ctx.runtime,
-                &envelope,
-                target,
+                session_id,
                 &ctx.subject.plugin(),
-                action,
+                &upstream,
+                Some((held.instance, held.revision)),
             )
-        };
-        let supported: Vec<Reply> = presentation.iter().map(|action| send(action)).collect();
-        let unsupported: Vec<Reply> = typed_actions(
-            &session.remote,
-            &ctx.runtime,
-            session_id,
-            &ctx.subject.plugin(),
-            &upstream,
-            Some((held.instance, held.revision)),
-        )
-        .into_iter()
-        .filter(|answer| !AGENT_READS.contains(&answer.call.as_str()))
-        .collect();
-        presentation_admitted_and_upstream_refused(&supported, &unsupported)
-            .unwrap_or_else(|why| panic!("under the binding: {why}"));
-        let after = shown_now(ctx, &session.remote, session_id);
-        check_unchanged(Some(held), &after)
-            .unwrap_or_else(|why| panic!("the calls change nothing: {why}"));
-        // The control breaks the property: the binding ends with the agent, and the same action,
-        // sent again as a new action, is refused.
-        agent.ends();
-        let gone = shown_gone(ctx, &session.remote, session_id);
-        check_ended(&gone).unwrap_or_else(|why| panic!("the instance has ended: {why}"));
-        let after_end: Vec<Reply> = presentation.iter().map(|action| send(action)).collect();
-        all_refused(&after_end).unwrap_or_else(|why| panic!("once the binding has ended: {why}"));
-        serde_json::json!({
-            "arm": arm(ctx),
-            "detection": shown.detection.evidence(),
-            "binding": shown.binding,
-            "held": { "instance": held.instance.to_string(), "revision": held.revision.get() },
-            "supported": supported.iter().map(Reply::evidence).collect::<Vec<_>>(),
-            "unsupported": unsupported.iter().map(Reply::evidence).collect::<Vec<_>>(),
-            "after": after.detection.evidence(),
-            "control": {
-                "what": "the agent ended, its binding with it, and the same presentation action sent again as a new action",
-                "breaks_property": true,
-                "answers": after_end.iter().map(Reply::evidence).collect::<Vec<_>>(),
-            },
-        })
-    });
+            .into_iter()
+            .filter(|answer| !AGENT_READS.contains(&answer.call.as_str()))
+            .collect();
+            presentation_admitted_and_upstream_refused(&supported, &unsupported)
+                .unwrap_or_else(|why| panic!("under the binding: {why}"));
+            let after = shown_now(ctx, &session.remote, session_id);
+            check_unchanged(Some(held), &after)
+                .unwrap_or_else(|why| panic!("the calls change nothing: {why}"));
+            // The control breaks the property: the binding ends with the agent, and the same action,
+            // sent again as a new action, is refused.
+            agent.ends();
+            let gone = shown_gone(ctx, &session.remote, session_id);
+            check_ended(&gone).unwrap_or_else(|why| panic!("the instance has ended: {why}"));
+            let after_end: Vec<Reply> = presentation.iter().map(|action| send(action)).collect();
+            all_refused(&after_end)
+                .unwrap_or_else(|why| panic!("once the binding has ended: {why}"));
+            serde_json::json!({
+                "arm": arm(ctx),
+                "detection": shown.detection.evidence(),
+                "binding": shown.binding,
+                "held": { "instance": held.instance.to_string(), "revision": held.revision.get() },
+                "supported": supported.iter().map(Reply::evidence).collect::<Vec<_>>(),
+                "unsupported": unsupported.iter().map(Reply::evidence).collect::<Vec<_>>(),
+                "after": after.detection.evidence(),
+                "control": {
+                    "what": "the agent ended, its binding with it, and the same presentation action sent again as a new action",
+                    "breaks_property": true,
+                    "answers": after_end.iter().map(Reply::evidence).collect::<Vec<_>>(),
+                },
+            })
+        },
+    );
 }
 
 /// The calls of 2c: a presentation action that is refused, an upstream action that is admitted and
@@ -746,70 +769,79 @@ fn a_presentation_action_that_is_refused_or_an_upstream_one_that_is_admitted_fai
 fn gateway_a_control_daemon_crash_leaves_the_agent_and_its_local_terminal_running() {
     const TEST: &str =
         "gateway_a_control_daemon_crash_leaves_the_agent_and_its_local_terminal_running";
-    part_5a(None, TEST);
+    part_5a(None, TEST, None);
 }
 
 /// Part 5a as the case `test`, for the agent the environment names, or for the stand-in made from
 /// the entry of `subject`.
-pub(super) fn part_5a(subject: Option<Subject>, test: &str) {
-    by_hand_case(subject, "5a", test, Setup::default(), |ctx, session| {
-        assert!(
-            matches!(ctx.route, Route::StandIn),
-            "the daemon-crash part runs on the stand-in route only"
-        );
-        let session_id = session.session_id();
-        let agent = HandAgent::starts(ctx, session);
-        let shown = detects(ctx, &session.remote, session_id);
-        let held = Held::of(&shown).expect("the agent is detected with a binding");
-        let survives = |what: &str| {
-            agent.runs().unwrap_or_else(|why| panic!("{what}: {why}"));
-        };
-        // Only the daemon is killed. The agent and its terminal go on, and the local terminal
-        // drives the agent with no daemon to carry what it writes.
-        session.host.kill_daemon();
-        survives("the daemon's crash left the rest");
-        let (input, shows) = harmless(ctx);
-        session.person.window.type_text(input.as_bytes());
-        let _ = session.person.sees(
-            &shows,
-            "the local terminal drives the agent without a daemon",
-        );
-        // A daemon is started again, and the device connects to it; nothing runs `kr`.
-        let remote = restarts_the_daemon(ctx, session);
-        let served = ctx.instances_within(
-            &remote,
-            session_id,
-            "the restarted daemon serves the instance",
-            |read| !read.agent_instances.instances.is_empty(),
-        );
-        assert!(served.is_ok(), "the restarted daemon serves: {served:?}");
-        survives("after the restart");
-        // The worker's view of the agent outlives the daemon: the same instance at the same
-        // revision, and still only observation and the terminal.
-        let restarted = shown_now(ctx, &remote, session_id);
-        check_unchanged(Some(held), &restarted)
-            .unwrap_or_else(|why| panic!("across the daemon's crash and restart: {why}"));
-        let (offered, _) = surface(ctx, session, &remote, session_id, &restarted);
-        check_observation_only(&offered)
-            .unwrap_or_else(|why| panic!("after the restart, only observation: {why}"));
-        // The control: the property broken on purpose. The agent is ended, and the same check has
-        // to say so.
-        agent.ends();
-        let control = agent.runs();
-        assert!(
-            control.is_err(),
-            "the survival check fails once the agent has ended"
-        );
-        serde_json::json!({
-            "arm": "stand-in only",
-            "route": arm(ctx),
-            "agent_processes": ["the worker", "the agent"],
-            "local_terminal_input": shows,
-            "detection": shown.detection.evidence(),
-            "after_restart": { "detection": restarted.detection.evidence(), "surface": offered.evidence() },
-            "control": { "what": "the agent ended by its recorded identity", "breaks_property": true, "check": control.err() },
-        })
-    });
+///
+/// Where `placed` is some, the part calls it with the run's context before it starts anything.
+pub(super) fn part_5a(subject: Option<Subject>, test: &str, placed: Option<&dyn Fn(&Context)>) {
+    by_hand_case(
+        subject,
+        "5a",
+        test,
+        placed,
+        Setup::default(),
+        |ctx, session| {
+            assert!(
+                matches!(ctx.route, Route::StandIn),
+                "the daemon-crash part runs on the stand-in route only"
+            );
+            let session_id = session.session_id();
+            let agent = HandAgent::starts(ctx, session);
+            let shown = detects(ctx, &session.remote, session_id);
+            let held = Held::of(&shown).expect("the agent is detected with a binding");
+            let survives = |what: &str| {
+                agent.runs().unwrap_or_else(|why| panic!("{what}: {why}"));
+            };
+            // Only the daemon is killed. The agent and its terminal go on, and the local terminal
+            // drives the agent with no daemon to carry what it writes.
+            session.host.kill_daemon();
+            survives("the daemon's crash left the rest");
+            let (input, shows) = harmless(ctx);
+            session.person.window.type_text(input.as_bytes());
+            let _ = session.person.sees(
+                &shows,
+                "the local terminal drives the agent without a daemon",
+            );
+            // A daemon is started again, and the device connects to it; nothing runs `kr`.
+            let remote = restarts_the_daemon(ctx, session);
+            let served = ctx.instances_within(
+                &remote,
+                session_id,
+                "the restarted daemon serves the instance",
+                |read| !read.agent_instances.instances.is_empty(),
+            );
+            assert!(served.is_ok(), "the restarted daemon serves: {served:?}");
+            survives("after the restart");
+            // The worker's view of the agent outlives the daemon: the same instance at the same
+            // revision, and still only observation and the terminal.
+            let restarted = shown_now(ctx, &remote, session_id);
+            check_unchanged(Some(held), &restarted)
+                .unwrap_or_else(|why| panic!("across the daemon's crash and restart: {why}"));
+            let (offered, _) = surface(ctx, session, &remote, session_id, &restarted);
+            check_observation_only(&offered)
+                .unwrap_or_else(|why| panic!("after the restart, only observation: {why}"));
+            // The control: the property broken on purpose. The agent is ended, and the same check has
+            // to say so.
+            agent.ends();
+            let control = agent.runs();
+            assert!(
+                control.is_err(),
+                "the survival check fails once the agent has ended"
+            );
+            serde_json::json!({
+                "arm": "stand-in only",
+                "route": arm(ctx),
+                "agent_processes": ["the worker", "the agent"],
+                "local_terminal_input": shows,
+                "detection": shown.detection.evidence(),
+                "after_restart": { "detection": restarted.detection.evidence(), "surface": offered.evidence() },
+                "control": { "what": "the agent ended by its recorded identity", "breaks_property": true, "check": control.err() },
+            })
+        },
+    );
 }
 
 /// The check that the agent survived fails for a process that ended, and holds for one that runs.
@@ -841,16 +873,19 @@ fn the_survival_check_of_5a_fails_for_a_process_that_ended() {
 fn gateway_a_running_agent_keeps_its_build_through_an_upgrade_and_the_newer_build_gets_the_terminal_route()
  {
     const TEST: &str = "gateway_a_running_agent_keeps_its_build_through_an_upgrade_and_the_newer_build_gets_the_terminal_route";
-    part_6a(None, TEST);
+    part_6a(None, TEST, None);
 }
 
 /// Part 6a as the case `test`, for the agent the environment names, or for the stand-in made from
 /// the entry of `subject`.
-pub(super) fn part_6a(subject: Option<Subject>, test: &str) {
+///
+/// Where `placed` is some, the part calls it with the run's context before it starts anything.
+pub(super) fn part_6a(subject: Option<Subject>, test: &str, placed: Option<&dyn Fn(&Context)>) {
     by_hand_case(
         subject,
         "6a",
         test,
+        placed,
         Setup {
             upgrade: true,
             ..Setup::default()
@@ -1365,16 +1400,19 @@ fn a_forged_transcript_is_written_only_below_the_run_and_never_through_a_link() 
 fn gateway_forged_titles_transcripts_identifiers_and_hook_input_leave_the_host_unchanged() {
     const TEST: &str =
         "gateway_forged_titles_transcripts_identifiers_and_hook_input_leave_the_host_unchanged";
-    part_8a(None, TEST);
+    part_8a(None, TEST, None);
 }
 
 /// Part 8a as the case `test`, for the agent the environment names, or for the stand-in made from
 /// the entry of `subject`.
-pub(super) fn part_8a(subject: Option<Subject>, test: &str) {
+///
+/// Where `placed` is some, the part calls it with the run's context before it starts anything.
+pub(super) fn part_8a(subject: Option<Subject>, test: &str, placed: Option<&dyn Fn(&Context)>) {
     by_hand_case(
         subject,
         "8a",
         test,
+        placed,
         Setup {
             second: true,
             ..Setup::default()
@@ -1867,107 +1905,118 @@ fn a_forged_channel_that_declares_a_capability_or_writes_after_a_stop_fails_the_
 fn gateway_a_path_typed_at_the_agent_is_terminal_input_that_reaches_its_composer() {
     const TEST: &str =
         "gateway_a_path_typed_at_the_agent_is_terminal_input_that_reaches_its_composer";
-    part_14_03a(None, TEST);
+    part_14_03a(None, TEST, None);
 }
 
 /// Part 14.03a as the case `test`, for the agent the environment names, or for the stand-in made
 /// from the entry of `subject`.
-pub(super) fn part_14_03a(subject: Option<Subject>, test: &str) {
-    by_hand_case(subject, "14.03a", test, Setup::default(), |ctx, session| {
-        // A build that shows no composer before an account is signed in has nothing to type at:
-        // the part is not run, and nothing is started for it.
-        let composer = match &ctx.route {
-            Route::Real(real) => match real.build.composer.clone() {
-                Some(composer) => Some(composer),
-                None => {
-                    return serde_json::json!({
-                        "arm": arm(ctx),
-                        "not_run": "the build shows no composer without an account",
-                    });
-                }
-            },
-            Route::StandIn => None,
-        };
-        let session_id = session.session_id();
-        let agent = HandAgent::starts(ctx, session);
-        let initial = detects(ctx, &session.remote, session_id);
-        check_detected(&launched(ctx, &agent), &initial)
-            .unwrap_or_else(|why| panic!("the host did not detect the manual launch: {why}"));
-        ctx.work
-            .as_ref()
-            .expect("the working directory was recorded")
-            .create_new(ctx.run.root(), ctx.run.pin(), SHOT, PNG)
-            .unwrap_or_else(|why| panic!("the image: {why}"));
-        let typed = ctx.run.work().join(SHOT).display().to_string();
+///
+/// Where `placed` is some, the part calls it with the run's context before it starts anything.
+pub(super) fn part_14_03a(subject: Option<Subject>, test: &str, placed: Option<&dyn Fn(&Context)>) {
+    by_hand_case(
+        subject,
+        "14.03a",
+        test,
+        placed,
+        Setup::default(),
+        |ctx, session| {
+            // A build that shows no composer before an account is signed in has nothing to type at:
+            // the part is not run, and nothing is started for it.
+            let composer = match &ctx.route {
+                Route::Real(real) => match real.build.composer.clone() {
+                    Some(composer) => Some(composer),
+                    None => {
+                        return serde_json::json!({
+                            "arm": arm(ctx),
+                            "not_run": "the build shows no composer without an account",
+                        });
+                    }
+                },
+                Route::StandIn => None,
+            };
+            let session_id = session.session_id();
+            let agent = HandAgent::starts(ctx, session);
+            let initial = detects(ctx, &session.remote, session_id);
+            check_detected(&launched(ctx, &agent), &initial)
+                .unwrap_or_else(|why| panic!("the host did not detect the manual launch: {why}"));
+            ctx.work
+                .as_ref()
+                .expect("the working directory was recorded")
+                .create_new(ctx.run.root(), ctx.run.pin(), SHOT, PNG)
+                .unwrap_or_else(|why| panic!("the image: {why}"));
+            let typed = ctx.run.work().join(SHOT).display().to_string();
 
-        // The control first: the same input from the device's keyboard before it holds the lease
-        // is refused, and the composer does not show it.
-        let mut keys = keyboard(ctx, session, false);
-        let control = match keys.type_text(&session.remote, &ctx.runtime, &typed) {
-            Err(refusal) if refusal.code == Some(ErrorCode::LeaseLost) => refusal.detail,
-            Err(refusal) => {
-                panic!("input without the lease is refused with LEASE_LOST: {refusal}")
+            // The control first: the same input from the device's keyboard before it holds the lease
+            // is refused, and the composer does not show it.
+            let mut keys = keyboard(ctx, session, false);
+            let control = match keys.type_text(&session.remote, &ctx.runtime, &typed) {
+                Err(refusal) if refusal.code == Some(ErrorCode::LeaseLost) => refusal.detail,
+                Err(refusal) => {
+                    panic!("input without the lease is refused with LEASE_LOST: {refusal}")
+                }
+                Ok(written) => panic!("input without the lease is refused: {written:?}"),
+            };
+            shows_no_trace(&session.person.window.screen(), SHOT)
+                .unwrap_or_else(|why| panic!("refused input does not reach the composer: {why}"));
+            keys.acquire(&session.remote, &ctx.runtime)
+                .unwrap_or_else(|why| panic!("the device takes the input lease: {why}"));
+            if let Some(composer) = &composer {
+                for prepare in &composer.prepare {
+                    let _ = keys
+                        .type_text(&session.remote, &ctx.runtime, &prepare.input)
+                        .unwrap_or_else(|why| panic!("{why}"));
+                    let _ = session
+                        .person
+                        .sees(&prepare.shows, "the agent reaches its composer");
+                }
             }
-            Ok(written) => panic!("input without the lease is refused: {written:?}"),
-        };
-        shows_no_trace(&session.person.window.screen(), SHOT)
-            .unwrap_or_else(|why| panic!("refused input does not reach the composer: {why}"));
-        keys.acquire(&session.remote, &ctx.runtime)
-            .unwrap_or_else(|why| panic!("the device takes the input lease: {why}"));
-        if let Some(composer) = &composer {
-            for prepare in &composer.prepare {
-                let _ = keys
-                    .type_text(&session.remote, &ctx.runtime, &prepare.input)
-                    .unwrap_or_else(|why| panic!("{why}"));
-                let _ = session
-                    .person
-                    .sees(&prepare.shows, "the agent reaches its composer");
+            let written = keys
+                .type_text(&session.remote, &ctx.runtime, &typed)
+                .unwrap_or_else(|why| panic!("{why}"));
+            // The lane's answer carries no count of what the worker took, so the screen shows that
+            // every byte of the path reached the terminal: the agent's composer shows the whole path
+            // and not only its last component, which is what a worker that forwarded a suffix of the
+            // input would leave.
+            let mut rows = shows_across_rows(&session.person, SHOT);
+            let whole_by = Instant::now() + WHOLE_PATH_WATCH;
+            while !shows_whole(&rows, &typed) && Instant::now() < whole_by {
+                std::thread::sleep(Duration::from_millis(200));
+                rows = session.person.window.screen();
             }
-        }
-        let written = keys
-            .type_text(&session.remote, &ctx.runtime, &typed)
-            .unwrap_or_else(|why| panic!("{why}"));
-        // The lane's answer carries no count of what the worker took, so the screen shows that
-        // every byte of the path reached the terminal: the agent's composer shows the whole path
-        // and not only its last component, which is what a worker that forwarded a suffix of the
-        // input would leave.
-        let mut rows = shows_across_rows(&session.person, SHOT);
-        let whole_by = Instant::now() + WHOLE_PATH_WATCH;
-        while !shows_whole(&rows, &typed) && Instant::now() < whole_by {
-            std::thread::sleep(Duration::from_millis(200));
-            rows = session.person.window.screen();
-        }
-        assert!(
-            shows_whole(&rows, &typed),
-            "the agent's composer shows the whole path {typed:?}, not only the end of it:\n{}",
-            rows.join("\n")
-        );
-        // The host announces nothing about the typed path: the instance and its revision as they
-        // were before it was typed, and no resource.
-        let after = shown_now(ctx, &session.remote, session_id);
-        check_unchanged(Held::of(&initial), &after)
-            .unwrap_or_else(|why| panic!("the typed path changes nothing the host shows: {why}"));
-        let (offered, _) = surface(ctx, session, &session.remote, session_id, &after);
-        check_observation_only(&offered).unwrap_or_else(|why| {
-            panic!("with the path typed, only observation and the terminal are offered: {why}")
-        });
-        let resources = events_snapshot(&session.remote, &ctx.runtime, session_id).agent_resources;
-        assert!(
-            resources.resources.is_empty() && resources.continue_after.0.is_none(),
-            "the typed path makes no resource"
-        );
-        agent
-            .runs()
-            .unwrap_or_else(|why| panic!("the agent goes on: {why}"));
-        serde_json::json!({
-            "arm": arm(ctx),
-            "typed": typed,
-            "sent_bytes": written.bytes,
-            "composer_rows": rows,
-            "detection": initial.detection.evidence(),
-            "announced": after.detection.evidence(),
-            "surface": offered.evidence(),
-            "control": { "what": "the same input without the lease", "breaks_property": true, "refused": control },
-        })
-    });
+            assert!(
+                shows_whole(&rows, &typed),
+                "the agent's composer shows the whole path {typed:?}, not only the end of it:\n{}",
+                rows.join("\n")
+            );
+            // The host announces nothing about the typed path: the instance and its revision as they
+            // were before it was typed, and no resource.
+            let after = shown_now(ctx, &session.remote, session_id);
+            check_unchanged(Held::of(&initial), &after).unwrap_or_else(|why| {
+                panic!("the typed path changes nothing the host shows: {why}")
+            });
+            let (offered, _) = surface(ctx, session, &session.remote, session_id, &after);
+            check_observation_only(&offered).unwrap_or_else(|why| {
+                panic!("with the path typed, only observation and the terminal are offered: {why}")
+            });
+            let resources =
+                events_snapshot(&session.remote, &ctx.runtime, session_id).agent_resources;
+            assert!(
+                resources.resources.is_empty() && resources.continue_after.0.is_none(),
+                "the typed path makes no resource"
+            );
+            agent
+                .runs()
+                .unwrap_or_else(|why| panic!("the agent goes on: {why}"));
+            serde_json::json!({
+                "arm": arm(ctx),
+                "typed": typed,
+                "sent_bytes": written.bytes,
+                "composer_rows": rows,
+                "detection": initial.detection.evidence(),
+                "announced": after.detection.evidence(),
+                "surface": offered.evidence(),
+                "control": { "what": "the same input without the lease", "breaks_property": true, "refused": control },
+            })
+        },
+    );
 }
