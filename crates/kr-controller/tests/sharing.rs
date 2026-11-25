@@ -3086,6 +3086,10 @@ async fn an_invitation_written_while_its_redemption_waits_is_not_redeemed_unanch
     let shared = SharingService::new(
         kr_controller::grants::GrantDirectory::open(&donor_path).expect("the donor store opens"),
         DeviceId::new(environment_id.get()),
+        kr_controller::boots::BootClock::new(
+            std::sync::Arc::new(kr_ipc::clock::SystemSharedClock),
+            kr_protocol::ids::BootEpoch::new(1),
+        ),
     )
     .share(
         &ShareRequest {

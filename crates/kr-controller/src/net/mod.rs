@@ -1631,7 +1631,9 @@ pub const CLOCK_MARK_INTERVAL: std::time::Duration = std::time::Duration::from_s
 /// Four things it owns rather than a connection: the mark that says time has passed, the
 /// tombstones a connection observed but could not write, the clock floor a refusal stood on when
 /// its write failed, and the time the offline bound has spent. Each has to outlive the connection
-/// that noticed it, and none can wait for the next device to arrive.
+/// that noticed it, and none can wait for the next device to arrive. It also records the highest
+/// reading of the host's order counter for this boot, which only a host on the network does between
+/// two starts.
 async fn keep_the_record(
     controller: Weak<Controller>,
     devices: Arc<DeviceDirectory>,
@@ -1657,6 +1659,10 @@ async fn keep_the_record(
         if let Some(controller) = controller.upgrade() {
             controller.keep_offline_time();
             controller.settle_floor();
+            // The boot's row keeps the highest reading of the order counter that any writer
+            // took in this boot. This is the one writer that takes one while nothing else is
+            // written, so a quiet host's high still rises.
+            controller.observe_boot();
             // The stored grants' ends this host found and could not write yet.
             controller
                 .lifetimes()

@@ -66,7 +66,7 @@ use crate::error::{ControllerError, Result};
 /// opens the other three before it writes the version, at a daemon's start and when an update
 /// brings the file forward alike, so a file that records `N` has all four at the shape `N` stands
 /// for.
-pub const SCHEMA_VERSION: i64 = 19;
+pub const SCHEMA_VERSION: i64 = 21;
 
 /// The newest schema version above [`SCHEMA_VERSION`] that this build reads without writing it.
 ///
@@ -76,7 +76,7 @@ pub const SCHEMA_VERSION: i64 = 19;
 /// update reads it. Its own next acceptance records the document at the version it writes, in a
 /// registry that stays at this version. A copy of the accepted document that this build cannot
 /// read stops the daemon's start ([`crate::config::from_record`]).
-pub const READS_THROUGH_SCHEMA_VERSION: i64 = 20;
+pub const READS_THROUGH_SCHEMA_VERSION: i64 = 22;
 
 /// The oldest schema version this build brings forward. A writer that stops handling an older
 /// shape raises this past the last version that wrote it.
@@ -1013,13 +1013,18 @@ impl Registry {
         // build reads through is refused below as it is, without a table of theirs being made in
         // it; a file an earlier build recorded at the current version before the others had opened
         // it is not brought here, and each writer brings its own tables the next time it opens the
-        // file. A file at 17, which no release wrote, is refused below, and nothing is written in
-        // it first.
-        if recorded.is_none_or(|version| version < SCHEMA_VERSION && version != 17) {
+        // file. A file at 17 or at 20, which no release wrote, is refused below, and nothing is
+        // written in it first: the two tables of version 21 are made by the steps that write it,
+        // never by the batch above.
+        if recorded.is_none_or(|version| version < SCHEMA_VERSION && version != 17 && version != 20)
+        {
             self.bring_the_other_writers_forward()?;
         }
         match recorded {
             None => {
+                self.connection
+                    .execute_batch(crate::boots::BOOTS_SCHEMA)
+                    .map_err(ControllerError::registry)?;
                 self.connection
                     .execute(
                         "INSERT INTO schema_version (version) VALUES (?1)",
@@ -1047,6 +1052,7 @@ impl Registry {
                 self.migrate_15_to_16()?;
                 self.migrate_16_to_18()?;
                 self.migrate_18_to_19()?;
+                self.migrate_19_to_21()?;
             }
             Some(2) => {
                 self.migrate_2_to_3()?;
@@ -1065,6 +1071,7 @@ impl Registry {
                 self.migrate_15_to_16()?;
                 self.migrate_16_to_18()?;
                 self.migrate_18_to_19()?;
+                self.migrate_19_to_21()?;
             }
             Some(3) => {
                 self.migrate_3_to_4()?;
@@ -1082,6 +1089,7 @@ impl Registry {
                 self.migrate_15_to_16()?;
                 self.migrate_16_to_18()?;
                 self.migrate_18_to_19()?;
+                self.migrate_19_to_21()?;
             }
             Some(4) => {
                 self.migrate_4_to_5()?;
@@ -1098,6 +1106,7 @@ impl Registry {
                 self.migrate_15_to_16()?;
                 self.migrate_16_to_18()?;
                 self.migrate_18_to_19()?;
+                self.migrate_19_to_21()?;
             }
             Some(5) => {
                 self.migrate_5_to_6()?;
@@ -1113,6 +1122,7 @@ impl Registry {
                 self.migrate_15_to_16()?;
                 self.migrate_16_to_18()?;
                 self.migrate_18_to_19()?;
+                self.migrate_19_to_21()?;
             }
             Some(6) => {
                 self.migrate_6_to_7()?;
@@ -1127,6 +1137,7 @@ impl Registry {
                 self.migrate_15_to_16()?;
                 self.migrate_16_to_18()?;
                 self.migrate_18_to_19()?;
+                self.migrate_19_to_21()?;
             }
             Some(7) => {
                 self.migrate_7_to_8()?;
@@ -1140,6 +1151,7 @@ impl Registry {
                 self.migrate_15_to_16()?;
                 self.migrate_16_to_18()?;
                 self.migrate_18_to_19()?;
+                self.migrate_19_to_21()?;
             }
             Some(8) => {
                 self.migrate_8_to_9()?;
@@ -1152,6 +1164,7 @@ impl Registry {
                 self.migrate_15_to_16()?;
                 self.migrate_16_to_18()?;
                 self.migrate_18_to_19()?;
+                self.migrate_19_to_21()?;
             }
             Some(9) => {
                 self.migrate_9_to_10()?;
@@ -1163,6 +1176,7 @@ impl Registry {
                 self.migrate_15_to_16()?;
                 self.migrate_16_to_18()?;
                 self.migrate_18_to_19()?;
+                self.migrate_19_to_21()?;
             }
             Some(10) => {
                 self.migrate_10_to_11()?;
@@ -1173,6 +1187,7 @@ impl Registry {
                 self.migrate_15_to_16()?;
                 self.migrate_16_to_18()?;
                 self.migrate_18_to_19()?;
+                self.migrate_19_to_21()?;
             }
             Some(11) => {
                 self.migrate_11_to_12()?;
@@ -1182,6 +1197,7 @@ impl Registry {
                 self.migrate_15_to_16()?;
                 self.migrate_16_to_18()?;
                 self.migrate_18_to_19()?;
+                self.migrate_19_to_21()?;
             }
             Some(12) => {
                 self.migrate_12_to_13()?;
@@ -1190,6 +1206,7 @@ impl Registry {
                 self.migrate_15_to_16()?;
                 self.migrate_16_to_18()?;
                 self.migrate_18_to_19()?;
+                self.migrate_19_to_21()?;
             }
             Some(13) => {
                 self.migrate_13_to_14()?;
@@ -1197,21 +1214,25 @@ impl Registry {
                 self.migrate_15_to_16()?;
                 self.migrate_16_to_18()?;
                 self.migrate_18_to_19()?;
+                self.migrate_19_to_21()?;
             }
             Some(14) => {
                 self.migrate_14_to_15()?;
                 self.migrate_15_to_16()?;
                 self.migrate_16_to_18()?;
                 self.migrate_18_to_19()?;
+                self.migrate_19_to_21()?;
             }
             Some(15) => {
                 self.migrate_15_to_16()?;
                 self.migrate_16_to_18()?;
                 self.migrate_18_to_19()?;
+                self.migrate_19_to_21()?;
             }
             Some(16) => {
                 self.migrate_16_to_18()?;
                 self.migrate_18_to_19()?;
+                self.migrate_19_to_21()?;
             }
             Some(17) => {
                 return Err(ControllerError::RegistryUnavailable {
@@ -1219,7 +1240,17 @@ impl Registry {
                         .to_owned(),
                 });
             }
-            Some(18) => self.migrate_18_to_19()?,
+            Some(18) => {
+                self.migrate_18_to_19()?;
+                self.migrate_19_to_21()?;
+            }
+            Some(19) => self.migrate_19_to_21()?,
+            Some(20) => {
+                return Err(ControllerError::RegistryUnavailable {
+                    detail: "this registry is at schema version 20, which no release wrote"
+                        .to_owned(),
+                });
+            }
             Some(version) => {
                 return Err(ControllerError::RegistryUnavailable {
                     detail: format!(
@@ -1715,6 +1746,32 @@ impl Registry {
         Ok(())
     }
 
+    /// Version 19 to 21: the host keeps the order of the boots it started in and, for each grant,
+    /// where its access began.
+    ///
+    /// Two tables are made, `boots` and `grant_starts` (see [`crate::boots`]), and the version is
+    /// written after them. No row is written: a boot is recorded when the daemon starts, and a grant
+    /// of an earlier release has no start until the next start of the daemon gives it one.
+    ///
+    /// No release writes version 20: the release before this one reads through it, so that a
+    /// release that writes the configuration document at its next version can write it, and this
+    /// release writes 21 and reads through 22 so that it can be the release such a rollback goes to. A
+    /// registry at 20 is refused as a version no release wrote. Two new tables are no change that a
+    /// release may read ahead of, so they take a version of their own.
+    ///
+    /// This migration, the two tables' creation by the grant store and the device store, and the
+    /// refusal of 20 go in the first release after every install has opened the registry at 21 or
+    /// later.
+    fn migrate_19_to_21(&self) -> Result<()> {
+        self.connection
+            .execute_batch(crate::boots::BOOTS_SCHEMA)
+            .map_err(ControllerError::registry)?;
+        self.connection
+            .execute("UPDATE schema_version SET version = 21", [])
+            .map_err(ControllerError::registry)?;
+        Ok(())
+    }
+
     /// Settles every record of a process in whole seconds that the kernel can settle.
     ///
     /// The previous build recorded a Windows process's start in whole seconds: a worker's launcher
@@ -2103,6 +2160,27 @@ impl Registry {
             )
             .map_err(ControllerError::registry)?;
         Ok(())
+    }
+
+    /// Records that the daemon started in `boot`: a row for the boot when the registry has none, and
+    /// a reading of the order counter taken under the write lock.
+    ///
+    /// This is the host's first record of a start, made before any start point of the boot is taken
+    /// and before any worker is adopted, so a start point is never one of a boot the record does not
+    /// hold. The caller writes the returned spoil's line to the log once this has returned.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::RegistryUnavailable`] when the write fails, and the start fails
+    /// with it: there is no start without the row.
+    pub fn record_boot(
+        &mut self,
+        boot: &crate::boots::BootClock,
+    ) -> Result<crate::boots::Observed> {
+        let transaction = begin_write(&mut self.connection)?;
+        let observed = crate::boots::Boots::observe(&transaction, boot.clock(), boot.epoch())?;
+        transaction.commit().map_err(ControllerError::registry)?;
+        Ok(observed)
     }
 
     /// Returns every clock floor this environment created in `boot`, and which is in force.
@@ -5683,5 +5761,57 @@ mod tests {
             !directory.path().join("gone.sqlite3").exists(),
             "a registry that is not there is not made"
         );
+    }
+}
+
+/// The boundary of a reading of the order counter, at the start: the registry reads it after its
+/// transaction holds the write lock.
+#[cfg(test)]
+mod the_boundary_of_a_reading_at_a_start {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use kr_protocol::ids::{BootEpoch, EnvironmentId};
+
+    use super::Registry;
+    use crate::boots::BootClock;
+    use crate::boots::testing::{SetClock, a_site_reads_after_the_lock};
+
+    static START_WAITS: AtomicU64 = AtomicU64::new(0);
+
+    fn count_the_start_wait(_attempts: i32) -> bool {
+        START_WAITS.fetch_add(1, Ordering::SeqCst);
+        std::thread::yield_now();
+        true
+    }
+
+    /// A start's record of its boot reads the counter after it holds the write lock.
+    #[test]
+    fn the_start_reads_the_counter_after_it_holds_the_write_lock() {
+        let temp = tempfile::tempdir().expect("a directory");
+        let path = temp.path().join("registry.db");
+        let mut registry = Registry::open(
+            &path,
+            EnvironmentId::new(kr_protocol::scalars::Uuid::from_bytes([7; 16])),
+        )
+        .expect("a registry");
+        registry
+            .connection
+            .busy_handler(Some(count_the_start_wait))
+            .expect("the handler");
+        let clock = SetClock::at(0);
+        let boot = BootClock::new(Arc::clone(&clock) as _, BootEpoch::new(7));
+        let delayed = a_site_reads_after_the_lock(&path, &START_WAITS, &clock, 7, || {
+            registry.record_boot(&boot).expect("the start is recorded");
+        });
+        assert_eq!(
+            delayed.reads_while_held, 0,
+            "the counter was read while another writer held the lock"
+        );
+        assert_eq!(
+            delayed.spoiled, 0,
+            "a healthy boot was spoiled by an older reading"
+        );
+        assert!(delayed.high >= 101, "{delayed:?}");
     }
 }

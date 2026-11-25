@@ -44,6 +44,7 @@ pub mod authority;
 pub mod authority_feed;
 pub mod automation;
 pub mod backup;
+pub mod boots;
 pub mod bridge;
 pub mod capability_answers;
 pub mod capacity;

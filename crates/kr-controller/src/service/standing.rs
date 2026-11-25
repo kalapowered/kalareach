@@ -569,6 +569,46 @@ impl Controller {
         }
     }
 
+    /// Records a reading of the host's order counter in this boot's row, in a transaction of the
+    /// grant store, for the pass that runs while the host is on the network.
+    ///
+    /// The row's high is what a later boot, or a restored copy, is compared with, so the more often
+    /// it is raised the shorter the stretch of this boot that it does not cover. A failed write
+    /// records nothing; the pass writes a line and tries again at its next turn.
+    pub(crate) fn observe_boot(&self) {
+        let boot = crate::boots::BootClock::new(
+            std::sync::Arc::clone(&self.shared_clock),
+            self.boot_epoch,
+        );
+        if let Err(error) = self.sharing.grants().observe_boot(&boot) {
+            eprintln!("kr-controller: could not record the host's boot reading: {error}");
+        }
+    }
+
+    /// Gives every grant that has no start point the start of this daemon, and re-points the grants
+    /// whose point is in a boot the host can no longer tell apart, once the daemon has started in a
+    /// boot it can tell apart.
+    ///
+    /// It runs at every start, whether or not the host joins the network, before the first device
+    /// request is served. The settled reading of UTC is taken here, outside the grant store's
+    /// transaction, because taking it takes the policy lock and may write through that store. A
+    /// pass that fails writes one line and the start goes on: the grants that had no point still
+    /// have none, and they are served no attention text until the host next starts.
+    pub(crate) fn give_starts_at_start(&self) {
+        let settled = self.settled_now_ms();
+        let boot = crate::boots::BootClock::new(
+            std::sync::Arc::clone(&self.shared_clock),
+            self.boot_epoch,
+        );
+        if let Err(error) = self.sharing.grants().start_points_at_start(&boot, settled) {
+            eprintln!(
+                "kr-controller: could not give the devices a new start point at this start: \
+                 {error}. A device with no start point is served no attention text until the \
+                 host next starts."
+            );
+        }
+    }
+
     /// Decides whether the grant a workflow names stands for one of its dispatches, the way a
     /// paired device's request is decided.
     ///

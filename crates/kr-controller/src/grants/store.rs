@@ -642,6 +642,12 @@ impl GrantDirectory {
                  );",
             )
             .map_err(ControllerError::registry)?;
+        // The boots record and the start points are the registry's tables too. A grant is given
+        // its start point in the transaction that writes it, so this store makes them as the
+        // registry does.
+        connection
+            .execute_batch(crate::boots::BOOTS_SCHEMA)
+            .map_err(ControllerError::registry)?;
         migrate_receipts(&connection)?;
         migrate_revocation_answers(&connection)?;
         migrate_delegation_answers(&connection)?;
@@ -932,6 +938,126 @@ impl GrantDirectory {
         let value = body(&transaction)?;
         transaction.commit().map_err(ControllerError::registry)?;
         Ok(value)
+    }
+
+    /// Records a reading of the host's order counter in the row of the boot `boot` names, in a
+    /// transaction of this store, as the host does while it runs: the highest reading kept for a
+    /// boot is the one a later boot, or a restored copy, is compared with.
+    ///
+    /// Nothing else is written, and no start point is taken. The spoil's line is written to the log
+    /// after the transaction has committed, when this call stored a spoil.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::RegistryUnavailable`] when the write fails; nothing is recorded
+    /// then, and the caller tries again at its next turn.
+    pub fn observe_boot(&self, boot: &crate::boots::BootClock) -> Result<crate::boots::Observed> {
+        let observed = self.in_transaction(|transaction| {
+            crate::boots::Boots::observe(transaction, boot.clock(), boot.epoch())
+        })?;
+        observed.report();
+        Ok(observed)
+    }
+
+    /// Gives this daemon's start to every grant that has no start point, and to every grant whose
+    /// point is in a boot the host can no longer tell from another.
+    ///
+    /// A grant has none when an earlier release wrote it, when a repair put the registry back, or
+    /// when it was written while the boot was one the host could not tell apart. `settled_ms` is the
+    /// host's settled reading of UTC, taken **before** this call and outside any transaction: it
+    /// takes the policy lock and may write through this store, and a transaction of this store
+    /// cannot take either again. The counter is read here, after the write lock.
+    ///
+    /// One transaction does everything, in this order: it records a reading of the order counter
+    /// for the boot; when the boot is one the host can no longer tell apart it stops there, and the
+    /// spoil is all that is written; otherwise it deletes the points whose boot is spoiled, which is
+    /// the one case where a grant's first point does not stand, and gives each active grant and
+    /// each unrevoked device without a point the reading, with the wall moment `max(settled_ms, the
+    /// grant's own bound)`: the grant began before this call, whatever the clock reads, and a bound
+    /// later than the clock would otherwise be later than its own start.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::RegistryUnavailable`] when a statement fails; the transaction
+    /// rolls back, no point is written or deleted, and the grants that had none have none still.
+    pub fn start_points_at_start(
+        &self,
+        boot: &crate::boots::BootClock,
+        settled_ms: u64,
+    ) -> Result<crate::boots::Observed> {
+        let observed = self.in_transaction(|connection| {
+            let (observed, point) =
+                crate::attention::order::StartPoint::read(settled_ms, connection, boot)?;
+            let Some(point) = point else {
+                return Ok(observed);
+            };
+            connection
+                .execute(
+                    "DELETE FROM grant_starts
+                      WHERE boot_epoch IN (SELECT boot_epoch FROM boots WHERE spoiled = 1)",
+                    [],
+                )
+                .map_err(ControllerError::registry)?;
+            let held: BTreeSet<Vec<u8>> = {
+                let mut statement = connection
+                    .prepare("SELECT grant_id FROM grant_starts")
+                    .map_err(ControllerError::registry)?;
+                statement
+                    .query_map([], |row| row.get::<_, Vec<u8>>(0))
+                    .map_err(ControllerError::registry)?
+                    .collect::<rusqlite::Result<_>>()
+                    .map_err(ControllerError::registry)?
+            };
+            let mut without: Vec<(Vec<u8>, Grant)> = Vec::new();
+            for record in scan_all(connection)?.readable {
+                let key = record.grant.grant_id.get().as_bytes().to_vec();
+                if record.is_active() && !held.contains(&key) {
+                    without.push((key, record.grant));
+                }
+            }
+            let has_devices: bool = connection
+                .query_row(
+                    "SELECT EXISTS (SELECT 1 FROM sqlite_master
+                                     WHERE type = 'table' AND name = 'network_devices')",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(ControllerError::registry)?;
+            if has_devices {
+                let mut statement = connection
+                    .prepare(
+                        "SELECT grant_id, grant FROM network_devices WHERE revoked_at_ms IS NULL",
+                    )
+                    .map_err(ControllerError::registry)?;
+                let devices: Vec<(Vec<u8>, Vec<u8>)> = statement
+                    .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                    .map_err(ControllerError::registry)?
+                    .collect::<rusqlite::Result<_>>()
+                    .map_err(ControllerError::registry)?;
+                for (key, encoded) in devices {
+                    if held.contains(&key) || without.iter().any(|(held, _)| *held == key) {
+                        continue;
+                    }
+                    // A device row whose grant this build cannot read is left without a point.
+                    if let Ok(grant) =
+                        kr_cbor::from_canonical_slice::<Grant>(&encoded, &kr_cbor::Limits::DEFAULT)
+                    {
+                        without.push((key, grant));
+                    }
+                }
+            }
+            for (key, grant) in without {
+                let bound = grant.history.lower_bound_ms.0.map_or(0, TimestampMs::get);
+                crate::attention::order::StartPoint {
+                    wall_ms: settled_ms.max(bound),
+                    ..point
+                }
+                .write(connection, &key)?;
+            }
+            Ok(observed)
+        })?;
+        observed.report();
+        Ok(observed)
     }
 
     /// Writes a grant.
@@ -1879,6 +2005,7 @@ impl GrantDirectory {
         preview: &InvitationPreview,
         issuer_device_id: DeviceId,
         now_ms: u64,
+        boot: &crate::boots::BootClock,
         still_admitted: impl FnOnce() -> Result<()>,
     ) -> Result<()> {
         if preview.historical_attachment_keys {
@@ -1939,9 +2066,17 @@ impl GrantDirectory {
                     "that invitation identity is already in use".to_owned(),
                 ));
             }
-            Ok(())
+            // Where this grant's access begins: the issue. The last statement of the transaction,
+            // so that what can still fail after the reading is the write and the commit.
+            crate::attention::order::StartPoint::take(
+                record.issued_at_ms,
+                connection,
+                boot,
+                record.grant.grant_id.get().as_bytes().as_slice(),
+            )
         });
-        self.after_effect(issued, ran_out.get())
+        self.after_effect(issued, ran_out.get())?.report();
+        Ok(())
     }
 
     /// Returns one invitation's record.
@@ -1990,6 +2125,7 @@ impl GrantDirectory {
         invitation_id: InvitationId,
         device_id: DeviceId,
         now_ms: u64,
+        boot: &crate::boots::BootClock,
         still_admitted: impl FnOnce() -> Result<()>,
         claim: Option<&ClaimHold>,
     ) -> Result<Grant> {
@@ -2123,9 +2259,21 @@ impl GrantDirectory {
                     now_ms,
                 )?;
             }
-            Ok(Ok(record.grant))
+            // Where this grant's access begins, when it has no start already: a grant that was
+            // issued under this release has the point of its issue, which stays. The last
+            // statement of the transaction.
+            let observed = crate::attention::order::StartPoint::take(
+                now_ms,
+                connection,
+                boot,
+                record.grant.grant_id.get().as_bytes().as_slice(),
+            )?;
+            Ok(Ok((record.grant, observed)))
         });
-        self.after_effect(redeemed.and_then(|redeemed| redeemed), ran_out.get())
+        let (grant, observed) =
+            self.after_effect(redeemed.and_then(|redeemed| redeemed), ran_out.get())?;
+        observed.report();
+        Ok(grant)
     }
 
     /// Transfers control: issues the replacement authority and revokes the source, in one
@@ -2150,6 +2298,7 @@ impl GrantDirectory {
         source_grant_id: GrantId,
         replacement: &GrantRecord,
         now_ms: u64,
+        boot: &crate::boots::BootClock,
         check: impl FnOnce(&GrantRecord) -> Result<()>,
         claim: Option<&ClaimHold>,
     ) -> Result<GrantRevocation> {
@@ -2216,9 +2365,19 @@ impl GrantDirectory {
             if let Some(hold) = claim {
                 record_withdrawal(connection, hold, &revocation.revoked)?;
             }
-            Ok(revocation)
+            // Where the replacement's access begins: the transfer. The last statement of the
+            // transaction.
+            let observed = crate::attention::order::StartPoint::take(
+                now_ms,
+                connection,
+                boot,
+                replacement.grant.grant_id.get().as_bytes().as_slice(),
+            )?;
+            Ok((revocation, observed))
         });
-        self.after_effect(transferred, ran_out.get())
+        let (revocation, observed) = self.after_effect(transferred, ran_out.get())?;
+        observed.report();
+        Ok(revocation)
     }
 
     // --- Fence debt -------------------------------------------------------------------------
@@ -6762,5 +6921,90 @@ mod a_grants_row_whose_key_is_not_its_own {
             refused.to_string().contains("with a malformed key"),
             "the refusal says the key is malformed: {refused}"
         );
+    }
+}
+
+/// The boundary of a reading of the order counter: a writer that has to wait for the file's write
+/// lock reads the counter after it holds it, never before.
+#[cfg(test)]
+mod the_boundary_of_a_reading {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use kr_protocol::ids::BootEpoch;
+
+    use super::GrantDirectory;
+    use crate::boots::BootClock;
+    use crate::boots::testing::{SetClock, a_site_reads_after_the_lock};
+
+    static REGULAR_PASS_WAITS: AtomicU64 = AtomicU64::new(0);
+    static NEXT_START_PASS_WAITS: AtomicU64 = AtomicU64::new(0);
+
+    fn count_the_regular_pass_wait(_attempts: i32) -> bool {
+        REGULAR_PASS_WAITS.fetch_add(1, Ordering::SeqCst);
+        std::thread::yield_now();
+        true
+    }
+
+    fn count_the_next_start_pass_wait(_attempts: i32) -> bool {
+        NEXT_START_PASS_WAITS.fetch_add(1, Ordering::SeqCst);
+        std::thread::yield_now();
+        true
+    }
+
+    /// The regular pass reads the counter after its transaction holds the write lock.
+    #[test]
+    fn the_regular_pass_reads_the_counter_after_it_holds_the_write_lock() {
+        let temp = tempfile::tempdir().expect("a directory");
+        let path = temp.path().join("registry.db");
+        let store = GrantDirectory::open(&path).expect("the store");
+        store
+            .connection
+            .lock()
+            .expect("the connection")
+            .busy_handler(Some(count_the_regular_pass_wait))
+            .expect("the handler");
+        let clock = SetClock::at(0);
+        let boot = BootClock::new(Arc::clone(&clock) as _, BootEpoch::new(7));
+        let delayed = a_site_reads_after_the_lock(&path, &REGULAR_PASS_WAITS, &clock, 7, || {
+            store.observe_boot(&boot).expect("the pass");
+        });
+        assert_eq!(
+            delayed.reads_while_held, 0,
+            "the counter was read while another writer held the lock"
+        );
+        assert_eq!(
+            delayed.spoiled, 0,
+            "a healthy boot was spoiled by an older reading"
+        );
+        assert!(delayed.high >= 101, "{delayed:?}");
+    }
+
+    /// So does the pass at a start.
+    #[test]
+    fn the_pass_at_a_start_reads_the_counter_after_it_holds_the_write_lock() {
+        let temp = tempfile::tempdir().expect("a directory");
+        let path = temp.path().join("registry.db");
+        let store = GrantDirectory::open(&path).expect("the store");
+        store
+            .connection
+            .lock()
+            .expect("the connection")
+            .busy_handler(Some(count_the_next_start_pass_wait))
+            .expect("the handler");
+        let clock = SetClock::at(0);
+        let boot = BootClock::new(Arc::clone(&clock) as _, BootEpoch::new(7));
+        let delayed = a_site_reads_after_the_lock(&path, &NEXT_START_PASS_WAITS, &clock, 7, || {
+            store.start_points_at_start(&boot, 1).expect("the pass");
+        });
+        assert_eq!(
+            delayed.reads_while_held, 0,
+            "the counter was read while another writer held the lock"
+        );
+        assert_eq!(
+            delayed.spoiled, 0,
+            "a healthy boot was spoiled by an older reading"
+        );
+        assert!(delayed.high >= 101, "{delayed:?}");
     }
 }

@@ -1028,6 +1028,7 @@ impl InvitationStore for InvitationRows {
                     .filter(|row| row.is_paired())
                     .try_for_each(|row| self.lifetimes.paired_standing(row).map(|_| ()))
             });
+        let observed = std::cell::Cell::new(None);
         let committed = standing.and_then(|()| {
             self.directory.transaction(|transaction| {
                 self.admission.check()?;
@@ -1047,9 +1048,25 @@ impl InvitationStore for InvitationRows {
                 {
                     claim_effect(transaction, action)?;
                 }
+                // Where the device's access begins: this commit. The last statement of the
+                // transaction, so that what can still fail after the reading is the write and the
+                // commit.
+                if outcome == TransitionOutcome::Written {
+                    observed.set(Some(crate::attention::order::StartPoint::take(
+                        commitment.committed_at_ms.get(),
+                        transaction,
+                        &self.lifetimes.boot_clock()?,
+                        commitment.grant.grant_id.get().as_bytes().as_slice(),
+                    )?));
+                }
                 Ok(outcome)
             })
         });
+        if matches!(committed, Ok(TransitionOutcome::Written))
+            && let Some(observed) = observed.take()
+        {
+            observed.report();
+        }
         self.lifetimes.settle();
         if action.is_some() && matches!(committed, Ok(TransitionOutcome::Written)) {
             self.admission.note_recorded();

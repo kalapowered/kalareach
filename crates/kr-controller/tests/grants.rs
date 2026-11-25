@@ -14,6 +14,14 @@ use std::time::Duration;
 mod net_support;
 mod organisation_support;
 
+/// A boot of the machine's own order counter, for a store that records where an access began.
+fn boot() -> kr_controller::boots::BootClock {
+    kr_controller::boots::BootClock::new(
+        std::sync::Arc::new(kr_ipc::clock::SystemSharedClock),
+        kr_protocol::ids::BootEpoch::new(1),
+    )
+}
+
 use kr_controller::grants::feed::Basis;
 use kr_controller::grants::organisation::LeasePresentation;
 use kr_controller::grants::{
@@ -1526,11 +1534,18 @@ fn a_tree_over_the_limit_redeems_no_invitation() {
     let (last, last_preview) = pending(2_000_001, 0x92);
     for (carried, preview) in [(&first, &first_preview), (&last, &last_preview)] {
         directory
-            .issue_shared(carried, preview, device_id(0xf0), now, || Ok(()))
+            .issue_shared(carried, preview, device_id(0xf0), now, &boot(), || Ok(()))
             .expect("room in the tree");
     }
     directory
-        .redeem(first_preview.invitation_id, redeemer, now, || Ok(()), None)
+        .redeem(
+            first_preview.invitation_id,
+            redeemer,
+            now,
+            &boot(),
+            || Ok(()),
+            None,
+        )
         .expect("a tree at the limit redeems");
 
     // A tree from before the limit: a row written past it, filed under the identity its grant
@@ -1555,7 +1570,14 @@ fn a_tree_over_the_limit_redeems_no_invitation() {
         )
         .expect("a row from before the limit");
     let refused = directory
-        .redeem(last_preview.invitation_id, redeemer, now, || Ok(()), None)
+        .redeem(
+            last_preview.invitation_id,
+            redeemer,
+            now,
+            &boot(),
+            || Ok(()),
+            None,
+        )
         .expect_err("a tree over the limit redeems nothing more");
     assert_eq!(refused.code(), kr_protocol::error::ErrorCode::QuotaExceeded);
     assert!(
@@ -6233,4 +6255,532 @@ async fn an_owners_grant_revoke_beside_a_row_with_no_name_is_answered() {
         Err(error) => panic!("the revocation is answered, not left unknown: {error:?}"),
     };
     assert!(answer.revoked_grants.contains(&held.grant_id));
+}
+
+// --- Where each grant's access began (KR-REQ-23.45) ---------------------------------------------
+
+/// A counter a case sets by hand: it can go down, which a real one does not. It counts the
+/// readings of the order counter.
+#[derive(Debug)]
+struct SetClock(std::sync::atomic::AtomicU64, std::sync::atomic::AtomicU64);
+
+impl SetClock {
+    fn at(ms: u64) -> Arc<Self> {
+        Arc::new(Self(
+            std::sync::atomic::AtomicU64::new(ms),
+            std::sync::atomic::AtomicU64::new(0),
+        ))
+    }
+
+    fn set(&self, ms: u64) {
+        self.0.store(ms, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn reads(&self) -> u64 {
+        self.1.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl kr_ipc::clock::SharedClock for SetClock {
+    fn boot_elapsed_ms(&self) -> u64 {
+        self.0.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn order_elapsed_ms(&self) -> u64 {
+        self.1.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.boot_elapsed_ms()
+    }
+}
+
+/// The counter `clock` reads, in the boot `epoch`.
+fn boot_in(clock: &Arc<SetClock>, epoch: u64) -> kr_controller::boots::BootClock {
+    kr_controller::boots::BootClock::new(
+        Arc::clone(clock) as Arc<dyn kr_ipc::clock::SharedClock>,
+        kr_protocol::ids::BootEpoch::new(epoch),
+    )
+}
+
+/// The start point a grant has: the wall moment, the boot's epoch and the counter reading.
+fn start_of(database: &std::path::Path, grant: GrantId) -> Option<(u64, u64, u64)> {
+    rusqlite::Connection::open(database)
+        .expect("the store opens")
+        .query_row(
+            "SELECT wall_ms, boot_epoch, boot_ms FROM grant_starts WHERE grant_id = ?1",
+            rusqlite::params![grant.get().as_bytes().as_slice()],
+            |row| {
+                let epoch: Vec<u8> = row.get(1)?;
+                Ok((
+                    row.get::<_, i64>(0)?.try_into().unwrap_or_default(),
+                    u64::from_be_bytes(epoch.try_into().unwrap_or_default()),
+                    row.get::<_, i64>(2)?.try_into().unwrap_or_default(),
+                ))
+            },
+        )
+        .ok()
+}
+
+/// The boot's row: its high and whether it is spoiled.
+fn boot_row(database: &std::path::Path, epoch: u64) -> Option<(i64, i64)> {
+    rusqlite::Connection::open(database)
+        .expect("the store opens")
+        .query_row(
+            "SELECT high_ms, spoiled FROM boots WHERE boot_epoch = ?1",
+            rusqlite::params![epoch.to_be_bytes().as_slice()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .ok()
+}
+
+fn sql(database: &std::path::Path, statement: &str) {
+    rusqlite::Connection::open(database)
+        .expect("the store opens")
+        .execute_batch(statement)
+        .expect("the statement runs");
+}
+
+/// A share nobody has redeemed, with the invitation that carries it.
+fn a_share(
+    root: GrantId,
+    id: u32,
+    invitation: u8,
+    redeemer: DeviceId,
+    now: u64,
+) -> (GrantRecord, kr_protocol::sharing::InvitationPreview) {
+    let mut carried = delegated(id, root);
+    carried.grant.recipient_device_id = redeemer;
+    carried.activated_at_ms = None;
+    let preview = kr_protocol::sharing::InvitationPreview {
+        invitation_id: kr_protocol::ids::InvitationId::new(Uuid::from_bytes([invitation; 16])),
+        session_id: session_id(0xa0),
+        environment_id: environment_id(0xe0),
+        role: kr_protocol::sharing::SessionRole::Viewer,
+        actions: carried.grant.actions.clone(),
+        history: no_history(),
+        expires_at_ms: TimestampMs::new(now + DAY_MS),
+        live_screen: Nullable::null(),
+        named_questions: Vec::new(),
+        named_approvals: Vec::new(),
+        notices: CanonicalSet::from_iter([]),
+        historical_attachment_keys: false,
+        single_use: true,
+    };
+    (carried, preview)
+}
+
+/// A store with a root grant in it, and the root's identity.
+fn a_store_with_a_root() -> (
+    tempfile::TempDir,
+    std::path::PathBuf,
+    GrantDirectory,
+    GrantId,
+) {
+    let temp = tempfile::tempdir().expect("a directory on the internal disk");
+    let database = temp.path().join("grants.db");
+    let directory = GrantDirectory::open(&database).expect("the grant store");
+    let root = grant(
+        1,
+        None,
+        &[ActionRight::SessionView, ActionRight::TerminalInput],
+        GrantExpiry::Never,
+    );
+    directory
+        .issue(&record(root.clone()), || Ok(()))
+        .expect("root");
+    (temp, database, directory, root.grant_id)
+}
+
+/// KR-REQ-23.45: a share takes the point of its issue, with the grant's own moment, in the
+/// transaction that writes the proposal; its redemption leaves that point; a share that has none
+/// takes the redemption's.
+#[test]
+fn a_share_takes_the_point_of_its_issue_and_a_redemption_leaves_it() {
+    let (_temp, database, directory, root) = a_store_with_a_root();
+    let clock = SetClock::at(1_000);
+    let boot = boot_in(&clock, 7);
+    let now = kr_ipc::now_ms().get();
+    let redeemer = device_id(0x31);
+
+    let (first, first_preview) = a_share(root, 2_000_000, 0x91, redeemer, now);
+    directory
+        .issue_shared(&first, &first_preview, device_id(0xf0), now, &boot, || {
+            Ok(())
+        })
+        .expect("issued");
+    assert_eq!(
+        start_of(&database, first.grant.grant_id),
+        Some((first.issued_at_ms, 7, 1_000)),
+        "the issue's own moment and the counter read at it"
+    );
+    clock.set(2_000);
+    directory
+        .redeem(
+            first_preview.invitation_id,
+            redeemer,
+            now,
+            &boot,
+            || Ok(()),
+            None,
+        )
+        .expect("redeemed");
+    assert_eq!(
+        start_of(&database, first.grant.grant_id),
+        Some((first.issued_at_ms, 7, 1_000)),
+        "the first point of a grant stands"
+    );
+    assert_eq!(
+        boot_row(&database, 7),
+        Some((2_000, 0)),
+        "the redemption raised the high"
+    );
+
+    // A share an earlier release wrote has no point: its redemption's is the first.
+    let (second, second_preview) = a_share(root, 2_000_001, 0x92, redeemer, now);
+    directory
+        .issue_shared(
+            &second,
+            &second_preview,
+            device_id(0xf0),
+            now,
+            &boot,
+            || Ok(()),
+        )
+        .expect("issued");
+    sql(&database, "DELETE FROM grant_starts");
+    clock.set(4_000);
+    directory
+        .redeem(
+            second_preview.invitation_id,
+            redeemer,
+            now,
+            &boot,
+            || Ok(()),
+            None,
+        )
+        .expect("redeemed");
+    assert_eq!(
+        start_of(&database, second.grant.grant_id),
+        Some((now, 7, 4_000)),
+        "a grant with none takes the redemption's"
+    );
+}
+
+/// KR-REQ-23.45: a point is written with its grant or not at all. A fault at the
+/// point's write leaves neither the grant nor the point, and the reading that raised the boot's
+/// high is rolled back with them.
+#[test]
+fn a_point_that_cannot_be_written_leaves_neither_the_grant_nor_the_point_nor_a_raised_high() {
+    let (_temp, database, directory, root) = a_store_with_a_root();
+    let clock = SetClock::at(1_000);
+    let boot = boot_in(&clock, 7);
+    let now = kr_ipc::now_ms().get();
+    sql(
+        &database,
+        "CREATE TRIGGER a_fault BEFORE INSERT ON grant_starts
+         BEGIN SELECT RAISE(ABORT, 'a fault at the point'); END;",
+    );
+    let (share, preview) = a_share(root, 2_000_000, 0x91, device_id(0x31), now);
+    let refused = directory.issue_shared(&share, &preview, device_id(0xf0), now, &boot, || Ok(()));
+    assert!(refused.is_err(), "the issue fails with its point");
+    assert!(
+        directory
+            .record(share.grant.grant_id)
+            .expect("readable")
+            .is_none(),
+        "the grant was rolled back"
+    );
+    assert_eq!(start_of(&database, share.grant.grant_id), None);
+    assert_eq!(
+        boot_row(&database, 7),
+        None,
+        "the observation was rolled back too"
+    );
+}
+
+/// KR-REQ-23.45: a transfer gives its replacement the point of the transfer.
+#[test]
+fn a_transfer_takes_the_point_of_its_replacement() {
+    let (_temp, database, directory, root) = a_store_with_a_root();
+    let clock = SetClock::at(5_000);
+    let boot = boot_in(&clock, 7);
+    let now = kr_ipc::now_ms().get();
+    let replacement = record(Grant {
+        grant_id: grant_id(9),
+        ..grant(9, None, &[ActionRight::SessionView], GrantExpiry::Never)
+    });
+    directory
+        .transfer(root, &replacement, now, &boot, |_| Ok(()), None)
+        .expect("transferred");
+    assert_eq!(
+        start_of(&database, replacement.grant.grant_id),
+        Some((now, 7, 5_000))
+    );
+}
+
+/// KR-REQ-23.45: in a boot the host can no longer tell from another no point is
+/// written. The grant commits without one, the regular pass and the next-start pass write nothing,
+/// and a second grant written later in the same boot has none either.
+#[test]
+fn no_point_is_written_in_a_boot_the_host_can_no_longer_tell_apart() {
+    let (_temp, database, directory, root) = a_store_with_a_root();
+    let clock = SetClock::at(50_000);
+    let boot = boot_in(&clock, 7);
+    let now = kr_ipc::now_ms().get();
+    directory.observe_boot(&boot).expect("the boot is recorded");
+    // The counter goes back inside the boot: the next point finds that.
+    clock.set(1_000);
+    let (first, first_preview) = a_share(root, 2_000_000, 0x91, device_id(0x31), now);
+    directory
+        .issue_shared(&first, &first_preview, device_id(0xf0), now, &boot, || {
+            Ok(())
+        })
+        .expect("the grant commits without a point");
+    assert!(
+        directory
+            .record(first.grant.grant_id)
+            .expect("readable")
+            .is_some()
+    );
+    assert_eq!(start_of(&database, first.grant.grant_id), None);
+    assert_eq!(
+        boot_row(&database, 7),
+        Some((50_000, 1)),
+        "the spoil is stored"
+    );
+    // Later in the same boot, the counter is above its high again; the boot stays spoiled.
+    clock.set(90_000);
+    let (second, second_preview) = a_share(root, 2_000_001, 0x92, device_id(0x31), now);
+    directory
+        .issue_shared(
+            &second,
+            &second_preview,
+            device_id(0xf0),
+            now,
+            &boot,
+            || Ok(()),
+        )
+        .expect("issued");
+    assert_eq!(start_of(&database, second.grant.grant_id), None);
+    directory.observe_boot(&boot).expect("the regular pass");
+    let seen = directory
+        .start_points_at_start(&boot, now)
+        .expect("the next-start pass");
+    assert_eq!(
+        seen.state,
+        kr_controller::attention::order::BootState::Spoiled
+    );
+    assert_eq!(start_of(&database, first.grant.grant_id), None);
+    assert_eq!(start_of(&database, second.grant.grant_id), None);
+}
+
+/// KR-REQ-23.45: rows as an earlier release wrote them have no point. The pass at a start
+/// gives each active grant the start's reading, with the wall moment `max(settled, the grant's own
+/// bound)`, so a bound above the settled reading is not left later than its own start; a proposal
+/// gets none; a grant that has a point keeps it; and a second pass changes nothing.
+#[test]
+fn the_pass_at_a_start_gives_each_active_grant_without_a_point_the_start() {
+    let (_temp, database, directory, root) = a_store_with_a_root();
+    let clock = SetClock::at(9_000);
+    let boot = boot_in(&clock, 7);
+    let now = kr_ipc::now_ms().get();
+    let held = Grant {
+        grant_id: grant_id(0x41),
+        ..grant(
+            0x41,
+            Some(root),
+            &[ActionRight::SessionView],
+            GrantExpiry::Never,
+        )
+    };
+    let mut later = Grant {
+        grant_id: grant_id(0x42),
+        ..grant(0x42, None, &[ActionRight::SessionView], GrantExpiry::Never)
+    };
+    later.history.lower_bound_ms = Nullable::some(TimestampMs::new(7_000_000));
+    let proposed = Grant {
+        grant_id: grant_id(0x43),
+        ..grant(
+            0x43,
+            Some(root),
+            &[ActionRight::SessionView],
+            GrantExpiry::Never,
+        )
+    };
+    for carried in [&held, &later] {
+        directory
+            .issue(&record((*carried).clone()), || Ok(()))
+            .expect("an active grant an earlier release wrote");
+    }
+    directory
+        .issue(&proposal(proposed.clone()), || Ok(()))
+        .expect("a proposal");
+    // `held` already has a point from an earlier start.
+    sql(
+        &database,
+        &format!(
+            "INSERT INTO grant_starts (grant_id, wall_ms, boot_epoch, boot_ms)
+             VALUES (x'{}', 11, x'0000000000000003', 12)",
+            "41".repeat(16)
+        ),
+    );
+    let observed = directory
+        .start_points_at_start(&boot, 5_000_000)
+        .expect("the pass");
+    assert_eq!(observed.reading, 9_000);
+    assert_eq!(
+        start_of(&database, held.grant_id),
+        Some((11, 3, 12)),
+        "a point that was there stands"
+    );
+    assert_eq!(
+        start_of(&database, later.grant_id),
+        Some((7_000_000, 7, 9_000)),
+        "a bound above the settled reading is the point's own moment, not later than it"
+    );
+    assert_eq!(
+        start_of(&database, root),
+        Some((5_000_000, 7, 9_000)),
+        "a grant with no history bound is given the settled reading"
+    );
+    assert_eq!(
+        start_of(&database, proposed.grant_id),
+        None,
+        "a proposal has none"
+    );
+    clock.set(9_500);
+    directory
+        .start_points_at_start(&boot, 6_000_000)
+        .expect("a second pass");
+    assert_eq!(
+        start_of(&database, root),
+        Some((5_000_000, 7, 9_000)),
+        "the first point stands"
+    );
+}
+
+/// KR-REQ-23.45: the first start in a boot the host can tell apart re-points every
+/// grant whose point is in a boot it can no longer tell apart, and keeps the points of known boots.
+#[test]
+fn the_first_start_in_a_known_boot_replaces_the_points_of_a_spoiled_boot() {
+    let (_temp, database, directory, root) = a_store_with_a_root();
+    let clock = SetClock::at(100);
+    let now = kr_ipc::now_ms().get();
+    // Three boots recorded in order: 4, 7 and the current 9. Boot 7 is found spoiled.
+    directory.observe_boot(&boot_in(&clock, 4)).expect("boot 4");
+    directory.observe_boot(&boot_in(&clock, 7)).expect("boot 7");
+    sql(
+        &database,
+        "UPDATE boots SET spoiled = 1 WHERE boot_epoch = x'0000000000000007'",
+    );
+    let spoiled_point = grant_id(0x51);
+    let known_point = grant_id(0x52);
+    for (carried, epoch) in [(spoiled_point, 7_u64), (known_point, 4)] {
+        directory
+            .issue(
+                &record(Grant {
+                    grant_id: carried,
+                    ..grant(
+                        0x51,
+                        Some(root),
+                        &[ActionRight::SessionView],
+                        GrantExpiry::Never,
+                    )
+                }),
+                || Ok(()),
+            )
+            .expect("an active grant");
+        sql(
+            &database,
+            &format!(
+                "INSERT INTO grant_starts (grant_id, wall_ms, boot_epoch, boot_ms)
+                 VALUES (x'{}', 21, x'{epoch:016x}', 22)",
+                format!("{:02x}", carried.get().as_bytes()[0]).repeat(16)
+            ),
+        );
+    }
+    clock.set(300);
+    let observed = directory
+        .start_points_at_start(&boot_in(&clock, 9), now)
+        .expect("the pass");
+    assert_eq!(
+        observed.state,
+        kr_controller::attention::order::BootState::Known(3)
+    );
+    assert_eq!(
+        start_of(&database, spoiled_point),
+        Some((now, 9, 300)),
+        "a point of a spoiled boot is replaced by the start's"
+    );
+    assert_eq!(
+        start_of(&database, known_point),
+        Some((21, 4, 22)),
+        "a point of a known boot stands"
+    );
+}
+
+/// KR-REQ-23.45: a pass that fails writes and deletes nothing, and the grants that had no
+/// point have none still; the next pass completes.
+#[test]
+fn a_pass_that_fails_writes_and_deletes_nothing_and_the_next_pass_completes() {
+    let (_temp, database, directory, _root) = a_store_with_a_root();
+    let clock = SetClock::at(100);
+    let boot = boot_in(&clock, 7);
+    sql(
+        &database,
+        "CREATE TRIGGER a_fault BEFORE INSERT ON grant_starts
+         BEGIN SELECT RAISE(ABORT, 'a fault at the point'); END;",
+    );
+    assert!(directory.start_points_at_start(&boot, 1_000).is_err());
+    assert_eq!(
+        start_of(&database, grant_id(1)),
+        None,
+        "no point was written"
+    );
+    assert_eq!(boot_row(&database, 7), None, "and the reading was not kept");
+    sql(&database, "DROP TRIGGER a_fault");
+    directory
+        .start_points_at_start(&boot, 1_000)
+        .expect("the next pass completes");
+    assert_eq!(start_of(&database, grant_id(1)), Some((1_000, 7, 100)));
+}
+
+/// KR-REQ-23.45: a daemon whose configuration does not put it on the network has no
+/// regular pass: the pass is a turn of the task that the network's registration starts, and there
+/// is no registration. Its start is recorded once, and nothing records its boot again until the
+/// next point or the next start.
+#[tokio::test]
+async fn a_daemon_that_is_off_the_network_has_no_regular_pass() {
+    let (temp, controller) = daemon().await;
+    assert!(
+        controller.network_guard().is_none(),
+        "no registration, so no task to turn: the regular pass lives and ends with the guard"
+    );
+    let database = temp.environment().registry_database();
+    let rows: i64 = rusqlite::Connection::open(&database)
+        .expect("the registry opens")
+        .query_row("SELECT COUNT(*) FROM boots", [], |row| row.get(0))
+        .expect("a count");
+    assert_eq!(rows, 1, "the start recorded its boot");
+}
+
+/// KR-REQ-23.45: the counter is read after a site's refusal checks, as the last statement
+/// before the point's write, so a refused issue reads it never and leaves the boot's row alone.
+#[test]
+fn a_refused_issue_reads_no_counter_and_leaves_the_boot_alone() {
+    let (_temp, database, directory, root) = a_store_with_a_root();
+    let clock = SetClock::at(1_000);
+    let boot = boot_in(&clock, 7);
+    let now = kr_ipc::now_ms().get();
+    let (share, preview) = a_share(root, 2_000_000, 0x91, device_id(0x31), now);
+    let refused = directory.issue_shared(&share, &preview, device_id(0xf0), now, &boot, || {
+        Err(kr_controller::error::ControllerError::InvalidArgument(
+            "refused".to_owned(),
+        ))
+    });
+    assert!(refused.is_err(), "the issue is refused");
+    assert_eq!(
+        clock.reads(),
+        0,
+        "the counter was read before the refusal check"
+    );
+    assert_eq!(boot_row(&database, 7), None);
 }

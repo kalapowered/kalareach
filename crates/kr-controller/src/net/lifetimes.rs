@@ -182,6 +182,19 @@ impl GrantLifetimes {
         }
     }
 
+    /// Returns the machine's order counter and the boot this host counts in: what a pairing's start
+    /// point is read from.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when this host's boot identity cannot be made into an epoch.
+    pub(crate) fn boot_clock(&self) -> crate::error::Result<crate::boots::BootClock> {
+        Ok(crate::boots::BootClock::new(
+            Arc::clone(&self.shared_clock),
+            kr_ipc::identity::boot_epoch(&self.boot_identity)?,
+        ))
+    }
+
     fn wall_now(&self) -> TimestampMs {
         TimestampMs::new(self.wall.now_ms())
     }

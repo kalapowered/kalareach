@@ -57,6 +57,14 @@ const SESSION_INVITATION: [u8; 16] = [0x13; 16];
 /// The device this host is, which issued the earlier grants.
 const HOST: [u8; 16] = [0x0f; 16];
 
+/// A boot of the machine's own order counter, for a store that records where an access began.
+fn boot() -> kr_controller::boots::BootClock {
+    kr_controller::boots::BootClock::new(
+        std::sync::Arc::new(kr_ipc::clock::SystemSharedClock),
+        kr_protocol::ids::BootEpoch::new(1),
+    )
+}
+
 /// One stored payload in both of the earlier forms: naming nothing, and naming the approval `1` by
 /// that text.
 struct Earlier {
@@ -600,6 +608,7 @@ fn kr_req_10_51_an_earlier_session_invitation_reads_unchanged_or_cannot_be_redee
             &preview,
             DeviceId::new(Uuid::from_bytes(HOST)),
             kr_ipc::now_ms().get(),
+            &boot(),
             || Ok(()),
         )
         .expect("issued");
@@ -639,6 +648,7 @@ fn kr_req_10_51_an_earlier_session_invitation_reads_unchanged_or_cannot_be_redee
             invitation,
             DeviceId::new(Uuid::from_bytes(DEVICE)),
             kr_ipc::now_ms().get(),
+            &boot(),
             || Ok(()),
             None,
         )
@@ -1054,4 +1064,109 @@ fn a_registry_at_17_is_refused_as_a_version_no_release_wrote() {
         before,
         "the refused file's schema is unchanged"
     );
+}
+
+/// A registry file as a release that did not make the two tables of version 21 left it: a registry
+/// as this build makes it, with those tables gone and the version `version`.
+fn registry_without_the_boot_tables_at(path: &Path, version: i64) {
+    drop(open_registry(path).expect("a registry"));
+    rusqlite::Connection::open(path)
+        .expect("the registry opens")
+        .execute_batch(&format!(
+            "DROP TABLE boots; DROP TABLE grant_starts; UPDATE schema_version SET version = {version};"
+        ))
+        .expect("the two tables go and the version is put back");
+}
+
+/// What the file says of the two tables of version 21, in a fixed order.
+fn boot_schema(path: &Path) -> Vec<(String, String, String)> {
+    schema_of(path)
+        .into_iter()
+        .filter(|(_, name, _)| name == "boots" || name == "grant_starts")
+        .collect()
+}
+
+/// KR-REQ-23.45: this build writes the registry at schema version 21 and reads through 22, and a
+/// registry at 19 is brought to 21: both tables made, with the schema of a new file's, and the
+/// version written after them, so a step that stops in the middle leaves the file at 19.
+#[test]
+fn a_registry_at_19_is_brought_to_21_with_the_two_boot_tables_and_the_version_last() {
+    assert_eq!(kr_controller::registry::SCHEMA_VERSION, 21);
+    assert_eq!(kr_controller::registry::READS_THROUGH_SCHEMA_VERSION, 22);
+    let temp = tempfile::tempdir().expect("a directory on the internal disk");
+    let fresh = temp.path().join("fresh.db");
+    drop(open_registry(&fresh).expect("a new registry"));
+    let path = temp.path().join("from-19.db");
+    registry_without_the_boot_tables_at(&path, 19);
+    assert!(
+        boot_schema(&path).is_empty(),
+        "the file is as release 19 left it"
+    );
+    // An index that has the name of the second table is in the way: the step stops, and the
+    // version is still the one the file had.
+    rusqlite::Connection::open(&path)
+        .expect("the registry opens")
+        .execute_batch("CREATE INDEX grant_starts ON grants (grant_id);")
+        .expect("the fault is made");
+    assert!(
+        open_registry(&path).is_err(),
+        "a step that cannot make a table fails"
+    );
+    assert_eq!(
+        recorded_version(&path),
+        19,
+        "the version is written after the tables, so a failed step leaves it"
+    );
+    rusqlite::Connection::open(&path)
+        .expect("the registry opens")
+        .execute_batch("DROP INDEX grant_starts;")
+        .expect("the fault goes");
+    let opened = open_registry(&path);
+    assert!(
+        opened.is_ok(),
+        "brought forward once the fault is gone: {:?}",
+        opened.err()
+    );
+    drop(opened);
+    assert_eq!(recorded_version(&path), 21);
+    assert_eq!(
+        boot_schema(&path),
+        boot_schema(&fresh),
+        "the two tables are a new file's"
+    );
+    assert_eq!(boot_schema(&path).len(), 2);
+}
+
+/// KR-REQ-23.45: no release writes schema version 20, so a registry that records it is refused as
+/// such, before a table is made: the file is left as it was, and neither boot table is in it.
+#[test]
+fn a_registry_at_20_is_refused_as_a_version_no_release_wrote_and_no_table_is_made() {
+    let temp = tempfile::tempdir().expect("a directory on the internal disk");
+    let path = temp.path().join("registry.db");
+    registry_without_the_boot_tables_at(&path, 20);
+    let before = schema_of(&path);
+    let error = match open_registry(&path) {
+        Err(error) => error.to_string(),
+        Ok(_) => panic!("a registry at 20 is refused"),
+    };
+    assert!(error.contains("no release wrote"), "{error}");
+    assert_eq!(recorded_version(&path), 20, "nothing was changed");
+    assert_eq!(schema_of(&path), before, "no table was made in the file");
+    assert!(boot_schema(&path).is_empty());
+}
+
+/// KR-REQ-23.45: a registry at 22 is the tables of 21 with the configuration document at its next
+/// version, and this build opens it as it finds it: nothing is brought forward, no table is made
+/// and no version is written.
+#[test]
+fn a_registry_at_22_is_opened_as_found() {
+    let temp = tempfile::tempdir().expect("a directory on the internal disk");
+    let path = temp.path().join("registry.db");
+    registry_without_the_boot_tables_at(&path, 22);
+    let before = schema_of(&path);
+    let opened = open_registry(&path);
+    assert!(opened.is_ok(), "a registry at 22 opens: {:?}", opened.err());
+    drop(opened);
+    assert_eq!(recorded_version(&path), 22, "no version was written");
+    assert_eq!(schema_of(&path), before, "nothing was brought forward");
 }

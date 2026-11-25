@@ -580,9 +580,9 @@
           "kind": "sqlite_table",
           "table": "schema_version"
         },
-        "version": 19,
+        "version": 21,
         "migrates_from": 1,
-        "reads_through": 20
+        "reads_through": 22
       },
       "digest": "960c4030cdc86ea392bcbc1d33f2ca79dff22cc0b11270494f080e6b68613f68",
       "kept": [

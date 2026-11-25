@@ -785,6 +785,14 @@ mod tests {
         store.issue(0x47, None);
         store.invitation(&key(0x47), 7, "open");
         store.invitation(&key(0x41), 4, "open");
+        // The record of boots and of where access began is not the repair's to touch: a row of the
+        // removed grant's start stays, harmless, as no caller names that identifier again.
+        store.sql(&format!(
+            "INSERT INTO boots (boot_epoch, high_ms, spoiled) VALUES (x'0000000000000007', 5, 0);
+             INSERT INTO grant_starts (grant_id, wall_ms, boot_epoch, boot_ms)
+             VALUES ({}, 1, x'0000000000000007', 2);",
+            key(0x41)
+        ));
         let before = tables_at(&store.path);
         let repaired = apply(&store.path, 5_000, 77)
             .expect("the repair")

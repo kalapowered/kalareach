@@ -486,6 +486,14 @@ impl Controller {
         drop(startup_configuration);
         let identity = (setup.identity)()?;
         let boot_epoch = kr_ipc::identity::boot_epoch(&setup.boot_identity)?;
+        // The machine's own continuous clock. The leases of the session text the attention module
+        // releases are held to it, and so is the offline bound's time, which is taken as the policy
+        // holding it is restored and before anything remote is decided under it: from what this
+        // boot recorded of it, advanced by this clock, and never less than this host's reading of
+        // UTC says. It is made before the registry records the start, which reads it.
+        let shared_clock: Arc<dyn kr_ipc::clock::SharedClock> =
+            Arc::new(kr_ipc::clock::SystemSharedClock);
+        let boot_clock = crate::boots::BootClock::new(Arc::clone(&shared_clock), boot_epoch);
         let boot = setup.boot_identity.clone();
         let paths = setup.paths.clone();
         let recorded_revision = capability_revision(&paths);
@@ -586,6 +594,7 @@ impl Controller {
         let sharing = Arc::new(crate::sharing::SharingService::new(
             crate::grants::GrantDirectory::open(setup.paths.registry_database())?,
             host_device_id,
+            boot_clock.clone(),
         ));
         // The policy and the feed are read back from the store rather than rebuilt empty. A host
         // that came back unrestricted after every restart would be the same failure as one that
@@ -596,6 +605,12 @@ impl Controller {
             Some(stored) => stored,
             None => crate::grants::HostPolicy::personal(authority_revision).snapshot(),
         };
+        // The start is recorded before anything else of this boot is: before the clock floor, before
+        // any worker is adopted and before a device's access is given a start point, so no start
+        // point is ever one of a boot that the record does not hold. A start that cannot be
+        // recorded does not go on.
+        let started_in = registry.record_boot(&boot_clock)?;
+        started_in.report();
         // The host's one reading of UTC in this boot, which every worker maps too. It is opened,
         // adopted or created here, before any worker is adopted or spawned, and it starts at least
         // where this host's record of it stands.
@@ -715,13 +730,6 @@ impl Controller {
         feed.enrol(host_device_id);
         sharing.grants().store_feed(&feed.snapshot())?;
         feed.written();
-        // The machine's own continuous clock. The leases of the session text the attention module
-        // releases are held to it, and so is the offline bound's time, which is taken as the policy
-        // holding it is restored and before anything remote is decided under it: from what this
-        // boot recorded of it, advanced by this clock, and never less than this host's reading of
-        // UTC says.
-        let shared_clock: Arc<dyn kr_ipc::clock::SharedClock> =
-            Arc::new(kr_ipc::clock::SystemSharedClock);
         let attention = Arc::new(
             crate::attention::AttentionModule::open(&setup.paths, setup.boot_identity.clone())?
                 .on_clock(Arc::clone(&shared_clock)),
@@ -1799,6 +1807,11 @@ impl Controller {
         if let Some(runtime) = &controller.release_matrix {
             runtime.run(&controller);
         }
+        // Every grant that has no start point is given this start, and every grant whose point is in
+        // a boot the host can no longer tell apart is given a new one. It runs here, once the
+        // controller exists and before the network serves its first device request, and it does
+        // not depend on the network: a host that is not on it has devices too.
+        controller.give_starts_at_start();
         // The network comes up last. A paired device must not reach a daemon that has not yet
         // recovered its reservations and rebuilt its worker directory, because it would be told
         // that sessions this host is running do not exist. Registering it also lends the project

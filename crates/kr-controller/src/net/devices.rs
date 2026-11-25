@@ -675,7 +675,9 @@ impl DeviceDirectory {
                      elapsed_ms INTEGER NOT NULL
                  );",
             )?;
-            connection.execute_batch(crate::registry::CLOCK_CONTINUITY_SCHEMA)
+            connection.execute_batch(crate::registry::CLOCK_CONTINUITY_SCHEMA)?;
+            // A pairing is given its start point in the transaction that records the device.
+            connection.execute_batch(crate::boots::BOOTS_SCHEMA)
         })?;
         // Forward-only, and applied to a table that already exists: `CREATE TABLE IF NOT EXISTS`
         // leaves an older table exactly as it was, and every read below names these columns. A

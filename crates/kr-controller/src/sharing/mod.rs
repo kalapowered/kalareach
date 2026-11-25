@@ -95,15 +95,23 @@ pub struct SharingService {
     /// The one issuer that may write a grant without delegating from one. Everything else has to
     /// name a parent it holds, which is what stops a device issuing authority out of nothing.
     host_device_id: DeviceId,
+    /// The host's order counter and its boot, which every grant's start point is read from.
+    boot: crate::boots::BootClock,
 }
 
 impl SharingService {
-    /// Builds a service over an open grant directory and invitation ledger.
+    /// Builds a service over an open grant directory and invitation ledger. A grant's access
+    /// begins at a reading of the order counter of `boot`.
     #[must_use]
-    pub const fn new(grants: GrantDirectory, host_device_id: DeviceId) -> Self {
+    pub const fn new(
+        grants: GrantDirectory,
+        host_device_id: DeviceId,
+        boot: crate::boots::BootClock,
+    ) -> Self {
         Self {
             grants,
             host_device_id,
+            boot,
         }
     }
 
@@ -114,7 +122,16 @@ impl SharingService {
     /// Returns an error when either store cannot be created.
     #[cfg(any(test, feature = "testing"))]
     pub fn in_memory(host_device_id: DeviceId) -> Result<Self> {
-        Ok(Self::new(GrantDirectory::in_memory()?, host_device_id))
+        // A boot of its own: the machine's order counter, and an epoch no daemon has.
+        let boot = crate::boots::BootClock::new(
+            std::sync::Arc::new(kr_ipc::clock::SystemSharedClock),
+            kr_protocol::ids::BootEpoch::new(0),
+        );
+        Ok(Self::new(
+            GrantDirectory::in_memory()?,
+            host_device_id,
+            boot,
+        ))
     }
 
     /// This host's own device identity.
@@ -368,6 +385,7 @@ impl SharingService {
             &preview,
             request.issuer_device_id,
             request.now_ms,
+            &self.boot,
             still_admitted,
         )?;
 
@@ -550,8 +568,14 @@ impl SharingService {
         still_admitted: impl FnOnce() -> Result<()>,
         claim: Option<&crate::grants::ClaimHold>,
     ) -> Result<Grant> {
-        self.grants
-            .redeem(invitation_id, device_id, now_ms, still_admitted, claim)
+        self.grants.redeem(
+            invitation_id,
+            device_id,
+            now_ms,
+            &self.boot,
+            still_admitted,
+            claim,
+        )
     }
 
     /// Transfers control of a session from one device to another, in one commit.
@@ -618,6 +642,7 @@ impl SharingService {
             plan.source_grant_id,
             &replacement,
             write.now_ms,
+            &self.boot,
             |source| {
                 still_admitted()?;
                 // Again, inside the transaction. The check above happened before the store's lock
