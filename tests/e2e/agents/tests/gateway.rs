@@ -116,7 +116,7 @@ use kr_e2e_agents::stub::RequestStub;
 use kr_e2e_agents::subject::Subject;
 use kr_e2e_agents::{GENERATION_VARIABLE, RESULT_VARIABLE};
 use kr_e2e_m1b::device::{Device, PairedHost, Remote, RequestError};
-use kr_e2e_m1b::host::{Host, HostOptions, LegNotRun, Preparation, Restart};
+use kr_e2e_m1b::host::{Application, Host, HostOptions, LegNotRun, Preparation, Restart};
 use kr_e2e_m1b::run::{PlacedDirectory, Run, binary_place};
 use kr_e2e_m1b::window::{Window, answered};
 use kr_e2e_m1b::{LIVENESS, ceremony, shells};
@@ -183,6 +183,11 @@ mod package;
 /// stand it in for.
 #[path = "gateway/stand_in.rs"]
 mod stand_in;
+
+/// The claude-code package's native bridge recipe, applied by the daemon of the host over the
+/// run's own home.
+#[path = "gateway/claude_recipe.rs"]
+mod claude_recipe;
 
 /// The variable naming the build list entry of a real agent; without it the agent is the stand-in.
 const BUILD_VARIABLE: &str = "KR_AGENTS_GATEWAY_BUILD";
@@ -1555,6 +1560,9 @@ struct Context {
     /// The programs of the stand-in route that every typed launch may run, by their place below
     /// the run's directory, each recorded when it was placed.
     placed_files: Vec<PathBuf>,
+    /// Whether the agent is the stand-in placed under the name `claude`, for a case that applies
+    /// the claude-code package's recipe (stand-in route).
+    claude_code: bool,
 }
 
 impl Context {
@@ -1589,6 +1597,7 @@ impl Context {
             newer_prefix: None,
             package_digest: std::sync::Mutex::new(None),
             placed_files: Vec::new(),
+            claude_code: false,
         }
     }
 
@@ -1727,6 +1736,18 @@ impl Context {
                 newer = Some((newer_file, newer_version));
                 newer_prefix = Some(second);
                 (executable, bin)
+            }
+            Route::StandIn if self.claude_code => {
+                // The host's daemon finds the program by its name on a search path of its own, and
+                // the recipe reads it there: the directory holds nothing else.
+                let tools = run.root().join("t");
+                kr_ipc::paths::create_private_tree(run.root(), &tools)
+                    .expect("a directory for the programs");
+                run.place_built("codex-stand-in", &tools.join("claude"), &["--version"]);
+                run.note_placed(Path::new(claude_recipe::CLAUDE_PLACE))
+                    .unwrap_or_else(|why| panic!("{ISOLATION_UNPROVEN} {why}"));
+                placed_files.push(PathBuf::from(claude_recipe::CLAUDE_PLACE));
+                (tools.join("claude"), tools)
             }
             Route::StandIn => {
                 let tools = run.root().join("t");
@@ -1868,6 +1889,9 @@ impl Context {
     /// The distribution and version the generation lists the executable as.
     fn qualified_as(&self) -> (&'static str, String) {
         match &self.route {
+            Route::StandIn if self.claude_code => {
+                ("test stand-in", claude_recipe::CLAUDE_VERSION.to_owned())
+            }
             Route::StandIn => (
                 "test stand-in",
                 self.subject.entry().map_or_else(
@@ -1882,6 +1906,9 @@ impl Context {
     /// A host whose catalogue holds the package installed and whose configuration turns its
     /// integration on, with the address devices dial kept across a restart of its daemon.
     fn host(&self) -> Host<'_> {
+        if self.claude_code {
+            return claude_recipe::host(self, &claude_recipe::Variant::default());
+        }
         Host::start_prepared(
             &self.run,
             &HostOptions {

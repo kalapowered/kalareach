@@ -1,0 +1,403 @@
+//! The claude-code package's native bridge recipe, applied by the daemon of the harness's host over
+//! the run's own home.
+//!
+//! The agent is the stand-in route's program placed under the name `claude`, and the package is the
+//! one the repository bundles, published in a signed generation of the case's own whose index names
+//! the digest of the one build it qualifies. The host makes the directory the recipe is written in
+//! before its daemon starts and gives the daemon a search path that holds that program and no other
+//! `claude`. Nothing here starts an agent or a forwarder, and nothing reads or writes the
+//! person's own `~/.claude`.
+
+use super::*;
+
+/// Where the stand-in is placed in the run as `claude`, below its directory.
+pub(super) const CLAUDE_PLACE: &str = "t/claude";
+
+/// The directory below the run's home where Claude Code keeps its configuration, and where the
+/// host's daemon writes the recipe.
+pub(super) const CLAUDE_CONFIGURATION: &str = ".claude";
+
+/// The version the generation lists the placed program as: the one the pinned build reports.
+pub(super) const CLAUDE_VERSION: &str = "2.1.278";
+
+/// The key the recipe adds to `settings.json`.
+const RECIPE_KEY: &str = "kalareach-channels@skills-dir";
+
+/// The files the recipe writes, below the configuration directory.
+const RECIPE_FILES: [&str; 3] = [
+    "skills/kalareach-channels/.claude-plugin/plugin.json",
+    "skills/kalareach-channels/.mcp.json",
+    "skills/kalareach-channels/hooks/hooks.json",
+];
+
+/// The settings a person's directory already holds when the recipe is applied: none of them is the
+/// recipe's.
+const SEEDED_SETTINGS: &str = r#"{"theme":"dark","enabledPlugins":{"other@elsewhere":true},"permissions":{"allow":["Read"]}}"#;
+
+fn claude_code() -> PluginId {
+    PluginId::new("kalareach/claude-code").expect("a plugin identifier")
+}
+
+/// The directory of the claude-code package the repository bundles: the one release it holds.
+fn claude_code_package() -> PathBuf {
+    let versions = kr_e2e_m1b::catalogue::workspace()
+        .join("bundled-plugins/targets/packages/kalareach/claude-code");
+    let mut releases: Vec<PathBuf> = std::fs::read_dir(&versions)
+        .unwrap_or_else(|error| panic!("{}: {error}", versions.display()))
+        .map(|entry| entry.expect("an entry").path())
+        .collect();
+    assert_eq!(
+        releases.len(),
+        1,
+        "the bundle holds one release of the claude-code package"
+    );
+    releases.remove(0)
+}
+
+/// What a case changes in the preparation of its host.
+#[derive(Clone, Debug)]
+pub(super) struct Variant {
+    /// Whether the generation names the digest of another file, which is not on the daemon's path,
+    /// and not the placed program's.
+    names_another: bool,
+    /// Whether the placed program is a script.
+    script: bool,
+    /// The capabilities the installation is given beyond the repository's ceiling.
+    grants: Vec<PluginCapability>,
+}
+
+impl Default for Variant {
+    fn default() -> Self {
+        Self {
+            names_another: false,
+            script: false,
+            grants: vec![
+                PluginCapability::NativeBridgeInstall,
+                PluginCapability::CommandIntegrationLaunch,
+                PluginCapability::ApprovalDecode,
+                PluginCapability::ApprovalRespond,
+                PluginCapability::UpstreamAction,
+            ],
+        }
+    }
+}
+
+/// Publishes the claude-code package in a signed generation of its own, whose index names the
+/// digest of `qualified` as the one build it qualifies, and installs and enables it in the
+/// environment with `grants`, as the owner's confirmation of that exact installation does.
+async fn install_claude_code(
+    environment: &EnvironmentPaths,
+    qualified: &Path,
+    grants: Vec<PluginCapability>,
+) {
+    let package = claude_code_package();
+    let manifest: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(package.join("plugin.json")).expect("the package's manifest"),
+    )
+    .expect("a manifest");
+    let version = kr_plugin_sdk::version::PackageVersion::parse(
+        manifest["version"].as_str().expect("the package's version"),
+    )
+    .expect("a version");
+    let build = QualifiedBuild {
+        application: Label::new("claude-code").expect("a label"),
+        distribution: Label::new("test stand-in").expect("a label"),
+        version: kr_plugin_sdk::version::PackageVersion::parse(CLAUDE_VERSION).expect("a version"),
+        os: if cfg!(target_os = "macos") {
+            OperatingSystem::MacOs
+        } else {
+            OperatingSystem::Linux
+        },
+        architecture: if std::env::consts::ARCH == "aarch64" {
+            Architecture::Aarch64
+        } else {
+            Architecture::X86_64
+        },
+        executable_digest: PayloadDigest::of(
+            &std::fs::read(qualified).expect("the program the generation names"),
+        ),
+    };
+    let home = environment.state_dir().join("generation-source");
+    std::fs::create_dir_all(&home).expect("a directory for the generation");
+    let fixture = generations::Generation::build(
+        &home,
+        generations::GenerationSpec {
+            package: Some(package),
+            builds: vec![build],
+            ..generations::GenerationSpec::default()
+        },
+    )
+    .await;
+    let mut catalogue = Catalogue::open(
+        &environment.state_dir().join("catalogue"),
+        Arc::new(RepositoryTransport::local_only(
+            "this test reads its repository from disk",
+        )),
+    )
+    .expect("an openable catalogue");
+    let id = RepositoryId::new("development").expect("an identifier");
+    catalogue
+        .enrol(
+            Enrolment::new(
+                id.clone(),
+                RepositoryKind::Local,
+                generations::directory_url(&fixture.metadata_dir()),
+                generations::directory_url(&fixture.targets_dir()),
+                fixture.root_bytes(),
+                kr_plugin_sdk::limits::RepositoryBudgets::defaults(),
+                CapabilityCeiling::default_ceiling(),
+            )
+            .expect("an enrollable repository"),
+            true,
+        )
+        .expect("the owner adopted the root");
+    catalogue.sync(&id).await.expect("a generation");
+    let digest = catalogue
+        .index(&id)
+        .expect("activated")
+        .find(&claude_code(), &version)
+        .expect("the package")
+        .manifest_digest;
+    catalogue
+        .install_with(
+            &id,
+            environment.environment_id(),
+            &claude_code(),
+            &version,
+            digest,
+            InstallationGrant::with(grants),
+            None,
+            &mut Change::new(&Owner::confirming()),
+        )
+        .await
+        .expect("installed");
+    catalogue
+        .set_enabled(environment.environment_id(), &claude_code(), true)
+        .await
+        .expect("enabled");
+}
+
+/// The program as a leg places it for the host: the directory below the run's home where the
+/// recipe is written and the program the daemon finds by its name.
+fn claude_application() -> Application {
+    Application {
+        program: PathBuf::from(CLAUDE_PLACE),
+        configuration: PathBuf::from(CLAUDE_CONFIGURATION),
+    }
+}
+
+/// A host whose daemon applies the claude-code recipe over the run's home, prepared as `variant`
+/// says, after the program was placed by [`Context::place`].
+pub(super) fn host<'a>(ctx: &'a Context, variant: &Variant) -> Host<'a> {
+    let configuration = ctx.run.home().join(CLAUDE_CONFIGURATION);
+    let qualified = if variant.names_another {
+        kr_ipc::paths::create_private_tree(ctx.run.root(), &ctx.run.root().join("q"))
+            .expect("a directory for the other program");
+        let other = ctx.run.root().join("q/claude");
+        std::fs::write(&other, b"another build\n").expect("another program");
+        other
+    } else {
+        ctx.executable.clone()
+    };
+    Host::start_prepared(
+        &ctx.run,
+        &HostOptions {
+            shell_packages: Some(ctx.shell.prefix.clone()),
+        },
+        &Preparation {
+            application: Some(claude_application()),
+            ..Preparation::default()
+        },
+        |environment| {
+            if configuration.is_dir() {
+                std::fs::write(configuration.join("settings.json"), SEEDED_SETTINGS)
+                    .expect("the person's settings");
+            }
+            ctx.runtime.block_on(install_claude_code(
+                environment,
+                &qualified,
+                variant.grants.clone(),
+            ));
+        },
+    )
+}
+
+/// Runs `body` over a host prepared as `variant` says, on the stand-in route, and closes the host.
+/// Where the case cannot run on this machine it says so and returns.
+fn in_a_host(case: &str, variant: &Variant, body: impl FnOnce(&Context, &Host<'_>)) {
+    if kr_ipc::testing::account_launchd::stands_down("the host start") {
+        return;
+    }
+    let shell = match shells::managed_zsh() {
+        Ok(shell) => shell,
+        Err(why) if shells::required() => panic!("the managed shell: {why}"),
+        Err(why) => {
+            eprintln!("skipping: {why}");
+            return;
+        }
+    };
+    let mut ctx = Context::new(shell, Route::StandIn, Run::start(case), runtime());
+    ctx.claude_code = true;
+    ctx.place();
+    if variant.script {
+        std::fs::write(&ctx.executable, "#!/bin/sh\nexit 0\n").expect("a script as the program");
+    }
+    let host = host(&ctx, variant);
+    body(&ctx, &host);
+    ctx.close(&host);
+}
+
+/// Every file below `directory`, by its path below it, in order.
+fn files_below(directory: &Path) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut pending = vec![directory.to_path_buf()];
+    while let Some(next) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&next) else {
+            continue;
+        };
+        for entry in entries {
+            let path = entry.expect("an entry").path();
+            if path.is_dir() {
+                pending.push(path);
+            } else {
+                found.push(
+                    path.strip_prefix(directory)
+                        .expect("below the directory")
+                        .to_string_lossy()
+                        .into_owned(),
+                );
+            }
+        }
+    }
+    found.sort();
+    found
+}
+
+/// What the doctor says where it names a bridge the host refused.
+const REFUSED: &str = "was refused, and nothing of it is in place";
+
+/// What the doctor says where it names a bridge the host applied.
+const APPLIED: &str = "is applied";
+
+/// What the host's doctor says of the native bridges.
+fn bridges_said(host: &Host<'_>) -> String {
+    let output = host
+        .kr_within(&["doctor", "--json"], LIVENESS)
+        .expect("the doctor answers");
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+/// The processes the run started that run the forwarder.
+fn forwarders(ctx: &Context) -> Vec<String> {
+    kr_e2e_m1b::run::processes_under(ctx.run.root())
+        .expect("the process table")
+        .into_iter()
+        .map(|(_, command)| command)
+        .filter(|command| command.contains("kr-hook"))
+        .collect()
+}
+
+/// A stand-in whose digest a signed record names has the recipe applied: exactly the three files
+/// and the one settings key, with every other setting as it was, and the registration names the
+/// forwarder the host placed.
+#[test]
+fn gateway_claude_recipe_a_stand_in_a_record_names_has_the_recipe_applied() {
+    in_a_host("claude-recipe-named", &Variant::default(), |ctx, host| {
+        let configuration = ctx.run.home().join(CLAUDE_CONFIGURATION);
+        let mut expected: Vec<String> =
+            RECIPE_FILES.iter().map(|file| (*file).to_owned()).collect();
+        expected.push("settings.json".to_owned());
+        expected.sort();
+        assert_eq!(
+            files_below(&configuration),
+            expected,
+            "the recipe wrote exactly its three files beside the person's settings"
+        );
+        let mut settings: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(configuration.join("settings.json")).expect("the settings"),
+        )
+        .expect("settings in JSON");
+        assert_eq!(
+            settings["enabledPlugins"][RECIPE_KEY],
+            serde_json::Value::Bool(true),
+            "the recipe's key is set"
+        );
+        settings["enabledPlugins"]
+            .as_object_mut()
+            .expect("the plugins")
+            .remove(RECIPE_KEY);
+        assert_eq!(
+            settings,
+            serde_json::from_str::<serde_json::Value>(SEEDED_SETTINGS).expect("the seed"),
+            "every other setting is as it was"
+        );
+        let registration: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(configuration.join(RECIPE_FILES[1])).expect("the registration"),
+        )
+        .expect("a registration in JSON");
+        let forwarder = registration["mcpServers"]["kalareach"]["command"]
+            .as_str()
+            .expect("the forwarder the registration starts");
+        assert!(
+            Path::new(forwarder).is_file() && forwarder.ends_with("b/kr-hook"),
+            "the registration names the forwarder the host placed, not {forwarder}"
+        );
+        let said = bridges_said(host);
+        assert!(
+            said.contains(APPLIED),
+            "the doctor says the bridge is applied: {said}"
+        );
+    });
+}
+
+/// A stand-in whose digest no signed record names has nothing written under the configuration
+/// directory, the person's settings are the bytes they were, no forwarder runs, and the doctor
+/// says the bridge was refused.
+#[test]
+fn gateway_claude_recipe_a_stand_in_no_record_names_writes_nothing_and_starts_no_forwarder() {
+    let variant = Variant {
+        names_another: true,
+        ..Variant::default()
+    };
+    in_a_host("claude-recipe-unnamed", &variant, |ctx, host| {
+        let configuration = ctx.run.home().join(CLAUDE_CONFIGURATION);
+        assert_eq!(
+            files_below(&configuration),
+            ["settings.json"],
+            "nothing was written beside the person's settings"
+        );
+        assert_eq!(
+            std::fs::read_to_string(configuration.join("settings.json")).expect("the settings"),
+            SEEDED_SETTINGS,
+            "the person's settings are the bytes they were"
+        );
+        assert_eq!(forwarders(ctx), Vec::<String>::new(), "no forwarder runs");
+        let said = bridges_said(host);
+        assert!(
+            said.contains(REFUSED),
+            "the doctor says the bridge was refused: {said}"
+        );
+    });
+}
+
+/// A stand-in that is a script is refused though a record names its digest: nothing is written.
+#[test]
+fn gateway_claude_recipe_a_stand_in_that_is_a_script_is_refused() {
+    let variant = Variant {
+        script: true,
+        ..Variant::default()
+    };
+    in_a_host("claude-recipe-script", &variant, |ctx, host| {
+        let configuration = ctx.run.home().join(CLAUDE_CONFIGURATION);
+        assert_eq!(
+            files_below(&configuration),
+            ["settings.json"],
+            "nothing was written beside the person's settings"
+        );
+        let said = bridges_said(host);
+        assert!(
+            said.contains(REFUSED),
+            "the doctor says the bridge was refused: {said}"
+        );
+    });
+}
