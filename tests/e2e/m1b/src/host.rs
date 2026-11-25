@@ -261,10 +261,12 @@ struct Placed {
     directory: PlacedDirectory,
     /// The directory below the run's home where the program keeps its configuration.
     configuration: PathBuf,
+    /// The configuration directory as it was made, by its device and inode.
+    configuration_placed: PlacedDirectory,
 }
 
-/// Makes the application's configuration directory and records its program and the directory that
-/// holds it as they stand.
+/// Makes the application's configuration directory and records it, its program and the directory
+/// that holds the program as they stand.
 ///
 /// # Panics
 ///
@@ -298,11 +300,21 @@ fn prepare_application(run: &Run, application: &Application) -> Placed {
         .unwrap_or_else(|why| panic!("{why}"));
     run.note_placed(&application.program)
         .unwrap_or_else(|why| panic!("{why}"));
+    let configuration = run.home().join(&application.configuration);
+    let configuration_placed = PlacedDirectory::record(
+        run.root(),
+        run.pin(),
+        configuration
+            .strip_prefix(run.root())
+            .expect("the run's home is below its directory"),
+    )
+    .unwrap_or_else(|why| panic!("{why}"));
     Placed {
         program: application.program.clone(),
         name,
         directory,
-        configuration: run.home().join(&application.configuration),
+        configuration,
+        configuration_placed,
     }
 }
 
@@ -1384,6 +1396,17 @@ impl<'r> Host<'r> {
         self.application
             .as_ref()
             .map(|placed| placed.configuration.clone())
+    }
+
+    /// The directory where the host's application keeps its configuration as the host made it, by
+    /// its device and inode, recorded before the daemon starts: what the end compare of a part
+    /// opens again, so that a directory another process put in its place is not the one compared.
+    /// None where the host was prepared with no application.
+    #[must_use]
+    pub fn application_directory_as_placed(&self) -> Option<&PlacedDirectory> {
+        self.application
+            .as_ref()
+            .map(|placed| &placed.configuration_placed)
     }
 
     /// The environment every `kr` this host runs is given, and nothing else.
@@ -4132,6 +4155,38 @@ mod shutdown_tests {
             let _ = prepare_application(&run, &application);
         }));
         assert!(refused.is_err(), "a program that is a link was taken");
+        drop(run);
+        std::fs::remove_dir_all(&root).expect("clean up");
+    }
+
+    /// The configuration directory is recorded as the host made it, before any daemon starts, and
+    /// the host gives the record: it is the directory below the home, it opens again while it is
+    /// the one that was made, and a directory put in its place is another one.
+    #[test]
+    fn the_configuration_directory_is_recorded_as_made_and_a_directory_in_its_place_is_another() {
+        let root = scratch("recorded");
+        let run = run_with_a_recording_controller(&root);
+        let application = an_application(&root);
+        let host = host_prepared_with(&run, &application);
+        let recorded = host
+            .application_directory_as_placed()
+            .expect("the host gives the directory it made");
+        assert_eq!(recorded.relative(), Path::new("h/.claude"));
+        assert!(
+            recorded.open(&root, run.pin()).is_ok(),
+            "the directory as made"
+        );
+        std::fs::rename(root.join("h/.claude"), root.join("h/moved")).expect("moved");
+        std::fs::create_dir(root.join("h/.claude")).expect("another directory");
+        let refused = recorded
+            .open(&root, run.pin())
+            .expect_err("a directory in its place");
+        assert!(refused.contains("it is another directory"), "{refused}");
+        assert!(
+            host_over(&run).application_directory_as_placed().is_none(),
+            "a host with no application gives none"
+        );
+        drop(host);
         drop(run);
         std::fs::remove_dir_all(&root).expect("clean up");
     }
