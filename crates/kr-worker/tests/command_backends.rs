@@ -1797,7 +1797,8 @@ async fn the_fixture_reads_a_commit_on_the_launchers_clock() {
 }
 
 /// A program a case watches and has to leave ended: it is ended by its identity, which the system
-/// checks against its start, when this is dropped, so that a case that fails leaves nothing running.
+/// checks against its start, when this is dropped, and waited for at most ten seconds, so that a
+/// case that fails leaves nothing running.
 #[cfg(windows)]
 struct EndsWhenDropped(ProcessStartIdentity);
 
@@ -1805,6 +1806,12 @@ struct EndsWhenDropped(ProcessStartIdentity);
 impl Drop for EndsWhenDropped {
     fn drop(&mut self) {
         let _ = kr_ipc::identity::stop_process(&self.0, kr_ipc::identity::Stop::Kill);
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while kr_ipc::identity::process_state(&self.0) != kr_ipc::identity::ProcessState::Ended
+            && std::time::Instant::now() < until
+        {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
 }
 
@@ -1900,6 +1907,8 @@ fn a_held_program_that_no_job_took_is_ended_when_it_is_dropped() {
     let held =
         windows_launcher::HeldProgram::start(&mut command).expect("the program is created held");
     let identity = kr_ipc::identity::process_start_identity(held.id()).expect("a process");
+    // Ended after the checks below if the guard did not end it.
+    let _ends = EndsWhenDropped(identity.clone());
     assert_eq!(
         kr_ipc::identity::process_state(&identity),
         kr_ipc::identity::ProcessState::Running,

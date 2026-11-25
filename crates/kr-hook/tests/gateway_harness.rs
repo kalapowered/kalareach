@@ -198,6 +198,23 @@ fn a_groups_job_holds_what_a_launch_started_and_ends_it() {
     let _ = launched.wait();
 }
 
+/// A program a case watches and has to leave ended: it is ended by its identity, which the system
+/// checks against its start, when this is dropped, and waited for at most ten seconds, so that a
+/// case that fails leaves nothing running.
+#[cfg(windows)]
+struct EndsWhenDropped(kr_protocol::identity::ProcessStartIdentity);
+
+#[cfg(windows)]
+impl Drop for EndsWhenDropped {
+    fn drop(&mut self) {
+        let _ = kr_ipc::identity::stop_process(&self.0, kr_ipc::identity::Stop::Kill);
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while process_state(&self.0) != ProcessState::Ended && std::time::Instant::now() < until {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+}
+
 /// A launch that was created held and has no job yet is ended and collected when what holds it is
 /// dropped, as it is when its placement in the group's job fails.
 #[cfg(windows)]
@@ -206,6 +223,8 @@ fn a_held_launch_that_no_job_took_is_ended_when_it_is_dropped() {
     let held =
         common::session::HeldChild::start(&mut lingering()).expect("the launch is created held");
     let identity = process_start_identity(held.id()).expect("a process");
+    // Ended after the checks below if the guard did not end it.
+    let _ends = EndsWhenDropped(identity.clone());
     assert_eq!(
         process_state(&identity),
         ProcessState::Running,
