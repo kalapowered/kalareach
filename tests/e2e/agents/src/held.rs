@@ -1738,18 +1738,25 @@ fn scan(
     }
 }
 
-/// Runs `work` on a thread of its own and waits `bound` for its answer: the error where it gave
-/// none in time, or the thread ended without one. A thread still waiting is not cancelled: it keeps
-/// its descriptor and its buffers until the call it waits in returns.
-fn bounded<T: Send + 'static>(
+/// What `work` gives within `bound`, run on a thread that `builder` makes: its own answer, or a
+/// refusal: too slow where it gave none in time, and failed where the thread could not be made or
+/// ended without an answer. A thread still waiting is not cancelled: it keeps its descriptor and
+/// its buffers until the call it waits in returns.
+fn read_within(
+    builder: std::thread::Builder,
     bound: std::time::Duration,
-    work: impl FnOnce() -> T + Send + 'static,
-) -> Result<T, std::sync::mpsc::RecvTimeoutError> {
+    work: impl FnOnce() -> Result<bool, Unread> + Send + 'static,
+) -> Result<bool, Unread> {
     let (sender, receiver) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
+    // A thread that cannot be made drops the sender, and the wait below ends as a failure.
+    let _ = builder.spawn(move || {
         let _ = sender.send(work());
     });
-    receiver.recv_timeout(bound)
+    match receiver.recv_timeout(bound) {
+        Ok(read) => read,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(Unread::TooSlow),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(Unread::Failed),
+    }
 }
 
 /// Whether the shared file at `path` holds one of `needles`, read once through a handle of its own:
@@ -1764,7 +1771,7 @@ fn shared_names_the_run(
     needles: Vec<String>,
 ) -> Result<bool, Unread> {
     let deadline = std::time::Instant::now() + SHARED_BOUND;
-    let read = bounded(SHARED_BOUND, move || {
+    read_within(std::thread::Builder::new(), SHARED_BOUND, move || {
         let needles: Vec<&[u8]> = needles
             .iter()
             .filter(|needle| !needle.is_empty())
@@ -1774,12 +1781,7 @@ fn shared_names_the_run(
             Some(mut file) => scan(&mut file, &needles, SHARED_LIMIT, deadline),
             None => Ok(false),
         }
-    });
-    match read {
-        Ok(read) => read,
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(Unread::TooSlow),
-        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(Unread::Failed),
-    }
+    })
 }
 
 /// An entry's named files of the person's home, as `lstat` showed them before a driver started
@@ -5221,14 +5223,46 @@ mod tests {
         assert_eq!(scan(&mut source, needle, u64::MAX, far_off()), Ok(false));
     }
 
+    /// A bound of thirty seconds, which no case here reaches.
+    fn long_bound() -> std::time::Duration {
+        std::time::Duration::from_secs(30)
+    }
+
     #[test]
-    fn a_read_that_waits_is_given_up_at_its_bound() {
-        let slow = bounded(std::time::Duration::from_millis(50), || {
-            std::thread::sleep(std::time::Duration::from_secs(2));
-            7
+    fn a_read_that_waits_past_its_bound_is_too_slow_and_one_in_time_gives_its_answer() {
+        let slow = read_within(
+            std::thread::Builder::new(),
+            std::time::Duration::from_millis(50),
+            || {
+                std::thread::sleep(std::time::Duration::from_secs(2));
+                Ok(true)
+            },
+        );
+        assert_eq!(slow, Err(Unread::TooSlow));
+        let builder = std::thread::Builder::new;
+        assert_eq!(read_within(builder(), long_bound(), || Ok(true)), Ok(true));
+        assert_eq!(
+            read_within(builder(), long_bound(), || Err(Unread::TooLarge)),
+            Err(Unread::TooLarge)
+        );
+    }
+
+    #[test]
+    fn a_read_whose_thread_ends_without_an_answer_is_a_failure() {
+        let ended = read_within(std::thread::Builder::new(), long_bound(), || {
+            panic!("the thread of the read ends without an answer")
         });
-        assert_eq!(slow, Err(std::sync::mpsc::RecvTimeoutError::Timeout));
-        assert_eq!(bounded(std::time::Duration::from_secs(30), || 7), Ok(7));
+        assert_eq!(ended, Err(Unread::Failed));
+    }
+
+    #[test]
+    fn a_read_whose_thread_cannot_be_made_is_a_failure() {
+        // A stack that no system has the memory for.
+        let builder = std::thread::Builder::new().stack_size(1 << 60);
+        assert_eq!(
+            read_within(builder, long_bound(), || Ok(true)),
+            Err(Unread::Failed)
+        );
     }
 
     #[test]
