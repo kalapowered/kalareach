@@ -99,22 +99,30 @@ pub const HARNESS_GAPS: [(&str, &str, &str); 2] = [
     ),
 ];
 
-/// The fields each part reads, by the part's name. `account.turn_line` is also read by every real
-/// case of an entry with an account.
-const NEEDS: [(&str, &[&str]); 5] = [
-    ("1", &["account.image_line"]),
-    ("4", &["account.turn_line"]),
+/// The fields each case reads, by the case's name: the parts of the qualification, and the thread
+/// case of the gateway, which only Codex's entry fills. `account.draft` is read by every case that
+/// starts the agent with the person's login: parts 1, 3 and 4 through the gateway, and 2a, 7 and 7f
+/// by hand. `account.turn_line` is also read by every real case of an entry with an account.
+const NEEDS: [(&str, &[&str]); 10] = [
+    ("1", &["account.image_line", "account.draft"]),
+    ("2a", &["account.draft"]),
+    ("3", &["account.draft"]),
+    ("4", &["account.turn_line", "account.draft"]),
+    ("6a", &["newer.isolated"]),
+    ("6b", &["newer.isolated"]),
+    ("7", &["account.draft", "account.resume_refused"]),
     (
-        "7",
+        "7f",
+        &["account.draft", "account.resume_refused", "account.fork"],
+    ),
+    (
+        "gateway-3",
         &[
-            "account.draft",
-            "account.resume_refused",
             "account.commands.fork",
             "account.commands.new",
             "account.commands.quit",
         ],
     ),
-    ("7f", &["account.fork"]),
     ("14.03a", &["composer"]),
 ];
 
@@ -131,6 +139,10 @@ fn given(build: &Build, field: &str) -> bool {
             .is_some_and(|(account, command)| account.commands.contains_key(command)),
         // An entry with an account reaches its composer by the account's own steps.
         "composer" => build.composer.is_some() || account.is_some(),
+        "newer.isolated" => build
+            .newer
+            .as_ref()
+            .is_some_and(|newer| !newer.isolated.is_empty()),
         _ => false,
     }
 }
@@ -155,6 +167,11 @@ pub fn check(build: &Build) -> Report {
                         reason: build.no_account.clone().unwrap_or_default(),
                     });
                 }
+                continue;
+            }
+            // A newer build is probed with an account's own commands; an entry with no account has
+            // the isolation contract of its own, and one with no newer build has the gap named below.
+            if field == "newer.isolated" && (build.newer.is_none() || build.account.is_none()) {
                 continue;
             }
             let listed = build.missing.get(field);
@@ -323,47 +340,74 @@ mod tests {
         rows
     }
 
-    /// Each committed entry has the gaps per part that its fields and its reasons state, each with
-    /// its class.
+    /// Each committed entry has the gaps per case that its fields and its reasons state, each with
+    /// its class. No committed entry gives `newer.isolated`, so each entry with an account and a
+    /// newer build lacks it in both upgrade cases; an entry with no account has the isolation
+    /// contract of its own instead.
     #[test]
     fn the_gaps_of_each_committed_entry_are_named_per_part_and_classed() {
         use Class::{EntryField, HarnessGap, ProductGap};
         let accountless = [
             ("1", "account", ProductGap),
+            ("2a", "account", ProductGap),
+            ("3", "account", ProductGap),
             ("4", "account", ProductGap),
             ("7", "account", ProductGap),
             ("7f", "account", ProductGap),
+            ("gateway-3", "account", ProductGap),
         ];
-        assert_eq!(found("kalareach/codex"), expected(&[]));
+        let upgrade = [
+            ("6a", "newer.isolated", EntryField),
+            ("6b", "newer.isolated", EntryField),
+        ];
+        let with_upgrade = |rows: &[(&'static str, &str, Class)]| {
+            let mut all = rows.to_vec();
+            all.extend(upgrade);
+            expected(&all)
+        };
+        assert_eq!(found("kalareach/codex"), with_upgrade(&[]));
         assert_eq!(
             found("kalareach/claude-code"),
-            expected(&[("4", "account.turn_line", EntryField)])
+            with_upgrade(&[("4", "account.turn_line", EntryField)])
         );
         assert_eq!(
             found("kalareach/gemini-cli"),
-            expected(&[
+            with_upgrade(&[
                 ("4", "account.turn_line", HarnessGap),
                 ("7", "account.resume_refused", EntryField),
-                ("7", "account.commands.fork", EntryField),
+                ("7f", "account.resume_refused", EntryField),
                 ("7f", "account.fork", EntryField),
+                ("gateway-3", "account.commands.fork", EntryField),
                 ("naming", "launch", ProductGap),
             ])
         );
         assert_eq!(
             found("kalareach/kimi-code-cli"),
-            expected(&[
+            with_upgrade(&[
                 ("1", "account.image_line", HarnessGap),
+                ("1", "account.draft", EntryField),
+                ("2a", "account.draft", EntryField),
+                ("3", "account.draft", EntryField),
+                ("4", "account.draft", EntryField),
                 ("7", "account.draft", EntryField),
                 ("7", "account.resume_refused", EntryField),
+                ("7f", "account.draft", EntryField),
+                ("7f", "account.resume_refused", EntryField),
                 ("7f", "account.fork", EntryField),
             ])
         );
         assert_eq!(
             found("kalareach/opencode"),
-            expected(&[
-                ("7", "account.commands.fork", EntryField),
+            with_upgrade(&[
+                ("1", "account.draft", EntryField),
+                ("2a", "account.draft", EntryField),
+                ("3", "account.draft", EntryField),
+                ("4", "account.draft", EntryField),
                 ("7", "account.draft", EntryField),
                 ("7", "account.resume_refused", EntryField),
+                ("7f", "account.draft", EntryField),
+                ("7f", "account.resume_refused", EntryField),
+                ("gateway-3", "account.commands.fork", EntryField),
             ])
         );
         let mut qoder = accountless.to_vec();
