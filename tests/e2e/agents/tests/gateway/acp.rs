@@ -574,29 +574,68 @@ const REAL_ARM: [RealArm; 4] = [
     },
 ];
 
-/// The attribute that ignores a case that waits for a part, without the part's name. It is written
-/// in two pieces so that this file's scan of its own source does not find it here.
-const WAITING: &str = concat!("#[ignore", " = \"waits for ");
+/// The attribute that ignores a case that waits for a part, without the part's name.
+const WAITING: &str = "#[ignore = \"waits for ";
 
-/// The cases of this file, read from its source: each `fn` that starts a case, with the part its
-/// `ignore` attribute names, or `None` when it has none.
-fn cases_in_source() -> BTreeMap<String, Option<String>> {
-    let lines: Vec<&str> = include_str!("acp.rs").lines().map(str::trim).collect();
+/// What the gate reads above a case: whether it has the `#[test]` attribute, and every attribute
+/// line that holds the word `ignore`, as written.
+#[derive(Debug, PartialEq, Eq)]
+struct Attributes {
+    /// The case has the `#[test]` attribute.
+    test: bool,
+    /// Every attribute line above the case that holds the word `ignore`, in order.
+    ignores: Vec<String>,
+}
+
+/// The attributes of each case in `source`, by the case's name. A case is each `fn` whose name starts
+/// with `acp_`, and its attributes are the attribute and comment lines right above it.
+fn attributes_of_cases(source: &str) -> BTreeMap<String, Attributes> {
+    let lines: Vec<&str> = source.lines().map(str::trim).collect();
     let mut cases = BTreeMap::new();
     for (at, line) in lines.iter().enumerate() {
         let Some(rest) = line.strip_prefix("fn acp_") else {
             continue;
         };
         let name = format!("acp_{}", rest.split('(').next().unwrap_or_default());
-        let waits_for = at
-            .checked_sub(1)
-            .and_then(|before| lines.get(before))
-            .and_then(|attribute| attribute.strip_prefix(WAITING))
-            .and_then(|part| part.strip_suffix("\"]"))
-            .map(str::to_owned);
-        cases.insert(name, waits_for);
+        let mut attributes = Attributes {
+            test: false,
+            ignores: Vec::new(),
+        };
+        let above = lines[..at]
+            .iter()
+            .rev()
+            .take_while(|line| line.starts_with("#[") || line.starts_with("//"));
+        for attribute in above {
+            if *attribute == "#[test]" {
+                attributes.test = true;
+            } else if attribute.starts_with("#[") && attribute.contains("ignore") {
+                attributes.ignores.insert(0, (*attribute).to_owned());
+            }
+        }
+        cases.insert(name, attributes);
     }
     cases
+}
+
+/// The attributes that each case of the table must have: `#[test]`, and the one `ignore` attribute
+/// of its owner part while it waits for that part, or none.
+fn attributes_of_the_table() -> BTreeMap<String, Attributes> {
+    let mut expected = BTreeMap::new();
+    for control in &CONTROLS {
+        let ignores = if control.waits {
+            vec![format!("{WAITING}{}\"]", control.owner)]
+        } else {
+            Vec::new()
+        };
+        expected.insert(
+            control.test.to_owned(),
+            Attributes {
+                test: true,
+                ignores,
+            },
+        );
+    }
+    expected
 }
 
 // The cases. Each is ignored while it waits for its owner and starts in ACP mode first.
@@ -1029,30 +1068,84 @@ fn the_acp_table_names_the_one_harness_start_and_its_reason() {
     );
 }
 
-/// The table and this file agree: a test the table says waits is ignored for the same part, a
-/// test it says does not wait has no `ignore`, and no case is missing from the table or left out
-/// of the file.
+/// The table and this file agree: every case has `#[test]`; a test the table says waits has the one
+/// `ignore` attribute of its part and nothing else that ignores it, a test it says does not wait
+/// has no `ignore` of any form, and no case is missing from the table or left out of the file.
 #[test]
 fn the_acp_table_matches_the_ignored_cases_of_this_file() {
-    let in_source = cases_in_source();
-    let mut in_table: BTreeMap<&str, Option<String>> = BTreeMap::new();
-    for control in &CONTROLS {
-        in_table.insert(
-            control.test,
-            control.waits.then(|| control.owner.to_owned()),
-        );
-    }
-    let table: BTreeMap<String, Option<String>> = in_table
-        .into_iter()
-        .map(|(test, part)| (test.to_owned(), part))
-        .collect();
+    let in_source = attributes_of_cases(include_str!("acp.rs"));
     assert_eq!(
-        in_source, table,
-        "the cases of this file (left) and the table's tests (right) differ"
+        in_source,
+        attributes_of_the_table(),
+        "the cases of this file (left) and the table's tests (right) differ in a name, in `#[test]` or in an `ignore` attribute"
     );
     assert!(
         in_source.keys().all(|name| !name.starts_with(GUARD_PREFIX)),
         "a guard is named as a case"
+    );
+}
+
+/// The scan reads every attribute and comment line right above a case, so that a bare `ignore`, an
+/// `ignore` with another reason or part, a second `ignore`, an `ignore` in another form, and a case
+/// with no `#[test]` all show.
+#[test]
+fn the_scan_of_the_cases_reads_every_attribute_above_a_case() {
+    let case = |above: &[&str]| {
+        let mut lines = above.to_vec();
+        lines.push("fn acp_a_case() {");
+        attributes_of_cases(&lines.join("\n"))
+            .remove("acp_a_case")
+            .expect("the case is found")
+    };
+    let waiting = format!("{WAITING}ACP-4\"]");
+    let held = |test: bool, ignores: &[&str]| Attributes {
+        test,
+        ignores: ignores.iter().map(|ignore| (*ignore).to_owned()).collect(),
+    };
+    assert_eq!(
+        case(&["/// A control.", "#[test]", &waiting]),
+        held(true, &[&waiting])
+    );
+    assert_eq!(case(&["#[test]"]), held(true, &[]));
+    assert_eq!(
+        case(&["#[test]", "#[ignore]"]),
+        held(true, &["#[ignore]"]),
+        "a bare ignore"
+    );
+    assert_eq!(
+        case(&["#[test]", "#[ignore = \"slow\"]"]),
+        held(true, &["#[ignore = \"slow\"]"]),
+        "an ignore with another reason"
+    );
+    assert_eq!(
+        case(&["#[test]", "#[ignore = \"waits for ACP-5\"]"]),
+        held(true, &["#[ignore = \"waits for ACP-5\"]"]),
+        "an ignore for another part"
+    );
+    assert_eq!(
+        case(&["#[test]", &waiting, "#[should_panic]"]),
+        held(true, &[&waiting]),
+        "an attribute between the ignore and the case"
+    );
+    assert_eq!(
+        case(&["#[test]", &waiting, &waiting]),
+        held(true, &[&waiting, &waiting]),
+        "a second ignore"
+    );
+    assert_eq!(
+        case(&["#[test]", "#[cfg_attr(unix, ignore)]"]),
+        held(true, &["#[cfg_attr(unix, ignore)]"]),
+        "an ignore in another form"
+    );
+    assert_eq!(
+        case(&[&waiting]),
+        held(false, &[&waiting]),
+        "a case with no `#[test]`"
+    );
+    assert_eq!(
+        case(&["#[test]", "", &waiting]),
+        held(false, &[&waiting]),
+        "a line that is no attribute ends the scan"
     );
 }
 
