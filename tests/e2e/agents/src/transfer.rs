@@ -316,32 +316,47 @@ pub fn hex_of(bytes: &[u8]) -> String {
     })
 }
 
-/// The digests of the images a conversation's `text` records as given to the agent: each line the
-/// build list's `marker` is in, with the base64 text after each `base64,` in it decoded and hashed,
-/// so a message that holds several images gives one digest for each. A line the marker is in with
-/// no image text after it, or whose image cannot be decoded, gives `None`.
-#[must_use]
-pub fn images_recorded(text: &str, marker: &str) -> Vec<Option<String>> {
+const DATA_MEMBER: &str = "\"data\":\"";
+
+fn digest_of_base64(encoded: &str) -> Option<String> {
     use base64::Engine as _;
 
+    base64::engine::general_purpose::STANDARD
+        .decode(encoded.as_bytes())
+        .ok()
+        .map(|bytes| hex_of(&kr_cbor::sha256(&bytes)))
+}
+
+/// The digests of the images a conversation's `text` records as given to the agent: each line the
+/// build list's `marker` is in. A line that holds `base64,` gives each text after a `base64,` in
+/// it, decoded and hashed, so a message that holds several images gives one digest for each. A line
+/// that holds none gives, for each mark in it, the text between the quotes after the first
+/// `"data":"` that starts at the mark, as Claude Code and Gemini CLI write an image. A mark with no
+/// image text after it, or whose image cannot be decoded, gives `None`.
+#[must_use]
+pub fn images_recorded(text: &str, marker: &str) -> Vec<Option<String>> {
     let mut found = Vec::new();
     for line in text.lines().filter(|line| line.contains(marker)) {
-        let mut images = line.split("base64,").skip(1).peekable();
-        if images.peek().is_none() {
-            found.push(None);
+        if line.contains("base64,") {
+            for after in line.split("base64,").skip(1) {
+                let encoded: String = after
+                    .chars()
+                    .take_while(|character| {
+                        character.is_ascii_alphanumeric() || matches!(character, '+' | '/' | '=')
+                    })
+                    .collect();
+                found.push(digest_of_base64(&encoded));
+            }
+            continue;
         }
-        for after in images {
-            let encoded: String = after
-                .chars()
-                .take_while(|character| {
-                    character.is_ascii_alphanumeric() || matches!(character, '+' | '/' | '=')
-                })
-                .collect();
+        let marks: Vec<usize> = line.match_indices(marker).map(|(at, _)| at).collect();
+        for (index, &start) in marks.iter().enumerate() {
+            let end = marks.get(index + 1).copied().unwrap_or(line.len());
             found.push(
-                base64::engine::general_purpose::STANDARD
-                    .decode(encoded.as_bytes())
-                    .ok()
-                    .map(|bytes| hex_of(&kr_cbor::sha256(&bytes))),
+                line[start..end]
+                    .split_once(DATA_MEMBER)
+                    .and_then(|(_, after)| after.split('"').next())
+                    .and_then(digest_of_base64),
             );
         }
     }
@@ -369,6 +384,65 @@ mod tests {
                 Some(hex_of(&kr_cbor::sha256(b"first image"))),
                 Some(hex_of(&kr_cbor::sha256(b"second image")))
             ]
+        );
+    }
+
+    /// The digests of the images a record holds in a data member are read after the mark, as Claude
+    /// Code and Gemini CLI write them.
+    #[test]
+    fn the_images_a_record_holds_in_a_data_member_are_read_after_the_mark() {
+        let encode = |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
+        let digest = |bytes: &[u8]| Some(hex_of(&kr_cbor::sha256(bytes)));
+        let claude = format!(
+            r#"{{"type":"user","message":{{"content":[{{"type":"image","source":{{"type":"base64","media_type":"image/png","data":"{}"}}}},{{"type":"text","text":"x"}}]}}}}"#,
+            encode(b"first image")
+        );
+        assert_eq!(
+            images_recorded(
+                &format!("{claude}\n"),
+                r#""type":"image","source":{"type":"base64""#
+            ),
+            vec![digest(b"first image")],
+            "the digests of the images a record holds in a data member are read after the mark, as \
+             Claude Code and Gemini CLI write them"
+        );
+        let gemini = format!(
+            r#"{{"type":"user","content":[{{"inlineData":{{"data":"{}","mimeType":"image/png"}}}},{{"inlineData":{{"data":"{}","mimeType":"image/png"}}}}]}}"#,
+            encode(b"first image"),
+            encode(b"second image")
+        );
+        assert_eq!(
+            images_recorded(&format!("{gemini}\n"), r#""inlineData":{"data":""#),
+            vec![digest(b"first image"), digest(b"second image")],
+            "a message that holds several images gives one digest for each"
+        );
+    }
+
+    /// A mark with no image text after it gives `None`.
+    #[test]
+    fn a_mark_with_no_data_member_gives_none() {
+        let line = r#"{"type":"user","message":{"content":[{"type":"image","source":{"type":"base64","media_type":"image/png"}}]}}"#;
+        assert_eq!(
+            images_recorded(
+                &format!("{line}\n"),
+                r#""type":"image","source":{"type":"base64""#
+            ),
+            vec![None],
+            "a mark with no data member gives None"
+        );
+    }
+
+    /// An image whose text cannot be decoded gives `None`.
+    #[test]
+    fn text_in_the_data_member_that_is_not_base64_gives_none() {
+        let line = r#"{"type":"user","message":{"content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"not base64!"}}]}}"#;
+        assert_eq!(
+            images_recorded(
+                &format!("{line}\n"),
+                r#""type":"image","source":{"type":"base64""#
+            ),
+            vec![None],
+            "text in the data member that is not base64 gives None"
         );
     }
 }
