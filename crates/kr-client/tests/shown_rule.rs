@@ -34,6 +34,13 @@
 //!   names, a macro that defines a type or writes an `impl`, a module whose file a `#[path]` names,
 //!   an `include!`, a `cfg` inside a block, or a field type it cannot place.
 //!
+//! One log call is allowed: in `crates/kr-client/src/pairing/candidate.rs`, `tracing::warn!` with
+//! one string literal that has no holes and at most one field, `cause = ?name`. The words are
+//! fixed and the cause is one of a closed set of kinds, so nothing a host sent reaches a log. Any
+//! other log call there, and this one in any other file, is a finding. The rule reads only the
+//! call's form and cannot see the cause's type, so `ReadCause` and `Unsettled` must stay enums
+//! whose variants hold no text.
+//!
 //! Test code is not held to the rule: an item whose `cfg` cannot hold without `test`, and every
 //! file such an item declares, is passed over. An item that may compile without `test`, such as
 //! one under `cfg(any(test, unix))`, is read like any other.
@@ -1529,6 +1536,44 @@ fn plain_literal(argument: &[Located]) -> bool {
     matches!(argument, [Located { token: Token::Str(text), .. }] if holes(text).is_empty())
 }
 
+/// The one file that may log, and the one form of log call it may make.
+const WARNING_FILE: &str = "crates/kr-client/src/pairing/candidate.rs";
+
+/// Whether the macro named at `index` is `tracing::warn!` with one string literal that has no holes
+/// and at most one field, `cause = ?name`.
+fn fixed_warning(tokens: &[Located], index: usize) -> bool {
+    let path = index >= 3
+        && ident(tokens.get(index - 3)) == Some("tracing")
+        && punct(tokens.get(index - 2), ':')
+        && punct(tokens.get(index - 1), ':')
+        && !(index >= 4 && punct(tokens.get(index - 4), ':'));
+    if !(path
+        && ident(tokens.get(index)) == Some("warn")
+        && punct(tokens.get(index + 1), '!')
+        && punct(tokens.get(index + 2), '('))
+    {
+        return false;
+    }
+    match arguments(tokens, index + 2).unwrap_or_default().as_slice() {
+        [message] => plain_literal(message),
+        [field, message] => cause_field(field) && plain_literal(message),
+        _ => false,
+    }
+}
+
+/// Whether a field is `cause = ?name`, the name one plain identifier.
+fn cause_field(field: &[Located]) -> bool {
+    matches!(
+        field,
+        [
+            Located { token: Token::Ident(name), .. },
+            Located { token: Token::Punct('='), .. },
+            Located { token: Token::Punct('?'), .. },
+            Located { token: Token::Ident(_), .. },
+        ] if name == "cause"
+    )
+}
+
 /// The last path segment of the type that starts at `start`, skipping `&`, `dyn`, `mut` and
 /// lifetimes, with generic arguments dropped.
 fn named_type(tokens: &[Located], mut start: usize) -> Option<(String, usize)> {
@@ -2092,7 +2137,9 @@ fn check_source(
             "info" | "warn" | "error" | "debug" | "trace" | "event" | "span" | "log"
                 if next_is_bang =>
             {
-                find(line, word, "a log line");
+                if !(source.name == WARNING_FILE && fixed_warning(tokens, index)) {
+                    find(line, word, "a log line");
+                }
             }
             "print" | "println" if next_is_bang && held_output => {
                 find(line, word, "standard output written outside the writer");
@@ -3245,6 +3292,116 @@ fn what_the_rule_allows_is_not_named() {
                 }\n";
     let findings = findings_in("allowed", text);
     assert!(findings.is_empty(), "{findings:?}");
+}
+
+/// What the rule finds in the pairing's candidate and in another file of the client, each read as
+/// the text it is given.
+fn warnings_in(label: &str, candidate: &str, elsewhere: &str) -> (Vec<Finding>, Vec<Finding>) {
+    let scratch = Scratch::files(
+        label,
+        &[
+            ("crates/kr-client/src/lib.rs", "mod pairing;\nmod shown;\n"),
+            ("crates/kr-client/src/shown.rs", SHOWN_CONTROL),
+            (
+                "crates/kr-client/src/pairing/mod.rs",
+                "mod candidate;\nmod elsewhere;\n",
+            ),
+            ("crates/kr-client/src/pairing/candidate.rs", candidate),
+            ("crates/kr-client/src/pairing/elsewhere.rs", elsewhere),
+        ],
+    );
+    let sources = crate_sources(
+        &scratch.workspace,
+        &scratch.workspace.join("crates/kr-client/src/lib.rs"),
+        "kr_client",
+    )
+    .expect("the control is readable");
+    let findings = check(&sources);
+    let named = |file: &str| -> Vec<Finding> {
+        findings
+            .iter()
+            .filter(|finding| finding.file.ends_with(file))
+            .cloned()
+            .collect()
+    };
+    (named("pairing/candidate.rs"), named("pairing/elsewhere.rs"))
+}
+
+/// The one log call the rule allows, in the one file that may make it, is not named.
+#[test]
+fn the_pairings_fixed_warning_is_not_named() {
+    let text = "fn f(cause: Kind) {\n    \
+                tracing::warn!(\"fixed words\");\n    \
+                tracing::warn!(cause = ?cause, \"fixed words\");\n}\n";
+    let (candidate, _) = warnings_in("warning-allowed", text, "");
+    assert!(candidate.is_empty(), "{candidate:?}");
+}
+
+/// A log call of the pairing's candidate that can say more than that is named, and so is the
+/// allowed call in any other file of the client.
+#[test]
+fn a_warning_that_can_carry_more_is_named_and_so_is_the_allowed_one_elsewhere() {
+    let cases = [
+        (
+            "a field shown as text",
+            "tracing::warn!(%text, \"failed\");",
+        ),
+        (
+            "a cause shown as text",
+            "tracing::warn!(cause = %text, \"failed\");",
+        ),
+        (
+            "a cause that is not one identifier",
+            "tracing::warn!(cause = ?self.cause, \"failed\");",
+        ),
+        (
+            "a field of another name",
+            "tracing::warn!(kind = ?cause, \"failed\");",
+        ),
+        (
+            "two fields",
+            "tracing::warn!(cause = ?cause, more = ?cause, \"failed\");",
+        ),
+        ("a format argument", "tracing::warn!(\"failed: {}\", text);"),
+        (
+            "a format argument beside the cause",
+            "tracing::warn!(cause = ?cause, \"failed: {}\", text);",
+        ),
+        (
+            "a hole in the message",
+            "tracing::warn!(\"failed: {text}\");",
+        ),
+        (
+            "a hole in the message beside the cause",
+            "tracing::warn!(cause = ?cause, \"failed: {text}\");",
+        ),
+        ("a message that is not a literal", "tracing::warn!(text);"),
+        ("another level", "tracing::error!(\"failed\");"),
+        (
+            "an event",
+            "tracing::event!(tracing::Level::WARN, \"failed\");",
+        ),
+        ("a call not spelled through tracing", "warn!(\"failed\");"),
+        ("another logger", "log::warn!(\"failed\");"),
+    ];
+    for (class, call) in cases {
+        let text = format!("fn f(cause: Kind, text: String) {{\n    {call}\n}}\n");
+        let (candidate, _) = warnings_in("warning-more", &text, "");
+        assert!(
+            candidate
+                .iter()
+                .any(|finding| finding.line == 2 && finding.what.contains("a log line")),
+            "{class}: expected a log line at line 2, found {candidate:?}"
+        );
+    }
+    let allowed = "fn f(cause: Kind) {\n    tracing::warn!(cause = ?cause, \"fixed words\");\n}\n";
+    let (_, elsewhere) = warnings_in("warning-elsewhere", "", allowed);
+    assert!(
+        elsewhere
+            .iter()
+            .any(|finding| finding.line == 2 && finding.what.contains("a log line")),
+        "the allowed call in another file: expected a log line at line 2, found {elsewhere:?}"
+    );
 }
 
 /// Standard output is written in the writer and taken whole only where a protocol or a terminal
