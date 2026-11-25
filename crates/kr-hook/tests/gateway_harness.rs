@@ -109,18 +109,53 @@ fn a_group_ends_a_launch_when_it_is_dropped() {
     });
 }
 
+/// How long the system's process list is waited for.
+#[cfg(windows)]
+const LISTING_BOUND: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The system's process list as `tasklist.exe` prints it, or nothing when it has not printed it
+/// within [`LISTING_BOUND`], in which case it is ended.
+#[cfg(windows)]
+fn process_listing() -> Option<String> {
+    use std::io::Read as _;
+    use std::process::Stdio;
+
+    let tasklist = Path::new(&std::env::var_os("SystemRoot").expect("a system directory"))
+        .join("System32")
+        .join("tasklist.exe");
+    let mut listing = Command::new(tasklist)
+        .args(["/FO", "CSV", "/NH"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("the system lists its processes");
+    let mut output = listing.stdout.take().expect("the listing's output");
+    let reader = std::thread::spawn(move || {
+        let mut text = Vec::new();
+        let _ = output.read_to_end(&mut text);
+        text
+    });
+    let until = std::time::Instant::now() + LISTING_BOUND;
+    while matches!(listing.try_wait(), Ok(None)) {
+        if std::time::Instant::now() >= until {
+            common::session::end_and_collect(&mut listing);
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let text = reader.join().ok()?;
+    Some(String::from_utf8_lossy(&text).into_owned())
+}
+
 /// Whether one of `members` is the `ping` the harness's command starts, by the image name the
 /// system's own process list gives: the identity module reads no image name on Windows.
 #[cfg(windows)]
 fn ping_among(members: &[u32]) -> bool {
-    let tasklist = Path::new(&std::env::var_os("SystemRoot").expect("a system directory"))
-        .join("System32")
-        .join("tasklist.exe");
-    let listed = Command::new(tasklist)
-        .args(["/FO", "CSV", "/NH"])
-        .output()
-        .expect("the system lists its processes");
-    String::from_utf8_lossy(&listed.stdout).lines().any(|line| {
+    let Some(listed) = process_listing() else {
+        return false;
+    };
+    listed.lines().any(|line| {
         let mut fields = line.trim_start_matches('"').split("\",\"");
         let name = fields.next().unwrap_or_default();
         let number = fields.next().and_then(|number| number.parse::<u32>().ok());
