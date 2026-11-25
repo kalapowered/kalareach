@@ -226,8 +226,8 @@ pub fn a_daemon_killed_with_a_request_pending(host: &mut Hosted) -> Result<(), R
     host.release("tick1");
     host.restart_daemon();
     reads_equal_after_a_restart(&before, &host.reads())?;
-    host.answer("allow-once");
-    one_reply_with_the_chosen_id(&host.record(), "allow-once")?;
+    host.answer("proceed_once");
+    one_reply_with_the_chosen_id(&host.record(), "proceed_once")?;
     ends_with_the_session(host.closes_the_session())?;
     host.second_session(&restart_script());
     refused_as_a_closed_sessions(&host.kills_the_daemon_then_the_worker())
@@ -235,10 +235,10 @@ pub fn a_daemon_killed_with_a_request_pending(host: &mut Hosted) -> Result<(), R
 
 /// Case 5b-4: two answers at once, and the same answer again after the daemon reconnected.
 pub fn two_answers_at_once(host: &mut Hosted) -> Result<(), Red> {
-    let accepted = host.answer_at_once("allow-once", 2);
+    let accepted = host.answer_at_once("proceed_once", 2);
     host.kill_daemon();
     host.restart_daemon();
-    host.answer("allow-once");
+    host.answer("proceed_once");
     one_answer_wins(accepted, &host.record())
 }
 
@@ -250,7 +250,7 @@ pub fn the_same_id_in_a_second_instance(host: &mut Hosted) -> Result<(), Red> {
 
 /// Case 5b-8: a fresh request after a restart.
 pub fn a_fresh_request_after_a_restart(host: &mut Hosted) -> Result<(), Red> {
-    host.answer("allow-once");
+    host.answer("proceed_once");
     host.kill_daemon();
     host.restart_daemon();
     host.release("second");
@@ -294,20 +294,20 @@ fn the_judge_of_the_four_reads_names_its_red_when_the_request_is_gone_after_the_
 
 #[test]
 fn the_judge_of_one_reply_names_its_red_when_the_answer_reached_the_stand_in_twice() {
-    let once = [response_line("allow-once")];
-    let twice = [response_line("allow-once"), response_line("allow-once")];
-    assert_eq!(one_reply_with_the_chosen_id(&once, "allow-once"), Ok(()));
+    let once = [response_line("proceed_once")];
+    let twice = [response_line("proceed_once"), response_line("proceed_once")];
+    assert_eq!(one_reply_with_the_chosen_id(&once, "proceed_once"), Ok(()));
     assert_eq!(
-        one_reply_with_the_chosen_id(&twice, "allow-once"),
+        one_reply_with_the_chosen_id(&twice, "proceed_once"),
         Err(red("5b-2"))
     );
     assert_eq!(
-        one_reply_with_the_chosen_id(&once, "reject-once"),
+        one_reply_with_the_chosen_id(&once, "cancel"),
         Err(red("5b-2")),
         "a reply with another id is not the chosen one"
     );
     assert_eq!(
-        one_reply_with_the_chosen_id(&[], "allow-once"),
+        one_reply_with_the_chosen_id(&[], "proceed_once"),
         Err(red("5b-2")),
         "no reply is not one"
     );
@@ -337,8 +337,8 @@ fn the_judge_of_the_close_names_its_red_when_the_agent_keeps_running() {
 
 #[test]
 fn the_judge_of_the_concurrent_answers_names_its_red_when_both_reach_the_stand_in() {
-    let once = [response_line("allow-once")];
-    let twice = [response_line("allow-once"), response_line("allow-once")];
+    let once = [response_line("proceed_once")];
+    let twice = [response_line("proceed_once"), response_line("proceed_once")];
     assert_eq!(one_answer_wins(1, &once), Ok(()));
     assert_eq!(one_answer_wins(2, &twice), Err(red("5b-4")));
     assert_eq!(
@@ -449,8 +449,8 @@ pub fn a_gemini_shaped_agent_exits_after_dispatch(host: &mut Hosted) -> Result<(
 /// The agent exits after one answer it used and one it did not, and the control `id` judges the
 /// receipts.
 fn exits_after_two_answers(id: &str, host: &mut Hosted) -> Result<(), Red> {
-    host.answer_next("allow-once");
-    host.answer_next("allow-once");
+    host.answer_next("proceed_once");
+    host.answer_next("proceed_once");
     host.release("die");
     the_exit_leaves_a_confirmed_answer_confirmed(id, &host.receipts())
 }
@@ -607,7 +607,7 @@ pub fn late_request_script() -> Value {
 
 /// Case 5b-5: a cancel and an answer at once.
 pub fn a_cancel_racing_an_approval(host: &mut Hosted) -> Result<(), Red> {
-    let race = host.cancel_and_answer_at_once("allow-once");
+    let race = host.cancel_and_answer_at_once("proceed_once");
     one_winner_and_the_call_settles(&race, &host.record_after("reply"))
 }
 
@@ -641,7 +641,7 @@ fn the_judge_of_the_race_names_its_red_when_the_cancel_leaves_the_call_unsettled
         answer_accepted: true,
     };
     let settled_by_cancel = [cancelled_response_line(0), sent_line("reply")];
-    let settled_by_answer = [response_line("allow-once"), sent_line("reply")];
+    let settled_by_answer = [response_line("proceed_once"), sent_line("reply")];
     assert_eq!(
         one_winner_and_the_call_settles(&cancel_won, &settled_by_cancel),
         Ok(())
@@ -690,7 +690,7 @@ fn the_judge_of_a_late_request_names_its_red_when_the_request_is_left_pending() 
     );
     let chosen = [
         cancelled_response_line(0),
-        response_line_for(1, "allow-once"),
+        response_line_for(1, "proceed_once"),
         sent_line("turn end"),
     ];
     assert_eq!(
@@ -845,7 +845,7 @@ pub fn completed_after_a_cancel_script() -> Value {
 
 /// Case 5b-14: the agent aborts the call after the answer.
 pub fn an_abort_after_the_answer(host: &mut Hosted) -> Result<(), Red> {
-    host.answer_next("allow-once");
+    host.answer_next("proceed_once");
     an_abort_leaves_the_receipt_unknown(&host.receipt_becoming("unknown"))
 }
 
@@ -853,7 +853,7 @@ pub fn an_abort_after_the_answer(host: &mut Hosted) -> Result<(), Red> {
 pub fn an_answer_and_three_hundred_seconds(host: &mut Hosted) -> Result<(), Red> {
     host.release("go");
     host.waits_for_a_request();
-    host.answer_next("allow-once");
+    host.answer_next("proceed_once");
     host.advance_clock(300);
     let receipt = host.receipt_becoming("unknown");
     the_deadline_leaves_the_receipt_unknown(&AtTheDeadline {
@@ -867,7 +867,7 @@ pub fn an_answer_and_three_hundred_seconds(host: &mut Hosted) -> Result<(), Red>
 pub fn a_decline_and_a_failed_update(host: &mut Hosted) -> Result<(), Red> {
     host.release("go");
     host.waits_for_a_request();
-    host.answer_next("reject-once");
+    host.answer_next("cancel");
     a_failed_update_leaves_a_decline_unknown(&host.receipt_becoming("unknown"))
 }
 
@@ -876,7 +876,7 @@ pub fn a_decline_and_a_failed_update(host: &mut Hosted) -> Result<(), Red> {
 pub fn an_allow_a_deadline_and_a_late_update(host: &mut Hosted) -> Result<(), Red> {
     host.release("go");
     host.waits_for_a_request();
-    host.answer_next("allow-once");
+    host.answer_next("proceed_once");
     host.advance_clock(301);
     let before = host.receipt_becoming("unknown");
     host.release("late");
@@ -885,7 +885,7 @@ pub fn an_allow_a_deadline_and_a_late_update(host: &mut Hosted) -> Result<(), Re
 
 /// Case 5b-23: an allow, the person's cancel, and then the call's `completed` update.
 pub fn a_completed_update_after_a_cancel(host: &mut Hosted) -> Result<(), Red> {
-    host.answer_next("allow-once");
+    host.answer_next("proceed_once");
     host.cancel();
     host.release("done");
     an_allow_stays_applied_after_a_cancel("5b-23", &host.receipt_becoming("applied"))
@@ -1427,18 +1427,18 @@ pub fn a_request_after_a_cancel_of_a_waiting_agent(host: &mut Hosted) -> Result<
 /// Case 5b-13: three declines, and what each receipt reads at its boundary: 300 seconds for the
 /// first, the agent's next request for the second and its reply for the third.
 pub fn three_declines_and_no_update(host: &mut Hosted) -> Result<(), Red> {
-    host.answer_next("reject-once");
+    host.answer_next("cancel");
     let first = host.receipt_becoming("applied");
     host.advance_clock(300);
     let first_settled = host.receipt_becoming("unknown");
     host.release("second");
     host.waits_for_a_request();
-    host.answer_next("reject-once");
+    host.answer_next("cancel");
     let second = host.receipt_becoming("applied");
     host.release("third");
     host.waits_for_a_request();
     let second_settled = host.receipt_becoming("unknown");
-    host.answer_next("reject-once");
+    host.answer_next("cancel");
     let third = host.receipt_becoming("applied");
     host.release("reply");
     let third_settled = host.receipt_becoming("unknown");
@@ -1463,7 +1463,7 @@ pub fn an_approval_at_thirty_one_seconds_with_a_prompt_in_flight(
 /// Case 5b-23g: an allow, the person's cancel, and then the call's `completed` update, with the
 /// Gemini-shaped agent.
 pub fn a_completed_update_after_a_cancel_of_a_waiting_agent(host: &mut Hosted) -> Result<(), Red> {
-    host.answer_next("allow-once");
+    host.answer_next("proceed_once");
     host.cancel();
     host.release("done");
     an_allow_stays_applied_after_a_cancel("5b-23g", &host.receipt_becoming("applied"))
@@ -1589,7 +1589,7 @@ pub fn a_fresh_request_is_decoded_by_the_pinned_table(
     record: &[Value],
 ) -> Result<(), Red> {
     ensure(
-        decoded.before == decoded.after && option_of(record, 1) == Some("allow-once"),
+        decoded.before == decoded.after && option_of(record, 1) == Some("proceed_once"),
         "6b-2",
     )
 }
@@ -1691,12 +1691,12 @@ pub fn an_upgrade_while_the_agent_runs(host: &mut Hosted) -> Result<(), Red> {
 /// Case 6b-2: a fresh request after the upgrade, answered with the pinned table's identifier.
 pub fn a_fresh_request_after_an_upgrade(host: &mut Hosted) -> Result<(), Red> {
     let before = host.decoded_options();
-    host.answer_next("allow-once");
+    host.answer_next("proceed_once");
     host.upgrades_the_installation();
     host.release("after");
     host.waits_for_a_request();
     let after = host.decoded_options();
-    host.answer_next("allow-once");
+    host.answer_next("proceed_once");
     a_fresh_request_is_decoded_by_the_pinned_table(&Decoded { before, after }, &host.record())
 }
 
@@ -1753,7 +1753,7 @@ fn the_judge_of_a_fresh_request_names_its_red_when_the_upgraded_table_decodes_it
         before: before.to_owned(),
         after: after.to_owned(),
     };
-    let answered = [response_line_for(1, "allow-once")];
+    let answered = [response_line_for(1, "proceed_once")];
     assert_eq!(
         a_fresh_request_is_decoded_by_the_pinned_table(&decoded("options", "options"), &answered),
         Ok(())
@@ -1766,7 +1766,7 @@ fn the_judge_of_a_fresh_request_names_its_red_when_the_upgraded_table_decodes_it
     assert_eq!(
         a_fresh_request_is_decoded_by_the_pinned_table(
             &decoded("options", "options"),
-            &[response_line_for(1, "allow-always")]
+            &[response_line_for(1, "proceed_always")]
         ),
         Err(red("6b-2")),
         "the answer carried another identifier than the pinned table's"
@@ -1891,7 +1891,7 @@ pub fn chunk_script() -> Value {
 /// Cases 6b-5 and 6b-3g: the first request is answered, the package is upgraded before the agent
 /// reads its chunk, and a second agent is started from the upgraded installation.
 pub fn an_upgrade_while_a_gemini_shaped_agent_runs(host: &mut Hosted) -> Result<(), Red> {
-    host.answer_next("allow-once");
+    host.answer_next("proceed_once");
     let chunks = host.upgrades_the_package();
     host.release("import");
     the_copys_chunk_is_read_after_the_upgrade(&chunks, host.chunk_read().as_deref())?;
@@ -1901,7 +1901,7 @@ pub fn an_upgrade_while_a_gemini_shaped_agent_runs(host: &mut Hosted) -> Result<
 
 /// Case 6b-6: the same upgrade, with the agent started from the installation and not from a copy.
 pub fn an_upgrade_while_the_agent_runs_from_the_installation(host: &mut Hosted) -> Result<(), Red> {
-    host.answer_next("allow-once");
+    host.answer_next("proceed_once");
     let chunks = host.upgrades_the_package();
     host.release("import");
     without_the_copy_the_upgraded_chunk_is_read(&chunks, host.chunk_read().as_deref())

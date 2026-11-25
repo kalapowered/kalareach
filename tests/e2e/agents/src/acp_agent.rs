@@ -34,7 +34,7 @@
 //! | --- | --- |
 //! | `{"say": "text"}` | sends an `agent_message_chunk` update |
 //! | `{"call": {"id": "c1", "kind": "execute"}}` | sends a `tool_call` update for a call, pending |
-//! | `{"ask": "c1"}` | sends `session/request_permission` for the call and waits for the response, offering `allow-once`, `allow-always` and `reject-once` |
+//! | `{"ask": "c1"}` | sends `session/request_permission` for the call and waits for the response, offering `proceed_once`, `proceed_always` and `cancel` |
 //! | `{"update": {"call": "c1", "status": "in_progress"}}` | sends a `tool_call_update` |
 //! | `{"when": {"outcome": "allowed", "then": [...]}}` | runs its steps if the last answer to a request was `allowed`, `declined` or `cancelled` |
 //! | `{"import": "name"}` | reads the file `name` from the folder of the package's main file and writes the bytes it read to [`MARKER_FILE`] |
@@ -694,15 +694,17 @@ impl<W: Write> Agent<W> {
 
     /// Sends a permission request for `call` and makes the turn wait for its response.
     fn ask_for(&mut self, call: &str) {
+        // The identifiers and kinds that both agents offer, as the host maps them: `proceed_once`
+        // allows the call once, `proceed_always` allows it for good, and `cancel` rejects it once.
         let options = [
-            ("allow-once", "Allow once", "allow_once", Outcome::Allowed),
+            ("proceed_once", "Allow once", "allow_once", Outcome::Allowed),
             (
-                "allow-always",
+                "proceed_always",
                 "Always allow",
                 "allow_always",
                 Outcome::Allowed,
             ),
-            ("reject-once", "Reject", "reject_once", Outcome::Declined),
+            ("cancel", "Reject", "reject_once", Outcome::Declined),
         ];
         self.outcomes = options
             .iter()

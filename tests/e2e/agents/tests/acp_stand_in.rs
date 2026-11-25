@@ -246,7 +246,7 @@ fn an_allowed_request_is_followed_by_the_calls_updates_and_the_prompts_reply() {
         .collect();
     assert_eq!(kinds, ["allow_once", "allow_always", "reject_once"]);
     assert!(agent.is_quiet(), "the turn waits for the answer");
-    agent.choose(0, "allow-once");
+    agent.choose(0, "proceed_once");
     assert_eq!(agent.frame()["params"]["update"]["status"], "in_progress");
     assert_eq!(agent.frame()["params"]["update"]["status"], "completed");
     let reply = agent.frame();
@@ -258,7 +258,43 @@ fn an_allowed_request_is_followed_by_the_calls_updates_and_the_prompts_reply() {
         .filter(|line| line["received"] == "response")
         .collect();
     assert_eq!(answered.len(), 1, "one response was received");
-    assert_eq!(answered[0]["option"], "allow-once");
+    assert_eq!(answered[0]["option"], "proceed_once");
+}
+
+#[test]
+fn both_shapes_offer_proceed_once_proceed_always_and_cancel_with_their_kinds() {
+    let package = installed_package();
+    let agents = [
+        Played::start(QODER, &guarded_turn()),
+        gemini_from(package.path(), &guarded_turn()),
+    ];
+    for mut agent in agents {
+        agent.open_session();
+        agent.prompt(3, "run it");
+        agent.frame();
+        agent.frame();
+        let request = agent.frame();
+        assert_eq!(request["method"], "session/request_permission");
+        let offered: Vec<(&str, &str)> = request["params"]["options"]
+            .as_array()
+            .expect("options")
+            .iter()
+            .map(|option| {
+                (
+                    option["optionId"].as_str().expect("an identifier"),
+                    option["kind"].as_str().expect("a kind"),
+                )
+            })
+            .collect();
+        assert_eq!(
+            offered,
+            [
+                ("proceed_once", "allow_once"),
+                ("proceed_always", "allow_always"),
+                ("cancel", "reject_once"),
+            ]
+        );
+    }
 }
 
 #[test]
@@ -269,7 +305,7 @@ fn a_declined_request_runs_the_steps_for_a_decline_and_not_those_for_an_allow() 
     for _ in 0..3 {
         agent.frame();
     }
-    agent.choose(0, "reject-once");
+    agent.choose(0, "cancel");
     assert_eq!(agent.frame()["params"]["update"]["status"], "failed");
     assert_eq!(agent.frame()["result"]["stopReason"], "end_turn");
     assert!(agent.is_quiet(), "no update of an allowed call follows");
@@ -587,7 +623,7 @@ fn the_agent_records_what_it_asked_and_how_each_call_and_turn_ended() {
     for _ in 0..2 {
         agent.frame();
     }
-    agent.choose(0, "allow-once");
+    agent.choose(0, "proceed_once");
     agent.frame();
     agent.frame();
     let asked = sent(&agent, "request");
@@ -689,7 +725,7 @@ fn the_gemini_shaped_stand_in_refuses_a_prompt_that_arrives_while_a_turn_runs() 
         refusal["error"]["code"].is_i64(),
         "a second prompt is refused with an error: {refusal}"
     );
-    agent.choose(0, "allow-once");
+    agent.choose(0, "proceed_once");
     let reply = agent.frame();
     assert_eq!(
         (reply["id"].as_u64(), stop(&reply)),
@@ -735,7 +771,7 @@ fn an_import_reads_the_chunk_from_the_folder_of_the_main_file_only_when_its_step
         "the chunk is not read before the first answer"
     );
     assert!(sent(&agent, "import").is_empty());
-    agent.choose(0, "allow-once");
+    agent.choose(0, "proceed_once");
     assert_eq!(stop(&agent.frame()), "end_turn");
     let original = std::fs::read(package.path().join("chunk.js")).expect("the chunk");
     assert_eq!(agent.marker(), Some(original.clone()));
@@ -749,7 +785,7 @@ fn an_agent_started_from_a_copy_reads_the_chunk_of_the_copy_after_the_installati
     let mut agent = gemini_from(copy.path(), &importing_turn());
     at_the_first_request(&mut agent);
     std::fs::write(installation.path().join("chunk.js"), UPGRADED_CHUNK).expect("the upgrade");
-    agent.choose(0, "allow-once");
+    agent.choose(0, "proceed_once");
     agent.frame();
     let original = std::fs::read(package_source().join("chunk.js")).expect("the chunk");
     assert_eq!(agent.marker(), Some(original));
@@ -761,7 +797,7 @@ fn an_agent_started_from_the_installation_reads_the_chunk_the_upgrade_put_there(
     let mut agent = gemini_from(installation.path(), &importing_turn());
     at_the_first_request(&mut agent);
     std::fs::write(installation.path().join("chunk.js"), UPGRADED_CHUNK).expect("the upgrade");
-    agent.choose(0, "allow-once");
+    agent.choose(0, "proceed_once");
     agent.frame();
     assert_eq!(agent.marker(), Some(UPGRADED_CHUNK.to_vec()));
 }
