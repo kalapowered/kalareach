@@ -794,9 +794,9 @@ fn open_registry(path: &Path) -> kr_controller::error::Result<kr_controller::reg
 }
 
 /// A registry at schema version 16, with the device table as it was, is brought to the version
-/// this build writes in one step: both rows read back as they were, the key stays fixed, the
-/// endpoint identity of a revoked row is free for a new record and that of a live row is not, and
-/// the file's schema equals a new file's.
+/// this build writes in two steps, 16 to 18 and 18 to 19: both rows read back as they were, the
+/// key stays fixed, the endpoint identity of a revoked row is free for a new record and that of a
+/// live row is not, and the file's schema equals a new file's.
 #[test]
 fn a_registry_at_16_is_rebuilt_so_an_ended_endpoint_identity_is_free() {
     for oldest in [false, true] {
@@ -900,7 +900,8 @@ fn without_the_columns_added_after(path: &Path, version: i64) {
     }
 }
 
-/// Every version a registry can be left at, from 1 to 16 (17 was written by no release), is
+/// Every version a registry can be left at with the earlier device table, from 1 to 16 (17 was
+/// written by no release, and a registry at 18 or later has the rebuilt table), is
 /// brought to the version this build writes with the device table rebuilt and both rows carried
 /// across, and the file's device schema equals a new file's. The file is made as
 /// `registry_left_at` makes it: a registry as this build makes it, its device table put back to
@@ -913,7 +914,7 @@ fn a_registry_left_at_any_earlier_version_is_brought_forward_to_the_shape_of_a_n
     let temp = tempfile::tempdir().expect("a directory on the internal disk");
     let fresh = temp.path().join("fresh.db");
     drop(open_registry(&fresh).expect("a new registry"));
-    for version in (1..kr_controller::registry::SCHEMA_VERSION).filter(|version| *version != 17) {
+    for version in 1..=16 {
         for oldest in [false, true] {
             let path = temp.path().join(format!("from-{version}-{oldest}.db"));
             registry_left_at(&path, version, oldest);
@@ -940,7 +941,8 @@ fn a_registry_left_at_any_earlier_version_is_brought_forward_to_the_shape_of_a_n
     }
 }
 
-/// A second open of a migrated registry changes nothing, and a registry at 18 is not rebuilt.
+/// A second open of a registry that was brought forward from 16 changes nothing: the device table
+/// keeps its schema and its rows.
 #[test]
 fn a_registry_that_was_brought_forward_is_not_rebuilt_again() {
     let temp = tempfile::tempdir().expect("a directory on the internal disk");

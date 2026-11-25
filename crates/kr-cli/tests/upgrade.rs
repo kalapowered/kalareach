@@ -1650,7 +1650,7 @@ fn the_version_of_an_attention_store_that_is_not_at_13_is_not_written_back() {
 /// KR-REQ-26.10, KR-REQ-26.08: a rollback to the release before goes on while only its session is
 /// live, and waits, exit 9, naming the session, while a session of this release is live.
 ///
-/// The registry is at schema version 18 under this release's daemon, which the release before does
+/// The registry is at schema version 19 under this release's daemon, which the release before does
 /// not read, so a rollback to it is refused
 /// (`a_rollback_to_the_release_before_is_refused_for_the_registry_it_cannot_read`). This case asks
 /// about sessions and `host.info`, not about the registry, so it puts the registry back to the

@@ -66,7 +66,7 @@ use crate::error::{ControllerError, Result};
 /// opens the other three before it writes the version, at a daemon's start and when an update
 /// brings the file forward alike, so a file that records `N` has all four at the shape `N` stands
 /// for.
-pub const SCHEMA_VERSION: i64 = 18;
+pub const SCHEMA_VERSION: i64 = 19;
 
 /// The newest schema version above [`SCHEMA_VERSION`] that this build reads without writing it.
 ///
@@ -76,7 +76,7 @@ pub const SCHEMA_VERSION: i64 = 18;
 /// update reads it. Its own next acceptance records the document at the version it writes, in a
 /// registry that stays at this version. A copy of the accepted document that this build cannot
 /// read stops the daemon's start ([`crate::config::from_record`]).
-pub const READS_THROUGH_SCHEMA_VERSION: i64 = 19;
+pub const READS_THROUGH_SCHEMA_VERSION: i64 = 20;
 
 /// The oldest schema version this build brings forward. A writer that stops handling an older
 /// shape raises this past the last version that wrote it.
@@ -1046,6 +1046,7 @@ impl Registry {
                 self.migrate_14_to_15()?;
                 self.migrate_15_to_16()?;
                 self.migrate_16_to_18()?;
+                self.migrate_18_to_19()?;
             }
             Some(2) => {
                 self.migrate_2_to_3()?;
@@ -1063,6 +1064,7 @@ impl Registry {
                 self.migrate_14_to_15()?;
                 self.migrate_15_to_16()?;
                 self.migrate_16_to_18()?;
+                self.migrate_18_to_19()?;
             }
             Some(3) => {
                 self.migrate_3_to_4()?;
@@ -1079,6 +1081,7 @@ impl Registry {
                 self.migrate_14_to_15()?;
                 self.migrate_15_to_16()?;
                 self.migrate_16_to_18()?;
+                self.migrate_18_to_19()?;
             }
             Some(4) => {
                 self.migrate_4_to_5()?;
@@ -1094,6 +1097,7 @@ impl Registry {
                 self.migrate_14_to_15()?;
                 self.migrate_15_to_16()?;
                 self.migrate_16_to_18()?;
+                self.migrate_18_to_19()?;
             }
             Some(5) => {
                 self.migrate_5_to_6()?;
@@ -1108,6 +1112,7 @@ impl Registry {
                 self.migrate_14_to_15()?;
                 self.migrate_15_to_16()?;
                 self.migrate_16_to_18()?;
+                self.migrate_18_to_19()?;
             }
             Some(6) => {
                 self.migrate_6_to_7()?;
@@ -1121,6 +1126,7 @@ impl Registry {
                 self.migrate_14_to_15()?;
                 self.migrate_15_to_16()?;
                 self.migrate_16_to_18()?;
+                self.migrate_18_to_19()?;
             }
             Some(7) => {
                 self.migrate_7_to_8()?;
@@ -1133,6 +1139,7 @@ impl Registry {
                 self.migrate_14_to_15()?;
                 self.migrate_15_to_16()?;
                 self.migrate_16_to_18()?;
+                self.migrate_18_to_19()?;
             }
             Some(8) => {
                 self.migrate_8_to_9()?;
@@ -1144,6 +1151,7 @@ impl Registry {
                 self.migrate_14_to_15()?;
                 self.migrate_15_to_16()?;
                 self.migrate_16_to_18()?;
+                self.migrate_18_to_19()?;
             }
             Some(9) => {
                 self.migrate_9_to_10()?;
@@ -1154,6 +1162,7 @@ impl Registry {
                 self.migrate_14_to_15()?;
                 self.migrate_15_to_16()?;
                 self.migrate_16_to_18()?;
+                self.migrate_18_to_19()?;
             }
             Some(10) => {
                 self.migrate_10_to_11()?;
@@ -1163,6 +1172,7 @@ impl Registry {
                 self.migrate_14_to_15()?;
                 self.migrate_15_to_16()?;
                 self.migrate_16_to_18()?;
+                self.migrate_18_to_19()?;
             }
             Some(11) => {
                 self.migrate_11_to_12()?;
@@ -1171,6 +1181,7 @@ impl Registry {
                 self.migrate_14_to_15()?;
                 self.migrate_15_to_16()?;
                 self.migrate_16_to_18()?;
+                self.migrate_18_to_19()?;
             }
             Some(12) => {
                 self.migrate_12_to_13()?;
@@ -1178,29 +1189,37 @@ impl Registry {
                 self.migrate_14_to_15()?;
                 self.migrate_15_to_16()?;
                 self.migrate_16_to_18()?;
+                self.migrate_18_to_19()?;
             }
             Some(13) => {
                 self.migrate_13_to_14()?;
                 self.migrate_14_to_15()?;
                 self.migrate_15_to_16()?;
                 self.migrate_16_to_18()?;
+                self.migrate_18_to_19()?;
             }
             Some(14) => {
                 self.migrate_14_to_15()?;
                 self.migrate_15_to_16()?;
                 self.migrate_16_to_18()?;
+                self.migrate_18_to_19()?;
             }
             Some(15) => {
                 self.migrate_15_to_16()?;
                 self.migrate_16_to_18()?;
+                self.migrate_18_to_19()?;
             }
-            Some(16) => self.migrate_16_to_18()?,
+            Some(16) => {
+                self.migrate_16_to_18()?;
+                self.migrate_18_to_19()?;
+            }
             Some(17) => {
                 return Err(ControllerError::RegistryUnavailable {
                     detail: "this registry is at schema version 17, which no release wrote"
                         .to_owned(),
                 });
             }
+            Some(18) => self.migrate_18_to_19()?,
             Some(version) => {
                 return Err(ControllerError::RegistryUnavailable {
                     detail: format!(
@@ -1629,7 +1648,7 @@ impl Registry {
     /// found and never names the column, so the rows it writes carry no record, and the statements
     /// that keep an answer leave an answer that already has one as it is. That release describes 16
     /// as schema 15 whose copy of the accepted document can be at version 4, with no table or
-    /// column added, which is not what 16 is here: the document's next version takes 19. A release
+    /// column added, which is not what 16 is here: the document's version 4 takes 19. A release
     /// that reads 15 only refuses a registry at 16, so a rollback to it is refused.
     ///
     /// This migration goes in the first release after every install has opened the registry at
@@ -1677,6 +1696,22 @@ impl Registry {
             let _ = self.connection.execute_batch("ROLLBACK");
             return Err(ControllerError::registry(error));
         }
+        Ok(())
+    }
+
+    /// Version 18 to 19: the configuration document gained the owner's description budgets.
+    ///
+    /// The member belongs to the document's ceilings, so the registry's copy of the accepted
+    /// document can hold it, and a daemon that reads the registry reads that copy as the document
+    /// at version 4. No table changes and no row is rewritten: a copy accepted before holds no
+    /// member, and the next acceptance records the document at the version this build writes.
+    ///
+    /// This migration goes in the first release after every install has opened the registry at
+    /// this version.
+    fn migrate_18_to_19(&self) -> Result<()> {
+        self.connection
+            .execute("UPDATE schema_version SET version = 19", [])
+            .map_err(ControllerError::registry)?;
         Ok(())
     }
 
@@ -4890,10 +4925,10 @@ mod tests {
         assert_eq!(document.revision, 4);
     }
 
-    /// KR-REQ-22.10: a registry at the version before the raise, and at the one before that, comes
-    /// forward to this version by the one statement that writes it, and holds the tables a new
-    /// registry has: the raise changes the version and the document the registry may copy, and no
-    /// table.
+    /// KR-REQ-22.10: a registry at the version before the raise, and at 16, the one before the
+    /// version no release wrote, comes forward to this version by the steps that write it, and
+    /// holds the tables a new registry has: the raise changes the version and the document the
+    /// registry may copy, and no table.
     #[test]
     fn a_registry_at_the_two_versions_before_comes_forward_with_the_tables_a_new_one_has() {
         let shape = |path: &std::path::Path| -> Vec<(String, Option<String>)> {
@@ -4914,7 +4949,7 @@ mod tests {
             version(&Registry::open(&fresh_path, environment()).expect("opens")),
             SCHEMA_VERSION
         );
-        for from in [SCHEMA_VERSION - 2, SCHEMA_VERSION - 1] {
+        for from in (SCHEMA_VERSION - 3..SCHEMA_VERSION).filter(|from| *from != 17) {
             let directory = tempfile::tempdir().expect("a directory");
             let path = directory.path().join("registry.sqlite3");
             drop(Registry::open(&path, environment()).expect("a registry"));

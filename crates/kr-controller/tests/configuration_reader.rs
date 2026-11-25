@@ -1,7 +1,7 @@
 //! A daemon over a registry one schema version ahead of the one it writes, and over the
 //! configuration document that registry accepted at the next version.
 //!
-//! A later release writes the next registry version and records the document it accepted at version 4 of
+//! A later release writes the next registry version and records the document it accepted at version 5 of
 //! the document. This build reads both as found when the document holds nothing it lacks. When the
 //! document holds a ceiling this build lacks, the daemon refuses to start: the copy decides the
 //! restrictions in force from the first request, and read as no copy it would lift the rights
@@ -210,12 +210,16 @@ async fn a_daemon_starts_over_the_next_registry_version_and_the_document_it_acce
     );
 }
 
+/// The registry's schema version in 0.78.0, the release before this one: a fact about a release
+/// that shipped, so a number here and not a constant of this build.
+const THE_RELEASE_BEFORE_WRITES: i64 = 15;
+
 /// KR-REQ-26.13, KR-REQ-26.10: a daemon starts over the copy of the document that the release
 /// before this one accepted, which records it at version 3 with the level it states, and over the
-/// same document on disk. The registry's version is the one it has; the daemon reads the copy
-/// through the document reader, so a copy that reader refuses would stop the start. The first
-/// question about what is in force accepts the document and records it at the version this build
-/// writes.
+/// same document on disk. The registry is at the version that release wrote, and the start brings
+/// it forward; the daemon reads the copy through the document reader, so a copy that reader
+/// refuses would stop the start. The first question about what is in force accepts the document
+/// and records it at the version this build writes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_daemon_starts_over_the_document_the_release_before_it_accepted_at_version_3() {
     let temp = a_stopped_environment().await;
@@ -224,8 +228,7 @@ async fn a_daemon_starts_over_the_document_the_release_before_it_accepted_at_ver
         saved.contains("\"version\": 3") && saved.contains("\"level\": 1"),
         "the saved copy is a version-3 document that states its level"
     );
-    let registry_version = recorded(&temp).0;
-    as_a_later_release_left_it(&temp, registry_version, Some(&saved));
+    as_a_later_release_left_it(&temp, THE_RELEASE_BEFORE_WRITES, Some(&saved));
     write_the_document(&temp, &saved);
 
     let controller = match start(&temp).await {
@@ -248,8 +251,9 @@ async fn a_daemon_starts_over_the_document_the_release_before_it_accepted_at_ver
     assert_eq!(as_this_build_reads_it.version, configuration::VERSION);
     let accepted = recorded(&temp);
     assert_eq!(
-        accepted.0, registry_version,
-        "the registry's version is as it was"
+        accepted.0,
+        kr_controller::registry::SCHEMA_VERSION,
+        "the start brought the registry forward to the version this build writes"
     );
     assert_eq!(
         accepted.1.as_deref(),
