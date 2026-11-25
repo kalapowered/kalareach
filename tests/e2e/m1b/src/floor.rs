@@ -675,4 +675,38 @@ mod tests {
         );
         world.clean();
     }
+
+    /// The floor opens again as the daemon opens it while its name still names the file held. A name
+    /// that names another file, and a floor that the daemon would not open, each fail the open again
+    /// and say which.
+    #[test]
+    fn the_floor_opens_again_while_its_name_names_the_file_held_and_says_why_it_cannot() {
+        let world = world("open-again", 1_000_000);
+        let watch = world.watch();
+        assert_eq!(watch.open_again(&world.path, world.environment), Ok(()));
+        // The file held is still at the name, and the daemon would refuse it: another environment's.
+        let another = EnvironmentId::new(kr_ipc::new_uuid());
+        assert_eq!(
+            watch.open_again(&world.path, another),
+            Err(
+                "the clock floor cannot be opened again before the attempt: the clock floor file \
+                 belongs to another environment"
+                    .to_owned()
+            )
+        );
+        // A copy on a new inode opens as the floor of this environment, so only the name tells it
+        // from the file held.
+        let staging = world.path.with_extension("copy");
+        std::fs::copy(&world.path, &staging).expect("a copy");
+        std::fs::rename(&staging, &world.path).expect("renamed over");
+        assert_eq!(
+            watch.open_again(&world.path, world.environment),
+            Err(
+                "the clock floor cannot be opened again before the attempt: its name no longer \
+                 names the file held since the start"
+                    .to_owned()
+            )
+        );
+        world.clean();
+    }
 }

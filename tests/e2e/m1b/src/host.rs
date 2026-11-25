@@ -1295,6 +1295,11 @@ impl<'r> Host<'r> {
     /// Kills the daemon with nothing said to it, as a crash does, and waits until it has gone.
     /// The sessions it started go on; [`Self::start_daemon`] starts a daemon over the same tree.
     ///
+    /// Where the agent under test has started and is not the stand-in, the workers and what runs
+    /// beneath them are recorded before this returns ([`Host::record_workers`]): a case that ends a
+    /// worker next leaves the agent running beneath it, and only a record made while the worker
+    /// lived lets the host end the agent.
+    ///
     /// # Panics
     ///
     /// Panics when the daemon is not running or does not end within twenty seconds.
@@ -1313,6 +1318,9 @@ impl<'r> Host<'r> {
         let _ = daemon.child.wait();
         self.survey_the_kill();
         self.verify_the_kill();
+        if self.agent_started.load(Ordering::SeqCst) && !self.stand_in.load(Ordering::SeqCst) {
+            self.record_workers();
+        }
     }
 
     /// The survey's look at the tree at a kill ([`Restart::Survey`]): the record at the kill, and
@@ -2945,15 +2953,21 @@ mod shutdown_tests {
     }
 
     /// A scratch run whose `kr-controller` is a script that counts its starts in the run's home,
-    /// exits when the home holds a file `fail`, and otherwise stays running.
+    /// exits when the home holds a file `fail`, exits once, with what a daemon says of an address
+    /// that was taken, when the home holds a file `taken`, and otherwise stays running.
     fn run_with_a_controller(root: &Path) -> Run {
         std::fs::create_dir_all(root.join("b")).expect("b");
         std::fs::create_dir_all(root.join("h")).expect("h");
         let program = root.join("b/kr-controller");
         std::fs::write(
             &program,
-            "#!/bin/sh\necho started >> \"$HOME/starts\"\nif [ -e \"$HOME/fail\" ]; then\n  \
-             echo \"the controller broke\" >&2\n  exit 3\nfi\nexec sleep 30\n",
+            format!(
+                "#!/bin/sh\necho started >> \"$HOME/starts\"\nif [ -e \"$HOME/fail\" ]; then\n  \
+                 echo \"the controller broke\" >&2\n  exit 3\nfi\nif [ -e \"$HOME/taken\" ]; then\n  \
+                 rm \"$HOME/taken\"\n  \
+                 echo \"network.bind_address could not be bound: {SOCKETS_NOT_BOUND}\" >&2\n  \
+                 exit 1\nfi\nexec sleep 30\n"
+            ),
         )
         .expect("a controller");
         std::fs::set_permissions(
@@ -2999,6 +3013,27 @@ mod shutdown_tests {
         host
     }
 
+    /// A host that declared `how` as its restart, whose daemon started once and was killed after
+    /// the harness's own stand-in started as its agent: `setup` runs before the agent starts.
+    fn killed_stand_in_host<'r>(
+        run: &'r Run,
+        how: Restart,
+        setup: impl FnOnce(&Host<'r>),
+    ) -> Host<'r> {
+        let host = host_over(run);
+        setup(&host);
+        assert!(
+            host.start_once(&started(run.root(), 1), Duration::from_secs(10))
+                .is_ok(),
+            "the first start"
+        );
+        host.declares_a_restart(how);
+        host.agent_is_a_stand_in();
+        host.agent_starts();
+        host.kill_daemon();
+        host
+    }
+
     /// The reason a leg that ends as not run gives.
     fn not_run(attempt: impl FnOnce()) -> String {
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(attempt))
@@ -3007,6 +3042,25 @@ mod shutdown_tests {
             .expect("a leg that is not run")
             .0
             .clone()
+    }
+
+    /// What `attempt` unwound with, or `None` where it returned.
+    fn unwound(attempt: impl FnOnce()) -> Option<Box<dyn std::any::Any + Send>> {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(attempt)).err()
+    }
+
+    /// The text an unwinding carries: the reason of a leg that did not run, or a panic's message.
+    fn said_by(unwinding: &(dyn std::any::Any + Send)) -> String {
+        unwinding
+            .downcast_ref::<LegNotRun>()
+            .map(|not_run| not_run.0.clone())
+            .or_else(|| unwinding.downcast_ref::<String>().cloned())
+            .or_else(|| {
+                unwinding
+                    .downcast_ref::<&str>()
+                    .map(|said| (*said).to_owned())
+            })
+            .unwrap_or_default()
     }
 
     const QUICKLY: Duration = Duration::from_secs(2);
@@ -3156,6 +3210,203 @@ mod shutdown_tests {
         host.start_daemon_ready_by(&started(&root, 2));
         assert_eq!(starts(&root), 2);
         assert!(host.restarts.lock().expect("a lock").verified.is_none());
+        drop(host);
+        drop(run);
+        std::fs::remove_dir_all(&root).expect("clean up");
+    }
+
+    /// The harness's own stand-in restarts by the route it always had, whatever the host records:
+    /// the survey host says what changed before the attempt, a start that fails is a failed leg and
+    /// not a leg that did not run, and a start that failed for its address is made again.
+    #[test]
+    fn a_stand_in_restarts_by_its_own_route_whatever_the_host_records() {
+        let root = scratch("stand-in-survey");
+        let run = run_with_a_controller(&root);
+        let host = killed_stand_in_host(&run, Restart::Survey, |_| {});
+        survey_quickly(&host);
+        std::fs::write(root.join("s/after-the-kill"), b"after").expect("written by the worker");
+        let unwinding = unwound(|| host.start_daemon_ready_by(&started(&root, 2)));
+        assert!(
+            unwinding.is_none(),
+            "the stand-in restarts: {:?}",
+            unwinding.as_deref().map(said_by)
+        );
+        let lines = surveyed_by(&host);
+        assert!(
+            lines.iter().any(|line| line
+                .contains("survey: kill 1, before the attempt: s/after-the-kill: added, a file")),
+            "the survey host says what changed before the attempt: {lines:#?}"
+        );
+        drop(host);
+        drop(run);
+        std::fs::remove_dir_all(&root).expect("clean up");
+
+        let root = scratch("stand-in-failing");
+        let run = run_with_a_controller(&root);
+        let host = killed_stand_in_host(&run, Restart::Declared, |_| {});
+        std::fs::write(root.join("h/fail"), b"").expect("a mark");
+        let unwinding = unwound(|| host.start_daemon_ready_by(&|_| Err("not ready".to_owned())))
+            .expect("a start that fails unwinds");
+        assert!(
+            unwinding.downcast_ref::<LegNotRun>().is_none(),
+            "a start of the stand-in that fails is a failed leg, not a leg that did not run"
+        );
+        let said = said_by(&*unwinding);
+        assert!(
+            said.starts_with("the control daemon exited before it answered: ")
+                && said.contains("the controller broke"),
+            "{said}"
+        );
+        assert_eq!(starts(&root), 2);
+        drop(host);
+        drop(run);
+        std::fs::remove_dir_all(&root).expect("clean up");
+
+        let port = std::net::UdpSocket::bind("127.0.0.1:0")
+            .expect("a socket")
+            .local_addr()
+            .expect("an address")
+            .port();
+        let root = scratch("stand-in-address");
+        let run = run_with_a_controller(&root);
+        let host = killed_stand_in_host(&run, Restart::Declared, |host| {
+            write_configuration(&host.environment, &[], port);
+        });
+        std::fs::write(root.join("h/taken"), b"").expect("a mark");
+        let unwinding = unwound(|| host.start_daemon_ready_by(&started(&root, 3)));
+        assert!(
+            unwinding.is_none(),
+            "the start is made again where the address was taken: {:?}",
+            unwinding.as_deref().map(said_by)
+        );
+        assert_eq!(
+            starts(&root),
+            3,
+            "the first start, the one refused, the retry"
+        );
+        drop(host);
+        drop(run);
+        std::fs::remove_dir_all(&root).expect("clean up");
+    }
+
+    /// A restart that is refused, and one that fails, after the worker was ended beside the dead
+    /// daemon, each end the leg as not run and leave no process of the agent: the agent runs on
+    /// beneath the dead worker, and the host's end ends it by the identity recorded while the worker
+    /// lived.
+    #[test]
+    fn a_restart_that_is_refused_or_fails_leaves_no_agent_process() {
+        use std::os::unix::process::CommandExt as _;
+        for refused in [true, false] {
+            let name = if refused { "refused" } else { "failing" };
+            let root = scratch(&format!("no-agent-{name}"));
+            let run = run_with_a_controller(&root);
+            let recorded = root.join("s/recorded");
+            // A process that runs as this run's worker for a session, with a process beneath it
+            // that stands for the agent.
+            let beneath = root.join("agent-started");
+            let mut worker = Command::new("/bin/sh")
+                .arg0(run.root().join("b/kr-worker"))
+                .args([
+                    "-c",
+                    &format!(
+                        "/bin/sleep 30 & echo started > '{}'; wait",
+                        beneath.display()
+                    ),
+                    "--session",
+                    &kr_ipc::new_uuid().to_string(),
+                ])
+                .stdin(Stdio::null())
+                .spawn()
+                .expect("a process standing for a worker");
+            let waiting = Instant::now();
+            while !beneath.exists() && waiting.elapsed() < Duration::from_secs(10) {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            assert!(
+                beneath.exists(),
+                "the worker started the process beneath it"
+            );
+            let host = killed_host(
+                &run,
+                |_| std::fs::write(&recorded, b"before").expect("a file"),
+                || {},
+            );
+            // The kill of a real agent's host records the worker and what runs beneath it, before
+            // the case ends the worker.
+            let agent = run
+                .owned()
+                .into_iter()
+                .find(|owned| owned.what.starts_with("under the worker of"))
+                .map(|owned| owned.identity);
+            let _ = worker.kill();
+            let _ = worker.wait();
+            let agent = agent.expect("the agent is recorded beneath the worker");
+            assert!(
+                running(&agent),
+                "{name}: the agent runs on beneath the dead worker"
+            );
+            let said = if refused {
+                std::fs::write(&recorded, b"after").expect("written by the worker");
+                not_run(|| host.start_daemon_ready_by(&|_| Ok(())))
+            } else {
+                std::fs::write(root.join("h/fail"), b"").expect("a mark");
+                not_run(|| {
+                    host.restart_after_a_real_agent(
+                        &|_| Err("not ready".to_owned()),
+                        QUICKLY,
+                        QUICKLY,
+                    );
+                })
+            };
+            let opening = if refused {
+                "the restart was refused: "
+            } else {
+                "the control daemon did not start after the kill: "
+            };
+            assert!(said.starts_with(opening), "{name}: {said}");
+            drop(host);
+            let left_running = running(&agent);
+            signal(&agent, rustix::process::Signal::KILL);
+            assert!(
+                !left_running,
+                "{name}: the agent was left running when the leg ended"
+            );
+            drop(run);
+            std::fs::remove_dir_all(&root).expect("clean up");
+        }
+    }
+
+    /// The kill of the harness's own stand-in's host records no worker: what that host ends is
+    /// found when it ends, as it was.
+    #[test]
+    fn the_kill_of_a_stand_ins_host_records_no_worker() {
+        use std::os::unix::process::CommandExt as _;
+        let root = scratch("stand-in-kill");
+        let run = run_with_a_controller(&root);
+        let mut worker = Command::new("/bin/sh")
+            .arg0(run.root().join("b/kr-worker"))
+            .args([
+                "-c",
+                "/bin/sleep 30; true",
+                "--session",
+                &kr_ipc::new_uuid().to_string(),
+            ])
+            .stdin(Stdio::null())
+            .spawn()
+            .expect("a process standing for a worker");
+        let host = killed_stand_in_host(&run, Restart::Declared, |_| {});
+        let workers: Vec<String> = run
+            .owned()
+            .into_iter()
+            .map(|owned| owned.what)
+            .filter(|what| what.contains("the worker of session"))
+            .collect();
+        assert!(
+            workers.is_empty(),
+            "the kill recorded workers of the stand-in's host: {workers:?}"
+        );
+        let _ = worker.kill();
+        let _ = worker.wait();
         drop(host);
         drop(run);
         std::fs::remove_dir_all(&root).expect("clean up");
