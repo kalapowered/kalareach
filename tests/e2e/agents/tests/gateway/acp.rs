@@ -415,8 +415,8 @@ const CONTROLS: [Control; 33] = [
         owner: "ACP-3a",
         waits: true,
         shows: "a start of a build outside the range `=1.1.63` is refused, and the launcher prints a message that names the range",
-        mutation: "the range is not checked",
-        red: "the second start is admitted",
+        mutation: "the range is not checked, or the refusal's message leaves the range out",
+        red: "the second start is admitted, or its message does not name the range",
     },
     Control {
         id: "6b-3g",
@@ -425,8 +425,8 @@ const CONTROLS: [Control; 33] = [
         owner: "ACP-7c",
         waits: true,
         shows: "a start of a build outside the range `=0.60.0` is refused, and the launcher prints a message that names the range",
-        mutation: "the range is not checked",
-        red: "the second start is admitted",
+        mutation: "the range is not checked, or the refusal's message leaves the range out",
+        red: "the second start is admitted, or its message does not name the range",
     },
     Control {
         id: "6b-4",
@@ -784,28 +784,44 @@ fn acp_a_completed_update_after_a_cancel_leaves_an_allow_applied_for_a_gemini_sh
 #[test]
 #[ignore = "waits for ACP-4"]
 fn acp_an_upgrade_leaves_a_qoder_shaped_process_its_copy_and_its_identity() {
-    unwritten("6b-1");
+    run_case(
+        "6b-1",
+        &controls::upgrade_script(),
+        controls::an_upgrade_while_the_agent_runs,
+    );
 }
 
 /// Control 6b-2.
 #[test]
 #[ignore = "waits for ACP-4"]
 fn acp_a_fresh_request_after_an_upgrade_is_decoded_by_the_pinned_table_and_answered_with_its_ids() {
-    unwritten("6b-2");
+    run_case(
+        "6b-2",
+        &controls::upgrade_script(),
+        controls::a_fresh_request_after_an_upgrade,
+    );
 }
 
 /// Control 6b-3.
 #[test]
 #[ignore = "waits for ACP-3a"]
 fn acp_a_build_outside_the_range_is_refused_with_a_message_that_names_the_range() {
-    unwritten("6b-3");
+    run_case(
+        "6b-3",
+        &controls::upgrade_script(),
+        controls::a_second_start_after_the_upgrade,
+    );
 }
 
 /// Control 6b-4.
 #[test]
 #[ignore = "waits for ACP-5"]
 fn acp_a_start_whose_version_differs_from_the_hashed_build_is_refused() {
-    unwritten("6b-4");
+    run_case(
+        "6b-4",
+        &controls::upgrade_script(),
+        controls::a_start_that_reports_another_version,
+    );
 }
 
 /// Controls 6b-3g and 6b-5.

@@ -9,11 +9,12 @@
 //! allowlist and no others.
 //!
 //! A script is `{"turns": [...], "ticks": [...], "exit_after": "name", "own": [...], "cancel":
-//! "settle", "on_cancel": [...]}`. The k-th prompt of the client runs the k-th turn, which is a list
-//! of steps; a prompt with no turn left is answered at once with the stop reason `end_turn`. A
-//! tick is `{"after": "name", "say": "text"}`: when the file `name` appears in the working
-//! directory the agent sends an update that says `text`, once, whatever its turn does. When the
-//! file `exit_after` names appears the agent ends with the code 0, whatever its turn waits for.
+//! "settle", "on_cancel": [...], "version": "text"}`. The k-th prompt of the client runs the k-th
+//! turn, which is a list of steps; a prompt with no turn left is answered at once with the stop
+//! reason `end_turn`. A tick is `{"after": "name", "say": "text"}`: when the file `name` appears in
+//! the working directory the agent sends an update that says `text`, once, whatever its turn does.
+//! When the file `exit_after` names appears the agent ends with the code 0, whatever its turn waits
+//! for. The agent reports the version of its shape in `initialize`, unless `version` names another.
 //!
 //! A turn of the agent's own is `{"after": "name", "steps": [...]}` in `own`: it starts when the
 //! file appears and no turn runs, and it ends with no reply, because it answers no prompt. A
@@ -165,6 +166,9 @@ struct Script {
     /// Steps that run once as a turn of the agent's own, after the first cancel settled its turn.
     #[serde(default)]
     on_cancel: Vec<Step>,
+    /// The version the agent reports in `initialize`, in place of its shape's.
+    #[serde(default)]
+    version: Option<String>,
 }
 
 /// A turn of the agent's own: it answers no prompt, so it ends with no reply.
@@ -446,7 +450,7 @@ impl<W: Write> Agent<W> {
                     "agentInfo": {
                         "name": self.shape.name(),
                         "title": self.shape.name(),
-                        "version": self.shape.version(),
+                        "version": self.script.version.as_deref().unwrap_or(self.shape.version()),
                     },
                     "authMethods": [],
                 });

@@ -915,6 +915,7 @@ fn scripts() -> Vec<(&'static str, Value)> {
             "completed_while_cancelling_script",
             completed_while_cancelling_script(),
         ),
+        ("upgrade_script", upgrade_script()),
         ("window_script", window_script()),
         ("queued_prompt_script", queued_prompt_script()),
         (
@@ -1529,5 +1530,301 @@ fn the_judge_of_the_gemini_window_names_its_red_when_the_window_is_capped_at_thi
         the_window_stays_open_until_the_prompts_reply(&answered, false),
         Err(red("5b-17")),
         "the prompt sent meanwhile was accepted"
+    );
+}
+
+/// What the host reads of an agent and of the program it runs: the agent's process identity, the
+/// digest of the executable the process runs, the digest of the verified copy the process was
+/// started from, and the digest of the installation's file.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Identity {
+    /// The process identity.
+    pub process: String,
+    /// The digest of the executable the process runs.
+    pub executable: String,
+    /// The digest of the verified copy.
+    pub copy: String,
+    /// The digest of the installation's file.
+    pub installation: String,
+}
+
+/// 6b-1: after the installation's file was replaced in place, the agent's process, its executable
+/// and its copy read as they did before.
+pub fn the_upgrade_leaves_the_process_and_its_copy(
+    before: &Identity,
+    after: &Identity,
+) -> Result<(), Red> {
+    ensure(
+        before.process == after.process
+            && before.executable == after.executable
+            && before.copy == after.copy,
+        "6b-1",
+    )
+}
+
+/// What the host decoded of a request before and after the upgrade.
+#[derive(Debug)]
+pub struct Decoded {
+    /// The options decoded from the request before the upgrade, as text.
+    pub before: String,
+    /// The options decoded from the fresh request after the upgrade, as text.
+    pub after: String,
+}
+
+/// The option the stand-in received in its response to the request numbered `number`.
+fn option_of(record: &[Value], number: u64) -> Option<&str> {
+    responses(record)
+        .into_iter()
+        .find(|line| line["id"] == number)
+        .and_then(|line| line["option"].as_str())
+}
+
+/// 6b-2: the options decoded from the fresh request equal those decoded before the upgrade, and the
+/// stand-in received the pinned table's identifier for the answer.
+pub fn a_fresh_request_is_decoded_by_the_pinned_table(
+    decoded: &Decoded,
+    record: &[Value],
+) -> Result<(), Red> {
+    ensure(
+        decoded.before == decoded.after && option_of(record, 1) == Some("allow-once"),
+        "6b-2",
+    )
+}
+
+/// What the host said of a start of a second agent.
+#[derive(Debug)]
+pub struct Start {
+    /// The host admitted the start.
+    pub admitted: bool,
+    /// What the launcher printed.
+    pub message: String,
+}
+
+/// 6b-3 and 6b-3g, by `id`: the start of a build outside the range was refused, and the launcher's
+/// message names the range.
+pub fn a_build_outside_the_range_is_refused(
+    id: &str,
+    range: &str,
+    start: &Start,
+) -> Result<(), Red> {
+    ensure(!start.admitted && start.message.contains(range), id)
+}
+
+/// The version an agent reports and the version of the binding the host made for it.
+#[derive(Debug)]
+pub struct Versions {
+    /// The version in the agent's `initialize` result.
+    pub reported: String,
+    /// The version of the binding.
+    pub binding: String,
+}
+
+/// 6b-4: the version the agent reports equals the binding's, and a start of an agent that reports
+/// another version was refused.
+pub fn the_reported_version_is_the_bindings(versions: &Versions, other: &Start) -> Result<(), Red> {
+    ensure(
+        versions.reported == versions.binding && !other.admitted,
+        "6b-4",
+    )
+}
+
+impl Hosted {
+    /// The identity of the agent's process, its executable and its copy, and the digest of the
+    /// installation's file, as the host reads them now.
+    pub fn identity(&mut self) -> Identity {
+        match *self {}
+    }
+
+    /// Replaces the installation's file in place, as an upgrade of the agent does, and stops the
+    /// case when the installation's digest did not change.
+    pub fn upgrades_the_installation(&mut self) {
+        match *self {}
+    }
+
+    /// The options of the pending request, as the host decoded them, as text.
+    pub fn decoded_options(&mut self) -> String {
+        match *self {}
+    }
+
+    /// Starts a second agent from the installation as it stands, with `script`, and says whether
+    /// the host admitted it and what the launcher printed.
+    pub fn starts_a_second_agent(&mut self, _script: &Value) -> Start {
+        match *self {}
+    }
+
+    /// The version in the agent's `initialize` result.
+    pub fn reported_version(&mut self) -> String {
+        match *self {}
+    }
+
+    /// The version of the agent's binding.
+    pub fn binding_version(&mut self) -> String {
+        match *self {}
+    }
+}
+
+/// The script of an agent that asks for a call and waits, and asks for a second call when the file
+/// `after` appears.
+pub fn upgrade_script() -> Value {
+    serde_json::json!({
+        "turns": [[
+            { "call": { "id": "c1", "kind": "execute" } },
+            { "ask": "c1" },
+            { "hold": "after" },
+            { "call": { "id": "c2", "kind": "execute" } },
+            { "ask": "c2" },
+            { "hold": "never" },
+        ]],
+    })
+}
+
+/// Case 6b-1: the installation's file is replaced while the agent runs with a request pending.
+pub fn an_upgrade_while_the_agent_runs(host: &mut Hosted) -> Result<(), Red> {
+    let before = host.identity();
+    host.upgrades_the_installation();
+    the_upgrade_leaves_the_process_and_its_copy(&before, &host.identity())
+}
+
+/// Case 6b-2: a fresh request after the upgrade, answered with the pinned table's identifier.
+pub fn a_fresh_request_after_an_upgrade(host: &mut Hosted) -> Result<(), Red> {
+    let before = host.decoded_options();
+    host.answer_next("allow-once");
+    host.upgrades_the_installation();
+    host.release("after");
+    host.waits_for_a_request();
+    let after = host.decoded_options();
+    host.answer_next("allow-once");
+    a_fresh_request_is_decoded_by_the_pinned_table(&Decoded { before, after }, &host.record())
+}
+
+/// Case 6b-3: a second agent started after the upgrade.
+pub fn a_second_start_after_the_upgrade(host: &mut Hosted) -> Result<(), Red> {
+    host.upgrades_the_installation();
+    let start = host.starts_a_second_agent(&serde_json::json!({}));
+    a_build_outside_the_range_is_refused("6b-3", "=1.1.63", &start)
+}
+
+/// Case 6b-4: a second agent that reports another version than the hashed build's.
+pub fn a_start_that_reports_another_version(host: &mut Hosted) -> Result<(), Red> {
+    let versions = Versions {
+        reported: host.reported_version(),
+        binding: host.binding_version(),
+    };
+    let other = host.starts_a_second_agent(&serde_json::json!({ "version": "1.1.64" }));
+    the_reported_version_is_the_bindings(&versions, &other)
+}
+
+#[test]
+fn the_judge_of_the_upgrade_names_its_red_when_the_process_or_its_copy_changes() {
+    let identity = |process: &str, executable: &str, copy: &str, installation: &str| Identity {
+        process: process.to_owned(),
+        executable: executable.to_owned(),
+        copy: copy.to_owned(),
+        installation: installation.to_owned(),
+    };
+    let before = identity("p1", "e1", "c1", "i1");
+    assert_eq!(
+        the_upgrade_leaves_the_process_and_its_copy(&before, &identity("p1", "e1", "c1", "i2")),
+        Ok(())
+    );
+    assert_eq!(
+        the_upgrade_leaves_the_process_and_its_copy(&before, &identity("p1", "e2", "c1", "i2")),
+        Err(red("6b-1")),
+        "the launch ran the installation's file, so the executable changed with the upgrade"
+    );
+    assert_eq!(
+        the_upgrade_leaves_the_process_and_its_copy(&before, &identity("p1", "e1", "c2", "i2")),
+        Err(red("6b-1")),
+        "the copy changed"
+    );
+    assert_eq!(
+        the_upgrade_leaves_the_process_and_its_copy(&before, &identity("p2", "e1", "c1", "i2")),
+        Err(red("6b-1")),
+        "the process was replaced"
+    );
+}
+
+#[test]
+fn the_judge_of_a_fresh_request_names_its_red_when_the_upgraded_table_decodes_it() {
+    let decoded = |before: &str, after: &str| Decoded {
+        before: before.to_owned(),
+        after: after.to_owned(),
+    };
+    let answered = [response_line_for(1, "allow-once")];
+    assert_eq!(
+        a_fresh_request_is_decoded_by_the_pinned_table(&decoded("options", "options"), &answered),
+        Ok(())
+    );
+    assert_eq!(
+        a_fresh_request_is_decoded_by_the_pinned_table(&decoded("options", "other"), &answered),
+        Err(red("6b-2")),
+        "the host decoded the fresh request with the table of the upgraded installation"
+    );
+    assert_eq!(
+        a_fresh_request_is_decoded_by_the_pinned_table(
+            &decoded("options", "options"),
+            &[response_line_for(1, "allow-always")]
+        ),
+        Err(red("6b-2")),
+        "the answer carried another identifier than the pinned table's"
+    );
+    assert_eq!(
+        a_fresh_request_is_decoded_by_the_pinned_table(&decoded("options", "options"), &[]),
+        Err(red("6b-2")),
+        "the stand-in received no answer"
+    );
+}
+
+#[test]
+fn the_judge_of_the_range_names_its_red_when_the_second_start_is_admitted_or_names_no_range() {
+    let start = |admitted: bool, message: &str| Start {
+        admitted,
+        message: message.to_owned(),
+    };
+    for (id, range) in [("6b-3", "=1.1.63"), ("6b-3g", "=0.60.0")] {
+        assert_eq!(
+            a_build_outside_the_range_is_refused(
+                id,
+                range,
+                &start(false, &format!("this build is outside {range}"))
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            a_build_outside_the_range_is_refused(id, range, &start(true, "")),
+            Err(red(id)),
+            "the range is not checked"
+        );
+        assert_eq!(
+            a_build_outside_the_range_is_refused(id, range, &start(false, "refused")),
+            Err(red(id)),
+            "the refusal leaves the range out"
+        );
+    }
+}
+
+#[test]
+fn the_judge_of_the_version_names_its_red_when_a_start_with_another_version_is_admitted() {
+    let versions = |reported: &str, binding: &str| Versions {
+        reported: reported.to_owned(),
+        binding: binding.to_owned(),
+    };
+    let start = |admitted: bool| Start {
+        admitted,
+        message: String::new(),
+    };
+    assert_eq!(
+        the_reported_version_is_the_bindings(&versions("1.1.63", "1.1.63"), &start(false)),
+        Ok(())
+    );
+    assert_eq!(
+        the_reported_version_is_the_bindings(&versions("1.1.63", "1.1.63"), &start(true)),
+        Err(red("6b-4")),
+        "the reported version is not compared with the hashed build"
+    );
+    assert_eq!(
+        the_reported_version_is_the_bindings(&versions("1.1.64", "1.1.63"), &start(false)),
+        Err(red("6b-4")),
+        "the agent reports another version than the binding's"
     );
 }

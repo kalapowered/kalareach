@@ -184,6 +184,20 @@ fn a_qoder_shaped_stand_in_answers_initialize_with_the_version_the_table_pins() 
 }
 
 #[test]
+fn a_script_can_name_another_version_than_the_one_its_shape_reports() {
+    let package = installed_package();
+    let script = json!({ "version": "9.9.9" });
+    let agents = [
+        Played::start(QODER, &script),
+        gemini_from(package.path(), &script),
+    ];
+    for mut agent in agents {
+        agent.send(&json!({ "jsonrpc": "2.0", "id": 7, "method": "initialize", "params": {} }));
+        assert_eq!(agent.frame()["result"]["agentInfo"]["version"], "9.9.9");
+    }
+}
+
+#[test]
 fn the_stand_in_writes_its_frames_with_the_keys_in_the_order_both_agents_write_them() {
     let mut agent = Played::start(QODER, &guarded_turn());
     agent.send(&json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {} }));
