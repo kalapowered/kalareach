@@ -1734,21 +1734,43 @@ pub fn a_decline_stays_dispatching_until_a_boundary(read: &Declines) -> Result<(
     )
 }
 
+/// What the host said of a message that the case sent while a turn ran.
+#[derive(Debug)]
+pub struct Meanwhile {
+    /// The host accepted the message.
+    pub accepted: bool,
+    /// What the host said of it.
+    pub message: String,
+}
+
+/// How many prompts the stand-in received.
+fn prompts_received(record: &[Value]) -> usize {
+    record
+        .iter()
+        .filter(|line| line["received"] == "request" && line["method"] == "session/prompt")
+        .count()
+}
+
 /// 5b-17: with our prompt in flight the window was still open at 31 seconds, so the approval at
-/// that time was answered `cancelled`, and a prompt sent meanwhile was refused.
+/// that time was answered `cancelled`. A message sent meanwhile was refused with a message that
+/// says a turn is running, and it never reached the stand-in, which received the one prompt only.
 pub fn the_window_stays_open_until_the_prompts_reply(
     record: &[Value],
-    prompt_refused: bool,
+    meanwhile: &Meanwhile,
 ) -> Result<(), Red> {
     ensure(
-        outcome_of(record, 1) == Some("cancelled") && prompt_refused,
+        outcome_of(record, 1) == Some("cancelled")
+            && !meanwhile.accepted
+            && meanwhile.message.contains("running")
+            && prompts_received(record) == 1,
         "5b-17",
     )
 }
 
 impl Hosted {
-    /// Sends a prompt through the device and says whether the host accepted it.
-    pub fn sends_a_prompt(&mut self, _text: &str) -> bool {
+    /// Sends a message through the device while a turn runs and says whether the host accepted it
+    /// and what it said.
+    pub fn sends_a_prompt(&mut self, _text: &str) -> Meanwhile {
         match *self {}
     }
 }
@@ -1860,9 +1882,9 @@ pub fn an_approval_at_thirty_one_seconds_with_a_prompt_in_flight(
 ) -> Result<(), Red> {
     host.cancel();
     host.advance_clock(31);
-    let refused = !host.sends_a_prompt("meanwhile");
+    let meanwhile = host.sends_a_prompt("meanwhile");
     host.release("t31");
-    the_window_stays_open_until_the_prompts_reply(&host.record_after("reply", 1), refused)
+    the_window_stays_open_until_the_prompts_reply(&host.record_after("reply", 1), &meanwhile)
 }
 
 /// Case 5b-23g: an allow, the person's cancel, and then the call's `completed` update, with the
@@ -1936,20 +1958,54 @@ fn the_judge_of_the_declines_names_its_red_at_dispatch_and_at_each_boundary() {
 
 #[test]
 fn the_judge_of_the_gemini_window_names_its_red_when_the_window_is_capped_at_thirty_seconds() {
-    let answered = [cancelled_response_line(0), cancelled_response_line(1)];
+    let prompt = || serde_json::json!({ "received": "request", "method": "session/prompt" });
+    let meanwhile = |accepted: bool, message: &str| Meanwhile {
+        accepted,
+        message: message.to_owned(),
+    };
+    let refused = meanwhile(false, "a turn is running");
+    let answered = [
+        prompt(),
+        cancelled_response_line(0),
+        cancelled_response_line(1),
+    ];
     assert_eq!(
-        the_window_stays_open_until_the_prompts_reply(&answered, true),
+        the_window_stays_open_until_the_prompts_reply(&answered, &refused),
         Ok(())
     );
     assert_eq!(
-        the_window_stays_open_until_the_prompts_reply(&answered[..1], true),
+        the_window_stays_open_until_the_prompts_reply(&answered[..2], &refused),
         Err(red("5b-17")),
         "the approval at 31 seconds shows"
     );
     assert_eq!(
-        the_window_stays_open_until_the_prompts_reply(&answered, false),
+        the_window_stays_open_until_the_prompts_reply(
+            &answered,
+            &meanwhile(true, "a turn is running")
+        ),
         Err(red("5b-17")),
         "the prompt sent meanwhile was accepted"
+    );
+    assert_eq!(
+        the_window_stays_open_until_the_prompts_reply(&answered, &meanwhile(false, "not now")),
+        Err(red("5b-17")),
+        "the refusal does not say a turn is running"
+    );
+    let forwarded = [
+        prompt(),
+        prompt(),
+        cancelled_response_line(0),
+        cancelled_response_line(1),
+    ];
+    assert_eq!(
+        the_window_stays_open_until_the_prompts_reply(&forwarded, &refused),
+        Err(red("5b-17")),
+        "the prompt sent meanwhile reached the stand-in"
+    );
+    assert_eq!(
+        the_window_stays_open_until_the_prompts_reply(&answered[1..], &refused),
+        Err(red("5b-17")),
+        "the stand-in received no prompt of ours"
     );
 }
 
