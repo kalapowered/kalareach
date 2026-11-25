@@ -313,15 +313,30 @@ pub fn compare(
                 },
             }
         }
+        let is_recorded = |start: i64| {
+            before.is_some_and(|before| before.marks.iter().any(|was| was.start == start))
+        };
+        // Where the recorded rows end now: a new row follows them all.
+        let recorded_end = rows
+            .marks
+            .iter()
+            .filter(|mark| is_recorded(mark.start))
+            .map(|mark| mark.end)
+            .max();
         let mut previous_end: Option<i64> = None;
-        for mark in &rows.marks {
-            let is_new = !before
-                .is_some_and(|before| before.marks.iter().any(|was| was.start == mark.start));
+        for (at, mark) in rows.marks.iter().enumerate() {
+            let is_new = !is_recorded(mark.start);
             if is_new {
-                if previous_end.is_some_and(|end| mark.start < end) || !matches!(mark.proven, 0 | 1)
-                {
+                let misplaced = previous_end.is_some_and(|end| mark.start < end)
+                    || recorded_end.is_some_and(|end| mark.start < end)
+                    || rows
+                        .marks
+                        .get(at + 1)
+                        .is_some_and(|next| mark.end > next.start)
+                    || mark.end < mark.start;
+                if misplaced || !matches!(mark.proven, 0 | 1) {
                     refuse(format!(
-                        "the output-time index of {session} has a new row {}..{} that starts before the end of the row before it, or has a proven value other than 0 or 1",
+                        "the output-time index of {session} has a new row {}..{} that is not placed after the recorded rows and between the rows beside it, or has a proven value other than 0 or 1",
                         mark.start, mark.end
                     ));
                 }
@@ -499,14 +514,14 @@ mod tests {
                     Some(0),
                     vec![VERSION],
                     early,
-                    "that starts before the end of the row before it, or has a proven value other than 0 or 1",
+                    "that is not placed after the recorded rows and between the rows beside it, or has a proven value other than 0 or 1",
                 ),
                 (
                     "proven",
                     Some(0),
                     vec![VERSION],
                     unproven,
-                    "that starts before the end of the row before it, or has a proven value other than 0 or 1",
+                    "that is not placed after the recorded rows and between the rows beside it, or has a proven value other than 0 or 1",
                 ),
                 (
                     "past-the-limit",
@@ -530,6 +545,48 @@ mod tests {
             assert!(
                 refused.iter().any(|line| line.contains(why)),
                 "{name}: expected {why:?} in {refused:#?}"
+            );
+            world.clean();
+        }
+    }
+
+    /// A new row that is placed before the recorded rows, that overlaps the row after it or that
+    /// ends before it starts is refused; a new row after the recorded rows is not.
+    #[test]
+    fn a_new_row_is_placed_after_the_recorded_rows_and_between_the_rows_beside_it() {
+        const WHY: &str = "that is not placed after the recorded rows and between the rows beside it, or has a proven value other than 0 or 1";
+        let before_all = {
+            let mut now = vec![mark(-10, -5, 50, 1)];
+            now.extend(recorded());
+            now
+        };
+        let over_the_next = {
+            let mut now = vec![mark(-10, 5, 50, 1)];
+            now.extend(recorded());
+            now
+        };
+        let backwards = {
+            let mut now = recorded();
+            now.push(mark(30, 28, 310, 1));
+            now
+        };
+        let after = {
+            let mut now = recorded();
+            now.push(mark(25, 30, 310, 1));
+            now
+        };
+        for (name, now, refused_for) in [
+            ("before-all", before_all, true),
+            ("over-the-next", over_the_next, true),
+            ("backwards", backwards, true),
+            ("after", after, false),
+        ] {
+            let world = world(name);
+            let lines = refused(&world, Some(0), &[VERSION], &now);
+            assert_eq!(
+                lines.iter().any(|line| line.contains(WHY)),
+                refused_for,
+                "{name}: {lines:#?}"
             );
             world.clean();
         }
