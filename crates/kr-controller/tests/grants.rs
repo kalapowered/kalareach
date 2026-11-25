@@ -3577,6 +3577,78 @@ fn only_the_host_issues_ordered_revisions_and_records_are_retained_until_acknowl
     assert!(restored.status(clock.now()).stale);
 }
 
+/// KR-REQ-10.46: a host keeps the latest revision it accepted through the store and a restart, and
+/// never takes an older one: a number at or below the accepted revision leaves it where it was and
+/// owes no write, the record read back from the store holds it, and a registry behind the store does
+/// not lower it.
+#[test]
+fn a_host_keeps_the_latest_revision_it_accepted_through_a_restart_and_never_takes_an_older_one() {
+    let directory = GrantDirectory::in_memory().expect("a grant store");
+    let mut feed = AuthorityFeed::new(device_id(0xf0), AuthorityRevision::new(5));
+
+    feed.note_revision(AuthorityRevision::new(6));
+    assert_eq!(
+        feed.accepted_revision(),
+        AuthorityRevision::new(6),
+        "a later revision is the one accepted"
+    );
+    feed.written();
+
+    // An older number, and the number already held, change nothing and owe no write.
+    feed.note_revision(AuthorityRevision::new(4));
+    assert_eq!(
+        feed.accepted_revision(),
+        AuthorityRevision::new(6),
+        "an older revision does not replace the accepted one"
+    );
+    assert!(
+        !feed.is_unwritten(),
+        "an older revision is not a reason to write"
+    );
+    feed.note_revision(AuthorityRevision::new(6));
+    assert_eq!(
+        feed.accepted_revision(),
+        AuthorityRevision::new(6),
+        "the revision already held is not a later one"
+    );
+    assert!(
+        !feed.is_unwritten(),
+        "the revision already held is not a reason to write"
+    );
+
+    // What the store holds is what a restart reads back.
+    directory
+        .store_feed(&feed.snapshot())
+        .expect("the feed is written down");
+    let stored = directory.stored_feed().expect("readable").expect("present");
+    let mut restarted = AuthorityFeed::restore(&stored, None);
+    assert_eq!(
+        restarted.accepted_revision(),
+        AuthorityRevision::new(6),
+        "a restart brings back the revision the host accepted"
+    );
+
+    // The host's registry can be behind the stored record when it starts, and a later number can
+    // arrive after the restart.
+    restarted.note_revision(AuthorityRevision::new(3));
+    assert_eq!(
+        restarted.accepted_revision(),
+        AuthorityRevision::new(6),
+        "a registry behind the stored record does not lower the revision"
+    );
+    assert!(
+        !restarted.is_unwritten(),
+        "a number behind the stored record is not a reason to write"
+    );
+    restarted.note_revision(AuthorityRevision::new(8));
+    assert_eq!(
+        restarted.accepted_revision(),
+        AuthorityRevision::new(8),
+        "a later revision after the restart is the one accepted"
+    );
+    assert!(restarted.is_unwritten(), "a later revision is written down");
+}
+
 /// KR-REQ-10.46: the status is stale when the last synchronisation is older than three polls on the
 /// continuous clock, current up to and including the bound, and stale where its age cannot be told:
 /// the host has not synchronised since it started, or the instant it recorded is later than now.
