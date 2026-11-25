@@ -111,6 +111,8 @@ mod stand_in {
         newer_version: Option<String>,
         /// The text the first screen shows.
         ready: String,
+        /// The text the newer build's first screen shows, where the entry has a newer build.
+        newer_ready: Option<String>,
         /// The text the composer shows while it waits for a prompt.
         composer: String,
         /// The variable that names the configuration directory, where the agent has one.
@@ -164,6 +166,18 @@ mod stand_in {
         })
     }
 
+    /// The text this build's first screen shows: the entry's, or the newer build's own.
+    fn ready_of(entry: &Entry) -> Result<&str, String> {
+        if newer() {
+            entry
+                .newer_ready
+                .as_deref()
+                .ok_or_else(|| "the entry names no newer first screen".to_owned())
+        } else {
+            Ok(&entry.ready)
+        }
+    }
+
     /// The version line this build prints.
     fn version_line(entry: Option<&Entry>) -> Result<String, String> {
         let Some(entry) = entry else {
@@ -208,6 +222,14 @@ mod stand_in {
             arguments.remove(0);
         }
         let (subcommand, identifier) = subcommand_of(&arguments);
+        let ready = entry
+            .as_ref()
+            .map(ready_of)
+            .transpose()
+            .unwrap_or_else(|why| {
+                eprintln!("Error: {why}");
+                std::process::exit(2);
+            });
         let home = configuration_directory(entry.as_ref());
         if entry.is_none() && !home.join("config.toml").is_file() {
             sign_in_screen();
@@ -237,7 +259,7 @@ mod stand_in {
         match &entry {
             Some(entry) => composer(
                 conversation,
-                std::slice::from_ref(&entry.ready),
+                &[ready.expect("the first screen of an entry").to_owned()],
                 &entry.composer,
                 true,
                 std::env::var_os(LEAVE_VARIABLE).filter(|program| !program.is_empty()),

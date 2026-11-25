@@ -38,12 +38,13 @@ const NEWER: &str = env!("CARGO_BIN_EXE_agent-stand-in-newer");
 const WITHIN: Duration = Duration::from_secs(20);
 
 /// The members of the file the stand-in takes: names and texts, and no path.
-const MEMBERS: [&str; 12] = [
+const MEMBERS: [&str; 13] = [
     "command",
     "launch",
     "version",
     "newer_version",
     "ready",
+    "newer_ready",
     "composer",
     "config_variable",
     "conversations",
@@ -91,6 +92,7 @@ fn entry_json(
     (ready, composer): (&str, &str),
     marks: [&str; 4],
 ) -> serde_json::Value {
+    let newer_ready = format!("{command} 1.3.0 is up");
     serde_json::json!({
         "package": package, "application": "a", "version": "1.2.3", "prefix": "/real/prefix",
         "pinned": pinned, "sha256": "00", "command": command, "launch": launch,
@@ -99,7 +101,7 @@ fn entry_json(
         "transcript": "sessions/{cwd_slug}/{session}.jsonl", "missing": {},
         "newer": {
             "version": "1.3.0", "prefix": "/real/newer", "pinned": pinned, "sha256": "00",
-            "ready": ready
+            "ready": newer_ready
         },
         "account": {
             "login": "l", "stored": "s", "home": "run", "budget": "b", "turns": 3,
@@ -202,6 +204,7 @@ pub fn stand_in_file(build: &Build) -> serde_json::Value {
         "version": build.version,
         "newer_version": build.newer.as_ref().map(|newer| newer.version.clone()),
         "ready": build.ready,
+        "newer_ready": build.newer.as_ref().map(|newer| newer.ready.clone()),
         "composer": account.composer,
         "config_variable": account
             .config_directory
@@ -610,6 +613,37 @@ fn the_stand_in_reports_the_entrys_version_and_the_newer_one_the_entrys_newer_ve
             ),
             "{}: the newer program's version line",
             synthetic.name
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+}
+
+/// The pinned program shows the entry's first screen, and the newer program the entry's newer first
+/// screen, which is another text.
+#[test]
+fn the_pinned_stand_in_shows_the_entrys_first_screen_and_the_newer_one_the_entrys_newer_first_screen()
+ {
+    for synthetic in synthetic() {
+        let base = scratch("newer-shows");
+        let file = stand_in_file(&synthetic.build);
+        let name = synthetic.name;
+        let ready = &synthetic.build.ready;
+        let newer_ready = &synthetic.build.newer.as_ref().expect("a newer build").ready;
+        assert!(
+            !ready.contains(newer_ready.as_str()) && !newer_ready.contains(ready.as_str()),
+            "{name}: neither of the entry's two first screens holds the other: {ready:?}, {newer_ready:?}"
+        );
+        let pinned = ran(&base, PROGRAM, &file, &[], &[], &[]);
+        assert!(
+            pinned.out.contains(ready.as_str()) && !pinned.out.contains(newer_ready.as_str()),
+            "{name}: the pinned program shows {ready:?} and not {newer_ready:?}, and printed:\n{}",
+            pinned.out
+        );
+        let newer = ran(&base, NEWER, &file, &[], &[], &[]);
+        assert!(
+            newer.out.contains(newer_ready.as_str()) && !newer.out.contains(ready.as_str()),
+            "{name}: the newer program shows {newer_ready:?} and not {ready:?}, and printed:\n{}",
+            newer.out
         );
         let _ = std::fs::remove_dir_all(&base);
     }
