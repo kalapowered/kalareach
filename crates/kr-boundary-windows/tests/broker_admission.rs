@@ -15,29 +15,37 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Barrier};
 use std::thread;
+use std::time::Duration;
 
 use windows_sys::Win32::Storage::FileSystem::{
     GetShortPathNameW, GetVolumeNameForVolumeMountPointW,
 };
 
 use kr_boundary_windows::lifecycle::{LEFTOVER_WORDS, RULE_BUSY, RULE_LEFTOVER};
+use kr_boundary_windows::remedy::REMOTE_VOLUME;
 use kr_boundary_windows::slot::{Blocked, SlotTable};
 use kr_boundary_windows::win::ffi::wide_path;
-use kr_boundary_windows::win::hold::hold_tree;
+use kr_boundary_windows::win::hold::{
+    FOLDER_LINK_WORDS, RULE_FOLDER_CHANGED, RULE_FOLDER_LINK, TreeHold, hold_tree,
+};
 
 use kr_boundary_windows::frame::Class;
 use kr_boundary_windows::manifest::{Manifest, ObjectKind};
 use kr_boundary_windows::refusal::Refusal;
 use kr_boundary_windows::win::admission::{
-    ADMISSION_FAILED_WORDS, Admitted, LABEL_WORDS, LINK_WORDS, OPEN_WORDS, OWNER_WORDS,
-    PERSON_LACKS_WORDS, Probes, RULE_LABEL, RULE_LINK, RULE_OPEN, RULE_OWNER, RULE_PERSON_LACKS,
-    RULE_SIBLING, RULE_STALE, RULE_SYSTEM_LACKS, RULE_WRITER, SIBLING_WORDS, STALE_WORDS,
-    SYSTEM_LACKS_WORDS, WRITER_WORDS, admit,
+    ADMISSION_FAILED_WORDS, Admitted, CASE_SENSITIVE_WORDS, CLOUD_WORDS, DRIVE_WORDS,
+    ENCRYPTED_WORDS, LABEL_WORDS, LIMITS, LINK_WORDS, Limits, NESTED_WORDS, OPEN_WORDS,
+    OWNER_WORDS, PERSON_LACKS_WORDS, PROFILE_WORDS, Probes, RULE_CASE_SENSITIVE, RULE_CLOUD,
+    RULE_DRIVE, RULE_ENCRYPTED, RULE_LABEL, RULE_LINK, RULE_NESTED, RULE_OPEN, RULE_OWNER,
+    RULE_PERSON_LACKS, RULE_PROFILE, RULE_SIBLING, RULE_STALE, RULE_SYSTEM_LACKS, RULE_TOO_LARGE,
+    RULE_WRITER, SIBLING_WORDS, STALE_WORDS, SYSTEM_LACKS_WORDS, TOO_LARGE_WORDS, WRITER_WORDS,
+    admit, admit_within, attributes_refusal, is_cloud_tag, reparse_refusal,
 };
 use kr_boundary_windows::win::ffi::Handle;
 use kr_boundary_windows::win::rights::{Right, Sd, may, probe_token};
 use kr_boundary_windows::win::sd::descriptor_from_text;
 
+use common::disk::Disk;
 use common::people::{Boundary, Person, acting_as, prepare, runs_as_the_system};
 use common::project::{Project, repository_at};
 use common::{Scratch, file_described, hostile_file, privileged, run};
@@ -890,5 +898,384 @@ fn broker_admission_a_mandatory_label_on_any_object_refuses_the_tree() {
             format!("{LABEL_WORDS} on {}", display(&file)),
             "{label}"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Where the product runs, and the bounds of the walk
+// ---------------------------------------------------------------------------------------------
+
+fn held(person: &Person, path: &Path) -> TreeHold {
+    hold_tree(path.to_str().unwrap(), &person.as_client()).expect("the tree is held")
+}
+
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn broker_admission_a_volume_that_is_not_local_ntfs_is_refused_with_its_reason() {
+    if !runs_as_the_system() {
+        eprintln!("skipped: the case needs the system's token");
+        return;
+    }
+    prepare();
+    let person = Person::new("krhap");
+    let scratch = Scratch::on_drive();
+    let client = person.as_client();
+
+    // A share of this computer is a remote volume, whatever file system the server reports.
+    let project = Project::make_private(&scratch, "share", &person.sid);
+    let share = format!(
+        r"\\localhost\C$\{}",
+        project.root.strip_prefix(r"C:\").unwrap().display()
+    );
+    let refusal = hold_tree(&share, &client).expect_err("a share is refused");
+    assert_eq!(refusal.detail(), REMOTE_VOLUME);
+    assert_eq!(refusal.rule, RULE_FOLDER_CHANGED);
+
+    // A volume of another file system is refused with the file system's name.
+    let fat = Disk::new(&scratch, "fat32", 100, 'R').expect("a FAT32 disk can be made");
+    fs::create_dir(r"R:\p").unwrap();
+    let refusal = hold_tree(r"R:\p", &client).expect_err("a FAT32 volume is refused");
+    assert_eq!(
+        refusal.detail(),
+        "the volume uses FAT32, and only NTFS volumes are supported"
+    );
+    drop(fat);
+
+    // ReFS, which a Dev Drive is, when the guest can make a volume of it.
+    match Disk::new(&scratch, "refs", 2048, 'S') {
+        Ok(refs) => {
+            fs::create_dir(r"S:\p").unwrap();
+            let refusal = hold_tree(r"S:\p", &client).expect_err("a ReFS volume is refused");
+            assert_eq!(
+                refusal.detail(),
+                "the volume uses ReFS, and only NTFS volumes are supported"
+            );
+            drop(refs);
+        }
+        Err(reason) => {
+            println!("NOT SHOWN: a ReFS volume could not be made on this guest: {reason}")
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn broker_admission_a_profile_folder_and_a_drive_root_are_refused_as_the_tree_root() {
+    if !runs_as_the_system() {
+        eprintln!("skipped: the case needs the system's token");
+        return;
+    }
+    prepare();
+    let person = Person::new("krhap");
+    let siblings = Siblings::new();
+    let scratch = Scratch::on_drive();
+    let who = person.sid.to_text().unwrap();
+
+    // A folder directly in the folder of the users' profiles.
+    let profile = PathBuf::from(format!(r"C:\Users\krprof-{}", &who[who.len() - 8..]));
+    fs::create_dir_all(&profile).unwrap();
+    grant(&profile, &format!("*{who}"), "(OI)(CI)F");
+    repository_at(&profile);
+    let hold = held(&person, &profile);
+    let refusal = admit(&hold, &person.as_client(), &siblings.probes())
+        .expect_err("a profile folder is refused");
+    assert_eq!(refusal.rule, RULE_PROFILE);
+    assert_eq!(
+        refusal.detail(),
+        format!("{}: {PROFILE_WORDS}", display(&profile))
+    );
+    drop(hold);
+
+    // The root of a drive.
+    let disk = Disk::new(&scratch, "ntfs", 100, 'T').expect("an NTFS disk can be made");
+    grant(Path::new(r"T:\"), &format!("*{who}"), "(OI)(CI)F");
+    repository_at(Path::new(r"T:\"));
+    let hold = held(&person, Path::new(r"T:\"));
+    let refusal = admit(&hold, &person.as_client(), &siblings.probes())
+        .expect_err("a drive's root is refused");
+    assert_eq!(refusal.rule, RULE_DRIVE);
+    assert_eq!(refusal.detail(), format!(r"T:\: {DRIVE_WORDS}"));
+    drop(hold);
+    drop(disk);
+}
+
+/// Makes a folder case-sensitive; the folder must be empty.
+fn make_case_sensitive(folder: &Path) {
+    run(
+        "fsutil.exe",
+        &[
+            "file",
+            "setCaseSensitiveInfo",
+            folder.to_str().unwrap(),
+            "enable",
+        ],
+    );
+}
+
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn broker_admission_a_case_sensitive_folder_and_a_repository_inside_the_project_are_refused() {
+    if !runs_as_the_system() {
+        eprintln!("skipped: the case needs the system's token");
+        return;
+    }
+    prepare();
+    let person = Person::new("krhap");
+    let siblings = Siblings::new();
+    let scratch = Scratch::on_drive();
+
+    // A folder inside the tree.
+    let project = Project::make_private(&scratch, "inside", &person.sid);
+    let folder = project.root.join("src");
+    fs::create_dir(&folder).unwrap();
+    make_case_sensitive(&folder);
+    let refusal = admit_project(&person, &siblings, &project).expect_err("the folder refuses");
+    assert_eq!(refusal.rule, RULE_CASE_SENSITIVE);
+    assert_eq!(
+        refusal.detail(),
+        format!("{}: {CASE_SENSITIVE_WORDS}", display(&folder))
+    );
+
+    // A folder above the tree: the empty folder is made case-sensitive before the tree is made in it.
+    let base = scratch.path("above");
+    let parent = base.join("parent");
+    fs::create_dir_all(&parent).unwrap();
+    grant(
+        &base,
+        &format!("*{}", person.sid.to_text().unwrap()),
+        "(OI)(CI)F",
+    );
+    make_case_sensitive(&parent);
+    let root = parent.join("root");
+    repository_at(&root);
+    let hold = held(&person, &root);
+    let refusal = admit(&hold, &person.as_client(), &siblings.probes())
+        .expect_err("the folder above refuses");
+    assert_eq!(refusal.rule, RULE_CASE_SENSITIVE);
+    assert_eq!(
+        refusal.detail(),
+        format!("{}: {CASE_SENSITIVE_WORDS}", display(&parent))
+    );
+    drop(hold);
+
+    // A repository inside the project, as a folder and as the file that a submodule leaves.
+    for (label, as_folder) in [("nested-folder", true), ("nested-file", false)] {
+        let project = Project::make_private(&scratch, label, &person.sid);
+        let inner = project.root.join("sub");
+        fs::create_dir(&inner).unwrap();
+        let marker = inner.join(".git");
+        if as_folder {
+            repository_at(&inner);
+        } else {
+            fs::write(&marker, "gitdir: ../.git/modules/sub\n").unwrap();
+        }
+        let refusal =
+            admit_project(&person, &siblings, &project).expect_err("a nested .git refuses");
+        assert_eq!(refusal.rule, RULE_NESTED, "{label}");
+        assert_eq!(
+            refusal.detail(),
+            format!("{}: {NESTED_WORDS}", display(&marker)),
+            "{label}"
+        );
+    }
+}
+
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn broker_admission_an_encrypted_object_and_a_cloud_placeholder_are_refused_naming_the_cause() {
+    use std::os::windows::ffi::OsStrExt as _;
+    use windows_sys::Win32::Storage::FileSystem::{EncryptFileW, FILE_ATTRIBUTE_ENCRYPTED};
+    use windows_sys::Win32::System::IO::DeviceIoControl;
+    if !runs_as_the_system() {
+        eprintln!("skipped: the case needs the system's token");
+        return;
+    }
+    prepare();
+    let person = Person::new("krhap");
+    let siblings = Siblings::new();
+    let scratch = Scratch::on_drive();
+
+    // What the attributes and the tag say, whatever a guest can make.
+    for tag in [0x9000_001A, 0x9000_101A, 0x9000_F01A] {
+        assert!(is_cloud_tag(tag), "{tag:#x} is a cloud tag");
+        assert_eq!(reparse_refusal(tag, "P").rule, RULE_CLOUD, "{tag:#x}");
+    }
+    for tag in [0xA000_0003, 0xA000_000C, 0x8000_0017] {
+        assert!(!is_cloud_tag(tag), "{tag:#x} is not a cloud tag");
+        assert_eq!(reparse_refusal(tag, "P").rule, RULE_LINK, "{tag:#x}");
+    }
+    assert_eq!(
+        attributes_refusal(FILE_ATTRIBUTE_ENCRYPTED, "P").map(|refusal| refusal.rule),
+        Some(RULE_ENCRYPTED)
+    );
+    assert!(attributes_refusal(0x20, "P").is_none());
+
+    // A placeholder of a cloud-synchronised folder, when the guest takes the tag.
+    let project = Project::make_private(&scratch, "cloud", &person.sid);
+    let placeholder = project.root.join("placeholder.txt");
+    fs::write(&placeholder, b"").unwrap();
+    let mut header = [0_u8; 8];
+    header[..4].copy_from_slice(&0x9000_001A_u32.to_le_bytes());
+    let file = {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(0x0020_0000)
+            .open(&placeholder)
+            .unwrap()
+    };
+    let mut returned = 0_u32;
+    // SAFETY: the file is open for writing; the buffer is 8 bytes and its length is passed.
+    let set = unsafe {
+        use std::os::windows::io::AsRawHandle as _;
+        DeviceIoControl(
+            file.as_raw_handle(),
+            0x0009_00A4,
+            header.as_ptr().cast(),
+            8,
+            std::ptr::null_mut(),
+            0,
+            &raw mut returned,
+            std::ptr::null_mut(),
+        )
+    };
+    // The error is read at the call that failed, before anything else can change it.
+    let set_error = std::io::Error::last_os_error();
+    drop(file);
+    if set == 0 {
+        println!("NOT SHOWN: the guest does not take a cloud tag on a file: {set_error}");
+    } else {
+        let refusal =
+            admit_project(&person, &siblings, &project).expect_err("a placeholder refuses");
+        assert_eq!(refusal.rule, RULE_CLOUD);
+        assert_eq!(
+            refusal.detail(),
+            format!("{}: {CLOUD_WORDS}", display(&placeholder))
+        );
+    }
+
+    // A file that the person encrypted, when the guest lets the account encrypt.
+    let project = Project::make_private(&scratch, "encrypted", &person.sid);
+    let secret = project.root.join("secret.txt");
+    fs::write(&secret, b"x").unwrap();
+    let wide: Vec<u16> = secret.as_os_str().encode_wide().chain([0]).collect();
+    // The error is read inside the account's turn, at the call that failed: ending the turn
+    // changes the thread's last error.
+    let (encrypted, encrypt_error) = acting_as(Some(&person.primary), || {
+        // SAFETY: the path is NUL-terminated and lives through the call.
+        let done = unsafe { EncryptFileW(wide.as_ptr()) };
+        (done, std::io::Error::last_os_error())
+    });
+    if encrypted == 0 {
+        println!("NOT SHOWN: the account cannot encrypt a file on this guest: {encrypt_error}");
+    } else {
+        let refusal =
+            admit_project(&person, &siblings, &project).expect_err("an encrypted file refuses");
+        assert_eq!(refusal.rule, RULE_ENCRYPTED);
+        assert_eq!(
+            refusal.detail(),
+            format!("{}: {ENCRYPTED_WORDS}", display(&secret))
+        );
+    }
+}
+
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn broker_admission_a_junction_as_the_tree_is_refused_and_one_above_it_leads_to_the_real_tree() {
+    if !runs_as_the_system() {
+        eprintln!("skipped: the case needs the system's token");
+        return;
+    }
+    prepare();
+    let person = Person::new("krhap");
+    let siblings = Siblings::new();
+    let scratch = Scratch::on_drive();
+    let project = Project::make_private(&scratch, "real", &person.sid);
+    let real = held(&person, &project.root);
+
+    let as_root = scratch.path("as-root");
+    run(
+        "cmd",
+        &[
+            "/c",
+            "mklink",
+            "/J",
+            as_root.to_str().unwrap(),
+            project.root.to_str().unwrap(),
+        ],
+    );
+    let refusal = hold_tree(as_root.to_str().unwrap(), &person.as_client())
+        .expect_err("a junction as the tree is refused");
+    assert_eq!(refusal.rule, RULE_FOLDER_LINK);
+    assert!(
+        refusal.detail().starts_with(FOLDER_LINK_WORDS),
+        "{}",
+        refusal.detail()
+    );
+
+    let above = scratch.path("above");
+    run(
+        "cmd",
+        &[
+            "/c",
+            "mklink",
+            "/J",
+            above.to_str().unwrap(),
+            project.parent.to_str().unwrap(),
+        ],
+    );
+    let through = held(&person, &above.join("root"));
+    assert_eq!(
+        through.identity, real.identity,
+        "the real chain, not the junction's"
+    );
+    assert_eq!(through.path, real.path);
+    admit(&through, &person.as_client(), &siblings.probes())
+        .expect("the tree reached through a junction above it is admitted");
+}
+
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn broker_admission_a_tree_beyond_the_bounds_of_the_walk_is_refused_as_too_large() {
+    if !runs_as_the_system() {
+        eprintln!("skipped: the case needs the system's token");
+        return;
+    }
+    prepare();
+    let person = Person::new("krhap");
+    let siblings = Siblings::new();
+    let scratch = Scratch::on_drive();
+    assert_eq!(
+        (LIMITS.objects, LIMITS.depth, LIMITS.time),
+        (100_000, 64, Duration::from_secs(60)),
+        "the bounds of the plan"
+    );
+    // The tree has five objects: .git, config, HEAD, objects and refs, at most two levels deep.
+    let project = Project::make_private(&scratch, "small", &person.sid);
+    let client = person.as_client();
+    let hold = held(&person, &project.root);
+    let probes = siblings.probes();
+    let within = |objects, depth, time| {
+        admit_within(
+            &hold,
+            &client,
+            &probes,
+            Limits {
+                objects,
+                depth,
+                time,
+            },
+        )
+    };
+    let minute = Duration::from_secs(60);
+    within(5, 3, minute).expect("five objects, three levels and a minute are enough");
+    for (what, outcome) in [
+        ("four objects", within(4, 3, minute)),
+        ("two levels", within(5, 2, minute)),
+        ("no time", within(5, 3, Duration::ZERO)),
+    ] {
+        let refusal = outcome.expect_err(&format!("{what} are too few"));
+        assert_eq!(refusal.rule, RULE_TOO_LARGE, "{what}");
+        assert_eq!(refusal.detail(), TOO_LARGE_WORDS, "{what}");
     }
 }

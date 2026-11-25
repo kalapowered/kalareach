@@ -44,7 +44,7 @@ use super::client::ClientIdentity;
 use super::ffi::{self, Handle, wide_path};
 use super::listing::{self, Failure, RepositoryListing};
 use super::rights::{Right, Sd};
-use super::walk::{AnchorRefusal, DirHandle, LIST, Lost, final_path, key_of, query};
+use super::walk::{AnchorRefusal, DirHandle, LIST, Lost, check_volume, final_path, key_of, query};
 
 /// The most bytes the repository's `config` may hold; a larger file is refused before it is read.
 pub const MAX_CONFIG_BYTES: u64 = 262_144;
@@ -500,6 +500,13 @@ fn resolve(path: &str) -> Result<(Handle, Vec<u16>), Refusal> {
             failed(&failure)
         }
     })?;
+    // The volume first, as the walk's anchor does: a volume of another kind may not answer the
+    // attribute query that follows, and the refusal must name the volume, not that query.
+    match check_volume(&handle) {
+        Ok(Ok(_)) => {}
+        Ok(Err(volume)) => return Err(refusal_for_anchor(&AnchorRefusal::Volume(volume), path)),
+        Err(failure) => return Err(failed(&failure)),
+    }
     let tag: FILE_ATTRIBUTE_TAG_INFO = query(
         &handle,
         FileAttributeTagInfo,

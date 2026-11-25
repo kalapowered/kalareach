@@ -9,6 +9,21 @@
 //! names the object and the right; a right that the person or the broker lacks, and that the grant
 //! needs, refuses it too, before anything is changed. A read right that a shared group holds is
 //! reported, not refused.
+//!
+//! The product runs on a local NTFS volume only; a tree the broker cannot read or walk as a whole
+//! (an encrypted or cloud-synchronised object, a case-sensitive folder, a repository inside the
+//! project, a user's profile folder or a drive's root as the tree's root, or a tree beyond the
+//! bounds of the walk) is refused with the cause.
+
+#![allow(unsafe_code)]
+
+use std::time::{Duration, Instant};
+
+use windows_sys::Win32::Storage::FileSystem::{
+    FILE_ATTRIBUTE_ENCRYPTED, FILE_ATTRIBUTE_TAG_INFO, FILE_CASE_SENSITIVE_INFO,
+    FileAttributeTagInfo, FileCaseSensitiveInfo,
+};
+use windows_sys::Win32::UI::Shell::GetProfilesDirectoryW;
 
 use crate::frame::Class;
 use crate::frame::invocation::{MAX_DETAIL_BYTES, RefusedKind};
@@ -16,7 +31,7 @@ use crate::manifest::Manifest;
 use crate::refusal::Refusal;
 
 use super::client::ClientIdentity;
-use super::ffi::Handle;
+use super::ffi::{self, Handle};
 use super::hold::{FOLDER_CHANGED_WORDS, RULE_FOLDER_CHANGED, TreeHold};
 use super::rights::{
     ImpersonationToken, ObjectKind, PERSON_RIGHTS, REPORT_RIGHT, Right, SYSTEM_RIGHTS, Sd, may,
@@ -24,7 +39,7 @@ use super::rights::{
 };
 use super::sd::{Entry as ListEntry, has_label_of_handle, summary_of_handle};
 use super::token::INVOCATION_GROUP_FIRST;
-use super::walk::{DirHandle, Entry, INSPECT, Kind, Lost, ROOT_BOUNDS, Verdict, walk};
+use super::walk::{Bounds, DirHandle, Entry, INSPECT, Kind, Lost, Verdict, WalkError, query, walk};
 
 /// The most notes admission keeps; the rest are counted.
 pub const MAX_NOTES: usize = 64;
@@ -39,6 +54,20 @@ pub const RULE_SYSTEM_LACKS: &str = "admission-broker-right";
 pub const RULE_OPEN: &str = "admission-open";
 /// The rule of a refusal for a link in the tree.
 pub const RULE_LINK: &str = "admission-link";
+/// The rule of a refusal for an encrypted object.
+pub const RULE_ENCRYPTED: &str = "admission-encrypted";
+/// The rule of a refusal for an object of a cloud-synchronised folder.
+pub const RULE_CLOUD: &str = "admission-cloud";
+/// The rule of a refusal for a folder that tells names apart by their case.
+pub const RULE_CASE_SENSITIVE: &str = "admission-case-sensitive";
+/// The rule of a refusal for a repository inside the project.
+pub const RULE_NESTED: &str = "admission-nested-repository";
+/// The rule of a refusal for a user's profile folder as the tree's root.
+pub const RULE_PROFILE: &str = "admission-profile-root";
+/// The rule of a refusal for a drive's root as the tree's root.
+pub const RULE_DRIVE: &str = "admission-drive-root";
+/// The rule of a refusal for a tree beyond the bounds of the walk.
+pub const RULE_TOO_LARGE: &str = "admission-tree-too-large";
 /// The rule of a refusal for a check that could not be made.
 pub const RULE_FAILED: &str = "admission-failed";
 /// The rule of a refusal for an entry that gives another principal a write right in the Git folder.
@@ -93,6 +122,38 @@ pub const STALE_WORDS: &str = "stale grant";
 // text: LABEL_WORDS
 pub const LABEL_WORDS: &str = "label";
 
+/// The end of the reply when an object is encrypted; the path comes before it.
+// text: ENCRYPTED_WORDS
+pub const ENCRYPTED_WORDS: &str =
+    "this object is encrypted, and the broker cannot read encrypted files";
+
+/// The end of the reply when an object is a placeholder of a cloud-synchronised folder; the path
+/// comes before it.
+// text: CLOUD_WORDS
+pub const CLOUD_WORDS: &str =
+    "this object belongs to a cloud-synchronised folder, and the broker does not accept those";
+
+/// The end of the reply when a folder tells names apart by their case; the path comes before it.
+// text: CASE_SENSITIVE_WORDS
+pub const CASE_SENSITIVE_WORDS: &str = "this folder treats names that differ in case as different names, and the broker does not accept that";
+
+/// The end of the reply when the project holds a second repository; the path comes before it.
+// text: NESTED_WORDS
+pub const NESTED_WORDS: &str =
+    "this marks a repository inside the project, and the broker does not accept one";
+
+/// The end of the reply when the tree's root is a user's profile folder; the path comes before it.
+// text: PROFILE_WORDS
+pub const PROFILE_WORDS: &str = "this is a user's profile folder; name a folder inside it";
+
+/// The end of the reply when the tree's root is a drive's root; the path comes before it.
+// text: DRIVE_WORDS
+pub const DRIVE_WORDS: &str = "this is the root of a drive; name a folder inside it";
+
+/// The reply when the tree is beyond the bounds of the walk.
+// text: TOO_LARGE_WORDS
+pub const TOO_LARGE_WORDS: &str = "the project is larger than the broker admits (at most 100,000 objects, 64 levels and 60 seconds)";
+
 /// The start of the reply when a check could not be made; the platform's error follows after a
 /// colon.
 // text: ADMISSION_FAILED_WORDS
@@ -107,6 +168,24 @@ const ANCESTOR_RIGHTS: [Right; 4] = [
     Right::WriteDac,
     Right::WriteOwner,
 ];
+
+/// How far admission walks a tree before it refuses the tree as too large.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Limits {
+    /// The most objects the walk visits.
+    pub objects: usize,
+    /// The deepest level below the tree's root.
+    pub depth: usize,
+    /// The longest the walk may take.
+    pub time: Duration,
+}
+
+/// The bounds of the walk: 100,000 objects, 64 levels and 60 seconds.
+pub const LIMITS: Limits = Limits {
+    objects: 100_000,
+    depth: 64,
+    time: Duration::from_secs(60),
+};
 
 /// What admission found that does not refuse the tree.
 #[derive(Debug, Default)]
@@ -239,6 +318,82 @@ fn chain_paths(tree_path: &str) -> Vec<String> {
         .collect()
 }
 
+/// The refusal for a tree beyond the bounds of the walk.
+fn too_large() -> Refusal {
+    Refusal::new(RefusedKind::Admission, RULE_TOO_LARGE, TOO_LARGE_WORDS)
+}
+
+/// Whether the cause of a reparse point is a cloud-synchronised folder: the tag of a placeholder
+/// is one of the platform's cloud tags, which differ in the third digit.
+#[must_use]
+pub fn is_cloud_tag(tag: u32) -> bool {
+    tag & 0xFFFF_0FFF == 0x9000_001A
+}
+
+/// The refusal for a link of the tree, by its cause: a placeholder of a cloud-synchronised folder
+/// or any other link.
+fn link_refusal(handle: &Handle, path: &str) -> Refusal {
+    match query::<FILE_ATTRIBUTE_TAG_INFO>(
+        handle,
+        FileAttributeTagInfo,
+        "reading the tag of a link",
+    ) {
+        Ok(tag) => reparse_refusal(tag.ReparseTag, path),
+        Err(failure) => failed(&failure),
+    }
+}
+
+/// The refusal for a link by its tag: a placeholder of a cloud-synchronised folder, or any other
+/// link.
+#[must_use]
+pub fn reparse_refusal(tag: u32, path: &str) -> Refusal {
+    if is_cloud_tag(tag) {
+        object_refusal(RULE_CLOUD, path, CLOUD_WORDS)
+    } else {
+        object_refusal(RULE_LINK, path, LINK_WORDS)
+    }
+}
+
+/// The refusal for what an object's attributes show: that it is encrypted.
+#[must_use]
+pub fn attributes_refusal(attributes: u32, path: &str) -> Option<Refusal> {
+    (attributes & FILE_ATTRIBUTE_ENCRYPTED != 0)
+        .then(|| object_refusal(RULE_ENCRYPTED, path, ENCRYPTED_WORDS))
+}
+
+/// Whether a folder tells names apart by their case.
+fn case_sensitive(handle: &Handle) -> ffi::Result<bool> {
+    let info: FILE_CASE_SENSITIVE_INFO = query(
+        handle,
+        FileCaseSensitiveInfo,
+        "reading whether a folder tells names apart by their case",
+    )?;
+    // The flag of a folder that does.
+    Ok(info.Flags & 1 != 0)
+}
+
+/// The folder that holds the users' profile folders, in the platform's spelling.
+fn profiles_directory() -> ffi::Result<String> {
+    let mut buffer = vec![0_u16; 260];
+    loop {
+        let mut size = buffer.len() as u32;
+        // SAFETY: the buffer's length is passed and the call writes at most that many units.
+        let read = unsafe { GetProfilesDirectoryW(buffer.as_mut_ptr(), &raw mut size) };
+        if read != 0 {
+            let length = buffer
+                .iter()
+                .position(|unit| *unit == 0)
+                .unwrap_or(buffer.len());
+            return Ok(String::from_utf16_lossy(&buffer[..length]));
+        }
+        if (size as usize) <= buffer.len() {
+            // text: admission_profiles_directory-1
+            return Err(ffi::last("reading the folder of the users' profiles"));
+        }
+        buffer.resize(size as usize, 0);
+    }
+}
+
 /// An object of the tree as the checks meet it.
 struct Object<'a> {
     path: &'a str,
@@ -255,6 +410,7 @@ struct Checking<'a> {
     /// The identifiers that may write in the Git folder: the person, the system, the
     /// administrators.
     writers: [String; 3],
+    limits: Limits,
     admitted: Admitted,
 }
 
@@ -349,6 +505,44 @@ impl Checking<'_> {
         Ok(())
     }
 
+    /// What makes the tree's place unacceptable whatever it holds: a drive's root or a user's
+    /// profile folder as the tree's root, a folder from the volume's root down that tells names
+    /// apart by their case, and an encrypted root.
+    fn place(&self, hold: &TreeHold) -> Result<(), Refusal> {
+        let path = spelled(&hold.path);
+        if hold.chain.len() == 1 {
+            return Err(object_refusal(RULE_DRIVE, path, DRIVE_WORDS));
+        }
+        let profiles = profiles_directory().map_err(|failure| failed(&failure))?;
+        let parent = path.rsplit_once('\\').map_or("", |(parent, _)| parent);
+        if parent.eq_ignore_ascii_case(&profiles) {
+            return Err(object_refusal(RULE_PROFILE, path, PROFILE_WORDS));
+        }
+        let paths = chain_paths(&hold.path);
+        for (index, directory) in hold.chain.iter().enumerate() {
+            if case_sensitive(directory.handle()).map_err(|failure| failed(&failure))? {
+                let named = paths.get(index).map_or(path, String::as_str);
+                return Err(object_refusal(
+                    RULE_CASE_SENSITIVE,
+                    named,
+                    CASE_SENSITIVE_WORDS,
+                ));
+            }
+        }
+        if let Some(root) = hold.chain.last() {
+            let tag: FILE_ATTRIBUTE_TAG_INFO = query(
+                root.handle(),
+                FileAttributeTagInfo,
+                "reading the attributes of the tree's root",
+            )
+            .map_err(|failure| failed(&failure))?;
+            if let Some(refusal) = attributes_refusal(tag.FileAttributes, path) {
+                return Err(refusal);
+            }
+        }
+        Ok(())
+    }
+
     /// The ancestors of the tree, from the volume's root: nothing a sibling holds may let it delete
     /// what is in an ancestor, or the ancestor, or change its list or its owner.
     fn ancestors(&self, hold: &TreeHold) -> Result<(), Refusal> {
@@ -381,8 +575,17 @@ impl Checking<'_> {
             in_git: false,
         })?;
         let mut refusal: Option<Refusal> = None;
-        let outcome = walk(root, ROOT_BOUNDS, &mut |entry: &Entry<'_>| {
+        let started = Instant::now();
+        let bounds = Bounds {
+            objects: self.limits.objects,
+            depth: self.limits.depth,
+        };
+        let outcome = walk(root, bounds, &mut |entry: &Entry<'_>| {
             if refusal.is_some() {
+                return Ok(Verdict::Skip);
+            }
+            if started.elapsed() >= self.limits.time {
+                refusal = Some(too_large());
                 return Ok(Verdict::Skip);
             }
             if let Err(found) = self.visit(hold, root, entry) {
@@ -401,6 +604,7 @@ impl Checking<'_> {
                 RULE_FOLDER_CHANGED,
                 FOLDER_CHANGED_WORDS,
             )),
+            Err(WalkError::TooLarge(_) | WalkError::TooDeep(_)) => Err(too_large()),
             Err(other) => Err(failed(&other)),
         }
     }
@@ -427,8 +631,23 @@ impl Checking<'_> {
         let kind = match opened.kind {
             Kind::File => ObjectKind::File,
             Kind::Directory => ObjectKind::Directory,
-            Kind::ReparsePoint => return Err(object_refusal(RULE_LINK, &path, LINK_WORDS)),
+            Kind::ReparsePoint => return Err(link_refusal(&opened.handle, &path)),
         };
+        if let Some(refusal) = attributes_refusal(opened.attributes, &path) {
+            return Err(refusal);
+        }
+        if entry.child.display().eq_ignore_ascii_case(".git") && opened.key != hold.git_dir.key() {
+            return Err(object_refusal(RULE_NESTED, &path, NESTED_WORDS));
+        }
+        if kind == ObjectKind::Directory
+            && case_sensitive(&opened.handle).map_err(|failure| failed(&failure))?
+        {
+            return Err(object_refusal(
+                RULE_CASE_SENSITIVE,
+                &path,
+                CASE_SENSITIVE_WORDS,
+            ));
+        }
         let descriptor = Sd::of_handle(&opened.handle).map_err(|failure| failed(&failure))?;
         let git = hold.git_dir.path();
         let place: Vec<u16> = entry
@@ -514,6 +733,20 @@ pub fn admit(
     client: &ClientIdentity,
     probes: &Probes,
 ) -> Result<Admitted, Refusal> {
+    admit_within(hold, client, probes, LIMITS)
+}
+
+/// Admits the held tree as [`admit`] does, with the bounds of the walk given.
+///
+/// # Errors
+///
+/// Refuses as [`admit`] does, and refuses a tree that the walk cannot finish within the bounds.
+pub fn admit_within(
+    hold: &TreeHold,
+    client: &ClientIdentity,
+    probes: &Probes,
+    limits: Limits,
+) -> Result<Admitted, Refusal> {
     let person = client
         .user_sid
         .to_text()
@@ -522,8 +755,10 @@ pub fn admit(
         client,
         probes,
         writers: [person, "S-1-5-18".to_owned(), "S-1-5-32-544".to_owned()],
+        limits,
         admitted: Admitted::default(),
     };
+    checking.place(hold)?;
     checking.ancestors(hold)?;
     checking.tree(hold)?;
     Ok(checking.admitted)

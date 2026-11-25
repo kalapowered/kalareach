@@ -730,6 +730,14 @@ WRITER_WORDS | writer | writer S on P | read: summary_of_handle of an object und
 OWNER_WORDS | owner | owner S on P | read: summary_of_handle of an object under .git showed an owner that is not the person, S-1-5-18 or S-1-5-32-544
 STALE_WORDS | stale grant | stale grant on P | read: summary_of_handle of an object of the tree showed an entry whose identifier has the form of an invocation's group (S-1-9, the crate's first part, three more parts)
 LABEL_WORDS | label | label on P | read: has_label_of_handle found a mandatory-label entry in the object's system access list
+ENCRYPTED_WORDS | this object is encrypted, and the broker cannot read encrypted files | X: this object is encrypted, and the broker cannot read encrypted files | read: the attributes of the tree's root, or of an object of the walk read from its handle, hold the encrypted flag
+CLOUD_WORDS | this object belongs to a cloud-synchronised folder, and the broker does not accept those | X: this object belongs to a cloud-synchronised folder, and the broker does not accept those | read: an object of the walk is a reparse point whose tag (FileAttributeTagInfo, read from its handle) is one of the platform's cloud tags
+CASE_SENSITIVE_WORDS | this folder treats names that differ in case as different names, and the broker does not accept that | X: this folder treats names that differ in case as different names, and the broker does not accept that | read: FileCaseSensitiveInfo of a directory of the chain or of the walk, read from its handle, has the case-sensitive flag
+NESTED_WORDS | this marks a repository inside the project, and the broker does not accept one | X: this marks a repository inside the project, and the broker does not accept one | read: an object of the walk is named .git (in any case) and is not the held .git folder of the tree's root
+PROFILE_WORDS | this is a user's profile folder; name a folder inside it | X: this is a user's profile folder; name a folder inside it | read: the folder above the tree's root is the folder that GetProfilesDirectoryW names, compared without regard to case
+DRIVE_WORDS | this is the root of a drive; name a folder inside it | X: this is the root of a drive; name a folder inside it | read: the tree's chain holds one directory, the volume's root
+TOO_LARGE_WORDS | the project is larger than the broker admits | the project is larger than the broker admits (at most 100,000 objects, 64 levels and 60 seconds) | read: the walk visited more objects than the bound, went deeper than the bound (WalkError::TooLarge, TooDeep) or ran for the time of the bound
+admission_profiles_directory-1 | reading the folder of the users' profiles | reading the folder of the users' profiles: Windows error N | read: GetProfilesDirectoryW returned 0 and asked for no larger buffer
 
 # ---- the places of a form that carry no identifier, counted by file (tests/sentences.rs)
 listed | #[error] | env.rs | 1 | reaches no person: production builds only the proof block, which never lacks a tree
@@ -789,7 +797,7 @@ listed | pub const | limits.rs | 2 | names of rules, for cases and documents; no
 listed | pub const | standing.rs | 8 | names of rules, for cases and documents; no sentence for a person
 listed | pub const | repository/readers.rs | 8 | names, keys, limits, encodings and paths; no sentence for a person
 listed | pub const | win/hold.rs | 12 | names of rules, for cases and documents; no sentence for a person
-listed | pub const | win/admission.rs | 10 | names of rules, for cases and documents; no sentence for a person
+listed | pub const | win/admission.rs | 17 | names of rules, for cases and documents; no sentence for a person
 listed | pub const | win/install.rs | 3 | names, keys, limits, encodings and paths; no sentence for a person
 listed | pub const | win/verify.rs | 1 | names, keys, limits, encodings and paths; no sentence for a person
 listed | pub fn | env.rs | 2 | names, keys, limits, encodings and paths; no sentence for a person
