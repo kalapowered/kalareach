@@ -328,7 +328,9 @@ impl Launcher {
         end_and_collect(&mut self.process);
     }
 
-    /// Lets the launcher go: it ends the program it created and itself.
+    /// Lets the launcher go. Before the program is started, the launcher ends the program it
+    /// created and itself. Once it is started, the launcher ends when the program does, and ten
+    /// seconds after this call it is ended.
     pub async fn end(mut self) {
         drop(self.input.take());
         let ended = Instant::now() + Duration::from_secs(10);
@@ -419,9 +421,10 @@ fn text(value: &serde_json::Value, name: &str) -> String {
 /// Plays the launcher when this program was started to, and returns at once when it was not.
 ///
 /// It reports each step to its standard output, one line each, for [`Launcher`] to read. It starts
-/// the program it created when a line comes in on its standard input, and ends when that input is
-/// closed, and the program it created ends with it. The program has no standard input and no output
-/// of its own.
+/// the program it created when a line comes in on its standard input, and then waits for the
+/// program and ends when it does. Before it has started the program, it ends when that input is
+/// closed, and the program it created ends with it. The program has no standard input and no
+/// output of its own.
 ///
 /// # Panics
 ///
