@@ -149,7 +149,7 @@ const OWNERS: [&str; 4] = ["ACP-3a", "ACP-4", "ACP-5", "ACP-7c"];
 const GUARD_PREFIX: &str = "the_acp_";
 
 /// Every control of cases 5b and 6b.
-const CONTROLS: [Control; 33] = [
+const CONTROLS: [Control; 35] = [
     Control {
         id: "5b-1",
         test: "acp_a_daemon_killed_with_a_request_pending_leaves_the_agent_and_the_restarted_daemon_serves_the_same_request",
@@ -442,9 +442,9 @@ const CONTROLS: [Control; 33] = [
         shape: Shape::Qoder,
         owner: "ACP-4",
         waits: true,
-        shows: "after the installation's file is replaced in place, the process identity, the executable's digest and the copy's digest equal those before, and the installation's digest differs",
+        shows: "after the installation's file is replaced in place, the process image is the copy's file, the process identity, the executable's digest, the copy's digest and the package and table digests equal those before, and the installation's digest differs",
         mutation: "the launch runs the installation's file, not the copy",
-        red: "the digests after the upgrade differ from those before",
+        red: "the process image is not the copy's file, or a digest or the process identity after the upgrade differs from before",
         harness_start: None,
     },
     Control {
@@ -453,9 +453,20 @@ const CONTROLS: [Control; 33] = [
         shape: Shape::Qoder,
         owner: "ACP-4",
         waits: true,
-        shows: "the agent asks a fresh permission request after the upgrade; its decoded options equal those decoded before, and it is answered with the pinned table's ids",
+        shows: "the agent asks a fresh permission request after the upgrade; its decoded options and the process, executable, package and table digests equal those read before, and it is answered with the pinned table's ids",
         mutation: "the host decodes the fresh request with the table of the upgraded installation",
-        red: "the decoded options differ from those before the upgrade",
+        red: "the table digest, a digest or the decoded options differ from those before the upgrade",
+        harness_start: None,
+    },
+    Control {
+        id: "6b-2g",
+        test: "acp_a_fresh_request_after_an_upgrade_is_decoded_by_the_pinned_table_and_answered_with_its_ids_for_a_gemini_shaped_agent",
+        shape: Shape::Gemini,
+        owner: "ACP-7c",
+        waits: true,
+        shows: "the agent asks a fresh permission request after the upgrade of its package; its decoded options and the process, executable, package and table digests equal those read before, and it is answered with the pinned table's ids",
+        mutation: "the host decodes the fresh request with the table of the upgraded installation",
+        red: "the table digest, a digest or the decoded options differ from those before the upgrade",
         harness_start: None,
     },
     Control {
@@ -486,9 +497,20 @@ const CONTROLS: [Control; 33] = [
         shape: Shape::Qoder,
         owner: "ACP-5",
         waits: true,
-        shows: "the version the agent reports equals the binding's, and a start whose version differs from the hashed build is refused",
+        shows: "the version the agent reports equals the binding's, and a start whose version differs from the hashed build is refused with a message that names both versions",
         mutation: "the reported version is not compared with the hashed build",
-        red: "a start with another version is admitted",
+        red: "a start with another version is admitted, or its message does not name both versions",
+        harness_start: None,
+    },
+    Control {
+        id: "6b-4g",
+        test: "acp_a_start_whose_version_differs_from_the_hashed_build_is_refused_for_a_gemini_shaped_agent",
+        shape: Shape::Gemini,
+        owner: "ACP-7c",
+        waits: true,
+        shows: "the version the agent reports equals the binding's, and a start whose version differs from the hashed build is refused with a message that names both versions",
+        mutation: "the reported version is not compared with the hashed build",
+        red: "a start with another version is admitted, or its message does not name both versions",
         harness_start: None,
     },
     Control {
@@ -859,6 +881,18 @@ fn acp_a_fresh_request_after_an_upgrade_is_decoded_by_the_pinned_table_and_answe
     );
 }
 
+/// Control 6b-2g.
+#[test]
+#[ignore = "waits for ACP-7c"]
+fn acp_a_fresh_request_after_an_upgrade_is_decoded_by_the_pinned_table_and_answered_with_its_ids_for_a_gemini_shaped_agent()
+ {
+    run_case(
+        "6b-2g",
+        &controls::upgrade_script(),
+        controls::a_fresh_request_after_an_upgrade_of_a_gemini_shaped_agent,
+    );
+}
+
 /// Control 6b-3.
 #[test]
 #[ignore = "waits for ACP-3a"]
@@ -878,6 +912,17 @@ fn acp_a_start_whose_version_differs_from_the_hashed_build_is_refused() {
         "6b-4",
         &controls::upgrade_script(),
         controls::a_start_that_reports_another_version,
+    );
+}
+
+/// Control 6b-4g.
+#[test]
+#[ignore = "waits for ACP-7c"]
+fn acp_a_start_whose_version_differs_from_the_hashed_build_is_refused_for_a_gemini_shaped_agent() {
+    run_case(
+        "6b-4g",
+        &controls::upgrade_script(),
+        controls::a_start_of_a_gemini_shaped_agent_that_reports_another_version,
     );
 }
 

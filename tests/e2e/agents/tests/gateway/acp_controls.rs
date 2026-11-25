@@ -2011,7 +2011,8 @@ fn the_judge_of_the_gemini_window_names_its_red_when_the_window_is_capped_at_thi
 
 /// What the host reads of an agent and of the program it runs: the agent's process identity, the
 /// digest of the executable the process runs, the digest of the verified copy the process was
-/// started from, and the digest of the installation's file.
+/// started from, the digest of the installation's file, the digests of the connector package and of
+/// its table, and the file identities of the process's image and of the verified copy.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Identity {
     /// The process identity.
@@ -2022,29 +2023,89 @@ pub struct Identity {
     pub copy: String,
     /// The digest of the installation's file.
     pub installation: String,
+    /// The digest of the connector package the host used.
+    pub package: String,
+    /// The digest of the table that the host decodes the agent's requests by.
+    pub table: String,
+    /// The file identity, device and inode, of the process's image.
+    pub image_file: String,
+    /// The file identity, device and inode, of the verified copy.
+    pub copy_file: String,
 }
 
-/// 6b-1: after the installation's file was replaced in place, the agent's process, its executable
-/// and its copy read as they did before.
+impl Identity {
+    /// Whether every one of the reads holds something.
+    pub fn is_filled(&self) -> bool {
+        [
+            &self.process,
+            &self.executable,
+            &self.copy,
+            &self.installation,
+            &self.package,
+            &self.table,
+            &self.image_file,
+            &self.copy_file,
+        ]
+        .iter()
+        .all(|read| !read.is_empty())
+    }
+
+    /// Whether `later` reads as `self` does: the same process, executable, copy, package and
+    /// table.
+    pub fn is_unchanged_by(&self, later: &Self) -> bool {
+        self.process == later.process
+            && self.executable == later.executable
+            && self.copy == later.copy
+            && self.package == later.package
+            && self.table == later.table
+    }
+
+    /// Whether the process's image is the verified copy's file.
+    pub fn runs_the_copy(&self) -> bool {
+        self.image_file == self.copy_file
+    }
+}
+
+/// What a case says when a read of an identity holds nothing.
+const EMPTY_IDENTITY: &str =
+    "a read of the process, the executable, the digests or a file identity is empty";
+
+/// 6b-1: after the installation's file was replaced in place, the agent's process, its executable,
+/// its copy, its package and its table read as they did before, and the process's image was the
+/// verified copy's file before and after.
 pub fn the_upgrade_leaves_the_process_and_its_copy(
     before: &Identity,
     after: &Identity,
 ) -> Result<(), Red> {
     ensure(
-        before.process == after.process
-            && before.executable == after.executable
-            && before.copy == after.copy,
+        before.is_unchanged_by(after) && before.runs_the_copy() && after.runs_the_copy(),
         "6b-1",
     )
 }
 
-/// What the host decoded of a request before and after the upgrade.
+/// What the host read of an agent and decoded of its pending request.
+#[derive(Debug)]
+pub struct Seen {
+    /// The agent's identity.
+    pub identity: Identity,
+    /// The options decoded from the request, as text.
+    pub options: String,
+}
+
+impl Seen {
+    /// Whether every read holds something.
+    pub fn is_filled(&self) -> bool {
+        self.identity.is_filled() && !self.options.is_empty()
+    }
+}
+
+/// What the host read of an agent and decoded of its request before and after the upgrade.
 #[derive(Debug)]
 pub struct Decoded {
-    /// The options decoded from the request before the upgrade, as text.
-    pub before: String,
-    /// The options decoded from the fresh request after the upgrade, as text.
-    pub after: String,
+    /// The reads with the request before the upgrade pending.
+    pub before: Seen,
+    /// The reads with the fresh request after the upgrade pending.
+    pub after: Seen,
 }
 
 /// The option the stand-in received in its response to the request numbered `number`.
@@ -2055,15 +2116,22 @@ fn option_of(record: &[Value], number: u64) -> Option<&str> {
         .and_then(|line| line["option"].as_str())
 }
 
-/// 6b-2: the options decoded from the fresh request equal those decoded before the upgrade, and the
-/// stand-in received the pinned table's identifier for the answer.
+/// 6b-2 and 6b-2g, by `id`: the process, the executable, the package and the table digest, and the
+/// options decoded from the fresh request equal those read before the upgrade, and the stand-in
+/// received the pinned table's identifier for the answer.
 pub fn a_fresh_request_is_decoded_by_the_pinned_table(
+    id: &str,
     decoded: &Decoded,
     record: &[Value],
 ) -> Result<(), Red> {
     ensure(
-        decoded.before == decoded.after && option_of(record, 1) == Some("proceed_once"),
-        "6b-2",
+        decoded
+            .before
+            .identity
+            .is_unchanged_by(&decoded.after.identity)
+            && decoded.before.options == decoded.after.options
+            && option_of(record, 1) == Some("proceed_once"),
+        id,
     )
 }
 
@@ -2095,18 +2163,27 @@ pub struct Versions {
     pub binding: String,
 }
 
-/// 6b-4: the version the agent reports equals the binding's, and a start of an agent that reports
-/// another version was refused.
-pub fn the_reported_version_is_the_bindings(versions: &Versions, other: &Start) -> Result<(), Red> {
+/// 6b-4 and 6b-4g, by `id`: the version the agent reports equals the binding's, and a start of an
+/// agent that reports `other_version` was refused with a message that names both versions.
+pub fn the_reported_version_is_the_bindings(
+    id: &str,
+    versions: &Versions,
+    other: &Start,
+    other_version: &str,
+) -> Result<(), Red> {
     ensure(
-        versions.reported == versions.binding && !other.admitted,
-        "6b-4",
+        versions.reported == versions.binding
+            && !other.admitted
+            && other.message.contains(other_version)
+            && other.message.contains(&versions.binding),
+        id,
     )
 }
 
 impl Hosted {
-    /// The identity of the agent's process, its executable and its copy, and the digest of the
-    /// installation's file, as the host reads them now.
+    /// The identity of the agent's process, its executable and its copy, the digest of the
+    /// installation's file, the digests of the package and of its table, and the file identities
+    /// of the process's image and of the copy, as the host reads them now.
     pub fn identity(&mut self) -> Identity {
         match *self {}
     }
@@ -2157,20 +2234,46 @@ pub fn upgrade_script() -> Value {
 /// Case 6b-1: the installation's file is replaced while the agent runs with a request pending.
 pub fn an_upgrade_while_the_agent_runs(host: &mut Hosted) -> Result<(), Red> {
     let before = host.identity();
+    requires("6b-1", before.is_filled(), EMPTY_IDENTITY);
     host.upgrades_the_installation();
-    the_upgrade_leaves_the_process_and_its_copy(&before, &host.identity())
+    let after = host.identity();
+    requires("6b-1", after.is_filled(), EMPTY_IDENTITY);
+    the_upgrade_leaves_the_process_and_its_copy(&before, &after)
 }
 
-/// Case 6b-2: a fresh request after the upgrade, answered with the pinned table's identifier.
-pub fn a_fresh_request_after_an_upgrade(host: &mut Hosted) -> Result<(), Red> {
-    let before = host.decoded_options();
+/// What the host reads of the agent and decodes of its pending request now.
+fn seen(host: &mut Hosted) -> Seen {
+    Seen {
+        identity: host.identity(),
+        options: host.decoded_options(),
+    }
+}
+
+/// Cases 6b-2 and 6b-2g, by `id`: a fresh request after the upgrade, answered with the pinned
+/// table's identifier.
+fn a_fresh_request_after_an_upgrade_for(id: &str, host: &mut Hosted) -> Result<(), Red> {
+    let before = seen(host);
+    requires(id, before.is_filled(), EMPTY_IDENTITY);
     host.answer_next("proceed_once");
     host.upgrades_the_installation();
     host.release("after");
     host.waits_for_a_request();
-    let after = host.decoded_options();
+    let after = seen(host);
+    requires(id, after.is_filled(), EMPTY_IDENTITY);
     host.answer_next("proceed_once");
-    a_fresh_request_is_decoded_by_the_pinned_table(&Decoded { before, after }, &host.record())
+    a_fresh_request_is_decoded_by_the_pinned_table(id, &Decoded { before, after }, &host.record())
+}
+
+/// Case 6b-2: a fresh request after the upgrade of a Qoder-shaped agent's installation.
+pub fn a_fresh_request_after_an_upgrade(host: &mut Hosted) -> Result<(), Red> {
+    a_fresh_request_after_an_upgrade_for("6b-2", host)
+}
+
+/// Case 6b-2g: a fresh request after the upgrade of a Gemini-shaped agent's package.
+pub fn a_fresh_request_after_an_upgrade_of_a_gemini_shaped_agent(
+    host: &mut Hosted,
+) -> Result<(), Red> {
+    a_fresh_request_after_an_upgrade_for("6b-2g", host)
 }
 
 /// Case 6b-3: a second agent started after the upgrade.
@@ -2180,75 +2283,231 @@ pub fn a_second_start_after_the_upgrade(host: &mut Hosted) -> Result<(), Red> {
     a_build_outside_the_range_is_refused("6b-3", "=1.1.63", &start)
 }
 
-/// Case 6b-4: a second agent that reports another version than the hashed build's.
-pub fn a_start_that_reports_another_version(host: &mut Hosted) -> Result<(), Red> {
+/// Cases 6b-4 and 6b-4g, by `id`: a second agent that reports `other_version`, which is not the
+/// hashed build's.
+fn another_version_is_refused(id: &str, other_version: &str, host: &mut Hosted) -> Result<(), Red> {
     let versions = Versions {
         reported: host.reported_version(),
         binding: host.binding_version(),
     };
-    let other = host.starts_a_second_agent(&serde_json::json!({ "version": "1.1.64" }));
-    the_reported_version_is_the_bindings(&versions, &other)
+    requires(
+        id,
+        !versions.reported.is_empty() && !versions.binding.is_empty(),
+        "the reported version or the binding's version is empty",
+    );
+    let other = host.starts_a_second_agent(&serde_json::json!({ "version": other_version }));
+    the_reported_version_is_the_bindings(id, &versions, &other, other_version)
+}
+
+/// Case 6b-4: a second Qoder-shaped agent that reports another version than the hashed build's.
+pub fn a_start_that_reports_another_version(host: &mut Hosted) -> Result<(), Red> {
+    another_version_is_refused("6b-4", "1.1.64", host)
+}
+
+/// Case 6b-4g: a second Gemini-shaped agent that reports another version than the hashed build's.
+pub fn a_start_of_a_gemini_shaped_agent_that_reports_another_version(
+    host: &mut Hosted,
+) -> Result<(), Red> {
+    another_version_is_refused("6b-4g", "0.60.1", host)
 }
 
 #[test]
 fn the_judge_of_the_upgrade_names_its_red_when_the_process_or_its_copy_changes() {
-    let identity = |process: &str, executable: &str, copy: &str, installation: &str| Identity {
-        process: process.to_owned(),
-        executable: executable.to_owned(),
-        copy: copy.to_owned(),
-        installation: installation.to_owned(),
+    let before = identity();
+    let upgraded = Identity {
+        installation: "i2".to_owned(),
+        ..identity()
     };
-    let before = identity("p1", "e1", "c1", "i1");
     assert_eq!(
-        the_upgrade_leaves_the_process_and_its_copy(&before, &identity("p1", "e1", "c1", "i2")),
+        the_upgrade_leaves_the_process_and_its_copy(&before, &upgraded),
         Ok(())
     );
+    for (what, changed) in [
+        (
+            "the launch ran the installation's file, so the executable changed with the upgrade",
+            Identity {
+                executable: "e2".to_owned(),
+                ..identity()
+            },
+        ),
+        (
+            "the copy changed",
+            Identity {
+                copy: "c2".to_owned(),
+                ..identity()
+            },
+        ),
+        (
+            "the process was replaced",
+            Identity {
+                process: "p2".to_owned(),
+                ..identity()
+            },
+        ),
+        (
+            "the package changed",
+            Identity {
+                package: "k2".to_owned(),
+                ..identity()
+            },
+        ),
+        (
+            "the table changed",
+            Identity {
+                table: "t2".to_owned(),
+                ..identity()
+            },
+        ),
+    ] {
+        assert_eq!(
+            the_upgrade_leaves_the_process_and_its_copy(&before, &changed),
+            Err(red("6b-1")),
+            "{what}"
+        );
+    }
+    // The bytes of the executable did not change, but the process runs the installation's file,
+    // which the upgrade renamed away: the image is not the copy's file.
+    let wrong_file = || Identity {
+        image_file: "dev1:ino9".to_owned(),
+        ..identity()
+    };
     assert_eq!(
-        the_upgrade_leaves_the_process_and_its_copy(&before, &identity("p1", "e2", "c1", "i2")),
+        the_upgrade_leaves_the_process_and_its_copy(&wrong_file(), &upgraded),
         Err(red("6b-1")),
-        "the launch ran the installation's file, so the executable changed with the upgrade"
+        "the process ran the installation's file before the upgrade"
     );
     assert_eq!(
-        the_upgrade_leaves_the_process_and_its_copy(&before, &identity("p1", "e1", "c2", "i2")),
+        the_upgrade_leaves_the_process_and_its_copy(&before, &wrong_file()),
         Err(red("6b-1")),
-        "the copy changed"
+        "the process image is another file than the copy after the upgrade, with every digest equal"
     );
-    assert_eq!(
-        the_upgrade_leaves_the_process_and_its_copy(&before, &identity("p2", "e1", "c1", "i2")),
-        Err(red("6b-1")),
-        "the process was replaced"
-    );
+}
+
+/// An identity that reads as a process running its verified copy.
+#[cfg(test)]
+fn identity() -> Identity {
+    Identity {
+        process: "p1".to_owned(),
+        executable: "e1".to_owned(),
+        copy: "c1".to_owned(),
+        installation: "i1".to_owned(),
+        package: "k1".to_owned(),
+        table: "t1".to_owned(),
+        image_file: "dev1:ino1".to_owned(),
+        copy_file: "dev1:ino1".to_owned(),
+    }
+}
+
+#[test]
+fn an_identity_with_an_empty_read_is_not_filled() {
+    assert!(identity().is_filled());
+    let empty: [fn(&mut Identity); 8] = [
+        |held| held.process.clear(),
+        |held| held.executable.clear(),
+        |held| held.copy.clear(),
+        |held| held.installation.clear(),
+        |held| held.package.clear(),
+        |held| held.table.clear(),
+        |held| held.image_file.clear(),
+        |held| held.copy_file.clear(),
+    ];
+    for (at, clear) in empty.into_iter().enumerate() {
+        let mut held = identity();
+        clear(&mut held);
+        assert!(!held.is_filled(), "read {at} is empty");
+    }
 }
 
 #[test]
 fn the_judge_of_a_fresh_request_names_its_red_when_the_upgraded_table_decodes_it() {
-    let decoded = |before: &str, after: &str| Decoded {
-        before: before.to_owned(),
-        after: after.to_owned(),
+    let seen = |identity: Identity, options: &str| Seen {
+        identity,
+        options: options.to_owned(),
+    };
+    let decoded = |after: Identity, options: &str| Decoded {
+        before: seen(identity(), "options"),
+        after: seen(after, options),
     };
     let answered = [response_line_for(1, "proceed_once")];
-    assert_eq!(
-        a_fresh_request_is_decoded_by_the_pinned_table(&decoded("options", "options"), &answered),
-        Ok(())
-    );
-    assert_eq!(
-        a_fresh_request_is_decoded_by_the_pinned_table(&decoded("options", "other"), &answered),
-        Err(red("6b-2")),
-        "the host decoded the fresh request with the table of the upgraded installation"
-    );
-    assert_eq!(
-        a_fresh_request_is_decoded_by_the_pinned_table(
-            &decoded("options", "options"),
-            &[response_line_for(1, "proceed_always")]
-        ),
-        Err(red("6b-2")),
-        "the answer carried another identifier than the pinned table's"
-    );
-    assert_eq!(
-        a_fresh_request_is_decoded_by_the_pinned_table(&decoded("options", "options"), &[]),
-        Err(red("6b-2")),
-        "the stand-in received no answer"
-    );
+    for id in ["6b-2", "6b-2g"] {
+        assert_eq!(
+            a_fresh_request_is_decoded_by_the_pinned_table(
+                id,
+                &decoded(identity(), "options"),
+                &answered
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            a_fresh_request_is_decoded_by_the_pinned_table(
+                id,
+                &decoded(identity(), "other"),
+                &answered
+            ),
+            Err(red(id)),
+            "the host decoded the fresh request with the table of the upgraded installation"
+        );
+        for (what, changed) in [
+            (
+                "the table digest changed",
+                Identity {
+                    table: "t2".to_owned(),
+                    ..identity()
+                },
+            ),
+            (
+                "the package digest changed",
+                Identity {
+                    package: "k2".to_owned(),
+                    ..identity()
+                },
+            ),
+            (
+                "the process was replaced",
+                Identity {
+                    process: "p2".to_owned(),
+                    ..identity()
+                },
+            ),
+            (
+                "the executable changed",
+                Identity {
+                    executable: "e2".to_owned(),
+                    ..identity()
+                },
+            ),
+        ] {
+            assert_eq!(
+                a_fresh_request_is_decoded_by_the_pinned_table(
+                    id,
+                    &decoded(changed, "options"),
+                    &answered
+                ),
+                Err(red(id)),
+                "{what} with the same options decoded"
+            );
+        }
+        assert_eq!(
+            a_fresh_request_is_decoded_by_the_pinned_table(
+                id,
+                &decoded(identity(), "options"),
+                &[response_line_for(1, "proceed_always")]
+            ),
+            Err(red(id)),
+            "the answer carried another identifier than the pinned table's"
+        );
+        assert_eq!(
+            a_fresh_request_is_decoded_by_the_pinned_table(
+                id,
+                &decoded(identity(), "options"),
+                &[]
+            ),
+            Err(red(id)),
+            "the stand-in received no answer"
+        );
+    }
+    assert!(seen(identity(), "options").is_filled());
+    assert!(!seen(identity(), "").is_filled(), "no options were decoded");
 }
 
 #[test]
@@ -2285,24 +2544,65 @@ fn the_judge_of_the_version_names_its_red_when_a_start_with_another_version_is_a
         reported: reported.to_owned(),
         binding: binding.to_owned(),
     };
-    let start = |admitted: bool| Start {
+    let start = |admitted: bool, message: &str| Start {
         admitted,
-        message: String::new(),
+        message: message.to_owned(),
     };
-    assert_eq!(
-        the_reported_version_is_the_bindings(&versions("1.1.63", "1.1.63"), &start(false)),
-        Ok(())
-    );
-    assert_eq!(
-        the_reported_version_is_the_bindings(&versions("1.1.63", "1.1.63"), &start(true)),
-        Err(red("6b-4")),
-        "the reported version is not compared with the hashed build"
-    );
-    assert_eq!(
-        the_reported_version_is_the_bindings(&versions("1.1.64", "1.1.63"), &start(false)),
-        Err(red("6b-4")),
-        "the agent reports another version than the binding's"
-    );
+    for (id, bound, other) in [("6b-4", "1.1.63", "1.1.64"), ("6b-4g", "0.60.0", "0.60.1")] {
+        let refused = start(
+            false,
+            &format!("the build {other} is not the hashed build {bound}"),
+        );
+        assert_eq!(
+            the_reported_version_is_the_bindings(id, &versions(bound, bound), &refused, other),
+            Ok(())
+        );
+        assert_eq!(
+            the_reported_version_is_the_bindings(
+                id,
+                &versions(bound, bound),
+                &start(true, &refused.message),
+                other
+            ),
+            Err(red(id)),
+            "the reported version is not compared with the hashed build"
+        );
+        assert_eq!(
+            the_reported_version_is_the_bindings(id, &versions(other, bound), &refused, other),
+            Err(red(id)),
+            "the agent reports another version than the binding's"
+        );
+        assert_eq!(
+            the_reported_version_is_the_bindings(
+                id,
+                &versions(bound, bound),
+                &start(false, "the start was refused"),
+                other
+            ),
+            Err(red(id)),
+            "the refusal names neither version"
+        );
+        assert_eq!(
+            the_reported_version_is_the_bindings(
+                id,
+                &versions(bound, bound),
+                &start(false, &format!("the build {other} is refused")),
+                other
+            ),
+            Err(red(id)),
+            "the refusal names the reported version and not the hashed build's"
+        );
+        assert_eq!(
+            the_reported_version_is_the_bindings(
+                id,
+                &versions(bound, bound),
+                &start(false, &format!("the hashed build is {bound}")),
+                other
+            ),
+            Err(red(id)),
+            "the refusal names the hashed build's version and not the reported one"
+        );
+    }
 }
 
 /// The bytes of the installation's chunk before and after the upgrade replaced it.
