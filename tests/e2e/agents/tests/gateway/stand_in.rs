@@ -1129,6 +1129,17 @@ pub fn placed_as_the_entry_says(ctx: &Context) {
             == std::fs::read(PROGRAM).expect("the terminal stand-in the harness built"),
         "{command}: the program placed as the agent is the terminal stand-in the harness built"
     );
+    assert_eq!(
+        ctx.qualified_as().1,
+        build.version,
+        "{command}: the generation lists the entry's build under the entry's version"
+    );
+    if let (Some((_, version)), Some(newer)) = (&ctx.newer, &build.newer) {
+        assert_eq!(
+            version, &newer.version,
+            "{command}: the newer build is listed under the entry's newer version"
+        );
+    }
     if let Some((newer, _)) = &ctx.newer {
         assert!(
             std::fs::read(newer).expect("the program placed as the newer build")

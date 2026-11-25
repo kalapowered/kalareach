@@ -1704,7 +1704,12 @@ impl Context {
                 let linked = Installation::link(run, &first, &[]);
                 let bin = linked.bin();
                 installation = Some(linked);
-                newer = Some((newer_file, "0.156.1".to_owned()));
+                let newer_version = self
+                    .subject
+                    .entry()
+                    .and_then(|build| build.newer.as_ref())
+                    .map_or_else(|| "0.156.1".to_owned(), |newer| newer.version.clone());
+                newer = Some((newer_file, newer_version));
                 newer_prefix = Some(second);
                 (executable, bin)
             }
@@ -1850,7 +1855,10 @@ impl Context {
         match &self.route {
             Route::StandIn => (
                 "test stand-in",
-                fixture::GATEWAY_QUALIFIED_VERSION.to_owned(),
+                self.subject.entry().map_or_else(
+                    || fixture::GATEWAY_QUALIFIED_VERSION.to_owned(),
+                    |build| build.version.clone(),
+                ),
             ),
             Route::Real(real) => ("native build", real.build.version.clone()),
         }
