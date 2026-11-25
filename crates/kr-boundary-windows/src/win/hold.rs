@@ -36,13 +36,15 @@ use windows_sys::Win32::Storage::FileSystem::{
 
 use crate::filekey::FileKey;
 use crate::frame::invocation::RefusedKind;
+use crate::journal::rows::{Row, SnapshotKind};
 use crate::refusal::Refusal;
 use crate::slot::TreeIdentity;
 
 use super::client::ClientIdentity;
 use super::ffi::{self, Handle, wide_path};
+use super::listing::{self, Failure, RepositoryListing};
 use super::rights::{Right, Sd};
-use super::walk::{AnchorRefusal, DirHandle, LIST, Lost, key_of, query};
+use super::walk::{AnchorRefusal, DirHandle, LIST, Lost, final_path, key_of, query};
 
 /// The most bytes the repository's `config` may hold; a larger file is refused before it is read.
 pub const MAX_CONFIG_BYTES: u64 = 262_144;
@@ -67,6 +69,20 @@ pub const RULE_CONFIG_BUSY: &str = "hold-config-busy";
 pub const RULE_CONFIG_SIZE: &str = "config-too-large";
 /// The rule of a refusal for a call that the platform failed.
 pub const RULE_HOLD_FAILED: &str = "hold-failed";
+/// The rule of a refusal for a name that must be absent from the Git folder and is there.
+pub const RULE_ABSENT_NAME: &str = "hold-absent-name";
+/// The rule of a refusal for a hooks folder or an attributes file over a bound of the listing.
+pub const RULE_LISTING_BOUND: &str = "hooks-too-large";
+
+/// The start of the reply when a name that must be absent is in the Git folder; the name follows
+/// after a colon.
+// text: ABSENT_NAME_WORDS
+pub const ABSENT_NAME_WORDS: &str =
+    "the repository holds a file or folder that the broker does not accept";
+
+/// The reply when the hooks folder or the attributes file is over a bound of the listing.
+// text: LISTING_BOUND_WORDS
+pub const LISTING_BOUND_WORDS: &str = "the repository's hooks folder or info attributes file is larger than the broker reads (at most 256 objects, 4 levels, 128 hook files, 255 bytes a name and 1 MiB a file)";
 
 /// The reply when the folder is not there.
 // text: FOLDER_MISSING_WORDS
@@ -139,8 +155,138 @@ pub struct TreeHold {
     pub config: ConfigSnapshot,
     /// The keys of `chain`: what the slot is keyed by.
     pub identity: TreeIdentity,
+    /// What the Git folder held, besides `config`, when the tree was held.
+    pub listing: RepositoryListing,
     /// The tree's path as the platform spells it now: what the journal records.
     pub path: String,
+}
+
+/// What a check found different from what the hold took: the names, sorted.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Changed {
+    /// The names of the objects that differ, relative to the Git folder; `config` for the
+    /// repository's configuration, and the final path of a held folder that changed.
+    pub names: Vec<String>,
+}
+
+impl TreeHold {
+    /// Looks again for the names that must be absent, from the held `.git` folder, immediately
+    /// before the operation's process resumes.
+    ///
+    /// # Errors
+    ///
+    /// Returns the names that are there now.
+    pub fn pre_resume_check(&self) -> Result<(), Changed> {
+        let names = listing::present_names(&self.git_dir);
+        if names.is_empty() {
+            Ok(())
+        } else {
+            Err(Changed { names })
+        }
+    }
+
+    /// Compares what the tree holds now with what the hold took, after the operation has ended: the
+    /// configuration opened afresh by its path (the same file, one name, the same size and bytes),
+    /// each held folder (the same identity and final path), the names that must be absent, and the
+    /// hooks and attributes by name, identity, size and digest.
+    ///
+    /// # Errors
+    ///
+    /// Returns the names that differ, or that could not be shown to be the same.
+    pub fn end_check(&self) -> Result<(), Changed> {
+        let mut names = std::collections::BTreeSet::new();
+        if !self.config_is_unchanged() {
+            names.insert("config".to_owned());
+        }
+        for folder in self.chain.iter().chain(std::iter::once(&self.git_dir)) {
+            if !folder_is_unchanged(folder) {
+                names.insert(String::from_utf16_lossy(folder.path()));
+            }
+        }
+        names.extend(listing::present_names(&self.git_dir));
+        match listing::take(&self.git_dir) {
+            Ok(now) => names.extend(listing::differences(&self.listing, &now)),
+            Err(_) => {
+                names.insert("hooks".to_owned());
+                names.insert(r"info\attributes".to_owned());
+            }
+        }
+        if names.is_empty() {
+            Ok(())
+        } else {
+            Err(Changed {
+                names: names.into_iter().collect(),
+            })
+        }
+    }
+
+    /// The journal row that records what the hold took: the configuration's digest, the hooks, the
+    /// attributes file and the names that must be absent.
+    #[must_use]
+    pub fn snapshot_row(&self, id: u32, kind: SnapshotKind) -> Row {
+        Row::RepositorySnapshot {
+            id,
+            kind,
+            config_digest: hex::encode(self.config.digest),
+            hooks: self.listing.hooks.clone(),
+            info_attributes: self.listing.info_attributes.clone(),
+            absent_names: self.listing.absent_names.clone(),
+        }
+    }
+
+    /// Opens `config` afresh by the tree's path and requires the held file: its identity, one name,
+    /// its size and the SHA-256 of its bytes.
+    fn config_is_unchanged(&self) -> bool {
+        let path = format!(r"{}\.git\config", self.path);
+        let wide = wide_path(Path::new(&path));
+        // SAFETY: the path is NUL-terminated and the call keeps nothing of it.
+        let raw = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                FILE_GENERIC_READ,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                null(),
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                null_mut(),
+            )
+        };
+        // text: hold_config_is_unchanged-1
+        let Ok(handle) = Handle::new(raw, "reading the repository's config") else {
+            return false;
+        };
+        let Ok(identity) = key_of(&handle) else {
+            return false;
+        };
+        let Ok(standard) = query::<FILE_STANDARD_INFO>(
+            &handle,
+            FileStandardInfo,
+            "reading the configuration's size and names",
+        ) else {
+            return false;
+        };
+        if identity != self.config.identity
+            || standard.NumberOfLinks != self.config.link_count
+            || standard.DeletePending
+            || standard.EndOfFile.cast_unsigned() != self.config.bytes.len() as u64
+        {
+            return false;
+        }
+        match read_all(&handle) {
+            Ok(Some(bytes)) => Sha256::digest(&bytes).as_slice() == self.config.digest,
+            // A read that failed or found more bytes shows nothing, so the file is not the same.
+            Ok(None) | Err(_) => false,
+        }
+    }
+}
+
+/// Whether the held folder is still the object it was, at the path it was opened at. A read that
+/// fails shows nothing, so the folder is then not shown to be the same.
+fn folder_is_unchanged(folder: &DirHandle) -> bool {
+    match (key_of(folder.handle()), final_path(folder.handle())) {
+        (Ok(key), Ok(path)) => key == folder.key() && path == folder.path(),
+        _ => false,
+    }
 }
 
 fn refuse(kind: RefusedKind, rule: &'static str, words: &str) -> Refusal {
@@ -232,6 +378,14 @@ pub fn hold_tree(path: &str, client: &ClientIdentity) -> Result<TreeHold, Refusa
     };
     person_reads(client, git_dir.handle(), &format!("{display}\\.git"))?;
     let config = read_config(&git_dir, client, &display)?;
+    if let Some(name) = listing::present_names(&git_dir).first() {
+        return Err(refuse(
+            RefusedKind::Repository,
+            RULE_ABSENT_NAME,
+            &named(ABSENT_NAME_WORDS, name),
+        ));
+    }
+    let listing = take_listing(&git_dir)?;
     let identity = TreeIdentity {
         chain: chain.iter().map(DirHandle::key).collect(),
     };
@@ -240,7 +394,25 @@ pub fn hold_tree(path: &str, client: &ClientIdentity) -> Result<TreeHold, Refusa
         git_dir,
         config,
         identity,
+        listing,
         path: display,
+    })
+}
+
+/// Takes the listing of the held `.git` folder, or refuses the repository.
+fn take_listing(git_dir: &DirHandle) -> Result<RepositoryListing, Refusal> {
+    listing::take(git_dir).map_err(|failure| match failure {
+        Failure::TooLarge => refuse(
+            RefusedKind::Repository,
+            RULE_LISTING_BOUND,
+            LISTING_BOUND_WORDS,
+        ),
+        Failure::Moved => refuse(
+            RefusedKind::Admission,
+            RULE_FOLDER_CHANGED,
+            FOLDER_CHANGED_WORDS,
+        ),
+        Failure::Os(failure) => failed(&failure),
     })
 }
 

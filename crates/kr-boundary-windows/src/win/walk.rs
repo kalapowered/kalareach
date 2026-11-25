@@ -328,7 +328,7 @@ pub(super) fn key_of(handle: &Handle) -> Result<FileKey> {
 }
 
 /// The object's final path in the system's own form, as UTF-16 units.
-fn final_path(handle: &Handle) -> Result<Vec<u16>> {
+pub(super) fn final_path(handle: &Handle) -> Result<Vec<u16>> {
     let mut buffer = vec![0_u16; 512];
     loop {
         // SAFETY: the handle is open and the buffer length is passed.

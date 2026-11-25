@@ -712,6 +712,11 @@ hold_resolve-2 | reading the project folder's final path | reading the project f
 hold_folder-1 | opening the .git folder | opening the .git folder: Windows error N | read: opening .git relative to the held project folder was refused by the platform with an error that is not a missing name
 hold_folder-2 | opening a directory of the project | opening a directory of the project: Windows error N | read: opening a directory of the final path relative to its held parent was refused by the platform with an error that is not a missing name
 hold_read_all-1 | reading the repository's config | reading the repository's config: Windows error N | read: the duplicate of the config handle could not be made or its read returned an error
+hold_config_is_unchanged-1 | reading the repository's config | reading the repository's config: Windows error N | read: CreateFileW of the config's path at the end check returned an error; the end check does not print it, it names config as changed
+ABSENT_NAME_WORDS | the repository holds a file or folder that the broker does not accept | the repository holds a file or folder that the broker does not accept: X | read: opening X relative to the held .git folder answered anything but not found (X is one of commondir, worktrees, config.worktree, objects\info\alternates, objects\info\http-alternates, info\grafts); a folder on the way to X that is a link or not a folder is counted as the name being there
+LISTING_BOUND_WORDS | the repository's hooks folder or info attributes file is larger than the broker reads | the repository's hooks folder or info attributes file is larger than the broker reads (at most 256 objects, 4 levels, 128 hook files, 255 bytes a name and 1 MiB a file) | read: the walk of the hooks folder passed 256 objects or 4 levels, or the folder held more than 128 objects, or a name relative to the Git folder was over 255 bytes (as the journal counts them), or a hook or info\attributes held more than 1 MiB
+listing_lost-1 | reading a hook or the attributes file of the repository | reading a hook or the attributes file of the repository: Windows error N | read: opening a hook, the attributes file or a folder of the listing relative to its held folder was refused by the platform with an error that is not a missing name
+listing_digest-1 | reading a hook or the attributes file of the repository | reading a hook or the attributes file of the repository: Windows error N | read: the duplicate of the handle of a hook or of the attributes file could not be made, or its read returned an error
 
 # ---- the places of a form that carry no identifier, counted by file (tests/sentences.rs)
 listed | #[error] | env.rs | 1 | reaches no person: production builds only the proof block, which never lacks a tree
@@ -770,7 +775,7 @@ listed | pub const | repository/config.rs | 17 | names, keys, limits, encodings 
 listed | pub const | limits.rs | 2 | names of rules, for cases and documents; no sentence for a person
 listed | pub const | standing.rs | 8 | names of rules, for cases and documents; no sentence for a person
 listed | pub const | repository/readers.rs | 8 | names, keys, limits, encodings and paths; no sentence for a person
-listed | pub const | win/hold.rs | 10 | names of rules, for cases and documents; no sentence for a person
+listed | pub const | win/hold.rs | 12 | names of rules, for cases and documents; no sentence for a person
 listed | pub const | win/install.rs | 3 | names, keys, limits, encodings and paths; no sentence for a person
 listed | pub const | win/verify.rs | 1 | names, keys, limits, encodings and paths; no sentence for a person
 listed | pub fn | env.rs | 2 | names, keys, limits, encodings and paths; no sentence for a person

@@ -47,6 +47,7 @@ pub mod job;
 pub mod journal;
 pub mod launch;
 pub mod lifecycle;
+pub mod listing;
 pub mod pipe;
 pub mod privilege;
 pub mod proof;
