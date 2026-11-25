@@ -973,9 +973,15 @@ mod unix {
                 };
                 let mut watcher = notify::recommended_watcher(handler)
                     .map_err(|error| format!("no watcher could be started: {error}"))?;
-                // FSEvents reports that it lost reports at each path a stream watches, so the
-                // report reaches the handler through the copy's own path, which the backend
-                // passes. The stream takes in no more than the copy and the directory it is in.
+                // FSEvents sends a notice that it lost reports at the path where it lost them,
+                // often a directory above the copy or the root of the volume. The backend passes
+                // that notice to the handler whatever path it names, so a loss anywhere on the
+                // volume reaches the handler, which takes it as a loss of the copy's reports too.
+                // A loss FSEvents does not announce shows only as the host's own file not being
+                // reported in time. The stream takes in no more than the copy and the directory
+                // it is in, two stream roots, and the process pays descriptors for each: a
+                // process whose limit of open files starts at 256 holds about a hundred of these
+                // watches at once, and a watch that cannot start makes the result indeterminate.
                 watcher
                     .watch(&copy_path, RecursiveMode::Recursive)
                     .and_then(|()| watcher.watch(&beside_path, RecursiveMode::NonRecursive))

@@ -674,15 +674,21 @@ A test result is what this host observed, and nothing a caller reports.
   follows the directory it was set on wherever it is renamed to. On macOS it is FSEvents, which
   reports by path and on its own schedule. The host judges each report as it arrives, and it writes
   a file of its own beside the copy and waits, for up to ten seconds, until the watcher reports it,
-  which means every report up to then has arrived. FSEvents reports that it dropped reports at each
-  path a stream watches, and the host watches the copy and the directory the copy is in, so such a
-  report reaches it and makes the result indeterminate. A report of dropped reports that named no
-  path the host watches would not reach it. A watcher that cannot start, that lost reports or that
-  does not answer in that time makes the result indeterminate, and so does a platform with no
-  watcher whenever a suite declares an output. FSEvents does lose reports, and falls behind by more
-  than the host waits, when files are written by the tens of thousands in one burst, by a suite or
-  by anything else on the machine, so on macOS such a run can get an indeterminate result that says
-  its watcher cannot be trusted, and a run again may not. A file the suite adds beside an output is
+  which means every report up to then has arrived. FSEvents says that it dropped reports at the
+  path where it dropped them, which may be a directory above the copy or the root of the volume.
+  The watcher passes that notice to the host whatever path it names, so it reaches the host and
+  makes the result indeterminate, and so does a loss that has nothing to do with the copy. A loss
+  that FSEvents does not announce shows only as the host's own file not being reported in time. A
+  watcher that cannot start, that lost reports or that does not answer in that time makes the
+  result indeterminate, and so does a platform with no watcher whenever a suite declares an output.
+  FSEvents does lose reports, and falls behind by more than the host waits, when files are written
+  by the tens of thousands in one burst, by a suite or by anything else on the machine, so on macOS
+  such a run can get an indeterminate result that says its watcher cannot be trusted, and a run
+  again may not. A macOS host whose limit of open files starts at 256 can hold about a hundred of
+  these watchers at once (102 measured with notify 9.0.0, each one two FSEvents stream roots, held
+  while a suite with a declared output runs); a suite that starts past that has no watcher, so its
+  result is indeterminate and says that the copy could not be watched. A file the suite adds
+  beside an output is
   not left out of the comparison and changes the source (an added empty directory leaves the source
   as it was, unless the reading cannot open or list it, reaches a bound, or the change set's rules
   keep its path out, which makes the source indeterminate, so no version of its own is stored for
