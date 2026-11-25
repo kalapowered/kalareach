@@ -669,12 +669,17 @@ pub fn is_allowed(patterns: &[String], relative: &str) -> bool {
 /// recipe wrote) and `settings.json` is looked at by its own path, whatever names the directory
 /// holds: a regular file with one name that holds those bytes, or, for `settings.json`, exactly the
 /// one key the recipe sets (`settings_key`, in `enabledPlugins`, set to `true`); one that is not
-/// there is refused. Every other name is looked at as the directory lists it: a link, and a
-/// regular file with more than one name, are refused at every name, an allowed one included; the
-/// names `settings.json`, `settings.local.json` and `rules`, in any letter case, are looked at
-/// before any directory is entered, so a directory with one of these names is refused and its
-/// contents are not compared, and `settings.local.json` and `rules` are refused whatever they are;
-/// any other file must be one that the entry's allowed files name.
+/// there is refused. Every other name is looked at as the directory lists it: a link, a regular
+/// file with more than one name, and an entry that is neither a regular file, a directory nor a
+/// link, are refused at every name, an allowed one included, and a name on another file system
+/// than the configuration directory is refused and not entered; the names `settings.json`,
+/// `settings.local.json` and `rules`, in any letter case, are looked at before any directory is
+/// entered, so a directory with one of these names is refused and its contents are not compared,
+/// and `settings.local.json` and `rules` are refused whatever they are; any other file must be one
+/// that the entry's allowed files name.
+///
+/// The compare holds only while no process of the run changes the tree: `settings.json` and the
+/// recipe's files are reached again from the pin, not through the handle that lists the directory.
 ///
 /// # Errors
 ///
@@ -692,6 +697,9 @@ pub fn end_compare(
     let directory = config
         .open(root, pin)
         .map_err(|refusal| format!("the configuration directory cannot be compared: {refusal}"))?;
+    let device = rustix::fs::fstat(&directory)
+        .map_err(|error| format!("the configuration directory cannot be compared: {error}"))?
+        .st_dev;
     let mut compare = EndCompare {
         root,
         pin,
@@ -701,6 +709,7 @@ pub fn end_compare(
         allowed: &allowed,
         refused: Vec::new(),
         seen: 0,
+        device,
     };
     compare.each_file_of_the_recipe();
     compare.walk(&directory, "", 0);
@@ -722,6 +731,8 @@ struct EndCompare<'a> {
     allowed: &'a [String],
     refused: Vec<String>,
     seen: usize,
+    /// The file system the configuration directory is on.
+    device: rustix::fs::Dev,
 }
 
 impl EndCompare<'_> {
@@ -789,6 +800,11 @@ impl EndCompare<'_> {
                     "{relative} is a name the agent reads its settings or rules from, which no \
                      entry may allow"
                 ));
+            } else if looked.st_dev != self.device {
+                self.refused.push(format!(
+                    "{relative} is on another file system than the configuration directory, and \
+                     nothing there is compared"
+                ));
             } else if kind == FileType::Directory {
                 match opened_directory(directory, name.as_c_str(), &looked, self.seen) {
                     Ok(child) => self.walk(&child, &relative, depth + 1),
@@ -805,6 +821,11 @@ impl EndCompare<'_> {
                 self.refused.push(format!(
                     "{relative} is a file with more than one name, and such a file is accepted \
                      at no name below the configuration directory"
+                ));
+            } else if kind != FileType::RegularFile {
+                self.refused.push(format!(
+                    "{relative} is neither a regular file, a directory nor a link, and such an \
+                     entry is accepted at no name below the configuration directory"
                 ));
             } else if !is_allowed(self.allowed, &relative) {
                 self.refused.push(format!(
@@ -3813,6 +3834,67 @@ mod tests {
         assert!(
             refused.starts_with("settings.json is not a file of the run's own: "),
             "{refused}"
+        );
+    }
+
+    /// An entry that is neither a regular file, a directory nor a link (a socket, a pipe) is refused
+    /// at every name below the configuration directory, an allowed name too: the agent may read
+    /// from it or write to it, and a name says nothing of what is on the other end.
+    #[cfg(unix)]
+    #[test]
+    fn an_entry_that_is_neither_a_file_a_directory_nor_a_link_is_refused_at_every_name() {
+        let root = configured("end-kind");
+        let config = root.join("c");
+        let said = |name: &str| {
+            format!(
+                "{name} is neither a regular file, a directory nor a link, and such an entry is \
+                 accepted at no name below the configuration directory"
+            )
+        };
+        let _socket =
+            std::os::unix::net::UnixListener::bind(config.join("sock")).expect("a socket");
+        assert_eq!(compared(&root, &[]), Err(said("sock")));
+        assert_eq!(compared(&root, &["sock"]), Err(said("sock")));
+        std::fs::remove_file(config.join(".claude.json")).ok();
+        let made = std::process::Command::new("/usr/bin/mkfifo")
+            .arg(config.join(".claude.json"))
+            .status()
+            .expect("mkfifo");
+        assert!(made.success(), "a pipe at an allowed name");
+        let refused = compared(&root, &[".claude.json", "sock"]).expect_err("a pipe");
+        assert!(refused.contains(&said(".claude.json")), "{refused}");
+    }
+
+    /// A name on another file system than the configuration directory is refused and not entered:
+    /// the walk is told that the directory is on a device that it is not on, so every name in it
+    /// is on another one.
+    #[test]
+    fn a_name_on_another_file_system_is_refused_and_not_entered() {
+        let root = configured("end-device");
+        let pin = pinned(&root);
+        let placed = placed(&root);
+        let directory = placed.open(&root, &pin).expect("the directory");
+        let device = rustix::fs::fstat(&directory)
+            .expect("the directory's device")
+            .st_dev;
+        let mut compare = EndCompare {
+            root: &root,
+            pin: &pin,
+            config: placed.relative(),
+            recipe_files: &RECIPE,
+            settings_key: KEY,
+            allowed: &[],
+            refused: Vec::new(),
+            seen: 0,
+            device: device.wrapping_add(1),
+        };
+        compare.walk(&directory, "", 0);
+        assert_eq!(
+            compare.refused,
+            [
+                "skills is on another file system than the configuration directory, and nothing there is compared"
+            ],
+            "the directory is refused where it is, and nothing below it is looked at"
         );
     }
 
