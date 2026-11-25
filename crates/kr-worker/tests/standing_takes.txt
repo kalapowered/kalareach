@@ -395,6 +395,7 @@ calls crates/kr-worker/src/broker/mod.rs suspension_reason suspension crates/kr-
 calls crates/kr-worker/src/broker/mod.rs unknown_binding unknown crates/kr-worker/src/broker/error.rs
 calls crates/kr-worker/src/broker/mod.rs unknown_instance unknown crates/kr-worker/src/broker/error.rs
 calls crates/kr-worker/src/broker/profiles.rs check_executable invalid crates/kr-worker/src/broker/error.rs
+calls crates/kr-worker/src/broker/profiles.rs check_profile_unheld invalid crates/kr-worker/src/broker/error.rs
 calls crates/kr-worker/src/broker/profiles.rs execute check_executable crates/kr-worker/src/broker/profiles.rs
 calls crates/kr-worker/src/broker/profiles.rs execute keep crates/kr-worker/src/broker/profiles.rs
 calls crates/kr-worker/src/history_filter/mod.rs admit_resource admit_approval crates/kr-worker/src/history_filter/mod.rs
