@@ -945,14 +945,11 @@ mod tests {
         assert!(why.contains("must not be a symbolic link"), "{why}");
         let why = attacked("pipe", &|copy| {
             std::fs::remove_file(copy).expect("the copy is removed");
-            rustix::fs::mknodat(
-                rustix::fs::CWD,
-                copy,
-                rustix::fs::FileType::Fifo,
-                Mode::from_raw_mode(0o600),
-                0,
-            )
-            .expect("a pipe in its place");
+            let made = std::process::Command::new("mkfifo")
+                .arg(copy)
+                .status()
+                .expect("mkfifo runs");
+            assert!(made.success(), "mkfifo made a pipe in the copy's place");
         })
         .expect_err("a pipe in the place of the copy");
         assert!(why.contains("must be a regular file"), "{why}");
