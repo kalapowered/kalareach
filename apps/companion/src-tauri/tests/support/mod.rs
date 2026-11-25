@@ -1102,14 +1102,18 @@ impl Companion {
     ///
     /// An attempt that has ended gets nowhere more, so a state `until` does not accept that says
     /// it ended fails the case there and then, with the words the attempt ended with, and not
-    /// after the watchdog. A watchdog that runs out says the state the screen was left in.
+    /// after the watchdog. A watchdog that runs out says the states the screen went through and
+    /// when, and the device's own state, and never the verification value.
     pub async fn reached(&self, until: impl Fn(&serde_json::Value) -> bool) -> serde_json::Value {
-        let mut last = serde_json::Value::Null;
+        let began = std::time::Instant::now();
+        let mut reads = 0_usize;
+        let mut seen: Vec<(String, u128)> = Vec::new();
         let waited = tokio::time::timeout(WATCHDOG, async {
             loop {
                 let view = self
                     .call("pairing_view", serde_json::json!({}))
                     .expect("the pairing screen's state");
+                reads += 1;
                 if until(&view["state"]) {
                     return view;
                 }
@@ -1119,13 +1123,29 @@ impl Companion {
                     view["state"],
                     self.device().view().state
                 );
-                last = view["state"].clone();
+                let name = view["state"]["state"].as_str().unwrap_or("?");
+                if seen.last().is_none_or(|(last, _)| last != name) {
+                    seen.push((name.to_owned(), began.elapsed().as_millis()));
+                }
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
         })
         .await;
         waited.unwrap_or_else(|_| {
-            panic!("the attempt did not get there within the watchdog; the screen shows {last}")
+            let states = seen
+                .iter()
+                .rev()
+                .take(32)
+                .rev()
+                .map(|(name, at)| format!("{name}@{at}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            panic!(
+                "the attempt did not get there within the watchdog: the screen was read {reads} \
+                 times; its states, each with the milliseconds since the wait began at which it was \
+                 first seen, were [{states}]; the device's own state is {:?}",
+                self.device().view().state
+            )
         })
     }
 
