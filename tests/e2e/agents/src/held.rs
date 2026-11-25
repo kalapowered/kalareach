@@ -1386,7 +1386,7 @@ impl MetaGuard {
                 Err(why) => {
                     stops.push((
                         "person_file_unreadable",
-                        format!("~/{relative} cannot be looked at after the run: {why}"),
+                        format!("~/{relative} cannot be looked at: {why}"),
                     ));
                     json!({ "path": format!("~/{relative}"), "unreadable": true })
                 }
@@ -1957,14 +1957,18 @@ fn shared_names_the_run(
 /// and refuses a handle with one of them, or with the one a guarded name holds at the end, so a
 /// guarded file moved or linked over the shared name is refused even when its guarded name is
 /// gone or holds another file. A look of a guarded name that fails, for any reason other than the
-/// name's not being there, is kept for the rest of the run, wherever it is made, and every shared
-/// read after it is refused; so is a read at which a guarded name cannot be looked at. What no look
-/// saw is not known, and is read: a file that was at no guarded name at any look, put there and
-/// then moved over the shared name between two looks; a file that a guarded name pointed to as a
-/// link, since a look records the link and not its target; and a file on a file system whose
-/// device and inode change when it is renamed or linked. A write to a file that is not named, a
-/// transcript below `~/.claude/projects` among them, is not seen. What is said is the path the
-/// entry names and whether it changed, never a value.
+/// name's not being there, a look that sees a link at the name, and a shared read that gives no
+/// answer in time are kept for the rest of the run, wherever they are made, a failed look of the
+/// entry's absent list among them, and every shared read after them is refused; so is a read at
+/// which a guarded name cannot be looked at. What no look saw can be read, where no saved or
+/// current identity matches it: a file that was at no guarded name at any look, put there and then
+/// moved over the shared name between two looks; the target of a link put at a guarded name after
+/// the take, when no look of the guard observed the link, since the worker's `stat` follows a link
+/// and does not see one at the name itself; and a file on a file system that gives a file another
+/// device and inode when it is renamed or linked, which defeats a saved identity where no current
+/// guarded name matches it. A write to a file that is not named, a transcript below
+/// `~/.claude/projects` among them, is not seen. What is said is the path the entry names and
+/// whether it changed, never a value.
 #[derive(Debug)]
 pub struct FileGuard {
     home: PathBuf,
@@ -2150,7 +2154,7 @@ impl FileGuard {
                     self.looks.lost();
                     stops.push((
                         "person_file_unreadable",
-                        format!("~/{relative} cannot be looked at after the run: {error}"),
+                        format!("~/{relative} cannot be looked at: {error}"),
                     ));
                     files.push(json!({ "path": format!("~/{relative}"), "unreadable": true }));
                 }
@@ -5990,6 +5994,23 @@ mod tests {
     }
 
     #[test]
+    fn a_tree_that_cannot_be_looked_at_at_a_charge_stops_the_run_in_words_that_fit_it() {
+        let home = scratch("tree-unlooked-at-a-charge");
+        std::fs::create_dir_all(home.join(".codex")).expect("a tree");
+        let guard = MetaGuard::take(&home, &[".codex"]);
+        // The tree is replaced by a link, which the look refuses.
+        std::fs::remove_dir_all(home.join(".codex")).expect("removed");
+        std::os::unix::fs::symlink(&home, home.join(".codex")).expect("a link");
+        let (stops, _) = guard.compare();
+        assert_eq!(stops.len(), 1, "{stops:?}");
+        assert!(
+            stops[0].1.starts_with("~/.codex cannot be looked at: "),
+            "{stops:?}"
+        );
+        std::fs::remove_dir_all(&home).expect("clean up");
+    }
+
+    #[test]
     fn a_guarded_file_that_cannot_be_looked_at_after_the_start_stops_the_run() {
         let home = claude_home("files-unlooked");
         let guard = claude_plan().take(&home);
@@ -6008,8 +6029,7 @@ mod tests {
             stops,
             vec![(
                 "person_file_unreadable",
-                "~/.claude/settings.json cannot be looked at after the run: permission denied"
-                    .to_owned()
+                "~/.claude/settings.json cannot be looked at: permission denied".to_owned()
             )]
         );
         assert_eq!(evidence[2]["unreadable"], json!(true));
