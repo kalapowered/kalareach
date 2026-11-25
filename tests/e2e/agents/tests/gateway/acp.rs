@@ -182,7 +182,7 @@ const CONTROLS: [Control; 33] = [
         waits: true,
         shows: "a cancel and an answer that race on one approval have one winner, and the other is told",
         mutation: "the cancel does not answer the pending approval",
-        red: "the stand-in's tool call never settles",
+        red: "the stand-in's tool call never settles, or both the cancel and the answer are accepted",
     },
     Control {
         id: "5b-6",
@@ -545,14 +545,22 @@ fn acp_two_concurrent_answers_to_one_request_reach_the_agent_once_also_across_a_
 #[test]
 #[ignore = "waits for ACP-4"]
 fn acp_a_cancel_racing_an_approval_has_one_winner_and_the_other_is_told() {
-    unwritten("5b-5");
+    run_case(
+        "5b-5",
+        &controls::race_script(),
+        controls::a_cancel_racing_an_approval,
+    );
 }
 
 /// Control 5b-6.
 #[test]
 #[ignore = "waits for ACP-4"]
 fn acp_a_permission_request_after_a_cancel_is_answered_cancelled_by_a_qoder_shaped_agent() {
-    unwritten("5b-6");
+    run_case(
+        "5b-6",
+        &controls::late_request_script(),
+        controls::a_request_after_a_cancel,
+    );
 }
 
 /// Control 5b-6g.

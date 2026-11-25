@@ -118,8 +118,10 @@ pub fn a_fresh_request_appears(pending: usize) -> Result<(), Red> {
 pub enum Hosted {}
 
 impl Hosted {
-    /// Starts the stand-in with `script` through the launch, sends a prompt, and returns once the
-    /// agent's first request is pending and read.
+    /// Starts the stand-in with `script` through the launch. When the script has a turn for a
+    /// prompt, it sends a prompt and returns once the agent's first request is pending and read;
+    /// when the script holds only turns of the agent's own, it returns once the agent runs, and the
+    /// case releases the file that starts the turn.
     pub fn start(_script: &Value) -> Result<Self, &'static str> {
         Err(super::NO_BODY)
     }
@@ -252,10 +254,16 @@ pub fn a_fresh_request_after_a_restart(host: &mut Hosted) -> Result<(), Red> {
     a_fresh_request_appears(host.pending_requests())
 }
 
-/// A record line that is a response with the chosen option.
+/// A record line that is the response to request 0 with the chosen option.
 #[cfg(test)]
 fn response_line(option: &str) -> Value {
-    serde_json::json!({ "received": "response", "id": 0, "outcome": "selected", "option": option })
+    response_line_for(0, option)
+}
+
+/// A record line that is the response to the request numbered `number` with the chosen option.
+#[cfg(test)]
+fn response_line_for(number: u64, option: &str) -> Value {
+    serde_json::json!({ "received": "response", "id": number, "outcome": "selected", "option": option })
 }
 
 /// Reads of an instance that are equal.
@@ -475,4 +483,200 @@ fn the_judge_of_an_exit_after_dispatch_names_its_red_when_a_receipt_is_rewritten
 fn the_judge_of_the_workers_connection_names_its_red_when_the_agent_keeps_running() {
     assert_eq!(ends_with_the_workers_connection(false), Ok(()));
     assert_eq!(ends_with_the_workers_connection(true), Err(red("5b-12")));
+}
+
+/// How many lines of the record the stand-in sent, of one kind.
+fn sent(record: &[Value], kind: &str) -> usize {
+    record.iter().filter(|line| line["sent"] == kind).count()
+}
+
+/// The outcome of the response to the request numbered `number`, or none when the stand-in
+/// received no response to it.
+fn outcome_of(record: &[Value], number: u64) -> Option<&str> {
+    responses(record)
+        .into_iter()
+        .find(|line| line["id"] == number)
+        .and_then(|line| line["outcome"].as_str())
+}
+
+/// What the host told a cancel and an answer that were sent at the same moment.
+#[derive(Debug)]
+pub struct Race {
+    /// The host accepted the cancel.
+    pub cancel_accepted: bool,
+    /// The host accepted the answer.
+    pub answer_accepted: bool,
+}
+
+/// 5b-5: of a cancel and an answer that race on one approval, one was accepted and the other was
+/// told, and the stand-in's call settled: it received one response and ended its turn.
+pub fn one_winner_and_the_call_settles(race: &Race, record: &[Value]) -> Result<(), Red> {
+    ensure(
+        race.cancel_accepted != race.answer_accepted
+            && responses(record).len() == 1
+            && sent(record, "reply") == 1,
+        "5b-5",
+    )
+}
+
+/// 5b-6: the request that the stand-in sent after the cancel was answered `cancelled`, and the
+/// stand-in's turn of its own ended.
+pub fn a_late_request_is_answered_cancelled(record: &[Value]) -> Result<(), Red> {
+    ensure(
+        outcome_of(record, 1) == Some("cancelled") && sent(record, "turn end") == 1,
+        "5b-6",
+    )
+}
+
+impl Hosted {
+    /// Sends the person's cancel through the device.
+    pub fn cancel(&mut self) {
+        match *self {}
+    }
+
+    /// Sends the person's cancel and an answer that chooses `option` at the same moment, each
+    /// through a device of its own, and says what the host told each.
+    pub fn cancel_and_answer_at_once(&mut self, _option: &str) -> Race {
+        match *self {}
+    }
+
+    /// The stand-in's record once it holds a line that the stand-in sent of `kind`, or after five
+    /// seconds when it holds none.
+    pub fn record_after(&mut self, _kind: &str) -> Vec<Value> {
+        match *self {}
+    }
+}
+
+/// The script of an agent that asks for a call and goes on waiting for the answer after a cancel,
+/// and then settles the call by the answer it got.
+pub fn race_script() -> Value {
+    serde_json::json!({
+        "cancel": "wait",
+        "turns": [[
+            { "call": { "id": "c1", "kind": "execute" } },
+            { "ask": "c1" },
+            { "when": { "outcome": "allowed", "then": [
+                { "update": { "call": "c1", "status": "completed" } },
+                { "end": "end_turn" },
+            ] } },
+            { "when": { "outcome": "cancelled", "then": [
+                { "update": { "call": "c1", "status": "cancelled" } },
+                { "end": "cancelled" },
+            ] } },
+            { "end": "end_turn" },
+        ]],
+    })
+}
+
+/// The script of an agent that asks for a call and is cancelled, and that sends a second request,
+/// after the cancel ended its turn, when the file `late` appears.
+pub fn late_request_script() -> Value {
+    serde_json::json!({
+        "turns": [[
+            { "call": { "id": "c1", "kind": "execute" } },
+            { "ask": "c1" },
+            { "end": "end_turn" },
+        ]],
+        "on_cancel": [
+            { "hold": "late" },
+            { "call": { "id": "c2", "kind": "execute" } },
+            { "ask": "c2" },
+            { "end": "end_turn" },
+        ],
+    })
+}
+
+/// Case 5b-5: a cancel and an answer at once.
+pub fn a_cancel_racing_an_approval(host: &mut Hosted) -> Result<(), Red> {
+    let race = host.cancel_and_answer_at_once("allow-once");
+    one_winner_and_the_call_settles(&race, &host.record_after("reply"))
+}
+
+/// Case 5b-6: the person cancels, and the stand-in then sends a request of the cancelled turn.
+pub fn a_request_after_a_cancel(host: &mut Hosted) -> Result<(), Red> {
+    host.cancel();
+    host.release("late");
+    a_late_request_is_answered_cancelled(&host.record_after("turn end"))
+}
+
+/// A record line that is a response whose outcome is `cancelled`.
+#[cfg(test)]
+fn cancelled_response_line(number: u64) -> Value {
+    serde_json::json!({ "received": "response", "id": number, "outcome": "cancelled", "option": null })
+}
+
+/// A record line that the stand-in sent, of one kind.
+#[cfg(test)]
+fn sent_line(kind: &str) -> Value {
+    serde_json::json!({ "sent": kind })
+}
+
+#[test]
+fn the_judge_of_the_race_names_its_red_when_the_cancel_leaves_the_call_unsettled_or_both_win() {
+    let cancel_won = Race {
+        cancel_accepted: true,
+        answer_accepted: false,
+    };
+    let answer_won = Race {
+        cancel_accepted: false,
+        answer_accepted: true,
+    };
+    let settled_by_cancel = [cancelled_response_line(0), sent_line("reply")];
+    let settled_by_answer = [response_line("allow-once"), sent_line("reply")];
+    assert_eq!(
+        one_winner_and_the_call_settles(&cancel_won, &settled_by_cancel),
+        Ok(())
+    );
+    assert_eq!(
+        one_winner_and_the_call_settles(&answer_won, &settled_by_answer),
+        Ok(())
+    );
+    assert_eq!(
+        one_winner_and_the_call_settles(&cancel_won, &[]),
+        Err(red("5b-5")),
+        "the cancel won and did not answer the approval, so the call never settles"
+    );
+    let both = Race {
+        cancel_accepted: true,
+        answer_accepted: true,
+    };
+    assert_eq!(
+        one_winner_and_the_call_settles(&both, &settled_by_answer),
+        Err(red("5b-5")),
+        "the cancel left the approval pending and the answer settled the call, with both accepted"
+    );
+    let neither = Race {
+        cancel_accepted: false,
+        answer_accepted: false,
+    };
+    assert_eq!(
+        one_winner_and_the_call_settles(&neither, &settled_by_cancel),
+        Err(red("5b-5"))
+    );
+}
+
+#[test]
+fn the_judge_of_a_late_request_names_its_red_when_the_request_is_left_pending() {
+    let answered = [
+        cancelled_response_line(0),
+        cancelled_response_line(1),
+        sent_line("turn end"),
+    ];
+    assert_eq!(a_late_request_is_answered_cancelled(&answered), Ok(()));
+    let pending = [cancelled_response_line(0)];
+    assert_eq!(
+        a_late_request_is_answered_cancelled(&pending),
+        Err(red("5b-6")),
+        "the late request is left pending and the stand-in's turn never ends"
+    );
+    let chosen = [
+        cancelled_response_line(0),
+        response_line_for(1, "allow-once"),
+        sent_line("turn end"),
+    ];
+    assert_eq!(
+        a_late_request_is_answered_cancelled(&chosen),
+        Err(red("5b-6")),
+        "an answer that chooses an option is not the cancelled answer"
+    );
 }
