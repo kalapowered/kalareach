@@ -3987,15 +3987,6 @@ mod shutdown_tests {
         host
     }
 
-    /// Why the host refuses to start its daemon, where it does.
-    fn refused_start(host: &Host<'_>, root: &Path) -> String {
-        match host.start_once(&started(root, 1), Duration::from_secs(10)) {
-            Err(Failed::Refused(why)) => why,
-            Err(_) => panic!("the daemon was started and failed, and was not refused"),
-            Ok(()) => panic!("the daemon was started"),
-        }
-    }
-
     /// The directory below the home that the program keeps its configuration in is there, and
     /// private to the account, when the daemon starts: the recipe's executor makes none.
     #[test]
@@ -4097,7 +4088,10 @@ mod shutdown_tests {
                 std::fs::create_dir_all(root.join("t")).expect("another directory");
                 std::fs::write(root.join("t/claude"), b"claude\n").expect("a program");
             }
-            let why = refused_start(&host, &root);
+            let result = host.start_once(&started(&root, 1), Duration::from_secs(10));
+            let Err(Failed::Refused(why)) = result else {
+                panic!("{form}: the daemon was not refused its start");
+            };
             assert!(why.contains("is not as the run placed it"), "{form}: {why}");
             assert_eq!(starts(&root), 0, "{form}: no daemon was started");
             drop(host);
@@ -4115,7 +4109,10 @@ mod shutdown_tests {
         let application = an_application(&root);
         let host = host_prepared_with(&run, &application);
         std::fs::write(root.join("t/claude"), b"theirs\n").expect("rewritten");
-        let why = refused_start(&host, &root);
+        let result = host.start_once(&started(&root, 1), Duration::from_secs(10));
+        let Err(Failed::Refused(why)) = result else {
+            panic!("the daemon was not refused its start");
+        };
         assert!(why.contains("not the file that was placed"), "{why}");
         assert_eq!(starts(&root), 0, "no daemon was started");
         drop(host);
@@ -4155,7 +4152,10 @@ mod shutdown_tests {
                 "a link" => std::os::unix::fs::symlink("/usr/bin/true", &place).expect("a link"),
                 _ => std::fs::create_dir(&place).expect("a directory"),
             }
-            let why = refused_start(&host, &root);
+            let result = host.start_once(&started(&root, 1), Duration::from_secs(10));
+            let Err(Failed::Refused(why)) = result else {
+                panic!("{kind}: the daemon was not refused its start");
+            };
             assert!(
                 why.contains("\"other\"") && why.contains("nothing but the program may be there"),
                 "{kind}: {why}"
