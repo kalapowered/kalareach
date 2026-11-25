@@ -120,9 +120,11 @@ pub const HARNESS_GAPS: [(&str, &str, &str); 2] = [
 /// The reader of images: it decodes the text after `base64,` in the record's line.
 const IMAGE_UNREADABLE: &str = "the image reader decodes the text after `base64,` in the record's line, and this record holds the image in a `data` member";
 
+const PROMPT_LINE_UNREADABLE: &str = "the line also marks a tool's answer and the lines that rewrite the message list, so a count by it needs reader rules the driver does not have";
+
 /// The values that an entry gives and the driver cannot read yet: a field of a package, with what
 /// the driver lacks.
-pub const HARNESS_VALUES: [(&str, &str, &str, &str); 6] = [
+pub const HARNESS_VALUES: [(&str, &str, &str, &str); 8] = [
     (
         "kalareach/claude-code",
         "1",
@@ -143,21 +145,33 @@ pub const HARNESS_VALUES: [(&str, &str, &str, &str); 6] = [
     ),
     (
         "kalareach/gemini-cli",
-        "1",
+        "2a",
         "account.prompt_line",
-        "the line also marks a tool's answer and the lines that rewrite the message list, so a count by it needs reader rules the driver does not have",
+        PROMPT_LINE_UNREADABLE,
     ),
     (
         "kalareach/gemini-cli",
-        "2a",
+        "3",
         "account.prompt_line",
-        "the line also marks a tool's answer and the lines that rewrite the message list, so a count by it needs reader rules the driver does not have",
+        PROMPT_LINE_UNREADABLE,
     ),
     (
         "kalareach/gemini-cli",
         "4",
         "account.prompt_line",
-        "the line also marks a tool's answer and the lines that rewrite the message list, so a count by it needs reader rules the driver does not have",
+        PROMPT_LINE_UNREADABLE,
+    ),
+    (
+        "kalareach/gemini-cli",
+        "7",
+        "account.prompt_line",
+        PROMPT_LINE_UNREADABLE,
+    ),
+    (
+        "kalareach/gemini-cli",
+        "7f",
+        "account.prompt_line",
+        PROMPT_LINE_UNREADABLE,
     ),
 ];
 
@@ -557,9 +571,11 @@ mod tests {
             found("kalareach/gemini-cli"),
             with_upgrade(&[
                 ("1", "account.image_line", HarnessGap),
-                ("1", "account.prompt_line", HarnessGap),
                 ("2a", "account.prompt_line", HarnessGap),
+                ("3", "account.prompt_line", HarnessGap),
                 ("4", "account.prompt_line", HarnessGap),
+                ("7", "account.prompt_line", HarnessGap),
+                ("7f", "account.prompt_line", HarnessGap),
                 ("8a", "transcript", HarnessGap),
                 ("4", "account.turn_line", HarnessGap),
                 ("7", "account.resume_refused", EntryField),
