@@ -65,6 +65,7 @@ legs = [
   "dep:url",
   "dep:portable-pty",
   "dep:rustix",
+  "dep:rusqlite",
   "dep:libproc",
 ]
 
@@ -97,6 +98,8 @@ kr-term = { workspace = true, optional = true }
 kr-transport = { workspace = true, optional = true, features = ["testing"] }
 # Where the host's configuration document lives, as the host itself works it out.
 kr-worker = { workspace = true, optional = true }
+# The worker's SQLite files are read through copies, with a connection of the harness's own.
+rusqlite = { workspace = true, features = ["bundled"], optional = true }
 rustls-platform-verifier = { workspace = true, optional = true }
 # The bounds a request's parameters are written under.
 serde = { workspace = true, optional = true }

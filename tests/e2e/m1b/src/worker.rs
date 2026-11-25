@@ -12,6 +12,13 @@ use crate::tree::{Change, Entry, Kind, Record, prefix_digest};
 /// The name of the conversation claims directory, directly below the state root.
 const CLAIMS: &str = "conversation-claims-1";
 
+/// The name of the directory of the output-time indexes, directly below the state directory.
+const OUTPUT_TIMES: &str = "output-times";
+
+/// The names that may stand beside an index `<session>.sqlite`: what a SQLite connection makes and
+/// what the worker makes while it builds a new index.
+const BESIDE_THE_INDEX: [&str; 5] = ["-wal", "-shm", "-journal", ".new", ".new-journal"];
+
 /// The letter every session root's name begins with, before its hexadecimal digits.
 const SESSION_ROOT_PREFIX: &str = "c";
 
@@ -72,6 +79,7 @@ pub fn covers(layout: &Layout, path: &Path) -> bool {
         || child_of(path, &layout.state_dir.join("sessions"))
             .is_some_and(|name| name.starts_with("session-"))
         || child_of(path, &layout.state_dir.join("jobs")).is_some_and(is_diagnostics)
+        || path.starts_with(layout.state_dir.join(OUTPUT_TIMES))
 }
 
 /// The cursor a spool segment's name gives: twenty digits and `.out`.
@@ -189,6 +197,8 @@ impl Judge<'_> {
             self.claim(path, rest);
         } else if first_below(path, &layout.runtime_dir).is_some() {
             self.session_root(path);
+        } else if let Ok(rest) = path.strip_prefix(layout.state_dir.join(OUTPUT_TIMES)) {
+            self.output_times(path, rest);
         } else if child_of(path, &layout.state_dir.join("jobs")).is_some() {
             self.diagnostics(path);
         } else {
@@ -401,6 +411,56 @@ impl Judge<'_> {
                 path.display(),
                 now.size - was.size
             ));
+        }
+    }
+
+    fn output_times(&mut self, path: &Path, rest: &Path) {
+        const W15: &str = "the output-times directory is new, owner-only and directly below the \
+                           state directory; the index keeps its object, its owner and its mode; \
+                           beside it only a -wal, a -shm, a -journal, a .new and a .new-journal \
+                           may stand, each a file of the account that others may not read or write";
+        let uid = self.uid;
+        let names: Vec<&str> = rest
+            .components()
+            .filter_map(|part| part.as_os_str().to_str())
+            .collect();
+        let now = self.added(path);
+        let fine = match names.as_slice() {
+            [] => {
+                let only_added = self
+                    .changes_at(path)
+                    .iter()
+                    .all(|change| matches!(change, Change::Added { .. }));
+                only_added
+                    && now.is_none_or(|now| {
+                        now.kind == Kind::Directory && now.owner == uid && now.mode & 0o777 == 0o700
+                    })
+            }
+            [name] if name.ends_with(".sqlite") => {
+                !self.object_changed(path)
+                    && now.is_none_or(|now| now.kind == Kind::File && now.owner == uid)
+            }
+            [name]
+                if BESIDE_THE_INDEX.iter().any(|suffix| {
+                    name.strip_suffix(suffix)
+                        .is_some_and(|index| index.ends_with(".sqlite"))
+                }) =>
+            {
+                let retyped_or_moved = self.changes_at(path).iter().any(|change| {
+                    matches!(
+                        change,
+                        Change::Retyped { .. } | Change::Owner { .. } | Change::Mode { .. }
+                    )
+                });
+                !retyped_or_moved
+                    && now.is_none_or(|now| {
+                        now.kind == Kind::File && now.owner == uid && now.mode & 0o077 == 0
+                    })
+            }
+            _ => false,
+        };
+        if !fine {
+            self.refuse(path, W15);
         }
     }
 
@@ -905,6 +965,156 @@ mod tests {
             W14,
             |_| {},
             |w| w.put(&beside(w, "-wal"), b"wal"),
+        );
+    }
+
+    const W15: &str = "the output-times directory is new, owner-only and directly below the state \
+                       directory; the index keeps its object, its owner and its mode; beside it \
+                       only a -wal, a -shm, a -journal, a .new and a .new-journal may stand, each a \
+                       file of the account that others may not read or write";
+
+    fn index(world: &World) -> std::path::PathBuf {
+        world.state("output-times/s1.sqlite")
+    }
+
+    fn beside_the_index(world: &World, suffix: &str) -> std::path::PathBuf {
+        world.state(&format!("output-times/s1.sqlite{suffix}"))
+    }
+
+    fn without_the_directory(world: &World) {
+        std::fs::remove_dir(world.state("output-times")).expect("an empty directory");
+    }
+
+    fn with_an_index(world: &World) {
+        world.put(&index(world), b"index");
+        world.put(&beside_the_index(world, "-wal"), b"wal");
+        world.put(&beside_the_index(world, "-shm"), b"shm");
+    }
+
+    /// The index may be written in place or built where it was absent, and the names beside it may
+    /// be made, changed, replaced and removed; a new owner-only directory is not refused.
+    #[test]
+    fn the_output_time_index_may_be_written_and_the_names_beside_it_come_and_go() {
+        allowed("written", with_an_index, |w| {
+            std::fs::write(index(w), b"index, written").expect("written");
+        });
+        allowed("sidecars", with_an_index, |w| {
+            std::fs::write(beside_the_index(w, "-wal"), b"wal, written").expect("written");
+            w.replace(&beside_the_index(w, "-shm"), b"another shm");
+        });
+        allowed("sidecars-removed", with_an_index, |w| {
+            std::fs::remove_file(beside_the_index(w, "-wal")).expect("removed");
+            std::fs::remove_file(beside_the_index(w, "-shm")).expect("removed");
+        });
+        allowed(
+            "names-made",
+            |w| w.put(&index(w), b"index"),
+            |w| {
+                for suffix in ["-wal", "-shm", "-journal", ".new", ".new-journal"] {
+                    w.put(&beside_the_index(w, suffix), b"x");
+                }
+            },
+        );
+        allowed(
+            "build-files-removed",
+            |w| {
+                w.put(&index(w), b"index");
+                w.put(&beside_the_index(w, ".new"), b"x");
+                w.put(&beside_the_index(w, ".new-journal"), b"x");
+            },
+            |w| {
+                std::fs::remove_file(beside_the_index(w, ".new")).expect("removed");
+                std::fs::remove_file(beside_the_index(w, ".new-journal")).expect("removed");
+            },
+        );
+        allowed(
+            "index-built",
+            |w| w.put(&beside_the_index(w, ".new"), b"x"),
+            |w| {
+                std::fs::rename(beside_the_index(w, ".new"), index(w)).expect("built");
+            },
+        );
+        allowed("new-directory", without_the_directory, |w| {
+            std::fs::create_dir_all(w.state("output-times")).expect("a directory");
+            std::fs::set_permissions(
+                w.state("output-times"),
+                std::fs::Permissions::from_mode(0o700),
+            )
+            .expect("owner only");
+            with_an_index(w);
+        });
+    }
+
+    /// The index replaced by a copy on a new inode, removed, retyped or changed in its mode, a name
+    /// beside it that no row knows, a sidecar that others may read, a link, a name below another
+    /// directory, and a directory that is not owner-only or changed its mode are each refused.
+    #[test]
+    fn a_replaced_index_and_a_name_no_row_knows_are_refused() {
+        refused_by("index-replaced", W15, with_an_index, |w| {
+            w.replace(&index(w), b"index");
+        });
+        refused_by("index-removed", W15, with_an_index, |w| {
+            std::fs::remove_file(index(w)).expect("removed");
+        });
+        refused_by("index-mode", W15, with_an_index, |w| {
+            std::fs::set_permissions(index(w), std::fs::Permissions::from_mode(0o644))
+                .expect("readable");
+        });
+        refused_by("index-retyped", W15, with_an_index, |w| {
+            std::fs::remove_file(index(w)).expect("removed");
+            std::fs::create_dir_all(index(w)).expect("a directory");
+        });
+        refused_by("unknown-name", W15, with_an_index, |w| {
+            w.put(&beside_the_index(w, ".other"), b"x");
+        });
+        refused_by("no-index-name", W15, with_an_index, |w| {
+            w.put(&w.state("output-times/s1-wal"), b"x");
+        });
+        refused_by("readable-sidecar", W15, with_an_index, |w| {
+            w.put(&beside_the_index(w, "-journal"), b"x");
+            std::fs::set_permissions(
+                beside_the_index(w, "-journal"),
+                std::fs::Permissions::from_mode(0o644),
+            )
+            .expect("readable");
+        });
+        refused_by("sidecar-a-link", W15, with_an_index, |w| {
+            std::os::unix::fs::symlink("/etc", beside_the_index(w, ".new")).expect("a link");
+        });
+        refused_by("sidecar-chmod", W15, with_an_index, |w| {
+            std::fs::set_permissions(
+                beside_the_index(w, "-wal"),
+                std::fs::Permissions::from_mode(0o644),
+            )
+            .expect("readable");
+        });
+        refused_by("directory-mode", W15, with_an_index, |w| {
+            std::fs::set_permissions(
+                w.state("output-times"),
+                std::fs::Permissions::from_mode(0o755),
+            )
+            .expect("open");
+        });
+        let (refused, _) = outcome("below-another-directory", with_an_index, |w| {
+            w.put(&w.state("output-times/more/s1.sqlite"), b"x");
+        });
+        assert_eq!(refused.len(), 2, "{refused:#?}");
+        assert!(
+            refused.iter().all(|line| line.ends_with(W15)),
+            "{refused:#?}"
+        );
+        refused_by(
+            "directory-not-owner-only",
+            W15,
+            without_the_directory,
+            |w| {
+                std::fs::create_dir_all(w.state("output-times")).expect("a directory");
+                std::fs::set_permissions(
+                    w.state("output-times"),
+                    std::fs::Permissions::from_mode(0o755),
+                )
+                .expect("open");
+            },
         );
     }
 }

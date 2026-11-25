@@ -4832,6 +4832,7 @@ dependencies = [
  "libproc",
  "portable-pty",
  "rcgen",
+ "rusqlite",
  "rustix",
  "rustls-platform-verifier",
  "serde",

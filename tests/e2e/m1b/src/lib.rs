@@ -65,6 +65,8 @@ pub mod floor;
 #[cfg(all(unix, feature = "legs"))]
 pub mod host;
 #[cfg(all(unix, feature = "legs"))]
+pub mod index;
+#[cfg(all(unix, feature = "legs"))]
 pub mod outside;
 #[cfg(all(unix, feature = "legs"))]
 pub mod relay;
