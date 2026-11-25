@@ -1194,7 +1194,8 @@ where
     BTreeMap::deserialize(deserializer).map(Some)
 }
 
-/// Reads a member that is absent or `null` as empty.
+/// Reads a member that is absent or `null` as empty. An absent member is read as empty only where
+/// `default` is also given.
 fn null_is_empty<'de, D, T>(deserializer: D) -> Result<T, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -2033,10 +2034,12 @@ mod tests {
     fn a_null_arguments_is_read_as_empty() {
         let mut json = entry_json(&serde_json::json!({}), &serde_json::json!({}));
         json["arguments"] = serde_json::Value::Null;
-        let build = serde_json::from_value::<Build>(json).expect("an entry");
+        let parsed = serde_json::from_value::<Build>(json);
         assert!(
-            build.arguments.is_empty(),
-            "a null arguments is read as empty"
+            parsed
+                .as_ref()
+                .is_ok_and(|build| build.arguments.is_empty()),
+            "a null arguments is read as empty: {parsed:?}"
         );
     }
 
@@ -2046,10 +2049,12 @@ mod tests {
     fn a_null_environment_is_read_as_empty() {
         let mut json = entry_json(&serde_json::json!({}), &serde_json::json!({}));
         json["environment"] = serde_json::Value::Null;
-        let build = serde_json::from_value::<Build>(json).expect("an entry");
+        let parsed = serde_json::from_value::<Build>(json);
         assert!(
-            build.environment.is_empty(),
-            "a null environment is read as empty"
+            parsed
+                .as_ref()
+                .is_ok_and(|build| build.environment.is_empty()),
+            "a null environment is read as empty: {parsed:?}"
         );
     }
 
@@ -2059,8 +2064,11 @@ mod tests {
     fn a_null_home_is_read_as_empty() {
         let mut json = entry_json(&serde_json::json!({}), &serde_json::json!({}));
         json["home"] = serde_json::Value::Null;
-        let build = serde_json::from_value::<Build>(json).expect("an entry");
-        assert!(build.home.is_empty(), "a null home is read as empty");
+        let parsed = serde_json::from_value::<Build>(json);
+        assert!(
+            parsed.as_ref().is_ok_and(|build| build.home.is_empty()),
+            "a null home is read as empty: {parsed:?}"
+        );
     }
 
     /// An entry that leaves out `arguments`, `environment` and `home` reads them as empty.
@@ -2070,16 +2078,23 @@ mod tests {
         json.as_object_mut()
             .expect("an object")
             .remove("environment");
-        let build = serde_json::from_value::<Build>(json).expect("an entry");
+        let parsed = serde_json::from_value::<Build>(json);
         assert!(
-            build.arguments.is_empty(),
-            "an absent arguments is read as empty"
+            parsed
+                .as_ref()
+                .is_ok_and(|build| build.arguments.is_empty()),
+            "an absent arguments is read as empty: {parsed:?}"
         );
         assert!(
-            build.environment.is_empty(),
-            "an absent environment is read as empty"
+            parsed
+                .as_ref()
+                .is_ok_and(|build| build.environment.is_empty()),
+            "an absent environment is read as empty: {parsed:?}"
         );
-        assert!(build.home.is_empty(), "an absent home is read as empty");
+        assert!(
+            parsed.as_ref().is_ok_and(|build| build.home.is_empty()),
+            "an absent home is read as empty: {parsed:?}"
+        );
     }
 
     /// An entry that types options is not served by a command integration, so its words are the keys
