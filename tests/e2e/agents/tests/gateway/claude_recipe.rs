@@ -40,8 +40,20 @@ const RECIPE_FILES: [&str; 3] = [
 ];
 
 /// The settings a person's directory already holds when the recipe is applied: none of them is the
-/// recipe's.
-const SEEDED_SETTINGS: &str = r#"{"theme":"dark","enabledPlugins":{"other@elsewhere":true},"permissions":{"allow":["Read"]}}"#;
+/// recipe's. They are indented and end in a newline, so that a rewrite of the file that compacts it
+/// or drops its last byte is not the bytes they were.
+const SEEDED_SETTINGS: &str = r#"{
+  "theme": "dark",
+  "enabledPlugins": {
+    "other@elsewhere": true
+  },
+  "permissions": {
+    "allow": [
+      "Read"
+    ]
+  }
+}
+"#;
 
 fn claude_code() -> PluginId {
     PluginId::new("kalareach/claude-code").expect("a plugin identifier")
