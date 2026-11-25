@@ -19,7 +19,8 @@ use std::time::{Duration, Instant};
 use kr_e2e_agents::build::{Build, Launch, read_build};
 use kr_e2e_agents::held::{conversations_relative_in, turns_recorded};
 use kr_e2e_agents::subject::Subject;
-use kr_e2e_m1b::run::RootPin;
+use kr_e2e_m1b::run::{RootPin, Run};
+use kr_e2e_m1b::shells;
 use kr_plugin_sdk::package::MANIFEST_FILE;
 
 use super::package::{Shape, release, write};
@@ -221,7 +222,8 @@ pub fn stand_in_file(build: &Build) -> serde_json::Value {
 /// # Errors
 ///
 /// Returns why the two are refused: one is named without the other, a real build is named beside
-/// them, the manifest is not a file named `plugin.json`, the entry has no account, or the entry and
+/// them, the manifest is not a file named `plugin.json`, the entry has no account, the entry's
+/// command, runtime file or wheel file is not one plain file name ([`placing_of`]), or the entry and
 /// the release are not one agent's.
 ///
 /// # Panics
@@ -274,6 +276,12 @@ pub fn stand_in_chosen(
              stand-in no composer text and no record marks"
         ));
     }
+    placing_of(Some(&build), &build.command).map_err(|why| {
+        format!(
+            "{STAND_IN_ENTRY_VARIABLE} names an entry the terminal stand-in cannot be placed \
+             for: {why}"
+        )
+    })?;
     let release = manifest.parent().unwrap_or_else(|| Path::new(""));
     let subject = Subject::from_release(&build, release).map_err(|why| {
         format!("{STAND_IN_ENTRY_VARIABLE} and {STAND_IN_MANIFEST_VARIABLE} do not name one agent: {why}")
@@ -862,6 +870,7 @@ fn an_entry_with_no_account_or_a_manifest_of_another_package_is_refused_for_the_
 }
 
 /// The names of the files the stand-in route places for an entry, below one directory.
+#[derive(Clone)]
 pub struct Placing {
     /// The file the host sees as the agent: the entry's command, or for a script or a wheel the
     /// file name of the entry's runtime.
@@ -872,40 +881,68 @@ pub struct Placing {
     pub wheel: Option<String>,
 }
 
+/// Whether `name` is one plain file name: not empty, with no separator, and not `.` or `..`.
+fn is_one_file_name(name: &str) -> bool {
+    Path::new(name).file_name() == Some(OsStr::new(name))
+}
+
 /// The names of the files the stand-in route places for `build`, typed as `command`. A name is the
 /// last part of a path and never a path: the entry's runtime and pinned file name real places, and
-/// nothing placed is a copy of either.
+/// nothing placed is a copy of either. Each name is one plain file name ([`is_one_file_name`]), so
+/// no file is placed outside the directory the route places them in.
 ///
-/// # Panics
+/// # Errors
 ///
-/// Panics where an entry that launches as a script or a wheel names no runtime.
-pub fn placing_of(build: Option<&Build>, command: &str) -> Placing {
+/// Returns why the command, the runtime's file name or the wheel's file name is not one plain file
+/// name, or why an entry that launches as a script or a wheel names no runtime.
+pub fn placing_of(build: Option<&Build>, command: &str) -> Result<Placing, String> {
+    if !is_one_file_name(command) {
+        return Err(format!(
+            "the command {command:?} is not one file name: the stand-in route places a file under \
+             it, and a name with a separator, an empty name, \".\" and \"..\" name another place"
+        ));
+    }
     let Some(build) = build.filter(|build| matches!(build.launch, Launch::Script | Launch::Wheel))
     else {
-        return Placing {
+        return Ok(Placing {
             program: command.to_owned(),
             script: None,
             wheel: None,
-        };
+        });
     };
     let last = |path: &Path| {
         path.file_name()
             .map(|name| name.to_string_lossy().into_owned())
+            .filter(|name| is_one_file_name(name))
     };
-    Placing {
-        program: build
-            .runtime
-            .first()
-            .and_then(|runtime| last(runtime))
-            .expect(
-                "the entry launches as a script or a wheel and names no runtime, so there is no \
-                 program for the stand-in to stand for",
-            ),
+    let runtime = build.runtime.first().ok_or_else(|| {
+        "the entry launches as a script or a wheel and names no runtime, so there is no program \
+         for the stand-in to stand for"
+            .to_owned()
+    })?;
+    let program = last(runtime).ok_or_else(|| {
+        format!(
+            "the runtime {} has no file name: the stand-in route places the program under the \
+             file name of the entry's runtime",
+            runtime.display()
+        )
+    })?;
+    let wheel = if build.launch == Launch::Wheel {
+        Some(last(Path::new(&build.pinned)).ok_or_else(|| {
+            format!(
+                "the pinned file {:?} has no file name: the stand-in route places the wheel's \
+                 file under the file name of the entry's pinned file",
+                build.pinned
+            )
+        })?)
+    } else {
+        None
+    };
+    Ok(Placing {
+        program,
         script: Some(command.to_owned()),
-        wheel: (build.launch == Launch::Wheel)
-            .then(|| last(Path::new(&build.pinned)))
-            .flatten(),
-    }
+        wheel,
+    })
 }
 
 /// Fails the case unless the stand-in is placed as the entry says. For a script or a wheel the
@@ -1001,7 +1038,9 @@ fn the_package_written_for_a_script_or_a_wheel_recognises_the_command_and_the_ru
             .unwrap_or_else(|why| panic!("{name}: {why}"));
         let written = write(&subject, &directory, &base.join("package"))
             .unwrap_or_else(|why| panic!("{name}: {why}"));
-        let runtime = placing_of(Some(&synthetic.build), command).program;
+        let runtime = placing_of(Some(&synthetic.build), command)
+            .unwrap_or_else(|why| panic!("{name}: {why}"))
+            .program;
         assert_eq!(
             written.match_rules.len(),
             2,
@@ -1027,6 +1066,186 @@ fn the_package_written_for_a_script_or_a_wheel_recognises_the_command_and_the_ru
         );
         let _ = std::fs::remove_dir_all(&base);
     }
+}
+
+/// What a person's file holds before a run, which a refused entry leaves as it is.
+const PERSONS_FILE: &[u8] = b"a file of the person, outside the run";
+
+/// An entry whose command, runtime file or wheel file is not one plain file name.
+struct NotAName {
+    /// What is not a file name.
+    what: String,
+    /// The synthetic entry it is made from: the script launch (0) or the wheel launch (1).
+    index: usize,
+    /// The members of that entry that are changed.
+    members: Vec<(&'static str, serde_json::Value)>,
+    /// What the refusal says.
+    reason: &'static str,
+}
+
+/// The entries that name a command, a runtime file or a wheel file that is not one plain file name.
+/// The absolute command names `outside`.
+fn not_one_file_name(outside: &Path) -> Vec<NotAName> {
+    let mut entries: Vec<NotAName> = [&outside.display().to_string(), "", ".", "..", "a/b", "x/"]
+        .into_iter()
+        .map(|command| NotAName {
+            what: format!("the command {command:?}"),
+            index: 0,
+            members: vec![("command", serde_json::json!(command))],
+            reason: "is not one file name",
+        })
+        .collect();
+    let others = [
+        (
+            "a script's runtime",
+            0,
+            "runtime",
+            serde_json::json!(["/real/node/bin/.."]),
+            "has no file name",
+        ),
+        (
+            "a script with no runtime",
+            0,
+            "runtime",
+            serde_json::json!([]),
+            "names no runtime",
+        ),
+        (
+            "a wheel's runtime",
+            1,
+            "runtime",
+            serde_json::json!(["/real/python/bin/.."]),
+            "has no file name",
+        ),
+        (
+            "a wheel's file",
+            1,
+            "pinned",
+            serde_json::json!("wheel/.."),
+            "has no file name",
+        ),
+    ];
+    for (what, index, member, value, reason) in others {
+        entries.push(NotAName {
+            what: what.to_owned(),
+            index,
+            members: vec![(member, value)],
+            reason,
+        });
+    }
+    entries
+}
+
+/// The entry of `synthetic` with the members `members` set.
+fn with_members(
+    synthetic: &Synthetic,
+    members: &[(&'static str, serde_json::Value)],
+) -> serde_json::Value {
+    let mut file = synthetic.file.clone();
+    for (member, value) in members {
+        file[*member] = value.clone();
+    }
+    file
+}
+
+/// An entry whose command, runtime file or wheel file is not one plain file name is refused for the
+/// stand-in route, with the reason.
+#[test]
+fn an_entry_whose_command_runtime_or_wheel_is_not_one_file_name_is_refused_for_the_stand_in_route()
+{
+    let base = scratch("not-a-name");
+    let synthetics = synthetic();
+    for entry_of in not_one_file_name(&base.join("outside")) {
+        let NotAName {
+            what,
+            index,
+            members,
+            reason,
+        } = entry_of;
+        let (entry, manifest) = named(&base, &synthetics[index]);
+        std::fs::write(
+            &entry,
+            with_members(&synthetics[index], &members).to_string(),
+        )
+        .expect("the entry whose names are not file names");
+        let why = refused(stand_in_chosen(Some(&entry), Some(&manifest), false), &what);
+        assert!(
+            why.starts_with(
+                "KR_AGENTS_STAND_IN_ENTRY names an entry the terminal stand-in cannot be placed for: "
+            ) && why.contains(reason),
+            "{what}: the refusal says why the entry cannot be placed ({reason}): {why}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// The stand-in route places nothing for such an entry and changes no file outside the run: an
+/// absolute command that names a file of the person leaves the file as it was.
+#[test]
+fn an_entry_whose_command_runtime_or_wheel_is_not_one_file_name_places_nothing_and_changes_no_file_outside_the_run()
+ {
+    let base = scratch("not-a-name-placed");
+    let outside = base.join("a-file-of-the-person");
+    let synthetics = synthetic();
+    for entry_of in not_one_file_name(&outside) {
+        let NotAName {
+            what,
+            index,
+            members,
+            reason,
+        } = entry_of;
+        let shell = match shells::managed_zsh() {
+            Ok(shell) => shell,
+            Err(why) if shells::required() => panic!("the managed shell: {why}"),
+            Err(why) => {
+                eprintln!("skipping: {why}");
+                return;
+            }
+        };
+        std::fs::write(&outside, PERSONS_FILE).expect("the person's file");
+        let build: Build = serde_json::from_value(with_members(&synthetics[index], &members))
+            .expect("the entry whose names are not file names");
+        let directory = base.join("release");
+        release(
+            &directory,
+            &build.package,
+            &synthetics[index].build.command,
+            Shape::Backend,
+        );
+        let subject =
+            Subject::from_release(&build, &directory).unwrap_or_else(|why| panic!("{what}: {why}"));
+        let mut ctx = Context::new(
+            shell,
+            Route::StandIn,
+            Run::start("gateway-not-a-name"),
+            super::runtime(),
+        );
+        ctx.subject = subject;
+        ctx.manual = true;
+        let placed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ctx.place()));
+        assert_eq!(
+            std::fs::read(&outside).expect("the person's file"),
+            PERSONS_FILE,
+            "{what}: the person's file outside the run is as it was"
+        );
+        let said = match placed {
+            Ok(()) => String::new(),
+            Err(panic) => kr_e2e_agents::held::panic_text(&*panic),
+        };
+        assert!(
+            said.starts_with("the stand-in route cannot place the agent: ")
+                && said.contains(reason),
+            "{what}: the route refuses the agent before it places anything ({reason}): {said:?}"
+        );
+        assert!(
+            !ctx.run.root().join("t").exists(),
+            "{what}: nothing is placed in the run"
+        );
+        ctx.run
+            .closing_check()
+            .unwrap_or_else(|why| panic!("{what}: {why}"));
+    }
+    let _ = std::fs::remove_dir_all(&base);
 }
 
 /// The entry of `synthetic` with a marker at every place it names a program to run: its pinned file

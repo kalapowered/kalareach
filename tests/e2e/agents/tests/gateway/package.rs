@@ -59,8 +59,9 @@ fn rule_of(manifest: &PluginManifest, program: &str, kind: &str) -> Result<Match
 /// # Errors
 ///
 /// Returns why no package is written: the release has no readable manifest, is another package's
-/// than the subject's, lists a file that is missing or is not the digest the manifest names, or
-/// the written package is not one the host reads.
+/// than the subject's, lists a file that is missing or is not the digest the manifest names, names
+/// a command or a runtime that is not one plain file name, or the written package is not one the
+/// host reads.
 pub fn write(subject: &Subject, release: &Path, into: &Path) -> Result<PluginManifest, String> {
     let manifest_path = release.join(MANIFEST_FILE);
     let bytes = std::fs::read(&manifest_path).map_err(|error| {
@@ -85,7 +86,7 @@ pub fn write(subject: &Subject, release: &Path, into: &Path) -> Result<PluginMan
     // The integration's command is the name a person types, and the host adopts a program by its
     // executable, which for a script or a wheel is its runtime: the package recognises both.
     let mut rules = vec![rule_of(&manifest, subject.command(), "executable")?];
-    let placing = placing_of(subject.entry(), subject.command());
+    let placing = placing_of(subject.entry(), subject.command())?;
     if placing.program != subject.command() {
         rules.push(rule_of(&manifest, &placing.program, "runtime")?);
     }

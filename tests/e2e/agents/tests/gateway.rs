@@ -1590,14 +1590,14 @@ impl Context {
     /// first line is `#!` and the absolute path of the placed runtime, as a launch line reads no
     /// search path.
     /// Each file is recorded when it is placed. Returns the file the host sees as the agent and
-    /// the files placed, relative to the run's directory.
+    /// the files placed, relative to the run's directory. The names in `placing` are the ones
+    /// [`stand_in::placing_of`] gave, each one plain file name.
     fn places_stand_in(
-        &self,
         run: &Run,
         program: &str,
         directory: &Path,
+        placing: stand_in::Placing,
     ) -> (PathBuf, Vec<PathBuf>) {
-        let placing = stand_in::placing_of(self.subject.entry(), self.subject.command());
         let executable = directory.join(&placing.program);
         run.place_built(program, &executable, &["--version"]);
         let mut names = vec![placing.program];
@@ -1627,6 +1627,15 @@ impl Context {
     /// Places the forwarder and the agent in the run, and checks the entry. A failure here is a
     /// failure of the case, which ends as every case does.
     fn place(&mut self) {
+        // The names the stand-in route places files under are checked before anything is placed.
+        let placing = match &self.route {
+            Route::StandIn => Some(
+                stand_in::placing_of(self.subject.entry(), self.subject.command()).unwrap_or_else(
+                    |why| panic!("the stand-in route cannot place the agent: {why}"),
+                ),
+            ),
+            Route::Real(_) => None,
+        };
         let run = &self.run;
         // Recorded before the session's shell is started in it: the shell's current directory is this
         // object for as long as the shell runs.
@@ -1674,10 +1683,18 @@ impl Context {
                     kr_ipc::paths::create_private_tree(run.root(), &prefix.join("bin"))
                         .expect("a directory for the programs");
                 }
-                let (executable, pinned_files) =
-                    self.places_stand_in(run, pinned_program, &first.join("bin"));
-                let (newer_file, newer_files) =
-                    self.places_stand_in(run, newer_program, &second.join("bin"));
+                let (executable, pinned_files) = Self::places_stand_in(
+                    run,
+                    pinned_program,
+                    &first.join("bin"),
+                    placing.clone().expect("the names of the stand-in's files"),
+                );
+                let (newer_file, newer_files) = Self::places_stand_in(
+                    run,
+                    newer_program,
+                    &second.join("bin"),
+                    placing.expect("the names of the stand-in's files"),
+                );
                 placed_files.extend(pinned_files);
                 placed_files.extend(newer_files);
                 let linked = Installation::link(run, &first, &[]);
@@ -1692,7 +1709,12 @@ impl Context {
                 kr_ipc::paths::create_private_tree(run.root(), &tools)
                     .expect("a directory for the programs");
                 // The shell finds the stand-in by its name on a search path, as it finds the build.
-                let (executable, files) = self.places_stand_in(run, pinned_program, &tools);
+                let (executable, files) = Self::places_stand_in(
+                    run,
+                    pinned_program,
+                    &tools,
+                    placing.expect("the names of the stand-in's files"),
+                );
                 placed_files.extend(files);
                 (executable, tools)
             }
@@ -8283,7 +8305,8 @@ fn gateway_a_stand_in_the_agent_replaced_is_not_run_by_the_next_start() {
     for synthetic in stand_in::synthetic() {
         let base = stand_in::scratch("replaced");
         let subject = stand_in::subject_for(&synthetic, &base);
-        let placing = stand_in::placing_of(Some(&synthetic.build), &synthetic.build.command);
+        let placing = stand_in::placing_of(Some(&synthetic.build), &synthetic.build.command)
+            .unwrap_or_else(|why| panic!("{}: {why}", synthetic.name));
         for name in [Some(placing.program), placing.script, placing.wheel]
             .into_iter()
             .flatten()
