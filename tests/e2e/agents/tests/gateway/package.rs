@@ -1,4 +1,4 @@
-//! The package the stand-in route installs for an agent other than Codex.
+//! The package the stand-in route installs.
 //!
 //! The stand-in route has no signed generation that an operator names, so the run publishes one of
 //! its own. For the default Codex subject the package is the one this crate keeps. For a subject
@@ -7,8 +7,8 @@
 //! change. A build list entry has no match rules, so the release's own are replaced by one rule
 //! that recognises the entry's command, which is the name the stand-in program is placed under.
 //! The actions, the capabilities, the command integration and the platforms stay the release's, so
-//! the host registers the actions the release declares and the installation's grant is what the
-//! release asks for.
+//! the host registers the actions the release declares, and the installation's grant is what the
+//! release asks for that the repository's ceiling does not already allow.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -513,8 +513,8 @@ fn starts_by_hand(
 
 /// The host that installed the package written for each synthetic entry detects a program that is
 /// typed under the entry's command, as one live instance of that package. The case starts the
-/// program itself and does not wait for an instance, so a host that detects nothing fails the
-/// case's own check.
+/// program with a helper that does not wait for an instance, and then waits for one through
+/// `detects`, so a host that detects nothing fails the case's own check.
 #[test]
 fn the_host_detects_a_program_typed_as_the_command_of_the_package_it_installed() {
     const TEST: &str =

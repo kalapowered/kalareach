@@ -73,7 +73,8 @@ fn by_hand_case(
     );
 }
 
-/// The actions of the package the host installed for `subject`, as its manifest declares them.
+/// The actions of the package the host installed for `subject` in `environment`, as the manifest
+/// that the environment's catalogue holds declares them.
 pub(super) fn package_actions(subject: &Subject, environment: &EnvironmentPaths) -> Vec<Action> {
     let manifest = super::package::installed_manifest(subject, environment);
     serde_json::from_value(manifest["actions"].clone()).expect("the package's actions")

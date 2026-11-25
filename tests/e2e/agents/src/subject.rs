@@ -33,7 +33,7 @@ pub struct GatewayRoute {
 #[derive(Clone, Debug)]
 pub struct Subject {
     /// The build list entry of a real route, or of a subject made from a release; none for the
-    /// Codex subject of the stand-in route, which has no entry.
+    /// default Codex subject, which has no entry.
     entry: Option<Build>,
     plugin: PluginId,
     command: String,
@@ -50,7 +50,7 @@ pub struct Subject {
 }
 
 impl Subject {
-    /// The Codex subject of the stand-in route, read from the Codex package kept in this crate.
+    /// The default Codex subject, read from the Codex package kept in this crate.
     ///
     /// # Panics
     ///
@@ -225,7 +225,7 @@ impl Subject {
     }
 
     /// The build list entry of a real route, or of a subject made from a release; none for the
-    /// Codex subject of the stand-in route.
+    /// default Codex subject.
     #[must_use]
     pub const fn entry(&self) -> Option<&Build> {
         self.entry.as_ref()
@@ -316,9 +316,9 @@ impl Subject {
         &self.requested
     }
 
-    /// The directory of the package the subject's actions are read from: the release the subject
-    /// was made from ([`Subject::from_release`]), or the Codex package kept in this crate; none for
-    /// another subject.
+    /// The directory the stand-in route takes the subject's package from: the release the subject
+    /// was made from ([`Subject::from_release`]), whose package the route writes, or the Codex
+    /// package kept in this crate; none for another subject.
     #[must_use]
     pub fn package(&self) -> Option<&Path> {
         self.package.as_deref()

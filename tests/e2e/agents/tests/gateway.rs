@@ -171,8 +171,8 @@ mod staged_c;
 #[path = "gateway/acp.rs"]
 mod acp;
 
-/// The package the stand-in route installs for an agent other than Codex, written from the release
-/// the run was given.
+/// The package the stand-in route installs: the one this crate keeps for the default Codex subject,
+/// or the one written from the release a subject was made from.
 #[path = "gateway/package.rs"]
 mod package;
 
@@ -2222,7 +2222,8 @@ fn subject(session_id: SessionId, instance: ApplicationInstanceId) -> AgentSubje
     }
 }
 
-/// The directory of the generation the stand-in route publishes for `environment`.
+/// The directory the stand-in route builds the generation for `environment` in: `Generation::build`
+/// publishes the generation itself in the `generation` directory below it.
 fn generation_source(environment: &EnvironmentPaths) -> PathBuf {
     environment.state_dir().join("generation-source")
 }
