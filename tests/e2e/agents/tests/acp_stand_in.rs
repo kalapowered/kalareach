@@ -32,9 +32,10 @@ struct Played {
 }
 
 impl Played {
-    /// Starts `program` in a working directory that holds `script`.
+    /// Starts `program` with the one argument `--acp`, as the host starts the agent, in a working
+    /// directory that holds `script`.
     fn start(program: &str, script: &Value) -> Self {
-        Self::start_with(program, &[], script)
+        Self::start_with(program, &["--acp"], script)
     }
 
     /// Starts `program` with `arguments` in a working directory that holds `script`.
@@ -181,6 +182,23 @@ fn a_qoder_shaped_stand_in_answers_initialize_with_the_version_the_table_pins() 
     assert_eq!(answer["result"]["protocolVersion"], 1);
     assert_eq!(answer["result"]["agentInfo"]["version"], "1.1.63");
     assert_eq!(answer["result"]["agentCapabilities"]["loadSession"], false);
+}
+
+#[test]
+fn the_qoder_shaped_program_takes_the_acp_flag_and_no_other_argument() {
+    for arguments in [
+        &[][..],
+        &["--sdk"][..],
+        &["--yolo"][..],
+        &["acp"][..],
+        &["--acp", "--yolo"][..],
+        &["--remote-control", "--acp"][..],
+    ] {
+        let mut agent = Played::start_with(QODER, arguments, &json!({}));
+        let status = agent.close();
+        assert_eq!(status.code(), Some(2), "{arguments:?} is refused");
+        assert!(agent.is_quiet(), "{arguments:?} gets no frame");
+    }
 }
 
 #[test]
