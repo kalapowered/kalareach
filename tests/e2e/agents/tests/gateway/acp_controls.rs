@@ -119,9 +119,86 @@ pub struct Reads {
     pub request: String,
 }
 
+impl Reads {
+    /// Whether every one of the four reads holds something.
+    pub fn is_filled(&self) -> bool {
+        [&self.instance, &self.binding, &self.identity, &self.request]
+            .iter()
+            .all(|read| !read.is_empty())
+    }
+}
+
 /// 5b-1: the four reads are equal after the daemon was killed and started again.
 pub fn reads_equal_after_a_restart(before: &Reads, after: &Reads) -> Result<(), Red> {
     ensure(before == after, "5b-1")
+}
+
+/// The identities of the worker, of the launcher and of the agent's process, as the host reads
+/// them.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Processes {
+    /// The worker's identity.
+    pub worker: String,
+    /// The launcher's identity.
+    pub launcher: String,
+    /// The agent's identity.
+    pub agent: String,
+}
+
+/// Says which of the three processes has no identity or changed it between two reads, or returns
+/// none when the three read as they did.
+pub fn why_the_processes_changed(before: &Processes, after: &Processes) -> Option<String> {
+    [
+        ("worker", &before.worker, &after.worker),
+        ("launcher", &before.launcher, &after.launcher),
+        ("agent", &before.agent, &after.agent),
+    ]
+    .into_iter()
+    .find_map(|(name, was, is)| {
+        if was.is_empty() || is.is_empty() {
+            Some(format!("the {name} has no identity"))
+        } else if was != is {
+            Some(format!("the {name} changed from {was} to {is}"))
+        } else {
+            None
+        }
+    })
+}
+
+/// Stops the case when the worker, the launcher or the agent is not the process it was.
+fn still_the_same_processes(id: &str, before: &Processes, host: &mut Hosted) {
+    if let Some(why) = why_the_processes_changed(before, &host.processes()) {
+        requires(id, false, &why);
+    }
+}
+
+/// The texts of the ticks that the stand-in sent, in order.
+fn ticks_sent(record: &[Value]) -> Vec<&str> {
+    record
+        .iter()
+        .filter(|line| line["sent"] == "tick")
+        .filter_map(|line| line["text"].as_str())
+        .collect()
+}
+
+/// The stop reasons of the replies that the stand-in sent, in order.
+fn replies_sent(record: &[Value]) -> Vec<&str> {
+    record
+        .iter()
+        .filter(|line| line["sent"] == "reply")
+        .filter_map(|line| line["stop"].as_str())
+        .collect()
+}
+
+/// Stops the case when the stand-in has not sent ticks 1 to `count` in order.
+fn ticks_arrive(id: &str, count: usize, host: &mut Hosted) {
+    let record = host.record_after("tick", count);
+    let expected: Vec<String> = (1..=count).map(|number| format!("tick {number}")).collect();
+    requires(
+        id,
+        ticks_sent(&record) == expected,
+        &format!("the stand-in has not sent tick {count} and the ticks before it in order"),
+    );
 }
 
 /// 5b-2: the stand-in received one response, with the chosen option.
@@ -203,6 +280,11 @@ impl Hosted {
 
     /// The four reads of the instance and its pending request.
     pub fn reads(&mut self) -> Reads {
+        match *self {}
+    }
+
+    /// The identities of the worker, the launcher and the agent's process, as the host reads them.
+    pub fn processes(&mut self) -> Processes {
         match *self {}
     }
 
@@ -301,9 +383,18 @@ pub fn restart_script() -> Value {
 /// agent, and, in a second session, the kill of the daemon and then the worker.
 pub fn a_daemon_killed_with_a_request_pending(host: &mut Hosted) -> Result<(), Red> {
     let before = host.reads();
+    requires(
+        "5b-1",
+        before.is_filled(),
+        "a read of the instance, the binding, the capability identity or the request is empty",
+    );
+    let processes = host.processes();
     host.kill_daemon();
     host.release("tick1");
+    ticks_arrive("5b-1", 1, host);
+    still_the_same_processes("5b-1", &processes, host);
     host.restart_daemon();
+    still_the_same_processes("5b-1", &processes, host);
     reads_equal_after_a_restart(&before, &host.reads())?;
     host.answer("proceed_once");
     one_reply_with_the_chosen_id(&host.record_after_quiet(), "proceed_once")?;
@@ -473,6 +564,79 @@ fn the_reader_of_the_record_finds_the_requests_the_stand_in_sent() {
         !sent_request(&record, 2),
         "a request that the stand-in received is not one it sent"
     );
+}
+
+#[test]
+fn a_set_of_reads_with_an_empty_read_is_not_filled() {
+    assert!(reads("pending").is_filled());
+    for empty in 0..4 {
+        let mut read = reads("pending");
+        match empty {
+            0 => read.instance.clear(),
+            1 => read.binding.clear(),
+            2 => read.identity.clear(),
+            _ => read.request.clear(),
+        }
+        assert!(!read.is_filled(), "read {empty} is empty");
+    }
+}
+
+#[test]
+fn the_check_of_the_processes_names_the_one_that_changed_or_has_no_identity() {
+    let processes = |worker: &str, launcher: &str, agent: &str| Processes {
+        worker: worker.to_owned(),
+        launcher: launcher.to_owned(),
+        agent: agent.to_owned(),
+    };
+    let first = processes("w1", "l1", "a1");
+    assert_eq!(
+        why_the_processes_changed(&first, &processes("w1", "l1", "a1")),
+        None
+    );
+    for (after, why) in [
+        (
+            processes("w2", "l1", "a1"),
+            "the worker changed from w1 to w2",
+        ),
+        (
+            processes("w1", "l2", "a1"),
+            "the launcher changed from l1 to l2",
+        ),
+        (
+            processes("w1", "l1", "a2"),
+            "the agent changed from a1 to a2",
+        ),
+    ] {
+        assert_eq!(
+            why_the_processes_changed(&first, &after).as_deref(),
+            Some(why)
+        );
+    }
+    for (empty, why) in [
+        (processes("", "l1", "a1"), "the worker has no identity"),
+        (processes("w1", "", "a1"), "the launcher has no identity"),
+        (processes("w1", "l1", ""), "the agent has no identity"),
+    ] {
+        assert_eq!(
+            why_the_processes_changed(&empty, &empty).as_deref(),
+            Some(why),
+            "two empty reads are no proof that the process stayed"
+        );
+    }
+}
+
+#[test]
+fn the_readers_of_the_record_find_the_ticks_and_the_replies_in_order() {
+    let record = [
+        serde_json::json!({ "sent": "tick", "text": "tick 1" }),
+        serde_json::json!({ "sent": "reply", "id": 3, "stop": "cancelled" }),
+        serde_json::json!({ "sent": "tick", "text": "tick 2" }),
+        serde_json::json!({ "received": "request", "method": "session/prompt" }),
+        serde_json::json!({ "sent": "reply", "id": 4, "stop": "end_turn" }),
+    ];
+    assert_eq!(ticks_sent(&record), ["tick 1", "tick 2"]);
+    assert_eq!(replies_sent(&record), ["cancelled", "end_turn"]);
+    assert!(ticks_sent(&[]).is_empty() && replies_sent(&[]).is_empty());
 }
 
 /// What the receipts of the two answers of [`exit_script`] read after the agent exited.
@@ -683,9 +847,9 @@ impl Hosted {
         match *self {}
     }
 
-    /// The stand-in's record once it holds a line that the stand-in sent of `kind`, or after five
-    /// seconds when it holds none.
-    pub fn record_after(&mut self, _kind: &str) -> Vec<Value> {
+    /// The stand-in's record once it holds `count` lines that the stand-in sent of `kind`, or after
+    /// five seconds when it holds fewer.
+    pub fn record_after(&mut self, _kind: &str, _count: usize) -> Vec<Value> {
         match *self {}
     }
 }
@@ -732,14 +896,14 @@ pub fn late_request_script() -> Value {
 /// Case 5b-5: a cancel and an answer at once.
 pub fn a_cancel_racing_an_approval(host: &mut Hosted) -> Result<(), Red> {
     let race = host.cancel_and_answer_at_once("proceed_once");
-    one_winner_and_the_call_settles(&race, &host.record_after("reply"))
+    one_winner_and_the_call_settles(&race, &host.record_after("reply", 1))
 }
 
 /// Case 5b-6: the person cancels, and the stand-in then sends a request of the cancelled turn.
 pub fn a_request_after_a_cancel(host: &mut Hosted) -> Result<(), Red> {
     host.cancel();
     host.release("late");
-    a_late_request_is_answered_cancelled(&host.record_after("turn end"))
+    a_late_request_is_answered_cancelled(&host.record_after("turn end", 1))
 }
 
 /// A record line that is a response whose outcome is `cancelled`.
@@ -1308,24 +1472,22 @@ pub fn window_script() -> Value {
     })
 }
 
-/// The script of the agent of 5b-18: a turn of its own that asks for a call and waits, a prompt of
-/// ours that waits behind it, and, after the cancel, a request of the old turn when the file `late`
-/// appears.
+/// The script of the agent of 5b-18: a turn of its own that asks for a call, goes on waiting for the
+/// answer after a cancel, and asks for a second call when the file `late` appears, and a prompt of
+/// ours that waits behind that turn.
 pub fn queued_prompt_script() -> Value {
     serde_json::json!({
+        "cancel": "wait",
         "own": [{ "after": "go", "steps": [
             { "say": "own" },
             { "call": { "id": "c0", "kind": "execute" } },
             { "ask": "c0" },
-            { "hold": "never" },
-        ] }],
-        "turns": [[{ "say": "ours" }, { "end": "end_turn" }]],
-        "on_cancel": [
             { "hold": "late" },
             { "call": { "id": "c1", "kind": "execute" } },
             { "ask": "c1" },
-            { "end": "end_turn" },
-        ],
+            { "hold": "never" },
+        ] }],
+        "turns": [[{ "say": "ours" }, { "end": "end_turn" }]],
     })
 }
 
@@ -1364,12 +1526,14 @@ pub fn approvals_at_twenty_nine_and_thirty_one_seconds(host: &mut Hosted) -> Res
     for tick in 1..=5 {
         host.advance_clock(5);
         host.release(&format!("tick{tick}"));
+        ticks_arrive("5b-16", tick, host);
     }
     host.advance_clock(4);
     host.release("t29");
     let _ = host.record_after_response(1);
     host.advance_clock(2);
     host.release("tick6");
+    ticks_arrive("5b-16", 6, host);
     host.release("t31");
     let record = host.record_after_response(2);
     requires(
@@ -1389,9 +1553,21 @@ pub fn a_prompt_answered_cancelled_while_the_old_turn_goes_on(
     host.waits_for_a_request();
     host.send_prompt("ours");
     host.cancel();
+    let record = host.record_after("reply", 1);
+    requires(
+        "5b-18",
+        replies_sent(&record) == ["cancelled"],
+        "our prompt was not answered `cancelled` before the clock moved",
+    );
     host.advance_clock(3);
     host.release("late");
-    a_prompt_answered_cancelled_leaves_the_window_open(&host.record_after_response(1))
+    let record = host.record_after_response(1);
+    requires(
+        "5b-18",
+        sent_request(&record, 1),
+        "the old turn did not send its request at 3 seconds",
+    );
+    a_prompt_answered_cancelled_leaves_the_window_open(&record)
 }
 
 /// Case 5b-19: a cancel, and a prompt of ours 5 seconds later whose turn asks for a call.
@@ -1650,7 +1826,7 @@ pub fn completed_while_cancelling_script() -> Value {
 pub fn a_request_after_a_cancel_of_a_waiting_agent(host: &mut Hosted) -> Result<(), Red> {
     host.cancel();
     host.release("late");
-    a_late_request_of_a_waiting_agent_is_answered_cancelled(&host.record_after("reply"))
+    a_late_request_of_a_waiting_agent_is_answered_cancelled(&host.record_after("reply", 1))
 }
 
 /// Case 5b-13: three declines, and what each receipt reads at its boundary: 300 seconds for the
@@ -1686,7 +1862,7 @@ pub fn an_approval_at_thirty_one_seconds_with_a_prompt_in_flight(
     host.advance_clock(31);
     let refused = !host.sends_a_prompt("meanwhile");
     host.release("t31");
-    the_window_stays_open_until_the_prompts_reply(&host.record_after("reply"), refused)
+    the_window_stays_open_until_the_prompts_reply(&host.record_after("reply", 1), refused)
 }
 
 /// Case 5b-23g: an allow, the person's cancel, and then the call's `completed` update, with the
