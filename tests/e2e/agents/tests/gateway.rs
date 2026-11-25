@@ -475,6 +475,13 @@ impl Real {
         run.root().join(CONFIG_DIRECTORY)
     }
 
+    /// Where the agent's conversations are, relative to the run's directory, as the subject gives it.
+    fn record_location(&self) -> PathBuf {
+        self.subject
+            .record_location()
+            .expect("the agent of a real route has an account")
+    }
+
     /// The line typed at the shell to start the agent: the command, and `extra` after it.
     fn typed(&self, extra: &[&str]) -> String {
         self.subject.typed_line(extra)
@@ -509,22 +516,15 @@ impl Real {
         host: &Host<'_>,
         shell: &shells::ManagedShell,
     ) -> Vec<(String, String)> {
-        let mut variables = session_variables(host, shell, &self.build.environment, closed_port());
-        for name in ["USER", "LOGNAME"] {
-            if let Ok(value) = std::env::var(name) {
-                variables.push((name.to_owned(), value));
-            }
-        }
-        if let Some((name, value)) = &self.held.key {
-            variables.push((name.clone(), value.clone()));
-        }
-        for (name, value) in &self.account.variables {
-            variables.retain(|(existing, _)| existing != name);
-            variables.push((name.clone(), value.clone()));
-        }
-        let config = self.account.config_directory.as_ref().expect(
+        let harness = session_variables(host, shell, &self.build.environment, closed_port());
+        let user: Vec<(String, String)> = ["USER", "LOGNAME"]
+            .into_iter()
+            .filter_map(|name| Some((name.to_owned(), std::env::var(name).ok()?)))
+            .collect();
+        assert!(
+            self.account.config_directory.is_some(),
             "the entry gives the agent no configuration directory of the run's own, and its \
-             switches have nowhere to go",
+             switches have nowhere to go"
         );
         let directory = Self::config(host.run());
         if !directory.is_dir() {
@@ -532,14 +532,10 @@ impl Real {
                 .expect("the run's configuration directory");
         }
         let (root, work) = Self::places(host.run());
-        let files = if self.names_a_provider() {
-            self.account
-                .configuration_with_switches("config.toml", &root, &work)
-        } else {
-            self.account
-                .configuration_without_provider("config.toml", &root, &work)
-        }
-        .unwrap_or_else(|why| panic!("{ISOLATION_UNPROVEN} {why}"));
+        let files = self
+            .subject
+            .configuration(&root, &work, self.names_a_provider())
+            .unwrap_or_else(|why| panic!("{ISOLATION_UNPROVEN} {why}"));
         for (relative, content) in &files {
             let path = directory.join(relative);
             assert!(
@@ -571,9 +567,9 @@ impl Real {
                 configured.push(place);
             }
         }
-        variables.retain(|(existing, _)| existing != &config.variable);
-        variables.push((config.variable.clone(), directory.display().to_string()));
-        let _ = self.build.without_provider_keys(&mut variables);
+        let variables =
+            self.subject
+                .session_variables(harness, user, self.held.key.clone(), &directory);
         let mut prepared = self
             .prepared
             .lock()
@@ -4162,7 +4158,7 @@ fn ends(
                 &real.account,
                 run.root(),
                 run.pin(),
-                &conversations_relative(&real.account),
+                &real.record_location(),
             );
             match audit_turns(result.is_ok(), charged, &recorded) {
                 Audit::Agrees => {}
