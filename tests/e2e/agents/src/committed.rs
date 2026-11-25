@@ -7,8 +7,9 @@ pub fn committed() -> serde_json::Value {
     serde_json::from_str(include_str!("../tests/fixtures/builds.json")).expect("the list")
 }
 
-/// The entry of `package` in the committed list, projected as the runner projects it for the
-/// driver.
+/// The entry of `package` in the committed list, projected so that the driver gets every member it
+/// reads: `missing` is `{}` where the list has none (the entries of kimi-cli and opencode-attach
+/// have no such member), `actions` is not given, and `newer` is kept whatever `$installed` says.
 pub fn build_of(package: &str) -> Build {
     let list = committed();
     let entry = list["builds"]
@@ -44,6 +45,8 @@ pub fn build_of(package: &str) -> Build {
             out.insert(name.to_owned(), value.clone());
         }
     }
+    out.entry("missing")
+        .or_insert_with(|| serde_json::json!({}));
     if let Some(newer) = entry.get("newer").filter(|newer| !newer.is_null()) {
         let mut kept = serde_json::Map::new();
         for name in ["version", "prefix", "pinned", "sha256", "ready", "isolated"] {

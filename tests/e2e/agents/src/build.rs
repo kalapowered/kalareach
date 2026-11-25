@@ -1172,9 +1172,11 @@ pub struct Build {
     #[serde(default)]
     pub isolation: Option<Isolation>,
     /// The fields the entry gives as missing, each by its dotted path (`account.turn_line`) with
-    /// the reason no value was found. A field listed here is missing, and never empty.
+    /// the reason no value was found. A field listed here is missing, and never empty. None where
+    /// the entry has no `missing` member: a real start of a non-Codex entry refuses that, so a
+    /// projection that drops the member fails closed.
     #[serde(default)]
-    pub missing: BTreeMap<String, String>,
+    pub missing: Option<BTreeMap<String, String>>,
 }
 
 impl Account {
@@ -1904,7 +1906,11 @@ mod tests {
         ));
         assert_eq!(isolation.absent, owned(&[".agent/settings.json"]));
         assert_eq!(
-            build.missing.get("account.turn_line").map(String::as_str),
+            build
+                .missing
+                .as_ref()
+                .and_then(|missing| missing.get("account.turn_line"))
+                .map(String::as_str),
             Some("no mark was found")
         );
         let plain = serde_json::from_value::<Build>(entry_json(
@@ -1912,7 +1918,7 @@ mod tests {
             &serde_json::json!({}),
         ))
         .expect("an entry with neither member");
-        assert!(plain.isolation.is_none() && plain.missing.is_empty());
+        assert!(plain.isolation.is_none() && plain.missing.is_none());
         json["isolation"]["covers"] = serde_json::json!([]);
         assert!(
             serde_json::from_value::<Build>(json).is_err(),

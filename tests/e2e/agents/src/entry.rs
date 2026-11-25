@@ -3,9 +3,10 @@
 //! A part reads fields of its entry. A field the entry lists in `missing` is missing, and a case
 //! that reads it stops: it is never read as empty. [`check`] names, for each part, the fields the
 //! entry lacks and says whose gap each is, and lists what a real start of the entry refuses: an
-//! entry with no isolation contract, an entry with an account and no `turn_line`, and a build the
-//! entry does not digest.
+//! entry with no isolation contract, an entry of another package than Codex's with no `missing`
+//! member, an entry with an account and no `turn_line`, and a build the entry does not digest.
 
+use std::collections::BTreeMap;
 use std::fmt;
 
 use crate::build::{Build, Launch};
@@ -49,6 +50,8 @@ pub enum Refusal {
     NotDigested(&'static str),
     /// A field the entry lists as missing is not one a part reads, or is given as well.
     Contradiction(String),
+    /// An entry of another package than Codex's has no `missing` member.
+    NoMissing,
 }
 
 impl fmt::Display for Refusal {
@@ -69,6 +72,11 @@ impl fmt::Display for Refusal {
                 "the entry gives no digest for {program}, so a real start of it is refused"
             ),
             Self::Contradiction(text) => write!(out, "{text}"),
+            Self::NoMissing => write!(
+                out,
+                "the entry has no `missing` member, so a field it lacks would read as empty, and a \
+                 real start of it is refused"
+            ),
         }
     }
 }
@@ -174,7 +182,10 @@ pub fn check(build: &Build) -> Report {
             if field == "newer.isolated" && (build.newer.is_none() || build.account.is_none()) {
                 continue;
             }
-            let listed = build.missing.get(field);
+            let listed = build
+                .missing
+                .as_ref()
+                .and_then(|missing| missing.get(field));
             if listed.is_none() && given(build, field) {
                 continue;
             }
@@ -199,7 +210,7 @@ pub fn check(build: &Build) -> Report {
         .iter()
         .flat_map(|(_, fields)| fields.iter().copied())
         .collect();
-    for field in build.missing.keys() {
+    for field in build.missing.iter().flat_map(BTreeMap::keys) {
         if !read.contains(&field.as_str()) {
             report.refusals.push(Refusal::Contradiction(format!(
                 "the entry lists {field} as missing, and no part reads it"
@@ -260,6 +271,9 @@ pub fn check(build: &Build) -> Report {
         }
         if !lacking.is_empty() {
             report.refusals.push(Refusal::NoIsolation(lacking));
+        }
+        if build.missing.is_none() {
+            report.refusals.push(Refusal::NoMissing);
         }
     }
     if build
@@ -459,7 +473,11 @@ mod tests {
             )),
             "{both:?}"
         );
-        given.missing.remove("account.turn_line");
+        given
+            .missing
+            .as_mut()
+            .expect("a missing member")
+            .remove("account.turn_line");
         assert_eq!(check(&given).refusals, Vec::new());
     }
 
@@ -469,6 +487,8 @@ mod tests {
         let mut build = build_of("kalareach/opencode");
         build
             .missing
+            .as_mut()
+            .expect("a missing member")
             .insert("account.nonsense".to_owned(), "a typing mistake".to_owned());
         assert!(check(&build).refusals.iter().any(|refusal| matches!(
             refusal, Refusal::Contradiction(text) if text.contains("account.nonsense")
@@ -499,6 +519,21 @@ mod tests {
         let mut codex = build_of("kalareach/codex");
         codex.isolation = None;
         assert_eq!(check(&codex).refusals, Vec::new());
+    }
+
+    /// An entry of another package than Codex's with no `missing` member is refused for a real
+    /// start, since a projection that dropped the member would make every missing field read as
+    /// empty; the Codex entry, which lists none, is not.
+    #[test]
+    fn a_real_start_is_refused_for_a_non_codex_entry_with_no_missing_member() {
+        let mut opencode = build_of("kalareach/opencode");
+        opencode.missing = None;
+        let why = refuse_real_start(&opencode)
+            .expect_err("an entry that has no `missing` member is refused");
+        assert!(why.contains("no `missing` member"), "{why}");
+        let mut codex = build_of("kalareach/codex");
+        codex.missing = None;
+        assert_eq!(refuse_real_start(&codex), Ok(()));
     }
 
     /// A real start is refused for a pinned or newer build that the entry does not digest.
@@ -547,7 +582,9 @@ mod tests {
     fn every_harness_gap_names_a_field_the_list_gives_as_missing_for_that_package() {
         for (package, field, _) in HARNESS_GAPS {
             assert!(
-                build_of(package).missing.contains_key(field),
+                build_of(package)
+                    .missing
+                    .is_some_and(|missing| missing.contains_key(field)),
                 "{package} does not list {field} as missing"
             );
         }
