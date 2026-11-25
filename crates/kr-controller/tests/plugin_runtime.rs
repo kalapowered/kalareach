@@ -731,6 +731,9 @@ struct World {
     /// The first package's generation and its package directory, in a world that installs a
     /// second package, for the next generation that revokes its release.
     first_published: Option<(generations::Generation, PathBuf)>,
+    /// In a world whose plugin host serves the third protocol alone, the listener of this test's
+    /// own that holds the endpoint of the fourth, so that the host cannot bind it.
+    _fourth_held: Option<Listener>,
     /// Before the hosts, so a daemon in a process of its own is gone before they are ended.
     apart: Apart,
     /// Before the tree, so every host the daemon started is ended before the tree goes.
@@ -788,6 +791,19 @@ impl World {
     /// not.
     async fn start_with_two_packages(component: &[u8]) -> Self {
         let mut world = Self::prepare_packages(component, true).await;
+        world.run().await;
+        world
+    }
+
+    /// [`Self::start_with_two_packages`], with the endpoint of the fourth protocol held by this
+    /// test, so that the plugin host cannot bind it, serves the third protocol alone, and the
+    /// workers speak the third.
+    async fn start_with_two_packages_over_the_third_protocol(component: &[u8]) -> Self {
+        let mut world = Self::prepare_packages(component, true).await;
+        let endpoint =
+            launcher::host_endpoint(&world.environment(), &HostProtocol::V4).expect("an endpoint");
+        world._fourth_held =
+            Some(Listener::bind(&endpoint).expect("the endpoint of the fourth protocol is held"));
         world.run().await;
         world
     }
@@ -887,6 +903,7 @@ impl World {
             _published: published,
             _published_second: published_second,
             first_published: second.then_some((generation, package)),
+            _fourth_held: None,
             apart: Apart { child: None },
             _hosts: HostEnding {
                 requested,
@@ -1441,6 +1458,15 @@ impl World {
     async fn health(&self) -> Option<HostHealth> {
         let client = PluginClient::connect(&self.environment()).await.ok()?;
         client.health().await.ok()
+    }
+
+    /// The protocol a connection to the plugin runtime is made over now, as a worker connects: the
+    /// newest one the runtime's descriptors let it verify.
+    async fn runtime_protocol(&self) -> Option<HostProtocol> {
+        PluginClient::connect(&self.environment())
+            .await
+            .ok()
+            .map(|client| client.protocol())
     }
 
     /// Waits until the plugin runtime holds `bindings` bindings, and returns what it reports. For a
@@ -2347,10 +2373,15 @@ struct Held {
 }
 
 /// What a case says when the link removed what the runtime holds of the binding before the step
-/// the case relies on: the runtime answered its health question inside the case's setup, which the
-/// case is built to fit between two answers, thirty seconds apart.
+/// the case relies on. Either the runtime answered its health question inside the case's setup,
+/// which the case is built to fit between two answers, thirty seconds apart; or the runtime refused
+/// a registration of the binding, as a host does over the fourth protocol while it holds the
+/// binding live, and the link removed the binding at once.
 const OVERRUN: &str = "the link removed what the runtime holds of the binding before the step this \
-    case relies on: its setup did not fit inside one health interval of the runtime";
+    case relies on: either the runtime answered its health question inside the case's setup, which \
+    is built to fit between two answers thirty seconds apart, or the runtime refused a \
+    registration of the binding, as a host does over the fourth protocol while it holds the \
+    binding live, and the link removed the binding at once";
 
 impl World {
     /// Runs the second package's program and registers its binding, which keeps the connection to
@@ -2506,14 +2537,27 @@ impl World {
 /// it gives up are not removed before the host holds both. It says so, and does not pass or wait
 /// for what cannot come, when the link removed anything of the binding before the second call was
 /// given up.
+///
+/// The case runs over the third protocol, and says so if the workers do not: a host of the fourth
+/// protocol refuses a registration of a binding it holds live as soon as it is sent, the link
+/// removes the binding then, and the host never holds a second registration beside the live one.
+/// A host of the third protocol holds it, as a host of the release before still does, and the
+/// removal this case is about is the one for that host.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_binding_whose_two_registrations_were_given_up_is_registered_when_it_is_wanted_again() {
     let Some(component) = well_behaved() else {
         return;
     };
-    let world = World::start_with_two_packages(&component).await;
+    let world = World::start_with_two_packages_over_the_third_protocol(&component).await;
     let created = world.session().await;
     let held = world.hold_a_registration(&created, true).await;
+    assert_eq!(
+        world.runtime_protocol().await,
+        Some(HostProtocol::V3),
+        "this case is about the host of the third protocol, which admits a second registration of \
+         a binding beside a live one; the workers do not speak it, because the plugin host bound \
+         the endpoint of the fourth protocol"
+    );
 
     // The policy disables at the next admission and the binding is not wanted: its registration is
     // given up. The host goes on with it and makes the binding live, and nothing waits for the
