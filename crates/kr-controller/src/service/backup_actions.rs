@@ -2,9 +2,11 @@
 //! storage service, and the owner's setup of what the host backs up.
 
 use kr_protocol::backup_bundle::BackupBundleWriteParams;
+use kr_protocol::backup_checkpoint::{BackupCheckpointParams, BackupCheckpointResult};
 use kr_protocol::backup_read::{BackupReadParams, BackupReadResult};
 use kr_protocol::backup_setup::{BackupEnableParams, BackupEnableResult, BackupStatusParams};
 use kr_protocol::envelope::{MutationRequest, ParamsValue};
+use kr_protocol::scalars::Nullable;
 
 use crate::backup::setup::SetupAdmission;
 use crate::error::{ControllerError, Result};
@@ -106,6 +108,33 @@ impl Controller {
         let answer = setup.status(self.privacy.state().now().private).await?;
         ParamsValue::from_typed(&answer)
             .map_err(|error| ControllerError::InvalidArgument(error.to_string()))
+    }
+
+    /// Answers `backup.checkpoint`: the newest generation of the current setup that the storage
+    /// service accepted and this host still keeps.
+    ///
+    /// The host reads its own records and asks no service, so the answer does not wait for the
+    /// service and privacy mode does not hold it: the record names a generation and the hash of
+    /// its manifest and carries no content. A host with no storage service configured answers from
+    /// its store as any other does.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::InvalidArgument`] for parameters that are not empty, and
+    /// [`ControllerError::RegistryUnavailable`] when the records cannot be read as a checkpoint:
+    /// a host that could not read them does not say it has published nothing.
+    pub(super) async fn backup_checkpoint(&self, params: &ParamsValue) -> Result<ParamsValue> {
+        let _: BackupCheckpointParams = parse(params)?;
+        let backup = std::sync::Arc::clone(&self.backup);
+        let checkpoint = tokio::task::spawn_blocking(move || backup.latest_published())
+            .await
+            .map_err(|_| ControllerError::RegistryUnavailable {
+                detail: "the thread that reads the recorded backups did not finish".to_owned(),
+            })??;
+        ParamsValue::from_typed(&BackupCheckpointResult {
+            checkpoint: Nullable(checkpoint),
+        })
+        .map_err(|error| ControllerError::InvalidArgument(error.to_string()))
     }
 
     /// Answers `backup.enable`: sets this host's backups up, as the command asked.

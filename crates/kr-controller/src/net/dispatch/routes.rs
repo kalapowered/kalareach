@@ -146,6 +146,7 @@ impl DeviceRead {
             | Method::OrganisationList
             | Method::ShellLaunchCommandsList
             | Method::PrivacyStatus
+            | Method::BackupCheckpoint
             | Method::DescriptionSetup => Self::Daemon,
             Method::ProjectList
             | Method::ProjectRead

@@ -13,13 +13,17 @@
 //!
 //! No worker is started here: every answer below is the daemon's own.
 
+#[path = "support/backup_seed.rs"]
+mod backup_seed;
 mod net_support;
 
 use std::collections::BTreeSet;
 
+use backup_seed::SeededBackups;
 use kr_client::session::Session;
 use kr_controller::grants::GrantRecord;
 use kr_crypto::keys::DeviceKeys;
+use kr_protocol::backup_checkpoint::{BackupCheckpointParams, BackupCheckpointResult};
 use kr_protocol::describe::{SessionDescribeParams, SessionDescribeResult};
 use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::grant::{Grant, GrantExpiry, SessionSelector};
@@ -360,5 +364,101 @@ async fn kr_req_10_50_a_device_that_holds_the_screen_and_history_but_not_files_r
         ],
         "without files.read the read is refused for it; with it, by name"
     );
+    host.stop().await;
+}
+
+/// What a device reads of the host's backups with `backup.checkpoint`.
+async fn read_checkpoint(session: &Session) -> BackupCheckpointResult {
+    session
+        .read(Method::BackupCheckpoint, &BackupCheckpointParams {})
+        .await
+        .expect("the host answers the owner device")
+}
+
+/// An owner device, over a real paired connection, is told the newest generation the host's
+/// service accepted: nothing before the host has a setup or a generation, and each newer
+/// generation the host publishes after. A device that does not manage the host and the owner's
+/// own local socket are refused, and a host whose record of its newest generation is damaged
+/// answers `STORAGE_UNAVAILABLE`, never null and never the generation before it. The answer
+/// carries the archive, the service, the generation and the manifest hash, and nothing else.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_owner_device_is_told_the_newest_generation_the_host_published_and_no_one_else_is() {
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = Host::start(&owner).await;
+    let device = Device::create().await;
+    let record = pair_with(&host, &device, &owner, proposal(&[ActionRight::HostManage])).await;
+    let session = connect(&host, &device, &record).await;
+
+    assert_eq!(
+        read_checkpoint(&session).await.checkpoint,
+        Nullable::null(),
+        "a host with no setup"
+    );
+    let service = host.controller().backup();
+    let seeded = SeededBackups::set_up(service);
+    assert_eq!(
+        read_checkpoint(&session).await.checkpoint,
+        Nullable::null(),
+        "a setup and no generation"
+    );
+    let first = seeded.publish(service, 1);
+    assert_eq!(
+        read_checkpoint(&session).await.checkpoint,
+        Nullable::some(first),
+        "the first generation the service accepted"
+    );
+    let second = seeded.publish(service, 2);
+    assert_eq!(
+        read_checkpoint(&session).await.checkpoint,
+        Nullable::some(second),
+        "a newer generation, read from a host already running"
+    );
+
+    // A device that does not manage the host is refused, as it always was.
+    let viewer = Device::create().await;
+    let viewer_record = pair_with(
+        &host,
+        &viewer,
+        &owner,
+        proposal(&[ActionRight::SessionView]),
+    )
+    .await;
+    let viewing = connect(&host, &viewer, &viewer_record).await;
+    let refusal = refused::<_, BackupCheckpointResult>(
+        &viewing,
+        Method::BackupCheckpoint,
+        &BackupCheckpointParams {},
+    )
+    .await;
+    assert_eq!(refusal.code, ErrorCode::PermissionDenied, "{refusal:?}");
+    viewing.close();
+
+    // The local socket does not serve it: the method's ingress is the paired device.
+    let mut local = host.client().await;
+    let answered = local
+        .request(Method::BackupCheckpoint, &BackupCheckpointParams {})
+        .await;
+    assert!(
+        matches!(&answered, Ok(Err(error)) if error.code == ErrorCode::PermissionDenied),
+        "the local socket is refused: {answered:?}"
+    );
+
+    // A newest row the host cannot read back is a refusal the device can tell from none.
+    let backups = host.registry_database().with_file_name("backup.sqlite");
+    rusqlite::Connection::open(backups)
+        .expect("the backup store")
+        .execute(
+            "UPDATE generations SET descriptor = NULL WHERE backup_generation = 2",
+            [],
+        )
+        .expect("the row is damaged");
+    let damaged = refused::<_, BackupCheckpointResult>(
+        &session,
+        Method::BackupCheckpoint,
+        &BackupCheckpointParams {},
+    )
+    .await;
+    assert_eq!(damaged.code, ErrorCode::StorageUnavailable, "{damaged:?}");
+    session.close();
     host.stop().await;
 }

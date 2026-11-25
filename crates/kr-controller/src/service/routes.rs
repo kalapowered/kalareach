@@ -363,6 +363,13 @@ impl Controller {
             Method::AccountStorageStatus => self.account_storage_status(&request.params),
             Method::BackupRead => self.backup_read(&request.params).await,
             Method::BackupStatus => self.backup_status(&request.params).await,
+            // A paired device reads it and the local socket does not, as the registry says.
+            Method::BackupCheckpoint if owner => Err(ControllerError::PermissionDenied {
+                detail: "the backup checkpoint is read by a paired device, and the local socket \
+                         does not serve it"
+                    .to_owned(),
+            }),
+            Method::BackupCheckpoint => self.backup_checkpoint(&request.params).await,
             Method::DescriptionSetup => self.description_setup(),
             _ => Err(ControllerError::InvalidArgument(format!(
                 "{} is not a read this daemon serves",
