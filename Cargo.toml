@@ -188,7 +188,7 @@ netwatch = { version = "=0.19.3", default-features = false }
 # record alone cannot tell a declared output from a file made beside it and removed again. Cut to
 # the FSEvents backend and used on macOS only; Linux uses the kernel's inotify through `rustix`.
 # Pinned to the newest stable release.
-notify = { version = "=8.2.0", default-features = false }
+notify = { version = "=9.0.0", default-features = false }
 # The Apple runtime bindings the companion application's user-verification ceremony calls through.
 objc2 = "=0.6.4"
 objc2-foundation = { version = "=0.3.2", default-features = false }
