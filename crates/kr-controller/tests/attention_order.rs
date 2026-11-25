@@ -318,8 +318,9 @@ async fn a_pairing_takes_the_point_of_its_commit_and_the_next_start_gives_a_gran
     .await;
     let grant = paired.grant.grant_id.get().as_bytes().to_vec();
     let path = host.registry_database();
-    let first = point_of(&path, &grant);
-    let first = first.expect("the pairing took a point");
+    let Some(first) = point_of(&path, &grant) else {
+        panic!("the pairing took no point");
+    };
     assert_eq!(
         first.0,
         paired.paired_at_ms.get(),
@@ -331,7 +332,9 @@ async fn a_pairing_takes_the_point_of_its_commit_and_the_next_start_gives_a_gran
         .execute("DELETE FROM grant_starts", [])
         .expect("the point goes, as it is for a grant an earlier release wrote");
     let host = host.restart().await;
-    let again = point_of(&path, &grant).expect("the pass at the start gave the grant a point");
+    let Some(again) = point_of(&path, &grant) else {
+        panic!("the pass at the start gave the grant no point");
+    };
     assert!(
         again.0 >= paired.paired_at_ms.get(),
         "the start's settled moment: {again:?}"
