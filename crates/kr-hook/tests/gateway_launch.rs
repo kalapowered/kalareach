@@ -535,6 +535,11 @@ fn kr_req_11_36_a_server_that_ends_under_an_unanswered_turn_is_not_replaced_or_a
     let servers = shell.servers();
     assert_eq!(servers.len(), 1, "{servers:?}");
     let server = servers[0].clone();
+    // The server is ended once the session has recorded its command. The command runs in a session
+    // of its own, so a server that dies before the record holds it leaves it running.
+    eventually("the session recorded what the server started", || {
+        !shell.started_by_servers().is_empty()
+    });
 
     let pid = i32::try_from(server.pid.get()).expect("a process identifier");
     rustix::process::kill_process(
