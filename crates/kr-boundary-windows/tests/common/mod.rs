@@ -5,6 +5,7 @@
 #![allow(dead_code, unsafe_code)]
 
 pub mod disk;
+pub mod entries;
 pub mod people;
 pub mod project;
 

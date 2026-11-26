@@ -416,14 +416,15 @@ fn held_environment(home: &Scratch, siblings: &Siblings) -> Arc<Environment> {
 }
 
 /// Puts the entry of a group that this broker made on a file of the project, as the grant of an
-/// invocation that did not end well leaves it.
+/// invocation that did not end well leaves it. The group belongs to no account, so the entry is
+/// written by its identifier and not by a tool that resolves names.
 fn leave_a_group_entry(project: &Project) -> PathBuf {
     let left = project.root.join("left.txt");
     std::fs::write(&left, b"x").unwrap();
     let group = kr_boundary_windows::win::token::new_invocation_group()
         .to_text()
         .unwrap();
-    grant(&left, &format!("*{group}"), "(W)");
+    common::entries::grant_write_to_identifier(&left, &group);
     left
 }
 
