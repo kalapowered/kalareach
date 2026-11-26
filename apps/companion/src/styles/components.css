@@ -262,12 +262,26 @@ main {
   font-size: 0.75rem;
   font-weight: 500;
   line-height: 1.4;
-  white-space: nowrap;
   transition:
     transform var(--press) var(--ease-out),
     background-color var(--press) ease,
     border-color var(--press) ease,
     color var(--press) ease;
+}
+
+/* A button's label wraps inside the button, whatever the text size and the face. A word wider than
+   the button's room is broken, as one in a line of text is, and the button stays inside the box that
+   holds it. Nothing asks for it: a layout follows the person's text size. */
+.btn {
+  white-space: normal;
+  overflow-wrap: anywhere;
+  max-inline-size: 100%;
+  text-align: center;
+}
+
+/* An icon has no label to wrap. */
+.icon-btn {
+  white-space: nowrap;
 }
 
 .btn:active,
