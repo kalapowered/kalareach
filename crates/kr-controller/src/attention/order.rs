@@ -319,8 +319,7 @@ mod tests {
         let here = root.join("attention").join("order.rs");
         for file in files {
             let text = std::fs::read_to_string(&file).expect("a source file");
-            // The production part of a file is what comes before its first test module.
-            let production = text.split("#[cfg(test)]").next().unwrap_or_default();
+            let production = production_part(&text);
             if file == here {
                 let literals = production.matches("Stamp {").count();
                 assert_eq!(
@@ -329,11 +328,54 @@ mod tests {
                 );
             } else {
                 assert!(
-                    !(production.contains("attention::order") && production.contains("Stamp")),
+                    !names_the_daemons_stamp(production),
                     "{} names the daemon's `Stamp`",
                     file.display()
                 );
             }
         }
+    }
+
+    /// The production part of a source: what comes before its first test module. A test-only item
+    /// that is not a module does not end it, since code that is built follows such items.
+    fn production_part(text: &str) -> &str {
+        text.split("#[cfg(test)]\nmod ").next().unwrap_or_default()
+    }
+
+    /// Whether `production` names the daemon's `Stamp` through the module that defines it, from
+    /// outside the module or from a sibling.
+    fn names_the_daemons_stamp(production: &str) -> bool {
+        (production.contains("attention::order") || production.contains("super::order"))
+            && production.contains("Stamp")
+    }
+
+    /// The scan reads a constructor that follows a test-only item: a source is cut at its first test
+    /// module and not at the first item that is built for tests only, and a path through `super`
+    /// names the `Stamp` as a path through `attention` does.
+    #[test]
+    fn the_scan_reads_what_follows_a_test_only_item() {
+        let source = "#[cfg(test)]\nfn only_in_tests() {}\n\nuse super::order::Stamp;\n\
+                      fn made() { let _ = Stamp { boot_ms: 1 }; }\n\n\
+                      #[cfg(test)]\nmod tests {\n    fn inside() {}\n}\n";
+        let production = production_part(source);
+        assert!(
+            production.contains("fn made()"),
+            "the code that follows a test-only item is read"
+        );
+        assert!(
+            !production.contains("fn inside()"),
+            "a test module ends the production part"
+        );
+        assert!(
+            names_the_daemons_stamp(production),
+            "a constructor after a test-only item, through `super::order`, is found"
+        );
+        assert!(names_the_daemons_stamp(
+            "use crate::attention::order::Stamp;\nfn made() {}"
+        ));
+        assert!(
+            !names_the_daemons_stamp("use crate::attention::order::BootState;\nfn made() {}"),
+            "a source that does not name `Stamp` is not found"
+        );
     }
 }
