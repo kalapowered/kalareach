@@ -70,10 +70,10 @@ jobs:
       # The runner arrives with toolchains, SDKs, cloud command lines and browsers this project never
       # uses, and removing them and the container images widens the margin the build has to work in.
       # At the test step's peak the workspace's whole test build stands on this disk beside the
-      # releases that the update suite stages, and an earlier run ran out of it there
-      # with 111 GB free at the start. Each path prints its size just before it goes, so that the run
-      # records what each freed; this reading and the ones the steps before and after the tests take
-      # are what the margin was.
+      # releases that the update suite stages, and the disk ran out there, in the update suite's
+      # cases, in a run that had 111 GB free once the image was cleared. Each path prints its size
+      # just before it goes, so that the run records what each freed; this reading and the ones the
+      # steps before and after the tests take are what the margin was.
       #
       # Why none of them can be needed here: Android, .NET, Haskell and CodeQL are what the step
       # always removed. Swift (the only case that runs swiftc is for macOS), Julia, Miniconda,
