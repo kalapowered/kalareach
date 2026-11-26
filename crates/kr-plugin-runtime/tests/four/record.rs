@@ -684,6 +684,12 @@ async fn session(served: &Served, open: bool) -> Option<Session> {
     let saved_from = components::request("recording", 33);
     raw.register(&saved_from, &recorded, 7).await;
     raw.event(&saved_from, "se-1", "x").await;
+    // The second event is offered once the host has taken the first off the binding's queue, which
+    // the document the host draws from it tells: the answer to an event says how many bytes the
+    // queue can still take, and that is the queue's capacity less the second event alone only when
+    // the first has left it.
+    raw.until(|notice| matches!(notice, Notice4::Document { call, .. } if call == "observe"))
+        .await;
     raw.event(&saved_from, "se-2", "y").await;
     // The state is read by one checkpoint, after the host has reported that both events were taken
     // in, so that the count the component prints in it, and the record that holds it, do not depend
