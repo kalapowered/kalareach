@@ -159,6 +159,10 @@ pub struct Adoptions {
     /// tests.
     #[cfg(feature = "testing")]
     arguments_read_pause: Mutex<Option<Pause>>,
+    /// Where the next identification stops between its image comparison and its second reading of
+    /// the process's identity, for this host's own tests.
+    #[cfg(feature = "testing")]
+    identity_pause: Mutex<Option<Pause>>,
     /// Where the next identification stops after its last comparison, for this host's own tests.
     #[cfg(feature = "testing")]
     bracket_pause: Mutex<Option<Pause>>,
@@ -200,6 +204,8 @@ impl Adoptions {
             arguments_pause: Mutex::new(None),
             #[cfg(feature = "testing")]
             arguments_read_pause: Mutex::new(None),
+            #[cfg(feature = "testing")]
+            identity_pause: Mutex::new(None),
             #[cfg(feature = "testing")]
             bracket_pause: Mutex::new(None),
             #[cfg(feature = "testing")]
@@ -268,6 +274,18 @@ impl Adoptions {
         &self,
     ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
         arm(&self.arguments_read_pause)
+    }
+
+    /// Stops the next identification after its image comparison and before it reads the process's
+    /// identity the second time, for this host's own tests: a process that ends there.
+    ///
+    /// Returns the end that says the identification has arrived there and the end that lets it go
+    /// on. It is compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    pub fn pause_before_second_identity(
+        &self,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        arm(&self.identity_pause)
     }
 
     /// Stops the next identification after its last comparison, for this host's own tests: a
@@ -526,6 +544,8 @@ impl Adoptions {
             return None;
         }
         drop(held);
+        #[cfg(feature = "testing")]
+        stop_if_armed(&self.identity_pause);
         // The executable and the arguments are this process's only if it still has its identity,
         // and so is the answer about who holds it.
         if !kr_ipc::identity::process_start_identity(pid).is_ok_and(|again| again.matches(&process))
@@ -876,17 +896,81 @@ fn script_of(second: &[u8]) -> Option<OsString> {
         .then(|| OsString::from_vec(second.to_vec()))
 }
 
-/// Returns the arguments a process was started with, as the kernel keeps them:
-/// `/proc/<pid>/cmdline`, one argument after each NUL-terminated one, read once.
+/// The size of the first buffer a process's argument area is read into, in bytes.
+#[cfg(any(target_os = "linux", feature = "testing"))]
+pub const FIRST_READING: usize = 64 * 1024;
+
+/// The size of the buffer the whole argument area is read into where the first reading filled its
+/// buffer, in bytes: 6 MiB, which is `_STK_LIM / 4 * 3`, the most that the kernel lets the argument
+/// and environment strings of a program take (`bprm_stack_limits` in `fs/exec.c`, Linux 6.12 line
+/// 528, which also takes eight bytes of that for each string's pointer). The argument area alone is
+/// below that, so no area of a program started in the usual way fills this buffer; one that does,
+/// which a process with the right to move its own area could make, is refused.
+#[cfg(any(target_os = "linux", feature = "testing"))]
+pub const LARGEST_AREA: usize = 6 * 1024 * 1024;
+
+/// What one read call of a process's argument area gave.
+#[cfg(any(target_os = "linux", feature = "testing"))]
+#[derive(Debug, PartialEq, Eq)]
+pub enum CmdlineReading {
+    /// The call gave fewer bytes than its buffer holds, so it gave the whole area.
+    Whole(Vec<u8>),
+    /// The call filled its buffer, so the area may be longer than what it gave.
+    Filled,
+}
+
+/// Reads `source` with one read call into a buffer of `capacity` bytes. `None` where the call
+/// failed.
+///
+/// One call, because the kernel answers one call from the memory map the process has at that moment
+/// (`get_task_cmdline` in `fs/proc/base.c` takes and releases it inside the call, and `get_mm_cmdline`
+/// copies up to the end of the argument area or the buffer, whichever comes first), so what it gave
+/// is one program's. Calls that continue where an earlier one ended can each find another program's
+/// memory, which is how an exec to the same image between two calls would pass for one reading.
+#[cfg(any(target_os = "linux", feature = "testing"))]
+#[must_use]
+pub fn read_in_one_call(
+    source: &mut impl std::io::Read,
+    capacity: usize,
+) -> Option<CmdlineReading> {
+    let mut buffer = vec![0_u8; capacity];
+    let length = source.read(&mut buffer).ok()?;
+    if length >= capacity {
+        return Some(CmdlineReading::Filled);
+    }
+    buffer.truncate(length);
+    Some(CmdlineReading::Whole(buffer))
+}
+
+/// Returns the arguments `open` gives access to the area of: one read call into the first buffer,
+/// and, where that call filled its buffer, a new reading from the start, one call into the largest
+/// buffer. A reading that fills the largest buffer is refused, and no reading is ever continued
+/// from where an earlier one ended. `open` is called once for each reading.
+#[cfg(any(target_os = "linux", feature = "testing"))]
+#[must_use]
+pub fn arguments_from<R: std::io::Read>(mut open: impl FnMut() -> Option<R>) -> Option<Arguments> {
+    let bytes = match read_in_one_call(&mut open()?, FIRST_READING)? {
+        CmdlineReading::Whole(bytes) => bytes,
+        CmdlineReading::Filled => match read_in_one_call(&mut open()?, LARGEST_AREA)? {
+            CmdlineReading::Whole(bytes) => bytes,
+            CmdlineReading::Filled => return None,
+        },
+    };
+    parse_cmdline(&bytes)
+}
+
+/// Reads what one read call of `/proc/<pid>/cmdline` gave: one argument after each NUL-terminated
+/// one.
 ///
 /// Every position is exact, empty arguments included. A reading that does not end in a zero byte is
-/// one a process rewrote, as a process that sets its title does, and names no script.
-#[cfg(target_os = "linux")]
+/// one a process rewrote, as a process that sets its title does, and names no script. An empty
+/// reading, as a process that has ended or is still being started gives, and a reading of one
+/// empty argument are read as nothing.
+#[cfg(any(target_os = "linux", feature = "testing"))]
 #[must_use]
-pub fn arguments_of(pid: u32) -> Option<Arguments> {
-    let bytes = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+pub fn parse_cmdline(bytes: &[u8]) -> Option<Arguments> {
     let area = bytes.strip_suffix(&[0]);
-    let arguments: Vec<&[u8]> = area.unwrap_or(&bytes).split(|byte| *byte == 0).collect();
+    let arguments: Vec<&[u8]> = area.unwrap_or(bytes).split(|byte| *byte == 0).collect();
     if arguments == [b"".as_slice()] {
         return None;
     }
@@ -899,6 +983,15 @@ pub fn arguments_of(pid: u32) -> Option<Arguments> {
             .and(arguments.get(1))
             .and_then(|second| script_of(second)),
     })
+}
+
+/// Returns the arguments a process was started with, as the kernel keeps them:
+/// `/proc/<pid>/cmdline`, read with one call into a buffer the area fits, as [`arguments_from`]
+/// reads it.
+#[cfg(target_os = "linux")]
+#[must_use]
+pub fn arguments_of(pid: u32) -> Option<Arguments> {
+    parse_cmdline(&std::fs::read(format!("/proc/{pid}/cmdline")).ok()?)
 }
 
 /// Returns the arguments a process was started with, as the kernel keeps them: macOS's

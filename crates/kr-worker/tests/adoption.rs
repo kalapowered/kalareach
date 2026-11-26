@@ -25,7 +25,8 @@ use kr_protocol::root::CommandBypassReason;
 use kr_protocol::scalars::{Digest256, Nullable, TimestampMs, U64, Uuid};
 use kr_worker::broker::Broker;
 use kr_worker::broker::adoption::{
-    ADOPTED_REFUSAL, Adoptions, Foreground, arguments_of, parse_kern_procargs2,
+    ADOPTED_REFUSAL, Adoptions, FIRST_READING, Foreground, LARGEST_AREA, arguments_from,
+    arguments_of, parse_cmdline, parse_kern_procargs2,
 };
 use kr_worker::broker::binder::Recognition;
 use kr_worker::broker::catalogue::{Admissions, testing};
@@ -77,21 +78,39 @@ const HOP_MARKS: &str = "KR_ADOPTION_HOP_MARKS";
 /// and `sleep` starts the system's own `sleep`.
 #[test]
 fn the_exec_helper_program() {
-    let Ok(hops) = std::env::var(HOPS) else {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::{OsStrExt as _, OsStringExt};
+
+    // The lines carry the paths as the bytes they are, which need not be text.
+    let Some(hops) = std::env::var_os(HOPS).map(OsStringExt::into_vec) else {
         return;
     };
     let own_tag = std::env::args().next_back().expect("a tag");
     if let Some(marks) = std::env::var_os(HOP_MARKS) {
         std::fs::write(Path::new(&marks).join(own_tag), b"").expect("says it is running");
     }
-    let (this, later) = hops.split_once('\n').unwrap_or((hops.as_str(), ""));
-    let fields: Vec<&str> = this.split('\t').collect();
+    let (this, later) = hops
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .map_or((&hops[..], &[][..]), |end| (&hops[..end], &hops[end + 1..]));
+    let fields: Vec<&[u8]> = this.split(|byte| *byte == b'\t').collect();
     let [go, target, kind, tag] = fields[..] else {
-        panic!("a hop names a file, a program, what it is and a tag: {this:?}");
+        panic!(
+            "a hop names a file, a program, what it is and a tag: {:?}",
+            String::from_utf8_lossy(this)
+        );
     };
+    let go = Path::new(OsStr::from_bytes(go));
+    let target = Path::new(OsStr::from_bytes(target));
+    let kind = std::str::from_utf8(kind).expect("a kind is text");
+    let tag = std::str::from_utf8(tag).expect("a tag is text");
     let began = std::time::Instant::now();
-    while !Path::new(go).exists() {
-        assert!(began.elapsed() < LIVENESS, "{go} was never written");
+    while !go.exists() {
+        assert!(
+            began.elapsed() < LIVENESS,
+            "{} was never written",
+            go.display()
+        );
         std::thread::sleep(Duration::from_millis(2));
     }
     let mut command = Command::new(target);
@@ -113,11 +132,11 @@ fn the_exec_helper_program() {
         "sleep" => command.arg0("sleep").arg("60"),
         other => panic!("a hop is to a helper, a stand-in or a sleep, not to {other}"),
     };
-    command.env(HOPS, later);
+    command.env(HOPS, OsStr::from_bytes(later));
     let target = target.to_owned();
     let mut execute = move || {
         let error = command.exec();
-        panic!("the helper could not execute {target}: {error}");
+        panic!("the helper could not execute {}: {error}", target.display());
     };
     if std::env::var_os(HOP_FROM_A_THREAD).is_some() {
         std::thread::spawn(execute);
@@ -334,24 +353,31 @@ impl Setup {
     /// the file the hop names exists, and the last of them starts the stand-in. A thread other than
     /// its main one executes the first when `from_a_thread` is set.
     fn start_hopping(&self, hops: &[Hop<'_>], from_a_thread: bool) -> Started {
-        let lines: Vec<String> = hops
+        self.start_hopping_from(&self.program, hops, from_a_thread)
+    }
+
+    /// The same, started as the program at `program`, a path to the placed program's file.
+    fn start_hopping_from(&self, program: &Path, hops: &[Hop<'_>], from_a_thread: bool) -> Started {
+        use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
+
+        let lines: Vec<Vec<u8>> = hops
             .iter()
             .map(|hop| {
-                format!(
-                    "{}\t{}\t{}\t{}",
-                    hop.go.display(),
-                    hop.target.display(),
-                    hop.kind,
-                    hop.tag
-                )
+                [
+                    hop.go.as_os_str().as_bytes(),
+                    hop.target.as_os_str().as_bytes(),
+                    hop.kind.as_bytes(),
+                    hop.tag.as_bytes(),
+                ]
+                .join(&b'\t')
             })
             .collect();
         let marks = self.marks();
         std::fs::create_dir_all(&marks).expect("a folder for the marks");
-        let mut command = Command::new(&self.program);
+        let mut command = Command::new(program);
         command
             .args(hop_arguments("the_exec_helper_program", "hop-a"))
-            .env(HOPS, lines.join("\n"))
+            .env(HOPS, std::ffi::OsString::from_vec(lines.join(&b'\n')))
             .env(HOP_MARKS, &marks)
             .env(STAND_IN, "60")
             .env(STAND_IN_RUNNING, self.running())
@@ -2783,5 +2809,480 @@ fn kr_req_12_07_a_program_that_rewrote_its_argument_area_claims_nothing() {
         "the area holds what the program wrote"
     );
     assert_eq!(read.script_argument, None, "and claims no script");
+    started.end();
+}
+
+/// KR-REQ-12.07: the Linux command line is read by position, from the bytes one read call gave: the
+/// arguments are what lies between the zero bytes, empty ones included, the second argument is the
+/// exact bytes when the reading ends where the kernel ends an area, and an empty reading names
+/// nothing.
+#[test]
+fn kr_req_12_07_the_linux_command_line_is_read_by_position() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt as _;
+
+    let strings = |vector: &[&str]| {
+        vector
+            .iter()
+            .map(|text| (*text).to_owned())
+            .collect::<Vec<_>>()
+    };
+    let script = |path: &str| Some(OsString::from(path));
+
+    assert!(
+        parse_cmdline(b"").is_none(),
+        "an empty reading, as a process that ended or is being started gives, is read as nothing"
+    );
+    assert!(
+        parse_cmdline(b"\0").is_none(),
+        "so is a reading of one empty argument"
+    );
+
+    let read = parse_cmdline(b"yes\0/opt/agent/cli.js\0x\0").expect("a plain reading");
+    assert_eq!(read.vector, strings(&["yes", "/opt/agent/cli.js", "x"]));
+    assert_eq!(read.script_argument, script("/opt/agent/cli.js"));
+
+    let read = parse_cmdline(b"yes\0/opt/agent/cli.js\0x").expect("a reading with no last zero");
+    assert_eq!(
+        read.vector,
+        strings(&["yes", "/opt/agent/cli.js", "x"]),
+        "the strings are what lies between the zero bytes"
+    );
+    assert_eq!(
+        read.script_argument, None,
+        "a reading that does not end where an area ends is a rewritten one and names no script"
+    );
+
+    let read = parse_cmdline(b"retitled\0").expect("a title with its zero");
+    assert_eq!(read.vector, strings(&["retitled"]));
+    assert_eq!(read.script_argument, None, "a title has no second argument");
+    let read = parse_cmdline(b"retitled").expect("a title of a page, with no zero");
+    assert_eq!(read.vector, strings(&["retitled"]));
+    assert_eq!(read.script_argument, None);
+
+    let read = parse_cmdline(b"\0/opt/agent/cli.js\0y\0").expect("an empty first argument");
+    assert_eq!(read.vector, strings(&["", "/opt/agent/cli.js", "y"]));
+    assert_eq!(
+        read.script_argument,
+        script("/opt/agent/cli.js"),
+        "every position is exact"
+    );
+
+    let read = parse_cmdline(b"yes\0\0/opt/agent/cli.js\0").expect("an empty second argument");
+    assert_eq!(read.vector, strings(&["yes", "", "/opt/agent/cli.js"]));
+    assert_eq!(read.script_argument, None, "an empty second argument");
+
+    let read = parse_cmdline(b"yes\0/opt/agent/cli.js\0\0y\0").expect("an empty argument after");
+    assert_eq!(read.vector, strings(&["yes", "/opt/agent/cli.js", "", "y"]));
+    assert_eq!(read.script_argument, script("/opt/agent/cli.js"));
+
+    let read = parse_cmdline(b"yes\0/opt/agent/\xff\xfe.js\0").expect("an argument not text");
+    assert_eq!(
+        read.vector,
+        strings(&["yes", "/opt/agent/\u{fffd}\u{fffd}.js"])
+    );
+    assert_eq!(
+        read.script_argument,
+        Some(OsString::from_vec(b"/opt/agent/\xff\xfe.js".to_vec())),
+        "the exact bytes"
+    );
+
+    assert_eq!(
+        parse_cmdline(b"yes\0opt/agent/cli.js\0")
+            .expect("a relative path")
+            .script_argument,
+        None
+    );
+    assert_eq!(
+        parse_cmdline(b"yes\0-\0")
+            .expect("an option")
+            .script_argument,
+        None
+    );
+    assert_eq!(
+        parse_cmdline(b"yes\0")
+            .expect("one argument")
+            .script_argument,
+        None
+    );
+}
+
+/// A reader that answers like a file the kernel reads: each call fills the buffer from where the
+/// last ended, with at most `answer` bytes where it is set. It counts the calls made on it.
+struct Answering<'a> {
+    area: &'a [u8],
+    answer: Option<usize>,
+    calls: &'a std::cell::Cell<usize>,
+}
+
+impl std::io::Read for Answering<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        self.calls.set(self.calls.get() + 1);
+        let length = buffer
+            .len()
+            .min(self.area.len())
+            .min(self.answer.unwrap_or(usize::MAX));
+        buffer[..length].copy_from_slice(&self.area[..length]);
+        self.area = &self.area[length..];
+        Ok(length)
+    }
+}
+
+/// KR-REQ-12.07: one reading of the Linux command line is one read call. A call that fills its
+/// buffer is made again whole from the start into the largest buffer, never continued, and a
+/// reading that fills the largest buffer, which no program started in the usual way can, is read as
+/// nothing.
+#[test]
+fn kr_req_12_07_a_reading_that_fills_its_buffer_is_made_again_whole_or_refused() {
+    use std::cell::Cell;
+
+    // A command line of `length` bytes: arguments of `a`, the second an absolute path.
+    let area = |length: usize| {
+        let mut bytes = b"yes\0/".to_vec();
+        bytes.resize(length - 1, b'a');
+        bytes.push(0);
+        bytes
+    };
+    let read = |area: &[u8], answer: Option<usize>| {
+        let (opens, calls) = (Cell::new(0), Cell::new(0));
+        let arguments = arguments_from(|| {
+            opens.set(opens.get() + 1);
+            Some(Answering {
+                area,
+                answer,
+                calls: &calls,
+            })
+        });
+        (arguments, opens.get(), calls.get())
+    };
+
+    // An area below the first buffer: one open, one call.
+    let small = area(1000);
+    let (arguments, opens, calls) = read(&small, None);
+    assert_eq!(
+        arguments.expect("a small area").vector[1].len(),
+        1000 - "yes\0".len() - 1,
+        "every byte of the second argument"
+    );
+    assert_eq!((opens, calls), (1, 1), "one reading, one call");
+
+    // An area that fills the first buffer, exactly and by more: the first call cannot tell whether
+    // it is whole, so a second reading is made from the start, into the largest buffer, in one call.
+    for length in [FIRST_READING, FIRST_READING + 1, 300_000] {
+        let large = area(length);
+        let (arguments, opens, calls) = read(&large, None);
+        let arguments = arguments.expect("an area above the first buffer");
+        assert_eq!(
+            arguments.vector.concat().len(),
+            length - 2,
+            "every argument is read, not the first buffer's worth"
+        );
+        assert_eq!(
+            (opens, calls),
+            (2, 2),
+            "two readings, one call each: {length}"
+        );
+    }
+
+    // A call that answers fewer bytes than the area holds is what the call gave: nothing is read
+    // from where it ended.
+    let (arguments, opens, calls) = read(&area(1000), Some(10));
+    assert_eq!(
+        arguments.expect("a short answer").vector,
+        ["yes", "/aaaaa"],
+        "the ten bytes it gave"
+    );
+    assert_eq!((opens, calls), (1, 1), "the area is not continued");
+
+    // An area that fills the largest buffer is refused, after its two readings.
+    let (arguments, opens, calls) = read(&area(LARGEST_AREA + 1), None);
+    assert!(
+        arguments.is_none(),
+        "a reading that fills the largest buffer"
+    );
+    assert_eq!((opens, calls), (2, 2));
+    let (arguments, ..) = read(&area(LARGEST_AREA - 1), None);
+    assert!(
+        arguments.is_some(),
+        "an area one byte below the largest buffer fits"
+    );
+
+    // A file that cannot be opened or read answers nothing.
+    assert!(arguments_from::<&[u8]>(|| None).is_none());
+}
+
+/// KR-REQ-12.07: the reader gives every argument of a process whose argument area is larger than a
+/// page and than the first buffer it reads into, with the second argument as the exact bytes.
+#[test]
+fn kr_req_12_07_the_reader_gives_every_argument_of_a_process_with_a_large_area() {
+    use std::ffi::OsString;
+
+    let lengths = [100_000_usize, 100_000, 100_000];
+    let arguments: Vec<Vec<u8>> = lengths
+        .iter()
+        .enumerate()
+        .map(|(index, length)| {
+            let mut argument = if index == 1 {
+                b"/".to_vec()
+            } else {
+                Vec::new()
+            };
+            argument.resize(*length, b'a' + u8::try_from(index).expect("a small index"));
+            argument
+        })
+        .collect();
+    let area: usize = arguments.iter().map(|argument| argument.len() + 1).sum();
+    assert!(
+        area > FIRST_READING && area > 4096,
+        "the area is larger than a page and than the first buffer: {area}"
+    );
+    let refs: Vec<&[u8]> = arguments.iter().map(Vec::as_slice).collect();
+    let mut child = start_yes(&refs);
+    let read = arguments_of(child.id()).expect("the arguments of a running process");
+    let _ = child.kill();
+    let _ = child.wait();
+
+    assert_eq!(read.vector.len(), 3);
+    for (index, argument) in arguments.iter().enumerate() {
+        assert_eq!(
+            read.vector[index].as_bytes(),
+            argument.as_slice(),
+            "argument {index} is read whole"
+        );
+    }
+    assert_eq!(
+        read.script_argument,
+        Some(OsString::from(
+            String::from_utf8_lossy(&arguments[1]).into_owned()
+        ))
+    );
+}
+
+/// KR-REQ-12.07: a process that has ended, whose command line the kernel reads as nothing, gives no
+/// arguments. (Linux: the process is a zombie until its parent, this test, collects it.)
+#[cfg(target_os = "linux")]
+#[test]
+fn kr_req_12_07_a_process_that_has_ended_gives_an_empty_reading_that_names_nothing() {
+    let mut child = start_yes(&[b"yes", b"/opt/agent/cli.js"]);
+    let pid = child.id();
+    assert!(
+        arguments_of(pid).is_some(),
+        "a running process gives its arguments"
+    );
+    child.kill().expect("the child it started ends");
+    until("the child is a zombie", || {
+        std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+            stat.rsplit_once(')')
+                .is_some_and(|(_, rest)| rest.trim_start().starts_with('Z'))
+        })
+    });
+    assert!(
+        std::fs::read(format!("/proc/{pid}/cmdline")).is_ok_and(|read| read.is_empty()),
+        "the kernel reads its command line as nothing"
+    );
+    assert_eq!(arguments_of(pid), None, "so no arguments are read");
+    let _ = child.wait();
+}
+
+/// KR-REQ-12.07: the image the look read is compared with the image the process runs after its
+/// arguments were read by the bytes of the path, not by the text that shows. Two directories whose
+/// names differ only in bytes that are not text hold hard links to one file; they read as one text
+/// and are one file by device and inode, so only the bytes tell them apart. A program that executes
+/// the one from the other, between the image and the arguments, is not adopted on that look.
+/// (macOS reads a path as text and reads none that is not.)
+#[cfg(target_os = "linux")]
+#[test]
+fn kr_req_12_07_an_exec_between_paths_that_differ_only_in_bytes_that_are_not_text_is_refused() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::os::unix::fs::MetadataExt as _;
+
+    let setup = Setup::new();
+    let place = |name: &[u8]| {
+        let directory = setup.host.root().join(OsStr::from_bytes(name));
+        std::fs::create_dir_all(&directory).expect("a folder");
+        let link = directory.join(fixture::COMMAND);
+        std::fs::hard_link(&setup.program, &link).expect("a second path to the program's file");
+        link
+    };
+    let first = place(b"d\xff");
+    let second = place(b"d\xfe");
+    assert_ne!(first, second, "two paths");
+    assert_eq!(
+        first.display().to_string(),
+        second.display().to_string(),
+        "which read as one text"
+    );
+    assert_eq!(
+        std::fs::metadata(&first).expect("the first").ino(),
+        std::fs::metadata(&second).expect("the second").ino(),
+        "and are one file"
+    );
+    let go = setup.host.root().join("go");
+    let started = setup.start_hopping_from(
+        &first,
+        &[Hop::new(&go, &second, "stand-in", "hop-b")],
+        false,
+    );
+    let foreground = Setup::foreground(&started, Vec::new());
+
+    let told = setup.look_with_stops(
+        &foreground,
+        vec![at(setup.adoptions.pause_before_arguments(), || {
+            setup.hop_to_the_stand_in(&go);
+        })],
+    );
+    assert!(
+        told.is_empty(),
+        "a program executed by another path of the same file is not adopted: {told:?}"
+    );
+
+    let told = setup.adopt(&foreground);
+    assert_eq!(told.len(), 1, "the next look adopts it: {told:?}");
+    started.end();
+}
+
+/// KR-REQ-12.07: the file the look hashed is compared at the end by its whole identity: device and
+/// inode, and also its size and its two times. A change of its times after the hash, one that
+/// leaves its device, inode and bytes as they were, refuses the look, and the next look reads the
+/// file as it is.
+#[test]
+fn kr_req_12_07_a_change_of_the_times_of_the_image_after_it_was_hashed_refuses_the_look() {
+    let setup = Setup::new();
+    let started = setup.start();
+    let foreground = Setup::foreground(&started, Vec::new());
+    let told = setup.look_with_stops(
+        &foreground,
+        vec![at(setup.adoptions.pause_before_arguments(), || {
+            std::fs::File::open(&setup.program)
+                .expect("the image opens")
+                .set_modified(std::time::SystemTime::now() - Duration::from_secs(3600))
+                .expect("its modification time is set");
+        })],
+    );
+    assert!(
+        told.is_empty(),
+        "a program whose file's times changed after it was hashed is not adopted: {told:?}"
+    );
+    let told = setup.adopt(&foreground);
+    assert_eq!(told.len(), 1, "the next look adopts it: {told:?}");
+    started.end();
+}
+
+/// KR-REQ-12.07: a write in place to the file the look hashed, after the hash, refuses the look
+/// where the system lets a running image be written to. macOS does; Linux refuses the write to a
+/// running image (the system's own error, which the case asserts), so on Linux the look is not
+/// reached by one.
+#[test]
+fn kr_req_12_07_a_write_in_place_to_the_image_after_it_was_hashed_refuses_the_look() {
+    use std::io::Write as _;
+
+    let setup = Setup::new();
+    let started = setup.start();
+    let foreground = Setup::foreground(&started, Vec::new());
+    let written = std::cell::Cell::new(None);
+    let told = setup.look_with_stops(
+        &foreground,
+        vec![at(setup.adoptions.pause_before_arguments(), || {
+            written.set(Some(
+                std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&setup.program)
+                    .and_then(|mut file| file.write_all(&[0]))
+                    .map_err(|error| error.kind()),
+            ));
+        })],
+    );
+    match written.take().expect("the stop ran its action") {
+        Ok(()) => assert!(
+            told.is_empty(),
+            "a program whose file was written after it was hashed is not adopted: {told:?}"
+        ),
+        Err(kind) => {
+            assert_eq!(
+                kind,
+                std::io::ErrorKind::ExecutableFileBusy,
+                "the system refuses a write to a running image, and says so"
+            );
+            assert_eq!(
+                told.len(),
+                1,
+                "so nothing changed and it is adopted: {told:?}"
+            );
+        }
+    }
+    // macOS lets a running image be written to, so the refusal above is the look's own there.
+    #[cfg(target_os = "macos")]
+    assert!(
+        told.is_empty(),
+        "a write to a running image is permitted on macOS and refused by the look"
+    );
+    started.end();
+}
+
+/// KR-REQ-12.07: a process that ends between the image comparison and the second reading of its
+/// identity is not adopted: that reading is the step that answers for a process that is gone.
+#[test]
+fn kr_req_12_07_a_process_that_ended_before_the_second_identity_is_not_adopted() {
+    let setup = Setup::new();
+    let mut started = setup.start();
+    let foreground = Setup::foreground(&started, Vec::new());
+    let told = setup.look_with_stops(
+        &foreground,
+        vec![at(setup.adoptions.pause_before_second_identity(), || {
+            started
+                .child
+                .kill()
+                .expect("the child this test started ends");
+            started.child.wait().expect("and is collected");
+        })],
+    );
+    assert!(
+        told.is_empty(),
+        "a process that ended after its image was compared is not adopted: {told:?}"
+    );
+    assert_eq!(setup.adoptions.adopted(&started.process), None);
+}
+
+/// KR-REQ-12.07, a stated limit: a program whose file is replaced before the look opens it. Linux
+/// opens the image the process runs and reads its path afterwards with the suffix that says it is
+/// deleted, so the look refuses it and no later look recognises it. macOS opens and compares the
+/// path, which now names the replacement, so both file checks name the replacement and the look
+/// adopts the running program with the replacement's digest.
+#[test]
+fn kr_req_12_07_a_replacement_before_the_image_is_opened_is_named_by_both_checks() {
+    let setup = Setup::new();
+    let started = setup.start();
+    let foreground = Setup::foreground(&started, Vec::new());
+    let told = setup.look_with_stops(
+        &foreground,
+        vec![at(setup.adoptions.pause_before_reading(), || {
+            replace_with_other_bytes(&setup.program);
+        })],
+    );
+    #[cfg(target_os = "linux")]
+    {
+        assert!(
+            told.is_empty(),
+            "the image the process runs no longer has the path it was read as: {told:?}"
+        );
+        assert!(
+            setup.adoptions.look(&foreground).is_empty(),
+            "and a later look recognises no program at the path that reads as deleted"
+        );
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let replacement = digest_of(&setup.program);
+        assert_eq!(told.len(), 1, "the look adopts the program: {told:?}");
+        let profile = setup
+            .broker
+            .profile_of(told[0].application_instance_id)
+            .expect("its profile");
+        assert_eq!(
+            profile.binary.digest, replacement,
+            "with the digest of the file the path names, which is not the image that runs"
+        );
+    }
     started.end();
 }
