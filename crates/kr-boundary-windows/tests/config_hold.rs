@@ -637,7 +637,7 @@ fn config_hold_a_name_made_after_the_hold_is_seen_before_the_resume_and_at_the_e
 
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
-fn config_hold_a_hook_rewritten_with_content_of_equal_length_is_seen_at_the_end() {
+fn config_hold_a_listed_hook_is_held_for_reading_only_and_a_new_name_is_seen_at_the_end() {
     if !runs_as_the_system() {
         eprintln!("skipped: the case needs the system's token");
         return;
@@ -688,27 +688,28 @@ fn config_hold_a_hook_rewritten_with_content_of_equal_length_is_seen_at_the_end(
         other => panic!("the snapshot is a snapshot row: {other:?}"),
     }
     assert_eq!(hold.end_check(), Ok(()), "nothing is changed yet");
-    // A hook rewritten with content of the same length is the same file of the same size.
-    assert_eq!(fs::metadata(&hook).unwrap().len(), 9);
-    fs::write(&hook, b"echo ONE\n").unwrap();
-    assert_eq!(fs::metadata(&hook).unwrap().len(), 9);
+    // Each listed file is held for reading and shared for reading only: a write, a rename and a
+    // removal are refused with a sharing violation, whoever asks, so a kept view of a hook cannot
+    // be a view of a file that is changed after the check.
+    for (what, file) in [
+        ("a hook", &hook),
+        ("a hook in a folder", &nested),
+        ("the attributes file", &attributes),
+    ] {
+        let written = fs::write(file, b"echo ONE\n").expect_err(what);
+        assert_eq!(code(&written), SHARING_VIOLATION, "{what} is written");
+        let renamed = fs::rename(file, file.with_extension("moved")).expect_err(what);
+        assert_eq!(code(&renamed), SHARING_VIOLATION, "{what} is renamed");
+        let removed = fs::remove_file(file).expect_err(what);
+        assert_eq!(code(&removed), SHARING_VIOLATION, "{what} is removed");
+    }
     assert_eq!(
-        hold.end_check(),
-        Err(changed(&[r"hooks\pre-commit"])),
-        "a hook rewritten with content of equal length"
+        fs::read(&hook).unwrap(),
+        b"echo one\n",
+        "a held hook is read as before"
     );
-    fs::write(&hook, b"echo one\n").unwrap();
-    assert_eq!(hold.end_check(), Ok(()), "the hook as it was");
-    // The attributes file, rewritten in the same way.
-    fs::write(&attributes, b"* text=AUTO\n").unwrap();
-    assert_eq!(
-        hold.end_check(),
-        Err(changed(&[r"info\attributes"])),
-        "the attributes file rewritten with content of equal length"
-    );
-    fs::write(&attributes, b"* text=auto\n").unwrap();
-    assert_eq!(hold.end_check(), Ok(()), "the attributes file as it was");
-    // A new hook, and a new folder in the hooks folder.
+    assert_eq!(hold.end_check(), Ok(()), "nothing changed");
+    // A new hook, and a new folder in the hooks folder: neither is held, and both are seen.
     let added = project.git.join(r"hooks\post-commit");
     plant(&added, b"echo three\n");
     assert_eq!(
@@ -725,20 +726,6 @@ fn config_hold_a_hook_rewritten_with_content_of_equal_length_is_seen_at_the_end(
     );
     fs::remove_dir(project.git.join(r"hooks\newdir")).unwrap();
     assert_eq!(hold.end_check(), Ok(()), "the folder removed");
-    // A removed hook and a removed attributes file cannot be put back as the same files, so these
-    // come last.
-    fs::remove_file(&nested).unwrap();
-    assert_eq!(
-        hold.end_check(),
-        Err(changed(&[r"hooks\sub\post-merge"])),
-        "a removed hook"
-    );
-    fs::remove_file(&attributes).unwrap();
-    assert_eq!(
-        hold.end_check(),
-        Err(changed(&[r"hooks\sub\post-merge", r"info\attributes"])),
-        "a removed attributes file"
-    );
 }
 
 /// Sets a reparse point with a cloud tag on a file or a folder through a handle that asks only for

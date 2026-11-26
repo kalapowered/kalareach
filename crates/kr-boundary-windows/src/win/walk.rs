@@ -610,7 +610,28 @@ impl DirHandle {
         child: &Child,
         access: u32,
     ) -> Result<std::result::Result<Opened, Lost>> {
-        let handle = match self.nt_open_name(&child.name, access, false, FILE_OPEN) {
+        self.open_child_shared(child, access, FILE_SHARE_READ | FILE_SHARE_WRITE)
+    }
+
+    /// As [`DirHandle::open_child`], with the sharing mode given whole: what another open of the
+    /// child may ask for while the returned handle is open.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the platform refuses a call that is not a loss of the child.
+    pub fn open_child_shared(
+        &self,
+        child: &Child,
+        access: u32,
+        share: u32,
+    ) -> Result<std::result::Result<Opened, Lost>> {
+        let handle = match DirHandle::open_beneath_shared(
+            &self.handle,
+            &child.name,
+            access,
+            share,
+            FILE_OPEN,
+        ) {
             Ok(handle) => handle,
             Err(failure)
                 if failure.code == ERROR_FILE_NOT_FOUND || failure.code == ERROR_PATH_NOT_FOUND =>

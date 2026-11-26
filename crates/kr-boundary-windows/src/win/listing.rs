@@ -5,8 +5,10 @@
 //! they do not stop the creation of a new name or a write to a file that is not held. A taken-over
 //! Git can leave a `commondir` file for the next operation, or a hook that the person's own Git
 //! runs later. The broker takes one listing when it holds the tree and compares it with a fresh one
-//! before the resume and at the end, by name, identity, size and digest, so that a hook rewritten
-//! with content of the same length is seen.
+//! before the resume and at the end, by name, identity, size and digest. At the hold it also keeps
+//! each listed file open for reading and sharing it for reading only, so that no account can write
+//! to, rename or delete a hook or the attributes file while the tree is held, whatever view of it
+//! a process keeps: a kept view maps the file's data, and that mapping outlives the broker's check.
 
 #![allow(unsafe_code)]
 
@@ -19,7 +21,8 @@ use sha2::{Digest, Sha256};
 use windows_sys::Wdk::Storage::FileSystem::FILE_OPEN;
 use windows_sys::Win32::Storage::FileSystem::{
     FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO,
-    FILE_GENERIC_READ, FILE_LIST_DIRECTORY, FileAttributeTagInfo,
+    FILE_GENERIC_READ, FILE_LIST_DIRECTORY, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    FileAttributeTagInfo,
 };
 
 use crate::filekey::FileKey;
@@ -156,6 +159,7 @@ fn record(
     child: &Child,
     name: String,
     limit: u64,
+    holds: Option<&mut Vec<Handle>>,
 ) -> Result<DigestedFile, Failure> {
     if json_bytes(&name) > NAME_BYTES {
         return Err(Failure::TooLarge);
@@ -166,7 +170,14 @@ fn record(
     if is_folder(child) {
         return Ok(plain(format!("{name}\\"), child.key));
     }
-    let opened = match dir.open_child(child, FILE_GENERIC_READ)? {
+    // A file that is kept is shared for reading only; a fresh look shares for writing too, which the
+    // kept handles allow, since they ask for no write.
+    let share = if holds.is_some() {
+        FILE_SHARE_READ
+    } else {
+        FILE_SHARE_READ | FILE_SHARE_WRITE
+    };
+    let opened = match dir.open_child_shared(child, FILE_GENERIC_READ, share)? {
         Ok(opened) if opened.kind == Kind::File => opened,
         Ok(_) => return Err(Failure::Moved),
         Err(lost) => return Err(failure_of(&lost)),
@@ -174,12 +185,16 @@ fn record(
     let Some((size, sha)) = digest(&opened.handle, limit)? else {
         return Err(Failure::TooLarge);
     };
-    Ok(DigestedFile {
+    let file = DigestedFile {
         name,
         key: opened.key,
         size,
         sha256: hex::encode(sha),
-    })
+    };
+    if let Some(kept) = holds {
+        kept.push(opened.handle);
+    }
+    Ok(file)
 }
 
 /// Opens a listed folder for listing.
@@ -207,17 +222,24 @@ fn list_hooks(
     git: &DirHandle,
     child: &Child,
     hooks: &mut Vec<DigestedFile>,
+    mut holds: Option<&mut Vec<Handle>>,
 ) -> Result<(), Failure> {
     if !is_folder(child) {
         // A file or a link where the folder belongs is recorded as it is, and nothing is entered.
-        hooks.push(record(git, child, child.display(), MAX_FILE_BYTES)?);
+        hooks.push(record(git, child, child.display(), MAX_FILE_BYTES, holds)?);
         return Ok(());
     }
     let folder = open_folder(git, child)?;
     let mut found: Option<Failure> = None;
     let mut visit = |entry: &Entry<'_>| -> ffi::Result<Verdict> {
         let name = relative_name(git, entry.dir, entry.child);
-        match record(entry.dir, entry.child, name, MAX_FILE_BYTES) {
+        match record(
+            entry.dir,
+            entry.child,
+            name,
+            MAX_FILE_BYTES,
+            holds.as_deref_mut(),
+        ) {
             Ok(file) => hooks.push(file),
             Err(failure) => {
                 found.get_or_insert(failure);
@@ -251,18 +273,22 @@ fn list_hooks(
 }
 
 /// The `info\attributes` file, when the `info` folder has one.
-fn read_info(git: &DirHandle, child: &Child) -> Result<Option<DigestedFile>, Failure> {
+fn read_info(
+    git: &DirHandle,
+    child: &Child,
+    holds: Option<&mut Vec<Handle>>,
+) -> Result<Option<DigestedFile>, Failure> {
     let name = child.display();
     if !is_folder(child) {
         // A file or a link where the folder belongs is recorded as it is, and nothing is entered.
-        return Ok(Some(record(git, child, name, MAX_FILE_BYTES)?));
+        return Ok(Some(record(git, child, name, MAX_FILE_BYTES, holds)?));
     }
     let info = open_folder(git, child)?;
     for inner in info.children()? {
         if inner.display().eq_ignore_ascii_case("attributes") {
             let relative = format!("{name}\\{}", inner.display());
             let limit = MAX_ATTRIBUTES_BYTES as u64;
-            return record(&info, &inner, relative, limit).map(Some);
+            return record(&info, &inner, relative, limit, holds).map(Some);
         }
     }
     Ok(None)
@@ -275,14 +301,33 @@ fn read_info(git: &DirHandle, child: &Child) -> Result<Option<DigestedFile>, Fai
 /// Fails when the hooks folder or a file is over a bound, when an object is not where the listing
 /// named it, or when the platform refuses a call.
 pub(super) fn take(git: &DirHandle) -> Result<RepositoryListing, Failure> {
+    take_by(git, None)
+}
+
+/// Takes the listing of the held Git directory and keeps each listed file open for reading, shared
+/// for reading only: the handles are returned for the hold to keep until the tree is let go.
+///
+/// # Errors
+///
+/// Fails as [`take`] does, and when a listed file is open for writing elsewhere.
+pub(super) fn take_held(git: &DirHandle) -> Result<(RepositoryListing, Vec<Handle>), Failure> {
+    let mut kept = Vec::new();
+    let listing = take_by(git, Some(&mut kept))?;
+    Ok((listing, kept))
+}
+
+fn take_by(
+    git: &DirHandle,
+    mut holds: Option<&mut Vec<Handle>>,
+) -> Result<RepositoryListing, Failure> {
     let mut hooks = Vec::new();
     let mut info_attributes = None;
     for child in git.children()? {
         let name = child.display();
         if name.eq_ignore_ascii_case("hooks") {
-            list_hooks(git, &child, &mut hooks)?;
+            list_hooks(git, &child, &mut hooks, holds.as_deref_mut())?;
         } else if name.eq_ignore_ascii_case("info") {
-            info_attributes = read_info(git, &child)?;
+            info_attributes = read_info(git, &child, holds.as_deref_mut())?;
         }
     }
     if hooks.len() > HOOKS {

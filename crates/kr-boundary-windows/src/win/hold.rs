@@ -172,6 +172,9 @@ pub struct TreeHold {
     pub identity: TreeIdentity,
     /// What the Git folder held, besides `config`, when the tree was held.
     pub listing: RepositoryListing,
+    /// Each listed hook and the attributes file, open for reading and shared for reading only, so
+    /// that no account can write, rename or delete one while the tree is held.
+    pub listed_files: Vec<Handle>,
     /// The tree's path as the platform spells it now: what the journal records.
     pub path: String,
 }
@@ -384,7 +387,7 @@ pub fn hold_tree(path: &str, client: &ClientIdentity) -> Result<TreeHold, Refusa
             &named(ABSENT_NAME_WORDS, name),
         ));
     }
-    let listing = take_listing(&git_dir)?;
+    let (listing, listed_files) = take_listing(&git_dir)?;
     let identity = TreeIdentity {
         chain: chain.iter().map(DirHandle::key).collect(),
     };
@@ -394,13 +397,15 @@ pub fn hold_tree(path: &str, client: &ClientIdentity) -> Result<TreeHold, Refusa
         config,
         identity,
         listing,
+        listed_files,
         path: display,
     })
 }
 
-/// Takes the listing of the held `.git` folder, or refuses the repository.
-fn take_listing(git_dir: &DirHandle) -> Result<RepositoryListing, Refusal> {
-    listing::take(git_dir).map_err(|failure| match failure {
+/// Takes the listing of the held `.git` folder and holds each listed file, or refuses the
+/// repository.
+fn take_listing(git_dir: &DirHandle) -> Result<(RepositoryListing, Vec<Handle>), Refusal> {
+    listing::take_held(git_dir).map_err(|failure| match failure {
         Failure::TooLarge => refuse(
             RefusedKind::Repository,
             RULE_LISTING_BOUND,
