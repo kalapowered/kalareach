@@ -210,6 +210,41 @@ fn recording(served: &Served) -> Option<ComponentSource> {
     })
 }
 
+/// A state of the `recording` component taken apart into the number of checkpoints its instance has
+/// taken (the `checkpoint=` member) and the text of every other member.
+fn counted(state: &[u8]) -> (u64, String) {
+    let text = std::str::from_utf8(state).expect("a state that is text");
+    let mut count = None;
+    let rest: Vec<&str> = text
+        .split(';')
+        .filter(|member| match member.strip_prefix("checkpoint=") {
+            Some(value) => {
+                count = Some(value.parse().expect("a count"));
+                false
+            }
+            None => true,
+        })
+        .collect();
+    (
+        count.expect("a state with a checkpoint count"),
+        rest.join(";"),
+    )
+}
+
+/// Asserts that `later` is `earlier` and nothing else but `reads` checkpoints on: every member other
+/// than the count is equal, and the count is the earlier one's plus the reads. Reading a state is
+/// itself a checkpoint, so the count rises by each read of the instance between the two.
+fn assert_only_counted(earlier: &[u8], later: &[u8], reads: u64, message: &str) {
+    let (count_earlier, rest_earlier) = counted(earlier);
+    let (count_later, rest_later) = counted(later);
+    assert_eq!(rest_later, rest_earlier, "{message}");
+    assert_eq!(
+        count_later,
+        count_earlier + reads,
+        "{message}: the count rises by the reads and by nothing else"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_24_24_each_endpoint_speaks_one_protocol_and_the_fourth_states_its_build() {
     let served = Served::start_dual(true).await;
@@ -547,11 +582,17 @@ async fn kr_req_24_24_a_restore_with_a_state_over_the_bound_is_refused_and_chang
             "a restore of a state over the bound was answered with {refused:?} (open: {open})"
         );
         if let Some(before) = before {
+            // Reading the state is itself a checkpoint, so its count rises by this one read.
             let after = four.checkpoint(&request).await;
+            assert_only_counted(
+                &before.state,
+                &after.state,
+                1,
+                "the refused restore changed the instance",
+            );
             assert_eq!(
-                (after.state, after.consumed),
-                (before.state, before.consumed),
-                "the refused restore changed the instance"
+                after.consumed, before.consumed,
+                "the refused restore changed what the instance has consumed"
             );
         }
         // The binding still runs: an event is consumed after the refusal.
@@ -764,11 +805,12 @@ async fn kr_req_24_24_a_closed_host_restores_nothing_for_a_position_and_says_it_
     four.register(&first, &component, 7).await;
     four.register(&second, &component, 8).await;
     four.event(&first, "se-1", "x").await;
-    // A state that differs from the second binding's own, once the first has taken the event in.
+    // A state that differs from the second binding's own, once the first has taken the event in:
+    // each instance counts its own checkpoints, so the counts are not what is compared.
     let before = four.checkpoint(&second).await.state;
     let saved = loop {
         let saved = four.checkpoint(&first).await;
-        if saved.state != before {
+        if counted(&saved.state).1 != counted(&before).1 {
             break saved;
         }
         tokio::task::yield_now().await;
@@ -794,10 +836,12 @@ async fn kr_req_24_24_a_closed_host_restores_nothing_for_a_position_and_says_it_
         ),
         "a closed host answered a restore with a position with {restored:?}"
     );
-    assert_eq!(
-        four.checkpoint(&second).await.state,
-        before,
-        "a closed host restored the state"
+    // Reading the state is itself a checkpoint, so its count rises by this one read.
+    assert_only_counted(
+        &before,
+        &four.checkpoint(&second).await.state,
+        1,
+        "a closed host restored the state",
     );
 }
 
@@ -840,7 +884,11 @@ async fn kr_req_24_24_an_open_host_restores_nothing_for_a_position_once_the_regi
         }
         tokio::task::yield_now().await;
     };
-    assert_ne!(saved.state, current.state, "the two states do not differ");
+    assert_ne!(
+        counted(&saved.state).1,
+        counted(&current.state).1,
+        "the two states do not differ apart from their counts"
+    );
 
     let restored = four
         .restore(
@@ -863,10 +911,13 @@ async fn kr_req_24_24_an_open_host_restores_nothing_for_a_position_once_the_regi
         ),
         "an open host answered a restore with a position, after an event was offered, with {restored:?}"
     );
+    // Reading the state is itself a checkpoint, so its count rises by this one read.
     let after = four.checkpoint(&second).await;
-    assert_eq!(
-        after.state, current.state,
-        "the host restored the state of another registration's position"
+    assert_only_counted(
+        &current.state,
+        &after.state,
+        1,
+        "the host restored the state of another registration's position",
     );
     assert_eq!(
         after.consumed, current.consumed,

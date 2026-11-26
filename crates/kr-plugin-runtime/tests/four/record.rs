@@ -685,18 +685,25 @@ async fn session(served: &Served, open: bool) -> Option<Session> {
     raw.register(&saved_from, &recorded, 7).await;
     raw.event(&saved_from, "se-1", "x").await;
     raw.event(&saved_from, "se-2", "y").await;
-    let saved = loop {
-        let saved = raw.checkpoint(&saved_from).await;
-        if !open
+    // The state is read by one checkpoint, after the host has reported that both events were taken
+    // in, so that the count the component prints in it, and the record that holds it, do not depend
+    // on how many times a poll came round.
+    if open {
+        raw.until(|notice| {
+            matches!(notice, Notice4::Consumed { terminal: Some(last), .. } if *last == handle("se-2"))
+        })
+        .await;
+    }
+    let saved = raw.checkpoint(&saved_from).await;
+    assert!(
+        !open
             || saved
                 .consumed
                 .as_ref()
-                .is_some_and(|consumed| consumed.terminal == Some(handle("se-2")))
-        {
-            break saved;
-        }
-        tokio::task::yield_now().await;
-    };
+                .is_some_and(|consumed| consumed.terminal == Some(handle("se-2"))),
+        "an open host's state holds both events: {:?}",
+        saved.consumed
+    );
     let moved_into = components::request("recording", 34);
     raw.register(&moved_into, &recorded, 8).await;
     // What the answer says is held by the record: the shape of the session and the frames.
