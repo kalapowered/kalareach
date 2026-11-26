@@ -361,7 +361,6 @@
  */
 .session-header {
   margin-bottom: 20px;
-  flex-wrap: wrap;
   row-gap: var(--gap-4);
 }
 
@@ -371,7 +370,6 @@
 }
 
 .session-header .page-actions {
-  flex-wrap: wrap;
   flex-shrink: 1;
   min-width: 0;
 }
@@ -762,6 +760,10 @@
   flex-wrap: wrap;
 }
 
+.composer-note > .row {
+  flex-wrap: wrap;
+}
+
 /* The reason nothing is sent, and the way past it when there is one, stacked. */
 .composer-why {
   display: flex;
@@ -882,8 +884,8 @@
  * badge longer than the terminal is wide wraps its own words, so none runs under the terminal's
  * edge. The footer's controls wrap the same way: the two sizes together, then the way back.
  */
-.terminal-heading > .row + .row,
-.terminal-footer > .row {
+.terminal-heading .row,
+.terminal-footer .row {
   flex-wrap: wrap;
 }
 
@@ -1054,6 +1056,7 @@
 
 .settings-row {
   display: flex;
+  flex-wrap: wrap;
   justify-content: space-between;
   align-items: center;
   gap: 20px;
@@ -1566,10 +1569,6 @@
  * The row that names the pairing service wraps like a host's row: at a larger text size the
  * control drops beneath the name instead of running past the screen's edge, and a long name breaks.
  */
-.pairing-settings .divided-row {
-  flex-wrap: wrap;
-}
-
 .pairing-settings .divided-row > p {
   flex: 1 1 10rem;
   min-width: 0;
@@ -1639,10 +1638,6 @@
  * size the controls wrap beneath the name instead of running past the screen's edge, and the
  * question about forgetting a host takes the row's whole width.
  */
-.paired-hosts .divided-row {
-  flex-wrap: wrap;
-}
-
 .paired-hosts .divided-row > .spacer {
   flex: 1 1 10rem;
   min-width: 0;
@@ -2064,7 +2059,6 @@
  * room, so at the largest text size the words keep a readable line and the control is whole.
  */
 .share-form .settings-row {
-  flex-wrap: wrap;
   row-gap: var(--gap-2);
 }
 

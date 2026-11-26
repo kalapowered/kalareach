@@ -220,6 +220,7 @@ main {
 
 .page-heading {
   display: flex;
+  flex-wrap: wrap;
   align-items: flex-start;
   justify-content: space-between;
   gap: 24px;
@@ -237,9 +238,11 @@ main {
 
 .page-actions {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 9px;
   flex-shrink: 0;
+  max-inline-size: 100%;
 }
 
 /* ---- Controls ------------------------------------------------------------------------------- */
@@ -278,6 +281,9 @@ main {
   max-inline-size: 100%;
   text-align: center;
 }
+
+/* A row that holds buttons wraps, so a button wider than the room beside its neighbours moves to the
+   next line instead of past the box. */
 
 /* An icon has no label to wrap. */
 .icon-btn {
@@ -559,6 +565,11 @@ textarea::placeholder {
   overflow-wrap: anywhere;
 }
 
+/* A row of a field and its button wraps, so the button moves under the field instead of past the box. */
+.form-field fieldset > .row {
+  flex-wrap: wrap;
+}
+
 .form-field input,
 .form-field select,
 .form-field textarea {
@@ -590,6 +601,7 @@ textarea::placeholder {
 
 .card-header {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 12px;
   padding: 20px 22px;
@@ -609,6 +621,10 @@ textarea::placeholder {
   padding: 12px 21px;
   border-top: 1px solid var(--line);
   background: var(--raised);
+}
+
+.card-footer > .row {
+  flex-wrap: wrap;
 }
 
 .card-grid {
@@ -726,6 +742,7 @@ textarea::placeholder {
 
 .divided-row {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 10px;
   padding: 16px 0;
@@ -739,6 +756,7 @@ textarea::placeholder {
 
 .banner {
   display: flex;
+  flex-wrap: wrap;
   align-items: flex-start;
   gap: 10px;
   padding: 13px 16px;
@@ -998,6 +1016,7 @@ textarea::placeholder {
   align-items: center;
   gap: 10px;
   flex: 0 0 auto;
+  max-inline-size: 100%;
 }
 
 /* Nothing appears from nothing: the toast starts below where it lands, not at zero size. */

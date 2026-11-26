@@ -60,15 +60,6 @@
 }
 
 /*
- * A title and the badge that says where it stands sit side by side where there is room. At a large
- * text size on a narrow window there is not, and the badge goes under the title instead of past
- * the card's edge, where the card clips it.
- */
-.setup .card-header {
-  flex-wrap: wrap;
-}
-
-/*
  * A badge says where something stands, in a few words. One that is longer than the card's room
  * wraps inside its own box instead of running past the card's edge, and the box is never wider
  * than the card.

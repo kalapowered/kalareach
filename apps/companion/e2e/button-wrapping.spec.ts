@@ -43,16 +43,21 @@ interface Drawn {
   readonly id?: string
 }
 
-/** One holder drawn the way the product draws it, with its buttons. */
-interface Holder {
-  readonly name: string
-  readonly classes: string
+/** One piece of a fixture: a box with its classes and its parts, some text, or a button. */
+interface Part {
+  readonly tag?: string
+  readonly classes?: string
   readonly style?: string
-  readonly buttons: readonly (string | Drawn)[]
+  /** Marks a holder: the measures read the buttons under it against its box. */
+  readonly name?: string
+  readonly attrs?: Readonly<Record<string, string>>
+  readonly text?: string
+  readonly button?: string | Drawn
+  readonly parts?: readonly Part[]
 }
 
 /** Opens the harness in `form` at `size` times the default text and puts `holders` over the page, in the real stylesheet. */
-async function drawn(page: Page, form: Form, size: number, holders: readonly Holder[]): Promise<void> {
+async function drawn(page: Page, form: Form, size: number, holders: readonly Part[]): Promise<void> {
   await page.setViewportSize({ width: form.width, height: form.height })
   if (form.phone) {
     await page.addInitScript((value) => {
@@ -80,42 +85,50 @@ async function drawn(page: Page, form: Form, size: number, holders: readonly Hol
   await page.waitForSelector(form.phone ? '.m-shell' : '.app-shell')
   await page.evaluate(
     ([id, drawing]) => {
-      const over = document.createElement('div')
-      over.id = id
-      over.style.cssText =
-        'position:fixed;inset:0;overflow:auto;box-sizing:border-box;padding:16px;z-index:99999;background:var(--bg, #fff);color:var(--text, #000)'
-      for (const one of drawing) {
-        const box = document.createElement('div')
-        box.className = one.classes
-        box.dataset.case = one.name
-        if (one.style !== undefined) box.style.cssText = one.style
-        for (const each of one.buttons) {
-          const spec = typeof each === 'string' ? { label: each } : each
+      const build = (part: Part): HTMLElement => {
+        if (part.button !== undefined) {
+          const spec = typeof part.button === 'string' ? { label: part.button } : part.button
           const button = document.createElement('button')
           button.type = 'button'
           button.className = 'className' in spec && spec.className !== undefined ? spec.className : 'btn'
           if ('id' in spec && spec.id !== undefined) button.id = spec.id
           if (button.className === 'icon-btn') button.setAttribute('aria-label', spec.label)
           button.textContent = spec.label
-          box.append(button)
+          return button
         }
-        over.append(box)
+        const box = document.createElement(part.tag ?? 'div')
+        if (part.classes !== undefined) box.className = part.classes
+        if (part.name !== undefined) box.dataset.case = part.name
+        for (const [key, value] of Object.entries(part.attrs ?? {})) box.setAttribute(key, value)
+        if (part.style !== undefined) box.style.cssText = part.style
+        if (part.text !== undefined) box.textContent = part.text
+        for (const each of part.parts ?? []) box.append(build(each))
+        return box
       }
+      const over = document.createElement('div')
+      over.id = id
+      over.style.cssText =
+        'position:fixed;inset:0;overflow:auto;box-sizing:border-box;padding:16px;z-index:99999;background:var(--bg, #fff);color:var(--text, #000)'
+      for (const one of drawing) over.append(build(one))
       document.body.append(over)
     },
     [FIXTURE.slice(1), holders] as const
   )
 }
 
-function holder(name: string, classes: string, buttons: readonly (string | Drawn)[], style?: string): Holder {
-  return { name, classes, buttons, style }
+/** A holder with only buttons in it. */
+function holder(name: string, classes: string, buttons: readonly (string | Drawn)[], style?: string): Part {
+  return { name, classes, style, parts: buttons.map((button) => ({ button })) }
 }
+
+const button = (label: string): Part => ({ button: label })
+const words = (tag: string, text: string, classes?: string): Part => ({ tag, text, classes })
 
 const LONG = 'Keep it for the new conversation'
 const NAME = 'sam-laptop-with-a-device-name-that-has-no-place-to-break'
 
 /** Holders in which a button is drawn on its own, as a column holds it, a nowrap row, a wrapping row and a card. */
-const BASIC: readonly Holder[] = [
+const BASIC: readonly Part[] = [
   holder('nowrap row, one button', 'row', [LONG]),
   holder('column, one button', '', [`Invite ${NAME}`], 'display:flex;flex-direction:column;align-items:flex-start'),
   holder('wrapping row, three buttons', 'row wrap', ['Put it in its composer', 'Move it', 'Discard']),
@@ -132,7 +145,7 @@ interface Found {
  * (or of the fixture, to either side), a label drawn outside its own button, a button over another,
  * and, through the page's one measure of text that runs out of its box, a line of text past a box.
  */
-async function measured(page: Page): Promise<Found> {
+async function measured(page: Page, text = true): Promise<Found> {
   const own = await page.evaluate((root) => {
     const faults: string[] = []
     const base = document.querySelector(root)
@@ -169,8 +182,8 @@ async function measured(page: Page): Promise<Found> {
     }
     return { faults, buttons }
   }, FIXTURE)
-  const text = await overrunning(page, FIXTURE)
-  return { faults: [...own.faults, ...text.map((each) => `text ${each}`)], buttons: own.buttons }
+  const overrun = text ? await overrunning(page, FIXTURE) : []
+  return { faults: [...own.faults, ...overrun.map((each) => `text ${each}`)], buttons: own.buttons }
 }
 
 function shot(name: string): string {
@@ -196,7 +209,7 @@ for (const form of FORMS) {
 }
 
 /** Short labels in the holders that are common in the product, drawn where the label fits on one line. */
-const FITTING: readonly Holder[] = [
+const FITTING: readonly Part[] = [
   holder('nowrap row', 'row', ['Try again']),
   holder('wrapping row', 'row wrap', ['Send', 'Queue', 'Steer']),
   holder('column', '', ['Refresh'], 'display:flex;flex-direction:column;align-items:flex-start'),
@@ -257,3 +270,241 @@ test('keeps the icon button on one line and lets the text button wrap', async ({
   expect(text).toMatch(/^normal (anywhere|break-word) 100%$/)
   expect(icon.startsWith('nowrap'), 'the icon button keeps its single line').toBe(true)
 })
+
+// ---- The holders of a button ---------------------------------------------------------------------------------
+
+/**
+ * Each holder a button is drawn in, with the real classes of the interface and the real label of the
+ * button, at the largest size in the narrowest windows. A label that wraps is not enough: a holder
+ * that cannot wrap its row, or that leaves its buttons no room, runs a button out of the box that
+ * holds it however the label is set. The text beside a button is representative; the classes and the
+ * labels are the interface's own.
+ */
+interface Holding {
+  readonly name: string
+  /** Only the phone's shell draws it. */
+  readonly phoneOnly?: boolean
+  /** The text beside the button is meant to be clipped with an ellipsis, so only the buttons are read. */
+  readonly buttonsOnly?: boolean
+  readonly parts: readonly Part[]
+}
+
+const banner: Part = {
+  name: 'banner',
+  classes: 'banner warning',
+  parts: [
+    {
+      classes: 'spacer',
+      parts: [
+        words('strong', 'The sessions could not be listed.'),
+        words('span', 'The host did not answer. Check that it is running and that this device can reach it.')
+      ]
+    },
+    button('Try again')
+  ]
+}
+
+const pageHeading = (name: string, title: string, actions: readonly string[]): Part => ({
+  name,
+  classes: 'page-heading',
+  parts: [{ parts: [words('h1', title)] }, { classes: 'page-actions', parts: actions.map(button) }]
+})
+
+const card = (name: string, inner: Part): Part => ({ name, classes: 'card', parts: [inner] })
+
+const HOLDINGS: readonly Holding[] = [
+  { name: 'banner with an action', parts: [banner] },
+  { name: 'page heading with one action', parts: [pageHeading('heading, one action', 'Kept drafts', ['Back to sessions'])] },
+  { name: 'page heading with two actions', parts: [pageHeading('heading, two actions', 'Sessions', ['New session', 'Refresh'])] },
+  {
+    name: 'card footer with three buttons in a row',
+    parts: [
+      card('attention card', {
+        classes: 'card-footer',
+        parts: [{ tag: 'span', classes: 'row', parts: [button('Open session'), button('Review changes'), button('Mark as seen')] }]
+      })
+    ]
+  },
+  {
+    name: 'composer note with three buttons in a row',
+    parts: [
+      {
+        name: 'composer note',
+        classes: 'composer',
+        parts: [
+          {
+            classes: 'composer-note between',
+            parts: [
+              words('span', 'Sent when the agent can take it.'),
+              { tag: 'span', classes: 'row', parts: [button('Steer'), button('Queue'), button('Send')] }
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  {
+    name: 'terminal footer with the move keys',
+    parts: [
+      {
+        name: 'terminal footer',
+        parts: [
+          {
+            tag: 'footer',
+            classes: 'terminal-footer between',
+            parts: [
+              words('span', 'Zoom 100%'),
+              {
+                tag: 'span',
+                classes: 'row',
+                parts: [
+                  { tag: 'span', classes: 'row', parts: [button('Up'), button('Down'), button('Left'), button('Right')] },
+                  button('Smaller'),
+                  button('Larger')
+                ]
+              },
+              { tag: 'span', classes: 'row', parts: [button('Back to the conversation')] }
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  {
+    name: 'divided row with a text column and one button',
+    parts: [
+      card('export row', {
+        classes: 'card-body',
+        parts: [
+          {
+            classes: 'divided-row',
+            parts: [
+              { classes: 'spacer', parts: [words('strong', 'Export the session'), words('p', 'Every message, as JSON.', 'muted small')] },
+              button('Export recording')
+            ]
+          }
+        ]
+      }),
+      card('saved settings row', {
+        classes: 'card-body',
+        parts: [
+          {
+            classes: 'divided-row',
+            parts: [
+              { classes: 'spacer', parts: [words('strong', 'Saved settings'), words('p', 'Left at a time not known.', 'muted small')] },
+              button('Remove from the bundle')
+            ]
+          }
+        ]
+      })
+    ]
+  },
+  {
+    name: 'card header with a title and one button',
+    parts: [
+      card('change set header', {
+        classes: 'card-header',
+        parts: [
+          { parts: [words('h2', 'Reading this change set'), words('p', 'Version 12 against main, 1,204 paths', 'muted small')] },
+          button('Mark version 12 reviewed')
+        ]
+      })
+    ]
+  },
+  {
+    name: 'settings row with a text column and one button',
+    parts: [
+      {
+        name: 'settings row',
+        parts: [
+          {
+            tag: 'li',
+            classes: 'settings-row',
+            style: 'list-style:none',
+            parts: [{ parts: [words('h3', 'Review the changes'), words('p', 'claude --review', 'mono small')] }, button('Remove')]
+          }
+        ]
+      }
+    ]
+  },
+  {
+    name: 'row with a field and one button',
+    parts: [
+      {
+        name: 'argument row',
+        classes: 'form-field',
+        parts: [
+          {
+            tag: 'fieldset',
+            parts: [{ classes: 'row', parts: [{ tag: 'input', style: 'flex:1 1 auto;min-width:0' }, button('Remove argument')] }]
+          }
+        ]
+      }
+    ]
+  },
+  {
+    name: 'terminal heading with a title and one button',
+    parts: [
+      {
+        name: 'terminal heading',
+        parts: [
+          {
+            tag: 'header',
+            classes: 'terminal-heading',
+            parts: [
+              { tag: 'span', classes: 'row', parts: [words('h2', 'Terminal'), button('Take control')] },
+              { tag: 'span', classes: 'row', parts: [words('span', 'Connected')] }
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  {
+    name: 'phone terminal status with one button',
+    phoneOnly: true,
+    buttonsOnly: true,
+    parts: [
+      {
+        name: 'terminal status',
+        parts: [
+          {
+            classes: 'm-terminal-status',
+            parts: [{ attrs: { 'data-expanded': 'false' }, parts: [words('p', 'The program is waiting for you to answer its question about the files.')] }, button('More')]
+          }
+        ]
+      }
+    ]
+  },
+  {
+    name: 'toast with an action',
+    parts: [
+      {
+        name: 'toast',
+        classes: 'toast-dock',
+        style: 'position:static',
+        parts: [
+          {
+            classes: 'toast',
+            parts: [
+              words('span', 'The session was closed on the host.', 'toast-text'),
+              { classes: 'toast-controls', parts: [button('Open the session')] }
+            ]
+          }
+        ]
+      }
+    ]
+  }
+]
+
+for (const holding of HOLDINGS) {
+  for (const form of FORMS) {
+    if (holding.phoneOnly === true && !form.phone) continue
+    test(`keeps the ${holding.name} whole at the largest size, ${form.name}`, async ({ page }) => {
+      await drawn(page, form, LARGEST, holding.parts)
+      const found = await measured(page, holding.buttonsOnly !== true)
+      expect(found.buttons, 'the fixture draws its buttons').toBeGreaterThan(0)
+      expect(found.faults, 'buttons and text that run out of the box that holds them').toEqual([])
+    })
+  }
+}
