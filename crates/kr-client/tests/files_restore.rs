@@ -5107,13 +5107,13 @@ fn the_digest_of_a_plan_held_by_a_host_is_a_fixed_value_that_names_no_host() {
     assert_eq!(
         plan(host(0x42)).standing.describe(),
         "Restoring backup generation 6. It is newer than generation 5, the newest that a host \
-         this device paired with named when this device asked. No restore can show that the \
+         this device paired with reported when this device asked. No restore can show that the \
          service is not holding a newer backup back.",
         "the sentence the digest covers"
     );
     assert_eq!(
         digest(host(0x42)),
-        "354125ee3ea2390001f89dd6a8ef4688508a8e5b47dd25f9010c9bbc9e373b2d",
+        "fa6a899689ee2a1f0dc21ff395f59eec4d7c9de0179c2abdad4a818b5995e2e2",
         "a plan held by a host"
     );
     assert_eq!(
