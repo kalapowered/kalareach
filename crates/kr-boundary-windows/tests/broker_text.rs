@@ -265,29 +265,29 @@ fn broker_text_a_drive_letter_that_is_not_a_local_disk_is_refused_before_its_roo
     let connections = smb_connections();
 
     // A letter that stands for the share of this computer that holds the project: its root would
-    // be opened through the redirector, so the check must come before that open.
-    {
+    // be opened through the redirector, so the check must come before that open. The connections
+    // are counted after the letter is gone: a PowerShell that starts while the letter exists reads
+    // each drive's root itself and would make the connection it is asked about.
+    let answers = {
         let _share = DriveLink::new("Y:", r"\Device\Mup\localhost\C$");
         let on_the_share = format!(r"Y:\{}", below_the_drive(&project.root));
-        let answers = [
+        [
             hold_tree(r"Y:\x\y", &client),
             hold_tree(&on_the_share, &client),
             // The verbatim spelling of the same path: the letter's link is read for it the same way.
             hold_tree(r"\\?\Y:\x\y", &client),
             hold_tree(&format!(r"\\?\{on_the_share}"), &client),
-        ];
-        // What the letter leads to is read first: the computer made no connection, whatever the
-        // refusals say.
-        assert_eq!(
-            smb_connections(),
-            connections,
-            "the letter's root was opened: the computer made an SMB connection"
-        );
-        for answer in answers {
-            let refusal = answer.expect_err("a letter that stands for a share is refused");
-            assert_eq!(refusal.rule, RULE_FOLDER_FORM);
-            assert_eq!(refusal.detail(), FOLDER_FORM_WORDS);
-        }
+        ]
+    };
+    assert_eq!(
+        smb_connections(),
+        connections,
+        "the letter's root was opened: the computer made an SMB connection"
+    );
+    for answer in answers {
+        let refusal = answer.expect_err("a letter that stands for a share is refused");
+        assert_eq!(refusal.rule, RULE_FOLDER_FORM);
+        assert_eq!(refusal.detail(), FOLDER_FORM_WORDS);
     }
 
     // A letter that a `subst` made of a folder is a folder, not a volume's root.
