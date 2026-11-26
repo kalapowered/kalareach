@@ -2809,28 +2809,38 @@ fn declare_acp(manifest: &mut serde_json::Value, words: &str) {
     manifest["sdk_range"] = serde_json::json!(">=0.1.11, <0.2.0");
 }
 
-/// A package that `declare_acp` builds carries a launch that the package check admits, so the cases
-/// that read the statement of such a package read the statement of a valid release.
+/// A package that `bridging` and `declare_acp` build, with the one file its bridge's recipe
+/// installs, is valid as a whole: the package check reports nothing, so the launch that
+/// `declare_acp` states is one the check admits and the cases that read the statement of such a
+/// package read the statement of a valid release.
 #[test]
-fn the_launch_the_helper_declares_passes_the_package_check() {
+fn a_package_with_the_launch_the_helper_declares_is_valid_as_a_whole() {
     let directory = tempfile::tempdir().expect("a temporary directory");
     let package = bridging(
         directory.path(),
         "0.1.0",
         "Changes one setting of the example agent.",
         true,
-        |manifest| declare_acp(manifest, "Starts the example agent in ACP mode."),
+        |manifest| {
+            declare_acp(manifest, "Starts the example agent in ACP mode.");
+            manifest["payloads"]
+                .as_array_mut()
+                .expect("the manifest declares payloads")
+                .push(serde_json::json!({
+                    "role": "native_bridge",
+                    "path": "bridge/example.json",
+                    "digest": PayloadDigest::of(b"{}").to_string(),
+                    "size_bytes": 2
+                }));
+        },
     );
+    std::fs::create_dir_all(package.join("bridge")).expect("the bridge directory");
+    std::fs::write(package.join("bridge/example.json"), b"{}").expect("the bridge file writes");
     let validated = kr_plugin_sdk::validate::validate_package_directory(&package);
-    let refused: Vec<_> = validated
-        .report
-        .findings
-        .iter()
-        .filter(|finding| finding.code == kr_plugin_sdk::validate::FindingCode::AcpLaunchInvalid)
-        .collect();
     assert!(
-        refused.is_empty(),
-        "the launch is admitted by the package check: {refused:?}"
+        validated.report.findings.is_empty(),
+        "the package check reports nothing: {:?}",
+        validated.report.findings
     );
 }
 
