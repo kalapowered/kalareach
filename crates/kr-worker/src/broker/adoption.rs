@@ -891,8 +891,10 @@ pub struct Arguments {
     pub vector: Vec<String>,
     /// The second argument, the one an interpreter is given its script as, as the exact bytes the
     /// kernel holds: present only where the reading proves that these bytes are the second argument
-    /// and that they are an absolute path. An empty first or second argument, a reading that ends
-    /// short of the count the kernel gave, a relative path or an option leave it absent.
+    /// and that they are an absolute path. An empty first argument on macOS, an empty second
+    /// argument, a reading of one argument, a relative path or an option leave it absent, and so
+    /// does a Linux reading that does not end where an argument area ends. A reading that cannot
+    /// be made exact, as a macOS record not laid out as observed, gives no `Arguments` at all.
     pub script_argument: Option<OsString>,
 }
 
