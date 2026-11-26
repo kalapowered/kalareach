@@ -746,6 +746,80 @@ fn broker_admission_an_inherit_only_entry_for_the_creators_group_that_writes_ref
 
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn broker_admission_an_object_entry_that_gives_writing_names_its_own_identifier_and_refuses_the_tree()
+ {
+    if !runs_as_the_system() {
+        eprintln!("skipped: the case needs the system's token");
+        return;
+    }
+    prepare();
+    let person = Person::new("krhap");
+    let other = Person::new("krsec");
+    let siblings = Siblings::new();
+    let scratch = Scratch::on_drive();
+    let who = person.sid.to_text().unwrap();
+    let other_sid = other.sid.to_text().unwrap();
+    // The person owns the object and keeps every right; `entry` is the one entry under test, added
+    // to a list that the platform's own text form writes.
+    let described =
+        |entry: &str| format!("O:{who}G:BAD:P(A;;FA;;;{who})(A;;FA;;;SY)(A;;FA;;;BA){entry}");
+    let make = |name: &str, entry: &str| {
+        let project = Project::make_private(&scratch, name, &person.sid);
+        let file = project.git.join("entry");
+        let descriptor = descriptor_from_text(&described(entry)).unwrap();
+        privileged(|| file_described(&file, &descriptor, b"x"));
+        (project, file)
+    };
+
+    // An allow entry for an object type, with no object type named, gives the right to write like a
+    // plain entry does: its identifier is the one the entry names, not the bytes that a plain entry
+    // would have at that place.
+    let (project, file) = make("plain", &format!("(OA;;0x2;;;{other_sid})"));
+    let refusal = admit_project(&person, &siblings, &project)
+        .expect_err("an object entry that gives writing to a second account refuses");
+    assert_eq!(refusal.rule, RULE_WRITER);
+    assert_eq!(
+        refusal.detail(),
+        format!("{WRITER_WORDS} {other_sid} on {}", display(&file))
+    );
+
+    // The same with an object type and an inherited object type named: the identifier lies after both.
+    let guid = "bf967aba-0de6-11d0-a285-00aa00304900";
+    let (project, file) = make("types", &format!("(OA;;0x2;{guid};{guid};{other_sid})"));
+    let refusal = admit_project(&person, &siblings, &project)
+        .expect_err("an object entry with two object types that gives writing refuses");
+    assert_eq!(refusal.rule, RULE_WRITER);
+    assert_eq!(
+        refusal.detail(),
+        format!("{WRITER_WORDS} {other_sid} on {}", display(&file))
+    );
+
+    // An allow entry with a condition is read by its type too.
+    let (project, file) = make(
+        "callback",
+        &format!("(XA;;0x2;;;{other_sid};(Member_of {{SID(BA)}}))"),
+    );
+    let refusal = admit_project(&person, &siblings, &project)
+        .expect_err("a conditional entry that gives writing refuses");
+    assert_eq!(refusal.rule, RULE_WRITER);
+    assert_eq!(
+        refusal.detail(),
+        format!("{WRITER_WORDS} {other_sid} on {}", display(&file))
+    );
+
+    // A deny entry for the second account gives nothing.
+    let (project, _) = make("deny", &format!("(OD;;0x2;;;{other_sid})"));
+    admit_project(&person, &siblings, &project)
+        .expect("an object entry that denies writing is admitted");
+
+    // An object entry for the person is an entry of a writer the rule allows.
+    let (project, _) = make("person", &format!("(OA;;0x2;;;{who})"));
+    admit_project(&person, &siblings, &project)
+        .expect("an object entry that gives the person the right to write is admitted");
+}
+
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
 fn broker_admission_an_owner_other_than_the_person_the_system_or_an_administrator_refuses_the_tree()
 {
     if !runs_as_the_system() {
