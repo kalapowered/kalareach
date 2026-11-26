@@ -2901,37 +2901,60 @@ jobs:
 
       # Gradle tries a dependency fetch again when a server refuses it with "too many requests", a
       # server error or a timeout, and for no other failure: a compile error or a failed check is
-      # never tried again. Its own limits are three tries with 1 and 2 seconds between them, which a
-      # refusal outlasts: the run that failed here gave up after 25 seconds. These two settings give
-      # six tries with 4, 8, 16, 32 and 64 seconds between them, at most 124 seconds for one fetch.
-      # They are read as system properties by the resolver (`ErrorHandlingModuleComponentRepository`,
-      # which takes them with `Integer.getInteger`), so the properties file needs the `systemProp.`
-      # prefix, and a name without it is a project property that Gradle never reads; they are
-      # Gradle's internal names, not a documented interface, and a wrapper version that drops or
-      # renames them would leave the defaults in force without a word. So the step runs an empty
-      # build with an init script that prints what the build's own process holds, and fails when it
-      # is not what was written; and whoever changes the wrapper's version reads the resolver's
-      # source for the new version again and checks that these two names are still the ones it
-      # reads. The settings are written to the user's Gradle home, which a developer's machine does
-      # not share.
+      # never tried again. Its own limits are three tries with 1 and 2 seconds between them, so a
+      # refusal that lasts longer than three seconds fails the build. These two settings give six
+      # tries with 4, 8, 16, 32 and 64 seconds between them: the waits add up to 124 seconds for
+      # each fetch, with the time of the requests on top. A refusal that stops within about two
+      # minutes for each fetch is survived; a nested lookup (a module whose parent file is refused
+      # as well) can wait about twice that. A longer refusal is not survived: a refused module file
+      # ends the build with the refusal in its output, which the build steps below try once more,
+      # but a refused jar does not disable the repository, so a long refusal of jars ends at the
+      # limit of the step that builds, with no refusal line.
+      #
+      # The resolver (`ErrorHandlingModuleComponentRepository`) takes the settings as system
+      # properties with `Integer.getInteger`, so the properties file needs the `systemProp.` prefix,
+      # and a name without it is a project property that Gradle never reads. They are Gradle's
+      # internal names, not a documented interface, and a wrapper version that drops or renames them
+      # would leave the defaults in force without a word. So the step fails when the wrapper names
+      # another distribution than the version whose source the names were read from (`gradle_version`
+      # below); whoever changes the wrapper's version reads the resolver's source for the new version,
+      # confirms that both names are still the ones it reads, and then changes `gradle_version`. The
+      # step also runs an empty build, a process of its own and not the builds' daemon, with an init
+      # script that prints what that process holds, and fails when it is not what was written. Each
+      # name is typed once, so a misspelling cannot stand in both the file and the check; the check
+      # shows that the values reach Gradle's process, and only the source read shows that Gradle
+      # reads the names. The settings are written to the user's Gradle home, which a developer's
+      # machine does not share.
       - name: Let Gradle wait longer between its fetch tries
         timeout-minutes: 5
         run: |
+          android=apps/companion/src-tauri/gen/android
+          gradle_version=8.14.3
+          distribution="$(grep '^distributionUrl=' "$android/gradle/wrapper/gradle-wrapper.properties" || true)"
+          case "$distribution" in
+            *"/gradle-$gradle_version-"*) echo "the wrapper names Gradle $gradle_version, the version whose resolver source the settings were read from" ;;
+            *)
+              echo "::error::the wrapper names '$distribution', not Gradle $gradle_version: read the resolver's source for the new version, confirm both setting names, then change gradle_version in this step"
+              exit 1
+              ;;
+          esac
+          tries_name=org.gradle.internal.repository.max.tentatives
+          wait_name=org.gradle.internal.repository.initial.backoff
           tries=6
           first_wait=4000
           gradle_home="${GRADLE_USER_HOME:-$HOME/.gradle}"
           mkdir -p "$gradle_home"
           {
-            echo "systemProp.org.gradle.internal.repository.max.tentatives=$tries"
-            echo "systemProp.org.gradle.internal.repository.initial.backoff=$first_wait"
+            echo "systemProp.$tries_name=$tries"
+            echo "systemProp.$wait_name=$first_wait"
           } >> "$gradle_home/gradle.properties"
           probe="$RUNNER_TEMP/gradle-probe"
           mkdir -p "$probe"
           echo "rootProject.name = 'probe'" > "$probe/settings.gradle"
-          cat > "$probe/print-fetch-settings.init.gradle" <<'EOF'
-          println "gradle took: tries=" + System.getProperty("org.gradle.internal.repository.max.tentatives") + " first wait=" + System.getProperty("org.gradle.internal.repository.initial.backoff") + " ms"
+          cat > "$probe/print-fetch-settings.init.gradle" <<EOF
+          println "gradle took: tries=" + System.getProperty("$tries_name") + " first wait=" + System.getProperty("$wait_name") + " ms"
           EOF
-          sh apps/companion/src-tauri/gen/android/gradlew -p "$probe" --no-daemon --console=plain \
+          sh "$android/gradlew" -p "$probe" --no-daemon --console=plain \
             -I "$probe/print-fetch-settings.init.gradle" help > "$RUNNER_TEMP/gradle-probe.log" 2>&1 || {
             cat "$RUNNER_TEMP/gradle-probe.log"
             exit 1
