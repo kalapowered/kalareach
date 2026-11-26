@@ -1,6 +1,6 @@
 //! Trees for the guest cases of the lifecycle. [`FixtureTrees`] is a fixed tree: one project, one
-//! whole-tree lock, no held directories. [`HeldTrees`] holds the project the request names, admits
-//! it and takes its slot in the real table. Both stand in for the tree's grant and its release, so
+//! whole-tree lock, no held directories. [`HeldTrees`] holds the project the request names, takes
+//! its slot in the real table and admits it. Both stand in for the tree's grant and its release, so
 //! that the phases and the ending function run for real on a machine before those modules exist. No
 //! production path uses them: they are built only with the `testing` feature.
 
@@ -299,10 +299,11 @@ impl Trees for FixtureTrees {
     }
 }
 
-/// The projects as the broker serves them: the directory the request names is held, admitted
-/// against the boundary accounts and given its slot in the real table, so a request for a tree
-/// that an earlier end left closed is refused as the broker refuses it. The grant, the end check
-/// and the release do nothing: a case reads what the hold, the admission and the slot do.
+/// The projects as the broker serves them: the directory the request names is held, given its slot
+/// in the real table and then admitted against the boundary accounts (a refusal frees the slot), so
+/// a request for a tree that an earlier end left closed is refused as the broker refuses it. The
+/// grant, the end check and the release do nothing: a case reads what the hold, the admission and
+/// the slot do.
 pub struct HeldTrees {
     slots: SlotTable,
     probes: Probes,
@@ -392,8 +393,14 @@ impl Trees for HeldTrees {
         client: &ClientIdentity,
     ) -> Result<(Box<dyn TreeHold>, Box<dyn Slot>), Refusal> {
         let hold = hold_tree(&request.directory, client)?;
-        admit(&hold, client, &self.probes)?;
+        // The slot comes before the admission: a tree that an invocation holds, or that an uncertain
+        // end left closed, is "busy" or "left over" whatever its lists say now, and a request that
+        // waits on it walks nothing that the invocation is changing. A refusal frees the slot.
         let guard = self.slots.try_acquire(&hold.identity)?;
+        if let Err(refusal) = admit(&hold, client, &self.probes) {
+            guard.free_after_clean_release();
+            return Err(refusal);
+        }
         Ok((
             Box::new(HeldTree {
                 hold,

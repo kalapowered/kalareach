@@ -37,7 +37,7 @@ use kr_boundary_windows::frame::invocation::{
     read_reply,
 };
 use kr_boundary_windows::lifecycle::{Session, UNCERTAIN_END_WORDS};
-use kr_boundary_windows::win::admission::{RULE_SIBLING, admit};
+use kr_boundary_windows::win::admission::{RULE_SIBLING, STALE_WORDS, admit};
 use kr_boundary_windows::win::boot::BootMarker;
 use kr_boundary_windows::win::client::ClientIdentity;
 use kr_boundary_windows::win::ffi::{Handle, Sid, system_windows_directory, wide};
@@ -390,19 +390,9 @@ fn copy_of_the_token() -> Handle {
     Handle::new(copy, "the held token").unwrap()
 }
 
-#[test]
-#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
-fn broker_sources_the_holder_of_a_kept_token_handle_blocks_the_next_admission_of_the_tree() {
-    if !runs_as_the_system() {
-        eprintln!("skipped: the case needs the system's token");
-        return;
-    }
-    prepare();
-    let person = Person::new("krhap");
-    let siblings = Siblings::new();
-    let home = Scratch::new();
-    let scratch = Scratch::on_drive();
-    let project = Project::make_private(&scratch, "kept", &person.sid);
+/// The broker's environment over the held trees: the project that a request names is held, given
+/// its slot and admitted, and the invocation runs the stand-in that exits at once.
+fn held_environment(home: &Scratch, siblings: &Siblings) -> Arc<Environment> {
     let account = siblings.checkout.name.clone();
     let trees = HeldTrees::new(siblings.probes(), stand_in_plan(&home.dir, &["exit", "0"]));
     let mut env = Environment::new(
@@ -419,7 +409,76 @@ fn broker_sources_the_holder_of_a_kept_token_handle_blocks_the_next_admission_of
         },
     );
     env.bounds.session = Duration::from_secs(2);
-    let env = Arc::new(env);
+    Arc::new(env)
+}
+
+/// Puts the entry of a group that this broker made on a file of the project, as the grant of an
+/// invocation that did not end well leaves it.
+fn leave_a_group_entry(project: &Project) -> PathBuf {
+    let left = project.root.join("left.txt");
+    std::fs::write(&left, b"x").unwrap();
+    let group = kr_boundary_windows::win::token::new_invocation_group()
+        .to_text()
+        .unwrap();
+    grant(&left, &format!("*{group}"), "(W)");
+    left
+}
+
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn broker_sources_a_request_that_the_admission_refuses_leaves_the_slot_open_for_the_next() {
+    if !runs_as_the_system() {
+        eprintln!("skipped: the case needs the system's token");
+        return;
+    }
+    prepare();
+    let person = Person::new("krhap");
+    let siblings = Siblings::new();
+    let home = Scratch::new();
+    let scratch = Scratch::on_drive();
+    let project = Project::make_private(&scratch, "refused", &person.sid);
+    let env = held_environment(&home, &siblings);
+
+    // A group entry on a file of the project: the admission refuses the tree.
+    let left = leave_a_group_entry(&project);
+    let first = run_one(&env, client_of(&person), &project.root);
+    assert!(
+        matches!(
+            first.last(),
+            Some(InvocationReply::Refused { detail, .. }) if detail.starts_with(STALE_WORDS)
+        ),
+        "{first:?}"
+    );
+
+    // The refusal gave the slot back: with the file gone, the next request runs and ends clean.
+    std::fs::remove_file(&left).unwrap();
+    let next = run_one(&env, client_of(&person), &project.root);
+    assert!(
+        matches!(
+            next.last(),
+            Some(InvocationReply::Finished {
+                cleanup: Cleanup::Clean,
+                ..
+            })
+        ),
+        "{next:?}"
+    );
+}
+
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn broker_sources_the_holder_of_a_kept_token_handle_blocks_the_next_admission_of_the_tree() {
+    if !runs_as_the_system() {
+        eprintln!("skipped: the case needs the system's token");
+        return;
+    }
+    prepare();
+    let person = Person::new("krhap");
+    let siblings = Siblings::new();
+    let home = Scratch::new();
+    let scratch = Scratch::on_drive();
+    let project = Project::make_private(&scratch, "kept", &person.sid);
+    let env = held_environment(&home, &siblings);
 
     // The invocation ends while a copy of its token is held: the session lives, so the end is not
     // proved.
@@ -444,7 +503,11 @@ fn broker_sources_the_holder_of_a_kept_token_handle_blocks_the_next_admission_of
         "the session {luid} lives while the copy of the token is held"
     );
 
-    // The next request for the tree is held and admitted as any, and is refused at the slot.
+    // The grant of an invocation that did not end well leaves its group's entry on the tree.
+    leave_a_group_entry(&project);
+
+    // The next request for the tree is held and takes its slot before it is admitted, so the tree
+    // reads as left unfinished and not as one with a stale entry.
     let again = run_one(&env, client_of(&person), &project.root);
     assert!(
         matches!(
