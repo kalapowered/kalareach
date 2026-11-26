@@ -18,8 +18,9 @@ use std::path::Path;
 
 use kr_controller::service::Clocks;
 use kr_crypto::keys::DeviceKeys;
+use kr_protocol::invitation::InviteGrantKind;
 use kr_protocol::rights::ActionRight;
-use net_support::{Device, Host, pair_with, proposal};
+use net_support::{Device, Host, pair_with, pairing, proposal};
 
 /// The rows of `boots`, in the order of their ordinals: the ordinal, the high and the spoiled flag.
 fn boots(path: &Path) -> Vec<(i64, i64, i64)> {
@@ -343,6 +344,99 @@ async fn a_pairing_takes_the_point_of_its_commit_and_the_next_start_gives_a_gran
     assert!(
         again.2 >= first.2,
         "read later: {again:?} against {first:?}"
+    );
+    host.stop().await;
+}
+
+/// The rows a pairing writes together, counted: the devices, the commitments, the events and the
+/// start points.
+fn pairing_rows(path: &Path) -> (i64, i64, i64, i64) {
+    let connection = rusqlite::Connection::open(path).expect("the registry opens");
+    let count = |table: &str| -> i64 {
+        connection
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .expect("a count")
+    };
+    (
+        count("network_devices"),
+        count("pairing_commitments"),
+        count("pairing_events"),
+        count("grant_starts"),
+    )
+}
+
+/// The fault between the device's row and its point: a point that cannot be written takes
+/// the pairing with it, so no device, commitment or event is recorded; with the fault gone another
+/// pairing commits and takes its point with them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_pairing_whose_point_cannot_be_written_records_no_device() {
+    let owner = DeviceKeys::generate().expect("keys");
+    let host = Host::start(&owner).await;
+    let device = Device::create().await;
+    let signer = pairing::Signer::OwnerDevice(&owner);
+    let mut client = host.client().await;
+    let invited = pairing::invite_direct(
+        host.environment_id,
+        &mut client,
+        InviteGrantKind::SessionInvitation,
+        &proposal(&[ActionRight::SessionView]),
+        &signer,
+    )
+    .await
+    .expect("an invitation");
+    let (connection, _candidate, _verification_value) =
+        pairing::redeem(&device.candidate(), &invited).await;
+    pairing::owner_status(&mut client, invited.invitation_id)
+        .await
+        .expect("the owner's view");
+    let path = host.registry_database();
+    let before = pairing_rows(&path);
+    rusqlite::Connection::open(&path)
+        .expect("the registry opens")
+        .execute_batch(
+            "CREATE TRIGGER a_fault BEFORE INSERT ON grant_starts
+             BEGIN SELECT RAISE(ABORT, 'a fault at the point'); END;",
+        )
+        .expect("the fault is set");
+    let refused = pairing::confirm_candidate(
+        host.environment_id,
+        &mut client,
+        invited.invitation_id,
+        &signer,
+    )
+    .await;
+    assert!(refused.is_err(), "the pairing fails with its point");
+    assert_eq!(
+        pairing_rows(&path),
+        before,
+        "neither the device, nor its commitment, nor its event, nor its point stands"
+    );
+
+    // The pairing store is fenced by its failed write until the daemon starts again, so the control
+    // is a pairing after a restart, with the fault gone and nothing else changed.
+    connection.close(0u32.into(), b"refused");
+    rusqlite::Connection::open(&path)
+        .expect("the registry opens")
+        .execute_batch("DROP TRIGGER a_fault")
+        .expect("the fault is gone");
+    let host = host.restart().await;
+    let paired = pair_with(
+        &host,
+        &Device::create().await,
+        &owner,
+        proposal(&[ActionRight::SessionView]),
+    )
+    .await;
+    assert!(
+        point_of(&path, paired.grant.grant_id.get().as_bytes().as_slice()).is_some(),
+        "the control's pairing took its point"
+    );
+    assert_eq!(
+        pairing_rows(&path),
+        (before.0 + 1, before.1 + 1, before.2 + 1, before.3 + 1),
+        "the device, its commitment, its event and its point are written together"
     );
     host.stop().await;
 }
