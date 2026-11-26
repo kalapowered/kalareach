@@ -1640,8 +1640,8 @@ impl Session {
             })?;
         let left = format!("the teardown left {}", typing.describe());
         if let Some(line) = dialect(self.package_kind).kept_interrupt_line {
-            // A return runs whatever is on the line, so it is only an empty line's when the line
-            // is empty.
+            // The return behind the line for a kept interrupt runs whatever the line already
+            // holds, so it spends the interrupt and does nothing else only when the line is empty.
             if !typing.buffer_empty {
                 return Err(format!(
                     "the teardown left text on the line, so a return would run it and no command \
@@ -2224,13 +2224,23 @@ impl Session {
     ///
     /// # Errors
     ///
-    /// Returns the terminal's output when the shell does not answer the command that makes the
-    /// prompt the fence is about, which is a shell that has stopped reading.
+    /// Returns why the reader did not come back from the line for a kept interrupt (see
+    /// [`Session::recover_or_why`]), or the terminal's output when the shell does not answer the
+    /// command that makes the prompt the fence is about, which is a shell that has stopped reading.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the reader does not give a fence for the prompt that command makes, as
+    /// [`Session::fenced_latest`] does.
     pub fn fenced_after_a_command_or_the_screen(
         &mut self,
         index: u8,
     ) -> Result<(RootEditorEnterParams, EditorFence), String> {
-        self.recover();
+        self.recover_or_why()?;
+        // The pump in `forget_events` gives the shell 200 ms before the proof command, so it could
+        // hide a wait for the reader's return that ended early. The byte of the command does not
+        // rest on it: the line for a kept interrupt stands ahead of the command in the terminal's
+        // queue. It stays because it is the boundary every caller of the fence draws.
         self.forget_events();
         if !self.answered("kr-fence-ready") {
             return Err(self.terminal_output());
@@ -2519,10 +2529,22 @@ impl Session {
     ///
     /// Panics when the shell keeps interrupts and no reader came back from that line.
     pub fn recover(&mut self) {
+        if let Err(why) = self.recover_or_why() {
+            panic!("{why}");
+        }
+    }
+
+    /// [`Session::recover`], giving back why the reader did not come back from the line for a kept
+    /// interrupt, for a case that decides on the outcome itself.
+    ///
+    /// # Errors
+    ///
+    /// Returns what [`Session::spent_a_kept_interrupt_or_why`] returns.
+    pub fn recover_or_why(&mut self) -> Result<(), String> {
         for bytes in self.recovery_keys().iter().copied() {
             self.type_bytes(bytes);
         }
-        self.spend_a_kept_interrupt();
+        self.spent_a_kept_interrupt_or_why()
     }
 
     /// Gives an interrupt the shell may be keeping a line to be spent on, and returns once the
@@ -2537,16 +2559,29 @@ impl Session {
     ///
     /// Panics when the reader did not come back from the line, naming what the terminal showed.
     pub fn spend_a_kept_interrupt(&mut self) {
+        if let Err(why) = self.spent_a_kept_interrupt_or_why() {
+            panic!("{why}");
+        }
+    }
+
+    /// [`Session::spend_a_kept_interrupt`], giving back why the reader did not come back from the
+    /// line, for a case that decides on the outcome itself.
+    ///
+    /// # Errors
+    ///
+    /// Returns that the reader did not come back from the line, with which of the two the reader
+    /// never reported and what the terminal showed.
+    pub fn spent_a_kept_interrupt_or_why(&mut self) -> Result<(), String> {
         let Some(line) = dialect(self.package_kind).kept_interrupt_line else {
-            return;
+            return Ok(());
         };
-        if let Err(why) = self.give_a_kept_interrupt_a_line(line) {
-            panic!(
+        self.give_a_kept_interrupt_a_line(line).map_err(|why| {
+            format!(
                 "the line for a kept interrupt did not come back to a reader after an interrupt: \
                  {why}:\n{}",
                 self.terminal_output()
-            );
-        }
+            )
+        })
     }
 
     /// The keys [`Session::recover`] types, in the order it types them.
