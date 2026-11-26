@@ -3070,7 +3070,7 @@ async fn a_restore_with_only_the_kit_reaches_the_archive_and_trusts_only_the_bun
     let reader = ArchiveReader::Recovery(&recovery);
     let expectation = ArchiveExpectation {
         archive_id: archive_id(),
-        generation: material.checkpoint(archive_id()).map_or(
+        generation: the_checkpoint(&material, archive_id()).map_or(
             GenerationExpectation::Unverified,
             |checkpoint| GenerationExpectation::Checkpoint {
                 checkpoint,
@@ -3111,14 +3111,13 @@ async fn a_restore_with_only_the_kit_reaches_the_archive_and_trusts_only_the_bun
     // it still cannot claim that no newer archive exists.
     let standing = RestoreGeneration::against(
         &descriptor,
-        material
-            .checkpoint(archive_id())
-            .map_or(GenerationExpectation::Unverified, |checkpoint| {
-                GenerationExpectation::Checkpoint {
-                    checkpoint,
-                    source: CheckpointSource::RecoveryBundle,
-                }
-            }),
+        the_checkpoint(&material, archive_id()).map_or(
+            GenerationExpectation::Unverified,
+            |checkpoint| GenerationExpectation::Checkpoint {
+                checkpoint,
+                source: CheckpointSource::RecoveryBundle,
+            },
+        ),
     );
     assert!(standing.describe().contains("generation 4"));
     assert!(!standing.proves_no_newer_archive());
@@ -4826,17 +4825,23 @@ fn a_checkpoint_the_bundle_carries_is_the_one_a_restore_compares_against() {
         device_settings: None,
     };
     assert_eq!(
-        material
-            .checkpoint(archive_id())
+        the_checkpoint(&material, archive_id())
             .expect("a checkpoint")
             .backup_generation,
         BackupGeneration::new(9)
     );
-    assert!(
-        material
-            .checkpoint(ArchiveId::new(Uuid::from_bytes([0x99; 16])))
-            .is_none()
-    );
+    assert!(the_checkpoint(&material, ArchiveId::new(Uuid::from_bytes([0x99; 16]))).is_none());
+}
+
+/// The checkpoint of the highest generation the bundle holds for an archive. The bundles of these
+/// cases hold one for each generation.
+fn the_checkpoint(
+    material: &kr_client::recovery::TrustedMaterial,
+    archive: ArchiveId,
+) -> Option<&ArchiveCheckpoint> {
+    material
+        .checkpoints_for(archive)
+        .max_by_key(|checkpoint| checkpoint.backup_generation)
 }
 
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {

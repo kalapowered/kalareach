@@ -176,17 +176,15 @@ impl TrustedMaterial {
             .find(|producer| producer.sender_key_id == sender_key_id)
     }
 
-    /// Returns the checkpoint for one archive, when the bundle carries one: the highest generation,
-    /// when it carries more than one.
-    #[must_use]
-    pub fn checkpoint(
+    /// Returns every checkpoint the bundle carries for one archive. It usually carries one; where it
+    /// carries more, no one of them is the checkpoint until a restore has weighed them all.
+    pub fn checkpoints_for(
         &self,
         archive_id: kr_protocol::ids::ArchiveId,
-    ) -> Option<&ArchiveCheckpoint> {
+    ) -> impl Iterator<Item = &ArchiveCheckpoint> {
         self.checkpoints
             .iter()
-            .filter(|checkpoint| checkpoint.archive_id == archive_id)
-            .max_by_key(|checkpoint| checkpoint.backup_generation)
+            .filter(move |checkpoint| checkpoint.archive_id == archive_id)
     }
 }
 

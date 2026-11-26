@@ -533,6 +533,21 @@ pub enum RestoreError {
         /// The first eight hexadecimal digits of the manifest hash the bundle holds.
         bundle: Shown,
     },
+    /// The bundle holds two checkpoints for one generation that name different manifests, so
+    /// neither can be trusted for it.
+    #[error(
+        "the recovery bundle holds two checkpoints for generation {generation} that name different \
+         manifests ({first} and {second}); the restore cannot tell which is the archive that was \
+         published"
+    )]
+    BundleCheckpointsDisagree {
+        /// The generation both name.
+        generation: u64,
+        /// The first eight hexadecimal digits of the manifest hash that sorts first.
+        first: Shown,
+        /// The first eight hexadecimal digits of the manifest hash that sorts second.
+        second: Shown,
+    },
     /// The service holds no generation of the archive at all.
     #[error("the service holds no generation of that archive")]
     NoGeneration,
@@ -716,6 +731,12 @@ pub enum CandidateState {
     /// The checkpoint kept from a paired host and the bundle's name different manifests for the
     /// generation the service holds.
     CheckpointsDisagree {
+        /// The generation both name.
+        generation: BackupGeneration,
+    },
+    /// The bundle holds two checkpoints that name different manifests for the generation the
+    /// service holds.
+    BundleCheckpointsDisagree {
         /// The generation both name.
         generation: BackupGeneration,
     },
@@ -1933,9 +1954,12 @@ async fn candidates(
                     published_at_ms: publication.payload.published_at_ms,
                     writer: publication.payload.writer_key_id,
                 }),
-                Err(Refused::Disagree(disagreement)) => CandidateState::CheckpointsDisagree {
-                    generation: disagreement.generation,
-                },
+                Err(Refused::Disagree(Disagreement::BundleAndHost { generation, .. })) => {
+                    CandidateState::CheckpointsDisagree { generation }
+                }
+                Err(Refused::Disagree(Disagreement::TwoInBundle { generation, .. })) => {
+                    CandidateState::BundleCheckpointsDisagree { generation }
+                }
                 Err(Refused::Publication(PublicationRefusal::Generation(
                     RestoreGeneration {
                         standing: GenerationStanding::Replayed { checkpoint },
@@ -2028,16 +2052,12 @@ fn verify_publication(
         .map_err(|_| PublicationRefusal::BadSignature)?;
     kr_crypto::sign::verify(&writer.signing_key, &transcript, &publication.signature)
         .map_err(|_| PublicationRefusal::BadSignature)?;
-    // Where the two checkpoints name one generation with different manifests, neither can be trusted
-    // for that generation, whatever the publication says: only it is refused.
-    if let Floor::Disagree { bundle, paired } = floor
-        && payload.descriptor.backup_generation == bundle.backup_generation
+    // Where two checkpoints name one generation with different manifests, neither can be trusted for
+    // that generation, whatever the publication says: only it is refused.
+    if let Floor::Disagree { held, disagreement } = floor
+        && payload.descriptor.backup_generation == held.backup_generation
     {
-        return Err(Refused::Disagree(Disagreement {
-            generation: bundle.backup_generation,
-            paired: paired.encrypted_manifest_hash,
-            bundle: bundle.encrypted_manifest_hash,
-        }));
+        return Err(Refused::Disagree(*disagreement));
     }
     let standing = RestoreGeneration::against(&payload.descriptor, floor.expectation(accepted));
     if !standing.is_admissible() {
@@ -2066,28 +2086,70 @@ impl From<PublicationRefusal> for Refused {
 }
 
 /// Two checkpoints that name different manifests for one generation of one archive.
-struct Disagreement {
-    generation: BackupGeneration,
-    paired: Digest256,
-    bundle: Digest256,
+#[derive(Clone, Copy)]
+enum Disagreement {
+    /// The bundle's checkpoint and the one a paired host gave.
+    BundleAndHost {
+        generation: BackupGeneration,
+        paired: Digest256,
+        bundle: Digest256,
+    },
+    /// Two checkpoints the bundle itself holds.
+    TwoInBundle {
+        generation: BackupGeneration,
+        first: Digest256,
+        second: Digest256,
+    },
 }
 
-impl From<Disagreement> for RestoreError {
-    fn from(disagreement: Disagreement) -> Self {
-        Self::PairingCheckpointDisagrees {
-            generation: disagreement.generation.get(),
-            paired: Shown::manifest_digits(&disagreement.paired),
-            bundle: Shown::manifest_digits(&disagreement.bundle),
+impl Disagreement {
+    /// Two of the bundle's own checkpoints, named in the order of their hashes so that the order the
+    /// bundle lists them in decides nothing.
+    fn in_bundle(generation: BackupGeneration, one: Digest256, other: Digest256) -> Self {
+        let (first, second) = if one.as_bytes() <= other.as_bytes() {
+            (one, other)
+        } else {
+            (other, one)
+        };
+        Self::TwoInBundle {
+            generation,
+            first,
+            second,
         }
     }
 }
 
-/// What a restore of one archive is held to, from the two places a checkpoint is kept.
+impl From<Disagreement> for RestoreError {
+    fn from(disagreement: Disagreement) -> Self {
+        match disagreement {
+            Disagreement::BundleAndHost {
+                generation,
+                paired,
+                bundle,
+            } => Self::PairingCheckpointDisagrees {
+                generation: generation.get(),
+                paired: Shown::manifest_digits(&paired),
+                bundle: Shown::manifest_digits(&bundle),
+            },
+            Disagreement::TwoInBundle {
+                generation,
+                first,
+                second,
+            } => Self::BundleCheckpointsDisagree {
+                generation: generation.get(),
+                first: Shown::manifest_digits(&first),
+                second: Shown::manifest_digits(&second),
+            },
+        }
+    }
+}
+
+/// What a restore of one archive is held to, from the places a checkpoint is kept.
 ///
 /// The recovery bundle holds a checkpoint for an archive, and the checkpoints the paired hosts gave
-/// this computer may hold another. The higher generation is the floor, with its source. The same
-/// generation with a different manifest in each is a disagreement, and neither is trusted for that
-/// generation.
+/// this computer may hold another. The higher generation is the floor, with its source. Two
+/// checkpoints at the floor's generation that name different manifests are a disagreement, whether
+/// both are the bundle's or one is a host's, and neither is trusted for that generation.
 enum Floor {
     /// No checkpoint is held for the archive.
     Unheld,
@@ -2096,56 +2158,80 @@ enum Floor {
         checkpoint: ArchiveCheckpoint,
         source: CheckpointSource,
     },
-    /// The two name different manifests for one generation.
+    /// Two checkpoints name different manifests for the floor's generation. `held` is the bundle's
+    /// checkpoint for it.
     Disagree {
-        bundle: ArchiveCheckpoint,
-        paired: ArchiveCheckpoint,
+        held: ArchiveCheckpoint,
+        disagreement: Disagreement,
     },
 }
 
 impl Floor {
-    /// The floor for `archive` at `origin`: the bundle's highest checkpoint for it, and the one in
-    /// `held` for it at that service.
+    /// The floor for `archive` at `origin`: the bundle's checkpoints for it, and the one in `held`
+    /// for it at that service.
     fn of(material: &TrustedMaterial, held: &Held, origin: &str, archive: ArchiveId) -> Self {
         let paired = paired_for(held, origin, archive).map(as_archive_checkpoint);
-        match (material.checkpoint(archive), paired) {
-            (None, None) => Self::Unheld,
-            (Some(bundle), None) => Self::One {
-                checkpoint: bundle.clone(),
+        let Some(top) = material
+            .checkpoints_for(archive)
+            .max_by_key(|checkpoint| checkpoint.backup_generation)
+        else {
+            return paired.map_or(Self::Unheld, |paired| Self::One {
+                checkpoint: paired,
+                source: CheckpointSource::Pairing,
+            });
+        };
+        // Another checkpoint of the bundle's own for the same generation that names another manifest:
+        // the bundle cannot say which was verified, and no one of the two is chosen for it.
+        let split = material.checkpoints_for(archive).find(|checkpoint| {
+            checkpoint.backup_generation == top.backup_generation
+                && checkpoint.encrypted_manifest_hash != top.encrypted_manifest_hash
+        });
+        let in_the_bundle = || match split {
+            Some(split) => Self::Disagree {
+                held: top.clone(),
+                disagreement: Disagreement::in_bundle(
+                    top.backup_generation,
+                    top.encrypted_manifest_hash,
+                    split.encrypted_manifest_hash,
+                ),
+            },
+            None => Self::One {
+                checkpoint: top.clone(),
                 source: CheckpointSource::RecoveryBundle,
             },
-            (None, Some(paired)) => Self::One {
+        };
+        let Some(paired) = paired else {
+            return in_the_bundle();
+        };
+        match Standing::of(
+            Some((top.backup_generation, &top.encrypted_manifest_hash)),
+            (paired.backup_generation, &paired.encrypted_manifest_hash),
+        ) {
+            Standing::Raises => Self::One {
                 checkpoint: paired,
                 source: CheckpointSource::Pairing,
             },
-            (Some(bundle), Some(paired)) => match Standing::of(
-                Some((bundle.backup_generation, &bundle.encrypted_manifest_hash)),
-                (paired.backup_generation, &paired.encrypted_manifest_hash),
-            ) {
-                Standing::Raises => Self::One {
-                    checkpoint: paired,
-                    source: CheckpointSource::Pairing,
-                },
-                Standing::Same | Standing::Lower => Self::One {
-                    checkpoint: bundle.clone(),
-                    source: CheckpointSource::RecoveryBundle,
-                },
-                Standing::Disagrees => Self::Disagree {
-                    bundle: bundle.clone(),
-                    paired,
+            Standing::Same | Standing::Lower => in_the_bundle(),
+            Standing::Disagrees if split.is_some() => in_the_bundle(),
+            Standing::Disagrees => Self::Disagree {
+                held: top.clone(),
+                disagreement: Disagreement::BundleAndHost {
+                    generation: top.backup_generation,
+                    paired: paired.encrypted_manifest_hash,
+                    bundle: top.encrypted_manifest_hash,
                 },
             },
         }
     }
 
-    /// The checkpoint a generation is compared with and where it came from. Where the two
-    /// disagree, both name one generation, so a generation other than that one stands against it
-    /// as against either, and the bundle's is the one named.
+    /// The checkpoint a generation is compared with and where it came from. Where two disagree, both
+    /// name one generation, so a generation other than that one stands against it as against either,
+    /// and the bundle's is the one named.
     fn holding(&self) -> Option<(&ArchiveCheckpoint, CheckpointSource)> {
         match self {
             Self::Unheld => None,
             Self::One { checkpoint, source } => Some((checkpoint, *source)),
-            Self::Disagree { bundle, .. } => Some((bundle, CheckpointSource::RecoveryBundle)),
+            Self::Disagree { held, .. } => Some((held, CheckpointSource::RecoveryBundle)),
         }
     }
 

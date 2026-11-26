@@ -42,8 +42,8 @@ use std::sync::{Arc, Mutex, PoisonError};
 use kr_client::Shown;
 use kr_client::pairing::checkpoint::{Held, PairedCheckpoints, SnapshotCause};
 use kr_client::recovery::{
-    AccountSource, BundleStore, CandidateState, FilesRestore, HostBackups, HostCover, Left,
-    LocalSettings, LostWrite, RecoveryError, RestoreError, RestoreSource, cover_host_archive,
+    AccountSource, BundleStore, Candidate, CandidateState, FilesRestore, HostBackups, HostCover,
+    Left, LocalSettings, LostWrite, RecoveryError, RestoreError, RestoreSource, cover_host_archive,
     fresh_locator, qr_payload, render_kit,
 };
 use kr_client::services::account::{
@@ -218,6 +218,9 @@ pub enum WithheldView {
     /// The checkpoint kept from a paired host and the recovery bundle's name different manifests
     /// for the generation the service holds.
     Disagree,
+    /// The recovery bundle holds two checkpoints that name different manifests for the generation
+    /// the service holds.
+    BundleDisagree,
 }
 
 /// Where a checkpoint came from, as the page is told.
@@ -836,40 +839,7 @@ impl Recovery {
         let listed = FilesRestore::archives(self.kit_of(&record)?, source, &held)
             .await
             .map_err(said_by_restore)?;
-        Ok(listed
-            .into_iter()
-            .map(|candidate| match candidate.newest {
-                CandidateState::Newest(newest) => ArchiveView {
-                    archive_id: candidate.archive_id.to_string(),
-                    generation: Some(newest.generation.get()),
-                    published_at_ms: Some(newest.published_at_ms.get()),
-                    withheld: None,
-                    held_generation: None,
-                    checkpoint_generation: None,
-                    checkpoint_source: None,
-                },
-                CandidateState::Nothing => {
-                    ArchiveView::withheld(candidate.archive_id, WithheldView::Nothing)
-                }
-                CandidateState::Refused(_) => {
-                    ArchiveView::withheld(candidate.archive_id, WithheldView::Refused)
-                }
-                CandidateState::HeldBack {
-                    held,
-                    checkpoint,
-                    source,
-                } => ArchiveView {
-                    held_generation: Some(held.get()),
-                    checkpoint_generation: Some(checkpoint.get()),
-                    checkpoint_source: Some(source.into()),
-                    ..ArchiveView::withheld(candidate.archive_id, WithheldView::HeldBack)
-                },
-                CandidateState::CheckpointsDisagree { generation } => ArchiveView {
-                    checkpoint_generation: Some(generation.get()),
-                    ..ArchiveView::withheld(candidate.archive_id, WithheldView::Disagree)
-                },
-            })
-            .collect())
+        Ok(listed.into_iter().map(archive_view).collect())
     }
 
     /// Writes an offline export to `destination`: the recovery bundle as the service holds it and,
@@ -1371,6 +1341,45 @@ fn said(error: RecoveryError) -> CommandError {
     }
 }
 
+/// One archive of the list, as the page is told of it.
+fn archive_view(candidate: Candidate) -> ArchiveView {
+    match candidate.newest {
+        CandidateState::Newest(newest) => ArchiveView {
+            archive_id: candidate.archive_id.to_string(),
+            generation: Some(newest.generation.get()),
+            published_at_ms: Some(newest.published_at_ms.get()),
+            withheld: None,
+            held_generation: None,
+            checkpoint_generation: None,
+            checkpoint_source: None,
+        },
+        CandidateState::Nothing => {
+            ArchiveView::withheld(candidate.archive_id, WithheldView::Nothing)
+        }
+        CandidateState::Refused(_) => {
+            ArchiveView::withheld(candidate.archive_id, WithheldView::Refused)
+        }
+        CandidateState::HeldBack {
+            held,
+            checkpoint,
+            source,
+        } => ArchiveView {
+            held_generation: Some(held.get()),
+            checkpoint_generation: Some(checkpoint.get()),
+            checkpoint_source: Some(source.into()),
+            ..ArchiveView::withheld(candidate.archive_id, WithheldView::HeldBack)
+        },
+        CandidateState::CheckpointsDisagree { generation } => ArchiveView {
+            checkpoint_generation: Some(generation.get()),
+            ..ArchiveView::withheld(candidate.archive_id, WithheldView::Disagree)
+        },
+        CandidateState::BundleCheckpointsDisagree { generation } => ArchiveView {
+            checkpoint_generation: Some(generation.get()),
+            ..ArchiveView::withheld(candidate.archive_id, WithheldView::BundleDisagree)
+        },
+    }
+}
+
 /// What a restore's failure is to the person: the service's own when it was the service, and words
 /// of this program's otherwise.
 fn said_by_restore(error: RestoreError) -> CommandError {
@@ -1389,6 +1398,13 @@ fn said_by_restore(error: RestoreError) -> CommandError {
                  disagree; a newer generation is not affected. Removing `checkpoints.json` leaves \
                  the recovery bundle's checkpoint alone to decide, and removes what this device \
                  recorded of each host's answer."
+            ))
+        }
+        two @ RestoreError::BundleCheckpointsDisagree { generation, .. } => {
+            CommandError::refused(format!(
+                "{two}. Both checkpoints are in the recovery bundle that this kit opens. Generation \
+                 {generation} of this archive stays refused while they differ; a newer generation \
+                 is not affected."
             ))
         }
         other => CommandError::refused(other.to_string()),
@@ -1522,4 +1538,59 @@ pub(crate) fn now() -> TimestampMs {
                 u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
             }),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use kr_client::recovery::PairingStanding;
+    use kr_protocol::ids::BackupGeneration;
+    use kr_protocol::scalars::{Digest256, Uuid};
+
+    use super::*;
+
+    fn listed(newest: CandidateState) -> ArchiveView {
+        archive_view(Candidate {
+            archive_id: ArchiveId::new(Uuid::from_bytes([7; 16])),
+            newest,
+            pairing: PairingStanding::None,
+        })
+    }
+
+    /// KR-REQ-20.12: two checkpoints in the bundle that name one generation differently are told to
+    /// the page as a state of their own, apart from a host's checkpoint and the bundle disagreeing.
+    #[test]
+    fn two_checkpoints_in_the_bundle_are_a_withheld_state_of_their_own() {
+        let in_bundle = listed(CandidateState::BundleCheckpointsDisagree {
+            generation: BackupGeneration::new(8),
+        });
+        assert_eq!(in_bundle.withheld, Some(WithheldView::BundleDisagree));
+        assert_eq!(in_bundle.checkpoint_generation, Some(8));
+        assert_eq!(in_bundle.generation, None);
+        assert_eq!(in_bundle.checkpoint_source, None);
+
+        let with_a_host = listed(CandidateState::CheckpointsDisagree {
+            generation: BackupGeneration::new(8),
+        });
+        assert_eq!(with_a_host.withheld, Some(WithheldView::Disagree));
+        assert_eq!(with_a_host.checkpoint_generation, Some(8));
+    }
+
+    /// KR-REQ-20.12: the refusal for two checkpoints in the bundle says where both are, and that only
+    /// that generation stays refused.
+    #[test]
+    fn the_refusal_for_two_checkpoints_in_the_bundle_says_where_they_are() {
+        let said = said_by_restore(RestoreError::BundleCheckpointsDisagree {
+            generation: 8,
+            first: Shown::manifest_digits(&Digest256::from_bytes([0x11; 32])),
+            second: Shown::manifest_digits(&Digest256::from_bytes([0x22; 32])),
+        });
+        assert_eq!(
+            said.message,
+            "the recovery bundle holds two checkpoints for generation 8 that name different \
+             manifests (11111111 and 22222222); the restore cannot tell which is the archive \
+             that was published. Both checkpoints are in the recovery bundle that this kit opens. \
+             Generation 8 of this archive stays refused while they differ; a newer generation is \
+             not affected."
+        );
+    }
 }

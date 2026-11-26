@@ -1046,12 +1046,38 @@ fn candidate_line(candidate: &Candidate) -> Shown {
             id,
             generation.get()
         ),
+        CandidateState::BundleCheckpointsDisagree { generation } => shown!(
+            "  {}: the recovery bundle holds two checkpoints that name different manifests for \
+             generation {}",
+            id,
+            generation.get()
+        ),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// KR-REQ-20.12: the list names an archive whose bundle holds two checkpoints for one generation
+    /// that name different manifests, and says it is the bundle that holds them.
+    #[test]
+    fn the_list_names_an_archive_whose_bundle_holds_two_checkpoints_for_one_generation() {
+        let line = candidate_line(&Candidate {
+            archive_id: ArchiveId::new(kr_protocol::scalars::Uuid::from_bytes([7; 16])),
+            newest: CandidateState::BundleCheckpointsDisagree {
+                generation: BackupGeneration::new(8),
+            },
+            pairing: kr_client::recovery::PairingStanding::None,
+        });
+        assert!(
+            line.to_string().ends_with(
+                ": the recovery bundle holds two checkpoints that name different manifests for \
+                 generation 8"
+            ),
+            "{line}"
+        );
+    }
 
     /// KR-REQ-20.17: a checkpoint written without the settings saved with the bundle says so after
     /// the line that says what the bundle records, and one written with them says nothing of the

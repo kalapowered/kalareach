@@ -221,6 +221,9 @@ export function describeArchive(archive: RecoveryArchive): string {
     if (archive.withheld === 'disagree' && archive.checkpoint_generation !== null) {
       return `${name}: the checkpoint this device kept when it paired and the recovery bundle name different backups for generation ${archive.checkpoint_generation}, so it is not offered.`
     }
+    if (archive.withheld === 'bundle_disagree' && archive.checkpoint_generation !== null) {
+      return `${name}: the recovery bundle holds two different backups for generation ${archive.checkpoint_generation}, so it is not offered.`
+    }
     return `${name}: the service holds no generation of it.`
   }
   const day = new Date(archive.published_at_ms).toISOString().slice(0, 10)

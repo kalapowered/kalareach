@@ -528,7 +528,8 @@ describe('recovery', () => {
         }),
         withheld('3', { withheld: 'disagree', checkpoint_generation: 7 }),
         withheld('4', { withheld: 'refused' }),
-        withheld('5', { withheld: 'nothing' })
+        withheld('5', { withheld: 'nothing' }),
+        withheld('6', { withheld: 'bundle_disagree', checkpoint_generation: 8 })
       ])
     })
     const recovery = await within(sheet).findByTestId('recovery')
@@ -548,7 +549,10 @@ describe('recovery', () => {
       'Archive 0a1b2c3d: what the service holds is not an archive this kit trusts.'
     )
     expect(copies).toHaveTextContent('Archive 0a1b2c3d: the service holds no generation of it.')
-    for (const suffix of ['1', '2', '3', '4', '5']) {
+    expect(copies).toHaveTextContent(
+      'Archive 0a1b2c3d: the recovery bundle holds two different backups for generation 8, so it is not offered.'
+    )
+    for (const suffix of ['1', '2', '3', '4', '5', '6']) {
       expect(
         within(recovery).getByTestId(`recovery-copy-0a1b2c3d-0000-4000-8000-00000000000${suffix}`),
         `an archive that is not offered has no copy (${suffix})`

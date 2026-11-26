@@ -3246,6 +3246,120 @@ async fn a_disagreement_between_the_two_checkpoints_refuses_only_the_generation_
     ));
 }
 
+/// The first eight hexadecimal digits of a manifest hash, as a refusal shows them.
+fn eight_digits(hash: Digest256) -> String {
+    hash.as_bytes()
+        .iter()
+        .take(4)
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>()
+}
+
+/// KR-REQ-20.12: where the bundle itself holds two checkpoints for its highest generation that name
+/// different manifests, that generation alone is refused, whichever manifest the service holds for
+/// it, and the order the bundle lists them in decides nothing.
+#[tokio::test]
+async fn two_bundle_checkpoints_for_one_generation_that_name_different_manifests_refuse_it() {
+    let world = World::new();
+    let members = honest_members();
+    let current = world.seal(5, &members);
+    let other = world.seal(5, &[("host/configuration.json", b"{}".to_vec())]);
+    let newer = world.seal(6, &members);
+    let older = world.seal(4, &members);
+    let bundle = || {
+        world.bundle(&Shape {
+            checkpoint: Some(checkpoint_of(&current)),
+            more_checkpoints: vec![checkpoint_of(&other)],
+            ..Shape::default()
+        })
+    };
+    let mut digits = [
+        eight_digits(checkpoint_of(&current).encrypted_manifest_hash),
+        eight_digits(checkpoint_of(&other).encrypted_manifest_hash),
+    ];
+    digits.sort();
+    let words = format!(
+        "the recovery bundle holds two checkpoints for generation 5 that name different manifests \
+         ({} and {}); the restore cannot tell which is the archive that was published",
+        digits[0], digits[1]
+    );
+
+    // Each manifest the two name, offered by the service for that generation, is refused, with and
+    // without a host's checkpoint that agrees with one of them.
+    for held in [Held::Absent, held_with(vec![given_by_a_host(&current)])] {
+        for served in [&current, &other] {
+            let source = Arc::new(Scripted::serving(&world, bundle()).publishing(served));
+            let Err(error) = restore_held(&world, &source, None, &held).await else {
+                panic!("the generation the bundle names twice is refused, whichever is served")
+            };
+            assert_eq!(error.to_string(), words);
+            assert_eq!(source.object_reads(), 0);
+        }
+    }
+
+    // A newer generation is ahead of both and restores; an older one is a replay.
+    let source = Arc::new(Scripted::serving(&world, bundle()).publishing(&newer));
+    assert!(
+        restore_held(&world, &source, None, &Held::Absent)
+            .await
+            .is_ok()
+    );
+    let source = Arc::new(
+        Scripted::serving(&world, bundle())
+            .publishing(&older)
+            .honouring_the_hold(),
+    );
+    let Err(error) = restore_held(&world, &source, None, &Held::Absent).await else {
+        panic!("an older generation is a replay")
+    };
+    assert!(matches!(
+        error,
+        RestoreError::OlderThanTheCheckpoint {
+            checkpoint: 5,
+            held: 4,
+            checkpoint_source: CheckpointSource::RecoveryBundle,
+            ..
+        }
+    ));
+
+    // A host's checkpoint above the two is the floor, and the two below it decide nothing.
+    let source = Arc::new(Scripted::serving(&world, bundle()).publishing(&newer));
+    let above = held_with(vec![given_by_a_host(&newer)]);
+    assert!(restore_held(&world, &source, None, &above).await.is_ok());
+
+    // The list marks the archive for the generation the two name, and not for a newer one.
+    let source = Arc::new(Scripted::serving(&world, bundle()).publishing(&current));
+    assert!(
+        list(&world, &source, &Held::Absent).await[0].newest
+            == CandidateState::BundleCheckpointsDisagree {
+                generation: BackupGeneration::new(5)
+            }
+    );
+    let source = Arc::new(Scripted::serving(&world, bundle()).publishing(&newer));
+    assert!(matches!(
+        list(&world, &source, &Held::Absent).await[0].newest,
+        CandidateState::Newest(_)
+    ));
+
+    // Another archive's checkpoint for the same generation is not a second one for this archive.
+    let source = Arc::new(
+        Scripted::serving(
+            &world,
+            world.bundle(&Shape {
+                checkpoint: Some(checkpoint_of(&current)),
+                more_checkpoints: vec![another_archive_at(5)],
+                ..Shape::default()
+            }),
+        )
+        .publishing(&current),
+    );
+    assert!(
+        restore_held(&world, &source, None, &Held::Absent)
+            .await
+            .is_ok()
+    );
+}
+
 /// KR-REQ-20.12: a file that cannot be read is a refusal before the service is asked, never an empty
 /// set; a restore of the bundle's settings and an export of the bundle alone are not held to it.
 #[tokio::test]
