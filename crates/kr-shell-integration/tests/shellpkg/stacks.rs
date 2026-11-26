@@ -2209,7 +2209,10 @@ impl Session {
     ///
     /// # Panics
     ///
-    /// Panics when the shell does not answer, which is a shell that has stopped reading.
+    /// Panics when the shell does not answer the command that makes the prompt, or when the
+    /// reader does not come back from the line for a kept interrupt (see
+    /// [`Session::recover_or_why`]). The first line of the message is the same for both, and the
+    /// second adds the words of that line ahead of the screen.
     pub fn fenced_after_a_command(&mut self, index: u8) -> (RootEditorEnterParams, EditorFence) {
         match self.fenced_after_a_command_or_the_screen(index) {
             Ok(fenced) => fenced,

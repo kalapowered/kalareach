@@ -7680,6 +7680,38 @@ fn is_in_a_control_group_that_schedules(
     })
 }
 
+/// Whether the kernel groups tasks by session, from the result of reading its switch.
+///
+/// A kernel built without the feature has no such file, and that alone reads as off. A file that
+/// cannot be read for another reason, or that holds anything but `0` or `1`, is not an answer:
+/// where the kernel might group by session, a pass would show nothing.
+fn autogroup_setting(read: std::io::Result<String>) -> Result<bool, String> {
+    let cannot_say = |why: String| {
+        format!(
+            "the premise of this case cannot be read back, so a pass would show nothing: {why}; \
+             the case needs to know whether the kernel groups tasks by session"
+        )
+    };
+    match read {
+        Ok(text) => match text.trim() {
+            "1" => Ok(true),
+            "0" => Ok(false),
+            other => Err(cannot_say(format!(
+                "the kernel's automatic grouping setting reads {other:?}, not 0 or 1"
+            ))),
+        },
+        Err(error) => {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                Ok(false)
+            } else {
+                Err(cannot_say(format!(
+                    "the kernel's automatic grouping setting could not be read: {error}"
+                )))
+            }
+        }
+    }
+}
+
 /// Why the premise of the slow-shell case does not hold for these readings, or `None` where it
 /// does.
 ///
@@ -7745,7 +7777,9 @@ fn why_the_premise_fails(
 /// run. It holds a task back only against the tasks of its own scheduling group, which is why the
 /// case reads the groups back too. The wait for the command that ends in the prompt wakes at the
 /// terminal's own write, through a doorbell that the thread reading the terminal rings after each
-/// read, so the shell is still between that write and its next read when the keys go in.
+/// read. That raises the chance that the shell is still between that write and its next read when
+/// the keys go in, and does not make it so: the scheduler may run the shell before the keys
+/// arrive.
 ///
 /// The case is a race, and it is red by likelihood and not by certainty: no form of the wait
 /// makes every round lose the byte, and the rate moves with the load of the machine, so a machine
@@ -7763,20 +7797,23 @@ fn why_the_premise_fails(
 ///
 /// The case asserts its premise, read back from the kernel for the shell and for this thread:
 /// both on the one processor and in one scheduling group, the shell in the idle class and this
-/// thread not. Where the shell cannot be put in the class, or the read-back differs, the case
+/// thread not. Where the shell cannot be put in the class, the kernel's automatic grouping
+/// setting cannot be read (only a missing file reads as off), or the read-back differs, the case
 /// fails with the premise's words, and does not pass. It writes one line with what it read to the
-/// process's own error stream, which a test that passes does not hold back, and prints in how
-/// many rounds the first reader event after the keys was an entry, without asserting the count:
-/// it counts the order in which events arrived, and does not show where the shell was when the
-/// keys went in. A round whose proof line does not run is followed by a second line that the shell
-/// must answer: a shell that answers it was reading, and the first line was cut or cancelled. It
-/// runs on Linux only, where the processor and the class can be set.
+/// process's own error stream, which a test that passes does not hold back, and one with the
+/// number of rounds in which the first reader event after the keys was an entry, without
+/// asserting the count: it counts the order in which events arrived, and does not show where the
+/// shell was when the keys went in. A round in which the recovery or the proof line does not
+/// complete is followed by a second line, and the failure reports what was observed: that the
+/// shell did or did not answer the second line within the whole window. It runs on Linux only,
+/// where the processor and the class can be set.
 ///
 /// # Panics
 ///
-/// Panics when the premise does not hold, when the shell does not answer the command that ends
-/// in the prompt the recovery keys are typed at, when it does not answer the line typed after
-/// them, and when it answers a line typed after that one but not the one before it.
+/// Panics when the premise does not hold or cannot be read back, when the shell does not answer
+/// the command that ends in the prompt the recovery keys are typed at, when the recovery or the
+/// line typed after its keys does not complete, and then says whether the shell answered a second
+/// line typed after it.
 #[cfg(target_os = "linux")]
 pub fn a_line_after_the_recovery_keys_keeps_its_first_byte_when_the_shell_is_slow_to_run(
     kind: ShellKind,
@@ -7875,8 +7912,10 @@ pub fn a_line_after_the_recovery_keys_keeps_its_first_byte_when_the_shell_is_slo
     session.forget_events();
     let shell_reads = kernel_says_of(&format!("/proc/{pid}"));
     let thread_reads = kernel_says_of("/proc/thread-self");
-    let autogroup = std::fs::read_to_string("/proc/sys/kernel/sched_autogroup_enabled")
-        .is_ok_and(|text| text.trim() == "1");
+    let autogroup = autogroup_setting(std::fs::read_to_string(
+        "/proc/sys/kernel/sched_autogroup_enabled",
+    ))
+    .unwrap_or_else(|words| panic!("{words}"));
     // One line of plain facts, written past the capture of a passing test so that a gate's log
     // shows what the premise read; it names no path.
     let _ = writeln!(
@@ -7913,24 +7952,26 @@ pub fn a_line_after_the_recovery_keys_keeps_its_first_byte_when_the_shell_is_slo
         let seen = session.commands.arrivals.len();
         // The recovery keys, and the line that proves the shell works typed behind them.
         let outcome = session.fenced_after_a_command_or_the_screen(30 + round);
-        if let Err(screen) = &outcome {
-            // The line did not run. A shell that answers a second line was reading all the time,
-            // so a wait that ran out and a shell that stopped are told apart from a line that
-            // was cut or cancelled.
-            let reading = session.answered("kr-after-the-line");
+        if outcome.is_err() {
+            // Either the recovery or the line behind its keys did not complete. A second line
+            // goes in, with the whole window to be answered in, so that the failure says what was
+            // observed after it: whether the shell answered the second line or not.
+            let second = print_assembled(kind, "kr-after-the-line");
+            let answered = session.run_by(&second, "kr-after-the-line", Deadline::after(REPLY));
             assert!(
-                reading,
-                "round {} of {ROUNDS}: the shell answered neither the line typed after the \
-                 recovery keys nor a second line typed after it, so it stopped reading; the \
-                 terminal showed:\n{screen}",
-                round + 1
+                answered,
+                "round {} of {ROUNDS}: the recovery or the line typed after its keys did not \
+                 complete, and the shell did not answer a second line within the wait after a \
+                 give-up; the terminal showed after that wait:\n{}",
+                round + 1,
+                session.terminal_output()
             );
         }
         assert!(
             outcome.is_ok(),
-            "round {} of {ROUNDS}: the line typed after the recovery keys did not run, and the \
-             shell answered a second line typed after it, so it was reading and the first line \
-             was cut or cancelled; the terminal showed:\n{}",
+            "round {} of {ROUNDS}: the recovery or the line typed after its keys did not \
+             complete, and the shell answered a second line typed after it; what the first \
+             failure reported:\n{}",
             round + 1,
             outcome.as_ref().err().map_or("", String::as_str)
         );
@@ -7944,7 +7985,10 @@ pub fn a_line_after_the_recovery_keys_keeps_its_first_byte_when_the_shell_is_slo
             held += 1;
         }
     }
-    eprintln!(
+    // Written past the capture of a passing test, like the premise line, so that a gate's log
+    // shows it.
+    let _ = writeln!(
+        std::io::stderr(),
         "rounds in which the first reader event after the recovery keys was an entry: \
          {held} of {ROUNDS}"
     );
@@ -7953,8 +7997,10 @@ pub fn a_line_after_the_recovery_keys_keeps_its_first_byte_when_the_shell_is_slo
 #[cfg(test)]
 mod premise_guards {
     use super::{
-        IDLE_POLICY, Placement, is_in_a_control_group_that_schedules, why_the_premise_fails,
+        IDLE_POLICY, Placement, autogroup_setting, is_in_a_control_group_that_schedules,
+        why_the_premise_fails,
     };
+    use std::io::{Error, ErrorKind};
 
     /// A reading of a task on processor 7 whose control-group lines are `groups`.
     fn reading(policy: &str, groups: &str, in_a_control_group: bool) -> Placement {
@@ -8018,11 +8064,100 @@ mod premise_guards {
         );
     }
 
+    /// A reading of a task that may run on processor 3 and not on the one the premise names.
+    fn on_another_processor(reading: Placement) -> Placement {
+        Placement {
+            allowed: "3".to_owned(),
+            ..reading
+        }
+    }
+
+    /// The shell and the thread must each be held to the processor: a shell that may run
+    /// elsewhere is not held back by a thread that cannot, and the other way round.
+    #[test]
+    fn the_slow_shell_premise_is_refused_where_only_the_shell_is_on_another_processor() {
+        let thread = reading("0", SESSION, true);
+        let held_back = reading(IDLE_POLICY, SESSION, true);
+        assert_eq!(why_the_premise_fails(7, false, &held_back, &thread), None);
+        let elsewhere = on_another_processor(held_back);
+        let words = why_the_premise_fails(7, false, &elsewhere, &thread);
+        assert!(
+            words
+                .as_ref()
+                .is_some_and(|words| words.contains("the premise of this case does not hold")),
+            "a shell on another processor is not held back: {words:?}"
+        );
+    }
+
+    #[test]
+    fn the_slow_shell_premise_is_refused_where_only_the_thread_is_on_another_processor() {
+        let held_back = reading(IDLE_POLICY, SESSION, true);
+        let thread = reading("0", SESSION, true);
+        assert_eq!(why_the_premise_fails(7, false, &held_back, &thread), None);
+        let elsewhere = on_another_processor(thread);
+        let words = why_the_premise_fails(7, false, &held_back, &elsewhere);
+        assert!(
+            words
+                .as_ref()
+                .is_some_and(|words| words.contains("the premise of this case does not hold")),
+            "a thread on another processor does not compete with the shell: {words:?}"
+        );
+    }
+
+    /// Only a file that is not there reads as off: a kernel without automatic grouping has none.
+    #[test]
+    fn a_missing_automatic_grouping_file_reads_as_off() {
+        assert_eq!(
+            autogroup_setting(Err(Error::from(ErrorKind::NotFound))),
+            Ok(false)
+        );
+    }
+
+    /// Any other failed read leaves it open whether the kernel groups by session, and the case
+    /// fails with the premise's words and does not take it for off.
+    #[test]
+    fn a_failed_read_of_the_automatic_grouping_setting_is_not_off() {
+        for kind in [
+            ErrorKind::PermissionDenied,
+            ErrorKind::InvalidData,
+            ErrorKind::Interrupted,
+            ErrorKind::Other,
+        ] {
+            let words = autogroup_setting(Err(Error::from(kind)))
+                .expect_err("a failed read that is not a missing file");
+            assert!(
+                words.contains("the premise of this case cannot be read back")
+                    && words.contains("could not be read"),
+                "{kind:?}: {words}"
+            );
+        }
+    }
+
+    /// The setting is `1` or `0`, as the kernel writes it with a newline, and nothing else is an
+    /// answer.
+    #[test]
+    fn the_automatic_grouping_setting_reads_on_or_off_by_its_content() {
+        assert_eq!(autogroup_setting(Ok("1\n".to_owned())), Ok(true));
+        assert_eq!(autogroup_setting(Ok("0\n".to_owned())), Ok(false));
+        for text in ["", "2\n", "on\n", "10\n"] {
+            let words = autogroup_setting(Ok(text.to_owned()))
+                .expect_err("content that is neither 0 nor 1");
+            assert!(
+                words.contains("the premise of this case cannot be read back")
+                    && words.contains("not 0 or 1"),
+                "{text:?}: {words}"
+            );
+        }
+    }
+
     /// A control group schedules where it, or the nearest one above it, has the processor
     /// controller, and the root group does not.
     #[test]
     fn a_control_group_schedules_only_where_it_has_the_processor_controller_below_the_root() {
         let controllers = |path: &str| match path {
+            // The root lists the processor controller, as a real one does, so a walk that asked
+            // about it, as `/` or as the empty path, would find a scheduling group there.
+            "" | "/" => Some("cpu memory pids".to_owned()),
             "/user.slice/session-1.scope" => Some("memory pids".to_owned()),
             "/user.slice" => Some("cpu memory pids".to_owned()),
             "/bare.slice" => Some("memory pids".to_owned()),
