@@ -38,13 +38,18 @@
 //! other than a declared output makes the result indeterminate, however briefly it existed. The
 //! parent itself is watched too, and so is the copy: a report that the directory was renamed,
 //! removed or changed (its mode, its owner, its attributes) is a write, because the record of a
-//! parent is the one thing the comparison leaves out. On macOS the reports come on the platform's
-//! schedule, so the host also records the device and inode of each parent before the command
-//! starts and reads them again once the watcher has reported the host's own file at the end: a
-//! parent that is gone, is no longer a directory or has another device or inode is a write
-//! whatever was reported of it. A parent's mode, owner or attributes that were changed and put back
-//! are shown by the reports alone. A watcher the host cannot start, or whose reports it cannot be
-//! sure it has all of, makes the result indeterminate too.
+//! parent is the one thing the comparison leaves out. On macOS a report of a parent can come after
+//! the host's own file or not at all, so the host also records the device and inode of each parent
+//! before the command starts and reads them again at the end, once the watcher has reported the
+//! host's own file: a parent that is gone, is no longer a directory or has another device or inode
+//! is a write whatever was reported of it. A parent keeps its device and inode when a suite changes
+//! its mode, owner or attributes, whether it puts them back or not, and when a suite moves it away
+//! and back, so only the watcher's reports show such a change. The record of the directory above a
+//! parent shows a move away and back too, except for the copy itself and for a parent in a
+//! directory that is also a parent. A parent whose full path is longer than the 1,024 bytes that
+//! macOS allows for a path cannot be read, and every result of that suite is indeterminate. A
+//! watcher the host cannot start, or whose reports it cannot be sure it has all of, makes the
+//! result indeterminate too.
 //!
 //! # What this does not establish
 //!
@@ -1307,12 +1312,16 @@ mod unix {
             _watcher: Held<'static, notify::RecommendedWatcher>,
             shared: Arc<Mutex<Shared>>,
             reported: Mutex<mpsc::Receiver<PathBuf>>,
+            site: Site,
+        }
+
+        /// Where a watch is, and what each directory an output is in was when the watch started.
+        struct Site {
             /// The directory the copy is in, where the host writes the files it marks time with.
             beside: AuthorisedDirectory,
             beside_path: PathBuf,
             copy_path: PathBuf,
-            /// What each directory an output is in was when the watch started, by its path in the
-            /// copy.
+            /// What each directory an output is in was, by its path in the copy.
             identities: BTreeMap<String, Identity>,
         }
 
@@ -1342,29 +1351,15 @@ mod unix {
                 .collect()
         }
 
-        impl std::fmt::Debug for NameWatch {
-            fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                formatter
-                    .debug_struct("NameWatch")
-                    .field("copy", &self.copy_path)
-                    .finish_non_exhaustive()
-            }
-        }
-
-        impl NameWatch {
-            /// Starts watching the copy, before the command does.
-            ///
-            /// A copy with no declared output needs no watcher, and the answer is none. The watch
-            /// is up when a file the host writes has been reported; whatever FSEvents reported
-            /// before that, of changes the host made itself, is discarded.
-            pub fn start(
+        impl Site {
+            /// Reads where `copy` is, with `beside` the directory it is in, and what each
+            /// directory an output is in is before the command starts, to be read again when it
+            /// has ended. A failure is the host's own and comes before the budget is asked.
+            fn of(
                 copy: &AuthorisedDirectory,
                 beside: &AuthorisedDirectory,
                 parents: &BTreeMap<String, BTreeSet<String>>,
-            ) -> Result<Option<Self>, String> {
-                if parents.is_empty() {
-                    return Ok(None);
-                }
+            ) -> Result<Self, String> {
                 let resolve = |directory: &AuthorisedDirectory| {
                     std::fs::canonicalize(directory.display_path())
                         .map_err(|error| format!("the copy's place could not be resolved: {error}"))
@@ -1385,13 +1380,47 @@ mod unix {
                         return Err("the copy is no longer where it was opened".to_owned());
                     }
                 }
-                // Every step that can fail without the library is made before the admission, so
-                // that after it only the library's own calls and the host's own marker file can
-                // fail.
                 let reopened = beside
                     .try_clone()
                     .map_err(|error| format!("the copy's place could not be reopened: {error}"))?;
-                let places = Arc::new(Places::new(copy_path.clone(), parents.clone()));
+                let identities = identities_of(&copy_path, parents)?;
+                Ok(Self {
+                    beside: reopened,
+                    beside_path,
+                    copy_path,
+                    identities,
+                })
+            }
+        }
+
+        impl std::fmt::Debug for NameWatch {
+            fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter
+                    .debug_struct("NameWatch")
+                    .field("copy", &self.site.copy_path)
+                    .finish_non_exhaustive()
+            }
+        }
+
+        impl NameWatch {
+            /// Starts watching the copy, before the command does.
+            ///
+            /// A copy with no declared output needs no watcher, and the answer is none. The watch
+            /// is up when a file the host writes has been reported; whatever FSEvents reported
+            /// before that, of changes the host made itself, is discarded.
+            pub fn start(
+                copy: &AuthorisedDirectory,
+                beside: &AuthorisedDirectory,
+                parents: &BTreeMap<String, BTreeSet<String>>,
+            ) -> Result<Option<Self>, String> {
+                if parents.is_empty() {
+                    return Ok(None);
+                }
+                // Every step that can fail without the library is made before the admission, so
+                // that after it only the library's own calls and the host's own marker file can
+                // fail.
+                let site = Site::of(copy, beside, parents)?;
+                let places = Arc::new(Places::new(site.copy_path.clone(), parents.clone()));
                 let shared = Arc::new(Mutex::new(Shared::default()));
                 let (tell, reported) = mpsc::channel();
                 // Each report is judged here, as it arrives, so the host keeps what it needs of a
@@ -1416,29 +1445,25 @@ mod unix {
                 // of them can end the process, so the host asks only for a watch that the budget
                 // admits.
                 let watcher = WATCHES.admit(
-                    budget::cost_of(&copy_path, &beside_path),
+                    budget::cost_of(&site.copy_path, &site.beside_path),
                     soft_limit(),
                     || {
                         let mut watcher = notify::recommended_watcher(handler)
                             .map_err(|error| format!("no watcher could be started: {error}"))?;
                         watcher
-                            .watch(&copy_path, RecursiveMode::Recursive)
-                            .and_then(|()| watcher.watch(&beside_path, RecursiveMode::NonRecursive))
+                            .watch(&site.copy_path, RecursiveMode::Recursive)
+                            .and_then(|()| {
+                                watcher.watch(&site.beside_path, RecursiveMode::NonRecursive)
+                            })
                             .map_err(|error| format!("the copy could not be watched: {error}"))?;
                         Ok(watcher)
                     },
                 )?;
-                // What each directory an output is in is before the command starts, to be read
-                // again when it has ended.
-                let identities = identities_of(&copy_path, parents)?;
                 let watch = Self {
                     _watcher: watcher,
                     shared,
                     reported: Mutex::new(reported),
-                    beside: reopened,
-                    beside_path,
-                    copy_path,
-                    identities,
+                    site,
                 };
                 watch.up_to_date()?;
                 watch
@@ -1456,12 +1481,13 @@ mod unix {
                 let mark = format!("{MARK}{}", kr_ipc::new_uuid());
                 let name = RelativeName::parse(&mark)
                     .map_err(|error| format!("a file to mark time with: {error}"))?;
-                let marked = self.beside_path.join(&mark);
+                let marked = self.site.beside_path.join(&mark);
                 self.shared
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
                     .awaited = Some(marked.clone());
                 let outcome = self
+                    .site
                     .beside
                     .create_new(&name)
                     .map_err(|error| format!("a file to mark time with: {error}"))
@@ -1470,7 +1496,7 @@ mod unix {
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
                     .awaited = None;
-                let _ = self.beside.remove(&name);
+                let _ = self.site.beside.remove(&name);
                 outcome
             }
 
@@ -1499,8 +1525,8 @@ mod unix {
             /// schedule.
             fn replaced(&self) -> Result<BTreeSet<String>, String> {
                 let mut replaced = BTreeSet::new();
-                for (relative, before) in &self.identities {
-                    match Identity::of(&place_in(&self.copy_path, relative)) {
+                for (relative, before) in &self.site.identities {
+                    match Identity::of(&place_in(&self.site.copy_path, relative)) {
                         Ok(now) if !before.is_another(now) => {}
                         Ok(_) => {
                             replaced.insert(relative.clone());
@@ -1551,7 +1577,7 @@ mod unix {
 
             use super::{
                 AuthorisedDirectory, Budget, Duration, Held, Instant, MARK, NameWatch, Places,
-                Shared, WATCHES, budget, identities_of, take,
+                Shared, Site, WATCHES, budget, take,
             };
 
             /// A copy at `/work/run/copy`, in the directory `/work/run`, with a declared output
@@ -1780,11 +1806,14 @@ mod unix {
                 let beside_path = root_path.join("materialisations");
                 let copy = beside_path.join("copy");
                 std::fs::create_dir_all(copy.join("target/debug")).expect("the directories above");
-                let beside = AuthorisedDirectory::open_root(
-                    kr_protocol::ids::EnvironmentId::new(kr_ipc::new_uuid()),
-                    &beside_path,
-                )
-                .expect("the directory beside the copy opens");
+                let open = |path: &Path| {
+                    AuthorisedDirectory::open_root(
+                        kr_protocol::ids::EnvironmentId::new(kr_ipc::new_uuid()),
+                        path,
+                    )
+                    .expect("the directory opens")
+                };
+                let (copy_directory, beside) = (open(&copy), open(&beside_path));
                 let places = Arc::new(Places::new(copy.clone(), parents_of_outputs()));
                 let shared = Arc::new(Mutex::new(Shared::default()));
                 let (tell, reported) = mpsc::channel();
@@ -1792,10 +1821,7 @@ mod unix {
                     _watcher: no_stream(),
                     shared: Arc::clone(&shared),
                     reported: Mutex::new(reported),
-                    beside,
-                    beside_path,
-                    copy_path: copy.clone(),
-                    identities: identities_of(&copy, &parents_of_outputs())
+                    site: Site::of(&copy_directory, &beside, &parents_of_outputs())
                         .expect("the directories above are examined"),
                 };
                 Place {
@@ -1835,7 +1861,7 @@ mod unix {
                     Arc::clone(&place.shared),
                     place.tell.clone(),
                 );
-                let beside = place.watch.beside_path.clone();
+                let beside = place.watch.site.beside_path.clone();
                 let (decided, decision) = mpsc::channel::<()>();
                 let tell_of = move |event: Event| {
                     let mut shared = shared.lock().unwrap_or_else(PoisonError::into_inner);
@@ -1984,6 +2010,76 @@ mod unix {
                 assert!(
                     written.iter().any(|path| path == "target"),
                     "the directory was removed and made again, and the watch says it wrote {written:?}"
+                );
+            }
+
+            /// KR-REQ-14.34: a directory an output is in that is gone is a write, though the
+            /// stream reports nothing of it: the host reads the copy and not the reports.
+            #[test]
+            fn a_parent_that_is_gone_is_a_write_though_nothing_was_reported() {
+                let place = a_place();
+                std::fs::remove_dir_all(place.copy.join("target")).expect("the run removes it");
+                let written = written_with(&place, Vec::new(), || {}, Vec::new());
+                assert_eq!(
+                    written,
+                    vec!["target".to_owned()],
+                    "the directory is gone, and the watch says it wrote {written:?}"
+                );
+            }
+
+            /// Gives a directory its mode back when it is dropped.
+            struct Shut(PathBuf);
+
+            impl Shut {
+                /// Takes every right to the directory away, so that nothing in it can be reached.
+                fn the_directory(path: &Path) -> Self {
+                    use std::os::unix::fs::PermissionsExt as _;
+                    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o000))
+                        .expect("the directory is shut");
+                    Self(path.to_path_buf())
+                }
+            }
+
+            impl Drop for Shut {
+                fn drop(&mut self) {
+                    use std::os::unix::fs::PermissionsExt as _;
+                    let _ =
+                        std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+                }
+            }
+
+            /// A directory an output is in that cannot be examined at the end is no answer: the
+            /// drain fails, so the result is not established, and it is neither a write nor none.
+            #[test]
+            fn a_parent_that_cannot_be_examined_makes_the_drain_fail() {
+                let place = a_place();
+                let _shut = Shut::the_directory(&place.copy);
+                let (platform, decided) = deliver(&place, Vec::new(), || {}, Vec::new());
+                let drained = place.watch.drain();
+                decided.send(()).expect("the platform waits");
+                platform.join().expect("the platform ends");
+                let why = drained.err().unwrap_or_default();
+                assert!(
+                    why.contains("could not be examined"),
+                    "the drain did not fail as it should: {why:?}"
+                );
+            }
+
+            /// KR-REQ-14.34: what each directory an output is in is, is read before the budget is
+            /// asked: with the whole budget held, a start for a copy that lacks one of those
+            /// directories says that it could not be examined, and not that too many copies are
+            /// watched.
+            #[test]
+            fn a_directory_an_output_is_in_is_read_before_the_budget_is_asked() {
+                let mut made = a_copy();
+                made.parents
+                    .insert("target".to_owned(), BTreeSet::from(["debug".to_owned()]));
+                let _whole = the_whole_budget();
+                let started = NameWatch::start(&made.copy, &made.beside, &made.parents);
+                let why = started.err().unwrap_or_default();
+                assert!(
+                    why.contains("could not be examined"),
+                    "the directory was not read before the budget was asked: {why:?}"
                 );
             }
         }

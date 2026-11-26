@@ -670,57 +670,67 @@ A test result is what this host observed, and nothing a caller reports.
   removed, or had its mode, owner or attributes changed makes the result indeterminate, and so does
   the same for the copy's own directory, which is a parent when an output is at its root. A suite
   that removes a directory above its declared output, or moves its copy away, writes in it and moves
-  it back, is writing outside the output. On Linux the watcher is the kernel's inotify, which
-  follows the directory it was set on wherever it is renamed to. On macOS it is FSEvents, which
-  reports by path and on its own schedule. The host judges each report as it arrives, and it writes
-  a file of its own beside the copy and waits, for up to ten seconds, until the watcher reports it,
-  which shows how far the watcher has come in its stream, and not that every earlier change was
-  reported. Because FSEvents reports on its own schedule, the host also records the device and inode
-  of each parent before the suite starts and reads them again after that wait: a parent that is
-  gone, is no longer a directory or has another device or inode makes the result indeterminate
-  whatever the watcher reported of it. A parent whose mode, owner or attributes a suite changed and
-  put back is shown by the watcher's reports alone. FSEvents says that it dropped reports at the
-  path where it dropped them, which may be a directory above the copy or the root of the volume. The
-  watcher passes every such notice it receives on its stream to the host whatever path it names, and
-  the host takes each as a loss, so it makes the result indeterminate, and so does a loss that has
-  nothing to do with the copy. The host cannot see a loss that FSEvents does not announce: its own
-  file, reported in time, shows only that the watcher has not fallen behind, and nothing more. A
-  watcher that cannot start, that reports a loss or that does not answer in that time makes the
-  result indeterminate, and so does a platform with no watcher whenever a suite declares an output.
-  FSEvents does lose reports, and falls behind by more than the host waits, when files are written
-  by the tens of thousands in one burst, by a suite or by anything else on the machine, so on macOS
-  such a run can get an indeterminate result that says its watcher cannot be trusted, and a run
-  again may not. A macOS host admits a watcher only while the watchers it holds, with the new one,
-  use no more than half of the process's limit of open files, read when the watcher starts, and half
-  of 2560 where that limit is higher or there is none, since nothing was measured past it. A watcher
-  uses one open file for each component of the copy's path and of the path of the directory beside
-  it, and eight more. That was measured on macOS 27.2.1 (build 26B131) with notify 9.0.0 at 11, 12
-  and 16 components, where it is 29, 31 and 39, with the limit at 256 and at 2560, and not
-  otherwise. A copy of a standard home directory is 11 components deep. The host does not count the
-  other open files of the process, nor the one directory that each watcher reopens beside its copy:
-  the other half of the limit is an allowance for them and not a reservation, so a process that
-  holds more of them can still reach the limit. Once the first FSEvents stream has raised a limit of
-  256 to 2560, a process admits 44 watchers of 29 at once; before that, and for good where a hard
-  limit of 256 does not allow the raise, it admits 4. A limit below twice the cost of one watcher,
-  58 at 11 components, admits none. A suite that starts past the limit has no watcher, so its result
-  is indeterminate and says that too many copies are watched at once. The limit is there because
-  FSEvents, with notify 9.0.0, could not start a stream past 88 of these watchers at that depth, and
-  a start that fails there can end the process. A file the suite adds beside an output is not left
-  out of the comparison and changes the source (an added empty directory leaves the source as it
-  was, unless the reading cannot open or list it, reaches a bound, or the change set's rules keep
-  its path out, which makes the source indeterminate, so no version of its own is stored for it; the
-  record sees the new entry all the same, and the result attests no version), so a tool that writes
-  beside each source directory (a compiled-code cache is the usual one) makes a run of that suite
-  that exits with status zero unknown and, where what the copy held can be read completely, stores
-  what it wrote as a version of its own under the conditions given above. An output path must be
-  exactly specified; it is not possible to use a pattern. An ancestor of an output is entered to
-  reach it, and its other entries follow the normal rules for the source. Declarations that repeat,
-  lie inside one another, or are or contain a path the version holds are refused before the suite
-  runs. So is a declaration with a name this host does not carry as input (a colon, one of `< > " |
-  ? *`, a trailing dot or space, a name a Windows device has with or without an extension, a name
-  over 255 bytes), which the configuration accepts and every dispatch of that suite then refuses. A
-  declaration beneath a file of the version is accepted, but the directory above its output cannot
-  be made, so the result of a suite that declares one is always indeterminate.
+  it back, is writing outside the output; on macOS the host sees the move away and back of the copy
+  itself only through the watcher's reports, as said below. On Linux the watcher is the kernel's
+  inotify, which follows the directory it was set on wherever it is renamed to. On macOS it is
+  FSEvents, which reports by path and on its own schedule. The host judges each report as it
+  arrives, and it writes a file of its own beside the copy and waits, for up to ten seconds, until
+  the watcher reports it, which shows how far the watcher has come in its stream, and not that every
+  earlier change was reported. A report of a parent can come after the report of the host's own
+  file, or not at all, so the host also records the device and inode of each parent before the suite
+  starts and reads them again at the end, after that wait: a parent that is gone, is no longer a
+  directory or has another device or inode makes the result indeterminate whatever the watcher
+  reported of it. A parent keeps its device and inode when a suite changes its mode, owner or
+  attributes, whether it puts them back or not, and when it moves the parent away and back, so the
+  watcher's reports alone show such a change. The record of the directory above a parent shows a
+  move away and back as well, except for the copy itself and for a parent in a directory that is
+  also a parent (declared outputs `out` and `target/debug` give that layout: `target` is in the
+  copy, which is a parent too). For those, and so for a suite that moves its copy away, tests other
+  sources at its path and moves it back, the host sees the move only through the watcher's reports,
+  and a loss that FSEvents does not announce leaves it unseen. A parent whose full path is longer
+  than the 1,024 bytes that macOS allows for a path makes every result of that suite indeterminate.
+  FSEvents says that it dropped reports at the path where it dropped them, which may be a directory
+  above the copy or the root of the volume. The watcher passes every such notice it receives on its
+  stream to the host whatever path it names, and the host takes each as a loss, so it makes the
+  result indeterminate, and so does a loss that has nothing to do with the copy. The host cannot see
+  a loss that FSEvents does not announce: its own file, reported in time, shows only that the
+  watcher has not fallen behind, and nothing more. A watcher that cannot start, that reports a loss
+  or that does not answer in that time makes the result indeterminate, and so does a platform with
+  no watcher whenever a suite declares an output. FSEvents does lose reports, and falls behind by
+  more than the host waits, when files are written by the tens of thousands in one burst, by a suite
+  or by anything else on the machine, so on macOS such a run can get an indeterminate result that
+  says its watcher cannot be trusted, and a run again may not. A macOS host admits a watcher only
+  while the watchers it holds, with the new one, use no more than half of the process's limit of
+  open files, read when the watcher starts, and half of 2560 where that limit is higher or there is
+  none, since nothing was measured past it. A watcher uses one open file for each component of the
+  copy's path and of the path of the directory beside it, and eight more. That was measured on macOS
+  27.2.1 (build 26B131) with notify 9.0.0 at 11, 12 and 16 components, where it is 29, 31 and 39,
+  with the limit at 256 and at 2560, and not otherwise. A copy of a standard home directory is 11
+  components deep. The host does not count the other open files of the process, nor the one
+  directory that each watcher reopens beside its copy: the other half of the limit is an allowance
+  for them and not a reservation, so a process that holds more of them can still reach the limit.
+  Once the first FSEvents stream has raised a limit of 256 to 2560, a process admits 44 watchers of
+  29 at once; before that, and for good where a hard limit of 256 does not allow the raise, it
+  admits 4. A limit below twice the cost of one watcher, 58 at 11 components, admits none. A suite
+  that starts past the limit has no watcher, so its result is indeterminate and says that too many
+  copies are watched at once. The limit is there because FSEvents, with notify 9.0.0, could not
+  start a stream past 88 of these watchers at that depth, and a start that fails there can end the
+  process. A file the suite adds beside an output is not left out of the comparison and changes the
+  source (an added empty directory leaves the source as it was, unless the reading cannot open or
+  list it, reaches a bound, or the change set's rules keep its path out, which makes the source
+  indeterminate, so no version of its own is stored for it; the record sees the new entry all the
+  same, and the result attests no version), so a tool that writes beside each source directory (a
+  compiled-code cache is the usual one) makes a run of that suite that exits with status zero
+  unknown and, where what the copy held can be read completely, stores what it wrote as a version of
+  its own under the conditions given above. An output path must be exactly specified; it is not
+  possible to use a pattern. An ancestor of an output is entered to reach it, and its other entries
+  follow the normal rules for the source. Declarations that repeat, lie inside one another, or are
+  or contain a path the version holds are refused before the suite runs. So is a declaration with a
+  name this host does not carry as input (a colon, one of `< > " | ? *`, a trailing dot or space, a
+  name a Windows device has with or without an extension, a name over 255 bytes), which the
+  configuration accepts and every dispatch of that suite then refuses. A declaration beneath a file
+  of the version is accepted, but the directory above its output cannot be made, so the result of a
+  suite that declares one is always indeterminate.
 * **Test reports.** After the result is recorded, the host reads each declared output that is a file
   and opens as a report in a format it documents. There are two: JUnit XML (`testsuites` or
   `testsuite` holding `testcase` elements, with the rerun and flaky elements of the tools that
