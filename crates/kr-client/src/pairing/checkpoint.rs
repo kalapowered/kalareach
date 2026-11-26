@@ -451,6 +451,10 @@ impl PairedCheckpoints {
         }
         if next != file {
             let bytes = serde_json::to_vec(&next).map_err(|_| Unsettled::WriteFailed)?;
+            // No input reaches this check: the file holds at most 1,024 checkpoints of 350 bytes or less and one
+            // `told` entry of 166 bytes or less for each record of `hosts.json`, which is read up to 4 MiB in
+            // records of at least 920 bytes, so a result is under 1.5 MiB, and the check guards a change to
+            // those bounds.
             if u64::try_from(bytes.len()).map_or(true, |len| len > MAX_FILE_BYTES) {
                 return Err(Unsettled::Full);
             }
@@ -601,10 +605,19 @@ impl Snapshot {
     }
 }
 
+/// The version member alone, read first. A repeated `version` is refused here; the file's own type
+/// then reads every other member and refuses one that appears twice or that it does not know.
+#[derive(Deserialize)]
+struct Header {
+    version: Option<u64>,
+}
+
 /// Reads a file as this release writes it, or says why it cannot.
 ///
 /// A version above this release's is [`SnapshotCause::NewerVersion`] whatever else that file holds,
-/// since a later release may change its shape.
+/// since a later release may change its shape. Otherwise the file is read from its bytes into its
+/// own type, so a member that appears twice, in the file or in an entry, makes it unreadable and
+/// the last of the two is never taken.
 fn parse(bytes: &[u8]) -> Result<CheckpointsFile, (SnapshotCause, Shown)> {
     let unreadable = |why: Shown| (SnapshotCause::Unreadable, why);
     let not_understood = |error: &serde_json::Error| {
@@ -613,9 +626,11 @@ fn parse(bytes: &[u8]) -> Result<CheckpointsFile, (SnapshotCause, Shown)> {
             Shown::json(error)
         ))
     };
-    let value: serde_json::Value = serde_json::from_slice(bytes).map_err(|e| not_understood(&e))?;
-    let version = value.get("version").and_then(serde_json::Value::as_u64);
-    if let Some(newer) = version.filter(|version| *version > u64::from(FORMAT_VERSION)) {
+    let header: Header = serde_json::from_slice(bytes).map_err(|e| not_understood(&e))?;
+    if let Some(newer) = header
+        .version
+        .filter(|version| *version > u64::from(FORMAT_VERSION))
+    {
         return Err((
             SnapshotCause::NewerVersion,
             crate::shown!(
@@ -625,7 +640,7 @@ fn parse(bytes: &[u8]) -> Result<CheckpointsFile, (SnapshotCause, Shown)> {
             ),
         ));
     }
-    let file: CheckpointsFile = serde_json::from_value(value).map_err(|e| not_understood(&e))?;
+    let file: CheckpointsFile = serde_json::from_slice(bytes).map_err(|e| not_understood(&e))?;
     if file.version != FORMAT_VERSION {
         return Err(unreadable(crate::shown!(
             "it is version {}, and this release reads {}",
@@ -983,6 +998,230 @@ mod tests {
             rig.checkpoints.held_checkpoints(),
             Held::Read { .. }
         ));
+    }
+
+    /// One object as JSON text: each member in turn, with its value as JSON text.
+    fn object(members: &[(String, String)]) -> String {
+        let written: Vec<String> = members
+            .iter()
+            .map(|(name, value)| format!("\"{name}\":{value}"))
+            .collect();
+        format!("{{{}}}", written.join(","))
+    }
+
+    /// The members of an object as (name, JSON text of the value).
+    fn members_of<T: Serialize>(value: &T) -> Vec<(String, String)> {
+        let value = serde_json::to_value(value).expect("a value");
+        value
+            .as_object()
+            .expect("an object")
+            .iter()
+            .map(|(name, member)| (name.clone(), member.to_string()))
+            .collect()
+    }
+
+    /// A file of one checkpoint entry and one `told` entry, as raw bytes, with `root` written after
+    /// the file's own members.
+    fn file_bytes(
+        entry: &[(String, String)],
+        told: &[(String, String)],
+        root: Option<(&str, &str)>,
+    ) -> Vec<u8> {
+        let mut members = vec![
+            ("version".to_owned(), "1".to_owned()),
+            ("checkpoints".to_owned(), format!("[{}]", object(entry))),
+            ("told".to_owned(), format!("[{}]", object(told))),
+        ];
+        if let Some((name, value)) = root {
+            members.push((name.to_owned(), value.to_owned()));
+        }
+        object(&members).into_bytes()
+    }
+
+    /// What each read and a settle make of a file's bytes, and the bytes the file holds after.
+    struct Tried {
+        held: Option<SnapshotCause>,
+        acquisition: Result<Acquisition, SnapshotCause>,
+        settle: Result<Settled, Unsettled>,
+        after: Vec<u8>,
+    }
+
+    /// Writes `bytes` as the file, reads it as a restore and as the watcher do, and settles an
+    /// answer against it.
+    fn tried(rig: &Rig, record: &PairedHost, bytes: &[u8]) -> Tried {
+        kr_ipc::paths::write_owner_only_file(&rig.path(CHECKPOINTS_FILE), bytes).expect("written");
+        Tried {
+            held: cause(&rig.checkpoints.held_checkpoints()),
+            acquisition: rig.checkpoints.acquisition(record),
+            settle: rig
+                .checkpoints
+                .settle_checkpoint(id(record), &given(1, 9), NOW),
+            after: std::fs::read(rig.path(CHECKPOINTS_FILE)).expect("the file"),
+        }
+    }
+
+    /// Raw files that each hold one member of the root twice, the second time with another value,
+    /// with the name of the member.
+    fn root_arms(record: &PairedHost) -> Vec<(String, Vec<u8>)> {
+        let entry = members_of(&entry(1, 7));
+        let told = members_of(&told(record, Intended::Checkpoint));
+        [("version", "1"), ("checkpoints", "[]"), ("told", "[]")]
+            .into_iter()
+            .map(|(name, again)| {
+                (
+                    format!("the root's {name}"),
+                    file_bytes(&entry, &told, Some((name, again))),
+                )
+            })
+            .collect()
+    }
+
+    /// Raw files that each hold one member of an entry twice, the second time with another value:
+    /// every member of a checkpoint entry and of a `told` entry in turn, with its name.
+    fn entry_arms(record: &PairedHost) -> Vec<(String, Vec<u8>)> {
+        let entry = members_of(&entry(1, 7));
+        let told = members_of(&told(record, Intended::Checkpoint));
+        let other_entry = members_of(&entry_of_another());
+        let other_told = members_of(&told_of_another());
+        let mut arms = Vec::new();
+        for (position, (name, _)) in entry.iter().enumerate() {
+            let mut repeated = entry.clone();
+            repeated.push((name.clone(), other_entry[position].1.clone()));
+            arms.push((
+                format!("a checkpoint's {name}"),
+                file_bytes(&repeated, &told, None),
+            ));
+        }
+        for (position, (name, _)) in told.iter().enumerate() {
+            let mut repeated = told.clone();
+            repeated.push((name.clone(), other_told[position].1.clone()));
+            arms.push((
+                format!("a told entry's {name}"),
+                file_bytes(&entry, &repeated, None),
+            ));
+        }
+        arms
+    }
+
+    /// The file that the arms above are made from, with no member repeated.
+    fn control_bytes(record: &PairedHost) -> Vec<u8> {
+        file_bytes(
+            &members_of(&entry(1, 7)),
+            &members_of(&told(record, Intended::Checkpoint)),
+            None,
+        )
+    }
+
+    /// A member that the file holds twice at its root makes it unreadable, whichever of the two a
+    /// reader would take, and a settle leaves its bytes as they were.
+    #[test]
+    fn a_member_repeated_at_the_root_makes_the_file_unreadable_and_a_settle_leaves_it() {
+        let rig = Rig::new();
+        let record = owner(1);
+        rig.hosts.record(record.clone()).expect("recorded");
+
+        let control = tried(&rig, &record, &control_bytes(&record));
+        assert_eq!(
+            control.acquisition,
+            Ok(Acquisition::Told),
+            "the file with no repeat reads"
+        );
+        for (name, bytes) in root_arms(&record) {
+            let tried = tried(&rig, &record, &bytes);
+            assert_eq!(tried.held, Some(SnapshotCause::Unreadable), "{name}");
+            assert_eq!(tried.acquisition, Err(SnapshotCause::Unreadable), "{name}");
+            assert_eq!(
+                tried.settle,
+                Err(Unsettled::Unreadable(SnapshotCause::Unreadable)),
+                "{name}"
+            );
+            assert_eq!(
+                tried.after, bytes,
+                "{name}: a settle leaves the file as it was"
+            );
+        }
+    }
+
+    /// A member that an entry holds twice, in a checkpoint or in a `told` entry, makes the file
+    /// unreadable, whichever of the two a reader would take, and a settle leaves its bytes as they
+    /// were.
+    #[test]
+    fn a_member_repeated_in_an_entry_makes_the_file_unreadable_and_a_settle_leaves_it() {
+        let rig = Rig::new();
+        let record = owner(1);
+        rig.hosts.record(record.clone()).expect("recorded");
+
+        for (name, bytes) in entry_arms(&record) {
+            let tried = tried(&rig, &record, &bytes);
+            assert_eq!(tried.held, Some(SnapshotCause::Unreadable), "{name}");
+            assert_eq!(tried.acquisition, Err(SnapshotCause::Unreadable), "{name}");
+            assert_eq!(
+                tried.settle,
+                Err(Unsettled::Unreadable(SnapshotCause::Unreadable)),
+                "{name}"
+            );
+            assert_eq!(
+                tried.after, bytes,
+                "{name}: a settle leaves the file as it was"
+            );
+        }
+    }
+
+    /// An entry that differs from the one of the file in every member, so that a repeat of any
+    /// member names another value.
+    fn entry_of_another() -> PairedCheckpoint {
+        PairedCheckpoint {
+            service_origin: GatewayOrigin::new("https://reach.kala.to").expect("an origin"),
+            archive_id: ArchiveId::new(Uuid::from_bytes([2; 16])),
+            backup_generation: BackupGeneration::new(1),
+            encrypted_manifest_hash: Digest256::from_bytes([2; 32]),
+            taken_at_ms: 5,
+        }
+    }
+
+    /// A `told` entry that differs from the one of the file in every member.
+    fn told_of_another() -> Told {
+        Told {
+            host_device_id: DeviceId::new(Uuid::from_bytes([9; 16])),
+            device_id: DeviceId::new(Uuid::from_bytes([10; 16])),
+            answer: Intended::NothingPublished,
+            at_ms: 5,
+        }
+    }
+
+    /// A file of exactly the largest size is read, and one byte more is unreadable and stays as it
+    /// was after a settle.
+    #[test]
+    fn a_file_over_four_mebibytes_is_unreadable_and_one_of_that_size_is_read() {
+        let rig = Rig::new();
+        let record = owner(1);
+        rig.hosts.record(record.clone()).expect("recorded");
+        let mut bytes = serde_json::to_vec(&CheckpointsFile {
+            version: FORMAT_VERSION,
+            checkpoints: vec![entry(1, 7)],
+            told: vec![told(&record, Intended::Checkpoint)],
+        })
+        .expect("bytes");
+        bytes.resize(4 * 1024 * 1024, b' ');
+        let at_the_size = tried(&rig, &record, &bytes);
+        assert_eq!(
+            at_the_size.acquisition,
+            Ok(Acquisition::Told),
+            "a file of 4 MiB is read"
+        );
+        bytes.push(b' ');
+        let over = tried(&rig, &record, &bytes);
+        assert_eq!(over.held, Some(SnapshotCause::Unreadable));
+        assert_eq!(
+            over.acquisition,
+            Err(SnapshotCause::Unreadable),
+            "a file one byte over 4 MiB"
+        );
+        assert_eq!(
+            over.settle,
+            Err(Unsettled::Unreadable(SnapshotCause::Unreadable))
+        );
+        assert_eq!(over.after, bytes, "a settle leaves the file as it was");
     }
 
     /// A file that is a directory, a link, or open to others is refused by the file helpers, and
