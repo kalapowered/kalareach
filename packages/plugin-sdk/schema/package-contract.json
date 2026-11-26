@@ -33,12 +33,22 @@
       "COMPLUS",
       "DOTNET",
       "CORECLR",
-      "COR"
+      "COR",
+      "OPENSSL"
     ],
     "loader_names": [
       "ENV",
       "LOCPATH",
-      "_JAVA_OPTIONS"
+      "_JAVA_OPTIONS",
+      "CLASSPATH",
+      "GEM_PATH",
+      "GEM_HOME",
+      "FPATH",
+      "KRB5_CONFIG",
+      "PHPRC",
+      "GLIBC_TUNABLES",
+      "GOOGLE_EXTERNAL_ACCOUNT_ALLOW_EXECUTABLES",
+      "GOOGLE_API_USE_CLIENT_CERTIFICATE"
     ],
     "max_constants": 16,
     "max_name_bytes": 64,
@@ -46,6 +56,9 @@
     "max_value_bytes": 256,
     "private_home_placeholder": "{private_home}",
     "sdk_version": "0.1.11",
+    "set_only_beginnings": [
+      "XDG"
+    ],
     "start_file_names": [
       "ZDOTDIR",
       "SHELLOPTS",

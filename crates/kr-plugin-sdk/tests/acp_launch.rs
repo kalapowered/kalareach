@@ -1097,7 +1097,7 @@ fn kr_req_11_26_the_loader_beginnings_are_the_launchs_own_list() {
         json!([
             "LD", "DYLD", "BASH", "NODE", "NPM", "BUN", "DENO", "PYTHON", "PERL", "RUBY", "LUA",
             "JAVA", "JDK", "GIT", "GCONV", "SSL", "CURL", "REQUESTS", "COMPLUS", "DOTNET",
-            "CORECLR", "COR"
+            "CORECLR", "COR", "OPENSSL"
         ])
     );
 }
@@ -1109,7 +1109,20 @@ fn kr_req_11_26_the_loader_names_are_the_launchs_own_list() {
     let contract = package_contract();
     assert_eq!(
         contract["acp_launch"]["loader_names"],
-        json!(["ENV", "LOCPATH", "_JAVA_OPTIONS"])
+        json!([
+            "ENV",
+            "LOCPATH",
+            "_JAVA_OPTIONS",
+            "CLASSPATH",
+            "GEM_PATH",
+            "GEM_HOME",
+            "FPATH",
+            "KRB5_CONFIG",
+            "PHPRC",
+            "GLIBC_TUNABLES",
+            "GOOGLE_EXTERNAL_ACCOUNT_ALLOW_EXECUTABLES",
+            "GOOGLE_API_USE_CLIENT_CERTIFICATE"
+        ])
     );
 }
 
@@ -1246,4 +1259,93 @@ fn kr_req_11_26_the_constants_of_the_two_real_launches_pass_the_value_rule() {
             "{constant}: {findings:?}"
         );
     }
+}
+
+/// KR-REQ-11.26: the one beginning that a launch may pass and may not set is stated in the package
+/// contract.
+#[test]
+fn kr_req_11_26_the_set_only_beginnings_are_the_launchs_own_list() {
+    let contract = package_contract();
+    assert_eq!(
+        contract["acp_launch"]["set_only_beginnings"],
+        json!(["XDG"])
+    );
+}
+
+/// KR-REQ-11.26: the names that make a program load or run code from a place the package chooses
+/// are refused whole as passed names and as constants: the four OpenSSL names that choose a
+/// configuration or a folder of providers and engines, a beginning that covers every name of that
+/// library, and the names of Java, RubyGems, the shell, Kerberos, PHP, the C library's loader and
+/// Google's credentials.
+#[test]
+fn kr_req_11_26_the_names_that_load_or_run_code_are_refused_in_both_lists() {
+    for name in [
+        "OPENSSL_CONF",
+        "OPENSSL_CONF_INCLUDE",
+        "OPENSSL_MODULES",
+        "OPENSSL_ENGINES",
+        "OPENSSL",
+        "OPENSSL_X",
+        "CLASSPATH",
+        "GEM_PATH",
+        "GEM_HOME",
+        "FPATH",
+        "KRB5_CONFIG",
+        "PHPRC",
+        "GLIBC_TUNABLES",
+        "GOOGLE_EXTERNAL_ACCOUNT_ALLOW_EXECUTABLES",
+        "GOOGLE_API_USE_CLIENT_CERTIFICATE",
+    ] {
+        let mut launch = declaration();
+        launch["passed_names"] = json!(["PATH", "HOME", "EXAMPLE_API_KEY", name]);
+        let findings = findings_of(&manifest_with(&launch, &GRANTS));
+        let reason = format!("name: \"{name}\" in passed_names ");
+        assert!(
+            has(&findings, FindingCode::AcpLaunchInvalid, &reason),
+            "a passed {name} is refused: {findings:?}"
+        );
+        let findings = findings_of(&with_constant(name, "x"));
+        let reason = format!("constant: the name \"{name}\" ");
+        assert!(
+            has(&findings, FindingCode::AcpLaunchInvalid, &reason),
+            "a constant {name} is refused: {findings:?}"
+        );
+    }
+}
+
+/// KR-REQ-11.26: the Kerberos names are refused whole, not by their beginning: the credential
+/// cache name that a real launch passes is accepted.
+#[test]
+fn kr_req_11_26_the_kerberos_credential_cache_name_is_still_accepted() {
+    let mut launch = declaration();
+    launch["passed_names"] = json!(["PATH", "HOME", "EXAMPLE_API_KEY", "KRB5CCNAME"]);
+    let findings = findings_of(&manifest_with(&launch, &GRANTS));
+    assert!(findings.is_empty(), "KRB5CCNAME is passed: {findings:?}");
+}
+
+/// KR-REQ-11.26: a constant that begins with `XDG` is refused: the folders it names are where
+/// Git, fish and other tools read what they run.
+#[test]
+fn kr_req_11_26_a_constant_that_begins_with_xdg_is_refused() {
+    for name in ["XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG"] {
+        let findings = findings_of(&with_constant(name, "x"));
+        let reason = format!("constant: the name \"{name}\" ");
+        assert!(
+            has(&findings, FindingCode::AcpLaunchInvalid, &reason),
+            "a constant {name} is refused: {findings:?}"
+        );
+    }
+}
+
+/// KR-REQ-11.26: a name that begins with `XDG` may be passed: it is the person's own value, and
+/// a real launch passes one.
+#[test]
+fn kr_req_11_26_a_passed_name_that_begins_with_xdg_is_accepted() {
+    let mut launch = declaration();
+    launch["passed_names"] = json!(["PATH", "HOME", "EXAMPLE_API_KEY", "XDG_CONFIG_HOME"]);
+    let findings = findings_of(&manifest_with(&launch, &GRANTS));
+    assert!(
+        findings.is_empty(),
+        "XDG_CONFIG_HOME is passed: {findings:?}"
+    );
 }

@@ -25,7 +25,7 @@
 //!   [`LOADER_BEGINNINGS`] (`LD`, `DYLD`, `BASH`, `NODE`, `BUN` and the rest), and none is one of
 //!   [`LOADER_NAMES`]. Three data names of Node.js begin that way and may be
 //!   passed ([`DATA_NAMES`]). A constant is also none of [`COPIED_NAMES`], [`DATA_NAMES`] or
-//!   [`START_FILE_NAMES`].
+//!   [`START_FILE_NAMES`], and does not begin with a word of [`SET_ONLY_BEGINNINGS`].
 //! * A constant is a name and a value on one line. A value is [`PRIVATE_HOME_PLACEHOLDER`] alone,
 //!   which the host replaces with the path of a folder it makes new and empty for each start, or
 //!   only ASCII letters, digits, `_`, `.` and `-`, and not dots only.
@@ -67,14 +67,28 @@ pub const MAX_VALUE_BYTES: usize = 256;
 /// command integration's so that a word added there does not refuse a published release of a
 /// package that declares a launch. A beginning, not a first word, so `PYTHONSTARTUP` and
 /// `PERL5OPT` are held too.
-pub const LOADER_BEGINNINGS: [&str; 22] = [
+pub const LOADER_BEGINNINGS: [&str; 23] = [
     "LD", "DYLD", "BASH", "NODE", "NPM", "BUN", "DENO", "PYTHON", "PERL", "RUBY", "LUA", "JAVA",
     "JDK", "GIT", "GCONV", "SSL", "CURL", "REQUESTS", "COMPLUS", "DOTNET", "CORECLR", "COR",
+    "OPENSSL",
 ];
 
 /// Names of loader and runtime variables that no beginning in [`LOADER_BEGINNINGS`] reaches. No
 /// declaration passes or sets one.
-pub const LOADER_NAMES: [&str; 3] = ["ENV", "LOCPATH", "_JAVA_OPTIONS"];
+pub const LOADER_NAMES: [&str; 12] = [
+    "ENV",
+    "LOCPATH",
+    "_JAVA_OPTIONS",
+    "CLASSPATH",
+    "GEM_PATH",
+    "GEM_HOME",
+    "FPATH",
+    "KRB5_CONFIG",
+    "PHPRC",
+    "GLIBC_TUNABLES",
+    "GOOGLE_EXTERNAL_ACCOUNT_ALLOW_EXECUTABLES",
+    "GOOGLE_API_USE_CLIENT_CERTIFICATE",
+];
 
 /// Names that begin like a loader or runtime name and load no code: the certificate and proxy
 /// switches of Node.js. A declaration may pass them and may not set them.
@@ -102,6 +116,11 @@ pub const START_FILE_NAMES: [&str; 10] = [
     "SSH_ASKPASS",
     "SUDO_ASKPASS",
 ];
+
+/// Words a constant's name may not begin with, though a declaration may pass such a name: the
+/// folders that `XDG` names are where Git, fish and other tools read what they run, and a passed
+/// name is the person's own.
+pub const SET_ONLY_BEGINNINGS: [&str; 1] = ["XDG"];
 
 /// What a declaration does with a name.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -416,6 +435,15 @@ fn name_problem(name: &str, role: Role) -> Option<String> {
             return Some(format!(
                 "is {listed}, a variable that makes a shell or a tool run a command or read a \
                  start file, and no ACP launch sets it"
+            ));
+        }
+        if let Some(word) = SET_ONLY_BEGINNINGS
+            .iter()
+            .find(|word| upper.starts_with(**word))
+        {
+            return Some(format!(
+                "begins with {word}, a variable that moves where a tool reads the settings and \
+                 start files it runs, and no ACP launch sets it"
             ));
         }
     }

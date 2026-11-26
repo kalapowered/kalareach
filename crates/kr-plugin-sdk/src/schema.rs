@@ -243,6 +243,7 @@ pub fn package_contract() -> Value {
             "data_names": crate::acp_launch::DATA_NAMES,
             "copied_names": crate::acp_launch::COPIED_NAMES,
             "start_file_names": crate::acp_launch::START_FILE_NAMES,
+            "set_only_beginnings": crate::acp_launch::SET_ONLY_BEGINNINGS,
         },
         "command_integration": {
             "max_command_bytes": crate::integration::MAX_COMMAND_BYTES,
