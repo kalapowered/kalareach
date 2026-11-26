@@ -1273,7 +1273,9 @@ textarea::placeholder {
   flex-direction: column;
   gap: var(--gap-1);
   margin: 0;
-  padding-inline-start: 1.25rem;
+  /* In the spacing scale, as the card's own padding is: on the phone it stops growing at one and a
+     half times its base, so that a larger text size does not take the column from the words. */
+  padding-inline-start: calc(var(--gap-4) * 1.25);
   font-size: 0.8125rem;
   line-height: 1.5;
   color: var(--muted);
