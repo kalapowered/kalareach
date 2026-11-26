@@ -161,14 +161,20 @@ fn record(
     limit: u64,
     holds: Option<&mut Vec<Handle>>,
 ) -> Result<DigestedFile, Failure> {
-    if json_bytes(&name) > NAME_BYTES {
+    // The name is counted as the journal records it: a folder's ends in a backslash and a link's in
+    // `:link`, and each backslash is two bytes of the row's text.
+    let spelled = if is_link(child) {
+        format!("{name}:link")
+    } else if is_folder(child) {
+        format!("{name}\\")
+    } else {
+        name.clone()
+    };
+    if json_bytes(&spelled) > NAME_BYTES {
         return Err(Failure::TooLarge);
     }
-    if is_link(child) {
-        return Ok(plain(format!("{name}:link"), child.key));
-    }
-    if is_folder(child) {
-        return Ok(plain(format!("{name}\\"), child.key));
+    if is_link(child) || is_folder(child) {
+        return Ok(plain(spelled, child.key));
     }
     // A file that is kept is shared for reading only; a fresh look shares for writing too, which the
     // kept handles allow, since they ask for no write.
