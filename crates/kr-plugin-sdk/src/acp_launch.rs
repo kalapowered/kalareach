@@ -17,7 +17,8 @@
 //!
 //! * The command is a bare name, the executable name of one of the package's own match rules.
 //! * The platforms are `linux` and `mac_os`, each one the package supports.
-//! * A variable is a name of letters, digits and underscores that does not begin with `KR_`.
+//! * A variable is a name of ASCII letters and digits and underscores that does not begin with
+//!   `KR_`.
 //!   The host copies a passed name only when the person's shell has it. A required name is a
 //!   passed name too, and the launch is refused when the shell has no such variable or it is
 //!   empty.
@@ -31,7 +32,10 @@
 //! * A constant is a name and a value on one line. A value is [`PRIVATE_HOME_PLACEHOLDER`] alone,
 //!   which the host replaces with the path of a folder it makes new and empty for each start, or
 //!   only ASCII letters, digits and `_`. The alphabet has no dot, hyphen, slash, colon or space,
-//!   so a dotted host name, a path, a URL, a command line and an option are refused.
+//!   so a value that has a path separator, a dotted host name or address, a command of more than
+//!   one word or an option that begins with a hyphen is refused. A single word of the alphabet
+//!   passes this rule, and it can still name a program on the person's search path, a file in the
+//!   working folder, or a tool's option that needs no hyphen.
 //! * The declaration has no argument member: the host passes [`AGENT_ARGUMENT`] and nothing else.
 
 use schemars::JsonSchema;
@@ -276,8 +280,8 @@ fn names_written(names: &[String]) -> String {
         .join(", ")
 }
 
-/// Whether `name` is letters, digits and underscores, not beginning with a digit, and within
-/// [`MAX_NAME_BYTES`].
+/// Whether `name` is ASCII letters and digits and underscores, not beginning with a digit, and
+/// within [`MAX_NAME_BYTES`].
 fn name_has_shape(name: &str) -> bool {
     let mut bytes = name.bytes();
     let Some(first) = bytes.next() else {
@@ -427,8 +431,8 @@ impl AcpLaunch {
 fn name_problem(name: &str, role: Role) -> Option<String> {
     if !name_has_shape(name) {
         return Some(format!(
-            "is not a variable name: letters, digits and '_' only, not beginning with a digit, \
-             and at most {MAX_NAME_BYTES} bytes"
+            "is not a variable name: ASCII letters and digits and '_' only, not beginning with a \
+             digit, and at most {MAX_NAME_BYTES} bytes"
         ));
     }
     if name.starts_with("KR_") {
@@ -457,8 +461,8 @@ fn name_problem(name: &str, role: Role) -> Option<String> {
             .find(|word| upper.starts_with(**word))
         {
             return Some(format!(
-                "begins with {word}, a variable that moves where a tool reads the settings and \
-                 start files it runs, and no ACP launch sets it"
+                "begins with {word}; a variable with that beginning can move where a tool reads the \
+                 settings and start files it runs, and no ACP launch sets it"
             ));
         }
     }
@@ -496,9 +500,11 @@ fn name_problem(name: &str, role: Role) -> Option<String> {
 
 /// Returns why a constant's value is not one a declaration may set, where it is not: a value is
 /// the private-home word alone, or only ASCII letters, digits and `_`. A dot, a hyphen, a slash, a
-/// colon and a space are none of them, so a dotted host name, a path, a URL, a command line and an
-/// option are refused by the alphabet. A later SDK version can admit a character again; it cannot
-/// refuse one that a published release used.
+/// colon and a space are none of them, so a value that has a path separator, a dotted host name or
+/// address, a command of more than one word or an option that begins with a hyphen is refused by
+/// the alphabet. A single word of the alphabet passes it; the module text says what a word can
+/// still name. A later SDK version can admit a character again; it cannot refuse one that a
+/// published release used.
 fn value_problem(value: &str) -> Option<String> {
     if value.is_empty() {
         return Some("is empty".to_owned());
@@ -539,7 +545,8 @@ fn value_problem(value: &str) -> Option<String> {
 /// Returns a character as a refused value is told of it: a visible ASCII character as itself and
 /// its code point, the space by its name and its code point, and any other character as one
 /// outside ASCII with its code point, since a reader cannot tell a non-breaking space from a
-/// space. The refusal tells of the first character that breaks the rule and of no other.
+/// space. The refusal tells of the first character that the alphabet refuses, after the earlier
+/// checks, and of no other.
 fn character_shown(character: char) -> String {
     let code = u32::from(character);
     if character.is_ascii_graphic() {
