@@ -1630,3 +1630,149 @@ fn kr_req_11_26_the_set_only_parts_are_the_launchs_own_list() {
     let contract = package_contract();
     assert_eq!(contract["acp_launch"]["set_only_parts"], json!(["PROXY"]));
 }
+
+/// The line of the plugin guide that begins with `start`.
+fn guide_bullet(start: &str) -> String {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/plugins/README.md");
+    let guide = std::fs::read_to_string(path).expect("the plugin guide reads");
+    let mut found = guide.lines().filter(|line| line.starts_with(start));
+    let line = found.next().expect("the guide holds the bullet");
+    assert!(
+        found.next().is_none(),
+        "the guide holds one bullet that begins {start:?}"
+    );
+    line.to_owned()
+}
+
+/// The names between backticks in `text` that are made of upper-case letters, digits and `_`.
+fn upper_case_names(text: &str) -> Vec<String> {
+    let mut names: Vec<String> = text
+        .split('`')
+        .skip(1)
+        .step_by(2)
+        .filter(|token| {
+            !token.is_empty()
+                && token
+                    .bytes()
+                    .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+        })
+        .map(str::to_owned)
+        .collect();
+    names.sort();
+    names
+}
+
+/// The strings of the contract's list `name` under `acp_launch`.
+fn contract_list(name: &str) -> Vec<String> {
+    package_contract()["acp_launch"][name]
+        .as_array()
+        .expect("the contract holds the list")
+        .iter()
+        .map(|entry| entry.as_str().expect("a name").to_owned())
+        .collect()
+}
+
+/// KR-REQ-11.26: the guide's hand copy of the floor's lists is the contract's: the beginnings and
+/// whole names of the first sentence, the three Node.js names, and the names a constant may not
+/// have, are each exactly what the contract states, and the guide says that the contract does not
+/// carry the character rules.
+#[test]
+fn kr_req_11_26_the_guide_holds_the_lists_of_the_contract() {
+    let floor = guide_bullet("- The floor of names is");
+    assert!(
+        floor.contains("the character rules for names and values are not in it"),
+        "the guide says what the contract does not carry: {floor}"
+    );
+    let refused = floor
+        .split_once("it begins with ")
+        .and_then(|(_, rest)| rest.split_once(". A beginning is held"))
+        .expect("the first sentence lists what the floor refuses")
+        .0;
+    let mut stated: Vec<String> = contract_list("loader_beginnings");
+    stated.extend(contract_list("loader_names"));
+    stated.sort();
+    assert_eq!(upper_case_names(refused), stated, "beginnings and names");
+    let data = floor
+        .split_once("a launch may pass ")
+        .expect("the guide names the data names")
+        .1;
+    let mut stated = contract_list("data_names");
+    stated.sort();
+    assert_eq!(upper_case_names(data), stated, "the Node.js names");
+
+    let constants = guide_bullet("- `constants` are");
+    let refused = constants
+        .split_once("The name of a constant is refused when it is ")
+        .and_then(|(_, rest)| rest.split_once(". A declaration may pass every one"))
+        .expect("the constants' sentence lists what a constant's name may not be")
+        .0;
+    let mut stated = contract_list("copied_names");
+    stated.extend(contract_list("start_file_names"));
+    stated.extend(contract_list("set_only_beginnings"));
+    stated.extend(contract_list("set_only_parts"));
+    stated.sort();
+    let mut shown = upper_case_names(refused);
+    let example = shown.iter().position(|name| name == "HTTPS_PROXY");
+    shown.remove(example.expect("the guide gives HTTPS_PROXY as its example"));
+    assert_eq!(shown, stated, "the names a constant may not have");
+}
+
+/// KR-REQ-11.26: the guide states the value's alphabet and the proxy rule as the validator holds
+/// them, and states no absolute that its own remainder contradicts.
+#[test]
+fn kr_req_11_26_the_guide_states_the_value_alphabet_and_the_proxy_rule() {
+    let constants = guide_bullet("- `constants` are");
+    for said in [
+        "or only ASCII letters, digits and `_`",
+        "`.`, `-`, `/`, `:`, the space, `=`, `$`, `;`, `|` and a letter outside ASCII",
+        "when it has `PROXY` in it in upper or lower case",
+        "a passed name keeps the person's own value",
+    ] {
+        assert!(
+            constants.contains(said),
+            "the constants' bullet says {said:?}: {constants}"
+        );
+    }
+    let remainder = guide_bullet("- What the floor does not do:");
+    for said in [
+        "A word can name a program on the person's own search path",
+        "a word can name a file in the working folder",
+        "a word or a number can name a host",
+        "A passed name keeps the person's own value",
+    ] {
+        assert!(
+            remainder.contains(said),
+            "the remainder says {said:?}: {remainder}"
+        );
+    }
+    for bullet in [&constants, &remainder] {
+        assert!(
+            !bullet.to_ascii_lowercase().contains("never"),
+            "the guide claims no absolute: {bullet}"
+        );
+    }
+}
+
+/// KR-REQ-11.26: the example names the guide gives of the classes that no list holds are accepted
+/// as constants, as it says.
+#[test]
+fn kr_req_11_26_the_guides_example_names_of_the_unlisted_classes_are_accepted() {
+    let remainder = guide_bullet("- What the floor does not do:");
+    let examples = remainder
+        .split_once("can be set as constants:")
+        .expect("the remainder gives its examples")
+        .1;
+    let names = upper_case_names(examples);
+    assert_eq!(
+        names.len(),
+        8,
+        "two examples for each of four classes: {names:?}"
+    );
+    for name in names {
+        let findings = findings_of(&with_constant(&name, "x"));
+        assert!(
+            findings.is_empty(),
+            "a constant {name} is accepted: {findings:?}"
+        );
+    }
+}
