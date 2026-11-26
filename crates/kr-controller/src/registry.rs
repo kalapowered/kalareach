@@ -5003,10 +5003,9 @@ mod tests {
         assert_eq!(document.revision, 4);
     }
 
-    /// KR-REQ-22.10: a registry at the version before the raise, and at 16, the one before the
-    /// version no release wrote, comes forward to this version by the steps that write it, and
-    /// holds the tables a new registry has: the raise changes the version and the document the
-    /// registry may copy, and no table.
+    /// KR-REQ-22.10: a registry at 18 or at 19 comes forward to this version by the steps that
+    /// write it, and holds the tables a new registry has, the two that the step from 19 makes
+    /// among them. A registry at 17 or at 20, which no release wrote, is not brought forward.
     #[test]
     fn a_registry_at_the_two_versions_before_comes_forward_with_the_tables_a_new_one_has() {
         let shape = |path: &std::path::Path| -> Vec<(String, Option<String>)> {
@@ -5027,7 +5026,7 @@ mod tests {
             version(&Registry::open(&fresh_path, environment()).expect("opens")),
             SCHEMA_VERSION
         );
-        for from in (SCHEMA_VERSION - 3..SCHEMA_VERSION).filter(|from| *from != 17) {
+        for from in (SCHEMA_VERSION - 3..SCHEMA_VERSION).filter(|from| ![17, 20].contains(from)) {
             let directory = tempfile::tempdir().expect("a directory");
             let path = directory.path().join("registry.sqlite3");
             drop(Registry::open(&path, environment()).expect("a registry"));
@@ -5049,8 +5048,9 @@ mod tests {
     /// later.
     #[test]
     fn a_registry_at_an_earlier_version_comes_forward_with_the_rows_it_held() {
-        // Version 17 was never written by a release: a registry that records it is refused.
-        for from in (9..SCHEMA_VERSION).filter(|from| *from != 17) {
+        // Versions 17 and 20 were never written by a release: a registry that records either is
+        // refused.
+        for from in (9..SCHEMA_VERSION).filter(|from| ![17, 20].contains(from)) {
             let directory = tempfile::tempdir().expect("a directory");
             let path = directory.path().join("registry.sqlite3");
             drop(Registry::open(&path, environment()).expect("a registry"));
