@@ -1064,8 +1064,8 @@ mod tests {
         }
     }
 
-    /// Raw files that each hold one member of the root twice, the second time with another value,
-    /// with the name of the member.
+    /// Raw files that each hold one member of the root twice, with the name of the member. The
+    /// second `version` is the same number: the repeat alone is refused.
     fn root_arms(record: &PairedHost) -> Vec<(String, Vec<u8>)> {
         let entry = members_of(&entry(1, 7));
         let told = members_of(&told(record, Intended::Checkpoint));
@@ -1080,8 +1080,8 @@ mod tests {
             .collect()
     }
 
-    /// Raw files that each hold one member of an entry twice, the second time with another value:
-    /// every member of a checkpoint entry and of a `told` entry in turn, with its name.
+    /// Raw files that each hold one member of an entry twice: every member of a checkpoint entry
+    /// and of a `told` entry in turn, with its name. The second `service_origin` is the same origin.
     fn entry_arms(record: &PairedHost) -> Vec<(String, Vec<u8>)> {
         let entry = members_of(&entry(1, 7));
         let told = members_of(&told(record, Intended::Checkpoint));
@@ -1171,8 +1171,8 @@ mod tests {
         }
     }
 
-    /// An entry that differs from the one of the file in every member, so that a repeat of any
-    /// member names another value.
+    /// An entry that differs from the one of the file in every member but the service, so that a
+    /// repeat of any other member names another value.
     fn entry_of_another() -> PairedCheckpoint {
         PairedCheckpoint {
             service_origin: GatewayOrigin::new("https://reach.kala.to").expect("an origin"),

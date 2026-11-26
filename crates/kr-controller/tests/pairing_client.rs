@@ -3823,9 +3823,9 @@ async fn an_owner_device_keeps_the_checkpoint_the_host_names_when_it_is_committe
 }
 
 /// KR-REQ-20.12: a host that has accepted no generation says so, and the device that manages it is
-/// not owed an answer but is asked again.
+/// not owed an answer; the state needs another read.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn an_owner_device_of_a_host_with_no_backup_is_told_so_and_asks_again() {
+async fn an_owner_device_of_a_host_with_no_backup_is_told_so_and_needs_another_read() {
     let owner_keys = keys();
     let host = Host::start(&owner_keys).await;
     let device = ProductDevice::new(Arc::new(host.room.clone()), |link| Arc::new(link));

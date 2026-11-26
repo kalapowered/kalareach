@@ -128,7 +128,7 @@ pub const WAIT_STEP: Duration = Duration::from_secs(10);
 
 /// How long the read of a host's backup checkpoint may take as the device is committed. It is
 /// shorter than [`WAIT_STEP`]: the last screen of a pairing is not held for a host that answers
-/// nothing, and that host stays owed.
+/// nothing, and that host stays owed, unless an earlier answer of that pairing is on file.
 pub const CHECKPOINT_WITHIN: Duration = Duration::from_secs(3);
 
 /// How far past an invitation's expiry, by this device's clock, it keeps asking. Two clocks never
@@ -4741,10 +4741,10 @@ mod tests {
         );
     }
 
-    /// KR-REQ-20.12: a host that has accepted no generation says so, and is not owed but is asked
-    /// again later.
+    /// KR-REQ-20.12: a host that has accepted no generation says so, and is not owed an answer; the
+    /// state needs another read.
     #[tokio::test(start_paused = true)]
-    async fn a_host_with_nothing_published_is_not_owed_and_is_asked_again() {
+    async fn a_host_with_nothing_published_is_not_owed_and_needs_another_read() {
         let run = committing(false, true, Checkpoint::Null, None).await;
         assert!(
             ended_paired(&run),
