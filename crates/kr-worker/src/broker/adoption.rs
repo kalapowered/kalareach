@@ -19,6 +19,14 @@
 //! questions it asks, and nothing more. It is watched by its identity and ended when it exits. A
 //! bind the broker refuses leaves nothing adopted, and the next look tries again.
 //!
+//! A program is identified from one reading of its process. Its image is opened and hashed and its
+//! arguments are read once. Then the image the kernel reports, the file that image names and the
+//! process's identity must all be what they were, or nothing is adopted and the next look reads
+//! again. What is recorded is what that reading found: the path, the digest and the arguments of one
+//! image. A process that executes another program and then the first again between the reads is
+//! read as one program, which the reading cannot tell apart, and a change after the last read is not
+//! part of the record.
+//!
 //! A program takes the terminal when the root shell starts a command, and the session knows when
 //! that is likely: the input it accepts, the output it produces, and an invocation the shell's
 //! integration asks about or a command it reports starting all mark its
@@ -495,11 +503,29 @@ impl Adoptions {
         if self.broker.holds_process(&process) {
             return None;
         }
+        // One reading of one program: the image is opened and hashed, then the arguments are read
+        // once, and then the image, the file the opened one is and the process's identity must all
+        // still be what they were. A program that executed another meanwhile, or whose file was
+        // replaced, is adopted on no pair of them: the next look reads again.
+        #[cfg(feature = "testing")]
+        stop_if_armed(&self.reading_pause);
+        // Bounded by the file's size, and stopped when the session closes. The file stays open to
+        // the last comparison, so its number cannot name another file meanwhile.
+        let (hashed, held) = crate::broker::image::read_holding(
+            &running_image(pid, &executable),
+            &self.hashed,
+            &self.stopped,
+        )
+        .ok()?;
         #[cfg(feature = "testing")]
         stop_if_armed(&self.arguments_pause);
         let arguments = arguments_of(pid)?;
         #[cfg(feature = "testing")]
         stop_if_armed(&self.arguments_read_pause);
+        if !still_runs(pid, &executable, &hashed.file) {
+            return None;
+        }
+        drop(held);
         // The executable and the arguments are this process's only if it still has its identity,
         // and so is the answer about who holds it.
         if !kr_ipc::identity::process_start_identity(pid).is_ok_and(|again| again.matches(&process))
@@ -508,15 +534,6 @@ impl Adoptions {
         }
         #[cfg(feature = "testing")]
         stop_if_armed(&self.bracket_pause);
-        #[cfg(feature = "testing")]
-        stop_if_armed(&self.reading_pause);
-        // Bounded by the file's size, and stopped when the session closes.
-        let hashed = crate::broker::image::read_identity(
-            &running_image(pid, &executable),
-            &self.hashed,
-            &self.stopped,
-        )
-        .ok()?;
         let now = kr_ipc::now_ms();
         let profile = LaunchProfile {
             profile_id: crate::broker::profiles::new_profile_id(now).ok()?,
@@ -1028,6 +1045,24 @@ fn running_image(pid: u32, executable: &str) -> std::path::PathBuf {
     } else {
         std::path::PathBuf::from(executable)
     }
+}
+
+/// Returns whether the process still runs the image that was read: the executable the kernel
+/// reports is the one it reported before, byte for byte, and the file it names is the file that was
+/// opened and hashed, by device and file number.
+///
+/// On Linux that file is the one the process runs, so a replaced image, whose path the kernel
+/// reports with a suffix that says it is deleted, is refused by the first comparison, and a
+/// replacement executed at the same path by the second. On macOS the file is the one the path names
+/// now, which a replacement inside the reading changes.
+fn still_runs(pid: u32, executable: &str, opened: &crate::broker::image::FileIdentity) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+
+    if crate::questions::binding::executable_of(pid).as_deref() != Some(executable) {
+        return false;
+    }
+    std::fs::metadata(running_image(pid, executable))
+        .is_ok_and(|file| file.dev() == opened.device && u128::from(file.ino()) == opened.inode)
 }
 
 /// Returns the bypass the latest prompt generation answered this executable with, where it
