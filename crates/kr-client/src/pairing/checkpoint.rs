@@ -451,10 +451,14 @@ impl PairedCheckpoints {
         }
         if next != file {
             let bytes = serde_json::to_vec(&next).map_err(|_| Unsettled::WriteFailed)?;
-            // No input reaches this check: the file holds at most 1,024 checkpoints of 350 bytes or less and one
-            // `told` entry of 166 bytes or less for each record of `hosts.json`, which is read up to 4 MiB in
-            // records of at least 920 bytes, so a result is under 1.5 MiB, and the check guards a change to
-            // those bounds.
+            // No readable file reaches this check. `parse` refuses a file of more than 1,024
+            // checkpoints or one that names an archive or a pairing twice, and `take` refuses a new
+            // archive at 1,024, so a result holds at most 1,024 checkpoints of 351 bytes or less. The
+            // settle drops each `told` entry of a pairing that no record of `hosts.json` holds, so a
+            // result holds at most one `told` entry of 166 bytes or less for each record. That file is
+            // read up to 4 MiB, in records whose values alone take 339 bytes or more (three identities
+            // and five keys), so it holds at most 12,372 records: 1,024 x 352 + 12,372 x 167 + 40 =
+            // 2,426,612 bytes. The check guards a change to those bounds.
             if u64::try_from(bytes.len()).map_or(true, |len| len > MAX_FILE_BYTES) {
                 return Err(Unsettled::Full);
             }
