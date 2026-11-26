@@ -34,12 +34,12 @@
 //!   names, a macro that defines a type or writes an `impl`, a module whose file a `#[path]` names,
 //!   an `include!`, a `cfg` inside a block, or a field type it cannot place.
 //!
-//! One log call is allowed: in `crates/kr-client/src/pairing/candidate.rs`, `tracing::warn!` with
-//! one string literal that has no holes and at most one field, `cause = ?name`. The words are
-//! fixed and the cause is one of a closed set of kinds, so nothing a host sent reaches a log. Any
-//! other log call there, and this one in any other file, is a finding. The rule reads only the
-//! call's form and cannot see the cause's type, so `ReadCause` and `Unsettled` must stay enums
-//! whose variants hold no text.
+//! One form of log call is allowed: in `crates/kr-client/src/pairing/candidate.rs`,
+//! `tracing::warn!` with one string literal that has no holes and at most one field,
+//! `cause = ?name`, in any number of calls. The words are fixed, so they hold nothing a host sent.
+//! Any other log call there, and this one in any other file, is a finding. The rule reads the
+//! call's form and not the type of `name`: each `cause = ?name` in that file must name a
+//! `ReadCause` or an `Unsettled`, enums whose variants hold no text, and a reviewer checks that.
 //!
 //! Test code is not held to the rule: an item whose `cfg` cannot hold without `test`, and every
 //! file such an item declares, is passed over. An item that may compile without `test`, such as

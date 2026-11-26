@@ -3923,6 +3923,20 @@ async fn a_device_that_pairs_again_and_fails_its_first_read_is_owed_and_keeps_it
         second.device_id, first.device_id,
         "the second pairing gives the device a new identity"
     );
+    let file: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(device.pairing.hosts.directory().join("checkpoints.json"))
+            .expect("the checkpoints file"),
+    )
+    .expect("a checkpoints file");
+    assert!(
+        file["told"]
+            .as_array()
+            .is_some_and(|told| told.iter().any(|entry| {
+                entry["host_device_id"] == serde_json::json!(first.host_device_id)
+                    && entry["device_id"] == serde_json::json!(first.device_id)
+            })),
+        "the first pairing's answer is on file"
+    );
     assert_eq!(
         checkpoints.acquisition(&second),
         Ok(Acquisition::Owed),

@@ -64,7 +64,9 @@ use serde::Serialize;
 use tokio::sync::{oneshot, watch};
 
 use super::BoxFuture;
-use super::checkpoint::{Answer, Outcome, PairingId, ReadCause, read_checkpoint};
+use super::checkpoint::{
+    Answer, Intended, Outcome, PairingId, ReadCause, Unsettled, read_checkpoint,
+};
 use super::failure::{FailureKind, PairingFailure, consumed, refused_by_host};
 use super::invitation::origin_host;
 use super::link::{ConnectionPeer, HostLink, LinkError, Preauth};
@@ -126,7 +128,7 @@ pub const WAIT_STEP: Duration = Duration::from_secs(10);
 
 /// How long the read of a host's backup checkpoint may take as the device is committed. It is
 /// shorter than [`WAIT_STEP`]: the last screen of a pairing is not held for a host that answers
-/// nothing, and the companion asks the host again later.
+/// nothing, and that host stays owed.
 pub const CHECKPOINT_WITHIN: Duration = Duration::from_secs(3);
 
 /// How far past an invitation's expiry, by this device's clock, it keeps asking. Two clocks never
@@ -1450,7 +1452,8 @@ impl Pairing {
 
     /// Asks the host of an owner device for its backup checkpoint on `session`, once, for no longer
     /// than [`CHECKPOINT_WITHIN`] and no longer than the recovery has. A host that cannot answer
-    /// leaves the device owed: its refusal is logged and does not fail the pairing.
+    /// leaves the device owed, unless an earlier answer of this pairing is on file: the failure is
+    /// logged and does not fail the pairing.
     async fn read_answer(
         &self,
         session: &Session,
@@ -1488,11 +1491,19 @@ impl Pairing {
                 Outcome::Disagrees => tracing::warn!(
                     "a host named another manifest than this device holds for the same backup generation, and the held checkpoint stands"
                 ),
+                Outcome::Uncertain if settled.intended == Intended::NothingPublished => {
+                    tracing::warn!(
+                        "the host's answer that it has no backup checkpoint was saved, and the directory could not be confirmed to hold it"
+                    );
+                }
                 Outcome::Uncertain => tracing::warn!(
                     "the host's backup checkpoint was saved, and the directory could not be confirmed to hold it"
                 ),
                 Outcome::New | Outcome::Raised | Outcome::Same | Outcome::NothingPublished => {}
             },
+            Ok(Err(Unsettled::Superseded)) => tracing::warn!(
+                "the host's backup checkpoint came for a pairing that has been replaced, and a newer checkpoint can have been saved"
+            ),
             Ok(Err(cause)) => tracing::warn!(
                 cause = ?cause,
                 "the host's backup checkpoint could not be saved, and the pairing stands"

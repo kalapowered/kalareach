@@ -38,9 +38,9 @@
 //! One macro is read as writing no type and no `Debug`: `tracing::warn!` in
 //! `crates/kr-client/src/pairing/candidate.rs`, in the one form that the rule on log calls allows,
 //! with one string literal that has no holes and at most one field, `cause = ?name`. The `Debug`
-//! of that field is held where its type is declared, so `ReadCause` and `Unsettled` must stay
-//! enums whose variants hold no text. Any other `tracing` call, and this one in any other file,
-//! is a finding.
+//! of that field is not read here: each `cause = ?name` in that file must name a `ReadCause` or an
+//! `Unsettled`, enums whose variants hold no text, and a reviewer checks that. Any other `tracing`
+//! call, and this one in any other file, is a finding.
 //!
 //! This reads the code the workspace writes, not every program Rust accepts, and it does not try
 //! to hold code written to get past it. What it does not read:
