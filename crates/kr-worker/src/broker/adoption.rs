@@ -844,70 +844,178 @@ pub struct Arguments {
     /// records.
     pub vector: Vec<String>,
     /// The second argument, the one an interpreter is given its script as, as the exact bytes the
-    /// kernel holds: present only where the reading proves that these bytes are the second argument.
+    /// kernel holds: present only where the reading proves that these bytes are the second argument
+    /// and that they are an absolute path. An empty first or second argument, a reading that ends
+    /// short of the count the kernel gave, a relative path or an option leave it absent.
     pub script_argument: Option<OsString>,
 }
 
+/// Returns the second argument as the script it names, where it names one: an absolute path.
+fn script_of(second: &[u8]) -> Option<OsString> {
+    use std::os::unix::ffi::OsStringExt as _;
+
+    second
+        .starts_with(b"/")
+        .then(|| OsString::from_vec(second.to_vec()))
+}
+
 /// Returns the arguments a process was started with, as the kernel keeps them:
-/// `/proc/<pid>/cmdline`, one argument after each NUL-terminated one.
+/// `/proc/<pid>/cmdline`, one argument after each NUL-terminated one, read once.
+///
+/// Every position is exact, empty arguments included. A reading that does not end in a zero byte is
+/// one a process rewrote, as a process that sets its title does, and names no script.
 #[cfg(target_os = "linux")]
+#[must_use]
 pub fn arguments_of(pid: u32) -> Option<Arguments> {
     let bytes = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
-    let bytes = bytes.strip_suffix(&[0]).unwrap_or(&bytes);
-    if bytes.is_empty() {
+    let area = bytes.strip_suffix(&[0]);
+    let arguments: Vec<&[u8]> = area.unwrap_or(&bytes).split(|byte| *byte == 0).collect();
+    if arguments == [b"".as_slice()] {
         return None;
     }
     Some(Arguments {
-        vector: bytes
-            .split(|byte| *byte == 0)
+        vector: arguments
+            .iter()
             .map(|argument| String::from_utf8_lossy(argument).into_owned())
             .collect(),
-        script_argument: None,
+        script_argument: area
+            .and(arguments.get(1))
+            .and_then(|second| script_of(second)),
     })
 }
 
 /// Returns the arguments a process was started with, as the kernel keeps them: macOS's
-/// `KERN_PROCARGS2`, read through `sysinfo`.
-#[cfg(not(target_os = "linux"))]
+/// `KERN_PROCARGS2`, read once into a buffer as long as the kernel lets arguments and environment
+/// be, and refused when the kernel's answer fills the buffer, since it might be cut.
+#[cfg(target_os = "macos")]
+#[must_use]
 pub fn arguments_of(pid: u32) -> Option<Arguments> {
-    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, UpdateKind};
+    let mut buffer = vec![0_u8; argument_limit()?];
+    let mut mib = [
+        libc::CTL_KERN,
+        libc::KERN_PROCARGS2,
+        libc::c_int::try_from(pid).ok()?,
+    ];
+    let length = kernel_read(&mut mib, &mut buffer)?;
+    if length >= buffer.len() {
+        return None;
+    }
+    parse_kern_procargs2(buffer.get(..length)?)
+}
 
-    let mut system = sysinfo::System::new();
-    let target = sysinfo::Pid::from_u32(pid);
-    system.refresh_processes_specifics(
-        ProcessesToUpdate::Some(&[target]),
-        true,
-        ProcessRefreshKind::nothing().with_cmd(UpdateKind::Always),
-    );
-    let process = system.process(target)?;
-    let vector: Vec<String> = process
-        .cmd()
-        .iter()
-        .map(|argument| argument.to_string_lossy().into_owned())
-        .collect();
-    (!vector.is_empty()).then_some(Arguments {
-        vector,
-        script_argument: None,
+/// Returns how many bytes of arguments and environment the kernel allows a program, read once.
+#[cfg(target_os = "macos")]
+fn argument_limit() -> Option<usize> {
+    static LIMIT: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        let mut mib = [libc::CTL_KERN, libc::KERN_ARGMAX];
+        let mut value = [0_u8; 4];
+        let length = kernel_read(&mut mib, &mut value)?;
+        let limit = usize::try_from(libc::c_int::from_ne_bytes(value)).ok()?;
+        (length == value.len() && limit > 0).then_some(limit)
     })
 }
 
+/// Reads one `sysctl` value into `out` and returns how many bytes the kernel wrote, or `None` where
+/// the kernel refused or reported more than `out` holds.
+///
+/// This is the only unsafe code of the argument reader. The caller holds three things: `mib` names
+/// the value and its length is the count passed with it, `out` is the whole buffer the kernel may
+/// write, and nothing is passed in to set: the length variable is set to the buffer's length before
+/// the call, the new-value pointer is null and its length is zero.
+#[cfg(target_os = "macos")]
+#[expect(
+    unsafe_code,
+    reason = "sysctl(3) has no safe form for the process-argument record: libproc binds no call \
+              for it and the sysctl crate reads by name, so the call is made once, with a live \
+              writable buffer of exactly the length it is told, which the kernel writes at most \
+              and keeps no pointer to"
+)]
+fn kernel_read(mib: &mut [libc::c_int], out: &mut [u8]) -> Option<usize> {
+    let mut length: libc::size_t = out.len();
+    let count = libc::c_uint::try_from(mib.len()).ok()?;
+    // SAFETY: `mib` is a live, writable array of `count` integers for the whole call. `out` is a
+    // live, writable buffer of `length` bytes, which the kernel writes at most and then sets
+    // `length` to the number it wrote. No new value is passed (a null pointer and a length of
+    // zero), and the kernel keeps no pointer to anything after it returns.
+    let status = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            count,
+            out.as_mut_ptr().cast(),
+            &mut length,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    (status == 0 && length <= out.len()).then_some(length)
+}
+
+/// How many bytes the kernel pads the path a program was executed by to, with at least one zero
+/// byte after it (macOS 27.2.1: the arguments start at the next multiple of eight).
+#[cfg(any(target_os = "macos", feature = "testing"))]
+const PATH_PADDING: usize = 8;
+
 /// Reads macOS's `KERN_PROCARGS2` record: the argument count, the path the program was executed
-/// by, the arguments and then the environment.
+/// by, zero bytes, the arguments and then the environment.
+///
+/// The zero bytes after the path are the padding that brings the path to a multiple of
+/// [`PATH_PADDING`] bytes, and one more for each empty argument at the front, so with that layout
+/// every position is known and the arguments are read one after another, empty ones included. A
+/// record with fewer zero bytes than the padding, or with fewer arguments than it counts, is a
+/// layout this reading was not made for: the vector is then what the reading gave before it was
+/// exact (the non-empty strings after the path, at most the count) and no second argument is named.
+/// The second argument is also left out where an empty first argument or an empty second one means
+/// that it cannot be told from padding or from nothing.
 #[cfg(any(target_os = "macos", feature = "testing"))]
 #[must_use]
 pub fn parse_kern_procargs2(buffer: &[u8]) -> Option<Arguments> {
-    let argc = i32::from_ne_bytes(buffer.get(..4)?.try_into().ok()?);
+    let argc = usize::try_from(i32::from_ne_bytes(buffer.get(..4)?.try_into().ok()?))
+        .ok()
+        .filter(|count| *count > 0)?;
     let record = buffer.get(4..)?;
-    let after_path = record.get(record.iter().position(|byte| *byte == 0)?..)?;
-    let vector: Vec<String> = after_path
-        .split(|byte| *byte == 0)
-        .filter(|argument| !argument.is_empty())
-        .take(usize::try_from(argc).ok()?)
-        .map(|argument| String::from_utf8_lossy(argument).into_owned())
-        .collect();
-    (!vector.is_empty()).then_some(Arguments {
-        vector,
-        script_argument: None,
+    let path_length = record.iter().position(|byte| *byte == 0)?;
+    let after_path = record.get(path_length..)?;
+    let zeros = after_path.iter().take_while(|byte| **byte == 0).count();
+    let rest = after_path.get(zeros..)?;
+    zeros
+        .checked_sub(PATH_PADDING - path_length % PATH_PADDING)
+        .and_then(|empty_first| read_by_position(argc, empty_first, rest))
+        .or_else(|| {
+            let vector: Vec<String> = rest
+                .split(|byte| *byte == 0)
+                .filter(|argument| !argument.is_empty())
+                .take(argc)
+                .map(|argument| String::from_utf8_lossy(argument).into_owned())
+                .collect();
+            (!vector.is_empty()).then_some(Arguments {
+                vector,
+                script_argument: None,
+            })
+        })
+}
+
+/// Reads `argc` arguments of which the first `empty_first` are empty and the rest follow in `rest`,
+/// each ended by a zero byte, or returns `None` where `rest` holds fewer.
+#[cfg(any(target_os = "macos", feature = "testing"))]
+fn read_by_position(argc: usize, empty_first: usize, rest: &[u8]) -> Option<Arguments> {
+    let mut arguments: Vec<&[u8]> = vec![b"".as_slice(); empty_first];
+    let mut remaining = rest;
+    for _ in 0..argc.checked_sub(empty_first)? {
+        let end = remaining.iter().position(|byte| *byte == 0)?;
+        arguments.push(remaining.get(..end)?);
+        remaining = remaining.get(end + 1..)?;
+    }
+    Some(Arguments {
+        vector: arguments
+            .iter()
+            .map(|argument| String::from_utf8_lossy(argument).into_owned())
+            .collect(),
+        script_argument: if empty_first == 0 {
+            arguments.get(1).and_then(|second| script_of(second))
+        } else {
+            None
+        },
     })
 }
 
