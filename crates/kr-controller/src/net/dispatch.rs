@@ -463,3 +463,6 @@ mod an_attempt_that_has_not_finished;
 
 #[cfg(test)]
 mod a_subscription_under_a_row_that_cannot_be_read;
+
+#[cfg(test)]
+mod limits_measure;
