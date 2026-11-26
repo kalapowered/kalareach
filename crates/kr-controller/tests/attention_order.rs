@@ -184,7 +184,7 @@ fn production_sources() -> Vec<(String, String)> {
         .map(|file| {
             let text = std::fs::read_to_string(&file).expect("a source file");
             let production = text
-                .split("#[cfg(test)]")
+                .split("#[cfg(test)]\nmod ")
                 .next()
                 .unwrap_or_default()
                 .to_owned();
