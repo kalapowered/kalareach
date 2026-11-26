@@ -21,10 +21,12 @@ use windows_sys::Win32::Security::Authorization::{
 };
 use windows_sys::Win32::Security::{
     ACE_HEADER, ACL, GetAce, GetSecurityDescriptorControl, GetSecurityDescriptorDacl,
-    GetSecurityDescriptorOwner, LABEL_SECURITY_INFORMATION, SECURITY_ATTRIBUTES,
+    GetSecurityDescriptorLength, GetSecurityDescriptorOwner, LABEL_SECURITY_INFORMATION,
+    SECURITY_ATTRIBUTES,
 };
 
 use super::ffi::{Handle, Result, Sid, error, last, wide};
+use crate::acl_entries::{self, Malformed};
 
 const SDDL_REVISION_1: u32 = 1;
 
@@ -257,18 +259,7 @@ pub fn descriptor(kind: SdKind, principals: &Principals) -> Result<OwnedSd> {
     OwnedSd::from_text(descriptor_text(kind, principals)?)
 }
 
-/// One entry of a permission list, as an access check reads it.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Entry {
-    /// The entry's type: 0 allows, 1 denies.
-    pub kind: u8,
-    /// The entry's inheritance flags.
-    pub flags: u8,
-    /// The rights it names.
-    pub mask: u32,
-    /// Who it names, as text.
-    pub sid: String,
-}
+pub use crate::acl_entries::Entry;
 
 /// What a descriptor says that an access check uses: its owner, whether its list is protected from
 /// inheritance, and every entry in order. It is how the broker compares the descriptor an object
@@ -287,6 +278,33 @@ const SE_DACL_PROTECTED: u16 = 0x1000;
 const SE_FILE_OBJECT: i32 = 1;
 const SE_REGISTRY_KEY: i32 = 4;
 const OWNER_AND_DACL: u32 = 0x1 | 0x4;
+
+/// The bytes of a list inside its descriptor: as many as the list's own size field says, when the
+/// header and all of those bytes lie within the descriptor's own length. The size field is read
+/// only after its place is known to lie inside the descriptor, and nothing is made of bytes beyond
+/// the descriptor.
+///
+/// # Safety
+///
+/// `descriptor` is a valid self-relative security descriptor, and `list` is the pointer the
+/// platform returned for its list.
+unsafe fn list_bytes<'a>(descriptor: *mut c_void, list: *mut ACL) -> Option<&'a [u8]> {
+    // SAFETY: the caller promises the descriptor is valid.
+    let total = unsafe { GetSecurityDescriptorLength(descriptor) } as usize;
+    let base = descriptor as usize;
+    let start = list as usize;
+    let header = start.checked_add(size_of::<ACL>())?;
+    if start < base || header > base.checked_add(total)? {
+        return None;
+    }
+    // SAFETY: the list's header lies inside the descriptor, which is valid.
+    let size = usize::from(unsafe { (*list).AclSize });
+    if start.checked_add(size)? > base.checked_add(total)? {
+        return None;
+    }
+    // SAFETY: the bytes lie inside the valid descriptor, which outlives the returned slice.
+    Some(unsafe { std::slice::from_raw_parts(list.cast::<u8>(), size) })
+}
 
 /// Reads the summary of a descriptor the platform gave.
 ///
@@ -333,35 +351,12 @@ unsafe fn summarise(descriptor: *mut c_void) -> Result<Summary> {
     let entries = if present == 0 || list.is_null() {
         None
     } else {
-        // SAFETY: the list pointer is inside the valid descriptor.
-        let count = unsafe { (*list).AceCount };
-        let mut entries = Vec::new();
-        for index in 0..u32::from(count) {
-            let mut ace: *mut c_void = null_mut();
-            // SAFETY: the index is below the entry count.
-            if unsafe { GetAce(list, index, &raw mut ace) } == 0 {
-                // text: sd_summarise-5
-                return Err(last("reading a list entry"));
-            }
-            // SAFETY: an access-allowed or access-denied entry is a header, a mask and a
-            // identifier; the platform returned a pointer to a whole entry.
-            let (kind, flags, mask, sid) = unsafe {
-                let header = &*ace.cast::<ACE_HEADER>();
-                let mask = *ace.cast::<u8>().add(size_of::<ACE_HEADER>()).cast::<u32>();
-                let sid = ace
-                    .cast::<u8>()
-                    .add(size_of::<ACE_HEADER>() + 4)
-                    .cast::<c_void>();
-                (header.AceType, header.AceFlags, mask, Sid::from_ptr(sid))
-            };
-            entries.push(Entry {
-                kind,
-                flags,
-                mask,
-                sid: sid.to_text()?,
-            });
-        }
-        Some(entries)
+        // SAFETY: the list pointer is the one the platform gave for this valid descriptor.
+        let read = unsafe { list_bytes(descriptor, list) }
+            .ok_or(Malformed)
+            .and_then(acl_entries::entries);
+        // text: sd_summarise-6
+        Some(read.map_err(|Malformed| error(0, "a permission list does not fit its own sizes"))?)
     };
     Ok(Summary {
         owner,

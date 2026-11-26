@@ -569,7 +569,7 @@ sd_summarise-1 | reading a descriptor's owner | reading a descriptor's owner: Wi
 sd_summarise-2 | the descriptor has no owner | the descriptor has no owner | read: the setup program's own check found this, and no call returned an error, so no number is printed
 sd_summarise-3 | reading a descriptor's flags | reading a descriptor's flags: Windows error N | read: the step that the words name, in `summarise`, returned an error
 sd_summarise-4 | reading a descriptor's list | reading a descriptor's list: Windows error N | read: the step that the words name, in `summarise`, returned an error
-sd_summarise-5 | reading a list entry | reading a list entry: Windows error N | read: the step that the words name, in `summarise`, returned an error
+sd_summarise-6 | a permission list does not fit its own sizes | a permission list does not fit its own sizes: Windows error 0 | read: the list's bytes, as its own size field gives them, are not inside the descriptor or fail the checks of `acl_entries::entries` (the revision, an entry's size, a field of an entry or an identifier's length)
 sd_summary_of_object-1 | reading an object's descriptor | reading an object's descriptor: Windows error N | read: the step that the words name, in `summary_of_object`, returned an error
 sd_has_label-1 | reading an object's label | reading an object's label: Windows error N | read: GetSecurityInfo for the label on the open object returned a nonzero code
 sd_has_label-2 | reading a label entry | reading a label entry: Windows error N | read: GetAce on the object's system access list returned 0
@@ -730,6 +730,7 @@ OPEN_WORDS | the broker cannot open this object | X: the broker cannot open this
 LINK_WORDS | this object is a link, and the broker does not follow links | X: this object is a link, and the broker does not follow links | read: the attributes read from the handle of an object of the tree hold the reparse flag
 ADMISSION_FAILED_WORDS | the broker could not check the access lists of the project | the broker could not check the access lists of the project: the platform's error | read: the descriptor of an object could not be read, a probe token could not be made, the walk was refused by the platform or the tree is over a bound of the walk; the words follow after the colon
 WRITER_WORDS | writer | writer S on P | read: summary_of_handle of an object under .git showed an allow entry with a write right (the write bits of a file or a directory, or the generic write or all bits) whose identifier is not the person's, S-1-5-18 or S-1-5-32-544
+UNREAD_ENTRY_WORDS | this object has a permission entry of a kind the broker does not read | P: this object has a permission entry of a kind the broker does not read | read: summary_of_handle of an object under .git showed an entry that `acl_entries` does not read (the compound allow type or a type above 0x15), which could allow
 OWNER_WORDS | owner | owner S on P | read: summary_of_handle of an object under .git showed an owner that is not the person, S-1-5-18 or S-1-5-32-544
 STALE_WORDS | stale grant | stale grant on P | read: summary_of_handle of an object of the tree showed an entry whose identifier has the form of an invocation's group (S-1-9, the crate's first part, three more parts)
 LABEL_WORDS | label | label on P | read: has_label_of_handle found a mandatory-label entry in the object's system access list
@@ -804,7 +805,7 @@ listed | pub const | limits.rs | 2 | names of rules, for cases and documents; no
 listed | pub const | standing.rs | 8 | names of rules, for cases and documents; no sentence for a person
 listed | pub const | repository/readers.rs | 8 | names, keys, limits, encodings and paths; no sentence for a person
 listed | pub const | win/hold.rs | 14 | names of rules, for cases and documents; no sentence for a person
-listed | pub const | win/admission.rs | 21 | names of rules, for cases and documents; no sentence for a person
+listed | pub const | win/admission.rs | 22 | names of rules, for cases and documents; no sentence for a person
 listed | pub const | win/install.rs | 3 | names, keys, limits, encodings and paths; no sentence for a person
 listed | pub const | win/verify.rs | 1 | names, keys, limits, encodings and paths; no sentence for a person
 listed | pub fn | env.rs | 2 | names, keys, limits, encodings and paths; no sentence for a person

@@ -59,6 +59,7 @@
 // without an expectation that says why nothing rests on the fold.
 #![deny(clippy::disallowed_methods)]
 
+pub mod acl_entries;
 pub mod channel;
 pub mod env;
 pub mod events;

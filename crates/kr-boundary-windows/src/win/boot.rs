@@ -263,6 +263,7 @@ mod tests {
             flags,
             mask,
             sid: sid.to_owned(),
+            understood: true,
         }
     }
 

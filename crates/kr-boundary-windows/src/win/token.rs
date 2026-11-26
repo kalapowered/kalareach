@@ -414,10 +414,12 @@ pub fn boundary_token(account: &str, group: &Sid) -> Result<Handle> {
             (&raw const default).cast(),
             size_of::<TOKEN_DEFAULT_DACL>() as u32,
         );
+        // The error is read before the free, which may replace it.
+        // text: token_boundary_token-5
+        let failure = (set == 0).then(|| last("setting the token's default permission list"));
         LocalFree(descriptor);
-        if set == 0 {
-            // text: token_boundary_token-5
-            return Err(last("setting the token's default permission list"));
+        if let Some(failure) = failure {
+            return Err(failure);
         }
     }
     Ok(token)

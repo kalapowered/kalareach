@@ -85,6 +85,8 @@ pub const RULE_RECHECK_LINKS: &str = "admission-recheck-links";
 pub const RULE_FAILED: &str = "admission-failed";
 /// The rule of a refusal for an entry that gives another principal a write right in the Git folder.
 pub const RULE_WRITER: &str = "admission-writer";
+/// The rule of a refusal for an object of the Git folder with an entry of a kind the broker does not read.
+pub const RULE_UNREAD_ENTRY: &str = "admission-unread-entry";
 /// The rule of a refusal for an owner that is not the person, the system or an administrator.
 pub const RULE_OWNER: &str = "admission-owner";
 /// The rule of a refusal for an entry that names a group of an invocation that did not finish.
@@ -112,6 +114,12 @@ pub const OPEN_WORDS: &str = "the broker cannot open this object";
 /// The end of the reply when an object of the tree is a link; the path comes before it.
 // text: LINK_WORDS
 pub const LINK_WORDS: &str = "this object is a link, and the broker does not follow links";
+
+/// The reply when an object of the Git folder has a permission entry of a kind the broker does not
+/// read and that could allow; it follows the object's path and a colon.
+// text: UNREAD_ENTRY_WORDS
+pub const UNREAD_ENTRY_WORDS: &str =
+    "this object has a permission entry of a kind the broker does not read";
 
 /// The start of the reply when a principal other than the person, the system and the
 /// administrators can write in the Git folder; the principal's identifier, `on` and the object's
@@ -515,6 +523,13 @@ impl Checking<'_> {
             return Err(named_last(RULE_LABEL, LABEL_WORDS, "", object.path));
         }
         if object.in_git {
+            if entries.iter().any(ListEntry::unread_allow) {
+                return Err(object_refusal(
+                    RULE_UNREAD_ENTRY,
+                    object.path,
+                    UNREAD_ENTRY_WORDS,
+                ));
+            }
             if let Some(entry) = entries
                 .iter()
                 .find(|entry| gives_writing(entry) && !self.writers.contains(&entry.sid))
@@ -740,7 +755,7 @@ const INHERIT_ONLY: u8 = 0x08;
 /// the creator's primary group the right on every object made later, and the boundary token neither
 /// sets nor checks its primary group, so another boundary account of that group could write it.
 fn gives_writing(entry: &ListEntry) -> bool {
-    let allows = entry.kind == 0 || entry.kind == 9;
+    let allows = matches!(entry.kind, 0 | 5 | 9 | 0xB);
     let template = entry.flags & INHERIT_ONLY != 0 && entry.sid == "S-1-3-0";
     allows && !template && entry.mask & WRITE_BITS != 0
 }
