@@ -477,7 +477,12 @@ fn broker_admission_the_probe_token_of_each_class_is_asked() {
                 "{label}"
             );
         } else {
-            outcome.expect("a group that no boundary account belongs to refuses nothing");
+            // The writer rule refuses it: no principal besides the person, the system and the
+            // administrators may write under the Git folder, because a group's members can change
+            // after the admission, so who belongs to the group today does not decide.
+            let refusal =
+                outcome.expect_err("a group that no boundary account belongs to is a writer");
+            assert_eq!(refusal.rule, RULE_WRITER, "{label}");
         }
     }
 }
