@@ -908,6 +908,103 @@ fn kr_req_24_24_every_recorded_frame_of_the_fourth_plugin_host_protocol_reads_an
     );
 }
 
+/// How much of a frame's form a report of a difference shows: enough to read every member of an
+/// answer, and not the whole of a frame that holds a document.
+const SHOWN: usize = 400;
+
+/// The frames under `prefix` that `live` holds more times than `recorded` ("written, not recorded")
+/// and the ones it holds fewer times ("recorded, not written"), one line for each form that differs
+/// with the form itself, cut to [`SHOWN`] characters. The written forms come first.
+fn differing(
+    live: &[(String, String)],
+    recorded: &[(String, String)],
+    prefix: &str,
+) -> Vec<String> {
+    let mut counts: std::collections::BTreeMap<(&str, &str), i64> = Default::default();
+    for (kind, held) in live {
+        if kind.starts_with(prefix) && kind != CONSUMED {
+            *counts.entry((kind, held)).or_default() += 1;
+        }
+    }
+    for (kind, held) in recorded {
+        if kind.starts_with(prefix) && kind != CONSUMED {
+            *counts.entry((kind, held)).or_default() -= 1;
+        }
+    }
+    let mut differing: Vec<_> = counts.into_iter().filter(|(_, left)| *left != 0).collect();
+    differing.sort_by_key(|(_, left)| core::cmp::Reverse(*left));
+    differing
+        .into_iter()
+        .map(|((kind, held), left)| {
+            let side = if left > 0 {
+                "written, not recorded"
+            } else {
+                "recorded, not written"
+            };
+            let length = held.chars().count();
+            let form = if length > SHOWN {
+                format!(
+                    "{}... ({length} characters)",
+                    held.chars().take(SHOWN).collect::<String>()
+                )
+            } else {
+                held.to_owned()
+            };
+            format!("{kind} {side} {} time(s): {form}", left.unsigned_abs())
+        })
+        .collect()
+}
+
+/// A difference between the answers of a session and the record shows both forms: the answer that
+/// was written and the answer that was recorded, so that a failure names the member that differs.
+#[test]
+fn kr_req_24_24_a_difference_from_the_record_shows_the_written_and_the_recorded_form() {
+    let admitted = |free_bytes: u64| {
+        (
+            "response:admitted".to_owned(),
+            format!(
+                "{{\"response\":{{\"body\":{{\"admitted\":{{\"admission\":\"queued\",\"free_bytes\":{free_bytes},\"lost_bytes\":0,\"lost_events\":0}}}},\"reply_to\":3}}}}"
+            ),
+        )
+    };
+    let hello = ("response:hello".to_owned(), "{\"hello\":1}".to_owned());
+    let consumed = ("notice:consumed".to_owned(), "{\"consumed\":1}".to_owned());
+    let recorded = vec![hello.clone(), admitted(4_194_299), consumed];
+    assert!(
+        differing(
+            &[admitted(4_194_299), hello.clone()],
+            &recorded,
+            "response:"
+        )
+        .is_empty(),
+        "the same answers in another order do not differ"
+    );
+    let written = vec![hello, admitted(4_194_294)];
+    let shown = differing(&written, &recorded, "response:");
+    assert_eq!(shown.len(), 2, "one line for each form: {shown:?}");
+    let (more, fewer) = (&shown[0], &shown[1]);
+    assert!(
+        more.contains("written") && more.contains("\"free_bytes\":4194294"),
+        "the written form is shown: {more}"
+    );
+    assert!(
+        fewer.contains("recorded") && fewer.contains("\"free_bytes\":4194299"),
+        "the recorded form is shown: {fewer}"
+    );
+    assert!(
+        differing(&written, &recorded, "notice:").is_empty(),
+        "a notice that is not under the prefix is not reported"
+    );
+    let long = ("response:called:document".to_owned(), "x".repeat(10_000));
+    let shown = differing(&[long], &[], "response:");
+    assert_eq!(shown.len(), 1);
+    assert!(
+        shown[0].len() < 1_000 && shown[0].contains("10000 characters"),
+        "a long form is cut to a bound and says how long it was: {}",
+        shown[0].len()
+    );
+}
+
 /// KR-REQ-24.24: the host answers a session the way the record says. Requests are the session's own
 /// and are the requests that were recorded; each is answered with the kind of answer it was recorded
 /// with, and the answers and notices are the ones that were recorded.
@@ -1006,25 +1103,11 @@ async fn kr_req_24_24_the_fourth_protocol_host_answers_its_sessions_the_way_the_
         // Answers and notices are a multiset: when a notice is written beside an answer is not what
         // the protocol fixes.
         for (what, prefix) in [("answer", "response:"), ("notice", "notice:")] {
-            let mut counts: std::collections::BTreeMap<(String, String), i64> = Default::default();
-            for (kind, held) in &live {
-                if kind.starts_with(prefix) && kind != CONSUMED {
-                    *counts.entry((kind.clone(), held.clone())).or_default() += 1;
-                }
-            }
-            for (kind, held) in &recorded {
-                if kind.starts_with(prefix) && kind != CONSUMED {
-                    *counts.entry((kind.clone(), held.clone())).or_default() -= 1;
-                }
-            }
-            let differing: Vec<(&str, i64)> = counts
-                .iter()
-                .filter(|(_, left)| **left != 0)
-                .map(|((kind, _), left)| (kind.as_str(), *left))
-                .collect();
+            let differing = differing(&live, &recorded, prefix);
             assert!(
                 differing.is_empty(),
-                "{which}: these {what}s were written more times (positive) or fewer (negative) than they were recorded: {differing:?}"
+                "{which}: these {what}s were not written as many times as they were recorded:\n{}",
+                differing.join("\n")
             );
         }
         // What an instance has consumed is told as the latest report: a newer report replaces one
