@@ -802,7 +802,7 @@ fn program_of(
         let reading = Ran {
             leader,
             image: image.clone(),
-            arguments: crate::broker::adoption::arguments_of(leader),
+            arguments: crate::broker::adoption::arguments_of(leader).map(|read| read.vector),
             command: typed.clone(),
         };
         let runs_it = match ran {

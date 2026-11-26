@@ -44,6 +44,7 @@
 //! holds it from its admission on.
 
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
@@ -142,6 +143,17 @@ pub struct Adoptions {
     /// Where the next identification stops before it reads the image, for this host's own tests.
     #[cfg(feature = "testing")]
     reading_pause: Mutex<Option<Pause>>,
+    /// Where the next identification stops before it reads the arguments, for this host's own
+    /// tests.
+    #[cfg(feature = "testing")]
+    arguments_pause: Mutex<Option<Pause>>,
+    /// Where the next identification stops after it has read the arguments, for this host's own
+    /// tests.
+    #[cfg(feature = "testing")]
+    arguments_read_pause: Mutex<Option<Pause>>,
+    /// Where the next identification stops after its last comparison, for this host's own tests.
+    #[cfg(feature = "testing")]
+    bracket_pause: Mutex<Option<Pause>>,
     /// Where the next adoption stops between recording the instance and binding it, for this
     /// host's own tests.
     #[cfg(feature = "testing")]
@@ -176,6 +188,12 @@ impl Adoptions {
             following: None,
             #[cfg(feature = "testing")]
             reading_pause: Mutex::new(None),
+            #[cfg(feature = "testing")]
+            arguments_pause: Mutex::new(None),
+            #[cfg(feature = "testing")]
+            arguments_read_pause: Mutex::new(None),
+            #[cfg(feature = "testing")]
+            bracket_pause: Mutex::new(None),
             #[cfg(feature = "testing")]
             binding_pause: Mutex::new(None),
         }
@@ -216,6 +234,44 @@ impl Adoptions {
         &self,
     ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
         arm(&self.reading_pause)
+    }
+
+    /// Stops the next identification just before it reads the arguments, for this host's own
+    /// tests: a program that changes between the reading of its image and the reading of its
+    /// arguments.
+    ///
+    /// Returns the end that says the identification has arrived there and the end that lets it go
+    /// on. It is compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    pub fn pause_before_arguments(
+        &self,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        arm(&self.arguments_pause)
+    }
+
+    /// Stops the next identification just after it has read the arguments, for this host's own
+    /// tests: a program that changes between the reading of its arguments and the check of its
+    /// image.
+    ///
+    /// Returns the end that says the identification has arrived there and the end that lets it go
+    /// on. It is compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    pub fn pause_after_arguments(
+        &self,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        arm(&self.arguments_read_pause)
+    }
+
+    /// Stops the next identification after its last comparison, for this host's own tests: a
+    /// program that changes once everything has been read and checked.
+    ///
+    /// Returns the end that says the identification has arrived there and the end that lets it go
+    /// on. It is compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    pub fn pause_after_bracket(
+        &self,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        arm(&self.bracket_pause)
     }
 
     /// Stops the next adoption between the moment its instance is recorded and the moment it is
@@ -439,13 +495,19 @@ impl Adoptions {
         if self.broker.holds_process(&process) {
             return None;
         }
+        #[cfg(feature = "testing")]
+        stop_if_armed(&self.arguments_pause);
         let arguments = arguments_of(pid)?;
+        #[cfg(feature = "testing")]
+        stop_if_armed(&self.arguments_read_pause);
         // The executable and the arguments are this process's only if it still has its identity,
         // and so is the answer about who holds it.
         if !kr_ipc::identity::process_start_identity(pid).is_ok_and(|again| again.matches(&process))
         {
             return None;
         }
+        #[cfg(feature = "testing")]
+        stop_if_armed(&self.bracket_pause);
         #[cfg(feature = "testing")]
         stop_if_armed(&self.reading_pause);
         // Bounded by the file's size, and stopped when the session closes.
@@ -470,7 +532,7 @@ impl Adoptions {
                 .to_owned(),
                 distribution: "adopted".to_owned(),
             },
-            arguments,
+            arguments: arguments.vector,
             authentication: AuthenticationState::Unknown,
             mode: IntegrationMode::NativeTerminal,
             // Started by the person's shell, so held by whatever holds the session's own
@@ -775,27 +837,39 @@ pub(crate) fn group_of(process: &ProcessStartIdentity) -> Option<i32> {
         .map(std::num::NonZeroI32::get)
 }
 
-/// Returns the argument vector a process was started with, as the kernel keeps it:
+/// What one reading of a process's argument area found.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Arguments {
+    /// The argument vector, each argument as text with any invalid UTF-8 replaced: what a profile
+    /// records.
+    pub vector: Vec<String>,
+    /// The second argument, the one an interpreter is given its script as, as the exact bytes the
+    /// kernel holds: present only where the reading proves that these bytes are the second argument.
+    pub script_argument: Option<OsString>,
+}
+
+/// Returns the arguments a process was started with, as the kernel keeps them:
 /// `/proc/<pid>/cmdline`, one argument after each NUL-terminated one.
 #[cfg(target_os = "linux")]
-pub(crate) fn arguments_of(pid: u32) -> Option<Vec<String>> {
+pub fn arguments_of(pid: u32) -> Option<Arguments> {
     let bytes = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
     let bytes = bytes.strip_suffix(&[0]).unwrap_or(&bytes);
     if bytes.is_empty() {
         return None;
     }
-    Some(
-        bytes
+    Some(Arguments {
+        vector: bytes
             .split(|byte| *byte == 0)
             .map(|argument| String::from_utf8_lossy(argument).into_owned())
             .collect(),
-    )
+        script_argument: None,
+    })
 }
 
-/// Returns the argument vector a process was started with, as the kernel keeps it: macOS's
+/// Returns the arguments a process was started with, as the kernel keeps them: macOS's
 /// `KERN_PROCARGS2`, read through `sysinfo`.
 #[cfg(not(target_os = "linux"))]
-pub(crate) fn arguments_of(pid: u32) -> Option<Vec<String>> {
+pub fn arguments_of(pid: u32) -> Option<Arguments> {
     use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, UpdateKind};
 
     let mut system = sysinfo::System::new();
@@ -806,12 +880,35 @@ pub(crate) fn arguments_of(pid: u32) -> Option<Vec<String>> {
         ProcessRefreshKind::nothing().with_cmd(UpdateKind::Always),
     );
     let process = system.process(target)?;
-    let arguments: Vec<String> = process
+    let vector: Vec<String> = process
         .cmd()
         .iter()
         .map(|argument| argument.to_string_lossy().into_owned())
         .collect();
-    (!arguments.is_empty()).then_some(arguments)
+    (!vector.is_empty()).then_some(Arguments {
+        vector,
+        script_argument: None,
+    })
+}
+
+/// Reads macOS's `KERN_PROCARGS2` record: the argument count, the path the program was executed
+/// by, the arguments and then the environment.
+#[cfg(any(target_os = "macos", feature = "testing"))]
+#[must_use]
+pub fn parse_kern_procargs2(buffer: &[u8]) -> Option<Arguments> {
+    let argc = i32::from_ne_bytes(buffer.get(..4)?.try_into().ok()?);
+    let record = buffer.get(4..)?;
+    let after_path = record.get(record.iter().position(|byte| *byte == 0)?..)?;
+    let vector: Vec<String> = after_path
+        .split(|byte| *byte == 0)
+        .filter(|argument| !argument.is_empty())
+        .take(usize::try_from(argc).ok()?)
+        .map(|argument| String::from_utf8_lossy(argument).into_owned())
+        .collect();
+    (!vector.is_empty()).then_some(Arguments {
+        vector,
+        script_argument: None,
+    })
 }
 
 /// Returns where the image a process runs is read from: on Linux the kernel's own link to it,
