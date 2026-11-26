@@ -359,6 +359,76 @@ async fn a_pairing_takes_the_point_of_its_commit_and_the_next_start_gives_a_gran
     host.stop().await;
 }
 
+/// At the daemon's level: a pass at the start that fails does not fail the start. The
+/// daemon writes a line that says what the devices lose, goes on, and the next start gives the
+/// grant its point. The line goes to the daemon's standard error, so the case runs its body in a
+/// child run of this program and reads what the child wrote.
+#[test]
+fn a_start_whose_pass_fails_goes_on_and_writes_its_line() {
+    let program = std::env::current_exe().expect("this program");
+    let output = std::process::Command::new(program)
+        .args([
+            "--exact",
+            "the_body_of_a_start_whose_pass_fails",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env("KR_ATTENTION_ORDER_BODY", "1")
+        .output()
+        .expect("the child run starts");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "the child failed: {stderr}");
+    assert!(
+        stderr
+            .contains("kr-controller: could not give the devices a new start point at this start"),
+        "the daemon wrote its line: {stderr}"
+    );
+}
+
+/// The body of [`a_start_whose_pass_fails_goes_on_and_writes_its_line`]: it does nothing unless
+/// that case runs it with the variable set.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_body_of_a_start_whose_pass_fails() {
+    if std::env::var_os("KR_ATTENTION_ORDER_BODY").is_none() {
+        return;
+    }
+    let owner = DeviceKeys::generate().expect("keys");
+    let host = Host::start(&owner).await;
+    let device = Device::create().await;
+    let paired = pair_with(
+        &host,
+        &device,
+        &owner,
+        proposal(&[ActionRight::SessionView]),
+    )
+    .await;
+    let grant = paired.grant.grant_id.get().as_bytes().to_vec();
+    let path = host.registry_database();
+    let connection = rusqlite::Connection::open(&path).expect("the registry opens");
+    connection
+        .execute_batch(
+            "DELETE FROM grant_starts;
+             CREATE TRIGGER a_fault BEFORE INSERT ON grant_starts
+             BEGIN SELECT RAISE(ABORT, 'a fault at the point'); END;",
+        )
+        .expect("the point goes and the next write of one fails");
+    let host = host.restart().await;
+    assert_eq!(
+        point_of(&path, &grant),
+        None,
+        "the pass failed and the daemon went on without giving the grant a point"
+    );
+    connection
+        .execute_batch("DROP TRIGGER a_fault")
+        .expect("the fault goes");
+    let host = host.restart().await;
+    assert!(
+        point_of(&path, &grant).is_some(),
+        "the next start gives the grant its point"
+    );
+    host.stop().await;
+}
+
 /// The rows a pairing writes together, counted: the devices, the commitments, the events and the
 /// start points.
 fn pairing_rows(path: &Path) -> (i64, i64, i64, i64) {

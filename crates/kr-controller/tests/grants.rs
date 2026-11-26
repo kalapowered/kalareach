@@ -6871,6 +6871,141 @@ fn the_pass_at_a_start_gives_a_revoked_grant_no_point() {
     );
 }
 
+/// KR-REQ-23.45: a pass that fails after it deleted the points of a spoiled boot
+/// puts them back with everything else, because the delete and the inserts are one transaction;
+/// the next pass replaces them.
+#[test]
+fn a_pass_that_fails_after_it_deleted_the_points_of_a_spoiled_boot_keeps_them() {
+    let (_temp, database, directory, root) = a_store_with_a_root();
+    let clock = SetClock::at(100);
+    directory.observe_boot(&boot_in(&clock, 4)).expect("boot 4");
+    directory.observe_boot(&boot_in(&clock, 7)).expect("boot 7");
+    sql(
+        &database,
+        "UPDATE boots SET spoiled = 1 WHERE boot_epoch = x'0000000000000007'",
+    );
+    sql(
+        &database,
+        &format!(
+            "INSERT INTO grant_starts (grant_id, wall_ms, boot_epoch, boot_ms)
+             VALUES (x'{}', 21, x'0000000000000007', 22)",
+            "01".repeat(16)
+        ),
+    );
+    let without = Grant {
+        grant_id: grant_id(0x52),
+        ..grant(0x52, None, &[ActionRight::SessionView], GrantExpiry::Never)
+    };
+    directory
+        .issue(&record(without.clone()), || Ok(()))
+        .expect("a grant with no point");
+    sql(
+        &database,
+        "CREATE TRIGGER a_fault BEFORE INSERT ON grant_starts
+         BEGIN SELECT RAISE(ABORT, 'a fault at the point'); END;",
+    );
+    clock.set(300);
+    let boot = boot_in(&clock, 9);
+    assert!(directory.start_points_at_start(&boot, 1_000_000).is_err());
+    assert_eq!(
+        start_of(&database, root),
+        Some((21, 7, 22)),
+        "the delete was rolled back with the failed insert"
+    );
+    assert_eq!(start_of(&database, without.grant_id), None);
+    assert_eq!(boot_row(&database, 9), None, "and so was the observation");
+    sql(&database, "DROP TRIGGER a_fault");
+    directory
+        .start_points_at_start(&boot, 1_000_000)
+        .expect("the next pass completes");
+    assert_eq!(
+        start_of(&database, root),
+        Some((1_000_000, 9, 300)),
+        "the next pass replaces the point of the spoiled boot"
+    );
+}
+
+/// KR-REQ-23.45: a redemption's point is written with the redemption or not at all.
+/// A fault at the point's write leaves the grant a proposal, and the high is as it was.
+#[test]
+fn a_redemption_whose_point_cannot_be_written_leaves_the_share_a_proposal() {
+    let (_temp, database, directory, root) = a_store_with_a_root();
+    let clock = SetClock::at(1_000);
+    let boot = boot_in(&clock, 7);
+    let now = kr_ipc::now_ms().get();
+    let redeemer = device_id(0x31);
+    let (share, preview) = a_share(root, 2_000_000, 0x91, redeemer, now);
+    directory
+        .issue_shared(&share, &preview, device_id(0xf0), now, &boot, || Ok(()))
+        .expect("issued");
+    // A share an earlier release wrote has no point, so the redemption writes the first.
+    sql(&database, "DELETE FROM grant_starts");
+    sql(
+        &database,
+        "CREATE TRIGGER a_fault BEFORE INSERT ON grant_starts
+         BEGIN SELECT RAISE(ABORT, 'a fault at the point'); END;",
+    );
+    clock.set(4_000);
+    let refused = directory.redeem(preview.invitation_id, redeemer, now, &boot, || Ok(()), None);
+    assert!(refused.is_err(), "the redemption fails with its point");
+    let stored = directory
+        .record(share.grant.grant_id)
+        .expect("readable")
+        .expect("the proposal is still there");
+    assert_eq!(
+        stored.activated_at_ms, None,
+        "the activation was rolled back"
+    );
+    assert_eq!(start_of(&database, share.grant.grant_id), None);
+    assert_eq!(
+        boot_row(&database, 7),
+        Some((1_000, 0)),
+        "the reading of the failed redemption was rolled back with it"
+    );
+}
+
+/// KR-REQ-23.45: a transfer's point is written with the replacement or not at all.
+/// A fault at the point's write leaves the grant it would have replaced standing, and no replacement.
+#[test]
+fn a_transfer_whose_point_cannot_be_written_replaces_nothing() {
+    let (_temp, database, directory, root) = a_store_with_a_root();
+    let clock = SetClock::at(5_000);
+    let boot = boot_in(&clock, 7);
+    let now = kr_ipc::now_ms().get();
+    let replacement = record(Grant {
+        grant_id: grant_id(9),
+        ..grant(9, None, &[ActionRight::SessionView], GrantExpiry::Never)
+    });
+    sql(
+        &database,
+        "CREATE TRIGGER a_fault BEFORE INSERT ON grant_starts
+         BEGIN SELECT RAISE(ABORT, 'a fault at the point'); END;",
+    );
+    let refused = directory.transfer(root, &replacement, now, &boot, |_| Ok(()), None);
+    assert!(refused.is_err(), "the transfer fails with its point");
+    assert!(
+        directory
+            .record(replacement.grant.grant_id)
+            .expect("readable")
+            .is_none(),
+        "no replacement was written"
+    );
+    assert_eq!(
+        directory
+            .record(root)
+            .expect("readable")
+            .expect("the grant is still there")
+            .revoked_at_ms,
+        None,
+        "the grant it would have replaced was not revoked"
+    );
+    assert_eq!(
+        boot_row(&database, 7),
+        None,
+        "the observation was rolled back too"
+    );
+}
+
 /// KR-REQ-23.45: a daemon whose configuration does not put it on the network has no
 /// regular pass: the pass is a turn of the task that the network's registration starts, and there
 /// is no registration. Its start is recorded once, and nothing records its boot again until the

@@ -5469,4 +5469,61 @@ pub(crate) mod tests {
         );
         network.shutdown().await;
     }
+
+    /// KR-REQ-23.45: a host on the network raises its boot's high in each turn of
+    /// the regular loop, with nothing else written. The high is put back to zero after the start,
+    /// and a turn of the loop, on time this test moves, raises it to a reading of the order
+    /// counter; a host that is off the network has no such turn.
+    #[tokio::test(start_paused = true)]
+    async fn a_turn_of_the_regular_loop_raises_the_high_of_the_boot() {
+        let temp = kr_ipc::testing::TempHost::create();
+        let controller = daemon(&temp).await;
+        let network = super::register(
+            &controller,
+            super::NetworkSetup {
+                settings: super::config::NetworkSettings {
+                    endpoint: kr_transport::config::EndpointConfig {
+                        bind_addr: Some("127.0.0.1:0".parse().expect("a loopback address")),
+                        ..kr_transport::config::EndpointConfig::default()
+                    },
+                    ..super::config::NetworkSettings::default()
+                },
+                secrets: Arc::new(kr_crypto::store::MemoryStore::new()),
+                rendezvous: None,
+            },
+        )
+        .await
+        .expect("the daemon joins the network");
+        let database = temp.environment().registry_database();
+        let high = || -> i64 {
+            rusqlite::Connection::open(&database)
+                .expect("the registry opens")
+                .query_row(
+                    "SELECT high_ms FROM boots ORDER BY ordinal DESC LIMIT 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("the boot's row")
+        };
+        assert!(high() > 0, "the start read a counter that is not zero");
+        rusqlite::Connection::open(&database)
+            .expect("the registry opens")
+            .execute_batch("UPDATE boots SET high_ms = 0")
+            .expect("the high goes back");
+        assert_eq!(high(), 0);
+        // The loop's task makes its sleep when it is first polled, so it is polled before the
+        // time moves: a sleep made after the move would not be due.
+        for _ in 0..200 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(super::CLOCK_MARK_INTERVAL + std::time::Duration::from_secs(1)).await;
+        for _ in 0..200 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            high() > 0,
+            "a turn of the loop raised the high that the test had put back"
+        );
+        network.shutdown().await;
+    }
 }
