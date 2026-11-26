@@ -741,6 +741,80 @@ fn config_hold_a_hook_rewritten_with_content_of_equal_length_is_seen_at_the_end(
     );
 }
 
+/// Sets a reparse point with a cloud tag on a file or a folder through a handle that asks only for
+/// the right to write attributes: the share mode of a held handle does not refuse that open.
+fn set_cloud_tag(path: &Path) -> std::io::Result<()> {
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::System::IO::DeviceIoControl;
+    let file = OpenOptions::new()
+        .access_mode(0x0100)
+        .share_mode(7)
+        .custom_flags(0x0220_0000)
+        .open(path)?;
+    let mut header = [0_u8; 8];
+    header[..4].copy_from_slice(&0x9000_001A_u32.to_le_bytes());
+    let mut returned = 0_u32;
+    // SAFETY: the file is open; the buffer is 8 bytes and its length is passed.
+    let set = unsafe {
+        DeviceIoControl(
+            file.as_raw_handle(),
+            0x0009_00A4,
+            header.as_ptr().cast(),
+            8,
+            std::ptr::null_mut(),
+            0,
+            &raw mut returned,
+            std::ptr::null_mut(),
+        )
+    };
+    if set == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn config_hold_a_reparse_point_set_on_the_held_config_or_a_held_folder_is_seen_at_the_end() {
+    if !runs_as_the_system() {
+        eprintln!("skipped: the case needs the system's token");
+        return;
+    }
+    prepare();
+    let ordinary = Person::new("krhcp");
+    let scratch = Scratch::new();
+    let project = Project::make(&scratch, "tag");
+    let hold =
+        hold_tree(project.root.to_str().unwrap(), &ordinary.as_client()).expect("the tree is held");
+    assert_eq!(hold.end_check(), Ok(()), "nothing is changed yet");
+
+    // A reparse point changes no byte, size, name or identity of the file: only its attributes show
+    // it.
+    set_cloud_tag(&project.git.join("config"))
+        .expect("the guest takes a reparse point on the held config");
+    assert_eq!(
+        hold.end_check(),
+        Err(changed(&["config"])),
+        "a reparse point on the held config"
+    );
+
+    // The same on a held folder, when the guest takes a tag on a folder that holds files.
+    match set_cloud_tag(&project.git) {
+        Ok(()) => {
+            let names = hold
+                .end_check()
+                .expect_err("a reparse point on a held folder");
+            assert!(
+                names.names.iter().any(|name| name.ends_with(".git")),
+                "{names:?}"
+            );
+        }
+        Err(failure) => {
+            println!("NOT SHOWN: the guest takes no tag on a folder that holds files: {failure}");
+        }
+    }
+}
+
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
 fn config_hold_a_hooks_folder_beyond_the_bounds_is_refused_at_the_hold() {

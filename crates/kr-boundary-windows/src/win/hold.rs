@@ -280,6 +280,18 @@ impl TreeHold {
         ) else {
             return false;
         };
+        // A reparse point set through a handle that may only write attributes changes no byte, size
+        // or name, so the attributes are read again.
+        let Ok(tag) = query::<FILE_ATTRIBUTE_TAG_INFO>(
+            &handle,
+            FileAttributeTagInfo,
+            "reading the configuration's attributes",
+        ) else {
+            return false;
+        };
+        if tag.FileAttributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY) != 0 {
+            return false;
+        }
         if identity != self.config.identity
             || standard.NumberOfLinks != self.config.link_count
             || standard.DeletePending
@@ -295,11 +307,20 @@ impl TreeHold {
     }
 }
 
-/// Whether the held folder is still the object it was, at the path it was opened at. A read that
-/// fails shows nothing, so the folder is then not shown to be the same.
+/// Whether the held folder is still the object it was, at the path it was opened at, and still no
+/// reparse point. A read that fails shows nothing, so the folder is then not shown to be the same.
 fn folder_is_unchanged(folder: &DirHandle) -> bool {
-    match (key_of(folder.handle()), final_path(folder.handle())) {
-        (Ok(key), Ok(path)) => key == folder.key() && path == folder.path(),
+    let tag = query::<FILE_ATTRIBUTE_TAG_INFO>(
+        folder.handle(),
+        FileAttributeTagInfo,
+        "reading a folder's attributes",
+    );
+    match (key_of(folder.handle()), final_path(folder.handle()), tag) {
+        (Ok(key), Ok(path), Ok(tag)) => {
+            key == folder.key()
+                && path == folder.path()
+                && tag.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT == 0
+        }
         _ => false,
     }
 }
