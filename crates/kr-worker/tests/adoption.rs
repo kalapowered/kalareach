@@ -2500,8 +2500,9 @@ mod procargs2 {
 
 /// KR-REQ-12.07: the macOS argument record is read by position. The second argument is the exact
 /// bytes the kernel holds when the record proves its position, and none where an empty first or
-/// second argument, a record the kernel does not lay out as observed or an argument that is not an
-/// absolute path leaves it in doubt. The vector is exact wherever the record is.
+/// second argument or an argument that is not an absolute path leaves it in doubt. A record the
+/// kernel is not seen to lay out as observed is read as nothing, never as a vector. The vector is
+/// exact wherever the record is read.
 #[test]
 fn kr_req_12_07_the_macos_argument_record_is_read_by_position() {
     use std::ffi::OsString;
@@ -2579,20 +2580,62 @@ fn kr_req_12_07_the_macos_argument_record_is_read_by_position() {
         );
     }
 
-    // Records the kernel is not seen to lay out leave the position in doubt: the vector is what
-    // the reader gave before, the non-empty strings after the path, and the second argument is none.
-    let short_padding = b"\x02\x00\x00\x00/usr/bin/yes\x00yes\x00/opt/agent/cli.js\x00".as_slice();
-    let read = parse_kern_procargs2(short_padding).expect("a record padded by less");
-    assert_eq!(read.vector, strings(&["yes", "/opt/agent/cli.js"]));
-    assert_eq!(
-        read.script_argument, None,
-        "a path padded by less than the layout observed"
+    // A record the kernel is not seen to lay out as observed is read as nothing: the reading does
+    // not say what the arguments are, so nothing is adopted from it. Each record below was read as
+    // arguments by a reading that fell back to the non-empty strings after the path.
+    let doubtful: [(&str, &[u8]); 5] = [
+        (
+            // The padding is one zero byte where this path needs four, and an environment string
+            // follows the arguments.
+            "a path padded by less than the layout observed, an environment string behind",
+            b"\x02\x00\x00\x00/usr/bin/yes\x00yes\x00\x00TOKEN=secret\x00",
+        ),
+        (
+            "fewer arguments than the count",
+            b"\x05\x00\x00\x00/usr/bin/yes\x00\x00\x00\x00yes\x00/opt/agent/cli.js\x00x\x00",
+        ),
+        (
+            "a last argument with no end",
+            b"\x02\x00\x00\x00/usr/bin/yes\x00\x00\x00\x00yes\x00/opt/agent/cli.js",
+        ),
+        (
+            // Seven zero bytes where four pad the path leave three empty arguments, which are more
+            // than the two the kernel counts.
+            "more leading empty arguments than the count",
+            b"\x02\x00\x00\x00/usr/bin/yes\x00\x00\x00\x00\x00\x00\x00yes\x00",
+        ),
+        ("no end of the path", b"\x02\x00\x00\x00/usr/bin/yes"),
+    ];
+    let read_as_arguments: Vec<&str> = doubtful
+        .iter()
+        .filter(|(_, record)| parse_kern_procargs2(record).is_some())
+        .map(|(which, _)| *which)
+        .collect();
+    assert!(
+        read_as_arguments.is_empty(),
+        "records read as arguments that are read as nothing: {read_as_arguments:?}"
     );
-    let too_few =
-        b"\x05\x00\x00\x00/usr/bin/yes\x00\x00\x00\x00yes\x00/opt/agent/cli.js\x00x\x00".as_slice();
-    let read = parse_kern_procargs2(too_few).expect("a record with fewer arguments than it counts");
-    assert_eq!(read.vector, strings(&["yes", "/opt/agent/cli.js", "x"]));
-    assert_eq!(read.script_argument, None, "fewer arguments than the count");
+    // A record with a very long run of zero bytes after the path is refused before any argument is
+    // made of it.
+    let mut run = b"\x01\x00\x00\x00/usr/bin/yes".to_vec();
+    run.resize(run.len() + (1 << 20), 0);
+    assert!(
+        parse_kern_procargs2(&run).is_none(),
+        "a run of a million zero bytes is more empty arguments than any count"
+    );
+    // The stated limit of a rewritten area: the record names no end of the arguments, so a process
+    // that overwrote its argument terminators has the strings that follow, its environment, read as
+    // the arguments the kernel still counts.
+    let merged =
+        b"\x04\x00\x00\x00/usr/bin/yes\x00\x00\x00\x00yes\x00/opt/agent/cli.js\x00x\x00E=e\x00"
+            .as_slice();
+    assert_eq!(
+        parse_kern_procargs2(merged)
+            .expect("a record that counts more arguments than it holds before the environment")
+            .vector,
+        strings(&["yes", "/opt/agent/cli.js", "x", "E=e"]),
+        "a rewritten area can put an environment string into the vector"
+    );
     let relative =
         b"\x02\x00\x00\x00/usr/bin/yes\x00\x00\x00\x00yes\x00opt/agent/cli.js\x00".as_slice();
     assert_eq!(

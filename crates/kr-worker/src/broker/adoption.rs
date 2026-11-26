@@ -977,11 +977,11 @@ const PATH_PADDING: usize = 8;
 /// by, zero bytes, the arguments and then the environment.
 ///
 /// The zero bytes after the path are the padding that brings the path to a multiple of eight
-/// bytes, and one more for each empty argument at the front, so with that layout
-/// every position is known and the arguments are read one after another, empty ones included. A
-/// record with fewer zero bytes than the padding, or with fewer arguments than it counts, is a
-/// layout this reading was not made for: the vector is then what the reading gave before it was
-/// exact (the non-empty strings after the path, at most the count) and no second argument is named.
+/// bytes, and one more for each empty argument at the front, so with that layout every position is
+/// known and the arguments are read one after another, empty ones included. A record that is not
+/// laid out that way, with fewer zero bytes than the padding, more empty arguments at the front
+/// than the count, or fewer arguments than it counts, is read as nothing: the record does not say
+/// where the arguments end, so nothing that follows the path is taken as an argument.
 /// The second argument is also left out where an empty first argument or an empty second one means
 /// that it cannot be told from padding or from nothing.
 #[cfg(any(target_os = "macos", feature = "testing"))]
@@ -995,30 +995,20 @@ pub fn parse_kern_procargs2(buffer: &[u8]) -> Option<Arguments> {
     let after_path = record.get(path_length..)?;
     let zeros = after_path.iter().take_while(|byte| **byte == 0).count();
     let rest = after_path.get(zeros..)?;
-    zeros
-        .checked_sub(PATH_PADDING - path_length % PATH_PADDING)
-        .and_then(|empty_first| read_by_position(argc, empty_first, rest))
-        .or_else(|| {
-            let vector: Vec<String> = rest
-                .split(|byte| *byte == 0)
-                .filter(|argument| !argument.is_empty())
-                .take(argc)
-                .map(|argument| String::from_utf8_lossy(argument).into_owned())
-                .collect();
-            (!vector.is_empty()).then_some(Arguments {
-                vector,
-                script_argument: None,
-            })
-        })
+    let empty_first = zeros.checked_sub(PATH_PADDING - path_length % PATH_PADDING)?;
+    read_by_position(argc, empty_first, rest)
 }
 
 /// Reads `argc` arguments of which the first `empty_first` are empty and the rest follow in `rest`,
-/// each ended by a zero byte, or returns `None` where `rest` holds fewer.
+/// each ended by a zero byte, or returns `None` where `empty_first` is more than `argc` or `rest`
+/// holds fewer.
 #[cfg(any(target_os = "macos", feature = "testing"))]
 fn read_by_position(argc: usize, empty_first: usize, rest: &[u8]) -> Option<Arguments> {
-    let mut arguments: Vec<&[u8]> = vec![b"".as_slice(); empty_first];
+    // Checked before anything is made of `empty_first`, which a record's run of zero bytes sets.
+    let counted = argc.checked_sub(empty_first)?;
+    let mut arguments: Vec<&[u8]> = std::iter::repeat_n(b"".as_slice(), empty_first).collect();
     let mut remaining = rest;
-    for _ in 0..argc.checked_sub(empty_first)? {
+    for _ in 0..counted {
         let end = remaining.iter().position(|byte| *byte == 0)?;
         arguments.push(remaining.get(..end)?);
         remaining = remaining.get(end + 1..)?;
