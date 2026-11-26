@@ -3354,27 +3354,20 @@ mod tests {
             environment.environment_id,
         )
         .expect("a daemon holds the environment");
-        // The lock file names a process of its own, not this one: no message tells a person to end
-        // the process that says it.
-        let mut named = std::process::Command::new("sleep")
-            .arg("300")
-            .spawn()
-            .expect("starts a process");
-        std::fs::write(
-            environment.paths.singleton_lock(),
-            format!("{}\n", named.id()),
-        )
-        .expect("names the process");
+        // The lock file names a number that is not this process: no message tells a person to end
+        // the process that says it. The number is above every process number a platform hands out
+        // and below the bound of the guard on a printed stop command, so no process has it.
+        let named: u32 = 2_000_000_011;
+        std::fs::write(environment.paths.singleton_lock(), format!("{named}\n"))
+            .expect("names a process");
         let expected = ReleaseName::new("0.2.0+bbbbbbbbbbbb").expect("a release");
         let said = handover::still_running(&store, &environment, &expected)
             .await
             .to_string();
         assert!(
-            said.contains(&format!("process {}", named.id())) && said.contains("kill"),
+            said.contains(&format!("process {named}")) && said.contains("kill"),
             "the control: a daemon still there is named: {said}"
         );
-        let _ = named.kill();
-        let _ = named.wait();
         drop(daemon);
         let expected = ReleaseName::new("0.2.0+bbbbbbbbbbbb").expect("a release");
         let said = handover::still_running(&store, &environment, &expected)

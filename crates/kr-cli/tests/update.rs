@@ -2216,7 +2216,7 @@ async fn an_update_that_cannot_take_the_install_lock_stops_nothing() {
     )
     .expect("holds the environment");
     #[cfg(unix)]
-    let mut named = stand_in_holder(&idle.temp.environment().singleton_lock());
+    let named = name_a_holder(&idle.temp.environment().singleton_lock());
     let (output, said) = host.kr_json(&["host", "update", "--archive", &archive, "--json"]);
     assert_eq!(
         output.status.code(),
@@ -2235,11 +2235,9 @@ async fn an_update_that_cannot_take_the_install_lock_stops_nothing() {
     #[cfg(unix)]
     {
         assert!(
-            message.contains(&stop_command(named.id())),
+            message.contains(&stop_command(named)),
             "the process that holds the environment nothing answers for is named: {said}"
         );
-        let _ = named.kill();
-        let _ = named.wait();
     }
     let daemon_pid = u32::try_from(host.daemon_started_like().await.pid.get()).expect("a process");
     assert!(
@@ -2653,17 +2651,19 @@ fn an_install_makes_the_store_first_and_publishes_under_the_install_lock() {
     );
 }
 
-/// A process of its own that a lock file names in place of this test's process. This process is the
-/// parent of the `kr` that reads the file, and no message tells a person to end the parent of the
-/// program that says it. The caller ends the process by the handle it gets.
+/// The number that a lock file names in place of this test's process: above every process number a
+/// platform hands out (Linux stops at 4194304, macOS at 99999) and below the bound of the guard on a
+/// printed stop command, so that no process has it and the message that names it can be read as
+/// text. This process is the parent of the `kr` that reads the file, and no message tells a person
+/// to end the parent of the program that says it.
 #[cfg(unix)]
-fn stand_in_holder(lock: &Path) -> std::process::Child {
-    let process = std::process::Command::new("sleep")
-        .arg("300")
-        .spawn()
-        .expect("starts a process");
-    std::fs::write(lock, format!("{}\n", process.id())).expect("names the process");
-    process
+const HOLDER_NUMBER: u32 = 2_000_000_011;
+
+/// Writes `HOLDER_NUMBER` into the lock file and returns it.
+#[cfg(unix)]
+fn name_a_holder(lock: &Path) -> u32 {
+    std::fs::write(lock, format!("{HOLDER_NUMBER}\n")).expect("names a process");
+    HOLDER_NUMBER
 }
 
 /// The command a message names to end the process `pid` on this platform.
@@ -7840,7 +7840,7 @@ async fn an_update_to_a_fixed_release_is_not_held_by_a_daemon_of_the_one_that_fa
         host.tree.environment_id(),
     )
     .expect("holds the environment");
-    let mut named = stand_in_holder(&host.tree.environment().singleton_lock());
+    let named = name_a_holder(&host.tree.environment().singleton_lock());
 
     let (output, said) = host.kr_json(&["host", "update", "--archive", &archive, "--json"]);
     assert_eq!(
@@ -7853,7 +7853,7 @@ async fn an_update_to_a_fixed_release_is_not_held_by_a_daemon_of_the_one_that_fa
         said["message"]
             .as_str()
             .unwrap_or_default()
-            .contains(&format!("kill -KILL {}", named.id())),
+            .contains(&format!("kill -KILL {named}")),
         "the process that holds the environment is named: {said}"
     );
     assert_eq!(
@@ -7863,8 +7863,6 @@ async fn an_update_to_a_fixed_release_is_not_held_by_a_daemon_of_the_one_that_fa
     );
     assert_eq!(host.record()["update"]["state"], "switched");
 
-    let _ = named.kill();
-    let _ = named.wait();
     drop(holding);
     let (output, said) = host.kr_json(&["host", "update", "--archive", &archive, "--json"]);
     assert!(
@@ -8899,7 +8897,7 @@ async fn a_rollback_names_the_process_that_holds_the_environment_and_starts_noth
         host.tree.environment_id(),
     )
     .expect("holds the environment");
-    let mut named = stand_in_holder(&host.tree.environment().singleton_lock());
+    let named = name_a_holder(&host.tree.environment().singleton_lock());
 
     let (output, said) = host.kr_json(&["host", "rollback", "--json"]);
     assert_eq!(
@@ -8912,7 +8910,7 @@ async fn a_rollback_names_the_process_that_holds_the_environment_and_starts_noth
         said["message"]
             .as_str()
             .unwrap_or_default()
-            .contains(&format!("kill -KILL {}", named.id())),
+            .contains(&format!("kill -KILL {named}")),
         "the process that holds the environment is named: {said}"
     );
     assert!(
@@ -8929,8 +8927,6 @@ async fn a_rollback_names_the_process_that_holds_the_environment_and_starts_noth
     );
     assert_eq!(host.record()["update"]["state"], "switched");
 
-    let _ = named.kill();
-    let _ = named.wait();
     drop(holding);
     let (output, said) = host.kr_json(&["host", "rollback", "--json"]);
     assert!(
