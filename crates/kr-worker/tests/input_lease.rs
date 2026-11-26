@@ -3178,9 +3178,10 @@ async fn answers_held_behind_a_paste_are_all_written_when_it_ends_though_more_th
 /// of it and its saying that answers wait still brings the answer out of the lane.
 ///
 /// The share of the host's answers is full and the writer holds all of them; one more answer
-/// waits in the lane behind the first bytes of a key sequence that a person has begun, and no pass
-/// of the pump has said that answers wait. The recogniser's timer forwards the held bytes at their
-/// deadline, which opens the gate and asks the pump to look: the first pass after the gate opens.
+/// waits in the lane behind the first bytes of a key sequence that a person has begun. The pass of
+/// the pump that its arrival asks for finds the gate shut, and is held and let go before anything
+/// else begins. The recogniser's timer forwards the held bytes at their deadline, which opens the
+/// gate and asks the pump to look: the first pass after the gate opens.
 /// That pass reads no room. Before it goes on, the writer writes every batch it holds, the
 /// forwarded bytes among them, and each give-back finds nothing to wake. Nothing else happens
 /// afterwards: the application writes nothing and nobody types. The answer must reach the
@@ -3193,7 +3194,7 @@ async fn room_given_back_between_the_pumps_reading_and_its_waiting_still_brings_
     let (writer_stopped, release_writer) = runtime.input().writer_hold().arm();
     let (timer_arrived, release_timer) = runtime.pause_the_timer_at_its_deadline();
 
-    {
+    let (early_stopped, release_early) = {
         let mut session = runtime.session();
         session.ingest_output(b"\x1b[?2004h");
         session.ingest_output(&STATUS_QUESTION.repeat(256));
@@ -3206,7 +3207,24 @@ async fn room_given_back_between_the_pumps_reading_and_its_waiting_still_brings_
         runtime.flush_input();
         clock.advance(Duration::from_secs(1));
         session.ingest_output(STATUS_QUESTION);
-    }
+        // The 257th answer's deadline is new, so the pump is asked for one pass of its own, with
+        // the gate shut by the held bytes. That pass takes the session when this block ends and is
+        // the first to reach the stop: nothing else has asked the pump for anything.
+        runtime.input().pump_hold().arm_blocking()
+    };
+    // The early pass is held and let go before anything else begins, so that no pass of the pump
+    // is on its way when the stop is armed again for the pass after the gate opens.
+    tokio::time::timeout(Duration::from_secs(20), early_stopped)
+        .await
+        .expect("the pump's pass for the new deadline reads the room")
+        .expect("the early stop fires");
+    drop(release_early);
+    // The input domain is free again only once that pass has made its last change to it, so the
+    // flag read here is the one it left: the gate is shut, so no answer is waiting to be let out.
+    assert!(
+        !runtime.input().lock().replies_waiting(),
+        "the early pass finds the gate shut and leaves the flag down"
+    );
     tokio::time::timeout(Duration::from_secs(20), writer_stopped)
         .await
         .expect("the writer takes the first batch")
@@ -3226,7 +3244,7 @@ async fn room_given_back_between_the_pumps_reading_and_its_waiting_still_brings_
     );
     assert!(
         !runtime.input().lock().replies_waiting(),
-        "and no pass of the pump has said that answers wait"
+        "and the flag is down: the last pass found the gate shut"
     );
 
     // The timer forwards the held bytes and asks the pump to look. The pump's pass is stopped
